@@ -2204,7 +2204,9 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   lane image prod runs (`lane_error`), or when prod runs another lane image than the current entry
   names and is not already on the previous entry's coordinator and lane image (a rollback whose
   Coordinator step applied and whose later step failed: a rerun finishes it). With neither entry
-  naming one it reads no lane image, as before. The record job writes the restored set with the
+  naming one it reads no lane image, as before, and the flagless release leaves
+  `FLEET_LAMBDA_IMAGE` alone: a lane image prod runs that neither entry names (the unsupported
+  switch-off below) stays on the task beside the previous coordinator, and stays unrecorded. The record job writes the restored set with the
   rolled-back one as its previous, so a second rollback returns to the set the first one left.
   When the previous entry's lane image is no longer in the lane repository, the Coordinator step
   fails before any tag moves or any release, but the Worker step has already run and the host and

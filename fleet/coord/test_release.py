@@ -2894,6 +2894,15 @@ class ManualRollbackLaneTests(unittest.TestCase):
                 code, outputs, _ = self.current(release, **kwargs)
                 self.assertEqual((code, outputs["lane"]), (0, ""))
 
+    def test_a_resumed_rollback_of_a_lane_only_set_is_accepted(self):
+        # Both entries name one coordinator image (a promotion that changed only the lane image), so the
+        # coordinator digest cannot tell the sets apart: prod running E0's lane image is the resumed state.
+        for back in (self.R, None):
+            with self.subTest(back=back):
+                release = {**self.entry(1, self.S), "previous": self.entry(0, back)}
+                code, outputs, _ = self.current(release, back or "")
+                self.assertEqual((code, outputs["lane"]), (0, back or "none"))
+
     def test_a_lane_image_prod_cannot_read_refuses_when_an_entry_names_one(self):
         for left, back in ((self.S, None), (None, self.S), (self.S, self.R)):
             with self.subTest(left=left, back=back):
