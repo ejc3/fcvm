@@ -162,8 +162,8 @@ past the link watch delay, in the campaign of the PR that adds the namespace poo
 ### Measured again, with a helper that stays attached
 
 These rows and the ones above are from different sessions and are not an A/B of the two
-hold times. Every figure of this section, the table and both bullets under it, is pending
-the rerun (changelog entry 8).
+hold times. Every figure of this section was measured again with the corrected tools
+(changelog entry 9), which is the measurement to cite.
 
 Same session as changelog entry 7 (2026-11-23), `HOLD_MS=1200`, the traced cells summarized by
 `tap-summary` as it is now: the mutex traced through fentry and fexit, the count of calls the
@@ -184,13 +184,13 @@ carrier-off are each handled on their own. The rows above came from a helper att
 | 2000, no pasta | 512 | 198 | 222 | 124 | 146 | 70 | 760 | 736 | 1316 |
 
 - **A clone life's attach and detach hold the mutex 1.3 to 3.8 ms with 2000 pastas alive**
-  (pending the rerun, entry 8): 266
+  (measured again in entry 9): 266
   to 748 lives a second for the whole host, and least at C=1, where every call and every link
   event runs alone. The sum of the columns and the host's own total agree within 4% in every
   cell, and in every cell the two counts of calls are within the 2% the summary allows.
-- **Without pasta the same cycle holds 0.76 to 1.16 ms** (pending the rerun, entry 8). The
+- **Without pasta the same cycle holds 0.76 to 1.16 ms** (measured again in entry 9). The
   bridge's own link events are in it now (two a cycle, the TAP being its only port). So 36 to
-  69% of the hold with pasta is there because pasta is (pending the rerun, entry 8): its
+  69% of the hold with pasta is there because pasta is (measured again in entry 9): its
   neighbour listener among every link notification's receivers, and its TAP on the bridge.
 
 ## Changelog
@@ -405,7 +405,7 @@ of the four cells, a pool built and destroyed for each; mean (lowest to highest)
   namespaces reaches (85 to 94 setups/s, 129 to 131 teardowns/s, entry 8), with one difference:
   the reset is the pool's work after a clone has stopped, and the setup was on the clone's
   start.
-- **A reset holds `rtnl_mutex` 2.29 ms** (pending the rerun, entry 8, as is its split below;
+- **A reset holds `rtnl_mutex` 2.29 ms** (measured again in entry 9, with its split: 2.17 ms;
   one traced cell at C=128, 2000 resets, `rtnl.py`),
   where a namespace's build and destroy hold it 24 ms (entry 8): 1.51 ms in pasta's four holds
   as it exits and starts again, with three expedited RCU grace periods, 0.56 ms in the holder's
@@ -453,10 +453,117 @@ to 106); setup p50 1358 ms (1120 to 1748) and 1483 (1162 to 1662); host CPU per 
   three runs), the second counts samples of whichever thread held the mutex (5.99, 8.06 and
   5.77 ms). About 2.6 ms of the 9.19 is held off CPU.
 - The setup rate did not move, as in entry 5: the ranges overlap.
-- Pending a rerun: after these runs the tracers' return programs were made to check which
+- Measured again in entry 9: after these runs the tracers' return programs were made to check which
   mutex returned (they went by the thread alone, so after a skipped return the thread's next
   return from `mutex_lock` on another mutex was counted as taking this one), and `tap-summary`
   to divide a call's summed hold by the holds summed. The requests and acquisitions of these
   dumps differ by 14 in 94,849 or less, and the tap cells' two counts by 1.5% or less, which
   bounds how many holds can be affected but not by how much. The traced figures of entries 7
-  and 8 and the "measured again" tap rows are to be measured again with the corrected tools.
+  and 8 and the "measured again" tap rows were measured again with the corrected tools, in
+  entry 9.
+
+### 9. The pool series in one session: three arms, and the pending rows again
+
+One on-demand c8g.metal-48xl (192 CPUs, 377 GiB), host kernel 7.0.0-1013-aws, one boot,
+2026-11-23. The store is btrfs on a loop file in tmpfs (this instance type has no instance-store
+disk), 200 GiB. Arms, each fcvm built from its tree with its own pinned Firecracker and pasta:
+**pool** (main after the pool PR), **queue** (plus the inherited TAP queue), **pasta** (plus
+pasta reset over its control socket and no neighbour listener, with the pool resetting pasta
+before the holder; the order was reversed afterwards and is not measured here). Tracers as
+corrected after entry 8. Mean (lowest to highest) of three runs unless said.
+
+**The pool piece** (`netpool.sh`: a pool of 2000, 1000 leased, three campaigns per arm in turn):
+
+| arm | C | claims/s | claim p50 ms | resets/s | all ready again after, s |
+|---|---|---|---|---|---|
+| pool | 1 | 2926 (2892 to 2947) | 0.33 | 120 (119 to 122) | 9.96 |
+| pool | 32 | 27685 (24630 to 32321) | 1.12 | 116 (115 to 117) | 17.2 |
+| pool | 128 | 24229 (23939 to 24509) | 5.19 | 114 (113 to 115) | 17.5 |
+| pool | 512 | 15801 (15675 to 15954) | 37.5 | 113 (112 to 113) | 17.7 |
+| queue | 1 | 1065 (1018 to 1130) | 0.97 | 113 (111 to 116) | 10.6 |
+| queue | 32 | 24284 (18757 to 27517) | 1.30 | 111 (109 to 112) | 18.1 |
+| queue | 128 | 22275 (18214 to 24563) | 5.71 | 110 (109 to 112) | 18.2 |
+| queue | 512 | 21554 (17423 to 23933) | 21.5 | 109 (106 to 113) | 18.3 |
+| pasta | 1 | 1263 (1168 to 1376) | 0.75 | 2119 (2010 to 2199) | 0.57 |
+| pasta | 32 | 27013 (20313 to 33984) | 1.17 | 3219 (3138 to 3287) | 0.62 |
+| pasta | 128 | 22822 (18329 to 26227) | 5.61 | 3163 (3114 to 3230) | 0.63 |
+| pasta | 512 | 21898 (17758 to 24799) | 21.3 | 3107 (3094 to 3118) | 0.64 |
+
+No claim failed and no namespace was destroyed in any cell. In the queue and pasta arms a claim
+includes the three ioctls a VMM makes on the inherited queue (stage `vmm-tap`, p50 5 us at C=32
+and above; 0.35 to 0.58 ms at C=1, where it is most of the claim).
+
+`rtnl_mutex` per reset, one traced cell per arm at C=128 (2000 resets):
+
+| arm | hold, ms | pasta | the holder | link watch worker | expedited grace periods |
+|---|---|---|---|---|---|
+| pool | 2.17 | 1.35 in 4 holds | 0.67 in 16 | 0.14 | 3 in pasta |
+| queue | 2.13 | 1.40 in 4 | 0.56 in 14 | 0.17 | 3 in pasta |
+| pasta | 0.18 | none | 0.18 in 14 | none | 0.03 per reset |
+
+- **Keeping pasta alive is what moves the reset**: 109 to 120 resets a second become 2100 to
+  3200, and the hold per reset 2.1 ms becomes 0.18 ms. The inherited queue changes neither;
+  what it removes is the VMM's own attach and detach, which this piece's pool arm does not make
+  (the rows below are that cost).
+- The reset's hold replaces entry 7's 2.29 ms: 2.17 ms with the corrected tracer.
+
+**The VMM's attach and detach by name** (`tap-floor.sh`, helper attached 1.2 s, 2000
+namespaces, one traced cell each; these replace the "Measured again" rows):
+
+| namespaces | C | TUNSETIFF | close | carrier-on | carrier-off | hold per cycle, us | all holds on the host, per cycle |
+|---|---|---|---|---|---|---|---|
+| with pasta | 1 | 874 | 1213 | 847 | 945 | 3881 | 3912 |
+| with pasta | 32 | 459 | 505 | 288 | 312 | 1564 | 1559 |
+| with pasta | 128 | 385 | 419 | 268 | 265 | 1337 | 1319 |
+| with pasta | 512 | 378 | 390 | 262 | 291 | 1322 | 1267 |
+| no pasta | 1 | 222 | 350 | 178 | 191 | 1223 | 1234 |
+| no pasta | 32 | 219 | 238 | 157 | 129 | 915 | 918 |
+| no pasta | 128 | 207 | 230 | 144 | 141 | 885 | 898 |
+| no pasta | 512 | 196 | 225 | 113 | 143 | 746 | 720 |
+
+A clone life's attach and detach by name hold the mutex 1.3 to 3.9 ms with 2000 pastas alive
+and 0.75 to 1.22 ms with none: within 4% of the rows they replace.
+
+**The builder's cell** (entry 8's, three traced runs each in turn): hold per namespace life
+25.00 ms before the builder (23.74 to 26.46) and 24.02 after (22.91 to 25.50); without the
+bridge's `rcu_barrier()` 10.90 (9.86 to 12.17) and 9.07 (8.35 to 10.31). The ranges overlap
+here, where entry 8's did not: the builder's gain in hold is at most what entry 8 said and is
+not shown by this session. The netns cleanup worker holds 15.15 and 16.40 ms per life, 14.10
+and 14.95 of it the barrier. Untraced: 83 setups/s before (70 to 108) and 104 after (90 to 113);
+host CPU per setup 0.159 s and 0.069 s.
+
+**Real clones: a ramp** (`startrate.py run`, 1000 clones at C=128, a snapshot of its own per
+run, UFFD): 42.1 clones/s unpooled (one run; the other's snapshot was not made), 41.6 (41.4 to
+41.8) in the pool arm, 38.2 (36.4 to 40.0) in the queue arm, 36.8 (34.0 to 39.6) in the pasta
+arm, two runs each. Spawn to healthy p50 is 2.9 to 3.5 s, of which 1.9 to 3.2 s is between the
+VM's resume and its agent answering. A pool does not move a ramp at this concurrency: the
+namespace is 0.26 s of an unpooled clone's 2.9 s.
+
+**Real clones: churn** (`startrate.py churn`, `LIFETIME=1`, a pool of 4000, a snapshot of its
+own per rung, 60 s windows, judged by the verdict of the harness as repaired after its review).
+No rung is a sustained rate:
+
+| arm | ALIVE | up + starting | starts/s | spawn to healthy p50 / p99 ms | reset p99 s | D-state threads, peak | conditions that failed |
+|---|---|---|---|---|---|---|---|
+| pool | 50 | 45.2 + 4.8 | 43.4 | 95 / 379 | 0.52 | 47 | alive count flat (32 to 50) |
+| pool | 100 | 55.9 + 44.1 | 48.2 | 869 / 1913 | 16.8 | 172 | alive count flat (4 to 97); free slots flat (3878 to 3372 ready) |
+| queue | 50 | 44.2 + 5.8 | 41.9 | 106 / 416 | 0.52 | 22 | alive count flat (33 to 50) |
+| queue | 100 | 60.2 + 39.8 | 54.7 | 656 / 1610 | 16.8 | 98 | alive count flat (23 to 99); free slots flat (3870 to 3291 ready) |
+| pasta | 50 | 47.0 + 3.0 | 44.9 | 63 / 87 | 0.033 | 44 | alive count flat (first and last tenth 1.2 apart, 1 allowed) |
+| pasta | 100 | 82.1 + 17.9 | 73.5 | 203 / 613 | 0.033 | 91 | alive count flat (56 to 99) |
+
+Every rung's records are whole: the pool's counters cover each window (47 to 63 samples, no gap
+over 2 s, no failed poll), no clone failed or hung, every start took a recycled namespace, no
+namespace was built or destroyed, and the harness used 0.15 to 0.26 of a core. Each arm stopped
+after two failed rungs, so nothing above 100 was run.
+
+- **With pasta restarted at every reset, the pool cannot hold 50 starts and stops a second of
+  real clones**: at 100 asked the ready namespaces run down by 500 to 580 in a minute and the
+  reset's p99 is 16.8 s, in both arms that restart pasta. The piece measures 109 to 120 resets
+  a second for those arms with nothing else on the host; with clones starting beside them the
+  resets get less.
+- **With pasta kept, the pool stays flat and the starts reach 73.5 a second** at 100 asked,
+  with a start p50 of 203 ms against 656 to 869 ms. What then keeps the count from holding at
+  100 is not attributed here.
+- 73.5 starts a second is the most this session saw sustained for a minute, and it is not a
+  passing run. The goal of 1000 is not near; a ramp on the same host makes 37 to 42.

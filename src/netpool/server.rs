@@ -28,9 +28,9 @@ use tracing::{info, warn};
 
 /// The least time between two namespaces destroyed. The kernel destroys the namespaces that
 /// died since its cleanup worker last ran as one batch under `rtnl_mutex`; this keeps a
-/// batch at one namespace, which is one hold of about 1.5 ms, or of about 15 ms on a kernel
-/// that still has the bridge's `rcu_barrier()` (traced before the tracer fixes of
-/// `bench/start-rate/pieces/RESULTS.md` changelog 8; pending its rerun).
+/// batch at one namespace, which is one hold of 1.1 to 1.5 ms, or of 15 to 16 ms on a
+/// kernel that still has the bridge's `rcu_barrier()`
+/// (`bench/start-rate/pieces/RESULTS.md` changelog 9).
 pub const DESTROY_SPACING: Duration = Duration::from_millis(50);
 
 /// Namespaces built at once. A build is bound by `rtnl_mutex`, so more builders wait for
