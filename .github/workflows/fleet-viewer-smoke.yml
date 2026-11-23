@@ -28,6 +28,11 @@ on:
       settle_seconds:
         type: number
         default: 600
+      # The caller released a coordinator just before (the staging deploy): the smoke then says when it
+      # tests another commit than that release's.
+      released:
+        type: boolean
+        default: false
     # Each family's summary line ({"family", "modes", "probes", "failed"}), empty when the family
     # never finished its probes. The release gate decides on these, not on the job results.
     outputs:
@@ -76,6 +81,7 @@ jobs:
           STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          SMOKE_RELEASED: ${{ inputs.released }}
           # Empty on the schedule and on a manual run, which relaunch.
           RELAUNCH: ${{ inputs.relaunch }}
           SETTLE_SECONDS: ${{ inputs.settle_seconds || 600 }}
@@ -126,6 +132,7 @@ jobs:
           STAGING_ORIGIN: ${{ vars.STAGING_ORIGIN }}
           CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          SMOKE_RELEASED: ${{ inputs.released }}
           SETTLE_SECONDS: ${{ inputs.settle_seconds || 600 }}
         run: |
           set -o pipefail

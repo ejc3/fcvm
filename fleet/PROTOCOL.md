@@ -2190,16 +2190,27 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   (`release.py paired_build`). When `keep-built` holds an earlier build, or none, the release
   waits up to 25 minutes for this commit's lane build; when it holds a later build with other lane
   inputs, or an image with no `rev-<commit>` tag, it refuses at once. Either refusal changes
-  nothing. A push that changes only lane inputs starts no coordinator deploy: it reaches staging
-  with the next coordinator deploy, or a manual `workflow_dispatch` of
-  `fleet-coordinator-deploy.yml`.
-- **A deploy can be stranded.** Push A changes the coordinator and a lane input; push B, landing
-  while A's deploy waits, changes only lane inputs. B's lane build moves `keep-built` past A, so
-  A's deploy is refused, B starts no deploy, and a rerun of A's run is refused again: staging stays
-  on the coordinator before A. The refusal says so. Recovery: run `fleet-coordinator-deploy.yml`
-  by `workflow_dispatch` at main's head. Do not turn `FLEET_LAMBDA_LANE` on before the stacked
-  release-ordering PR lands; with releases ordered at the point of release, a lane build starts
-  the staging release itself and this case goes away.
+  nothing.
+- **Ordering.** With the lane on, a lane build main publishes starts a staging release at main's
+  head (`workflow_run` in `fleet-coordinator-deploy.yml`), so a push that changes only lane inputs
+  reaches staging. Four rules hold:
+  1. No release of an ancestor over a descendant: under the deploy job's `fleet-viewer-smoke`
+     group, before any release call, the order step (`publish.py --order`) asks the release
+     function which commits the running coordinator image carries, and skips the release step when
+     the run's commit is a strict ancestor of one (`staging-runs-a-descendant`). The skipped release
+     step concludes `skipped`, so prod's release discovery does not take that run for what staging
+     runs. A running commit main does not contain, after a fetch of main (a commit of another branch
+     can be in the full-history checkout), stops the release; an answer with no commit does too.
+  2. A no-op run cannot cancel or displace a real one: a lane-started run has a concurrency group of
+     its own, one per lane run, and a push's deploys keep `fleet-coordinator-stage`.
+  3. At most one release at a time: every release runs in the deploy job, which holds
+     `fleet-viewer-smoke` with `queue: max`.
+  4. A smoke says which commit it tested: the coordinator reports its image's commit at
+     `GET /version` (baked in at build, `FLEET_COMMIT`), and the smoke prints it beside its run's
+     commit (`tested_commit`, `run_commit`, `same`).
+
+  A deploy refused because `keep-built` holds a newer lane build is recovered by that build's own
+  lane-started release; the refusal also names a `workflow_dispatch` at main's head.
 - `release.py select --stack S --built --running R` (or `--digest D`; R is the digest S's
   coordinator runs now, or `none`) takes D from `keep-built`, moves `keep-S-next` to D,
   `keep-S-previous` to R, then `keep-S-current` to D, and reads them back. Both digests carry a protected tag after every write, a rollback (a swap of
