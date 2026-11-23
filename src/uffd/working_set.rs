@@ -523,7 +523,9 @@ impl PageSet {
             granules,
             words: Vec::with_capacity(words),
             first: vec![0; granules as usize],
-            recordings: u64_at(72),
+            // Clamped: the count is only compared with the bound, and a corrupt one must not
+            // overflow `completed + in_flight`.
+            recordings: u64_at(72).min(RECORDING_CLONES),
         };
         for i in 0..words {
             let off = HEADER_LEN + i * 8;
@@ -752,6 +754,19 @@ impl WorkingSetPersistence {
         self.prompt(vm_id, faulted_pages, learned_pages);
     }
 
+    /// Prompt the worker again when its last publication did not land: a busy sidecar skips
+    /// a publication, and without a retry the fourth recording's count would wait for the
+    /// shutdown drain. The fault handler calls this on its progress tick.
+    pub(crate) fn retry_if_unpublished(&self, vm_id: &str) {
+        if self
+            .store
+            .unpublished
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.prompt(vm_id, 0, 0);
+        }
+    }
+
     fn prompt(&self, vm_id: &str, faulted_pages: u64, learned_pages: u64) {
         let request = PersistRequest {
             vm_id: vm_id.to_string(),
@@ -859,6 +874,14 @@ pub struct WorkingSetStore {
     completed: std::sync::atomic::AtomicU64,
     /// Clones of this server recording now ([`WorkingSetStore::admit_recorder`]).
     in_flight: std::sync::atomic::AtomicU64,
+    /// Complete recordings this server finished, and how many of them a publication has
+    /// added to the sidecar's count. A publication adds the difference to the count on disk,
+    /// so servers that record at the same time sum their recordings.
+    local_completed: std::sync::atomic::AtomicU64,
+    published: std::sync::atomic::AtomicU64,
+    /// The last publication attempt did not land (the sidecar was busy or the write failed);
+    /// [`WorkingSetPersistence::retry_if_unpublished`] tries again.
+    unpublished: std::sync::atomic::AtomicBool,
     /// `known` split by first-touch tier, for replay. Splitting a large set scans every
     /// granule (about 144 ms for a dense 128 GiB guest), so it is done when the set is loaded
     /// and on a thread of its own after the set changes, never on a clone's fault path.
@@ -976,6 +999,9 @@ impl WorkingSetStore {
             })),
             completed: std::sync::atomic::AtomicU64::new(known.recordings),
             in_flight: std::sync::atomic::AtomicU64::new(0),
+            local_completed: std::sync::atomic::AtomicU64::new(0),
+            published: std::sync::atomic::AtomicU64::new(0),
+            unpublished: std::sync::atomic::AtomicBool::new(false),
             known: Mutex::new(known),
         })
     }
@@ -1130,6 +1156,7 @@ impl WorkingSetStore {
         let mut known = self.known.lock().expect("working set mutex");
         let (added, mut changed) = known.union_changes(observed);
         if completed && !observed.is_empty() {
+            self.local_completed.fetch_add(1, SeqCst);
             let count = self.completed.fetch_add(1, SeqCst) + 1;
             if count > known.recordings {
                 known.recordings = count;
@@ -1198,7 +1225,12 @@ impl WorkingSetStore {
     /// observations remain in `known`; that worker's queued successor or a later clone will
     /// publish the union. Contention can therefore cost a cache update, never liveness.
     fn try_persist_known(&self) -> Result<Option<MergeOutcome>> {
-        self.merge_and_persist_inner(&PageSet::empty(self.mem_len), true)
+        let result = self.merge_and_persist_inner(&PageSet::empty(self.mem_len), true);
+        self.unpublished.store(
+            !matches!(result, Ok(Some(_))),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        result
     }
 
     fn merge_and_persist_inner(
@@ -1258,6 +1290,18 @@ impl WorkingSetStore {
         }
         let added = merged.union_from(observed);
         let total = merged.len();
+        // The count on disk plus this server's complete recordings it has not added yet, so
+        // servers recording at once sum their counts. A wave that passes the bound together
+        // is accepted whole: its union stays, and the count stops at the bound.
+        let local = self
+            .local_completed
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let published = self.published.load(std::sync::atomic::Ordering::SeqCst);
+        merged.recordings = on_disk
+            .as_ref()
+            .map_or(0, |disk| disk.recordings)
+            .saturating_add(local.saturating_sub(published))
+            .min(RECORDING_CLONES);
         // The union holds everything on disk, so it differs from the file only when it gained
         // granules or an earlier first-touch time. With no file, only a non-empty union is new.
         let changed = match on_disk.as_ref() {
@@ -1277,6 +1321,10 @@ impl WorkingSetStore {
         } else {
             Ok(())
         };
+        if result.is_ok() && !superseded {
+            self.published
+                .store(local, std::sync::atomic::Ordering::SeqCst);
+        }
 
         // Release explicitly, so both locks demonstrably span the whole identity-check and
         // publication transaction above rather than ending wherever the compiler last uses
@@ -2716,5 +2764,73 @@ mod tests {
             store.finish_recording(&recorder, true);
         }
         assert!(store.admit_recorder().is_some());
+    }
+
+    /// Servers that record at the same time sum their complete recordings in the sidecar,
+    /// and a server adds each of its own recordings once however often it publishes.
+    #[test]
+    fn servers_recording_at_once_sum_their_counts() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (_dir, mem, config, lock, mem_len) = bound_fixture();
+        let first = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        let second = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        for (g, store) in [&first, &second].into_iter().enumerate() {
+            let recorder = store.admit_recorder().unwrap();
+            store.finish_recording(&one_page(recorder, g as u64), true);
+        }
+        first.merge_and_persist(&PageSet::empty(mem_len)).unwrap();
+        second.merge_and_persist(&PageSet::empty(mem_len)).unwrap();
+        first.merge_and_persist(&PageSet::empty(mem_len)).unwrap();
+        let next = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        assert_eq!(next.completed.load(SeqCst), 2);
+        assert_eq!(next.to_prefetch().len(), 2);
+    }
+
+    /// A publication skipped because the sidecar was busy is retried once it is free, not
+    /// left for the shutdown drain.
+    #[test]
+    fn a_skipped_publication_is_retried() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (_dir, mem, config, lock, mem_len) = bound_fixture();
+        let store = Arc::new(WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap());
+        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
+        let held = Flock::lock(
+            File::options()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&store.lock_path)
+                .unwrap(),
+            FlockArg::LockExclusive,
+        )
+        .map_err(|(_, e)| e)
+        .unwrap();
+        let recorder = store.admit_recorder().unwrap();
+        persistence.finish("vm-busy", one_page(recorder, 0), true);
+        assert!(persistence.drain(Duration::from_secs(10)));
+        assert!(store.unpublished.load(SeqCst));
+        assert!(!store.path.exists());
+        drop(held);
+        persistence.retry_if_unpublished("vm-busy");
+        assert!(persistence.drain(Duration::from_secs(10)));
+        assert!(!store.unpublished.load(SeqCst));
+        let next = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        assert_eq!(next.completed.load(SeqCst), 1);
+    }
+
+    /// A count read from a sidecar is clamped to the bound, so a corrupt one cannot overflow
+    /// the admission arithmetic.
+    #[test]
+    fn a_sidecar_count_is_clamped_to_the_bound() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (_dir, mem, config, lock, mem_len) = bound_fixture();
+        let store = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        let mut set = one_page(store.recorder(), 0);
+        set.recordings = u64::MAX;
+        write_set(&store.path, &set, &store.key, mem_len).unwrap();
+        let next = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        assert_eq!(next.completed.load(SeqCst), RECORDING_CLONES);
+        assert!(next.admit_recorder().is_none());
     }
 }

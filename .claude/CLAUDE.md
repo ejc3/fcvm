@@ -3022,9 +3022,15 @@ separately.
   `RECORDING_CLONES` (4) clones of a server record at once, and a set whose sidecar counts
   four complete recordings is frozen. A recording is complete when its window closed and it
   saw a page; a clone killed before then, or one that never faulted, merges what it saw and
-  gives its slot to the next clone. The sidecar carries the count, so a serve per restore
-  (the implicit server of `snapshot run --snapshot`) freezes the set at the fourth complete
-  restore, not the first. The server logs `froze the recorded working set` once; to
+  gives its slot to the next clone. The sidecar carries the count (format version 3: a v2
+  sidecar is dropped and re-recorded on upgrade, and an older serve sharing the snapshot
+  rewrites v2 over it, which loses the hint and corrupts nothing). Each publication adds the
+  server's unpublished complete recordings to the count on disk, so servers that record at
+  once sum their counts, and a serve per restore (the implicit server of `snapshot run
+  --snapshot`) freezes the set at the fourth complete restore, not the first. When one wave
+  of overlapping restores passes four together, that wave's union is kept and the count
+  stops at four. A publication the busy sidecar skipped is retried on the fault handler's
+  10 s progress tick. The server logs `froze the recorded working set` once; to
   re-record, stop the serve, delete the sidecar and start it again. A recording clone's
   bitmap is unioned into the serve process's in-memory set when its window closes, while the
   clone keeps running, or when it exits first, and scheduled onto one bounded, coalescing

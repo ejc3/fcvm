@@ -5023,6 +5023,13 @@ async fn serve_faults(
             _ = retry_due => {}
 
             _ = progress.tick() => {
+                if let Some(persistence) = state
+                    .recording_sink
+                    .as_ref()
+                    .and_then(|sink| sink.persistence.as_ref())
+                {
+                    persistence.retry_if_unpublished(ctx.vm_id);
+                }
                 report_fault_progress(ctx, state, async_uffd.get_ref().as_raw_fd(), last_count);
                 last_count = state.fault_count;
             }
