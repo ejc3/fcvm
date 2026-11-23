@@ -348,8 +348,10 @@ impl VmManager {
             cmd.arg("--show-log-origin");
         }
 
-        // Seccomp is enabled by default (Firecracker's security boundary).
-        // Set FCVM_NO_SECCOMP=1 to disable for debugging.
+        // Firecracker installs its default seccomp policy unless told otherwise. fcvm's
+        // build is for the gnu target, whose default policy allows every syscall of the
+        // native architecture (rootfs-config.toml, [firecracker]).
+        // Set FCVM_NO_SECCOMP=1 to install none, for debugging.
         if std::env::var("FCVM_NO_SECCOMP").is_ok() {
             warn!("Seccomp disabled via FCVM_NO_SECCOMP - reduced security");
             cmd.arg("--no-seccomp");
