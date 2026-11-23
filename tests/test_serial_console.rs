@@ -378,6 +378,16 @@ const RESTORE_PROGRESS_LINES: [&str; 4] = [
     "[fc-agent] restore phases complete",
 ];
 
+/// Lines that are not fc-agent's own which its console writer carries, and which end a
+/// restore's hand-off as an urgent line does: a panic's message and a failpoint's line.
+/// Kernel messages and systemd's status lines reach the console another way and end
+/// nothing, so no other console line counts as a cause.
+const FALLBACK_CAUSES: [&str; 2] = ["panicked at", "FAILPOINT "];
+
+/// fc-agent's line when the output connection's reconnect fails, which ends the hand-off
+/// (`output_writer` in fc-agent/src/output.rs).
+const RECONNECT_FAILED: &str = "output vsock reconnect failed";
+
 /// What a line of fc-agent's starts with, after `[fc-agent] `, when fc-agent's console
 /// writer puts it on the console at once and ends the restore's hand-off (`URGENT_WORDS`
 /// in fc-agent/src/console.rs; the reader's test below pins the two lists together).
@@ -398,10 +408,14 @@ struct RestoreLog {
     /// The restore progress lines that came over the output connection, each of which
     /// says when the guest logged it.
     progress_from_agent: usize,
-    /// The first console line that shows the restore put its lines on the console, as
-    /// fc-agent documents it does: a line with `held_ms=` (a line it had held), or an
-    /// urgent line of its own, ahead of any hand-off line.
-    fallback: Option<String>,
+    /// The first console line, ahead of any hand-off line, that makes fc-agent put a
+    /// restore's lines on the console at once: an urgent line of its own, a line that is
+    /// not its own which its writer carries (a panic, a failpoint), or the failure of
+    /// the output connection's reconnect.
+    fallback_cause: Option<String>,
+    /// The first console line with `held_ms=` ahead of any hand-off line: a line the
+    /// restore held for the host and then wrote to the console.
+    held_on_console: Option<String>,
 }
 
 impl RestoreLog {
@@ -410,6 +424,13 @@ impl RestoreLog {
         let is_urgent = |line: &str| {
             line.split_once(&format!("{AGENT_CONSOLE_LINE} "))
                 .is_some_and(|(_, message)| URGENT_WORDS.iter().any(|w| message.starts_with(w)))
+        };
+        // What ends the hand-off without being an urgent line of fc-agent's: a line its
+        // writer carries that is not its own, or its output connection failing.
+        let is_other_cause = |line: &str| {
+            let agent = line.contains("[fc-agent]");
+            (!agent && FALLBACK_CAUSES.iter().any(|cause| line.contains(cause)))
+                || (agent && line.contains(RECONNECT_FAILED))
         };
         let agent_console_lines: Vec<&str> = log
             .lines()
@@ -426,9 +447,16 @@ impl RestoreLog {
             .collect();
         Self {
             console_agent_lines: agent_console_lines.len(),
-            fallback: console_lines_before_hand_off
+            // Any console line counts here, fc-agent's or not, up to the hand-off line.
+            fallback_cause: log
+                .lines()
+                .filter(|line| is_console_line(line) && !line.contains("[fcvm-vitals]"))
+                .take_while(|line| !line.contains(RESTORE_HAND_OFF_LINE))
+                .find(|line| is_urgent(line) || is_other_cause(line))
+                .map(|line| line.to_string()),
+            held_on_console: console_lines_before_hand_off
                 .iter()
-                .find(|line| line.contains(" held_ms=") || is_urgent(line))
+                .find(|line| line.contains(" held_ms="))
                 .cloned(),
             console_lines_before_hand_off,
             console_hand_off_lines: agent_console_lines
@@ -454,17 +482,22 @@ impl RestoreLog {
     /// Always: an fc-agent line crossed the serial console. None means the restored UART
     /// is dead.
     ///
-    /// When the restore handed its lines to the host: no progress line on the console,
-    /// one hand-off line, nothing of fc-agent's ahead of it, and the progress lines in
-    /// the log from the output connection.
-    ///
-    /// When it fell back to the console (`fallback`): only the first. fc-agent puts a
-    /// restore's lines on the console when it logs a warning or an error, and when the
-    /// restore is not acknowledged within its window, and those lines crossing the
-    /// console are themselves the proof of the UART. 6 of 3,000 clones in a 128-way ramp
-    /// logged `WARNING: chronyd pid N survived SIGKILL for 2s` during their restore, so a
-    /// test that demanded the hand-off would fail about once in 500 runs on a loaded
+    /// When the log shows why the restore put its lines on the console
+    /// (`fallback_cause`): only that. fc-agent does so when it logs a warning or an
+    /// error, when a line that is not its own passes through its writer, and when the
+    /// output connection's reconnect fails, and those lines crossing the console are
+    /// themselves the proof of the UART. 6 of 3,000 clones in a 128-way ramp logged
+    /// `WARNING: chronyd pid N survived SIGKILL for 2s` during their restore, so a test
+    /// that demanded the hand-off there would fail about once in 500 runs on a loaded
     /// runner, and would blame the UART.
+    ///
+    /// With no such line, the restore must have handed its lines to the host: no
+    /// progress line on the console, one hand-off line, nothing of fc-agent's ahead of
+    /// it, and the progress lines in the log from the output connection. Held lines on
+    /// the console with nothing to explain them (`held_ms=` and no cause) fail: the
+    /// hand-off never happened. fc-agent's window ran out, which one clone on a test
+    /// host has no reason to do, or the output connection refused the lines. That is
+    /// what a restore that never tells the console it was acknowledged looks like.
     fn assert_console_after_restore(&self, log: &std::path::Path) {
         assert!(
             self.console_agent_lines > 0,
@@ -474,14 +507,26 @@ impl RestoreLog {
              Firecracker's stdout. {self:#?}\nlog at {}",
             log.display()
         );
-        match &self.fallback {
-            Some(line) => println!(
-                "  the restore put its lines on the console, not the output connection; \
-                 the first that shows it: {}",
-                line.trim()
-            ),
-            None => self.assert_progress_stayed_off_the_console(log),
+        if let Some(cause) = &self.fallback_cause {
+            println!(
+                "  the restore put its lines on the console, not the output connection, \
+                 because of this line: {}",
+                cause.trim()
+            );
+            return;
         }
+        if let Some(held) = &self.held_on_console {
+            panic!(
+                "the restore held its progress lines and then wrote them to the console \
+                 with `held_ms=`, and no warning, error, panic, failpoint or failed \
+                 reconnect in the log explains it: the hand-off to the host never \
+                 happened (fc-agent's window ran out, or the output connection refused \
+                 the lines). The UART works. First held line: {}\n{self:#?}\nlog at {}",
+                held.trim(),
+                log.display()
+            );
+        }
+        self.assert_progress_stayed_off_the_console(log);
     }
 
     /// A restore writes one fc-agent line to the serial console, the hand-off line, and
@@ -524,8 +569,10 @@ impl RestoreLog {
 /// a restore that wrote its progress to the console, or that a restore which fell back
 /// to the console passes without it. This does.
 ///
-/// RED BEFORE THE FALLBACK WAS READ: the two fallen-back logs failed the verdict, as a
-/// VM test whose clone logged a warning during its restore did.
+/// RED BEFORE THE FALLBACK WAS READ: the log that fell back on a warning failed the
+/// verdict, as a VM test whose clone logged one during its restore did.
+/// RED WHEN `held_ms=` ALONE COUNTED AS A FALLBACK: held lines with no cause passed, so
+/// the VM tests passed with the hand-off gone.
 #[test]
 fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
     let stamp = "2026-01-01T00:00:10.120000Z  INFO";
@@ -563,7 +610,7 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
         (log.console_hand_off_lines, log.progress_from_agent),
         (0, 0)
     );
-    assert_eq!(log.fallback, None);
+    assert_eq!((&log.fallback_cause, &log.held_on_console), (&None, &None));
     assert!(fails(&log), "progress on the console passed: {log:#?}");
 
     // Queued for the host: one console line, the rest under fcvm::agent with logged=.
@@ -574,7 +621,8 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
         (log.console_hand_off_lines, log.progress_from_agent),
         (1, 4)
     );
-    assert_eq!((log.console_agent_lines, &log.fallback), (1, &None));
+    assert_eq!(log.console_agent_lines, 1);
+    assert_eq!((&log.fallback_cause, &log.held_on_console), (&None, &None));
     assert!(!fails(&log), "a handed-over restore failed: {log:#?}");
 
     // The hand-off line alone: nothing proves the progress lines reached the log.
@@ -593,16 +641,25 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
     assert_eq!(log.console_agent_lines, 0);
     assert!(fails(&log), "a dead console passed: {log:#?}");
 
-    // Fell back when its window ran out: the held lines are on the console with held_ms.
-    let log = RestoreLog::read(&on_console(&progress, " held_ms=12.5"));
+    // Held lines on the console and no cause: the hand-off never happened. The window
+    // ran out, as it does when the restore never tells the console it was acknowledged,
+    // or the output connection refused the lines. Fails, whatever else the console has:
+    // systemd's status lines and the kernel's messages are not causes.
+    let held = on_console(&progress, " held_ms=10000.2");
+    let log = RestoreLog::read(&held);
     assert_eq!(log.progress_on_console.len(), 4, "{log:#?}");
-    assert!(
-        log.fallback
-            .as_deref()
-            .is_some_and(|l| l.contains(progress[0])),
-        "{log:#?}"
+    assert!(log.held_on_console.is_some() && log.fallback_cause.is_none());
+    assert!(fails(&log), "held lines with no cause passed: {log:#?}");
+    let other_console = format!(
+        "{stamp} firecracker: [  OK  ] Started systemd-journald.service - Journal Service.\n\
+         {stamp} firecracker: [   12.345678] random: crng reseeded due to virtual machine fork\n"
     );
-    assert!(!fails(&log), "a fallen-back restore failed: {log:#?}");
+    let log = RestoreLog::read(&(other_console.clone() + &held));
+    assert_eq!(log.fallback_cause, None, "{log:#?}");
+    assert!(
+        fails(&log),
+        "held lines passed on a systemd or kernel line: {log:#?}"
+    );
 
     // Fell back on a warning: two held lines, the warning, the rest as they were logged.
     let warning = "[fc-agent] WARNING: chronyd pid 327 survived SIGKILL for 2s";
@@ -611,26 +668,43 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
             + &on_console(&[warning], "")
             + &on_console(&progress[2..], "")),
     );
+    assert_eq!(
+        log.fallback_cause.as_deref().map(str::trim),
+        Some(format!("{stamp} fcvm::console: {warning}").as_str())
+    );
     assert!(
         !fails(&log),
         "a restore that logged a warning failed: {log:#?}"
     );
-    // And on a warning with nothing held yet: the warning is what shows it.
+    // And on a warning with nothing held yet.
     let log = RestoreLog::read(&(on_console(&[warning], "") + &on_console(&progress, "")));
-    assert_eq!(
-        log.fallback.as_deref().map(str::trim),
-        Some(format!("{stamp} fcvm::console: {warning}").as_str())
-    );
+    assert!(log.fallback_cause.is_some() && log.held_on_console.is_none());
     assert!(!fails(&log), "{log:#?}");
     // A warning after the hand-off is no fallback: the restore's lines were handed over.
     let log = RestoreLog::read(&(hand_off.clone() + &from_agent + &on_console(&[warning], "")));
-    assert_eq!(log.fallback, None);
+    assert_eq!(log.fallback_cause, None);
     assert!(!fails(&log), "{log:#?}");
-    // Each urgent word counts, and no other line of fc-agent's does.
+    // Each urgent word is a cause, and so are a panic, a failpoint and a failed reconnect.
     for word in URGENT_WORDS {
         let line = format!("[fc-agent] {word} x");
-        let log = RestoreLog::read(&(on_console(&[&line], "") + &on_console(&progress, "")));
-        assert!(log.fallback.is_some(), "{word:?} is not read as urgent");
+        let log = RestoreLog::read(&(held.clone() + &on_console(&[&line], "")));
+        assert!(
+            log.fallback_cause.is_some(),
+            "{word:?} is not read as urgent"
+        );
+        assert!(!fails(&log), "{log:#?}");
+    }
+    for cause in [
+        format!("{stamp} firecracker: thread 'main' panicked at fc-agent/src/restore.rs:1:1:\n"),
+        format!("{stamp} firecracker: FAILPOINT restore.post_epoch_read reached action=sleep\n"),
+        on_console(&["[fc-agent] output vsock reconnect failed, retrying"], ""),
+    ] {
+        let log = RestoreLog::read(&(held.clone() + &cause));
+        assert!(
+            log.fallback_cause.is_some(),
+            "{cause:?} is not read as a cause"
+        );
+        assert!(!fails(&log), "{log:#?}");
     }
     // The words are fc-agent's own.
     let agent = include_str!("../fc-agent/src/console.rs");
