@@ -148,3 +148,39 @@ Teardown ran at 144 to 377 clones/s on main, 171 to 1319 with this PR and 702 to
 subvolume. Up to 8 at once the PR is main (reflinks); always-subvolume is faster at C=8 on this
 quiet host, but the fleet measured the subvolume commit at 193 ms p50 and 1.8 s p99 while it was
 taking snapshots, against a C=8 reflink p50 of 47 ms here.
+
+### 5. vmm: stage-2 faults per clone, and the write set (#2035)
+
+Where a restored clone's stage-2 aborts come from: real clones (`bench-start-rate-run`, rootless,
+20 at C=1 and 256 at C=128), one snapshot, c8g.metal-48xl, stock host kernel 7.0.0-1013-aws,
+bpftrace on `kvm_guest_fault`, `io_mem_abort` and `kvm_handle_guest_abort`. RAM kinds come from
+every abort at C=1; at C=128 the tracer dropped most per-page lines, so only the permission
+faults (which are all RAM) are given there.
+
+| restore | C | aborts / clone | MMIO / clone | RAM read first | RAM write first | RAM write after a read | on-CPU us / abort | handler on-CPU ms / clone |
+|---|---|---|---|---|---|---|---|---|
+| File | 1 | 38,589 | 15,064 | 13,382 | 4,766 | 5,207 | 3.7 | 141 |
+| File | 128 | 47,214 | 8,077 | | | 7,242 | 10.0 | 471 |
+| UFFD copy | 1 | 36,723 | 14,065 | 12,822 | 5,229 | 4,594 | 1.9 | 67 |
+| UFFD copy | 128 | 45,797 | 8,502 | | | 7,135 | 10.2 | 447 |
+| UFFD minor | 1 | 46,240 | 14,803 | 14,572 | 10,409 | 6,540 | 4.0 | 178 |
+| UFFD minor | 128 | 72,277 | 8,425 | | | 7,031 | 33.3 | 2,475 |
+
+Every stage-2 mapping was 4 KiB. At C=1 a File clone touched 17,667 distinct RAM pages and its
+5,119 repeats were nearly all the write after a read. UFFD minor mode is the slow one under
+concurrency: at C=128 it takes 72k aborts per clone at 33 us each, 2.5 s of handler time per
+clone, against 10 us for File and UFFD copy; that is not attributed further here.
+
+The write set (#2035) removes the copy-on-write from a File clone's restore. End-to-end, to 1000
+clones alive, main against #2035, three fresh snapshots per arm: 30.0-35.3 against 38.6-59.3
+clones/s at C=128 and 28.5-34.8 against 34.5-58.3 at C=512; fault-handler on-CPU time per clone
+2.7-4.2 s against 60-81 ms; anonymous memory per clone 36.5-49.6 against 38.4-49.1 MB (the
+table is in #2035).
+
+MMIO, by device (10 File clones at C=1 on #2024's head, then 5 on main, from `kvm_mmio`): on
+#2024's head the virtio-net device took 4,313 interrupt status reads and acknowledgements and
+2,723 queue notifies per clone, and the serial console 3,247 byte writes plus about 1,150 status
+reads. On main the virtio-net exits are under 100 per clone, which fits fc-agent's MMDS polling
+over the network having moved to the vsock reset (#2033). What remains is the console: 2,975
+transmit-register writes per clone in the first second, one exit to Firecracker per byte, which
+are fc-agent's 37 restore lines (about 2.7 KB) on ttyS0. Block takes about 150 and vsock about 20.
