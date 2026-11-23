@@ -354,17 +354,24 @@ def main(argv):
         elif action == "record":
             output(record=record(json.loads(rest[0]), rest[1] or None, json.loads(rest[2])))
         elif action == "current":
-            release = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"}).get("release")
+            answer = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"})
+            release = answer.get("release")
             if not release or not release.get("previous"):
                 raise RuntimeError("prod has no recorded previous release to roll back to")
-            # The manual rollback (fleet-prod-rollback.yml) does not return a lane image yet: with the prod lane on,
-            # or a set on either side naming one, it stops here, before any release.
-            if (publish.lane_setting("FLEET_LAMBDA_LANE_PROD") or "lambda_digest" in release
-                    or "lambda_digest" in release["previous"]):
-                raise RuntimeError("a manual rollback of a lane image is not supported yet; recover by hand: "
+            # What prod runs must be what its record names (an entry without lambda_digest names none), or the
+            # rollback would start from a set nobody recorded.
+            runs = answer.get("prod") or {}
+            if runs.get("lane_error"):
+                raise RuntimeError(f"the release function could not read the lane image prod runs ({runs['lane_error']})")
+            if (runs.get("lambda_digest") or "") != release.get("lambda_digest", ""):
+                raise RuntimeError("prod runs another lane image than its release record names; recover by hand: "
                                    "publish.py --stack prod --force --commit C --digest D --lambda-digest <the "
-                                   "previous set's lane digest, or none>, then prod_release.py record")
-            output(current=entry(release), previous=release["previous"])
+                                   "lane digest to run, or none>, then prod_release.py record")
+            # The lane flag comes from both entries: the previous set's lane image when it names one, else none
+            # when the set being left names one, else no flag (today's release).
+            back = release["previous"].get("lambda_digest")
+            lane = back if back else "none" if release.get("lambda_digest") else ""
+            output(current=entry(release), previous=release["previous"], lane=lane)
         else:
             raise ValueError("unknown action")
     except publish.Held:

@@ -3,7 +3,8 @@ name: Fleet prod rollback
 # Returns the production fleet to the set before its current one, as /fcvm-fleet/prod/release records
 # it (`previous`): the Worker version, the coordinator image (the release function's `force`, which
 # skips the viewer hold and is accepted only for an image prod ran before) and the host and tile
-# images (only while prod is asleep: this waits up to 350 minutes for it). Then the prod smoke, and
+# images (only while prod is asleep: this waits up to 350 minutes for it), and the Lambda lane image the
+# previous set names (none when only the current set names one). Then the prod smoke, and
 # the record names the restored set with the rolled-back one as its previous. Run by hand from main;
 # a failed promotion rolls itself back (fleet-prod-promote.yml).
 
@@ -54,12 +55,12 @@ jobs:
           role-session-name: fcvm-prod-rollback-${{ github.run_id }}
           role-duration-seconds: 21600
           mask-aws-account-id: true
-      # A lane image is not rolled back by hand yet: with the prod lane on, or a set naming one, this step
-      # fails, and every step below needs it to succeed.
+      # Fails when prod runs another lane image than its record names; every step below needs it to succeed.
+      # Its `lane` output is the Coordinator step's --lambda-digest: the previous set's lane image, none, or
+      # empty (no flag) when neither set names one.
       - id: current
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
-          FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}
         run: python3 -B fleet/coord/prod_release.py current
       # Each component is returned whatever the one before it did; any failure still fails the job.
       - name: Worker
@@ -84,9 +85,12 @@ jobs:
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           PREVIOUS: ${{ steps.current.outputs.previous }}
+          LANE: ${{ steps.current.outputs.lane }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
           python3 -B fleet/coord/publish.py --stack prod --force \
-            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")"
+            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")" \
+            ${LANE:+--lambda-digest "$LANE"}
       - name: Host and tile images
         if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:

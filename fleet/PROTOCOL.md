@@ -2195,15 +2195,17 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   runs as previous), releases it with the coordinator, and puts prod's tags back if the release
   fails or is held. Leaving a set that carries a lane image, a failed promotion's rollback returns
   to the lane image prod ran before it, or, when it ran none, passes `--lambda-digest none`, and
-  the function removes `FLEET_LAMBDA_IMAGE`. With the lane on, a record entry without
-  `lambda_digest` names no lane image. Off, prod's sets carry no lane image and its releases are
-  the ones without a lane.
-- **Not supported yet, so the prod switch stays off until they are:** a manual rollback
-  (`fleet-prod-rollback.yml`) of a lane image: with the switch on, or a set on either side naming
-  one, it stops before any release and names the recovery by hand. And turning
-  `FLEET_LAMBDA_LANE_PROD` off while prod runs a lane image: a lane-off promotion writes an entry
-  without `lambda_digest` while the running task keeps its lane image. Return prod to `none`
-  first.
+  the function removes `FLEET_LAMBDA_IMAGE`. A record entry without `lambda_digest` names no lane
+  image. Off, prod's sets carry no lane image and its releases are the ones without a lane.
+- **Manual rollback.** `fleet-prod-rollback.yml` takes its lane flag from both recorded entries:
+  the previous set's lane image when it names one, else `none` when the current set names one,
+  else no flag, which is today's release. Its first step (`prod_release.py current`) refuses when
+  prod runs another lane image than its record's current entry names, or when the function could
+  not read it (`lane_error`), before any release. The record job writes the restored set with the
+  rolled-back one as its previous, so a second rollback returns to the set the first one left.
+- **Not supported:** turning `FLEET_LAMBDA_LANE_PROD` off while prod runs a lane image. A lane-off
+  promotion writes an entry without `lambda_digest` while the running task keeps its lane image.
+  Return prod to `none` first.
 - **A stack's first selection is not put back.** `release.py reset` restores the tags a
   selection moved, but a stack's first selection moved tags that did not exist, and nothing here
   deletes a tag: after a failed or held first release, `keep-<stack>-current` stays on the image
