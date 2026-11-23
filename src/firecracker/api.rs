@@ -474,6 +474,10 @@ pub struct DriveOverride {
 pub struct MemBackend {
     pub backend_path: String,
     pub backend_type: String, // "File" or "Uffd"
+    /// File backend: the recorded write set Firecracker populates writable before the VM runs
+    /// (`crate::storage::write_set`). Left out of the request when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_set_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -9143,3 +9143,110 @@ async fn an_unprivileged_user_restores_a_snapshot_another_uid_owns() -> Result<(
     );
     Ok(())
 }
+
+/// A File-backend clone records the pages it wrote after its restore beside the memory image
+/// (`storage::write_set`), and the next clone's Firecracker populates them writable before it
+/// runs: its log says how many ranges it populated, the same number the first clone recorded.
+/// A set Firecracker cannot use (here, rewritten to garbage) is logged and the clone still
+/// comes up healthy.
+#[tokio::test]
+async fn a_file_clone_records_its_write_set_and_the_next_clone_populates_it() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("writeset");
+    let (_baseline, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+    common::kill_process(baseline_pid).await;
+    let snapshot_dir = fcvm::paths::snapshot_dir().join(&snapshot_name);
+    let sidecar = fcvm::storage::write_set::sidecar_path(
+        &snapshot_dir,
+        &snapshot_dir.join("memory.bin"),
+        &snapshot_dir.join("config.json"),
+    )?;
+
+    let outcome = async {
+        let mut recorded = None;
+        for round in 0..3 {
+            if round == 2 {
+                std::fs::write(&sidecar, "not a write set\n")?;
+            }
+            let name = format!("{clone_name}-{round}");
+            let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--snapshot",
+                    &snapshot_name,
+                    "--name",
+                    &name,
+                ],
+                &name,
+            )
+            .await?;
+            let result = async {
+                common::poll_health_by_pid(clone_pid, 120).await?;
+                let vm_id = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+                    .load_state_by_pid(clone_pid)
+                    .await?
+                    .vm_id;
+                if round == 0 {
+                    // Recorded RECORD_AFTER after the restore completed.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    while !sidecar.is_file() {
+                        anyhow::ensure!(
+                            std::time::Instant::now() < deadline,
+                            "the first clone recorded no write set"
+                        );
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    let ranges = std::fs::read_to_string(&sidecar)?.lines().count();
+                    anyhow::ensure!(ranges > 0, "the recorded write set is empty");
+                    recorded = Some(ranges);
+                }
+                anyhow::Ok(vm_id)
+            }
+            .await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            let vm_id = result?;
+            if round > 0 {
+                let log_path = format!("/tmp/fcvm-firecracker-{vm_id}.log");
+                let log = std::fs::read_to_string(&log_path)
+                    .with_context(|| format!("reading {log_path}"))?;
+                if round == 1 {
+                    let line = log
+                        .lines()
+                        .find(|l| l.contains("populated the write set"))
+                        .with_context(|| {
+                            format!("the second clone populated no write set: {log_path}")
+                        })?;
+                    let wanted = format!("{} ranges", recorded.unwrap());
+                    anyhow::ensure!(line.contains(&wanted), "{line} (wanted {wanted})");
+                } else {
+                    anyhow::ensure!(
+                        log.contains("did not populate the write set"),
+                        "a garbage write set was not reported: {log_path}"
+                    );
+                }
+            }
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    let _ = common::delete_snapshot(&snapshot_name).await;
+    outcome?;
+    // The set and its claim live in the snapshot directory and go with the generation.
+    anyhow::ensure!(!sidecar.exists(), "the write set outlived its snapshot");
+    Ok(())
+}
