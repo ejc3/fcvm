@@ -152,6 +152,20 @@ pub fn receive_packet(
             message = libc::CMSG_NXTHDR(&header, message);
         }
     }
+    // A packet longer than `buffer`, or with more descriptors than the control buffer
+    // holds, arrives cut: the kernel drops the rest of the data and closes the descriptors
+    // that did not fit, and says so only in these flags. The ones that did fit are closed
+    // here with `fds`.
+    if header.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "a packet was truncated on receipt: it is over {} bytes or carries over \
+                 {MAX_PACKET_FDS} descriptors",
+                buffer.len()
+            ),
+        ));
+    }
     Ok((len as usize, fds))
 }
 
@@ -674,6 +688,32 @@ mod tests {
         drop(a);
         let (len, fds) = receive_packet(&b, &mut buffer).unwrap();
         assert_eq!((len, fds.len()), (0, 0));
+    }
+
+    /// A packet with more descriptors than `receive_packet` has room for, or more bytes
+    /// than the caller's buffer, is an error: the kernel drops what does not fit, and a
+    /// caller handed the rest would act on part of a message.
+    #[test]
+    fn a_truncated_packet_is_an_error() {
+        let (a, b) = channel().unwrap();
+        let files: Vec<std::fs::File> = (0..MAX_PACKET_FDS + 1)
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
+            .collect();
+        let raw: Vec<RawFd> = files.iter().map(|file| file.as_raw_fd()).collect();
+        a.send_with_fds(&[&b"hello"[..]], &raw).unwrap();
+        let mut buffer = [0u8; 16];
+        let refused = receive_packet(&b, &mut buffer).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData);
+        assert!(refused.to_string().contains("truncated"), "{refused}");
+
+        a.send_with_fds(&[&[7u8; 17][..]], &[]).unwrap();
+        let refused = receive_packet(&b, &mut buffer).unwrap_err();
+        assert!(refused.to_string().contains("over 16 bytes"), "{refused}");
+
+        // The channel still carries the next packet whole.
+        a.send_with_fds(&[&b"next"[..]], &raw[..1]).unwrap();
+        let (len, fds) = receive_packet(&b, &mut buffer).unwrap();
+        assert_eq!((&buffer[..len], fds.len()), (&b"next"[..], 1));
     }
 
     /// An fcvm starts its agents from the file it is itself running from, whatever its

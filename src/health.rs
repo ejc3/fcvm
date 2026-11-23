@@ -1265,7 +1265,6 @@ pub async fn check_http_health_agent(
     }
 }
 
-/// One `GET` of `path` over `stream`, with the response read to its end, and its status.
 /// The Host header for a request to `address` on `port` when the health check URL names no
 /// host: the address, in brackets if it is IPv6, and the port unless it is HTTP's own. It
 /// is what `curl http://ADDRESS:PORT/` sends, which this probe replaced; a server that
@@ -1282,6 +1281,7 @@ fn default_host_header(address: std::net::IpAddr, port: u16) -> String {
     }
 }
 
+/// One `GET` of `path` over `stream`, with the response read to its end, and its status.
 /// `default_host` is sent as the Host header unless the health check URL named a virtual
 /// host ([`default_host_header`]).
 async fn http_get_status<S>(

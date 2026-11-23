@@ -649,8 +649,9 @@ ip link set tap-fc mtu 65520 master br0 addrgenmode none up
 ip link set br0 up
 ip addr add 10.0.2.1/24 dev br0
 ```
-Each line is one request and one `rtnl_mutex` hold; a TAP's line is two (`TUNSETIFF` and the
-close that leaves it persistent, then the netlink request). The bridge takes four: its
+Each line is one request and one `rtnl_mutex` hold, except a TAP's first line, which is three
+(`TUNSETIFF`, `TUNSETPERSIST` and the close that leaves the device detached, `rtnl::add_tap`);
+its second line is the netlink request. The bridge takes four: its
 address generation has to be off before it is up, because the kernel applies the up flag
 first and a bridge that has a carrier at that moment gets a link-local address
 (`the_bridge_stops_generating_addresses_before_it_comes_up`). The two TAPs and the bridge

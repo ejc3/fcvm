@@ -235,6 +235,10 @@ fn add_scalars(text: &str, into: &mut std::collections::BTreeMap<String, f64>) {
     }
 }
 
+/// Carrier-on and carrier-off link events the worker must have handled per cycle, each, for
+/// [`summarize`] to charge one of each to a cycle.
+const LINK_EVENTS_FLOOR: f64 = 0.5;
+
 /// What one attach and detach cost in rtnl_mutex hold time and grace periods, from the
 /// `tap.bt` dumps of a tap-attach cell (its timed and steady windows together).
 pub fn summarize(maps: &std::collections::BTreeMap<String, f64>) -> Result<serde_json::Value> {
@@ -293,6 +297,14 @@ pub fn summarize(maps: &std::collections::BTreeMap<String, f64>) -> Result<serde
     let others = get("lw_other_devs");
     let other_us_per_cycle = get("lw_other_dev_us") / cycles;
     let link_hold_us = on_us + off_us + other_us_per_cycle;
+    // The per-cycle hold charges one carrier-on and one carrier-off to every cycle. That
+    // is a cycle's cost only when the worker handled about one of each per cycle. In a
+    // namespace with no pasta it handled the TAP's carrier-on in 1% of the cycles: the
+    // helper was gone before the worker ran, and the mean of the few events seen is not
+    // what the other cycles held. Below half an event per cycle the sums are left out, and
+    // `window_rtnl_hold_us_per_cycle` is the cell's figure.
+    let events_per_cycle_seen = (on / cycles).min(off / cycles) >= LINK_EVENTS_FLOOR;
+    let per_cycle = |us: f64| events_per_cycle_seen.then_some(us);
     let runs = get("lw_holds[1]");
     Ok(serde_json::json!({
         "cycles_traced": cycles,
@@ -311,15 +323,15 @@ pub fn summarize(maps: &std::collections::BTreeMap<String, f64>) -> Result<serde
             "other_devices_seen_per_cycle": others / cycles,
             "other_devices_us": if others > 0.0 { get("lw_other_dev_us") / others } else { 0.0 },
             "other_devices_us_per_cycle": other_us_per_cycle,
-            "rtnl_hold_us_per_cycle": link_hold_us,
+            "rtnl_hold_us_per_cycle": per_cycle(link_hold_us),
         },
         // Every hold of the mutex on the host in the cell's two windows, per cycle: what
         // the cycles held and whatever else ran. On a quiet host it checks the sum below,
         // which counts one carrier-on and one carrier-off per cycle whether or not the
         // worker handled both inside the windows.
         "window_rtnl_hold_us_per_cycle": get("hold_us_total") / cycles,
-        "rtnl_hold_us_per_cycle": helper_hold_us + link_hold_us,
-        "rtnl_ceiling_cycles_per_s": 1e6 / (helper_hold_us + link_hold_us),
+        "rtnl_hold_us_per_cycle": per_cycle(helper_hold_us + link_hold_us),
+        "rtnl_ceiling_cycles_per_s": per_cycle(1e6 / (helper_hold_us + link_hold_us)),
     }))
 }
 
@@ -417,6 +429,41 @@ mod tests {
         // One call that straddles a window's edge is not a drop.
         maps.insert("helper_holds[1074025674]".into(), 999.0);
         summarize(&maps).unwrap();
+    }
+
+    /// A cell where the worker handled a link event in under half the cycles gets no
+    /// per-cycle hold and no ceiling: one event's mean is not what every cycle held. The
+    /// host's own total per cycle stays.
+    #[test]
+    fn link_events_seen_in_few_cycles_give_no_per_cycle_hold() {
+        let mut maps = std::collections::BTreeMap::new();
+        add_scalars(TIMED, &mut maps);
+        add_scalars(STEADY, &mut maps);
+        let cycles = maps["calls[1]"];
+        for kind in ["lw_tap_devs[1]", "lw_tap_devs[0]"] {
+            let mut few = maps.clone();
+            few.insert(kind.into(), cycles * 0.25);
+            let s = summarize(&few).unwrap();
+            assert!(s["rtnl_hold_us_per_cycle"].is_null(), "{kind}: {s}");
+            assert!(s["rtnl_ceiling_cycles_per_s"].is_null(), "{kind}: {s}");
+            assert!(
+                s["link_events"]["rtnl_hold_us_per_cycle"].is_null(),
+                "{kind}: {s}"
+            );
+            assert!(
+                s["window_rtnl_hold_us_per_cycle"].as_f64().unwrap() > 0.0,
+                "{kind}: {s}"
+            );
+            assert!(
+                s["helper_rtnl_hold_us_per_cycle"].as_f64().unwrap() > 0.0,
+                "{kind}: {s}"
+            );
+        }
+        // Half an event per cycle, each kind, is enough.
+        let mut half = maps.clone();
+        half.insert("lw_tap_devs[1]".into(), cycles * 0.5);
+        half.insert("lw_tap_devs[0]".into(), cycles * 0.5);
+        assert!(summarize(&half).unwrap()["rtnl_hold_us_per_cycle"].is_f64());
     }
 
     #[test]

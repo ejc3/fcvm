@@ -1184,6 +1184,8 @@ impl PastaNetwork {
             .map(std::net::Ipv6Addr::from)
     }
 
+    /// The first of `addresses` that `ip -6 addr show scope global` would list and that is
+    /// not in fd00::/8: not loopback, link-local (fe80::/10) or site-local (fec0::/10).
     fn first_global_ipv6(
         addresses: impl IntoIterator<Item = std::net::Ipv6Addr>,
     ) -> Option<std::net::Ipv6Addr> {
@@ -4063,7 +4065,6 @@ mod tests {
         assert_eq!(pick(&[]), None);
     }
 
-    /// The netlink dump finds the address getifaddrs finds on this host.
     /// On a point-to-point interface the kernel reports the peer in `IFA_ADDRESS` and this
     /// host in `IFA_LOCAL`; elsewhere only `IFA_ADDRESS` is present and is this host's.
     #[test]
@@ -4078,6 +4079,7 @@ mod tests {
         assert_eq!(PastaNetwork::own_ipv6_address(&[]), None);
     }
 
+    /// The netlink dump finds the address getifaddrs finds on this host.
     #[test]
     fn the_host_ipv6_probe_agrees_with_getifaddrs() {
         let listed = nix::ifaddrs::getifaddrs()

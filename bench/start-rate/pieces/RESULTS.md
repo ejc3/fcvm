@@ -101,15 +101,15 @@ one cycle while preparing.
 | 2000 with pasta | 32 | 857 | 13.80 / 40.5 | 436 | 1 | 487 (126) | 269 | 288 | 1481 | 675 |
 | 2000 with pasta | 128 | 923 | 114.56 / 197.8 | 419 | 1 | 515 (114) | 271 | 289 | 1497 | 668 |
 | 2000 with pasta | 512 (undercounted) | 752 | 560.41 / 1207.7 | 313 | 1 | 403 (118) | 269 | 297 | 1284 | 779 |
-| 2000, no pasta | 1 | 46 | 0.39 / 5.5 | 221 | 0 | 212 (68) | 211 | 148 | 792 | 1263 |
-| 2000, no pasta | 32 | 987 | 10.27 / 25.3 | 217 | 0 | 229 (34) | 246 | 145 | 836 | 1196 |
-| 2000, no pasta | 128 | 2051 | 38.87 / 80.0 | 210 | 1 | 230 (31) | 300 | 147 | 887 | 1127 |
-| 2000, no pasta | 512 (undercounted) | 2139 | 176.99 / 391.8 | 167 | 1 | 204 (33) | 282 | 143 | 797 | 1254 |
+| 2000, no pasta (hold columns wrong) | 1 | 46 | 0.39 / 5.5 | 221 | 0 | 212 (68) | 211 | 148 | 792 | 1263 |
+| 2000, no pasta (hold columns wrong) | 32 | 987 | 10.27 / 25.3 | 217 | 0 | 229 (34) | 246 | 145 | 836 | 1196 |
+| 2000, no pasta (hold columns wrong) | 128 | 2051 | 38.87 / 80.0 | 210 | 1 | 230 (31) | 300 | 147 | 887 | 1127 |
+| 2000, no pasta (hold columns wrong) | 512 (undercounted) | 2139 | 176.99 / 391.8 | 167 | 1 | 204 (33) | 282 | 143 | 797 | 1254 |
 | 200 with pasta | 1 | 47 | 0.23 / 0.3 | 116 | 0 | 112 (34) | 82 | 102 | 413 | 2422 |
 | 2000 with pasta, first attach | 1 | 44 | 1.08 / 12.6 | 451 | 294 | 686 (372) | 432 | 283 | 2147 | 466 |
 | 2000 with pasta, first attach | 128 | 727 | 148.86 / 304.2 | 380 | 289 | 435 (105) | 359 | 281 | 1744 | 573 |
-| 2000, no pasta, first attach | 1 | 46 | 0.57 / 1.7 | 228 | 409 | 171 (30) | 210 | 146 | 1165 | 859 |
-| 2000, no pasta, first attach | 128 | 1067 | 93.70 / 191.5 | 264 | 253 | 277 (34) | 179 | 142 | 1117 | 896 |
+| 2000, no pasta, first attach (hold columns wrong) | 1 | 46 | 0.57 / 1.7 | 228 | 409 | 171 (30) | 210 | 146 | 1165 | 859 |
+| 2000, no pasta, first attach (hold columns wrong) | 128 | 1067 | 93.70 / 191.5 | 264 | 253 | 277 (34) | 179 | 142 | 1117 | 896 |
 
 Two sets of rows are not measurements of a clone life, found in review after the campaign:
 
@@ -122,10 +122,13 @@ Two sets of rows are not measurements of a clone life, found in review after the
   only port. The worker handled the TAP's carrier-on after the helper's 20 ms were over in all
   but 1% of cycles, so those rows' carrier-on column is the average of one or two events, and
   the bridge's own carrier events (0.13 to 1.8 seen per cycle, 75 to 82 us each) are in no
-  column. Every hold of the mutex on the host during those cells, per cycle, was 1.43 ms at
-  C=1, 0.82 at C=32 and 0.59 at C=128, against the 0.79 to 0.89 the rows say. In the rows with
-  pasta the same total agrees with the row (1.79, 1.34 and 1.50 ms at C=1, 32 and 128).
-  `tap-summary` now reports both.
+  column. Every hold of the mutex on the host inside those cells' two traced windows, per
+  cycle, was 1.43 ms at C=1, 0.82 at C=32 and 0.59 at C=128, against the 0.79 to 0.89 the rows
+  say; a carrier-off handled after a window closed is in neither, so these are floors. In
+  the rows with pasta the same total is 1.79, 1.34 and 1.50 ms at C=1, 32 and 128 against the
+  rows' 1.80, 1.48 and 1.50: within 1% at C=1 and 128, and 9.5% under the row at C=32.
+  `tap-summary` now reports the total, and leaves the per-cycle hold and the ceiling out of
+  a cell where the worker handled a link event in under half the cycles.
 
 Both are measured again, with a tracer that drops nothing and a helper that stays attached
 past the link watch delay, in the campaign of the PR that adds the namespace pool.
@@ -150,9 +153,9 @@ past the link watch delay, in the campaign of the PR that adds the namespace poo
   waiting, 21.9% (`PERF_FREQ=99`, `perf record -a -g` over the timed phase of the untraced
   C=128 cell with 1000 held, top frames by `perftop.sh`). How much of the hold is pasta's
   listener is not established: the no-pasta rows that were to show it are the ones above.
-- **The attach and detach have to go.** With pasta a cycle holds 1.5 ms or more, and without
-  it the host still held the mutex 0.59 to 1.43 ms per cycle. The design's bound for keeping
-  them was 0.7 ms, so the pool has to keep the TAP attached and hand the VMM the descriptor.
+- **The attach and detach have to go.** With pasta, which every pooled namespace has, a cycle
+  holds 1.5 ms or more. The design's bound for keeping them was 0.7 ms, so the pool has to
+  keep the TAP attached and hand the VMM the descriptor.
 
 ## Changelog
 
