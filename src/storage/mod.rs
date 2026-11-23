@@ -10,6 +10,7 @@ pub mod pmem_store;
 pub mod snapshot;
 pub mod snapshot_archive;
 pub mod volume;
+pub mod write_set;
 
 pub use disk::{DiskConfig, DiskManager};
 pub use snapshot::{

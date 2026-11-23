@@ -933,7 +933,7 @@ fn snapshot_files(dir: &Path, memory_by_config: bool) -> Result<Vec<PathBuf>> {
             if memory_by_config && relative == Path::new(SNAPSHOT_MEMORY_FILE) {
                 continue;
             }
-            if is_lock_or_temporary(&entry.file_name()) {
+            if is_lock_or_temporary(&entry.file_name()) || is_write_set(&entry.file_name()) {
                 continue;
             }
             let kind = entry
@@ -966,6 +966,14 @@ fn snapshot_files(dir: &Path, memory_by_config: bool) -> Result<Vec<PathBuf>> {
 
 /// Whether a file of this name is a lock file or a writer's temporary, which belong to the
 /// host and not to the snapshot.
+/// A write-set sidecar or its claim (`storage::write_set`). It is named for this host's
+/// generation key, which an import does not reproduce, so it is left out and the imported
+/// snapshot's first File-backend clone records its own.
+fn is_write_set(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy()
+        .contains(crate::storage::write_set::SIDECAR_MARK)
+}
+
 fn is_lock_or_temporary(name: &std::ffi::OsStr) -> bool {
     let name = name.as_encoded_bytes();
     name.ends_with(b".lock") || name.ends_with(b".tmp")
@@ -1309,6 +1317,13 @@ pub(crate) mod tests {
         // its writers, and a writer's temporary.
         std::fs::write(dir.join("memory.bin.working-set"), pattern(6, 300)).unwrap();
         std::fs::write(dir.join("memory.bin.working-set.lock"), b"").unwrap();
+        // The File backend's write set and the claim of its recording, which stay behind.
+        std::fs::write(
+            dir.join("memory.bin.write-set-0123456789abcdef"),
+            b"0 4096\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("memory.bin.write-set-0123456789abcdef.claim"), b"").unwrap();
         std::fs::write(
             dir.join(format!(
                 "memory.bin.working-set.{}.tmp",

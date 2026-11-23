@@ -296,3 +296,52 @@ Traced (`attribution.sh`, C=128, 1000 held, 2000 namespace lives; `rtnl.py`, sum
   via rtnetlink is not supported"). None is cheaper, so the TAPs stay as they are.
 - The VMM's attach and detach on a prepared namespace, the tap-attach floor (C=128, 2000
   namespaces with pasta, one traced cell each): 1538 us of hold per cycle before, 1426 after.
+
+### 6. vmm: stage-2 faults per clone, and the write set (#2035)
+
+**Where a clone's stage-2 aborts come from.** Real clones (`bench-start-rate-run`, rootless, 20
+at C=1 and 256 at C=128, all held at the end), one snapshot, fcvm built from 9d6b094 (#2014's first draft, on
+main of 2026-11-22) with Firecracker 3057dcb7, c8g.metal-48xl, stock host kernel 7.0.0-1013-aws. bpftrace
+on `kvm_guest_fault` (every abort, with its kind and guest page), `io_mem_abort` (MMIO) and
+`kvm_handle_guest_abort` (on-CPU time: entry to return less time switched out). Every value is a
+mean per clone; on-CPU us per abort is the on-CPU ms divided by the aborts. At C=1 every abort's
+guest page was kept, so RAM aborts split exactly: RAM = aborts - MMIO, distinct pages = read first
++ write first, repeats = RAM - distinct, each derived column computed from the rounded ones. At C=128 the tracer dropped most per-page lines, so only
+the totals and the copy-on-write count (permission faults on a write, all RAM) are given.
+
+| restore | C | aborts | MMIO | RAM | read first | write first | repeats | of them copy-on-write | on-CPU ms | on-CPU us / abort |
+|---|---|---|---|---|---|---|---|---|---|---|
+| File | 1 | 36,804 | 14,018 | 22,786 | 13,052 | 4,615 | 5,119 | 5,041 | 137 | 3.7 |
+| File | 128 | 47,347 | 8,290 | | | | | 7,216 | 474 | 10.0 |
+| UFFD copy | 1 | 34,844 | 12,188 | 22,656 | 12,680 | 4,472 | 5,504 | 4,568 | 65 | 1.9 |
+| UFFD copy | 128 | 44,661 | 8,235 | | | | | 6,963 | 454 | 10.2 |
+| UFFD minor | 1 | 45,290 | 13,714 | 31,576 | 12,529 | 3,896 | 15,151 | 6,367 | 180 | 4.0 |
+| UFFD minor | 128 | 73,600 | 7,706 | | | | | 7,201 | 2,451 | 33.3 |
+
+Every stage-2 mapping was 4 KiB. UFFD minor mode is the slow one under concurrency: at C=128 it
+takes 73,600 aborts per clone at 33.3 us each, 2.5 s of handler time per clone, against 10 us
+for File and UFFD copy; that is not attributed further here.
+
+**The write set (#2035)** removes the copy-on-write from a File clone's restore. End-to-end
+(`startrate.py` to healthy, rootless, File backend), to 1000 clones alive, main (878fc71e)
+against #2035, three fresh snapshots per arm, same session, stock host kernel 7.0.0-1013-aws:
+30.0-35.3 against 38.6-59.3 clones/s at C=128 and 28.5-34.8 against 34.5-58.3 at C=512. Measured
+there the same way as above, but as the median per clone over 1000, the handler's on-CPU time
+was 2.7-4.2 s per clone on main against 60-81 ms with #2035, and anonymous memory per clone
+36.5-49.6 against 38.4-49.1 MB. The table is in #2035. The C=128 row above (474 ms) is the
+smaller run: 256 clones, an older head, one snapshot.
+
+**MMIO aborts by device**, from `kvm_mmio` (each guest read and write, kernel-handled notifies
+included), mean per clone:
+
+| head | clones | net | serial | block | vsock | rng | total |
+|---|---|---|---|---|---|---|---|
+| #2024's head (bd898093) | 10 at C=1, held 5 s | 11,349 | 4,392 | 655 | 53 | 8 | 16,457 |
+| main (878fc71e) | 5 at C=1, held 10 s | 234 | 4,270 | 444 | 56 | 12 | 5,016 |
+
+On #2024's head the net device's aborts were 4,313 interrupt-status reads, 4,313 interrupt
+acknowledgements and 2,723 queue notifies (the notifies are ioeventfds, handled in the kernel).
+On main they are under 250; which change between the two heads removed that traffic is not
+identified here. What remains is the console: on main, 2,975 transmit-register writes per clone in
+the first second, one exit to Firecracker per byte, which are fc-agent's 37 restore lines (about
+2.7 KB) on ttyS0. These MMIO counts are from different runs than the table's MMIO column.

@@ -209,6 +209,19 @@ jobs:
           aws-region: us-west-1
           role-session-name: fcvm-prod-release-${{ github.run_id }}
           mask-aws-account-id: true
+      # The lane image staging tested reaches prod's own lane repository only as a copy of that digest, on prod's
+      # credentials, before anything prod runs moves: a failed copy changes nothing, and a copy no release selects
+      # carries no keep- tag and expires on its own. The Coordinator step then selects it there.
+      - name: Copy the lane image into prod's repository
+        env:
+          TARGET: ${{ needs.candidate.outputs.target }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
+        run: |
+          lane=$(jq -r '.lambda_digest // empty' <<<"$TARGET")
+          if [ -z "$lane" ]; then exit 0; fi
+          if ! command -v skopeo >/dev/null; then sudo apt-get update && sudo apt-get install -y skopeo; fi
+          command -v skopeo >/dev/null || { echo "::error::skopeo is not installed: the lane image cannot be copied"; exit 1; }
+          python3 -B fcvm/fleet/lambda/release.py copy --digest "$lane"
       # Asleep only (the function checks again under Terraform's lock). Held here: nothing has changed.
       - name: Host and tile images
         id: image
