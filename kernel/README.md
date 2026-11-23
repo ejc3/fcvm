@@ -75,8 +75,11 @@ own `host_kernel` table, minus the `.vm.patch` files, both on 7.3.3:
 `kernel/patches-x86-host` on x86_64, which links the 7.3 fuse patches, and
 `kernel/patches-arm64-host` on arm64, which links the patches it shares with the
 7.3.3 nested guest from `kernel/patches-arm64` and holds the host-only KVM patches
-below. The x86_64 host also sets the Kconfig lines in `kernel/host-x86.conf` on top
-of the running kernel's config. A host must not be older than its L1 guest kernel:
+below. Each host also sets the Kconfig lines of its `config_fragment` on top of the
+running kernel's config, and its build stops if one does not hold after `olddefconfig`:
+`kernel/host-x86.conf` on x86_64 (ENA built in, wireless extensions off) and
+`kernel/host-arm64.conf` on arm64 (wireless extensions off, #2034). A host must not
+be older than its L1 guest kernel:
 an arm64 guest newer than its host wedges L2 (#659). Edit a host patch with
 `scripts/kernel-patch.sh edit nested.host_kernel <patch>`. The host kernels pin
 6.18.60 or a later 6.18 release, or 7.2 or later: the first releases with Linux commit

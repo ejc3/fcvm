@@ -217,7 +217,7 @@ impl VmManager {
     /// Set namespace holder PID for rootless networking
     ///
     /// When set, Firecracker will be launched inside an existing user+net namespace
-    /// via nsenter. The holder process (created by `unshare --user --net -- sleep infinity`)
+    /// via nsenter. The holder process (`fcvm __netns-agent`)
     /// keeps the namespace alive while Firecracker runs.
     ///
     /// UID/GID mappings are written externally by `setup_namespace_mappings()`, which

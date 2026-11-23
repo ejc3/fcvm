@@ -18,10 +18,10 @@ In order, for `fcvm snapshot run --pid <serve>` (UFFD) or `--snapshot <tag>` (Fi
 | 4 | state claim | the name lock, a scan of every VM's state for the name, the first state write; then the loopback IP allocation under its own lock | `StateManager::claim_name` and `allocate_loopback_ip`, `src/state/manager.rs:343,988`; called at `snapshot.rs:3463,3753` | `state` |
 | 5 | listeners | volume servers, output listener, status listener, the restore boot-plan and completion listeners on the clone's vsock paths | `snapshot.rs:3570-4320` | not split out |
 | 6 | network config | `PastaNetwork::setup`: MAC, addresses, one `ip -6 addr show` fork per process for the host IPv6 | `src/network/pasta.rs:2202,1350` | `rootless-net` stage `config` |
-| 7 | namespace holder | `unshare --user --net -- sleep infinity`, then `newuidmap` and `newgidmap`, then a wait for the maps | `spawn_namespace_holder`, `src/commands/common.rs:423,311` | `holder`; `rootless-net` stage `holder` |
+| 7 | namespace holder | `fcvm __netns-agent` unshares its user and network namespaces, then `newuidmap` and `newgidmap`, then the agent confirms it is ready | `spawn_namespace_holder`, `src/commands/common.rs`; `src/network/netns_agent.rs` | `holder`; `rootless-net` stage `holder` |
 | 8 | disk | the clone's disk directory as a reflink of `disk.raw` when its extent count is at most 4096 (`REFLINK_MAX_EXTENTS`) and one of the snapshot's 8 reflink slots (`REFLINK_SLOTS`) is free, else as a btrfs subvolume snapshot of the snapshot's `disk/`; runs beside 9 | `DiskManager::create_cow_disk`, `src/storage/disk.rs:587` | `disk` |
-| 9 | TAP setup | one `nsenter -U -n -- bash -c 'ip -batch'`: the TAP, its MTU, up, `lo` up, a verify step | `run_namespace_setup_script` (`common.rs`), `PastaNetwork::build_setup_script`, `pasta.rs:1170` | `rootless-net` stage `tap` |
-| 10 | pasta and bridge | pasta spawned in the namespace and waited for through its PID file; `nsenter ip link show pasta0` polled until the device exists; one more `nsenter ... ip -batch` for the bridge, its MAC, ports, address, and `ip_forward` | `PastaNetwork::post_start`, `start_pasta`, `wait_for_pasta_device`, `run_bridge_script`, `pasta.rs:2270,1636,1931,1846` | `rootless-net` stage `pasta+bridge` |
+| 9 | links | one request to the holder, which makes the VMM's TAP and pasta's (both persistent), `br0` with its MAC and address, and sets the MTUs, over netlink in its own namespace (one request per TAP, four for the bridge); runs beside 8 | `PastaNetwork::build_namespace`, `netns_agent::build`, `src/network/rtnl.rs` | `rootless-net` stage `links` |
+| 10 | pasta | pasta spawned in the namespace, where it attaches to its TAP, and waited for through its PID file (ready once pasta has written its PID into it) | `PastaNetwork::post_start`, `start_pasta` | `rootless-net` stage `pasta` |
 | 11 | Firecracker spawn | fork/exec of Firecracker with `setns` into the holder's user and net namespaces in `pre_exec` (no `nsenter` hop), then a wait for its API socket | `VmManager::start`, `src/firecracker/vm.rs:258`; `install_namespace_pre_exec`, `src/utils.rs:1092` | `fc-spawn`; `vmm` stage `spawn` |
 | 11a | KVM VM | inside Firecracker: `KVM_CREATE_VM`, the memory slot, the vCPU (`KVM_ARM_VCPU_INIT`), the GICv3 | Firecracker's `vmm` crate | `kvm-vm`: the same ioctls with no VMM process, a floor under 11 and 12 |
 | 12 | snapshot load | `PUT /snapshot/load` with the network, vsock and drive overrides, `resume_vm: false`. File backend: Firecracker maps `memory.bin` `MAP_PRIVATE`. UFFD: Firecracker connects to the serve's socket and hands over its userfaultfd; the serve may replay the recorded working set | `restore_from_snapshot`, `common.rs:4141`; `src/uffd/server.rs` | `vmm` stage `load` |
@@ -30,7 +30,7 @@ In order, for `fcvm snapshot run --pid <serve>` (UFFD) or `--snapshot <tag>` (Fi
 | 15 | MMDS, state save | the restore epoch into MMDS; the state file saved with the network and PIDs | `common.rs:4279,4382` | not split out |
 | 16 | guest restore | fc-agent sees the transport reset, fetches the restore document over vsock, pins neighbours, takes the host identity, runs the snapshot network boundary (retires snapshot-time sockets by cookie, opens the gate), steps the clock, restarts chronyd, re-registers exec, publishes | `handle_clone_restore`, `fc-agent/src/restore.rs:388`; `fc-agent/src/snapshot_network.rs` | none: owned by the end-to-end work (see below) |
 | 17 | output connect | the host waits for fc-agent's output connection, which gates the health monitor | `wait_for_restored_output`, `snapshot.rs:4709` | none (part of 16) |
-| 18 | health check | the monitor polls from 100 ms up; each rootless HTTP probe is `nsenter -U -n -- curl` into the holder's namespace; Healthy is written to the state file, then polls slow to every 10 s | `spawn_health_monitor_full`, `src/health.rs:71`; `check_http_health_nsenter`, `health.rs:1191` | `health` |
+| 18 | health check | the monitor polls from 100 ms up; each rootless HTTP probe is one GET from a socket the holder made in its namespace; Healthy is written to the state file, then polls slow to every 10 s | `spawn_health_monitor_full`, `src/health.rs:71`; `check_http_health_holder`, `health.rs` | `health` |
 | 19 | steady cost | each held clone: an idle guest (KVM exits, timers), its fcvm process, pasta, the holder, a probe every 10 s | | `vmm` and `health` with ALIVE held, `steady_per_s` |
 
 Pieces 2, 3, 5, 13 and 15 have no sample program yet: at C=1 the end-to-end harness puts
@@ -81,10 +81,18 @@ part of the op; `noop` with `COLD=1` is the cost of an instance process. `--disk
 (in `ARGS=`) makes the disk piece reflink from one of the files in DIR instead of the snapshot's
 disk. `attribution.sh` runs one cell per piece under `kernel.bt` (rtnl_mutex hold and wait, RCU
 syncs and their stacks, netns cleanup, KVM VM create and destroy, copy-on-write and userfaultfd
-faults, KVM exits by class, execs); its timings are not measurements.
+faults, KVM exits by class, execs); its timings are not measurements. The tracer stays until
+the kernel has destroyed the cell's namespaces, which it does after the driver has exited, and
+it traces `rtnl_mutex` as a mutex: a probe on `rtnl_lock()` misses every hold taken inside
+rtnetlink.c, where that function is inlined. `rtnl.py CELL.bt OPS` prints the hold per op by
+holder, with the `rcu_barrier()` time under it apart.
 `perftop.sh` writes each cell's top frames, and `table.py` prints the table in `RESULTS.md`.
 The `kernel.bt` output of the first table's attribution pass (C=128, 1000 held, one file per
 piece; start, steady and teardown in one window) is in `traces/`.
+Those dumps were taken with the tracer stopped at the driver's exit and with probes on
+`rtnl_lock()`. For the pieces that make namespaces, `traces/rtnl/` holds what `rtnl.py` reads
+from complete dumps instead: `rootless-net` before and after changelog step 4 (three runs
+each), `holder` and `health`.
 
 `PERF_FREQ=99` adds `perf record -a -g` over the timed phase (`perf.data`), and
 `PERF_EVENTS=...` adds `perf stat -a` over the timed and steady phases. Host-wide numbers mean
@@ -95,4 +103,32 @@ anything only on a quiet box.
 | `noop`, `state`, `holder`, `rootless-net`, `health`, `kvm-vm` | nothing |
 | `disk` | `SNAPSHOT_DIR=` a snapshot directory (`.../snapshots/<tag>`) |
 | `fc-spawn` | `FIRECRACKER=` the Firecracker binary fcvm restores with |
+| `tap-attach` | nothing; `tap-floor.sh` runs its campaign |
 | `vmm` | both; `UFFD_SOCKET=` a `snapshot serve` socket to load through UFFD |
+
+## tap-attach: what a reused namespace still costs
+
+`tap-attach` is not a piece of today's start. It measures what would be left of piece 9 and 10
+if a clone took a namespace that already had its TAP, pasta and bridge: the VMM's attach to
+the TAP when it loads the snapshot and its detach when it exits. Each instance prepares a full
+rootless network (untimed), a helper process inside the holder's namespaces, and
+`--tap-warm-cycles` attach and detach cycles (1 by default), because a reused namespace's TAP
+has had a VMM before and a TAP's first attach costs more (it changes the device's offload
+features, and the bridge follows). `--tap-no-pasta` prepares the same namespace with no pasta
+(`PastaNetwork::isolated`). The timed op is
+one clone life's worth: the helper opens `/dev/net/tun` and makes Firecracker's three ioctls
+(`TUNSETIFF`, `TUNSETVNETHDRSZ`, `TUNSETOFFLOAD`), stays attached for `--tap-hold-ms` (20 by
+default, so the kernel handles the carrier-on before the carrier-off), and closes the
+descriptor. The op's stages are the helper's own timing of each call; `attach+detach` is their
+sum, and the op's latency also holds the 20 ms.
+
+Each of the four calls takes `rtnl_mutex`, and the two carrier changes are handled afterwards
+by the kernel's link watch worker under the same mutex. `tap.bt` attributes the hold time and
+the RCU grace periods to each call and to the link events of TAP devices. The driver runs it
+over the timed and steady phases when given `PERF_EVENTS=tap ARGS="--perf-cmd
+$PWD/bench/start-rate/pieces/tap-bt.sh"`, and `start-pieces tap-summary CELL` turns its two
+dumps into per-cycle numbers. A traced cell's timings are not measurements.
+
+```bash
+bash bench/start-rate/pieces/tap-floor.sh /mnt/fcvm-btrfs/pieces-out/tap   # every cell holds 2000 pastas
+```

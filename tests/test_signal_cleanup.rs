@@ -281,6 +281,42 @@ fn exit_diagnostics(pid: u32) -> String {
 /// TAP fd for up to 4.55 s and namespace creations for up to 6.34 s.
 const EXIT_BOUND: Duration = Duration::from_secs(30);
 
+/// A `sleep` that joins the process group `pid` leads, killed and reaped when dropped.
+struct Anchor(std::process::Child);
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Put a child of this test into the process group of `pid`, which must lead a group of its
+/// own in this test's session. With a member whose parent is outside the group, the group
+/// is not orphaned when `pid`'s parent dies.
+fn anchor_process_group(pid: u32) -> Result<Anchor> {
+    use std::os::unix::process::CommandExt;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .with_context(|| format!("reading /proc/{pid}/stat"))?;
+    // After the command name, which may hold spaces: state, ppid, pgrp.
+    let pgid: i32 = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+        .and_then(|field| field.parse().ok())
+        .with_context(|| format!("no process group in /proc/{pid}/stat"))?;
+    anyhow::ensure!(
+        pgid == pid as i32,
+        "PID {pid} is in process group {pgid}, not one of its own"
+    );
+    let mut command = Command::new("sleep");
+    command.arg("600").process_group(pgid);
+    common::set_test_pdeathsig_std(&mut command);
+    let anchor = command
+        .spawn()
+        .with_context(|| format!("starting an anchor in process group {pgid}"))?;
+    Ok(Anchor(anchor))
+}
+
 /// SIGKILLs every tracked process when dropped, on unwinding as well as on return.
 struct KillOnDrop<const N: usize>([Tracked; N]);
 
@@ -882,6 +918,23 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
         let _ = fcvm.wait();
     };
 
+    // Each child is the only member of its own process group, so fcvm's death would orphan
+    // that group, and the kernel sends a stopped member of a newly orphaned group SIGHUP and
+    // SIGCONT. Continued, the holder reads end-of-file on its channel and exits by itself
+    // (and so would anything SIGHUP ends), with no parent-death signal involved. An anchor
+    // in each group, whose parent is this test, keeps the group from being orphaned: the
+    // stopped child then stays stopped unless the kernel kills it.
+    let mut anchors = Vec::new();
+    for (role, t) in &tree {
+        match anchor_process_group(t.pid) {
+            Ok(anchor) => anchors.push(anchor),
+            Err(e) => {
+                abandon(&mut fcvm);
+                return Err(e).with_context(|| format!("anchoring the {role}'s process group"));
+            }
+        }
+    }
+
     // Stop all three first. A stopped process runs none of its own code, so passt's PID watch
     // (pasta exits once the holder's PID is gone) cannot end pasta, and the only thing that
     // can end any of them is a SIGKILL from the kernel: the parent-death signal its hop armed.
@@ -912,6 +965,9 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
     let _ = fcvm.wait();
     let killed = std::time::Instant::now();
     println!("fcvm process reaped");
+    // The anchors outlive fcvm: that is what kept each group from being orphaned by its
+    // death. They go when this test returns.
+    let _anchors = anchors;
 
     // 1. Delivery. fcvm's exit sent each child its parent-death signal before wait() returned,
     // so each one already has SIGKILL pending or is inside do_exit(). A child without it is
@@ -1304,33 +1360,13 @@ fn find_pasta_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     None
 }
 
-/// Holder discovery is coupled to production by a literal string. Pin it.
-///
-/// `find_holder_for_fcvm` pgreps for `sleep infinity`, which is what
-/// `PastaNetwork::build_holder_command` emits. Nothing enforces that agreement, and
-/// when it broke (verified by changing the argv to `sleep 2147483647`) discovery
-/// returned `None`, the leak assertions in the two teardown tests silently stopped
-/// checking anything, and both tests still passed while a real orphan sat on the box.
-///
-/// Honest scope: this is GREEN today. It is a drift alarm, not a regression test for
-/// a present defect — it fires the moment someone changes the holder's argv, which is
-/// the one change that would re-disarm those assertions without any other symptom.
-#[test]
-fn holder_discovery_pattern_tracks_production_holder_argv() {
-    let argv = fcvm::network::PastaNetwork::new("t".into(), "tap-t".into(), vec![])
-        .build_holder_command()
-        .join(" ");
-    assert!(
-        argv.contains("sleep infinity"),
-        "find_holder_for_fcvm() pgreps for `sleep infinity`, but the production holder \
-         argv is `{argv}`. Holder discovery would silently return None and every \
-         holder-leak assertion in this file would stop checking anything. Update BOTH."
-    );
-}
-
+/// The namespace holder under `fcvm_pid`. Discovery uses the holder's own constants: the
+/// argument its command line starts with and the `comm` it gives itself
+/// (`fcvm::network::netns_agent`), so a change to either cannot leave this looking for a
+/// process that no longer exists while the leak assertions pass on `None`.
 fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     let output = Command::new("pgrep")
-        .args(["-f", "sleep infinity"])
+        .args(["-f", fcvm::network::netns_agent::SUBCOMMAND])
         .output()
         .ok()?;
 
@@ -1342,8 +1378,8 @@ fn find_holder_for_fcvm(fcvm_pid: u32) -> Option<Tracked> {
     for line in stdout.lines() {
         if let Ok(pid) = line.trim().parse::<u32>() {
             if is_descendant_of(pid, fcvm_pid) {
-                // The holder is `sleep infinity`, whose comm is "sleep".
-                if let Some(t) = capture_descendant(pid, fcvm_pid, "sleep") {
+                let comm = fcvm::network::netns_agent::COMM.to_str().unwrap();
+                if let Some(t) = capture_descendant(pid, fcvm_pid, comm) {
                     return Some(t);
                 }
             }
@@ -2068,11 +2104,10 @@ fn test_start_time_identity_defeats_pid_reuse_628() {
 /// skipped assertion. Until 2026-08-08 the holder was captured as a bare `Option` and the
 /// leak assertion read `assert!(!holder.as_ref().is_some_and(|h| h.running()))` — which is
 /// `assert!(!false)` when discovery returns `None`, i.e. an assertion that CANNOT FAIL when
-/// the thing it checks is absent. Discovery is coupled to production by string
-/// (`find_holder_for_fcvm` pgreps for the literal `sleep infinity` that
-/// `PastaNetwork::build_holder_command` emits), so any drift in that argv silently converted
+/// the thing it checks is absent. Discovery was coupled to production by a literal string
+/// (a pgrep for the holder's argv), so any drift in that argv silently converted
 /// this test into coverage-shaped nothing. Verified by fault injection: with the holder argv
-/// changed to `sleep 2147483647` the OLD test still passed while a real `sleep` orphan sat on
+/// changed the OLD test still passed while a real orphan sat on
 /// the box; with this `.context(...)?` it fails at discovery. Same reasoning applies to pasta,
 /// which the old version did not look for at all.
 ///
@@ -2159,9 +2194,8 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                 find_firecracker_for_fcvm(clone_pid).context("clone has no firecracker child")?;
             let holder = find_holder_for_fcvm(clone_pid).context(
                 "clone has no namespace holder child — the rootless restore path spawns \
-                 `unshare --user --net -- sleep infinity`, and find_holder_for_fcvm pgreps for \
-                 that exact argv. If discovery drifts, the holder-leak assertion below checks \
-                 nothing at all",
+                 `fcvm __netns-agent`, and find_holder_for_fcvm looks for that. If discovery \
+                 drifts, the holder-leak assertion below checks nothing at all",
             )?;
             let pasta = find_pasta_for_fcvm(clone_pid)
                 .context("clone has no pasta child — rootless networking always spawns one")?;

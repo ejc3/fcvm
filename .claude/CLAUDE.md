@@ -2236,8 +2236,12 @@ cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm �
 - `src/utils.rs::install_namespace_pre_exec` covers **every VMM spawn** (Firecracker, Cloud
   Hypervisor, and the Layer-2 setup VM in `src/setup/rootfs.rs`). It must stay the LAST
   `pre_exec` — `setns(CLONE_NEWUSER)` zeroes `pdeath_signal`, so setting it earlier is lost.
-- `src/commands/common.rs::spawn_namespace_holder` covers the **holder hop** (rootless mode).
-  The holder's pdeathsig is armed in its `pre_exec`, before UID/GID mappings are written.
+- `src/network/netns_agent.rs::run` covers the **holder hop** (rootless mode). The holder is
+  `fcvm __netns-agent`, started by `spawn_namespace_holder` with no `pre_exec` pdeathsig: it
+  arms `PR_SET_PDEATHSIG` itself right after `unshare(CLONE_NEWUSER | CLONE_NEWNET)` (a
+  credential change would clear one armed earlier), then checks its parent is still the
+  fcvm that started it and exits if not, and only then says `unshared`, on which fcvm writes
+  the UID/GID maps. It also exits when fcvm's end of its channel closes.
 - `src/network/pasta.rs` (in `start_pasta`) covers the **pasta hop** (rootless mode). Must be
   the last `pre_exec`; includes a `getppid` re-check to close the fork/exec race window.
 
@@ -2605,7 +2609,7 @@ fuse-pipe/benches/
    - `--network rootless` (default): pasta, no root required
    - `--network bridged`: Network namespace + iptables, requires root
    - `--network routed`: veth + IPv6 kernel routing, requires root + IPv6 host
-   - User namespace via `unshare --user --net` with external UID/GID mappings
+   - User and network namespaces made by the holder, `fcvm __netns-agent`, with external UID/GID mappings
    - Health checks use unique loopback IPs (127.x.y.z) per VM
 
 4. **Hierarchical Logging** (2025-11-15)
@@ -2655,12 +2659,13 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 | Routed | `--network routed` | Yes (+ IPv6 host) | Best (kernel line rate) | TCP proxy on the mapping's HOSTIP, else loopback IP |
 
 **Rootless Architecture:**
-- Holder process starts with `unshare --user --net`, UID/GID mappings written externally
+- Holder process is `fcvm __netns-agent` (`src/network/netns_agent.rs`): it unshares its user and network namespaces, UID/GID mappings are written externally, and it hands sockets made in the namespace to the fcvm that started it
 - Linux bridge (br0) connects pasta0 and tap-fc for L2 forwarding
 - Bridge preserves MAC addresses for proper pasta ARP/NDP learning
-- Namespace IP (10.0.2.1) on bridge enables health checks via nsenter
+- Namespace IP (10.0.2.1) on bridge is the source of health checks, which connect from a socket the holder made
 - Guest uses pasta network (10.0.2.100)
 - Port forwarding via pasta CLI flags (-t/-u)
+- The holder builds every link over netlink in one `build` request from fcvm (`netns_agent::build`, `src/network/rtnl.rs`); both TAPs are persistent, so the VMM and pasta attach to devices that exist. The bridge takes four netlink requests (create, MTU and `addrgenmode none` while it is down, up after its ports have joined, address) and each TAP one
 - IPv6 supported with `--enable-ipv6` and native DNS proxying
 
 **Routed Architecture** (`src/network/routed.rs`):
