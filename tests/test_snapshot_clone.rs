@@ -7968,7 +7968,7 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
     // nextest runs each test in a process of its own; the fcvm processes it starts inherit this
     std::env::set_var(fcvm::storage::disk::REFLINK_MAX_EXTENTS_ENV, "0");
     let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
-        clone_disks_case("subvol").await?;
+        clone_disks_case("subvol", false).await?;
     assert_eq!(
         snapshot_ino, 256,
         "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
@@ -7982,14 +7982,14 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
 }
 
 /// A clone whose disks have at most `REFLINK_MAX_EXTENTS` extents (a test VM's do) gets
-/// them as reflinks into an ordinary directory, with no subvolume snapshot and so no
-/// btrfs commit on the restore's path; the snapshot's own disk directory is still a
-/// subvolume.
+/// them as reflinks into an ordinary directory while one of the snapshot's
+/// `REFLINK_SLOTS` reflink slots is free, with no subvolume snapshot and so no btrfs
+/// commit on the restore's path; the snapshot's own disk directory is still a subvolume.
 #[tokio::test]
 #[cfg_attr(not(feature = "privileged-tests"), ignore)]
 async fn clone_disks_with_few_extents_are_reflinks() -> anyhow::Result<()> {
     let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
-        clone_disks_case("reflinked").await?;
+        clone_disks_case("reflinked", false).await?;
     assert_eq!(
         snapshot_ino, 256,
         "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
@@ -7997,6 +7997,29 @@ async fn clone_disks_with_few_extents_are_reflinks() -> anyhow::Result<()> {
     assert_ne!(
         disks_ino, 256,
         "the clone of a small disk got a subvolume snapshot, not reflinks"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// A clone of a small disk that finds every reflink slot of its snapshot held (that many
+/// reflinks of the disk queued, each waiting for the last on the source inode's lock)
+/// takes the subvolume snapshot instead.
+///
+/// RED BEFORE THE FIX: the clone reflinked whatever the queue.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_clone_that_finds_every_reflink_slot_held_takes_the_subvolume_snapshot(
+) -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("slotsheld", true).await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_eq!(
+        disks_ino, 256,
+        "with every reflink slot held the clone reflinked (inode {disks_ino})"
     );
     clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
     Ok(())
@@ -8018,11 +8041,13 @@ fn clone_disks_hold_the_snapshots_disks(entries: Vec<String>, extra: Vec<String>
     );
 }
 
-/// A VM with one extra disk, its snapshot, and a clone of it: the inode of the snapshot's
+/// A VM with one extra disk, its snapshot, and a clone of it (made while this test holds
+/// every reflink slot of the snapshot when `hold_slots`): the inode of the snapshot's
 /// disk directory, the snapshot's extra disk names, the inode of the clone's disk
 /// directory and what it holds, and what the clone read from the extra disk.
 async fn clone_disks_case(
     prefix: &str,
+    hold_slots: bool,
 ) -> anyhow::Result<(u64, Vec<String>, u64, Vec<String>, String)> {
     use std::os::unix::fs::MetadataExt;
 
@@ -8071,6 +8096,18 @@ async fn clone_disks_case(
             extra_disk_names.len() == 1,
             "the snapshot records {extra_disk_names:?} extra disks, wanted one"
         );
+        let mut slots = Vec::new();
+        if hold_slots {
+            for _ in 0..fcvm::storage::disk::REFLINK_SLOTS {
+                slots.push(
+                    fcvm::storage::disk::take_reflink_slot(
+                        &snapshot_disk_dir,
+                        fcvm::storage::disk::REFLINK_SLOTS,
+                    )?
+                    .ok_or_else(|| anyhow::anyhow!("a reflink slot was already held"))?,
+                );
+            }
+        }
         let (mut serve, serve_pid) = common::start_memory_server(&snap_tag).await?;
         let clone = async {
             common::poll_serve_ready(&snap_tag, serve_pid, 60).await?;
@@ -8098,6 +8135,7 @@ async fn clone_disks_case(
         .await;
         common::kill_process(serve_pid).await;
         let _ = serve.wait().await;
+        drop(slots);
         anyhow::Ok((snapshot_ino, extra_disk_names, clone?))
     }
     .await;
