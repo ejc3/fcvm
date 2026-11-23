@@ -1017,6 +1017,23 @@ mod tests {
         }
     }
 
+    /// Wait up to 10 s for `marker` in the file at `path`: a collector that prints it after
+    /// installing its SIGINT handler is ready to be stopped.
+    fn wait_for_marker(path: &Path, marker: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(marker)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{} never said {marker:?}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// A collector that ignores SIGINT is killed after the grace period, and the run is told.
     #[test]
     fn a_perf_collector_that_will_not_stop_is_killed() {
@@ -1025,7 +1042,10 @@ mod tests {
             "python3",
             &[
                 "-c".into(),
-                "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(60)"
+                "import signal, sys, time\n\
+                 signal.signal(signal.SIGINT, signal.SIG_IGN)\n\
+                 print('ready', file=sys.stderr, flush=True)\n\
+                 time.sleep(60)"
                     .into(),
             ],
             &dir.path().join("perf.err"),
@@ -1033,7 +1053,7 @@ mod tests {
         .unwrap();
         stubborn.1 = Duration::from_millis(300);
         let pid = stubborn.0.as_ref().unwrap().0.id() as i32;
-        std::thread::sleep(Duration::from_millis(200));
+        wait_for_marker(&dir.path().join("perf.err"), "ready");
         let started = Instant::now();
         let error = stubborn.stop().expect_err("a collector that never stopped");
         assert!(format!("{error:#}").contains("did not stop"), "{error:#}");
@@ -1093,7 +1113,15 @@ mod tests {
             &err,
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Exited before it is stopped: a SIGINT that beat the exit would end it as asked.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while failing.0.as_mut().unwrap().0.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the failing collector never exited"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let error = failing
             .stop()
             .expect_err("a perf that exited 3 is not a collector");
@@ -1107,13 +1135,14 @@ mod tests {
                 "-c".into(),
                 "import signal, sys, time\n\
                  signal.signal(signal.SIGINT, lambda *_: sys.exit(0))\n\
+                 print('ready', file=sys.stderr, flush=True)\n\
                  time.sleep(60)"
                     .into(),
             ],
             &err,
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_marker(&err, "ready");
         running.stop().unwrap();
 
         // One that the SIGINT ends, as `sudo perf record` reports a stopped perf, is fine too.

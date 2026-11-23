@@ -62,6 +62,51 @@ pub const REFLINK_MAX_EXTENTS: u64 = 4096;
 /// that path reach it with a test VM's small disk.
 pub const REFLINK_MAX_EXTENTS_ENV: &str = "FCVM_REFLINK_MAX_EXTENTS";
 
+/// How many clones of one snapshot reflink its disk at a time before the next one takes the
+/// subvolume snapshot instead. Every clone of a snapshot reflinks the same source file, and
+/// btrfs holds that inode's lock for the whole reflink (`lock_two_nondirectories` in
+/// `btrfs_remap_file_range`), so reflinks of one snapshot run one after another: 4.6 ms each
+/// for an 871-extent disk, about 240 per second at any concurrency. A subvolume snapshot of
+/// the disk directory takes no such lock but commits a transaction: 3.7 ms on a quiet host,
+/// 193 ms at the median and 1.8 s at p99 on a fleet host that was taking snapshots at the
+/// same time, against 17 and 192 ms for a reflink. With 8 reflinks queued the last waits about
+/// 8 x 4.6 = 37 ms, under that median, and the fleet relaunches 8 tiles of one snapshot at
+/// once, which stay on reflinks; a ninth clone in the queue takes the subvolume snapshot.
+pub const REFLINK_SLOTS: usize = 8;
+
+/// The slot files of the snapshot whose disk directory is `base_dir`: beside the disk
+/// directory, outside the subvolume a clone snapshots, and named `.lock` so an export leaves
+/// them out.
+fn reflink_slot_path(base_dir: &Path, slot: usize) -> Option<PathBuf> {
+    Some(base_dir.parent()?.join(format!("reflink-slot-{slot}.lock")))
+}
+
+/// One of `slots` reflink slots of the snapshot whose disk directory is `base_dir`, held
+/// until the returned file is closed, or `Ok(None)` when every slot is held. A slot is an
+/// exclusive `flock` taken without waiting, so the kernel releases it when its holder exits,
+/// killed or not, and no state outlives a clone.
+pub fn take_reflink_slot(base_dir: &Path, slots: usize) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    for slot in 0..slots {
+        let path = reflink_slot_path(base_dir, slot)
+            .ok_or_else(|| std::io::Error::other("the disk directory has no parent"))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(error);
+        }
+    }
+    Ok(None)
+}
+
 /// `ioctl(FICLONE)`: make the destination share the source's extents.
 const FICLONE: libc::c_ulong = 0x4004_9409;
 
@@ -73,7 +118,7 @@ pub fn reflink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let source = std::fs::File::open(src)?;
-    let mode = source.metadata()?.permissions().mode() & 0o7777;
+    let mode = source.metadata()?.permissions().mode() & 0o777;
     let target = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -624,28 +669,47 @@ impl DiskManager {
         }
 
         // A base in a snapshot's disk directory (a btrfs subvolume holding the
-        // snapshot's disks and nothing else) is cloned with one subvolume
-        // snapshot of that directory when the disk has many extents. That costs
-        // one btrfs transaction commit whatever the disks' extent count: 20 to
-        // 60 ms on a quiet host, 0.2 to 1.0 s on a shared devserver at load 14
-        // to 46, 1.8 s at p99 with eight snapshots and restores at once. A
-        // reflink costs one extent reference per extent: 12 ms for a test VM's
-        // disk, 9 to 11 s for a 154 GB disk of 860,177 extents. A disk of at most
-        // REFLINK_MAX_EXTENTS extents is reflinked below instead. The snapshot
-        // becomes this VM's disk directory, with the base disk renamed to the
-        // rootfs name; the extra disks it carried are already in place.
+        // snapshot's disks and nothing else) is cloned either with a reflink of
+        // the disk or with one subvolume snapshot of that directory, which
+        // becomes this VM's disk directory with the base disk renamed to the
+        // rootfs name (the extra disks it carried are already in place). A
+        // reflink costs one extent reference per extent (12 ms for a test VM's
+        // disk, 9 to 11 s for a 154 GB disk of 860,177 extents) and waits for
+        // every other reflink of the same disk; a subvolume snapshot costs one
+        // transaction commit whatever the extent count (20 to 60 ms on a quiet
+        // host, 0.2 to 1.0 s on a devserver at load 14 to 46, 1.8 s at p99 with
+        // eight snapshots and restores at once). So a disk of more than
+        // REFLINK_MAX_EXTENTS extents is snapshotted, and a smaller one is
+        // reflinked while one of the snapshot's REFLINK_SLOTS reflink slots is
+        // free, and snapshotted when the queue of reflinks is that deep.
         let limit = reflink_max_extents(std::env::var(REFLINK_MAX_EXTENTS_ENV).ok().as_deref());
-        let base_extents = self
+        let base_dir = self
             .base_rootfs
             .parent()
-            .filter(|d| is_snapshot_disk_subvolume(d))
-            .and_then(|d| snapshot_disks_extents(d, limit));
-        if let Some(base_dir) = self
-            .base_rootfs
-            .parent()
-            .filter(|d| is_snapshot_disk_subvolume(d))
-            .filter(|_| !reflink_is_cheaper(base_extents, limit))
-        {
+            .filter(|d| is_snapshot_disk_subvolume(d));
+        let base_extents = base_dir.and_then(|d| snapshot_disks_extents(d, limit));
+        // Held until the reflink below is done.
+        let mut reflink_slot = None;
+        let snapshot_dir = match base_dir {
+            Some(dir) if !reflink_is_cheaper(base_extents, limit) => Some(dir),
+            Some(dir) => match take_reflink_slot(dir, REFLINK_SLOTS) {
+                Ok(Some(slot)) => {
+                    reflink_slot = Some(slot);
+                    None
+                }
+                Ok(None) => Some(dir),
+                Err(error) => {
+                    debug!(
+                        base = %dir.display(),
+                        %error,
+                        "no reflink slot file; reflinking without one"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(base_dir) = snapshot_dir {
             let started = std::time::Instant::now();
             match self.snapshot_base_subvolume(base_dir, &disk_path).await {
                 Ok(()) => {
@@ -727,6 +791,7 @@ impl DiskManager {
                 duration_ms = started.elapsed().as_millis() as u64,
                 "reflink copy done"
             );
+            drop(reflink_slot);
         }
 
         Ok(disk_path)
@@ -1415,6 +1480,16 @@ mod snapshot_dir_tests {
             Err(error) => {
                 let text = format!("{error:#}");
                 assert!(text.contains("Reflink copy failed"), "{text}");
+                // The refusal is the filesystem's, not some other failure.
+                let refused = reflink_file(&dir.path().join("base.raw"), &dir.path().join("probe"))
+                    .expect_err("this filesystem refused the clone above");
+                assert!(
+                    matches!(
+                        refused.raw_os_error(),
+                        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::EXDEV)
+                    ),
+                    "{refused}"
+                );
                 assert!(
                     !vm_dir.join("rootfs.raw").exists(),
                     "a failed clone left its file"
@@ -1429,6 +1504,65 @@ mod snapshot_dir_tests {
             !create.contains("helper_command(\"cp\")"),
             "create_cow_disk runs cp"
         );
+    }
+
+    /// A snapshot has REFLINK_SLOTS reflink slots: each is an exclusive flock, a slot of a
+    /// holder that is killed is free again, and with every slot held there is none.
+    #[test]
+    fn reflink_slots_are_flocks_that_die_with_their_holder() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let root = tempfile::tempdir().unwrap();
+        let base_dir = root.path().join("disk");
+        std::fs::create_dir(&base_dir).unwrap();
+        let mut held: Vec<_> = (0..REFLINK_SLOTS - 1)
+            .map(|_| {
+                take_reflink_slot(&base_dir, REFLINK_SLOTS)
+                    .unwrap()
+                    .expect("a free slot")
+            })
+            .collect();
+        // The last slot is held by another process.
+        let last = reflink_slot_path(&base_dir, REFLINK_SLOTS - 1).unwrap();
+        let mut holder = std::process::Command::new("flock")
+            .args(["-x", "-o"])
+            .arg(&last)
+            .args(["sh", "-c", "echo held; exec sleep 60"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "held");
+        assert!(
+            take_reflink_slot(&base_dir, REFLINK_SLOTS)
+                .unwrap()
+                .is_none(),
+            "every slot is held"
+        );
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(holder.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        holder.wait().unwrap();
+        let freed = take_reflink_slot(&base_dir, REFLINK_SLOTS)
+            .unwrap()
+            .expect("the killed holder's slot is free");
+        assert!(take_reflink_slot(&base_dir, REFLINK_SLOTS)
+            .unwrap()
+            .is_none());
+        held.pop();
+        assert!(
+            take_reflink_slot(&base_dir, REFLINK_SLOTS)
+                .unwrap()
+                .is_some(),
+            "a closed slot is free"
+        );
+        drop(freed);
     }
 
     /// A counted disk of at most REFLINK_MAX_EXTENTS extents is reflinked; a larger one, or
@@ -1452,14 +1586,20 @@ mod snapshot_dir_tests {
         ));
         let source = include_str!("disk.rs");
         let create = &source[source.find("pub async fn create_cow_disk").unwrap()..];
-        let subvolume = create.find("if let Some(base_dir) = self").unwrap();
+        let choice = create.find("let snapshot_dir = match base_dir").unwrap();
+        let choice_text = &create[choice..choice + 700];
         assert!(
-            create[subvolume..subvolume + 260].contains("!reflink_is_cheaper(base_extents, limit)"),
-            "create_cow_disk takes the subvolume snapshot only for disks not cheaper to reflink"
+            choice_text
+                .contains("Some(dir) if !reflink_is_cheaper(base_extents, limit) => Some(dir)"),
+            "create_cow_disk takes the subvolume snapshot for disks not cheaper to reflink"
+        );
+        assert!(
+            choice_text.contains("take_reflink_slot(dir, REFLINK_SLOTS)"),
+            "a smaller disk is reflinked only with a reflink slot"
         );
         // the count covers every disk the reflink path would copy, the extra disks too
         assert!(
-            create[..subvolume].contains(".and_then(|d| snapshot_disks_extents(d, limit))"),
+            create[..choice].contains(".and_then(|d| snapshot_disks_extents(d, limit))"),
             "the reflink decision counts the snapshot's extra disks as well as its root disk"
         );
     }

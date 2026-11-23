@@ -86,13 +86,16 @@ each build (`bench-start-rate-prep`, `bench-start-rate-run COUNT=1000 CONCURRENC
 then 60 s of host busy CPU and `perf stat -a` from 30 s after the last clone was healthy. The
 main arm's fcvm carried the disk-extents-once change, which no idle clone runs.
 
-| arm | idle cores per 1000 clones | KVM exits /VM/s | exits to Firecracker /VM/s | context switches /VM/s |
-|---|---|---|---|---|
-| main | 26.78 | 1116 | 442 | 785 |
-| fc-agent fix | 9.30 | 183 | 26 | 307 |
-| main | 34.50 | 1362 | 436 | 775 |
-| fc-agent fix | 11.66 | 217 | 26 | 307 |
+Two pairs, run in this order. Host load over each 60 s window (`host.tsv`): `load1` still
+carries the clone starts that ended 30 s before the window, so the runnable count is the
+better guide.
 
+| pair | arm | idle cores per 1000 clones | KVM exits /VM/s | exits to Firecracker /VM/s | context switches /VM/s | load1 mean | runnable mean |
+|---|---|---|---|---|---|---|---|
+| 1 | main | 26.78 | 1116 | 442 | 785 | 34.4 | 26.4 |
+| 1 | fc-agent fix | 9.30 | 183 | 26 | 307 | 79.5 | 5.9 |
+| 2 | main | 34.50 | 1362 | 436 | 775 | 119.4 | 29.1 |
+| 2 | fc-agent fix | 11.66 | 217 | 26 | 307 | 129.6 | 5.8 |
 
 Every arm's 1000 clones were healthy; resume to agent-ready p50 was 868 and 949 ms on main,
 933 and 924 ms with the change, so restores still find the reset.
@@ -116,3 +119,32 @@ The rate is still near 240/s. What is left, measured with `--disk-shard-dir` (th
 reflinks one of K reflinked copies of the disk, chosen by PID, which skips the extent count):
 C=128, 0 held, one copy 232 ops/s, 16 copies 366 ops/s, 0.014 and 0.016 CPU-s per op. One
 source file serializes part of it; the rest is not attributed yet.
+
+### 4. disk: reflink while one of 8 slots is free, else a subvolume snapshot (#2014)
+
+The rest is the source inode's lock: every clone of a snapshot reflinks the same file, and
+`btrfs_remap_file_range` holds that inode's lock (`lock_two_nondirectories`) for the whole
+reflink. Under bpftrace, 1000 clones at C=128 spent 514.6 s in reflinks, 510.3 s of it waiting
+for that lock. A clone now reflinks while it can take one of the snapshot's 8 reflink slots
+(`flock` without waiting) and takes a subvolume snapshot of the snapshot's `disk/` when all 8 are
+held. A subvolume snapshot takes no such lock.
+
+Same session, c8g.metal-48xl, stock host kernel 7.0.0-1013-aws, the store a btrfs loop file in
+RAM, an 863-extent disk, N=1000. Two rounds, in the order main, this PR, always-subvolume (this
+PR with `FCVM_REFLINK_MAX_EXTENTS=0`), then again. Both rates are listed; p50 is the mean of the two.
+
+| C | held | main clones/s | this PR clones/s | always-subvolume clones/s | p50 ms main / PR / subvolume |
+|---|---|---|---|---|---|
+| 1 | 0 | 287, 285 | 286, 286 | 128, 140 | 3.5 / 3.5 / 7.4 |
+| 1 | 1000 | 245, 283 | 285, 286 | 100, 109 | 3.8 / 3.5 / 9.3 |
+| 8 | 0 | 237, 236 | 237, 238 | 561, 640 | 47.4 / 47.3 / 12.7 |
+| 8 | 1000 | 139, 236 | 232, 237 | 281, 353 | 54.5 / 47.1 / 24.7 |
+| 128 | 0 | 238, 235 | 1689, 1263 | 1316, 1287 | 533.7 / 85.7 / 82.1 |
+| 128 | 1000 | 166, 234 | 1174, 1000 | 1393, 1193 | 659.1 / 110.9 / 100.6 |
+| 512 | 0 | 253, 256 | 1977, 1641 | 1943, 1779 | 1947.6 / 269.4 / 228.7 |
+| 512 | 1000 | 256, 258 | 1936, 1635 | 1782, 2081 | 1933.9 / 242.7 / 274.9 |
+
+Teardown ran at 144 to 377 clones/s on main, 171 to 1319 with this PR and 702 to 1308 always
+subvolume. Up to 8 at once the PR is main (reflinks); always-subvolume is faster at C=8 on this
+quiet host, but the fleet measured the subvolume commit at 193 ms p50 and 1.8 s p99 while it was
+taking snapshots, against a C=8 reflink p50 of 47 ms here.

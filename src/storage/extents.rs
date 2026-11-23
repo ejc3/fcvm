@@ -165,6 +165,10 @@ pub fn extents_in_files_up_to(paths: &[std::path::PathBuf], limit: u64) -> std::
 const EXTENTS_XATTR: &std::ffi::CStr = c"user.fcvm.extents";
 
 /// The identity a recorded count was taken for: device, inode, length and modification time.
+/// The attribute travels with a file's copies (a subvolume snapshot, `cp -a`), so the count
+/// one of them inherits must not be trusted for it: the device and inode tell a copy apart
+/// where they differ, and the modification time makes the count stale once the file is written
+/// in place, even inside its length, where the length does not change.
 fn extents_identity(meta: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
     format!(
@@ -345,12 +349,14 @@ mod tests {
         let paths = [path.clone()];
         assert_eq!(recorded_extents_in_files_up_to(&paths, 10).unwrap(), 3);
         std::thread::sleep(std::time::Duration::from_millis(20));
-        // A block past a hole: a new extent on every filesystem (an appended block can join
-        // the last extent on ext4 and xfs, which CI's checkout is on).
+        // A block inside an existing hole: a new extent on every filesystem, and the length
+        // stays, so only the modification time can tell the record is stale.
+        let length = std::fs::metadata(&path).unwrap().len();
         let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        writer.seek(SeekFrom::Start(1 << 20)).unwrap();
+        writer.seek(SeekFrom::Start(32 * 1024)).unwrap();
         writer.write_all(&[1; 4096]).unwrap();
         writer.sync_all().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
         assert_eq!(recorded_extents_in_files_up_to(&paths, 10).unwrap(), 4);
     }
 
