@@ -1,0 +1,31 @@
+{
+ "ops": 2000.0,
+ "hold_ms_per_op": 0.85,
+ "hold_ms_per_op_without_rcu_barrier": 0.85,
+ "rcu_barrier_ms_per_op": 0.0,
+ "rcu_barriers_per_op": 0.0,
+ "wait_ms_per_op": 22.2,
+ "by_holder": {
+  "fcvm-netns": {
+   "hold_ms_per_op": 0.361,
+   "holds_per_op": 1.0
+  },
+  "ip": {
+   "hold_ms_per_op": 0.292,
+   "holds_per_op": 5.0
+  },
+  "worker cleanup_net": {
+   "hold_ms_per_op": 0.197,
+   "holds_per_op": 1.01
+  }
+ },
+ "on_cpu_ms_per_op": {
+  "all": 0.84,
+  "wireless_nlevent_flush": 0.285,
+  "do_one_broadcast": 0.002,
+  "rcu_barrier": 0.0
+ },
+ "expedited_grace_periods_per_op": {
+  "worker": 0.05
+ }
+}

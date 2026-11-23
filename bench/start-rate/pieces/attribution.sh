@@ -10,6 +10,7 @@ pieces=$2
 C=${C:-128}; N=${N:-1000}; ALIVE=${ALIVE:-1000}
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here/../../.."
+source "$here/matrix.sh"  # quiet()
 mkdir -p "$out_root"
 for piece in ${pieces//,/ }; do
   cell="$out_root/$piece-c$C-n$N-a$ALIVE"
@@ -24,6 +25,9 @@ for piece in ${pieces//,/ }; do
     CONCURRENCY="$C" ALIVE="$ALIVE" SNAPSHOT_DIR="${SNAPSHOT_DIR:-}" FIRECRACKER="${FIRECRACKER:-}" \
     UFFD_SOCKET="${UFFD_SOCKET:-}" ARGS="--steady-secs 5" > "$cell.log" 2>&1
   echo "exit=$?"
+  # The kernel destroys the cell's namespaces after its last process has exited, under
+  # rtnl_mutex: the tracer stays until that has finished, or it misses most of the teardown.
+  quiet "the end of $piece's namespace cleanup" || echo "WARN: $piece: namespace cleanup still running, its hold is cut short"
   sudo kill -INT "$bt"
   wait "$bt"
   sudo chown "$(id -u):$(id -g)" "$cell.bt" 2>/dev/null

@@ -81,10 +81,18 @@ part of the op; `noop` with `COLD=1` is the cost of an instance process. `--disk
 (in `ARGS=`) makes the disk piece reflink from one of the files in DIR instead of the snapshot's
 disk. `attribution.sh` runs one cell per piece under `kernel.bt` (rtnl_mutex hold and wait, RCU
 syncs and their stacks, netns cleanup, KVM VM create and destroy, copy-on-write and userfaultfd
-faults, KVM exits by class, execs); its timings are not measurements.
+faults, KVM exits by class, execs); its timings are not measurements. The tracer stays until
+the kernel has destroyed the cell's namespaces, which it does after the driver has exited, and
+it traces `rtnl_mutex` as a mutex: a probe on `rtnl_lock()` misses every hold taken inside
+rtnetlink.c, where that function is inlined. `rtnl.py CELL.bt OPS` prints the hold per op by
+holder, with the `rcu_barrier()` time under it apart.
 `perftop.sh` writes each cell's top frames, and `table.py` prints the table in `RESULTS.md`.
 The `kernel.bt` output of the first table's attribution pass (C=128, 1000 held, one file per
 piece; start, steady and teardown in one window) is in `traces/`.
+Those dumps were taken with the tracer stopped at the driver's exit and with probes on
+`rtnl_lock()`. For the pieces that make namespaces, `traces/rtnl/` holds what `rtnl.py` reads
+from complete dumps instead: `rootless-net` before and after changelog step 4 (three runs
+each), `holder` and `health`.
 
 `PERF_FREQ=99` adds `perf record -a -g` over the timed phase (`perf.data`), and
 `PERF_EVENTS=...` adds `perf stat -a` over the timed and steady phases. Host-wide numbers mean
