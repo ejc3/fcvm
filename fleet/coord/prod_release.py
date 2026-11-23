@@ -195,6 +195,15 @@ def decide():
     smoke = max(covering, key=lambda s: s["end"])
     target = {"coordinator": {"commit": coordinator, "digest": candidate["stage"]["digest"]}, "web_commit": web,
               "generation": verified["generation"], "build_id": verified["build_id"], "smoke_run": smoke["run"]}
+    # With the prod lane on, the set carries staging's lane image: its selection, which a staging release that
+    # failed puts back, so it is the image staging runs.
+    lane = publish.lane_setting("FLEET_LAMBDA_LANE_PROD")
+    if lane:
+        lane_module, ecr = publish.lane_repository()
+        staged = ecr.tagged(lane_module.current("stage"))
+        if staged is None:
+            raise Skip("staging has selected no lane image")
+        target["lambda_digest"] = staged.digest
 
     record = candidate.get("release")
     prod_receipt = status["prod"]
@@ -211,6 +220,11 @@ def decide():
     changes = {"image": {"generation": target["generation"], "build_id": target["build_id"]} != prod_receipt,
                "coordinator": target["coordinator"]["digest"] != prior["coordinator"]["digest"],
                "web": prior["web_commit"] != web}
+    if lane:
+        # Prod's lane image: as its record names it, or, before a record carries one, as prod runs it.
+        if not prior.get("lambda_digest"):
+            prior["lambda_digest"] = publish.lane_running(os.environ["COORDINATOR_RELEASE"])
+        changes["lane"] = target["lambda_digest"] != prior["lambda_digest"]
     if not any(changes.values()):
         raise Skip("prod already runs the staging set")
     return target, prior, changes
@@ -307,7 +321,8 @@ def main(argv):
                 output(promote="false")
                 return 0
             output(promote="true", target=target, prior=prior, image=str(changes["image"]).lower(),
-                   coordinator=str(changes["coordinator"]).lower(), web=str(changes["web"]).lower())
+                   coordinator=str(changes["coordinator"]).lower(), web=str(changes["web"]).lower(),
+                   lane=str(changes.get("lane", False)).lower())
         elif action == "hold":
             if rest[:1] != ["--image"] or rest[1:] not in (["true"], ["false"]):
                 raise ValueError("hold --image true|false")

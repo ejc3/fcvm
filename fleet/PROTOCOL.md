@@ -2182,8 +2182,15 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   (ejc3/aws `fcvm-coordinator-release`) refuses a lane digest that `keep-stage-current` does not
   hold, and sets the coordinator's `FLEET_LAMBDA_IMAGE`. If the release fails, publish.py asks
   again what runs and, unless the new lane image does, puts the stage's tags back as they were
-  before the selection. Unset or `off`, the release is the one without a lane. Prod's promote and
-  rollback do not carry a lane digest yet.
+  before the selection. Unset or `off`, the release is the one without a lane.
+- **Prod.** With the repository variable `FLEET_LAMBDA_LANE_PROD` on, the set prod takes
+  (`prod_release.py decide`) carries staging's lane selection as `lambda_digest`, and a new lane
+  image alone is a promotion. The promotion passes it to `publish.py --stack prod
+  --lambda-digest`, which selects it for prod (keeping the lane image prod runs as previous),
+  releases it with the coordinator, and puts prod's tags back if the release fails or is held.
+  The release record keeps the set's `lambda_digest`, and both rollbacks (a failed promotion's
+  and `fleet-prod-rollback.yml`) return to the one the earlier set names. Off, prod's sets carry
+  no lane image and its releases are the ones without a lane.
 - **Pairing.** With the lane on, a coordinator deploy carries the lane build paired with its
   commit: the `keep-built` image's `rev-<commit>` is the deployed commit, or a commit on its line
   (an ancestor or a descendant) with no path of the lane workflow changed in between

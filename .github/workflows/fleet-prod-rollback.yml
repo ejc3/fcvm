@@ -76,14 +76,18 @@ jobs:
           [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
           pnpm install --frozen-lockfile
           WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm:rollback"
+      # The lane image the previous set ran, when its record names one, returns with the coordinator.
       - name: Coordinator
         if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           PREVIOUS: ${{ steps.current.outputs.previous }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
+          lane=$(jq -r '.lambda_digest // empty' <<<"$PREVIOUS")
           python3 -B fleet/coord/publish.py --stack prod --force \
-            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")"
+            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")" \
+            ${lane:+--lambda-digest "$lane"}
       - name: Host and tile images
         if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:

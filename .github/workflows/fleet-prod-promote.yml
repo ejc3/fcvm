@@ -89,11 +89,15 @@ jobs:
       image: ${{ steps.decide.outputs.image }}
       coordinator: ${{ steps.decide.outputs.coordinator }}
       web: ${{ steps.decide.outputs.web }}
+      lane: ${{ steps.decide.outputs.lane }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          sparse-checkout: fleet/coord
+          # decide reads staging's lane selection through fleet/lambda/release.py when the prod lane is on.
+          sparse-checkout: |
+            fleet/coord
+            fleet/lambda
       - id: role
         env:
           ROLE: ${{ secrets.AWS_ROLE_ARN }}
@@ -117,6 +121,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
+          # With the prod lane on (repository variable), the set carries staging's lane image.
+          FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: python3 -B fleet/coord/prod_release.py decide
 
   hold:
@@ -213,14 +220,18 @@ jobs:
           python3 -B fcvm/fleet/coord/prod_release.py image-promote "$TARGET" || rc=$?
           if [ "$rc" = 3 ]; then echo "::notice::prod woke before its images moved: nothing changed"; echo "held=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           exit "$rc"
+      # The set's lane image, when it carries one, is selected for prod and released with the coordinator.
       - name: Coordinator
-        if: needs.candidate.outputs.coordinator == 'true' && steps.image.outputs.held != 'true'
+        if: (needs.candidate.outputs.coordinator == 'true' || needs.candidate.outputs.lane == 'true') && steps.image.outputs.held != 'true'
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           TARGET: ${{ needs.candidate.outputs.target }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
+          lane=$(jq -r '.lambda_digest // empty' <<<"$TARGET")
           python3 -B fcvm/fleet/coord/publish.py --stack prod \
-            --commit "$(jq -r .coordinator.commit <<<"$TARGET")" --digest "$(jq -r .coordinator.digest <<<"$TARGET")"
+            --commit "$(jq -r .coordinator.commit <<<"$TARGET")" --digest "$(jq -r .coordinator.digest <<<"$TARGET")" \
+            ${lane:+--lambda-digest "$lane"}
       - name: Worker
         id: worker
         if: needs.candidate.outputs.web == 'true' && steps.image.outputs.held != 'true'
@@ -346,10 +357,11 @@ jobs:
           pnpm install --frozen-lockfile
           WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$previous@100%" --env production --yes --message "fcvm:rollback"
       - name: Coordinator
-        if: ${{ !cancelled() && needs.candidate.outputs.coordinator == 'true' }}
+        if: ${{ !cancelled() && (needs.candidate.outputs.coordinator == 'true' || needs.candidate.outputs.lane == 'true') }}
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
           PRIOR: ${{ needs.candidate.outputs.prior }}
+          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
           set -euo pipefail
           commit=$(jq -r '.coordinator.commit // empty' <<<"$PRIOR")
@@ -357,7 +369,9 @@ jobs:
             echo "::error::prod's previous coordinator image has no commit tag, so the release function cannot return to it"
             exit 1
           fi
-          python3 -B fleet/coord/publish.py --stack prod --force --commit "$commit" --digest "$(jq -r .coordinator.digest <<<"$PRIOR")"
+          lane=$(jq -r '.lambda_digest // empty' <<<"$PRIOR")
+          python3 -B fleet/coord/publish.py --stack prod --force --commit "$commit" --digest "$(jq -r .coordinator.digest <<<"$PRIOR")" \
+            ${lane:+--lambda-digest "$lane"}
       # Waits for prod to sleep: its templates change only then.
       - name: Host and tile images
         if: ${{ !cancelled() && needs.candidate.outputs.image == 'true' }}
