@@ -521,10 +521,11 @@ namespaces, one traced cell each; these replace the "Measured again" rows):
 | no pasta | 128 | 207 | 230 | 144 | 141 | 163 | 885 | 898 |
 | no pasta | 512 | 196 | 225 | 113 | 143 | 69 | 746 | 720 |
 
-The two carrier columns are per event the link watch worker handled, and it handled a
-carrier-off in 0.70 to 1.00 of the cycles (fewest at C=512, where one pass takes several), so
-the columns sum to the hold per cycle only where it handled every one (C=1: 874 + 1213 + 847 +
-945 = 3879 with pasta, 222 + 350 + 178 + 191 + 283 = 1224 without).
+Every column is per cycle, and the five sum to the hold per cycle in every row within 1 us
+(with pasta at C=32: 459 + 505 + 288 + 312 = 1564; without at C=512: 196 + 225 + 113 + 143 +
+69 = 746). The link watch worker handled a carrier-off of its own in 0.70 to 1.00 of the
+cycles (fewest at C=512, where one pass takes several); the carrier columns already count
+that.
 
 A clone life's attach and detach by name hold the mutex 1.3 to 3.9 ms with 2000 pastas alive
 and 0.75 to 1.22 ms with none. Against the rows they replace the hold per cycle is 6.3% lower
