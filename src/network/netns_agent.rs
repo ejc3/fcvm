@@ -354,7 +354,6 @@ pub fn reset(lessees: &mut Vec<UnixStream>) -> Result<()> {
             }
         }
     }
-    const NDA_LLADDR: u16 = 2;
     const NDA_MASTER: u16 = 9;
     const NTF_SELF: u8 = 0x02;
     const NUD_PERMANENT: u16 = 0x80;
@@ -363,29 +362,29 @@ pub fn reset(lessees: &mut Vec<UnixStream>) -> Result<()> {
     let learned = rtnl
         .dump(RTM_GETNEIGH, &header)
         .context("listing the bridge's learned addresses")?;
+    // The bridges that have learned an address: an entry of a bridge's table names its
+    // bridge, and one that is not a port's own or added to stay was learned. Each such
+    // bridge is told once to forget what it learned, which is a link change; deleting the
+    // entries one by one is refused in a user namespace on Linux 6.14
+    // (`Rtnl::flush_learned_addresses`).
+    let mut bridges = std::collections::BTreeSet::new();
     for entry in learned {
         let p = &entry.payload;
-        // The bridge's table (its entries name their bridge), less the addresses that are
-        // a port's own or were added to stay.
         if p.len() < 12
             || p[10] & NTF_SELF != 0
             || u16::from_ne_bytes([p[8], p[9]]) & (NUD_PERMANENT | NUD_NOARP) != 0
         {
             continue;
         }
-        let index = u32::from_ne_bytes([p[4], p[5], p[6], p[7]]);
-        let attrs = entry.attrs(12);
-        if !attrs.iter().any(|(k, _)| *k == NDA_MASTER) {
-            continue;
+        if let Some((_, master)) = entry.attrs(12).into_iter().find(|(k, _)| *k == NDA_MASTER) {
+            if let Ok(index) = <[u8; 4]>::try_from(master) {
+                bridges.insert(u32::from_ne_bytes(index));
+            }
         }
-        let Some((_, mac)) = attrs.into_iter().find(|(k, _)| *k == NDA_LLADDR) else {
-            continue;
-        };
-        match rtnl.del_learned_address(index, mac) {
-            Ok(()) => {}
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
-            Err(error) => return Err(error).context("deleting a learned address"),
-        }
+    }
+    for bridge in bridges {
+        rtnl.flush_learned_addresses(bridge)
+            .context("having a bridge forget its learned addresses")?;
     }
     rtnl.renew_addresses()
         .context("renewing the namespace's addresses")?;

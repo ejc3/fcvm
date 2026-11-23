@@ -382,16 +382,29 @@ impl Rtnl {
         self.change(RTM_DELNEIGH, 0, &payload)
     }
 
-    /// Delete the address `mac` that the bridge learned on its port `index`:
-    /// `bridge fdb del MAC dev INDEX master`.
-    pub fn del_learned_address(&mut self, index: u32, mac: &[u8]) -> io::Result<()> {
-        const NDA_LLADDR: u16 = 2;
-        const NTF_MASTER: u8 = 0x04;
-        let mut payload = vec![libc::AF_BRIDGE as u8, 0, 0, 0];
-        payload.extend_from_slice(&(index as i32).to_ne_bytes());
-        payload.extend_from_slice(&[0, 0, NTF_MASTER, 0]);
-        attr(&mut payload, NDA_LLADDR, mac);
-        self.change(RTM_DELNEIGH, 0, &payload)
+    /// Have the bridge `index` forget every address it learned:
+    /// `ip link set dev BRIDGE type bridge fdb_flush`. The kernel removes the entries that
+    /// are not static, on every port; a port's own address and an entry added to stay are
+    /// static and remain.
+    ///
+    /// Not one `RTM_DELNEIGH` per entry (`bridge fdb del`): Linux 6.14 refuses that
+    /// request with EPERM to the root of an unprivileged user's namespace (seen on the
+    /// x86_64 CI runners, 6.14.0-1018-aws; 7.0 and later allow it), which failed every
+    /// reset there. That 6.14 refuses it is known from those runs' error, not from reading
+    /// its source. A link change needs CAP_NET_ADMIN in the namespace's own user
+    /// namespace only, and it is the request this module already makes to build the
+    /// bridge.
+    pub fn flush_learned_addresses(&mut self, index: u32) -> io::Result<()> {
+        const IFLA_INFO_DATA: u16 = 2;
+        const IFLA_BR_FDB_FLUSH: u16 = 21;
+        let mut data = Vec::new();
+        attr(&mut data, IFLA_BR_FDB_FLUSH, &[]);
+        let mut info = Vec::new();
+        attr(&mut info, IFLA_INFO_KIND, b"bridge\0");
+        attr(&mut info, IFLA_INFO_DATA, &data);
+        let mut payload = ifinfomsg(index, 0, 0);
+        attr(&mut payload, IFLA_LINKINFO, &info);
+        self.change(RTM_NEWLINK, 0, &payload)
     }
 
     /// Remove every IPv4 address of this namespace that is not loopback's and add it

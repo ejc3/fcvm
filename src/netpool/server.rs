@@ -120,6 +120,12 @@ impl Namespace {
     /// Build a namespace the way an unpooled clone's is built, through the same holder,
     /// the same link builder and the same pasta start.
     async fn build(pid_dir: PathBuf, vm_id: String) -> Result<Self> {
+        Self::build_with(pid_dir, vm_id, true).await
+    }
+
+    /// [`Self::build`], with pasta started or not. A unit test builds without it: pasta is
+    /// a setup asset, and the unit lanes run no setup.
+    async fn build_with(pid_dir: PathBuf, vm_id: String, pasta: bool) -> Result<Self> {
         tokio::fs::create_dir_all(&pid_dir)
             .await
             .with_context(|| format!("creating {}", pid_dir.display()))?;
@@ -133,10 +139,12 @@ impl Namespace {
                 .build_namespace(holder_pid)
                 .await
                 .context("building the links")?;
-            network
-                .post_start(holder_pid)
-                .await
-                .context("starting pasta")?;
+            if pasta {
+                network
+                    .post_start(holder_pid)
+                    .await
+                    .context("starting pasta")?;
+            }
             let agent = netns_agent::client(holder_pid)
                 .context("the holder's channel is not registered")?;
             let open = |kind: &str| {
@@ -725,12 +733,16 @@ mod tests {
 
     /// A pooled namespace is built by the code an unpooled clone's is, so the two read the
     /// same but for the TAP's name. This fails when the pool gets a build of its own.
+    ///
+    /// Neither side starts pasta: what is compared is the links, and pasta is a setup
+    /// asset the unit lanes do not have.
     #[tokio::test(flavor = "current_thread")]
     async fn a_pooled_namespace_reads_as_a_clones_own_would() {
         let scratch = tempfile::tempdir().unwrap();
-        let pooled = Namespace::build(scratch.path().join("pooled"), "pooled-build".into())
-            .await
-            .expect("building a namespace as the pool does");
+        let pooled =
+            Namespace::build_with(scratch.path().join("pooled"), "pooled-build".into(), false)
+                .await
+                .expect("building a namespace as the pool does");
 
         let own_dir = scratch.path().join("own");
         std::fs::create_dir_all(&own_dir).unwrap();
@@ -743,7 +755,6 @@ mod tests {
         own.build_namespace(holder_pid)
             .await
             .expect("building the links");
-        own.post_start(holder_pid).await.expect("starting pasta");
         let own_fingerprint = netns_agent::client(holder_pid)
             .unwrap()
             .fingerprint("tap-own")
