@@ -6237,6 +6237,12 @@ mod tests {
         let descriptor = descriptor.expect("the message's descriptor");
         // SAFETY: fcntl with F_GETFD takes no pointers.
         let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+        // -1 has every bit set, so a failed call would read as the flag being there.
+        assert!(
+            flags >= 0,
+            "F_GETFD failed: {}",
+            std::io::Error::last_os_error()
+        );
         assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
     }
 
