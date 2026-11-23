@@ -212,7 +212,8 @@ def release(function, payload, digest, name):
             print(json.dumps({"status": "held", "reason": reason}), flush=True)
             raise Held("the release was held")
         if status not in ("deployed", "unchanged") or result.get("digest") != digest \
-                or "lambda_digest" in payload and result.get("lambda_digest") != payload["lambda_digest"]:
+                or "lambda_digest" in payload and ("lambda_digest" not in result
+                                                   or result["lambda_digest"] != payload["lambda_digest"]):
             if attribution(result):
                 print(json.dumps({"release": attribution(result)}), flush=True)
             raise RuntimeError(f"{name} release did not complete")

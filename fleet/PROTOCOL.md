@@ -2193,11 +2193,17 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   names another lane image than prod runs. The promotion passes the set's lane image to
   `publish.py --stack prod --lambda-digest`, which selects it for prod (keeping the lane image prod
   runs as previous), releases it with the coordinator, and puts prod's tags back if the release
-  fails or is held. Leaving a set that carries a lane image, both rollbacks (a failed promotion's,
-  to the lane image prod ran before it, and `fleet-prod-rollback.yml`, to the previous set's)
-  return to that lane image, or, when it ran none, pass `--lambda-digest none`, and the function
-  removes `FLEET_LAMBDA_IMAGE`. Off, prod's sets carry no lane image and its releases are the ones
-  without a lane.
+  fails or is held. Leaving a set that carries a lane image, a failed promotion's rollback returns
+  to the lane image prod ran before it, or, when it ran none, passes `--lambda-digest none`, and
+  the function removes `FLEET_LAMBDA_IMAGE`. With the lane on, a record entry without
+  `lambda_digest` names no lane image. Off, prod's sets carry no lane image and its releases are
+  the ones without a lane.
+- **Not supported yet, so the prod switch stays off until they are:** a manual rollback
+  (`fleet-prod-rollback.yml`) of a lane image: with the switch on, or a set on either side naming
+  one, it stops before any release and names the recovery by hand. And turning
+  `FLEET_LAMBDA_LANE_PROD` off while prod runs a lane image: a lane-off promotion writes an entry
+  without `lambda_digest` while the running task keeps its lane image. Return prod to `none`
+  first.
 - **A stack's first selection is not put back.** `release.py reset` restores the tags a
   selection moved, but a stack's first selection moved tags that did not exist, and nothing here
   deletes a tag: after a failed or held first release, `keep-<stack>-current` stays on the image

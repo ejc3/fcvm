@@ -207,6 +207,10 @@ def decide():
             raise RuntimeError("a release function refused to describe the releases")
         if now["stage"]["digest"] != candidate["stage"]["digest"]:
             raise Skip("staging's coordinator changed while the promotion was deciding")
+        for stack in ("stage", "prod"):
+            if now[stack].get("lane_error"):
+                raise Skip(f"the release function could not read the lane image {stack} runs "
+                           f"({now[stack]['lane_error']})")
         staged = now["stage"].get("lambda_digest")
         if not staged:
             raise Skip("staging runs no lane image")
@@ -223,7 +227,8 @@ def decide():
         if record["coordinator"]["digest"] != candidate["prod"]["digest"] \
                 or {"generation": record["generation"], "build_id": record["build_id"]} != prod_receipt:
             raise Skip("prod changed outside a promotion: its release record does not describe it")
-        if lane and "lambda_digest" in record and record["lambda_digest"] != prior_lane:
+        # With the lane on, an entry without lambda_digest names no lane image ("").
+        if lane and record.get("lambda_digest", "") != prior_lane:
             raise Skip("prod changed outside a promotion: its record names another lane image than it runs")
         # Passed back byte for byte: the record's compare-and-swap takes it as the record it replaces.
         prior = entry(record)
@@ -352,6 +357,13 @@ def main(argv):
             release = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"}).get("release")
             if not release or not release.get("previous"):
                 raise RuntimeError("prod has no recorded previous release to roll back to")
+            # The manual rollback (fleet-prod-rollback.yml) does not return a lane image yet: with the prod lane on,
+            # or a set on either side naming one, it stops here, before any release.
+            if (publish.lane_setting("FLEET_LAMBDA_LANE_PROD") or "lambda_digest" in release
+                    or "lambda_digest" in release["previous"]):
+                raise RuntimeError("a manual rollback of a lane image is not supported yet; recover by hand: "
+                                   "publish.py --stack prod --force --commit C --digest D --lambda-digest <the "
+                                   "previous set's lane digest, or none>, then prod_release.py record")
             output(current=entry(release), previous=release["previous"])
         else:
             raise ValueError("unknown action")

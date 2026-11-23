@@ -54,9 +54,12 @@ jobs:
           role-session-name: fcvm-prod-rollback-${{ github.run_id }}
           role-duration-seconds: 21600
           mask-aws-account-id: true
+      # A lane image is not rolled back by hand yet: with the prod lane on, or a set naming one, this step
+      # fails, and every step below needs it to succeed.
       - id: current
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
+          FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}
         run: python3 -B fleet/coord/prod_release.py current
       # Each component is returned whatever the one before it did; any failure still fails the job.
       - name: Worker
@@ -76,24 +79,14 @@ jobs:
           [[ "$version" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]
           pnpm install --frozen-lockfile
           WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$version@100%" --env production --yes --message "fcvm:rollback"
-      # The lane image the previous set ran returns with the coordinator (none when it ran none).
       - name: Coordinator
         if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
-          CURRENT: ${{ steps.current.outputs.current }}
           PREVIOUS: ${{ steps.current.outputs.previous }}
-          LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
-          # Leaving a set that names a lane image: return to the previous set's, or, when it names none, to none
-          # (the function removes FLEET_LAMBDA_IMAGE).
-          lane=
-          if [ -n "$(jq -r '.lambda_digest // empty' <<<"$CURRENT")" ]; then
-            lane=$(jq -r '.lambda_digest // "none"' <<<"$PREVIOUS")
-          fi
           python3 -B fleet/coord/publish.py --stack prod --force \
-            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")" \
-            ${lane:+--lambda-digest "$lane"}
+            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" --digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")"
       - name: Host and tile images
         if: ${{ !cancelled() && steps.current.outcome == 'success' }}
         env:
