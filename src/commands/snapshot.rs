@@ -3936,6 +3936,7 @@ async fn cmd_snapshot_run_inner(
         // placeholder so the shared RestoreParams shape is satisfied.
         MemoryBackend::File {
             memory_path: snapshot_config.memory_path.clone(),
+            write_set: None,
         }
     } else if let Some(ref uffd_socket_path) = uffd_socket {
         // Explicit UFFD mode (--pid): connect to existing serve process, speaking whichever
@@ -4138,16 +4139,33 @@ async fn cmd_snapshot_run_inner(
                 },
             }
         } else {
+            // The write set is named for this generation's key, taken now, while the
+            // generation this clone restores is the one on disk (storage::write_set).
+            let write_set = crate::storage::write_set::sidecar_path(
+                &snapshot_config.memory_path,
+                &paths::snapshot_dir()
+                    .join(&snapshot_name)
+                    .join("config.json"),
+            );
+            if let Err(error) = &write_set {
+                warn!(error = %format!("{error:#}"), "no write set for this restore");
+            }
             MemoryBackend::File {
                 memory_path: snapshot_config.memory_path.clone(),
+                write_set: write_set.ok(),
             }
         }
     };
 
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
-    // A File-backend clone records the snapshot's write set once (storage::write_set).
+    // A File-backend clone records the snapshot's write set once (storage::write_set). Only
+    // the File backend carries one: hugepage and NV2 snapshots restore through an implicit
+    // UFFD server (direct_restore_memory), and Cloud Hypervisor through its own directory.
     let write_set_memory = match &memory_backend {
-        MemoryBackend::File { memory_path } => Some(memory_path.clone()),
+        MemoryBackend::File {
+            memory_path,
+            write_set: Some(sidecar),
+        } if !is_ch => Some((memory_path.clone(), sidecar.clone())),
         _ => None,
     };
     let restore_config = SnapshotRestoreConfig {
@@ -4752,10 +4770,10 @@ async fn cmd_snapshot_run_inner(
     // (8250 on ttyS0); Cloud Hypervisor restores use the hvc0 virtio
     // console, so they get a backend-neutral missing-console error.
     if output_connected {
-        if let (Some(memory), Ok(vmm_pid)) = (
+        if let (Some((memory, sidecar)), Ok(vmm_pid)) = (
             write_set_memory
                 .clone()
-                .filter(|m| crate::storage::write_set::existing(m).is_none()),
+                .filter(|(_, sidecar)| !sidecar.is_file()),
             vm_manager.pid(),
         ) {
             let cancel = health_cancel_token.clone();
@@ -4765,7 +4783,7 @@ async fn cmd_snapshot_run_inner(
                     _ = tokio::time::sleep(crate::storage::write_set::RECORD_AFTER) => {}
                 }
                 let recorded = tokio::task::spawn_blocking(move || {
-                    crate::storage::write_set::record(vmm_pid, &memory)
+                    crate::storage::write_set::record(vmm_pid, &memory, &sidecar)
                 })
                 .await;
                 match recorded {
@@ -6202,6 +6220,7 @@ async fn cmd_snapshot_run_raw(
         // Unused by the Cloud Hypervisor restore, which reads its own `ch/` directory.
         memory_backend: MemoryBackend::File {
             memory_path: snapshot_config.memory_path.clone(),
+            write_set: None,
         },
         source_disk_path: snapshot_config.disk_path.clone(),
         original_vm_id: snapshot_config
@@ -6532,6 +6551,38 @@ async fn record_diff_parent(
 
 #[cfg(test)]
 mod tests {
+    /// Only the File backend carries a write set: its sidecar is named in the branch that
+    /// chooses the File backend, after the implicit UFFD server that hugepage and NV2
+    /// snapshots restore through (direct_restore_memory, pinned by the tests of that
+    /// function), and the restore passes it to Firecracker in the File arm alone.
+    #[test]
+    fn only_a_file_backend_restore_takes_the_write_set() {
+        let source = include_str!("snapshot.rs");
+        let code = &source[..source.find("#[cfg(test)]").unwrap()];
+        let inner = &code[code.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let named = inner.find("write_set::sidecar_path(").unwrap();
+        let implicit = inner
+            .find("UffdBacking::Minor { .. } => MemoryBackend::UffdMinor")
+            .unwrap();
+        let file = inner.find("write_set: write_set.ok(),").unwrap();
+        assert!(
+            implicit < named && named < file,
+            "the sidecar is named outside the File branch"
+        );
+        assert_eq!(inner.matches("write_set::sidecar_path(").count(), 1);
+        let common = include_str!("common.rs");
+        assert_eq!(common.matches("write_set_path: write_set.map(").count(), 1);
+        let file_arm = common
+            .find("MemoryBackend::File {\n                memory_path,\n                write_set,")
+            .unwrap();
+        assert!(
+            common[file_arm..]
+                .find("write_set_path: write_set.map(")
+                .unwrap()
+                < 1200
+        );
+    }
+
     /// `--stop` pins one VM: the wrapper hands the create the VM id it pinned before the
     /// pidfd, and the create refuses any other right after it loads the selector's VM, before
     /// it can pause anything. Without the check, a VM that took the selector's name or PID

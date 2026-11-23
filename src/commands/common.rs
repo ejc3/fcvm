@@ -2554,7 +2554,12 @@ pub enum MemoryBackend {
     /// Load memory directly from file (used by podman cache restore).
     /// Firecracker maps the snapshot file MAP_PRIVATE, so clean pages are shared through
     /// the host page cache and guest writes CoW.
-    File { memory_path: PathBuf },
+    File {
+        memory_path: PathBuf,
+        /// The snapshot generation's recorded write set (`storage::write_set`), which
+        /// Firecracker populates writable before the VM runs, when the file exists.
+        write_set: Option<PathBuf>,
+    },
     /// Use UFFD server for on-demand page loading (used by snapshot clones).
     /// MISSING faults on anonymous memory, resolved with UFFDIO_COPY: lazy, but every
     /// faulted page becomes a private per-clone copy.
@@ -4083,7 +4088,7 @@ pub async fn restore_from_snapshot(
         // process runs. A memory server that starts for another snapshot then leaves its
         // page cache alone. Best effort, like a server's mark: without it the restore works
         // and may read pages from disk.
-        if let MemoryBackend::File { memory_path } = &restore_config.memory_backend {
+        if let MemoryBackend::File { memory_path, .. } = &restore_config.memory_backend {
             if let Err(error) = vm_manager.mark_memory_in_use(memory_path).await {
                 warn!(
                     error = %format!("{error:#}"),
@@ -4102,13 +4107,16 @@ pub async fn restore_from_snapshot(
         };
 
         let mem_backend = match &restore_config.memory_backend {
-            MemoryBackend::File { memory_path } => {
+            MemoryBackend::File {
+                memory_path,
+                write_set,
+            } => {
                 info!(
                     memory = %memory_path.display(),
                     "loading snapshot with File backend"
                 );
-                let write_set = crate::storage::write_set::existing(memory_path);
-                if let Some(path) = &write_set {
+                let write_set = write_set.as_ref().filter(|p| p.is_file());
+                if let Some(path) = write_set {
                     info!(write_set = %path.display(), "populating the recorded write set before resume");
                 }
                 MemBackend {
@@ -8641,7 +8649,7 @@ mod tests {
         let body = &source[start..start + end];
         let steps = [
             ".start(&firecracker_bin, None, firecracker_args.as_deref())",
-            "MemoryBackend::File { memory_path } = &restore_config.memory_backend",
+            "MemoryBackend::File { memory_path, .. } = &restore_config.memory_backend",
             "vm_manager.mark_memory_in_use(memory_path)",
             ".load_snapshot(",
             "if let Err(e) = post_start {",

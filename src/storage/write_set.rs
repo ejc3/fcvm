@@ -17,13 +17,17 @@
 //! populated page is private to its clone, so a set larger than [`MAX_SET_FRACTION`] of the image
 //! is not recorded: shared clean pages are what let many clones fit.
 //!
-//! The sidecar's name carries the memory image's identity (device, inode, length, modification
-//! time), so a new generation of the snapshot records its own set. Two clones that both find no
+//! The sidecar's name carries the snapshot generation's key, the one the UFFD working-set
+//! sidecar is bound to (`uffd::working_set::ImageKey`: the SHA-256 of `config.json` with the
+//! memory image's length and modification time), so a set recorded for one generation is never
+//! applied to another, including a replaced image of the same length written within the
+//! filesystem's timestamp granularity: its `config.json` differs. The key is taken when the
+//! clone restores, and the recording is named for that key, so a generation installed while
+//! the recording clone runs does not receive its set. Two clones that both find no
 //! set record one each: each writes a temporary of a unique name and renames it onto the
 //! sidecar, so a reader sees one whole set, the last one renamed.
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -38,39 +42,22 @@ const PAGE: u64 = 4096;
 /// more is not recorded.
 pub const MAX_SET_FRACTION: u64 = 4;
 
-/// The write-set sidecar of the memory image at `memory`, named for that image's identity.
-pub fn sidecar_path(memory: &Path) -> std::io::Result<PathBuf> {
-    let meta = std::fs::metadata(memory)?;
-    let mut hasher = Sha256::new();
-    for part in [
-        meta.dev(),
-        meta.ino(),
-        meta.len(),
-        meta.mtime() as u64,
-        meta.mtime_nsec() as u64,
-    ] {
-        hasher.update(part.to_le_bytes());
-    }
-    let digest = hasher.finalize();
-    let key: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+/// The write-set sidecar of the snapshot generation whose memory image is `memory` and whose
+/// config is `config`: beside the image, named for the generation's key.
+pub fn sidecar_path(memory: &Path, config: &Path) -> Result<PathBuf> {
+    let key = crate::uffd::ImageKey::of_generation(memory, config)?;
     let mut name = memory
         .file_name()
-        .ok_or_else(|| std::io::Error::other("the memory image has no file name"))?
+        .context("the memory image has no file name")?
         .to_os_string();
-    name.push(format!(".write-set-{key}"));
+    name.push(format!(".write-set-{key:?}"));
     Ok(memory.with_file_name(name))
 }
 
-/// The recorded write set of the memory image at `memory`, if there is one.
-pub fn existing(memory: &Path) -> Option<PathBuf> {
-    sidecar_path(memory).ok().filter(|p| p.is_file())
-}
-
-/// Records the write set of the memory image at `memory` from the process `vmm_pid`, which maps
-/// it privately as guest memory, unless one is recorded already. Returns the number of ranges
-/// written, or None when a set existed.
-pub fn record(vmm_pid: u32, memory: &Path) -> Result<Option<usize>> {
-    let sidecar = sidecar_path(memory).context("naming the write-set sidecar")?;
+/// Records at `sidecar` the write set of the memory image at `memory` from the process
+/// `vmm_pid`, which maps it privately as guest memory, unless a set is recorded there already.
+/// Returns the number of ranges written, or None when a set existed.
+pub fn record(vmm_pid: u32, memory: &Path, sidecar: &Path) -> Result<Option<usize>> {
     if sidecar.is_file() {
         return Ok(None);
     }
@@ -96,11 +83,11 @@ pub fn record(vmm_pid: u32, memory: &Path) -> Result<Option<usize>> {
     }
     // A unique temporary and an atomic rename: two clones that record at once write the same
     // kind of set, and the last rename wins whole.
-    let mut temporary = sidecar.clone().into_os_string();
+    let mut temporary = sidecar.as_os_str().to_os_string();
     temporary.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let temporary = PathBuf::from(temporary);
     std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
-    std::fs::rename(&temporary, &sidecar).with_context(|| {
+    std::fs::rename(&temporary, sidecar).with_context(|| {
         let _ = std::fs::remove_file(&temporary);
         format!("installing {}", sidecar.display())
     })?;
@@ -189,14 +176,20 @@ mod tests {
                 std::ptr::read_volatile(bytes.add(page * PAGE as usize));
             }
         }
-        assert_eq!(record(std::process::id(), &memory).unwrap(), Some(2));
-        let recorded = std::fs::read_to_string(sidecar_path(&memory).unwrap()).unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        let sidecar = sidecar_path(&memory, &config).unwrap();
+        assert_eq!(
+            record(std::process::id(), &memory, &sidecar).unwrap(),
+            Some(2)
+        );
+        let recorded = std::fs::read_to_string(&sidecar).unwrap();
         assert_eq!(
             recorded,
             format!("{} {}\n{} {}\n", 6 * PAGE, 2 * PAGE, 11 * PAGE, PAGE)
         );
         // Recorded once: a second call leaves it.
-        assert_eq!(record(std::process::id(), &memory).unwrap(), None);
+        assert_eq!(record(std::process::id(), &memory, &sidecar).unwrap(), None);
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(base, length) };
     }
@@ -227,22 +220,41 @@ mod tests {
                 *base.cast::<u8>().add(page * PAGE as usize) = 1;
             }
         }
-        assert!(record(std::process::id(), &memory).is_err());
-        assert!(existing(&memory).is_none());
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        let sidecar = sidecar_path(&memory, &config).unwrap();
+        assert!(record(std::process::id(), &memory, &sidecar).is_err());
+        assert!(!sidecar.exists());
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(base, length) };
     }
 
-    /// A new generation of the image (here, rewritten) gets a sidecar of its own name.
+    /// A set is named for its snapshot generation: another generation whose memory image has
+    /// the same length and the same modification time, to the nanosecond, but another
+    /// `config.json` gets another name, so its clones never apply this set; the same
+    /// generation always gets the same name.
     #[test]
-    fn the_sidecar_is_named_for_the_image_it_was_recorded_from() {
+    fn a_set_never_applies_to_another_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let memory = dir.path().join("memory.bin");
-        std::fs::write(&memory, [0u8; 4096]).unwrap();
-        let first = sidecar_path(&memory).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&memory, [1u8; 8192]).unwrap();
-        assert_ne!(first, sidecar_path(&memory).unwrap());
-        assert!(existing(&memory).is_none());
+        let (memory, config) = (
+            dir.path().join("memory.bin"),
+            dir.path().join("config.json"),
+        );
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::new(1_800_000_000, 5);
+        let generation = |bytes: &[u8], config_text: &str| {
+            std::fs::write(&memory, bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&memory)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+            std::fs::write(&config, config_text).unwrap();
+            sidecar_path(&memory, &config).unwrap()
+        };
+        let first = generation(&[1u8; 4096], r#"{"generation":1}"#);
+        assert_eq!(first, generation(&[1u8; 4096], r#"{"generation":1}"#));
+        // A replaced image: same length, same mtime, new config.
+        assert_ne!(first, generation(&[2u8; 4096], r#"{"generation":2}"#));
     }
 }
