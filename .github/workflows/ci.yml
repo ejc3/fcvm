@@ -791,10 +791,19 @@ jobs:
           uris="${{ runner.temp }}/apt-uris.txt"
           awk '{gsub(/\x27/, "", $2); print $2}' "$uris" > "${{ runner.temp }}/apt-wanted.txt"
           needed=$(wc -l < "${{ runner.temp }}/apt-wanted.txt")
+          # apt takes a file already in the archives directory on its size alone, so every
+          # restored file is checked here against the hash in the fresh package lists, and one
+          # that does not match (or has no SHA256 there) is removed and downloaded again.
           cached=0
-          while read -r name; do
-            [ -f "$APT_DIR/$name" ] && cached=$((cached + 1))
-          done < "${{ runner.temp }}/apt-wanted.txt"
+          while read -r _ name _ hash; do
+            f="$APT_DIR/$name"
+            [ -f "$f" ] || continue
+            if [ "${hash#SHA256:}" != "$hash" ] && [ "$(sha256sum < "$f" | cut -d' ' -f1)" = "${hash#SHA256:}" ]; then
+              cached=$((cached + 1))
+            else
+              sudo rm -f "$f"
+            fi
+          done < "$uris"
           ls "$APT_DIR" > "${{ runner.temp }}/apt-before.txt"
           ./fcvm/scripts/ci-apt-get.sh install -y -o Dir::Cache::archives="$APT_DIR" $APT_PACKAGES
           # Keep only the files this package set needs, then hand the directory back for the cache save.
@@ -811,7 +820,9 @@ jobs:
           echo "apt archives: needed=$needed from_cache=$cached fetched_bytes=$fetched"
           if ls "$APT_DIR"/*.deb >/dev/null 2>&1; then echo "has_debs=true" >> "$GITHUB_OUTPUT"; fi
       - name: Save apt archives
-        if: steps.apt-restore.outputs.cache-hit != 'true' && steps.apt-install.outputs.has_debs == 'true'
+        # Not from a pull request: its cache is scoped to that pull request, so each one that met
+        # a new key would keep its own copy of about 228 MB. Main's pushes and dispatched runs save.
+        if: github.event_name != 'pull_request' && steps.apt-restore.outputs.cache-hit != 'true' && steps.apt-install.outputs.has_debs == 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -1130,10 +1141,19 @@ jobs:
           uris="${{ runner.temp }}/apt-uris.txt"
           awk '{gsub(/\x27/, "", $2); print $2}' "$uris" > "${{ runner.temp }}/apt-wanted.txt"
           needed=$(wc -l < "${{ runner.temp }}/apt-wanted.txt")
+          # apt takes a file already in the archives directory on its size alone, so every
+          # restored file is checked here against the hash in the fresh package lists, and one
+          # that does not match (or has no SHA256 there) is removed and downloaded again.
           cached=0
-          while read -r name; do
-            [ -f "$APT_DIR/$name" ] && cached=$((cached + 1))
-          done < "${{ runner.temp }}/apt-wanted.txt"
+          while read -r _ name _ hash; do
+            f="$APT_DIR/$name"
+            [ -f "$f" ] || continue
+            if [ "${hash#SHA256:}" != "$hash" ] && [ "$(sha256sum < "$f" | cut -d' ' -f1)" = "${hash#SHA256:}" ]; then
+              cached=$((cached + 1))
+            else
+              sudo rm -f "$f"
+            fi
+          done < "$uris"
           ls "$APT_DIR" > "${{ runner.temp }}/apt-before.txt"
           ./fcvm/scripts/ci-apt-get.sh install -y -o Dir::Cache::archives="$APT_DIR" $APT_PACKAGES
           # Keep only the files this package set needs, then hand the directory back for the cache save.
@@ -1150,7 +1170,9 @@ jobs:
           echo "apt archives: needed=$needed from_cache=$cached fetched_bytes=$fetched"
           if ls "$APT_DIR"/*.deb >/dev/null 2>&1; then echo "has_debs=true" >> "$GITHUB_OUTPUT"; fi
       - name: Save apt archives
-        if: steps.apt-restore.outputs.cache-hit != 'true' && steps.apt-install.outputs.has_debs == 'true'
+        # Not from a pull request: its cache is scoped to that pull request, so each one that met
+        # a new key would keep its own copy of about 228 MB. Main's pushes and dispatched runs save.
+        if: github.event_name != 'pull_request' && steps.apt-restore.outputs.cache-hit != 'true' && steps.apt-install.outputs.has_debs == 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:

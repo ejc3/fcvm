@@ -3131,6 +3131,16 @@ fn host_jobs_install_from_cached_apt_archives_and_save_on_a_miss() {
                 && run.contains("Dir::Cache::archives=\"$APT_DIR\""),
             "{job}: Install dependencies must install from the cached archives directory"
         );
+        // apt takes a file already in its archives directory on size alone, so the step
+        // checks every restored file's SHA256 itself, before the install.
+        let check = run.find("sha256sum <").unwrap_or_else(|| {
+            panic!("{job}: restored archives must be checked against the package lists' SHA256")
+        });
+        let installs = run.find("ci-apt-get.sh install").unwrap();
+        assert!(
+            check < installs,
+            "{job}: the hash check must run before the install"
+        );
         let restore = step("Restore apt archives");
         assert!(
             restore
@@ -3144,6 +3154,10 @@ fn host_jobs_install_from_cached_apt_archives_and_save_on_a_miss() {
         assert!(
             cond.contains("cache-hit != 'true'") && cond.contains("has_debs == 'true'"),
             "{job}: the save must run only on a miss and only when archives exist, got {cond:?}"
+        );
+        assert!(
+            cond.contains("github.event_name != 'pull_request'"),
+            "{job}: a pull request must not save its own copy of the archives, got {cond:?}"
         );
         for s in [restore, save] {
             assert_eq!(
