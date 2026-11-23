@@ -137,6 +137,8 @@ struct FirecrackerLogErrors {
     repeated: usize,
     /// ERROR lines found after [`REPEATED_FIRECRACKER_ERRORS`] were returned.
     counted: u64,
+    /// Bytes the last [`Self::read_new`] read.
+    last_read: u64,
 }
 
 impl FirecrackerLogErrors {
@@ -158,7 +160,8 @@ impl FirecrackerLogErrors {
         let mut appended = Vec::new();
         file.take(FIRECRACKER_LOG_READ_MAX)
             .read_to_end(&mut appended)?;
-        self.offset += appended.len() as u64;
+        self.last_read = appended.len() as u64;
+        self.offset += self.last_read;
         self.partial.extend_from_slice(&appended);
         let mut lines = Vec::new();
         let mut start = 0;
@@ -190,9 +193,8 @@ impl FirecrackerLogErrors {
     ) -> std::io::Result<Vec<String>> {
         let mut lines = Vec::new();
         loop {
-            let before = self.offset;
             lines.extend(self.read_new(file)?);
-            if self.offset - before < FIRECRACKER_LOG_READ_MAX {
+            if self.last_read < FIRECRACKER_LOG_READ_MAX {
                 return Ok(lines);
             }
         }
@@ -202,16 +204,25 @@ impl FirecrackerLogErrors {
 /// Empties the log `path` names before a launch. Firecracker opens `--log-path` without
 /// truncating it and writes from its start, so a relaunch over the log an earlier process wrote
 /// would leave that process's lines after its own, and the follower would repeat that
-/// process's errors as the new one's. A missing log is left to be created.
+/// process's errors as the new one's. A missing log, or one that is not a regular file, is left
+/// as it is. A log fcvm cannot open for writing fails the launch: Firecracker, run as the same
+/// user, opens it for writing too.
 fn clear_log_before_launch(path: &Path) -> Result<()> {
-    match std::fs::OpenOptions::new().write(true).open(path) {
-        Ok(file) => file
-            .set_len(0)
-            .with_context(|| format!("emptying {} before launching Firecracker", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("opening {} before launching Firecracker", path.display())),
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading {} before launching Firecracker", path.display())
+            })
+        }
     }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_len(0))
+        .with_context(|| format!("emptying {} before launching Firecracker", path.display()))
 }
 
 /// Repeats Firecracker's ERROR lines in fcvm's log while the VMM runs, under fcvm's own target,
@@ -221,10 +232,11 @@ struct FirecrackerLogFollower {
     vm_id: String,
     file: Option<std::fs::File>,
     errors: FirecrackerLogErrors,
-    /// `errors.counted` when it was last reported.
-    reported: u64,
     /// Whether a read failed, after which nothing more is read.
     failed: bool,
+    /// Whether the last poll ran. A read the follower's task queued before it was stopped can
+    /// run after it, when the log may already hold the next process's lines.
+    stopped: bool,
 }
 
 impl FirecrackerLogFollower {
@@ -234,16 +246,21 @@ impl FirecrackerLogFollower {
             vm_id,
             file: None,
             errors: FirecrackerLogErrors::default(),
-            reported: 0,
             failed: false,
+            stopped: false,
         }
     }
 
     /// Reads what Firecracker appended and logs its ERROR lines; with `last`, to the end of the
     /// file, and then how many were only counted since the last report. A failed read stops the
-    /// reading, not that report. Returns the messages it logged.
+    /// reading, not that report. After the last poll it reads nothing. Returns the messages it
+    /// logged.
     fn poll(&mut self, last: bool) -> Vec<String> {
         let mut messages = Vec::new();
+        if self.stopped {
+            return messages;
+        }
+        self.stopped = last;
         if !self.failed && self.file.is_none() {
             self.file = std::fs::File::open(&self.path).ok();
         }
@@ -269,12 +286,11 @@ impl FirecrackerLogFollower {
                 }
             }
         }
-        if last && self.errors.counted > self.reported {
+        if last && self.errors.counted > 0 {
             messages.push(format!(
-                "Firecracker logged {} more errors than are repeated here; they are in its log",
-                self.errors.counted - self.reported
+                "Firecracker logged {} more errors than are repeated here; they are in its log until a relaunch empties it",
+                self.errors.counted
             ));
-            self.reported = self.errors.counted;
         }
         for message in &messages {
             warn!(vm_id = %self.vm_id, log = %self.path.display(), "{message}");
@@ -848,13 +864,9 @@ impl VmManager {
         }
     }
 
-    /// SIGKILL the Firecracker process without waiting for it to exit.
-    ///
-    /// Pairs with [`Self::reap`]. Keeping the handle here (rather than taking it) is what
-    /// lets the caller signal other processes before coming back to wait on this one.
-    /// Starts repeating the VMM's ERROR lines from its log, if it has one.
+    /// Starts repeating the VMM's ERROR lines from its log, if it has one. `start` has
+    /// stopped the previous process's follower.
     fn start_log_follower(&mut self) {
-        self.stop_log_follower();
         let Some(path) = self.log_path.clone() else {
             return;
         };
@@ -891,6 +903,10 @@ impl VmManager {
         }
     }
 
+    /// SIGKILL the Firecracker process without waiting for it to exit.
+    ///
+    /// Pairs with [`Self::reap`]. Keeping the handle here (rather than taking it) is what
+    /// lets the caller signal other processes before coming back to wait on this one.
     pub fn start_kill(&mut self) -> Result<()> {
         if let Some(ref mut process) = self.process {
             info!(vm_id = %self.vm_id, "SIGKILL to Firecracker process");
@@ -1044,14 +1060,64 @@ mod tests {
     }
 
     #[test]
-    fn firecracker_log_errors_read_rest_reaches_an_error_behind_a_large_backlog() {
+    fn the_last_poll_reaches_an_error_behind_a_large_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
         let backlog = format!("{INFO_LINE}\n")
             .repeat((FIRECRACKER_LOG_READ_MAX as usize / (INFO_LINE.len() + 1)) + 10);
-        let mut file = std::io::Cursor::new(format!("{backlog}{BLOCK_ENOSPC}\n").into_bytes());
+        std::fs::write(&path, format!("{backlog}{BLOCK_ENOSPC}\n")).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path, "vm-test".to_string());
+        assert_eq!(
+            follower.poll(true),
+            vec![format!("Firecracker logged an error: {BLOCK_ENOSPC}")]
+        );
+    }
+
+    #[test]
+    fn firecracker_log_errors_read_rest_reads_a_log_that_shrank_from_its_start() {
+        let mut file = std::io::Cursor::new(format!("{INFO_LINE}\n{INFO_LINE}\n").into_bytes());
         let mut errors = FirecrackerLogErrors::default();
+        assert!(errors.read_new(&mut file).unwrap().is_empty());
+        let short = "t [i:main:ERROR:f.rs:1] x";
+        *file.get_mut() = format!("{short}\n").into_bytes();
         assert_eq!(
             errors.read_rest(&mut file).unwrap(),
-            vec![BLOCK_ENOSPC.to_string()]
+            vec![short.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_poll_after_the_last_one_reads_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::write(&path, format!("{INFO_LINE}\n")).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path.clone(), "vm-test".to_string());
+        assert!(follower.poll(true).is_empty());
+        // A read the stopped follower's task had already queued runs after the relaunch emptied
+        // the log and the next process wrote an error: that error is the new follower's.
+        let short = "t [i:main:ERROR:f.rs:1] new";
+        assert!(short.len() < INFO_LINE.len());
+        std::fs::write(&path, format!("{short}\n")).unwrap();
+        assert!(follower.poll(false).is_empty());
+    }
+
+    #[test]
+    fn start_stops_the_old_follower_then_empties_the_log_then_starts_the_new_one() {
+        let src = include_str!("vm.rs");
+        let start = &src[src.find("    pub async fn start(").unwrap()..];
+        let start = &start[..start.find("\n    }\n").unwrap()];
+        let at = |needle: &str| {
+            start
+                .find(needle)
+                .unwrap_or_else(|| panic!("start() no longer contains {needle}"))
+        };
+        assert!(
+            at("self.stop_log_follower();") < at("clear_log_before_launch(")
+                && at("clear_log_before_launch(")
+                    < at(".context(\"spawning Firecracker process\")")
+                && at(".context(\"spawning Firecracker process\")")
+                    < at("self.start_log_follower();"),
+            "start() must stop the old follower, empty the log, spawn, then start the new follower"
         );
     }
 
@@ -1069,6 +1135,7 @@ mod tests {
         let mut file = std::fs::File::open(&path).unwrap();
         assert_eq!(errors.read_new(&mut file).unwrap(), vec![short.to_string()]);
         clear_log_before_launch(&dir.path().join("missing.log")).unwrap();
+        assert!(!dir.path().join("missing.log").exists());
     }
 
     #[test]
@@ -1088,7 +1155,7 @@ mod tests {
         let last = follower.poll(true);
         assert_eq!(
             last,
-            vec!["Firecracker logged 5 more errors than are repeated here; they are in its log"]
+            vec!["Firecracker logged 5 more errors than are repeated here; they are in its log until a relaunch empties it"]
         );
     }
 
