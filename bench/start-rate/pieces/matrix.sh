@@ -42,7 +42,9 @@ quiet() {
 }
 
 # A cell counts once its summary says nothing failed and it ran in this run's mode (COLD,
-# UFFD_SOCKET); any other cell is run again.
+# UFFD_SOCKET) with this run's piece arguments (ARGS, which the cell keeps in its `args`
+# file: the tap-attach options, for one, are part of what a cell measured); any other cell
+# is run again.
 cell_done() {
   local cold=false uffd=false
   [ -n "${COLD:-}" ] && cold=true
@@ -50,7 +52,8 @@ cell_done() {
   [ -f "$1/summary.json" ] &&
     jq -e --argjson cold "$cold" --argjson uffd "$uffd" \
       '.timed.failed == 0 and .teardown.failed == 0 and ((.perf_errors // []) | length) == 0
-       and .cold == $cold and .uffd == $uffd' "$1/summary.json" > /dev/null
+       and .cold == $cold and .uffd == $uffd' "$1/summary.json" > /dev/null &&
+    [ "$(cat "$1/args" 2> /dev/null)" = "${ARGS:-}" ]
 }
 
 # Sourced (by test_pieces.py) for its functions only.
@@ -78,6 +81,9 @@ for piece in ${pieces//,/ }; do
         CONCURRENCY="$c" ALIVE="$alive" SNAPSHOT_DIR="${SNAPSHOT_DIR:-}" \
         FIRECRACKER="${FIRECRACKER:-}" UFFD_SOCKET="${UFFD_SOCKET:-}" \
         PERF_FREQ="${PERF_FREQ:-}" PERF_EVENTS="${PERF_EVENTS:-}" > "$cell.log" 2>&1
+      status=$?
+      [ -d "$cell" ] && printf '%s' "${ARGS:-}" > "$cell/args"
+      (exit $status)
       echo "exit=$? $(jq -c '{ops_s: .timed.ops_per_s, p50: .timed.latency_ms.p50, p99: .timed.latency_ms.p99, cg: .timed.cgroup_cpu_s_per_op_net, host: .timed.host_cpu_s_per_op_net, failed: .timed.failed}' "$cell/summary.json" 2>/dev/null)"
     done
   done

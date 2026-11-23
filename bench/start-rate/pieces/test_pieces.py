@@ -133,9 +133,20 @@ class MatrixTest(unittest.TestCase):
         # rtnl_lock() is inlined into its callers inside rtnetlink.c, so a probe on that symbol
         # misses every RTM_NEWLINK, RTM_SETLINK and RTM_DELLINK hold.
         bt = (HERE / "kernel.bt").read_text()
-        self.assertIn('kprobe:mutex_unlock /arg0 == kaddr("rtnl_mutex")', bt)
-        self.assertNotIn("kprobe:rtnl_lock", bt)
-        self.assertNotIn("kprobe:rtnl_unlock", bt)
+        for bt in (bt, (HERE / "tap.bt").read_text()):
+            self.assertIn('kfunc:vmlinux:mutex_unlock /(uint64)args.lock == kaddr("rtnl_mutex")', bt)
+            self.assertNotIn("probe:rtnl_lock", bt)
+            self.assertNotIn("probe:rtnl_unlock", bt)
+
+    def test_the_acquisition_is_not_traced_with_a_return_probe(self):
+        # The kernel keeps 2 x CPUs return-probe instances per probe and drops the rest
+        # silently: with 512 helpers asleep in rtnl_lock on 192 CPUs a quarter of the holds
+        # went unsummed. fentry and fexit have no such limit.
+        for name in ("kernel.bt", "tap.bt"):
+            bt = (HERE / name).read_text()
+            self.assertIn("kretfunc:vmlinux:mutex_lock /", bt, name)
+            self.assertNotIn("kretprobe:mutex_lock", bt, name)
+            self.assertNotIn("kretprobe:rtnl_lock", bt, name)
 
     def test_the_tracer_outlives_the_namespace_cleanup(self):
         # The kernel destroys a cell's namespaces after the driver has exited. A tracer stopped
@@ -152,10 +163,27 @@ class MatrixTest(unittest.TestCase):
             self.assertNotEqual(self.sh(f"COLD=1 cell_done {root}/c").returncode, 0)
             self.assertNotEqual(self.sh(f"UFFD_SOCKET=/u cell_done {root}/c").returncode, 0)
 
+    def test_a_cell_run_with_other_piece_arguments_is_not_done(self):
+        with tempfile.TemporaryDirectory() as root:
+            cell = pathlib.Path(root) / "c"
+            cell.mkdir()
+            (cell / "summary.json").write_text(json.dumps(summary()))
+            warm = "--tap-warm-cycles 1 --tap-hold-ms 20"
+            # A cell from before the arguments were kept ran with unknown ones.
+            self.assertNotEqual(self.sh(f"ARGS='{warm}' cell_done {cell}").returncode, 0)
+            (cell / "args").write_text(warm)
+            self.assertEqual(self.sh(f"ARGS='{warm}' cell_done {cell}").returncode, 0)
+            self.assertNotEqual(self.sh(f"ARGS='{warm} --tap-no-pasta' cell_done {cell}").returncode, 0)
+            self.assertNotEqual(self.sh(f"ARGS='--tap-warm-cycles 0 --tap-hold-ms 20' cell_done {cell}").returncode, 0)
+            self.assertNotEqual(self.sh(f"cell_done {cell}").returncode, 0)
+
 
 class RtnlSummaryTest(unittest.TestCase):
     DUMP = """
 @rtnl_hold_us_total: 40000
+@rtnl_requests: 139
+@rtnl_acquired: 138
+@rtnl_interrupted: 1
 
 @rtnl_hold_us_by_work[cleanup_net+0]: 30000
 @rtnl_holds_by_work[cleanup_net+0]: 3
@@ -205,6 +233,21 @@ class RtnlSummaryTest(unittest.TestCase):
         self.assertEqual(s["expedited_grace_periods_per_op"], {"worker": 5.0, "fcvm-netns": 2.0})
         self.assertEqual(s["on_cpu_ms_per_op"], {"all": 600.0, "wireless_nlevent_flush": 200.0,
                                                  "do_one_broadcast": 100.0, "rcu_barrier": 0.0})
+
+    def test_a_dump_that_lost_acquisitions_is_refused(self):
+        import rtnl
+        short = self.DUMP.replace("@rtnl_acquired: 138", "@rtnl_acquired: 100")
+        with self.assertRaises(SystemExit) as refused:
+            rtnl.summarize(short, 10)
+        self.assertIn("dropped", str(refused.exception))
+        with self.assertRaises(SystemExit):
+            rtnl.summarize(self.DUMP.replace("@rtnl_requests: 139\n", ""), 10)
+        # The kernel skips a few fentry and fexit runs; a share under 0.5% is not a lost dump.
+        big = self.DUMP.replace("@rtnl_requests: 139", "@rtnl_requests: 94849").replace(
+            "@rtnl_acquired: 138", "@rtnl_acquired: 94835")
+        rtnl.summarize(big, 10)
+        with self.assertRaises(SystemExit):
+            rtnl.summarize(big.replace("@rtnl_acquired: 94835", "@rtnl_acquired: 94000"), 10)
 
     def test_a_dump_from_a_tracer_that_did_not_run_is_refused(self):
         import rtnl
