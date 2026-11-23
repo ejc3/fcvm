@@ -68,8 +68,8 @@ The run exits 1 unless every condition holds (`churn_verdict`, a test per condit
 |---|---|
 | window | a window under 60 s or under 10 lifetimes (`churn` refuses to start with such a `DURATION`) |
 | starts equal stops | starts and stops in the window more than 2% apart: a ramp, or a backlog of stops |
-| no failed clone | a clone that failed or exited before its stop in the window, and a clone still starting at the window's end after ten times the window's p99 (or `--timeout`, which must be under `DURATION`) |
-| alive count flat | an alive count whose first and last tenth of the window differ by over 2% of `ALIVE` (one clone for a small run), or that swings by over 20% of it (5 clones for a small run) |
+| no failed clone | a clone that failed or exited before its stop in the window, and a clone still starting at the window's end after ten times the window's p99 (or `--timeout`, which must be under `DURATION`), whatever became of it after the end |
+| alive count flat | an alive count whose first and last tenth of the window differ by over 2% of `ALIVE` (one clone for a small run), or that swings by over 20% of it (5 clones for a small run), or whose samples do not cover the window (one within 2 s of each edge, none over 3 s apart) |
 | alive count accounted for | clones up plus starting more than 5% from `ALIVE`, or an alive count more than 10% from the start rate times the time a clone stayed up |
 | every start in a recycled namespace | a start in a namespace no clone had before, or in one the clone built for itself |
 | pool counters cover the window | no sample of the pool's counters answered within 2 s before the window or asked within 2 s after it, or two samples over 3 s apart (a poll that fails or takes over 2 s is counted and leaves a gap) |

@@ -535,6 +535,17 @@ class ChurnVerdict(unittest.TestCase):
         self.assertEqual(self.failed(v), ["no failed clone"])
         self.assertEqual(v["failures"], {"window": 0, "still_starting_at_end": 3, "warmup": 0, "total": 3})
 
+    def test_a_start_that_hangs_and_exits_just_after_the_window_fails(self):
+        # Spawned 20 s before the window's end, never healthy, and its fcvm exits half a
+        # second after the end: an error with a time outside the window. It was still
+        # starting when the window ended.
+        clones, samples, pool = self.records()
+        clones.append({"spawn_s": 60.0, "healthy_s": None, "stop_s": None, "exit_s": 80.5, "fail_s": 80.5,
+                       "generation": None, "error": "exited 1 before healthy"})
+        v = startrate.churn_verdict(self.CFG, clones, samples, pool)
+        self.assertEqual(self.failed(v), ["no failed clone"])
+        self.assertEqual(v["failures"], {"window": 0, "still_starting_at_end": 1, "warmup": 0, "total": 1})
+
     def test_a_clone_just_spawned_at_the_windows_end_is_not_hung(self):
         # Ten times the window's p99 (100 ms) is 1 s: a clone 0.9 s old at the end is still
         # starting, one 1.1 s old is hung.
@@ -573,6 +584,23 @@ class ChurnVerdict(unittest.TestCase):
         clones, _, pool = self.records()
         v = startrate.churn_verdict(self.CFG, clones, [], pool)
         self.assertEqual(self.failed(v), ["alive count flat", "alive count accounted for", "slots cover the resets"])
+
+    def test_a_stalled_alive_sampler_fails_the_alive_conditions(self):
+        clones, samples, pool = self.records()
+        alive = ["alive count flat", "alive count accounted for", "slots cover the resets"]
+        cases = {
+            "one sample in the middle": [x for x in samples if x[0] == 50.0],
+            "no sample in the last 3 s": [x for x in samples if x[0] < 77.0],
+            "no sample in the first 3 s": [x for x in samples if x[0] > 23.0],
+            "a gap of 4 s": [x for x in samples if not 50.2 < x[0] < 54.0],
+        }
+        for what, kept in cases.items():
+            v = startrate.churn_verdict(self.CFG, clones, kept, pool)
+            self.assertEqual(self.failed(v), alive, what)
+            self.assertFalse(v["alive_coverage"]["ok"], what)
+        # A gap of 3 s is allowed, and the samples need not start before the window.
+        for kept in ([x for x in samples if not 50.2 < x[0] < 53.0], [x for x in samples if 21.5 <= x[0] <= 78.5]):
+            self.assertEqual(self.failed(startrate.churn_verdict(self.CFG, clones, kept, pool)), [])
 
     def test_fewer_clones_up_and_starting_than_asked_for_fails(self):
         # Six up and none starting against the twenty asked for: steady, and not the run

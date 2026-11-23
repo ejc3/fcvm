@@ -780,6 +780,20 @@ def pool_bracket(pool, w0, w1):
     return rows[first], rows[last], span, coverage
 
 
+def alive_coverage(alive, w0, w1):
+    """Whether the (t_s, in_flight, running) samples watch the whole window: one within
+    CHURN_POOL_EDGE_S of each edge, and no two over CHURN_POOL_GAP_S apart between them."""
+    times = sorted(x[0] for x in alive if w0 - CHURN_POOL_EDGE_S <= x[0] <= w1 + CHURN_POOL_EDGE_S)
+    cover = {"samples": len(times), "first_s": None, "last_s": None, "max_gap_s": None, "ok": False}
+    if times:
+        gaps = [b - a for a, b in zip(times, times[1:])]
+        cover.update(first_s=round(max(0.0, times[0] - w0), 3), last_s=round(max(0.0, w1 - times[-1]), 3),
+                     max_gap_s=round(max(gaps), 3) if gaps else None)
+        cover["ok"] = (times[0] <= w0 + CHURN_POOL_EDGE_S and times[-1] >= w1 - CHURN_POOL_EDGE_S
+                       and bool(gaps) and max(gaps) <= CHURN_POOL_GAP_S)
+    return cover
+
+
 def churn_verdict(cfg, clones, alive, pool, run=None):
     """Whether a churn window is a sustained rate, and its figures.
 
@@ -821,9 +835,15 @@ def churn_verdict(cfg, clones, alive, pool, run=None):
     p99 = pct(lat, 0.99)
     bounds = [x for x in (timeout, CHURN_HUNG_P99S * p99 / 1000 if p99 is not None else None) if x is not None]
     hung_after = min(bounds) if bounds else 0.0
-    hung = [c for c in clones if not c["error"] and c["spawn_s"] is not None and c["spawn_s"] < w1
+    # Decided from when things happened, not from whether an error was recorded: a clone
+    # that was not healthy by the window's end and had not failed by then was still
+    # starting at the end, whatever became of it afterwards (its fcvm exiting half a
+    # second later gives it an error with a time outside the window).
+    failed_by_end = lambda c: bool(c["error"]) and failed_at(c) is not None and failed_at(c) < w1  # noqa: E731
+    hung = [c for c in clones if not failed_by_end(c) and c["spawn_s"] is not None and c["spawn_s"] < w1
             and (c["healthy_s"] is None or c["healthy_s"] >= w1) and w1 - c["spawn_s"] > hung_after]
     alive_w = [x for x in alive if w0 <= x[0] < w1]
+    alive_cover = alive_coverage(alive, w0, w1)
     rate = len(starts) / window if window > 0 else 0.0
     conditions = []
 
@@ -842,7 +862,16 @@ def churn_verdict(cfg, clones, alive, pool, run=None):
          + f", {len(failed_warmup)} failed in warm-up")
 
     mean = in_flight = None
-    if alive_w:
+    if not alive_cover["ok"]:
+        # A sampler that stalled leaves one sample, or a stretch without any: a count
+        # that was not watched over the whole window cannot be called flat.
+        detail = (f"the alive samples do not cover the window: {alive_cover['samples']} samples, the first "
+                  f"{alive_cover['first_s']} s from its start, the last {alive_cover['last_s']} s from its end, "
+                  f"{alive_cover['max_gap_s']} s the longest gap (allowed: {CHURN_POOL_EDGE_S} s, "
+                  f"{CHURN_POOL_EDGE_S} s, {CHURN_POOL_GAP_S} s)")
+        cond("alive count flat", False, detail)
+        cond("alive count accounted for", False, detail)
+    elif alive_w:
         running = [x[2] for x in alive_w]
         head, tail = ends(alive_w, lambda x: x[2])
         mean = sum(running) / len(running)
@@ -936,7 +965,8 @@ def churn_verdict(cfg, clones, alive, pool, run=None):
         "sustained": figures if ok else None,
         "observed": figures,
         "failures": {"window": len(failed), "still_starting_at_end": len(hung), "warmup": len(failed_warmup),
-                     "total": len(errors) + len(hung)},
+                     "total": len({id(c) for c in errors} | {id(c) for c in hung})},
+        "alive_coverage": alive_cover,
         "pool": {"slots": slots, "builds": builds, "destroys": destroys, "reset_p99_s": reset_p99,
                  "coverage": coverage, "polls_failed": polls_failed},
     }

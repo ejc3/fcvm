@@ -510,19 +510,26 @@ and above; 0.35 to 0.58 ms at C=1, where it is most of the claim).
 **The VMM's attach and detach by name** (`tap-floor.sh`, helper attached 1.2 s, 2000
 namespaces, one traced cell each; these replace the "Measured again" rows):
 
-| namespaces | C | TUNSETIFF | close | carrier-on | carrier-off | hold per cycle, us | all holds on the host, per cycle |
-|---|---|---|---|---|---|---|---|
-| with pasta | 1 | 874 | 1213 | 847 | 945 | 3881 | 3912 |
-| with pasta | 32 | 459 | 505 | 288 | 312 | 1564 | 1559 |
-| with pasta | 128 | 385 | 419 | 268 | 265 | 1337 | 1319 |
-| with pasta | 512 | 378 | 390 | 262 | 291 | 1322 | 1267 |
-| no pasta | 1 | 222 | 350 | 178 | 191 | 1223 | 1234 |
-| no pasta | 32 | 219 | 238 | 157 | 129 | 915 | 918 |
-| no pasta | 128 | 207 | 230 | 144 | 141 | 885 | 898 |
-| no pasta | 512 | 196 | 225 | 113 | 143 | 746 | 720 |
+| namespaces | C | TUNSETIFF | close | carrier-on | carrier-off | other devices, per cycle | hold per cycle, us | all holds on the host, per cycle |
+|---|---|---|---|---|---|---|---|---|
+| with pasta | 1 | 874 | 1213 | 847 | 945 | 0 | 3881 | 3912 |
+| with pasta | 32 | 459 | 505 | 288 | 312 | 0 | 1564 | 1559 |
+| with pasta | 128 | 385 | 419 | 268 | 265 | 0 | 1337 | 1319 |
+| with pasta | 512 | 378 | 390 | 262 | 291 | 0 | 1322 | 1267 |
+| no pasta | 1 | 222 | 350 | 178 | 191 | 283 | 1223 | 1234 |
+| no pasta | 32 | 219 | 238 | 157 | 129 | 172 | 915 | 918 |
+| no pasta | 128 | 207 | 230 | 144 | 141 | 163 | 885 | 898 |
+| no pasta | 512 | 196 | 225 | 113 | 143 | 69 | 746 | 720 |
+
+The two carrier columns are per event the link watch worker handled, and it handled a
+carrier-off in 0.70 to 1.00 of the cycles (fewest at C=512, where one pass takes several), so
+the columns sum to the hold per cycle only where it handled every one (C=1: 874 + 1213 + 847 +
+945 = 3879 with pasta, 222 + 350 + 178 + 191 + 283 = 1224 without).
 
 A clone life's attach and detach by name hold the mutex 1.3 to 3.9 ms with 2000 pastas alive
-and 0.75 to 1.22 ms with none: within 4% of the rows they replace.
+and 0.75 to 1.22 ms with none. Against the rows they replace the hold per cycle is 6.3% lower
+to 3.3% higher with pasta (1670 to 1564 us at C=32; 3756 to 3881 at C=1) and 1.8% lower to 5.1%
+higher without (1164 to 1223 us at C=1).
 
 **The builder's cell** (entry 8's, three traced runs each in turn): hold per namespace life
 25.00 ms before the builder (23.74 to 26.46) and 24.02 after (22.91 to 25.50); without the
@@ -543,7 +550,7 @@ namespace is 0.26 s of an unpooled clone's 2.9 s.
 own per rung, 60 s windows, judged by the verdict of the harness as repaired after its review).
 No rung is a sustained rate:
 
-| arm | ALIVE | up + starting | starts/s | spawn to healthy p50 / p99 ms | reset p99 s | D-state threads, peak | conditions that failed |
+| arm | ALIVE | up + starting | starts/s | spawn to healthy p50 / p99 ms | reset p99, at most, s | D-state threads, peak | conditions that failed |
 |---|---|---|---|---|---|---|---|
 | pool | 50 | 45.2 + 4.8 | 43.4 | 95 / 379 | 0.52 | 47 | alive count flat (32 to 50) |
 | pool | 100 | 55.9 + 44.1 | 48.2 | 869 / 1913 | 16.8 | 172 | alive count flat (4 to 97); free slots flat (3878 to 3372 ready) |
@@ -555,15 +562,17 @@ No rung is a sustained rate:
 Every rung's records are whole: the pool's counters cover each window (47 to 63 samples, no gap
 over 2 s, no failed poll), no clone failed or hung, every start took a recycled namespace, no
 namespace was built or destroyed, and the harness used 0.15 to 0.26 of a core. Each arm stopped
-after two failed rungs, so nothing above 100 was run.
+after two failed rungs, so nothing above 100 was run. The reset's p99 is the upper edge of the
+bucket it falls in, and the buckets double: 0.52 s means over 0.26 s, 16.8 s over 8.4 s, 0.033 s
+over 0.016 s.
 
 - **With pasta restarted at every reset, the pool cannot hold 50 starts and stops a second of
   real clones**: at 100 asked the ready namespaces run down by 500 to 580 in a minute and the
-  reset's p99 is 16.8 s, in both arms that restart pasta. The piece measures 109 to 120 resets
+  reset's p99 is at most 16.8 s (over 8.4 s), in both arms that restart pasta. The piece measures 109 to 120 resets
   a second for those arms with nothing else on the host; with clones starting beside them the
   resets get less.
 - **With pasta kept, the pool stays flat and the starts reach 73.5 a second** at 100 asked,
   with a start p50 of 203 ms against 656 to 869 ms. What then keeps the count from holding at
   100 is not attributed here.
-- 73.5 starts a second is the most this session saw sustained for a minute, and it is not a
-  passing run. The goal of 1000 is not near; a ramp on the same host makes 37 to 42.
+- 73.5 starts a second is the most this session observed over a minute, in a run that is
+  not a sustained rate by the verdict. The goal of 1000 is not near; a ramp on the same host makes 37 to 42.
