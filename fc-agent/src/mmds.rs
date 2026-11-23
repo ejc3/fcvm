@@ -168,8 +168,11 @@ enum RestoreEpochWake {
 /// restore-only vsock listener, with the new epoch in its document, before it resumes the
 /// guest, and a guest restored behind the snapshot boundary reads that document
 /// (`RestoreMetadataControl::select_transport`), so the first fetch after the reset finds
-/// the epoch. The reset used to open a one-second window of fetches 2 ms apart, meant for
-/// an epoch that reached MMDS only after the resume. The window closed when a restore was
+/// the epoch. If that fetch fails, nothing retries it faster than the steady poll
+/// (`poll_interval`: 50 ms over MMDS, 250 ms over Cloud Hypervisor's vsock), which applies
+/// because the writer dropped its connection on the reset; the watcher logs which of the
+/// two happened. The reset used to open a one-second window of fetches 2 ms apart, meant
+/// for an epoch that reached MMDS only after the resume. The window closed when a restore was
 /// dispatched inside it, so a reset the watcher read after it had dispatched that restore
 /// (the poll, or the connection edge, had woken it first) and the reset on a resumed
 /// snapshot source each ran the full second: about 500 token and document requests.
@@ -254,7 +257,9 @@ impl RestoreEpochSchedule {
 /// backstop ([`RestoreEpochSchedule::ARMED_POLL`]); while it is not (TTY VMs, a writer
 /// that has dropped its connection, Cloud Hypervisor) the loop polls as it always did.
 /// The writer drops its connection on the reset it reports, so a fetch that fails right
-/// after a reset is followed by the 50 ms poll until the restore has reconnected it.
+/// after a reset is followed by the steady poll (50 ms over MMDS, 250 ms over Cloud
+/// Hypervisor's vsock) until the restore has reconnected it. The loop logs whether the
+/// fetch a reset asked for succeeded.
 pub async fn watch_restore_epoch(
     signals: crate::restore::RestoreSignals,
     transport: crate::bootplan::Transport,
@@ -270,15 +275,32 @@ pub async fn watch_restore_epoch(
     let mut schedule = RestoreEpochSchedule::new(transport, signals.vsock_reset.clone());
 
     loop {
-        if schedule.wait().await == RestoreEpochWake::TransportReset {
+        let after_reset = schedule.wait().await == RestoreEpochWake::TransportReset;
+        if after_reset {
             eprintln!("[fc-agent] vsock transport reset observed; reading the restore document");
         }
 
         let boundary_is_armed = crate::snapshot_network::boundary_is_armed();
         let metadata_transport = restore_control.select_transport(boundary_is_armed);
         let metadata = match crate::bootplan::fetch_metadata(metadata_transport).await {
-            Ok(value) => value,
+            Ok(value) => {
+                if after_reset {
+                    eprintln!(
+                        "[fc-agent] restore document read after the transport reset \
+                         (restore_epoch={:?})",
+                        value.restore_epoch
+                    );
+                }
+                value
+            }
             Err(e) => {
+                if after_reset {
+                    eprintln!(
+                        "[fc-agent] the restore document fetch after the transport reset \
+                         failed; the next is the {:?} poll: {:#}",
+                        schedule.poll_interval, e
+                    );
+                }
                 // Log the first few then every 200th failure to avoid spam while still
                 // surfacing persistent errors after snapshot restore.
                 static FAIL_COUNT: std::sync::atomic::AtomicU64 =
