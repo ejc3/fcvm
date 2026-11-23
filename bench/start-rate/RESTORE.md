@@ -174,7 +174,8 @@ an earlier read fault mapped the page-cache page read-only (the page it wanted, 
 two calls: KVM's unmap of the stage-2 entry through the MMU notifier, 205 µs a call, and the
 `ptep_clear_flush` of the host mapping, 145 µs a call. Why they take that long is not measured. Each
 ends in a TLB invalidation, but the three functions the program lists for one were not probeable on
-this kernel (`__flush_tlb_range`, `flush_tlb_page`, `kvm_tlb_flush_vmid_ipa`); of the two related ones that were
+this kernel (`__flush_tlb_range`, `flush_tlb_page`, `kvm_tlb_flush_vmid_ipa`); of the two related
+ones that were
 probed, `kvm_flush_remote_tlbs` was never called on a traced thread and
 `smp_call_function_many_cond` ran 115 times, 0.11 s in all.
 
@@ -197,12 +198,12 @@ Lock waits (`lock:contention_begin` to `contention_end`) of the vCPU threads of 
 `folio_lruvec_lock` in `__page_cache_release` under `folios_put_refs` (578,094 waits); the other 48
 stacks hold 0.8 s between them. These are lower bounds. The program keeps one pending wait per
 thread, so a contention that begins while another is pending on the same thread replaces it, and the
-outer wait is not counted. The 48 other stacks, 0.8 s, are all the lock wait seen outside those two.
+outer wait is not counted.
 The `folios_put_refs` stack is seven frames deep and does not show its caller, and that function is
-also reached from the fault path (`wp_page_copy` adds its new page to the LRU), so whether its
+also reached from the fault path (its LRU batch flush calls it), so whether its
 111.0 s belongs to the fault path is not determined. If all of it did, it would be 111.0 s over 1000
 clones against `wp_page_copy`'s 285.8 s over the 115 traced ones (768,345 calls of 372 µs), about
-2,485 s scaled to 1000: at most 4.5% of it.
+2,485 s scaled to 1000: about 4.5% of it, on the waits the program counted.
 
 ## A snapshot can carry a compaction pass
 
