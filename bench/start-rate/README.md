@@ -40,14 +40,16 @@ layouts. In a run of 200 clones after `drop_caches`, each clone's Firecracker re
 `/proc/<pid>/io` `read_bytes`). Each clone's `rootfs.raw` is an inode of its own, so no clone finds
 another's reads in the page cache; which guest reads these are is not yet measured.
 
-| store | in flight, most | read await | busy | state-file creates and renames blocked > 20 ms, start window |
+| store | host, 2026-11-23 | in flight, most | read await | state-file creates and renames blocked > 20 ms, start window |
 |---|---|---|---|---|
-| btrfs on a loop file in tmpfs, c8g.metal-48xl | 124 to 126 of 128 | 6.3 ms | 100% | 1,573 creates, 768 s; 1,158 renames, 412 s |
-| btrfs on NVMe RAID0, c8gd.metal-24xl | 25 per member of 127 | 0.31 ms | 99% | 1,474 creates, 126 s; 785 renames, 54 s |
+| btrfs on a loop file in tmpfs | c8g.metal-48xl (192 cores) | 124 to 126 of 128 | 6.3 ms | 1,573 creates, 768 s; 1,158 renames, 412 s |
+| btrfs on NVMe RAID0 (3 members) | c8gd.metal-24xl (96 cores) | at most 25 per member, of 127 each | 0.31 ms | 1,474 creates, 126 s; 785 renames, 54 s |
 
-On the loop store Firecracker threads wait for a request tag, and the state directory's creates and
-renames, each holding the directory's lock, queue behind slow btrfs operations. `host.json` records
-the store's device, its backing file and that file's filesystem, and the device's queue depth.
+The two rows come from different hosts, so only the queue occupancy and read await describe the
+store: the loop device's queue was full and its reads waited 20 times longer. The blocked-time
+column also differs in core count and in what else ran, and is not attributed to the store alone.
+`host.json` records the store's device, its backing file and that file's filesystem, and the
+`nr_requests` of the device, or of each member when it has members (an md RAID0).
 
 ## Records (OUT)
 

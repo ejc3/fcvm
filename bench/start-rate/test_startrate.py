@@ -423,3 +423,33 @@ class PrepOwnsItsChildren(FakeBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StoreQueueDepths(unittest.TestCase):
+    def tree(self, root, devices):
+        for path, value in devices.items():
+            p = Path(root) / path / "queue"
+            p.mkdir(parents=True)
+            (p / "nr_requests").write_text(f"{value}\n")
+
+    def test_a_plain_device_reports_its_own_queue(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root, {"loop3": 128})
+            self.assertEqual(startrate.store_queue_depths("loop3", Path(root)), {"loop3": 128})
+
+    def test_an_md_device_reports_its_members(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root, {"md127": 128, "nvme1n1": 127, "nvme2n1": 127})
+            slaves = Path(root) / "md127" / "slaves"
+            slaves.mkdir()
+            for m in ("nvme1n1", "nvme2n1"):
+                (slaves / m).symlink_to(Path(root) / m)
+            self.assertEqual(
+                startrate.store_queue_depths("md127", Path(root)),
+                {"nvme1n1": 127, "nvme2n1": 127},
+            )
+
+    def test_a_missing_device_reports_none(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(startrate.store_queue_depths("nvme9n1", Path(root)))
+            self.assertIsNone(startrate.store_queue_depths("", Path(root)))

@@ -99,6 +99,23 @@ def imds(path):
         return None
 
 
+def store_queue_depths(dev, sys_block=Path("/sys/class/block")):
+    """`nr_requests` of the store's devices: of each member when the device has members (an
+    md RAID0 over NVMe disks, whose own queue says nothing about theirs), else of the device
+    itself. A device or value that cannot be read is left out; none at all gives None."""
+    if not dev:
+        return None
+    base = sys_block / dev
+    members = sorted((base / "slaves").glob("*")) if (base / "slaves").is_dir() else []
+    depths = {}
+    for d in members or [base]:
+        try:
+            depths[d.name] = int((d / "queue" / "nr_requests").read_text())
+        except (OSError, ValueError):
+            pass
+    return depths or None
+
+
 def host_facts(repo):
     store = sh(["stat", "-f", "-c", "%T", "/mnt/fcvm-btrfs"]).strip()
     src = ""
@@ -114,10 +131,7 @@ def host_facts(repo):
             backing_fs = sh(["stat", "-f", "-c", "%T", backing]).strip()
         except (OSError, subprocess.CalledProcessError):
             backing = backing or "unknown"
-    try:
-        queue_depth = int(Path(f"/sys/class/block/{Path(src).name}/queue/nr_requests").read_text())
-    except (OSError, ValueError):
-        queue_depth = None
+    queue_depth = store_queue_depths(Path(src).name)
     mem_kb = int(
         next(ln for ln in Path("/proc/meminfo").read_text().splitlines() if ln.startswith("MemTotal")).split()[1]
     )
@@ -132,7 +146,7 @@ def host_facts(repo):
         "store_device": src,
         "store_backing_file": backing,
         "store_backing_fs": backing_fs,
-        "store_queue_depth": queue_depth,
+        "store_queue_depths": queue_depth,
         "source_revision": rev,
         "source_dirty": dirty,
     }
