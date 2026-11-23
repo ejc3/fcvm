@@ -688,15 +688,28 @@ CHURN_MIN_WINDOW_S = 60
 CHURN_MIN_LIFETIMES = 10
 # How far two figures that should be equal may differ, as a fraction of their scale.
 CHURN_FLAT = 0.02
+# The samples of the pool's counters around a window: how far from each edge the nearest
+# may be, and how far apart two may be.
+CHURN_POOL_EDGE_S = 2.0
+CHURN_POOL_GAP_S = 3.0
+CHURN_POOL_TIMEOUT_S = 2.0
+# A clone still starting at the window's end is hung past this many window p99s.
+CHURN_HUNG_P99S = 10
+# How far the clones up and starting may be from ALIVE, and the alive count from
+# rate x time up.
+CHURN_OCCUPANCY = 0.05
+CHURN_LITTLE = 0.10
+CHURN_WARM_STARTS = 20
 POOL_STATES = ("building", "ready", "leased", "resetting", "destroying")
 
 
-def pool_stats(fcvm, sudo):
-    """`fcvm netpool stats` as a dict, or None when no pool answers."""
+def pool_stats(fcvm, sudo, timeout=None):
+    """`fcvm netpool stats` as a dict, or None when no pool answers (within `timeout` s)."""
     try:
-        r = subprocess.run(fcvm_cmd(fcvm, sudo) + ["netpool", "stats"], text=True, capture_output=True)
+        r = subprocess.run(fcvm_cmd(fcvm, sudo) + ["netpool", "stats"], text=True, capture_output=True,
+                           timeout=timeout)
         return json.loads(r.stdout) if r.returncode == 0 else None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, subprocess.TimeoutExpired):
         return None
 
 
@@ -723,26 +736,94 @@ def ends(samples, value):
     return sum(head) / len(head), sum(tail) / len(tail)
 
 
-def churn_verdict(cfg, clones, alive, pool):
+def pool_bracket(pool, w0, w1):
+    """The pool's counters around a window: the last sample answered by w0, the first asked
+    for at or after w1, and whether the samples between cover the window.
+
+    `pool` is (asked_s, answered_s, counters) per sample, or (asked_s, counters) from a
+    sampler that asked one question after another: such a sample was answered by the time
+    the next was asked. A count taken from samples inside the window alone misses what
+    happened between the last of them and the window's end, so the two edges are samples
+    known to lie outside it. Returns (first, last, between, coverage); first or last is
+    None when there is none, and coverage["ok"] says whether each edge is within
+    CHURN_POOL_EDGE_S of the window and no two samples are over CHURN_POOL_GAP_S apart.
+    """
+    rows = sorted(((x[0], x[1], x[2]) if len(x) == 3 else (x[0], None, x[1]) for x in pool), key=lambda x: x[0])
+    answered = [done if done is not None else (rows[i + 1][0] if i + 1 < len(rows) else None)
+                for i, (_, done, _) in enumerate(rows)]
+    first = last = None
+    for i, done in enumerate(answered):
+        if done is not None and done <= w0:
+            first = i
+    for i, (asked, _, _) in enumerate(rows):
+        if asked >= w1:
+            last = i
+            break
+    coverage = {"samples": 0, "before_s": None, "after_s": None, "max_gap_s": None, "ok": False}
+    if first is None or last is None:
+        inside = [x for x in rows if w0 <= x[0] < w1]
+        coverage["samples"] = len(inside)
+        if first is not None:
+            coverage["before_s"] = round(w0 - answered[first], 3)
+        if last is not None:
+            coverage["after_s"] = round(rows[last][0] - w1, 3)
+        return (rows[first] if first is not None else None, rows[last] if last is not None else None,
+                inside, coverage)
+    span = rows[first:last + 1]
+    gaps = [b[0] - a[0] for a, b in zip(span, span[1:])]
+    coverage.update(
+        samples=len(span), before_s=round(w0 - answered[first], 3), after_s=round(rows[last][0] - w1, 3),
+        max_gap_s=round(max(gaps), 3) if gaps else None,
+    )
+    coverage["ok"] = (coverage["before_s"] <= CHURN_POOL_EDGE_S and coverage["after_s"] <= CHURN_POOL_EDGE_S
+                      and bool(gaps) and max(gaps) <= CHURN_POOL_GAP_S)
+    return rows[first], rows[last], span, coverage
+
+
+def churn_verdict(cfg, clones, alive, pool, run=None):
     """Whether a churn window is a sustained rate, and its figures.
 
-    cfg: alive, lifetime_s, concurrency, window_start_s, window_end_s.
+    cfg: alive, lifetime_s, concurrency, window_start_s, window_end_s, clone_timeout_s.
     clones: one dict per clone with spawn_s, healthy_s, stop_s, exit_s (seconds since the
       run's start, None when it did not happen), generation (None when the clone built its
-      own namespace) and error.
-    alive: (t_s, in_flight, running) samples. pool: (t_s, counters) samples.
+      own namespace), error, and fail_s, when the harness called it failed (records
+      without it are judged by exit_s).
+    alive: (t_s, in_flight, running) samples. pool: samples as `pool_bracket` takes them.
+    run: what only the run itself knows: warm (warm-up ended), warm_detail, measured (the
+      window ran to its end), state_steady and state_healthy (clones the logs call running,
+      and how many of them `fcvm ls` calls healthy), left ({leased, resetting, listed} after
+      the drain), polls_failed. None judges the window's records alone.
 
     Each condition of bench/start-rate/README.md "Churn" is one entry of `conditions`; the
     verdict is ok only when every one holds. A condition whose records are missing fails.
+    `sustained` holds the window's figures when the verdict is ok and is None otherwise;
+    `observed` holds them either way.
     """
     w0, w1 = cfg["window_start_s"], cfg["window_end_s"]
     window = w1 - w0
     inside = lambda t: t is not None and w0 <= t < w1  # noqa: E731
     starts = [c for c in clones if inside(c["healthy_s"])]
     stops = [c for c in clones if c["healthy_s"] is not None and inside(c["exit_s"])]
-    failed = [c for c in clones if c["error"] and (inside(c["spawn_s"]) or inside(c["exit_s"]))]
+    lat = [(c["healthy_s"] - c["spawn_s"]) * 1000 for c in starts if c["spawn_s"] is not None]
+
+    def failed_at(c):
+        for key in ("fail_s", "exit_s", "spawn_s"):
+            if c.get(key) is not None:
+                return c[key]
+        return None
+
+    errors = [c for c in clones if c["error"]]
+    failed = [c for c in errors if inside(failed_at(c))]
+    failed_warmup = [c for c in errors if failed_at(c) is not None and failed_at(c) < w0]
+    # A start that hangs has no error yet when the window ends. A clone spawned before the
+    # end and not healthy by it is one, once it is older than ten times the window's p99.
+    timeout = cfg.get("clone_timeout_s")
+    p99 = pct(lat, 0.99)
+    bounds = [x for x in (timeout, CHURN_HUNG_P99S * p99 / 1000 if p99 is not None else None) if x is not None]
+    hung_after = min(bounds) if bounds else 0.0
+    hung = [c for c in clones if not c["error"] and c["spawn_s"] is not None and c["spawn_s"] < w1
+            and (c["healthy_s"] is None or c["healthy_s"] >= w1) and w1 - c["spawn_s"] > hung_after]
     alive_w = [x for x in alive if w0 <= x[0] < w1]
-    pool_w = [x for x in pool if w0 <= x[0] < w1]
     rate = len(starts) / window if window > 0 else 0.0
     conditions = []
 
@@ -755,36 +836,62 @@ def churn_verdict(cfg, clones, alive, pool):
     slack = max(2, CHURN_FLAT * len(starts))
     cond("starts equal stops", starts and abs(len(starts) - len(stops)) <= slack,
          f"{len(starts)} starts, {len(stops)} stops, {slack:.0f} apart allowed")
-    cond("no failed clone", not failed, f"{len(failed)} failed" + (f", first: {failed[0]['error']}" if failed else ""))
+    cond("no failed clone", not failed and not hung,
+         f"{len(failed)} failed in the window" + (f" (first: {failed[0]['error']})" if failed else "")
+         + f", {len(hung)} still starting at its end after more than {hung_after:.2f} s"
+         + f", {len(failed_warmup)} failed in warm-up")
 
+    mean = in_flight = None
     if alive_w:
         running = [x[2] for x in alive_w]
         head, tail = ends(alive_w, lambda x: x[2])
         mean = sum(running) / len(running)
+        in_flight = sum(x[1] for x in alive_w) / len(alive_w)
         # The clones being replaced at any moment are a random few (rate x time to
         # healthy), so the count is never still; a swing of a fifth is a sawtooth.
         swing = max(5, 0.2 * cfg["alive"])
         flat = abs(tail - head) <= max(1, CHURN_FLAT * cfg["alive"]) and max(running) - min(running) <= swing
         cond("alive count flat", flat, f"mean {mean:.1f}, {min(running)} to {max(running)}, "
              f"first tenth {head:.1f}, last tenth {tail:.1f}, target {cfg['alive']}")
+        # The loop is closed: ALIVE is asked for and the rate is what comes out. The run
+        # held ALIVE only if the clones up and starting add up to it, and its rate is the
+        # rate of that many clones only if alive = rate x the time a clone stays up.
+        up_s = [c["exit_s"] - c["healthy_s"] for c in stops]
+        occupied = mean + in_flight
+        held = abs(occupied - cfg["alive"]) <= max(1, CHURN_OCCUPANCY * cfg["alive"])
+        if up_s:
+            expected = rate * sum(up_s) / len(up_s)
+            consistent = abs(mean - expected) <= max(1, CHURN_LITTLE * mean)
+            cond("alive count accounted for", held and consistent,
+                 f"{mean:.1f} up + {in_flight:.1f} starting = {occupied:.1f} of the {cfg['alive']} asked for; "
+                 f"{rate:.1f} starts/s x {sum(up_s) / len(up_s):.2f} s up each = {expected:.1f}")
+        else:
+            cond("alive count accounted for", False, "no clone stopped in the window")
     else:
-        mean = None
         cond("alive count flat", False, "no alive samples in the window")
+        cond("alive count accounted for", False, "no alive samples in the window")
 
     recycled = [c for c in starts if (c["generation"] or 0) >= 2]
     cond("every start in a recycled namespace", starts and len(recycled) == len(starts),
          f"{len(recycled)} of {len(starts)} starts had generation 2 or more")
 
     slots = builds = destroys = reset_p99 = None
-    if len(pool_w) >= 2:
-        first, last = pool_w[0][1], pool_w[-1][1]
+    polls_failed = (run or {}).get("polls_failed")
+    first, last, between, coverage = pool_bracket(pool, w0, w1)
+    cond("pool counters cover the window", coverage["ok"],
+         f"{coverage['samples']} samples; the first answered {coverage['before_s']} s before the window, "
+         f"the last asked {coverage['after_s']} s after it, {coverage['max_gap_s']} s the longest gap "
+         f"(allowed: {CHURN_POOL_EDGE_S} s, {CHURN_POOL_EDGE_S} s, {CHURN_POOL_GAP_S} s)"
+         + (f"; {polls_failed} polls failed" if polls_failed else ""))
+    if coverage["ok"]:
+        first, last = first[2], last[2]
         slots = sum(first[k] for k in POOL_STATES)
-        head, tail = ends(pool_w, lambda x: x[1]["ready"])
+        head, tail = ends(between, lambda x: x[2]["ready"])
         cond("free slots flat", abs(tail - head) <= CHURN_FLAT * slots,
              f"ready: first tenth {head:.1f}, last tenth {tail:.1f}, of {slots} slots")
         builds, destroys = last["builds"] - first["builds"], last["destroys"] - first["destroys"]
         cond("no namespace built or destroyed", builds == 0 and destroys == 0,
-             f"{builds} built, {destroys} destroyed in the window")
+             f"{builds} built, {destroys} destroyed between the samples around the window")
         reset_p99 = reset_quantile_s(first, last, 0.99)
         if reset_p99 is None or mean is None:
             cond("slots cover the resets", False, "no reset finished in the window")
@@ -795,21 +902,43 @@ def churn_verdict(cfg, clones, alive, pool):
                  f"+ {cfg['concurrency']} in flight = {wanted:.0f}")
     else:
         for name in ("free slots flat", "no namespace built or destroyed", "slots cover the resets"):
-            cond(name, False, "fewer than two samples of the pool's counters in the window")
+            cond(name, False, "the pool's counters do not cover the window")
 
-    lat = [(c["healthy_s"] - c["spawn_s"]) * 1000 for c in starts if c["spawn_s"] is not None]
-    return {
-        "ok": all(c["ok"] for c in conditions),
-        "conditions": conditions,
+    if run is not None:
+        cond("warm-up ended", run.get("warm"), run.get("warm_detail") or "not recorded")
+        cond("window completed", run.get("measured"),
+             "the window ran to its end" if run.get("measured") else "the run stopped before the window's end")
+        steady, state_healthy = run.get("state_steady"), run.get("state_healthy")
+        cond("state files agree", steady and state_healthy == steady,
+             f"{state_healthy} of {steady} running clones healthy in fcvm ls")
+        left = run.get("left") or {}
+        counts = [left.get(k) for k in ("leased", "resetting", "listed")]
+        cond("nothing left after the drain", all(n == 0 for n in counts),
+             "after the drain: " + ", ".join(
+                 f"{k} {'not recorded' if n is None else n}" for k, n in zip(("leased", "resetting", "listed in fcvm ls"), counts)))
+
+    figures = {
         "window_s": round(window, 2),
         "starts": len(starts),
         "stops": len(stops),
         "starts_per_s": round(rate, 2),
         "stops_per_s": round(len(stops) / window, 2) if window > 0 else 0.0,
         "recycled_fraction": round(len(recycled) / len(starts), 4) if starts else None,
+        "alive_target": cfg["alive"],
         "alive_mean": round(mean, 1) if mean is not None else None,
-        "spawn_to_healthy_ms": {"p50": pct(lat, 0.5), "p90": pct(lat, 0.9), "p99": pct(lat, 0.99), "max": pct(lat, 1.0)},
-        "pool": {"slots": slots, "builds": builds, "destroys": destroys, "reset_p99_s": reset_p99},
+        "in_flight_mean": round(in_flight, 1) if in_flight is not None else None,
+        "spawn_to_healthy_ms": {"p50": pct(lat, 0.5), "p90": pct(lat, 0.9), "p99": p99, "max": pct(lat, 1.0)},
+    }
+    ok = all(c["ok"] for c in conditions)
+    return {
+        "ok": ok,
+        "conditions": conditions,
+        "sustained": figures if ok else None,
+        "observed": figures,
+        "failures": {"window": len(failed), "still_starting_at_end": len(hung), "warmup": len(failed_warmup),
+                     "total": len(errors) + len(hung)},
+        "pool": {"slots": slots, "builds": builds, "destroys": destroys, "reset_p99_s": reset_p99,
+                 "coverage": coverage, "polls_failed": polls_failed},
     }
 
 
@@ -820,7 +949,14 @@ def lifetime_of(index, lifetime_s, jitter):
     return lifetime_s * (1 + jitter * (2 * random.Random(index).random() - 1))
 
 
-def recycled_only_since(clones, lifetime_s, now_s, quiet_s=2.0, min_starts=20):
+def warmup_quiet_s(alive, lifetime_s, min_starts=CHURN_WARM_STARTS):
+    """The stretch of all-recycled starts that ends warm-up: 2 s, or for a small run twice
+    the time ALIVE clones of this lifetime take to make `min_starts` starts. With 2 s for
+    every run, one that starts fewer than ten clones a second never ends its warm-up."""
+    return max(2.0, 2 * min_starts * lifetime_s / alive)
+
+
+def recycled_only_since(clones, lifetime_s, now_s, quiet_s=2.0, min_starts=CHURN_WARM_STARTS):
     """Whether warm-up is over at now_s: a lifetime has passed since the first healthy
     clone, and every start of the last quiet_s (at least min_starts of them) took a
     recycled namespace. `clones` is (healthy_s, generation) per healthy clone, in order."""
@@ -837,13 +973,15 @@ def recycled_only_since(clones, lifetime_s, now_s, quiet_s=2.0, min_starts=20):
 
 
 class ChurnClone(Clone):
-    __slots__ = ("generation", "stop_ns", "exit_ns")
+    __slots__ = ("generation", "stop_ns", "exit_ns", "fail_ns", "popen_ms")
 
     def __init__(self, i, name):
         super().__init__(i, name)
         self.generation = None
         self.stop_ns = None
         self.exit_ns = None
+        self.fail_ns = None
+        self.popen_ms = None
 
 
 def cmd_churn(a):
@@ -853,8 +991,17 @@ def cmd_churn(a):
     if a.duration < need:
         sys.exit(f"BLOCKED: --duration {a.duration} is under {need:.0f} s "
                  f"({CHURN_MIN_WINDOW_S} s and {CHURN_MIN_LIFETIMES} lifetimes)")
+    if a.timeout >= a.duration:
+        sys.exit(f"BLOCKED: --timeout {a.timeout} is not under --duration {a.duration}: a start that hangs "
+                 "would outlast the window without ever timing out")
+    quiet_s = warmup_quiet_s(a.alive, a.lifetime)
+    if quiet_s > a.warmup_limit / 2:
+        sys.exit(f"BLOCKED: {a.alive} clones of {a.lifetime} s start too seldom for a warm-up within "
+                 f"--warmup-limit {a.warmup_limit}: it ends on {quiet_s:.0f} s of recycled starts")
     prep = json.loads(Path(a.prep).read_text())
-    if pool_stats(a.fcvm, prep["sudo"]) is None:
+    if prep["network"] != "rootless":
+        sys.exit(f"BLOCKED: the prep's network is {prep['network']}; only a rootless clone is pooled")
+    if pool_stats(a.fcvm, prep["sudo"], CHURN_POOL_TIMEOUT_S) is None:
         sys.exit("BLOCKED: `fcvm netpool stats` gave no counters; churn measures clones in a running pool")
     out = claim_dir(a.out)
     (out / "clones").mkdir()
@@ -865,7 +1012,7 @@ def cmd_churn(a):
         "backend": "uffd" if prep["serve_pid"] else "file", "network": prep["network"],
         "cpu": prep["cpu"], "mem_mib": prep["mem_mib"], "image": prep["image"],
         "snapshot": prep["snapshot"], "clone_timeout_s": a.timeout, "rust_log": a.rust_log,
-        "launchers": a.launchers,
+        "launchers": a.launchers, "warmup_quiet_s": quiet_s,
     }
     (out / "host.json").write_text(json.dumps({**host_facts(repo), "config": cfg}, indent=2) + "\n")
     print(json.dumps(cfg))
@@ -916,14 +1063,14 @@ def cmd_churn(a):
         with cv:
             if not c.done:
                 c.done = True
-                c.error = f"exited {c.exit} before healthy"
+                c.error, c.fail_ns = f"exited {c.exit} before healthy", t
                 flying.pop(c.i, None)
                 st["in_flight"] -= 1
                 st["failed"] += 1
             elif c.t_healthy is not None:
                 st["running"] -= 1
                 if c.stop_ns is None:
-                    c.error = f"exited {c.exit} while running, before its stop"
+                    c.error, c.fail_ns = f"exited {c.exit} while running, before its stop", t
                     st["failed"] += 1
             cv.notify_all()
 
@@ -985,12 +1132,13 @@ def cmd_churn(a):
                     ),
                     group="clones",
                 )
+                c.popen_ms = (now_ns() - c.spawn_ns) / 1e6
             except OSError as e:
                 for fd in (w, r):
                     if fd is not None:
                         os.close(fd)
                 with cv:
-                    c.done, c.error = True, f"spawn failed: {e}"
+                    c.done, c.error, c.fail_ns = True, f"spawn failed: {e}", now_ns()
                     flying.pop(c.i, None)
                     st["in_flight"] -= 1
                     st["failed"] += 1
@@ -1001,6 +1149,9 @@ def cmd_churn(a):
                 sel.register(r, selectors.EVENT_READ, c)
 
     alive_samples, pool_samples = [], []
+    polls = {"failed": 0}
+    pool_lock = threading.Lock()
+    pool_log = open(out / "pool.jsonl", "w")
     samplers_stop = threading.Event()
 
     def alive_sampler():
@@ -1008,15 +1159,28 @@ def cmd_churn(a):
             with cv:
                 alive_samples.append((secs(now_ns()), st["in_flight"], st["running"]))
 
+    def sample_pool():
+        """Ask the pool for its counters once and record the answer, or that there was
+        none: a pool too loaded to answer must show as a gap, not as fewer samples."""
+        asked = secs(now_ns())
+        counters = pool_stats(a.fcvm, prep["sudo"], CHURN_POOL_TIMEOUT_S)
+        answered = secs(now_ns())
+        with pool_lock:
+            if counters is None:
+                polls["failed"] += 1
+                row = {"t_s": asked, "answered_s": answered, "failed": True}
+            else:
+                pool_samples.append((asked, answered, counters))
+                # Unrounded: the window's edges lie microseconds from the two samples taken
+                # around it, and a rounded time can land on the other side of an edge.
+                row = {"t_s": asked, "answered_s": answered, **counters}
+            pool_log.write(json.dumps(row) + "\n")
+            pool_log.flush()
+        return counters
+
     def pool_sampler():
-        with open(out / "pool.jsonl", "w") as fh:
-            while not samplers_stop.wait(1.0):
-                t = secs(now_ns())
-                counters = pool_stats(a.fcvm, prep["sudo"])
-                if counters is not None:
-                    pool_samples.append((t, counters))
-                    fh.write(json.dumps({"t_s": round(t, 3), **counters}) + "\n")
-                    fh.flush()
+        while not samplers_stop.wait(1.0):
+            sample_pool()
 
     def service(until_ns):
         """Stop the clones whose lifetime is over and fail the ones that never got healthy,
@@ -1029,7 +1193,7 @@ def cmd_churn(a):
                     expired.append(clones[heapq.heappop(due)[1]])
                 late = [c for c in flying.values() if c.spawn_ns and t - c.spawn_ns > a.timeout * 1e9]
                 for c in late:
-                    c.done, c.error = True, f"not healthy within {a.timeout}s"
+                    c.done, c.error, c.fail_ns = True, f"not healthy within {a.timeout}s", t
                     del flying[c.i]
                     st["in_flight"] -= 1
                     st["failed"] += 1
@@ -1083,12 +1247,18 @@ def cmd_churn(a):
             if not service(now_ns() + int(0.25e9)):
                 break
             with cv:
-                warm = recycled_only_since(healthy, a.lifetime, secs(now_ns()))
+                warm = recycled_only_since(healthy, a.lifetime, secs(now_ns()), quiet_s)
             if warm:
                 break
+        # The window lies between two samples of the pool's counters: one answered before
+        # it starts, one asked for after it ends.
+        sample_pool()
         w0 = now_ns()
+        cpu0 = resource.getrusage(resource.RUSAGE_SELF)
         measured = warm and service(w0 + int(a.duration * 1e9))
         w1 = now_ns()
+        cpu1 = resource.getrusage(resource.RUSAGE_SELF)
+        sample_pool()
 
         # Verify against the state files: a clone the logs call healthy, that was not being
         # stopped before or after the listing, must be healthy in its state file.
@@ -1113,15 +1283,29 @@ def cmd_churn(a):
             st["in_flight"] -= len(flying)
             flying.clear()
         teardown_s = own.stop("clones")
+        # Until the pool has every namespace back, or has not answered three times in a
+        # row: a pool that is gone has nothing to wait for, and the leak check then fails
+        # for want of its counters.
+        counters, unanswered = None, 0
         while True:
-            counters = pool_stats(a.fcvm, prep["sudo"])
-            idle = counters is None or (counters["leased"] == 0 and counters["resetting"] == 0)
-            if idle or now_ns() - drain0 > 300e9:
+            counters = pool_stats(a.fcvm, prep["sudo"], CHURN_POOL_TIMEOUT_S)
+            unanswered = 0 if counters is not None else unanswered + 1
+            idle = counters is not None and counters["leased"] == 0 and counters["resetting"] == 0
+            if idle or unanswered >= 3 or now_ns() - drain0 > 300e9:
                 break
             time.sleep(0.2)
         drain_s = (now_ns() - drain0) / 1e9
         time.sleep(0.5)
         stop_threads()
+        pool_log.close()
+        # What the run left behind: namespaces still lent or being reset, and clones of
+        # this run still in `fcvm ls`.
+        try:
+            listed = sum(1 for v in list_vms(a.fcvm, prep["sudo"]) if str(v.get("name", "")).startswith(run_id + "-"))
+        except SystemExit:
+            listed = None
+        left_after = {"leased": counters["leased"] if counters else None,
+                      "resetting": counters["resetting"] if counters else None, "listed": listed}
 
         rows = []
         with open(out / "samples.jsonl", "w") as fh:
@@ -1130,35 +1314,31 @@ def cmd_churn(a):
                     c.log.close()
                 row = {
                     "i": c.i, "name": c.name, "spawn_s": secs(c.spawn_ns), "healthy_s": secs(c.t_healthy),
-                    "stop_s": secs(c.stop_ns), "exit_s": secs(c.exit_ns), "generation": c.generation,
-                    "error": c.error, "exit": c.exit,
+                    "stop_s": secs(c.stop_ns), "exit_s": secs(c.exit_ns), "fail_s": secs(c.fail_ns),
+                    "generation": c.generation, "error": c.error, "exit": c.exit, "popen_ms": c.popen_ms,
                 }
                 rows.append(row)
                 fh.write(json.dumps(row) + "\n")
         with open(out / "alive.tsv", "w") as fh:
             fh.write("t_s\tin_flight\trunning\n")
             for t, flying, running in alive_samples:
-                fh.write(f"{t:.3f}\t{flying}\t{running}\n")
-        window = {"alive": a.alive, "lifetime_s": a.lifetime, "concurrency": a.concurrency,
-                  "window_start_s": secs(w0), "window_end_s": secs(w1)}
-        verdict = churn_verdict(window, rows, alive_samples, pool_samples)
-        verdict["conditions"].append({
-            "name": "warm-up ended", "ok": bool(warm),
-            "detail": f"{secs(w0):.1f} s until every start of 2 s took a recycled namespace"
-                      if warm else f"starts were not all recycled within {a.warmup_limit} s",
-        })
-        verdict["conditions"].append({
-            "name": "state files agree", "ok": bool(steady) and len(state_healthy) == len(steady),
-            "detail": f"{len(state_healthy)} of {len(steady)} running clones healthy in fcvm ls",
-        })
-        verdict["ok"] = bool(measured) and all(c["ok"] for c in verdict["conditions"])
-        warm_starts = [r for r in rows if r["healthy_s"] is not None and r["healthy_s"] < secs(w0)]
-        summary = {
-            "config": cfg, "t0_wall": t0_wall, **verdict,
-            "warmup": {"s": round(secs(w0), 2), "starts": len(warm_starts),
-                       "starts_per_s": round(len(warm_starts) / secs(w0), 2) if secs(w0) else None},
+                fh.write(f"{t!r}\t{flying}\t{running}\n")
+        window_s = (w1 - w0) / 1e9
+        cpu_s = (cpu1.ru_utime + cpu1.ru_stime) - (cpu0.ru_utime + cpu0.ru_stime)
+        run = {
+            "window_start_s": secs(w0), "window_end_s": secs(w1),
+            "warm": bool(warm), "measured": bool(measured),
+            "warm_detail": f"{secs(w0):.1f} s until every start of {quiet_s:.1f} s took a recycled namespace"
+                           if warm else f"starts were not all recycled within {a.warmup_limit} s",
+            "state_steady": len(steady), "state_healthy": len(state_healthy),
+            "left": left_after, "polls_failed": polls["failed"],
             "drain": {"clones": left, "teardown_s": round(teardown_s, 2), "until_pool_idle_s": round(drain_s, 2)},
+            # The harness's own cost over the window: one process, its reader and launcher
+            # threads under one interpreter lock. Near one core, the harness is the limit.
+            "driver": {"cpu_s": round(cpu_s, 2), "cpu_cores": round(cpu_s / window_s, 3) if window_s > 0 else None},
         }
+        (out / "run.json").write_text(json.dumps(run, indent=2) + "\n")
+        summary = churn_summary(cfg, t0_wall, rows, alive_samples, pool_samples, run)
         (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         print_churn(summary)
         if not summary["ok"]:
@@ -1166,12 +1346,92 @@ def cmd_churn(a):
             sys.exit(1)
 
 
+def churn_summary(cfg, t0_wall, rows, alive_samples, pool_samples, run):
+    """A churn run's summary from its records: the verdict, the warm-up and the drain apart,
+    and the harness's own cost."""
+    w0, w1 = run["window_start_s"], run["window_end_s"]
+    window = {"alive": cfg["alive"], "lifetime_s": cfg["lifetime_s"], "concurrency": cfg["concurrency"],
+              "clone_timeout_s": cfg.get("clone_timeout_s"), "window_start_s": w0, "window_end_s": w1}
+    verdict = churn_verdict(window, rows, alive_samples, pool_samples, run)
+    warm_starts = [r for r in rows if r["healthy_s"] is not None and r["healthy_s"] < w0]
+    popen = [r["popen_ms"] for r in rows
+             if r.get("popen_ms") is not None and r["spawn_s"] is not None and w0 <= r["spawn_s"] < w1]
+    driver = dict(run.get("driver") or {})
+    driver["popen_ms"] = {"p50": pct(popen, 0.5), "p99": pct(popen, 0.99), "max": pct(popen, 1.0)}
+    return {
+        "config": cfg, "t0_wall": t0_wall, "window_start_s": w0, "window_end_s": w1, **verdict,
+        "warmup": {"s": round(w0, 2), "starts": len(warm_starts),
+                   "starts_per_s": round(len(warm_starts) / w0, 2) if w0 else None,
+                   "failures": verdict["failures"]["warmup"]},
+        "drain": run.get("drain"),
+        "left": run.get("left"),
+        "driver": driver,
+    }
+
+
+def churn_from_records(out):
+    """A churn directory's summary, judged again from its records (samples.jsonl,
+    alive.tsv, pool.jsonl, and run.json or, for a run of the first harness, what its
+    summary.json says of the run). A record a condition needs and the directory lacks
+    fails that condition."""
+    out = Path(out)
+    old = json.loads((out / "summary.json").read_text()) if (out / "summary.json").exists() else {}
+    cfg = old.get("config") or json.loads((out / "host.json").read_text())["config"]
+    rows = [json.loads(line) for line in (out / "samples.jsonl").read_text().splitlines() if line.strip()]
+    alive = []
+    for line in (out / "alive.tsv").read_text().splitlines()[1:]:
+        t, flying, running = line.split("\t")
+        alive.append((float(t), int(flying), int(running)))
+    pool, polls_failed = [], 0
+    for line in (out / "pool.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        if row.get("failed"):
+            polls_failed += 1
+            continue
+        asked, answered = row.pop("t_s"), row.pop("answered_s", None)
+        pool.append((asked, answered, row))
+    if (out / "run.json").exists():
+        run = json.loads((out / "run.json").read_text())
+    else:
+        # The first harness kept these in its summary alone: the window's edges rounded, its
+        # two run-time conditions as text, and no listing after the drain.
+        by_name = {c["name"]: c for c in old.get("conditions", [])}
+        w0 = old["warmup"]["s"]
+        state = re.match(r"(\d+) of (\d+) ", by_name.get("state files agree", {}).get("detail", ""))
+        warm = by_name.get("warm-up ended", {}).get("ok")
+        drain = old.get("drain") or {}
+        idle = drain.get("until_pool_idle_s") is not None and drain["until_pool_idle_s"] < 300
+        run = {
+            "window_start_s": w0, "window_end_s": w0 + old["window_s"],
+            "warm": warm, "measured": warm, "warm_detail": by_name.get("warm-up ended", {}).get("detail"),
+            "state_healthy": int(state.group(1)) if state else None,
+            "state_steady": int(state.group(2)) if state else None,
+            "left": {"leased": 0 if idle else None, "resetting": 0 if idle else None, "listed": None},
+            "polls_failed": None, "drain": drain, "driver": None,
+        }
+    run.setdefault("polls_failed", polls_failed)
+    return churn_summary(cfg, old.get("t0_wall"), rows, alive, pool, run)
+
+
 def print_churn(s):
-    print(f"window {s['window_s']} s: {s['starts_per_s']} starts/s, {s['stops_per_s']} stops/s, "
-          f"alive {s['alive_mean']}, recycled {s['recycled_fraction']}, "
-          f"spawn to healthy p50 {s['spawn_to_healthy_ms']['p50']} ms p99 {s['spawn_to_healthy_ms']['p99']} ms")
-    print(f"warm-up {s['warmup']['s']} s at {s['warmup']['starts_per_s']} starts/s; "
-          f"drain of {s['drain']['clones']} clones {s['drain']['teardown_s']} s, pool idle after {s['drain']['until_pool_idle_s']} s")
+    o = s["observed"]
+    print(("" if s["ok"] else "NOT SUSTAINED: ")
+          + f"window {o['window_s']} s: {o['starts_per_s']} starts/s, {o['stops_per_s']} stops/s, "
+          f"alive {o['alive_mean']} up + {o['in_flight_mean']} starting of {o['alive_target']} asked for, "
+          f"recycled {o['recycled_fraction']}, "
+          f"spawn to healthy p50 {o['spawn_to_healthy_ms']['p50']} ms p99 {o['spawn_to_healthy_ms']['p99']} ms")
+    f = s["failures"]
+    print(f"failures: {f['window']} in the window, {f['still_starting_at_end']} still starting at its end, "
+          f"{f['warmup']} in warm-up")
+    if s.get("warmup"):
+        print(f"warm-up {s['warmup']['s']} s at {s['warmup']['starts_per_s']} starts/s")
+    if s.get("drain"):
+        print(f"drain of {s['drain']['clones']} clones {s['drain']['teardown_s']} s, "
+              f"pool idle after {s['drain']['until_pool_idle_s']} s")
+    d = s.get("driver") or {}
+    if d.get("cpu_cores") is not None:
+        print(f"harness: {d['cpu_cores']} cores of its own over the window, "
+              f"spawn call p50 {d['popen_ms']['p50']} ms p99 {d['popen_ms']['p99']} ms")
     for c in s["conditions"]:
         print(f"  {'ok  ' if c['ok'] else 'FAIL'} {c['name']}: {c['detail']}")
 
@@ -1275,6 +1535,16 @@ def print_summary(s):
 
 def cmd_report(a):
     for d in a.dirs:
+        host = Path(d) / "host.json"
+        mode = json.loads(host.read_text()).get("config", {}).get("mode") if host.exists() else None
+        if mode == "churn":
+            # A churn run is judged again from its records, by the verdict as it is now.
+            s = churn_from_records(d)
+            if a.json:
+                print(json.dumps(s))
+            else:
+                print_churn(s)
+            continue
         p = Path(d) / "summary.json"
         s = json.loads(p.read_text()) if p.exists() else summarize(d)
         print_summary(s)
@@ -1320,7 +1590,8 @@ def build_parser():
     c.add_argument("--duration", type=float, default=120, help="seconds of the measured window")
     c.add_argument("--warmup-limit", type=float, default=600, help="give up when starts are not all recycled by then")
     c.add_argument("--launchers", type=positive_int, default=4)
-    c.add_argument("--timeout", type=float, default=180)
+    c.add_argument("--timeout", type=float, default=30,
+                   help="seconds a clone has to get healthy; must be under --duration")
     c.add_argument("--rust-log", default="fcvm=info,health-monitor=info")
     c.add_argument("--fail-fast", action="store_true")
     c.set_defaults(fn=cmd_churn)
@@ -1330,6 +1601,7 @@ def build_parser():
     t.set_defaults(fn=cmd_teardown)
     q = sub.add_parser("report")
     q.add_argument("dirs", nargs="+")
+    q.add_argument("--json", action="store_true", help="print a churn directory's summary as JSON")
     q.set_defaults(fn=cmd_report)
     return ap
 

@@ -396,7 +396,7 @@ help:
 	@echo "  test-chromium-fault  Run the fault harness's deterministic unit tests"
 	@echo "  bench-clone-latency  Clone spawn->exec-ready latency (LABEL=, N=)"
 	@echo "  bench-start-rate-prep/-run/-teardown  Snapshot clones reaching healthy per second (OUT=, PREP=, COUNT=, CONCURRENCY=, NETWORK=, UFFD=1)"
-	@echo "  bench-start-rate-churn                Starts and stops at one sustained rate in a namespace pool (PREP=, OUT=, ALIVE=, LIFETIME=, CONCURRENCY=, DURATION=)"
+	@echo "  bench-start-rate-churn                The start rate held with ALIVE clones up, each for LIFETIME, in a namespace pool (PREP=, OUT=, ALIVE=, LIFETIME=, CONCURRENCY=, DURATION=)"
 	@echo "  bench-start-pieces[-build]            One piece of a clone start, N times at C (PIECE=, OUT=, COUNT=, CONCURRENCY=, ALIVE=)"
 	@echo ""
 	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
@@ -1738,14 +1738,16 @@ bench-start-rate-run:
 	$$(jq -e .sudo $(PREP) >/dev/null && echo sudo -E) $(START_RATE) run --fcvm $(START_RATE_FCVM) --prep $(PREP) --out $(OUT) --count $(COUNT) \
 		--concurrency $(CONCURRENCY) --launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180) --hold $(or $(HOLD),0)
 
-# Starts and stops at one rate, in a namespace pool that is already running
-# (`fcvm netpool serve`); the run fails unless the window is a sustained rate.
+# Keeps ALIVE clones up, each for LIFETIME, in a namespace pool that is already running
+# (`fcvm netpool serve`), and measures the rate of starts and stops that takes: the loop is
+# closed, so the rate is an outcome, not a setting. The run fails unless the window is a
+# sustained rate.
 #   make bench-start-rate-churn PREP=... OUT=... ALIVE=1000 LIFETIME=1 CONCURRENCY=128
 bench-start-rate-churn:
 	@test -n "$(PREP)" -a -n "$(OUT)" -a -n "$(ALIVE)" -a -n "$(LIFETIME)" -a -n "$(CONCURRENCY)" || { echo "PREP= OUT= ALIVE= LIFETIME= CONCURRENCY= are required"; exit 2; }
 	$(START_RATE) churn --fcvm $(START_RATE_FCVM) --prep $(PREP) --out $(OUT) --alive $(ALIVE) \
 		--lifetime $(LIFETIME) --concurrency $(CONCURRENCY) --duration $(or $(DURATION),120) \
-		--launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180)
+		--launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),30)
 
 bench-start-rate-teardown:
 	@test -n "$(PREP)" || { echo "PREP= is required"; exit 2; }
