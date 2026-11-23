@@ -34,10 +34,20 @@ use crate::setup::rootfs::PastaConfig;
 /// content hash tracks patch edits automatically. The same file is applied by
 /// `scripts/build-passt.sh` (CI, AMI, runners), and both references are pinned
 /// together by `tests/test_pasta_pin.rs`.
-const PATCHES: &[(&str, &str)] = &[(
-    "passt-udp-sock-errs-null-flow.patch",
-    include_str!("../../scripts/passt-udp-sock-errs-null-flow.patch"),
-)];
+const PATCHES: &[(&str, &str)] = &[
+    (
+        "passt-udp-sock-errs-null-flow.patch",
+        include_str!("../../scripts/passt-udp-sock-errs-null-flow.patch"),
+    ),
+    (
+        "passt-no-neigh-notify.patch",
+        include_str!("../../scripts/passt-no-neigh-notify.patch"),
+    ),
+    (
+        "passt-control-reset-status.patch",
+        include_str!("../../scripts/passt-control-reset-status.patch"),
+    ),
+];
 
 /// Content hash for the pasta binary: upstream repo + pinned commit + every
 /// carried patch + the host libc (dynamically linked binaries must not be

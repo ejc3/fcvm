@@ -124,6 +124,7 @@ fn slot_network(vm_id: String, pid_dir: PathBuf) -> PastaNetwork {
     PastaNetwork::new(vm_id, proto::TAP.to_string(), Vec::new())
         .with_pid_dir(pid_dir)
         .with_attached_tap()
+        .with_control_socket()
 }
 
 impl Namespace {
@@ -233,9 +234,9 @@ impl Namespace {
         proto::watch(offer.connection).context("watching the lease")
     }
 
-    /// After a lease: restart pasta, have the holder remove what a VM's use leaves, and
-    /// check the namespace against its fingerprint. An error means it must not be lent
-    /// again.
+    /// After a lease: have pasta forget the guest, have the holder remove what a VM's use
+    /// leaves, and check the namespace against its fingerprint. An error means it must not
+    /// be lent again.
     ///
     /// The lease's end is what says the VMM is gone. The TAP is attached by its holder
     /// for the namespace's whole life, so its carrier cannot say whether a VMM still has the
@@ -243,15 +244,16 @@ impl Namespace {
     /// together with the lease, and is close-on-exec in every other process.
     async fn reset(&mut self) -> Result<()> {
         failpoint::hit_async("pool.pre_reset").await;
-        self.network.cleanup().await.context("stopping pasta")?;
+        // pasta first: its flows hold sockets in the namespace, and a reply a host
+        // service sends late must find no flow to ride to the next guest.
+        self.network
+            .reset_pasta()
+            .await
+            .context("resetting pasta")?;
         self.agent
             .reset()
             .await
             .context("resetting the namespace")?;
-        self.network
-            .post_start(self.holder_pid)
-            .await
-            .context("starting pasta again")?;
         let deadline = tokio::time::Instant::now() + VERIFY_BUDGET;
         let mut pause = Duration::from_millis(2);
         loop {

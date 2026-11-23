@@ -392,7 +392,7 @@ fcvm snapshot run --snapshot my-snapshot --name clone1   # takes a pooled namesp
 fcvm netpool stats                    # {"ready":1999,"leased":1,"grants":1,"recycled_grants":0,...}
 ```
 
-- A restored clone with no published port takes a pooled namespace when a pool runs and one is free, and gives it back when its VMM has exited. The pool restarts the namespace's pasta, removes what the VM left, and checks the namespace against a fingerprint taken when it was built; one that differs is destroyed and built again.
+- A restored clone with no published port takes a pooled namespace when a pool runs and one is free, and gives it back when its VMM has exited. The pool has the namespace's pasta drop the VM's flows, removes what the VM left, and checks the namespace against a fingerprint taken when it was built; one that differs is destroyed and built again.
 - A pooled namespace's TAP stays attached by the pool, and the clone's Firecracker uses it through a descriptor it inherits, so a start and a stop change no link. That takes the Firecracker `fcvm setup` builds; a snapshot that restores with an older binary, and a Cloud Hypervisor clone, are not pooled.
 - A clone with `--publish`, a cold boot (`podman run`), and any clone when no pool runs or none is free build their own namespace, as before.
 - Every holder and pasta of a pool is the pool's child. If the pool dies they die with it, and the clones in its namespaces exit with an error.
