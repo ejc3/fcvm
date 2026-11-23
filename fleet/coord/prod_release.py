@@ -214,7 +214,7 @@ def decide():
         staged = now["stage"].get("lambda_digest")
         if not staged:
             raise Skip("staging runs no lane image")
-        lane_module, ecr = publish.lane_repository()
+        lane_module, ecr = publish.staging_lane()
         selection = ecr.tagged(lane_module.current("stage"))
         if selection is None or selection.digest != staged:
             raise Skip("staging's lane selection (keep-stage-current) is not the lane image it runs")

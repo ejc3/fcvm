@@ -2158,18 +2158,27 @@ stops the renderer, so the GPU is idle until Lambda retires the environment.
 
 ### Which lane image a stack runs
 
-Both stacks pull from one repository, `fcvm-fleet/lambda-tile` in us-east-1 (ejc3/aws
-`fcvm-fleet-lambda.tf`). `.github/workflows/fleet-lambda-image.yml` builds the image on an
-x86_64 runner when any of its inputs changes (the workflow's `paths`, which
+Each stack has its own lane repository in us-east-1 (ejc3/aws `fcvm-fleet-lambda.tf`):
+staging's `fcvm-fleet/lambda-tile` and prod's `fcvm-fleet/lambda-tile-prod`. Each stack's
+GitHub environment sets `LAMBDA_TILE_REPO` to its own repository, and `release.py` and
+`publish.py` refuse a stack's tags, or a stack's release, in any other repository. Nothing in
+staging reads or writes prod's repository. `.github/workflows/fleet-lambda-image.yml` builds
+the image on an x86_64 runner when any of its inputs changes (the workflow's `paths`, which
 `fleet/lambda/test_release.py` checks against the inputs it derives from the sources) and, on
-main, pushes it as `rev-<commit>` and records its digest as `keep-built` (`release.py publish`).
-`keep-built` moves only forward in commit order: a build of an older commit that finishes later,
-or a rerun, leaves it on the newer one. A tag outside `keep-` is immutable. The repository's
-lifecycle policy
-expires every image outside the newest five unless it carries a protected tag,
-`keep-<stack>-current`, `keep-<stack>-previous` or `keep-<stack>-next` for `stage` and `prod`,
-or `keep-built`. Those seven are the repository's only mutable tags, and
-`fleet/lambda/release.py` is what moves them:
+main, pushes it to staging's repository as `rev-<commit>` and records its digest as
+`keep-built` (`release.py publish`). `keep-built` moves only forward in commit order: a build
+of an older commit that finishes later, or a rerun, leaves it on the newer one. A tag outside
+`keep-` is immutable. Each repository's lifecycle policy expires every image outside the newest
+five unless it carries one of its stack's protected tags: `keep-stage-current`,
+`keep-stage-previous`, `keep-stage-next` and `keep-built` in staging's, `keep-prod-current`,
+`keep-prod-previous` and `keep-prod-next` in prod's. Those are the only mutable tags, and
+`fleet/lambda/release.py` is what moves them. An image reaches prod's repository only as a
+copy: a promotion copies the digest staging tested from staging's repository into prod's by
+digest, on prod CI's credentials (`release.py copy`, `skopeo copy --preserve-digests`), tags it
+`from-stage-<hex>`, and refuses unless prod's repository then holds that same digest. Prod CI
+may only read staging's repository. The lane image build is not reproducible (no fixed
+timestamps, an unpinned base, a cargo-built binary), so prod cannot rebuild it and prove the
+digest instead.
 
 - A stack's coordinator takes `--lambda-image <repository>@sha256:<digest>` and refuses a tag, so
   every function it creates runs that one digest, and it deletes its functions at start and at
@@ -2186,14 +2195,17 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
 - **Prod.** With the repository variable `FLEET_LAMBDA_LANE_PROD` on, the set prod takes
   (`prod_release.py decide`) carries the lane image staging runs as `lambda_digest`. What a stack
   runs comes from its release function: the prod function's `candidate` action names the lane
-  image each running coordinator task names (`FLEET_LAMBDA_IMAGE`). The lane repository's tags only
+  image each running coordinator task names (`FLEET_LAMBDA_IMAGE`). The lane repositories' tags only
   protect images: decide reads staging's running lane image after its other checks and refuses
-  unless `keep-stage-current` holds it. A new lane image alone is a promotion. The release record
+  unless `keep-stage-current` in staging's repository holds it (read on prod CI's credentials). A new lane image alone is a promotion. The release record
   is passed back to the record's compare-and-swap byte for byte, and decide refuses when the record
-  names another lane image than prod runs. The promotion passes the set's lane image to
-  `publish.py --stack prod --lambda-digest`, which selects it for prod (keeping the lane image prod
+  names another lane image than prod runs. The promotion copies the set's lane image into prod's
+  repository (`release.py copy`, above), then passes it to `publish.py --stack prod
+  --lambda-digest`, which selects it for prod in prod's repository (keeping the lane image prod
   runs as previous), releases it with the coordinator, and puts prod's tags back if the release
-  fails or is held. Leaving a set that carries a lane image, a failed promotion's rollback returns
+  fails or is held. A prod release with `--lambda-digest` is refused before any call when
+  `LAMBDA_TILE_REPO` is unset or names staging's repository. Neither rollback copies: each returns
+  to an image prod's repository already holds, or the selection is refused. Leaving a set that carries a lane image, a failed promotion's rollback returns
   to the lane image prod ran before it, or, when it ran none, passes `--lambda-digest none`, and
   the function removes `FLEET_LAMBDA_IMAGE`. A record entry without `lambda_digest` names no lane
   image. Off, prod's sets carry no lane image and its releases are the ones without a lane.
@@ -2257,14 +2269,17 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   current and previous) included, and a selection that stopped part way completes when run again.
   Selecting the digest S already runs leaves `keep-S-previous` where it is. Configure the
   coordinator with D after the selection; R stays as the rollback target.
-- `release.py promote --running R` selects staging's current digest for prod.
+- `release.py copy --digest D` (prod CI, `LAMBDA_TILE_REPO` set to prod's repository) copies D from
+  staging's repository into prod's as `from-stage-<hex>` and refuses unless prod's repository then
+  holds D; it moves no `keep-` tag. A digest prod's repository already holds is not copied again.
 - `release.py rollback --stack S --running R` needs R to be `keep-S-current`, selects
-  `keep-S-previous`, and keeps R as previous.
+  `keep-S-previous`, and keeps R as previous, all in S's own repository.
 - Selections of one stack run one at a time: the script fails when another holds that stack's
-  lock on the host, and a promote holds both stacks'.
+  lock on the host.
 
-An image no stack runs or can roll back to keeps no protected tag and expires once five newer
-images exist. `fleet/lambda/test_release.py` checks both against a model of the policy.
+An image its stack does not run and cannot roll back to keeps no protected tag and expires once five
+newer images exist in its repository. `fleet/lambda/test_release.py` checks both repositories
+against a model of each policy.
 
 ### The tunnel
 

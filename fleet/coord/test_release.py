@@ -2403,7 +2403,7 @@ class ProdDecideTests(unittest.TestCase):
         selected = lane.Image(selection or self.STAGED, "{}", lane.MEDIA_TYPES[0])
         ecr = types.SimpleNamespace(tagged=lambda tag: selected if tag == "keep-stage-current" else None)
         for p in (patch.dict(os.environ, {"FLEET_LAMBDA_LANE_PROD": "on"}),
-                  patch.object(prod.publish, "lane_repository", lambda: (lane, ecr))):
+                  patch.object(prod.publish, "staging_lane", lambda: (lane, ecr))):
             p.start()
             self.addCleanup(p.stop)
         self.candidate["stage"]["lambda_digest"] = self.STAGED if stage_runs is None else stage_runs
@@ -2657,7 +2657,7 @@ class ProdLaneTests(unittest.TestCase):
     RUNNING, STAGED, EARLIER = "sha256:" + "1" * 64, "sha256:" + "2" * 64, "sha256:" + "0" * 64
     BEFORE = {"current": RUNNING, "previous": EARLIER, "next": RUNNING}
 
-    def run_prod(self, results, extra=()):
+    def run_prod(self, results, extra=(), repository=None):
         results, events = list(results), []
         def invoke(name, payload):
             events.append(("invoke", payload))
@@ -2670,7 +2670,8 @@ class ProdLaneTests(unittest.TestCase):
             return digest, dict(self.BEFORE)
         def restore_lane(stack, before):
             events.append(("restore", stack, before))
-        with patch.dict(os.environ, {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod"}), patch.object(publish, "invoke", invoke), \
+        env = {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod", "LAMBDA_TILE_REPO": repository or "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"}
+        with patch.dict(os.environ, env), patch.object(publish, "invoke", invoke), \
                 patch.object(publish, "select_prod_lane", select_prod_lane), patch.object(publish, "restore_lane", restore_lane), \
                 patch.object(publish, "command", side_effect=AssertionError("prod pushes nothing")), \
                 patch.object(publish.time, "sleep", lambda _: None), contextlib.redirect_stdout(io.StringIO()), \
@@ -2728,14 +2729,56 @@ class ProdLaneTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             publish.arguments(["--lambda-digest", self.STAGED])  # staging takes none
 
+    def test_a_production_release_naming_the_staging_repository_is_refused(self):
+        # Before any call: a prod release that moves or names a lane image uses prod's repository only.
+        for lane in (self.STAGED, "none"):
+            for repository in ("111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile", "registry.example/other"):
+                with self.subTest(lane=lane, repository=repository):
+                    code, events = self.run_prod([], extra=["--force", "--lambda-digest", lane], repository=repository)
+                    self.assertEqual((code, events), (1, []))
+
+    def test_each_stack_takes_only_its_own_lane_repository(self):
+        for stack, url, other in (("stage", "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile", "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"), ("prod", "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod", "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile")):
+            with self.subTest(stack=stack):
+                with patch.dict(os.environ, {"LAMBDA_TILE_REPO": url}):
+                    _, ecr = publish.lane_repository(stack)
+                self.assertEqual((ecr.repository, ecr.registry), (publish.lane_release().REPOSITORIES[stack], "111122223333"))
+                for wrong in (other, ""):
+                    with patch.dict(os.environ, {"LAMBDA_TILE_REPO": wrong}), self.assertRaisesRegex(ValueError, stack):
+                        publish.lane_repository(stack)
+
+    def test_prod_reads_stagings_selection_from_stagings_repository_on_its_own_credentials(self):
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"}):
+            _, source = publish.staging_lane()
+        self.assertEqual((source.repository, source.registry), ("fcvm-fleet/lambda-tile", "111122223333"))
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile"}), self.assertRaises(ValueError):
+            publish.staging_lane()
+
+    def test_staging_code_paths_never_name_the_production_repository(self):
+        import inspect
+        for function in (publish.main, publish.order, publish.select_lane):
+            source = inspect.getsource(function)
+            with self.subTest(function=function.__name__):
+                self.assertNotIn('"prod"', source)
+                self.assertNotIn("lambda-tile-prod", source)
+                self.assertNotIn("staging_lane", source)
+        self.assertIn('lane_repository("stage")', inspect.getsource(publish.select_lane))
+        workflows = HERE.parent.parent / ".github/workflows"
+        for name in ("fleet-lambda-image.yml", "fleet-coordinator-deploy.yml"):
+            text = (workflows / name).read_text()
+            with self.subTest(workflow=name):
+                self.assertNotIn("lambda-tile-prod", text)
+                self.assertNotIn("fleet-prod-deploy", text)
+                self.assertNotIn("release.py copy", text)
+
     def test_the_prod_selection_takes_the_named_digest(self):
         calls = []
         lane = publish.lane_release()
-        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile"}), \
-                patch.object(lane, "snapshot", lambda ecr, stack: calls.append(("snapshot", stack)) or dict(self.BEFORE)), \
+        with patch.dict(os.environ, {"LAMBDA_TILE_REPO": "111122223333.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"}), \
+                patch.object(lane, "snapshot", lambda ecr, stack: calls.append(("snapshot", ecr.repository, stack)) or dict(self.BEFORE)), \
                 patch.object(lane, "select", lambda ecr, stack, new, running: calls.append((stack, new, running)) or {}):
             self.assertEqual(publish.select_prod_lane(self.STAGED, self.EARLIER), (self.EARLIER, self.BEFORE))
-        self.assertEqual(calls, [("snapshot", "prod"), ("prod", self.EARLIER, self.STAGED)])
+        self.assertEqual(calls, [("snapshot", "fcvm-fleet/lambda-tile-prod", "prod"), ("prod", self.EARLIER, self.STAGED)])
 
 
 class ProdLaneWorkflowTests(unittest.TestCase):
@@ -2769,6 +2812,28 @@ class ProdLaneWorkflowTests(unittest.TestCase):
         self.assertIn("PRIOR_LANE: ${{ needs.candidate.outputs.prior_lane }}", coordinator)
         self.assertIn('if [ -n "$(jq -r \'.lambda_digest // empty\' <<<"$TARGET")" ]; then lane="${PRIOR_LANE:-none}"; fi', coordinator)
         self.assertIn(self.FLAG, coordinator)
+
+    def test_a_promotion_copies_the_tested_lane_image_before_it_releases_and_no_rollback_copies(self):
+        # The promotion's Coordinator step, run by bash with python3 stubbed: the copy into prod's repository comes
+        # first, on prod's credentials, then the release names the same digest. Neither rollback copies.
+        promote = (self.WORKFLOWS / "fleet-prod-promote.yml").read_text()
+        release = promote.split("\n  release:\n", 1)[1].split("\n  smoke:\n", 1)[0]
+        coordinator, _ = self.step(release, "Coordinator")
+        script = textwrap.dedent(coordinator.split("        run: |\n", 1)[1])
+        lane = "sha256:" + "2" * 64
+        target = json.dumps({"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}, "lambda_digest": lane})
+        out = subprocess.run(["bash", "-c", 'python3() { echo "$*"; }\n' + script],
+                             env={"PATH": os.environ["PATH"], "TARGET": target}, capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.splitlines(), [
+            f"-B fcvm/fleet/lambda/release.py copy --digest {lane}",
+            f"-B fcvm/fleet/coord/publish.py --stack prod --commit {'a' * 40} --digest sha256:{'a' * 64} --lambda-digest {lane}"])
+        without = json.dumps({"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}})
+        out = subprocess.run(["bash", "-c", 'python3() { echo "$*"; }\n' + script],
+                             env={"PATH": os.environ["PATH"], "TARGET": without}, capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.splitlines(), [
+            f"-B fcvm/fleet/coord/publish.py --stack prod --commit {'a' * 40} --digest sha256:{'a' * 64}"])
+        rollbacks = promote.split("\n  rollback:\n", 1)[1] + (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
+        self.assertNotIn("release.py copy", rollbacks)
 
     def run_coordinator_step(self, lane):
         """The manual rollback's Coordinator step, run by bash with python3 replaced by a stub that prints its

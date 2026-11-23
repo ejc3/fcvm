@@ -107,12 +107,22 @@ def lane_setting(name="FLEET_LAMBDA_LANE"):
     return value == "on"
 
 
-def lane_repository():
+def lane_repository(stack):
+    """The stack's own lane repository (ejc3/aws fcvm-fleet-lambda.tf: one per stack), from LAMBDA_TILE_REPO, which each
+    stack's GitHub environment sets to its own repository. Refused when unset or naming another repository, so a
+    staging run never touches prod's repository and a prod release never names staging's."""
     lane = lane_release()
     url = os.environ.get("LAMBDA_TILE_REPO", "")
-    if not lane.REPOSITORY_URL.fullmatch(url):
-        raise ValueError("not the lane repository")
-    return lane, lane.Ecr(registry=url.split(".", 1)[0])
+    if not lane.REPOSITORY_URLS[stack].fullmatch(url):
+        raise ValueError(f"LAMBDA_TILE_REPO is not the {stack} lane repository")
+    return lane, lane.Ecr(lane.REPOSITORIES[stack], registry=url.split(".", 1)[0])
+
+
+def staging_lane():
+    """Prod's read of staging's lane repository (the same account as prod's), on prod CI's credentials, which may
+    only read there: decide checks staging's selection, and the promotion copies the tested digest from it."""
+    lane, own = lane_repository("prod")
+    return lane, lane.Ecr(lane.REPOSITORIES["stage"], registry=own.registry)
 
 
 def select_lane(stack, running, commit):
@@ -120,7 +130,7 @@ def select_lane(stack, running, commit):
     from it, or from a commit on its line with the same lane inputs; it waits, bounded, for this commit's lane
     build), keeping `running`, the digest its coordinator runs, as the rollback target. Returns the selected
     digest and the stack's tags before the selection, which restore_lane puts back if the release fails."""
-    lane, ecr = lane_repository()
+    lane, ecr = lane_repository("stage")
     new = lane.paired_build(ecr, commit)
     before = lane.snapshot(ecr, stack)
     lane.select(ecr, stack, new, running)
@@ -129,15 +139,17 @@ def select_lane(stack, running, commit):
 
 def select_prod_lane(running, digest):
     """Select `digest` for prod (the lane image of the set prod takes, or of the set it returns to), keeping
-    `running` as prod's previous. Returns it and prod's tags before the selection."""
-    lane, ecr = lane_repository()
+    `running` as prod's previous. Returns it and prod's tags before the selection. Prod's repository only: a
+    promotion copied the digest there first (fleet/lambda/release.py copy), and a rollback returns to an image
+    prod's repository already holds, or is refused."""
+    lane, ecr = lane_repository("prod")
     before = lane.snapshot(ecr, "prod")
     lane.select(ecr, "prod", digest, running)
     return digest, before
 
 
 def restore_lane(stack, before):
-    lane, ecr = lane_repository()
+    lane, ecr = lane_repository(stack)
     lane.reset(ecr, stack, before)
 
 
@@ -300,6 +312,9 @@ def main_prod(commit, digest, force, lambda_digest=None):
         raise ValueError("--lambda-digest is an image digest, or none")
     if os.environ["COORDINATOR_RELEASE"] != FUNCTIONS["prod"]:
         raise ValueError("unexpected release function")
+    if lambda_digest is not None:
+        # Refused before any call when LAMBDA_TILE_REPO is unset or names staging's repository.
+        lane_repository("prod")
     payload = {"commit": commit, "digest": digest, **({"force": True} if force else {})}
     if lambda_digest is None:
         status = release(FUNCTIONS["prod"], payload, digest, "prod")

@@ -230,6 +230,11 @@ jobs:
           LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}
         run: |
           lane=$(jq -r '.lambda_digest // empty' <<<"$TARGET")
+          # The lane image staging tested reaches prod's own lane repository only as a copy of that digest, on prod's
+          # credentials; the release then selects it there.
+          if [ -n "$lane" ]; then
+            python3 -B fcvm/fleet/lambda/release.py copy --digest "$lane"
+          fi
           python3 -B fcvm/fleet/coord/publish.py --stack prod \
             --commit "$(jq -r .coordinator.commit <<<"$TARGET")" --digest "$(jq -r .coordinator.digest <<<"$TARGET")" \
             ${lane:+--lambda-digest "$lane"}

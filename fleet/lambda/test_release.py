@@ -29,10 +29,21 @@ class FakeEcr:
     """The repository as ECR keeps it: images by digest with their tags and push order. A tag matching
     a mutability exclusion moves when put on another image; any other tag is immutable."""
 
-    def __init__(self, mutable=(release.PROTECTED,)):
-        self.mutable = mutable
+    def __init__(self, repository=release.REPOSITORIES["stage"], mutable=None, registry=None):
+        self.repository, self.registry, self.region = repository, registry, release.REGION
+        self.stack = next(k for k, v in release.REPOSITORIES.items() if v == repository)
+        self.mutable = mutable or (release.PROTECTED[self.stack],)
         self.images = {}  # digest -> {"tags": set, "pushed": int, "manifest": str}
         self.clock = 0
+
+    def url(self):
+        return release.Ecr.url(self)
+
+    def get(self, image_id):
+        kind, value = image_id.split("=", 1)
+        if kind == "imageTag":
+            return self.tagged(value)
+        return self.image(value) if value in self.images else None
 
     def push(self, tag, config=None):
         # The image's config digest is what podman calls its image ID: by default one per tag.
@@ -70,7 +81,7 @@ class FakeEcr:
     def tags_of(self, digest):
         return self.images[digest]["tags"]
 
-    def lifecycle(self, policy=release.LIFECYCLE):
+    def lifecycle(self, policy=None):
         """Apply a lifecycle policy as ECR documents it, and return the digests it expired.
 
         Rules run in priority order; a rule selects images by its tag requirements and orders them
@@ -85,6 +96,7 @@ class FakeEcr:
             return bool(image["tags"]) and all(
                 any(fnmatch.fnmatchcase(t, p) for t in image["tags"]) for p in s["tagPatternList"])
 
+        policy = policy or release.LIFECYCLES[self.stack]
         expired, claimed = set(), set()
         for rule in sorted(policy["rules"], key=lambda r: r["rulePriority"]):
             s = rule["selection"]
@@ -113,7 +125,7 @@ class Selection(unittest.TestCase):
 
     def test_a_selected_digest_outlives_more_than_five_later_pushes(self):
         a = self.ecr.push("rev-a")
-        release.select(self.ecr, "prod", a, None)
+        release.select(self.ecr, "stage", a, None)
         later = self.pushes(8)
         expired = self.ecr.lifecycle()
         self.assertIn(a, self.ecr.images)
@@ -122,33 +134,12 @@ class Selection(unittest.TestCase):
         self.assertTrue(set(later[3:]) <= set(self.ecr.images))
 
     def test_the_model_expires_it_under_the_policy_this_replaces(self):
-        # Without the protected tags' rule, the same history loses prod's image: the model is not vacuous.
+        # Without the protected tags' rule, the same history loses staging's image: the model is not vacuous.
         a = self.ecr.push("rev-a")
-        release.select(self.ecr, "prod", a, None)
+        release.select(self.ecr, "stage", a, None)
         self.pushes(8)
-        only_newest_five = {"rules": [dict(release.LIFECYCLE["rules"][1], rulePriority=1)]}
+        only_newest_five = {"rules": [dict(release.LIFECYCLES["stage"]["rules"][1], rulePriority=1)]}
         self.assertIn(a, self.ecr.lifecycle(only_newest_five))
-
-    def test_both_stacks_keep_what_they_run_and_can_roll_back_to(self):
-        prod_old, prod_now = self.pushes(2)
-        release.select(self.ecr, "prod", prod_old, None)
-        release.select(self.ecr, "prod", prod_now, prod_old)
-        # prod now runs prod_now; staging pushes and selects many times after it.
-        running, staged = None, []
-        for i in range(12):
-            new = self.ecr.push(f"rev-stage-{i}")
-            release.select(self.ecr, "stage", new, running)
-            running = new
-            staged.append(new)
-            self.ecr.lifecycle()
-        self.assertIn(prod_old, self.ecr.images)
-        self.assertIn(prod_now, self.ecr.images)
-        self.assertEqual(self.ecr.tags_of(prod_now) & {"keep-prod-current"}, {"keep-prod-current"})
-        self.assertIn("keep-prod-previous", self.ecr.tags_of(prod_old))
-        # Staging's last two (running and its rollback) are held; its older selections went.
-        self.assertEqual(release.tags(self.ecr, "stage"),
-                         {"keep-stage-current": staged[-1], "keep-stage-previous": staged[-2]})
-        self.assertFalse(set(staged[:-5]) & set(self.ecr.images))
 
     def test_an_image_no_stack_runs_or_rolls_back_to_stays_eligible(self):
         a, b, c = self.pushes(3)
@@ -199,7 +190,7 @@ class Selection(unittest.TestCase):
     def test_an_interrupted_rollback_keeps_both_images_and_completes_on_retry(self):
         for k in range(1, 10):
             with self.subTest(failing_write=k):
-                self.ecr = FakeEcr()
+                self.ecr = FakeEcr(release.REPOSITORIES["prod"])
                 a, b = self.pushes(2)
                 release.select(self.ecr, "prod", a, None)
                 release.select(self.ecr, "prod", b, a)
@@ -229,13 +220,11 @@ class Selection(unittest.TestCase):
             self.fail("the selection never completed")
 
     def test_selecting_the_running_image_again_keeps_the_rollback_target(self):
+        self.ecr = FakeEcr(release.REPOSITORIES["prod"])
         a, b = self.pushes(2)
-        release.select(self.ecr, "stage", a, None)
-        release.promote(self.ecr, None)
-        release.select(self.ecr, "stage", b, a)
-        release.promote(self.ecr, a)
-        # A retried promotion, and a retried selection, of the image prod already runs.
-        release.promote(self.ecr, b)
+        release.select(self.ecr, "prod", a, None)
+        release.select(self.ecr, "prod", b, a)
+        # A retried selection of the image prod already runs.
         release.select(self.ecr, "prod", b, b)
         self.assertEqual(release.tags(self.ecr, "prod"), {"keep-prod-current": b, "keep-prod-previous": a})
         release.rollback(self.ecr, "prod", b)
@@ -254,12 +243,11 @@ class Selection(unittest.TestCase):
         release.select(self.ecr, "stage", b, a)
         self.assertEqual(seen, [True, True, True])
 
-    def test_promote_takes_stagings_selection_and_rollback_swaps(self):
+    def test_a_rollback_swaps_current_and_previous(self):
+        self.ecr = FakeEcr(release.REPOSITORIES["prod"])
         a, b = self.pushes(2)
-        release.select(self.ecr, "stage", a, None)
-        release.promote(self.ecr, None)
-        release.select(self.ecr, "stage", b, a)
-        release.promote(self.ecr, a)
+        release.select(self.ecr, "prod", a, None)
+        release.select(self.ecr, "prod", b, a)
         self.assertEqual(release.tags(self.ecr, "prod"), {"keep-prod-current": b, "keep-prod-previous": a})
         release.rollback(self.ecr, "prod", b)
         self.assertEqual(release.tags(self.ecr, "prod"), {"keep-prod-current": a, "keep-prod-previous": b})
@@ -298,9 +286,6 @@ class Selection(unittest.TestCase):
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(RuntimeError, "another selection for stage"):
                 release.select(self.ecr, "stage", a, None)
-            # promote holds staging's lock too: staging's selection cannot move under it.
-            with self.assertRaisesRegex(RuntimeError, "another selection for stage"):
-                release.promote(self.ecr, None)
         self.assertEqual(release.tags(self.ecr, "stage")["keep-stage-current"], None)
 
     def test_only_protected_tags_move(self):
@@ -425,6 +410,7 @@ class Selection(unittest.TestCase):
         # A stack's first selection: nothing to put back, and nothing here deletes a tag, so keep-<stack>-current
         # stays on the image the failed release selected (fleet/PROTOCOL.md says so). It only protects that image;
         # what the stack runs comes from its release function.
+        self.ecr = FakeEcr(release.REPOSITORIES["prod"])
         a = self.ecr.push("rev-a")
         before = release.snapshot(self.ecr, "prod")
         self.assertEqual(before, {"current": None, "previous": None, "next": None})
@@ -621,6 +607,155 @@ class Selection(unittest.TestCase):
             release.digest("none")
         with self.assertRaises(SystemExit):
             release.arguments(["select", "--stack", "other", "--digest", "x", "--running", "none"])
+
+
+class PerStackRepository(unittest.TestCase):
+    """One lane repository per stack (ejc3/aws#986): staging's fcvm-fleet/lambda-tile and prod's
+    fcvm-fleet/lambda-tile-prod. A stack's keep- tags move only in its own repository, builds are recorded only in
+    staging's, and an image reaches prod's only as a copy of the digest staging tested."""
+
+    STAGE_URL = "123456789012.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile"
+    PROD_URL = "123456789012.dkr.ecr.us-east-1.amazonaws.com/fcvm-fleet/lambda-tile-prod"
+
+    def setUp(self):
+        self.stage, self.prod = FakeEcr(release.REPOSITORIES["stage"]), FakeEcr(release.REPOSITORIES["prod"])
+        self.tmp = tempfile.TemporaryDirectory()
+        patcher = patch.object(release.tempfile, "gettempdir", return_value=self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_each_stack_has_its_own_repository_url(self):
+        self.assertTrue(release.REPOSITORY_URLS["stage"].fullmatch(self.STAGE_URL))
+        self.assertTrue(release.REPOSITORY_URLS["prod"].fullmatch(self.PROD_URL))
+        self.assertFalse(release.REPOSITORY_URLS["prod"].fullmatch(self.STAGE_URL))
+        self.assertFalse(release.REPOSITORY_URLS["stage"].fullmatch(self.PROD_URL))
+
+    def test_a_stacks_tags_move_only_in_its_own_repository(self):
+        a = self.stage.push("rev-a")
+        for ecr, stack in ((self.stage, "prod"), (self.prod, "stage")):
+            with self.subTest(repository=ecr.repository, stack=stack):
+                with self.assertRaisesRegex(ValueError, f"{stack}'s lane repository"):
+                    release.select(ecr, stack, a, None)
+                with self.assertRaisesRegex(ValueError, f"{stack}'s lane repository"):
+                    release.rollback(ecr, stack, a)
+                with self.assertRaisesRegex(ValueError, f"{stack}'s lane repository"):
+                    release.snapshot(ecr, stack)
+                with self.assertRaisesRegex(ValueError, f"{stack}'s lane repository"):
+                    release.reset(ecr, stack, {"current": a, "previous": None, "next": None})
+        self.assertEqual(self.stage.tags_of(a), {"rev-a"})
+
+    def test_builds_are_recorded_only_in_stagings_repository(self):
+        with self.assertRaisesRegex(ValueError, "stage's lane repository"):
+            release.record(self.prod, "sha256:" + "1" * 64)
+        with self.assertRaisesRegex(ValueError, "stage's lane repository"):
+            release.newest_build(self.prod)
+        with self.assertRaisesRegex(ValueError, "stage's lane repository"):
+            release.paired_build(self.prod, "a" * 40, is_ancestor=lambda a, b: True, changed=lambda a, b: False)
+
+    def test_prods_repository_keeps_what_prod_runs_and_can_roll_back_to(self):
+        a, b = (self.copied(f"rev-{n}") for n in "ab")
+        release.select(self.prod, "prod", a, None)
+        release.select(self.prod, "prod", b, a)
+        later = [self.copied(f"rev-later-{i}") for i in range(8)]
+        expired = self.prod.lifecycle(release.LIFECYCLES["prod"])
+        self.assertEqual(expired, set(later[:3]))
+        self.assertIn(a, self.prod.images)
+        self.assertIn(b, self.prod.images)
+        # Prod's policy keeps keep-prod-* only: a keep-stage- tag in prod's repository would protect nothing.
+        self.assertEqual(release.LIFECYCLES["prod"]["rules"][0]["selection"]["tagPatternList"], ["keep-prod-*"])
+
+    def copied(self, tag):
+        """An image staging tested, copied into prod's repository as the copy leaves it."""
+        digest = self.stage.push(tag)
+        image = self.stage.image(digest)
+        self.prod.clock += 1
+        self.prod.images[digest] = {"tags": set(), "pushed": self.prod.clock, "manifest": image.manifest}
+        self.prod.put(release.copied(digest), image)
+        return digest
+
+    def transfer(self, *, manifest=None):
+        """A copy as skopeo makes it (the same manifest bytes, so the same digest), or with other bytes."""
+        calls = []
+        def run(source, dest, digest, tag):
+            calls.append((source.repository, dest.repository, digest, tag))
+            image = source.image(digest)
+            body = manifest if manifest is not None else image.manifest
+            landed = "sha256:" + hashlib.sha256(body.encode()).hexdigest()
+            dest.clock += 1
+            dest.images[landed] = {"tags": set(), "pushed": dest.clock, "manifest": body}
+            dest.put(tag, release.Image(landed, body, image.media_type))
+        return run, calls
+
+    def test_a_copy_lands_the_tested_digest_in_prods_repository_and_moves_no_keep_tag(self):
+        d = self.stage.push("rev-a")
+        run, calls = self.transfer()
+        result = release.copy(self.stage, self.prod, d, transfer=run)
+        self.assertEqual(result, {"status": "copied", "digest": d, "tag": release.copied(d)})
+        self.assertEqual(calls, [("fcvm-fleet/lambda-tile", "fcvm-fleet/lambda-tile-prod", d, release.copied(d))])
+        self.assertEqual(self.prod.tags_of(d), {release.copied(d)})
+        self.assertEqual(self.stage.tags_of(d), {"rev-a"})
+        # Then prod's selection takes it from prod's own repository.
+        release.select(self.prod, "prod", d, None)
+        self.assertEqual(release.tags(self.prod, "prod")["keep-prod-current"], d)
+
+    def test_a_copy_whose_digest_is_not_the_tested_one_is_refused(self):
+        d = self.stage.push("rev-a")
+        run, _ = self.transfer(manifest=json.dumps({"schemaVersion": 2, "config": {"digest": "sha256:" + "9" * 64}}))
+        with self.assertRaisesRegex(RuntimeError, "not the digest staging tested"):
+            release.copy(self.stage, self.prod, d, transfer=run)
+        self.assertIsNone(self.prod.tagged("keep-prod-current"))
+
+    def test_a_copy_reads_only_stagings_repository_and_writes_only_prods(self):
+        d = self.stage.push("rev-a")
+        run, calls = self.transfer()
+        for source, dest in ((self.prod, self.prod), (self.stage, self.stage), (self.prod, self.stage)):
+            with self.subTest(source=source.repository, dest=dest.repository):
+                with self.assertRaises(ValueError):
+                    release.copy(source, dest, d, transfer=run)
+        self.assertEqual(calls, [])
+
+    def test_a_digest_staging_does_not_hold_is_not_copied(self):
+        run, calls = self.transfer()
+        with self.assertRaises(LookupError):
+            release.copy(self.stage, self.prod, "sha256:" + "2" * 64, transfer=run)
+        self.assertEqual(calls, [])
+
+    def test_a_copy_prod_already_holds_is_not_made_again(self):
+        d = self.copied("rev-a")
+        run, calls = self.transfer()
+        self.assertEqual(release.copy(self.stage, self.prod, d, transfer=run)["status"], "present")
+        self.assertEqual(calls, [])
+
+    def test_a_rollback_uses_prods_tags_only(self):
+        a, b = self.copied("rev-a"), self.copied("rev-b")
+        release.select(self.prod, "prod", a, None)
+        release.select(self.prod, "prod", b, a)
+        before = {d: set(i["tags"]) for d, i in self.stage.images.items()}
+        release.rollback(self.prod, "prod", b)
+        self.assertEqual(release.tags(self.prod, "prod"), {"keep-prod-current": a, "keep-prod-previous": b})
+        self.assertEqual({d: set(i["tags"]) for d, i in self.stage.images.items()}, before)
+        # An image prod's repository does not hold cannot be selected for prod, wherever else it is.
+        c = self.stage.push("rev-c")
+        with self.assertRaises(LookupError):
+            release.select(self.prod, "prod", c, a)
+
+    def test_the_copy_uses_skopeo_and_preserves_the_digest(self):
+        d = self.stage.push("rev-a")
+        self.stage.registry = self.prod.registry = "123456789012"
+        commands = []
+        def quiet(args, body=None, env=None):
+            commands.append(args)
+            return "token" if args[:3] == ["aws", "ecr", "get-login-password"] else ""
+        with patch.object(release, "quiet", quiet):
+            release.skopeo_copy(self.stage, self.prod, d, release.copied(d))
+        login = [c for c in commands if c[:2] == ["skopeo", "login"]]
+        self.assertEqual(len(login), 1)
+        self.assertIn("--password-stdin", login[0])
+        copy_ = [c for c in commands if c[:2] == ["skopeo", "copy"]]
+        self.assertEqual(len(copy_), 1)
+        self.assertIn("--preserve-digests", copy_[0])
+        self.assertEqual(copy_[0][-2:], [f"docker://{self.STAGE_URL}@{d}", f"docker://{self.PROD_URL}:{release.copied(d)}"])
 
 
 class Publish(unittest.TestCase):
@@ -908,8 +1043,8 @@ class AwsCli(unittest.TestCase):
         calls, p = self.run_with([(0, ok, ""),
                                   (254, "", "An error occurred (ImageAlreadyExistsException) when calling")])
         with p:
-            release.Ecr().put("keep-stage-current", image)
-            release.Ecr().put("keep-stage-current", image)  # already there: nothing to do
+            release.Ecr(release.REPOSITORIES["stage"]).put("keep-stage-current", image)
+            release.Ecr(release.REPOSITORIES["stage"]).put("keep-stage-current", image)  # already there: nothing to do
         args, body = calls[0]
         self.assertEqual(args[:3], ["aws", "ecr", "put-image"])
         self.assertIn("us-east-1", args)
@@ -924,9 +1059,9 @@ class AwsCli(unittest.TestCase):
         _, p = self.run_with([(0, other, ""), (254, "", "An error occurred (AccessDeniedException) when")])
         with p:
             with self.assertRaisesRegex(RuntimeError, "another digest"):
-                release.Ecr().put("keep-stage-current", image)
+                release.Ecr(release.REPOSITORIES["stage"]).put("keep-stage-current", image)
             with self.assertRaises(release.CommandFailed):
-                release.Ecr().put("keep-stage-current", image)
+                release.Ecr(release.REPOSITORIES["stage"]).put("keep-stage-current", image)
 
     def test_a_caller_in_another_account_names_the_repositorys(self):
         found = json.dumps({"images": [{"imageId": {"imageDigest": "sha256:" + "3" * 64},
@@ -935,7 +1070,7 @@ class AwsCli(unittest.TestCase):
         ok = json.dumps({"image": {"imageId": {"imageDigest": image.digest}}})
         calls, p = self.run_with([(0, found, ""), (0, ok, "")])
         with p:
-            ecr = release.Ecr(registry="123456789012")
+            ecr = release.Ecr(release.REPOSITORIES["stage"], registry="123456789012")
             ecr.tagged("keep-built")
             ecr.put("keep-built", image)
         self.assertEqual(calls[0][0][calls[0][0].index("--registry-id") + 1], "123456789012")
@@ -949,7 +1084,7 @@ class AwsCli(unittest.TestCase):
         out = json.dumps({"imageDetails": [{"imageTags": ["rev-" + "a" * 40, "keep-built"]}]})
         calls, p = self.run_with([(0, out, "")])
         with p:
-            self.assertEqual(release.Ecr().tags("sha256:" + "4" * 64), ["keep-built", "rev-" + "a" * 40])
+            self.assertEqual(release.Ecr(release.REPOSITORIES["stage"]).tags("sha256:" + "4" * 64), ["keep-built", "rev-" + "a" * 40])
         self.assertEqual(calls[0][0][:3], ["aws", "ecr", "describe-images"])
         self.assertIn("imageDigest=sha256:" + "4" * 64, calls[0][0])
 
@@ -959,8 +1094,8 @@ class AwsCli(unittest.TestCase):
                                         "imageManifest": "{}", "imageManifestMediaType": release.MEDIA_TYPES[0]}]})
         calls, p = self.run_with([(0, missing, ""), (0, found, "")])
         with p:
-            self.assertIsNone(release.Ecr().tagged("keep-prod-current"))
-            self.assertEqual(release.Ecr().tagged("keep-prod-current").digest, "sha256:" + "3" * 64)
+            self.assertIsNone(release.Ecr(release.REPOSITORIES["prod"]).tagged("keep-prod-current"))
+            self.assertEqual(release.Ecr(release.REPOSITORIES["prod"]).tagged("keep-prod-current").digest, "sha256:" + "3" * 64)
         self.assertIn("imageTag=keep-prod-current", calls[0][0])
         self.assertIn("--accepted-media-types", calls[0][0])
 
