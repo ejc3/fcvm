@@ -3379,6 +3379,30 @@ branch = "agent/nv2"
         }
     }
 
+    /// The guest boot does not wait for network-online.target. fc-agent configures the
+    /// guest's network itself, so networkd never reports it online and the wait ran into its
+    /// 2 min timeout on every boot. A snapshot taken during that wait carried it into every
+    /// clone, which then started the 24 jobs queued behind it together, about 120 s after
+    /// the guest booted.
+    ///
+    /// RED BEFORE THE FIX: systemd-networkd-wait-online.service was left enabled.
+    #[test]
+    fn the_guest_boot_does_not_wait_for_network_online() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let script = generate_setup_script(&plan);
+        let unit = "systemd-networkd-wait-online.service";
+        assert!(
+            plan.services.disable.iter().any(|s| s == unit),
+            "{unit} is not in [services] disable"
+        );
+        assert!(
+            script.contains(&format!(
+                "find /etc/systemd/system -name '{unit}' -type l -delete"
+            )),
+            "the setup script does not remove {unit}'s enablement"
+        );
+    }
+
     /// A profile on the PCI transport keeps the guest's NIC named eth0: virtio-net is a
     /// PCI device there and udev would rename it, and fc-agent and fcvm configure eth0
     /// (a routed guest restored on the gpu profile came up with no global IPv6 at all).

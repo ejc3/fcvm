@@ -585,6 +585,38 @@ pub fn log_console_line_under_fcvm(clean: &str) -> bool {
     true
 }
 
+/// The target of fc-agent's lines that reached fcvm on the output vsock connection and not
+/// on the serial console: a restore's progress lines. Apart from [`CONSOLE_TARGET`], so a
+/// line under that target is still proof that the guest's serial console works.
+pub const AGENT_TARGET: &str = "fcvm::agent";
+
+/// One `agent` line of the output connection, `<when> <line>`: when the guest logged the
+/// line, by its own clock in microseconds since the Unix epoch, and fc-agent's line. The
+/// time is returned in the form of fcvm's log timestamps (UTC, microseconds). None when
+/// the content has no such stamp.
+pub fn parse_agent_line(content: &str) -> Option<(String, &str)> {
+    let (when, line) = content.split_once(' ')?;
+    let when = jiff::Timestamp::from_microsecond(when.parse().ok()?).ok()?;
+    Some((when.strftime("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(), line))
+}
+
+/// Log one `agent` line of the output connection at the level its console form has: an
+/// agent error at WARN, anything else at INFO, under [`AGENT_TARGET`]. `logged` is when the
+/// guest logged it, which is before fcvm received it: the agent holds a restore's progress
+/// lines until the host has acknowledged the restore. A line without a stamp is logged
+/// whole, with no `logged`.
+pub fn log_agent_line(content: &str) {
+    let Some((logged, line)) = parse_agent_line(content) else {
+        tracing::info!(target: "fcvm::agent", "{}", content);
+        return;
+    };
+    if console_line_is_an_agent_error(line) {
+        tracing::warn!(target: "fcvm::agent", %logged, "{}", line);
+    } else {
+        tracing::info!(target: "fcvm::agent", %logged, "{}", line);
+    }
+}
+
 /// Log `clean` at WARN under `fcvm::guest` when it is a guest kernel crash
 /// headline, and say whether it was. The console's own targets (`firecracker`,
 /// `cloud-hypervisor`) are outside `fcvm`, so a log filtered to fcvm's targets
@@ -768,6 +800,18 @@ pub struct NamespaceParams {
     pub net_namespace_path: Option<std::path::PathBuf>,
     /// The mount namespace a restored clone's VMM runs in. See [`MountRedirects`].
     pub mount_redirects: Option<MountRedirects>,
+    /// Descriptors the VMM keeps open across its exec, and so until it exits. A VM in a
+    /// pooled namespace passes its lease here ([`crate::netpool`]): the pool takes the
+    /// namespace back only when every holder of the lease is gone, and the VMM is the
+    /// process that must be gone before another VM gets its TAP. Each stays close-on-exec in
+    /// this process, so no other child inherits it.
+    ///
+    /// These are descriptor numbers, not owned descriptors, as are the `/proc/self/fd/N`
+    /// paths a lease gives for its namespaces. A number means what it meant only while
+    /// the lease that owns the descriptor is alive and unmoved: a clone spawns its VMM
+    /// while it holds the lease (and again from the same lease after a guest reboot), and
+    /// drops the lease only after the VMM has exited.
+    pub keep_fds: Vec<std::os::fd::RawFd>,
 }
 
 /// The mount namespace that gives a restored clone's VMM its own directories at the
@@ -951,6 +995,21 @@ pub fn install_namespace_pre_exec(
     ns: &NamespaceParams,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
+
+    if !ns.keep_fds.is_empty() {
+        let keep_fds = ns.keep_fds.clone();
+        // SAFETY: fcntl is async-signal-safe and the closure owns its list, allocated here.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in &keep_fds {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
 
     let ns_id_clone = ns.namespace_id.clone();
     let mount_redirects_clone = ns.mount_redirects.clone();
@@ -2056,6 +2115,49 @@ mod tests {
                 "taken for a warning: {line}: {log:?}"
             );
         }
+    }
+
+    /// A restore's progress line that fc-agent sent on the output connection is in fcvm's
+    /// log at INFO with its text unchanged, under a target of its own (a line under the
+    /// console's target has crossed the serial console, which tests rely on), and with
+    /// the time the guest logged it, in the form of the log's own timestamps.
+    #[test]
+    fn an_agent_line_from_the_output_connection_is_logged_under_its_own_target() {
+        let log = log_capture::logged("fcvm=info", || {
+            log_agent_line("1795332623625264 [fc-agent] handling restore (epoch=e)");
+        });
+        assert!(
+            log.trim_end().ends_with(
+                " INFO fcvm::agent: [fc-agent] handling restore (epoch=e) \
+                 logged=2026-11-22T07:30:23.625264Z"
+            ),
+            "{log:?}"
+        );
+        assert!(
+            log.contains(AGENT_TARGET) && !log.contains(CONSOLE_TARGET),
+            "{log:?}"
+        );
+        assert_eq!(
+            parse_agent_line("1795332623000000 [fc-agent] x y"),
+            Some(("2026-11-22T07:30:23.000000Z".to_string(), "[fc-agent] x y"))
+        );
+        // An error keeps its level, and a line with no stamp is logged whole.
+        let log = log_capture::logged("warn", || {
+            log_agent_line("1795332623625264 [fc-agent] WARNING: journald restart failed");
+        });
+        assert!(
+            log.contains(" WARN fcvm::agent: [fc-agent] WARNING: journald"),
+            "{log:?}"
+        );
+        let log = log_capture::logged("fcvm=info", || {
+            log_agent_line("[fc-agent] no stamp here");
+        });
+        assert!(
+            log.trim_end()
+                .ends_with(" INFO fcvm::agent: [fc-agent] no stamp here"),
+            "{log:?}"
+        );
+        assert_eq!(parse_agent_line("soon [fc-agent] x"), None);
     }
 
     /// The container's marker survives the Firecracker prefix strip, so container output that

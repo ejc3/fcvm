@@ -25,6 +25,7 @@ async fn test_state_persistence() {
         pid_start_time: None,
         lifecycle_ready: false,
         holder_pid: None,
+        netpool: None,
         vsock_epoch: 0,
         created_at: now,
         last_updated: now,
@@ -145,6 +146,7 @@ async fn test_list_vms() {
             pid_start_time: None,
             lifecycle_ready: false,
             holder_pid: None,
+            netpool: None,
             vsock_epoch: 0,
             created_at: now,
             last_updated: now,
@@ -220,8 +222,11 @@ async fn test_load_state_by_name_duplicate_detection() {
 
     let now = Timestamp::now();
 
-    // Save two VMs with the same name but different vm_ids and PIDs
-    for (i, pid) in [(1u32, 5000u32), (2, 5001)] {
+    // Save two VMs with the same name but different vm_ids and PIDs. The PIDs are above
+    // the kernel's limit for one (2^22), so neither can be a live process: with 5000 and
+    // 5001 the test failed on a host where one of them was.
+    const DEAD_PIDS: [u32; 2] = [2_000_000_001, 2_000_000_002];
+    for (i, pid) in [(1u32, DEAD_PIDS[0]), (2, DEAD_PIDS[1])] {
         let state = VmState {
             schema_version: 1,
             vm_id: format!("vm-dup-{}", i),
@@ -233,6 +238,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             pid_start_time: None,
             lifecycle_ready: false,
             holder_pid: None,
+            netpool: None,
             vsock_epoch: 0,
             created_at: now,
             last_updated: now,
@@ -300,8 +306,12 @@ async fn test_load_state_by_name_duplicate_detection() {
         "error should mention multiple VMs: {}",
         msg
     );
-    assert!(msg.contains("5000"), "error should list PID 5000: {}", msg);
-    assert!(msg.contains("5001"), "error should list PID 5001: {}", msg);
+    for pid in DEAD_PIDS {
+        assert!(
+            msg.contains(&pid.to_string()),
+            "error should list PID {pid}: {msg}"
+        );
+    }
 
     // Looking up a unique name should still work
     let state = VmState {
@@ -315,6 +325,7 @@ async fn test_load_state_by_name_duplicate_detection() {
         pid_start_time: None,
         lifecycle_ready: false,
         holder_pid: None,
+        netpool: None,
         vsock_epoch: 0,
         created_at: now,
         last_updated: now,
@@ -446,6 +457,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
         pid_start_time: None,
         lifecycle_ready: false,
         holder_pid: None,
+        netpool: None,
         vsock_epoch: 0,
         created_at: Timestamp::now(),
         last_updated: Timestamp::now(),

@@ -221,6 +221,9 @@ const RESTORE_JOB_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shutdown the VM. This function never returns.
 pub async fn shutdown_vm(exit_code: i32) -> ! {
+    // The output connection is about to go: a restore's progress lines not yet sent to
+    // the host, and every line of the shutdown, go to the console.
+    crate::console::end_restore_log();
     eprintln!("[fc-agent] shutting down VM (exit_code={})", exit_code);
 
     // Settle the background jobs a restore started (journald restart, chrony

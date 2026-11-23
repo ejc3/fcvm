@@ -176,6 +176,12 @@ disable = [
     "update-notifier-motd.timer",
     "ua-timer.timer",
     "apport-autoreport.timer",
+    # fc-agent configures the guest's network itself, so nothing ever marks it online for
+    # networkd: the wait ran into its 2 min timeout on every boot, holding network-online.target
+    # and 24 jobs behind it (multi-user and graphical targets, apport, pollinate, ModemManager,
+    # udisks2 and more). A snapshot taken before then carried that wait into every clone, which
+    # then ran all of those jobs together about 120 s after the guest booted.
+    "systemd-networkd-wait-online.service",
 ]
 
 [files]

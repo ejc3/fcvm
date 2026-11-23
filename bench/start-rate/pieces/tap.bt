@@ -31,15 +31,29 @@ kretprobe:linkwatch_do_dev /@dev_s[tid]/ {
   delete(@dev_s[tid]); delete(@dev_tap[tid]); delete(@dev_up[tid]);
 }
 
-kprobe:rtnl_lock { @req[tid] = nsecs; }
-kretprobe:rtnl_lock /@req[tid]/ {
+// The mutex's acquisition is traced with fentry and fexit (kfunc, kretfunc), not a return
+// probe on rtnl_lock: the kernel keeps 2 x CPUs return-probe instances per probe and drops
+// the rest without a word, and with more helpers than that asleep in rtnl_lock at once the
+// holds of the others went unsummed (0.77 holds per call at C=512 on 192 CPUs). The return
+// probes on the tun calls above only clear @call, which the next call overwrites.
+kfunc:vmlinux:mutex_lock, kfunc:vmlinux:mutex_lock_killable, kfunc:vmlinux:mutex_lock_interruptible
+/(uint64)args.lock == kaddr("rtnl_mutex")/ { @req[tid] = nsecs; }
+kretfunc:vmlinux:mutex_lock /(uint64)args.lock == kaddr("rtnl_mutex") && @req[tid]/ {
   $us = (nsecs - @req[tid]) / 1000;
   if (@call[tid]) { @helper_wait_us[@call[tid]] = sum($us); }
   @wait_us_total = sum($us);
   delete(@req[tid]);
   @held[tid] = nsecs;
 }
-kprobe:rtnl_unlock /@held[tid]/ {
+kretfunc:vmlinux:mutex_lock_killable, kretfunc:vmlinux:mutex_lock_interruptible
+/(uint64)args.lock == kaddr("rtnl_mutex") && @req[tid]/ {
+  if (retval == 0) { @held[tid] = nsecs; }
+  delete(@req[tid]);
+}
+kretfunc:vmlinux:mutex_trylock /(uint64)args.lock == kaddr("rtnl_mutex") && retval == 1/ {
+  @held[tid] = nsecs;
+}
+kfunc:vmlinux:mutex_unlock /(uint64)args.lock == kaddr("rtnl_mutex") && @held[tid]/ {
   $us = (nsecs - @held[tid]) / 1000;
   if (@call[tid]) {
     @helper_hold_us[@call[tid]] = sum($us);

@@ -42,6 +42,41 @@ class ParseClone(unittest.TestCase):
         self.assertEqual(c["phases"]["total_ms"], 30.0)
         self.assertAlmostEqual(c["wall"]["ready"] - c["wall"]["resume"], 0.1, places=6)
 
+    def test_a_line_logged_before_fcvm_received_it_is_placed_when_it_was_logged(self):
+        """fc-agent's progress lines reach fcvm after the acknowledgement. Placed at their
+        receive times, every step between them would be zero and `phases_done -> ack`
+        negative. They are placed where the guest logged them, which gives the steps of the
+        same restore logged line by line on the console."""
+        with tempfile.TemporaryDirectory() as t:
+            direct, deferred = Path(t) / "direct.log", Path(t) / "deferred.log"
+            direct.write_text(CLONE_LOG)
+            deferred.write_text(CLONE_LOG_DEFERRED)
+            want = restore_timeline.parse_clone(direct)
+            got = restore_timeline.parse_clone(deferred)
+        for key in ("resume", "epoch", "handling", "tcp_begin", "tcp_done", "phases_done", "ack", "ready"):
+            # A wall-clock stamp as a float of seconds resolves about 0.2 us.
+            self.assertAlmostEqual(got["t"][key], want["t"][key], places=3, msg=key)
+            self.assertAlmostEqual(got["wall"][key], want["wall"][key], places=6, msg=key)
+        self.assertEqual(restore_timeline.logged_before_receipt_ms(
+            "   1.00 2026-01-01T00:00:10.000000Z  INFO fcvm::console: [fc-agent] x"), 0.0)
+
+
+# The same restore with its progress lines on the output connection: fcvm receives them
+# after the acknowledgement, each with the time the guest logged it. One line went to the
+# serial console instead, 70 ms after it was logged.
+CLONE_LOG_DEFERRED = """\
+   100.00 2026-01-01T00:00:10.000000Z  INFO fcvm::firecracker::vm: Firecracker Child.id() returned: Some(4242)
+   200.00 2026-01-01T00:00:10.100000Z  INFO fcvm::commands::common: VM resume completed duration_ms=0 total_snapshot_ms=6
+   290.00 2026-01-01T00:00:10.190000Z  INFO fcvm::commands::snapshot: fc-agent acknowledged exact restore generation vm_id=v restore_epoch=e guest_phases={"total_ms":30.0,"tcp_gate_netlink":true,"gpus":0}
+   300.00 2026-01-01T00:00:10.200000Z  INFO fcvm::commands::snapshot: fc-agent output connected, exec server ready vm_id=v
+   301.00 2026-01-01T00:00:10.201000Z  INFO fcvm::agent: [fc-agent] detected restore-epoch: e logged=2026-01-01T00:00:10.120000Z
+   301.00 2026-01-01T00:00:10.201000Z  INFO fcvm::agent: [fc-agent] handling restore (epoch=e) logged=2026-01-01T00:00:10.121000Z
+   301.00 2026-01-01T00:00:10.201000Z  INFO fcvm::agent: [fc-agent] restore phase=tcp-cleanup epoch=e begin logged=2026-01-01T00:00:10.130000Z
+   301.00 2026-01-01T00:00:10.201000Z  INFO fcvm::agent: [fc-agent] restore phase=tcp-cleanup epoch=e complete elapsed_ms=10.0 destroyed=1 already_gone=0 logged=2026-01-01T00:00:10.140000Z
+   320.00 2026-01-01T00:00:10.220000Z  INFO fcvm::console: [fc-agent] restore phases complete (epoch=e): exec + egress ready elapsed_ms=30.0 held_ms=70.000
+   302.00 2026-01-01T00:00:10.202000Z  INFO fcvm::console: [fc-agent] restore: 5 progress lines queued for the host over vsock
+   400.00 2026-01-01T00:00:10.300000Z  INFO health-monitor: VM healthy, switching to 10s polling
+"""
 
 MONO0 = 6_000_000_000_000  # CLOCK_MONOTONIC at the anchor, ns
 PID = 4242

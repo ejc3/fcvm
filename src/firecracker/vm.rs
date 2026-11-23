@@ -132,6 +132,7 @@ pub struct VmManager {
     user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
     mount_redirects: Option<crate::utils::MountRedirects>, // mount namespace for a restored clone
+    keep_fds: Vec<std::os::fd::RawFd>,   // descriptors left open across the VMM's exec
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
     // Reader task for the child's stderr pipe. Awaited (bounded) before rendering
@@ -163,6 +164,7 @@ impl VmManager {
             user_namespace_path: None,
             net_namespace_path: None,
             mount_redirects: None,
+            keep_fds: Vec::new(),
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             stderr_reader: None,
@@ -226,6 +228,12 @@ impl VmManager {
     /// files - the user has access both inside and outside.
     pub fn set_holder_pid(&mut self, pid: u32) {
         self.holder_pid = Some(pid);
+    }
+
+    /// Descriptors the VMM keeps open across its exec
+    /// ([`crate::utils::NamespaceParams::keep_fds`]).
+    pub fn set_keep_fds(&mut self, fds: Vec<std::os::fd::RawFd>) {
+        self.keep_fds = fds;
     }
 
     /// Set user namespace path for rootless clones
@@ -415,6 +423,7 @@ impl VmManager {
                 user_namespace_path: self.user_namespace_path.clone(),
                 net_namespace_path: self.net_namespace_path.clone(),
                 mount_redirects: self.mount_redirects.clone(),
+                keep_fds: self.keep_fds.clone(),
             },
         )?;
 

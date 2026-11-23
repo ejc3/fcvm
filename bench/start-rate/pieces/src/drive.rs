@@ -212,6 +212,7 @@ fn piece_argv(p: &PieceArgs) -> Vec<String> {
         ("--snapshot-dir", &p.snapshot_dir),
         ("--firecracker", &p.firecracker),
         ("--uffd-socket", &p.uffd_socket),
+        ("--netpool-socket", &p.netpool_socket),
         ("--disk-shard-dir", &p.disk_shard_dir),
     ] {
         if let Some(value) = value {
@@ -760,12 +761,45 @@ async fn measure_held(
     let steady = delta(&s0, &s1, steady_secs);
 
     let held_n = held.len();
+    let pool_before = pool_stats(args).await?;
     let d0 = read_counters(cgroup)?;
     let t = Instant::now();
     let torn = phase(std::mem::take(held), args.concurrency, "exit", "torn").await;
     let down_wall = t.elapsed().as_secs_f64();
     let d1 = read_counters(cgroup)?;
     let teardown = summarize(&torn, down_wall, &d0, &d1, &json!({}));
+    let pool = match pool_before {
+        None => Value::Null,
+        Some(before) => {
+            // The instances gave their leases back in the teardown; the pool resets the
+            // namespaces after that. Its counters say when the last one is ready again.
+            let deadline = Instant::now() + Duration::from_secs(600);
+            let after = loop {
+                let now = pool_stats(args)
+                    .await?
+                    .context("the pool stopped answering")?;
+                if now.leased == 0 && now.resetting == 0 && now.destroying == 0 && now.building == 0
+                {
+                    break now;
+                }
+                anyhow::ensure!(Instant::now() < deadline, "the pool never settled: {now:?}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            let resets = after.resets - before.resets;
+            let reset_s = t.elapsed().as_secs_f64();
+            json!({
+                "at_teardown": before,
+                "settled": after,
+                "resets": resets,
+                "destroys": after.destroys - before.destroys,
+                "release_to_ready_s": reset_s,
+                "resets_per_s": resets as f64 / reset_s,
+                "reset_ms_mean": if resets == 0 { Value::Null } else {
+                    json!((after.reset_us_total - before.reset_us_total) as f64 / resets as f64 / 1000.0)
+                },
+            })
+        }
+    };
 
     Ok(json!({
         "piece": args.piece.piece,
@@ -787,8 +821,22 @@ async fn measure_held(
             delta(&s0, &s1, steady_secs * held_n as f64)
         },
         "teardown": teardown,
+        "pool": pool,
         "perf_errors": perf_errors,
     }))
+}
+
+/// The counters of the pool the netpool piece claims from, or `None` for another piece.
+async fn pool_stats(args: &DriveArgs) -> Result<Option<fcvm::netpool::proto::Stats>> {
+    match (&args.piece.piece, &args.piece.netpool_socket) {
+        (crate::pieces::Piece::Netpool, Some(socket)) => Ok(Some(
+            fcvm::netpool::client::stats_at(socket)
+                .await?
+                .context("no pool is listening on --netpool-socket")?,
+        )),
+        (crate::pieces::Piece::Netpool, None) => bail!("the netpool piece needs --netpool-socket"),
+        _ => Ok(None),
+    }
 }
 
 pub async fn run(args: DriveArgs) -> Result<()> {
@@ -1178,6 +1226,7 @@ mod tests {
             snapshot_dir: Some("/s".into()),
             firecracker: Some("/fc".into()),
             uffd_socket: Some("/u.sock".into()),
+            netpool_socket: Some("/n.sock".into()),
             disk_shard_dir: Some("/d".into()),
             track_dirty_pages: false,
             prober: crate::pieces::Prober::Holder,

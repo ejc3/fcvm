@@ -45,11 +45,18 @@ use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
 
-/// Format tracing events as `[fc-agent] message` — no timestamp, level, or target.
+/// Format tracing events as `[fc-agent] message`: no timestamp or target, and no level
+/// below ERROR.
 ///
 /// The host reads these lines from Firecracker's serial console and adds its own
 /// timestamp and level. Including `[fc-agent]` ensures the host logs them at INFO
 /// (the host checks `contains("fc-agent")` to distinguish important lines).
+///
+/// An ERROR event is `[fc-agent] ERROR: message`, the form of fc-agent's own error
+/// lines: the console writer puts such a line on the console at once during a restore
+/// (`console::classify`), and the host logs it at WARN. WARN events keep the plain form:
+/// the FUSE client logs at WARN that its connection was reset, which every restore of a
+/// VM with a `--map` volume does.
 struct FcAgentFormat;
 
 impl<S, N> FormatEvent<S, N> for FcAgentFormat
@@ -63,9 +70,18 @@ where
         mut writer: Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> fmt::Result {
-        write!(writer, "[fc-agent] ")?;
+        write!(writer, "{}", event_prefix(event.metadata().level()))?;
         ctx.format_fields(writer.by_ref(), event)?;
         writeln!(writer)
+    }
+}
+
+/// What a tracing event's console line starts with (see [`FcAgentFormat`]).
+fn event_prefix(level: &tracing::Level) -> &'static str {
+    if *level == tracing::Level::ERROR {
+        "[fc-agent] ERROR: "
+    } else {
+        "[fc-agent] "
     }
 }
 
@@ -263,6 +279,24 @@ mod tests {
 
     use super::fatal_error_line;
     use anyhow::Context;
+
+    /// An ERROR event from a library (the FUSE client) is an `ERROR:` line, which the
+    /// console writer never holds back during a restore and the host logs at WARN. The
+    /// other levels keep the plain prefix.
+    #[test]
+    fn an_error_event_is_an_error_line() {
+        assert_eq!(
+            super::event_prefix(&tracing::Level::ERROR),
+            "[fc-agent] ERROR: "
+        );
+        for level in [
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+        ] {
+            assert_eq!(super::event_prefix(&level), "[fc-agent] ");
+        }
+    }
 
     /// The line names every cause, innermost last, and is one line even when
     /// a cause is a command's multi-line stderr.

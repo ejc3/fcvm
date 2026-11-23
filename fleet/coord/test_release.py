@@ -2546,7 +2546,8 @@ class ProdStepTests(unittest.TestCase):
                                       "IMAGE_RELEASE": "fcvm-fleet-ami-prod-release"})
         env.start()
         self.addCleanup(env.stop)
-        self.answers, self.calls = {}, []
+        # prod-status answers prod's current receipt; image_promote reads it before its first call.
+        self.answers, self.calls = {"prod-status": {"prod": {"generation": 11, "build_id": "factory:old"}}}, []
         def invoke(function, payload):
             self.calls.append(payload.get("action", "release"))
             answer = self.answers[payload.get("action")]
@@ -2576,6 +2577,131 @@ class ProdStepTests(unittest.TestCase):
                 self.answers["promote-prod"] = answer
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(prod.main(["image-promote", receipt]), code)
+
+    def test_a_promotion_waits_while_terraforms_lock_is_held(self):
+        # The image release function shares Terraform's backend lock. With ejc3/aws#1014 applied it answers "busy"
+        # while someone else holds it (an apply, a plan, another release); until then a held lock is still a function
+        # error, which is what failed run 45149811634. Busy means nothing ran: ask again, at most 11 times.
+        receipt = {"generation": 24, "build_id": "factory:new"}
+        self.answers["promote-prod"] = [{"status": "busy"}] * 10 + [{"status": "promoted", **receipt}]
+        sleeps = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_promote(receipt, sleep=sleeps.append), "promoted")
+        self.assertEqual(sleeps, [60] * 10)
+        self.assertEqual(self.calls.count("promote-prod"), 11)
+        self.assertEqual(self.calls.count("prod-status"), 1)
+
+    def test_a_promotion_still_locked_after_eleven_answers_is_held_not_failed(self):
+        # Held (exit 3): the release job ends with a notice and no rollback runs for a set that never moved. Held only
+        # when prod-status, which takes no lock, still names the receipt prod ran before the call.
+        receipt = '{"generation": 24, "build_id": "factory:new"}'
+        old = {"generation": 11, "build_id": "factory:old"}
+        self.answers["prod-status"] = [{"prod": old}, {"prod": old}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11 + [{"status": "promoted", "generation": 24, "build_id": "factory:new"}]
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(prod.time, "sleep", lambda _: None):
+            self.assertEqual(prod.main(["image-promote", receipt]), prod.HELD)
+        self.assertEqual(self.calls.count("promote-prod"), 11)
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-prod-promote.yml").read_text()
+        notice = [line for line in workflow.splitlines() if 'if [ "$rc" = 3 ]' in line and "image" in line]
+        self.assertEqual(len(notice), 1)
+        self.assertIn("Terraform's lock", notice[0])
+
+    def test_a_lock_held_after_the_promotion_completed_is_that_promotion(self):
+        # publish.invoke retries a call that ended without a result while the function went on: the first
+        # promote-prod completed and every retry answers busy. prod-status names the receipt: the release continues.
+        receipt = {"generation": 24, "build_id": "factory:new"}
+        self.answers["prod-status"] = [{"prod": {"generation": 11, "build_id": "factory:old"}}, {"prod": dict(receipt)}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_promote(receipt, sleep=lambda _: None), "unchanged")
+            self.answers["prod-status"] = [{"prod": {"generation": 11, "build_id": "factory:old"}}, {"prod": dict(receipt)}]
+            self.answers["promote-prod"] = [{"status": "busy"}] * 11
+            with patch.object(prod.time, "sleep", lambda _: None):
+                self.assertEqual(prod.main(["image-promote", json.dumps(receipt)]), 0)
+
+    def test_a_lock_held_with_prod_on_a_third_release_is_a_failure(self):
+        receipt = '{"generation": 24, "build_id": "factory:new"}'
+        self.answers["prod-status"] = [{"prod": {"generation": 11, "build_id": "factory:old"}},
+                                       {"prod": {"generation": 9, "build_id": "factory:other"}}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(prod.time, "sleep", lambda _: None):
+            self.assertEqual(prod.main(["image-promote", receipt]), 1)
+
+    def test_a_lock_held_with_prods_images_unreadable_is_a_failure(self):
+        # prod-status refused both times names no receipt at all: two unreadable answers are not "nothing moved".
+        receipt = '{"generation": 24, "build_id": "factory:new"}'
+        self.answers["prod-status"] = [{"status": "refused", "reason": "x"}] * 2
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()), patch.object(prod.time, "sleep", lambda _: None):
+            self.assertEqual(prod.main(["image-promote", receipt]), 1)
+
+    def test_a_lock_held_with_prod_already_on_the_receipt_is_that_promotion(self):
+        # A rerun after an earlier attempt completed, with the lock held: prod-status names the receipt before and
+        # after, which is the completed promotion and not a held one.
+        receipt = {"generation": 24, "build_id": "factory:new"}
+        self.answers["prod-status"] = [{"prod": dict(receipt)}, {"prod": dict(receipt)}]
+        self.answers["promote-prod"] = [{"status": "busy"}] * 11
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_promote(receipt, sleep=lambda _: None), "unchanged")
+
+    def test_an_image_rollback_waits_while_terraforms_lock_is_held(self):
+        new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
+        self.answers["prod-status"] = {"prod": new}
+        self.answers["rollback-prod"] = [{"status": "busy"}, {"status": "rolled_back", **old}]
+        sleeps = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_rollback(new, old, deadline=time.time() + 1000, sleep=sleeps.append), "rolled_back")
+        self.assertEqual(sleeps, [60])
+
+    def test_an_image_rollback_keeps_asking_through_a_long_lock_until_its_deadline(self):
+        # A Terraform apply that holds the lock for 30 minutes: the rollback keeps asking every 60 s and then runs.
+        new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
+        self.answers["prod-status"] = {"prod": new}
+        self.answers["rollback-prod"] = [{"status": "busy"}] * 30 + [{"status": "rolled_back", **old}]
+        sleeps = []
+        clock = lambda: sum(sleeps)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_rollback(new, old, deadline=3600, clock=clock, sleep=sleeps.append), "rolled_back")
+        self.assertEqual(sleeps, [60] * 30)
+
+    def test_an_image_rollback_that_cannot_run_fails_by_its_deadline(self):
+        # A rollback that could not run fails (never held), and the busy wait ends at the rollback's own deadline, not
+        # at the job's timeout or the role's session.
+        new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
+        self.answers["prod-status"] = {"prod": new}
+        self.answers["rollback-prod"] = [{"status": "busy"}] * 200
+        sleeps = []
+        clock = lambda: sum(sleeps)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "deadline") as raised:
+            prod.image_rollback(new, old, deadline=1800, clock=clock, sleep=sleeps.append)
+        self.assertNotIsInstance(raised.exception, prod.publish.Held)
+        self.assertEqual(sum(sleeps), 1800)
+
+    def test_the_rollback_job_says_which_return_failed(self):
+        # "prod was returned to its previous set" only when every step that ran succeeded.
+        workflow = (HERE.parent.parent / ".github/workflows/fleet-prod-promote.yml").read_text()
+        rollback = workflow.split("\n  rollback:\n", 1)[1]
+        step = rollback[rollback.index("      - name: The promotion failed\n"):]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        for outcomes, says in (({"WORKER": "success", "COORDINATOR": "skipped", "IMAGES": "success"}, "was returned to its previous set"),
+                               ({"WORKER": "skipped", "COORDINATOR": "success", "IMAGES": "failure"}, "Host and tile images"),
+                               # A job cancelled before a return step started reports that step skipped too.
+                               ({"WORKER": "skipped", "COORDINATOR": "skipped", "IMAGES": "skipped", "CANCELLED": "true"},
+                                "was cancelled")):
+            with self.subTest(**outcomes):
+                out = subprocess.run(["bash", "-c", script],
+                                     env={"PATH": os.environ["PATH"], "CANCELLED": "false", **outcomes},
+                                     capture_output=True, text=True)
+                self.assertEqual(out.returncode, 1)
+                self.assertIn(says, out.stdout)
+                if outcomes["IMAGES"] == "failure" or outcomes.get("CANCELLED") == "true":
+                    self.assertNotIn("was returned to its previous set", out.stdout)
+        for name, id_ in (("Worker", "worker"), ("Coordinator", "coordinator"), ("Host and tile images", "images")):
+            self.assertRegex(rollback, r"      - name: " + re.escape(name) + r"\n        id: " + id_ + r"\n")
+        self.assertIn("IMAGES: ${{ steps.images.outcome }}", step)
+        self.assertIn("CANCELLED: ${{ job.status == 'cancelled' }}", step)
+        # Status functions such as cancelled() are valid only in `if:`; in a step's env they make the whole file invalid.
+        self.assertNotRegex(workflow, r"(?m)^\s+[A-Z_]+: \$\{\{[^}]*\b(cancelled|always|success|failure)\(\)")
 
     def test_an_image_rollback_returns_only_to_the_previous_release(self):
         new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}

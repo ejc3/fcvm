@@ -152,6 +152,15 @@ pub async fn run() -> Result<()> {
     // reset = snapshot restore) to the restore-epoch watcher.
     let (output, output_writer, vsock_reset) = output::create();
     tokio::spawn(output_writer);
+    // A restore's progress lines travel on this connection instead of the serial console
+    // (`console` module doc). A TTY VM's host has no output listener, so its lines stay
+    // on the console.
+    if !plan.tty {
+        crate::console::set_progress_sink(std::sync::Arc::new(output::ProgressOverOutput::new(
+            output.clone(),
+            &vsock_reset,
+        )));
+    }
     // How the host's resume of a snapshotted source asks for the output to reconnect.
     output::spawn_reconnect_listener(output.clone())
         .context("starting the output reconnect listener")?;

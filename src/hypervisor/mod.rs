@@ -128,6 +128,9 @@ pub struct ProcessSpec {
     /// The mount namespace a restored clone's VMM runs in
     /// ([`crate::utils::MountRedirects`]).
     pub mount_redirects: Option<crate::utils::MountRedirects>,
+    /// Descriptors the VMM keeps open across its exec
+    /// ([`crate::utils::NamespaceParams::keep_fds`]).
+    pub keep_fds: Vec<std::os::fd::RawFd>,
 }
 
 /// A block device to attach (rootfs or data disk), VMM-neutral.

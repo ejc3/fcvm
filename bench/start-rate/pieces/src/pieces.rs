@@ -31,6 +31,10 @@ pub enum Piece {
     /// A VMM's TAP attach, then its detach, on a prepared rootless network: the network work
     /// left on a clone's start and stop when its namespace is reused (`tap.rs`).
     TapAttach,
+    /// A namespace from a running pool (`fcvm netpool serve`): the claim a restored clone
+    /// makes instead of building its namespace, held as the clone holds it and given back
+    /// at teardown. Needs `--netpool-socket`.
+    Netpool,
     /// A bare KVM VM as Firecracker builds one on arm64 (VM, 256 MiB memory slot, one vCPU,
     /// a GICv3), no VMM process: the floor under `fc-spawn` and `vmm`.
     KvmVm,
@@ -78,6 +82,9 @@ pub struct PieceArgs {
     /// attach also changes the device's offload features, which the bridge above it follows.
     #[arg(long, default_value_t = 1)]
     pub tap_warm_cycles: u32,
+    /// The pool's socket (`<data_dir>/netpool/<user>/pool.sock`) for the netpool piece.
+    #[arg(long)]
+    pub netpool_socket: Option<PathBuf>,
     /// The tap-attach piece prepares namespaces with the TAP and the bridge and no pasta
     /// (`PastaNetwork::isolated`): the same link events with no pasta listening for them.
     #[arg(long)]
@@ -98,6 +105,7 @@ struct Held {
     runtime_dir: Option<PathBuf>,
     kvm: Option<crate::kvm::BareVm>,
     tap: Option<crate::tap::Helper>,
+    lease: Option<fcvm::netpool::client::Lease>,
 }
 
 /// The driver's PID, so an instance can tell it was reparented before arming its
@@ -277,6 +285,7 @@ async fn prepare(args: &PieceArgs, held: &mut Held) -> Result<()> {
         | Piece::Disk
         | Piece::Holder
         | Piece::RootlessNet
+        | Piece::Netpool
         | Piece::KvmVm => {}
         Piece::FcSpawn => {
             spawn_holder(held).await?;
@@ -292,7 +301,7 @@ async fn prepare(args: &PieceArgs, held: &mut Held) -> Result<()> {
             } else {
                 rootless_network(held, &mut Vec::new()).await?
             };
-            let mut helper = crate::tap::Helper::spawn(pid, &tap_device(&held.vm_id))?;
+            let mut helper = crate::tap::Helper::spawn(pid, &tap_device(&held.vm_id)).await?;
             let hold = std::time::Duration::from_millis(args.tap_hold_ms);
             for _ in 0..args.tap_warm_cycles {
                 helper.cycle(hold, &mut Vec::new()).await?;
@@ -386,6 +395,19 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
         }
         Piece::RootlessNet => {
             rootless_network(held, &mut stages).await?;
+        }
+        Piece::Netpool => {
+            let socket = args
+                .netpool_socket
+                .as_ref()
+                .context("this piece needs --netpool-socket")?;
+            // The key of a default restored clone's network, as `PastaNetwork::setup` asks.
+            let key = pasta_network(&held.vm_id).pool_key();
+            let lease = fcvm::netpool::client::claim_at(socket, &key)
+                .await?
+                .context("the pool had no free namespace")?;
+            stages.push(("generation", lease.grant.generation as f64));
+            held.lease = Some(lease);
         }
         Piece::FcSpawn => {
             let pid = held.holder.as_ref().map(|(_, p)| *p).context("no holder")?;
@@ -520,6 +542,13 @@ async fn teardown(held: &mut Held) -> Result<Stages> {
     }
     if let Some(helper) = held.tap.take() {
         helper.stop().await;
+    }
+    if let Some(lease) = held.lease.take() {
+        // The lease ends here. The pool resets the namespace afterwards; the driver waits
+        // for that and reports it from the pool's own counters.
+        let t = Instant::now();
+        drop(lease);
+        stages.push(("release", ms(t)));
     }
     if let Some(mut vmm) = held.vmm.take() {
         let t = Instant::now();

@@ -20,6 +20,9 @@ use std::process::Stdio;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 
+/// The helper's first line, written once it has entered the holder's namespaces.
+const READY: &str = "ready";
+
 /// The helper's `comm`, which `tap.bt` filters on.
 pub const HELPER_COMM: &std::ffi::CStr = c"tap-helper";
 
@@ -118,6 +121,9 @@ pub fn helper(parent: u32, holder_pid: u32, tap: &str) -> Result<()> {
     unsafe { libc::prctl(libc::PR_SET_NAME, HELPER_COMM.as_ptr()) };
     let mut held: Option<OwnedFd> = None;
     let mut out = std::io::stdout().lock();
+    // The namespaces are entered: whoever started this may time a request from here.
+    writeln!(out, "{READY}")?;
+    out.flush()?;
     for line in std::io::stdin().lock().lines() {
         let reply = match line?.as_str() {
             "attach" => {
@@ -147,8 +153,24 @@ pub struct Helper {
     lines: Lines<BufReader<tokio::process::ChildStdout>>,
 }
 
+/// Read the helper's readiness line.
+async fn await_ready<R: tokio::io::AsyncBufRead + Unpin>(lines: &mut Lines<R>) -> Result<()> {
+    let line = lines
+        .next_line()
+        .await?
+        .context("the TAP helper exited before it entered the namespaces")?;
+    anyhow::ensure!(
+        line == READY,
+        "the TAP helper said '{line}' before it was ready"
+    );
+    Ok(())
+}
+
 impl Helper {
-    pub fn spawn(holder_pid: u32, tap: &str) -> Result<Self> {
+    /// Start the helper and wait until it has entered the holder's namespaces. Without the
+    /// wait its first request's time would include the exec and the two `setns` calls,
+    /// whenever no warm cycle and no idle time came before the timed op.
+    pub async fn spawn(holder_pid: u32, tap: &str) -> Result<Self> {
         let mut child = tokio::process::Command::new(std::env::current_exe()?)
             .arg("tap-helper")
             .arg(std::process::id().to_string())
@@ -160,7 +182,8 @@ impl Helper {
             .spawn()
             .context("starting the TAP helper")?;
         let stdin = child.stdin.take().unwrap();
-        let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        await_ready(&mut lines).await?;
         Ok(Self {
             child,
             stdin,
@@ -243,29 +266,39 @@ const LINK_EVENTS_FLOOR: f64 = 0.5;
 /// `tap.bt` dumps of a tap-attach cell (its timed and steady windows together).
 pub fn summarize(maps: &std::collections::BTreeMap<String, f64>) -> Result<serde_json::Value> {
     let get = |key: &str| maps.get(key).copied().unwrap_or(0.0);
-    let cycles = get("calls[1]");
     anyhow::ensure!(
-        cycles > 0.0,
+        get("calls[1]") > 0.0,
         "the tracer saw no close by the helper: it was not attached during the timed phase"
     );
+    // A cycle ends with one close. The closes are counted twice, by a probe on the call and
+    // by the tracer of the mutex, and either can skip a run (see below): the larger count
+    // is the number of cycles.
+    let cycles = get("calls[1]").max(get("helper_holds[1]"));
     let mut calls = serde_json::Map::new();
     let mut helper_hold_us = 0.0;
     for (key, name) in CALLS {
         let n = get(&format!("calls[{key}]"));
         anyhow::ensure!(n > 0.0, "the tracer saw no {name} by the helper");
-        // Each call takes the mutex once. `tap.bt` sums a hold from a return probe on
-        // rtnl_lock, and the kernel keeps a fixed number of return-probe instances (twice
-        // the CPUs): when more helpers than that sleep in rtnl_lock at once, the holds of
-        // the rest are not summed while their calls are still counted, and every hold
-        // column reads short (0.77 of the calls at C=512 on 192 CPUs). A call that
-        // straddles a window's edge accounts for a difference of one.
+        // Each call takes the mutex once, and the two are counted by different probes:
+        // the call by a kprobe on the ioctl or the close, the hold by fentry and fexit on
+        // mutex_lock. Either can skip a run. The kernel skips a kprobe that fires while
+        // another probe's handler runs on its CPU (5 or 6 of 400 calls with the mutex
+        // traced), which only lowers the count of calls. A hold whose end was skipped, or
+        // whose return probe had no instance left (the first tracer summed holds from a
+        // return probe on rtnl_lock, of which the kernel keeps twice the CPUs: 0.77 of the
+        // calls at C=512 on 192 CPUs), is missing from the sum, and every hold column reads
+        // short by that share. So the larger of the two counts is the number of calls, and
+        // a cell whose counts are over 2% apart is refused.
         let holds = get(&format!("helper_holds[{key}]"));
         anyhow::ensure!(
-            (holds - n).abs() <= (n * 0.005).max(1.0),
+            (holds - n).abs() <= (n.max(holds) * 0.02).max(1.0),
             "the tracer summed {holds} rtnl_mutex holds for {n} {name} calls: it dropped \
-             some (return-probe instances ran out), so the hold columns would read short"
+             some, so the hold columns would read short"
         );
-        let hold = get(&format!("helper_hold_us[{key}]")) / n;
+        // The summed hold is of the holds that were summed: divided by the calls it would
+        // read short by the share of holds a probe skipped.
+        let hold = get(&format!("helper_hold_us[{key}]")) / holds;
+        let n = n.max(holds);
         helper_hold_us += hold;
         calls.insert(
             name.into(),
@@ -426,9 +459,24 @@ mod tests {
             refused.contains("770") && refused.contains("TUNSETIFF") && refused.contains("dropped"),
             "{refused}"
         );
-        // One call that straddles a window's edge is not a drop.
-        maps.insert("helper_holds[1074025674]".into(), 999.0);
+        // A probe that skipped a few runs is not a tracer that ran out: within 2% the larger
+        // count is the number of calls.
+        maps.insert("helper_holds[1074025674]".into(), 985.0);
         summarize(&maps).unwrap();
+        maps.insert("calls[1074025674]".into(), 395.0);
+        maps.insert("helper_holds[1074025674]".into(), 400.0);
+        maps.insert("helper_hold_us[1074025674]".into(), 200_000.0);
+        let s = summarize(&maps).unwrap();
+        assert_eq!(s["calls"]["TUNSETIFF"]["calls"], 400.0);
+        assert_eq!(s["calls"]["TUNSETIFF"]["rtnl_hold_us"], 500.0);
+        // The other way round, a few holds missing from the sum: the mean is over the
+        // holds that were summed, not over the calls.
+        maps.insert("calls[1074025674]".into(), 400.0);
+        maps.insert("helper_holds[1074025674]".into(), 395.0);
+        maps.insert("helper_hold_us[1074025674]".into(), 197_500.0);
+        let s = summarize(&maps).unwrap();
+        assert_eq!(s["calls"]["TUNSETIFF"]["calls"], 400.0);
+        assert_eq!(s["calls"]["TUNSETIFF"]["rtnl_hold_us"], 500.0);
     }
 
     /// A cell where the worker handled a link event in under half the cycles gets no
@@ -464,6 +512,22 @@ mod tests {
         half.insert("lw_tap_devs[1]".into(), cycles * 0.5);
         half.insert("lw_tap_devs[0]".into(), cycles * 0.5);
         assert!(summarize(&half).unwrap()["rtnl_hold_us_per_cycle"].is_f64());
+    }
+
+    /// The instance waits for the helper's readiness line before it sends a request; a
+    /// helper that exits or says anything else first is an error, not a ready helper.
+    #[tokio::test]
+    async fn the_helper_is_ready_only_after_its_readiness_line() {
+        let mut ready = BufReader::new(&b"ready\nok 1 2 3\n"[..]).lines();
+        await_ready(&mut ready).await.unwrap();
+        assert_eq!(
+            ready.next_line().await.unwrap().as_deref(),
+            Some("ok 1 2 3")
+        );
+        let mut gone = BufReader::new(&b""[..]).lines();
+        assert!(await_ready(&mut gone).await.is_err());
+        let mut other = BufReader::new(&b"ok 1\n"[..]).lines();
+        assert!(await_ready(&mut other).await.is_err());
     }
 
     #[test]

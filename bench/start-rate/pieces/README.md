@@ -91,7 +91,7 @@ The `kernel.bt` output of the first table's attribution pass (C=128, 1000 held, 
 piece; start, steady and teardown in one window) is in `traces/`.
 Those dumps were taken with the tracer stopped at the driver's exit and with probes on
 `rtnl_lock()`. For the pieces that make namespaces, `traces/rtnl/` holds what `rtnl.py` reads
-from complete dumps instead: `rootless-net` before and after changelog step 4 (three runs
+from complete dumps instead: `rootless-net` before and after changelog step 5 (three runs
 each), `holder` and `health`.
 
 `PERF_FREQ=99` adds `perf record -a -g` over the timed phase (`perf.data`), and
@@ -104,7 +104,28 @@ anything only on a quiet box.
 | `disk` | `SNAPSHOT_DIR=` a snapshot directory (`.../snapshots/<tag>`) |
 | `fc-spawn` | `FIRECRACKER=` the Firecracker binary fcvm restores with |
 | `tap-attach` | nothing; `tap-floor.sh` runs its campaign |
+| `netpool` | `ARGS="--netpool-socket <data_dir>/netpool/<user>/pool.sock"` of a running `fcvm netpool serve`; `netpool.sh` runs its campaign |
 | `vmm` | both; `UFFD_SOCKET=` a `snapshot serve` socket to load through UFFD |
+
+## netpool: a namespace from the pool
+
+`netpool` is the claim a restored clone makes when a pool runs (`fcvm netpool serve`,
+`src/netpool/`): one connection to the pool's socket, one request, one reply that carries the
+namespace's descriptors. It runs in the instance's own process, as it does in a clone's,
+because the connection is the lease and has to be held. The op is the claim; the instance holds
+the lease through the steady phase and drops it at teardown. The stage `generation` is the
+namespace's generation, not a time: 1 for a namespace no lease has used.
+
+The pool resets a namespace after its lease has ended, so the reset is not in the teardown's
+latency. The driver reads the pool's counters before the teardown and waits until every
+namespace is ready again: `pool.release_to_ready_s` is that wait from the first release,
+`pool.resets_per_s` the resets over it, `pool.reset_ms_mean` the pool's own mean time from a
+lease's end to its namespace being ready, and `pool.destroys` the namespaces whose
+verification failed (0 in a healthy run).
+
+```bash
+bash bench/start-rate/pieces/netpool.sh /mnt/fcvm-btrfs/pieces-out/netpool   # 1000 leased, C=1..512
+```
 
 ## tap-attach: what a reused namespace still costs
 

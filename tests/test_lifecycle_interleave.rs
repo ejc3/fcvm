@@ -1109,8 +1109,8 @@ async fn test_lifecycle_interleave_healthy_means_live_dataplane() -> Result<()> 
 ///
 /// Run 1 (unique cmd → cold) CREATES the pre-start snapshot inside that
 /// widened window. Run 2 (same cmd/env → same key) RESTORES it. Oracle on run
-/// 2: the restore path was taken (no silent cold-boot fallback), fc-agent
-/// serial lines and the container's console output appear after restore, the
+/// 2: the restore path was taken (no silent cold-boot fallback), an fc-agent
+/// serial line and the container's output appear after restore, the
 /// dead-serial watchdog ERROR ("captured the guest UART mid-transmit") never
 /// fires, the run reaches healthy, and SIGTERM produces an orderly exit.
 ///
@@ -1209,9 +1209,18 @@ async fn test_lifecycle_interleave_quiesce_survives_long_prepause() -> Result<()
         return Err(e.context("run 2 must restore the pre-start snapshot"));
     }
     common::poll_health_by_pid(pid2, 300).await?;
-    // fc-agent serial lines after restore: the quiesce guard's buffered lines
-    // and restore-progress lines all arrive over the restored UART.
-    wait_for_marker(&log2, "[fc-agent]", 0, Duration::from_secs(30)).await?;
+    // An fc-agent line over the restored UART. A restore's progress lines, the
+    // quiesce guard's buffered ones included, reach the log over the output vsock
+    // connection under `fcvm::agent` and prove nothing about the UART; the one line
+    // fc-agent writes to the console when it hands them over is logged under
+    // `fcvm::console`, as every console line of fc-agent's is.
+    wait_for_marker(
+        &log2,
+        "fcvm::console: [fc-agent]",
+        0,
+        Duration::from_secs(30),
+    )
+    .await?;
     // The container's console output flows after restore too.
     wait_for_marker(&log2, &canary, 0, Duration::from_secs(90)).await?;
 

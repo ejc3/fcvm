@@ -37,7 +37,7 @@ How each piece scales:
   C=1 to 0.090 s at C=128 with none held, and to 0.177 s at C=128 and 0.39 s at C=512 with
   1000 held. Under `kernel.bt` (C=128, 1000 held, 2000 namespace lives from their start to the
   end of the kernel's cleanup, three runs on a second boot of the same instance type on
-  2026-11-23, at the commit before the netlink builder of changelog step 4) `rtnl_mutex` was held 25.7 ms per namespace life (24.1 to 26.6) and waited
+  2026-11-23, at the commit before the netlink builder of changelog step 5) `rtnl_mutex` was held 25.7 ms per namespace life (24.1 to 26.6) and waited
   for 2.2 s. Of the hold:
   - 14.4 ms is one `rcu_barrier()` per namespace in the netns cleanup worker (`cleanup_net`
     -> `br_dev_uninit` -> `br_multicast_dev_del`): every bridge destroyed waits for the RCU
@@ -133,8 +133,9 @@ Two sets of rows are not measurements of a clone life, found in review after the
 Both are measured again, with a tracer that drops nothing and a helper that stays attached
 past the link watch delay, in the campaign of the PR that adds the namespace pool.
 
-- **A reused namespace costs 1.5 to 1.8 ms of `rtnl_mutex` per clone life with 2000 pastas
-  alive** (C=1 to 128), which caps attach and detach at 555 to 675 per second. The untraced
+- **A reused namespace costs 1.3 to 1.8 ms of `rtnl_mutex` per clone life with 2000 pastas
+  alive** (C=1 to 128: the rows say 1.48 to 1.80 ms, the host's totals over the traced windows
+  1.34 to 1.79), which caps attach and detach at 555 to 750 per second. The untraced
   bursts ran at 857 and 923 cycles/s at C=32 and 128, above that cap, because a burst runs
   ahead of its link events: the helper's own calls hold 0.92 to 0.94 ms per cycle, which
   alone would allow about 1070.
@@ -153,9 +154,42 @@ past the link watch delay, in the campaign of the PR that adds the namespace poo
   waiting, 21.9% (`PERF_FREQ=99`, `perf record -a -g` over the timed phase of the untraced
   C=128 cell with 1000 held, top frames by `perftop.sh`). How much of the hold is pasta's
   listener is not established: the no-pasta rows that were to show it are the ones above.
-- **The attach and detach have to go.** With pasta, which every pooled namespace has, a cycle
-  holds 1.5 ms or more. The design's bound for keeping them was 0.7 ms, so the pool has to
+- **The attach and detach have to go.** With 2000 namespaces with pasta alive, and every
+  pooled namespace has pasta, a cycle holds 1.3 to 1.8 ms (0.41 ms with 200). The design's
+  bound for keeping them was 0.7 ms, so the pool has to
   keep the TAP attached and hand the VMM the descriptor.
+
+### Measured again, with a helper that stays attached
+
+These rows and the ones above are from different sessions and are not an A/B of the two
+hold times.
+
+Same session as changelog entry 7 (2026-11-23), `HOLD_MS=1200`, the traced cells summarized by
+`tap-summary` as it is now: the mutex traced through fentry and fexit, the count of calls the
+larger of the two probes' counts, the other devices' link events included. The helper stays
+attached 1.2 s, past the link watch worker's delay, as a VM does, so the carrier-on and the
+carrier-off are each handled on their own. The rows above came from a helper attached for
+20 ms.
+
+| namespaces | C | TUNSETIFF | close | carrier-on | carrier-off | other devices, per cycle | hold per cycle, us | all holds on the host, per cycle | 1 s / hold |
+|---|---|---|---|---|---|---|---|---|---|
+| 2000 with pasta | 1 | 905 | 1402 | 678 | 768 | 0 | 3756 | 3779 | 266 |
+| 2000 with pasta | 32 | 490 | 523 | 321 | 336 | 0 | 1670 | 1665 | 599 |
+| 2000 with pasta | 128 | 409 | 446 | 264 | 269 | 0 | 1389 | 1372 | 720 |
+| 2000 with pasta | 512 | 383 | 396 | 280 | 277 | 0 | 1337 | 1287 | 748 |
+| 2000, no pasta | 1 | 216 | 296 | 173 | 202 | 277 | 1164 | 1185 | 859 |
+| 2000, no pasta | 32 | 208 | 227 | 160 | 134 | 203 | 932 | 935 | 1073 |
+| 2000, no pasta | 128 | 201 | 224 | 151 | 146 | 167 | 890 | 909 | 1124 |
+| 2000, no pasta | 512 | 198 | 222 | 124 | 146 | 70 | 760 | 736 | 1316 |
+
+- **A clone life's attach and detach hold the mutex 1.3 to 3.8 ms with 2000 pastas alive**: 266
+  to 748 lives a second for the whole host, and least at C=1, where every call and every link
+  event runs alone. The sum of the columns and the host's own total agree within 4% in every
+  cell, and in every cell the two counts of calls are within the 2% the summary allows.
+- **Without pasta the same cycle holds 0.76 to 1.16 ms.** The bridge's own link events are in
+  it now (two a cycle, the TAP being its only port). So 36 to 69% of the hold with pasta is
+  there because pasta is: its neighbour listener among every link notification's receivers,
+  and its TAP on the bridge.
 
 ## Changelog
 
@@ -345,3 +379,80 @@ On main they are under 250; which change between the two heads removed that traf
 identified here. What remains is the console: on main, 2,975 transmit-register writes per clone in
 the first second, one exit to Firecracker per byte, which are fc-agent's 37 restore lines (about
 2.7 KB) on ttyS0. These MMIO counts are from different runs than the table's MMIO column.
+
+### 7. netpool: a pool lends namespaces (the pool PR)
+
+One on-demand c8g.metal-48xl (192 CPUs), host kernel 7.0.0-1013-aws, one boot, 2026-11-23,
+this tree. `netpool.sh`: one pool of 2000 namespaces, 1000 leased throughout, three campaigns
+of the four cells, a pool built and destroyed for each; mean (lowest to highest).
+
+| C | claims/s | claim p50 ms | claim p99 ms | host CPU-s per claim | resets/s | all ready again after, s |
+|---|---|---|---|---|---|---|
+| 1 | 3392 (3372 to 3431) | 0.28 (0.28 to 0.29) | 0.38 (0.37 to 0.40) | 0.00036 | 120 (119 to 120) | 10.0 (1200 leases) |
+| 32 | 28198 (25171 to 33361) | 1.10 (0.91 to 1.22) | 1.62 (1.41 to 1.72) | 0.00034 | 115 (113 to 117) | 17.4 (2000 leases) |
+| 128 | 22278 (18648 to 24200) | 5.69 (5.18 to 6.69) | 7.14 (6.43 to 8.47) | 0.00041 | 114 (114 to 114) | 17.6 |
+| 512 | 13622 (12234 to 14581) | 44.3 (41.3 to 48.1) | 55.2 (50.7 to 61.0) | 0.00057 | 114 (112 to 115) | 17.6 |
+
+- **A claim is 0.28 ms alone, and one pool answers 22,000 to 28,000 a second at C=32 and
+  128** (13,600 at C=512), against a namespace setup of 1.1 to 1.7 s at C=128 (entry 8). No
+  claim failed and no namespace was destroyed (7200 grants, 5200 of them of a recycled
+  namespace, 7200 resets and 0 destroys in each campaign).
+- **The pool resets 114 to 120 namespaces per second**, whatever the claim rate: a cell ends
+  by dropping every lease at once and the pool works through them 64 at a time. That is this
+  PR's ceiling for starts and stops sustained together, about what building and destroying
+  namespaces reaches (85 to 94 setups/s, 129 to 131 teardowns/s, entry 8), with one difference:
+  the reset is the pool's work after a clone has stopped, and the setup was on the clone's
+  start.
+- **A reset holds `rtnl_mutex` 2.29 ms** (one traced cell at C=128, 2000 resets, `rtnl.py`),
+  where a namespace's build and destroy hold it 24 ms (entry 8): 1.51 ms in pasta's four holds
+  as it exits and starts again, with three expedited RCU grace periods, 0.56 ms in the holder's
+  fourteen (neighbours, the bridge's learned addresses, the address renewal), 0.21 ms in the
+  link watch worker. Of the 2.17 ms on CPU under the mutex, 0.83 is `do_one_broadcast` and 0.68
+  `wireless_nlevent_flush`. By hold time alone about 440 resets a second fit; what else keeps
+  the pool at 114 to 120 is not attributed here. The restart is what the later PRs of the
+  series remove.
+- **Building the pool took 23 to 24 s for 2000 namespaces and destroying it 122 to 123 s.** The
+  destroy is spaced 50 ms a namespace on purpose: the kernel destroys dead namespaces in batches
+  under the mutex, and on this kernel each bridge in a batch is an `rcu_barrier()` of 14 ms
+  (entry 5).
+
+### 8. rootless-net: entry 5's cell again, with tracers that drop nothing
+
+Entry 5's tracer summed a hold from a return probe on `mutex_lock`, and the kernel keeps a
+fixed number of return-probe instances (384 on this host). `kernel.bt` now uses fentry and
+fexit. Same session as entry 7; the start-pieces of the agent PR (before) and of the builder
+PR (after), three traced runs each in turn, C=128, 1000 held, 2000 namespace lives:
+
+| per namespace life | before | after |
+|---|---|---|
+| `rtnl_mutex` hold, ms | 26.44 (26.04 to 26.78) | 24.00 (22.32 to 27.18) |
+| of it `rcu_barrier()` in the netns cleanup worker | 14.33 (14.12 to 14.46) | 14.81 (13.90 to 16.26) |
+| all but that | 12.11 (11.92 to 12.32) | 9.19 (8.21 to 10.93) |
+| the builder: `ip` and the holder's one request, or the holder | 8.13 (7.54 in 34 holds of `ip`, 0.59 in 1 of the holder) | 6.61 (5.76 to 8.15), 14 holds |
+| pasta | 2.37 (2.36 to 2.37) | 0.77 (0.70 to 0.89) |
+| netns cleanup worker, with its barrier | 15.34 (15.14 to 15.47) | 16.18 (15.27 to 17.66) |
+| link watch worker | 0.23 (0.22 to 0.24) | 0.43 (0.40 to 0.48) |
+| IPv6 address worker | 0.37 (0.36 to 0.38) | none |
+| on CPU under the mutex, ms | 8.45 (8.28 to 8.61) | 6.61 (5.77 to 8.06) |
+| of it `wireless_nlevent_flush` | 4.12 (3.92 to 4.26) | 2.75 (2.04 to 3.98) |
+| of it `do_one_broadcast` | 1.62 (1.54 to 1.66) | 1.35 (1.31 to 1.40) |
+
+Untraced, same cell, three runs each in turn: 94 setups/s before (70 to 109) and 85 after (73
+to 106); setup p50 1358 ms (1120 to 1748) and 1483 (1162 to 1662); host CPU per setup 0.144 s
+(0.125 to 0.169) and 0.086 (0.069 to 0.100); teardown 131 and 129 instances/s.
+
+- Outside the barrier the builder holds the mutex 9.19 ms a namespace life where the scripts
+  held 12.11, and the ranges do not overlap. Entry 5 read 10.72 against 11.32 and called them
+  equal; that tracer could drop holds.
+- The builder's 6.61 ms and the 6.61 ms on CPU are two measurements that happen to agree:
+  the first is the time between the holder's lock and unlock (5.92, 8.15 and 5.76 ms in the
+  three runs), the second counts samples of whichever thread held the mutex (5.99, 8.06 and
+  5.77 ms). About 2.6 ms of the 9.19 is held off CPU.
+- The setup rate did not move, as in entry 5: the ranges overlap.
+- Pending a rerun: after these runs the tracers' return programs were made to check which
+  mutex returned (they went by the thread alone, so after a skipped return the thread's next
+  return from `mutex_lock` on another mutex was counted as taking this one), and `tap-summary`
+  to divide a call's summed hold by the holds summed. The requests and acquisitions of these
+  dumps differ by 14 in 94,849 or less, and the tap cells' two counts by 1.5% or less, which
+  bounds how many holds can be affected but not by how much. The traced figures of entries 7
+  and 8 and the "measured again" tap rows are to be measured again with the corrected tools.

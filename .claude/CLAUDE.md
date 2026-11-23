@@ -682,6 +682,27 @@ filter and RUST_LOG=fcvm=info: a guest that panics leaves
 nothing else that says why (on x86 Firecracker logs only `Unexpected exit reason on vcpu run:
 Shutdown`; on arm64 the guest resets through PSCI).
 
+A restore's progress lines are not console lines. Every byte on the 8250 is an MMIO write the
+VMM handles in userspace, and a restore printed about 2.7 KB. From the snapshot boundary until
+10 s later, fc-agent's console writer (`fc-agent/src/console.rs`, "Restore log") holds
+fc-agent's own lines that name no failure and sends them on the output vsock connection once
+the host has acknowledged the restore. fcvm logs them under `fcvm::agent` at INFO, each with
+`logged=`, the guest's clock when the line was logged, which is earlier than the log line's own
+timestamp. One console line, `[fc-agent] restore: N progress lines queued for the host over vsock`,
+is then the only fc-agent line a restore puts on the serial console, and the proof that the
+restored console works (the dead-serial check counts it; `tests/test_serial_console.rs` reads
+any `fcvm::console: [fc-agent]` line as that proof, because a restore that falls back puts its
+progress lines there). fc-agent does this only for a host whose restore document carries
+`agent-log` (`RestoreIdentity::write_into`): an fcvm older than the stream would print the
+lines as the container's stderr. The console still gets everything held so far, each
+line ending in `held_ms=`, as soon as fc-agent logs an `ERROR`, `FATAL`, `WARNING`, `Error:` or
+`VITALS` line or anything that is not its own line (a panic, a child's output, a failpoint),
+when the 10 s pass without an acknowledgement and an output connection made after the
+restore's reconnect request, when that reconnect fails, and when the output connection is
+shut down because the container exited. A guest that
+stops running inside those 10 s without such a line leaves no fc-agent line of the restore;
+the host has no acknowledgement for it. `[fcvm-vitals]` samples always go to the console.
+
 Rules learned the hard way, each from a check that could not fire:
 
 - **Never conclude "no OOM" from a job log.** A job log keeps no guest console line but a crash
@@ -2244,6 +2265,13 @@ cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm �
   the UID/GID maps. It also exits when fcvm's end of its channel closes.
 - `src/network/pasta.rs` (in `start_pasta`) covers the **pasta hop** (rootless mode). Must be
   the last `pre_exec`; includes a `getppid` re-check to close the fork/exec race window.
+- `src/netpool/server.rs` is the **pool hop**: a pooled namespace's holder and pasta are
+  children of `fcvm netpool serve`, through the same two spawns as above, forked from the
+  pool's main thread (the signal follows the forking thread). A clone in a pooled namespace
+  has no holder or pasta of its own; its VMM inherits the lease, and the pool lends the
+  namespace again only when the lease's last holder has exited
+  (`a_killed_pool_leaves_no_process_and_ends_every_lease`,
+  `a_namespace_is_not_lent_while_a_process_of_its_last_lease_runs`, `tests/test_netpool.rs`).
 
 Regression tests: `test_sigkill_reaps_rootless_vm_tree` asserts all three children (firecracker,
 holder, pasta) die when fcvm is SIGKILL'd. `test_root_test_runner_reaps_vm_when_sudo_is_killed`
@@ -2667,6 +2695,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Port forwarding via pasta CLI flags (-t/-u)
 - The holder builds every link over netlink in one `build` request from fcvm (`netns_agent::build`, `src/network/rtnl.rs`); both TAPs are persistent, so the VMM and pasta attach to devices that exist. The bridge takes four netlink requests (create, MTU and `addrgenmode none` while it is down, up after its ports have joined, address) and each TAP one
 - IPv6 supported with `--enable-ipv6` and native DNS proxying
+- `fcvm netpool serve --slots N` (`src/netpool/`) keeps N such namespaces and lends each to one restored clone at a time. The lease is the clone's connection to the pool, which the VMM inherits; the pool resets a returned namespace, checks it against the fingerprint taken at build (`src/network/fingerprint.rs`) and destroys one that differs. A clone with a published port, a cold boot and a clone with no pool build their own. A pooled clone's `holder_pid` is the pool's process: never signal it from a clone
 
 **Routed Architecture** (`src/network/routed.rs`):
 - veth pair connects VM namespace to host with native IPv6 kernel routing (no userspace proxy)

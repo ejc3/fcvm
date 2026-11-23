@@ -409,8 +409,13 @@ async fn apply_restore_epoch(
 ) {
     // A snapshot of a running VM was taken with the agent's console held quiet
     // (`--prepare-snapshot-network`), and this clone inherits that hold. Release it
-    // first, so every line of this restore reaches the console.
-    crate::console::release_source_snapshot_hold();
+    // first, so no line of this restore waits behind it. With a host that takes the
+    // `agent` stream, the release opens the restore log window: this restore's progress
+    // lines go to the host over the output connection once it has acknowledged, and to
+    // the console if anything goes wrong (`console` module doc). With a host that does
+    // not say it takes the stream, no window opens, and one the cache handshake opened
+    // before this document was read ends here.
+    crate::console::release_source_snapshot_hold(metadata.agent_log);
     // Test-only hold between the watcher's read of the restore document and the
     // restore sequence: a guest that stalls here, as one paging its memory in from a
     // cold file does, must still step its clock to the host's (issue 1375).
@@ -478,6 +483,9 @@ async fn apply_restore_epoch(
         );
         crate::system::shutdown_vm(1).await;
     }
+    // The host has the acknowledgement and the output reconnect is requested: the
+    // restore's progress lines may go to the host on that connection.
+    crate::console::restore_log_acknowledged();
     // 6. A container that was running when the snapshot was taken is running in the
     //    clone, and the clone's host process has not been told.
     crate::container::resend_container_started_after_restore().await;

@@ -3637,7 +3637,7 @@ mod tests {
     fn a_restored_clone_releases_the_inherited_console_hold_first() {
         let body = function_body(include_str!("mmds.rs"), "async fn apply_restore_epoch(");
         let released = body
-            .find("crate::console::release_source_snapshot_hold()")
+            .find("crate::console::release_source_snapshot_hold(metadata.agent_log)")
             .expect("the restore no longer releases the console hold it inherits");
         let begun = body
             .find("signals.restore_status.begin()")
@@ -3646,6 +3646,28 @@ mod tests {
         assert!(
             include_str!("agent.rs").contains("crate::console::spawn_source_gate_listener()"),
             "the agent no longer listens for the boundary's console requests"
+        );
+    }
+
+    /// A restore tells the console writer it was acknowledged, after the host has the
+    /// ACK and the output reconnect is requested (`RestoreStatus::succeed`). Nothing
+    /// else does: without the call the restore's progress lines are never queued for
+    /// the host, wait out their window and go to the serial console ten seconds late.
+    #[test]
+    fn a_restore_tells_the_console_it_was_acknowledged_after_it_succeeds() {
+        let body = function_body(include_str!("mmds.rs"), "async fn apply_restore_epoch(");
+        let acked = body
+            .find("crate::vsock::notify_restore_complete(")
+            .expect("the restore acknowledges to the host");
+        let succeeded = body
+            .find("signals.restore_status.succeed()")
+            .expect("the restore publishes its readiness");
+        let told = body
+            .find("crate::console::restore_log_acknowledged();")
+            .expect("the restore never tells the console writer it was acknowledged");
+        assert!(
+            acked < succeeded && succeeded < told,
+            "acked={acked} succeeded={succeeded} told={told}"
         );
     }
 

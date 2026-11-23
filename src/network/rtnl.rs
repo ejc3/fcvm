@@ -23,12 +23,15 @@ const NLM_F_CREATE: u16 = 0x400;
 pub const RTM_NEWLINK: u16 = 16;
 pub const RTM_GETLINK: u16 = 18;
 pub const RTM_NEWADDR: u16 = 20;
+pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_NEWNEIGH: u16 = 28;
 pub const RTM_DELNEIGH: u16 = 29;
 pub const RTM_GETNEIGH: u16 = 30;
+pub const RTM_GETRULE: u16 = 34;
 pub const RTM_GETQDISC: u16 = 38;
+pub const RTM_GETNETCONF: u16 = 82;
 
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
@@ -98,6 +101,84 @@ impl Message {
     }
 }
 
+/// How many times [`Rtnl::dump`] asks for a dump the kernel keeps interrupting.
+const DUMP_ATTEMPTS: usize = 4;
+/// `NLM_F_DUMP_INTR`: set on a dump's messages when the table changed under it.
+const NLM_F_DUMP_INTR: u16 = 0x10;
+const INTERRUPTED_DUMP: &str =
+    "the kernel interrupted the dump: the table changed while it was read";
+
+fn is_interrupted_dump(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted && error.to_string().contains(INTERRUPTED_DUMP)
+}
+
+/// Take the messages of request `sequence` out of one datagram into `messages`, and say
+/// whether the request is finished (its acknowledgement or the end of its dump was in the
+/// datagram).
+///
+/// Errors: a kernel error, in an `NLMSG_ERROR` or in the code an `NLMSG_DONE` carries (a
+/// dump that failed part-way ends with one), and a dump any of whose messages has
+/// `NLM_F_DUMP_INTR`. The last is reported at the dump's end, so the socket is left with
+/// nothing of this request unread.
+fn take_replies(
+    datagram: &[u8],
+    sequence: u32,
+    messages: &mut Vec<Message>,
+    interrupted: &mut bool,
+) -> io::Result<bool> {
+    let mut rest = datagram;
+    while rest.len() >= NLMSG_HDRLEN {
+        let len = u32::from_ne_bytes(rest[0..4].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes(rest[4..6].try_into().unwrap());
+        let flags = u16::from_ne_bytes(rest[6..8].try_into().unwrap());
+        let seq = u32::from_ne_bytes(rest[8..12].try_into().unwrap());
+        if len < NLMSG_HDRLEN || len > rest.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated netlink message",
+            ));
+        }
+        let payload = &rest[NLMSG_HDRLEN..len];
+        rest = rest.get(len.next_multiple_of(4)..).unwrap_or(&[]);
+        if seq != sequence {
+            continue;
+        }
+        if flags & NLM_F_DUMP_INTR != 0 {
+            *interrupted = true;
+        }
+        let code = || {
+            payload
+                .get(0..4)
+                .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
+        };
+        match kind {
+            NLMSG_ERROR => {
+                let code = code().unwrap_or(-libc::EIO);
+                if code != 0 {
+                    return Err(io::Error::from_raw_os_error(-code));
+                }
+                return Ok(true);
+            }
+            NLMSG_DONE => {
+                // The end of a dump carries the dump's own result; an old kernel sends
+                // none, which is success.
+                if let Some(code) = code().filter(|code| *code < 0) {
+                    return Err(io::Error::from_raw_os_error(-code));
+                }
+                if *interrupted {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, INTERRUPTED_DUMP));
+                }
+                return Ok(true);
+            }
+            _ => messages.push(Message {
+                kind,
+                payload: payload.to_vec(),
+            }),
+        }
+    }
+    Ok(false)
+}
+
 /// A NETLINK_ROUTE socket in the calling process's network namespace.
 pub struct Rtnl {
     socket: OwnedFd,
@@ -106,12 +187,18 @@ pub struct Rtnl {
 
 impl Rtnl {
     pub fn open() -> io::Result<Self> {
+        Self::open_protocol(libc::NETLINK_ROUTE)
+    }
+
+    /// A netlink socket of another protocol (`NETLINK_NETFILTER`, `NETLINK_SOCK_DIAG`),
+    /// with the same request, acknowledgement and dump framing.
+    pub fn open_protocol(protocol: libc::c_int) -> io::Result<Self> {
         // SAFETY: socket takes no pointers.
         let fd = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::NETLINK_ROUTE,
+                protocol,
             )
         };
         if fd < 0 {
@@ -120,17 +207,21 @@ impl Rtnl {
         // SAFETY: socket returned a new descriptor nothing else owns.
         let socket = unsafe { OwnedFd::from_raw_fd(fd) };
         // Strict checking makes the kernel refuse a dump request it would otherwise answer
-        // with every object, filter ignored.
+        // with every object, filter ignored. A socket without it is not used: a dump that
+        // silently ignored its filter would read as a namespace's whole state.
         let on: libc::c_int = 1;
         // SAFETY: the option value is one int that outlives the call.
-        unsafe {
+        let set = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
                 libc::SOL_NETLINK,
                 libc::NETLINK_GET_STRICT_CHK,
                 (&on as *const libc::c_int).cast(),
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
+            )
+        };
+        if set != 0 {
+            return Err(io::Error::last_os_error());
         }
         Ok(Self {
             socket,
@@ -163,9 +254,11 @@ impl Rtnl {
     }
 
     /// Read replies to request `sequence` until its acknowledgement or the end of its dump,
-    /// collecting everything else it was sent. A kernel error becomes this call's error.
+    /// collecting everything else it was sent. A kernel error becomes this call's error,
+    /// and so does a dump the kernel says was interrupted ([`take_replies`]).
     fn replies(&mut self, sequence: u32) -> io::Result<Vec<Message>> {
         let mut messages = Vec::new();
+        let mut interrupted = false;
         let mut buffer = vec![0u8; 64 * 1024];
         loop {
             // SAFETY: the buffer is writable for its whole length.
@@ -184,54 +277,39 @@ impl Rtnl {
                 }
                 return Err(error);
             }
-            let mut rest = &buffer[..got as usize];
-            while rest.len() >= NLMSG_HDRLEN {
-                let len = u32::from_ne_bytes(rest[0..4].try_into().unwrap()) as usize;
-                let kind = u16::from_ne_bytes(rest[4..6].try_into().unwrap());
-                let seq = u32::from_ne_bytes(rest[8..12].try_into().unwrap());
-                if len < NLMSG_HDRLEN || len > rest.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "truncated netlink message",
-                    ));
-                }
-                let payload = &rest[NLMSG_HDRLEN..len];
-                rest = rest.get(len.next_multiple_of(4)..).unwrap_or(&[]);
-                if seq != sequence {
-                    continue;
-                }
-                match kind {
-                    NLMSG_ERROR => {
-                        let code = payload
-                            .get(0..4)
-                            .map(|b| i32::from_ne_bytes(b.try_into().unwrap()))
-                            .unwrap_or(-libc::EIO);
-                        if code != 0 {
-                            return Err(io::Error::from_raw_os_error(-code));
-                        }
-                        return Ok(messages);
-                    }
-                    NLMSG_DONE => return Ok(messages),
-                    _ => messages.push(Message {
-                        kind,
-                        payload: payload.to_vec(),
-                    }),
-                }
+            if take_replies(
+                &buffer[..got as usize],
+                sequence,
+                &mut messages,
+                &mut interrupted,
+            )? {
+                return Ok(messages);
             }
         }
     }
 
     /// A change request: sent with `NLM_F_ACK`, done when the kernel acknowledges it.
-    fn change(&mut self, kind: u16, flags: u16, payload: &[u8]) -> io::Result<()> {
+    pub fn change(&mut self, kind: u16, flags: u16, payload: &[u8]) -> io::Result<()> {
         let sequence = self.send(kind, NLM_F_ACK | flags, payload)?;
         self.replies(sequence).map(drop)
     }
 
     /// Every object of one kind in this namespace (`RTM_GET*` with `NLM_F_DUMP`).
     /// `header` is the request's fixed header, zeroed but for the address family.
+    ///
+    /// A dump the kernel marks interrupted (the table changed while it was read, so the
+    /// listing may miss or repeat objects) is asked for again, a few times, and is an error
+    /// after that: a listing known to be inconsistent is never returned.
     pub fn dump(&mut self, kind: u16, header: &[u8]) -> io::Result<Vec<Message>> {
-        let sequence = self.send(kind, NLM_F_DUMP, header)?;
-        self.replies(sequence)
+        let mut last = None;
+        for _ in 0..DUMP_ATTEMPTS {
+            let sequence = self.send(kind, NLM_F_DUMP, header)?;
+            match self.replies(sequence) {
+                Err(error) if is_interrupted_dump(&error) => last = Some(error),
+                other => return other,
+            }
+        }
+        Err(last.expect("at least one attempt was made"))
     }
 
     /// `ip link add NAME address MAC type bridge`.
@@ -288,6 +366,83 @@ impl Rtnl {
         attr(&mut payload, IFA_LOCAL, &address.octets());
         attr(&mut payload, IFA_ADDRESS, &address.octets());
         self.change(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &payload)
+    }
+}
+
+const NDA_DST: u16 = 1;
+impl Rtnl {
+    /// Delete the neighbour entry for `address` (4 or 16 bytes) on link `index`, whatever
+    /// its state: `ip neigh del ADDRESS dev INDEX`.
+    pub fn del_neighbour(&mut self, index: u32, family: u8, address: &[u8]) -> io::Result<()> {
+        // struct ndmsg: family, two pad bytes, a pad short, index, state, flags, type.
+        let mut payload = vec![family, 0, 0, 0];
+        payload.extend_from_slice(&(index as i32).to_ne_bytes());
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        attr(&mut payload, NDA_DST, address);
+        self.change(RTM_DELNEIGH, 0, &payload)
+    }
+
+    /// Have the bridge `index` forget every address it learned:
+    /// `ip link set dev BRIDGE type bridge fdb_flush`. The kernel removes the entries that
+    /// are not static, on every port; a port's own address and an entry added to stay are
+    /// static and remain.
+    ///
+    /// Not one `RTM_DELNEIGH` per entry (`bridge fdb del`): Linux 6.14 refuses that
+    /// request with EPERM to the root of an unprivileged user's namespace (seen on the
+    /// x86_64 CI runners, 6.14.0-1018-aws; 7.0 and later allow it), which failed every
+    /// reset there. That 6.14 refuses it is known from those runs' error, not from reading
+    /// its source. A link change needs CAP_NET_ADMIN in the namespace's own user
+    /// namespace only, and it is the request this module already makes to build the
+    /// bridge.
+    pub fn flush_learned_addresses(&mut self, index: u32) -> io::Result<()> {
+        const IFLA_INFO_DATA: u16 = 2;
+        const IFLA_BR_FDB_FLUSH: u16 = 21;
+        let mut data = Vec::new();
+        attr(&mut data, IFLA_BR_FDB_FLUSH, &[]);
+        let mut info = Vec::new();
+        attr(&mut info, IFLA_INFO_KIND, b"bridge\0");
+        attr(&mut info, IFLA_INFO_DATA, &data);
+        let mut payload = ifinfomsg(index, 0, 0);
+        attr(&mut payload, IFLA_LINKINFO, &info);
+        self.change(RTM_NEWLINK, 0, &payload)
+    }
+
+    /// Remove every IPv4 address of this namespace that is not loopback's and add it
+    /// again, and return how many there were.
+    ///
+    /// The kernel keeps what it learned about a destination from ICMP (a path MTU from
+    /// "fragmentation needed", a gateway from a redirect) on the route that leads there, for
+    /// ten minutes, and no netlink request deletes such an entry. Removing an address
+    /// removes its connected and local routes and everything kept on them; adding it again
+    /// makes the routes anew. `ip route flush cache` does the same through a file under
+    /// /proc/sys, which a namespace of an unprivileged user does not have and whose lookup
+    /// takes a lock every other namespace's lookups take.
+    pub fn renew_addresses(&mut self) -> io::Result<usize> {
+        const IFA_BROADCAST: u16 = 4;
+        const RT_SCOPE_HOST: u8 = 254;
+        let addresses = self.dump(RTM_GETADDR, &[libc::AF_INET as u8, 0, 0, 0, 0, 0, 0, 0])?;
+        let mut renewed = 0;
+        for address in addresses {
+            let Some(header) = address.payload.get(..8) else {
+                continue;
+            };
+            if header[3] == RT_SCOPE_HOST {
+                continue;
+            }
+            // struct ifaddrmsg as dumped, without the flags the kernel set on its own
+            // (permanent), and the attributes that say what the address is.
+            let mut payload = vec![header[0], header[1], 0, header[3]];
+            payload.extend_from_slice(&header[4..8]);
+            for (kind, value) in address.attrs(8) {
+                if [IFA_ADDRESS, IFA_LOCAL, IFA_BROADCAST].contains(&kind) {
+                    attr(&mut payload, kind, value);
+                }
+            }
+            self.change(RTM_DELADDR, 0, &payload)?;
+            self.change(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &payload)?;
+            renewed += 1;
+        }
+        Ok(renewed)
     }
 }
 
@@ -350,6 +505,99 @@ pub fn add_tap(name: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One netlink message: header and payload, padded.
+    fn message(kind: u16, flags: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = ((NLMSG_HDRLEN + payload.len()) as u32)
+            .to_ne_bytes()
+            .to_vec();
+        bytes.extend_from_slice(&kind.to_ne_bytes());
+        bytes.extend_from_slice(&flags.to_ne_bytes());
+        bytes.extend_from_slice(&sequence.to_ne_bytes());
+        bytes.extend_from_slice(&0u32.to_ne_bytes());
+        bytes.extend_from_slice(payload);
+        bytes.resize(bytes.len().next_multiple_of(4), 0);
+        bytes
+    }
+
+    fn taken(datagrams: &[Vec<u8>]) -> io::Result<(bool, usize)> {
+        let (mut messages, mut interrupted, mut done) = (Vec::new(), false, false);
+        for datagram in datagrams {
+            done = take_replies(datagram, 7, &mut messages, &mut interrupted)?;
+        }
+        Ok((done, messages.len()))
+    }
+
+    /// A dump is whole only when the kernel says so: its end carries no error and none of
+    /// its messages was marked interrupted. Anything else is an error, never a shorter
+    /// listing: the pool's check of a namespace is made of these listings.
+    #[test]
+    fn a_dump_that_failed_or_was_interrupted_is_an_error() {
+        const NLM_F_MULTI: u16 = 0x2;
+        let object = |flags| message(RTM_NEWLINK, NLM_F_MULTI | flags, 7, &[1u8; 16]);
+        let done = |code: i32| message(NLMSG_DONE, NLM_F_MULTI, 7, &code.to_ne_bytes());
+
+        let whole = [[object(0), object(0)].concat(), done(0)];
+        assert_eq!(taken(&whole).unwrap(), (true, 2));
+        // Not finished until the end arrives; another request's messages are not counted.
+        assert_eq!(taken(&whole[..1]).unwrap(), (false, 2));
+        let other = message(RTM_NEWLINK, NLM_F_MULTI, 8, &[1u8; 16]);
+        assert_eq!(
+            taken(&[[other, object(0)].concat(), done(0)]).unwrap(),
+            (true, 1)
+        );
+        // A kernel before the code existed ends a dump with an empty payload.
+        let bare = message(NLMSG_DONE, NLM_F_MULTI, 7, &[]);
+        assert_eq!(taken(&[object(0), bare]).unwrap(), (true, 1));
+
+        let failed = taken(&[object(0), done(-libc::ENOMEM)]).unwrap_err();
+        assert_eq!(failed.raw_os_error(), Some(libc::ENOMEM));
+
+        // Interrupted on an object in an earlier datagram, reported at the end.
+        let marked = [object(0), object(NLM_F_DUMP_INTR), object(0)];
+        assert_eq!(taken(&marked).unwrap(), (false, 3));
+        let interrupted = taken(&[marked.concat(), done(0)]).unwrap_err();
+        assert!(is_interrupted_dump(&interrupted), "{interrupted}");
+        // Or on the end itself.
+        let end = message(
+            NLMSG_DONE,
+            NLM_F_MULTI | NLM_F_DUMP_INTR,
+            7,
+            &0i32.to_ne_bytes(),
+        );
+        assert!(is_interrupted_dump(&taken(&[object(0), end]).unwrap_err()));
+        // EINTR from recv is another thing.
+        assert!(!is_interrupted_dump(&io::Error::from_raw_os_error(
+            libc::EINTR
+        )));
+
+        let refused = message(NLMSG_ERROR, 0, 7, &(-libc::EPERM).to_ne_bytes());
+        assert_eq!(
+            taken(&[refused]).unwrap_err().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        let acknowledged = message(NLMSG_ERROR, 0, 7, &0i32.to_ne_bytes());
+        assert_eq!(taken(&[acknowledged]).unwrap(), (true, 0));
+    }
+
+    /// Every socket has strict checking on, or is not handed out.
+    #[test]
+    fn a_socket_has_strict_checking_on() {
+        let rtnl = Rtnl::open().unwrap();
+        let mut on: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: both pointers are to locals that outlive the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                rtnl.socket.as_raw_fd(),
+                libc::SOL_NETLINK,
+                libc::NETLINK_GET_STRICT_CHK,
+                (&mut on as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!((rc, on), (0, 1));
+    }
 
     /// An attribute is its four-byte header, its value, and zeros up to a multiple of four;
     /// the length in the header does not count the padding.
