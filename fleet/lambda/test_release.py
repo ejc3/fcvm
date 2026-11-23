@@ -1060,7 +1060,21 @@ class AwsCli(unittest.TestCase):
         calls = []
 
         def fake(args, input=None, capture_output=None, text=None):
-            calls.append((args, input))
+            body = None
+            if "--cli-input-json" in args:
+                # The CLI opens the named path twice and parses the second read (aws-cli 2.32).
+                # Standard input is a pipe: the first read drains it.
+                path = args[args.index("--cli-input-json") + 1].removeprefix("file://")
+                reads = [input, ""] if path == "/dev/stdin" else [Path(path).read_text(), Path(path).read_text()]
+                body = reads[1]
+                try:
+                    json.loads(body)
+                except ValueError:
+                    calls.append((args, body))
+                    return type("R", (), {"returncode": 252, "stdout": "", "stderr":
+                                          "An error occurred (ParamValidation): Error parsing parameter "
+                                          "'cli-input-json': Invalid JSON received."})()
+            calls.append((args, body))
             code, out, err = responses.pop(0)
             return type("R", (), {"returncode": code, "stdout": out, "stderr": err})()
         return calls, patch.object(release.subprocess, "run", side_effect=fake)
@@ -1075,6 +1089,8 @@ class AwsCli(unittest.TestCase):
             release.Ecr(release.REPOSITORIES["stage"]).put("keep-stage-current", image)  # already there: nothing to do
         args, body = calls[0]
         self.assertEqual(args[:3], ["aws", "ecr", "put-image"])
+        # The request file is gone once the command returns.
+        self.assertFalse(Path(args[args.index("--cli-input-json") + 1].removeprefix("file://")).exists())
         self.assertIn("us-east-1", args)
         self.assertEqual(json.loads(body), {
             "repositoryName": "fcvm-fleet/lambda-tile", "imageTag": "keep-stage-current",

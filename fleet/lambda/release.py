@@ -122,9 +122,20 @@ class Ecr:
         return f"{self.registry}.dkr.ecr.{self.region}.amazonaws.com/{self.repository}"
 
     def aws(self, args, body=None):
+        """Run one command. `body` is the request as JSON, for a command whose arguments would not
+        fit a command line. It goes in a file: the CLI opens the path --cli-input-json names twice
+        (aws-cli 2.32, two openat calls under strace), and a pipe is empty the second time, which
+        the CLI reports as "Invalid JSON received"."""
         account = [] if self.registry is None or body is not None else ["--registry-id", self.registry]
-        result = subprocess.run(["aws", "ecr", *args, *account, "--region", self.region, "--output", "json"],
-                                input=body, capture_output=True, text=True)
+        with contextlib.ExitStack() as stack:
+            request = []
+            if body is not None:
+                file = stack.enter_context(tempfile.NamedTemporaryFile("w", suffix=".json"))
+                file.write(body)
+                file.flush()
+                request = ["--cli-input-json", "file://" + file.name]
+            result = subprocess.run(["aws", "ecr", *args, *request, *account, "--region", self.region,
+                                     "--output", "json"], capture_output=True, text=True)
         if result.returncode:
             found = AWS_ERROR.search(result.stderr or "")
             raise CommandFailed(found.group(1) if found else None)
@@ -159,7 +170,7 @@ class Ecr:
                            "repositoryName": self.repository, "imageTag": tag, "imageDigest": image.digest,
                            "imageManifest": image.manifest, "imageManifestMediaType": image.media_type})
         try:
-            out = self.aws(["put-image", "--cli-input-json", "file:///dev/stdin"], body=body)
+            out = self.aws(["put-image"], body=body)
         except CommandFailed as error:
             # The tag is on this image already.
             if error.code == "ImageAlreadyExistsException":
