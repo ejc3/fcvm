@@ -421,10 +421,6 @@ class PrepOwnsItsChildren(FakeBase):
         self.assertEqual((rec["baseline_pid"], rec["serve_pid"]), (4242, 4243))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class StoreQueueDepths(unittest.TestCase):
     def tree(self, root, devices):
         for path, value in devices.items():
@@ -453,3 +449,30 @@ class StoreQueueDepths(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             self.assertIsNone(startrate.store_queue_depths("nvme9n1", Path(root)))
             self.assertIsNone(startrate.store_queue_depths("", Path(root)))
+
+    def partition(self, root, disk, part):
+        (Path(root) / disk / part).mkdir(parents=True)
+        (Path(root) / part).symlink_to(Path(root) / disk / part)
+
+    def test_a_partition_reports_its_disk(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root, {"nvme0n1": 255})
+            self.partition(root, "nvme0n1", "nvme0n1p1")
+            self.assertEqual(startrate.store_queue_depths("nvme0n1p1", Path(root)), {"nvme0n1": 255})
+
+    def test_an_md_device_over_partitions_reports_their_disks(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root, {"md127": 128, "nvme1n1": 127, "nvme2n1": 127})
+            slaves = Path(root) / "md127" / "slaves"
+            slaves.mkdir()
+            for disk in ("nvme1n1", "nvme2n1"):
+                self.partition(root, disk, disk + "p1")
+                (slaves / (disk + "p1")).symlink_to(Path(root) / disk / (disk + "p1"))
+            self.assertEqual(
+                startrate.store_queue_depths("md127", Path(root)),
+                {"nvme1n1": 127, "nvme2n1": 127},
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

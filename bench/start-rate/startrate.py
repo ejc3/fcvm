@@ -102,13 +102,17 @@ def imds(path):
 def store_queue_depths(dev, sys_block=Path("/sys/class/block")):
     """`nr_requests` of the store's devices: of each member when the device has members (an
     md RAID0 over NVMe disks, whose own queue says nothing about theirs), else of the device
-    itself. A device or value that cannot be read is left out; none at all gives None."""
+    itself. A partition has no queue of its own, so its disk's is read. A device or value that
+    cannot be read is left out; none at all gives None."""
     if not dev:
         return None
     base = sys_block / dev
     members = sorted((base / "slaves").glob("*")) if (base / "slaves").is_dir() else []
     depths = {}
     for d in members or [base]:
+        d = d.resolve()
+        if not (d / "queue").is_dir():
+            d = d.parent
         try:
             depths[d.name] = int((d / "queue" / "nr_requests").read_text())
         except (OSError, ValueError):
