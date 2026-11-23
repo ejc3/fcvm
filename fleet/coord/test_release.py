@@ -2699,7 +2699,9 @@ class ProdStepTests(unittest.TestCase):
         for name, id_ in (("Worker", "worker"), ("Coordinator", "coordinator"), ("Host and tile images", "images")):
             self.assertRegex(rollback, r"      - name: " + re.escape(name) + r"\n        id: " + id_ + r"\n")
         self.assertIn("IMAGES: ${{ steps.images.outcome }}", step)
-        self.assertIn("CANCELLED: ${{ cancelled() }}", step)
+        self.assertIn("CANCELLED: ${{ job.status == 'cancelled' }}", step)
+        # Status functions such as cancelled() are valid only in `if:`; in a step's env they make the whole file invalid.
+        self.assertNotRegex(workflow, r"(?m)^\s+[A-Z_]+: \$\{\{[^}]*\b(cancelled|always|success|failure)\(\)")
 
     def test_an_image_rollback_returns_only_to_the_previous_release(self):
         new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}

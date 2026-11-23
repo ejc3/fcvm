@@ -410,7 +410,7 @@ jobs:
           WORKER: ${{ steps.worker.outcome }}
           COORDINATOR: ${{ steps.coordinator.outcome }}
           IMAGES: ${{ steps.images.outcome }}
-          CANCELLED: ${{ cancelled() }}
+          CANCELLED: ${{ job.status == 'cancelled' }}
         run: |
           if [ "$CANCELLED" = true ]; then
             echo "::error::the promotion failed, and returning prod to its previous set was cancelled (Worker $WORKER, Coordinator $COORDINATOR, Host and tile images $IMAGES): prod may run parts of both sets"
