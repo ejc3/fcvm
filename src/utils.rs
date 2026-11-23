@@ -2249,7 +2249,10 @@ mod tests {
             ),
             "{log:?}"
         );
-        assert!(!log.contains(CONSOLE_TARGET), "{log:?}");
+        assert!(
+            log.contains(AGENT_TARGET) && !log.contains(CONSOLE_TARGET),
+            "{log:?}"
+        );
         assert_eq!(
             parse_agent_line("1795332623000000 [fc-agent] x y"),
             Some(("2026-11-22T07:30:23.000000Z".to_string(), "[fc-agent] x y"))

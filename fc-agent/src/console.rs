@@ -100,9 +100,9 @@ const PENDING_CAP: usize = 1024 * 1024;
 /// How long after a snapshot boundary a restore's progress lines are kept off the console
 /// (see the module doc). A restore that has not been acknowledged and reconnected by then
 /// gets its lines on the console, so a restore that hangs shows where within this bound.
-/// Above every healthy restore measured (resume to ready is tens of milliseconds alone and
-/// 1.3 to 2.7 s at the median in a 128-way ramp on the File backend) and far below the
-/// 15 minutes the host waits for the acknowledgement.
+/// Resume to ready takes tens of milliseconds alone. In 128-way ramps to 1000 clones on
+/// the File backend its 99th percentile was 4 to 8 s, and 2 of 6,000 clones took over 10 s.
+/// The host waits 15 minutes for the acknowledgement.
 const RESTORE_LOG_WINDOW: Duration = Duration::from_secs(10);
 
 /// Upper bound on progress lines held for the host. Past it the window ends and they go to
