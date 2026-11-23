@@ -2005,14 +2005,53 @@ mod proactive_compaction_tests {
     #[test]
     fn the_boot_mode_is_recorded_before_any_snapshot_of_the_guest() {
         let source = include_str!("agent.rs");
-        let run = &source[source.find("pub async fn run() -> Result<()> {").unwrap()..];
+        assert_eq!(record_precedes_snapshot(source), Ok(()));
+        // The check reads `run` alone. It read on to the end of the file before, where
+        // this module's own text holds both needles: a `run` that no longer offered the
+        // snapshot, or no longer recorded the mode ahead of it, still passed.
+        let offer = "container::notify_cache_ready_and_wait(&facts.digest, &restore_flag)";
+        let code = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        assert!(
+            code.contains(offer),
+            "run no longer offers the snapshot this way"
+        );
+        let without_offer = source.replacen(offer, "Ok::<(), anyhow::Error>(())", 1);
+        assert_eq!(
+            record_precedes_snapshot(&without_offer),
+            Err("the boot no longer offers the pre-start snapshot".to_string())
+        );
+        let record = "    thp::record_boot_default();\n";
+        let unrecorded = source.replacen(record, "", 1);
+        assert_eq!(
+            record_precedes_snapshot(&unrecorded),
+            Err("the boot no longer records the huge page mode".to_string())
+        );
+        let late = unrecorded.replacen(offer, &format!("{offer};\n{record}"), 1);
+        assert!(record_precedes_snapshot(&late)
+            .unwrap_err()
+            .starts_with("the huge page mode is recorded after the snapshot is offered"));
+    }
+
+    /// Whether `run` in `source` records the boot mode before it offers the pre-start
+    /// snapshot.
+    fn record_precedes_snapshot(source: &str) -> Result<(), String> {
+        let run = &source[source
+            .find("pub async fn run() -> Result<()> {")
+            .ok_or("no run")?..];
+        let run = &run[..run.find("\n}\n").ok_or("run does not end")?];
         let record = run
             .find("thp::record_boot_default();")
-            .expect("the boot no longer records the huge page mode");
+            .ok_or("the boot no longer records the huge page mode")?;
         let snapshot = run
             .find("container::notify_cache_ready_and_wait(")
-            .expect("the boot no longer offers the pre-start snapshot");
-        assert!(record < snapshot, "record={record} snapshot={snapshot}");
+            .ok_or("the boot no longer offers the pre-start snapshot")?;
+        if record < snapshot {
+            Ok(())
+        } else {
+            Err(format!(
+                "the huge page mode is recorded after the snapshot is offered: record={record} snapshot={snapshot}"
+            ))
+        }
     }
 }
 
