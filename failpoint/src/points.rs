@@ -14,6 +14,8 @@ pub const HOST_POINTS: &[&str] = &[
     "fleet.agent.slot_running",
     "health.pre_persist_healthy",
     "lifecycle.before_ready_claim",
+    "pool.post_claim",
+    "pool.pre_reset",
     "restore.locked",
     "restore.post_clone_disk",
     "restore.pre_spawn_vmm",

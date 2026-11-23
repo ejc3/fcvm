@@ -1057,6 +1057,143 @@ fn test_sigkill_reaps_rootless_vm_tree() -> Result<()> {
     Ok(())
 }
 
+/// A namespace pool's holders and pastas die with the pool (`fcvm netpool serve`), each by
+/// its own parent-death signal.
+///
+/// Same method as [`test_sigkill_reaps_rootless_vm_tree`]: every child is stopped before the
+/// pool is killed, so a holder cannot exit on its owner's closed channel and passt's PID
+/// watch cannot end a pasta, and each child's process group is anchored, so the kernel
+/// does not continue it. Only a SIGKILL from the kernel ends a child then. A pooled
+/// namespace has no VM's fcvm above it; the pool is the hop.
+#[test]
+fn test_sigkill_reaps_a_namespace_pools_holders_and_pastas() -> Result<()> {
+    const SLOTS: usize = 2;
+    let fcvm_path = common::find_fcvm_binary()?;
+    let data_dir = std::path::PathBuf::from(format!(
+        "/mnt/fcvm-btrfs/netpool-sigkill-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&data_dir)?;
+    let mut cmd = Command::new(&fcvm_path);
+    cmd.args(["netpool", "serve", "--slots", &SLOTS.to_string()])
+        .env("FCVM_DATA_DIR", &data_dir);
+    common::set_test_pdeathsig_std(&mut cmd);
+    let mut pool = cmd.spawn().context("starting the pool")?;
+    let pool_pid = pool.id();
+    let abandon = |pool: &mut std::process::Child| {
+        let _ = pool.kill();
+        let _ = pool.wait();
+        let _ = std::fs::remove_dir_all(&data_dir);
+    };
+
+    // Every namespace built: the pool says so, and it has a holder and a pasta for each.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let stats = Command::new(&fcvm_path)
+            .args(["netpool", "stats"])
+            .env("FCVM_DATA_DIR", &data_dir)
+            .output()?;
+        let ready = serde_json::from_slice::<serde_json::Value>(&stats.stdout)
+            .ok()
+            .and_then(|stats| stats["ready"].as_u64());
+        if ready == Some(SLOTS as u64) {
+            break;
+        }
+        if std::time::Instant::now() > deadline || pool.try_wait()?.is_some() {
+            abandon(&mut pool);
+            anyhow::bail!("the pool did not build its namespaces (ready: {ready:?})");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut children: Vec<(String, Tracked)> = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pool_pid}/task"))?.flatten() {
+        let list = std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+        for pid in list.split_whitespace().filter_map(|pid| pid.parse().ok()) {
+            if let Some(tracked) = Tracked::capture(pid) {
+                children.push((proc_comm(pid).unwrap_or_default(), tracked));
+            }
+        }
+    }
+    let holders = children
+        .iter()
+        .filter(|(comm, _)| comm == "fcvm-netns")
+        .count();
+    let pastas = children
+        .iter()
+        .filter(|(comm, _)| comm.starts_with("pasta"))
+        .count();
+    if (children.len(), holders, pastas) != (2 * SLOTS, SLOTS, SLOTS) {
+        let found: Vec<&String> = children.iter().map(|(comm, _)| comm).collect();
+        abandon(&mut pool);
+        anyhow::bail!("the pool's children are {found:?}, not {SLOTS} holders and {SLOTS} pastas");
+    }
+    let tree: [(String, Tracked); 2 * SLOTS] = children
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("counted above"));
+    let _children = KillOnDrop([tree[0].1, tree[1].1, tree[2].1, tree[3].1]);
+
+    let mut anchors = Vec::new();
+    for (role, t) in &tree {
+        match anchor_process_group(t.pid) {
+            Ok(anchor) => anchors.push(anchor),
+            Err(e) => {
+                abandon(&mut pool);
+                return Err(e).with_context(|| format!("anchoring the group of {role}"));
+            }
+        }
+    }
+    for (role, t) in &tree {
+        if let Err(e) = t.signal(libc::SIGSTOP) {
+            abandon(&mut pool);
+            anyhow::bail!("SIGSTOP to {role} (PID {}): {e}", t.pid);
+        }
+    }
+    let stop_deadline = std::time::Instant::now() + EXIT_BOUND;
+    while !tree
+        .iter()
+        .all(|(_, t)| matches!(proc_sample(t.pid), Some(s) if s.start == t.start && s.state == 'T'))
+    {
+        if std::time::Instant::now() > stop_deadline {
+            abandon(&mut pool);
+            anyhow::bail!("the pool's children did not reach the stopped state");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    send_signal(pool_pid, "KILL").context("sending SIGKILL to the pool")?;
+    let _ = pool.wait();
+    let killed = std::time::Instant::now();
+    let _anchors = anchors;
+
+    let signalled = seen_signalled::<4>(|i| tree[i].1.fate(), Duration::from_secs(10));
+    let unsignalled: Vec<String> = tree
+        .iter()
+        .zip(signalled)
+        .filter(|(_, s)| !s)
+        .map(|((role, t), _)| format!("{role} (PID {})", t.pid))
+        .collect();
+    assert!(
+        unsignalled.is_empty(),
+        "the pool was SIGKILLed and these children were never sent SIGKILL: {unsignalled:?}. \
+         Each was stopped first, so only the kernel could end it: its hop did not arm \
+         PR_SET_PDEATHSIG, or it was not forked from a thread that lives as long as the pool."
+    );
+    while killed.elapsed() < EXIT_BOUND && tree.iter().any(|(_, t)| t.fate() != Fate::Dead) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stuck: Vec<String> = tree
+        .iter()
+        .filter(|(_, t)| t.fate() != Fate::Dead)
+        .map(|(role, t)| format!("{role} (PID {}): {}", t.pid, exit_diagnostics(t.pid)))
+        .collect();
+    assert!(
+        stuck.is_empty(),
+        "sent SIGKILL but not gone {EXIT_BOUND:?} later: {stuck:?}"
+    );
+    let _ = std::fs::remove_dir_all(&data_dir);
+    Ok(())
+}
+
 /// The `sudo` hop in the CI process tree must not break VM teardown.
 ///
 /// `make test-root` runs cargo-nextest UNPRIVILEGED and elevates only the test binary, via

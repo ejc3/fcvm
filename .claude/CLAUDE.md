@@ -2264,6 +2264,13 @@ cargo-nextest (uid 1000) → sudo (ruid 1000) → test binary (uid 0) → fcvm �
   the UID/GID maps. It also exits when fcvm's end of its channel closes.
 - `src/network/pasta.rs` (in `start_pasta`) covers the **pasta hop** (rootless mode). Must be
   the last `pre_exec`; includes a `getppid` re-check to close the fork/exec race window.
+- `src/netpool/server.rs` is the **pool hop**: a pooled namespace's holder and pasta are
+  children of `fcvm netpool serve`, through the same two spawns as above, forked from the
+  pool's main thread (the signal follows the forking thread). A clone in a pooled namespace
+  has no holder or pasta of its own; its VMM inherits the lease, and the pool lends the
+  namespace again only when the lease's last holder has exited
+  (`a_killed_pool_leaves_no_process_and_ends_every_lease`,
+  `a_namespace_is_not_lent_while_a_process_of_its_last_lease_runs`, `tests/test_netpool.rs`).
 
 Regression tests: `test_sigkill_reaps_rootless_vm_tree` asserts all three children (firecracker,
 holder, pasta) die when fcvm is SIGKILL'd. `test_root_test_runner_reaps_vm_when_sudo_is_killed`
@@ -2687,6 +2694,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Port forwarding via pasta CLI flags (-t/-u)
 - The holder builds every link over netlink in one `build` request from fcvm (`netns_agent::build`, `src/network/rtnl.rs`); both TAPs are persistent, so the VMM and pasta attach to devices that exist. The bridge takes four netlink requests (create, MTU and `addrgenmode none` while it is down, up after its ports have joined, address) and each TAP one
 - IPv6 supported with `--enable-ipv6` and native DNS proxying
+- `fcvm netpool serve --slots N` (`src/netpool/`) keeps N such namespaces and lends each to one restored clone at a time. The lease is the clone's connection to the pool, which the VMM inherits; the pool resets a returned namespace, checks it against the fingerprint taken at build (`src/network/fingerprint.rs`) and destroys one that differs. A clone with a published port, a cold boot and a clone with no pool build their own. A pooled clone's `holder_pid` is the pool's process: never signal it from a clone
 
 **Routed Architecture** (`src/network/routed.rs`):
 - veth pair connects VM namespace to host with native IPv6 kernel routing (no userspace proxy)

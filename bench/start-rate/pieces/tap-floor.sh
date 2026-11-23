@@ -4,7 +4,10 @@
 # pasta), split between the held set and the cell's own ops.
 # Usage: tap-floor.sh OUT_ROOT   (env: TOTAL, default 2000; RUNGS, C:COUNT pairs;
 #        NO_PASTA=1 for namespaces with the TAP and bridge and no pasta;
-#        WARM, attach and detach cycles before the timed one, default 1)
+#        WARM, attach and detach cycles before the timed one, default 1;
+#        HOLD_MS, how long the helper stays attached, default 20. The link watch worker
+#        handles a carrier-on that is not urgent up to a second after it, so only a helper
+#        attached for longer than that has its carrier-on and carrier-off handled apart)
 # OUT_ROOT/plain holds the measured cells, OUT_ROOT/traced the same cells under tap.bt
 # (their timings are not measurements), with a tap-summary.json in each traced cell.
 set -uo pipefail
@@ -12,7 +15,7 @@ out_root=$1
 TOTAL=${TOTAL:-2000}
 RUNGS=${RUNGS:-"1:200 32:400 128:1000 512:1000"}
 here=$(cd "$(dirname "$0")" && pwd)
-extra="--tap-warm-cycles ${WARM:-1} ${NO_PASTA:+--tap-no-pasta}"
+extra="--tap-warm-cycles ${WARM:-1} --tap-hold-ms ${HOLD_MS:-20} ${NO_PASTA:+--tap-no-pasta}"
 bin=${START_PIECES:-$here/../../../target/release/start-pieces}
 for rung in $RUNGS; do
   n=${rung##*:}

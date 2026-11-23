@@ -169,6 +169,11 @@ impl CloudHypervisorBackend {
         if let Some(path) = &spec.net_namespace_path {
             self.namespace.net_namespace_path = Some(path.clone());
         }
+        // An empty list keeps what an earlier spawn set, as the fields below do: a relaunch
+        // after a guest reboot passes a minimal spec.
+        if !spec.keep_fds.is_empty() {
+            self.namespace.keep_fds = spec.keep_fds.clone();
+        }
         if let Some(redirects) = &spec.mount_redirects {
             self.namespace.mount_redirects = Some(redirects.clone());
         }

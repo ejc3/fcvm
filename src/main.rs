@@ -204,6 +204,10 @@ async fn run(cli: cli::Cli) -> Result<()> {
         }
         Commands::Fleet(args) => fcvm::fleet::cmd_fleet(args).await,
         Commands::Vm(args) => commands::cmd_vm(args).await,
+        Commands::Netpool(args) => match args.cmd {
+            cli::NetpoolCommands::Serve(serve) => fcvm::netpool::server::serve(serve.slots).await,
+            cli::NetpoolCommands::Stats => fcvm::netpool::client::print_stats().await,
+        },
     };
 
     if let Some(scope) = scope {

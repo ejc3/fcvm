@@ -50,7 +50,8 @@ fn runtime_workers_with(cmd: &Commands, env: Option<&str>) -> Option<usize> {
         | Commands::Exec(_)
         | Commands::Ls(_)
         | Commands::Snapshots(_)
-        | Commands::Balloon(_) => Some(VM_COMMAND_WORKERS),
+        | Commands::Balloon(_)
+        | Commands::Netpool(_) => Some(VM_COMMAND_WORKERS),
         _ => None,
     }
 }

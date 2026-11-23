@@ -67,6 +67,16 @@ def summarize(text, ops):
     total = scalar(text, "rtnl_hold_us_total")
     if not total:
         raise SystemExit("the dump holds no rtnl_hold_us_total: the tracer did not run or was cut off")
+    # Both ends of every acquisition are counted. A thread or two can be between the two when
+    # the tracer stops, and the kernel skips a run of an fentry or fexit program that is
+    # already running on the same CPU (a task preempted inside it): 14 of 94,849 requests in
+    # one cell at C=128 on 192 CPUs. A hold whose end was skipped is not summed, so the sums
+    # are short by at most the share that differs; over 0.5% the dump is refused.
+    requests = scalar(text, "rtnl_requests")
+    acquired = scalar(text, "rtnl_acquired") + scalar(text, "rtnl_interrupted")
+    if not requests or abs(requests - acquired) > max(2, 0.005 * requests):
+        raise SystemExit(f"the dump counts {requests} requests for rtnl_mutex and {acquired} acquisitions: "
+                         "the tracer dropped events, or the dump is from one that could")
     barrier = scalar(text, "rcu_barrier_us_under_rtnl")
     expedited = collections.Counter()
     for key, n in maps(text, "rcu_exp").items():

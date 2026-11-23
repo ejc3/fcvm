@@ -276,9 +276,16 @@ fn pick_owner_dir(
 
 /// [`owner_dir`] under an explicit data directory.
 pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
+    owner_dir_under(data_dir, "reclaim")
+}
+
+/// This user's directory under `<data_dir>/<area>/`, made and checked as the owner records'
+/// directory is: mode 0700, owned by this user, refused when anyone else can write it. Root
+/// and a user share a data directory but never such a directory.
+pub fn owner_dir_under(data_dir: &Path, area: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating data directory {}", data_dir.display()))?;
-    let shared = data_dir.join("reclaim");
+    let shared = data_dir.join(area);
     match std::fs::DirBuilder::new().mode(0o1777).create(&shared) {
         // Like /tmp: every user makes a directory of its own here, and the sticky bit
         // keeps users from removing each other's. The umask cleared some of the bits.
@@ -303,7 +310,7 @@ pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
         std::fs::symlink_metadata(&mine).with_context(|| format!("reading {}", mine.display()))?;
     if !metadata.is_dir() || metadata.uid() != euid || metadata.mode() & 0o022 != 0 {
         bail!(
-            "refusing owner records in {}: it must be a directory owned by uid {euid} that \
+            "refusing this user's directory {}: it must be a directory owned by uid {euid} that \
              no one else can write (found uid {}, mode {:o}{})",
             mine.display(),
             metadata.uid(),

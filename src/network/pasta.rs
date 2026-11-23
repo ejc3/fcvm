@@ -66,6 +66,10 @@ pub const GUEST_MTU: u32 = 65520;
 /// TAP device name for pasta
 const PASTA_DEVICE_NAME: &str = "pasta0";
 
+/// What a VM in a pooled namespace reports when the pool ends its lease.
+const LEASE_ENDED: &str = "the namespace pool ended this VM's lease: the pool exited, or the \
+     holder or pasta of the VM's namespace did";
+
 /// Timeout for waiting for pasta PID file (readiness signal)
 const PASTA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -806,6 +810,31 @@ fn pid_file_is_written(pid_file: &Path) -> bool {
         .is_ok_and(|text| text.ends_with('\n') && text.trim().parse::<u32>().is_ok())
 }
 
+/// What a pool key holds of the host and of the user, beside the network's own shape.
+struct PoolHost {
+    /// The host's global IPv6 address, which pasta is started with.
+    ipv6: Option<String>,
+    /// The ids the holder's user namespace maps (`holder_id_inputs`).
+    id_maps: String,
+    /// A digest of /etc/resolv.conf, which pasta reads once, at its start.
+    resolv_conf: String,
+}
+
+impl PoolHost {
+    fn of(ipv6: Option<String>) -> Self {
+        use sha2::Digest;
+        let resolv_conf = match std::fs::read("/etc/resolv.conf") {
+            Ok(text) => hex::encode(sha2::Sha256::digest(&text)),
+            Err(error) => format!("unreadable: {}", error.kind()),
+        };
+        Self {
+            ipv6,
+            id_maps: crate::commands::common::holder_id_inputs(),
+            resolv_conf,
+        }
+    }
+}
+
 /// Rootless networking using pasta with bridge architecture
 ///
 /// This mode uses user namespaces and pasta (from passt project) for true
@@ -871,6 +900,14 @@ pub struct PastaNetwork {
     // the snapshot's baked value on a restore). None for the default rootless
     // guest, which takes pasta's own DNS handling.
     dns_server: Option<String>,
+    // Where pasta's PID file goes when not in the VM's runtime directory: a pooled
+    // namespace is no VM's.
+    pid_dir: Option<PathBuf>,
+    // Whether this VM may ask a namespace pool for its namespace (`with_pooling`).
+    pooling: bool,
+    // The pooled namespace this VM runs in, when it claimed one (`crate::netpool`). The pool
+    // owns that namespace's holder and pasta; this network starts and stops neither.
+    lease: Option<crate::netpool::client::Lease>,
 }
 
 impl PastaNetwork {
@@ -984,7 +1021,78 @@ impl PastaNetwork {
             restore_mode: false,
             isolated: false,
             dns_server: None,
+            pid_dir: None,
+            pooling: false,
+            lease: None,
         }
+    }
+
+    /// Let this VM run in a pooled namespace when one is to be had ([`Self::poolable`]).
+    /// Off unless the caller turns it on: the caller knows what will run in the namespace.
+    pub fn with_pooling(mut self, pooling: bool) -> Self {
+        self.pooling = pooling;
+        self
+    }
+
+    /// Keep pasta's PID file in `dir` instead of the VM's runtime directory.
+    pub fn with_pid_dir(mut self, dir: PathBuf) -> Self {
+        self.pid_dir = Some(dir);
+        self
+    }
+
+    /// The pooled namespace this VM runs in, once [`NetworkManager::setup`] has claimed one.
+    pub fn lease(&self) -> Option<&crate::netpool::client::Lease> {
+        self.lease.as_ref()
+    }
+
+    /// What a namespace must be like for this VM, as one string: the links
+    /// ([`Self::shape`]) and pasta's command line, without what names one VM or one
+    /// process (the TAP's name, the PID file, the holder's PID). The pool lends a namespace
+    /// only to a VM whose key equals the key of the network the pool builds
+    /// ([`crate::netpool`]), so a pooled namespace is the one this VM would have built.
+    pub fn pool_key(&self) -> String {
+        self.pool_key_of(&PoolHost::of(Self::detect_host_ipv6()))
+    }
+
+    /// [`Self::pool_key`] with the host probed now. A pool lives for days: what it found
+    /// when it started (the host's IPv6 address, its resolver file) may no longer be what a
+    /// clone that starts now finds.
+    pub fn pool_key_now(&self) -> String {
+        self.pool_key_of(&PoolHost::of(Self::probe_host_ipv6()))
+    }
+
+    fn pool_key_of(&self, host: &PoolHost) -> String {
+        use sha2::Digest;
+        let mut shape = self.shape();
+        shape.tap = String::new();
+        let args = self.build_pasta_args(
+            Path::new("/"),
+            0,
+            host.ipv6.as_deref(),
+            nix::unistd::geteuid().is_root(),
+        );
+        let mut hash = sha2::Sha256::new();
+        hash.update(serde_json::to_vec(&shape).expect("a shape is plain data"));
+        for arg in &args {
+            hash.update([0u8]);
+            hash.update(arg.as_encoded_bytes());
+        }
+        // Who the holder's user namespace maps: a namespace a root pool built for one sudo
+        // invoker does not map another's uid, and that clone's VMM could not open what
+        // its own namespace would let it.
+        hash.update([0u8]);
+        hash.update(host.id_maps.as_bytes());
+        // The resolver file pasta read when it started.
+        hash.update([0u8]);
+        hash.update(host.resolv_conf.as_bytes());
+        hex::encode(hash.finalize())
+    }
+
+    /// Whether this VM asks a pool for its namespace: its caller allowed it
+    /// ([`Self::with_pooling`]), and it is a restored VM with pasta and no published port.
+    /// A pooled pasta has no forwards, and a cold boot keeps its own namespace.
+    fn poolable(&self) -> bool {
+        self.pooling && self.restore_mode && !self.isolated && self.port_mappings.is_empty()
     }
 
     /// A namespace with no way out, for a raw VM (`fcvm vm run`): the holder's user and
@@ -1458,7 +1566,10 @@ impl PastaNetwork {
     /// pasta attaches to the TAP the holder made for it ([`Self::build_namespace`]) and
     /// provides L2↔L4 translation to the host. Its PID file signals readiness.
     pub async fn start_pasta(&mut self, namespace_pid: u32) -> Result<()> {
-        let pid_file = pasta_pid_file(&self.vm_id);
+        let pid_file = match &self.pid_dir {
+            Some(dir) => dir.join("pasta.pid"),
+            None => pasta_pid_file(&self.vm_id),
+        };
         let pid_dir = pid_file
             .parent()
             .context("the pasta PID file has no directory")?
@@ -1888,6 +1999,10 @@ fn port_forward_deadline_error(addr: &str, budget: std::time::Duration) -> anyho
 #[async_trait::async_trait]
 impl NetworkManager for PastaNetwork {
     async fn companion_exited(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(lease) = &self.lease {
+            lease.ended().await;
+            return Err(std::io::Error::other(LEASE_ENDED));
+        }
         let Some(child) = self.pasta_process.as_mut() else {
             return std::future::pending().await;
         };
@@ -1915,6 +2030,7 @@ impl NetworkManager for PastaNetwork {
                     &self.stderr_tail,
                 )
             }
+            Err(error) if self.lease.is_some() => error.to_string(),
             Err(error) => format!("pasta could not be watched: {error}"),
         }
     }
@@ -1930,6 +2046,38 @@ impl NetworkManager for PastaNetwork {
             });
         }
         info!(vm_id = %self.vm_id, "setting up rootless networking with pasta (bridge mode)");
+
+        // A namespace from the pool, when one serves this data directory and has a free
+        // namespace built the way this VM's would be. Here, before anything names the TAP:
+        // a pooled namespace's TAP has the pool's name, not this VM's.
+        if self.poolable() {
+            // A clone is never worse off because a pool exists: a pool that does not
+            // answer, answers wrongly or is stopping has lent this clone nothing, and the
+            // clone builds its own namespace as it would with no pool.
+            let claimed = match crate::netpool::client::claim(&self.pool_key()).await {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    warn!(
+                        vm_id = %self.vm_id,
+                        error = %format!("{error:#}"),
+                        "the namespace pool gave no answer to use; building this clone's own namespace"
+                    );
+                    None
+                }
+            };
+            if let Some(lease) = claimed {
+                info!(
+                    vm_id = %self.vm_id,
+                    slot = lease.grant.slot,
+                    generation = lease.grant.generation,
+                    holder_pid = lease.grant.holder_pid,
+                    "running in a pooled namespace"
+                );
+                self.tap_device = lease.grant.tap.clone();
+                self.lease = Some(lease);
+                failpoint::hit_async("pool.post_claim").await;
+            }
+        }
 
         info!(
             guest_ip = %self.guest_ip,
@@ -1989,6 +2137,13 @@ impl NetworkManager for PastaNetwork {
 
     async fn post_start(&mut self, holder_pid: u32) -> Result<()> {
         self.holder_pid = Some(holder_pid);
+        if let Some(lease) = &self.lease {
+            // The pool built the namespace and runs its pasta. What this process needs is
+            // its channel to the holder, where every other user of a holder looks for it.
+            super::netns_agent::register(holder_pid, lease.agent.clone());
+            info!(holder_pid = holder_pid, "pasta + bridge setup complete");
+            return Ok(());
+        }
         if self.isolated {
             // An isolated namespace is its links, which the holder has built
             // (`build_namespace`); there is no pasta to start.
@@ -2076,6 +2231,13 @@ impl NetworkManager for PastaNetwork {
     }
 
     async fn cleanup(&mut self) -> Result<()> {
+        if let Some(lease) = self.lease.take() {
+            // Giving the namespace back is closing the lease. The pool resets it once the
+            // VMM, which holds the lease too, is gone.
+            super::netns_agent::forget(lease.grant.holder_pid);
+            info!(vm_id = %self.vm_id, slot = lease.grant.slot, "returned the pooled namespace");
+            return Ok(());
+        }
         info!(vm_id = %self.vm_id, "cleaning up pasta resources");
         let mut errors = Vec::new();
 
@@ -3253,6 +3415,98 @@ mod tests {
         let message = net.stderr_tail_message();
         assert!(message.contains("current attempt output"), "{message}");
         assert!(!message.contains("previous attempt"), "{message}");
+    }
+
+    fn default_clone() -> PastaNetwork {
+        PastaNetwork::new("clone".into(), "tap-clone".into(), vec![])
+            .with_loopback_ip("127.0.0.9".into())
+            .with_restore_mode()
+            .with_pooling(true)
+    }
+
+    /// The pool builds its namespaces from a network with the pool's TAP name and no
+    /// loopback address. A default restored clone's key is that network's: neither the
+    /// TAP's name nor the clone's loopback address is part of what the namespace is.
+    #[test]
+    fn a_default_restored_clone_has_the_key_of_a_pooled_namespace() {
+        let pooled = PastaNetwork::new("slot".into(), "tap-pool".into(), vec![]);
+        assert_eq!(default_clone().pool_key(), pooled.pool_key());
+        assert!(default_clone().poolable());
+    }
+
+    /// The key holds who the holder's user namespace maps, the host's IPv6 address and its
+    /// resolver file: a pool built for one sudo invoker, or before the host's address or
+    /// resolvers changed, has another key than a clone that starts now.
+    #[test]
+    fn the_key_holds_the_id_maps_and_the_hosts_address_and_resolvers() {
+        let host = |id_maps: &str, ipv6: Option<&str>, resolv_conf: &str| PoolHost {
+            ipv6: ipv6.map(str::to_string),
+            id_maps: id_maps.to_string(),
+            resolv_conf: resolv_conf.to_string(),
+        };
+        let network = default_clone();
+        let key = |host: &PoolHost| network.pool_key_of(host);
+        let base = host("uid=0 gid=0 invoker=1000:1000", None, "aa");
+        assert_eq!(
+            key(&base),
+            key(&host("uid=0 gid=0 invoker=1000:1000", None, "aa"))
+        );
+        assert_ne!(
+            key(&base),
+            key(&host("uid=0 gid=0 invoker=1001:1001", None, "aa"))
+        );
+        assert_ne!(
+            key(&base),
+            key(&host("uid=0 gid=0 invoker=none", None, "aa"))
+        );
+        assert_ne!(
+            key(&base),
+            key(&host("uid=0 gid=0 invoker=1000:1000", None, "bb"))
+        );
+        assert_ne!(
+            key(&base),
+            key(&host(
+                "uid=0 gid=0 invoker=1000:1000",
+                Some("2001:db8::1"),
+                "aa"
+            ))
+        );
+        // In one process the two public forms agree while the host does not change.
+        assert_eq!(network.pool_key(), network.pool_key_now());
+    }
+
+    /// A clone whose pasta would be started differently does not match: here one that
+    /// bakes its own resolver.
+    #[test]
+    fn a_clone_with_its_own_resolver_has_another_key() {
+        let own_dns = default_clone().with_dns_server(Some("10.0.2.2".into()));
+        assert_ne!(own_dns.pool_key(), default_clone().pool_key());
+    }
+
+    /// A pooled pasta has no forwards, so a clone that publishes a port builds its own
+    /// namespace, as do a cold boot and an isolated namespace.
+    #[test]
+    fn only_a_restored_clone_without_published_ports_is_poolable() {
+        let mapping = crate::network::PortMapping {
+            host_ip: None,
+            host_port: 8080,
+            guest_port: 80,
+            proto: crate::network::Protocol::Tcp,
+            loopback_client: false,
+        };
+        let publishing = PastaNetwork::new("clone".into(), "tap-clone".into(), vec![mapping])
+            .with_loopback_ip("127.0.0.9".into())
+            .with_restore_mode()
+            .with_pooling(true);
+        assert!(!publishing.poolable());
+        let cold = PastaNetwork::new("vm".into(), "tap-vm".into(), vec![]).with_pooling(true);
+        assert!(!cold.poolable());
+        let isolated = PastaNetwork::isolated("raw".into(), "tap-raw".into()).with_pooling(true);
+        assert!(!isolated.poolable());
+        // And a clone whose caller did not allow it: a Cloud Hypervisor restore.
+        let not_allowed =
+            PastaNetwork::new("clone".into(), "tap-clone".into(), vec![]).with_restore_mode();
+        assert!(!not_allowed.poolable());
     }
 
     #[test]

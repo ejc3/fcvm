@@ -8,6 +8,7 @@ pub mod gpu;
 pub mod health;
 pub mod hypervisor;
 pub mod kvm_trace;
+pub mod netpool;
 pub mod network;
 pub mod paths;
 pub mod reclaim;
