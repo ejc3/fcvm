@@ -823,7 +823,7 @@ struct PoolHost {
 impl PoolHost {
     fn of(ipv6: Option<String>) -> Self {
         use sha2::Digest;
-        let resolv_conf = match std::fs::read("/etc/resolv.conf") {
+        let resolv_conf = match std::fs::read(super::ETC_RESOLV_CONF) {
             Ok(text) => hex::encode(sha2::Sha256::digest(&text)),
             Err(error) => format!("unreadable: {}", error.kind()),
         };
