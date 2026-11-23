@@ -37,7 +37,7 @@ How each piece scales:
   C=1 to 0.090 s at C=128 with none held, and to 0.177 s at C=128 and 0.39 s at C=512 with
   1000 held. Under `kernel.bt` (C=128, 1000 held, 2000 namespace lives from their start to the
   end of the kernel's cleanup, three runs on a second boot of the same instance type on
-  2026-11-23, at the commit before the netlink builder of changelog step 4) `rtnl_mutex` was held 25.7 ms per namespace life (24.1 to 26.6) and waited
+  2026-11-23, at the commit before the netlink builder of changelog step 5) `rtnl_mutex` was held 25.7 ms per namespace life (24.1 to 26.6) and waited
   for 2.2 s. Of the hold:
   - 14.4 ms is one `rcu_barrier()` per namespace in the netns cleanup worker (`cleanup_net`
     -> `br_dev_uninit` -> `br_multicast_dev_del`): every bridge destroyed waits for the RCU
