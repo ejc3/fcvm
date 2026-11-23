@@ -355,6 +355,7 @@ jobs:
           role-duration-seconds: 21600
           mask-aws-account-id: true
       - name: Worker
+        id: worker
         if: ${{ !cancelled() && needs.candidate.outputs.web == 'true' }}
         working-directory: fleet/web
         env:
@@ -371,6 +372,7 @@ jobs:
           pnpm install --frozen-lockfile
           WRANGLER_SEND_METRICS=false pnpm exec wrangler versions deploy "$previous@100%" --env production --yes --message "fcvm:rollback"
       - name: Coordinator
+        id: coordinator
         if: ${{ !cancelled() && (needs.candidate.outputs.coordinator == 'true' || needs.candidate.outputs.lane == 'true') }}
         env:
           COORDINATOR_RELEASE: ${{ vars.COORDINATOR_RELEASE }}
@@ -393,14 +395,28 @@ jobs:
             ${lane:+--lambda-digest "$lane"}
       # Waits for prod to sleep: its templates change only then.
       - name: Host and tile images
+        id: images
         if: ${{ !cancelled() && needs.candidate.outputs.image == 'true' }}
         env:
           IMAGE_RELEASE: ${{ vars.IMAGE_RELEASE }}
           TARGET: ${{ needs.candidate.outputs.target }}
           PRIOR: ${{ needs.candidate.outputs.prior }}
         run: python3 -B fleet/coord/prod_release.py image-rollback "$TARGET" "$PRIOR"
+      # Says prod was returned to its previous set only when every return that ran succeeded.
       - name: The promotion failed
         if: ${{ always() }}
+        env:
+          WORKER: ${{ steps.worker.outcome }}
+          COORDINATOR: ${{ steps.coordinator.outcome }}
+          IMAGES: ${{ steps.images.outcome }}
         run: |
-          echo "::error::the promotion failed; prod was returned to its previous set"
+          failed=
+          [ "$WORKER" = success ] || [ "$WORKER" = skipped ] || failed="${failed:+$failed, }Worker"
+          [ "$COORDINATOR" = success ] || [ "$COORDINATOR" = skipped ] || failed="${failed:+$failed, }Coordinator"
+          [ "$IMAGES" = success ] || [ "$IMAGES" = skipped ] || failed="${failed:+$failed, }Host and tile images"
+          if [ -z "$failed" ]; then
+            echo "::error::the promotion failed; prod was returned to its previous set"
+          else
+            echo "::error::the promotion failed, and returning prod to its previous set did not complete ($failed): prod may run parts of both sets"
+          fi
           exit 1

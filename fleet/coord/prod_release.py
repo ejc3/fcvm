@@ -302,12 +302,29 @@ def image_call(payload, sleep=None, deadline=None, clock=time.time):
     raise LockHeld("Terraform's lock stayed held: the image release did not run")
 
 
+def image_prod():
+    """The receipt prod's image pointer names (prod-status takes no lock)."""
+    return lambda_result("IMAGE_RELEASE", {"action": "prod-status"}).get("prod")
+
+
 def image_promote(receipt, sleep=None):
+    before = image_prod()
     try:
         result = image_call({"action": "promote-prod", "receipt": receipt}, sleep)
     except LockHeld:
-        # Nothing moved: held, like a prod that woke, so no rollback runs and the next promotion tries again.
-        raise publish.Held("Terraform's lock stayed held before prod's images moved") from None
+        # Busy every time is not proof that nothing moved: publish.invoke retries a call that ended without a result
+        # while the function went on, and that first call may have completed (or been killed holding the lock).
+        # The function writes prod's pointer last, after every template moved (ProdPublisher.move), and a later
+        # promote-prod answers "unchanged" for exactly that state, so a pointer naming the receipt is the completed
+        # promotion. A pointer still naming what prod ran before the call is held: no rollback, and the next
+        # promotion tries again. Anything else is a failure, and the rollback runs.
+        now = image_prod()
+        if now == receipt:
+            return "unchanged"
+        if now == before:
+            raise publish.Held("Terraform's lock stayed held before prod's images moved") from None
+        raise RuntimeError("Terraform's lock stayed held, and prod's images name neither the release it ran nor the "
+                           "promoted one") from None
     status = result.get("status")
     if status == "held":
         raise publish.Held("prod woke before its images moved")
@@ -321,14 +338,21 @@ def image_rollback(receipt, want, deadline=None, clock=time.time, sleep=None):
     prod to sleep (the templates change only then) until the deadline."""
     sleep = sleep or time.sleep
     deadline = deadline or clock() + HOLD_SECONDS
-    current = lambda_result("IMAGE_RELEASE", {"action": "prod-status"}).get("prod")
+    current = image_prod()
     if current == want:
         return "unchanged"  # the promotion never moved them
     if current != receipt:
         raise RuntimeError("prod's images are neither the promoted release nor the previous one")
     while True:
-        # A rollback that could not run fails (LockHeld is a RuntimeError), by its own deadline.
-        result = image_call({"action": "rollback-prod", "receipt": receipt}, sleep, deadline, clock)
+        # Terraform's lock held: keep asking every minute until the rollback's own deadline, as for a prod that is
+        # awake. A rollback that could not run by then fails (LockHeld is a RuntimeError, never held).
+        try:
+            result = image_call({"action": "rollback-prod", "receipt": receipt}, sleep, deadline, clock)
+        except LockHeld:
+            if clock() >= deadline:
+                raise
+            sleep(POLL_SECONDS)
+            continue
         status = result.get("status")
         if status in ("rolled_back", "unchanged"):
             if receipt_of(result) != want:
