@@ -1176,7 +1176,8 @@ impl FaultAround {
 /// The most of the recorded working set one clone replays, in bytes of the set, or no
 /// bound (#955).
 ///
-/// The recorded set is a union over clones and only grows, and in copy mode every replayed
+/// The recorded set is a union over a generation's first few clones
+/// ([`crate::uffd::working_set::RECORDING_CLONES`]), and in copy mode every replayed
 /// page is a private copy in each clone. Clones that do real work inside their recording
 /// window add the pages that work touched: on one 128 GiB guest, 8.6 M to 14.1 M pages over
 /// four such clones, and a clone of it held 52.7 GiB at healthy against 25.4 GiB for a set
@@ -3495,7 +3496,9 @@ async fn handle_vm_page_faults(
         fault_workers: None,
         replay_progress,
         replay_limit,
-        recorded: working_set.as_deref().map(WorkingSetStore::recorder),
+        recorded: working_set
+            .as_deref()
+            .and_then(WorkingSetStore::admit_recorder),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
         // clock cannot represent (checked_add overflow) means unbounded recording.

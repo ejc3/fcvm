@@ -2987,12 +2987,15 @@ separately.
   is answered with zeros and recorded like any other. The window starts
   at the clone's UFFD handshake and defaults to 300 s (`--uffd-prefetch-record-window` /
   `FCVM_UFFD_PREFETCH_RECORD_WINDOW`; 0 records nothing; issue #858). Later faults are
-  served but not recorded. On handler exit the bitmap is unioned into the serve
+  served but not recorded. Only a few clones record: while a serve loaded no set, its first
+  `RECORDING_CLONES` (4) clones do, and once a set is on disk no clone of that generation
+  adds to it (#955; before, every clone's window was unioned in, and one snapshot's replay
+  grew from 33 to 177 MiB per clone over four 1000-clone runs, until 2000 UFFD clones ran the
+  host out of memory). On handler exit a recording clone's bitmap is unioned into the serve
   process's in-memory set and scheduled onto one bounded, coalescing background writer. The
   writer publishes `<memory.bin>.working-set` beside the snapshot under an `flock` + atomic
-  rename, and only writes when the union actually grew — so the steady state writes nothing,
-  and a clone that was killed mid-restore gets completed by the next one instead of baking in
-  a truncated set. Persistence is a performance hint: sidecar lock contention skips that
+  rename, and only writes when the union actually grew. A set from clones killed early is
+  kept as it is: it costs demand faults, never correctness. Persistence is a performance hint: sidecar lock contention skips that
   publication attempt without delaying clone teardown or admission slots; the in-memory union
   remains available for the next request. A stopping server waits up to 10 s for publications
   already scheduled, after its last clone has gone: without the wait a serve stopped right
@@ -3163,13 +3166,13 @@ separately.
   takes only the sidecar's own lock, because the create already holds the generation lock
   exclusively. A parent that is the target itself, a different image length, or any read or
   write failure logs a warning and leaves the snapshot without a set. The inherited
-  set is a hint like any other: serves of the new snapshot keep recording on top of it, and
-  since sets only grow, a long chain of inherited sets grows with it (#955). Measured on a
+  set is a hint like any other, and a set on disk takes no more recordings (#955), so serves
+  of the new snapshot replay the inherited set as it is and record nothing on top of it. Measured on a
   128 GiB guest, one per-diff snapshot: a clone of it with the inherited set (13.7 M pages)
   was ready in 317 s, the same as with a set recorded for it in a 485 s pass (6.6 M pages, 315 s)
   and against 606 s with no set, but held 52.7 GiB at healthy against 25.4 GiB. Inheriting
-  skips the recording pass at the price of every clone's memory, until a recording that
-  replaces the set (rather than adding to it) takes its place.
+  skips the recording pass at the price of every clone's memory; deleting the sidecar makes
+  the next serve record the snapshot's own set.
 - **Import (`snapshot import`)**: an import writes a `config.json` with a new generation id and
   a memory image with a new mtime, so the archived sidecar's key is the key of nothing on the
   importing host. When the import reaches the sidecar's entry it compares the staged memory
@@ -3198,7 +3201,7 @@ separately.
 - **Replay trades memory for latency.** A replaying clone materialises the recorded set at
   restore instead of faulting it in as it runs. Commit 86a05b9a reports, from a Chromium run
   that is not committed, that 98% of faults arrived within 750 ms. The set is a union over
-  clones' recording windows and only grows. In copy mode every replayed page is a private
+  the recording windows of a generation's first few clones (above). In copy mode every replayed page is a private
   copy, so a clone also holds pages it would never have touched, including a clone that is
   created and destroyed at once. On one 128 GiB guest the set grew from 3.7M pages after one
   clone to 9.4M after six (issue #955). PR #956 measured two clones on that guest at first

@@ -55,6 +55,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+/// How many clones of one serve record into a generation's working set while it has none
+/// ([`WorkingSetStore::admit_recorder`]). Several, so one clone killed early or atypical does
+/// not decide the set alone; few, so the set stays one restore's working set.
+pub const RECORDING_CLONES: u64 = 4;
+
 /// Bitmap granularity, in bytes.
 ///
 /// Fixed at 4 KiB rather than the clone's page size so ONE recorded set serves every clone of
@@ -824,6 +829,11 @@ pub struct WorkingSetStore {
     key: ImageKey,
     mem_len: u64,
     known: Mutex<PageSet>,
+    /// The set loaded at open was not empty: this generation's set is recorded, and no clone
+    /// of this server adds to it ([`WorkingSetStore::admit_recorder`]).
+    frozen: bool,
+    /// Clones this server has let record ([`RECORDING_CLONES`] at most).
+    admitted: std::sync::atomic::AtomicU64,
     /// `known` split by first-touch tier, for replay. Splitting a large set scans every
     /// granule (about 144 ms for a dense 128 GiB guest), so it is done when the set is loaded
     /// and on a thread of its own after the set changes, never on a clone's fault path.
@@ -937,6 +947,8 @@ impl WorkingSetStore {
                 split_from: 0,
                 tiers: Some(Arc::new(known.by_first_touch())),
             })),
+            frozen: !known.is_empty(),
+            admitted: std::sync::atomic::AtomicU64::new(0),
             known: Mutex::new(known),
         })
     }
@@ -1062,6 +1074,24 @@ impl WorkingSetStore {
     /// An empty set sized for this image, for a clone to record into.
     pub fn recorder(&self) -> PageSet {
         PageSet::empty(self.mem_len)
+    }
+
+    /// A recorder for one more clone, or None when the set no longer takes recordings: the
+    /// set loaded from disk was not empty (a generation's set is recorded once, then
+    /// replayed as it is), or [`RECORDING_CLONES`] clones of this server already record.
+    ///
+    /// Before this bound every clone's recording window was unioned in, so the set grew with
+    /// every clone of a snapshot (issue #955): one snapshot's replay grew from 33 to 177 MiB
+    /// per clone over four 1000-clone runs, and 2000 UFFD clones then ran the host out of
+    /// memory. A set from too few or atypical clones costs demand faults, never correctness.
+    pub fn admit_recorder(&self) -> Option<PageSet> {
+        if self.frozen {
+            return None;
+        }
+        let admitted = self
+            .admitted
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (admitted < RECORDING_CLONES).then(|| self.recorder())
     }
 
     /// Add one clone's observations to the in-process union without touching the filesystem.
@@ -2538,5 +2568,31 @@ mod tests {
         );
         assert!(max_recorded_len(MAX_MEM_LEN).is_some());
         assert_eq!(max_recorded_len(MAX_MEM_LEN + 1), None);
+    }
+
+    /// A generation's set takes recordings from at most RECORDING_CLONES clones of a server,
+    /// and none once a set is on disk: it does not grow with every clone (#955).
+    #[test]
+    fn a_working_set_takes_recordings_from_a_few_clones_then_freezes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mem, config, lock) = (
+            dir.path().join("memory.bin"),
+            dir.path().join("config.json"),
+            dir.path().join("snapshot.lock"),
+        );
+        let mem_len = 16 * GRANULE;
+        std::fs::write(&mem, vec![0u8; mem_len as usize]).unwrap();
+        std::fs::write(&config, "{}").unwrap();
+        let store = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        let admitted: Vec<_> = (0..RECORDING_CLONES + 3)
+            .filter_map(|_| store.admit_recorder())
+            .collect();
+        assert_eq!(admitted.len() as u64, RECORDING_CLONES);
+        let mut observed = admitted.into_iter().next().unwrap();
+        observed.insert_range(3 * GRANULE, GRANULE);
+        store.merge_and_persist(&observed).unwrap();
+        // The next server of the generation loads a set, and records nothing into it.
+        let next = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        assert!(next.admit_recorder().is_none());
     }
 }
