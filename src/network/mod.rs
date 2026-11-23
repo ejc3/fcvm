@@ -2,6 +2,7 @@ pub mod bridged;
 pub mod egress_proxy;
 pub mod names;
 pub mod namespace;
+pub mod netns_agent;
 pub mod pasta;
 pub mod portmap;
 pub mod relay_socket;

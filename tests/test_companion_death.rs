@@ -124,12 +124,13 @@ async fn a_killed_pasta_ends_the_vm_with_pastas_own_report() {
     killing_a_companion_ends_it_naming_it(child, pid, log, "pasta", "pasta").await;
 }
 
-/// The holder is `unshare --user --net -- sleep infinity`, so its comm is `sleep`.
+/// The holder is `fcvm __netns-agent`, which names itself `fcvm-netns` (`netns_agent::COMM`).
 #[tokio::test]
 async fn a_killed_namespace_holder_ends_the_vm_with_the_holders_report() {
     let (name, _, _, _) = common::unique_names("companion-holder");
     let (child, pid, log) = healthy_vm(&name).await;
-    killing_a_companion_ends_it_naming_it(child, pid, log, "sleep", "namespace holder").await;
+    let comm = fcvm::network::netns_agent::COMM.to_str().unwrap();
+    killing_a_companion_ends_it_naming_it(child, pid, log, comm, "namespace holder").await;
 }
 
 /// A clone runs its own pasta and holder, watched by the clone's own loop.

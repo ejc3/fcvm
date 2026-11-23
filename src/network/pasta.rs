@@ -904,7 +904,7 @@ fn pasta_pid_file(vm_id: &str) -> PathBuf {
 ///
 /// Architecture (L2 Bridge + L4 translation):
 /// ```text
-/// Host                    | User Namespace (unshare --user --net)
+/// Host                    | User Namespace (the holder's)
 ///                         |
 /// pasta  <----------------+-- pasta0 --+
 ///   (L2↔L4 translation,   |            |
@@ -921,12 +921,12 @@ fn pasta_pid_file(vm_id: &str) -> PathBuf {
 /// routes to the VM via br0 → tap-fc.
 ///
 /// Setup sequence:
-/// 1. Spawn holder process: `unshare --user --net -- sleep infinity`
+/// 1. Spawn holder process: `fcvm __netns-agent` (`netns_agent`), which unshares both namespaces
 /// 2. Run pre-setup via nsenter: create Firecracker TAP only
 /// 3. Start pasta: creates pasta0 TAP in namespace with L2↔L4 translation
 /// 4. Run post-setup via nsenter: create bridge, add both TAPs
 /// 5. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
-/// 6. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl guest_ip:80`
+/// 6. Health checks connect to guest_ip:80 from a socket the holder made in the namespace
 pub struct PastaNetwork {
     vm_id: String,
     tap_device: String,   // TAP device for Firecracker (tap-fc)
@@ -1140,25 +1140,6 @@ impl PastaNetwork {
         self.loopback_ip.as_deref()
     }
 
-    /// Build the holder command for creating the namespace
-    ///
-    /// Returns command to spawn a holder process that keeps the namespace alive.
-    /// The holder runs `sleep infinity` which blocks forever until killed.
-    /// Note: We use sleep instead of cat because cat requires stdin management.
-    ///
-    /// UID/GID mapping is handled by setup_namespace_mappings() in common.rs after
-    /// the namespace is created (tries newuidmap first, falls back to single-UID mapping).
-    pub fn build_holder_command(&self) -> Vec<String> {
-        vec![
-            "unshare".to_string(),
-            "--user".to_string(),
-            "--net".to_string(),
-            "--".to_string(),
-            "sleep".to_string(),
-            "infinity".to_string(),
-        ]
-    }
-
     /// Build the pre-pasta setup script to run inside the namespace via nsenter.
     ///
     /// Creates the Firecracker TAP device, brings loopback up, and verifies the
@@ -1345,7 +1326,7 @@ impl PastaNetwork {
 
     /// Get a human-readable representation of the rootless networking flow
     pub fn rootless_flow_string(&self) -> String {
-        "holder(unshare --user --net) + nsenter for setup/firecracker".to_string()
+        "holder(fcvm __netns-agent) + nsenter for setup, setns for firecracker".to_string()
     }
 
     /// Detect host's global IPv6 address for pasta outbound traffic.

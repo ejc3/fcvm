@@ -2605,7 +2605,7 @@ fuse-pipe/benches/
    - `--network rootless` (default): pasta, no root required
    - `--network bridged`: Network namespace + iptables, requires root
    - `--network routed`: veth + IPv6 kernel routing, requires root + IPv6 host
-   - User namespace via `unshare --user --net` with external UID/GID mappings
+   - User and network namespaces made by the holder, `fcvm __netns-agent`, with external UID/GID mappings
    - Health checks use unique loopback IPs (127.x.y.z) per VM
 
 4. **Hierarchical Logging** (2025-11-15)
@@ -2655,10 +2655,10 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 | Routed | `--network routed` | Yes (+ IPv6 host) | Best (kernel line rate) | TCP proxy on the mapping's HOSTIP, else loopback IP |
 
 **Rootless Architecture:**
-- Holder process starts with `unshare --user --net`, UID/GID mappings written externally
+- Holder process is `fcvm __netns-agent` (`src/network/netns_agent.rs`): it unshares its user and network namespaces, UID/GID mappings are written externally, and it hands sockets made in the namespace to the fcvm that started it
 - Linux bridge (br0) connects pasta0 and tap-fc for L2 forwarding
 - Bridge preserves MAC addresses for proper pasta ARP/NDP learning
-- Namespace IP (10.0.2.1) on bridge enables health checks via nsenter
+- Namespace IP (10.0.2.1) on bridge is the source of health checks, which connect from a socket the holder made
 - Guest uses pasta network (10.0.2.100)
 - Port forwarding via pasta CLI flags (-t/-u)
 - IPv6 supported with `--enable-ipv6` and native DNS proxying

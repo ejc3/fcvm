@@ -604,7 +604,7 @@ lineage).
 
 **Topology**:
 ```
-Host                     │ User Namespace (unshare --user --net)
+Host                     │ User Namespace (the holder's)
                          │
 pasta <──────────────────┼── pasta0 ─┐
   (L4 splice/TAP)        │           │
@@ -624,12 +624,12 @@ pasta <──────────────────┼── pasta0 �
 - Bridge also enables IPv6 with proper NDP neighbor discovery
 
 **Setup Sequence** (3-phase with nsenter):
-1. Spawn holder process: `unshare --user --net -- sleep infinity` (UID/GID mappings written externally)
+1. Spawn holder process: `fcvm __netns-agent`, which unshares its user and network namespaces (UID/GID mappings written externally)
 2. Pre-pasta setup via nsenter: create Firecracker TAP device only
 3. Start pasta attached to holder's namespace (creates pasta0 TAP)
 4. Post-pasta setup via nsenter: create bridge, attach pasta0 + tap-fc, add namespace IP
 5. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
-6. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl 10.0.2.100:80`
+6. Health checks: an HTTP GET to 10.0.2.100:80 from a socket the holder made in the namespace
 
 **Pre-Pasta Setup Script** (Phase 2, executed via nsenter):
 ```bash
@@ -651,7 +651,7 @@ ip link set pasta0 master br0
 ip link set tap-fc master br0
 
 # Add IP to bridge for health checks
-# This enables nsenter to route to guest via the 10.0.2.x subnet
+# A socket made in the namespace then routes to the guest via the 10.0.2.x subnet
 ip addr add 10.0.2.1/24 dev br0
 ```
 
@@ -687,7 +687,7 @@ Guest (10.0.2.100) → tap-fc → br0 (L2) → pasta0 → pasta → Host → Int
 
 **Traffic Flow** (Health Check from namespace):
 ```
-nsenter curl → br0 (10.0.2.1) → L2 forward → tap-fc → Guest (10.0.2.100:80)
+HTTP GET from a socket the holder made → br0 (10.0.2.1) → L2 forward → tap-fc → Guest (10.0.2.100:80)
 ```
 
 **Traffic Flow** (Host to VM port forward):
@@ -707,7 +707,7 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 - All VMs use same 10.0.2.x subnet (isolated by user namespace)
 - Unique loopback IP per VM enables same port on multiple VMs
 - Bridge-based L2 preserves MAC addresses for proper pasta ARP/NDP learning
-- Namespace IP (10.0.2.1) enables health checks via nsenter
+- Namespace IP (10.0.2.1) is the source address of health checks, made from a socket the holder hands out
 - IPv6 support with native pasta IPv6 forwarding
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest

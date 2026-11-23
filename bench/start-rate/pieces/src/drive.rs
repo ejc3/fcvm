@@ -1180,7 +1180,7 @@ mod tests {
             uffd_socket: Some("/u.sock".into()),
             disk_shard_dir: Some("/d".into()),
             track_dirty_pages: false,
-            prober: crate::pieces::Prober::Nsenter,
+            prober: crate::pieces::Prober::Holder,
             tap_hold_ms: 7,
             tap_warm_cycles: 3,
             tap_no_pasta: true,
