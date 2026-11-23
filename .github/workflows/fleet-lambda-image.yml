@@ -2,7 +2,7 @@ name: Fleet Lambda lane image
 
 # The Lambda tile's image (fleet/lambda): the renderer image with the fcvm binary as its Lambda
 # runtime, for g4dn (x86_64). A change to its inputs builds it on an x86_64 runner; on main the
-# image is pushed to the shared lane repository as rev-<commit> and its digest recorded as
+# image is pushed to staging's lane repository as rev-<commit> and its digest recorded as
 # keep-built (fleet/lambda/release.py record), where `release.py select --built` reads it.
 # fleet/PROTOCOL.md, "Which lane image a stack runs".
 on:
