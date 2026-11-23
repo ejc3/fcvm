@@ -115,6 +115,56 @@ async fn sanity_test_impl(network: &str) -> Result<()> {
     result
 }
 
+/// A VM's guest memory starts out of automatic NUMA balancing: fcvm asks Firecracker to bind
+/// it MPOL_LOCAL for `NUMA_BALANCING_AFTER_SECS` after creating or restoring it
+/// (`--numa-balancing-after-secs`), so `/proc/<firecracker>/numa_maps` reports the guest
+/// memory's policy as `local` for that long, and as `default` without the flag.
+///
+/// The policy returns to `default` when the window ends, so this polls from the spawn and
+/// passes at the first `local` it reads. It does not wait for the VM to turn healthy: on a
+/// host where that takes longer than the window, a read taken afterwards finds `default` in a
+/// correct build. It gives up after 100 s, before nextest ends a test of the default profile
+/// (120 s), so a build without the window fails with what was read, not as a timeout.
+#[tokio::test]
+async fn a_new_vms_guest_memory_starts_out_of_numa_balancing() -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let (vm_name, _, _, _) = common::unique_names("numa-window");
+    let (mut child, fcvm_pid) =
+        common::spawn_fcvm(&["podman", "run", "--name", &vm_name, common::TEST_IMAGE])
+            .await
+            .context("spawning fcvm podman run")?;
+    let result = async {
+        let deadline = Instant::now() + Duration::from_secs(100);
+        let mut last_read = None;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!(
+                    "fcvm exited ({status}) before its guest memory's policy read `local` \
+                     (last read: {last_read:?})"
+                );
+            }
+            let read = common::firecracker_child_of(fcvm_pid)
+                .and_then(common::largest_mapping_numa_policy);
+            if let Some((policy, _)) = read {
+                if policy == "local" {
+                    return Ok(());
+                }
+                last_read = Some(policy);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the guest memory's policy never read `local` in the 100 s after the spawn \
+                 (last read: {last_read:?}), so NUMA balancing scans it from the start"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    .await;
+    common::kill_process(fcvm_pid).await;
+    result
+}
+
 /// Test that VM exits gracefully when container finishes (PSCI shutdown)
 /// This tests the full shutdown path: container exit → fc-agent poweroff -f → PSCI SYSTEM_OFF → KVM exit
 #[tokio::test]

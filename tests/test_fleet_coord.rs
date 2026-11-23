@@ -52,6 +52,8 @@ struct Opts {
     access: Option<Arc<access_jwt::AccessCheck>>,
     /// The check on a dialed agent's host; any host when absent.
     agent_identity: Option<Arc<dyn agents::AgentIdentity>>,
+    /// The commit the coordinator reports at /version.
+    commit: Option<String>,
 }
 
 impl Default for Opts {
@@ -74,6 +76,7 @@ impl Default for Opts {
             store: None,
             access: None,
             agent_identity: None,
+            commit: None,
         }
     }
 }
@@ -107,6 +110,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         sockets: o.sockets,
         access: o.access,
         agent_identity: o.agent_identity,
+        commit: o.commit,
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -2278,6 +2282,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         sockets: live::SocketCaps::default(),
         access: None,
         agent_identity: None,
+        commit: None,
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -4103,6 +4108,7 @@ async fn page_url(handle: &Handle) -> String {
         sockets: live::SocketCaps::default(),
         access: None,
         agent_identity: None,
+        commit: None,
     };
     let h = handle.clone();
     tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
@@ -9303,5 +9309,26 @@ async fn a_hello_during_a_wake_gets_its_assignment_at_once() {
                 "EC2 awake: {ec2_awake}: {s:?}"
             );
         }
+    }
+}
+
+/// The coordinator reports the commit its image was built from (FLEET_COMMIT, baked in at build), so a
+/// smoke can say which commit it tested; a coordinator built without one says so with null.
+#[tokio::test]
+async fn the_coordinator_reports_the_commit_it_was_built_from() {
+    for commit in [Some("a".repeat(40)), None] {
+        let c = coordinator_with(Opts {
+            commit: commit.clone(),
+            ..Opts::default()
+        })
+        .await;
+        let url = c
+            .url
+            .replace("ws://", "http://")
+            .replace("/live", "/version");
+        let r = reqwest::get(&url).await.unwrap();
+        assert_eq!(r.status(), 200);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body, json!({"commit": commit}));
     }
 }

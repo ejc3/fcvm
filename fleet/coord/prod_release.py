@@ -195,6 +195,31 @@ def decide():
     smoke = max(covering, key=lambda s: s["end"])
     target = {"coordinator": {"commit": coordinator, "digest": candidate["stage"]["digest"]}, "web_commit": web,
               "generation": verified["generation"], "build_id": verified["build_id"], "smoke_run": smoke["run"]}
+    # With the prod lane on, the set carries the lane image staging runs. What a stack runs comes from its
+    # release function (the running task's FLEET_LAMBDA_IMAGE); the lane repository's tags only protect images,
+    # and stay moved after a cancelled deploy or a hand selection. The candidate is read again here, after the
+    # in-progress and smoke checks above, so it describes the staging those checks saw.
+    lane = publish.lane_setting("FLEET_LAMBDA_LANE_PROD")
+    prior_lane = None
+    if lane:
+        now = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"})
+        if now.get("status") != "ok":
+            raise RuntimeError("a release function refused to describe the releases")
+        if now["stage"]["digest"] != candidate["stage"]["digest"]:
+            raise Skip("staging's coordinator changed while the promotion was deciding")
+        for stack in ("stage", "prod"):
+            if now[stack].get("lane_error"):
+                raise Skip(f"the release function could not read the lane image {stack} runs "
+                           f"({now[stack]['lane_error']})")
+        staged = now["stage"].get("lambda_digest")
+        if not staged:
+            raise Skip("staging runs no lane image")
+        lane_module, ecr = publish.lane_repository()
+        selection = ecr.tagged(lane_module.current("stage"))
+        if selection is None or selection.digest != staged:
+            raise Skip("staging's lane selection (keep-stage-current) is not the lane image it runs")
+        target["lambda_digest"] = staged
+        prior_lane = now["prod"].get("lambda_digest") or ""
 
     record = candidate.get("release")
     prod_receipt = status["prod"]
@@ -202,6 +227,10 @@ def decide():
         if record["coordinator"]["digest"] != candidate["prod"]["digest"] \
                 or {"generation": record["generation"], "build_id": record["build_id"]} != prod_receipt:
             raise Skip("prod changed outside a promotion: its release record does not describe it")
+        # With the lane on, an entry without lambda_digest names no lane image ("").
+        if lane and record.get("lambda_digest", "") != prior_lane:
+            raise Skip("prod changed outside a promotion: its record names another lane image than it runs")
+        # Passed back byte for byte: the record's compare-and-swap takes it as the record it replaces.
         prior = entry(record)
     else:
         commits = candidate["prod"]["commits"]
@@ -211,9 +240,12 @@ def decide():
     changes = {"image": {"generation": target["generation"], "build_id": target["build_id"]} != prod_receipt,
                "coordinator": target["coordinator"]["digest"] != prior["coordinator"]["digest"],
                "web": prior["web_commit"] != web}
+    if lane:
+        # Against what prod runs (empty before its first lane image), never a value written into `prior`.
+        changes["lane"] = target["lambda_digest"] != prior_lane
     if not any(changes.values()):
         raise Skip("prod already runs the staging set")
-    return target, prior, changes
+    return target, prior, changes, prior_lane
 
 
 def hold(image, deadline=None, clock=time.time, sleep=time.sleep):
@@ -301,13 +333,16 @@ def main(argv):
             output(run="true" if enabled() else "false")
         elif action == "decide":
             try:
-                target, prior, changes = decide()
+                target, prior, changes, prior_lane = decide()
             except Skip as skip:
                 notice(f"nothing promoted: {skip}")
                 output(promote="false")
                 return 0
             output(promote="true", target=target, prior=prior, image=str(changes["image"]).lower(),
-                   coordinator=str(changes["coordinator"]).lower(), web=str(changes["web"]).lower())
+                   coordinator=str(changes["coordinator"]).lower(), web=str(changes["web"]).lower(),
+                   lane=str(changes.get("lane", False)).lower(),
+                   # The lane image prod ran before (empty: none), for a rollback; set only with the prod lane on.
+                   **({"prior_lane": prior_lane} if prior_lane is not None else {}))
         elif action == "hold":
             if rest[:1] != ["--image"] or rest[1:] not in (["true"], ["false"]):
                 raise ValueError("hold --image true|false")
@@ -319,10 +354,30 @@ def main(argv):
         elif action == "record":
             output(record=record(json.loads(rest[0]), rest[1] or None, json.loads(rest[2])))
         elif action == "current":
-            release = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"}).get("release")
+            answer = lambda_result("COORDINATOR_RELEASE", {"action": "candidate"})
+            release = answer.get("release")
             if not release or not release.get("previous"):
                 raise RuntimeError("prod has no recorded previous release to roll back to")
-            output(current=entry(release), previous=release["previous"])
+            # The lane flag comes from both entries: the previous set's lane image when it names one, else none
+            # when the set being left names one, else no flag (today's release, which leaves FLEET_LAMBDA_IMAGE
+            # alone and so needs no lane read).
+            previous = release["previous"]
+            back = previous.get("lambda_digest")
+            lane = back if back else "none" if release.get("lambda_digest") else ""
+            if back or release.get("lambda_digest"):
+                # What prod runs must be what the record's current entry names (an entry without lambda_digest names
+                # none), or what its previous one names with its coordinator: a rollback whose Coordinator step
+                # applied and whose later step failed, so the record job did not run. A rerun finishes it.
+                runs = answer.get("prod") or {}
+                if runs.get("lane_error"):
+                    raise RuntimeError(f"the release function could not read the lane image prod runs ({runs['lane_error']})")
+                running = runs.get("lambda_digest") or ""
+                resumed = runs.get("digest") == previous["coordinator"]["digest"] and running == (back or "")
+                if running != release.get("lambda_digest", "") and not resumed:
+                    raise RuntimeError("prod runs another lane image than its release record names; recover by hand: "
+                                       "publish.py --stack prod --force --commit C --digest D --lambda-digest <the "
+                                       "lane digest to run, or none>, then prod_release.py record")
+            output(current=entry(release), previous=release["previous"], lane=lane)
         else:
             raise ValueError("unknown action")
     except publish.Held:
