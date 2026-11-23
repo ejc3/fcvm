@@ -180,7 +180,7 @@ table is in #2035).
 MMIO, by device (10 File clones at C=1 on #2024's head, then 5 on main, from `kvm_mmio`): on
 #2024's head the virtio-net device took 4,313 interrupt status reads and acknowledgements and
 2,723 queue notifies per clone, and the serial console 3,247 byte writes plus about 1,150 status
-reads. On main the virtio-net exits are under 100 per clone, which fits fc-agent's MMDS polling
-over the network having moved to the vsock reset (#2033). What remains is the console: 2,975
+reads. On main the virtio-net exits are under 100 per clone; which of the changes between the two
+heads removed that traffic is not identified here. What remains is the console: 2,975
 transmit-register writes per clone in the first second, one exit to Firecracker per byte, which
 are fc-agent's 37 restore lines (about 2.7 KB) on ttyS0. Block takes about 150 and vsock about 20.
