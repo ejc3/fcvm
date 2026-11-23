@@ -2761,6 +2761,16 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   make one) is reflinked as before. An unprivileged user may delete a subvolume only on a filesystem mounted with
   `user_subvol_rm_allowed`; fcvm's own loopback store is mounted with it, and on a btrfs store mounted without it a
   rootless delete falls back to removing the files one by one.
+- Each write into an in-place diff's memory file costs about the same whatever its length (0.2 to 0.4 ms on a
+  file shared with its parent), so the save time follows the number of writes, and a diff of a 128 GiB guest is
+  millions of runs of one or two pages. The Firecracker fork therefore writes clean gaps of up to 4 pages with the
+  runs around them (in a userfaultfd-restored VM every clean page; elsewhere only pages the VM has mapped or, for
+  file-backed memory, pages in the page cache). One 15.7 GB diff of 2,025,511 runs, replayed into a copy of its
+  parent's memory file, took 810 s as written and 302 s bridged (839,660 writes, 25.5 GB). Those pages hold the
+  bytes the file already has: a paused guest compared page by page with the file its diff wrote matched in all
+  3,608,512 mapped pages. In a userfaultfd-restored VM a bridged page the guest never touched is read through the
+  memory server, so in copy mode it becomes private to the paused VM, and a save inside the clone's recording
+  window adds it to the snapshot's working set, which later clones then replay.
 - A snapshot's memory file is nodatacow (`chattr +C`, `create_memory_file_nodatacow`), so it is stored
   uncompressed even on a store mounted with `compress-force`: btrfs compresses only copy-on-write data. A
   compressed memory file makes every scattered 4 KiB read decompress its whole 128 KiB extent; replaying a
