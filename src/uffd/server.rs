@@ -6767,6 +6767,8 @@ mod tests {
         assert!(
             serve.contains("state.finish_recording(ctx.vm_id, std::time::Instant::now(), false);")
         );
+        // And its progress tick retries a publication a busy sidecar skipped.
+        assert!(serve.contains("persistence.retry_if_unpublished(ctx.vm_id);"));
     }
 
     /// The implicit-restore socket must fit in `sun_path` under the LONGEST path fcvm

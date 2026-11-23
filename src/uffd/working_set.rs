@@ -1226,8 +1226,10 @@ impl WorkingSetStore {
     /// publish the union. Contention can therefore cost a cache update, never liveness.
     fn try_persist_known(&self) -> Result<Option<MergeOutcome>> {
         let result = self.merge_and_persist_inner(&PageSet::empty(self.mem_len), true);
+        // Only a busy sidecar is retried: an error (a directory that cannot be written) would
+        // fail the same way every tick.
         self.unpublished.store(
-            !matches!(result, Ok(Some(_))),
+            matches!(result, Ok(None)),
             std::sync::atomic::Ordering::SeqCst,
         );
         result
@@ -1238,7 +1240,17 @@ impl WorkingSetStore {
         observed: &PageSet,
         nonblocking_sidecar: bool,
     ) -> Result<Option<MergeOutcome>> {
-        let mut merged = self.known.lock().expect("working set mutex").clone();
+        // The union and this server's count of complete recordings are read together:
+        // `finish_recording` adds a recording's pages and its count under this mutex, so a
+        // publication never counts a recording whose pages it does not write.
+        let (mut merged, local) = {
+            let known = self.known.lock().expect("working set mutex");
+            (
+                known.clone(),
+                self.local_completed
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            )
+        };
 
         // Snapshot creators/deleters take this inode exclusively. Keep the shared lease from
         // the image-identity check through the sidecar rename: checking first and locking
@@ -1293,9 +1305,6 @@ impl WorkingSetStore {
         // The count on disk plus this server's complete recordings it has not added yet, so
         // servers recording at once sum their counts. A wave that passes the bound together
         // is accepted whole: its union stays, and the count stops at the bound.
-        let local = self
-            .local_completed
-            .load(std::sync::atomic::Ordering::SeqCst);
         let published = self.published.load(std::sync::atomic::Ordering::SeqCst);
         merged.recordings = on_disk
             .as_ref()
@@ -2832,5 +2841,47 @@ mod tests {
         let next = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
         assert_eq!(next.completed.load(SeqCst), RECORDING_CLONES);
         assert!(next.admit_recorder().is_none());
+    }
+
+    /// A publication reads the union and this server's count of complete recordings in one
+    /// critical section, the one `finish_recording` updates both in, so it never writes a
+    /// count ahead of the pages it counts. An ordering contract, pinned in the source.
+    #[test]
+    fn a_publication_reads_the_pages_and_the_count_together() {
+        let source = include_str!("working_set.rs");
+        let merge = &source[source.find("fn merge_and_persist_inner(").unwrap()..];
+        let merge = &merge[..merge.find("\n    }\n").unwrap()];
+        let block = &merge[merge
+            .find("let (mut merged, local) = {")
+            .expect("the union and the count are not read in one block")..];
+        let block = &block[..block.find("\n        };").unwrap()];
+        assert!(block.contains("self.known.lock()"), "{block}");
+        assert!(block.contains("self.local_completed"), "{block}");
+        assert_eq!(
+            merge.matches("self.local_completed").count(),
+            1,
+            "the count is read outside the known lock"
+        );
+        let finish = &source[source.find("fn finish_recording(").unwrap()..];
+        let finish = &finish[..finish.find("\n    }\n").unwrap()];
+        let lock = finish.find("self.known.lock()").unwrap();
+        assert!(lock < finish.find("self.local_completed.fetch_add").unwrap());
+    }
+
+    /// A publication that fails (here: a sidecar directory that cannot be written) is not
+    /// retried every tick; only a busy sidecar is.
+    #[test]
+    fn a_failed_publication_is_not_retried() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        let (dir, mem, config, lock, mem_len) = bound_fixture();
+        let store = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        let recorder = store.admit_recorder().unwrap();
+        store.finish_recording(&one_page(recorder, 0), true);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = store.try_persist_known();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "{result:?}");
+        assert!(!store.unpublished.load(SeqCst));
     }
 }
