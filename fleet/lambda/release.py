@@ -374,25 +374,33 @@ def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, cl
         built = ecr.tagged(BUILT)
         if built is not None:
             held = [t[len("rev-"):] for t in ecr.tags(built.digest) if re.fullmatch(r"rev-[0-9a-f]{40}", t)]
-            stranded = RuntimeError(
-                f"no lane build pairs with {commit}: keep-built holds a newer lane build with other lane inputs, "
-                "and it only moves forward, so a rerun of this run cannot succeed. Release staging with a "
-                "workflow_dispatch of fleet-coordinator-deploy.yml at main's head")
-            try:
-                for h in held:
+            # Every held commit is asked, as record() does: one this checkout lacks decides nothing alone.
+            pairs, ahead, unknown = False, False, []
+            for h in held:
+                try:
                     if h == commit or ((is_ancestor(h, commit) or is_ancestor(commit, h)) and not changed(h, commit)):
-                        return built.digest
-                behind = all(is_ancestor(h, commit) for h in held)
-            except UnknownCommit:
-                # keep-built's commit is not in this checkout: main moved past it after the run started.
-                raise stranded from None
-            # keep-built moves only forward: a build of a later commit (or of another line) with other lane
-            # inputs means no build will ever pair with this commit. Only a build behind it is worth waiting on.
+                        pairs = True
+                        break
+                    ahead = ahead or not is_ancestor(h, commit)
+                except UnknownCommit:
+                    unknown.append(h)
+            if pairs:
+                return built.digest
             if not held:
                 raise RuntimeError(f"no lane build pairs with {commit}: keep-built holds an image with no "
                                    "rev-<commit> tag")
-            if not behind:
-                raise stranded
+            # keep-built moves only forward: a build of a later commit (or of another line) with other lane
+            # inputs means no build will ever pair with this commit. Only a build behind it is worth waiting on.
+            if ahead:
+                raise RuntimeError(
+                    f"no lane build pairs with {commit}: keep-built holds a newer lane build with other lane "
+                    "inputs, and it only moves forward, so a rerun of this run cannot succeed. Release staging "
+                    "with a workflow_dispatch of fleet-coordinator-deploy.yml at main's head")
+            if unknown:
+                raise RuntimeError(
+                    f"no lane build pairs with {commit}: keep-built holds a build of {unknown[0]}, which this "
+                    "checkout does not contain (main moved after this run started). A rerun fetches main again; "
+                    "or release staging with a workflow_dispatch of fleet-coordinator-deploy.yml at main's head")
         if clock() >= deadline:
             if built is None:
                 raise RuntimeError(f"no lane build is recorded (keep-built) for {commit}")
