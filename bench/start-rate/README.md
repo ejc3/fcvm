@@ -30,6 +30,48 @@ make bench-start-rate-teardown PREP=/mnt/fcvm-btrfs/sr/prep/prep.json
 - `LAUNCHERS=` is the number of harness threads spawning clones (default 4); `popen_ms` in the summary
   shows whether spawning itself limits the rate.
 
+## Churn: starts and stops at one rate
+
+`run` measures a ramp: every clone stays up, so nothing is torn down while clones start and
+no namespace is used twice. `churn` measures a rate a host can hold: each clone runs
+`LIFETIME` seconds after it is healthy (uniform in `LIFETIME` plus or minus 20%, so the
+clones a burst started together do not stop together for the whole run) and is then stopped, and a new one starts while fewer
+than `ALIVE` are up or starting, at most `CONCURRENCY` starting at once. It runs rootless
+clones in a namespace pool that is already running (`fcvm netpool serve`, in the same
+`FCVM_DATA_DIR`), with `--publish none`, because a clone with a published port is not pooled.
+
+```bash
+fcvm netpool serve --slots 2000 &
+make bench-start-rate-prep OUT=/mnt/fcvm-btrfs/sr/prep NETWORK=rootless UFFD=1
+make bench-start-rate-churn PREP=/mnt/fcvm-btrfs/sr/prep/prep.json OUT=/mnt/fcvm-btrfs/sr/churn \
+    ALIVE=1000 LIFETIME=1 CONCURRENCY=128 DURATION=120
+```
+
+The run warms up until every start of the last 2 s took a namespace another clone had before
+(`generation` 2 or more in the clone's "running in a pooled namespace" line) and a lifetime has
+passed, measures a window of `DURATION` seconds, then stops everything. `summary.json` holds
+the window's `starts_per_s`, `stops_per_s`, `recycled_fraction`, `alive_mean` and latencies,
+the warm-up and the drain apart, and one entry of `conditions` for each of these. The run
+exits 1 unless all hold (`churn_verdict`, one test per condition in `test_startrate.py`):
+
+| condition | what it refuses |
+|---|---|
+| window | a window under 60 s or under 10 lifetimes (`churn` refuses to start with such a `DURATION`) |
+| starts equal stops | starts and stops in the window more than 2% apart: a ramp, or a backlog of stops |
+| no failed clone | a clone that failed or exited before its stop |
+| alive count flat | an alive count whose first and last tenth of the window differ by over 2% of `ALIVE` (one clone for a small run), or that swings by over 20% of it (5 clones for a small run) |
+| every start in a recycled namespace | a start in a namespace no clone had before, or in one the clone built for itself |
+| free slots flat | a pool whose ready namespaces run down over the window (2% of its slots) |
+| no namespace built or destroyed | a build or a destroy in the window (both are counted in `pool`) |
+| slots cover the resets | a pool with fewer slots than the alive clones, plus the rate times the window's reset p99, plus `CONCURRENCY` |
+| warm-up ended | starts that were not all recycled within `--warmup-limit` (600 s) |
+| state files agree | a running clone the logs call healthy that `fcvm ls` does not |
+
+A start counts as in `run`: the clone's own log says its health monitor saw the VM healthy.
+A stop counts when the clone's fcvm process has exited. Records: `samples.jsonl` (per clone:
+spawn, healthy, stop, exit, generation), `alive.tsv` (every 0.5 s), `pool.jsonl` (the pool's
+counters every second), `host.tsv`.
+
 ## Records (OUT)
 
 | file | what |

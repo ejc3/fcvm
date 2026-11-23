@@ -421,5 +421,168 @@ class PrepOwnsItsChildren(FakeBase):
         self.assertEqual((rec["baseline_pid"], rec["serve_pid"]), (4242, 4243))
 
 
+class ChurnVerdict(unittest.TestCase):
+    """Each honesty condition of a churn window, on records made by hand."""
+
+    CFG = {"alive": 20, "lifetime_s": 2.0, "concurrency": 4, "window_start_s": 20.0, "window_end_s": 80.0}
+
+    def records(self, rate=10, lifetime=2.0, end=90.0, slots=100, alive=20):
+        """A steady run: a clone every 1/rate s, healthy 0.1 s after its spawn, stopped a
+        lifetime later, gone 0.05 s after that; every namespace recycled; no builds."""
+        clones = []
+        for i in range(int(end * rate)):
+            spawn = i / rate
+            healthy = spawn + 0.1
+            clones.append({"spawn_s": spawn, "healthy_s": healthy, "stop_s": healthy + lifetime,
+                           "exit_s": healthy + lifetime + 0.05, "generation": 2 + i // slots, "error": None})
+        samples = [(t / 2, 1, alive) for t in range(int(end * 2))]
+        pool = []
+        for t in range(int(end)):
+            hist = [0] * 24
+            hist[14] = t * rate  # resets of 16 to 33 ms
+            pool.append((float(t), {
+                "building": 0, "ready": slots - alive - 1, "leased": alive, "resetting": 1, "destroying": 0,
+                "builds": slots, "destroys": 0, "grants": t * rate, "recycled_grants": t * rate,
+                "misses": 0, "resets": t * rate, "reset_us_total": t * rate * 20000, "reset_us_log2": hist,
+            }))
+        return clones, samples, pool
+
+    def failed(self, verdict):
+        return [c["name"] for c in verdict["conditions"] if not c["ok"]]
+
+    def test_a_steady_window_passes_and_reports_its_rates(self):
+        v = startrate.churn_verdict(self.CFG, *self.records())
+        self.assertEqual(self.failed(v), [])
+        self.assertTrue(v["ok"])
+        self.assertEqual((v["starts"], v["stops"]), (600, 600))
+        self.assertEqual((v["starts_per_s"], v["stops_per_s"], v["recycled_fraction"]), (10.0, 10.0, 1.0))
+        self.assertEqual(v["alive_mean"], 20.0)
+        self.assertEqual(v["pool"], {"slots": 100, "builds": 0, "destroys": 0, "reset_p99_s": 0.032768})
+        self.assertEqual(v["spawn_to_healthy_ms"]["p50"], 100.0)
+
+    def test_a_window_under_sixty_seconds_fails(self):
+        cfg = dict(self.CFG, window_end_s=70.0)
+        v = startrate.churn_verdict(cfg, *self.records())
+        self.assertEqual(self.failed(v), ["window"])
+        self.assertFalse(v["ok"])
+
+    def test_a_window_under_ten_lifetimes_fails(self):
+        cfg = dict(self.CFG, lifetime_s=7.0)
+        v = startrate.churn_verdict(cfg, *self.records(lifetime=7.0, alive=70, slots=200))
+        self.assertIn("window", self.failed(v))
+
+    def test_more_starts_than_stops_fails(self):
+        clones, samples, pool = self.records()
+        for c in clones[::5]:
+            c["stop_s"] = c["exit_s"] = None  # a fifth of the clones never stop
+        v = startrate.churn_verdict(self.CFG, clones, samples, pool)
+        self.assertEqual(self.failed(v), ["starts equal stops"])
+
+    def test_a_failed_clone_fails(self):
+        clones, samples, pool = self.records()
+        clones[300].update(healthy_s=None, stop_s=None, exit_s=31.0, error="exited 1 before healthy")
+        v = startrate.churn_verdict(self.CFG, clones, samples, pool)
+        self.assertEqual(self.failed(v), ["no failed clone"])
+
+    def test_a_rising_alive_count_fails(self):
+        clones, _, pool = self.records()
+        rising = [(t / 2, 1, 15 + int(t / 2 / 9)) for t in range(180)]  # 17 at 20 s, 23 at 80 s
+        v = startrate.churn_verdict(self.CFG, clones, rising, pool)
+        self.assertEqual(self.failed(v), ["alive count flat"])
+
+    def test_no_alive_samples_fail(self):
+        clones, _, pool = self.records()
+        v = startrate.churn_verdict(self.CFG, clones, [], pool)
+        self.assertEqual(self.failed(v), ["alive count flat", "slots cover the resets"])
+
+    def test_a_start_in_a_first_generation_namespace_fails(self):
+        for generation in (1, None):  # a namespace no clone had before; a namespace of the clone's own
+            clones, samples, pool = self.records()
+            clones[400]["generation"] = generation
+            v = startrate.churn_verdict(self.CFG, clones, samples, pool)
+            self.assertEqual(self.failed(v), ["every start in a recycled namespace"], generation)
+            self.assertEqual(v["recycled_fraction"], round(599 / 600, 4))
+
+    def test_free_slots_that_run_down_fail(self):
+        clones, samples, pool = self.records()
+        for t, counters in pool:
+            counters["ready"] = 79 - int(t / 10)  # 77 at 20 s, 72 at 79 s: 5 of 100 slots
+            counters["resetting"] = 100 - 20 - counters["ready"]
+        v = startrate.churn_verdict(self.CFG, clones, samples, pool)
+        self.assertEqual(self.failed(v), ["free slots flat"])
+
+    def test_a_namespace_built_or_destroyed_in_the_window_fails(self):
+        for counter in ("builds", "destroys"):
+            clones, samples, pool = self.records()
+            for t, counters in pool:
+                counters[counter] += 1 if t >= 50 else 0
+            v = startrate.churn_verdict(self.CFG, clones, samples, pool)
+            self.assertEqual(self.failed(v), ["no namespace built or destroyed"], counter)
+
+    def test_too_few_slots_for_the_resets_fail(self):
+        # 20 alive + 10/s x 0.033 s + 4 in flight is 24.3; 24 slots are one short.
+        clones, samples, pool = self.records(slots=24)
+        v = startrate.churn_verdict(self.CFG, clones, samples, pool)
+        self.assertEqual(self.failed(v), ["slots cover the resets"])
+        clones, samples, pool = self.records(slots=25)
+        self.assertEqual(self.failed(startrate.churn_verdict(self.CFG, clones, samples, pool)), [])
+
+    def test_missing_pool_counters_fail_every_pool_condition(self):
+        clones, samples, _ = self.records()
+        v = startrate.churn_verdict(self.CFG, clones, samples, [])
+        self.assertEqual(self.failed(v), ["free slots flat", "no namespace built or destroyed", "slots cover the resets"])
+        self.assertFalse(v["ok"])
+
+    def test_the_reset_quantile_is_the_upper_edge_of_its_bucket_over_the_window(self):
+        first = {"reset_us_log2": [5] + [0] * 23}
+        last = {"reset_us_log2": [5] + [0] * 9 + [98, 0, 0, 2] + [0] * 10}  # 98 of ~1.5 ms, 2 of ~12 ms
+        self.assertEqual(startrate.reset_quantile_s(first, last, 0.5), 2048 / 1e6)
+        self.assertEqual(startrate.reset_quantile_s(first, last, 0.98), 2048 / 1e6)
+        self.assertEqual(startrate.reset_quantile_s(first, last, 0.99), 16384 / 1e6)
+        self.assertIsNone(startrate.reset_quantile_s(first, first, 0.99))
+
+    def test_warm_up_ends_only_when_recent_starts_are_all_recycled(self):
+        fresh = [(t / 10, 1) for t in range(100)]            # 10 s of first-generation starts
+        mixed = fresh + [(10 + t / 10, 2) for t in range(15)]  # then 1.5 s of recycled ones
+        done = fresh + [(10 + t / 10, 2) for t in range(25)]   # then 2.5 s of them
+        self.assertFalse(startrate.recycled_only_since(fresh, 2.0, 10.0))
+        self.assertFalse(startrate.recycled_only_since(mixed, 2.0, 11.5))
+        self.assertTrue(startrate.recycled_only_since(done, 2.0, 12.5))
+        # Not before a lifetime has passed since the first healthy clone.
+        self.assertFalse(startrate.recycled_only_since([(t / 10, 2) for t in range(30)], 5.0, 3.0))
+        # Not on a handful of starts.
+        self.assertFalse(startrate.recycled_only_since([(0.0, 2), (9.5, 2)], 2.0, 10.0))
+
+    def test_lifetimes_spread_around_the_mean_and_repeat(self):
+        lives = [startrate.lifetime_of(i, 2.0, 0.2) for i in range(2000)]
+        self.assertTrue(all(1.6 <= x <= 2.4 for x in lives))
+        self.assertAlmostEqual(sum(lives) / len(lives), 2.0, delta=0.02)
+        self.assertGreater(max(lives) - min(lives), 0.7)
+        self.assertEqual(lives[:50], [startrate.lifetime_of(i, 2.0, 0.2) for i in range(50)])
+        self.assertEqual(startrate.lifetime_of(7, 2.0, 0.0), 2.0)
+
+    def test_a_small_run_may_swing_by_five_clones_and_no_more(self):
+        clones, _, pool = self.records()
+        swing = lambda low: [(t / 2, 1, low if t % 6 == 0 else 20) for t in range(180)]  # noqa: E731
+        self.assertEqual(self.failed(startrate.churn_verdict(self.CFG, clones, swing(15), pool)), [])
+        self.assertEqual(self.failed(startrate.churn_verdict(self.CFG, clones, swing(14), pool)), ["alive count flat"])
+
+    def test_a_large_run_may_swing_by_a_fifth(self):
+        cfg = dict(self.CFG, alive=200)
+        clones, _, pool = self.records(rate=100, alive=200, slots=400)
+        swing = lambda low: [(t / 2, 1, low if t % 6 == 0 else 200) for t in range(180)]  # noqa: E731
+        self.assertEqual(self.failed(startrate.churn_verdict(cfg, clones, swing(160), pool)), [])
+        self.assertEqual(self.failed(startrate.churn_verdict(cfg, clones, swing(159), pool)), ["alive count flat"])
+
+    def test_churn_refuses_a_window_too_short_to_judge(self):
+        args = startrate.build_parser().parse_args([
+            "churn", "--fcvm", "/nonexistent", "--prep", "/nonexistent", "--out", "/nonexistent",
+            "--alive", "10", "--lifetime", "30", "--concurrency", "2", "--duration", "120",
+        ])
+        with self.assertRaises(SystemExit) as refused:
+            args.fn(args)
+        self.assertIn("BLOCKED: --duration 120.0 is under 300 s", str(refused.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
