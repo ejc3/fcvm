@@ -1721,6 +1721,7 @@ pub(crate) fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersi
         drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
         numa_window: build.first() == Some(&"fcvm") && build.contains(&"numa-window"),
         write_set: build.first() == Some(&"fcvm") && build.contains(&"write-set"),
+        tap_fd: build.first() == Some(&"fcvm") && build.contains(&"tap-fd"),
     })
 }
 
@@ -1739,6 +1740,9 @@ pub(crate) struct FirecrackerVersion {
     /// Whether a File-backend load takes `mem_backend.write_set_path` (`+fcvm.…write-set`).
     /// Earlier builds refuse the field.
     pub write_set: bool,
+    /// Whether the build metadata says a net device takes `host_dev_fd`, a TAP queue the
+    /// VMM inherited (`tap-fd` after `+fcvm.`, ejc3/firecracker).
+    pub tap_fd: bool,
 }
 
 /// The context of a snapshot load that failed. A restore that died under its memory server
@@ -1761,6 +1765,19 @@ impl FirecrackerVersion {
     fn at_least(&self, min: (u32, u32, u32)) -> bool {
         self.release > min || (self.release == min && !self.prerelease)
     }
+}
+
+/// Whether a clone restored by `backend` gets its TAP as a queue it inherits, which is what
+/// lets it run in a pooled namespace (`crate::netpool`): a pooled TAP is attached once, by
+/// its namespace's holder, and nothing can attach to it by name. `firecracker` is the
+/// version of the binary the restore runs, when the backend is Firecracker and the binary
+/// could be read.
+pub(crate) fn vmm_takes_a_tap_queue(
+    backend: crate::hypervisor::Backend,
+    firecracker: Option<FirecrackerVersion>,
+) -> bool {
+    backend == crate::hypervisor::Backend::Firecracker
+        && firecracker.is_some_and(|version| version.tap_fd)
 }
 
 /// Save VM state with complete network configuration
@@ -3703,7 +3720,9 @@ async fn prepare_clone_substrate(
         );
         namespace.user_namespace_path = Some(lease.user_namespace_path());
         namespace.net_namespace_path = Some(lease.net_namespace_path());
-        namespace.keep_fds = vec![lease.fd()];
+        // The lease, and the queue of the namespace's TAP: the VMM uses the device through
+        // it and attaches nothing.
+        namespace.keep_fds = vec![lease.fd(), lease.tap_fd()];
         vm_state.holder_pid = Some(lease.grant.holder_pid);
         vm_state.netpool = Some(crate::state::PooledNamespace {
             slot: lease.grant.slot,
@@ -4191,6 +4210,7 @@ pub async fn restore_from_snapshot(
                 network_overrides: Some(vec![NetworkOverride {
                     iface_id: "eth0".to_string(),
                     host_dev_name: network_config.tap_device.clone(),
+                    host_dev_fd: network_config.tap_fd,
                 }]),
                 vsock_override: vsock_override.clone(),
                 drive_overrides: drive_overrides.clone(),
@@ -7423,10 +7443,6 @@ mod tests {
         assert!(built.contains("link tap-fc "), "{built}");
         assert!(built.contains("sockets sockstat: TCP=0 "), "{built}");
         assert!(!built.contains("cached route"), "{built}");
-        // Nothing is attached to the TAP; loopback is up and has a carrier.
-        assert!(!agent.carrier("tap-fc").await.expect("the TAP's carrier"));
-        assert!(agent.carrier("lo").await.expect("loopback's carrier"));
-        assert!(agent.carrier("no-such-link").await.is_err());
 
         let mac = "02:00:00:00:00:99";
         in_namespace(
@@ -10579,6 +10595,36 @@ mod tests {
         assert!(dev.prerelease && dev.drive_overrides);
     }
 
+    /// Only a Firecracker whose version says `tap-fd` is given a pooled namespace: any
+    /// other VMM would attach to the TAP by name, and a pooled TAP is already attached.
+    #[test]
+    fn only_a_vmm_that_takes_a_tap_queue_is_pooled() {
+        use crate::hypervisor::Backend;
+        let version = |output: &str| Some(parse_firecracker_version(output).unwrap());
+        let takes =
+            version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set.tap-fd\n");
+        assert!(takes.unwrap().tap_fd && takes.unwrap().drive_overrides);
+        assert!(vmm_takes_a_tap_queue(Backend::Firecracker, takes));
+        assert!(vmm_takes_a_tap_queue(
+            Backend::Firecracker,
+            version("Firecracker v1.17.0+fcvm.drive-overrides.tap-fd.fuzzing")
+        ));
+        for other in [
+            "Firecracker v1.17.0",
+            "Firecracker v1.17.0+fcvm.drive-overrides",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set",
+            "Firecracker v1.17.0+other.tap-fd",
+        ] {
+            assert!(
+                !vmm_takes_a_tap_queue(Backend::Firecracker, version(other)),
+                "{other}"
+            );
+        }
+        assert!(!vmm_takes_a_tap_queue(Backend::Firecracker, None));
+        assert!(!vmm_takes_a_tap_queue(Backend::CloudHypervisor, takes));
+    }
+
     /// A load overrides the drives only when the binary takes the field, the vsock path is
     /// overridden too, and the vmstate names nothing else under a source directory.
     #[test]
@@ -10589,6 +10635,7 @@ mod tests {
             drive_overrides: true,
             numa_window: false,
             write_set: false,
+            tap_fd: false,
         };
         let source = PathBuf::from("/data/vm-disks/vm-source");
         let sources = vec![source.clone()];

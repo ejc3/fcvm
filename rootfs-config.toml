@@ -62,6 +62,8 @@ archives = [
 # architecture allowed, the same program for the API, vCPU and VMM threads. This build
 # installs that program once per process and its threads inherit it, where each thread
 # installed a copy (one kernel BPF program per thread to compile and to free).
+# A net device takes host_dev_fd, a TAP queue the process inherited, which is how a clone
+# in a pooled namespace gets its TAP (`tap-fd` in the same build metadata).
 # v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
 # build cannot restore format 12. A restore uses the binary the snapshot
 # recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
@@ -78,8 +80,8 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-write-set"
-commit = "0cc0408b9565f5c9fd9f55fd477bc208887a8d63"
+branch = "agent/uffd-minor-v1.17.0-write-set-tap-fd"
+commit = "a6a15cafed4d56fc87f25f67084cea8a90911fdc"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).

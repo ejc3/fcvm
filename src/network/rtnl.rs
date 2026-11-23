@@ -462,9 +462,11 @@ const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
 const IFF_TAP: libc::c_short = 0x0002;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
-/// `ip tuntap add NAME mode tap`: a TAP device that stays when the descriptor that made it
-/// closes. Whoever opens it later attaches to this device instead of making one.
-pub fn add_tap(name: &str) -> io::Result<()> {
+const IFF_VNET_HDR: libc::c_short = 0x4000;
+
+/// Open `/dev/net/tun` and attach the descriptor to the TAP device `name` with `flags`,
+/// making the device if it does not exist.
+fn attach_tap(name: &str, flags: libc::c_short, open_flags: libc::c_int) -> io::Result<OwnedFd> {
     #[repr(C)]
     struct IfReq {
         name: [u8; libc::IFNAMSIZ],
@@ -479,12 +481,12 @@ pub fn add_tap(name: &str) -> io::Result<()> {
     }
     let mut request = IfReq {
         name: [0; libc::IFNAMSIZ],
-        flags: IFF_TAP | IFF_NO_PI,
+        flags,
         pad: [0; 22],
     };
     request.name[..name.len()].copy_from_slice(name.as_bytes());
     // SAFETY: the path is a NUL-terminated literal.
-    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | open_flags) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -495,11 +497,58 @@ pub fn add_tap(name: &str) -> io::Result<()> {
     if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETIFF as _, &request) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(tun)
+}
+
+/// `ip tuntap add NAME mode tap`: a TAP device that stays when the descriptor that made it
+/// closes. Whoever opens it later attaches to this device instead of making one.
+pub fn add_tap(name: &str) -> io::Result<()> {
+    let tun = attach_tap(name, IFF_TAP | IFF_NO_PI, libc::O_CLOEXEC)?;
     // SAFETY: TUNSETPERSIST takes its argument by value.
     if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETPERSIST as _, 1 as libc::c_ulong) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// A TAP device made attached, and the queue it is attached by: the device has a carrier
+/// from here on and keeps it for as long as the descriptor, or a copy of it, is open.
+///
+/// A VMM uses the device through a copy of this descriptor. It attaches nothing and, when
+/// it exits, detaches nothing, so neither its start nor its stop takes `rtnl_mutex` for the
+/// TAP or flips its carrier: on a host with 2000 namespaces an attach and detach by name
+/// hold that mutex 1.5 ms or more (`bench/start-rate/pieces/RESULTS.md`, tap-attach). The
+/// queue has the flags Firecracker opens a TAP with, virtio-net header included, and is
+/// non-blocking, which is a property of the open file and so of every copy.
+pub fn add_attached_tap(name: &str) -> io::Result<OwnedFd> {
+    attach_tap(
+        name,
+        IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
+        libc::O_CLOEXEC | libc::O_NONBLOCK,
+    )
+}
+
+/// Read and discard every frame waiting in the TAP queue `queue`, and say how many there
+/// were. The queue holds frames the namespace sent towards the VMM that the VMM had not
+/// read; with the queue kept open across VMMs the kernel never purges them (it does at the
+/// close of a queue), so they would be the next VMM's first frames.
+pub fn drain_tap(queue: &OwnedFd) -> io::Result<usize> {
+    let mut frame = [0u8; 65536 + 64];
+    let mut drained = 0;
+    loop {
+        // SAFETY: `frame` is writable for its whole length.
+        let got = unsafe { libc::read(queue.as_raw_fd(), frame.as_mut_ptr().cast(), frame.len()) };
+        if got >= 0 {
+            drained += 1;
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::WouldBlock => return Ok(drained),
+            io::ErrorKind::Interrupted => continue,
+            _ => return Err(error),
+        }
+    }
 }
 
 #[cfg(test)]

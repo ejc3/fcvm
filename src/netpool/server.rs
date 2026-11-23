@@ -17,7 +17,7 @@ use crate::network::{netns_agent, NetworkManager, PastaNetwork};
 use anyhow::{bail, Context, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -44,9 +44,9 @@ const RESET_CONCURRENCY: usize = 64;
 /// How long a connection has to send its request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a reset waits for the namespace to read as it did when it was built. The
-/// lease's connection closes a moment before the VMM's TAP does (both in the VMM's exit,
-/// the TAP's close behind `rtnl_mutex`), and until then the TAP has a carrier.
+/// How long a reset waits for the namespace to read as it did when it was built: what
+/// trails a link change (a route's link-down flag, pasta's TAP coming up again) settles
+/// well within it.
 const VERIFY_BUDGET: Duration = Duration::from_secs(2);
 
 /// How long a failed build waits before the next attempt.
@@ -106,6 +106,9 @@ struct Namespace {
     network: PastaNetwork,
     user_namespace: std::fs::File,
     net_namespace: std::fs::File,
+    /// The queue the TAP is attached by: a copy of the one the holder keeps. Every lease
+    /// gets a copy for its VMM.
+    tap: OwnedFd,
     /// The fingerprint taken when the build finished.
     built_as: String,
     pid_dir: PathBuf,
@@ -114,7 +117,9 @@ struct Namespace {
 /// The network every namespace of a pool is built from: a restored clone's, with no
 /// published port. Its [`PastaNetwork::pool_key`] is the pool's key.
 fn slot_network(vm_id: String, pid_dir: PathBuf) -> PastaNetwork {
-    PastaNetwork::new(vm_id, proto::TAP.to_string(), Vec::new()).with_pid_dir(pid_dir)
+    PastaNetwork::new(vm_id, proto::TAP.to_string(), Vec::new())
+        .with_pid_dir(pid_dir)
+        .with_attached_tap()
 }
 
 impl Namespace {
@@ -153,21 +158,23 @@ impl Namespace {
                 std::fs::File::open(&path).with_context(|| format!("opening {path}"))
             };
             let (user_namespace, net_namespace) = (open("user")?, open("net")?);
+            let tap = agent.queue().await.context("getting the TAP's queue")?;
             let built_as = agent
                 .fingerprint(proto::TAP)
                 .await
                 .context("taking the fingerprint")?;
-            Ok::<_, anyhow::Error>((agent, user_namespace, net_namespace, built_as))
+            Ok::<_, anyhow::Error>((agent, user_namespace, net_namespace, tap, built_as))
         }
         .await;
         match built {
-            Ok((agent, user_namespace, net_namespace, built_as)) => Ok(Self {
+            Ok((agent, user_namespace, net_namespace, tap, built_as)) => Ok(Self {
                 holder,
                 holder_pid,
                 agent,
                 network,
                 user_namespace,
                 net_namespace,
+                tap,
                 built_as,
                 pid_dir,
             }),
@@ -215,41 +222,23 @@ impl Namespace {
                 self.user_namespace.as_raw_fd(),
                 self.net_namespace.as_raw_fd(),
                 lessee_end.as_raw_fd(),
+                self.tap.as_raw_fd(),
             ],
         )
         .context("sending the grant")?;
         proto::watch(offer.connection).context("watching the lease")
     }
 
-    /// After a lease: wait until nothing is attached to the VMM's TAP, restart pasta, have
-    /// the holder remove what a VM's use leaves, and check the namespace against its
-    /// fingerprint. An error means it must not be lent again.
+    /// After a lease: restart pasta, have the holder remove what a VM's use leaves, and
+    /// check the namespace against its fingerprint. An error means it must not be lent
+    /// again.
     ///
-    /// The wait comes first. While a process is attached to the TAP it can send frames,
-    /// and what a frame leaves in the kernel shows in the fingerprint but what it leaves in
-    /// pasta does not: a flow, the MAC and the address pasta learns. So the pasta that
-    /// serves the next VM is started only after the last writer is gone, and cleaning
-    /// happens after that. A TAP that still has a carrier at the end of the budget gets
-    /// the namespace destroyed.
+    /// The lease's end is what says the VMM is gone. The TAP is attached by its holder
+    /// for the namespace's whole life, so its carrier cannot say whether a VMM still has the
+    /// queue, as it could while a VMM attached by name. The queue goes to the VMM alone,
+    /// together with the lease, and is close-on-exec in every other process.
     async fn reset(&mut self) -> Result<()> {
         failpoint::hit_async("pool.pre_reset").await;
-        let deadline = tokio::time::Instant::now() + VERIFY_BUDGET;
-        let mut pause = Duration::from_millis(1);
-        while self
-            .agent
-            .carrier(proto::TAP)
-            .await
-            .context("reading the TAP's carrier")?
-        {
-            if tokio::time::Instant::now() >= deadline {
-                bail!(
-                    "a process is still attached to the namespace's TAP, {VERIFY_BUDGET:?} \
-                     after its lease ended"
-                );
-            }
-            tokio::time::sleep(pause).await;
-            pause = (pause * 2).min(Duration::from_millis(50));
-        }
         self.network.cleanup().await.context("stopping pasta")?;
         self.agent
             .reset()
@@ -851,6 +840,10 @@ mod tests {
             "{}",
             pooled.built_as
         );
+        // The one difference: the pooled TAP is attached from its build on, by its holder,
+        // and has a carrier; a clone's own is attached when its VMM starts.
+        assert!(tap_flags(&pooled.built_as, proto::TAP) & CARRIER == CARRIER);
+        assert!(tap_flags(&own_fingerprint, "tap-own") & CARRIER == 0);
         assert_eq!(
             comparable(&pooled.built_as, proto::TAP),
             comparable(&own_fingerprint, "tap-own"),
@@ -863,10 +856,30 @@ mod tests {
         pooled.destroy().await;
     }
 
+    /// IFF_LOWER_UP: the flag of a link with a carrier that a fingerprint keeps.
+    const CARRIER: u32 = 0x1_0000;
+
+    /// The flags on the fingerprint's line for the link `tap`.
+    fn tap_flags(fingerprint: &str, tap: &str) -> u32 {
+        let line = fingerprint
+            .lines()
+            .find(|line| line.starts_with(&format!("link {tap} ")))
+            .unwrap_or_else(|| panic!("no link {tap}: {fingerprint}"));
+        let flags = line.split("flags=0x").nth(1).unwrap();
+        u32::from_str_radix(flags.split_whitespace().next().unwrap(), 16).unwrap()
+    }
+
     /// A fingerprint with what differs between any two namespaces taken out: the VMM's
-    /// TAP's name, and the MAC the kernel drew for each TAP.
+    /// TAP's name, the MAC the kernel drew for each TAP, and whether the VMM's TAP has a
+    /// carrier yet.
     fn comparable(fingerprint: &str, tap: &str) -> String {
-        let mut text = fingerprint.replace(tap, "TAP");
+        let flags = tap_flags(fingerprint, tap);
+        let mut text = fingerprint
+            .replace(
+                &format!("link {tap} flags={flags:#x} "),
+                &format!("link {tap} flags={:#x} ", flags & !CARRIER),
+            )
+            .replace(tap, "TAP");
         let drawn: Vec<(String, String)> = text
             .lines()
             .filter(|line| line.starts_with("link ") && line.ends_with("kind=tun"))

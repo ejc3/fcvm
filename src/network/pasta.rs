@@ -903,6 +903,9 @@ pub struct PastaNetwork {
     // Where pasta's PID file goes when not in the VM's runtime directory: a pooled
     // namespace is no VM's.
     pid_dir: Option<PathBuf>,
+    // The VMM's TAP is made attached and its queue kept by the holder (`with_attached_tap`):
+    // the namespaces a pool builds.
+    attached_tap: bool,
     // Whether this VM may ask a namespace pool for its namespace (`with_pooling`).
     pooling: bool,
     // The pooled namespace this VM runs in, when it claimed one (`crate::netpool`). The pool
@@ -1022,9 +1025,18 @@ impl PastaNetwork {
             isolated: false,
             dns_server: None,
             pid_dir: None,
+            attached_tap: false,
             pooling: false,
             lease: None,
         }
+    }
+
+    /// Build the namespace with the VMM's TAP attached, its queue held by the holder
+    /// ([`super::netns_agent::Shape::tap_attached`]): what a pool builds, for VMMs that take
+    /// the queue as a descriptor.
+    pub fn with_attached_tap(mut self) -> Self {
+        self.attached_tap = true;
+        self
     }
 
     /// Let this VM run in a pooled namespace when one is to be had ([`Self::poolable`]).
@@ -1074,6 +1086,8 @@ impl PastaNetwork {
         use sha2::Digest;
         let mut shape = self.shape();
         shape.tap = String::new();
+        // A pooled namespace's TAP is attached, whatever this VM would build for itself.
+        shape.tap_attached = true;
         let args = self.build_pasta_args(
             Path::new("/"),
             0,
@@ -1183,6 +1197,7 @@ impl PastaNetwork {
                 .expect("NAMESPACE_IP is an IPv4 address"),
             bridge_prefix: 24,
             mtu: self.links_mtu(),
+            tap_attached: self.attached_tap,
         }
     }
 
@@ -2081,6 +2096,7 @@ impl NetworkManager for PastaNetwork {
         }
         info!(vm_id = %self.vm_id, "setting up rootless networking with pasta (bridge mode)");
 
+        let mut tap_fd = None;
         // A namespace from the pool, when one serves this data directory and has a free
         // namespace built the way this VM's would be. Here, before anything names the TAP:
         // a pooled namespace's TAP has the pool's name, not this VM's.
@@ -2108,6 +2124,7 @@ impl NetworkManager for PastaNetwork {
                     "running in a pooled namespace"
                 );
                 self.tap_device = lease.grant.tap.clone();
+                tap_fd = Some(lease.tap_fd());
                 self.lease = Some(lease);
                 failpoint::hit_async("pool.post_claim").await;
             }
@@ -2149,6 +2166,7 @@ impl NetworkManager for PastaNetwork {
 
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
+            tap_fd,
             guest_mac,
             guest_ip: Some(format!("{}/24", self.guest_ip)),
             host_ip: Some(GUEST_GATEWAY.to_string()),
@@ -4280,6 +4298,7 @@ mod tests {
                 bridge_address: "10.0.2.1".parse().unwrap(),
                 bridge_prefix: 24,
                 mtu: Some(GUEST_MTU),
+                tap_attached: false,
             }
         );
     }

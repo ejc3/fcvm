@@ -1,8 +1,9 @@
 //! What a clone and the pool say to each other, over a `SOCK_SEQPACKET` connection.
 //!
 //! The clone sends one [`Claim`]. The pool answers with one [`Reply`]; an `ok` carries
-//! three descriptors, in this order: the namespace's user namespace, its network namespace,
-//! and the clone's channel to the namespace's holder. After that the connection carries
+//! four descriptors, in this order: the namespace's user namespace, its network namespace,
+//! the clone's channel to the namespace's holder, and the queue the namespace's TAP is
+//! attached by. After that the connection carries
 //! nothing: it is the lease, and it ends when every process holding it has exited.
 
 use anyhow::{Context, Result};
@@ -20,7 +21,7 @@ pub const TAP: &str = "tap-pool";
 pub const MAX_MESSAGE: usize = 4096;
 
 /// Descriptors an `ok` reply carries.
-pub const GRANT_FDS: usize = 3;
+pub const GRANT_FDS: usize = 4;
 const _: () = assert!(GRANT_FDS <= crate::network::netns_agent::MAX_PACKET_FDS);
 
 /// The area of the data directory that holds each user's pool directory.

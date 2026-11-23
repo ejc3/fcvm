@@ -24,9 +24,9 @@
 //! | `tcp4`, `tcp6` | `ok` with a non-blocking, unconnected TCP socket made in the namespace |
 //! | `build` and a [`Shape`] as JSON | `ok` once the namespace's links exist as the shape says |
 //! | `adopt` with a socket | `ok`: the agent now also serves `tcp4` and `tcp6` on that socket |
+//! | `queue` | `ok` with the queue the VMM's TAP is attached by, when the shape made it attached |
 //! | `reset` | `ok` once nothing a VM's use of the namespace left is in it ([`reset`]) |
 //! | `fingerprint` and the VMM's TAP | `ok` and the namespace's [`fingerprint`](super::fingerprint) |
-//! | `carrier` and a link's name | `ok 1` when the link has a carrier (a process is attached to a TAP), `ok 0` when not |
 //!
 //! An adopted socket is a second channel, for a process the owner lends the namespace to
 //! (the pool's lessee): it gets sockets and nothing else, so it cannot rebuild or reset a
@@ -62,9 +62,9 @@ const TCP6: &[u8] = b"tcp6";
 
 const BUILD: &[u8] = b"build ";
 const ADOPT: &[u8] = b"adopt";
+const QUEUE: &[u8] = b"queue";
 const RESET: &[u8] = b"reset";
 const FINGERPRINT: &[u8] = b"fingerprint ";
-const CARRIER: &[u8] = b"carrier ";
 
 /// The longest message either side sends. Every message is one `sendmsg` of fewer bytes
 /// than this on a `SOCK_SEQPACKET` socket, so one `recvmsg` returns exactly one message.
@@ -231,6 +231,12 @@ pub struct Shape {
     pub bridge_prefix: u8,
     /// The MTU of every link. `None` leaves each at the kernel's default.
     pub mtu: Option<u32>,
+    /// Make the VMM's TAP attached: the holder keeps the queue open
+    /// ([`super::rtnl::add_attached_tap`]) and a VMM uses the device through a copy of that
+    /// descriptor. Otherwise the TAP is persistent and detached, and a VMM attaches to it
+    /// by name.
+    #[serde(default)]
+    pub tap_attached: bool,
 }
 
 /// Build `shape` in the calling process's network namespace, which must hold nothing but
@@ -242,7 +248,9 @@ pub struct Shape {
 /// for every other network namespace under one global lock. Nothing in the namespace
 /// forwards at L3 (the TAPs are bridged, and pasta reaches the guest from inside the
 /// namespace), so `ip_forward` stays as it is.
-pub fn build(shape: &Shape) -> Result<()> {
+///
+/// Returns the queue of the VMM's TAP when the shape asks for it attached.
+pub fn build(shape: &Shape) -> Result<Option<OwnedFd>> {
     use super::rtnl::{add_tap, link_index, LinkChange, Rtnl};
     let mut rtnl = Rtnl::open().context("opening a netlink socket")?;
     let index = |name: &str| link_index(name).with_context(|| format!("finding {name}"));
@@ -275,11 +283,30 @@ pub fn build(shape: &Shape) -> Result<()> {
     rtnl.set_link(bridge_index, &bridge_quiet)
         .with_context(|| format!("configuring bridge {bridge}"))?;
     // pasta's TAP first, then the VMM's, as the ports were added when pasta made its own.
-    // A TAP takes its mode in the request that brings it up: nothing is attached to it, so
-    // it has no carrier and no queueing discipline yet, and the kernel generates no address
-    // for such a link.
+    // A detached TAP takes its mode in the request that brings it up: nothing is attached
+    // to it, so it has no carrier and no queueing discipline yet, and the kernel generates
+    // no address for such a link. An attached TAP has a carrier from the start, so like the
+    // bridge it gets its mode in a request of its own while it is down: brought up in the
+    // same request it took a link-local address and sent a router solicitation out of its
+    // own queue, to whichever VM read it first.
+    let mut queue = None;
     for tap in shape.pasta_tap.iter().chain(std::iter::once(&shape.tap)) {
-        add_tap(tap).with_context(|| format!("creating TAP device {tap}"))?;
+        if shape.tap_attached && *tap == shape.tap {
+            queue = Some(
+                super::rtnl::add_attached_tap(tap)
+                    .with_context(|| format!("creating TAP device {tap} with its queue"))?,
+            );
+            let tap_quiet = LinkChange {
+                mtu: shape.mtu,
+                master: None,
+                up: false,
+                no_ipv6_link_local: true,
+            };
+            rtnl.set_link(index(tap)?, &tap_quiet)
+                .with_context(|| format!("configuring TAP device {tap}"))?;
+        } else {
+            add_tap(tap).with_context(|| format!("creating TAP device {tap}"))?;
+        }
         let port = LinkChange {
             mtu: shape.mtu,
             master: Some(bridge_index),
@@ -298,7 +325,7 @@ pub fn build(shape: &Shape) -> Result<()> {
                 shape.bridge_address, shape.bridge_prefix
             )
         })?;
-    Ok(())
+    Ok(queue)
 }
 
 /// Remove what a VM's use of the namespace can leave in it, so the next VM starts from what
@@ -456,6 +483,8 @@ fn serve_socket(channel: &UnixStream, request: &[u8]) -> std::io::Result<()> {
 /// fails or closes is dropped; only the owner's channel ends the agent.
 pub fn serve(owner: &UnixStream) -> Result<()> {
     let mut lessees: Vec<UnixStream> = Vec::new();
+    // The queue of the VMM's TAP, when the namespace was built with it attached.
+    let mut queue: Option<OwnedFd> = None;
     loop {
         let mut fds: Vec<libc::pollfd> = std::iter::once(owner)
             .chain(lessees.iter())
@@ -511,17 +540,37 @@ pub fn serve(owner: &UnixStream) -> Result<()> {
             request if request.starts_with(BUILD) => {
                 let built = serde_json::from_slice::<Shape>(&request[BUILD.len()..])
                     .context("reading the shape")
-                    .and_then(|shape| build(&shape));
+                    .and_then(|shape| build(&shape))
+                    .map(|made| queue = made);
                 answer(owner, built.map(|()| Vec::new())).context("answering a build")?;
             }
+            QUEUE => match &queue {
+                Some(queue) => owner
+                    .send_with_fd(OK, queue.as_raw_fd())
+                    .map(drop)
+                    .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))
+                    .context("sending the queue")?,
+                None => send(
+                    owner,
+                    b"err the namespace was not built with an attached TAP",
+                )
+                .context("answering a queue request")?,
+            },
             ADOPT => {
                 // A lessee's channel is non-blocking on this side: a lessee that asks and
                 // never reads would otherwise fill its queue and hold the holder in a send,
                 // and with it the pool's reset of this namespace. A reply that cannot be
                 // queued drops the lessee (`served` below).
+                //
+                // A new lessee starts with an empty TAP queue. Whatever the namespace sent
+                // towards a VMM since the last one read it is still there: the kernel
+                // purges a queue when it is closed, and this one stays open.
                 let adopted = passed
                     .context("the request carried no socket")
                     .and_then(|socket| {
+                        if let Some(queue) = &queue {
+                            super::rtnl::drain_tap(queue).context("emptying the TAP's queue")?;
+                        }
                         let socket = UnixStream::from(socket);
                         socket
                             .set_nonblocking(true)
@@ -534,17 +583,6 @@ pub fn serve(owner: &UnixStream) -> Result<()> {
             RESET => {
                 answer(owner, reset(&mut lessees).map(|()| Vec::new()))
                     .context("answering a reset")?;
-            }
-            request if request.starts_with(CARRIER) => {
-                let link = String::from_utf8_lossy(&request[CARRIER.len()..]).into_owned();
-                let carrier = super::fingerprint::has_carrier(&link).map(|carrier| {
-                    if carrier {
-                        b" 1".to_vec()
-                    } else {
-                        b" 0".to_vec()
-                    }
-                });
-                answer(owner, carrier).context("answering a carrier request")?;
             }
             request if request.starts_with(FINGERPRINT) => {
                 let tap = String::from_utf8_lossy(&request[FINGERPRINT.len()..]).into_owned();
@@ -843,8 +881,22 @@ impl Client {
         }
     }
 
+    /// The queue the VMM's TAP is attached by, in a namespace built with
+    /// [`Shape::tap_attached`]. The descriptor is a copy: the agent keeps its own.
+    pub async fn queue(&self) -> Result<OwnedFd> {
+        let (reply, queue) = self
+            .exchange(QUEUE, None)
+            .await
+            .context("asking the namespace agent for the TAP's queue")?;
+        if let Some(reason) = reply.strip_prefix(b"err ") {
+            bail!("{}", String::from_utf8_lossy(reason));
+        }
+        queue.context("the namespace agent's reply carried no queue")
+    }
+
     /// Have the agent serve socket requests on `channel` too: the other end of that socket
-    /// pair goes to the process the namespace is lent to.
+    /// pair goes to the process the namespace is lent to. The agent empties the TAP's queue
+    /// first, when it holds one.
     pub async fn adopt(&self, channel: &UnixStream) -> Result<()> {
         self.request(ADOPT, Some(channel.as_raw_fd()), "an adopted channel")
             .await
@@ -854,22 +906,6 @@ impl Client {
     /// Have the agent remove what a VM's use left in the namespace ([`reset`]).
     pub async fn reset(&self) -> Result<()> {
         self.request(RESET, None, "a reset").await.map(drop)
-    }
-
-    /// Whether the link `name` in the namespace has a carrier. A TAP has one while a
-    /// process is attached to it.
-    pub async fn carrier(&self, name: &str) -> Result<bool> {
-        let mut request = CARRIER.to_vec();
-        request.extend_from_slice(name.as_bytes());
-        let body = self.request(&request, None, "a link's carrier").await?;
-        match body.as_slice() {
-            b" 1" => Ok(true),
-            b" 0" => Ok(false),
-            other => bail!(
-                "the namespace agent answered a carrier request with {:?}",
-                String::from_utf8_lossy(other)
-            ),
-        }
     }
 
     /// The namespace's fingerprint ([`super::fingerprint`]); `tap` is the VMM's TAP.
@@ -991,6 +1027,33 @@ mod tests {
             body.matches("rtnl.set_link(bridge_index").count(),
             2,
             "another request to the bridge"
+        );
+    }
+
+    /// An attached TAP has a carrier before it is up, so its address generation is turned
+    /// off in a request that leaves it down, sent before the one that puts it on the bridge
+    /// and brings it up. In one request it took a link-local address and solicited routers
+    /// through its own queue (`the_next_tenant_gets_no_frame_from_the_last` reads the queue
+    /// of a namespace nothing has used).
+    #[test]
+    fn an_attached_tap_stops_generating_addresses_before_it_comes_up() {
+        let source = include_str!("netns_agent.rs");
+        let body = &source[source.find("pub fn build(shape: &Shape)").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let made = body.find("add_attached_tap(tap)").expect("no attached TAP");
+        let quiet = body
+            .find("let tap_quiet = LinkChange {")
+            .expect("no quiet request for the attached TAP");
+        let request = &body[quiet..quiet + body[quiet..].find("};").unwrap()];
+        assert!(request.contains("up: false"), "{request}");
+        assert!(request.contains("no_ipv6_link_local: true"), "{request}");
+        let sent = body
+            .find("rtnl.set_link(index(tap)?, &tap_quiet)")
+            .expect("the quiet request is not sent");
+        let port = body.find("rtnl.set_link(index(tap)?, &port)").unwrap();
+        assert!(
+            made < sent && sent < port,
+            "the attached TAP's requests are out of order"
         );
     }
 
