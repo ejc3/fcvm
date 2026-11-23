@@ -5881,6 +5881,20 @@ fn validate_mappings(mappings: &[GuestRegionUffdMapping], mem_size: usize) -> Re
     Ok(())
 }
 
+/// One message of a clone's handshake and the descriptor that came with it, close-on-exec.
+///
+/// The descriptor is the clone's userfaultfd. Received without the flag (`recv_with_fd`)
+/// it stayed open across the exec of every process this one started afterwards.
+fn receive_handshake(
+    stream: &std::os::unix::net::UnixStream,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, Option<std::os::fd::OwnedFd>)> {
+    let (read, mut descriptors) = crate::network::netns_agent::receive_packet(stream, buffer)?;
+    // The handshake carries one descriptor; any other is closed here.
+    descriptors.truncate(1);
+    Ok((read, descriptors.pop()))
+}
+
 /// Complete the handshake with a newly connected Firecracker.
 ///
 /// MINOR mode is a two-message exchange (fcvm speaks first):
@@ -5913,9 +5927,9 @@ async fn handshake(
     // Wait for data to arrive, then recv with fd passing
     let (bytes_read, uffd_fd_opt) = loop {
         let mut guard = async_stream.readable().await?;
-        match guard.get_inner().recv_with_fd(&mut message_buf) {
+        match receive_handshake(guard.get_inner(), &mut message_buf) {
             Ok(result) => break result,
-            Err(e) if e.errno() == libc::EWOULDBLOCK || e.errno() == libc::EAGAIN => {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 guard.clear_ready();
                 continue;
             }
@@ -6208,6 +6222,22 @@ mod tests {
             !body.contains("\n            super::failure::write_failure("),
             "record_failure still writes the failure file inline"
         );
+    }
+
+    /// The userfaultfd a clone's VMM sends arrives close-on-exec, so no process this one
+    /// starts later holds it.
+    #[test]
+    fn the_handshake_descriptor_is_close_on_exec() {
+        let (tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
+        let file = File::open("/dev/null").unwrap();
+        tx.send_with_fd(&b"[]"[..], file.as_raw_fd()).unwrap();
+        let mut buffer = [0u8; 16];
+        let (read, descriptor) = receive_handshake(&rx, &mut buffer).unwrap();
+        assert_eq!(&buffer[..read], b"[]");
+        let descriptor = descriptor.expect("the message's descriptor");
+        // SAFETY: fcntl with F_GETFD takes no pointers.
+        let flags = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
     }
 
     use super::*;
