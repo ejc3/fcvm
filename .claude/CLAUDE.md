@@ -698,7 +698,8 @@ lines as the container's stderr. The console still gets everything held so far, 
 line ending in `held_ms=`, as soon as fc-agent logs an `ERROR`, `FATAL`, `WARNING`, `Error:` or
 `VITALS` line or anything that is not its own line (a panic, a child's output, a failpoint),
 when the 10 s pass without an acknowledgement and an output connection made after the
-restore's reconnect request, and when that reconnect fails. A guest that
+restore's reconnect request, when that reconnect fails, and when the output connection is
+shut down because the container exited. A guest that
 stops running inside those 10 s without such a line leaves no fc-agent line of the restore;
 the host has no acknowledgement for it. `[fcvm-vitals]` samples always go to the console.
 
