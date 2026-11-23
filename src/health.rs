@@ -1222,10 +1222,11 @@ pub async fn check_http_health_agent(
     host_header: Option<&str>,
     timeout_secs: u64,
 ) -> Result<()> {
-    let target = format!("{guest_ip}:{port}");
     let address: std::net::IpAddr = guest_ip
         .parse()
         .with_context(|| format!("the guest address {guest_ip} is not an IP address"))?;
+    let target = std::net::SocketAddr::new(address, port).to_string();
+    let default_host = default_host_header(address, port);
     let start = Instant::now();
     let probe = async {
         let socket = agent.tcp_socket(&address).await?;
@@ -1233,7 +1234,7 @@ pub async fn check_http_health_agent(
             .connect(std::net::SocketAddr::new(address, port))
             .await
             .context("connecting")?;
-        http_get_status(stream, &target, health_path, host_header).await
+        http_get_status(stream, &default_host, health_path, host_header).await
     };
     let status = match tokio::time::timeout(Duration::from_secs(timeout_secs), probe).await {
         Ok(Ok(status)) => status,
@@ -1264,12 +1265,28 @@ pub async fn check_http_health_agent(
     }
 }
 
+/// The Host header for a request to `address` on `port` when the health check URL names no
+/// host: the address, in brackets if it is IPv6, and the port unless it is HTTP's own. It
+/// is what `curl http://ADDRESS:PORT/` sends, which this probe replaced; a server that
+/// matches Host exactly sees no change.
+fn default_host_header(address: std::net::IpAddr, port: u16) -> String {
+    let host = match address {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    if port == 80 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 /// One `GET` of `path` over `stream`, with the response read to its end, and its status.
-/// `target` is the `host:port` the stream is connected to, sent as the Host header unless
-/// the health check URL named a virtual host.
+/// `default_host` is sent as the Host header unless the health check URL named a virtual
+/// host ([`default_host_header`]).
 async fn http_get_status<S>(
     stream: S,
-    target: &str,
+    default_host: &str,
     path: &str,
     host_header: Option<&str>,
 ) -> Result<hyper::StatusCode>
@@ -1283,7 +1300,7 @@ where
             .await
             .context("starting HTTP")?;
     let request = hyper::Request::get(path)
-        .header(hyper::header::HOST, host_header.unwrap_or(target))
+        .header(hyper::header::HOST, host_header.unwrap_or(default_host))
         .header(
             hyper::header::USER_AGENT,
             concat!("fcvm/", env!("CARGO_PKG_VERSION")),
@@ -2008,6 +2025,17 @@ mod tests {
             request.contains(&format!("\r\nhost: 127.0.0.1:{}\r\n", address.port())),
             "{request}"
         );
+    }
+
+    /// The Host header is curl's for the same URL: no port when it is 80, an IPv6 address
+    /// in brackets.
+    #[test]
+    fn the_default_host_header_is_curls() {
+        let host = |address: &str, port| default_host_header(address.parse().unwrap(), port);
+        assert_eq!(host("10.0.2.100", 80), "10.0.2.100");
+        assert_eq!(host("10.0.2.100", 8080), "10.0.2.100:8080");
+        assert_eq!(host("fd00::100", 80), "[fd00::100]");
+        assert_eq!(host("fd00::100", 8080), "[fd00::100]:8080");
     }
 
     /// A health check URL with a hostname sends it as the Host header, for servers that

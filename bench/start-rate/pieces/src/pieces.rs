@@ -20,7 +20,7 @@ pub enum Piece {
     /// The rootless namespace holder (`spawn_namespace_holder`: the agent process, uid/gid
     /// maps).
     Holder,
-    /// The rootless network: holder, TAP setup script, pasta and the bridge.
+    /// The rootless network: the holder, its links, pasta.
     RootlessNet,
     /// A Firecracker process to its API socket, inside a prepared holder's namespaces.
     FcSpawn,
@@ -209,18 +209,13 @@ async fn rootless_network(held: &mut Held, stages: &mut Stages) -> Result<u32> {
     let pid = spawn_holder(held).await?;
     stages.push(("holder", ms(t)));
     let t = Instant::now();
-    fcvm::commands::common::run_namespace_setup_script(
-        pid,
-        &network.build_nsenter_prefix(pid),
-        &network.build_setup_script(),
-    )
-    .await?;
-    stages.push(("tap", ms(t)));
+    network.build_namespace(pid).await?;
+    stages.push(("links", ms(t)));
     let t = Instant::now();
     let result = network.post_start(pid).await;
     held.network = Some(network);
     result.context("pasta post_start")?;
-    stages.push(("pasta+bridge", ms(t)));
+    stages.push(("pasta", ms(t)));
     Ok(pid)
 }
 
@@ -229,12 +224,7 @@ async fn rootless_network(held: &mut Held, stages: &mut Stages) -> Result<u32> {
 async fn isolated_network(held: &mut Held) -> Result<u32> {
     let mut network = PastaNetwork::isolated(held.vm_id.clone(), tap_device(&held.vm_id));
     let pid = spawn_holder(held).await?;
-    fcvm::commands::common::run_namespace_setup_script(
-        pid,
-        &network.build_nsenter_prefix(pid),
-        &network.build_setup_script(),
-    )
-    .await?;
+    network.build_namespace(pid).await?;
     let result = network.post_start(pid).await;
     held.network = Some(network);
     result.context("isolated post_start")?;

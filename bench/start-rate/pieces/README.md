@@ -20,8 +20,8 @@ In order, for `fcvm snapshot run --pid <serve>` (UFFD) or `--snapshot <tag>` (Fi
 | 6 | network config | `PastaNetwork::setup`: MAC, addresses, one `ip -6 addr show` fork per process for the host IPv6 | `src/network/pasta.rs:2202,1350` | `rootless-net` stage `config` |
 | 7 | namespace holder | `fcvm __netns-agent` unshares its user and network namespaces, then `newuidmap` and `newgidmap`, then the agent confirms it is ready | `spawn_namespace_holder`, `src/commands/common.rs`; `src/network/netns_agent.rs` | `holder`; `rootless-net` stage `holder` |
 | 8 | disk | the clone's disk directory as a reflink of `disk.raw` when its extent count is at most 4096 (`REFLINK_MAX_EXTENTS`) and one of the snapshot's 8 reflink slots (`REFLINK_SLOTS`) is free, else as a btrfs subvolume snapshot of the snapshot's `disk/`; runs beside 9 | `DiskManager::create_cow_disk`, `src/storage/disk.rs:587` | `disk` |
-| 9 | TAP setup | one `nsenter -U -n -- bash -c 'ip -batch'`: the TAP, its MTU, up, `lo` up, a verify step | `run_namespace_setup_script` (`common.rs`), `PastaNetwork::build_setup_script`, `pasta.rs:1170` | `rootless-net` stage `tap` |
-| 10 | pasta and bridge | pasta spawned in the namespace and waited for through its PID file; `nsenter ip link show pasta0` polled until the device exists; one more `nsenter ... ip -batch` for the bridge, its MAC, ports, address, and `ip_forward` | `PastaNetwork::post_start`, `start_pasta`, `wait_for_pasta_device`, `run_bridge_script`, `pasta.rs:2270,1636,1931,1846` | `rootless-net` stage `pasta+bridge` |
+| 9 | links | one request to the holder, which makes the VMM's TAP and pasta's (both persistent), `br0` with its MAC and address, and sets the MTUs, over netlink in its own namespace (one request per TAP, four for the bridge); runs beside 8 | `PastaNetwork::build_namespace`, `netns_agent::build`, `src/network/rtnl.rs` | `rootless-net` stage `links` |
+| 10 | pasta | pasta spawned in the namespace, where it attaches to its TAP, and waited for through its PID file (ready once pasta has written its PID into it) | `PastaNetwork::post_start`, `start_pasta` | `rootless-net` stage `pasta` |
 | 11 | Firecracker spawn | fork/exec of Firecracker with `setns` into the holder's user and net namespaces in `pre_exec` (no `nsenter` hop), then a wait for its API socket | `VmManager::start`, `src/firecracker/vm.rs:258`; `install_namespace_pre_exec`, `src/utils.rs:1092` | `fc-spawn`; `vmm` stage `spawn` |
 | 11a | KVM VM | inside Firecracker: `KVM_CREATE_VM`, the memory slot, the vCPU (`KVM_ARM_VCPU_INIT`), the GICv3 | Firecracker's `vmm` crate | `kvm-vm`: the same ioctls with no VMM process, a floor under 11 and 12 |
 | 12 | snapshot load | `PUT /snapshot/load` with the network, vsock and drive overrides, `resume_vm: false`. File backend: Firecracker maps `memory.bin` `MAP_PRIVATE`. UFFD: Firecracker connects to the serve's socket and hands over its userfaultfd; the serve may replay the recorded working set | `restore_from_snapshot`, `common.rs:4141`; `src/uffd/server.rs` | `vmm` stage `load` |
@@ -81,10 +81,18 @@ part of the op; `noop` with `COLD=1` is the cost of an instance process. `--disk
 (in `ARGS=`) makes the disk piece reflink from one of the files in DIR instead of the snapshot's
 disk. `attribution.sh` runs one cell per piece under `kernel.bt` (rtnl_mutex hold and wait, RCU
 syncs and their stacks, netns cleanup, KVM VM create and destroy, copy-on-write and userfaultfd
-faults, KVM exits by class, execs); its timings are not measurements.
+faults, KVM exits by class, execs); its timings are not measurements. The tracer stays until
+the kernel has destroyed the cell's namespaces, which it does after the driver has exited, and
+it traces `rtnl_mutex` as a mutex: a probe on `rtnl_lock()` misses every hold taken inside
+rtnetlink.c, where that function is inlined. `rtnl.py CELL.bt OPS` prints the hold per op by
+holder, with the `rcu_barrier()` time under it apart.
 `perftop.sh` writes each cell's top frames, and `table.py` prints the table in `RESULTS.md`.
 The `kernel.bt` output of the first table's attribution pass (C=128, 1000 held, one file per
 piece; start, steady and teardown in one window) is in `traces/`.
+Those dumps were taken with the tracer stopped at the driver's exit and with probes on
+`rtnl_lock()`. For the pieces that make namespaces, `traces/rtnl/` holds what `rtnl.py` reads
+from complete dumps instead: `rootless-net` before and after changelog step 4 (three runs
+each), `holder` and `health`.
 
 `PERF_FREQ=99` adds `perf record -a -g` over the timed phase (`perf.data`), and
 `PERF_EVENTS=...` adds `perf stat -a` over the timed and steady phases. Host-wide numbers mean

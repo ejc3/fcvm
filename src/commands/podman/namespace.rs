@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use tracing::{debug, info, warn};
 
 use crate::hypervisor::ProcessSpec;
@@ -7,8 +7,8 @@ use crate::state::VmState;
 
 /// Set up rootless namespace for VM networking.
 ///
-/// Spawns a holder process with retry logic, runs network setup via nsenter,
-/// and verifies TAP device creation. Records the namespace paths + holder PID into
+/// Spawns the namespace holder and has it build the VM's links
+/// (`PastaNetwork::build_namespace`). Records the namespace paths + holder PID into
 /// `process_spec` so the VMM is launched into them, and returns the holder child.
 pub(crate) async fn setup_rootless_namespace(
     pasta_net: &PastaNetwork,
@@ -16,167 +16,62 @@ pub(crate) async fn setup_rootless_namespace(
     process_spec: &mut ProcessSpec,
     vm_state: &mut VmState,
 ) -> Result<tokio::process::Child> {
-    // Step 1: Spawn holder process (keeps namespace alive)
-    // Uses shared function that gives the holder the full retry deadline,
-    // only respawning if the holder actually dies (not on timeout).
     info!("spawning namespace holder for rootless networking");
-
     let (mut child, mut holder_pid) = crate::commands::common::spawn_namespace_holder().await?;
 
-    // Step 2: Run setup script via nsenter (creates TAPs, iptables, etc.)
-    // This is also inside retry logic - if holder dies during nsenter, retry everything
-    let setup_script = pasta_net.build_setup_script();
-    let nsenter_prefix = pasta_net.build_nsenter_prefix(holder_pid);
-
-    // Debug: Check if holder is still alive and namespace files exist
-    let proc_dir = format!("/proc/{}", holder_pid);
-    let ns_user = format!("/proc/{}/ns/user", holder_pid);
-    let ns_net = format!("/proc/{}/ns/net", holder_pid);
-    debug!(
-        holder_pid = holder_pid,
-        proc_exists = std::path::Path::new(&proc_dir).exists(),
-        ns_user_exists = std::path::Path::new(&ns_user).exists(),
-        ns_net_exists = std::path::Path::new(&ns_net).exists(),
-        "checking holder process before nsenter"
-    );
-
-    // Check for required devices before attempting network setup
+    // The holder makes the TAP through /dev/net/tun.
     let tun_exists = std::path::Path::new("/dev/net/tun").exists();
-    debug!(
-        holder_pid = holder_pid,
-        tun_exists = tun_exists,
-        "checking /dev/net/tun availability"
-    );
     if !tun_exists {
         warn!("/dev/net/tun not available - TAP device creation will fail");
     }
 
-    info!(holder_pid = holder_pid, "running network setup via nsenter");
-
-    // Log the setup script for debugging
-    debug!(
-        holder_pid = holder_pid,
-        script = %setup_script.summary(),
-        "network setup script"
-    );
-
-    // One nsenter+bash+ip for the whole phase: the script batches every `ip`
-    // command (TAP creation, link up, loopback, and the TAP existence check)
-    // into a single `ip -batch` process.
-    let setup_output = tokio::process::Command::new(&nsenter_prefix[0])
-        .args(&nsenter_prefix[1..])
-        .arg("bash")
-        .arg("-c")
-        .arg(setup_script.script())
-        .output()
-        .await
-        .context("running network setup via nsenter")?;
-
-    if !setup_output.status.success() {
-        let stderr = String::from_utf8_lossy(&setup_output.stderr);
-        let stdout = String::from_utf8_lossy(&setup_output.stdout);
-
-        // Re-check state for diagnostics
-        let holder_alive = std::path::Path::new(&proc_dir).exists();
-        let ns_user_exists = std::path::Path::new(&ns_user).exists();
-        let ns_net_exists = std::path::Path::new(&ns_net).exists();
-
-        // If holder died during nsenter, this is a retryable error
-        if !holder_alive {
-            let _ = child.kill().await;
-
-            warn!(
-                holder_pid = holder_pid,
-                nsenter_stderr = %stderr.trim(),
-                "holder died during nsenter, spawning new holder..."
-            );
-
-            // Use spawn_namespace_holder for the retry — it handles its own
-            // deadline and readiness waiting
-            let (retry_child, retry_holder_pid) =
-                crate::commands::common::spawn_namespace_holder().await?;
-
-            // Retry nsenter with new holder
-            let retry_nsenter_prefix = pasta_net.build_nsenter_prefix(retry_holder_pid);
-            let retry_output = tokio::process::Command::new(&retry_nsenter_prefix[0])
-                .args(&retry_nsenter_prefix[1..])
-                .arg("bash")
-                .arg("-c")
-                .arg(setup_script.script())
-                .output()
-                .await
-                .context("running network setup via nsenter (retry)")?;
-
-            if !retry_output.status.success() {
-                let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
-                let _ = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(retry_holder_pid as i32),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-                bail!(
-                    "network setup failed on retry: {}",
-                    setup_script.describe_failure(&retry_stderr)
-                );
+    info!(holder_pid = holder_pid, "building the namespace's links");
+    if let Err(error) = pasta_net.build_namespace(holder_pid).await {
+        // A holder that died under the build is replaced once; any other failure is the
+        // build's own and a second holder would fail the same way.
+        let died = match child.try_wait() {
+            Ok(status) => status,
+            Err(wait_error) => {
+                warn!(holder_pid, error = %wait_error, "could not check the namespace holder");
+                None
             }
-
-            // Success on retry - update variables for rest of function
-            child = retry_child;
-            holder_pid = retry_holder_pid;
-            info!(
-                holder_pid = holder_pid,
-                "network setup succeeded after retry"
-            );
-        } else {
-            // If holder died, its stderr (captured since spawn) says why
-            let holder_stderr_content = if !holder_alive {
-                crate::companion::tail_of(holder_pid).lines().join("\n")
-            } else {
-                String::new()
-            };
-
-            // Kill holder before bailing
+        };
+        let Some(status) = died else {
             let _ = child.kill().await;
-
-            // Log comprehensive error info at ERROR level (always visible)
-            warn!(
-                holder_pid = holder_pid,
-                holder_alive = holder_alive,
-                holder_stderr = %holder_stderr_content.trim(),
-                tun_exists = tun_exists,
-                ns_user_exists = ns_user_exists,
-                ns_net_exists = ns_net_exists,
-                nsenter_stderr = %stderr.trim(),
-                nsenter_stdout = %stdout.trim(),
-                "network setup failed - diagnostics"
+            crate::companion::forget(holder_pid);
+            crate::network::netns_agent::forget(holder_pid);
+            bail!("network setup failed: {error:#} (tun={tun_exists})");
+        };
+        let report =
+            crate::companion::describe_registered("namespace holder", Some(holder_pid), Ok(status))
+                .await;
+        crate::network::netns_agent::forget(holder_pid);
+        warn!(
+            holder_pid = holder_pid,
+            error = %format!("{error:#}"),
+            report = %report,
+            "holder died during network setup, spawning new holder..."
+        );
+        let (mut retry_child, retry_holder_pid) =
+            crate::commands::common::spawn_namespace_holder().await?;
+        if let Err(retry_error) = pasta_net.build_namespace(retry_holder_pid).await {
+            let _ = retry_child.kill().await;
+            crate::companion::forget(retry_holder_pid);
+            crate::network::netns_agent::forget(retry_holder_pid);
+            bail!(
+                "network setup failed on retry: {retry_error:#} (the first holder: {report}; \
+                 tun={tun_exists})"
             );
-
-            if !holder_alive {
-                bail!(
-                    "network setup failed: holder died during nsenter. \
-                     nsenter_stderr='{}', holder_stderr='{}', \
-                     (tun={}, ns_user={}, ns_net={})",
-                    setup_script.describe_failure(&stderr),
-                    holder_stderr_content.trim(),
-                    tun_exists,
-                    ns_user_exists,
-                    ns_net_exists
-                );
-            } else {
-                bail!(
-                    "network setup failed: {} (tun={}, holder_alive={}, ns_user={}, ns_net={})",
-                    setup_script.describe_failure(&stderr),
-                    tun_exists,
-                    holder_alive,
-                    ns_user_exists,
-                    ns_net_exists
-                );
-            }
         }
+        child = retry_child;
+        holder_pid = retry_holder_pid;
+        info!(
+            holder_pid = holder_pid,
+            "network setup succeeded after retry"
+        );
     }
 
-    // The TAP existence check is the last step of the batched setup script, so a
-    // successful run already proves the device is there — no second nsenter+ip.
-    debug!(tap_device = %network_config.tap_device, "TAP device verified");
+    debug!(tap_device = %network_config.tap_device, "TAP device built");
     info!(holder_pid = holder_pid, "network setup complete");
 
     // Use pre_exec setns path (not nsenter) for rootless baselines.
@@ -192,7 +87,7 @@ pub(crate) async fn setup_rootless_namespace(
         "/proc/{}/ns/net",
         holder_pid
     )));
-    // Still track holder_pid for health checks (nsenter curl) and cleanup
+    // Still track holder_pid for health checks and cleanup
     process_spec.holder_pid = Some(holder_pid);
 
     // Store holder_pid in state for health checks and cleanup

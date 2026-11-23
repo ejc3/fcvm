@@ -35,16 +35,28 @@ How each piece scales:
 
 - **rootless-net** degrades with C and with alive namespaces. CPU per op rises from 0.022 s at
   C=1 to 0.090 s at C=128 with none held, and to 0.177 s at C=128 and 0.39 s at C=512 with
-  1000 held. Under `kernel.bt` (C=128, 1000
-  held, start and teardown in one window) rtnl_mutex was held 21.1 s and waited for 2,280 s in
-  total, 1.14 s of wait per namespace. Of the hold, 14.4 s was the netns cleanup worker
-  (`cleanup_net`, which tears down a batch of dying namespaces under one hold: one batch held it
-  8 to 16 s), 4.2 s pasta (2 holds per pasta) and 2.1 s `ip` (4 holds per namespace). pasta also
-  ran 9 expedited RCU grace periods per namespace, 3 of them under rtnl at its exit
-  (`__tun_detach` -> `br_del_if` -> `nbp_vlan_flush`, `del_nbp`), plus `do_umount` and
-  `put_mnt_ns`. `do_one_broadcast` under `ip` walks every rtnetlink multicast listener in every
-  namespace, and each pasta binds one (`nl_neigh_notify_init`, `RTMGRP_NEIGH`), so the hold
-  grows with the namespaces alive. Each
+  1000 held. Under `kernel.bt` (C=128, 1000 held, 2000 namespace lives from their start to the
+  end of the kernel's cleanup, three runs on a second boot of the same instance type on
+  2026-11-23, at the commit before the netlink builder of changelog step 4) `rtnl_mutex` was held 25.7 ms per namespace life (24.1 to 26.6) and waited
+  for 2.2 s. Of the hold:
+  - 14.4 ms is one `rcu_barrier()` per namespace in the netns cleanup worker (`cleanup_net`
+    -> `br_dev_uninit` -> `br_multicast_dev_del`): every bridge destroyed waits for the RCU
+    callbacks of all 192 CPUs under the mutex, so a batch of 1000 dying namespaces is one
+    hold of about 15 s. Linux 25ae123db10b removed that barrier (in 6.18.60; not in 7.0.y,
+    which this host runs); the fcvm host kernels carry the removal (#1685).
+  - 7.3 ms is `ip` and the namespace's creation (35 holds per namespace: loopback, the TAP,
+    the bridge and every link change), 2.3 ms pasta (it makes and removes its TAP), 1.1 ms
+    the rest of the cleanup worker.
+  - Sampled on CPU under the mutex (7.6 ms per namespace), 3.3 ms is
+    `wireless_nlevent_flush` (2.3 to 3.9): the wireless extensions' netdev notifier
+    (`CONFIG_WEXT_CORE`) walks every network namespace on the host on every netdev event
+    of any device. Another 1.6 ms is `do_one_broadcast`: every rtnetlink notification walks
+    every NETLINK_ROUTE multicast listener on the host, and each pasta binds one
+    (`nl_neigh_notify_init`, `RTMGRP_NEIGH`). Both grow with the namespaces alive.
+
+  pasta also ran 9 expedited RCU grace periods per namespace, 3 of them under the mutex at
+  its exit (`__tun_detach` -> `br_del_if` -> `nbp_vlan_flush`, `del_nbp`), plus `do_umount`
+  and `put_mnt_ns`. Each
   namespace costs about 15 execs (unshare, sleep, newuidmap, newgidmap, nsenter and true, then
   nsenter, bash and ip twice, pasta, nsenter and ip per device poll).
 - **disk** is serialized: about 150 ops/s at any C. Most of its CPU was FIEMAP of the
@@ -88,35 +100,62 @@ one cycle while preparing.
 | 2000 with pasta | 1 | 44 | 0.90 / 7.3 | 478 | 1 | 692 (264) | 363 | 268 | 1802 | 555 |
 | 2000 with pasta | 32 | 857 | 13.80 / 40.5 | 436 | 1 | 487 (126) | 269 | 288 | 1481 | 675 |
 | 2000 with pasta | 128 | 923 | 114.56 / 197.8 | 419 | 1 | 515 (114) | 271 | 289 | 1497 | 668 |
-| 2000 with pasta | 512 | 752 | 560.41 / 1207.7 | 313 | 1 | 403 (118) | 269 | 297 | 1284 | 779 |
-| 2000, no pasta | 1 | 46 | 0.39 / 5.5 | 221 | 0 | 212 (68) | 211 | 148 | 792 | 1263 |
-| 2000, no pasta | 32 | 987 | 10.27 / 25.3 | 217 | 0 | 229 (34) | 246 | 145 | 836 | 1196 |
-| 2000, no pasta | 128 | 2051 | 38.87 / 80.0 | 210 | 1 | 230 (31) | 300 | 147 | 887 | 1127 |
-| 2000, no pasta | 512 | 2139 | 176.99 / 391.8 | 167 | 1 | 204 (33) | 282 | 143 | 797 | 1254 |
+| 2000 with pasta | 512 (undercounted) | 752 | 560.41 / 1207.7 | 313 | 1 | 403 (118) | 269 | 297 | 1284 | 779 |
+| 2000, no pasta (hold columns wrong) | 1 | 46 | 0.39 / 5.5 | 221 | 0 | 212 (68) | 211 | 148 | 792 | 1263 |
+| 2000, no pasta (hold columns wrong) | 32 | 987 | 10.27 / 25.3 | 217 | 0 | 229 (34) | 246 | 145 | 836 | 1196 |
+| 2000, no pasta (hold columns wrong) | 128 | 2051 | 38.87 / 80.0 | 210 | 1 | 230 (31) | 300 | 147 | 887 | 1127 |
+| 2000, no pasta (hold columns wrong) | 512 (undercounted) | 2139 | 176.99 / 391.8 | 167 | 1 | 204 (33) | 282 | 143 | 797 | 1254 |
 | 200 with pasta | 1 | 47 | 0.23 / 0.3 | 116 | 0 | 112 (34) | 82 | 102 | 413 | 2422 |
 | 2000 with pasta, first attach | 1 | 44 | 1.08 / 12.6 | 451 | 294 | 686 (372) | 432 | 283 | 2147 | 466 |
 | 2000 with pasta, first attach | 128 | 727 | 148.86 / 304.2 | 380 | 289 | 435 (105) | 359 | 281 | 1744 | 573 |
-| 2000, no pasta, first attach | 1 | 46 | 0.57 / 1.7 | 228 | 409 | 171 (30) | 210 | 146 | 1165 | 859 |
-| 2000, no pasta, first attach | 128 | 1067 | 93.70 / 191.5 | 264 | 253 | 277 (34) | 179 | 142 | 1117 | 896 |
+| 2000, no pasta, first attach (hold columns wrong) | 1 | 46 | 0.57 / 1.7 | 228 | 409 | 171 (30) | 210 | 146 | 1165 | 859 |
+| 2000, no pasta, first attach (hold columns wrong) | 128 | 1067 | 93.70 / 191.5 | 264 | 253 | 277 (34) | 179 | 142 | 1117 | 896 |
 
-- **A reused namespace costs 1.3 to 1.8 ms of `rtnl_mutex` per clone life with 2000 pastas
-  alive**, which caps attach and detach at 555 to 779 per second. The burst rate agrees: 752
-  to 923 cycles/s at C=32 to 512.
-- **Half of it is not the VMM's own calls.** `TUNSETIFF` holds 0.31 to 0.48 ms and the close
-  0.40 to 0.69 ms (0.11 to 0.26 ms of that an expedited RCU grace period under the mutex,
-  `__tun_detach` -> `synchronize_net`); each of the two carrier changes is then handled by the
-  link watch worker for another 0.27 to 0.36 ms. `TUNSETVNETHDRSZ` holds under a microsecond.
+Two sets of rows are not measurements of a clone life, found in review after the campaign:
+
+- **The C=512 rows undercount.** `tap.bt` sums a hold from a return probe on `rtnl_lock`, and
+  the kernel keeps a fixed number of return-probe instances (twice the CPUs, 384 here). With
+  512 helpers asleep in `rtnl_lock` at once the rest are dropped: the dumps hold 0.77 to 0.95
+  holds per call at C=512 and 1.00 in every other cell, so those rows' hold columns are short
+  by up to a quarter. `tap-summary` now refuses such a cell.
+- **The no-pasta rows count the wrong link events.** With no pasta the TAP is the bridge's
+  only port. The worker handled the TAP's carrier-on after the helper's 20 ms were over in all
+  but 1% of cycles, so those rows' carrier-on column is the average of one or two events, and
+  the bridge's own carrier events (0.13 to 1.8 seen per cycle, 75 to 82 us each) are in no
+  column. Every hold of the mutex on the host inside those cells' two traced windows, per
+  cycle, was 1.43 ms at C=1, 0.82 at C=32 and 0.59 at C=128, against the 0.79 to 0.89 the rows
+  say; a carrier-off handled after a window closed is in neither, so these are floors. In
+  the rows with pasta the same total is 1.79, 1.34 and 1.50 ms at C=1, 32 and 128 against the
+  rows' 1.80, 1.48 and 1.50: within 1% at C=1 and 128, and 9.5% under the row at C=32.
+  `tap-summary` now reports the total, and leaves the per-cycle hold and the ceiling out of
+  a cell where the worker handled a link event in under half the cycles.
+
+Both are measured again, with a tracer that drops nothing and a helper that stays attached
+past the link watch delay, in the campaign of the PR that adds the namespace pool.
+
+- **A reused namespace costs 1.5 to 1.8 ms of `rtnl_mutex` per clone life with 2000 pastas
+  alive** (C=1 to 128), which caps attach and detach at 555 to 675 per second. The untraced
+  bursts ran at 857 and 923 cycles/s at C=32 and 128, above that cap, because a burst runs
+  ahead of its link events: the helper's own calls hold 0.92 to 0.94 ms per cycle, which
+  alone would allow about 1070.
+- **35 to 38% of it is not the VMM's own calls.** `TUNSETIFF` holds 0.42 to 0.48 ms and the
+  close 0.49 to 0.69 ms (0.11 to 0.26 ms of that an expedited RCU grace period under the
+  mutex, `__tun_detach` -> `synchronize_net`); each of the two carrier changes is then handled
+  by the link watch worker for another 0.27 to 0.36 ms. `TUNSETVNETHDRSZ` holds under a
+  microsecond.
 - **`TUNSETOFFLOAD` is free after a TAP's first attach.** The first one changes the device's
   features and the bridge above it follows (0.25 to 0.41 ms); later ones set what is already set.
-- **pasta's netlink listener is half the hold.** The same 2000 namespaces with no pasta hold
-  0.79 to 0.89 ms per cycle, and 200 namespaces with pasta 0.41 ms. Each pasta binds a
-  NETLINK_ROUTE socket to a multicast group (its neighbour listener, in the host's namespace),
-  and every link notification walks every such socket on the host under the mutex
-  (`do_one_broadcast`, 8% of the samples of the C=128 cell; `mutex_spin_on_owner`, the waiting,
-  22%). The rest grows with the namespaces themselves.
-- **No patch to pasta gets a cycle under 0.7 ms.** With no pasta at all a cycle still holds
-  0.8 ms, so the attach and detach have to go: the pool has to keep the TAP attached and hand
-  the VMM the descriptor.
+- **The hold grows with what is alive on the host.** 200 namespaces with pasta hold 0.41 ms
+  per cycle where 2000 hold 1.80 (C=1). Each pasta binds a NETLINK_ROUTE socket to a multicast
+  group (its neighbour listener, in the host's namespace), and every link notification walks
+  every such socket on the host under the mutex: `do_one_broadcast` is 8.0% of all samples
+  under the helper and 2.0% under the link watch worker, and `mutex_spin_on_owner`, the
+  waiting, 21.9% (`PERF_FREQ=99`, `perf record -a -g` over the timed phase of the untraced
+  C=128 cell with 1000 held, top frames by `perftop.sh`). How much of the hold is pasta's
+  listener is not established: the no-pasta rows that were to show it are the ones above.
+- **The attach and detach have to go.** With pasta, which every pooled namespace has, a cycle
+  holds 1.5 ms or more. The design's bound for keeping them was 0.7 ms, so the pool has to
+  keep the TAP attached and hand the VMM the descriptor.
 
 ## Changelog
 
@@ -198,3 +237,62 @@ Teardown ran at 144 to 377 clones/s on main, 171 to 1319 with this PR and 702 to
 subvolume. Up to 8 at once the PR is main (reflinks); always-subvolume is faster at C=8 on this
 quiet host, but the fleet measured the subvolume commit at 193 ms p50 and 1.8 s p99 while it was
 taking snapshots, against a C=8 reflink p50 of 47 ms here.
+
+### 5. rootless-net: the holder builds the links over netlink (#2025)
+
+One c8g.metal-48xl, host kernel 7.0.0-1013-aws, one boot, 2026-11-22 to 23. Before: the parent
+commit, where two `nsenter bash ip -batch` scripts make the links and pasta makes its TAP.
+After: the holder makes every link over netlink, both TAPs are persistent, pasta attaches to
+its TAP. Three runs of each cell, the two binaries in turn; mean (lowest to highest).
+
+1000 held, untraced:
+
+| C | | setups/s | setup p50 ms | CPU-s per setup (host, net) | instances torn down/s | from the first teardown until the kernel's cleanup is idle, s |
+|---|---|---|---|---|---|---|
+| 128 | before | 68 (63 to 72) | 1746 (1719 to 1769) | 0.204 (0.170 to 0.271) | 134 (130 to 139) | 30.2 (29.4 to 31.0) |
+| 128 | after | 89 (74 to 111) | 1395 (1085 to 1624) | 0.087 (0.066 to 0.108) | 124 (115 to 129) | 28.9 (28.5 to 29.4) |
+| 512 | before | 53 (40 to 77) | 6738 (5627 to 7374) | 0.815 (0.235 to 1.221) | 593 (586 to 600) | 24.7 (24.4 to 25.3) |
+| 512 | after | 86 (75 to 106) | 5352 (4250 to 5969) | 0.092 (0.076 to 0.102) | 762 (121, 124 and 2042) | 23.5 (23.1 to 24.0) |
+
+The last column is the cell's teardown wall time plus the time `matrix.sh` then waits for the
+netns cleanup worker to go idle (1 s steps).
+
+Traced (`attribution.sh`, C=128, 1000 held, 2000 namespace lives; `rtnl.py`, summaries in
+`traces/rtnl/`):
+
+| per namespace life | before | after |
+|---|---|---|
+| `rtnl_mutex` hold, ms | 25.70 (24.07 to 26.64) | 26.20 (24.98 to 27.26) |
+| of it `rcu_barrier()` in the netns cleanup worker, one per bridge | 14.38 (14.14 to 14.58) | 15.48 (14.88 to 16.13) |
+| all but that | 11.32 (9.94 to 12.07) | 10.72 (10.11 to 11.13) |
+| the builder: `ip`, or the holder | 7.35 (6.12 to 8.01), 35 holds | 7.64 (7.04 to 8.03), 13 holds |
+| pasta | 2.30 (2.14 to 2.40) | 0.88 (0.85 to 0.93) |
+| netns cleanup worker, less its barrier | 1.09 (1.07 to 1.11) | 1.52 (1.49 to 1.56) |
+| link watch worker | 0.22 (0.19 to 0.23) | 0.48 (0.45 to 0.49) |
+| IPv6 address worker | 0.36 (0.35 to 0.37) | 0.19 (0.19 to 0.20) |
+| on CPU under the mutex, ms | 7.64 (6.46 to 8.27) | 7.73 (7.15 to 8.11) |
+| of it `wireless_nlevent_flush` | 3.30 (2.27 to 3.91) | 3.55 (2.98 to 3.92) |
+| of it `do_one_broadcast` | 1.60 (1.56 to 1.67) | 1.41 (1.36 to 1.48) |
+| expedited grace periods | 14.1 | 12.7 |
+| wait for the mutex, s | 2.21 (1.98 to 2.34) | 2.40 (2.12 to 2.68) |
+
+- The hold per namespace life did not change: the two ranges overlap with and without the
+  barrier. The work on pasta's TAP moved. pasta no longer makes and removes a device (2.30 to
+  0.88 ms); the holder makes it, the link watch worker handles the two carrier changes of
+  pasta's attach and exit, and the cleanup worker unregisters it.
+- CPU per setup fell to 0.43 of what it was at C=128 and to 0.11 at C=512. Setups per second
+  are bound by the mutex, not by CPU: 63 to 72 against 74 to 111 at C=128, 40 to 77 against 75
+  to 106 at C=512.
+- Instances torn down per second is not a rate of namespaces destroyed. The kernel destroys
+  them afterwards, a batch under one hold, and 2000 of them take 23 to 31 s from the first
+  teardown whichever binary made them (2000 barriers of 14 ms are 29 s). What differs is how
+  much of that the instances wait for: pasta's exit needs the mutex to detach its TAP, and it
+  either gets in before the cleanup worker's first batch (2042/s, then 23 s of cleanup) or
+  queues behind the batches (121/s, then 7 s).
+- Three other ways to make the TAPs were measured the same way, in a build that could switch
+  each on (three traced runs each, hold without the barrier): `IFF_NO_CARRIER` at creation, 10.54 ms (9.42 to 11.43) against 10.72
+  in the same round; pasta making its own TAP and the holder bridging it afterwards, 11.38
+  (11.22 to 11.59); `RTM_NEWLINK` of kind `tun` is refused by the kernel ("tun/tap creation
+  via rtnetlink is not supported"). None is cheaper, so the TAPs stay as they are.
+- The VMM's attach and detach on a prepared namespace, the tap-attach floor (C=128, 2000
+  namespaces with pasta, one traced cell each): 1538 us of hold per cycle before, 1426 after.
