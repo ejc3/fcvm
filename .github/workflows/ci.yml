@@ -976,6 +976,14 @@ jobs:
       - name: test-fast
         working-directory: fcvm
         run: make test-fast
+      # --confine's gate: the rootless VM tests with every VMM confined and its syscall
+      # allowlist enforcing; an unlisted syscall kills the VMM and fails its test. arm64
+      # only: the x64 runners' 6.14 kernel is below the Landlock floor, where a confined
+      # start is refused, which test_confine_rootless_vm asserts in test-fast there.
+      - name: test-confine
+        if: matrix.arch == 'arm64'
+        working-directory: fcvm
+        run: make test-confine
       # And what THIS job left behind. A non-zero count here means the run leaked microVMs:
       # it is annotated on the run page, not just buried in the step log.
       - name: Stray microVM guard (post)

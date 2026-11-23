@@ -114,6 +114,96 @@ pub fn host_mode(config: Mode, env: Option<&str>) -> anyhow::Result<Mode> {
 pub enum Layer {
     /// No capabilities and none to regain, `no_new_privs`, no core dumps.
     Process,
+    /// The VMM's syscalls are an allowlist ([`SeccompMode`]).
+    Seccomp,
+}
+
+/// What the confined seccomp policy does with a syscall it does not list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeccompMode {
+    /// `SECCOMP_RET_TRAP`: Firecracker's SIGSYS handler logs the syscall number and the
+    /// VMM exits with status [`BAD_SYSCALL_EXIT`].
+    Enforce,
+    /// `SECCOMP_RET_LOG`: allowed, and recorded by the kernel's audit subsystem. For
+    /// finding what the policy misses, never for running workloads.
+    Log,
+}
+
+impl SeccompMode {
+    pub const ALL: [SeccompMode; 2] = [SeccompMode::Enforce, SeccompMode::Log];
+
+    fn action(self) -> &'static str {
+        match self {
+            SeccompMode::Enforce => "trap",
+            SeccompMode::Log => "log",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SeccompMode::Enforce => "enforce",
+            SeccompMode::Log => "log",
+        }
+    }
+}
+
+/// Selects [`SeccompMode`]: `enforce` (the default) or `log`.
+pub const SECCOMP_ENV: &str = "FCVM_CONFINE_SECCOMP";
+
+/// Firecracker's exit status after its SIGSYS handler caught a syscall its filter traps.
+pub const BAD_SYSCALL_EXIT: i32 = 148;
+
+/// The confined policy for this architecture, in Firecracker's seccompiler JSON: per thread
+/// class (`vmm`, `api`, `vcpu`), the syscalls Firecracker uses in fcvm.
+#[cfg(target_arch = "aarch64")]
+const SECCOMP_POLICY: &str = include_str!("../resources/seccomp/firecracker-confined-aarch64.json");
+#[cfg(target_arch = "x86_64")]
+const SECCOMP_POLICY: &str = include_str!("../resources/seccomp/firecracker-confined-x86_64.json");
+/// `seccompiler-bin --target-arch` for this architecture.
+#[cfg(target_arch = "aarch64")]
+pub const SECCOMP_ARCH: &str = "aarch64";
+#[cfg(target_arch = "x86_64")]
+pub const SECCOMP_ARCH: &str = "x86_64";
+
+/// The policy with every thread class's default action set for `mode`.
+pub fn seccomp_policy(mode: SeccompMode) -> String {
+    let mut policy: serde_json::Value =
+        serde_json::from_str(SECCOMP_POLICY).expect("the embedded seccomp policy is JSON");
+    for (_, class) in policy
+        .as_object_mut()
+        .expect("the seccomp policy is a map of thread classes")
+        .iter_mut()
+    {
+        class["default_action"] = serde_json::Value::from(mode.action());
+    }
+    serde_json::to_string_pretty(&policy).expect("serializing JSON")
+}
+
+/// The compiled filter for `mode`, beside the content-addressed `firecracker` it was built
+/// for, named after the policy's digest so a policy change makes a new file.
+pub fn filter_path(firecracker: &std::path::Path, mode: SeccompMode) -> std::path::PathBuf {
+    use sha2::Digest;
+    let digest = hex::encode(sha2::Sha256::digest(seccomp_policy(mode).as_bytes()));
+    let mut path = firecracker.as_os_str().to_owned();
+    path.push(format!(".confined-{}-{}.bpf", mode.name(), &digest[..16]));
+    path.into()
+}
+
+/// The syscall number in the last "bad syscall" line of a Firecracker log, which its SIGSYS
+/// handler writes before it exits [`BAD_SYSCALL_EXIT`].
+pub fn trapped_syscall(log: &str) -> Option<u64> {
+    const MARK: &str = "intercepting a bad syscall (";
+    let line = log.lines().rev().find(|line| line.contains(MARK))?;
+    let rest = &line[line.find(MARK)? + MARK.len()..];
+    rest[..rest.find(')')?].parse().ok()
+}
+
+/// `seccompiler-bin` built from the same Firecracker commit as `firecracker`.
+pub fn seccompiler_path(firecracker: &std::path::Path) -> std::path::PathBuf {
+    let mut path = firecracker.as_os_str().to_owned();
+    path.push(".seccompiler-bin");
+    path.into()
 }
 
 /// How a VM's VMM was confined, recorded in its state and shown by `fcvm ls`. It is a
@@ -129,6 +219,9 @@ pub struct Confinement {
     /// exactly this, and fails if it cannot, rather than read the limit again.
     #[serde(default)]
     pub core_limit: u64,
+    /// What the seccomp layer does with an unlisted syscall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<SeccompMode>,
 }
 
 /// What a missing piece belongs to.
@@ -227,6 +320,8 @@ pub struct Host {
     /// This process's hard RLIMIT_CORE, which the VMM inherits: an unprivileged process
     /// cannot raise it.
     pub core_hard_limit: u64,
+    /// `FCVM_CONFINE_SECCOMP`.
+    pub seccomp: SeccompMode,
 }
 
 /// The host's mode: the config's, tightened by `FCVM_CONFINE`.
@@ -271,6 +366,11 @@ impl Host {
             strace_fc: std::env::var_os("FCVM_STRACE_FC").is_some(),
             no_seccomp: std::env::var_os("FCVM_NO_SECCOMP").is_some(),
             firecracker_args: std::env::var("FCVM_FIRECRACKER_ARGS").ok(),
+            seccomp: match std::env::var(SECCOMP_ENV).as_deref() {
+                Err(_) | Ok("enforce") => SeccompMode::Enforce,
+                Ok("log") => SeccompMode::Log,
+                Ok(other) => anyhow::bail!("{SECCOMP_ENV}={other}: expected enforce or log"),
+            },
         })
     }
 }
@@ -436,7 +536,8 @@ pub fn decide(request: &Request<'_>, host: &Host) -> anyhow::Result<Option<Confi
         return Ok(Some(Confinement {
             landlock_abi: host.landlock_abi.unwrap_or_default(),
             core_limit: core_limit_for(host.core_hard_limit),
-            layers: vec![Layer::Process],
+            layers: vec![Layer::Process, Layer::Seccomp],
+            seccomp: Some(host.seccomp),
         }));
     }
     let why = if request.flag {
@@ -660,6 +761,7 @@ mod tests {
             firecracker_args: None,
             core_pattern: Some("core".to_string()),
             core_hard_limit: u64::MAX,
+            seccomp: SeccompMode::Enforce,
         }
     }
 
@@ -688,10 +790,69 @@ mod tests {
             decide(&request(true), &host(Ok(11))).unwrap(),
             Some(Confinement {
                 landlock_abi: 11,
-                layers: vec![Layer::Process],
+                layers: vec![Layer::Process, Layer::Seccomp],
                 core_limit: 1,
+                seccomp: Some(SeccompMode::Enforce),
             })
         );
+    }
+
+    /// Each mode's policy differs only in the default action of every thread class, and
+    /// each compiles to its own file name, so a policy change never reuses a stale filter.
+    #[test]
+    fn the_seccomp_policy_sets_the_default_action_per_mode_and_names_its_file() {
+        let bin = std::path::Path::new("/assets/firecracker/firecracker-abc");
+        for mode in SeccompMode::ALL {
+            let policy: serde_json::Value = serde_json::from_str(&seccomp_policy(mode)).unwrap();
+            for class in ["vmm", "api", "vcpu"] {
+                assert_eq!(policy[class]["default_action"], mode.action(), "{class}");
+                assert_eq!(policy[class]["filter_action"], "allow", "{class}");
+            }
+            let path = filter_path(bin, mode).to_string_lossy().into_owned();
+            assert!(
+                path.starts_with(&format!(
+                    "/assets/firecracker/firecracker-abc.confined-{}-",
+                    mode.name()
+                )) && path.ends_with(".bpf"),
+                "{path}"
+            );
+        }
+        assert_ne!(
+            filter_path(bin, SeccompMode::Enforce),
+            filter_path(bin, SeccompMode::Log)
+        );
+    }
+
+    #[test]
+    fn the_trapped_syscall_is_read_from_the_firecracker_log() {
+        let log = "2026-11-23 [vmm] ok\n\
+                   2026-11-23T17:00:00 [anonymous-instance:main] Shutting down VM after \
+                   intercepting a bad syscall (220).\n";
+        assert_eq!(trapped_syscall(log), Some(220));
+        assert_eq!(trapped_syscall("nothing here\n"), None);
+    }
+
+    /// io_uring operations are not seen by seccomp, so the policy must not let the VMM
+    /// make a ring; fcvm's drives use the Sync engine. No thread may create a process or
+    /// exec either.
+    #[test]
+    fn the_seccomp_policy_denies_io_uring_process_creation_and_exec() {
+        let policy: serde_json::Value = serde_json::from_str(SECCOMP_POLICY).unwrap();
+        for class in ["vmm", "api", "vcpu"] {
+            for rule in policy[class]["filter"].as_array().unwrap() {
+                let syscall = rule["syscall"].as_str().unwrap();
+                assert!(
+                    !syscall.starts_with("io_uring")
+                        && !["fork", "vfork", "clone", "clone3", "execve", "execveat"]
+                            .contains(&syscall)
+                        && !["ptrace", "process_vm_readv", "process_vm_writev"].contains(&syscall)
+                        && !["pidfd_open", "pidfd_getfd", "kill", "unshare", "setns"]
+                            .contains(&syscall)
+                        && !["mount", "bpf", "perf_event_open", "keyctl"].contains(&syscall),
+                    "{class} allows {syscall}"
+                );
+            }
+        }
     }
 
     /// The x64 CI runners' 6.14 kernel has ABI 6 and stock 7.0 has 8: both are refused,
@@ -734,6 +895,7 @@ mod tests {
             firecracker_args: Some("--seccomp-filter /x.bpf".to_string()),
             core_pattern: Some("|/usr/lib/systemd/systemd-coredump %P".to_string()),
             core_hard_limit: u64::MAX,
+            seccomp: SeccompMode::Enforce,
         };
         let mechanisms: Vec<Mechanism> = missing(&request, &host)
             .iter()
@@ -897,6 +1059,7 @@ mod tests {
             landlock_abi: LANDLOCK_ABI_FLOOR,
             layers: vec![Layer::Process],
             core_limit: 1,
+            seccomp: None,
         }));
         // Then this process's hard limit drops to 0, which it cannot raise again. (Each
         // test runs in a process of its own.)
@@ -1378,6 +1541,7 @@ mod tests {
                         landlock_abi: LANDLOCK_ABI_FLOOR,
                         layers: vec![Layer::Process],
                         core_limit: core_limit_for(core_hard_limit()),
+                        seccomp: None,
                     })),
                 )
             },

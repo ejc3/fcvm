@@ -8,8 +8,8 @@ mod common;
 
 use anyhow::{Context, Result};
 
-/// Every thread of `pid`: its name, then CapEff, CapPrm, CapInh, CapBnd, CapAmb and
-/// NoNewPrivs, from its status.
+/// Every thread of `pid`: its name, then CapEff, CapPrm, CapInh, CapBnd, CapAmb,
+/// NoNewPrivs and Seccomp, from its status.
 fn thread_credentials(pid: u32) -> Result<Vec<(String, Vec<String>)>> {
     let mut threads = Vec::new();
     for task in std::fs::read_dir(format!("/proc/{pid}/task"))? {
@@ -29,6 +29,7 @@ fn thread_credentials(pid: u32) -> Result<Vec<(String, Vec<String>)>> {
             "CapBnd",
             "CapAmb",
             "NoNewPrivs",
+            "Seccomp",
         ] {
             values.push(field(name)?);
         }
@@ -146,6 +147,22 @@ async fn test_confine_rootless_vm() -> Result<()> {
         );
         let threads = thread_credentials(firecrackers[0])?;
         println!("firecracker threads: {threads:?}");
+        // The VMM was given the confined filter, not its default policy (whose filter would
+        // also read Seccomp 2), and every thread runs under a filter.
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", firecrackers[0]))?;
+        let args: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let filter = args
+            .iter()
+            .position(|a| a == "--seccomp-filter")
+            .and_then(|i| args.get(i + 1))
+            .with_context(|| format!("no --seccomp-filter in {args:?}"))?;
+        anyhow::ensure!(
+            filter.contains(".confined-enforce-") && std::path::Path::new(filter).is_file(),
+            "seccomp filter {filter}"
+        );
         let zero = "0000000000000000".to_string();
         let expected = vec![
             zero.clone(),
@@ -154,11 +171,12 @@ async fn test_confine_rootless_vm() -> Result<()> {
             zero.clone(),
             zero,
             "1".to_string(),
+            "2".to_string(),
         ];
         for (name, values) in &threads {
             anyhow::ensure!(
                 values == &expected,
-                "thread {name}: CapEff, CapPrm, CapInh, CapBnd, CapAmb, NoNewPrivs = {values:?}"
+                "thread {name}: CapEff, CapPrm, CapInh, CapBnd, CapAmb, NoNewPrivs, Seccomp = {values:?}"
             );
         }
         let limits = std::fs::read_to_string(format!("/proc/{}/limits", firecrackers[0]))?;
@@ -186,7 +204,8 @@ async fn test_confine_rootless_vm() -> Result<()> {
             .find(|vm| vm["pid"] == serde_json::json!(fcvm_pid))
             .with_context(|| format!("no VM with pid {fcvm_pid} in fcvm ls --json"))?;
         anyhow::ensure!(
-            vm["confinement"]["layers"] == serde_json::json!(["process"]),
+            vm["confinement"]["layers"] == serde_json::json!(["process", "seccomp"])
+                && vm["confinement"]["seccomp"] == serde_json::json!("enforce"),
             "fcvm ls --json confinement: {vm}"
         );
 

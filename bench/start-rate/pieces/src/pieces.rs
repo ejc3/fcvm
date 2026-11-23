@@ -669,7 +669,7 @@ fn vmm_decision() -> Result<fcvm::confine::Decision> {
 
 #[cfg(test)]
 mod confine_tests {
-    use fcvm::confine::{decide, Host, Mode};
+    use fcvm::confine::{decide, Host, Mode, SeccompMode};
 
     fn host(mode: Mode) -> Host {
         Host {
@@ -680,6 +680,7 @@ mod confine_tests {
             firecracker_args: None,
             core_pattern: Some("core".to_string()),
             core_hard_limit: u64::MAX,
+            seccomp: SeccompMode::Enforce,
         }
     }
 

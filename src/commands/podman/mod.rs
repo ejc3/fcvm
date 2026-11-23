@@ -4297,6 +4297,7 @@ mod tests {
             landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
             layers: vec![crate::confine::Layer::Process],
             core_limit: 1,
+            seccomp: None,
         }));
         let unconfined = crate::confine::Decision::for_test(None);
         assert!(!super::setup_may_boot_its_vm(true, &confined));

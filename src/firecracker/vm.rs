@@ -607,6 +607,20 @@ impl VmManager {
                 self.vm_id
             );
         }
+        // A confined VMM gets fcvm's syscall allowlist for this build in place of the
+        // default policy, which for a gnu build allows every syscall.
+        if let Some(mode) = self.decision.confinement().and_then(|c| c.seccomp) {
+            let filter = crate::confine::filter_path(firecracker_bin, mode);
+            anyhow::ensure!(
+                filter.is_file(),
+                "the VMM of {} is confined, and its seccomp filter {} is missing: run `fcvm \
+                 setup`, which compiles it for {}",
+                self.vm_id,
+                filter.display(),
+                firecracker_bin.display()
+            );
+            cmd.arg("--seccomp-filter").arg(&filter);
+        }
         if std::env::var("FCVM_NO_SECCOMP").is_ok() {
             warn!("Seccomp disabled via FCVM_NO_SECCOMP - reduced security");
             cmd.arg("--no-seccomp");
@@ -866,6 +880,31 @@ impl VmManager {
         }
     }
 
+    /// A confined VMM that exits [`crate::confine::BAD_SYSCALL_EXIT`] was stopped by its
+    /// seccomp filter: say so at ERROR with the syscall number Firecracker logged, so a
+    /// syscall the policy misses fails loudly and names itself.
+    fn report_confinement_exit(&self, status: &std::process::ExitStatus) {
+        if self.decision.confinement().is_none()
+            || status.code() != Some(crate::confine::BAD_SYSCALL_EXIT)
+        {
+            return;
+        }
+        let logged = self
+            .log_path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|log| crate::confine::trapped_syscall(&log));
+        error!(
+            target: "vm",
+            vm_id = %self.vm_id,
+            syscall = ?logged,
+            "Firecracker was stopped by its confinement policy: syscall {} is not in the \
+             confined allowlist (resources/seccomp/firecracker-confined-{}.json)",
+            logged.map_or_else(|| "(not found in its log)".to_string(), |nr| nr.to_string()),
+            crate::confine::SECCOMP_ARCH,
+        );
+    }
+
     /// Non-blocking check if the VM process has exited.
     /// Returns Some(ExitStatus) if the process has exited, None if still running.
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
@@ -878,6 +917,7 @@ impl VmManager {
                     self.process = None;
                     self.memory_in_use = None;
                     self.stop_log_follower();
+                    self.report_confinement_exit(&status);
                     Ok(Some(status))
                 }
                 None => Ok(None),
@@ -901,6 +941,7 @@ impl VmManager {
             self.process = None;
             self.memory_in_use = None;
             self.stop_log_follower();
+            self.report_confinement_exit(&status);
             Ok(status)
         } else {
             bail!("VM process not running")
@@ -1067,6 +1108,7 @@ mod tests {
                 landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
                 layers: vec![crate::confine::Layer::Process],
                 core_limit: 1,
+                seccomp: None,
             })),
         );
         for args in ["--no-seccomp", "--enable-nv2 --seccomp-filter /x.bpf"] {
