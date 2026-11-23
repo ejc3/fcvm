@@ -497,13 +497,36 @@ impl Drop for SlotGuard {
     }
 }
 
-/// How many refused clones can have their refusal recorded at once.
+/// How many refusals are recorded at once.
 ///
-/// A record is bounded at 2 s and reads the refused clone's own state, but a server at its
-/// cap can be sent any number of clones, and it serves its admitted clones' page faults on
-/// the runtime the records run on. Past this many in flight, a refused clone is killed
-/// without a record.
+/// A record reads the refused clone's own state and is bounded at 2 s, and it runs on the
+/// runtime that serves the admitted clones' page faults, so a burst of refusals takes turns
+/// at it. A refusal waits its turn: at C=128 against a server at its cap the accept loop
+/// hands refusals over faster than a record finishes, and a clone refused without a record
+/// reports only a snapshot load that failed.
 const REFUSAL_RECORDS: usize = 4;
+
+/// How many refusals can be in flight, recording or waiting their turn. Each holds a parked
+/// task, the refused VMM's pidfd and its connection. Past this many, a refused clone is
+/// killed without a record.
+const REFUSALS_IN_FLIGHT: usize = 256;
+
+/// How long a refusal waits its turn to record. Its VMM, port and disk are held until its
+/// kill, so the wait is bounded as the record is: a refused clone is killed within this and
+/// the record's 2 s, also when every record ahead of it runs into that bound. After the
+/// wait it is killed without a record. With `REFUSALS_IN_FLIGHT` waiting, every one of them
+/// gets its turn while a record takes under 150 ms on average; one takes milliseconds.
+const REFUSAL_WAIT: Duration = Duration::from_secs(10);
+
+type RecordFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+/// What a refusal does with its reason before the kill: outside tests,
+/// [`PeerVmm::record_failure`].
+type RecordRefusal = Arc<dyn for<'a> Fn(&'a PeerVmm, &'a str) -> RecordFuture<'a> + Send + Sync>;
+
+fn record_for_the_clone<'a>(peer: &'a PeerVmm, reason: &'a str) -> RecordFuture<'a> {
+    Box::pin(peer.record_failure(reason))
+}
 
 /// Clones refused at the concurrent-clone cap, on their way to being killed.
 ///
@@ -513,24 +536,49 @@ const REFUSAL_RECORDS: usize = 4;
 struct Refusals {
     tasks: JoinSet<()>,
     records: Arc<tokio::sync::Semaphore>,
+    in_flight: usize,
+    wait: Duration,
+    record: RecordRefusal,
 }
 
 impl Refusals {
     fn new() -> Self {
+        Self::with(
+            REFUSAL_RECORDS,
+            REFUSALS_IN_FLIGHT,
+            REFUSAL_WAIT,
+            record_for_the_clone,
+        )
+    }
+
+    fn with(
+        records: usize,
+        in_flight: usize,
+        wait: Duration,
+        record: impl for<'a> Fn(&'a PeerVmm, &'a str) -> RecordFuture<'a> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             tasks: JoinSet::new(),
-            records: Arc::new(tokio::sync::Semaphore::new(REFUSAL_RECORDS)),
+            records: Arc::new(tokio::sync::Semaphore::new(records)),
+            in_flight,
+            wait,
+            record: Arc::new(record),
         }
     }
 
     /// Refuse the clone whose VMM is `peer`, which means killing that VMM.
     ///
-    /// With a record slot free, `reason` is first written where the clone reads it
-    /// (`record_failure`), on a task of its own so the accept loop goes on; the guard kills
-    /// the VMM if that task is dropped before it does. With none free the VMM is killed here
-    /// and now, and the clone reports only that its snapshot load failed. `connection` stays
-    /// open until the kill: closed earlier, the clone's load could fail before the reason is
-    /// written.
+    /// The refusal gets a task of its own, so the accept loop goes on; the guard kills the
+    /// VMM if that task is dropped before it does. The task waits its turn to record, writes
+    /// `reason` where the clone reads it (`record_failure`), and then kills. `connection`
+    /// stays open until the kill: closed earlier, the clone's load could fail before the
+    /// reason is written.
+    ///
+    /// Two cases kill without a record, and the clone then reports a snapshot load that got
+    /// no answer, with a pointer to this server's log
+    /// (`restore_failure_with_its_memory_server`): a refusal that arrives with `in_flight`
+    /// refusals already in flight (killed here and now), and one whose turn has not come
+    /// after `wait`.
     fn refuse<C: Send + 'static>(
         &mut self,
         peer: PeerVmm,
@@ -538,23 +586,45 @@ impl Refusals {
         reason: String,
         connection: C,
     ) {
-        let Ok(slot) = Arc::clone(&self.records).try_acquire_owned() else {
+        // Reap what has finished, so the count below is of refusals still in flight.
+        while let Some(result) = self.tasks.try_join_next() {
+            if let Err(e) = result {
+                error!(target: "uffd", error = %e, "refusal task panicked");
+            }
+        }
+        if self.tasks.len() >= self.in_flight {
             warn!(
                 target: "uffd",
                 vm_id = %vm_id,
                 peer_pid = peer.pid,
-                recording = REFUSAL_RECORDS,
-                "refused clone killed without a recorded reason: that many refusals are \
-                 being recorded already"
+                in_flight = self.tasks.len(),
+                "refused clone killed without a recorded reason: that many refusals are in \
+                 flight already"
             );
             peer.kill_now(&reason);
             drop(connection);
             return;
-        };
+        }
+        let records = Arc::clone(&self.records);
+        let record = Arc::clone(&self.record);
+        let wait = self.wait;
         let mut guard = PeerTaskGuard::new(peer, vm_id.clone());
         self.tasks.spawn(async move {
-            let _slot = slot;
-            guard.peer().record_failure(&reason).await;
+            match tokio::time::timeout(wait, records.acquire_owned()).await {
+                // The slot is held until the record is written.
+                Ok(Ok(_slot)) => {
+                    failpoint::hit_async("uffd.refusal.pre_record").await;
+                    (*record)(guard.peer(), &reason).await
+                }
+                _ => warn!(
+                    target: "uffd",
+                    vm_id = %vm_id,
+                    peer_pid = guard.peer().pid,
+                    waited_ms = wait.as_millis() as u64,
+                    "refused clone killed without a recorded reason: its turn to record did \
+                     not come"
+                ),
+            }
             guard.peer().kill_now(&reason);
             guard.disarm();
             drop(connection);
@@ -1642,7 +1712,7 @@ impl UffdServer {
                 Err(e) => error!(target: "uffd", error = %e, "VM task panicked"),
             }
         }
-        // A refusal still in flight kills its VMM within its record's 2 s bound.
+        // A refusal still in flight kills its VMM within `REFUSAL_WAIT` and its record's 2 s.
         refusals.drain().await;
         // Every handler has scheduled its clone's faults by now. Give the writer a bounded
         // time to publish them before the process exits with them only in memory.
@@ -8146,23 +8216,161 @@ mod tests {
         assert_eq!(refusals.records.available_permits(), REFUSAL_RECORDS);
     }
 
-    /// With `REFUSAL_RECORDS` refusals being recorded, the next refused clone is killed at
-    /// once: no task, no record, so the work refusals put on the runtime that serves page
-    /// faults stays bounded however many clones are sent to a server at its cap.
+    /// What a test's stand-in for `record_failure` saw.
+    #[derive(Default)]
+    struct Recorded {
+        pids: std::sync::Mutex<Vec<u32>>,
+        at_once: AtomicUsize,
+        most_at_once: AtomicUsize,
+        already_dead: AtomicUsize,
+    }
+
+    impl Recorded {
+        fn pids(&self) -> Vec<u32> {
+            let mut pids = self.pids.lock().unwrap().clone();
+            pids.sort_unstable();
+            pids
+        }
+    }
+
+    /// A record that notes the VMM it was for and then waits on `gate`.
+    fn gated_record(
+        recorded: &Arc<Recorded>,
+        gate: &Arc<tokio::sync::Semaphore>,
+    ) -> impl for<'a> Fn(&'a PeerVmm, &'a str) -> RecordFuture<'a> + Send + Sync + 'static {
+        let (recorded, gate) = (Arc::clone(recorded), Arc::clone(gate));
+        move |peer, _reason| {
+            let (pid, alive) = (peer.pid, peer.is_alive());
+            let (recorded, gate) = (Arc::clone(&recorded), Arc::clone(&gate));
+            let record: RecordFuture<'static> = Box::pin(async move {
+                let at_once = recorded.at_once.fetch_add(1, Ordering::SeqCst) + 1;
+                recorded.most_at_once.fetch_max(at_once, Ordering::SeqCst);
+                if !alive {
+                    recorded.already_dead.fetch_add(1, Ordering::SeqCst);
+                }
+                recorded.pids.lock().unwrap().push(pid);
+                let _turn = gate.acquire().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                recorded.at_once.fetch_sub(1, Ordering::SeqCst);
+            });
+            record
+        }
+    }
+
+    /// A burst of refusals, many more than are recorded at once, as a C=128 ramp against a
+    /// server at its cap sends them: every one of them gets its reason recorded, before its
+    /// kill, `REFUSAL_RECORDS` at a time. Dropping the record of a refusal that found the
+    /// slots taken left all but the first few clones of a burst with a bare snapshot-load
+    /// error.
     #[tokio::test]
-    async fn a_refusal_past_the_record_bound_is_killed_at_once() {
-        let mut refusals = Refusals::new();
-        let _recording = Arc::clone(&refusals.records)
-            .try_acquire_many_owned(REFUSAL_RECORDS as u32)
-            .unwrap();
-        let victim = spawn_victim();
-        let peer = PeerVmm::from_pid(victim.id()).unwrap();
-        refusals.refuse(peer, "vm-over-bound".into(), "test: at the cap".into(), ());
-        assert!(
-            refusals.tasks.is_empty(),
-            "a refusal past the record bound was given a task to record on"
+    async fn refusals_arriving_together_are_all_recorded_before_their_kills() {
+        const BURST: usize = 8 * REFUSAL_RECORDS;
+        let recorded = Arc::new(Recorded::default());
+        let open = Arc::new(tokio::sync::Semaphore::new(BURST));
+        let mut refusals = Refusals::with(
+            REFUSAL_RECORDS,
+            REFUSALS_IN_FLIGHT,
+            REFUSAL_WAIT,
+            gated_record(&recorded, &open),
         );
-        assert_vmm_was_killed(victim).await;
+        let victims: Vec<Victim> = (0..BURST).map(|_| spawn_victim()).collect();
+        let mut pids: Vec<u32> = victims.iter().map(|victim| victim.id()).collect();
+        pids.sort_unstable();
+        // No await between them: the accept loop hands refusals over faster than one records.
+        for (index, victim) in victims.iter().enumerate() {
+            let peer = PeerVmm::from_pid(victim.id()).unwrap();
+            refusals.refuse(peer, format!("vm-{index}"), "test: at the cap".into(), ());
+        }
+        refusals.drain().await;
+        assert_eq!(
+            recorded.pids(),
+            pids,
+            "not every refused clone of the burst had its reason recorded"
+        );
+        assert_eq!(
+            recorded.already_dead.load(Ordering::SeqCst),
+            0,
+            "a refused clone was killed before its reason was recorded"
+        );
+        assert_eq!(
+            recorded.most_at_once.load(Ordering::SeqCst),
+            REFUSAL_RECORDS,
+            "the records of a burst run REFUSAL_RECORDS at a time"
+        );
+        for victim in victims {
+            assert_vmm_was_killed(victim).await;
+        }
+    }
+
+    /// With as many refusals in flight as the bound allows, the next refused clone is killed
+    /// at once: no task, no record, so the tasks, pidfds and connections that refusals hold
+    /// stay bounded however many clones are sent to a server at its cap.
+    #[tokio::test]
+    async fn a_refusal_past_the_in_flight_bound_is_killed_at_once_without_a_record() {
+        let recorded = Arc::new(Recorded::default());
+        let closed = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut refusals = Refusals::with(
+            1,
+            2,
+            Duration::from_secs(60),
+            gated_record(&recorded, &closed),
+        );
+        let in_flight = [spawn_victim(), spawn_victim()];
+        for victim in &in_flight {
+            let peer = PeerVmm::from_pid(victim.id()).unwrap();
+            refusals.refuse(peer, "vm-in-flight".into(), "test: at the cap".into(), ());
+        }
+        let over = spawn_victim();
+        let over_pid = over.id();
+        let peer = PeerVmm::from_pid(over_pid).unwrap();
+        refusals.refuse(peer, "vm-over".into(), "test: at the cap".into(), ());
+        assert_eq!(
+            refusals.tasks.len(),
+            2,
+            "a refusal past the in-flight bound was given a task"
+        );
+        assert_vmm_was_killed(over).await;
+        // The two in flight are untouched: one recording behind the closed gate, one waiting.
+        for victim in &in_flight {
+            assert!(PeerVmm::from_pid(victim.id()).unwrap().is_alive());
+        }
+        closed.add_permits(2);
+        refusals.drain().await;
+        assert!(!recorded.pids().contains(&over_pid));
+        assert_eq!(recorded.pids().len(), 2);
+        for victim in in_flight {
+            assert_vmm_was_killed(victim).await;
+        }
+    }
+
+    /// A refusal whose turn to record does not come within the wait is killed without a
+    /// record: a refused VMM runs until its kill, so the kill is not put off for as long as
+    /// the records ahead of it take.
+    #[tokio::test]
+    async fn a_refusal_whose_turn_does_not_come_is_killed_without_a_record() {
+        let recorded = Arc::new(Recorded::default());
+        let closed = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut refusals = Refusals::with(
+            1,
+            8,
+            Duration::from_millis(50),
+            gated_record(&recorded, &closed),
+        );
+        let recording = spawn_victim();
+        let waiting = spawn_victim();
+        let (recording_pid, waiting_pid) = (recording.id(), waiting.id());
+        for victim in [&recording, &waiting] {
+            let peer = PeerVmm::from_pid(victim.id()).unwrap();
+            refusals.refuse(peer, "vm-refused".into(), "test: at the cap".into(), ());
+        }
+        // The first holds the only slot behind the closed gate; the second's wait runs out.
+        assert_vmm_was_killed(waiting).await;
+        assert!(PeerVmm::from_pid(recording_pid).unwrap().is_alive());
+        closed.add_permits(1);
+        refusals.drain().await;
+        assert_eq!(recorded.pids(), [recording_pid]);
+        assert_ne!(recording_pid, waiting_pid);
+        assert_vmm_was_killed(recording).await;
     }
 
     /// Cancellation can drop a spawned future before Tokio polls its body even once. The

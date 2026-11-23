@@ -7027,6 +7027,9 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
     let mut serve: Option<(tokio::process::Child, u32)> = None;
     let mut first_clone: Option<(tokio::process::Child, u32)> = None;
     let mut refused: Option<(tokio::process::Child, u32)> = None;
+    // Four times what the server records at once.
+    const REFUSED_BURST: usize = 16;
+    let mut burst: Vec<(tokio::process::Child, u32)> = Vec::new();
     let mut snapshot_created = false;
 
     let verdict: Result<()> = async {
@@ -7048,9 +7051,14 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
         common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
         snapshot_created = true;
 
+        // Every record of a refusal is held for a second first, so the refusals of the burst
+        // below overlap whatever the host's speed.
         let (serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_env_and_log_path(
             &["snapshot", "serve", &snapshot_name],
-            &[("FCVM_UFFD_MAX_CLONES", "1")],
+            &[
+                ("FCVM_UFFD_MAX_CLONES", "1"),
+                ("FCVM_FAILPOINT", "uffd.refusal.pre_record:sleep:1000"),
+            ],
         )
         .await?;
         serve = Some((serve_child, serve_pid));
@@ -7136,11 +7144,62 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
             serve_output.contains("refused clone killed"),
             "the memory server did not log that it killed the refused clone"
         );
+
+        // A burst of clones against the server at its cap, four times what it records at
+        // once, with each record taking a second: every one of them names the cap.
+        let mut logs = Vec::new();
+        for index in 0..REFUSED_BURST {
+            let name = format!("{refused_name}-{index}");
+            let (child, pid, log) = common::spawn_fcvm_with_env_and_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_string,
+                    "--name",
+                    &name,
+                ],
+                &[],
+            )
+            .await?;
+            burst.push((child, pid));
+            logs.push(log);
+        }
+        let mut unnamed = Vec::new();
+        for (index, log) in logs.iter().enumerate() {
+            let status = tokio::time::timeout(Duration::from_secs(120), burst[index].0.wait())
+                .await
+                .with_context(|| format!("refused clone {index} did not exit within 120 s"))??;
+            anyhow::ensure!(!status.success(), "refused clone {index} exited 0");
+            let text = tokio::fs::read_to_string(log).await?;
+            if !(text.contains("concurrent-clone cap of 1")
+                && text.contains("FCVM_UFFD_MAX_CLONES"))
+            {
+                unnamed.push(format!(
+                    "clone {index}: {}",
+                    text.lines()
+                        .rev()
+                        .find(|line| line.contains("Error"))
+                        .unwrap_or("no error line")
+                ));
+            }
+        }
+        anyhow::ensure!(
+            unnamed.is_empty(),
+            "{} of {REFUSED_BURST} clones refused together do not name the cap:\n{}",
+            unnamed.len(),
+            unnamed.join("\n")
+        );
         Ok(())
     }
     .await;
 
     let mut cleanup_errors = Vec::new();
+    for (mut child, pid) in burst {
+        if let Err(e) = terminate_and_reap(&mut child, pid, "refused clone of the burst").await {
+            cleanup_errors.push(format!("refused clone of the burst: {e:#}"));
+        }
+    }
     for (entry, label) in [
         (&mut refused, "refused clone"),
         (&mut first_clone, "first clone"),

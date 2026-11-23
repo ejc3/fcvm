@@ -1729,6 +1729,10 @@ pub(crate) struct FirecrackerVersion {
     pub numa_window: bool,
 }
 
+/// The context of a snapshot load that failed. A restore that died under its memory server
+/// is told from other failed restores by it (`restore_failure_with_its_memory_server`).
+pub(crate) const LOADING_SNAPSHOT: &str = "loading snapshot";
+
 /// Whether the Firecracker at `bin` takes `--numa-balancing-after-secs`. False when its
 /// version cannot be read: the flag is then left off, which leaves its guest memory under
 /// the default policy.
@@ -4169,7 +4173,7 @@ pub async fn restore_from_snapshot(
                 huge_pages,
             })
             .await
-            .context("loading snapshot")
+            .context(LOADING_SNAPSHOT)
             .map_err(|error| {
                 match firecracker_choice.load_failure_hint(&error, &firecracker_bin) {
                     Some(hint) => error.context(hint),

@@ -4400,15 +4400,13 @@ async fn cmd_snapshot_run_inner(
     // A memory server that killed this clone's VMM during the load (a refusal at its
     // concurrent-clone cap, a failed handshake) wrote why before the kill; the load itself
     // reports only a closed connection. Read before the cleanup removes the directory.
-    let setup_result =
-        setup_result.map_err(
-            |error| match crate::uffd::failure::read_failure(&data_dir) {
-                Some(reason) => {
-                    error.context(format!("the memory server killed this clone: {reason}"))
-                }
-                None => error,
-            },
-        );
+    let setup_result = setup_result.map_err(|error| {
+        restore_failure_with_its_memory_server(
+            error,
+            crate::uffd::failure::read_failure(&data_dir),
+            serve_pid,
+        )
+    });
     let (mut vm_manager, mut holder_child) = setup_try!(setup_result);
 
     // The VMM is now owned by the normal lifecycle. Move every companion out of
@@ -5582,6 +5580,42 @@ fn clone_failure_after_vmm_exit(
         return None;
     }
     vmm_exit_failure(status)
+}
+
+/// A failed restore, with what is known of its memory server's part in it.
+///
+/// `recorded` is the reason the server wrote before it killed the clone's VMM. A server at
+/// its concurrent-clone cap kills a refused clone's VMM without writing one when too many
+/// refusals are in flight (`Refusals` in `uffd::server`). The clone then sees only that the
+/// snapshot load, the request during which the VMM connects to the server, got no answer.
+/// So a restore from a `snapshot serve` that failed that way points at the server's log. A
+/// load that Firecracker answered with an error was not ended by a kill.
+fn restore_failure_with_its_memory_server(
+    error: anyhow::Error,
+    recorded: Option<String>,
+    serve_pid: Option<u32>,
+) -> anyhow::Error {
+    if let Some(reason) = recorded {
+        return error.context(format!("the memory server killed this clone: {reason}"));
+    }
+    let Some(serve_pid) = serve_pid else {
+        return error;
+    };
+    let during_the_load = error
+        .chain()
+        .any(|cause| cause.to_string() == super::common::LOADING_SNAPSHOT);
+    let answered = error
+        .chain()
+        .any(|cause| cause.is::<crate::firecracker::api::ApiRefusal>());
+    if !during_the_load || answered {
+        return error;
+    }
+    error.context(format!(
+        "the snapshot load got no answer from Firecracker, and the memory server (serve PID \
+         {serve_pid}) recorded no reason for killing it: see the serve log (it may be at its \
+         concurrent-clone cap, {})",
+        crate::uffd::MAX_CLONES_ENV
+    ))
 }
 
 /// Classify how a restored clone's VMM exited: `Some(reason)` when the exit is a FAILURE.
@@ -9766,6 +9800,70 @@ mod watchdog_exit_classification_tests {
         assert!(
             body.contains("watchdog.rearm();\n                        watchdog_killed = false;"),
             "relaunch does not rearm"
+        );
+    }
+
+    /// A restore that failed says what its memory server had to do with it: the reason the
+    /// server recorded; or, when the load of a clone of a `snapshot serve` got no answer and
+    /// nothing was recorded, where to look. Any other failure is left as it is.
+    #[test]
+    fn a_failed_restore_names_its_memory_server_s_part() {
+        let died_under_the_load = || {
+            anyhow::anyhow!(
+                "client error (SendRequest): connection closed before message completed"
+            )
+            .context(super::super::common::LOADING_SNAPSHOT)
+        };
+        let recorded = super::restore_failure_with_its_memory_server(
+            died_under_the_load(),
+            Some("at its concurrent-clone cap of 1".into()),
+            Some(4242),
+        );
+        assert!(
+            format!("{recorded:#}")
+                .starts_with("the memory server killed this clone: at its concurrent-clone cap"),
+            "{recorded:#}"
+        );
+
+        let unrecorded = format!(
+            "{:#}",
+            super::restore_failure_with_its_memory_server(died_under_the_load(), None, Some(4242))
+        );
+        for expected in [
+            "the snapshot load got no answer from Firecracker",
+            "serve PID 4242",
+            "see the serve log",
+            "concurrent-clone cap",
+            crate::uffd::MAX_CLONES_ENV,
+            "connection closed before message completed",
+        ] {
+            assert!(
+                unrecorded.contains(expected),
+                "no {expected:?} in: {unrecorded}"
+            );
+        }
+
+        // No memory server of its own to look at: a File restore.
+        let direct =
+            super::restore_failure_with_its_memory_server(died_under_the_load(), None, None);
+        assert!(!format!("{direct:#}").contains("serve log"), "{direct:#}");
+        // A load Firecracker answered was not ended by a kill.
+        let answered = anyhow::Error::new(crate::firecracker::api::ApiRefusal {
+            status: hyper::StatusCode::BAD_REQUEST,
+            reply: "Load snapshot error".into(),
+        })
+        .context(super::super::common::LOADING_SNAPSHOT);
+        let answered = super::restore_failure_with_its_memory_server(answered, None, Some(4242));
+        assert!(
+            !format!("{answered:#}").contains("serve log"),
+            "{answered:#}"
+        );
+        // A failure before or after the load.
+        let elsewhere = anyhow::anyhow!("no such device").context("creating the TAP device");
+        let elsewhere = super::restore_failure_with_its_memory_server(elsewhere, None, Some(4242));
+        assert!(
+            !format!("{elsewhere:#}").contains("serve log"),
+            "{elsewhere:#}"
         );
     }
 
