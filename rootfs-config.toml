@@ -496,10 +496,14 @@ fuse_readers = 64
 # nested guest from kernel/patches-arm64 and holds the host-only KVM patches.
 kernel_version = "7.3.3"
 patches_dir = "kernel/patches-arm64-host"
+# Kconfig lines set on top of the running kernel's config and checked after olddefconfig:
+# no wireless extensions (#2034).
+config_fragment = "kernel/host-arm64.conf"
 
-# Build inputs for SHA calculation (patches only, skip *.vm.patch for host)
+# Build inputs for SHA calculation (patches and the config fragment)
 build_inputs = [
     "kernel/patches-arm64-host/*.patch",
+    "kernel/host-arm64.conf",
 ]
 
 # x86_64 nested profile (Intel VT-x / AMD-V)
