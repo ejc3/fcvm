@@ -3016,15 +3016,20 @@ separately.
   is answered with zeros and recorded like any other. The window starts
   at the clone's UFFD handshake and defaults to 300 s (`--uffd-prefetch-record-window` /
   `FCVM_UFFD_PREFETCH_RECORD_WINDOW`; 0 records nothing; issue #858). Later faults are
-  served but not recorded. Only a few clones record: while a serve loaded no set, its first
-  `RECORDING_CLONES` (4) clones do, and once a set is on disk no clone of that generation
-  adds to it (#955; before, every clone's window was unioned in, and one snapshot's replay
-  grew from 33 to 177 MiB per clone over four 1000-clone runs, until 2000 UFFD clones ran the
-  host out of memory). On handler exit a recording clone's bitmap is unioned into the serve
-  process's in-memory set and scheduled onto one bounded, coalescing background writer. The
-  writer publishes `<memory.bin>.working-set` beside the snapshot under an `flock` + atomic
-  rename, and only writes when the union actually grew. A set from clones killed early is
-  kept as it is: it costs demand faults, never correctness. Persistence is a performance hint: sidecar lock contention skips that
+  served but not recorded. Only a few clones record (#955; before, every clone's window was
+  unioned in, and one snapshot's replay grew from 33 to 177 MiB per clone over four
+  1000-clone runs, until 2000 UFFD clones ran the host out of memory): at most
+  `RECORDING_CLONES` (4) clones of a server record at once, and a set whose sidecar counts
+  four complete recordings is frozen. A recording is complete when its window closed and it
+  saw a page; a clone killed before then, or one that never faulted, merges what it saw and
+  gives its slot to the next clone. The sidecar carries the count, so a serve per restore
+  (the implicit server of `snapshot run --snapshot`) freezes the set at the fourth complete
+  restore, not the first. The server logs `froze the recorded working set` once; to
+  re-record, stop the serve, delete the sidecar and start it again. A recording clone's
+  bitmap is unioned into the serve process's in-memory set when its window closes, while the
+  clone keeps running, or when it exits first, and scheduled onto one bounded, coalescing
+  background writer. The writer publishes `<memory.bin>.working-set` beside the snapshot under
+  an `flock` + atomic rename, and only writes when the union or the count changed. Persistence is a performance hint: sidecar lock contention skips that
   publication attempt without delaying clone teardown or admission slots; the in-memory union
   remains available for the next request. A stopping server waits up to 10 s for publications
   already scheduled, after its last clone has gone: without the wait a serve stopped right
@@ -3195,8 +3200,10 @@ separately.
   takes only the sidecar's own lock, because the create already holds the generation lock
   exclusively. A parent that is the target itself, a different image length, or any read or
   write failure logs a warning and leaves the snapshot without a set. The inherited
-  set is a hint like any other, and a set on disk takes no more recordings (#955), so serves
-  of the new snapshot replay the inherited set as it is and record nothing on top of it. Measured on a
+  set is a hint like any other, and it carries the parent's count of complete recordings
+  (#955): a set the parent froze is replayed as it is, so a snapshot whose workload differs
+  from its parent's keeps the parent's set until its sidecar is deleted, and a set with fewer
+  than four takes recordings on top. Measured on a
   128 GiB guest, one per-diff snapshot: a clone of it with the inherited set (13.7 M pages)
   was ready in 317 s, the same as with a set recorded for it in a 485 s pass (6.6 M pages, 315 s)
   and against 606 s with no set, but held 52.7 GiB at healthy against 25.4 GiB. Inheriting
@@ -3230,7 +3237,12 @@ separately.
 - **Replay trades memory for latency.** A replaying clone materialises the recorded set at
   restore instead of faulting it in as it runs. Commit 86a05b9a reports, from a Chromium run
   that is not committed, that 98% of faults arrived within 750 ms. The set is a union over
-  the recording windows of a generation's first few clones (above). In copy mode every replayed page is a private
+  the recording windows of a generation's first few clones (above). Measured at C=128 with
+  1000 rootless nginx clones per wave (256 MiB guests, one snapshot per arm, three waves each
+  held 330 s, past the 300 s window), the bound to four complete recordings held the set at
+  65 MiB where every clone's window gave 106 to 112 MiB, and wave 3's private memory at 71.5
+  MB per clone against 106.3 (#2056). Its waves 2 and 3 started 75.8 and 71.4 clones/s against
+  61.6 and 63.8, with resume to fc-agent p99 51 to 81 ms against 720 to 886 ms. In copy mode every replayed page is a private
   copy, so a clone also holds pages it would never have touched, including a clone that is
   created and destroyed at once. On one 128 GiB guest the set grew from 3.7M pages after one
   clone to 9.4M after six (issue #955). PR #956 measured two clones on that guest at first
@@ -3331,8 +3343,9 @@ with the granule.
 - **Limitation: recording under the option is thin, and replay does not make up for it**:
   only the demanded page is recorded, and a page that fault-around installed is never
   recorded, because the guest never faults on it. So with the option on the recorded working
-  set converges one demanded page per granule per clone: clone 1 faults on A and records A,
-  clone 2 replays A alone, faults on B and records B, and so on. Replay restores the
+  set holds about one demanded page per granule: clone 1 faults on A and records A,
+  clone 2 replays A alone, faults on B and records B, and so on, until four complete
+  recordings freeze the set. Replay restores the
   recorded pages and nothing more, so it never restores what fault-around would have
   installed. That is a reason to record with the option off: a set recorded that way holds
   every page the guest faulted on, not one per granule.
@@ -3341,7 +3354,7 @@ with the granule.
   demanded pages are sparse: at 64 KiB, 14.5 of the 16 pages of a granule were installed
   beyond demand. Expanding every recorded run would multiply the replayed memory by up to
   the granule factor, in a restore the option already slows. Not expanding costs one extra
-  fault per granule per clone until the set converges.
+  fault per missing page in every clone.
   `replay_populates_only_the_recorded_pages_with_fault_around_on` pins it.
 - **What the option leaves behind**: the sidecar stays a record of demand, so it is still
   valid with the option off or with a smaller granule. It is thinner than a record made
