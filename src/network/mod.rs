@@ -1,5 +1,6 @@
 pub mod bridged;
 pub mod egress_proxy;
+pub mod fingerprint;
 pub mod names;
 pub mod namespace;
 pub mod netns_agent;
@@ -8,6 +9,7 @@ pub mod portmap;
 pub mod relay_socket;
 pub mod routed;
 pub mod rtnl;
+pub mod sock_destroy;
 pub mod source_limit;
 pub mod tcp_proxy;
 pub mod types;

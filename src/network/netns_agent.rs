@@ -23,6 +23,14 @@
 //! |---|---|
 //! | `tcp4`, `tcp6` | `ok` with a non-blocking, unconnected TCP socket made in the namespace |
 //! | `build` and a [`Shape`] as JSON | `ok` once the namespace's links exist as the shape says |
+//! | `adopt` with a socket | `ok`: the agent now also serves `tcp4` and `tcp6` on that socket |
+//! | `reset` | `ok` once nothing a VM's use of the namespace left is in it ([`reset`]) |
+//! | `fingerprint` and the VMM's TAP | `ok` and the namespace's [`fingerprint`](super::fingerprint) |
+//!
+//! An adopted socket is a second channel, for a process the owner lends the namespace to
+//! (the pool's lessee): it gets sockets and nothing else, so it cannot rebuild or reset a
+//! namespace it does not own. The agent drops an adopted channel when its peer closes it and
+//! at every `reset`.
 //!
 //! A socket belongs to the network namespace it was made in for its whole life, so the
 //! owner connects it to a guest address without entering the namespace.
@@ -52,10 +60,13 @@ const TCP4: &[u8] = b"tcp4";
 const TCP6: &[u8] = b"tcp6";
 
 const BUILD: &[u8] = b"build ";
+const ADOPT: &[u8] = b"adopt";
+const RESET: &[u8] = b"reset";
+const FINGERPRINT: &[u8] = b"fingerprint ";
 
 /// The longest message either side sends. Every message is one `sendmsg` of fewer bytes
 /// than this on a `SOCK_SEQPACKET` socket, so one `recvmsg` returns exactly one message.
-const MAX_MESSAGE: usize = 4096;
+const MAX_MESSAGE: usize = 16 * 1024;
 
 /// A connected pair of `SOCK_SEQPACKET` sockets, both close-on-exec: the owner's end and
 /// the agent's. Sequenced packets keep message boundaries, and a closed peer reads as
@@ -288,47 +299,224 @@ pub fn build(shape: &Shape) -> Result<()> {
     Ok(())
 }
 
-/// Answer the owner's requests until its end of the channel closes.
+/// Remove what a VM's use of the namespace can leave in it, so the next VM starts from what
+/// the build made. Nothing here is a list of things a VM is known to change: each step
+/// empties one kind of kernel state whole, and [`fingerprint`](super::fingerprint) then
+/// checks the namespace against the one taken when it was built.
+///
+/// - every adopted channel is dropped: the lessee is gone;
+/// - every TCP socket is destroyed ([`super::sock_destroy`]), so nothing retransmits to the
+///   next guest;
+/// - every resolved neighbour entry is deleted, so no MAC a guest answered with survives,
+///   and every address the bridge learned on a port, which the kernel would otherwise
+///   drop up to a second after the port lost its carrier;
+/// - every IPv4 address but loopback's is removed and added again, which makes its routes
+///   anew: a path MTU from a guest's ICMP "fragmentation needed", or a redirect, is kept on
+///   the route. Any other route through that link goes with its last address. IPv6 has no
+///   such step; a kept IPv6 path MTU shows in the fingerprint and gets the namespace
+///   destroyed.
+///
+/// Not reset: the namespace's TCP metrics (the round-trip time and congestion window the
+/// kernel remembers per destination). Deleting them takes `CAP_NET_ADMIN` in the initial
+/// user namespace, and they are not sent to a guest.
+pub fn reset(lessees: &mut Vec<UnixStream>) -> Result<()> {
+    use super::rtnl::{Rtnl, RTM_GETNEIGH};
+    const NDA_DST: u16 = 1;
+    const NUD_NOARP: u16 = 0x40;
+    lessees.clear();
+    // Sockets first: a socket that retransmits after the neighbours are gone would make the
+    // kernel look for the guest again and leave a new entry.
+    super::sock_destroy::destroy_tcp_sockets().context("destroying the namespace's TCP sockets")?;
+    let mut rtnl = Rtnl::open().context("opening a netlink socket")?;
+    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+        let mut header = [0u8; 12];
+        header[0] = family;
+        let entries = rtnl
+            .dump(RTM_GETNEIGH, &header)
+            .context("listing neighbours")?;
+        for entry in entries {
+            let p = &entry.payload;
+            if p.len() < 12 || u16::from_ne_bytes([p[8], p[9]]) & NUD_NOARP != 0 {
+                continue;
+            }
+            let index = u32::from_ne_bytes([p[4], p[5], p[6], p[7]]);
+            let Some((_, address)) = entry.attrs(12).into_iter().find(|(k, _)| *k == NDA_DST)
+            else {
+                continue;
+            };
+            match rtnl.del_neighbour(index, family, address) {
+                Ok(()) => {}
+                // Expired between the listing and here.
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(error) => return Err(error).context("deleting a neighbour"),
+            }
+        }
+    }
+    const NDA_LLADDR: u16 = 2;
+    const NDA_MASTER: u16 = 9;
+    const NTF_SELF: u8 = 0x02;
+    const NUD_PERMANENT: u16 = 0x80;
+    let mut header = [0u8; 12];
+    header[0] = libc::AF_BRIDGE as u8;
+    let learned = rtnl
+        .dump(RTM_GETNEIGH, &header)
+        .context("listing the bridge's learned addresses")?;
+    for entry in learned {
+        let p = &entry.payload;
+        // The bridge's table (its entries name their bridge), less the addresses that are
+        // a port's own or were added to stay.
+        if p.len() < 12
+            || p[10] & NTF_SELF != 0
+            || u16::from_ne_bytes([p[8], p[9]]) & (NUD_PERMANENT | NUD_NOARP) != 0
+        {
+            continue;
+        }
+        let index = u32::from_ne_bytes([p[4], p[5], p[6], p[7]]);
+        let attrs = entry.attrs(12);
+        if !attrs.iter().any(|(k, _)| *k == NDA_MASTER) {
+            continue;
+        }
+        let Some((_, mac)) = attrs.into_iter().find(|(k, _)| *k == NDA_LLADDR) else {
+            continue;
+        };
+        match rtnl.del_learned_address(index, mac) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error).context("deleting a learned address"),
+        }
+    }
+    rtnl.renew_addresses()
+        .context("renewing the namespace's addresses")?;
+    Ok(())
+}
+
+fn answer(channel: &UnixStream, result: Result<Vec<u8>>) -> std::io::Result<()> {
+    let reply = match result {
+        Ok(mut body) => {
+            let mut reply = OK.to_vec();
+            reply.append(&mut body);
+            reply
+        }
+        Err(error) => format!("err {error:#}").into_bytes(),
+    };
+    send(channel, &reply[..reply.len().min(MAX_MESSAGE)])
+}
+
+/// Answer a request that is not served with `err <reason>`, cut to what a reply may hold.
+fn refuse(channel: &UnixStream, reason: &str) -> std::io::Result<()> {
+    let reply = format!("err {reason}").into_bytes();
+    send(channel, &reply[..reply.len().min(MAX_MESSAGE)])
+}
+
+/// Answer a request for a socket (`tcp4`, `tcp6`); anything else is refused.
+fn serve_socket(channel: &UnixStream, request: &[u8]) -> std::io::Result<()> {
+    let family = match request {
+        TCP4 => libc::AF_INET,
+        TCP6 => libc::AF_INET6,
+        other => {
+            // The request is echoed, and one near the size limit would make a reply over
+            // it, which the client would take for a truncated packet.
+            let reason = format!("unknown request {:?}", String::from_utf8_lossy(other));
+            return refuse(channel, &reason);
+        }
+    };
+    match tcp_socket(family) {
+        Ok(socket) => channel
+            .send_with_fd(OK, socket.as_raw_fd())
+            .map(drop)
+            .map_err(|error| std::io::Error::from_raw_os_error(error.errno())),
+        Err(error) => send(channel, format!("err socket: {error}").as_bytes()),
+    }
+}
+
+/// Answer the owner's requests, and the socket requests of the channels it had adopted,
+/// until the owner's end of its channel closes.
 ///
 /// A request the agent cannot serve is answered with `err <reason>` and the agent keeps
-/// serving: one bad request must not take the namespace down.
-pub fn serve(channel: &UnixStream) -> Result<()> {
-    while let Some((request, _)) = receive(channel).context("reading a request")? {
-        let family = match request.as_slice() {
-            TCP4 => libc::AF_INET,
-            TCP6 => libc::AF_INET6,
+/// serving: one bad request must not take the namespace down. An adopted channel that
+/// fails or closes is dropped; only the owner's channel ends the agent.
+pub fn serve(owner: &UnixStream) -> Result<()> {
+    let mut lessees: Vec<UnixStream> = Vec::new();
+    loop {
+        let mut fds: Vec<libc::pollfd> = std::iter::once(owner)
+            .chain(lessees.iter())
+            .map(|channel| libc::pollfd {
+                fd: channel.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        // SAFETY: `fds` is a valid array of its own length for the whole call.
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("waiting for a request");
+        }
+        // Lessees first and from the last one down, so removing one keeps the indices of
+        // those not yet looked at. The owner's request may replace the whole list.
+        for at in (0..lessees.len()).rev() {
+            if fds[at + 1].revents == 0 {
+                continue;
+            }
+            let served = match receive(&lessees[at]) {
+                Ok(Some((request, _))) => serve_socket(&lessees[at], &request).is_ok(),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    refuse(&lessees[at], &error.to_string()).is_ok()
+                }
+                Ok(None) | Err(_) => false,
+            };
+            if !served {
+                lessees.remove(at);
+            }
+        }
+        if fds[0].revents == 0 {
+            continue;
+        }
+        let received = match receive(owner) {
+            Ok(received) => received,
+            // A request the kernel cut on receipt (over the size limit, or with more
+            // descriptors than a request carries) is one bad request: it is refused and the
+            // namespace stays.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                refuse(owner, &error.to_string()).context("refusing a cut request")?;
+                continue;
+            }
+            Err(error) => return Err(error).context("reading a request"),
+        };
+        let Some((request, passed)) = received else {
+            return Ok(());
+        };
+        match request.as_slice() {
             request if request.starts_with(BUILD) => {
                 let built = serde_json::from_slice::<Shape>(&request[BUILD.len()..])
                     .context("reading the shape")
                     .and_then(|shape| build(&shape));
-                let reply = match built {
-                    Ok(()) => OK.to_vec(),
-                    Err(error) => format!("err {error:#}").into_bytes(),
-                };
-                send(channel, &reply[..reply.len().min(MAX_MESSAGE)])
-                    .context("answering a build")?;
-                continue;
+                answer(owner, built.map(|()| Vec::new())).context("answering a build")?;
             }
-            other => {
-                let reply = format!("err unknown request {:?}", String::from_utf8_lossy(other));
-                send(channel, reply.as_bytes()).context("answering an unknown request")?;
-                continue;
+            ADOPT => {
+                let adopted = passed
+                    .context("the request carried no socket")
+                    .map(|socket| lessees.push(UnixStream::from(socket)));
+                answer(owner, adopted.map(|()| Vec::new())).context("answering an adopt")?;
             }
-        };
-        match tcp_socket(family) {
-            Ok(socket) => {
-                channel
-                    .send_with_fd(OK, socket.as_raw_fd())
-                    .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))
-                    .context("sending a socket")?;
+            RESET => {
+                answer(owner, reset(&mut lessees).map(|()| Vec::new()))
+                    .context("answering a reset")?;
             }
-            Err(error) => {
-                send(channel, format!("err socket: {error}").as_bytes())
-                    .context("answering a failed socket")?;
+            request if request.starts_with(FINGERPRINT) => {
+                let tap = String::from_utf8_lossy(&request[FINGERPRINT.len()..]).into_owned();
+                let text = super::fingerprint::fingerprint(&tap).map(|text| {
+                    let mut body = b" ".to_vec();
+                    body.extend_from_slice(text.as_bytes());
+                    body
+                });
+                answer(owner, text).context("answering a fingerprint")?;
             }
+            other => serve_socket(owner, other).context("answering a socket request")?,
         }
     }
-    Ok(())
 }
 
 /// Set once [`main_if_agent`] has run in this process: its executable can be an agent.
@@ -446,7 +634,9 @@ pub fn run(channel: RawFd, owner: u32) -> Result<()> {
 /// at a time, so a second caller waits for the first reply.
 pub struct Client {
     channel: tokio::io::unix::AsyncFd<UnixStream>,
-    turn: tokio::sync::Mutex<()>,
+    /// Held for one request and its reply. The count is the replies the agent still owes
+    /// to requests whose callers stopped waiting ([`Client::exchange`]).
+    turn: tokio::sync::Mutex<u32>,
 }
 
 impl Client {
@@ -459,7 +649,7 @@ impl Client {
             unsafe { tokio::io::unix::AsyncFd::register(channel) }.map_err(std::io::Error::from)?;
         Ok(Self {
             channel,
-            turn: tokio::sync::Mutex::new(()),
+            turn: tokio::sync::Mutex::new(0),
         })
     }
 
@@ -491,6 +681,34 @@ impl Client {
         }
     }
 
+    /// One request, with a descriptor if `passed`, and the agent's reply to it.
+    ///
+    /// The agent answers in order, one reply per request. A caller that is dropped between
+    /// the two (a probe that timed out) leaves its reply in the channel, and the next
+    /// request would read it as its own: a socket where a fingerprint was asked for. So a
+    /// request that has been sent is counted until its reply has been read, and a request
+    /// first reads and discards the replies owed to callers that left. A descriptor in a
+    /// discarded reply is closed.
+    async fn exchange(
+        &self,
+        request: &[u8],
+        passed: Option<RawFd>,
+    ) -> std::io::Result<(Vec<u8>, Option<OwnedFd>)> {
+        let mut owed = self.turn.lock().await;
+        while *owed > 0 {
+            self.receive().await?;
+            *owed -= 1;
+        }
+        match passed {
+            None => self.send(request).await?,
+            Some(fd) => self.send_with_fd(request, fd).await?,
+        }
+        *owed += 1;
+        let reply = self.receive().await?;
+        *owed -= 1;
+        Ok(reply)
+    }
+
     /// Wait for the agent to say its namespaces exist.
     pub async fn unshared(&self) -> Result<()> {
         self.expect(UNSHARED).await
@@ -498,8 +716,17 @@ impl Client {
 
     /// Tell the agent its id maps are written and wait for it to confirm it is ready.
     pub async fn mapped(&self) -> Result<()> {
-        self.send(MAPPED).await.context("sending 'mapped'")?;
-        self.expect(READY).await
+        let (message, _) = self
+            .exchange(MAPPED, None)
+            .await
+            .context("sending 'mapped' and waiting for the agent's 'ready'")?;
+        if message != READY {
+            bail!(
+                "the namespace agent said {:?} instead of 'ready'",
+                String::from_utf8_lossy(&message)
+            );
+        }
+        Ok(())
     }
 
     async fn expect(&self, word: &[u8]) -> Result<()> {
@@ -527,9 +754,10 @@ impl Client {
             request.len() <= MAX_MESSAGE,
             "the shape is too long to send"
         );
-        let _turn = self.turn.lock().await;
-        self.send(&request).await.context("asking for a build")?;
-        let (reply, _) = self.receive().await.context("waiting for the build")?;
+        let (reply, _) = self
+            .exchange(&request, None)
+            .await
+            .context("asking for a build")?;
         match reply.strip_prefix(b"err ") {
             Some(reason) => bail!("{}", String::from_utf8_lossy(reason)),
             None if reply == OK => Ok(()),
@@ -540,13 +768,69 @@ impl Client {
         }
     }
 
+    /// One request and its reply's body after `ok`. `err <reason>` is this call's error.
+    async fn request(&self, request: &[u8], passed: Option<RawFd>, what: &str) -> Result<Vec<u8>> {
+        let (reply, _) = self
+            .exchange(request, passed)
+            .await
+            .with_context(|| format!("asking the namespace agent for {what}"))?;
+        if let Some(reason) = reply.strip_prefix(b"err ") {
+            bail!("{}", String::from_utf8_lossy(reason));
+        }
+        match reply.strip_prefix(OK) {
+            Some(body) => Ok(body.to_vec()),
+            None => bail!(
+                "the namespace agent answered {what} with {:?}",
+                String::from_utf8_lossy(&reply)
+            ),
+        }
+    }
+
+    async fn send_with_fd(&self, message: &[u8], fd: RawFd) -> std::io::Result<()> {
+        loop {
+            let mut guard = self.channel.writable().await?;
+            match guard.try_io(|channel| {
+                channel
+                    .get_ref()
+                    .send_with_fd(message, fd)
+                    .map(drop)
+                    .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))
+            }) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    /// Have the agent serve socket requests on `channel` too: the other end of that socket
+    /// pair goes to the process the namespace is lent to.
+    pub async fn adopt(&self, channel: &UnixStream) -> Result<()> {
+        self.request(ADOPT, Some(channel.as_raw_fd()), "an adopted channel")
+            .await
+            .map(drop)
+    }
+
+    /// Have the agent remove what a VM's use left in the namespace ([`reset`]).
+    pub async fn reset(&self) -> Result<()> {
+        self.request(RESET, None, "a reset").await.map(drop)
+    }
+
+    /// The namespace's fingerprint ([`super::fingerprint`]); `tap` is the VMM's TAP.
+    pub async fn fingerprint(&self, tap: &str) -> Result<String> {
+        let mut request = FINGERPRINT.to_vec();
+        request.extend_from_slice(tap.as_bytes());
+        let body = self.request(&request, None, "a fingerprint").await?;
+        Ok(String::from_utf8_lossy(&body).trim_start().to_string())
+    }
+
     /// An unconnected TCP socket made inside the agent's network namespace, for `address`'s
     /// family.
     pub async fn tcp_socket(&self, address: &std::net::IpAddr) -> Result<tokio::net::TcpSocket> {
         let request = if address.is_ipv4() { TCP4 } else { TCP6 };
-        let _turn = self.turn.lock().await;
-        self.send(request).await.context("asking for a socket")?;
-        let (message, socket) = self.receive().await.context("waiting for a socket")?;
+        let (message, socket) = self
+            .exchange(request, None)
+            .await
+            .context("asking for a socket")?;
         if message != OK {
             bail!(
                 "the namespace agent refused a socket: {}",
@@ -606,6 +890,8 @@ mod tests {
         for (file, source) in [
             ("netns_agent.rs", include_str!("netns_agent.rs")),
             ("rtnl.rs", include_str!("rtnl.rs")),
+            ("fingerprint.rs", include_str!("fingerprint.rs")),
+            ("sock_destroy.rs", include_str!("sock_destroy.rs")),
         ] {
             let code = source.split("#[cfg(test)]").next().unwrap();
             for (number, line) in code.lines().enumerate() {
@@ -724,6 +1010,89 @@ mod tests {
         assert_eq!(from, std::path::Path::new("/proc/self/exe"));
         let missing = executable_for(false, || Ok("/nonexistent/deps/test-binary".into()));
         assert!(format!("{:#}", missing.unwrap_err()).contains("/nonexistent/fcvm"));
+    }
+
+    /// A caller that stops waiting for its reply does not put the next request out of
+    /// step. Here a probe is dropped after its request for a socket was sent; the agent
+    /// answers it anyway, and the fingerprint asked for next gets the fingerprint's reply,
+    /// not the socket's.
+    #[tokio::test]
+    async fn a_request_whose_caller_left_does_not_shift_the_next_reply() {
+        let (owner, agent) = channel().unwrap();
+        let client = std::sync::Arc::new(Client::new(owner).unwrap());
+        let agent = std::sync::Arc::new(agent);
+        let next_request = |agent: std::sync::Arc<UnixStream>| async move {
+            tokio::task::spawn_blocking(move || receive(&agent).unwrap().unwrap().0)
+                .await
+                .unwrap()
+        };
+
+        let probe = tokio::spawn({
+            let client = client.clone();
+            async move { client.tcp_socket(&"127.0.0.1".parse().unwrap()).await }
+        });
+        assert_eq!(next_request(agent.clone()).await, TCP4);
+        probe.abort();
+        assert!(probe.await.unwrap_err().is_cancelled());
+
+        let fingerprint = tokio::spawn({
+            let client = client.clone();
+            async move { client.fingerprint("tap").await }
+        });
+        // The agent answers the first request, then reads and answers the second.
+        let socket = tcp_socket(libc::AF_INET).unwrap();
+        agent.send_with_fd(OK, socket.as_raw_fd()).unwrap();
+        assert_eq!(next_request(agent.clone()).await, b"fingerprint tap");
+        send(&agent, b"ok the fingerprint").unwrap();
+        assert_eq!(fingerprint.await.unwrap().unwrap(), "the fingerprint");
+
+        // And the request after that is in step too.
+        let again = tokio::spawn({
+            let client = client.clone();
+            async move { client.reset().await }
+        });
+        assert_eq!(next_request(agent.clone()).await, RESET);
+        send(&agent, OK).unwrap();
+        again.await.unwrap().unwrap();
+    }
+
+    /// One bad request does not take the namespace down: a request over the size limit is
+    /// answered with `err` and the agent serves the next one, on the owner's channel and on
+    /// an adopted one. A request it does not know is echoed in a reply that fits.
+    #[test]
+    fn an_oversize_or_unknown_request_is_refused_and_the_agent_serves_on() {
+        let (owner, agent) = channel().unwrap();
+        let serving = std::thread::spawn(move || serve(&agent));
+        let ask = |channel: &UnixStream, request: &[u8]| {
+            send(channel, request).unwrap();
+            receive(channel).unwrap().expect("a reply")
+        };
+        let refused = |reply: &[u8], what: &str| {
+            let text = String::from_utf8_lossy(reply).into_owned();
+            assert!(text.starts_with("err ") && text.contains(what), "{text}");
+            assert!(reply.len() <= MAX_MESSAGE);
+        };
+
+        let (reply, _) = ask(&owner, &vec![b'x'; MAX_MESSAGE + 1]);
+        refused(&reply, "truncated");
+        let (reply, _) = ask(&owner, &vec![b'q'; MAX_MESSAGE]);
+        refused(&reply, "unknown request");
+        let (reply, socket) = ask(&owner, TCP4);
+        assert_eq!((reply.as_slice(), socket.is_some()), (OK, true));
+
+        let (lessee, adopted) = channel().unwrap();
+        owner.send_with_fd(ADOPT, adopted.as_raw_fd()).unwrap();
+        assert_eq!(receive(&owner).unwrap().unwrap().0, OK);
+        drop(adopted);
+        let (reply, _) = ask(&lessee, &vec![b'x'; MAX_MESSAGE + 1]);
+        refused(&reply, "truncated");
+        let (reply, _) = ask(&lessee, &vec![b'q'; MAX_MESSAGE]);
+        refused(&reply, "unknown request");
+        let (reply, socket) = ask(&lessee, TCP6);
+        assert_eq!((reply.as_slice(), socket.is_some()), (OK, true));
+
+        drop(owner);
+        serving.join().unwrap().unwrap();
     }
 
     /// The serve loop on a thread, in this process's own namespaces: the protocol without

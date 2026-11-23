@@ -768,6 +768,12 @@ pub struct NamespaceParams {
     pub net_namespace_path: Option<std::path::PathBuf>,
     /// The mount namespace a restored clone's VMM runs in. See [`MountRedirects`].
     pub mount_redirects: Option<MountRedirects>,
+    /// Descriptors the VMM keeps open across its exec, and so until it exits. A VM in a
+    /// pooled namespace passes its lease here ([`crate::netpool`]): the pool takes the
+    /// namespace back only when every holder of the lease is gone, and the VMM is the
+    /// process that must be gone before another VM gets its TAP. Each stays close-on-exec in
+    /// this process, so no other child inherits it.
+    pub keep_fds: Vec<std::os::fd::RawFd>,
 }
 
 /// The mount namespace that gives a restored clone's VMM its own directories at the
@@ -951,6 +957,21 @@ pub fn install_namespace_pre_exec(
     ns: &NamespaceParams,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
+
+    if !ns.keep_fds.is_empty() {
+        let keep_fds = ns.keep_fds.clone();
+        // SAFETY: fcntl is async-signal-safe and the closure owns its list, allocated here.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in &keep_fds {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
 
     let ns_id_clone = ns.namespace_id.clone();
     let mount_redirects_clone = ns.mount_redirects.clone();

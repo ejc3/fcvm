@@ -713,6 +713,22 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
 
+#### Recycled namespaces (`src/netpool/`)
+
+`fcvm netpool serve --slots N` builds N rootless namespaces through the builder above and lends each to one restored clone at a time.
+
+| | |
+|---|---|
+| Owner | One pool process per data directory and user (`<data_dir>/netpool/<user>/`, `pool.lock` held for life, `pool.sock`). Holders and pastas are its children with `PR_SET_PDEATHSIG`, forked from its main thread. |
+| Claim | `PastaNetwork::setup` of a restored clone with no published port connects to `pool.sock` and sends the key of its network (`PastaNetwork::pool_key`: the links and pasta's command line). The pool answers with the user and network namespace descriptors, a channel to the holder for sockets, the TAP's name, the slot and its generation. |
+| Lease | The connection. The VMM inherits it across its exec (`NamespaceParams::keep_fds`), so it reads end-of-file only when the clone and its VMM have both exited. |
+| Reset | pasta restarted; the holder destroys every TCP socket, deletes every resolved neighbour and every address the bridge learned, and removes and re-adds the namespace's addresses, which makes their routes anew and drops a path MTU or redirect a guest's ICMP left on them (`netns_agent::reset`). No `/proc/sys` path is opened. |
+| Verify | The holder's fingerprint of the namespace (`src/network/fingerprint.rs`: links with their carrier, addresses, routes, neighbours, bridge table, extra qdiscs, forwarding switches, cached routes, nftables tables, sockets in use) must equal the one taken at build. It is retried for 2 s, because the VMM's TAP closes a moment after its lease. A namespace that still differs is destroyed and built again. |
+| Destroy | One namespace at a time, 50 ms apart. The kernel destroys the namespaces that died since its cleanup worker last ran as one batch under `rtnl_mutex`, and each bridge in a batch costs an `rcu_barrier()` under it on kernels before Linux 25ae123db10b (14 ms on 192 CPUs, measured). |
+| Not pooled | A clone with a published port, an isolated namespace, a cold boot, a clone whose network key is not the pool's, and any clone when no pool runs or no namespace is free. They build their own namespace through the same builder. |
+
+The slot table (`src/netpool/slots.rs`) is pure state: Building, Ready, Leased(lease), Resetting, Destroying. A lease's end is refused for any lease but the one the namespace has, so a connection seen closing late cannot take a namespace from its next tenant.
+
 ### Egress Proxy (Outbound IPv4 TCP)
 
 In rootless mode, outbound IPv4 TCP from the guest requires a transparent proxy because
@@ -1468,6 +1484,7 @@ One async session per connection:
 | `fcvm snapshot export` | Write a snapshot, with the image disk and pmem images it reads, as one archive |
 | `fcvm snapshot import` | Install the snapshot in an archive that `snapshot export` wrote |
 | `fcvm snapshots ls` | List stored snapshots (also: `delete <NAME>`, `prune`) |
+| `fcvm netpool serve` | Keep a pool of rootless network namespaces for restored clones (also: `stats`) |
 
 ### Key CLI Design Decisions
 

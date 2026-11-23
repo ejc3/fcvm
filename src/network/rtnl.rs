@@ -23,12 +23,14 @@ const NLM_F_CREATE: u16 = 0x400;
 pub const RTM_NEWLINK: u16 = 16;
 pub const RTM_GETLINK: u16 = 18;
 pub const RTM_NEWADDR: u16 = 20;
+pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_GETROUTE: u16 = 26;
 pub const RTM_NEWNEIGH: u16 = 28;
 pub const RTM_DELNEIGH: u16 = 29;
 pub const RTM_GETNEIGH: u16 = 30;
 pub const RTM_GETQDISC: u16 = 38;
+pub const RTM_GETNETCONF: u16 = 82;
 
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
@@ -106,12 +108,18 @@ pub struct Rtnl {
 
 impl Rtnl {
     pub fn open() -> io::Result<Self> {
+        Self::open_protocol(libc::NETLINK_ROUTE)
+    }
+
+    /// A netlink socket of another protocol (`NETLINK_NETFILTER`, `NETLINK_SOCK_DIAG`),
+    /// with the same request, acknowledgement and dump framing.
+    pub fn open_protocol(protocol: libc::c_int) -> io::Result<Self> {
         // SAFETY: socket takes no pointers.
         let fd = unsafe {
             libc::socket(
                 libc::AF_NETLINK,
                 libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-                libc::NETLINK_ROUTE,
+                protocol,
             )
         };
         if fd < 0 {
@@ -222,7 +230,7 @@ impl Rtnl {
     }
 
     /// A change request: sent with `NLM_F_ACK`, done when the kernel acknowledges it.
-    fn change(&mut self, kind: u16, flags: u16, payload: &[u8]) -> io::Result<()> {
+    pub fn change(&mut self, kind: u16, flags: u16, payload: &[u8]) -> io::Result<()> {
         let sequence = self.send(kind, NLM_F_ACK | flags, payload)?;
         self.replies(sequence).map(drop)
     }
@@ -288,6 +296,70 @@ impl Rtnl {
         attr(&mut payload, IFA_LOCAL, &address.octets());
         attr(&mut payload, IFA_ADDRESS, &address.octets());
         self.change(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &payload)
+    }
+}
+
+const NDA_DST: u16 = 1;
+impl Rtnl {
+    /// Delete the neighbour entry for `address` (4 or 16 bytes) on link `index`, whatever
+    /// its state: `ip neigh del ADDRESS dev INDEX`.
+    pub fn del_neighbour(&mut self, index: u32, family: u8, address: &[u8]) -> io::Result<()> {
+        // struct ndmsg: family, two pad bytes, a pad short, index, state, flags, type.
+        let mut payload = vec![family, 0, 0, 0];
+        payload.extend_from_slice(&(index as i32).to_ne_bytes());
+        payload.extend_from_slice(&[0, 0, 0, 0]);
+        attr(&mut payload, NDA_DST, address);
+        self.change(RTM_DELNEIGH, 0, &payload)
+    }
+
+    /// Delete the address `mac` that the bridge learned on its port `index`:
+    /// `bridge fdb del MAC dev INDEX master`.
+    pub fn del_learned_address(&mut self, index: u32, mac: &[u8]) -> io::Result<()> {
+        const NDA_LLADDR: u16 = 2;
+        const NTF_MASTER: u8 = 0x04;
+        let mut payload = vec![libc::AF_BRIDGE as u8, 0, 0, 0];
+        payload.extend_from_slice(&(index as i32).to_ne_bytes());
+        payload.extend_from_slice(&[0, 0, NTF_MASTER, 0]);
+        attr(&mut payload, NDA_LLADDR, mac);
+        self.change(RTM_DELNEIGH, 0, &payload)
+    }
+
+    /// Remove every IPv4 address of this namespace that is not loopback's and add it
+    /// again, and return how many there were.
+    ///
+    /// The kernel keeps what it learned about a destination from ICMP (a path MTU from
+    /// "fragmentation needed", a gateway from a redirect) on the route that leads there, for
+    /// ten minutes, and no netlink request deletes such an entry. Removing an address
+    /// removes its connected and local routes and everything kept on them; adding it again
+    /// makes the routes anew. `ip route flush cache` does the same through a file under
+    /// /proc/sys, which a namespace of an unprivileged user does not have and whose lookup
+    /// takes a lock every other namespace's lookups take.
+    pub fn renew_addresses(&mut self) -> io::Result<usize> {
+        const IFA_BROADCAST: u16 = 4;
+        const RT_SCOPE_HOST: u8 = 254;
+        let addresses = self.dump(RTM_GETADDR, &[libc::AF_INET as u8, 0, 0, 0, 0, 0, 0, 0])?;
+        let mut renewed = 0;
+        for address in addresses {
+            let Some(header) = address.payload.get(..8) else {
+                continue;
+            };
+            if header[3] == RT_SCOPE_HOST {
+                continue;
+            }
+            // struct ifaddrmsg as dumped, without the flags the kernel set on its own
+            // (permanent), and the attributes that say what the address is.
+            let mut payload = vec![header[0], header[1], 0, header[3]];
+            payload.extend_from_slice(&header[4..8]);
+            for (kind, value) in address.attrs(8) {
+                if [IFA_ADDRESS, IFA_LOCAL, IFA_BROADCAST].contains(&kind) {
+                    attr(&mut payload, kind, value);
+                }
+            }
+            self.change(RTM_DELADDR, 0, &payload)?;
+            self.change(RTM_NEWADDR, NLM_F_CREATE | NLM_F_EXCL, &payload)?;
+            renewed += 1;
+        }
+        Ok(renewed)
     }
 }
 

@@ -10,6 +10,16 @@ pub fn truncate_id(s: &str, max_len: usize) -> &str {
     &s[..max_len.min(s.len())]
 }
 
+/// Which pooled namespace a VM has, and which use of it this is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PooledNamespace {
+    /// The pool's number for the namespace.
+    pub slot: u32,
+    /// The leases the namespace has had, this VM's included: 1 is a namespace no VM used
+    /// before, 2 or more a recycled one.
+    pub generation: u64,
+}
+
 /// VM state information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmState {
@@ -40,6 +50,12 @@ pub struct VmState {
     /// Namespace holder PID for rootless networking (used for nsenter health checks)
     #[serde(default)]
     pub holder_pid: Option<u32>,
+    /// The pooled namespace this VM runs in, when it claimed one (`crate::netpool`).
+    /// `holder_pid` is then the pool's process: it holds this VM's namespace only while
+    /// this VM's own process (`pid`, `pid_start_time`) is alive, and serves another VM
+    /// afterwards. A reader of a state whose owner is dead must not use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netpool: Option<PooledNamespace>,
     /// Monotonically increasing count of host-side vsock transport resets.
     /// Bumped (locked read-modify-write via `StateManager::bump_vsock_epoch`)
     /// after every snapshot pause/save of this VM and BEFORE the VM resumes:
@@ -417,6 +433,7 @@ impl VmState {
             pid_start_time: None,
             lifecycle_ready: false,
             holder_pid: None,
+            netpool: None,
             vsock_epoch: 0,
             created_at: now,
             last_updated: now,

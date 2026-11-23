@@ -382,6 +382,21 @@ Uses [pasta](https://passt.top/) (from the passt project) with a Linux bridge fo
 
 Host services are reachable from VMs via pasta gateways: `10.0.2.2` (IPv4) and `fd00::2` (IPv6).
 
+#### Recycled namespaces (`fcvm netpool serve`)
+
+Building and destroying a rootless namespace holds the kernel's `rtnl_mutex`, one lock for the whole host, for milliseconds. A host that starts and stops many clones can keep a pool of namespaces instead:
+
+```bash
+fcvm netpool serve --slots 2000 &     # one per user and data directory; SIGTERM stops it
+fcvm snapshot run --snapshot my-snapshot --name clone1   # takes a pooled namespace when one is free
+fcvm netpool stats                    # {"ready":1999,"leased":1,"grants":1,"recycled_grants":0,...}
+```
+
+- A restored clone with no published port takes a pooled namespace when a pool runs and one is free, and gives it back when its VMM has exited. The pool restarts the namespace's pasta, removes what the VM left, and checks the namespace against a fingerprint taken when it was built; one that differs is destroyed and built again.
+- A clone with `--publish`, a cold boot (`podman run`), and any clone when no pool runs or none is free build their own namespace, as before.
+- Every holder and pasta of a pool is the pool's child. If the pool dies they die with it, and the clones in its namespaces exit with an error.
+- A clone's state records its namespace as `netpool: {slot, generation}`; a generation of 2 or more is a recycled namespace.
+
 ### Routed Architecture
 
 Connects VMs directly to the host via a veth pair with native IPv6 routing — no userspace proxy. Each VM gets a unique IPv6 derived from the host's /64 subnet. Requires a host with a global IPv6 address (e.g., AWS VPC with IPv6 enabled).
@@ -508,6 +523,8 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | `fcvm snapshot export` | Write a Firecracker snapshot as one archive, with the image disk and the pmem images it reads, to stdout or `--output <FILE>` |
 | `fcvm snapshot import` | Install the snapshot in an archive that `snapshot export` wrote, and the image disk and pmem images this host lacks, from stdin or `--input <FILE>` |
 | `fcvm serve` | Start HTTP API server |
+| `fcvm netpool serve` | Keep `--slots` rootless network namespaces and lend them to restored clones, one after another |
+| `fcvm netpool stats` | Print the running pool's namespaces by state and its counters as one JSON line |
 
 **Key `podman run` flags:**
 ```

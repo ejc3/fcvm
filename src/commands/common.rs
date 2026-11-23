@@ -3618,6 +3618,38 @@ async fn prepare_clone_substrate(
             source_disk = %restore_config.source_disk_path.display(),
             "CoW disk prepared from snapshot"
         );
+    } else if let Some(lease) = network
+        .as_any()
+        .downcast_ref::<PastaNetwork>()
+        .and_then(PastaNetwork::lease)
+    {
+        // Rootless mode in a pooled namespace (`crate::netpool`): the namespace, its links
+        // and its pasta exist. The VMM enters it through the descriptors the pool sent and
+        // keeps the lease open for as long as it runs.
+        let disk_manager = DiskManager::new(
+            vm_id.to_string(),
+            restore_config.source_disk_path.clone(),
+            vm_dir.clone(),
+        );
+        rootfs_path = disk_manager
+            .create_cow_disk()
+            .await
+            .context("creating CoW disk from snapshot")?;
+        info!(
+            rootfs = %rootfs_path.display(),
+            source_disk = %restore_config.source_disk_path.display(),
+            slot = lease.grant.slot,
+            "CoW disk prepared from snapshot (pooled namespace)"
+        );
+        namespace.user_namespace_path = Some(lease.user_namespace_path());
+        namespace.net_namespace_path = Some(lease.net_namespace_path());
+        namespace.keep_fds = vec![lease.fd()];
+        vm_state.holder_pid = Some(lease.grant.holder_pid);
+        vm_state.netpool = Some(crate::state::PooledNamespace {
+            slot: lease.grant.slot,
+            generation: lease.grant.generation,
+        });
+        holder_pid_for_post_start = Some(lease.grant.holder_pid);
     } else if let Some(pasta_net) = network.as_any().downcast_ref::<PastaNetwork>() {
         // Rootless mode: spawn holder process, then run disk creation and network setup
         // in parallel.
@@ -3955,6 +3987,7 @@ pub async fn restore_from_snapshot(
     if let Some(p) = &ns.net_namespace_path {
         vm_manager.set_net_namespace_path(p.clone());
     }
+    vm_manager.set_keep_fds(ns.keep_fds.clone());
     if let Some(redirects) = &ns.mount_redirects {
         vm_manager.set_mount_redirects(redirects.clone());
     }
@@ -4563,6 +4596,7 @@ pub async fn restore_from_snapshot_ch(
         user_namespace_path: substrate.namespace.user_namespace_path.clone(),
         net_namespace_path: substrate.namespace.net_namespace_path.clone(),
         mount_redirects: substrate.namespace.mount_redirects.clone(),
+        keep_fds: substrate.namespace.keep_fds.clone(),
     };
     if let Err(error) = backend
         .spawn(&spec)
@@ -7228,6 +7262,204 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(netns_cookie(&first), netns_cookie(&second));
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// `argv` in the holder's namespaces; its failure fails the test.
+    fn in_namespace(holder_pid: u32, argv: &[&str]) {
+        let output = std::process::Command::new("nsenter")
+            .args(["--preserve-credentials", "-U", "-n", "-t"])
+            .arg(holder_pid.to_string())
+            .arg("--")
+            .args(argv)
+            .output()
+            .expect("running a command in the holder's namespaces");
+        assert!(
+            output.status.success(),
+            "{argv:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A lessee's channel gets sockets made in the namespace and nothing else: it cannot
+    /// build, reset or fingerprint a namespace it does not own. The reset ends it, and the
+    /// owner is served before and after.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_adopted_channel_gets_sockets_and_nothing_else() {
+        use crate::network::netns_agent;
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let owner = netns_agent::client(holder_pid).unwrap();
+        let (holder_end, lessee_end) = netns_agent::channel().unwrap();
+        owner.adopt(&holder_end).await.expect("adopting a channel");
+        drop(holder_end);
+        let lessee = netns_agent::Client::new(lessee_end).unwrap();
+        let guest: std::net::IpAddr = "10.0.2.100".parse().unwrap();
+
+        let theirs = lessee.tcp_socket(&guest).await.expect("a lessee's socket");
+        let ours = owner.tcp_socket(&guest).await.expect("the owner's socket");
+        assert_eq!(netns_cookie(&theirs), netns_cookie(&ours));
+
+        let network = crate::network::PastaNetwork::isolated("vm-lessee".into(), "tap-fc".into());
+        let refused = lessee.build(&network.shape()).await.unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("unknown request"),
+            "{refused:#}"
+        );
+        assert!(lessee.reset().await.is_err());
+        assert!(lessee.fingerprint("tap-fc").await.is_err());
+        let links = ip_json(holder_pid, &["link", "show"]);
+        assert_eq!(
+            links.as_array().unwrap().len(),
+            1,
+            "a lessee built links: {links}"
+        );
+
+        owner.reset().await.expect("resetting the namespace");
+        // The holder closed the lessee's channel before it answered the reset.
+        let ended = lessee.tcp_socket(&guest).await.unwrap_err();
+        assert!(format!("{ended:#}").contains("Broken pipe"), "{ended:#}");
+        owner
+            .tcp_socket(&guest)
+            .await
+            .expect("the owner after a reset");
+        stop_holder(holder, holder_pid).await;
+    }
+
+    /// What a VM's use leaves in a namespace shows in its fingerprint, and the reset takes
+    /// it out: a neighbour entry, an address the bridge learned on the VMM's port, a TCP
+    /// connection towards the guest. A route through loopback is something no VM can add
+    /// and no reset removes (the reset renews the bridge's address, and with it every route
+    /// through the bridge): the namespace then reads differently for good, which is what
+    /// gets a pooled namespace destroyed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reset_namespace_reads_as_it_was_built() {
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+        let (holder, holder_pid) = super::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        let network = crate::network::PastaNetwork::isolated("vm-reset".into(), "tap-fc".into());
+        network
+            .build_namespace(holder_pid)
+            .await
+            .expect("building the namespace");
+        let agent = crate::network::netns_agent::client(holder_pid).unwrap();
+        let built = agent
+            .fingerprint("tap-fc")
+            .await
+            .expect("the first fingerprint");
+        assert!(built.contains("link tap-fc "), "{built}");
+        assert!(built.contains("sockets sockstat: TCP=0 "), "{built}");
+        assert!(!built.contains("cached route"), "{built}");
+
+        let mac = "02:00:00:00:00:99";
+        in_namespace(
+            holder_pid,
+            &[
+                "ip",
+                "neigh",
+                "replace",
+                "10.0.2.100",
+                "lladdr",
+                mac,
+                "dev",
+                "br0",
+                "nud",
+                "reachable",
+            ],
+        );
+        // An IPv6 neighbour too. The renewal of the bridge's IPv4 address takes the IPv4
+        // entries of the bridge with it; nothing but the reset's own pass over the
+        // neighbours removes this one.
+        in_namespace(
+            holder_pid,
+            &[
+                "ip",
+                "-6",
+                "neigh",
+                "replace",
+                "fd00::99",
+                "lladdr",
+                mac,
+                "dev",
+                "br0",
+                "nud",
+                "reachable",
+            ],
+        );
+        in_namespace(
+            holder_pid,
+            &[
+                "bridge", "fdb", "add", mac, "dev", "tap-fc", "master", "dynamic",
+            ],
+        );
+        // A connection towards the guest that nothing answers: the socket stays, sending SYNs.
+        let socket = agent
+            .tcp_socket(&"10.0.2.100".parse().unwrap())
+            .await
+            .expect("a socket in the namespace");
+        // SAFETY: the descriptor is a TCP socket this test owns alone.
+        let socket = unsafe { std::net::TcpStream::from_raw_fd(socket.into_raw_fd()) };
+        let guest: std::net::SocketAddrV4 = "10.0.2.100:80".parse().unwrap();
+        let address = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: guest.port().to_be(),
+            sin_addr: libc::in_addr {
+                s_addr: u32::from(*guest.ip()).to_be(),
+            },
+            sin_zero: [0; 8],
+        };
+        // SAFETY: `address` is a sockaddr_in that outlives the call.
+        let rc = unsafe {
+            libc::connect(
+                socket.as_raw_fd(),
+                (&address as *const libc::sockaddr_in).cast(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            (rc, std::io::Error::last_os_error().raw_os_error()),
+            (-1, Some(libc::EINPROGRESS))
+        );
+
+        let used = agent
+            .fingerprint("tap-fc")
+            .await
+            .expect("the used fingerprint");
+        assert!(
+            used.contains(&format!("neigh br0 10.0.2.100 {mac}")),
+            "{used}"
+        );
+        assert!(
+            used.contains(&format!("neigh br0 fd00::99 {mac}")),
+            "{used}"
+        );
+        assert!(
+            used.contains(&format!("fdb tap-fc {mac} learned")),
+            "{used}"
+        );
+        assert!(used.contains("sockets sockstat: TCP=1 "), "{used}");
+
+        agent.reset().await.expect("resetting the namespace");
+        let after = agent
+            .fingerprint("tap-fc")
+            .await
+            .expect("the reset fingerprint");
+        assert_eq!(after, built);
+        drop(socket);
+
+        in_namespace(
+            holder_pid,
+            &["ip", "route", "add", "192.0.2.0/24", "dev", "lo"],
+        );
+        agent.reset().await.expect("resetting again");
+        let foreign = agent
+            .fingerprint("tap-fc")
+            .await
+            .expect("the last fingerprint");
+        assert_ne!(foreign, built);
+        assert!(foreign.contains("192.0.2.0/24"), "{foreign}");
         stop_holder(holder, holder_pid).await;
     }
 

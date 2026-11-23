@@ -42,6 +42,36 @@ pub enum Commands {
     Fleet(FleetArgs),
     /// Raw VMs: a guest that runs no fc-agent (Windows), booted from UEFI firmware
     Vm(VmArgs),
+    /// A pool of rootless network namespaces that restored clones run in, one after another
+    Netpool(NetpoolArgs),
+}
+
+// ============================================================================
+// Netpool Command (recycled rootless network namespaces)
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct NetpoolArgs {
+    #[command(subcommand)]
+    pub cmd: NetpoolCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NetpoolCommands {
+    /// Build SLOTS namespaces and lend them to this user's rootless clones in this data
+    /// directory until SIGTERM or SIGINT. A clone with no published port takes one when
+    /// one is free and builds its own otherwise.
+    Serve(NetpoolServeArgs),
+    /// Print the running pool's namespaces by state and its counters as one JSON line
+    Stats,
+}
+
+#[derive(Args, Debug)]
+pub struct NetpoolServeArgs {
+    /// Namespaces the pool keeps. Each is a holder process, a pasta process and a network
+    /// namespace with a bridge and two TAPs, whether lent or not
+    #[arg(long)]
+    pub slots: usize,
 }
 
 // ============================================================================

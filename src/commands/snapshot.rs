@@ -3762,10 +3762,15 @@ async fn cmd_snapshot_run_inner(
             // --dns 10.0.2.2 restores with pasta's DNS special case off, so its
             // guests keep reaching the host loopback service the golden was
             // recorded against.
+            // A Firecracker clone may run in a pooled namespace (`crate::netpool`). The
+            // Cloud Hypervisor restore has not been run in one.
             let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                 .with_loopback_ip(loopback_ip)
                 .with_dns_server(resolvers.mode_server.clone())
-                .with_restore_mode();
+                .with_restore_mode()
+                .with_pooling(
+                    snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker,
+                );
             Box::new(net)
         }
     };
