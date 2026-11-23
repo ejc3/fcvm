@@ -286,7 +286,9 @@ fn run_probe(cmd: &mut Command) -> Output {
 ///
 /// The situation is built rather than waited for: a tmpfs over `/mnt` inside a
 /// private mount namespace, holding one plausible-looking `pasta-*.bin` that
-/// records nothing and sleeps. Everything else is the shipped script.
+/// records nothing and sleeps. Everything else is the shipped script, run from a
+/// copy in the test's temp directory so that a checkout under `/mnt` is not
+/// hidden with the rest.
 ///
 /// RED BEFORE THE FIX:
 ///
@@ -304,8 +306,21 @@ fn run_probe(cmd: &mut Command) -> Output {
 #[test]
 fn the_probe_refuses_to_guess_which_pasta_to_run() {
     require_tools();
-    let script = repo_root().join("scripts/probe-pasta-dns-gateway.sh");
     let tmp = tempfile::tempdir().expect("temp dir");
+    // The script runs from a copy outside `/mnt`: the tmpfs below hides everything under
+    // `/mnt`, a checkout there included, and the probe then failed with 127 (no such
+    // file) instead of answering.
+    assert!(
+        !tmp.path().starts_with("/mnt"),
+        "the temp directory {} is under /mnt, which this test hides",
+        tmp.path().display()
+    );
+    let script = tmp.path().join("probe-pasta-dns-gateway.sh");
+    std::fs::copy(
+        repo_root().join("scripts/probe-pasta-dns-gateway.sh"),
+        &script,
+    )
+    .expect("copying the probe out of the checkout");
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).expect("create stub bin");
     write_guest_stubs(&bin, &tmp.path().join("dig-calls"), None);

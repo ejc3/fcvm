@@ -2,17 +2,21 @@
 """Select the lane image a stack's Lambda tiles run, so the image and its rollback stay in the repository.
 
     release.py select   --stack stage --digest sha256:<new>|--built --running sha256:<now>|none
-    release.py promote  --running sha256:<now>|none     prod takes the digest staging selected
     release.py rollback --stack prod --running sha256:<now>
-    release.py show
+    release.py show     --stack stage|prod
     release.py record   --digest sha256:<built>         the newest lane image built from main
     release.py publish  --archive lane.tar --commit C   CI: push rev-C (LAMBDA_TILE_REPO) and record it
+    release.py copy     --digest sha256:<tested>        prod CI: copy staging's tested image into prod's
 
-The lane repository (fcvm-fleet/lambda-tile in us-east-1, ejc3/aws fcvm-fleet-lambda.tf) is
-shared by both stacks. Its lifecycle policy expires every image outside the newest five unless the
-image carries a protected tag, `keep-<stack>-current`, `keep-<stack>-previous` or `keep-<stack>-next`
-(LIFECYCLE below), and `keep-built`. Those seven tags are the only mutable tags in the repository,
-and this script is what moves them; a push names an image `rev-<commit>` or any other tag outside `keep-`.
+Each stack has its own lane repository in us-east-1 (ejc3/aws fcvm-fleet-lambda.tf): staging's
+fcvm-fleet/lambda-tile and prod's fcvm-fleet/lambda-tile-prod (REPOSITORIES). Each lifecycle
+policy expires every image outside the newest five unless the image carries one of its stack's
+protected tags, `keep-<stack>-current`, `keep-<stack>-previous` or `keep-<stack>-next` (LIFECYCLES
+below), and in staging's also `keep-built`. Those are the only mutable tags, a stack's tags move only
+in its own repository, and this script is what moves them; a push names an image `rev-<commit>` or
+any other tag outside `keep-`. Staging never reads or writes prod's repository. A promotion copies the
+digest staging tested into prod's by digest, on prod CI's credentials (`copy`), tagged
+`from-stage-<hex>`, and checks prod's repository holds that same digest before prod selects it.
 
 A stack's coordinator runs one digest, its `--lambda-image <repository>@<digest>`, and every
 function it creates runs that digest (the coordinator deletes its functions at start and at
@@ -44,9 +48,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REGION = "us-east-1"
-REPOSITORY = "fcvm-fleet/lambda-tile"
 STACKS = ("stage", "prod")
-PROTECTED = "keep-*"
+REPOSITORIES = {"stage": "fcvm-fleet/lambda-tile", "prod": "fcvm-fleet/lambda-tile-prod"}
+# Each repository's mutable, never-expired tags (ejc3/aws fcvm-fleet-lambda.tf).
+PROTECTED = {"stage": "keep-*", "prod": "keep-prod-*"}
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 # Kept with the bytes and media type that were pushed, so a tag put on them names the same digest.
 MEDIA_TYPES = [
@@ -56,19 +61,20 @@ MEDIA_TYPES = [
     "application/vnd.oci.image.index.v1+json",
 ]
 
-# The repository's lifecycle policy, as ejc3/aws fcvm-fleet-lambda.tf sets it. An image a rule's
+# Each repository's lifecycle policy, as ejc3/aws fcvm-fleet-lambda.tf sets it. An image a rule's
 # tags select cannot be expired by a lower-priority rule, so rule 1 (which keeps up to 100 images,
-# and at most seven carry a protected tag) keeps every protected image; rule 2 counts every image
+# and at most four carry a protected tag) keeps every protected image; rule 2 counts every image
 # and expires the ones outside the newest five that no protected tag holds.
-LIFECYCLE = {"rules": [
-    {"rulePriority": 1, "description": "never an image a stack runs or can roll back to",
-     "selection": {"tagStatus": "tagged", "tagPatternList": [PROTECTED],
+LIFECYCLES = {stack: {"rules": [
+    {"rulePriority": 1, "description": description,
+     "selection": {"tagStatus": "tagged", "tagPatternList": [PROTECTED[stack]],
                    "countType": "imageCountMoreThan", "countNumber": 100},
      "action": {"type": "expire"}},
     {"rulePriority": 2, "description": "keep the newest 5 images",
      "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 5},
      "action": {"type": "expire"}},
-]}
+]} for stack, description in (("stage", "never an image a stack runs or can roll back to"),
+                               ("prod", "never an image prod runs or can roll back to"))}
 
 
 def current(stack):
@@ -104,11 +110,16 @@ AWS_ERROR = re.compile(r"An error occurred \(([A-Za-z0-9]{1,64})\)")
 
 
 class Ecr:
-    """The repository through the AWS CLI: read an image by tag or digest, put a tag on one."""
+    """A lane repository through the AWS CLI: read an image by tag or digest, put a tag on one."""
 
-    def __init__(self, repository=REPOSITORY, region=REGION, registry=None):
+    def __init__(self, repository, region=REGION, registry=None):
         # registry: the repository's account, for a caller in another one (CI's role).
         self.repository, self.region, self.registry = repository, region, registry
+
+    def url(self):
+        if self.registry is None:
+            raise ValueError(f"{self.repository}'s account is not known: set LAMBDA_TILE_REPO")
+        return f"{self.registry}.dkr.ecr.{self.region}.amazonaws.com/{self.repository}"
 
     def aws(self, args, body=None):
         account = [] if self.registry is None or body is not None else ["--registry-id", self.registry]
@@ -158,6 +169,14 @@ class Ecr:
             raise RuntimeError(f"{tag} landed on another digest")
 
 
+def own(ecr, stack):
+    """Refuse a stack's tags, or staging's builds, anywhere but that stack's own repository."""
+    if stack not in STACKS:
+        raise ValueError(f"unknown stack {stack!r}")
+    if ecr.repository != REPOSITORIES[stack]:
+        raise ValueError(f"{ecr.repository} is not {stack}'s lane repository")
+
+
 def digest(value, *, none=False):
     if none and value == "none":
         return None
@@ -180,6 +199,7 @@ def locked(*stacks):
 
 
 def tags(ecr, stack):
+    own(ecr, stack)
     return {name: (found.digest if found else None)
             for name in (current(stack), previous(stack)) for found in [ecr.tagged(name)]}
 
@@ -193,8 +213,7 @@ def move(ecr, stack, new, running):
     `previous`) is a swap that two tags could not do without a moment where one image has none. An
     interrupted move is finished by running it again. Selecting the image the stack already runs
     leaves `previous`, its rollback target, where it is."""
-    if stack not in STACKS:
-        raise ValueError(f"unknown stack {stack!r}")
+    own(ecr, stack)
     image = ecr.image(new)
     ecr.put(following(stack), image)
     if running is not None and running != new:
@@ -218,6 +237,7 @@ def record(ecr, built, commit=None, is_ancestor=None):
     The lock is a flock in this host's temp directory and orders nothing across runners: CI's
     publishes are ordered by the workflow's concurrency group (fleet-lambda-image). A manual
     `record` must not run while a publish does."""
+    own(ecr, "stage")
     with locked("built"):
         now = ecr.tagged(BUILT)
         if commit is not None and now is not None and now.digest != built:
@@ -269,7 +289,8 @@ def git_is_ancestor(older, newer):
     raise failure
 
 
-REPOSITORY_URL = re.compile(r"[0-9]{12}\.dkr\.ecr\." + re.escape(REGION) + r"\.amazonaws\.com/" + re.escape(REPOSITORY))
+REPOSITORY_URLS = {stack: re.compile(r"[0-9]{12}\.dkr\.ecr\." + re.escape(REGION) + r"\.amazonaws\.com/" + re.escape(name))
+                   for stack, name in REPOSITORIES.items()}
 LOCAL = "localhost/fcvm-lambda-tile"
 
 
@@ -286,11 +307,13 @@ def publish(ecr, archive, commit, repository_url, is_ancestor=git_is_ancestor):
 
     The tag is immutable, so a rerun finds it. Whichever push put it there, the image under the tag
     must be the one this run built and checked (the same config digest, which podman calls the
-    image ID), and after a push it must hold the digest podman pushed, or nothing is recorded."""
+    image ID), and after a push it must hold the digest podman pushed, or nothing is recorded. Staging's
+    repository only: prod's receives images only by copy."""
+    own(ecr, "stage")
     if not re.fullmatch(r"[0-9a-f]{40}", commit or ""):
         raise ValueError("a full commit is required")
-    if not REPOSITORY_URL.fullmatch(repository_url or ""):
-        raise ValueError("not the lane repository")
+    if not REPOSITORY_URLS["stage"].fullmatch(repository_url or ""):
+        raise ValueError("not staging's lane repository")
     tag, local = "rev-" + commit, f"{LOCAL}:{commit}"
     quiet(["podman", "load", "-q", "-i", archive])
     built = "sha256:" + quiet(["podman", "image", "inspect", "--format", "{{.Id}}", local]).strip()
@@ -320,6 +343,7 @@ def publish(ecr, archive, commit, repository_url, is_ancestor=git_is_ancestor):
 
 def snapshot(ecr, stack):
     """The stack's protected tags as they stand: what reset() puts back."""
+    own(ecr, stack)
     found = {name: ecr.tagged(tag) for name, tag in (("current", current(stack)), ("previous", previous(stack)),
                                                        ("next", following(stack)))}
     return {name: image.digest if image else None for name, image in found.items()}
@@ -330,6 +354,7 @@ def reset(ecr, stack, before):
     first: the image the stack still runs held previous throughout the selection and holds current again before
     previous moves back to the old rollback target; next last, which unprotects the image the failed release
     selected. A tag that did not exist before is left where it is (nothing here deletes a tag)."""
+    own(ecr, stack)
     with locked(stack):
         for name, tag in (("current", current(stack)), ("previous", previous(stack)), ("next", following(stack))):
             digest_ = before["current"] if name == "next" else before[name]
@@ -364,6 +389,7 @@ def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, cl
     only forward: when it holds a later build with other lane inputs, refuse at once; when it holds an earlier
     build, or none, wait (every 30 s, at most `timeout`) for this commit's lane build, then refuse. A coordinator
     never runs beside a lane image built from other lane inputs."""
+    own(ecr, "stage")
     if changed is None:
         patterns = inputs if inputs is not None else lane_inputs(
             (Path(__file__).resolve().parents[2] / ".github/workflows/fleet-lambda-image.yml").read_text())
@@ -409,6 +435,7 @@ def paired_build(ecr, commit, *, is_ancestor=None, changed=None, inputs=None, cl
 
 
 def newest_build(ecr):
+    own(ecr, "stage")
     built = ecr.tagged(BUILT)
     if built is None:
         raise LookupError("no lane image is recorded as built (keep-built): CI has not published one")
@@ -420,12 +447,45 @@ def select(ecr, stack, new, running):
         return move(ecr, stack, new, running)
 
 
-def promote(ecr, running):
-    with locked("stage", "prod"):
-        staged = ecr.tagged(current("stage"))
-        if staged is None:
-            raise LookupError("staging has selected no lane image")
-        return move(ecr, "prod", staged.digest, running)
+def copied(digest_):
+    """The tag a copy into prod's repository carries: immutable there, so a rerun finds it."""
+    return "from-stage-" + digest(digest_).split(":", 1)[1]
+
+
+def skopeo_copy(source, dest, digest_, tag):
+    """Copy one image by digest between the lane repositories through the registry API, on the caller's
+    credentials. --preserve-digests makes skopeo refuse any copy that would change the manifest, so the copy
+    is the same digest or nothing."""
+    with tempfile.TemporaryDirectory(prefix="lane-copy-") as tmp:
+        auth = os.path.join(tmp, "auth.json")
+        for registry in sorted({source.url().split("/", 1)[0], dest.url().split("/", 1)[0]}):
+            password = quiet(["aws", "ecr", "get-login-password", "--region", REGION])
+            quiet(["skopeo", "login", "--authfile", auth, "--username", "AWS", "--password-stdin", registry], body=password)
+            password = None
+        quiet(["skopeo", "copy", "--authfile", auth, "--preserve-digests", "--retry-times", "3",
+               f"docker://{source.url()}@{digest_}", f"docker://{dest.url()}:{tag}"])
+
+
+def copy(source, dest, digest_, transfer=None):
+    """Prod CI: copy the digest staging tested from staging's repository into prod's, and check prod's
+    repository holds that same digest under `from-stage-<hex>`. Moves no keep- tag: the release that follows
+    selects it for prod. An image prod's repository already holds under that tag is not copied again."""
+    own(source, "stage")
+    own(dest, "prod")
+    tag = copied(digest_)
+    status = "present"
+    # The tag decides, not the digest: an image prod's repository holds without it (the tag removed by hand while a
+    # keep-prod- tag keeps the image) is copied again, so a rerun converges.
+    landed = dest.tagged(tag)
+    if landed is None:
+        source.image(digest_)  # LookupError when staging's repository does not hold it
+        (transfer or skopeo_copy)(source, dest, digest_, tag)
+        status = "copied"
+        landed = dest.tagged(tag)
+    if landed is None or landed.digest != digest_ or dest.get("imageDigest=" + digest_) is None:
+        raise RuntimeError(f"prod's lane repository holds {landed.digest if landed else 'nothing'} under {tag}, "
+                           f"not the digest staging tested ({digest_})")
+    return {"status": status, "digest": digest_, "tag": tag}
 
 
 def rollback(ecr, stack, running):
@@ -443,9 +503,12 @@ def rollback(ecr, stack, running):
         return move(ecr, stack, target, running)
 
 
-def show(ecr):
-    built = ecr.tagged(BUILT)
-    return {**{stack: tags(ecr, stack) for stack in STACKS}, BUILT: built.digest if built else None}
+def show(ecr, stack):
+    shown = {stack: tags(ecr, stack)}
+    if stack == "stage":
+        built = ecr.tagged(BUILT)
+        shown[BUILT] = built.digest if built else None
+    return shown
 
 
 def arguments(argv=None):
@@ -457,25 +520,36 @@ def arguments(argv=None):
     which.add_argument("--digest")
     which.add_argument("--built", action="store_true", help="the newest lane image CI built (keep-built)")
     s.add_argument("--running", required=True, help="the digest the stack's coordinator runs now, or none")
-    p = sub.add_parser("promote")
-    p.add_argument("--running", required=True, help="the digest prod's coordinator runs now, or none")
     r = sub.add_parser("rollback")
     r.add_argument("--stack", choices=STACKS, required=True)
     r.add_argument("--running", required=True, help="the digest the stack's coordinator runs now")
-    sub.add_parser("show")
+    w = sub.add_parser("show")
+    w.add_argument("--stack", choices=STACKS, required=True)
     c = sub.add_parser("record")
     c.add_argument("--digest", required=True)
     u = sub.add_parser("publish", help="CI: push the image built for --commit and record it")
     u.add_argument("--archive", required=True)
     u.add_argument("--commit", required=True)
+    y = sub.add_parser("copy", help="prod CI: copy the digest staging tested into prod's repository (LAMBDA_TILE_REPO)")
+    y.add_argument("--digest", required=True)
     return parser.parse_args(argv)
 
 
-def run(argv=None, ecr=None):
+def stack_of(args):
+    return {"publish": "stage", "record": "stage", "copy": "prod"}.get(args.action) or args.stack
+
+
+def run(argv=None, ecr=None, source=None):
     args = arguments(argv)
+    stack = stack_of(args)
     url = os.environ.get("LAMBDA_TILE_REPO", "")
+    # LAMBDA_TILE_REPO names this stack's repository (its account, for CI's role in another one); CI's
+    # publish and copy refuse to run without it.
+    registry = url.split(".", 1)[0] if REPOSITORY_URLS[stack].fullmatch(url) else None
+    if args.action in ("publish", "copy") and registry is None:
+        raise ValueError(f"LAMBDA_TILE_REPO is not {stack}'s lane repository")
     if ecr is None:
-        ecr = Ecr(registry=url.split(".", 1)[0]) if args.action == "publish" and REPOSITORY_URL.fullmatch(url) else Ecr()
+        ecr = Ecr(REPOSITORIES[stack], registry=registry)
     if args.action == "select":
         new = newest_build(ecr) if args.built else digest(args.digest)
         result = select(ecr, args.stack, new, digest(args.running, none=True))
@@ -483,12 +557,13 @@ def run(argv=None, ecr=None):
         result = record(ecr, digest(args.digest))
     elif args.action == "publish":
         result = publish(ecr, args.archive, args.commit, url)
-    elif args.action == "promote":
-        result = promote(ecr, digest(args.running, none=True))
+    elif args.action == "copy":
+        # Staging's repository is in the same account as prod's.
+        result = copy(source or Ecr(REPOSITORIES["stage"], registry=registry), ecr, digest(args.digest))
     elif args.action == "rollback":
         result = rollback(ecr, args.stack, digest(args.running))
     else:
-        result = show(ecr)
+        result = show(ecr, args.stack)
     print(json.dumps(result, sort_keys=True))
     return result
 

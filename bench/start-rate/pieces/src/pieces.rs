@@ -490,10 +490,12 @@ async fn restore(args: &PieceArgs, held: &mut Held, stages: &mut Stages) -> Resu
         Some(socket) => MemBackend {
             backend_type: "Uffd".into(),
             backend_path: socket.display().to_string(),
+            write_set_path: None,
         },
         None => MemBackend {
             backend_type: "File".into(),
             backend_path: snapshot.join("memory.bin").display().to_string(),
+            write_set_path: None,
         },
     };
     let t = Instant::now();

@@ -164,7 +164,7 @@ past the link watch delay, in the campaign of the PR that adds the namespace poo
 These rows and the ones above are from different sessions and are not an A/B of the two
 hold times.
 
-Same session as changelog entry 6 (2026-11-23), `HOLD_MS=1200`, the traced cells summarized by
+Same session as changelog entry 7 (2026-11-23), `HOLD_MS=1200`, the traced cells summarized by
 `tap-summary` as it is now: the mutex traced through fentry and fexit, the count of calls the
 larger of the two probes' counts, the other devices' link events included. The helper stays
 attached 1.2 s, past the link watch worker's delay, as a VM does, so the carrier-on and the
@@ -331,7 +331,56 @@ Traced (`attribution.sh`, C=128, 1000 held, 2000 namespace lives; `rtnl.py`, sum
 - The VMM's attach and detach on a prepared namespace, the tap-attach floor (C=128, 2000
   namespaces with pasta, one traced cell each): 1538 us of hold per cycle before, 1426 after.
 
-### 6. netpool: a pool lends namespaces (the pool PR)
+### 6. vmm: stage-2 faults per clone, and the write set (#2035)
+
+**Where a clone's stage-2 aborts come from.** Real clones (`bench-start-rate-run`, rootless, 20
+at C=1 and 256 at C=128, all held at the end), one snapshot, fcvm built from 9d6b094 (#2014's first draft, on
+main of 2026-11-22) with Firecracker 3057dcb7, c8g.metal-48xl, stock host kernel 7.0.0-1013-aws. bpftrace
+on `kvm_guest_fault` (every abort, with its kind and guest page), `io_mem_abort` (MMIO) and
+`kvm_handle_guest_abort` (on-CPU time: entry to return less time switched out). Every value is a
+mean per clone; on-CPU us per abort is the on-CPU ms divided by the aborts. At C=1 every abort's
+guest page was kept, so RAM aborts split exactly: RAM = aborts - MMIO, distinct pages = read first
++ write first, repeats = RAM - distinct, each derived column computed from the rounded ones. At C=128 the tracer dropped most per-page lines, so only
+the totals and the copy-on-write count (permission faults on a write, all RAM) are given.
+
+| restore | C | aborts | MMIO | RAM | read first | write first | repeats | of them copy-on-write | on-CPU ms | on-CPU us / abort |
+|---|---|---|---|---|---|---|---|---|---|---|
+| File | 1 | 36,804 | 14,018 | 22,786 | 13,052 | 4,615 | 5,119 | 5,041 | 137 | 3.7 |
+| File | 128 | 47,347 | 8,290 | | | | | 7,216 | 474 | 10.0 |
+| UFFD copy | 1 | 34,844 | 12,188 | 22,656 | 12,680 | 4,472 | 5,504 | 4,568 | 65 | 1.9 |
+| UFFD copy | 128 | 44,661 | 8,235 | | | | | 6,963 | 454 | 10.2 |
+| UFFD minor | 1 | 45,290 | 13,714 | 31,576 | 12,529 | 3,896 | 15,151 | 6,367 | 180 | 4.0 |
+| UFFD minor | 128 | 73,600 | 7,706 | | | | | 7,201 | 2,451 | 33.3 |
+
+Every stage-2 mapping was 4 KiB. UFFD minor mode is the slow one under concurrency: at C=128 it
+takes 73,600 aborts per clone at 33.3 us each, 2.5 s of handler time per clone, against 10 us
+for File and UFFD copy; that is not attributed further here.
+
+**The write set (#2035)** removes the copy-on-write from a File clone's restore. End-to-end
+(`startrate.py` to healthy, rootless, File backend), to 1000 clones alive, main (878fc71e)
+against #2035, three fresh snapshots per arm, same session, stock host kernel 7.0.0-1013-aws:
+30.0-35.3 against 38.6-59.3 clones/s at C=128 and 28.5-34.8 against 34.5-58.3 at C=512. Measured
+there the same way as above, but as the median per clone over 1000, the handler's on-CPU time
+was 2.7-4.2 s per clone on main against 60-81 ms with #2035, and anonymous memory per clone
+36.5-49.6 against 38.4-49.1 MB. The table is in #2035. The C=128 row above (474 ms) is the
+smaller run: 256 clones, an older head, one snapshot.
+
+**MMIO aborts by device**, from `kvm_mmio` (each guest read and write, kernel-handled notifies
+included), mean per clone:
+
+| head | clones | net | serial | block | vsock | rng | total |
+|---|---|---|---|---|---|---|---|
+| #2024's head (bd898093) | 10 at C=1, held 5 s | 11,349 | 4,392 | 655 | 53 | 8 | 16,457 |
+| main (878fc71e) | 5 at C=1, held 10 s | 234 | 4,270 | 444 | 56 | 12 | 5,016 |
+
+On #2024's head the net device's aborts were 4,313 interrupt-status reads, 4,313 interrupt
+acknowledgements and 2,723 queue notifies (the notifies are ioeventfds, handled in the kernel).
+On main they are under 250; which change between the two heads removed that traffic is not
+identified here. What remains is the console: on main, 2,975 transmit-register writes per clone in
+the first second, one exit to Firecracker per byte, which are fc-agent's 37 restore lines (about
+2.7 KB) on ttyS0. These MMIO counts are from different runs than the table's MMIO column.
+
+### 7. netpool: a pool lends namespaces (the pool PR)
 
 One on-demand c8g.metal-48xl (192 CPUs), host kernel 7.0.0-1013-aws, one boot, 2026-11-23,
 this tree. `netpool.sh`: one pool of 2000 namespaces, 1000 leased throughout, three campaigns
@@ -345,17 +394,17 @@ of the four cells, a pool built and destroyed for each; mean (lowest to highest)
 | 512 | 13622 (12234 to 14581) | 44.3 (41.3 to 48.1) | 55.2 (50.7 to 61.0) | 0.00057 | 114 (112 to 115) | 17.6 |
 
 - **A claim is 0.28 ms alone, and one pool answers 22,000 to 28,000 a second at C=32 and
-  128** (13,600 at C=512), against a namespace setup of 1.1 to 1.7 s at C=128 (entry 7). No
+  128** (13,600 at C=512), against a namespace setup of 1.1 to 1.7 s at C=128 (entry 8). No
   claim failed and no namespace was destroyed (7200 grants, 5200 of them of a recycled
   namespace, 7200 resets and 0 destroys in each campaign).
 - **The pool resets 114 to 120 namespaces per second**, whatever the claim rate: a cell ends
   by dropping every lease at once and the pool works through them 64 at a time. That is this
   PR's ceiling for starts and stops sustained together, about what building and destroying
-  namespaces reaches (85 to 94 setups/s, 129 to 131 teardowns/s, entry 7), with one difference:
+  namespaces reaches (85 to 94 setups/s, 129 to 131 teardowns/s, entry 8), with one difference:
   the reset is the pool's work after a clone has stopped, and the setup was on the clone's
   start.
 - **A reset holds `rtnl_mutex` 2.29 ms** (one traced cell at C=128, 2000 resets, `rtnl.py`),
-  where a namespace's build and destroy hold it 24 ms (entry 7): 1.51 ms in pasta's four holds
+  where a namespace's build and destroy hold it 24 ms (entry 8): 1.51 ms in pasta's four holds
   as it exits and starts again, with three expedited RCU grace periods, 0.56 ms in the holder's
   fourteen (neighbours, the bridge's learned addresses, the address renewal), 0.21 ms in the
   link watch worker. Of the 2.17 ms on CPU under the mutex, 0.83 is `do_one_broadcast` and 0.68
@@ -367,11 +416,11 @@ of the four cells, a pool built and destroyed for each; mean (lowest to highest)
   under the mutex, and on this kernel each bridge in a batch is an `rcu_barrier()` of 14 ms
   (entry 5).
 
-### 7. rootless-net: entry 5's cell again, with tracers that drop nothing
+### 8. rootless-net: entry 5's cell again, with tracers that drop nothing
 
 Entry 5's tracer summed a hold from a return probe on `mutex_lock`, and the kernel keeps a
 fixed number of return-probe instances (384 on this host). `kernel.bt` now uses fentry and
-fexit. Same session as entry 6; the start-pieces of the agent PR (before) and of the builder
+fexit. Same session as entry 7; the start-pieces of the agent PR (before) and of the builder
 PR (after), three traced runs each in turn, C=128, 1000 held, 2000 namespace lives:
 
 | per namespace life | before | after |
@@ -405,5 +454,5 @@ to 106); setup p50 1358 ms (1120 to 1748) and 1483 (1162 to 1662); host CPU per 
   return from `mutex_lock` on another mutex was counted as taking this one), and `tap-summary`
   to divide a call's summed hold by the holds summed. The requests and acquisitions of these
   dumps differ by 14 in 94,849 or less, and the tap cells' two counts by 1.5% or less, which
-  bounds how many holds can be affected but not by how much. The traced figures of entries 6
-  and 7 and the "measured again" tap rows are to be measured again with the corrected tools.
+  bounds how many holds can be affected but not by how much. The traced figures of entries 7
+  and 8 and the "measured again" tap rows are to be measured again with the corrected tools.

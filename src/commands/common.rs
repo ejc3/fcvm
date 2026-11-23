@@ -1670,7 +1670,7 @@ pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
 /// Parse Firecracker version from --version output
 ///
 /// Expected format: "Firecracker v1.14.0" or similar
-fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
+pub(crate) fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
     // Find version number pattern vX.Y.Z, with an optional pre-release suffix (-dev).
     let version_re =
         regex::Regex::new(r"v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?")
@@ -1693,6 +1693,7 @@ fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
         prerelease: caps.get(4).is_some(),
         drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
         numa_window: build.first() == Some(&"fcvm") && build.contains(&"numa-window"),
+        write_set: build.first() == Some(&"fcvm") && build.contains(&"write-set"),
     })
 }
 
@@ -1708,6 +1709,9 @@ pub(crate) struct FirecrackerVersion {
     pub drive_overrides: bool,
     /// Whether the build takes `--numa-balancing-after-secs` (`+fcvm.…numa-window`).
     pub numa_window: bool,
+    /// Whether a File-backend load takes `mem_backend.write_set_path` (`+fcvm.…write-set`).
+    /// Earlier builds refuse the field.
+    pub write_set: bool,
 }
 
 /// The context of a snapshot load that failed. A restore that died under its memory server
@@ -2536,7 +2540,12 @@ pub enum MemoryBackend {
     /// Load memory directly from file (used by podman cache restore).
     /// Firecracker maps the snapshot file MAP_PRIVATE, so clean pages are shared through
     /// the host page cache and guest writes CoW.
-    File { memory_path: PathBuf },
+    File {
+        memory_path: PathBuf,
+        /// The snapshot generation's recorded write set (`storage::write_set`), which
+        /// Firecracker populates writable before the VM runs, when the file exists.
+        write_set: Option<PathBuf>,
+    },
     /// Use UFFD server for on-demand page loading (used by snapshot clones).
     /// MISSING faults on anonymous memory, resolved with UFFDIO_COPY: lazy, but every
     /// faulted page becomes a private per-clone copy.
@@ -4044,7 +4053,7 @@ pub async fn restore_from_snapshot(
         // process runs. A memory server that starts for another snapshot then leaves its
         // page cache alone. Best effort, like a server's mark: without it the restore works
         // and may read pages from disk.
-        if let MemoryBackend::File { memory_path } = &restore_config.memory_backend {
+        if let MemoryBackend::File { memory_path, .. } = &restore_config.memory_backend {
             if let Err(error) = vm_manager.mark_memory_in_use(memory_path).await {
                 warn!(
                     error = %format!("{error:#}"),
@@ -4063,14 +4072,22 @@ pub async fn restore_from_snapshot(
         };
 
         let mem_backend = match &restore_config.memory_backend {
-            MemoryBackend::File { memory_path } => {
+            MemoryBackend::File {
+                memory_path,
+                write_set,
+            } => {
                 info!(
                     memory = %memory_path.display(),
                     "loading snapshot with File backend"
                 );
+                let write_set = write_set.as_ref().filter(|p| p.is_file());
+                if let Some(path) = write_set {
+                    info!(write_set = %path.display(), "populating the recorded write set before resume");
+                }
                 MemBackend {
                     backend_type: "File".to_string(),
                     backend_path: memory_path.display().to_string(),
+                    write_set_path: write_set.map(|p| p.display().to_string()),
                 }
             }
             MemoryBackend::Uffd { socket_path } => {
@@ -4081,6 +4098,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "Uffd".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
             MemoryBackend::UffdMinor { socket_path } => {
@@ -4091,6 +4109,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "UffdMinor".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
             MemoryBackend::Prefilled { socket_path, .. } => {
@@ -4101,6 +4120,7 @@ pub async fn restore_from_snapshot(
                 MemBackend {
                     backend_type: "Prefilled".to_string(),
                     backend_path: socket_path.display().to_string(),
+                    write_set_path: None,
                 }
             }
         };
@@ -9117,7 +9137,7 @@ mod tests {
         let body = &source[start..start + end];
         let steps = [
             ".start(&firecracker_bin, None, firecracker_args.as_deref())",
-            "MemoryBackend::File { memory_path } = &restore_config.memory_backend",
+            "MemoryBackend::File { memory_path, .. } = &restore_config.memory_backend",
             "vm_manager.mark_memory_in_use(memory_path)",
             ".load_snapshot(",
             "if let Err(e) = post_start {",
@@ -10414,6 +10434,29 @@ mod tests {
     /// `--numa-balancing-after-secs`; an older build or upstream would refuse the flag and
     /// not start.
     #[test]
+    fn the_version_says_whether_firecracker_takes_a_write_set() {
+        for takes in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set\n",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set.fuzzing",
+        ] {
+            assert!(
+                parse_firecracker_version(takes).unwrap().write_set,
+                "{takes}"
+            );
+        }
+        for other in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window",
+            "Firecracker v1.17.0+other.write-set",
+            "Firecracker v1.17.0",
+        ] {
+            assert!(
+                !parse_firecracker_version(other).unwrap().write_set,
+                "{other}"
+            );
+        }
+    }
+
+    #[test]
     fn the_version_says_whether_firecracker_takes_the_numa_window() {
         for takes in [
             "Firecracker v1.17.0+fcvm.drive-overrides.numa-window\n",
@@ -10472,6 +10515,7 @@ mod tests {
             prerelease: false,
             drive_overrides: true,
             numa_window: false,
+            write_set: false,
         };
         let source = PathBuf::from("/data/vm-disks/vm-source");
         let sources = vec![source.clone()];
@@ -10655,6 +10699,7 @@ mod tests {
             snapshot_path: "/snap/vmstate.bin".to_string(),
             mem_backend: MemBackend {
                 backend_path: "/snap/memory.bin".to_string(),
+                write_set_path: None,
                 backend_type: "File".to_string(),
             },
             track_dirty_pages: None,
