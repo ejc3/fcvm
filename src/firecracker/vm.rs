@@ -104,6 +104,139 @@ impl ApiSocketProbe for TokioApiSocketProbe {
     }
 }
 
+/// Firecracker's own ERROR lines repeated in fcvm's log per VMM process; later ones are only counted.
+const REPEATED_FIRECRACKER_ERRORS: usize = 20;
+/// How often [`FirecrackerLogFollower`] reads what Firecracker appended to its log.
+const FIRECRACKER_LOG_POLL: Duration = Duration::from_secs(1);
+/// The most [`FirecrackerLogErrors::read_new`] reads in one call.
+const FIRECRACKER_LOG_READ_MAX: u64 = 16 << 20;
+/// The longest unterminated line [`FirecrackerLogErrors`] keeps waiting for its newline.
+const FIRECRACKER_LOG_LINE_MAX: usize = 64 << 10;
+
+/// Whether `line` is one Firecracker wrote at level ERROR. With `--show-level --show-log-origin`
+/// a line is `<time> [<instance>:<thread>:<LEVEL>:<file>:<line>] <message>`.
+fn is_firecracker_error_line(line: &str) -> bool {
+    line.split_once(" [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .is_some_and(|(origin, _)| origin.split(':').nth(2) == Some("ERROR"))
+}
+
+/// Picks Firecracker's ERROR lines out of what it appends to its own log (`--log-path`).
+///
+/// Firecracker reports a failure it answers the guest for, such as a block write the host
+/// refused, only in that file, which fcvm otherwise reads only at teardown. A guest whose disk
+/// write failed with ENOSPC on the host remounted its filesystem read-only, and the one record
+/// of why was `Failed to execute Out virtio block request ... No space left on device` there.
+#[derive(Debug, Default)]
+struct FirecrackerLogErrors {
+    /// Bytes of the file already read.
+    offset: u64,
+    /// The end of the last read, after its last newline.
+    partial: Vec<u8>,
+    /// ERROR lines returned so far.
+    repeated: usize,
+    /// ERROR lines found after [`REPEATED_FIRECRACKER_ERRORS`] were returned.
+    counted: u64,
+}
+
+impl FirecrackerLogErrors {
+    /// Reads what was appended since the last call and returns the ERROR lines to repeat. A
+    /// line is returned once it is complete, and only the first [`REPEATED_FIRECRACKER_ERRORS`]
+    /// are; later ones are counted in `counted`. A file shorter than what was read is read again
+    /// from its start.
+    fn read_new<F: std::io::Read + std::io::Seek>(
+        &mut self,
+        file: &mut F,
+    ) -> std::io::Result<Vec<String>> {
+        use std::io::{Read, SeekFrom};
+        let len = file.seek(SeekFrom::End(0))?;
+        if len < self.offset {
+            self.offset = 0;
+            self.partial.clear();
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut appended = Vec::new();
+        file.take(FIRECRACKER_LOG_READ_MAX)
+            .read_to_end(&mut appended)?;
+        self.offset += appended.len() as u64;
+        self.partial.extend_from_slice(&appended);
+        let mut lines = Vec::new();
+        let mut start = 0;
+        while let Some(end) = self.partial[start..].iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.partial[start..start + end]);
+            start += end + 1;
+            if !is_firecracker_error_line(&line) {
+                continue;
+            }
+            if self.repeated < REPEATED_FIRECRACKER_ERRORS {
+                self.repeated += 1;
+                lines.push(line.into_owned());
+            } else {
+                self.counted += 1;
+            }
+        }
+        self.partial.drain(..start);
+        if self.partial.len() > FIRECRACKER_LOG_LINE_MAX {
+            self.partial.clear();
+        }
+        Ok(lines)
+    }
+}
+
+/// Repeats Firecracker's ERROR lines in fcvm's log while the VMM runs, under fcvm's own target,
+/// so they survive a filter on fcvm's targets (`RUST_LOG=fcvm=info`).
+struct FirecrackerLogFollower {
+    path: PathBuf,
+    vm_id: String,
+    file: Option<std::fs::File>,
+    errors: FirecrackerLogErrors,
+    /// `errors.counted` when it was last reported.
+    reported: u64,
+    /// Whether a read failed, after which nothing more is read.
+    failed: bool,
+}
+
+impl FirecrackerLogFollower {
+    fn new(path: PathBuf, vm_id: String) -> Self {
+        Self {
+            path,
+            vm_id,
+            file: None,
+            errors: FirecrackerLogErrors::default(),
+            reported: 0,
+            failed: false,
+        }
+    }
+
+    /// Reads what Firecracker appended and logs its ERROR lines. With `last`, also logs how many
+    /// were only counted since the last report.
+    fn poll(&mut self, last: bool) {
+        if self.failed {
+            return;
+        }
+        if self.file.is_none() {
+            self.file = std::fs::File::open(&self.path).ok();
+        }
+        if let Some(file) = self.file.as_mut() {
+            match self.errors.read_new(file) {
+                Ok(lines) => {
+                    for line in lines {
+                        warn!(vm_id = %self.vm_id, log = %self.path.display(), "Firecracker logged an error: {line}");
+                    }
+                }
+                Err(error) => {
+                    self.failed = true;
+                    warn!(vm_id = %self.vm_id, log = %self.path.display(), %error, "cannot read Firecracker's log, so its errors are no longer repeated here");
+                }
+            }
+        }
+        if last && self.errors.counted > self.reported {
+            warn!(vm_id = %self.vm_id, log = %self.path.display(), more = self.errors.counted - self.reported, "Firecracker logged more errors than are repeated here; they are in its log");
+            self.reported = self.errors.counted;
+        }
+    }
+}
+
 /// Manages a Firecracker VM process
 ///
 /// IMPORTANT: PID Tracking Architecture
@@ -149,6 +282,12 @@ pub struct VmManager {
     /// its page cache alone. It belongs to the VMM process, not to fcvm: it is dropped when
     /// that process exits or is reaped, and when [`Self::start`] launches another one.
     memory_in_use: Option<std::fs::File>,
+    /// Repeats the running VMM's ERROR lines from its log ([`FirecrackerLogFollower`]); stopped
+    /// with the process, after one last read.
+    log_follower: Option<(
+        Arc<Mutex<FirecrackerLogFollower>>,
+        tokio::task::JoinHandle<()>,
+    )>,
 }
 
 impl VmManager {
@@ -171,6 +310,7 @@ impl VmManager {
             console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client: None,
             memory_in_use: None,
+            log_follower: None,
         }
     }
 
@@ -291,6 +431,7 @@ impl VmManager {
     ) -> Result<()> {
         // A relaunch is another VMM process, and it maps no snapshot the previous one did.
         self.memory_in_use = None;
+        self.stop_log_follower();
         let log_level = firecracker_log_level(self.firecracker_log_level.as_deref())?;
         if let Some(ref name) = self.vm_name {
             info!(target: "vm", vm_name = %name, vm_id = %self.vm_id, "starting Firecracker process");
@@ -455,6 +596,7 @@ impl VmManager {
 
         self.process = Some(spawned.child);
         self.stderr_reader = Some(spawned.stderr_reader);
+        self.start_log_follower();
 
         // Wait for socket to be ready
         self.wait_for_socket().await?;
@@ -627,6 +769,7 @@ impl VmManager {
                 Some(status) => {
                     self.process = None;
                     self.memory_in_use = None;
+                    self.stop_log_follower();
                     Ok(Some(status))
                 }
                 None => Ok(None),
@@ -649,6 +792,7 @@ impl VmManager {
             // Process exited naturally, clear the handle
             self.process = None;
             self.memory_in_use = None;
+            self.stop_log_follower();
             Ok(status)
         } else {
             bail!("VM process not running")
@@ -659,6 +803,45 @@ impl VmManager {
     ///
     /// Pairs with [`Self::reap`]. Keeping the handle here (rather than taking it) is what
     /// lets the caller signal other processes before coming back to wait on this one.
+    /// Starts repeating the VMM's ERROR lines from its log, if it has one.
+    fn start_log_follower(&mut self) {
+        self.stop_log_follower();
+        let Some(path) = self.log_path.clone() else {
+            return;
+        };
+        let follower = Arc::new(Mutex::new(FirecrackerLogFollower::new(
+            path,
+            self.vm_id.clone(),
+        )));
+        let polled = Arc::clone(&follower);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FIRECRACKER_LOG_POLL).await;
+                let polled = Arc::clone(&polled);
+                let read = tokio::task::spawn_blocking(move || {
+                    if let Ok(mut follower) = polled.lock() {
+                        follower.poll(false);
+                    }
+                });
+                if read.await.is_err() {
+                    return;
+                }
+            }
+        });
+        self.log_follower = Some((follower, task));
+    }
+
+    /// Stops the follower and reads the log once more, so an error logged just before the VMM
+    /// exited is repeated too.
+    fn stop_log_follower(&mut self) {
+        if let Some((follower, task)) = self.log_follower.take() {
+            task.abort();
+            if let Ok(mut follower) = follower.lock() {
+                follower.poll(true);
+            }
+        }
+    }
+
     pub fn start_kill(&mut self) -> Result<()> {
         if let Some(ref mut process) = self.process {
             info!(vm_id = %self.vm_id, "SIGKILL to Firecracker process");
@@ -678,6 +861,7 @@ impl VmManager {
             let _ = process.wait().await;
         }
         self.memory_in_use = None;
+        self.stop_log_follower();
     }
 
     /// SIGKILL the Firecracker process and reap it. For callers that have nothing else to
@@ -733,6 +917,7 @@ impl VmManager {
 
 impl Drop for VmManager {
     fn drop(&mut self) {
+        self.stop_log_follower();
         // Clean up socket on drop
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
@@ -764,6 +949,62 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::pin::Pin;
     use std::task::Poll;
+
+    const BLOCK_ENOSPC: &str = "2026-11-23T00:09:21.211902195 [anonymous-instance:main:ERROR:src/vmm/src/devices/virtio/block/virtio/request.rs:121] Failed to execute Out virtio block request: FileEngine(Sync(Transfer(IOError(Os { code: 28, kind: StorageFull, message: \"No space left on device\" }))))";
+    const INFO_LINE: &str = "2026-11-23T00:04:33.374854932 [anonymous-instance:main:INFO:src/vmm/src/devices/virtio/device.rs:228] [Block:rootfs] notifying queues";
+
+    #[test]
+    fn firecracker_error_lines_are_picked_by_their_level() {
+        assert!(is_firecracker_error_line(BLOCK_ENOSPC));
+        assert!(!is_firecracker_error_line(INFO_LINE));
+        // The level is the third field of the origin, not any "ERROR" in the message.
+        assert!(!is_firecracker_error_line(
+            "2026-11-23T00:04:33.37 [anonymous-instance:main:WARN:src/x.rs:1] saw ERROR: in a message"
+        ));
+        assert!(!is_firecracker_error_line("ERROR without an origin"));
+    }
+
+    #[test]
+    fn firecracker_log_errors_returns_each_complete_error_line_once() {
+        let mut file = std::io::Cursor::new(Vec::new());
+        let mut errors = FirecrackerLogErrors::default();
+        file.get_mut()
+            .extend_from_slice(format!("{INFO_LINE}\n{}", &BLOCK_ENOSPC[..40]).as_bytes());
+        assert!(errors.read_new(&mut file).unwrap().is_empty());
+        file.get_mut()
+            .extend_from_slice(format!("{}\n{INFO_LINE}\n", &BLOCK_ENOSPC[40..]).as_bytes());
+        assert_eq!(
+            errors.read_new(&mut file).unwrap(),
+            vec![BLOCK_ENOSPC.to_string()]
+        );
+        assert!(errors.read_new(&mut file).unwrap().is_empty());
+    }
+
+    #[test]
+    fn firecracker_log_errors_counts_the_errors_past_the_cap() {
+        let lines: String = (0..REPEATED_FIRECRACKER_ERRORS + 5)
+            .map(|_| format!("{BLOCK_ENOSPC}\n"))
+            .collect();
+        let mut file = std::io::Cursor::new(lines.into_bytes());
+        let mut errors = FirecrackerLogErrors::default();
+        assert_eq!(
+            errors.read_new(&mut file).unwrap().len(),
+            REPEATED_FIRECRACKER_ERRORS
+        );
+        assert_eq!(errors.counted, 5);
+    }
+
+    #[test]
+    fn firecracker_log_errors_reads_a_truncated_log_from_its_start() {
+        let mut file = std::io::Cursor::new(format!("{INFO_LINE}\n{INFO_LINE}\n").into_bytes());
+        let mut errors = FirecrackerLogErrors::default();
+        assert!(errors.read_new(&mut file).unwrap().is_empty());
+        let short = "t [i:main:ERROR:f.rs:1] x";
+        assert!(short.len() + 1 < 2 * (INFO_LINE.len() + 1));
+        *file.get_mut() = format!("{short}\n").into_bytes();
+        file.set_position(0);
+        assert_eq!(errors.read_new(&mut file).unwrap(), vec![short.to_string()]);
+    }
 
     #[derive(Clone, Copy)]
     enum ProbeStep {
