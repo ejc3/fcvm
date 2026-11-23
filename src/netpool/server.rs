@@ -28,8 +28,9 @@ use tracing::{info, warn};
 
 /// The least time between two namespaces destroyed. The kernel destroys the namespaces that
 /// died since its cleanup worker last ran as one batch under `rtnl_mutex`; this keeps a
-/// batch at one namespace, which is one hold of 1.5 ms, or of 15 ms on a kernel that still
-/// has the bridge's `rcu_barrier()`.
+/// batch at one namespace, which is one hold of about 1.5 ms, or of about 15 ms on a kernel
+/// that still has the bridge's `rcu_barrier()` (traced before the tracer fixes of
+/// `bench/start-rate/pieces/RESULTS.md` changelog 8; pending its rerun).
 pub const DESTROY_SPACING: Duration = Duration::from_millis(50);
 
 /// Namespaces built at once. A build is bound by `rtnl_mutex`, so more builders wait for
@@ -328,15 +329,16 @@ impl Pool {
             return;
         }
         self.key_miss_reported.set(Some(now));
+        // A probe that failed says nothing about the host: the plain report is made.
         let current = slot_network(String::new(), self.dir.clone()).pool_key_now();
-        if current != self.key {
+        if let Some(current) = current.filter(|current| *current != self.key) {
             warn!(
                 built_for = %self.key,
                 host_now = %current,
                 asked,
                 "the host has changed since this pool started (its IPv6 address, \
-                 /etc/resolv.conf or the invoking user): the pool's namespaces match no \
-                 clone started now. Restart the pool"
+                 /etc/resolv.conf, /etc/subuid, /etc/subgid or the invoking user): the \
+                 pool's namespaces match no clone started now. Restart the pool"
             );
         } else {
             warn!(
@@ -393,6 +395,13 @@ async fn lend(pool: &Pool, slot: SlotId, namespace: &mut Namespace) -> String {
         let Ok(offer) = offer else {
             return "its offer was dropped".to_string();
         };
+        // The stop and an offer can both be ready when this task runs. A grant made now
+        // would be revoked in the next statement's select, and a clone that has a grant
+        // and loses it fails, where one that is refused builds its own namespace. Dropping
+        // the offer closes the claimer's connection, which is that refusal.
+        if pool.stopping() {
+            return "the pool is stopping".to_string();
+        }
         let claimed = offer.claimed;
         let lease = match namespace.grant(slot, offer).await {
             Ok(lease) => lease,
@@ -730,6 +739,72 @@ pub async fn serve(slots: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A claim that reaches a namespace's task together with the pool's stop is refused,
+    /// not granted and then revoked: the claimer's connection closes with nothing sent on
+    /// it. The offer and the stop are both made ready between two polls of `lend`, which
+    /// is the one schedule where its `biased` select takes the offer of a stopping pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_claim_that_arrives_with_the_stop_is_refused_not_granted() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut namespace = Namespace::build(scratch.path().join("slot"), "stop-claim".into())
+            .await
+            .expect("building a namespace as the pool does");
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let pool = Pool {
+            dir: scratch.path().to_path_buf(),
+            key: String::new(),
+            table: RefCell::new(Table::new(1)),
+            offers: RefCell::new(HashMap::new()),
+            counters: RefCell::new(Stats::default()),
+            builds: tokio::sync::Semaphore::new(1),
+            resets: tokio::sync::Semaphore::new(1),
+            destroying: tokio::sync::Mutex::new(()),
+            key_miss_reported: std::cell::Cell::new(None),
+            stop,
+        };
+        pool.table.borrow_mut().built(0).unwrap();
+        let (claimer, pools_end) = netns_agent::channel().unwrap();
+        let reason = {
+            let lending = lend(&pool, 0, &mut namespace);
+            tokio::pin!(lending);
+            // One poll: `lend` registers its offer and waits.
+            tokio::select! {
+                biased;
+                reason = &mut lending => panic!("lend ended before a claim: {reason}"),
+                _ = std::future::ready(()) => {}
+            }
+            let claimed = pool
+                .table
+                .borrow_mut()
+                .claim()
+                .expect("the ready namespace");
+            let offer = pool
+                .offers
+                .borrow_mut()
+                .remove(&claimed.slot)
+                .expect("the namespace's offer");
+            assert!(offer
+                .send(Offer {
+                    connection: pools_end,
+                    claimed,
+                })
+                .is_ok());
+            pool.stop.send_replace(true);
+            lending.await
+        };
+        assert_eq!(reason, "the pool is stopping");
+        assert_eq!(
+            pool.counters.borrow().grants,
+            0,
+            "a stopping pool granted a namespace"
+        );
+        assert!(
+            matches!(proto::receive(&claimer), Ok(None)),
+            "the claimer was sent something before its connection closed"
+        );
+        namespace.destroy().await;
+    }
 
     /// A pooled namespace is built by the code an unpooled clone's is, so the two read the
     /// same but for the TAP's name. This fails when the pool gets a build of its own.

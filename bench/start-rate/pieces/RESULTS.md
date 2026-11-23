@@ -162,7 +162,8 @@ past the link watch delay, in the campaign of the PR that adds the namespace poo
 ### Measured again, with a helper that stays attached
 
 These rows and the ones above are from different sessions and are not an A/B of the two
-hold times.
+hold times. Every figure of this section, the table and both bullets under it, is pending
+the rerun (changelog entry 8).
 
 Same session as changelog entry 7 (2026-11-23), `HOLD_MS=1200`, the traced cells summarized by
 `tap-summary` as it is now: the mutex traced through fentry and fexit, the count of calls the
@@ -182,14 +183,15 @@ carrier-off are each handled on their own. The rows above came from a helper att
 | 2000, no pasta | 128 | 201 | 224 | 151 | 146 | 167 | 890 | 909 | 1124 |
 | 2000, no pasta | 512 | 198 | 222 | 124 | 146 | 70 | 760 | 736 | 1316 |
 
-- **A clone life's attach and detach hold the mutex 1.3 to 3.8 ms with 2000 pastas alive**: 266
+- **A clone life's attach and detach hold the mutex 1.3 to 3.8 ms with 2000 pastas alive**
+  (pending the rerun, entry 8): 266
   to 748 lives a second for the whole host, and least at C=1, where every call and every link
   event runs alone. The sum of the columns and the host's own total agree within 4% in every
   cell, and in every cell the two counts of calls are within the 2% the summary allows.
-- **Without pasta the same cycle holds 0.76 to 1.16 ms.** The bridge's own link events are in
-  it now (two a cycle, the TAP being its only port). So 36 to 69% of the hold with pasta is
-  there because pasta is: its neighbour listener among every link notification's receivers,
-  and its TAP on the bridge.
+- **Without pasta the same cycle holds 0.76 to 1.16 ms** (pending the rerun, entry 8). The
+  bridge's own link events are in it now (two a cycle, the TAP being its only port). So 36 to
+  69% of the hold with pasta is there because pasta is (pending the rerun, entry 8): its
+  neighbour listener among every link notification's receivers, and its TAP on the bridge.
 
 ## Changelog
 
@@ -403,12 +405,14 @@ of the four cells, a pool built and destroyed for each; mean (lowest to highest)
   namespaces reaches (85 to 94 setups/s, 129 to 131 teardowns/s, entry 8), with one difference:
   the reset is the pool's work after a clone has stopped, and the setup was on the clone's
   start.
-- **A reset holds `rtnl_mutex` 2.29 ms** (one traced cell at C=128, 2000 resets, `rtnl.py`),
+- **A reset holds `rtnl_mutex` 2.29 ms** (pending the rerun, entry 8, as is its split below;
+  one traced cell at C=128, 2000 resets, `rtnl.py`),
   where a namespace's build and destroy hold it 24 ms (entry 8): 1.51 ms in pasta's four holds
   as it exits and starts again, with three expedited RCU grace periods, 0.56 ms in the holder's
   fourteen (neighbours, the bridge's learned addresses, the address renewal), 0.21 ms in the
   link watch worker. Of the 2.17 ms on CPU under the mutex, 0.83 is `do_one_broadcast` and 0.68
-  `wireless_nlevent_flush`. By hold time alone about 440 resets a second fit; what else keeps
+  `wireless_nlevent_flush`. By hold time alone about 440 resets a second fit (pending the
+  rerun, entry 8); what else keeps
   the pool at 114 to 120 is not attributed here. The restart is what the later PRs of the
   series remove.
 - **Building the pool took 23 to 24 s for 2000 namespaces and destroying it 122 to 123 s.** The

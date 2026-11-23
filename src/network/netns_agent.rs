@@ -856,7 +856,6 @@ impl Client {
         self.request(RESET, None, "a reset").await.map(drop)
     }
 
-    /// The namespace's fingerprint ([`super::fingerprint`]); `tap` is the VMM's TAP.
     /// Whether the link `name` in the namespace has a carrier. A TAP has one while a
     /// process is attached to it.
     pub async fn carrier(&self, name: &str) -> Result<bool> {
@@ -873,6 +872,7 @@ impl Client {
         }
     }
 
+    /// The namespace's fingerprint ([`super::fingerprint`]); `tap` is the VMM's TAP.
     pub async fn fingerprint(&self, tap: &str) -> Result<String> {
         let mut request = FINGERPRINT.to_vec();
         request.extend_from_slice(tap.as_bytes());

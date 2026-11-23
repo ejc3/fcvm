@@ -228,16 +228,43 @@ fn subordinate_range_granted_to_root(text: &str) -> bool {
 }
 
 /// What decides the id maps of a holder this process would start, as text: its own uid and
-/// gid and, for a root run started with sudo, the invoker's (`setup_namespace_mappings`).
-/// Two processes with the same text start holders whose user namespaces map the same ids.
+/// gid, for a root run started with sudo the invoker's, and the subordinate id files, which
+/// decide between the extended and the single layout (`setup_namespace_mappings`: a root
+/// run reads them itself, any other run through newuidmap and newgidmap). Two processes
+/// with the same text start holders whose user namespaces map the same ids. The files are
+/// read at each call: a pool lives for days, and a clone that starts after an edit to
+/// either file would build a namespace the pool's are not.
 pub(crate) fn holder_id_inputs() -> String {
-    let invoker = crate::setup::sudo_invoker()
-        .map(|user| format!("{}:{}", user.uid.as_raw(), user.gid.as_raw()))
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "uid={} gid={} invoker={invoker}",
+    let invoker = crate::setup::sudo_invoker().map(|user| (user.uid.as_raw(), user.gid.as_raw()));
+    holder_id_inputs_of(
         nix::unistd::getuid().as_raw(),
-        nix::unistd::getgid().as_raw()
+        nix::unistd::getgid().as_raw(),
+        invoker,
+        std::fs::read("/etc/subuid").as_deref().ok(),
+        std::fs::read("/etc/subgid").as_deref().ok(),
+    )
+}
+
+/// [`holder_id_inputs`] of the ids and of the two files' contents (`None`: unreadable).
+fn holder_id_inputs_of(
+    uid: u32,
+    gid: u32,
+    invoker: Option<(u32, u32)>,
+    subuid: Option<&[u8]>,
+    subgid: Option<&[u8]>,
+) -> String {
+    use sha2::Digest;
+    let invoker = invoker
+        .map(|(uid, gid)| format!("{uid}:{gid}"))
+        .unwrap_or_else(|| "none".to_string());
+    let digest = |file: Option<&[u8]>| match file {
+        Some(text) => hex::encode(&sha2::Sha256::digest(text)[..8]),
+        None => "unreadable".to_string(),
+    };
+    format!(
+        "uid={uid} gid={gid} invoker={invoker} subuid={} subgid={}",
+        digest(subuid),
+        digest(subgid)
     )
 }
 
@@ -8659,6 +8686,29 @@ mod tests {
                 .lifecycle_ready,
             "cancellation that wins the lifecycle gate must leave persisted readiness false"
         );
+    }
+
+    /// What a pool key holds of the holder's id maps changes with every input that decides
+    /// them: the ids, the sudo invoker, and each subordinate id file.
+    #[test]
+    fn the_holders_id_inputs_follow_the_subordinate_id_files() {
+        let grants = b"root:100000:65536\n";
+        let other = b"someone:100000:65536\n";
+        let base = holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(grants));
+        assert_eq!(
+            base,
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(grants))
+        );
+        for changed in [
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(other), Some(grants)),
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(other)),
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), None, Some(grants)),
+            holder_id_inputs_of(0, 0, Some((1001, 1000)), Some(grants), Some(grants)),
+            holder_id_inputs_of(0, 0, None, Some(grants), Some(grants)),
+            holder_id_inputs_of(1000, 1000, None, Some(grants), Some(grants)),
+        ] {
+            assert_ne!(base, changed);
+        }
     }
 
     /// The holder namespace's id maps: unchanged without a sudo invoker, and with one, the
