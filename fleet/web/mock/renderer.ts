@@ -109,6 +109,9 @@ export class MockRenderers {
     });
     this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
     this.server.on("upgrade", (req, socket, head) => {
+      // Node hands an upgraded socket over with no error listener, and a page that goes away
+      // resets its pending connects: unheard, that reset ends the whole mock.
+      socket.on("error", () => {});
       const url = new URL(req.url ?? "/", "http://mock");
       // a phone's GPU mirror (mock/mirror.ts)
       const mm = /^\/frames\/([A-Za-z0-9_-]+)\/mirror$/.exec(url.pathname);

@@ -10,6 +10,8 @@ import { FFMPEG } from "../encoder.ts";
 import { tileGeometry } from "../../core/layout.ts";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import type http from "node:http";
+import net from "node:net";
 import { expectedRgb, frameCtx, renderI420 } from "../pattern.ts";
 import { ensureReel } from "../media.ts";
 
@@ -213,6 +215,39 @@ describe("mock coordinator", () => {
     expect(ra.fcvm_done_at!).toBeLessThan(ra.ec2_done_at!);
     c.ws.close();
     await sleep(1000); // the cooldown
+  });
+});
+
+describe("mock servers, refused upgrades", () => {
+  it("hear the socket's errors on every upgrade path: a client's reset cannot end the mock", async () => {
+    // The 2026-11-23 e2e run: `Error: read ECONNRESET`, unhandled on a Socket, `mock exited 1`,
+    // and every later test timed out opening the wall.
+    const servers = [
+      { name: "renderer", port: renderers.port, server: (renderers as unknown as { server: http.Server }).server },
+      { name: "coordinator", port: coord.port, server: (coord as unknown as { server: http.Server }).server },
+      { name: "minecraft", port: (coord as unknown as { minecraft: { port: number; http: http.Server } }).minecraft.port,
+        server: (coord as unknown as { minecraft: { http: http.Server } }).minecraft.http },
+    ];
+    for (const { name, port, server } of servers) {
+      const seen: import("node:stream").Duplex[] = [];
+      const watch = (_req: http.IncomingMessage, socket: import("node:stream").Duplex) => void seen.push(socket);
+      server.prependListener("upgrade", watch);
+      const client = net.connect(port, "127.0.0.1");
+      const answered = new Promise<string>((res, rej) => {
+        client.once("data", (d) => res(d.toString()));
+        client.once("error", rej);
+      });
+      client.write("GET /no-such-path HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"
+        + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
+      expect(await answered, name).toMatch(/^HTTP\/1\.1 404 /);
+      server.off("upgrade", watch);
+      expect(seen.length, name).toBe(1);
+      expect(seen[0]!.listenerCount("error"), name).toBeGreaterThan(0);
+      client.resetAndDestroy();
+    }
+    // The resets have been read by now if they are going to be: the servers still answer.
+    await new Promise((r) => setTimeout(r, 100));
+    expect((await fetch(`http://127.0.0.1:${coord.port}/no-such-path`)).status).toBe(404);
   });
 });
 
