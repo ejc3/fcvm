@@ -682,6 +682,21 @@ filter and RUST_LOG=fcvm=info: a guest that panics leaves
 nothing else that says why (on x86 Firecracker logs only `Unexpected exit reason on vcpu run:
 Shutdown`; on arm64 the guest resets through PSCI).
 
+A restore's progress lines are not console lines. Every byte on the 8250 is an MMIO write the
+VMM handles in userspace, and a restore printed about 2.7 KB. From the snapshot boundary until
+10 s later, fc-agent's console writer (`fc-agent/src/console.rs`, "Restore log") holds
+fc-agent's own lines that name no failure and sends them on the output vsock connection once
+the host has acknowledged the restore. fcvm logs them under `fcvm::agent` at INFO, each with
+`logged=`, the guest's clock when the line was logged, which is earlier than the log line's own
+timestamp. One console line, `[fc-agent] restore: N progress lines sent to the host over vsock`,
+is the only proof that a restored serial console works (the dead-serial check and
+`tests/test_serial_console.rs` read it). The console still gets everything held so far, each
+line ending in `held_ms=`, as soon as fc-agent logs an `ERROR`, `FATAL`, `WARNING`, `Error:` or
+`VITALS` line or anything that is not its own line (a panic, a child's output, a failpoint),
+and when the 10 s pass without an acknowledgement and an output connection. A guest that
+stops running inside those 10 s without such a line leaves no fc-agent line of the restore;
+the host has no acknowledgement for it. `[fcvm-vitals]` samples always go to the console.
+
 Rules learned the hard way, each from a check that could not fire:
 
 - **Never conclude "no OOM" from a job log.** A job log keeps no guest console line but a crash

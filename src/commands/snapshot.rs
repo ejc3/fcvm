@@ -4740,8 +4740,11 @@ async fn cmd_snapshot_run_inner(
     // the restored guest's 8250 driver then waits forever for a TX
     // interrupt the re-created serial device never delivers, and every log
     // line from the VM silently disappears. A healthy restored fc-agent
-    // always prints restore-progress lines BEFORE reconnecting output, so
-    // zero console lines shortly after this point is proof of a poisoned
+    // writes one console line when it hands its restore-progress lines to
+    // this output connection (the lines themselves stay off the console,
+    // fc-agent/src/console.rs), and writes them all to the console when it
+    // cannot hand them over within 10 s, so zero console lines 30 s after
+    // this point is proof of a poisoned
     // snapshot. One loud error naming the snapshot instead of a trail of
     // mystery test failures. The mid-TX-UART diagnosis is Firecracker-only
     // (8250 on ttyS0); Cloud Hypervisor restores use the hvc0 virtio
@@ -4752,8 +4755,9 @@ async fn cmd_snapshot_run_inner(
         let snapshot_name = snapshot_name.clone();
         let vm_id = vm_id.clone();
         // 30s, not a few seconds: a freshly restored VM can be CPU-starved for a
-        // while (see the untimed output-connect wait above), and fc-agent's
-        // console gate releases up to ~500ms after WarmStart. A poisoned
+        // while (see the untimed output-connect wait above), fc-agent's
+        // console gate releases up to ~500ms after WarmStart, and its one
+        // console line follows this connection. A poisoned
         // snapshot's serial is dead FOREVER, so a generous window costs nothing.
         // Cancel-aware so it can't fire after the VM is torn down.
         let watchdog_cancel = health_cancel_token.clone();

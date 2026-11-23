@@ -2,9 +2,13 @@
 """Where a restored clone's time goes between the VMM's resume and fc-agent's readiness.
 
 Reads one start-rate run directory (bench/start-rate/startrate.py run). Per clone it takes,
-from the clone's own log, the harness's receive time of each restore marker and fc-agent's
-phase record in the restore acknowledgement. With `--trace DIR` it joins two host-side
-records taken during the run:
+from the clone's own log, the time of each restore marker and fc-agent's phase record in
+the restore acknowledgement. A marker's time is the harness's receive time of its line,
+except for a line fc-agent logged earlier than fcvm received it: a restore's progress lines
+travel on the output connection after the acknowledgement and say when the guest logged
+them (`logged=`), and a held line that went to the serial console says how long it was held
+(`held_ms=`). Those are placed at the time they were logged. With `--trace DIR` it joins
+two host-side records taken during the run:
 
   s2fault.txt     (s2fault.bt)   the vCPU thread's stage-2 faults and the time each took to
                                  return to the guest, device aborts, time in handle_userfault,
@@ -64,6 +68,9 @@ STEPS = [
     ("resume", "ready"), ("ready", "healthy"), ("ready", "chronyd"), ("ready", "journald"),
 ]
 STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z")
+# When the guest logged a line fcvm received later (see the module docstring).
+LOGGED = re.compile(r" logged=(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+)Z")
+HELD_MS = re.compile(r" held_ms=(\d+(?:\.\d+)?)\s*$")
 FC_PID = re.compile(r"Firecracker Child\.id\(\) returned: Some\((\d+)\)")
 FINE_NS, FINE_BUCKETS, COARSE_NS = 10_000_000, 100, 100_000_000
 TICK_MS = 10
@@ -93,6 +100,22 @@ def within(buckets, start_ns, end_ns):
     return total
 
 
+def stamp_s(text):
+    return datetime.datetime.fromisoformat(text).replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def logged_before_receipt_ms(line):
+    """How long before fcvm logged `line` the guest logged it: 0 for a line fcvm logs as it
+    arrives, and for a line that says when it was logged or how long it was held, that long."""
+    held = HELD_MS.search(line)
+    if held:
+        return float(held.group(1))
+    logged, received = LOGGED.search(line), STAMP.search(line)
+    if logged and received:
+        return (stamp_s(received.group(1)) - stamp_s(logged.group(1))) * 1000
+    return 0.0
+
+
 def parse_clone(path):
     t, wall, phases, fc_pid = {}, {}, None, None
     with open(path, errors="replace") as f:
@@ -109,15 +132,15 @@ def parse_clone(path):
         for key, needle in MARKS:
             if key in t or needle not in line:
                 continue
-            if key == "tcp_begin" and not line.rstrip().endswith("begin"):
+            if key == "tcp_begin" and " begin" not in line:
                 continue
             if key == "tcp_done" and " complete " not in line:
                 continue
-            t[key] = ms
+            earlier = logged_before_receipt_ms(line)
+            t[key] = ms - earlier
             m = STAMP.search(line)
             if m:
-                wall[key] = datetime.datetime.fromisoformat(m.group(1)).replace(
-                    tzinfo=datetime.timezone.utc).timestamp()
+                wall[key] = stamp_s(m.group(1)) - earlier / 1000
         if phases is None and "guest_phases=" in line:
             m = re.search(r"guest_phases=(\{.*\})", line)
             if m:
@@ -289,7 +312,7 @@ def main():
     print(f"{a.run}: {cell} clones, {len(clones)} with resume and ready, "
           f"{cell - len(clones)} without (left out of every row)")
 
-    table("steps, harness receive times of the clone's log lines",
+    table("steps, between the clone's log lines (fc-agent's at the time the guest logged them)",
           [(f"{x} -> {y}", [c["t"][y] - c["t"][x] for c in clones if x in c["t"] and y in c["t"]])
            for x, y in STEPS], of=cell)
     late = sum(1 for c in clones if "reset_wake" in c["t"] and c["t"]["reset_wake"] > c["t"].get("phases_done", 1e18))

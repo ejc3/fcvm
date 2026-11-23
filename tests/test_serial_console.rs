@@ -16,6 +16,11 @@
 //! Architecture:
 //!   Guest eprintln!() → fd 2 (pipe) → console-writer thread → /dev/console
 //!   → /dev/ttyS0 → Firecracker UART emulation → host stdout → tracing → log file
+//!
+//! A restore's progress lines do not take that path: the console-writer thread hands them
+//! to the output vsock connection once the host has acknowledged the restore, fcvm logs
+//! them under `fcvm::agent`, and one line on the console says so. That line is the proof
+//! here that the restored serial console works.
 
 #![cfg(feature = "integration-fast")]
 
@@ -166,27 +171,25 @@ async fn test_serial_console_after_restore() -> Result<()> {
     });
     println!("  UART marker found in host log: {}", found_marker);
 
-    // Check for fc-agent restore messages (only relevant on warm start)
-    let found_restore_msg = contents.contains("[fc-agent] handling restore")
-        || contents.contains("[fc-agent] restore phases complete");
-    println!(
-        "  fc-agent restore messages in host log: {}",
-        found_restore_msg
-    );
+    // Where the restore's own lines went (only relevant on warm start)
+    let restore_log = RestoreLog::read(&contents);
+    println!("  restore log: {restore_log:?}");
 
     // Assertions
     if was_warm_start {
-        // On warm start, fc-agent prints restore messages via eprintln!().
-        // If UART works, these appear in the host log.
-        assert!(
-            found_restore_msg,
-            "fc-agent restore messages not found in host log after warm start — \
+        // On warm start, fc-agent writes one line to the console when it hands its
+        // restore progress to the output connection. If UART works, it is in the host log.
+        assert_eq!(
+            restore_log.console_hand_off_lines,
+            1,
+            "fc-agent's restore line not found on the console after warm start: \
              serial console (UART) is broken after snapshot restore. \
              fc-agent IS running (VM is healthy, vsock works), but eprintln!() \
              output to /dev/ttyS0 never reaches Firecracker's stdout.\n\
              Log: {}",
             log_path.display()
         );
+        restore_log.assert_progress_stayed_off_the_console(&log_path);
 
         assert!(
             found_marker,
@@ -320,7 +323,7 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
             common::poll_health_by_pid(clone_pid, 120).await?;
             anyhow::Ok(
                 wait_for_log_line(&clone_log, Duration::from_secs(30), |l| {
-                    is_console_line(l) && l.contains("[fc-agent] handling restore")
+                    is_console_line(l) && l.contains(RESTORE_HAND_OFF_LINE)
                 })
                 .await,
             )
@@ -350,14 +353,118 @@ async fn the_snapshot_boundary_holds_the_agent_console_until_the_resume() -> Res
     );
     assert!(
         clone_console,
-        "the clone's restore lines never reached its console; log at {}",
+        "the clone's restore line never reached its console; log at {}",
+        clone_log.display()
+    );
+    let contents = std::fs::read_to_string(&clone_log)
+        .with_context(|| format!("reading {}", clone_log.display()))?;
+    let restore_log = RestoreLog::read(&contents);
+    restore_log.assert_progress_stayed_off_the_console(&clone_log);
+    // The clone's VMM restored and did nothing else, so the hand-off line is the first
+    // line of fc-agent's on its console: the restore wrote no other.
+    assert!(
+        restore_log.console_lines_before_hand_off.is_empty(),
+        "the clone's console has fc-agent lines ahead of the restore's one: {restore_log:#?}\n\
+         log at {}",
         clone_log.display()
     );
     Ok(())
 }
 
+/// What fc-agent writes to the serial console when it hands a restore's progress lines to
+/// the output connection: `[fc-agent] restore: N progress lines sent to the host over vsock`.
+const RESTORE_HAND_OFF_LINE: &str = "progress lines sent to the host over vsock";
+
+/// Lines every restore logs on its way to readiness.
+const RESTORE_PROGRESS_LINES: [&str; 4] = [
+    "[fc-agent] detected restore-epoch",
+    "[fc-agent] handling restore",
+    "[fc-agent] restore phase=tcp-cleanup",
+    "[fc-agent] restore phases complete",
+];
+
+/// Where a restored VM's log has the restore's own lines.
+#[derive(Debug)]
+struct RestoreLog {
+    /// fc-agent's lines on the serial console ahead of its hand-off line (all of them when
+    /// there is none).
+    console_lines_before_hand_off: Vec<String>,
+    /// The hand-off lines on the serial console.
+    console_hand_off_lines: usize,
+    /// The restore progress lines on the serial console.
+    progress_on_console: Vec<String>,
+    /// The restore progress lines that came over the output connection, each of which
+    /// says when the guest logged it.
+    progress_from_agent: usize,
+}
+
+impl RestoreLog {
+    fn read(log: &str) -> Self {
+        let is_progress = |line: &str| RESTORE_PROGRESS_LINES.iter().any(|p| line.contains(p));
+        let agent_console_lines: Vec<&str> = log
+            .lines()
+            .filter(|line| {
+                is_console_line(line)
+                    && line.contains("[fc-agent]")
+                    && !line.contains("[fcvm-vitals]")
+            })
+            .collect();
+        Self {
+            console_lines_before_hand_off: agent_console_lines
+                .iter()
+                .take_while(|line| !line.contains(RESTORE_HAND_OFF_LINE))
+                .map(|line| line.to_string())
+                .collect(),
+            console_hand_off_lines: agent_console_lines
+                .iter()
+                .filter(|line| line.contains(RESTORE_HAND_OFF_LINE))
+                .count(),
+            progress_on_console: agent_console_lines
+                .iter()
+                .filter(|line| is_progress(line))
+                .map(|line| line.to_string())
+                .collect(),
+            progress_from_agent: log
+                .lines()
+                .filter(|line| {
+                    line.contains("fcvm::agent:") && line.contains(" logged=") && is_progress(line)
+                })
+                .count(),
+        }
+    }
+
+    /// A restore writes one fc-agent line to the serial console, the hand-off line, and
+    /// its progress lines reach fcvm's log over the output connection. Each byte on the
+    /// 8250 is an exit to the VMM, and the progress lines were about 2.7 KB of them per
+    /// restore.
+    ///
+    /// RED WITHOUT THE RESTORE LOG WINDOW (fc-agent/src/console.rs): every progress line
+    /// was on the console and none came over the output connection.
+    fn assert_progress_stayed_off_the_console(&self, log: &std::path::Path) {
+        assert!(
+            self.progress_on_console.is_empty(),
+            "a restore wrote its progress to the serial console: {self:#?}\nlog at {}",
+            log.display()
+        );
+        assert_eq!(
+            self.console_hand_off_lines,
+            1,
+            "a restore's one console line is missing or repeated: {self:#?}\nlog at {}",
+            log.display()
+        );
+        assert!(
+            self.progress_from_agent >= RESTORE_PROGRESS_LINES.len(),
+            "the restore's progress lines did not reach fcvm's log over the output \
+             connection: {self:#?}\nlog at {}",
+            log.display()
+        );
+    }
+}
+
 /// Whether a line of fcvm's log is a guest console line: fc-agent's lines are logged under
 /// `fcvm::console` (#1104), every other console line under the VMM's own `firecracker` target.
+/// fc-agent's lines that came over the output connection are under `fcvm::agent` and are not
+/// console lines.
 fn is_console_line(line: &str) -> bool {
     line.contains("fcvm::console:") || line.contains("firecracker:")
 }
