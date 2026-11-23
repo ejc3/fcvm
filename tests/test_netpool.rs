@@ -42,6 +42,8 @@ const POISON_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xaa];
 ///   with an ICMP "fragmentation needed" for 576 bytes, never acknowledging the data.
 /// - `udp PORT`: send one UDP datagram to the gateway's PORT, as a guest that starts a flow
 ///   through pasta.
+/// - `tcp PORT`: open a TCP connection to the gateway's PORT, as a guest that connects out
+///   through pasta, and leave it open.
 /// - `detach`: close the TAP.
 /// - `fingerprint`: the namespace's fingerprint as the holder would take it, its lines
 ///   joined by " | ".
@@ -71,6 +73,10 @@ fn helper_in_the_namespace() {
             (Some("udp"), Some(port)) => {
                 let port = port.parse().expect("a port");
                 println!("@@={}", udp_to_gateway(tap.as_mut().unwrap(), port));
+            }
+            (Some("tcp"), Some(port)) => {
+                let port = port.parse().expect("a port");
+                println!("@@={}", tcp_to_gateway(tap.as_mut().unwrap(), port));
             }
             (Some("detach"), _) => {
                 tap = None;
@@ -221,8 +227,8 @@ fn poison(tap: &mut std::fs::File) -> String {
     format!("no data segment arrived (connected: {connected})")
 }
 
-/// Ask who has the gateway's address, then send one UDP datagram to `port` there.
-fn udp_to_gateway(tap: &mut std::fs::File, port: u16) -> String {
+/// The gateway's MAC, by asking who has its address.
+fn gateway_mac(tap: &mut std::fs::File) -> Option<Vec<u8>> {
     let mut request = vec![0, 1, 8, 0, 6, 4, 0, 1];
     request.extend_from_slice(&POISON_MAC);
     request.extend_from_slice(&GUEST_IP);
@@ -231,18 +237,75 @@ fn udp_to_gateway(tap: &mut std::fs::File, port: u16) -> String {
     tap.write_all(&ethernet(&[0xff; 6], 0x0806, &request))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let gateway = loop {
-        let Some(frame) = read_frame(tap, deadline) else {
-            return "no ARP reply for the gateway".to_string();
-        };
+    loop {
+        let frame = read_frame(tap, deadline)?;
         let body = &frame[14.min(frame.len())..];
         if frame.len() >= 42
             && frame[12..14] == [0x08, 0x06]
             && body[7] == 2
             && body[14..18] == GATEWAY_IP
         {
-            break body[8..14].to_vec();
+            return Some(body[8..14].to_vec());
         }
+    }
+}
+
+/// One TCP segment without data from the guest's port 40001 to the gateway's `port`.
+fn tcp_segment(gateway: &[u8], port: u16, seq: u32, ack: u32, flags: u8) -> Vec<u8> {
+    let mut tcp = Vec::new();
+    tcp.extend_from_slice(&40001u16.to_be_bytes());
+    tcp.extend_from_slice(&port.to_be_bytes());
+    tcp.extend_from_slice(&seq.to_be_bytes());
+    tcp.extend_from_slice(&ack.to_be_bytes());
+    tcp.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
+    let pseudo = [&GUEST_IP[..], &GATEWAY_IP[..], &[0, 6, 0, 20][..]].concat();
+    let sum = checksum(&[&pseudo, &tcp]);
+    tcp[16..18].copy_from_slice(&sum);
+    let packet = [ipv4_header(GATEWAY_IP, 6, tcp.len()), tcp].concat();
+    ethernet(gateway, 0x0800, &packet)
+}
+
+/// Connect to the gateway's `port` as a guest does: SYN, the gateway's SYN and ACK, ACK.
+/// pasta makes the connection to the host on the guest's behalf, and keeps it as a flow.
+fn tcp_to_gateway(tap: &mut std::fs::File, port: u16) -> String {
+    let Some(gateway) = gateway_mac(tap) else {
+        return "no ARP reply for the gateway".to_string();
+    };
+    tap.write_all(&tcp_segment(&gateway, port, 5000, 0, 0x02))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Some(frame) = read_frame(tap, deadline) {
+        if frame.len() < 14 + 20 + 20 || frame[12..14] != [0x08, 0x00] {
+            continue;
+        }
+        let body = &frame[14..];
+        let ip_len = usize::from(body[0] & 0xf) * 4;
+        if body[9] != 6 || body[12..16] != GATEWAY_IP || body.len() < ip_len + 20 {
+            continue;
+        }
+        let tcp = &body[ip_len..];
+        let to_us = u16::from_be_bytes([tcp[2], tcp[3]]) == 40001;
+        // SYN and ACK, acknowledging our sequence number plus one.
+        if to_us && tcp[13] & 0x12 == 0x12 {
+            let theirs = u32::from_be_bytes(tcp[4..8].try_into().unwrap());
+            tap.write_all(&tcp_segment(
+                &gateway,
+                port,
+                5001,
+                theirs.wrapping_add(1),
+                0x10,
+            ))
+            .unwrap();
+            return "connected".to_string();
+        }
+    }
+    "the gateway did not accept the connection".to_string()
+}
+
+/// Ask who has the gateway's address, then send one UDP datagram to `port` there.
+fn udp_to_gateway(tap: &mut std::fs::File, port: u16) -> String {
+    let Some(gateway) = gateway_mac(tap) else {
+        return "no ARP reply for the gateway".to_string();
     };
     let payload = b"from the first tenant";
     let mut udp = Vec::new();
@@ -846,6 +909,19 @@ async fn the_next_tenant_gets_no_frame_from_the_last() {
             .unwrap();
     assert_eq!(&datagram[..len], b"from the first tenant");
 
+    // A TCP connection through pasta: the tenant connects out to a service on the host's
+    // loopback, which accepts and will write to it after the tenant has left.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_port = listener.local_addr().unwrap().port();
+    assert_eq!(
+        first.command(&format!("tcp {tcp_port}")).await.0,
+        "connected"
+    );
+    let (mut from_tenant, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("the tenant's connection never reached the host")
+        .unwrap();
+
     // The tenant leaves: its VMM exits and its clone's descriptors close.
     first.kill().await;
     drop(stream);
@@ -867,9 +943,13 @@ async fn the_next_tenant_gets_no_frame_from_the_last() {
         (holder, 2)
     );
     let mut second = Helper::start(&lease).await;
-    // The host service answers the first tenant now. The pasta that had the flow is gone,
-    // so the answer goes nowhere; the send itself may be refused.
+    // The host services answer the first tenant now. pasta is the same process, and its
+    // reset closed both flows without a word to the TAP, so the answers go nowhere; the
+    // sends themselves may be refused.
     let _ = service.send_to(b"a late answer", pasta_flow).await;
+    let _ = from_tenant
+        .write_all(b"late data on the first tenant's connection")
+        .await;
     // Long enough for a retransmission of the first tenant's data, were its socket alive.
     let (_, frames) = second.command("capture 3500").await;
     assert_eq!(

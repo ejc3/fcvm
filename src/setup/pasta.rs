@@ -1,11 +1,13 @@
-//! Build pasta (passt) from a pinned upstream commit plus one carried patch.
+//! Build pasta (passt) from a pinned upstream commit plus three carried patches.
 //!
 //! The pin contains the upstream addr_seen fix for issue #661, and the fix
 //! that keeps `-a`, `-g` and `-n` on a host without IPv4. On top of it fcvm
-//! carries one patch (see `PATCHES`) that guards `udp_sock_errs()` against a
-//! NULL flow, so a published UDP port's listening socket cannot crash pasta on
-//! a socket error; it is submitted upstream and dropped once the pin moves past
-//! the merge. fcvm builds pasta on demand into the content-addressed shared
+//! carries three patches (see `PATCHES`). The first guards `udp_sock_errs()`
+//! against a NULL flow, so a published UDP port's listening socket cannot crash
+//! pasta on a socket error; it is submitted upstream and dropped once the pin
+//! moves past the merge. The other two serve the pastas of a namespace pool:
+//! `--no-neigh-notify`, and a reset with a status reply on the control socket
+//! (`crate::network::pesto`). fcvm builds pasta on demand into the content-addressed shared
 //! assets directory, so rootless networking does not depend on the host's
 //! distro pasta version.
 //!

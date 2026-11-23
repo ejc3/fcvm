@@ -40,7 +40,7 @@ const PATCHES: &[(&str, &str)] = &[
     ),
     (
         "scripts/passt-control-reset-status.patch",
-        "a45a5e1539fb784dacaac41b0c18198104d055f1317d9d9490402ab062cd2414",
+        "e9597ffcc9e5cd93b37c0e432bccf9e7c9e2b0130d655fe8a7d716c483fb4c55",
     ),
 ];
 

@@ -244,16 +244,20 @@ impl Namespace {
     /// together with the lease, and is close-on-exec in every other process.
     async fn reset(&mut self) -> Result<()> {
         failpoint::hit_async("pool.pre_reset").await;
-        // pasta first: its flows hold sockets in the namespace, and a reply a host
-        // service sends late must find no flow to ride to the next guest.
-        self.network
-            .reset_pasta()
-            .await
-            .context("resetting pasta")?;
+        // The namespace first, pasta second. A frame of the last tenant can still be in
+        // the kernel on its way to pasta when the lease ends; one that reaches a pasta
+        // already reset opens a new flow, and the host's answer would be framed to the
+        // next guest. With pasta reset last, such a frame has the whole of the holder's
+        // reset to arrive in and be forgotten with the rest. That is a margin, not a
+        // proof: nothing here waits for the kernel's queues to be empty.
         self.agent
             .reset()
             .await
             .context("resetting the namespace")?;
+        self.network
+            .reset_pasta()
+            .await
+            .context("resetting pasta")?;
         let deadline = tokio::time::Instant::now() + VERIFY_BUDGET;
         let mut pause = Duration::from_millis(2);
         loop {
