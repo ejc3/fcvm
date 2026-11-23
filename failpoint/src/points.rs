@@ -33,6 +33,7 @@ pub const HOST_POINTS: &[&str] = &[
     "snapshot.startup.pre_create",
     "teardown.pre_kill",
     "teardown.pre_remove_data_dir",
+    "uffd.refusal.pre_record",
     "working_set.pre_persist",
 ];
 

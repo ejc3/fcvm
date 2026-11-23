@@ -1711,6 +1711,7 @@ fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
         release: (major, minor, patch),
         prerelease: caps.get(4).is_some(),
         drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
+        numa_window: build.first() == Some(&"fcvm") && build.contains(&"numa-window"),
     })
 }
 
@@ -1724,6 +1725,22 @@ pub(crate) struct FirecrackerVersion {
     /// Whether the build metadata says the snapshot load takes `drive_overrides`
     /// (`+fcvm.drive-overrides`, ejc3/firecracker).
     pub drive_overrides: bool,
+    /// Whether the build takes `--numa-balancing-after-secs` (`+fcvm.…numa-window`).
+    pub numa_window: bool,
+}
+
+/// The context of a snapshot load that failed. A restore that died under its memory server
+/// is told from other failed restores by it (`restore_failure_with_its_memory_server`).
+pub(crate) const LOADING_SNAPSHOT: &str = "loading snapshot";
+
+/// Whether the Firecracker at `bin` takes `--numa-balancing-after-secs`. False when its
+/// version cannot be read: the flag is then left off, which leaves its guest memory under
+/// the default policy.
+pub(crate) fn firecracker_takes_numa_window(bin: &Path) -> bool {
+    crate::version_cache::version_output(bin)
+        .ok()
+        .and_then(|out| parse_firecracker_version(&out).ok())
+        .is_some_and(|version| version.numa_window)
 }
 
 impl FirecrackerVersion {
@@ -4163,7 +4180,7 @@ pub async fn restore_from_snapshot(
                 huge_pages,
             })
             .await
-            .context("loading snapshot")
+            .context(LOADING_SNAPSHOT)
             .map_err(|error| {
                 match firecracker_choice.load_failure_hint(&error, &firecracker_bin) {
                     Some(hint) => error.context(hint),
@@ -9856,6 +9873,32 @@ mod tests {
         assert_eq!(restored_vsock_source_path(None, ancestor), ancestor);
     }
 
+    /// Only an ejc3/firecracker build that says so in its build metadata takes
+    /// `--numa-balancing-after-secs`; an older build or upstream would refuse the flag and
+    /// not start.
+    #[test]
+    fn the_version_says_whether_firecracker_takes_the_numa_window() {
+        for takes in [
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window\n",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.fuzzing",
+        ] {
+            assert!(
+                parse_firecracker_version(takes).unwrap().numa_window,
+                "{takes}"
+            );
+        }
+        for other in [
+            "Firecracker v1.17.0",
+            "Firecracker v1.17.0+fcvm.drive-overrides",
+            "Firecracker v1.17.0+other.numa-window",
+        ] {
+            assert!(
+                !parse_firecracker_version(other).unwrap().numa_window,
+                "{other}"
+            );
+        }
+    }
+
     /// Only an ejc3/firecracker build that says so in its build metadata takes drive
     /// overrides; upstream 1.17.0 rejects the field.
     #[test]
@@ -9891,6 +9934,7 @@ mod tests {
             release: (1, 17, 0),
             prerelease: false,
             drive_overrides: true,
+            numa_window: false,
         };
         let source = PathBuf::from("/data/vm-disks/vm-source");
         let sources = vec![source.clone()];
@@ -9945,6 +9989,7 @@ mod tests {
 
         let upstream = FirecrackerVersion {
             drive_overrides: false,
+            numa_window: false,
             ..capable
         };
         assert!(snapshot_load_drive_overrides(

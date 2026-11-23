@@ -10,6 +10,26 @@ use tracing::{debug, error, info, warn};
 
 use crate::utils::{spawn_streaming, strip_firecracker_prefix};
 
+/// Seconds a guest's memory stays out of automatic NUMA balancing after Firecracker creates
+/// or restores it (`--numa-balancing-after-secs`, ejc3/firecracker).
+///
+/// A balancing scan unmaps guest memory from stage 2 and the guest faults it back in, and a
+/// UFFD clone's freshly copied pages are hinted and migrated. On a two-node c8g.metal-48xl,
+/// with balancing on, a UFFD clone took 6,906 hinting faults and 3,317 migrations to start at
+/// C=128 to 1000 clones, and 7.5 host CPU-s; out of balancing, 32, 15 and 2.6 CPU-s.
+/// A guest that lives on gains from balancing: a 32-vCPU 200 GiB guest running a memory
+/// bandwidth loop for 10 min reached 700 GB/s once balancing had placed its memory, against a
+/// steady 434 GB/s without it, and 1000 idle clones cost 20% less CPU with it. So the
+/// exclusion covers a clone's start (a C=128 ramp to 1000 clones takes 20 to 35 s) and ends.
+///
+/// Firecracker binds anonymous guest memory and a private mapping of a snapshot's memory
+/// file. It leaves guest memory that maps a memfd as it is, which is what a clone of a
+/// `--uffd-mode minor` serve has: a shmem mapping keeps its policy in the file, where every
+/// clone of the serve reads it, so one clone's window would begin and end every clone's.
+/// Such a clone has no window and needs none, because the kernel does not scan a shmem
+/// mapping whose file has no policy (`vma_policy_mof`).
+pub const NUMA_BALANCING_AFTER_SECS: u64 = 60;
+
 use super::FirecrackerClient;
 
 /// Socket/device wait timeout (total wait time = RETRY_COUNT * RETRY_DELAY)
@@ -333,6 +353,12 @@ impl VmManager {
         if std::env::var("FCVM_NO_SECCOMP").is_ok() {
             warn!("Seccomp disabled via FCVM_NO_SECCOMP - reduced security");
             cmd.arg("--no-seccomp");
+        }
+
+        // The guest's memory stays out of NUMA balancing for its first minute.
+        if crate::commands::common::firecracker_takes_numa_window(firecracker_bin) {
+            cmd.arg("--numa-balancing-after-secs")
+                .arg(NUMA_BALANCING_AFTER_SECS.to_string());
         }
 
         // Additional firecracker args from RuntimeConfig (passed explicitly by caller)
