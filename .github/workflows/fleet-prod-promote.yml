@@ -232,7 +232,7 @@ jobs:
         run: |
           rc=0
           python3 -B fcvm/fleet/coord/prod_release.py image-promote "$TARGET" || rc=$?
-          if [ "$rc" = 3 ]; then echo "::notice::prod woke before its images moved: nothing changed"; echo "held=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if [ "$rc" = 3 ]; then echo "::notice::the image release was held (prod woke, or Terraform's lock stayed held) before prod's images moved: nothing changed"; echo "held=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           exit "$rc"
       # The set's lane image, when it carries one, is selected for prod and released with the coordinator.
       - name: Coordinator

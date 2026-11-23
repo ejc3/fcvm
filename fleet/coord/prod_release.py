@@ -275,25 +275,39 @@ def receipt_of(value):
     return receipt
 
 
-# The image release function takes Terraform's backend lock, as the coordinator release does (publish.release): while
-# someone else holds it (an apply, a plan, another release) it answers busy, and the call is made again a minute later.
+# The image release function takes Terraform's backend lock, as the coordinator release does (publish.release). With
+# ejc3/aws#1014 applied it answers busy while someone else holds the lock (an apply, a plan, another release), and the
+# call is made again a minute later; until then a held lock is still a function error, as in run 45149811634.
 BUSY_ATTEMPTS = 11
 
 
-def image_call(payload, sleep=time.sleep):
-    """One image release call, made again while the function answers busy."""
+class LockHeld(RuntimeError):
+    """The image release answered busy every time: Terraform's lock stayed held, and nothing ran."""
+
+
+def image_call(payload, sleep=None, deadline=None, clock=time.time):
+    """One image release call, made again while the function answers busy: at most BUSY_ATTEMPTS calls, and none
+    after `deadline`."""
+    sleep = sleep or time.sleep
     for attempt in range(BUSY_ATTEMPTS):
         result = lambda_result("IMAGE_RELEASE", payload)
         if result.get("status") != "busy":
             return result
-        if attempt < BUSY_ATTEMPTS - 1:
-            print(f"Terraform's lock is held; asking the image release again in {POLL_SECONDS} seconds", flush=True)
-            sleep(POLL_SECONDS)
-    raise RuntimeError("Terraform's lock stayed held: the image release did not run")
+        if attempt == BUSY_ATTEMPTS - 1:
+            break
+        if deadline is not None and clock() >= deadline:
+            raise LockHeld("Terraform's lock stayed held until the deadline: the image release did not run")
+        print(f"Terraform's lock is held; asking the image release again in {POLL_SECONDS} seconds", flush=True)
+        sleep(POLL_SECONDS)
+    raise LockHeld("Terraform's lock stayed held: the image release did not run")
 
 
-def image_promote(receipt, sleep=time.sleep):
-    result = image_call({"action": "promote-prod", "receipt": receipt}, sleep)
+def image_promote(receipt, sleep=None):
+    try:
+        result = image_call({"action": "promote-prod", "receipt": receipt}, sleep)
+    except LockHeld:
+        # Nothing moved: held, like a prod that woke, so no rollback runs and the next promotion tries again.
+        raise publish.Held("Terraform's lock stayed held before prod's images moved") from None
     status = result.get("status")
     if status == "held":
         raise publish.Held("prod woke before its images moved")
@@ -302,9 +316,10 @@ def image_promote(receipt, sleep=time.sleep):
     return status
 
 
-def image_rollback(receipt, want, deadline=None, clock=time.time, sleep=time.sleep):
+def image_rollback(receipt, want, deadline=None, clock=time.time, sleep=None):
     """Return prod's images from `receipt` to their previous release, which must be `want`; waits for
     prod to sleep (the templates change only then) until the deadline."""
+    sleep = sleep or time.sleep
     deadline = deadline or clock() + HOLD_SECONDS
     current = lambda_result("IMAGE_RELEASE", {"action": "prod-status"}).get("prod")
     if current == want:
@@ -312,7 +327,8 @@ def image_rollback(receipt, want, deadline=None, clock=time.time, sleep=time.sle
     if current != receipt:
         raise RuntimeError("prod's images are neither the promoted release nor the previous one")
     while True:
-        result = image_call({"action": "rollback-prod", "receipt": receipt}, sleep)
+        # A rollback that could not run fails (LockHeld is a RuntimeError), by its own deadline.
+        result = image_call({"action": "rollback-prod", "receipt": receipt}, sleep, deadline, clock)
         status = result.get("status")
         if status in ("rolled_back", "unchanged"):
             if receipt_of(result) != want:
