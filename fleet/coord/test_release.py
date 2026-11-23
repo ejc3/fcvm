@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline checks for publishing and the live IPv4/name-regression probe."""
 import subprocess
+import textwrap
 import importlib.util
 import contextlib
 import fnmatch
@@ -2769,59 +2770,154 @@ class ProdLaneWorkflowTests(unittest.TestCase):
         self.assertIn('if [ -n "$(jq -r \'.lambda_digest // empty\' <<<"$TARGET")" ]; then lane="${PRIOR_LANE:-none}"; fi', coordinator)
         self.assertIn(self.FLAG, coordinator)
 
-    def test_a_manual_rollback_has_no_lane_handling_and_is_todays(self):
+    def run_coordinator_step(self, lane):
+        """The manual rollback's Coordinator step, run by bash with python3 replaced by a stub that prints its
+        arguments one per line."""
         rollback = (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
         coordinator, _ = self.step(rollback, "Coordinator")
-        self.assertNotIn("lambda", coordinator)
-        self.assertIn('python3 -B fleet/coord/publish.py --stack prod --force \\\n            --commit "$(jq -r .coordinator.commit <<<"$PREVIOUS")" '
-                      '--digest "$(jq -r .coordinator.digest <<<"$PREVIOUS")"', coordinator)
-        # The refusal is in `current`, whose failure skips every step after it.
-        current = rollback.split("      - id: current\n", 1)[1].split("\n      - ", 1)[0]
-        self.assertIn("FLEET_LAMBDA_LANE_PROD: ${{ vars.FLEET_LAMBDA_LANE_PROD }}", current)
+        script = textwrap.dedent(coordinator.split("        run: |\n", 1)[1])
+        previous = json.dumps({"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}})
+        env = {"PATH": os.environ["PATH"], "PREVIOUS": previous, "LANE": lane}
+        return subprocess.run(["bash", "-c", 'python3() { printf "%s\\n" "$@"; }\n' + script], env=env,
+                              capture_output=True, text=True, check=True).stdout.splitlines()
+
+    def test_a_manual_rollback_passes_the_lane_the_current_step_chose(self):
+        today = ["-B", "fleet/coord/publish.py", "--stack", "prod", "--force",
+                 "--commit", "a" * 40, "--digest", "sha256:" + "a" * 64]
+        self.assertEqual(self.run_coordinator_step(""), today)
+        self.assertEqual(self.run_coordinator_step("none"), today + ["--lambda-digest", "none"])
+        lane = "sha256:" + "2" * 64
+        self.assertEqual(self.run_coordinator_step(lane), today + ["--lambda-digest", lane])
+        rollback = (self.WORKFLOWS / "fleet-prod-rollback.yml").read_text()
+        coordinator, _ = self.step(rollback, "Coordinator")
+        self.assertIn("LANE: ${{ steps.current.outputs.lane }}", coordinator)
+        self.assertIn("LAMBDA_TILE_REPO: ${{ secrets.LAMBDA_TILE_REPO }}", coordinator)
         for step in ("Worker", "Coordinator", "Host and tile images"):
             body, _ = self.step(rollback, step)
             self.assertIn("steps.current.outcome == 'success'", body)
 
 
-class ManualRollbackRefusalTests(unittest.TestCase):
-    """prod_release.py current, the manual rollback's first step: a lane image is not rolled back by hand yet."""
+class ManualRollbackLaneTests(unittest.TestCase):
+    """prod_release.py current, the manual rollback's first step, chooses its lane flag from both recorded
+    entries and refuses when prod runs another lane image than its record names."""
 
-    def current(self, release, lane=None):
+    S, R = "sha256:" + "5" * 64, "sha256:" + "2" * 64
+
+    C1, C0 = "sha256:" + "a" * 64, "sha256:" + "c" * 64
+
+    def entry(self, generation, lane=None, coordinator=None):
+        return {"coordinator": {"commit": "a" * 40, "digest": coordinator or self.C1}, "web_commit": None,
+                "worker_version": None, "generation": generation, "build_id": "b", "smoke_run": None,
+                **({"lambda_digest": lane} if lane else {})}
+
+    def current(self, release, runs=None, lane_error=None, switch=None, coordinator=None):
+        """Run `current` against a candidate answer whose prod runs `runs` (None: the function names nothing, as
+        before ejc3/aws#1002; "": no lane image). Returns the exit code, the outputs and what was printed."""
         out = tempfile.NamedTemporaryFile("r", delete=False)
         self.addCleanup(os.unlink, out.name)
+        prod_side = {"digest": coordinator or self.C1, "commits": ["a" * 40]}
+        if runs is not None:
+            prod_side["lambda_digest"] = runs or None
+        if lane_error:
+            prod_side.update({"lambda_digest": None, "lane_error": lane_error})
+        answer = {"status": "ok", "stage": {"digest": "sha256:" + "b" * 64, "commits": []}, "prod": prod_side,
+                  "release": release}
         env = {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod", "GITHUB_OUTPUT": out.name}
-        if lane is not None:
-            env["FLEET_LAMBDA_LANE_PROD"] = lane
         printed = io.StringIO()
-        with patch.dict(os.environ, env), patch.object(prod.publish, "invoke", lambda f, p: {"status": "ok", "release": release}), \
+        with patch.dict(os.environ, env), patch.object(prod.publish, "invoke", lambda f, p: copy.deepcopy(answer)), \
                 contextlib.redirect_stdout(printed):
-            if lane is None:
-                os.environ.pop("FLEET_LAMBDA_LANE_PROD", None)
+            os.environ.pop("FLEET_LAMBDA_LANE_PROD", None)
+            if switch:
+                os.environ["FLEET_LAMBDA_LANE_PROD"] = switch
             code = prod.main(["current"])
-        return code, Path(out.name).read_text(), printed.getvalue()
+        outputs = dict(line.split("=", 1) for line in Path(out.name).read_text().splitlines())
+        return code, outputs, printed.getvalue()
 
-    def entry(self, **extra):
-        return {"coordinator": {"commit": "a" * 40, "digest": "sha256:" + "a" * 64}, "web_commit": None,
-                "worker_version": None, "generation": 1, "build_id": "b", "smoke_run": None, **extra}
+    def test_with_no_lane_image_anywhere_it_is_todays(self):
+        release = {**self.entry(1), "previous": self.entry(0)}
+        for runs in (None, ""):
+            for switch in (None, "on"):
+                with self.subTest(runs=runs, switch=switch):
+                    code, outputs, _ = self.current(release, runs, switch=switch)
+                    self.assertEqual(code, 0)
+                    self.assertEqual(json.loads(outputs["previous"]), self.entry(0))
+                    self.assertEqual(json.loads(outputs["current"]), self.entry(1))
+                    self.assertEqual(outputs["lane"], "")
 
-    def test_with_the_switch_off_and_no_lane_image_it_is_todays(self):
-        release = {**self.entry(), "previous": self.entry(generation=0)}
-        code, out, _ = self.current(release)
-        self.assertEqual(code, 0)
-        self.assertIn("current=", out)
-        self.assertIn("previous=", out)
+    def test_the_lane_flag_is_chosen_from_both_entries(self):
+        # PREVIOUS names a lane image: pass it. Else CURRENT names one: none. Else no flag.
+        cases = [(self.S, self.R, self.R), (self.S, None, "none"), (None, self.S, self.S), (self.S, self.S, self.S)]
+        for left, back, flag in cases:
+            with self.subTest(left=left, back=back):
+                release = {**self.entry(1, left), "previous": self.entry(0, back)}
+                code, outputs, _ = self.current(release, left or "")
+                self.assertEqual(code, 0)
+                self.assertEqual(outputs["lane"], flag)
 
-    def test_a_lane_image_in_either_set_or_the_switch_on_stops_before_any_release(self):
-        lane = "sha256:" + "2" * 64
-        cases = [({**self.entry(lambda_digest=lane), "previous": self.entry()}, None),
-                 ({**self.entry(), "previous": self.entry(lambda_digest=lane)}, None),
-                 ({**self.entry(), "previous": self.entry()}, "on")]
-        for release, switch in cases:
-            with self.subTest(switch=switch):
-                code, out, printed = self.current(release, switch)
+    def test_a_rollback_of_a_rollback_returns_to_the_set_it_left(self):
+        # The record job writes the restored set with the rolled-back one as its previous (record(PREVIOUS, ...,
+        # CURRENT)); rolling back again must return to the lane image the first rollback left.
+        for back in (self.R, None):
+            with self.subTest(back=back):
+                release = {**self.entry(1, self.S), "previous": self.entry(0, back)}
+                code, outputs, _ = self.current(release, self.S)
+                self.assertEqual((code, outputs["lane"]), (0, back or "none"))
+                written = {}
+                def record(function, payload):
+                    written.update(payload["release"])
+                    return {"status": "recorded"}
+                with patch.object(prod.publish, "invoke", record), contextlib.redirect_stdout(io.StringIO()), \
+                        patch.dict(os.environ, {"COORDINATOR_RELEASE": "fcvm-coordinator-release-prod"}):
+                    prod.record(json.loads(outputs["previous"]), None, json.loads(outputs["current"]))
+                code, outputs, _ = self.current(written, back or "")
+                self.assertEqual((code, outputs["lane"]), (0, self.S))
+                self.assertEqual(json.loads(outputs["previous"]), self.entry(1, self.S))
+
+    def test_prod_running_another_lane_image_than_its_record_names_refuses(self):
+        # What prod runs, not only the record: a rollback whose record step failed, or a switch turned off while
+        # prod ran a lane image, leaves the record describing something else.
+        cases = [(self.S, self.R), (self.S, "")]
+        for recorded, runs in cases:
+            with self.subTest(recorded=recorded, runs=runs):
+                release = {**self.entry(1, recorded), "previous": self.entry(0, coordinator=self.C0)}
+                code, outputs, printed = self.current(release, runs)
                 self.assertEqual(code, 1)
-                self.assertNotIn("previous=", out)
-                self.assertIn("a manual rollback of a lane image is not supported yet", printed)
+                self.assertNotIn("previous", outputs)
+                self.assertIn("prod runs another lane image than its release record names", printed)
+
+    def test_with_no_lane_image_recorded_the_lane_read_is_not_consulted(self):
+        # Main's emergency path: a flagless release leaves FLEET_LAMBDA_IMAGE alone, so a lane read that failed (a
+        # deployment not COMPLETED, a pointer mismatch, an ECS error) or a lane image nobody recorded stops nothing.
+        release = {**self.entry(1), "previous": self.entry(0)}
+        for kwargs in ({"lane_error": "not-idle"}, {"lane_error": "unreadable"}, {"runs": self.S}):
+            with self.subTest(**kwargs):
+                code, outputs, _ = self.current(release, **kwargs)
+                self.assertEqual((code, outputs["lane"]), (0, ""))
+
+    def test_a_lane_image_prod_cannot_read_refuses_when_an_entry_names_one(self):
+        for left, back in ((self.S, None), (None, self.S), (self.S, self.R)):
+            with self.subTest(left=left, back=back):
+                release = {**self.entry(1, left), "previous": self.entry(0, back)}
+                code, outputs, printed = self.current(release, lane_error="not-idle")
+                self.assertEqual(code, 1)
+                self.assertNotIn("previous", outputs)
+                self.assertIn("could not read the lane image prod runs (not-idle)", printed)
+
+    def test_a_rollback_whose_later_step_failed_is_resumed(self):
+        # The Coordinator step applied the previous set, then a later step failed, so the record job did not run:
+        # prod runs E0's coordinator and lane image while the record still says E1. A rerun must go on.
+        for back in (self.R, None):
+            with self.subTest(back=back):
+                release = {**self.entry(1, self.S), "previous": self.entry(0, back, coordinator=self.C0)}
+                code, outputs, _ = self.current(release, back or "", coordinator=self.C0)
+                self.assertEqual((code, outputs["lane"]), (0, back or "none"))
+        # Only E0's coordinator with E0's lane image is that state.
+        release = {**self.entry(1, self.S), "previous": self.entry(0, self.R, coordinator=self.C0)}
+        for runs, coordinator in ((self.R, self.C1), ("", self.C0)):
+            with self.subTest(runs=runs, coordinator=coordinator):
+                code, _, printed = self.current(release, runs, coordinator=coordinator)
+                self.assertEqual(code, 1)
+                self.assertIn("prod runs another lane image than its release record names", printed)
 
 
 class FakeLive:
