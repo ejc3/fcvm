@@ -160,6 +160,108 @@ pub fn extents_in_files_up_to(paths: &[std::path::PathBuf], limit: u64) -> std::
     Ok(total)
 }
 
+/// The extended attribute that records a file's extent count, as
+/// `<identity> <limit> <count>` ([`recorded_extents_in_files_up_to`]).
+const EXTENTS_XATTR: &std::ffi::CStr = c"user.fcvm.extents";
+
+/// The identity a recorded count was taken for: device, inode, length and modification time.
+fn extents_identity(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "{}:{}:{}:{}.{:09}",
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec()
+    )
+}
+
+/// What a recorded `<identity> <limit> <count>` says about the count up to `limit`, when its
+/// identity is `identity`: the answer, or None when it does not say.
+fn recorded_answer(recorded: &str, identity: &str, limit: u64) -> Option<u64> {
+    let mut fields = recorded.split(' ');
+    if fields.next()? != identity {
+        return None;
+    }
+    let recorded_limit: u64 = fields.next()?.parse().ok()?;
+    let count: u64 = fields.next()?.parse().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    if count <= recorded_limit {
+        // Exact.
+        Some(count.min(limit.saturating_add(1)))
+    } else if limit <= recorded_limit {
+        // More than a limit at least as high as this one.
+        Some(limit + 1)
+    } else {
+        None
+    }
+}
+
+fn read_recorded(file: &File) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let n = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            EXTENTS_XATTR.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    (n > 0)
+        .then(|| String::from_utf8(buf[..n as usize].to_vec()).ok())
+        .flatten()
+}
+
+/// [`extents_in_files_up_to`] for files that are never written again, a published snapshot's
+/// disks: each file's count is recorded on the file the first time it is counted and read back
+/// while the file keeps the identity it was counted with. FIEMAP reports whether each extent is
+/// shared, and on btrfs that walks the extent's back references, one per clone that reflinked
+/// it: with 1000 clones of a snapshot alive, counting its 854-extent disk was most of the CPU of
+/// a clone's disk step. A file whose count cannot be recorded (another user's snapshot, a
+/// filesystem without user extended attributes) is counted every time, as before.
+pub fn recorded_extents_in_files_up_to(
+    paths: &[std::path::PathBuf],
+    limit: u64,
+) -> std::io::Result<u64> {
+    let mut total = 0u64;
+    for path in paths {
+        let file = File::open(path)?;
+        let identity = extents_identity(&file.metadata()?);
+        let remaining = limit - total;
+        let count = match read_recorded(&file)
+            .and_then(|recorded| recorded_answer(&recorded, &identity, remaining))
+        {
+            Some(count) => count,
+            None => {
+                let count = extents_up_to(&file, remaining)?;
+                let value = format!("{identity} {remaining} {count}");
+                let rc = unsafe {
+                    libc::fsetxattr(
+                        file.as_raw_fd(),
+                        EXTENTS_XATTR.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                    )
+                };
+                if rc != 0 {
+                    tracing::debug!(path = %path.display(), error = %std::io::Error::last_os_error(),
+                        "cannot record the extent count on the file; it is counted again next time");
+                }
+                count
+            }
+        };
+        total += count;
+        if total > limit {
+            return Ok(limit + 1);
+        }
+    }
+    Ok(total)
+}
+
 /// The ranges of `file` in extents no other file shares, with touching ranges joined.
 pub fn unshared_ranges(file: &File) -> std::io::Result<Vec<std::ops::Range<u64>>> {
     let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
@@ -219,6 +321,37 @@ mod tests {
         assert_eq!(extents_up_to(&file, 10).unwrap(), 3);
         assert_eq!(extents_up_to(&file, 3).unwrap(), 3);
         assert_eq!(extents_up_to(&file, 1).unwrap(), 2);
+    }
+
+    /// A recorded count answers for the file while its identity holds, and only for limits it
+    /// can answer; any other identity is counted again.
+    #[test]
+    fn a_recorded_count_answers_only_for_its_identity_and_limit() {
+        assert_eq!(recorded_answer("i 100 7", "i", 10), Some(7));
+        assert_eq!(recorded_answer("i 100 7", "i", 5), Some(6));
+        assert_eq!(recorded_answer("i 100 101", "i", 50), Some(51));
+        assert_eq!(recorded_answer("i 100 101", "i", 100), Some(101));
+        assert_eq!(recorded_answer("i 100 101", "i", 200), None);
+        assert_eq!(recorded_answer("j 100 7", "i", 10), None);
+        assert_eq!(recorded_answer("i 100 7 x", "i", 10), None);
+        assert_eq!(recorded_answer("garbage", "i", 10), None);
+    }
+
+    /// Writing a file changes its identity, and it is counted again.
+    #[test]
+    fn a_written_file_is_counted_again() {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let path = three_extents(dir.path(), "disk.raw");
+        let paths = [path.clone()];
+        assert_eq!(recorded_extents_in_files_up_to(&paths, 10).unwrap(), 3);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // A block past a hole: a new extent on every filesystem (an appended block can join
+        // the last extent on ext4 and xfs, which CI's checkout is on).
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.seek(SeekFrom::Start(1 << 20)).unwrap();
+        writer.write_all(&[1; 4096]).unwrap();
+        writer.sync_all().unwrap();
+        assert_eq!(recorded_extents_in_files_up_to(&paths, 10).unwrap(), 4);
     }
 
     /// Several files count together, up to one past the limit.

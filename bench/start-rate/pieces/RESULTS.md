@@ -96,3 +96,23 @@ main arm's fcvm carried the disk-extents-once change, which no idle clone runs.
 
 Every arm's 1000 clones were healthy; resume to agent-ready p50 was 868 and 949 ms on main,
 933 and 924 ms with the change, so restores still find the reset.
+
+### 3. disk: count a snapshot's disk extents once (branch disk-extents-once)
+
+Every clone counted the snapshot disk's extents with FIEMAP to choose between a reflink and a
+subvolume snapshot; on btrfs FIEMAP walks each extent's back references, one per clone. The
+count is now recorded on the file (`user.fcvm.extents`) the first time.
+
+| cell | before ops/s | after ops/s | before CPU-s/op | after CPU-s/op |
+|---|---|---|---|---|
+| C=1, 0 held | 148 | 234 | 0.0073 | 0.0056 |
+| C=128, 0 held | 146 | 241 | 0.078 | 0.0146 |
+| C=512, 0 held | 98 | 174 | 0.96 | 0.021 |
+| C=128, 1000 held | 146 | 235 | 0.069 | 0.016 |
+| C=512, 1000 held | 87 | 250 | 1.15 | 0.013 |
+| C=128, 1000 held, A B A B | 145.7, 142.3 | 239.4, 243.5 | 0.088, 0.090 | 0.0144, 0.0148 |
+
+The rate is still near 240/s. What is left, measured with `--disk-shard-dir` (the clone
+reflinks one of K reflinked copies of the disk, chosen by PID, which skips the extent count):
+C=128, 0 held, one copy 232 ops/s, 16 copies 366 ops/s, 0.014 and 0.016 CPU-s per op. One
+source file serializes part of it; the rest is not attributed yet.

@@ -273,7 +273,8 @@ fn remove_linked_memory_file_with(
 
 /// The extents a clone of `base_dir`'s disks would reflink: every file in it, the root disk
 /// and the extra disks, which the reflink path copies one by one. Counted up to one past
-/// `limit`; None when they cannot be counted.
+/// `limit`; None when they cannot be counted. A snapshot's disks are never written once it is
+/// published, so the count is taken once and recorded on each file.
 fn snapshot_disks_extents(base_dir: &Path, limit: u64) -> Option<u64> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(base_dir).ok()? {
@@ -282,7 +283,7 @@ fn snapshot_disks_extents(base_dir: &Path, limit: u64) -> Option<u64> {
             files.push(entry.path());
         }
     }
-    crate::storage::extents::extents_in_files_up_to(&files, limit).ok()
+    crate::storage::extents::recorded_extents_in_files_up_to(&files, limit).ok()
 }
 
 /// Create `path` as a btrfs subvolume, or as an ordinary directory where that
@@ -1353,6 +1354,51 @@ pub fn parse_size(s: &str) -> Result<u64> {
 #[cfg(test)]
 mod snapshot_dir_tests {
     use super::*;
+
+    /// A clone counts the snapshot's disks once and records the count on them; the next
+    /// clone reads the record instead of asking FIEMAP, so a planted record is what it gets.
+    /// FIEMAP on a disk that 1000 clones share walked every extent's references for each
+    /// clone (bench/start-rate/pieces/RESULTS.md).
+    #[test]
+    fn a_snapshot_disk_is_counted_once() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let disk = dir.path().join("disk.raw");
+        let mut file = std::fs::File::create(&disk).unwrap();
+        for block in 0..3u64 {
+            file.seek(SeekFrom::Start(block * 64 * 1024)).unwrap();
+            file.write_all(&[0xa5; 4096]).unwrap();
+        }
+        file.sync_all().unwrap();
+        assert_eq!(snapshot_disks_extents(dir.path(), 10), Some(3));
+
+        let name = c"user.fcvm.extents";
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        assert!(n > 0, "the first count is not recorded on the disk");
+        let planted = String::from_utf8(buf[..n as usize].to_vec())
+            .unwrap()
+            .replace(" 10 3", " 10 8");
+        let rc = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                planted.as_ptr().cast(),
+                planted.len(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(snapshot_disks_extents(dir.path(), 10), Some(8));
+    }
 
     /// The clone's disk is reflinked in this process: on a filesystem that clones it is made,
     /// on one that does not the refusal is reported and nothing is left, and create_cow_disk
