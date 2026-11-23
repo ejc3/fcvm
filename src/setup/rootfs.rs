@@ -40,6 +40,9 @@ const LAYER2_SIZE: &str = "10G";
 pub struct Plan {
     #[serde(default)]
     pub paths: PathsConfig,
+    /// `[confine]`: whether this host requires every VMM to be confined (`crate::confine`).
+    #[serde(default)]
+    pub confine: crate::confine::ConfineConfig,
     pub base: BaseConfig,
     pub packages: PackagesConfig,
     pub services: ServicesConfig,

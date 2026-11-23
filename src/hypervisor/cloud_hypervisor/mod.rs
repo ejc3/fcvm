@@ -377,6 +377,10 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn spawn(&mut self, spec: &ProcessSpec) -> Result<()> {
+        anyhow::ensure!(
+            spec.confinement.is_none(),
+            "confinement supports the Firecracker backend only"
+        );
         self.stop_reboot_monitor().await;
         // A reboot relaunch re-enters spawn() with a minimal spec (binary + args). Update
         // retained state only when the spec provides a value, so the namespace isolation

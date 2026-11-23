@@ -4021,6 +4021,15 @@ pub async fn restore_from_snapshot(
         vm_manager.set_net_namespace_path(p.clone());
     }
     vm_manager.set_keep_fds(ns.keep_fds.clone());
+    vm_manager.set_confinement(vm_state.confinement.clone());
+    // A confined clone never runs in a pooled namespace (`clone_may_pool`), so this TAP is
+    // its own.
+    vm_manager.set_tap_owner(
+        vm_state
+            .confinement
+            .as_ref()
+            .map(|_| network.tap_device().to_string()),
+    );
     if let Some(redirects) = &ns.mount_redirects {
         vm_manager.set_mount_redirects(redirects.clone());
     }
@@ -4502,6 +4511,10 @@ pub async fn restore_from_snapshot_ch(
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<RestoredVmm<crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend>> {
+    anyhow::ensure!(
+        vm_state.confinement.is_none(),
+        "confinement supports the Firecracker backend only"
+    );
     use crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend;
     use crate::hypervisor::{Hypervisor, ProcessSpec};
 
@@ -4641,6 +4654,9 @@ pub async fn restore_from_snapshot_ch(
         net_namespace_path: substrate.namespace.net_namespace_path.clone(),
         mount_redirects: substrate.namespace.mount_redirects.clone(),
         keep_fds: substrate.namespace.keep_fds.clone(),
+        // Refused for Cloud Hypervisor at the top of this function.
+        confinement: None,
+        tap_owner: None,
     };
     if let Err(error) = backend
         .spawn(&spec)

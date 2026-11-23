@@ -1073,6 +1073,7 @@ fn snapshot_restore_args(
         exec: None,
         no_dirty_tracking: false, // podman needs dirty tracking for later snapshots
         no_swap: args.no_swap,
+        confine: args.confine,
         vsock_dir: args.vsock_dir.clone(),
         publish: if args.publish.is_empty() {
             vec![crate::commands::snapshot::PUBLISH_NONE.to_string()]
@@ -1623,6 +1624,14 @@ async fn prepare_vm_for_lifecycle(
 ) -> Result<VmPreparation> {
     // Every podman launch, the library's start_vm and prepare_vm included, comes here first.
     crate::cgroup::require_swap_disabled(args.no_swap)?;
+    // Before any side effect: a start that must be confined and cannot be is refused here.
+    let confinement = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: args.hypervisor.into(),
+        network: args.network.into(),
+        firecracker_args: None,
+        unsupported: None,
+    })?;
     info!(
         lifecycle = ?lifecycle,
         "Starting fcvm podman lifecycle"
@@ -2187,6 +2196,7 @@ async fn prepare_vm_for_lifecycle(
     // Instead, env is passed directly to MMDS at VM start time
     let mut vm_state = VmState::new(vm_id.clone(), args.image.clone(), args.cpu, args.mem);
     vm_state.name = Some(vm_name.clone());
+    vm_state.confinement = confinement;
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
@@ -4463,6 +4473,7 @@ mod tests {
             pmem_devices: vec![],
             resolved_extra_disks: None,
             no_swap: false,
+            confine: false,
         }
     }
 

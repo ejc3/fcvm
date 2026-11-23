@@ -328,6 +328,8 @@ pub struct VmManager {
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
     mount_redirects: Option<crate::utils::MountRedirects>, // mount namespace for a restored clone
     keep_fds: Vec<std::os::fd::RawFd>,   // descriptors left open across the VMM's exec
+    confinement: Option<crate::confine::Confinement>, // `--confine` (crate::confine)
+    tap_owner: Option<String>,           // confined: the TAP its pre_exec makes the VMM's own
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
     // Reader task for the child's stderr pipe. Awaited (bounded) before rendering
@@ -366,6 +368,8 @@ impl VmManager {
             net_namespace_path: None,
             mount_redirects: None,
             keep_fds: Vec::new(),
+            confinement: None,
+            tap_owner: None,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             stderr_reader: None,
@@ -436,6 +440,17 @@ impl VmManager {
     /// ([`crate::utils::NamespaceParams::keep_fds`]).
     pub fn set_keep_fds(&mut self, fds: Vec<std::os::fd::RawFd>) {
         self.keep_fds = fds;
+    }
+
+    /// The unpooled TAP a confined VMM's pre_exec makes its own
+    /// ([`crate::utils::NamespaceParams::tap_owner`]). Kept across relaunches.
+    pub fn set_tap_owner(&mut self, tap: Option<String>) {
+        self.tap_owner = tap;
+    }
+
+    /// Confine the VMM ([`crate::confine`]). Kept across relaunches.
+    pub fn set_confinement(&mut self, confinement: Option<crate::confine::Confinement>) {
+        self.confinement = confinement;
     }
 
     /// Set user namespace path for rootless clones
@@ -566,6 +581,16 @@ impl VmManager {
         // build is for the gnu target, whose default policy allows every syscall of the
         // native architecture (rootfs-config.toml, [firecracker]).
         // Set FCVM_NO_SECCOMP=1 to install none, for debugging.
+        if self.confinement.is_some()
+            && (std::env::var_os("FCVM_NO_SECCOMP").is_some()
+                || std::env::var_os("FCVM_STRACE_FC").is_some())
+        {
+            anyhow::bail!(
+                "the VMM of {} is confined, and FCVM_NO_SECCOMP or FCVM_STRACE_FC would \
+                 undo that; unset them",
+                self.vm_id
+            );
+        }
         if std::env::var("FCVM_NO_SECCOMP").is_ok() {
             warn!("Seccomp disabled via FCVM_NO_SECCOMP - reduced security");
             cmd.arg("--no-seccomp");
@@ -630,6 +655,8 @@ impl VmManager {
                 net_namespace_path: self.net_namespace_path.clone(),
                 mount_redirects: self.mount_redirects.clone(),
                 keep_fds: self.keep_fds.clone(),
+                confine: self.confinement.is_some(),
+                tap_owner: self.confinement.as_ref().and(self.tap_owner.clone()),
             },
         )?;
 

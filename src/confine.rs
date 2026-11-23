@@ -1,0 +1,889 @@
+//! Opt-in confinement of a VM's VMM process (`--confine`).
+//!
+//! Without it, the only boundary between a guest and the host is KVM plus the VMM's device
+//! emulation: code that escapes into the Firecracker process holds the host user's account
+//! and, in rootless mode, every capability inside the namespace holder's user namespace.
+//! Confinement starts the VMM so that such code can do as little as possible. The layers
+//! arrive one pull request at a time, and [`Confinement::layers`] records which ones a VM
+//! was started with:
+//!
+//! - [`Layer::Process`] (this module, [`apply_process_layer`]): no capabilities, none to
+//!   regain across exec, no core dumps, `no_new_privs`.
+//!
+//! Default starts are untouched: with confinement off no pre_exec step and no VMM argument
+//! is added.
+//!
+//! # Fail closed
+//!
+//! A start that asks for confinement (the flag, or the host's `required` mode) and cannot
+//! have all of it is refused before anything is created, with every missing piece listed
+//! by mechanism ([`Missing`]). Nothing falls back to an unconfined start.
+//!
+//! # Kernel floor
+//!
+//! Confinement needs Landlock ABI [`LANDLOCK_ABI_FLOOR`]: ABI 9 added
+//! `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, without which Landlock does not mediate `connect()`
+//! to a pathname Unix socket, and the VMM must keep `connect()` for vsock. The floor is
+//! checked from the first layer on, so the flag means the same thing on every kernel it is
+//! accepted on. A second tier for older kernels (a private PID and mount namespace in place
+//! of `RESOLVE_UNIX`) would be another entry under [`Mechanism::Landlock`], not a new flag.
+
+use serde::{Deserialize, Serialize};
+
+/// The lowest Landlock ABI confinement accepts (see the module documentation).
+pub const LANDLOCK_ABI_FLOOR: u32 = 9;
+
+/// The host's confinement mode: the `[confine] mode` config key, tightened by
+/// `FCVM_CONFINE`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Each start is confined when it asks with `--confine`.
+    #[default]
+    Off,
+    /// Every start is confined, and one that cannot be fails.
+    Required,
+}
+
+impl std::str::FromStr for Mode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "off" => Ok(Mode::Off),
+            "required" => Ok(Mode::Required),
+            other => anyhow::bail!("unknown confinement mode {other:?}: expected off or required"),
+        }
+    }
+}
+
+/// The `[confine]` table of the fcvm config.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub struct ConfineConfig {
+    #[serde(default)]
+    pub mode: Mode,
+}
+
+static CONFIG_MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+
+/// Record the config's mode; called once by [`crate::paths::init_from_loaded_config`].
+pub fn set_config_mode(mode: Mode) {
+    let _ = CONFIG_MODE.set(mode);
+}
+
+/// The environment variable that can make a host's mode stricter than its config.
+pub const MODE_ENV: &str = "FCVM_CONFINE";
+
+/// The host's mode: the config's, unless `FCVM_CONFINE` asks for a stricter one. An
+/// environment value that would loosen the config is an error, not ignored.
+pub fn host_mode(config: Mode, env: Option<&str>) -> anyhow::Result<Mode> {
+    let Some(env) = env else {
+        return Ok(config);
+    };
+    let from_env: Mode = env
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{MODE_ENV}={env}: {e}"))?;
+    anyhow::ensure!(
+        from_env >= config,
+        "{MODE_ENV}={env} cannot loosen the fcvm config's [confine] mode = \"required\""
+    );
+    Ok(from_env)
+}
+
+/// A layer of confinement, recorded in VM state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Layer {
+    /// No capabilities and none to regain, `no_new_privs`, no core dumps.
+    Process,
+}
+
+/// How a VM's VMM was confined, recorded in its state and shown by `fcvm ls`. It is a
+/// property of the VMM process: it enters no snapshot, cache or pool key, so a confined
+/// clone restores a snapshot an unconfined VMM wrote and the reverse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confinement {
+    /// The kernel's Landlock ABI when the VM started.
+    pub landlock_abi: u32,
+    pub layers: Vec<Layer>,
+}
+
+/// What a missing piece belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mechanism {
+    /// The kernel's Landlock support.
+    Landlock,
+    /// The VMM backend.
+    Backend,
+    /// The network mode.
+    Network,
+    /// A debugging setting that needs the VMM unconfined.
+    Debugging,
+    /// The command itself.
+    Command,
+}
+
+impl std::fmt::Display for Mechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Mechanism::Landlock => "landlock",
+            Mechanism::Backend => "backend",
+            Mechanism::Network => "network",
+            Mechanism::Debugging => "debugging",
+            Mechanism::Command => "command",
+        })
+    }
+}
+
+/// One piece of confinement a start cannot have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Missing {
+    pub mechanism: Mechanism,
+    pub detail: String,
+}
+
+/// The network mode of the VM being started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Rootless,
+    Bridged,
+    Routed,
+}
+
+impl From<crate::cli::NetworkMode> for Network {
+    fn from(mode: crate::cli::NetworkMode) -> Self {
+        match mode {
+            crate::cli::NetworkMode::Rootless => Network::Rootless,
+            crate::cli::NetworkMode::Bridged => Network::Bridged,
+            crate::cli::NetworkMode::Routed => Network::Routed,
+        }
+    }
+}
+
+impl From<crate::firecracker::config::NetworkMode> for Network {
+    fn from(mode: crate::firecracker::config::NetworkMode) -> Self {
+        match mode {
+            crate::firecracker::config::NetworkMode::Rootless => Network::Rootless,
+            crate::firecracker::config::NetworkMode::Bridged => Network::Bridged,
+            crate::firecracker::config::NetworkMode::Routed => Network::Routed,
+        }
+    }
+}
+
+/// One start, as confinement sees it.
+#[derive(Debug, Clone)]
+pub struct Request<'a> {
+    /// `--confine` was given.
+    pub flag: bool,
+    pub backend: crate::hypervisor::Backend,
+    pub network: Network,
+    /// The extra Firecracker arguments the VMM would get (`FCVM_FIRECRACKER_ARGS` included).
+    pub firecracker_args: Option<&'a str>,
+    /// Why this command cannot confine its VMM at all, when it cannot.
+    pub unsupported: Option<&'static str>,
+}
+
+/// What the host offers, read once per start.
+#[derive(Debug, Clone)]
+pub struct Host {
+    pub mode: Mode,
+    /// The Landlock ABI, or the errno `landlock_create_ruleset` failed with.
+    pub landlock_abi: Result<u32, i32>,
+    pub strace_fc: bool,
+    pub no_seccomp: bool,
+    /// `FCVM_FIRECRACKER_ARGS`.
+    pub firecracker_args: Option<String>,
+}
+
+impl Host {
+    /// Read this host: the config's mode, `FCVM_CONFINE`, the kernel's Landlock ABI and the
+    /// debugging environment variables.
+    pub fn read() -> anyhow::Result<Self> {
+        let env = std::env::var(MODE_ENV).ok();
+        Ok(Host {
+            mode: host_mode(
+                CONFIG_MODE.get().copied().unwrap_or_default(),
+                env.as_deref(),
+            )?,
+            landlock_abi: landlock_abi(),
+            strace_fc: std::env::var_os("FCVM_STRACE_FC").is_some(),
+            no_seccomp: std::env::var_os("FCVM_NO_SECCOMP").is_some(),
+            firecracker_args: std::env::var("FCVM_FIRECRACKER_ARGS").ok(),
+        })
+    }
+}
+
+/// The kernel's Landlock ABI version, or the errno: EOPNOTSUPP when Landlock is built but
+/// not enabled, ENOSYS when it is not built.
+pub fn landlock_abi() -> Result<u32, i32> {
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_uint = 1;
+    // SAFETY: with a null attribute and size 0 the call only reports the version.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if abi < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        Ok(abi as u32)
+    }
+}
+
+/// Every piece of confinement `request` cannot have on `host`.
+pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
+    let mut missing = Vec::new();
+    let mut add = |mechanism, detail: String| missing.push(Missing { mechanism, detail });
+    if let Some(reason) = request.unsupported {
+        add(Mechanism::Command, reason.to_string());
+    }
+    match host.landlock_abi {
+        Ok(abi) if abi >= LANDLOCK_ABI_FLOOR => {}
+        Ok(abi) => add(
+            Mechanism::Landlock,
+            format!(
+                "the kernel's Landlock ABI is {abi}; confinement needs ABI {LANDLOCK_ABI_FLOOR} \
+                 or later, whose RESOLVE_UNIX right restricts connect() to pathname Unix sockets"
+            ),
+        ),
+        Err(errno) => add(
+            Mechanism::Landlock,
+            format!(
+                "Landlock is unavailable ({}); confinement needs Landlock ABI \
+                 {LANDLOCK_ABI_FLOOR} or later",
+                std::io::Error::from_raw_os_error(errno)
+            ),
+        ),
+    }
+    if request.backend != crate::hypervisor::Backend::Firecracker {
+        add(
+            Mechanism::Backend,
+            "confinement supports the Firecracker backend only".to_string(),
+        );
+    }
+    match request.network {
+        Network::Rootless => {}
+        Network::Bridged | Network::Routed => add(
+            Mechanism::Network,
+            format!(
+                "--network {} runs the VMM as root; confinement supports --network rootless \
+                 only until a later change drops a root VMM to an unprivileged uid before exec",
+                if request.network == Network::Bridged {
+                    "bridged"
+                } else {
+                    "routed"
+                }
+            ),
+        ),
+    }
+    if host.strace_fc {
+        add(
+            Mechanism::Debugging,
+            "FCVM_STRACE_FC runs the VMM under strace, which must fork and ptrace".to_string(),
+        );
+    }
+    if host.no_seccomp {
+        add(
+            Mechanism::Debugging,
+            "FCVM_NO_SECCOMP turns the VMM's seccomp filter off".to_string(),
+        );
+    }
+    for args in [request.firecracker_args, host.firecracker_args.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        for arg in ["--no-seccomp", "--seccomp-filter"] {
+            if args.split_whitespace().any(|a| a == arg) {
+                add(
+                    Mechanism::Debugging,
+                    format!("the extra Firecracker arguments set {arg}, which confinement owns"),
+                );
+            }
+        }
+    }
+    missing
+}
+
+/// Decide whether this start is confined. `Ok(None)` is an unconfined start the host
+/// allows; an error lists everything a start that must be confined is missing.
+pub fn decide(request: &Request<'_>, host: &Host) -> anyhow::Result<Option<Confinement>> {
+    if !request.flag && host.mode == Mode::Off {
+        return Ok(None);
+    }
+    let missing = missing(request, host);
+    if missing.is_empty() {
+        return Ok(Some(Confinement {
+            landlock_abi: host.landlock_abi.unwrap_or_default(),
+            layers: vec![Layer::Process],
+        }));
+    }
+    let why = if request.flag {
+        "--confine was given"
+    } else {
+        "the host requires confinement ([confine] mode or FCVM_CONFINE = required)"
+    };
+    let list: String = missing
+        .iter()
+        .map(|m| format!("\n  {}: {}", m.mechanism, m.detail))
+        .collect();
+    anyhow::bail!("{why}, and this start cannot be confined; nothing was started:{list}")
+}
+
+/// [`decide`] on this host.
+pub fn resolve(request: &Request<'_>) -> anyhow::Result<Option<Confinement>> {
+    let host = Host::read()?;
+    let decided = decide(request, &host)?;
+    if let Some(confinement) = &decided {
+        tracing::info!(
+            landlock_abi = confinement.landlock_abi,
+            layers = ?confinement.layers,
+            "the VMM will be confined"
+        );
+    }
+    Ok(decided)
+}
+
+const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+const TUNSETOWNER: libc::c_ulong = 0x4004_54cc;
+
+/// A TAP name as `struct ifreq` takes it, built before the fork.
+#[derive(Debug, Clone)]
+pub struct TapName([u8; libc::IFNAMSIZ]);
+
+impl TapName {
+    pub fn new(name: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !name.is_empty() && name.len() < libc::IFNAMSIZ && !name.contains('\0'),
+            "TAP name {name:?} does not fit an ifreq"
+        );
+        let mut bytes = [0u8; libc::IFNAMSIZ];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        Ok(Self(bytes))
+    }
+}
+
+/// Make the persistent TAP `name` owned by the calling process's uid: attach with
+/// `TUNSETIFF`, which needs CAP_NET_ADMIN over the namespace, set `TUNSETOWNER`, detach.
+/// On Linux 7.3 a process without CAP_NET_ADMIN gets EPERM attaching to an unowned TAP (7.0
+/// lets it), so a confined VMM's TAP is owned before its capabilities are dropped. Only
+/// confined starts do this, so the default path's namespace build is untouched.
+///
+/// Async-signal-safe: raw syscalls only, no allocation.
+pub(crate) fn own_tap(name: &TapName) -> std::io::Result<()> {
+    #[repr(C)]
+    struct IfReq {
+        name: [u8; libc::IFNAMSIZ],
+        flags: libc::c_short,
+        pad: [u8; 22],
+    }
+    let request = IfReq {
+        name: name.0,
+        flags: 0x0002 | 0x1000, // IFF_TAP | IFF_NO_PI
+        pad: [0; 22],
+    };
+    // SAFETY: a NUL-terminated literal path.
+    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `request` is a struct ifreq that outlives the call; TUNSETOWNER takes the uid
+    // by value; `fd` is ours to close.
+    let result = unsafe {
+        if libc::ioctl(fd, TUNSETIFF as _, &request) != 0
+            || libc::ioctl(fd, TUNSETOWNER as _, libc::geteuid() as libc::c_ulong) != 0
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+    // SAFETY: `fd` is ours.
+    unsafe { libc::close(fd) };
+    result
+}
+
+/// Apply [`Layer::Process`] to the calling process. Runs in the VMM's pre_exec, after it
+/// has entered its namespaces and before `PR_SET_PDEATHSIG`. It needs CAP_SETPCAP, which
+/// the process holds after entering the holder's user namespace.
+///
+/// Async-signal-safe: raw syscalls only, no allocation. No step changes a uid, gid or
+/// fsuid or raises a capability, so none clears the parent-death signal.
+pub(crate) fn apply_process_layer() -> std::io::Result<()> {
+    // securebits (linux/securebits.h): NOROOT, NO_SETUID_FIXUP and NO_CAP_AMBIENT_RAISE on,
+    // KEEP_CAPS off, all four locked. With NOROOT the exec as namespace uid 0 grants no
+    // capabilities.
+    const SECBITS: libc::c_ulong = (1 << 0) // SECBIT_NOROOT
+        | (1 << 1) // SECBIT_NOROOT_LOCKED
+        | (1 << 2) // SECBIT_NO_SETUID_FIXUP
+        | (1 << 3) // SECBIT_NO_SETUID_FIXUP_LOCKED
+        | (1 << 5) // SECBIT_KEEP_CAPS_LOCKED
+        | (1 << 6) // SECBIT_NO_CAP_AMBIENT_RAISE
+        | (1 << 7); // SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let check = |rc: libc::c_int| {
+        if rc != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    };
+
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit reads the struct, which outlives the call.
+    check(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) })?;
+    // SAFETY: prctl with integer arguments only.
+    check(unsafe { libc::prctl(libc::PR_SET_SECUREBITS, SECBITS) })?;
+    // Capability numbers past the kernel's last one fail with EINVAL, which ends the loop.
+    for cap in 0..64 as libc::c_ulong {
+        // SAFETY: prctl with integer arguments only.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) && cap > 0 {
+                break;
+            }
+            return Err(error);
+        }
+    }
+    // SAFETY: prctl with integer arguments only.
+    check(unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    })?;
+    let header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capset reads a version 3 header and two data structs, both outlive the call.
+    check(unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } as libc::c_int)?;
+    // SAFETY: prctl with integer arguments only.
+    check(unsafe {
+        libc::prctl(
+            libc::PR_SET_NO_NEW_PRIVS,
+            1 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hypervisor::Backend;
+
+    fn host(abi: Result<u32, i32>) -> Host {
+        Host {
+            mode: Mode::Off,
+            landlock_abi: abi,
+            strace_fc: false,
+            no_seccomp: false,
+            firecracker_args: None,
+        }
+    }
+
+    fn request(flag: bool) -> Request<'static> {
+        Request {
+            flag,
+            backend: Backend::Firecracker,
+            network: Network::Rootless,
+            firecracker_args: None,
+            unsupported: None,
+        }
+    }
+
+    #[test]
+    fn an_unconfined_start_on_an_off_host_is_left_alone_whatever_the_kernel() {
+        assert_eq!(decide(&request(false), &host(Ok(1))).unwrap(), None);
+        assert_eq!(
+            decide(&request(false), &host(Err(libc::ENOSYS))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_confined_start_records_the_abi_and_its_layers() {
+        assert_eq!(
+            decide(&request(true), &host(Ok(11))).unwrap(),
+            Some(Confinement {
+                landlock_abi: 11,
+                layers: vec![Layer::Process],
+            })
+        );
+    }
+
+    /// The x64 CI runners' 6.14 kernel has ABI 6 and stock 7.0 has 8: both are refused,
+    /// naming the ABI found.
+    #[test]
+    fn below_the_landlock_floor_the_start_is_refused_naming_the_abi() {
+        for abi in [4, 6, 8] {
+            let error = decide(&request(true), &host(Ok(abi)))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("landlock: the kernel's Landlock ABI is {abi};")),
+                "{error}"
+            );
+            assert!(error.contains("nothing was started"), "{error}");
+        }
+        let error = decide(&request(true), &host(Err(libc::EOPNOTSUPP)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("landlock: Landlock is unavailable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn every_missing_piece_is_listed_by_mechanism() {
+        let request = Request {
+            flag: true,
+            backend: Backend::CloudHypervisor,
+            network: Network::Bridged,
+            firecracker_args: Some("--enable-nv2 --no-seccomp"),
+            unsupported: None,
+        };
+        let host = Host {
+            mode: Mode::Off,
+            landlock_abi: Ok(6),
+            strace_fc: true,
+            no_seccomp: true,
+            firecracker_args: Some("--seccomp-filter /x.bpf".to_string()),
+        };
+        let mechanisms: Vec<Mechanism> = missing(&request, &host)
+            .iter()
+            .map(|m| m.mechanism)
+            .collect();
+        assert_eq!(
+            mechanisms,
+            vec![
+                Mechanism::Landlock,
+                Mechanism::Backend,
+                Mechanism::Network,
+                Mechanism::Debugging,
+                Mechanism::Debugging,
+                Mechanism::Debugging,
+                Mechanism::Debugging,
+            ]
+        );
+        let error = decide(&request, &host).unwrap_err().to_string();
+        for needle in [
+            "backend: confinement supports the Firecracker backend only",
+            "network: --network bridged runs the VMM as root",
+            "debugging: FCVM_STRACE_FC",
+            "debugging: FCVM_NO_SECCOMP",
+            "debugging: the extra Firecracker arguments set --no-seccomp",
+            "debugging: the extra Firecracker arguments set --seccomp-filter",
+        ] {
+            assert!(error.contains(needle), "missing {needle:?} in {error}");
+        }
+    }
+
+    #[test]
+    fn routed_and_an_unsupported_command_are_refused() {
+        let request = Request {
+            network: Network::Routed,
+            unsupported: Some("raw VM snapshots"),
+            ..request(true)
+        };
+        let error = decide(&request, &host(Ok(11))).unwrap_err().to_string();
+        assert!(error.contains("command: raw VM snapshots"), "{error}");
+        assert!(error.contains("network: --network routed"), "{error}");
+    }
+
+    #[test]
+    fn a_required_host_confines_a_start_without_the_flag_or_refuses_it() {
+        let required = Host {
+            mode: Mode::Required,
+            ..host(Ok(11))
+        };
+        assert!(decide(&request(false), &required).unwrap().is_some());
+        let required_old = Host {
+            mode: Mode::Required,
+            ..host(Ok(6))
+        };
+        let error = decide(&request(false), &required_old)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("the host requires confinement"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_environment_can_tighten_the_config_but_not_loosen_it() {
+        assert_eq!(host_mode(Mode::Off, None).unwrap(), Mode::Off);
+        assert_eq!(
+            host_mode(Mode::Off, Some("required")).unwrap(),
+            Mode::Required
+        );
+        assert_eq!(
+            host_mode(Mode::Required, Some("required")).unwrap(),
+            Mode::Required
+        );
+        let error = host_mode(Mode::Required, Some("off"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot loosen"), "{error}");
+        assert!(host_mode(Mode::Off, Some("on")).is_err());
+    }
+
+    #[test]
+    fn the_config_key_parses_and_defaults_to_off() {
+        #[derive(Deserialize)]
+        struct Doc {
+            #[serde(default)]
+            confine: ConfineConfig,
+        }
+        let empty: Doc = toml::from_str("").unwrap();
+        assert_eq!(empty.confine.mode, Mode::Off);
+        let required: Doc = toml::from_str("[confine]\nmode = \"required\"\n").unwrap();
+        assert_eq!(required.confine.mode, Mode::Required);
+    }
+
+    /// What the probe child prints about itself.
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    struct ProbeReport {
+        cap_eff: String,
+        cap_prm: String,
+        cap_bnd: String,
+        cap_amb: String,
+        no_new_privs: String,
+        /// errno of writing a network sysctl of its own namespace back unchanged, 0 if it
+        /// succeeded: the write needs CAP_NET_ADMIN over the namespace. Refused, it is EACCES
+        /// for an unprivileged invoker and EPERM when fcvm runs as root.
+        net_sysctl_errno: i32,
+        /// errno of `unshare(CLONE_NEWNS)`, 0 if it succeeded: needs CAP_SYS_ADMIN.
+        unshare_errno: i32,
+        core_limit: u64,
+        /// errno of attaching to the namespace's persistent TAP as the VMM does
+        /// (`TUNSETIFF` by name), 0 if it succeeded.
+        tap_attach_errno: i32,
+    }
+
+    const PROBE_ENV: &str = "FCVM_CONFINE_PROBE_CHILD";
+    /// Set for the probe that first makes the TAP, as the namespace's builder does.
+    const PROBE_MAKE_TAP_ENV: &str = "FCVM_CONFINE_PROBE_MAKE_TAP";
+    const PROBE_TAP: &str = "tap-probe";
+
+    /// `TUNSETIFF` on `name`, as Firecracker attaches to its TAP: the errno, or 0.
+    fn attach_tap(name: &str) -> i32 {
+        #[repr(C)]
+        struct IfReq {
+            name: [u8; libc::IFNAMSIZ],
+            flags: libc::c_short,
+            pad: [u8; 22],
+        }
+        let mut request = IfReq {
+            name: [0; libc::IFNAMSIZ],
+            flags: 0x0002 | 0x1000, // IFF_TAP | IFF_NO_PI
+            pad: [0; 22],
+        };
+        request.name[..name.len()].copy_from_slice(name.as_bytes());
+        // SAFETY: a NUL-terminated literal path.
+        let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        assert!(
+            fd >= 0,
+            "open /dev/net/tun: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `request` is a struct ifreq that outlives the call.
+        let rc = unsafe { libc::ioctl(fd, 0x4004_54ca as _, &request) };
+        let errno = if rc == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+        };
+        // SAFETY: fd is ours.
+        unsafe { libc::close(fd) };
+        errno
+    }
+
+    /// The probe child's body. It is a test so that the test binary can run it in a child
+    /// spawned through the VMM's pre_exec (`probe_reports`); run any other way it has no
+    /// child to be and returns.
+    #[test]
+    fn confine_probe_child() {
+        if std::env::var_os(PROBE_ENV).is_none() {
+            return;
+        }
+        if std::env::var_os(PROBE_MAKE_TAP_ENV).is_some() {
+            crate::network::rtnl::add_tap(PROBE_TAP).expect("making the probe's TAP");
+        }
+        let tap_attach_errno = attach_tap(PROBE_TAP);
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}:")))
+                .unwrap_or_else(|| panic!("{name} in /proc/self/status"))
+                .trim()
+                .to_string()
+        };
+        let errno = |ok: bool| {
+            if ok {
+                0
+            } else {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            }
+        };
+        let sysctl = "/proc/sys/net/ipv4/conf/lo/forwarding";
+        let value = std::fs::read(sysctl).unwrap();
+        let net_sysctl_errno = match std::fs::write(sysctl, &value) {
+            Ok(()) => 0,
+            Err(e) => e.raw_os_error().unwrap_or(-1),
+        };
+        // SAFETY: unshare of the mount namespace affects this short-lived child only.
+        let unshare_errno = errno(unsafe { libc::unshare(libc::CLONE_NEWNS) } == 0);
+        let mut core = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        // SAFETY: getrlimit writes the struct.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) }, 0);
+        println!(
+            "PROBE {}",
+            serde_json::json!({
+                "cap_eff": field("CapEff"),
+                "cap_prm": field("CapPrm"),
+                "cap_bnd": field("CapBnd"),
+                "cap_amb": field("CapAmb"),
+                "no_new_privs": field("NoNewPrivs"),
+                "net_sysctl_errno": net_sysctl_errno,
+                "unshare_errno": unshare_errno,
+                "core_limit": core.rlim_max,
+                "tap_attach_errno": tap_attach_errno,
+            })
+        );
+    }
+
+    /// Run [`confine_probe_child`] in the namespaces of a rootless holder, through the
+    /// same pre_exec a VMM gets, confined or not.
+    async fn probe_report(holder_pid: u32, confine: bool, make_tap: bool) -> ProbeReport {
+        let mut cmd = tokio::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "confine::tests::confine_probe_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE_ENV, "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        if make_tap {
+            cmd.env(PROBE_MAKE_TAP_ENV, "1");
+        }
+        crate::utils::install_namespace_pre_exec(
+            &mut cmd,
+            &crate::utils::NamespaceParams {
+                vm_id: "confine-probe".to_string(),
+                user_namespace_path: Some(format!("/proc/{holder_pid}/ns/user").into()),
+                net_namespace_path: Some(format!("/proc/{holder_pid}/ns/net").into()),
+                confine,
+                tap_owner: confine.then(|| PROBE_TAP.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "probe failed: {}\nstdout: {stdout}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // libtest prints the test's name and its output on one line.
+        let line = stdout
+            .lines()
+            .find_map(|l| l.find("PROBE ").map(|at| &l[at + "PROBE ".len()..]))
+            .unwrap_or_else(|| panic!("no PROBE line in {stdout}"));
+        serde_json::from_str(line).unwrap()
+    }
+
+    /// Unconfined, the VMM holds every capability in the holder's user namespace and can
+    /// reconfigure the namespace's network and make mount namespaces. Confined, it holds
+    /// none, the exec as namespace uid 0 gave none back, and both of those fail. It still
+    /// attaches to the namespace's TAP, which `rtnl::add_tap` made unowned, as the default
+    /// path makes every TAP, because its pre_exec owned the TAP before dropping its
+    /// capabilities: on Linux 7.3 a process without CAP_NET_ADMIN gets EPERM attaching to an
+    /// unowned TAP (on 7.0 it does not).
+    /// (The parent-death signal is checked on a real VMM in tests/test_confine.rs: the probe
+    /// runs in a libtest thread, and a new thread's parent-death signal is always 0.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_process_layer_leaves_the_vmm_no_capabilities_in_its_namespace() {
+        let (mut holder, holder_pid) = crate::commands::common::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        // The first probe makes the TAP as the namespace's builder does (`rtnl::add_tap`).
+        let open = probe_report(holder_pid, false, true).await;
+        let confined = probe_report(holder_pid, true, false).await;
+        let _ = holder.start_kill();
+        let _ = holder.wait().await;
+        crate::companion::forget(holder_pid);
+        crate::network::netns_agent::forget(holder_pid);
+
+        // Refused either way; which errno depends on whether fcvm runs as root.
+        assert!(
+            [libc::EACCES, libc::EPERM].contains(&confined.net_sysctl_errno),
+            "{confined:?}"
+        );
+        let confined = ProbeReport {
+            net_sysctl_errno: libc::EACCES,
+            ..confined
+        };
+
+        // The control: the probe sees what an unconfined VMM has today.
+        assert_ne!(open.cap_eff, "0000000000000000", "{open:?}");
+        assert_eq!(open.net_sysctl_errno, 0, "{open:?}");
+        assert_eq!(open.unshare_errno, 0, "{open:?}");
+        assert_eq!(open.no_new_privs, "0", "{open:?}");
+        assert_eq!(open.tap_attach_errno, 0, "{open:?}");
+
+        assert_eq!(
+            confined,
+            ProbeReport {
+                cap_eff: "0000000000000000".to_string(),
+                cap_prm: "0000000000000000".to_string(),
+                cap_bnd: "0000000000000000".to_string(),
+                cap_amb: "0000000000000000".to_string(),
+                no_new_privs: "1".to_string(),
+                net_sysctl_errno: libc::EACCES,
+                unshare_errno: libc::EPERM,
+                core_limit: 0,
+                tap_attach_errno: 0,
+            }
+        );
+    }
+}

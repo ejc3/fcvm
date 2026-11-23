@@ -812,6 +812,13 @@ pub struct NamespaceParams {
     /// while it holds the lease (and again from the same lease after a guest reboot), and
     /// drops the lease only after the VMM has exited.
     pub keep_fds: Vec<std::os::fd::RawFd>,
+    /// Apply [`crate::confine::Layer::Process`] after the namespaces are entered. Needs
+    /// `user_namespace_path`: the layer drops capabilities held in that namespace.
+    pub confine: bool,
+    /// With `confine`: the namespace's persistent TAP, made owned by the VMM's uid before
+    /// its capabilities are dropped ([`crate::confine::own_tap`]), so the VMM can attach
+    /// to it without CAP_NET_ADMIN. Only an unpooled namespace, which is this VM's alone.
+    pub tap_owner: Option<String>,
 }
 
 /// The mount namespace that gives a restored clone's VMM its own directories at the
@@ -1270,6 +1277,31 @@ pub fn install_namespace_pre_exec(
                 }
 
                 Ok(())
+            });
+        }
+    }
+
+    if ns.confine {
+        anyhow::ensure!(
+            ns.user_namespace_path.is_some(),
+            "confining the VMM of {} needs it to enter a user namespace (rootless mode)",
+            ns.vm_id
+        );
+        let tap = ns
+            .tap_owner
+            .as_deref()
+            .map(crate::confine::TapName::new)
+            .transpose()?;
+        // After the namespace step, which needs the capabilities this drops, and before
+        // PR_SET_PDEATHSIG, which stays last. The TAP is owned while CAP_NET_ADMIN is held.
+        // SAFETY: own_tap and apply_process_layer make raw syscalls only and do not
+        // allocate; the name was built before the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Some(tap) = &tap {
+                    crate::confine::own_tap(tap)?;
+                }
+                crate::confine::apply_process_layer()
             });
         }
     }

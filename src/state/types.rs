@@ -56,6 +56,9 @@ pub struct VmState {
     /// afterwards. A reader of a state whose owner is dead must not use it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub netpool: Option<PooledNamespace>,
+    /// How this VM's VMM is confined (`--confine`), when it is (`crate::confine`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confinement: Option<crate::confine::Confinement>,
     /// Monotonically increasing count of host-side vsock transport resets.
     /// Bumped (locked read-modify-write via `StateManager::bump_vsock_epoch`)
     /// after every snapshot pause/save of this VM and BEFORE the VM resumes:
@@ -434,6 +437,7 @@ impl VmState {
             lifecycle_ready: false,
             holder_pid: None,
             netpool: None,
+            confinement: None,
             vsock_epoch: 0,
             created_at: now,
             last_updated: now,

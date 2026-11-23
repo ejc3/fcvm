@@ -102,6 +102,12 @@ impl Hypervisor for FirecrackerBackend {
         if let Some(redirects) = &spec.mount_redirects {
             self.vm.set_mount_redirects(redirects.clone());
         }
+        if spec.confinement.is_some() {
+            self.vm.set_confinement(spec.confinement.clone());
+        }
+        if spec.tap_owner.is_some() {
+            self.vm.set_tap_owner(spec.tap_owner.clone());
+        }
         self.pci_transport = crate::gpu::pci_transport_enabled(spec.extra_args.as_deref());
         self.vm
             .start(&spec.binary, None, spec.extra_args.as_deref())

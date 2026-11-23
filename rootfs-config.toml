@@ -18,6 +18,12 @@ assets_dir = "/mnt/fcvm-btrfs"
 # Ignored if the host filesystem is already btrfs.
 btrfs_size = "60G"
 
+# Confinement of each VM's VMM (`--confine` on `podman run` and `snapshot run`; src/confine.rs).
+# "off": a start is confined when it passes --confine. "required": every start is confined,
+# and one that cannot be fails. FCVM_CONFINE=required tightens this; it cannot loosen it.
+[confine]
+mode = "off"
+
 # Pinned pasta (passt) build
 # This upstream commit keeps `-a`, `-g` and `-n` on a host with no IPv4
 # interface for pasta to copy its configuration from. Before it, pasta used

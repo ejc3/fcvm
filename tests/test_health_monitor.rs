@@ -40,6 +40,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
         lifecycle_ready: false,
         holder_pid: None,
         netpool: None,
+        confinement: None,
         vsock_epoch: 0,
         created_at: now,
         last_updated: now,

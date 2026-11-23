@@ -3318,6 +3318,13 @@ async fn cmd_snapshot_run_inner(
         args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
     );
     vm_state.name = Some(vm_name.clone());
+    vm_state.confinement = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: snapshot_config.metadata.hypervisor,
+        network: snapshot_config.metadata.network_mode.into(),
+        firecracker_args: args.firecracker_args.as_deref(),
+        unsupported: None,
+    })?;
 
     // Save snapshot tracking info in clone state
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
@@ -3789,9 +3796,10 @@ async fn cmd_snapshot_run_inner(
                 .with_loopback_ip(loopback_ip)
                 .with_dns_server(resolvers.mode_server.clone())
                 .with_restore_mode()
-                .with_pooling(
-                    snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker,
-                );
+                .with_pooling(clone_may_pool(
+                    snapshot_config.metadata.hypervisor,
+                    vm_state.confinement.is_some(),
+                ));
             Box::new(net)
         }
     };
@@ -6016,6 +6024,7 @@ fn run_args_from_snapshot_metadata(
         // The VM's cgroup, and its swap setting, were entered from the snapshot run's own
         // --no-swap before this runs (`crate::cgroup`).
         no_swap: false,
+        confine: false,
     }
 }
 
@@ -6177,6 +6186,14 @@ async fn cmd_snapshot_run_raw(
     validate_vm_name(&vm_name).context("invalid VM name")?;
     paths::check_socket_path_budget(&vm_id)?;
 
+    // Refused when asked for, or when the host requires it: this path does not confine.
+    crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: crate::hypervisor::Backend::Firecracker,
+        network: crate::confine::Network::Rootless,
+        firecracker_args: args.firecracker_args.as_deref(),
+        unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
+    })?;
     let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
     let mut vm_state = VmState::new(
@@ -6580,8 +6597,25 @@ async fn record_diff_parent(
         .map(|opt| opt.map(|_| ()))
 }
 
+/// Whether a clone may take its namespace from the pool (`crate::netpool`). A Cloud
+/// Hypervisor restore has not been run in one. A confined clone builds its own: a pooled
+/// TAP is unowned and shared across leases, and a confined VMM, without CAP_NET_ADMIN, can
+/// attach only to a TAP owned by its uid (Linux 7.3), which only an unpooled namespace may
+/// be given. A pooled confined clone needs the inherited TAP queue of #2051.
+fn clone_may_pool(hypervisor: crate::hypervisor::Backend, confined: bool) -> bool {
+    hypervisor == crate::hypervisor::Backend::Firecracker && !confined
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_confined_clone_builds_its_own_namespace() {
+        use crate::hypervisor::Backend;
+        assert!(super::clone_may_pool(Backend::Firecracker, false));
+        assert!(!super::clone_may_pool(Backend::Firecracker, true));
+        assert!(!super::clone_may_pool(Backend::CloudHypervisor, false));
+    }
+
     /// Only the File backend carries a write set: its sidecar is named in the branch that
     /// chooses the File backend, after the implicit UFFD server that hugepage and NV2
     /// snapshots restore through (direct_restore_memory, pinned by the tests of that
@@ -8466,6 +8500,7 @@ mod tests {
             prepare: None,
             no_dirty_tracking: false,
             no_swap: false,
+            confine: false,
             vsock_dir: None,
             publish: vec![],
             publish_limit_per_source: None,
@@ -8954,6 +8989,7 @@ mod tests {
             prepare: None,
             no_dirty_tracking: false,
             no_swap: false,
+            confine: false,
             vsock_dir: None,
             publish: vec![],
             publish_limit_per_source: None,

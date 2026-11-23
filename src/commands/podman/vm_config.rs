@@ -1921,6 +1921,11 @@ async fn run_vm_setup_inner(
         binary: vmm_bin.clone(),
         extra_args: vmm_extra_args.clone(),
         vm_name: Some(vm_name),
+        confinement: vm_state.confinement.clone(),
+        tap_owner: vm_state
+            .confinement
+            .as_ref()
+            .map(|_| network.tap_device().to_string()),
         ..Default::default()
     };
 

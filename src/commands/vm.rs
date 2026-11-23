@@ -586,6 +586,14 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         path: paths::vm_runtime_dir(&vm_id),
     })?;
     paths::check_socket_path_budget(&vm_id)?;
+    // Refused when the host requires confinement: this command does not confine.
+    crate::confine::resolve(&crate::confine::Request {
+        flag: false,
+        backend: crate::hypervisor::Backend::Firecracker,
+        network: args.network.into(),
+        firecracker_args: None,
+        unsupported: Some("fcvm vm run does not support confinement yet"),
+    })?;
     let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
         .await
