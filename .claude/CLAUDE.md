@@ -1593,7 +1593,8 @@ How it works:
   packet: 311 MiB for a 75 s FUSE workload in a small VM, and 9.99 GiB in the first 84 minutes
   of a 128 GiB guest whose volumes are FUSE over vsock.
   While the VMM runs, fcvm repeats each ERROR line Firecracker writes there as a WARN in its own log (the
-  first 20 per process; the rest are counted when it stops). A guest disk write the host refused (ENOSPC) is
+  first 20 per process; the rest are counted when it stops). fcvm empties the file before each launch, because
+  Firecracker writes it from its start without truncating it. A guest disk write the host refused (ENOSPC) is
   recorded nowhere else, and the guest sees it only as an I/O error that remounts its filesystem read-only.
 
 ### Common Commands

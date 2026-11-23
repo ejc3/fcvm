@@ -181,6 +181,37 @@ impl FirecrackerLogErrors {
         }
         Ok(lines)
     }
+
+    /// [`Self::read_new`] until the end of the file, in reads of at most
+    /// [`FIRECRACKER_LOG_READ_MAX`], for the last read when the VMM has stopped.
+    fn read_rest<F: std::io::Read + std::io::Seek>(
+        &mut self,
+        file: &mut F,
+    ) -> std::io::Result<Vec<String>> {
+        let mut lines = Vec::new();
+        loop {
+            let before = self.offset;
+            lines.extend(self.read_new(file)?);
+            if self.offset - before < FIRECRACKER_LOG_READ_MAX {
+                return Ok(lines);
+            }
+        }
+    }
+}
+
+/// Empties the log `path` names before a launch. Firecracker opens `--log-path` without
+/// truncating it and writes from its start, so a relaunch over the log an earlier process wrote
+/// would leave that process's lines after its own, and the follower would repeat that
+/// process's errors as the new one's. A missing log is left to be created.
+fn clear_log_before_launch(path: &Path) -> Result<()> {
+    match std::fs::OpenOptions::new().write(true).open(path) {
+        Ok(file) => file
+            .set_len(0)
+            .with_context(|| format!("emptying {} before launching Firecracker", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("opening {} before launching Firecracker", path.display())),
+    }
 }
 
 /// Repeats Firecracker's ERROR lines in fcvm's log while the VMM runs, under fcvm's own target,
@@ -208,32 +239,47 @@ impl FirecrackerLogFollower {
         }
     }
 
-    /// Reads what Firecracker appended and logs its ERROR lines. With `last`, also logs how many
-    /// were only counted since the last report.
-    fn poll(&mut self, last: bool) {
-        if self.failed {
-            return;
-        }
-        if self.file.is_none() {
+    /// Reads what Firecracker appended and logs its ERROR lines; with `last`, to the end of the
+    /// file, and then how many were only counted since the last report. A failed read stops the
+    /// reading, not that report. Returns the messages it logged.
+    fn poll(&mut self, last: bool) -> Vec<String> {
+        let mut messages = Vec::new();
+        if !self.failed && self.file.is_none() {
             self.file = std::fs::File::open(&self.path).ok();
         }
-        if let Some(file) = self.file.as_mut() {
-            match self.errors.read_new(file) {
+        if let (false, Some(file)) = (self.failed, self.file.as_mut()) {
+            let read = if last {
+                self.errors.read_rest(file)
+            } else {
+                self.errors.read_new(file)
+            };
+            match read {
                 Ok(lines) => {
-                    for line in lines {
-                        warn!(vm_id = %self.vm_id, log = %self.path.display(), "Firecracker logged an error: {line}");
-                    }
+                    messages.extend(
+                        lines
+                            .into_iter()
+                            .map(|line| format!("Firecracker logged an error: {line}")),
+                    );
                 }
                 Err(error) => {
                     self.failed = true;
-                    warn!(vm_id = %self.vm_id, log = %self.path.display(), %error, "cannot read Firecracker's log, so its errors are no longer repeated here");
+                    messages.push(format!(
+                        "cannot read Firecracker's log ({error}), so its errors are no longer repeated here"
+                    ));
                 }
             }
         }
         if last && self.errors.counted > self.reported {
-            warn!(vm_id = %self.vm_id, log = %self.path.display(), more = self.errors.counted - self.reported, "Firecracker logged more errors than are repeated here; they are in its log");
+            messages.push(format!(
+                "Firecracker logged {} more errors than are repeated here; they are in its log",
+                self.errors.counted - self.reported
+            ));
             self.reported = self.errors.counted;
         }
+        for message in &messages {
+            warn!(vm_id = %self.vm_id, log = %self.path.display(), "{message}");
+        }
+        messages
     }
 }
 
@@ -432,6 +478,9 @@ impl VmManager {
         // A relaunch is another VMM process, and it maps no snapshot the previous one did.
         self.memory_in_use = None;
         self.stop_log_follower();
+        if let Some(log_path) = &self.log_path {
+            clear_log_before_launch(log_path)?;
+        }
         let log_level = firecracker_log_level(self.firecracker_log_level.as_deref())?;
         if let Some(ref name) = self.vm_name {
             info!(target: "vm", vm_name = %name, vm_id = %self.vm_id, "starting Firecracker process");
@@ -992,6 +1041,55 @@ mod tests {
             REPEATED_FIRECRACKER_ERRORS
         );
         assert_eq!(errors.counted, 5);
+    }
+
+    #[test]
+    fn firecracker_log_errors_read_rest_reaches_an_error_behind_a_large_backlog() {
+        let backlog = format!("{INFO_LINE}\n")
+            .repeat((FIRECRACKER_LOG_READ_MAX as usize / (INFO_LINE.len() + 1)) + 10);
+        let mut file = std::io::Cursor::new(format!("{backlog}{BLOCK_ENOSPC}\n").into_bytes());
+        let mut errors = FirecrackerLogErrors::default();
+        assert_eq!(
+            errors.read_rest(&mut file).unwrap(),
+            vec![BLOCK_ENOSPC.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_relaunch_repeats_only_the_new_processs_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::write(&path, format!("{BLOCK_ENOSPC}\n{INFO_LINE}\n")).unwrap();
+        clear_log_before_launch(&path).unwrap();
+        // Firecracker writes from the start of the file without truncating it.
+        let short = "t [i:main:ERROR:f.rs:1] new";
+        let mut log = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut log, format!("{short}\n").as_bytes()).unwrap();
+        let mut errors = FirecrackerLogErrors::default();
+        let mut file = std::fs::File::open(&path).unwrap();
+        assert_eq!(errors.read_new(&mut file).unwrap(), vec![short.to_string()]);
+        clear_log_before_launch(&dir.path().join("missing.log")).unwrap();
+    }
+
+    #[test]
+    fn the_last_poll_reports_the_counted_errors_after_a_failed_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::write(
+            &path,
+            format!("{BLOCK_ENOSPC}\n").repeat(REPEATED_FIRECRACKER_ERRORS + 5),
+        )
+        .unwrap();
+        let mut follower = FirecrackerLogFollower::new(path, "vm-test".to_string());
+        assert_eq!(follower.poll(false).len(), REPEATED_FIRECRACKER_ERRORS);
+        // Reading a directory fails with EISDIR.
+        follower.file = Some(std::fs::File::open(dir.path()).unwrap());
+        assert!(follower.poll(false)[0].starts_with("cannot read Firecracker's log"));
+        let last = follower.poll(true);
+        assert_eq!(
+            last,
+            vec!["Firecracker logged 5 more errors than are repeated here; they are in its log"]
+        );
     }
 
     #[test]
