@@ -370,11 +370,15 @@ const RESTORE_HAND_OFF_LINE: &str = "progress lines queued for the host over vso
 /// How fcvm logs a line of fc-agent's that crossed the serial console.
 const AGENT_CONSOLE_LINE: &str = "fcvm::console: [fc-agent]";
 
-/// Lines every restore logs on its way to readiness.
+/// Lines every restore logs on its way to readiness, each from
+/// `restore::handle_clone_restore`. How the watcher announces the epoch is not among
+/// them: a guest's first restore logs `detected restore-epoch`, and a restore of a
+/// snapshot of a restored VM logs `restore-epoch changed`, as the clone below does
+/// whenever its source VM started from a cached pre-start snapshot.
 const RESTORE_PROGRESS_LINES: [&str; 4] = [
-    "[fc-agent] detected restore-epoch",
     "[fc-agent] handling restore",
     "[fc-agent] restore phase=tcp-cleanup",
+    "[fc-agent] exec re-registered after restore",
     "[fc-agent] restore phases complete",
 ];
 
@@ -659,9 +663,9 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
         )
     };
     let progress = [
-        "[fc-agent] detected restore-epoch: e",
         "[fc-agent] handling restore (epoch=e)",
         "[fc-agent] restore phase=tcp-cleanup epoch=e begin",
+        "[fc-agent] exec re-registered after restore",
         "[fc-agent] restore phases complete (epoch=e): exec + egress ready elapsed_ms=9.8",
     ];
     let hand_off = format!(
@@ -715,6 +719,18 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
     assert!(log.progress_missing_from_agent.is_empty(), "{log:#?}");
     assert_eq!((&log.fallback_cause, &log.held_on_console), (&none, &none));
     assert!(!fails(&log), "a handed-over restore failed: {log:#?}");
+
+    // The same whichever way the watcher announced the epoch: a first restore's line, or
+    // the line of a restore of a snapshot of a restored VM.
+    for announced in [
+        "[fc-agent] detected restore-epoch: e",
+        "[fc-agent] restore-epoch changed: d -> e",
+    ] {
+        let log = RestoreLog::read(
+            &(hand_off.clone() + &from_agent(&[announced]) + &from_agent(&progress)),
+        );
+        assert!(!fails(&log), "{announced:?}: {log:#?}");
+    }
 
     // The hand-off line alone: nothing proves the progress lines reached the log.
     let log = RestoreLog::read(&hand_off);
@@ -886,6 +902,18 @@ fn the_restore_log_reader_tells_the_console_from_the_output_connection() {
             "{cause:?} is not read as a cause"
         );
         assert!(!fails(&log), "{log:#?}");
+    }
+    // Every marker is a line `handle_clone_restore` logs, so every restore has it.
+    let restore = include_str!("../fc-agent/src/restore.rs");
+    let handler = &restore[restore
+        .find("pub async fn handle_clone_restore(")
+        .expect("handle_clone_restore is in restore.rs")..];
+    let handler = &handler[..handler.find("\n}\n").expect("the function ends")];
+    for marker in RESTORE_PROGRESS_LINES {
+        assert!(
+            handler.contains(marker),
+            "{marker:?} is not a line of handle_clone_restore"
+        );
     }
     // The words and the window are fc-agent's own.
     let agent = include_str!("../fc-agent/src/console.rs");
