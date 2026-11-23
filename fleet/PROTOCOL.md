@@ -2199,10 +2199,21 @@ or `keep-built`. Those seven are the repository's only mutable tags, and
   image. Off, prod's sets carry no lane image and its releases are the ones without a lane.
 - **Manual rollback.** `fleet-prod-rollback.yml` takes its lane flag from both recorded entries:
   the previous set's lane image when it names one, else `none` when the current set names one,
-  else no flag, which is today's release. Its first step (`prod_release.py current`) refuses when
-  prod runs another lane image than its record's current entry names, or when the function could
-  not read it (`lane_error`), before any release. The record job writes the restored set with the
+  else no flag, which is today's release. When either entry names a lane image, its first step
+  (`prod_release.py current`) refuses, before any release, when the function could not read the
+  lane image prod runs (`lane_error`), or when prod runs another lane image than the current entry
+  names and is not already on the previous entry's coordinator and lane image (a rollback whose
+  Coordinator step applied and whose later step failed: a rerun finishes it). With neither entry
+  naming one it reads no lane image, as before. The record job writes the restored set with the
   rolled-back one as its previous, so a second rollback returns to the set the first one left.
+  When the previous entry's lane image is no longer in the lane repository, the Coordinator step
+  fails before any tag moves or any release, but the Worker step has already run and the host and
+  tile image step still runs: the fleet ends on the previous Worker and images with the current
+  coordinator and lane image, the record unchanged, and every rerun fails at the same point.
+  Recover by hand: `publish.py --stack prod --force --commit C --digest D --lambda-digest none`
+  (or a lane image the repository holds) with the previous entry's coordinator, then
+  `prod_release.py record` with that entry, its `lambda_digest` set to what was passed (removed
+  for `none`).
 - **Not supported:** turning `FLEET_LAMBDA_LANE_PROD` off while prod runs a lane image. A lane-off
   promotion writes an entry without `lambda_digest` while the running task keeps its lane image.
   Return prod to `none` first.

@@ -358,19 +358,25 @@ def main(argv):
             release = answer.get("release")
             if not release or not release.get("previous"):
                 raise RuntimeError("prod has no recorded previous release to roll back to")
-            # What prod runs must be what its record names (an entry without lambda_digest names none), or the
-            # rollback would start from a set nobody recorded.
-            runs = answer.get("prod") or {}
-            if runs.get("lane_error"):
-                raise RuntimeError(f"the release function could not read the lane image prod runs ({runs['lane_error']})")
-            if (runs.get("lambda_digest") or "") != release.get("lambda_digest", ""):
-                raise RuntimeError("prod runs another lane image than its release record names; recover by hand: "
-                                   "publish.py --stack prod --force --commit C --digest D --lambda-digest <the "
-                                   "lane digest to run, or none>, then prod_release.py record")
             # The lane flag comes from both entries: the previous set's lane image when it names one, else none
-            # when the set being left names one, else no flag (today's release).
-            back = release["previous"].get("lambda_digest")
+            # when the set being left names one, else no flag (today's release, which leaves FLEET_LAMBDA_IMAGE
+            # alone and so needs no lane read).
+            previous = release["previous"]
+            back = previous.get("lambda_digest")
             lane = back if back else "none" if release.get("lambda_digest") else ""
+            if back or release.get("lambda_digest"):
+                # What prod runs must be what the record's current entry names (an entry without lambda_digest names
+                # none), or what its previous one names with its coordinator: a rollback whose Coordinator step
+                # applied and whose later step failed, so the record job did not run. A rerun finishes it.
+                runs = answer.get("prod") or {}
+                if runs.get("lane_error"):
+                    raise RuntimeError(f"the release function could not read the lane image prod runs ({runs['lane_error']})")
+                running = runs.get("lambda_digest") or ""
+                resumed = runs.get("digest") == previous["coordinator"]["digest"] and running == (back or "")
+                if running != release.get("lambda_digest", "") and not resumed:
+                    raise RuntimeError("prod runs another lane image than its release record names; recover by hand: "
+                                       "publish.py --stack prod --force --commit C --digest D --lambda-digest <the "
+                                       "lane digest to run, or none>, then prod_release.py record")
             output(current=entry(release), previous=release["previous"], lane=lane)
         else:
             raise ValueError("unknown action")
