@@ -79,7 +79,7 @@ archives = [
 [firecracker]
 repo = "ejc3/firecracker"
 branch = "agent/uffd-minor-v1.17.0-drive-random"
-commit = "c152c991c1af6ad6d47ab82df8c57bbce4179cee"
+commit = "d7ba021a4cb58e3512b93b13aabb4ad2468e228f"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
