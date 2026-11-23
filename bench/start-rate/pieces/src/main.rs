@@ -10,6 +10,7 @@
 mod drive;
 mod kvm;
 mod pieces;
+mod tap;
 
 use clap::{Parser, Subcommand};
 
@@ -30,6 +31,21 @@ enum Cmd {
     HttpServe {
         /// Address to listen on.
         addr: String,
+    },
+    /// Attach and detach a TAP on request, inside a holder's namespaces, for the tap-attach
+    /// piece (spawned by its instance).
+    TapHelper {
+        /// The instance that spawned this helper.
+        parent: u32,
+        /// The namespace holder's PID.
+        holder_pid: u32,
+        /// The TAP device to attach to.
+        tap: String,
+    },
+    /// What a tap-attach cell's `tap.bt` dumps say one attach and detach cost.
+    TapSummary {
+        /// The cell's results directory.
+        cell: std::path::PathBuf,
     },
 }
 
@@ -54,6 +70,12 @@ fn main() -> anyhow::Result<()> {
                 .block_on(pieces::instance(args))
         }
         Cmd::HttpServe { addr } => pieces::http_serve(&addr),
+        Cmd::TapHelper {
+            parent,
+            holder_pid,
+            tap,
+        } => tap::helper(parent, holder_pid, &tap),
+        Cmd::TapSummary { cell } => tap::summary(&cell),
     }
 }
 

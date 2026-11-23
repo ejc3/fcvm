@@ -27,6 +27,9 @@ pub enum Piece {
     Vmm,
     /// One HTTP health probe into a prepared namespace.
     Health,
+    /// A VMM's TAP attach, then its detach, on a prepared rootless network: the network work
+    /// left on a clone's start and stop when its namespace is reused (`tap.rs`).
+    TapAttach,
     /// A bare KVM VM as Firecracker builds one on arm64 (VM, 256 MiB memory slot, one vCPU,
     /// a GICv3), no VMM process: the floor under `fc-spawn` and `vmm`.
     KvmVm,
@@ -64,6 +67,19 @@ pub struct PieceArgs {
     pub track_dirty_pages: bool,
     #[arg(long, value_enum, default_value = "nsenter")]
     pub prober: Prober,
+    /// The tap-attach piece stays attached this long between its attach and its detach, so
+    /// the kernel handles the carrier-on as a link event of its own.
+    #[arg(long, default_value_t = 20)]
+    pub tap_hold_ms: u64,
+    /// Attach and detach cycles the tap-attach piece makes while preparing, so the timed one
+    /// is not the TAP's first. A reused namespace's TAP has had a VMM before: its first
+    /// attach also changes the device's offload features, which the bridge above it follows.
+    #[arg(long, default_value_t = 1)]
+    pub tap_warm_cycles: u32,
+    /// The tap-attach piece prepares namespaces with the TAP and the bridge and no pasta
+    /// (`PastaNetwork::isolated`): the same link events with no pasta listening for them.
+    #[arg(long)]
+    pub tap_no_pasta: bool,
 }
 
 /// What an instance made, held until teardown.
@@ -79,6 +95,7 @@ struct Held {
     server: Option<std::process::Child>,
     runtime_dir: Option<PathBuf>,
     kvm: Option<crate::kvm::BareVm>,
+    tap: Option<crate::tap::Helper>,
 }
 
 /// The driver's PID, so an instance can tell it was reparented before arming its
@@ -206,6 +223,23 @@ async fn rootless_network(held: &mut Held, stages: &mut Stages) -> Result<u32> {
     Ok(pid)
 }
 
+/// A namespace with the TAP on the bridge and no pasta, the way a raw VM's is made
+/// (`PastaNetwork::isolated`).
+async fn isolated_network(held: &mut Held) -> Result<u32> {
+    let mut network = PastaNetwork::isolated(held.vm_id.clone(), tap_device(&held.vm_id));
+    let pid = spawn_holder(held).await?;
+    fcvm::commands::common::run_namespace_setup_script(
+        pid,
+        &network.build_nsenter_prefix(pid),
+        &network.build_setup_script(),
+    )
+    .await?;
+    let result = network.post_start(pid).await;
+    held.network = Some(network);
+    result.context("isolated post_start")?;
+    Ok(pid)
+}
+
 /// The clone's runtime directory (`vm-disks/<vm_id>`), as `cmd_snapshot_run_inner` makes it.
 async fn runtime_dir(held: &mut Held) -> Result<PathBuf> {
     let dir = fcvm::paths::vm_runtime_dir(&held.vm_id);
@@ -260,6 +294,19 @@ async fn prepare(args: &PieceArgs, held: &mut Held) -> Result<()> {
             snapshot_dir(args)?;
             rootless_network(held, &mut Vec::new()).await?;
             clone_disk(args, held).await?;
+        }
+        Piece::TapAttach => {
+            let pid = if args.tap_no_pasta {
+                isolated_network(held).await?
+            } else {
+                rootless_network(held, &mut Vec::new()).await?
+            };
+            let mut helper = crate::tap::Helper::spawn(pid, &tap_device(&held.vm_id))?;
+            let hold = std::time::Duration::from_millis(args.tap_hold_ms);
+            for _ in 0..args.tap_warm_cycles {
+                helper.cycle(hold, &mut Vec::new()).await?;
+            }
+            held.tap = Some(helper);
         }
         Piece::Health => {
             let pid = spawn_holder(held).await?;
@@ -369,6 +416,11 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
         Piece::KvmVm => {
             held.kvm = Some(crate::kvm::BareVm::create(&mut stages)?);
         }
+        Piece::TapAttach => {
+            let hold = std::time::Duration::from_millis(args.tap_hold_ms);
+            let helper = held.tap.as_mut().context("no TAP helper")?;
+            helper.cycle(hold, &mut stages).await?;
+        }
         Piece::Health => {
             let pid = held.holder.as_ref().map(|(_, p)| *p).context("no holder")?;
             if !probe(args, pid).await? {
@@ -471,6 +523,9 @@ async fn teardown(held: &mut Held) -> Result<Stages> {
         let t = Instant::now();
         drop(vm);
         stages.push(("kvm", ms(t)));
+    }
+    if let Some(helper) = held.tap.take() {
+        helper.stop().await;
     }
     if let Some(mut vmm) = held.vmm.take() {
         let t = Instant::now();
