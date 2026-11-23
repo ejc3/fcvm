@@ -150,7 +150,8 @@ The table covers the whole trace, from before the first clone starts until the r
 clones: everything the traced vCPU threads did, 8,036,815 stage-2 faults on guest memory, not the
 resume to ready window alone. A time is wall time from a function's entry to its return: it holds
 the function's callees, and any preemption or wait inside it. A row counts every entry of its
-function on a traced vCPU thread, whatever called it.
+function on a traced vCPU thread, whatever called it, except the two rows marked as inside
+`wp_page_copy`.
 
 | function | calls | µs per call | µs per stage-2 fault |
 |---|---|---|---|
@@ -166,14 +167,14 @@ function on a traced vCPU thread, whatever called it.
 `kvm_pgtable_stage2_unmap` ran 857,693 times in all; the other 89,348 calls were made outside
 `wp_page_copy` and are not in its row.
 
-66% of `user_mem_abort`'s time is inside `wp_page_copy` (35.5 of 54.2 µs per fault), the
+`wp_page_copy`'s time is 66% of `user_mem_abort`'s (35.5 against 54.2 µs per fault), the
 copy-on-write of a page that was already mapped read-only: the memory file is mapped `MAP_PRIVATE`,
 an earlier read fault mapped the page-cache page read-only (the page it wanted, or the ones
 `filemap_map_pages` maps around it), and the write replaces it. Of those 35.5 µs, 33.5 are inside
 two calls: KVM's unmap of the stage-2 entry through the MMU notifier, 205 µs a call, and the
 `ptep_clear_flush` of the host mapping, 145 µs a call. Why they take that long is not measured. Each
-ends in a TLB invalidation, but the functions that would time one were not probeable on this kernel
-(`__flush_tlb_range`, `flush_tlb_page`, `kvm_tlb_flush_vmid_ipa`); of the two related ones that were
+ends in a TLB invalidation, but the three functions the program lists for one were not probeable on
+this kernel (`__flush_tlb_range`, `flush_tlb_page`, `kvm_tlb_flush_vmid_ipa`); of the two related ones that were
 probed, `kvm_flush_remote_tlbs` was never called on a traced thread and
 `smp_call_function_many_cond` ran 115 times, 0.11 s in all.
 
@@ -187,14 +188,21 @@ grep -m1 -ho 'Firecracker Child.id() returned: Some([0-9]*)' $OUT/clones/*.log |
 
 That gives about 69,900 stage-2 faults and about 6,700 `wp_page_copy` calls per traced clone over
 its life in the trace. Both are approximate: the snapshot's baseline VM, idle through the ramp, is
-in the filter too if its VMM's pid is a multiple of 8, which the records do not say.
+in the filter too if its VMM's pid is a multiple of 8. That was not checked: its log
+(`prep/baseline.log`) carries the same line, and one more VMM would change the figures in the third
+digit (8,036,815 / 116 = 69,283).
 
 Lock waits (`lock:contention_begin` to `contention_end`) of the vCPU threads of all 1000 clones:
 655.7 s in all, 543.9 s of it on `rtnl_lock` in `tun_chr_close` (357 waits) and 111.0 s on
 `folio_lruvec_lock` in `__page_cache_release` under `folios_put_refs` (578,094 waits); the other 48
 stacks hold 0.8 s between them. These are lower bounds. The program keeps one pending wait per
 thread, so a contention that begins while another is pending on the same thread replaces it, and the
-outer wait is not counted. With that limit, no lock was seen in the fault path.
+outer wait is not counted. The 48 other stacks, 0.8 s, are all the lock wait seen outside those two.
+The `folios_put_refs` stack is seven frames deep and does not show its caller, and that function is
+also reached from the fault path (`wp_page_copy` adds its new page to the LRU), so whether its
+111.0 s belongs to the fault path is not determined. If all of it did, it would be 111.0 s over 1000
+clones against `wp_page_copy`'s 285.8 s over the 115 traced ones (768,345 calls of 372 µs), about
+2,485 s scaled to 1000: at most 4.5% of it.
 
 ## A snapshot can carry a compaction pass
 
