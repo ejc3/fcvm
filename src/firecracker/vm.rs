@@ -186,16 +186,20 @@ impl FirecrackerLogErrors {
     }
 
     /// [`Self::read_new`] until the end of the file, in reads of at most
-    /// [`FIRECRACKER_LOG_READ_MAX`], for the last read when the VMM has stopped.
+    /// [`FIRECRACKER_LOG_READ_MAX`], for the last read when the VMM has stopped. A failed read
+    /// ends it, and the lines of the reads before it are still returned.
     fn read_rest<F: std::io::Read + std::io::Seek>(
         &mut self,
         file: &mut F,
-    ) -> std::io::Result<Vec<String>> {
+    ) -> (Vec<String>, std::io::Result<()>) {
         let mut lines = Vec::new();
         loop {
-            lines.extend(self.read_new(file)?);
+            match self.read_new(file) {
+                Ok(more) => lines.extend(more),
+                Err(error) => return (lines, Err(error)),
+            }
             if self.last_read < FIRECRACKER_LOG_READ_MAX {
-                return Ok(lines);
+                return (lines, Ok(()));
             }
         }
     }
@@ -261,29 +265,33 @@ impl FirecrackerLogFollower {
             return messages;
         }
         self.stopped = last;
+        // Only a regular file is opened: opening a FIFO with no writer would block this caller,
+        // which on the last poll is the thread stopping the VM.
         if !self.failed && self.file.is_none() {
-            self.file = std::fs::File::open(&self.path).ok();
+            self.file = std::fs::metadata(&self.path)
+                .is_ok_and(|meta| meta.is_file())
+                .then(|| std::fs::File::open(&self.path).ok())
+                .flatten();
         }
         if let (false, Some(file)) = (self.failed, self.file.as_mut()) {
-            let read = if last {
+            let (lines, read) = if last {
                 self.errors.read_rest(file)
             } else {
-                self.errors.read_new(file)
+                match self.errors.read_new(file) {
+                    Ok(lines) => (lines, Ok(())),
+                    Err(error) => (Vec::new(), Err(error)),
+                }
             };
-            match read {
-                Ok(lines) => {
-                    messages.extend(
-                        lines
-                            .into_iter()
-                            .map(|line| format!("Firecracker logged an error: {line}")),
-                    );
-                }
-                Err(error) => {
-                    self.failed = true;
-                    messages.push(format!(
-                        "cannot read Firecracker's log ({error}), so its errors are no longer repeated here"
-                    ));
-                }
+            messages.extend(
+                lines
+                    .into_iter()
+                    .map(|line| format!("Firecracker logged an error: {line}")),
+            );
+            if let Err(error) = read {
+                self.failed = true;
+                messages.push(format!(
+                    "cannot read Firecracker's log ({error}), so its errors are no longer repeated here"
+                ));
             }
         }
         if last && self.errors.counted > 0 {
@@ -1011,7 +1019,7 @@ mod tests {
     use super::*;
     use crate::utils::DirEventSource;
     use std::future::{poll_fn, Future};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::pin::Pin;
     use std::task::Poll;
 
@@ -1059,6 +1067,65 @@ mod tests {
         assert_eq!(errors.counted, 5);
     }
 
+    /// Serves `inner` until a read starts at or past `fail_at`, then fails every read.
+    struct FailingLog {
+        inner: std::io::Cursor<Vec<u8>>,
+        fail_at: u64,
+    }
+
+    impl std::io::Read for FailingLog {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() >= self.fail_at {
+                return Err(std::io::Error::other("injected read failure"));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl std::io::Seek for FailingLog {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn read_rest_keeps_the_errors_it_read_before_a_failed_read() {
+        let backlog = format!("{INFO_LINE}\n")
+            .repeat((FIRECRACKER_LOG_READ_MAX as usize / (INFO_LINE.len() + 1)) + 10);
+        let mut file = FailingLog {
+            inner: std::io::Cursor::new(format!("{BLOCK_ENOSPC}\n{backlog}").into_bytes()),
+            fail_at: FIRECRACKER_LOG_READ_MAX,
+        };
+        let mut errors = FirecrackerLogErrors::default();
+        let (lines, read) = errors.read_rest(&mut file);
+        assert_eq!(lines, vec![BLOCK_ENOSPC.to_string()]);
+        assert!(read.is_err());
+    }
+
+    #[test]
+    fn the_follower_does_not_open_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path.clone(), "vm-test".to_string());
+        let (done, polled) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(follower.poll(true));
+        });
+        let result = polled.recv_timeout(Duration::from_secs(5));
+        if result.is_err() {
+            // Release the blocked open so the thread can finish.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path);
+        }
+        assert_eq!(
+            result.expect("polling a FIFO with no writer blocked"),
+            Vec::<String>::new()
+        );
+    }
+
     #[test]
     fn the_last_poll_reaches_an_error_behind_a_large_backlog() {
         let dir = tempfile::tempdir().unwrap();
@@ -1080,10 +1147,9 @@ mod tests {
         assert!(errors.read_new(&mut file).unwrap().is_empty());
         let short = "t [i:main:ERROR:f.rs:1] x";
         *file.get_mut() = format!("{short}\n").into_bytes();
-        assert_eq!(
-            errors.read_rest(&mut file).unwrap(),
-            vec![short.to_string()]
-        );
+        let (lines, read) = errors.read_rest(&mut file);
+        read.unwrap();
+        assert_eq!(lines, vec![short.to_string()]);
     }
 
     #[test]
