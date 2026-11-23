@@ -91,7 +91,7 @@ The `kernel.bt` output of the first table's attribution pass (C=128, 1000 held, 
 piece; start, steady and teardown in one window) is in `traces/`.
 Those dumps were taken with the tracer stopped at the driver's exit and with probes on
 `rtnl_lock()`. For the pieces that make namespaces, `traces/rtnl/` holds what `rtnl.py` reads
-from complete dumps instead: `rootless-net` before and after changelog step 4 (three runs
+from complete dumps instead: `rootless-net` before and after changelog step 5 (three runs
 each), `holder` and `health`.
 
 `PERF_FREQ=99` adds `perf record -a -g` over the timed phase (`perf.data`), and

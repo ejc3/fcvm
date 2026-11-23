@@ -461,6 +461,9 @@ mod tests {
             "{error:#}"
         );
         assert!(target.recorded().is_none());
+        // A transient outcome: the generation is not marked, and the next clone records.
+        assert!(!target.marked_unrecordable());
+        assert!(target.claim(std::process::id()).unwrap().is_some());
     }
 
     /// A VMM that exits between its restore and the recording records nothing, though its
@@ -498,8 +501,31 @@ mod tests {
         }
         assert!(recording.record().is_err());
         assert!(target.recorded().is_none());
+        assert!(!target.marked_unrecordable());
+        assert!(target.claim(std::process::id()).unwrap().is_some());
         // SAFETY: the child forked above.
         unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
+    }
+
+    /// A VMM that maps the image but wrote none of its pages gets no set, and the outcome
+    /// would repeat for every clone, so the generation is marked and no clone claims again.
+    #[test]
+    fn a_vmm_that_wrote_no_page_marks_the_generation() {
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        let bytes = map(&memory, 0, 8, &[], &[0, 3]);
+        let error = target
+            .claim(std::process::id())
+            .unwrap()
+            .unwrap()
+            .record()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("wrote no page"), "{error:#}");
+        assert!(target.recorded().is_none());
+        assert!(target.marked_unrecordable());
+        assert!(target.claim(std::process::id()).unwrap().is_none());
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
     }
@@ -519,6 +545,7 @@ mod tests {
         std::fs::write(&config, r#"{"generation":2}"#).unwrap();
         assert!(recording.record().is_err());
         assert!(!target.sidecar().exists());
+        assert!(!target.marked_unrecordable());
         let next = Target::at_restore(&snapshot, &memory, &config).unwrap();
         assert!(next.recorded().is_none());
         // SAFETY: the mapping made above.
