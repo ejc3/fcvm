@@ -200,7 +200,14 @@ fn piece_argv(p: &PieceArgs) -> Vec<String> {
             .unwrap()
             .get_name()
             .to_string(),
+        "--tap-hold-ms".into(),
+        p.tap_hold_ms.to_string(),
+        "--tap-warm-cycles".into(),
+        p.tap_warm_cycles.to_string(),
     ];
+    if p.tap_no_pasta {
+        v.push("--tap-no-pasta".into());
+    }
     for (flag, value) in [
         ("--snapshot-dir", &p.snapshot_dir),
         ("--firecracker", &p.firecracker),
@@ -1173,7 +1180,10 @@ mod tests {
             uffd_socket: Some("/u.sock".into()),
             disk_shard_dir: Some("/d".into()),
             track_dirty_pages: false,
-            prober: crate::pieces::Prober::Nsenter,
+            prober: crate::pieces::Prober::Holder,
+            tap_hold_ms: 7,
+            tap_warm_cycles: 3,
+            tap_no_pasta: true,
         };
         let argv = std::iter::once("x".to_string()).chain(piece_argv(&given));
         let Sub::Instance(back) = Wrap::parse_from(argv).cmd;

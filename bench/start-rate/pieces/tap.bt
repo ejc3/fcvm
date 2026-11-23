@@ -1,0 +1,78 @@
+// What rtnl_mutex and RCU cost one TAP attach and detach (the tap-attach piece), split into
+// the four calls the helper makes and the link events the kernel handles for them afterwards.
+// Keys: 1074025674 TUNSETIFF, 1074025688 TUNSETVNETHDRSZ, 1074025680 TUNSETOFFLOAD, 1 close.
+// sudo bpftrace bench/start-rate/pieces/tap.bt   (SIGINT prints the maps)
+
+kprobe:tun_chr_ioctl /comm == "tap-helper"/ { @call[tid] = arg1; @calls[arg1] = count(); }
+kretprobe:tun_chr_ioctl /@call[tid]/ { delete(@call[tid]); }
+kprobe:tun_chr_close /comm == "tap-helper"/ { @call[tid] = 1; @calls[1] = count(); }
+kretprobe:tun_chr_close /@call[tid]/ { delete(@call[tid]); }
+
+// The kernel's link watch worker: carrier changes are queued and handled here, under rtnl.
+kprobe:linkwatch_event { @lw[tid] = 1; }
+kretprobe:linkwatch_event /@lw[tid]/ { delete(@lw[tid]); delete(@lw_tap[tid]); }
+kprobe:linkwatch_do_dev /@lw[tid]/ {
+  $dev = (struct net_device *)arg0;
+  @dev_s[tid] = nsecs;
+  @dev_tap[tid] = strncmp($dev->name, "tap-", 4) == 0 ? 1 : 0;
+  @dev_up[tid] = ($dev->state & 4) == 0 ? 1 : 0;  // __LINK_STATE_NOCARRIER is bit 2
+}
+kretprobe:linkwatch_do_dev /@dev_s[tid]/ {
+  $us = (nsecs - @dev_s[tid]) / 1000;
+  if (@dev_tap[tid]) {
+    @lw_tap[tid] = 1;
+    @lw_tap_dev_us[@dev_up[tid]] = sum($us);
+    @lw_tap_devs[@dev_up[tid]] = count();
+    @lw_tap_dev_us_hist[@dev_up[tid]] = hist($us);
+  } else {
+    @lw_other_dev_us = sum($us);
+    @lw_other_devs = count();
+  }
+  delete(@dev_s[tid]); delete(@dev_tap[tid]); delete(@dev_up[tid]);
+}
+
+kprobe:rtnl_lock { @req[tid] = nsecs; }
+kretprobe:rtnl_lock /@req[tid]/ {
+  $us = (nsecs - @req[tid]) / 1000;
+  if (@call[tid]) { @helper_wait_us[@call[tid]] = sum($us); }
+  @wait_us_total = sum($us);
+  delete(@req[tid]);
+  @held[tid] = nsecs;
+}
+kprobe:rtnl_unlock /@held[tid]/ {
+  $us = (nsecs - @held[tid]) / 1000;
+  if (@call[tid]) {
+    @helper_hold_us[@call[tid]] = sum($us);
+    @helper_holds[@call[tid]] = count();
+    @helper_hold_us_hist[@call[tid]] = hist($us);
+  } else if (@lw[tid]) {
+    @lw_hold_us[@lw_tap[tid]] = sum($us);
+    @lw_holds[@lw_tap[tid]] = count();
+    @lw_hold_us_hist[@lw_tap[tid]] = hist($us);
+  } else {
+    @other_hold_us[comm] = sum($us);
+    @other_holds[comm] = count();
+  }
+  @hold_us_total = sum($us);
+  delete(@held[tid]);
+}
+
+kprobe:synchronize_rcu_expedited {
+  @gp_s[tid] = nsecs;
+  if (@call[tid]) { @helper_gp[@call[tid]] = count(); }
+  else if (@lw[tid]) { @lw_gp = count(); }
+  else { @other_gp[comm] = count(); }
+}
+kretprobe:synchronize_rcu_expedited /@gp_s[tid]/ {
+  $us = (nsecs - @gp_s[tid]) / 1000;
+  if (@call[tid]) { @helper_gp_us[@call[tid]] = sum($us); @helper_gp_us_hist[@call[tid]] = hist($us); }
+  else if (@lw[tid]) { @lw_gp_us = sum($us); @lw_gp_us_hist = hist($us); }
+  delete(@gp_s[tid]);
+}
+kprobe:synchronize_rcu {
+  if (@call[tid]) { @helper_rcu_sync[@call[tid]] = count(); }
+  else if (@lw[tid]) { @lw_rcu_sync = count(); }
+}
+
+END { clear(@call); clear(@lw); clear(@lw_tap); clear(@req); clear(@held); clear(@gp_s);
+      clear(@dev_s); clear(@dev_tap); clear(@dev_up); }

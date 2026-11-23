@@ -2637,6 +2637,66 @@ fn every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier() {
     );
 }
 
+/// With CONFIG_WEXT_CORE=y every netdev notifier event walks every network namespace under RTNL
+/// (wext_netdev_notifier_call -> wireless_nlevent_flush -> for_each_net): 3.3 to 3.6 ms of hold
+/// per VM namespace life with 2000 to 3000 namespaces alive (#2034). WEXT_CORE is def_bool on
+/// CFG80211_WEXT || WIRELESS_EXT. The host builds from the running kernel's config, which
+/// descends from Ubuntu's and sets CFG80211_WEXT=y, and IPW2100=m and IPW2200=m, which select
+/// WIRELESS_EXT themselves and through LIBIPW (Linux 7.3.3,
+/// drivers/net/wireless/intel/ipw2x00/Kconfig). Every host kernel therefore has to name a
+/// config fragment, list it as a build input, and set all three to n. It also sets
+/// WIRELESS_EXT and WEXT_CORE to n, which changes nothing by itself (neither has a prompt)
+/// and makes the build's check after olddefconfig fail if anything still selects them.
+#[test]
+fn every_host_kernel_leaves_wireless_extensions_off() {
+    let root = repo_root();
+    let config = rootfs_config();
+    let mut checked = Vec::new();
+    let mut wrong = Vec::new();
+    for (profile_name, arches) in config["kernel_profiles"].as_table().unwrap() {
+        for (arch, table) in arches.as_table().unwrap() {
+            let Some(host) = table.get("host_kernel") else {
+                continue;
+            };
+            let name = format!("{profile_name}.{arch}");
+            checked.push(name.clone());
+            let Some(fragment) = host.get("config_fragment").and_then(|f| f.as_str()) else {
+                wrong.push(format!("{name} has no config_fragment"));
+                continue;
+            };
+            let listed = host["build_inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|input| input.as_str() == Some(fragment));
+            if !listed {
+                wrong.push(format!("{name}: {fragment} is not a build input"));
+            }
+            let text = std::fs::read_to_string(root.join(fragment)).unwrap();
+            for option in [
+                "CFG80211_WEXT",
+                "IPW2100",
+                "IPW2200",
+                "WIRELESS_EXT",
+                "WEXT_CORE",
+            ] {
+                let line = format!("CONFIG_{option}=n");
+                if !text.lines().any(|l| l.trim() == line) {
+                    wrong.push(format!("{name}: {fragment} lacks {line}"));
+                }
+            }
+        }
+    }
+    assert!(
+        checked.len() >= 2,
+        "expected a host kernel for both arches, found {checked:?}"
+    );
+    assert!(
+        wrong.is_empty(),
+        "host kernels must be built without wireless extensions: {wrong:?}"
+    );
+}
+
 /// For each default, nested and btrfs guest kernel table, as `("profile.arch", applies)`, whether the
 /// patches it applies contain `fix`.
 fn shipped_guest_kernels_applying(fix: &str) -> Vec<(String, bool)> {

@@ -604,7 +604,7 @@ lineage).
 
 **Topology**:
 ```
-Host                     │ User Namespace (unshare --user --net)
+Host                     │ User Namespace (the holder's)
                          │
 pasta <──────────────────┼── pasta0 ─┐
   (L4 splice/TAP)        │           │
@@ -623,41 +623,42 @@ pasta <──────────────────┼── pasta0 �
 - IP forwarding rewrites source MAC, breaking pasta's connection tracking
 - Bridge also enables IPv6 with proper NDP neighbor discovery
 
-**Setup Sequence** (3-phase with nsenter):
-1. Spawn holder process: `unshare --user --net -- sleep infinity` (UID/GID mappings written externally)
-2. Pre-pasta setup via nsenter: create Firecracker TAP device only
-3. Start pasta attached to holder's namespace (creates pasta0 TAP)
-4. Post-pasta setup via nsenter: create bridge, attach pasta0 + tap-fc, add namespace IP
-5. Run Firecracker via nsenter: `nsenter -t HOLDER_PID -U -n -- firecracker ...`
-6. Health checks via nsenter: `nsenter -t HOLDER_PID -U -n -- curl 10.0.2.100:80`
+**Setup Sequence**:
+1. Spawn holder process: `fcvm __netns-agent`, which unshares its user and network namespaces (UID/GID mappings written externally)
+2. The holder builds every link on one `build` request from fcvm, over netlink in its own namespace (`netns_agent::build`): loopback up, the bridge with its MAC, MTU and `addrgenmode none` while it is down, the Firecracker TAP and pasta's TAP as persistent devices on it, then the bridge up and its address
+3. Start pasta attached to the holder's namespace; it attaches to the pasta0 the holder made
+4. Start Firecracker in the holder's namespaces (`setns` in `pre_exec`); it attaches to its TAP
+5. Health checks: an HTTP GET to 10.0.2.100:80 from a socket the holder made in the namespace
 
-**Pre-Pasta Setup Script** (Phase 2, executed via nsenter):
+**What the holder builds** (step 2), as the `ip` commands it replaces:
 ```bash
-# Create TAP device for Firecracker (pasta creates its own TAP separately)
-ip tuntap add tap-fc mode tap
-ip link set tap-fc up
 ip link set lo up
-```
 
-**Post-Pasta Bridge Script** (Phase 4, executed via nsenter after pasta starts):
-```bash
-# Bring pasta0 up (pasta creates it but doesn't bring it up without --config-net)
-ip link set pasta0 up
+# L2 bridge, configured while it is down
+ip link add br0 address 02:fc:00:00:02:01 type bridge
+ip link set br0 mtu 65520 addrgenmode none
 
-# Create L2 bridge — connects pasta0 and Firecracker TAP
-ip link add br0 type bridge
+# Persistent TAPs on the bridge: pasta and the VMM attach to devices that already exist
+ip tuntap add pasta0 mode tap
+ip link set pasta0 mtu 65520 master br0 addrgenmode none up
+ip tuntap add tap-fc mode tap
+ip link set tap-fc mtu 65520 master br0 addrgenmode none up
+
+# The bridge comes up after its ports, then gets the address health checks come from:
+# a socket made in the namespace routes to the guest via the 10.0.2.x subnet
 ip link set br0 up
-ip link set pasta0 master br0
-ip link set tap-fc master br0
-
-# Add IP to bridge for health checks
-# This enables nsenter to route to guest via the 10.0.2.x subnet
 ip addr add 10.0.2.1/24 dev br0
 ```
-
-Nothing in the namespace forwards at L3, so the script does not set `ip_forward` and
-opens nothing under /proc/sys (a lookup there walks every other namespace's cached entry
-under a global lock; see `build_bridge_script`).
+Each line is one request and one `rtnl_mutex` hold, except a TAP's first line, which is three
+(`TUNSETIFF`, `TUNSETPERSIST` and the close that leaves the device detached, `rtnl::add_tap`);
+its second line is the netlink request. The bridge takes four: its
+address generation has to be off before it is up, because the kernel applies the up flag
+first and a bridge that has a carrier at that moment gets a link-local address
+(`the_bridge_stops_generating_addresses_before_it_comes_up`). The two TAPs and the bridge
+get `addrgenmode none`: nothing in the namespace's own stack speaks IPv6.
+Nothing forwards at L3 there either (the TAPs are bridged, and pasta reaches the guest from
+inside the namespace), so `ip_forward` is not set and nothing under /proc/sys is opened: a
+lookup there walks an entry for every other network namespace under one global lock.
 
 **Port Forwarding** (unique loopback IPs):
 ```bash
@@ -687,7 +688,7 @@ Guest (10.0.2.100) → tap-fc → br0 (L2) → pasta0 → pasta → Host → Int
 
 **Traffic Flow** (Health Check from namespace):
 ```
-nsenter curl → br0 (10.0.2.1) → L2 forward → tap-fc → Guest (10.0.2.100:80)
+HTTP GET from a socket the holder made → br0 (10.0.2.1) → L2 forward → tap-fc → Guest (10.0.2.100:80)
 ```
 
 **Traffic Flow** (Host to VM port forward):
@@ -707,7 +708,7 @@ Host (127.0.0.x:8080) → pasta → pasta0 → br0 (L2) → tap-fc → Guest (10
 - All VMs use same 10.0.2.x subnet (isolated by user namespace)
 - Unique loopback IP per VM enables same port on multiple VMs
 - Bridge-based L2 preserves MAC addresses for proper pasta ARP/NDP learning
-- Namespace IP (10.0.2.1) enables health checks via nsenter
+- Namespace IP (10.0.2.1) is the source address of health checks, made from a socket the holder hands out
 - IPv6 support with native pasta IPv6 forwarding
 - Works in nested VMs and restricted environments
 - Fully compatible with rootless Podman in guest
@@ -3771,7 +3772,7 @@ An earlier (2026-02-28) version of this table ranked the backends by per-clone R
 firecracker process alone on a 131 GB guest, and called the File backend "Broken — KVM
 CoW-copies pages into Private_Clean even for reads". Recomputing on a **matched accounting
 basis** — PSS/RSS summed over *every* process belonging to a clone (fcvm + firecracker +
-pasta + the `unshare` namespace holder), plus each backend's costs *outside* the clones —
+pasta + the namespace holder, an `unshare` process when this was measured), plus each backend's costs *outside* the clones —
 showed that ranking was inverted: the File backend's big RSS is the same reclaimable page
 cache counted once per clone, not per-clone private waste, and on whole-machine cost it is
 the *cheapest* 4 KiB option, not a broken one. Measured, N=4 concurrent 1 GiB alpine/nginx
@@ -3950,7 +3951,7 @@ one another, while `mincore` needs only the view and the server's mm read lock.
 ### Measured (2026-08-07, N=4 concurrent alpine/nginx clones, 1 GiB guest, aarch64)
 
 Matched accounting basis: **PSS/RSS summed over every process belonging to a clone** — the
-`fcvm` clone process, its `firecracker` child, the `unshare --user --net` holder, and `pasta`
+`fcvm` clone process, its `firecracker` child, the namespace holder (an `unshare --user --net` process when this was measured), and `pasta`
 (4 processes per clone) — plus the serve process measured *after* it had served all 4 clones.
 
 | Config | Σ clone PSS | Σ clone RSS | 1-clone PSS | Serve-process PSS after N | Unevictable shmem | Marginal PSS per extra clone |

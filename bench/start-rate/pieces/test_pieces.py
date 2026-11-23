@@ -129,6 +129,21 @@ class MatrixTest(unittest.TestCase):
     def test_the_netns_probe_counts_only_new_namespace_requests(self):
         self.assertIn("kprobe:copy_net_ns /arg0 & 0x40000000/", (HERE / "kernel.bt").read_text())
 
+    def test_rtnl_mutex_is_traced_as_a_mutex(self):
+        # rtnl_lock() is inlined into its callers inside rtnetlink.c, so a probe on that symbol
+        # misses every RTM_NEWLINK, RTM_SETLINK and RTM_DELLINK hold.
+        bt = (HERE / "kernel.bt").read_text()
+        self.assertIn('kprobe:mutex_unlock /arg0 == kaddr("rtnl_mutex")', bt)
+        self.assertNotIn("kprobe:rtnl_lock", bt)
+        self.assertNotIn("kprobe:rtnl_unlock", bt)
+
+    def test_the_tracer_outlives_the_namespace_cleanup(self):
+        # The kernel destroys a cell's namespaces after the driver has exited. A tracer stopped
+        # at the driver's exit misses most of that hold.
+        script = (HERE / "attribution.sh").read_text()
+        self.assertLess(script.index('quiet "the end of'), script.index('sudo kill -INT "$bt"'))
+
+
     def test_a_cell_from_another_mode_is_not_done(self):
         with tempfile.TemporaryDirectory() as root:
             (pathlib.Path(root) / "c").mkdir()
@@ -136,6 +151,65 @@ class MatrixTest(unittest.TestCase):
             self.assertEqual(self.sh(f"cell_done {root}/c").returncode, 0)
             self.assertNotEqual(self.sh(f"COLD=1 cell_done {root}/c").returncode, 0)
             self.assertNotEqual(self.sh(f"UFFD_SOCKET=/u cell_done {root}/c").returncode, 0)
+
+
+class RtnlSummaryTest(unittest.TestCase):
+    DUMP = """
+@rtnl_hold_us_total: 40000
+
+@rtnl_hold_us_by_work[cleanup_net+0]: 30000
+@rtnl_holds_by_work[cleanup_net+0]: 3
+@rtnl_hold_us_by_work[linkwatch_event+0]: 1000
+@rtnl_holds_by_work[linkwatch_event+0]: 5
+@rtnl_hold_us_by_comm[pasta-4707649d2]: 4000
+@rtnl_hold_us_by_comm[fcvm-netns]: 5000
+@rtnl_holds[pasta-4707649d2]: 20
+@rtnl_holds[fcvm-netns]: 110
+@rtnl_hold_us_by_site[fcvm-netns, 
+    mutex_unlock+0
+    rtnl_newlink+1036
+]: 5000
+@rtnl_oncpu[
+    wireless_nlevent_flush+40
+    wext_netdev_notifier_call+12
+    notifier_call_chain+120
+]: 3998
+@rtnl_oncpu[
+    _raw_read_lock+20
+    do_one_broadcast+80
+    netlink_broadcast_filtered+300
+]: 1999
+@rtnl_oncpu[
+    __dev_open+100
+    netif_change_flags+60
+]: 5997
+@rcu_barrier_us_under_rtnl: 26000
+@rcu_barriers_under_rtnl: 10
+@rtnl_wait_us_total: 2000000
+@rcu_exp[kworker/u769:3]: 40
+@rcu_exp[kworker/1:2]: 10
+@rcu_exp[fcvm-netns]: 20
+"""
+
+    def test_holds_are_per_op_and_split_by_holder(self):
+        import rtnl
+        s = rtnl.summarize(self.DUMP, 10)
+        self.assertEqual(s["hold_ms_per_op"], 4.0)
+        self.assertEqual(s["rcu_barrier_ms_per_op"], 2.6)
+        self.assertEqual(s["hold_ms_per_op_without_rcu_barrier"], 1.4)
+        self.assertEqual(s["rcu_barriers_per_op"], 1.0)
+        self.assertEqual(s["wait_ms_per_op"], 200.0)
+        self.assertEqual(s["by_holder"]["worker cleanup_net"], {"hold_ms_per_op": 3.0, "holds_per_op": 0.3})
+        self.assertEqual(s["by_holder"]["pasta"], {"hold_ms_per_op": 0.4, "holds_per_op": 2.0})
+        self.assertEqual(s["by_holder"]["fcvm-netns"], {"hold_ms_per_op": 0.5, "holds_per_op": 11.0})
+        self.assertEqual(s["expedited_grace_periods_per_op"], {"worker": 5.0, "fcvm-netns": 2.0})
+        self.assertEqual(s["on_cpu_ms_per_op"], {"all": 600.0, "wireless_nlevent_flush": 200.0,
+                                                 "do_one_broadcast": 100.0, "rcu_barrier": 0.0})
+
+    def test_a_dump_from_a_tracer_that_did_not_run_is_refused(self):
+        import rtnl
+        with self.assertRaises(SystemExit):
+            rtnl.summarize("Attaching 30 probes...\n", 10)
 
 
 if __name__ == "__main__":
