@@ -249,13 +249,25 @@ pub fn summarize(maps: &std::collections::BTreeMap<String, f64>) -> Result<serde
     for (key, name) in CALLS {
         let n = get(&format!("calls[{key}]"));
         anyhow::ensure!(n > 0.0, "the tracer saw no {name} by the helper");
+        // Each call takes the mutex once. `tap.bt` sums a hold from a return probe on
+        // rtnl_lock, and the kernel keeps a fixed number of return-probe instances (twice
+        // the CPUs): when more helpers than that sleep in rtnl_lock at once, the holds of
+        // the rest are not summed while their calls are still counted, and every hold
+        // column reads short (0.77 of the calls at C=512 on 192 CPUs). A call that
+        // straddles a window's edge accounts for a difference of one.
+        let holds = get(&format!("helper_holds[{key}]"));
+        anyhow::ensure!(
+            (holds - n).abs() <= (n * 0.005).max(1.0),
+            "the tracer summed {holds} rtnl_mutex holds for {n} {name} calls: it dropped \
+             some (return-probe instances ran out), so the hold columns would read short"
+        );
         let hold = get(&format!("helper_hold_us[{key}]")) / n;
         helper_hold_us += hold;
         calls.insert(
             name.into(),
             serde_json::json!({
                 "calls": n,
-                "rtnl_holds_per_call": get(&format!("helper_holds[{key}]")) / n,
+                "rtnl_holds_per_call": holds / n,
                 "rtnl_hold_us": hold,
                 "rtnl_wait_us": get(&format!("helper_wait_us[{key}]")) / n,
                 "expedited_gps_per_call": get(&format!("helper_gp[{key}]")) / n,
@@ -275,7 +287,12 @@ pub fn summarize(maps: &std::collections::BTreeMap<String, f64>) -> Result<serde
     );
     let on_us = get("lw_tap_dev_us[1]") / on;
     let off_us = get("lw_tap_dev_us[0]") / off;
-    let link_hold_us = on_us + off_us;
+    // Link events of every other device, which a cycle can cause too: in a namespace with
+    // no pasta the TAP is the bridge's only port, so the bridge's carrier follows it. These
+    // are per cycle as seen, since nothing says how many a cycle should cause.
+    let others = get("lw_other_devs");
+    let other_us_per_cycle = get("lw_other_dev_us") / cycles;
+    let link_hold_us = on_us + off_us + other_us_per_cycle;
     let runs = get("lw_holds[1]");
     Ok(serde_json::json!({
         "cycles_traced": cycles,
@@ -291,8 +308,16 @@ pub fn summarize(maps: &std::collections::BTreeMap<String, f64>) -> Result<serde
             "worker_hold_us_per_run": if runs > 0.0 { get("lw_hold_us[1]") / runs } else { 0.0 },
             "expedited_gps_per_event": get("lw_gp") / (on + off),
             "expedited_gp_us": if get("lw_gp") > 0.0 { get("lw_gp_us") / get("lw_gp") } else { 0.0 },
+            "other_devices_seen_per_cycle": others / cycles,
+            "other_devices_us": if others > 0.0 { get("lw_other_dev_us") / others } else { 0.0 },
+            "other_devices_us_per_cycle": other_us_per_cycle,
             "rtnl_hold_us_per_cycle": link_hold_us,
         },
+        // Every hold of the mutex on the host in the cell's two windows, per cycle: what
+        // the cycles held and whatever else ran. On a quiet host it checks the sum below,
+        // which counts one carrier-on and one carrier-off per cycle whether or not the
+        // worker handled both inside the windows.
+        "window_rtnl_hold_us_per_cycle": get("hold_us_total") / cycles,
         "rtnl_hold_us_per_cycle": helper_hold_us + link_hold_us,
         "rtnl_ceiling_cycles_per_s": 1e6 / (helper_hold_us + link_hold_us),
     }))
@@ -331,6 +356,7 @@ mod tests {
         @helper_hold_us[1074025674]: 400\n@helper_hold_us[1074025688]: 8\n\
         @helper_hold_us[1074025680]: 40\n@helper_hold_us[1]: 900\n\
         @helper_holds[1]: 3\n@helper_holds[1074025674]: 4\n\
+        @helper_holds[1074025688]: 4\n@helper_holds[1074025680]: 4\n\
         @helper_gp[1]: 3\n@helper_gp_us[1]: 600\n\
         @helper_hold_us_hist[1]: \n[256, 512)             3 |@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@|\n\n\
         @lw_tap_devs[1]: 4\n@lw_tap_dev_us[1]: 200\n@lw_holds[1]: 4\n@lw_hold_us[1]: 220\n\
@@ -340,7 +366,8 @@ mod tests {
     const STEADY: &str = "@calls[1]: 1\n@helper_hold_us[1]: 300\n@helper_holds[1]: 1\n\
         @helper_gp[1]: 1\n@helper_gp_us[1]: 200\n\
         @lw_tap_devs[0]: 2\n@lw_tap_dev_us[0]: 200\n@lw_holds[1]: 1\n@lw_hold_us[1]: 210\n\
-        @lw_gp: 3\n@lw_gp_us: 240\n";
+        @lw_gp: 3\n@lw_gp_us: 240\n@lw_other_devs: 2\n@lw_other_dev_us: 80\n\
+        @hold_us_total: 2400\n";
 
     #[test]
     fn a_cycle_is_the_four_calls_and_its_two_link_events() {
@@ -363,9 +390,33 @@ mod tests {
         assert_eq!(s["link_events"]["carrier_off_us"], 100.0);
         assert_eq!(s["link_events"]["expedited_gp_us"], 80.0);
         assert_eq!(s["link_events"]["expedited_gps_per_event"], 0.5);
-        // One carrier-on and one carrier-off per cycle, each at its own average.
-        assert_eq!(s["link_events"]["rtnl_hold_us_per_cycle"], 150.0);
-        assert_eq!(s["rtnl_hold_us_per_cycle"], 562.0);
+        // One carrier-on and one carrier-off per cycle, each at its own average, and the
+        // other devices' events as seen: 2 of 40 us in 4 cycles.
+        assert_eq!(s["link_events"]["other_devices_seen_per_cycle"], 0.5);
+        assert_eq!(s["link_events"]["other_devices_us"], 40.0);
+        assert_eq!(s["link_events"]["rtnl_hold_us_per_cycle"], 170.0);
+        assert_eq!(s["rtnl_hold_us_per_cycle"], 582.0);
+        assert_eq!(s["window_rtnl_hold_us_per_cycle"], 600.0);
+    }
+
+    /// A cell whose calls outnumber the holds summed for them is refused: the tracer ran
+    /// out of return-probe instances and every hold column would be short by that share.
+    #[test]
+    fn holds_the_tracer_dropped_are_refused() {
+        let mut maps = std::collections::BTreeMap::new();
+        add_scalars(TIMED, &mut maps);
+        add_scalars(STEADY, &mut maps);
+        // 1000 TUNSETIFF calls, 770 holds summed for them.
+        maps.insert("calls[1074025674]".into(), 1000.0);
+        maps.insert("helper_holds[1074025674]".into(), 770.0);
+        let refused = summarize(&maps).unwrap_err().to_string();
+        assert!(
+            refused.contains("770") && refused.contains("TUNSETIFF") && refused.contains("dropped"),
+            "{refused}"
+        );
+        // One call that straddles a window's edge is not a drop.
+        maps.insert("helper_holds[1074025674]".into(), 999.0);
+        summarize(&maps).unwrap();
     }
 
     #[test]

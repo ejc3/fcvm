@@ -832,7 +832,8 @@ fn pid_file_is_written(pid_file: &Path) -> bool {
 ///
 /// Setup sequence:
 /// 1. Spawn the holder: `fcvm __netns-agent` (`netns_agent`), which unshares both namespaces
-/// 2. The holder builds every link in one request (`build_namespace`, `netns_agent::build`):
+/// 2. The holder builds every link on one request from fcvm (`build_namespace`,
+///    `netns_agent::build`; several netlink requests, see there):
 ///    both TAPs as persistent devices, the bridge, its MAC and address
 /// 3. Start pasta, which attaches to its TAP
 /// 4. Start the VMM in the holder's namespaces (`install_namespace_pre_exec`); it attaches
@@ -1157,27 +1158,32 @@ impl PastaNetwork {
         let mut header = [0u8; 8];
         header[0] = libc::AF_INET6 as u8;
         let entries = rtnl.dump(super::rtnl::RTM_GETADDR, &header).ok()?;
-        const IFA_ADDRESS: u16 = 1;
         const RT_SCOPE_UNIVERSE: u8 = 0;
         Self::first_global_ipv6(
             entries
                 .iter()
                 .filter(|entry| entry.payload.get(3) == Some(&RT_SCOPE_UNIVERSE))
-                .filter_map(|entry| {
-                    let (_, value) = entry
-                        .attrs(8)
-                        .into_iter()
-                        .find(|(kind, _)| *kind == IFA_ADDRESS)?;
-                    <[u8; 16]>::try_from(value)
-                        .ok()
-                        .map(std::net::Ipv6Addr::from)
-                }),
+                .filter_map(|entry| Self::own_ipv6_address(&entry.attrs(8))),
         )
         .map(|address| address.to_string())
     }
 
-    /// The first of `addresses` that `ip -6 addr show scope global` would list and that is
-    /// not in fd00::/8: not loopback, link-local (fe80::/10) or site-local (fec0::/10).
+    /// This host's own address in one dumped IPv6 address entry: `IFA_LOCAL` when the entry
+    /// has one, else `IFA_ADDRESS`. On a point-to-point link `IFA_ADDRESS` is the peer's.
+    fn own_ipv6_address(attrs: &[(u16, &[u8])]) -> Option<std::net::Ipv6Addr> {
+        const IFA_ADDRESS: u16 = 1;
+        const IFA_LOCAL: u16 = 2;
+        let value = [IFA_LOCAL, IFA_ADDRESS].iter().find_map(|wanted| {
+            attrs
+                .iter()
+                .find(|(kind, _)| kind == wanted)
+                .map(|(_, value)| *value)
+        })?;
+        <[u8; 16]>::try_from(value)
+            .ok()
+            .map(std::net::Ipv6Addr::from)
+    }
+
     fn first_global_ipv6(
         addresses: impl IntoIterator<Item = std::net::Ipv6Addr>,
     ) -> Option<std::net::Ipv6Addr> {
@@ -4058,6 +4064,20 @@ mod tests {
     }
 
     /// The netlink dump finds the address getifaddrs finds on this host.
+    /// On a point-to-point interface the kernel reports the peer in `IFA_ADDRESS` and this
+    /// host in `IFA_LOCAL`; elsewhere only `IFA_ADDRESS` is present and is this host's.
+    #[test]
+    fn the_hosts_own_ipv6_address_is_the_local_one() {
+        let own: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let peer: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let (own_bytes, peer_bytes) = (own.octets(), peer.octets());
+        let point_to_point = [(1u16, &peer_bytes[..]), (2u16, &own_bytes[..])];
+        assert_eq!(PastaNetwork::own_ipv6_address(&point_to_point), Some(own));
+        let ordinary = [(1u16, &own_bytes[..])];
+        assert_eq!(PastaNetwork::own_ipv6_address(&ordinary), Some(own));
+        assert_eq!(PastaNetwork::own_ipv6_address(&[]), None);
+    }
+
     #[test]
     fn the_host_ipv6_probe_agrees_with_getifaddrs() {
         let listed = nix::ifaddrs::getifaddrs()

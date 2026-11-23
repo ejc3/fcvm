@@ -99,16 +99,72 @@ fn send(channel: &UnixStream, message: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The most descriptors one packet can carry here. A packet that carries more is cut short
+/// by the kernel, which closes the ones that do not fit.
+pub const MAX_PACKET_FDS: usize = 4;
+
+/// One packet from `socket` into `buffer`: how many bytes it had, and the descriptors that
+/// came with it. Zero bytes and no descriptor is end-of-file.
+///
+/// Every descriptor arrives close-on-exec (`MSG_CMSG_CLOEXEC`): the flag is set by the
+/// kernel as it installs the descriptor. Set afterwards with `fcntl`, a child this process
+/// forks in between would inherit the descriptor. A socket made in a VM's namespace that
+/// leaks into another VM's holder, pasta or VMM keeps that namespace alive and its
+/// connection to the guest open.
+pub fn receive_packet(
+    socket: &UnixStream,
+    buffer: &mut [u8],
+) -> std::io::Result<(usize, Vec<OwnedFd>)> {
+    // Room for the control message of MAX_PACKET_FDS descriptors: a 16-byte header and
+    // four bytes each, in 8-byte units so the header is aligned.
+    let mut control = [0u64; 2 + MAX_PACKET_FDS.div_ceil(2)];
+    let mut iov = libc::iovec {
+        iov_base: buffer.as_mut_ptr().cast(),
+        iov_len: buffer.len(),
+    };
+    // SAFETY: msghdr is plain data, valid when zeroed.
+    let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+    header.msg_iov = &mut iov;
+    header.msg_iovlen = 1;
+    header.msg_control = control.as_mut_ptr().cast();
+    header.msg_controllen = std::mem::size_of_val(&control) as _;
+    // SAFETY: `header` names `buffer` and `control`, both writable for the lengths given
+    // and alive for the whole call.
+    let len = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut header, libc::MSG_CMSG_CLOEXEC) };
+    if len < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut fds = Vec::new();
+    // SAFETY: the kernel filled `control` up to `msg_controllen` with well-formed control
+    // messages, which the CMSG macros walk. Each descriptor in an SCM_RIGHTS message is new
+    // in this process and owned by nothing else.
+    unsafe {
+        let mut message = libc::CMSG_FIRSTHDR(&header);
+        while !message.is_null() {
+            if (*message).cmsg_level == libc::SOL_SOCKET && (*message).cmsg_type == libc::SCM_RIGHTS
+            {
+                let bytes = (*message).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let data = libc::CMSG_DATA(message).cast::<RawFd>();
+                for at in 0..bytes / std::mem::size_of::<RawFd>() {
+                    fds.push(OwnedFd::from_raw_fd(data.add(at).read_unaligned()));
+                }
+            }
+            message = libc::CMSG_NXTHDR(&header, message);
+        }
+    }
+    Ok((len as usize, fds))
+}
+
 /// One message and the descriptor that came with it, or `None` at end-of-file.
 fn receive(channel: &UnixStream) -> std::io::Result<Option<(Vec<u8>, Option<OwnedFd>)>> {
     let mut buffer = [0u8; MAX_MESSAGE];
-    let (len, file) = channel
-        .recv_with_fd(&mut buffer)
-        .map_err(|error| std::io::Error::from_raw_os_error(error.errno()))?;
-    if len == 0 {
+    let (len, mut fds) = receive_packet(channel, &mut buffer)?;
+    if len == 0 && fds.is_empty() {
         return Ok(None);
     }
-    Ok(Some((buffer[..len].to_vec(), file.map(OwnedFd::from))))
+    // A message carries at most one descriptor; any other is closed here.
+    fds.truncate(1);
+    Ok(Some((buffer[..len].to_vec(), fds.pop())))
 }
 
 /// A TCP socket made in the calling process's network namespace: non-blocking and
@@ -286,14 +342,27 @@ pub fn main_if_agent() -> Option<Result<()>> {
     })())
 }
 
-/// The executable to start an agent from: this one when its `main` begins with
+/// The executable to start an agent from: this process's own when its `main` begins with
 /// [`main_if_agent`], otherwise the `fcvm` beside it or one directory up (a test binary in
 /// `target/<profile>/deps`).
 pub fn executable() -> Result<std::path::PathBuf> {
-    let current = std::env::current_exe().context("finding this executable")?;
-    if CAN_BE_AGENT.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(current);
+    executable_for(
+        CAN_BE_AGENT.load(std::sync::atomic::Ordering::Relaxed),
+        || std::env::current_exe().context("finding this executable"),
+    )
+}
+
+fn executable_for(
+    can_be_agent: bool,
+    current: impl FnOnce() -> Result<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    if can_be_agent {
+        // The file this process runs from, through the kernel's own link to it. The path
+        // it was started by can name another file by now (a rebuilt or upgraded binary), or
+        // none; a VM started later must still get an agent of this process's own build.
+        return Ok("/proc/self/exe".into());
     }
+    let current = current()?;
     let mut tried = Vec::new();
     for dir in current.ancestors().skip(1).take(2) {
         let candidate = dir.join("fcvm");
@@ -566,6 +635,55 @@ mod tests {
             2,
             "another request to the bridge"
         );
+    }
+
+    /// A descriptor the agent sends arrives close-on-exec. Without the flag, a holder,
+    /// pasta or VMM this process starts while a probe is in flight inherits a socket made
+    /// in another VM's namespace and keeps that namespace alive.
+    #[tokio::test]
+    async fn a_socket_from_the_agent_is_close_on_exec() {
+        let (client, _agent) = serving();
+        let socket = client
+            .tcp_socket(&"127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        // SAFETY: fcntl with F_GETFD takes no pointers.
+        let flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    }
+
+    /// A packet's descriptors all arrive, each close-on-exec, and a closed peer reads as
+    /// zero bytes with none.
+    #[test]
+    fn a_packet_carries_its_descriptors_close_on_exec() {
+        let (a, b) = channel().unwrap();
+        let files: Vec<std::fs::File> = (0..MAX_PACKET_FDS)
+            .map(|_| std::fs::File::open("/dev/null").unwrap())
+            .collect();
+        let raw: Vec<RawFd> = files.iter().map(|file| file.as_raw_fd()).collect();
+        a.send_with_fds(&[&b"hello"[..]], &raw).unwrap();
+        let mut buffer = [0u8; 16];
+        let (len, fds) = receive_packet(&b, &mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"hello");
+        assert_eq!(fds.len(), MAX_PACKET_FDS);
+        for fd in &fds {
+            // SAFETY: fcntl with F_GETFD takes no pointers.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        }
+        drop(a);
+        let (len, fds) = receive_packet(&b, &mut buffer).unwrap();
+        assert_eq!((len, fds.len()), (0, 0));
+    }
+
+    /// An fcvm starts its agents from the file it is itself running from, whatever its
+    /// path names now.
+    #[test]
+    fn an_agent_capable_binary_starts_agents_from_its_own_file() {
+        let from = executable_for(true, || panic!("the path is not looked at")).unwrap();
+        assert_eq!(from, std::path::Path::new("/proc/self/exe"));
+        let missing = executable_for(false, || Ok("/nonexistent/deps/test-binary".into()));
+        assert!(format!("{:#}", missing.unwrap_err()).contains("/nonexistent/fcvm"));
     }
 
     /// The serve loop on a thread, in this process's own namespaces: the protocol without

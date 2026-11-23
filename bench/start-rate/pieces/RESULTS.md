@@ -100,36 +100,59 @@ one cycle while preparing.
 | 2000 with pasta | 1 | 44 | 0.90 / 7.3 | 478 | 1 | 692 (264) | 363 | 268 | 1802 | 555 |
 | 2000 with pasta | 32 | 857 | 13.80 / 40.5 | 436 | 1 | 487 (126) | 269 | 288 | 1481 | 675 |
 | 2000 with pasta | 128 | 923 | 114.56 / 197.8 | 419 | 1 | 515 (114) | 271 | 289 | 1497 | 668 |
-| 2000 with pasta | 512 | 752 | 560.41 / 1207.7 | 313 | 1 | 403 (118) | 269 | 297 | 1284 | 779 |
+| 2000 with pasta | 512 (undercounted) | 752 | 560.41 / 1207.7 | 313 | 1 | 403 (118) | 269 | 297 | 1284 | 779 |
 | 2000, no pasta | 1 | 46 | 0.39 / 5.5 | 221 | 0 | 212 (68) | 211 | 148 | 792 | 1263 |
 | 2000, no pasta | 32 | 987 | 10.27 / 25.3 | 217 | 0 | 229 (34) | 246 | 145 | 836 | 1196 |
 | 2000, no pasta | 128 | 2051 | 38.87 / 80.0 | 210 | 1 | 230 (31) | 300 | 147 | 887 | 1127 |
-| 2000, no pasta | 512 | 2139 | 176.99 / 391.8 | 167 | 1 | 204 (33) | 282 | 143 | 797 | 1254 |
+| 2000, no pasta | 512 (undercounted) | 2139 | 176.99 / 391.8 | 167 | 1 | 204 (33) | 282 | 143 | 797 | 1254 |
 | 200 with pasta | 1 | 47 | 0.23 / 0.3 | 116 | 0 | 112 (34) | 82 | 102 | 413 | 2422 |
 | 2000 with pasta, first attach | 1 | 44 | 1.08 / 12.6 | 451 | 294 | 686 (372) | 432 | 283 | 2147 | 466 |
 | 2000 with pasta, first attach | 128 | 727 | 148.86 / 304.2 | 380 | 289 | 435 (105) | 359 | 281 | 1744 | 573 |
 | 2000, no pasta, first attach | 1 | 46 | 0.57 / 1.7 | 228 | 409 | 171 (30) | 210 | 146 | 1165 | 859 |
 | 2000, no pasta, first attach | 128 | 1067 | 93.70 / 191.5 | 264 | 253 | 277 (34) | 179 | 142 | 1117 | 896 |
 
-- **A reused namespace costs 1.3 to 1.8 ms of `rtnl_mutex` per clone life with 2000 pastas
-  alive**, which caps attach and detach at 555 to 779 per second. The burst rate agrees: 752
-  to 923 cycles/s at C=32 to 512.
-- **Half of it is not the VMM's own calls.** `TUNSETIFF` holds 0.31 to 0.48 ms and the close
-  0.40 to 0.69 ms (0.11 to 0.26 ms of that an expedited RCU grace period under the mutex,
-  `__tun_detach` -> `synchronize_net`); each of the two carrier changes is then handled by the
-  link watch worker for another 0.27 to 0.36 ms. `TUNSETVNETHDRSZ` holds under a microsecond.
+Two sets of rows are not measurements of a clone life, found in review after the campaign:
+
+- **The C=512 rows undercount.** `tap.bt` sums a hold from a return probe on `rtnl_lock`, and
+  the kernel keeps a fixed number of return-probe instances (twice the CPUs, 384 here). With
+  512 helpers asleep in `rtnl_lock` at once the rest are dropped: the dumps hold 0.77 to 0.95
+  holds per call at C=512 and 1.00 in every other cell, so those rows' hold columns are short
+  by up to a quarter. `tap-summary` now refuses such a cell.
+- **The no-pasta rows count the wrong link events.** With no pasta the TAP is the bridge's
+  only port. The worker handled the TAP's carrier-on after the helper's 20 ms were over in all
+  but 1% of cycles, so those rows' carrier-on column is the average of one or two events, and
+  the bridge's own carrier events (0.13 to 1.8 seen per cycle, 75 to 82 us each) are in no
+  column. Every hold of the mutex on the host during those cells, per cycle, was 1.43 ms at
+  C=1, 0.82 at C=32 and 0.59 at C=128, against the 0.79 to 0.89 the rows say. In the rows with
+  pasta the same total agrees with the row (1.79, 1.34 and 1.50 ms at C=1, 32 and 128).
+  `tap-summary` now reports both.
+
+Both are measured again, with a tracer that drops nothing and a helper that stays attached
+past the link watch delay, in the campaign of the PR that adds the namespace pool.
+
+- **A reused namespace costs 1.5 to 1.8 ms of `rtnl_mutex` per clone life with 2000 pastas
+  alive** (C=1 to 128), which caps attach and detach at 555 to 675 per second. The untraced
+  bursts ran at 857 and 923 cycles/s at C=32 and 128, above that cap, because a burst runs
+  ahead of its link events: the helper's own calls hold 0.92 to 0.94 ms per cycle, which
+  alone would allow about 1070.
+- **35 to 38% of it is not the VMM's own calls.** `TUNSETIFF` holds 0.42 to 0.48 ms and the
+  close 0.49 to 0.69 ms (0.11 to 0.26 ms of that an expedited RCU grace period under the
+  mutex, `__tun_detach` -> `synchronize_net`); each of the two carrier changes is then handled
+  by the link watch worker for another 0.27 to 0.36 ms. `TUNSETVNETHDRSZ` holds under a
+  microsecond.
 - **`TUNSETOFFLOAD` is free after a TAP's first attach.** The first one changes the device's
   features and the bridge above it follows (0.25 to 0.41 ms); later ones set what is already set.
-- **pasta's netlink listener is half the hold.** The same 2000 namespaces with no pasta hold
-  0.79 to 0.89 ms per cycle, and 200 namespaces with pasta 0.41 ms. Each pasta binds a
-  NETLINK_ROUTE socket to a multicast group (its neighbour listener, in the host's namespace),
-  and every link notification walks every such socket on the host under the mutex
-  (`do_one_broadcast`, 8% of the samples of the C=128 cell; `mutex_spin_on_owner`, the waiting,
-  22%). The rest grows with the namespaces themselves: `wireless_nlevent_flush` walks
-  every namespace on every netdev event (see rootless-net above).
-- **No patch to pasta gets a cycle under 0.7 ms.** With no pasta at all a cycle still holds
-  0.8 ms, so the attach and detach have to go: the pool has to keep the TAP attached and hand
-  the VMM the descriptor.
+- **The hold grows with what is alive on the host.** 200 namespaces with pasta hold 0.41 ms
+  per cycle where 2000 hold 1.80 (C=1). Each pasta binds a NETLINK_ROUTE socket to a multicast
+  group (its neighbour listener, in the host's namespace), and every link notification walks
+  every such socket on the host under the mutex: `do_one_broadcast` is 8.0% of all samples
+  under the helper and 2.0% under the link watch worker, and `mutex_spin_on_owner`, the
+  waiting, 21.9% (`PERF_FREQ=99`, `perf record -a -g` over the timed phase of the untraced
+  C=128 cell with 1000 held, top frames by `perftop.sh`). How much of the hold is pasta's
+  listener is not established: the no-pasta rows that were to show it are the ones above.
+- **The attach and detach have to go.** With pasta a cycle holds 1.5 ms or more, and without
+  it the host still held the mutex 0.59 to 1.43 ms per cycle. The design's bound for keeping
+  them was 0.7 ms, so the pool has to keep the TAP attached and hand the VMM the descriptor.
 
 ## Changelog
 

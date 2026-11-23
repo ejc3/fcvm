@@ -249,7 +249,9 @@ impl Rtnl {
 
     /// `ip link set dev INDEX ...`: every change of `change` in one request, so in one
     /// `rtnl_mutex` hold. The kernel applies the MTU, then the master, then the flags, then
-    /// the address generation mode.
+    /// the address generation mode: a link that can have a carrier when it comes up must
+    /// get `no_ipv6_link_local` in an earlier request than `up`, or it generates an address
+    /// in between (`netns_agent::build` does that for the bridge).
     pub fn set_link(&mut self, index: u32, change: &LinkChange) -> io::Result<()> {
         let up = if change.up { libc::IFF_UP as u32 } else { 0 };
         let mut payload = ifinfomsg(index, up, up);
