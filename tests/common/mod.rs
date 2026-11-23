@@ -427,6 +427,52 @@ pub async fn ext4_disk_image(
     Ok(())
 }
 
+/// The Firecracker process that fcvm process `fcvm_pid` has started, if it has one now.
+pub fn firecracker_child_of(fcvm_pid: u32) -> Option<u32> {
+    std::fs::read_dir(format!("/proc/{fcvm_pid}/task"))
+        .ok()?
+        .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("children")).ok())
+        .flat_map(|list| {
+            list.split_whitespace()
+                .filter_map(|pid| pid.parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
+        .find(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|comm| comm.starts_with("firecracker"))
+        })
+}
+
+/// The NUMA policy of process `pid`'s largest mapping (`/proc/<pid>/numa_maps`) and the file
+/// the mapping is of (empty for anonymous memory). A running Firecracker's largest mapping is
+/// its guest memory. `None` when the process is gone or its mappings changed between the
+/// two reads.
+pub fn largest_mapping_numa_policy(pid: u32) -> Option<(String, String)> {
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    let (start, _, file) = maps
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let (lo, hi) = fields.next()?.split_once('-')?;
+            let (lo, hi) = (
+                u64::from_str_radix(lo, 16).ok()?,
+                u64::from_str_radix(hi, 16).ok()?,
+            );
+            // perms, offset, device, inode, then the path when there is one.
+            let file = fields.nth(4).unwrap_or_default().to_string();
+            Some((lo, hi - lo, file))
+        })
+        .max_by_key(|&(_, len, _)| len)?;
+    let numa_maps = std::fs::read_to_string(format!("/proc/{pid}/numa_maps")).ok()?;
+    let policy = numa_maps
+        .lines()
+        .find(|line| line.starts_with(&format!("{start:x} ")))?
+        .split_whitespace()
+        .nth(1)?
+        .to_string();
+    Some((policy, file))
+}
+
 /// Generate unique names for snapshot/clone tests.
 ///
 /// Returns (baseline_name, clone_name, snapshot_name, serve_name) with unique suffixes.

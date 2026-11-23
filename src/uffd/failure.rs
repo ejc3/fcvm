@@ -56,6 +56,30 @@ pub(crate) fn clone_of_parent(
     }
 }
 
+/// The states among which the clone of fcvm process `(parent, parent_start)` is looked for,
+/// and whether every VM's state was read to get them.
+///
+/// The PID index names the states saved by a process, so a clone is found by reading its own
+/// state: a memory server refusing many clones at once must not read every VM's state once
+/// per refusal on the runtime that serves page faults. All states are listed only when the
+/// index names no state of that process, which is a state `save_state` could not enter in
+/// the index (it logs that) or one written without it.
+pub(crate) async fn states_of_parent(
+    manager: &crate::state::StateManager,
+    parent: u32,
+    parent_start: u64,
+) -> Result<(Vec<crate::state::VmState>, bool)> {
+    let indexed = manager.indexed_states_of_pid(parent).await;
+    if indexed
+        .iter()
+        .any(|state| state.pid_start_time == Some(parent_start))
+    {
+        return Ok((indexed, false));
+    }
+    let listed = manager.list_vms().await.context("listing VM states")?;
+    Ok((listed, true))
+}
+
 /// Write `reason` to `dir`'s failure file, atomically.
 pub(crate) fn write_failure(dir: &Path, reason: &str) -> Result<PathBuf> {
     let path = dir.join(FAILURE_FILE);
@@ -103,6 +127,52 @@ mod tests {
         sibling.pid_start_time = Some(2);
         states.push(sibling);
         assert_eq!(clone_of_parent(&states, 100, 2), None);
+    }
+
+    /// A clone whose state went through `save_state` is found through the PID index, without
+    /// listing every VM's state; a state the index does not name is still found, by listing.
+    #[tokio::test]
+    async fn the_clone_is_found_through_the_pid_index_without_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = crate::state::StateManager::new(dir.path().to_path_buf());
+        manager.init().await.unwrap();
+        let pid = std::process::id();
+        let start = crate::utils::process_start_time(pid).unwrap();
+        let mut clone = crate::state::VmState::new("vm-clone".into(), "alpine".into(), 1, 128);
+        clone.pid = Some(pid);
+        manager.save_state(&clone).await.unwrap();
+
+        let (states, listed) = states_of_parent(&manager, pid, start).await.unwrap();
+        assert!(
+            !listed,
+            "every VM's state was read to find an indexed clone"
+        );
+        assert_eq!(
+            clone_of_parent(&states, pid, start).as_deref(),
+            Some("vm-clone")
+        );
+
+        // A state the index does not name: written beside it, as a build without the index
+        // would have.
+        let parent = std::os::unix::process::parent_id();
+        let parent_start = crate::utils::process_start_time(parent).unwrap();
+        let mut unindexed =
+            crate::state::VmState::new("vm-unindexed".into(), "alpine".into(), 1, 128);
+        unindexed.pid = Some(parent);
+        unindexed.pid_start_time = Some(parent_start);
+        std::fs::write(
+            dir.path().join("vm-unindexed.json"),
+            serde_json::to_string(&unindexed).unwrap(),
+        )
+        .unwrap();
+        let (states, listed) = states_of_parent(&manager, parent, parent_start)
+            .await
+            .unwrap();
+        assert!(listed);
+        assert_eq!(
+            clone_of_parent(&states, parent, parent_start).as_deref(),
+            Some("vm-unindexed")
+        );
     }
 
     #[test]
