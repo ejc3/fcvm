@@ -32,10 +32,15 @@
 //!   waits. The open files hold that process's address space, so a VMM that exits meanwhile reads
 //!   as nothing mapped, never as another process that reused its PID.
 //!
-//! One clone records per generation: the first to create `<sidecar>.claim` (`create_new`). The
-//! claim stays, so a recording that fails, a set over the bound, or a directory the clone cannot
-//! write is not tried again by every later clone. Nothing is published when no mapping matched
-//! or the set is empty.
+//! One clone records at a time: the one holding an exclusive `flock` on `<sidecar>.claim`, taken
+//! without waiting when its restore completes and held until its recording ends. The kernel
+//! releases the lock when the clone's fcvm exits, killed or not, so a clone that does not get to
+//! record (cancelled inside the wait, its VMM gone, the maps it could not open) leaves the next
+//! clone of the generation to record instead. A `flock` is local to one kernel: on a store shared
+//! through fuse-pipe, clones in two guests can both record, and each publishes a whole set by
+//! rename. An outcome that would repeat for every clone (a set over the bound, an empty set)
+//! marks the generation `<sidecar>.unrecordable`, once, and no clone of it records again.
+//! Nothing is published when no mapping matched or the set is empty.
 
 use anyhow::{Context, Result};
 use std::io::{Read, Seek, SeekFrom};
@@ -99,21 +104,28 @@ impl Target {
     /// `maps` and `pagemap` now, before the wait. None when a set is recorded, another clone
     /// claimed it, or the claim cannot be made (a directory this clone cannot write).
     pub fn claim(&self, vmm_pid: u32) -> Result<Option<Recording>> {
-        if self.recorded().is_some() {
+        use std::os::fd::AsRawFd;
+        if self.recorded().is_some() || self.marked_unrecordable() {
             return Ok(None);
         }
-        let mut claim = self.sidecar.clone().into_os_string();
-        claim.push(".claim");
-        match std::fs::OpenOptions::new()
+        let path = self.with_suffix(".claim");
+        let claim = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
             .write(true)
-            .create_new(true)
-            .open(&claim)
-        {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
-            Err(error) => {
-                return Err(error).with_context(|| format!("claiming {}", claim.to_string_lossy()))
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
             }
+            return Err(error).with_context(|| format!("locking {}", path.display()));
+        }
+        // A clone that took the claim after another clone recorded and released it.
+        if self.recorded().is_some() || self.marked_unrecordable() {
+            return Ok(None);
         }
         let maps = std::fs::File::open(format!("/proc/{vmm_pid}/maps"))
             .with_context(|| format!("opening the memory map of {vmm_pid}"))?;
@@ -121,15 +133,46 @@ impl Target {
             .with_context(|| format!("opening the page map of {vmm_pid}"))?;
         Ok(Some(Recording {
             target: self.clone(),
+            _claim: claim,
             maps,
             pagemap,
         }))
     }
+
+    /// Whether an earlier clone found this generation's set over the bound or empty.
+    pub fn marked_unrecordable(&self) -> bool {
+        self.with_suffix(".unrecordable").exists()
+    }
+
+    fn with_suffix(&self, suffix: &str) -> PathBuf {
+        let mut path = self.sidecar.clone().into_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    /// Marks the generation as one no clone records, saying why, once.
+    fn mark_unrecordable(&self, why: &str) {
+        let path = self.with_suffix(".unrecordable");
+        match std::fs::write(&path, format!("{why}\n")) {
+            Ok(()) => tracing::info!(
+                sidecar = %self.sidecar.display(),
+                why,
+                "this snapshot generation gets no write set"
+            ),
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not mark the snapshot generation as getting no write set"
+            ),
+        }
+    }
 }
 
-/// A claimed recording, holding the VMM's `maps` and `pagemap` open.
+/// A claimed recording: the claim's lock, held until the recording ends or is dropped, and the
+/// VMM's `maps` and `pagemap`, open.
 pub struct Recording {
     target: Target,
+    _claim: std::fs::File,
     maps: std::fs::File,
     pagemap: std::fs::File,
 }
@@ -138,7 +181,8 @@ impl Recording {
     /// Reads the pages the VMM wrote and publishes them as the generation's set. Returns the
     /// number of ranges. Publishes nothing, and says why, when the VMM no longer maps the image
     /// (it exited, or the generation was replaced), when it wrote nothing, when the set is over
-    /// the bound, or when the generation on disk is no longer the one restored.
+    /// the bound, or when the generation on disk is no longer the one restored. An empty set or
+    /// one over the bound marks the generation, so no later clone records it again.
     pub fn record(mut self) -> Result<usize> {
         let mut maps = String::new();
         self.maps.read_to_string(&mut maps)?;
@@ -149,17 +193,21 @@ impl Recording {
             self.target.inode,
         )?
         .context("the VMM maps no memory image of the restored generation")?;
-        anyhow::ensure!(
-            !runs.is_empty(),
-            "the VMM wrote no page of the memory image"
-        );
+        if runs.is_empty() {
+            let why = "the VMM wrote no page of the memory image";
+            self.target.mark_unrecordable(why);
+            anyhow::bail!(why);
+        }
         let bytes: u64 = runs.iter().map(|(_, length)| length).sum();
         let image = std::fs::metadata(&self.target.canonical)?.len();
-        anyhow::ensure!(
-            bytes <= image / MAX_SET_FRACTION,
-            "the clone wrote {bytes} of the image's {image} bytes, more than \
-             1/{MAX_SET_FRACTION}; no write set is recorded"
-        );
+        if bytes > image / MAX_SET_FRACTION {
+            let why = format!(
+                "the clone wrote {bytes} of the image's {image} bytes, more than \
+                 1/{MAX_SET_FRACTION}; no write set is recorded"
+            );
+            self.target.mark_unrecordable(&why);
+            anyhow::bail!(why);
+        }
         let now = sidecar_path(
             self.target.sidecar.parent().unwrap_or(Path::new(".")),
             &self.target.memory,
@@ -333,8 +381,8 @@ mod tests {
         unsafe { libc::munmap(bytes.cast(), 12 * PAGE as usize) };
     }
 
-    /// A clone that wrote more than 1/MAX_SET_FRACTION of the image records nothing, and its
-    /// claim keeps every later clone from trying again.
+    /// A clone that wrote more than 1/MAX_SET_FRACTION of the image records nothing, and marks
+    /// the generation so no later clone tries again.
     #[test]
     fn a_set_over_the_bound_is_not_recorded() {
         let (_dir, snapshot, memory, config) = generation(8);
@@ -350,6 +398,50 @@ mod tests {
         assert!(target.claim(std::process::id()).unwrap().is_none());
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
+    }
+
+    /// A claim given up without recording (the clone cancelled inside the wait) leaves the next
+    /// clone to record: the claim is a lock, not a mark.
+    #[test]
+    fn a_claim_given_up_lets_the_next_clone_record() {
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        let first = target.claim(std::process::id()).unwrap().unwrap();
+        assert!(
+            target.claim(std::process::id()).unwrap().is_none(),
+            "held by the first"
+        );
+        drop(first);
+        assert!(target.claim(std::process::id()).unwrap().is_some());
+    }
+
+    /// A clone killed while it holds the claim, without any cleanup, is taken over: the kernel
+    /// releases its lock.
+    #[test]
+    fn a_claimer_killed_without_cleanup_is_taken_over() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        let claim = target.with_suffix(".claim");
+        let mut holder = std::process::Command::new("flock")
+            .args(["-x", "-o"])
+            .arg(&claim)
+            .args(["sh", "-c", "echo held; exec sleep 60"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "held");
+        assert!(target.claim(std::process::id()).unwrap().is_none());
+        // SAFETY: the holder's own process group, made above.
+        unsafe { libc::killpg(holder.id() as i32, libc::SIGKILL) };
+        holder.wait().unwrap();
+        assert!(target.claim(std::process::id()).unwrap().is_some());
     }
 
     /// A VMM that does not map the image (another process's PID, a VMM that mapped another

@@ -158,7 +158,7 @@ on `kvm_guest_fault` (every abort, with its kind and guest page), `io_mem_abort`
 `kvm_handle_guest_abort` (on-CPU time: entry to return less time switched out). Every value is a
 mean per clone; on-CPU us per abort is the on-CPU ms divided by the aborts. At C=1 every abort's
 guest page was kept, so RAM aborts split exactly: RAM = aborts - MMIO, distinct pages = read first
-+ write first, repeats = RAM - distinct. At C=128 the tracer dropped most per-page lines, so only
++ write first, repeats = RAM - distinct, each derived column computed from the rounded ones. At C=128 the tracer dropped most per-page lines, so only
 the totals and the copy-on-write count (permission faults on a write, all RAM) are given.
 
 | restore | C | aborts | MMIO | RAM | read first | write first | repeats | of them copy-on-write | on-CPU ms | on-CPU us / abort |
@@ -167,7 +167,7 @@ the totals and the copy-on-write count (permission faults on a write, all RAM) a
 | File | 128 | 47,347 | 8,290 | | | | | 7,216 | 474 | 10.0 |
 | UFFD copy | 1 | 34,844 | 12,188 | 22,656 | 12,680 | 4,472 | 5,504 | 4,568 | 65 | 1.9 |
 | UFFD copy | 128 | 44,661 | 8,235 | | | | | 6,963 | 454 | 10.2 |
-| UFFD minor | 1 | 45,290 | 13,714 | 31,577 | 12,529 | 3,896 | 15,152 | 6,367 | 180 | 4.0 |
+| UFFD minor | 1 | 45,290 | 13,714 | 31,576 | 12,529 | 3,896 | 15,151 | 6,367 | 180 | 4.0 |
 | UFFD minor | 128 | 73,600 | 7,706 | | | | | 7,201 | 2,451 | 33.3 |
 
 Every stage-2 mapping was 4 KiB. UFFD minor mode is the slow one under concurrency: at C=128 it
