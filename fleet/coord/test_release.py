@@ -2577,6 +2577,28 @@ class ProdStepTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(prod.main(["image-promote", receipt]), code)
 
+    def test_a_promotion_waits_while_terraforms_lock_is_held(self):
+        # The image release function shares Terraform's backend lock: "busy" means someone else holds it (an apply,
+        # a plan, another release), not a failure. 2026-11-23 run 45149811634 failed and rolled back on exactly that.
+        receipt = {"generation": 24, "build_id": "factory:new"}
+        self.answers["promote-prod"] = [{"status": "busy"}, {"status": "busy"}, {"status": "promoted", **receipt}]
+        sleeps = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_promote(receipt, sleep=sleeps.append), "promoted")
+        self.assertEqual(sleeps, [60, 60])
+        self.answers["promote-prod"] = [{"status": "busy"}] * 20
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "Terraform's lock"):
+            prod.image_promote(receipt, sleep=lambda _: None)
+
+    def test_an_image_rollback_waits_while_terraforms_lock_is_held(self):
+        new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
+        self.answers["prod-status"] = {"prod": new}
+        self.answers["rollback-prod"] = [{"status": "busy"}, {"status": "rolled_back", **old}]
+        sleeps = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(prod.image_rollback(new, old, deadline=time.time() + 1000, sleep=sleeps.append), "rolled_back")
+        self.assertEqual(sleeps, [60])
+
     def test_an_image_rollback_returns_only_to_the_previous_release(self):
         new, old = {"generation": 12, "build_id": "n"}, {"generation": 11, "build_id": "o"}
         self.answers["prod-status"] = {"prod": old}

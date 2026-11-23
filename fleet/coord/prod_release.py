@@ -275,8 +275,25 @@ def receipt_of(value):
     return receipt
 
 
-def image_promote(receipt):
-    result = lambda_result("IMAGE_RELEASE", {"action": "promote-prod", "receipt": receipt})
+# The image release function takes Terraform's backend lock, as the coordinator release does (publish.release): while
+# someone else holds it (an apply, a plan, another release) it answers busy, and the call is made again a minute later.
+BUSY_ATTEMPTS = 11
+
+
+def image_call(payload, sleep=time.sleep):
+    """One image release call, made again while the function answers busy."""
+    for attempt in range(BUSY_ATTEMPTS):
+        result = lambda_result("IMAGE_RELEASE", payload)
+        if result.get("status") != "busy":
+            return result
+        if attempt < BUSY_ATTEMPTS - 1:
+            print(f"Terraform's lock is held; asking the image release again in {POLL_SECONDS} seconds", flush=True)
+            sleep(POLL_SECONDS)
+    raise RuntimeError("Terraform's lock stayed held: the image release did not run")
+
+
+def image_promote(receipt, sleep=time.sleep):
+    result = image_call({"action": "promote-prod", "receipt": receipt}, sleep)
     status = result.get("status")
     if status == "held":
         raise publish.Held("prod woke before its images moved")
@@ -295,7 +312,7 @@ def image_rollback(receipt, want, deadline=None, clock=time.time, sleep=time.sle
     if current != receipt:
         raise RuntimeError("prod's images are neither the promoted release nor the previous one")
     while True:
-        result = lambda_result("IMAGE_RELEASE", {"action": "rollback-prod", "receipt": receipt})
+        result = image_call({"action": "rollback-prod", "receipt": receipt}, sleep)
         status = result.get("status")
         if status in ("rolled_back", "unchanged"):
             if receipt_of(result) != want:
