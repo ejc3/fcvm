@@ -5588,8 +5588,10 @@ fn clone_failure_after_vmm_exit(
 /// its concurrent-clone cap kills a refused clone's VMM without writing one when too many
 /// refusals are in flight (`Refusals` in `uffd::server`). The clone then sees only that the
 /// snapshot load, the request during which the VMM connects to the server, got no answer.
-/// So a restore from a `snapshot serve` that failed that way points at the server's log. A
-/// load that Firecracker answered with an error was not ended by a kill.
+/// It sees the same when the request ran into its timeout and when Firecracker died on its
+/// own during the load, so a restore from a `snapshot serve` that failed that way names the
+/// server's kill as a possibility and points at the server's log. A load that Firecracker
+/// answered with an error was not ended by a kill.
 fn restore_failure_with_its_memory_server(
     error: anyhow::Error,
     recorded: Option<String>,
@@ -5611,9 +5613,9 @@ fn restore_failure_with_its_memory_server(
         return error;
     }
     error.context(format!(
-        "the snapshot load got no answer from Firecracker, and the memory server (serve PID \
-         {serve_pid}) recorded no reason for killing it: see the serve log (it may be at its \
-         concurrent-clone cap, {})",
+        "the snapshot load got no answer from Firecracker. If the memory server (serve PID \
+         {serve_pid}) killed this clone's VMM, it recorded no reason: see the serve log (the \
+         server may be at its concurrent-clone cap, {})",
         crate::uffd::MAX_CLONES_ENV
     ))
 }
@@ -9829,8 +9831,16 @@ mod watchdog_exit_classification_tests {
             "{:#}",
             super::restore_failure_with_its_memory_server(died_under_the_load(), None, Some(4242))
         );
+        // Firecracker's death or the request's timeout looks the same from here, so the
+        // server's kill is named as a possibility.
+        assert!(
+            !unrecorded.contains("for killing it"),
+            "the message says the memory server killed the clone, which is not known: \
+             {unrecorded}"
+        );
         for expected in [
-            "the snapshot load got no answer from Firecracker",
+            "the snapshot load got no answer from Firecracker. If the memory server",
+            "killed this clone's VMM, it recorded no reason",
             "serve PID 4242",
             "see the serve log",
             "concurrent-clone cap",

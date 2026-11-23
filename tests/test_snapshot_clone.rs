@@ -7190,6 +7190,26 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
             unnamed.len(),
             unnamed.join("\n")
         );
+        // The burst did make refusals wait their turn: by the server's own count, more were
+        // in flight at once than it records at once (REFUSAL_RECORDS, 4). Without that the
+        // check above passes whether or not a waiting refusal keeps its record.
+        let serve_output = tokio::fs::read_to_string(&serve_log).await?;
+        let most_in_flight = serve_output
+            .lines()
+            .filter_map(|line| {
+                line.split_once("refusals_in_flight=")?
+                    .1
+                    .split_whitespace()
+                    .next()
+            })
+            .filter_map(|count| count.parse::<usize>().ok())
+            .max()
+            .context("the memory server logged no count of refusals in flight")?;
+        anyhow::ensure!(
+            most_in_flight > 4,
+            "at most {most_in_flight} refusals were in flight at once, so none of the burst \
+             waited its turn to be recorded"
+        );
         Ok(())
     }
     .await;
