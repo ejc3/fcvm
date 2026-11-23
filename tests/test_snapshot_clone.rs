@@ -7051,13 +7051,15 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
         common::create_snapshot_by_pid(*baseline_pid, &snapshot_name).await?;
         snapshot_created = true;
 
-        // Every record of a refusal is held for a second first, so the refusals of the burst
-        // below overlap whatever the host's speed.
+        // Every record of a refusal is held for two seconds first, so the records of the
+        // burst below overlap whatever the host's speed: five clones that arrive within two
+        // seconds are more than the server records at once. With all 16 at once the last
+        // waits 6 s for its turn, inside the server's 10 s.
         let (serve_child, serve_pid, serve_log) = common::spawn_fcvm_with_env_and_log_path(
             &["snapshot", "serve", &snapshot_name],
             &[
                 ("FCVM_UFFD_MAX_CLONES", "1"),
-                ("FCVM_FAILPOINT", "uffd.refusal.pre_record:sleep:1000"),
+                ("FCVM_FAILPOINT", "uffd.refusal.pre_record:sleep:2000"),
             ],
         )
         .await?;
@@ -7146,7 +7148,7 @@ async fn a_clone_refused_at_the_cap_names_the_cap() -> Result<()> {
         );
 
         // A burst of clones against the server at its cap, four times what it records at
-        // once, with each record taking a second: every one of them names the cap.
+        // once, with each record taking two seconds: every one of them names the cap.
         let mut logs = Vec::new();
         for index in 0..REFUSED_BURST {
             let name = format!("{refused_name}-{index}");

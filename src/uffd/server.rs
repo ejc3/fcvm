@@ -449,11 +449,21 @@ impl PeerVmm {
 ///
 /// The normal Result path disarms this only after [`serve_clone_fail_closed`] has either
 /// completed cleanly or killed the peer for an error. Any other exit leaves it armed.
+///
+/// A refused clone's task holds one too ([`PeerTaskGuard::for_refusal`]), disarmed after its
+/// own kill. A stopping server cancels those tasks, which is how their VMMs are killed
+/// then, so that guard's drop says so instead of reporting an admitted clone's task.
 struct PeerTaskGuard {
     peer: PeerVmm,
     vm_id: String,
     armed: bool,
+    refusal: bool,
 }
+
+/// What a refusal's guard logs, and gives as the kill's reason, when its task is dropped
+/// before the task's own kill.
+const REFUSAL_TASK_CANCELLED: &str =
+    "refused clone's task was cancelled before its kill (the server is stopping)";
 
 impl PeerTaskGuard {
     fn new(peer: PeerVmm, vm_id: impl Into<String>) -> Self {
@@ -461,6 +471,17 @@ impl PeerTaskGuard {
             peer,
             vm_id: vm_id.into(),
             armed: true,
+            refusal: false,
+        }
+    }
+
+    /// The guard of a refused clone's task ([`Refusals::refuse`]).
+    fn for_refusal(peer: PeerVmm, vm_id: impl Into<String>) -> Self {
+        Self {
+            peer,
+            vm_id: vm_id.into(),
+            armed: true,
+            refusal: true,
         }
     }
 
@@ -475,16 +496,27 @@ impl PeerTaskGuard {
 
 impl Drop for PeerTaskGuard {
     fn drop(&mut self) {
-        if self.armed {
-            error!(
+        if !self.armed {
+            return;
+        }
+        if self.refusal {
+            warn!(
                 target: "uffd",
                 vm_id = %self.vm_id,
                 peer_pid = self.peer.pid,
-                "admitted clone task ended without normal fail-closed completion; killing VMM"
+                "{REFUSAL_TASK_CANCELLED}; killing its VMM"
             );
-            self.peer
-                .kill_now("admitted clone task unwound or was cancelled");
+            self.peer.kill_now(REFUSAL_TASK_CANCELLED);
+            return;
         }
+        error!(
+            target: "uffd",
+            vm_id = %self.vm_id,
+            peer_pid = self.peer.pid,
+            "admitted clone task ended without normal fail-closed completion; killing VMM"
+        );
+        self.peer
+            .kill_now("admitted clone task unwound or was cancelled");
     }
 }
 
@@ -514,11 +546,13 @@ const REFUSALS_IN_FLIGHT: usize = 256;
 /// The bound on one record ([`PeerVmm::record_failure`]).
 const RECORD_BOUND: Duration = Duration::from_secs(2);
 
-/// How long a refusal waits its turn to record. Its VMM, port and disk are held until its
-/// kill, so the wait is bounded as the record is: a refused clone is killed within this and
-/// the record's 2 s, also when every record ahead of it runs into that bound. After the
-/// wait it is killed without a record. With `REFUSALS_IN_FLIGHT` waiting, every one of them
-/// gets its turn while a record takes under 150 ms on average; one takes milliseconds.
+/// How long a copy-mode server's refusal waits its turn to record; a minor-mode server's
+/// waits [`REFUSAL_WAIT_MINOR`]. Its VMM, port and disk are held until its kill, so the wait
+/// is bounded as the record is: a refused clone is killed within the server's wait and the
+/// record's 2 s, also when every record ahead of it runs into that bound. After the wait it
+/// is killed without a record. With `REFUSALS_IN_FLIGHT` waiting, every one of them gets its
+/// turn while a record takes under 156 ms on average here (10 s x 4 / 256) and under 31 ms
+/// on a minor-mode server (2 s x 4 / 256); one takes milliseconds.
 const REFUSAL_WAIT: Duration = Duration::from_secs(10);
 
 /// How long Firecracker waits for a minor-mode server's greeting before it answers the
@@ -605,7 +639,7 @@ impl Refusals {
     /// no answer, with a pointer to this server's log
     /// (`restore_failure_with_its_memory_server`): a refusal that arrives with `in_flight`
     /// refusals already in flight (killed here and now), and one whose turn has not come
-    /// after `wait`.
+    /// after the server's wait (`wait`: [`REFUSAL_WAIT`], or [`REFUSAL_WAIT_MINOR`]).
     fn refuse<C: Send + 'static>(
         &mut self,
         peer: PeerVmm,
@@ -643,7 +677,7 @@ impl Refusals {
         let records = Arc::clone(&self.records);
         let record = Arc::clone(&self.record);
         let wait = self.wait;
-        let mut guard = PeerTaskGuard::new(peer, vm_id.clone());
+        let mut guard = PeerTaskGuard::for_refusal(peer, vm_id.clone());
         self.tasks.spawn(async move {
             match tokio::time::timeout(wait, records.acquire_owned()).await {
                 // The slot is held until the record is written.
@@ -674,8 +708,8 @@ impl Refusals {
 
     /// End every refusal in flight now, for a server that is stopping. Each task is dropped
     /// where it waits, and its guard kills its VMM, without a record. Waiting for the turns
-    /// and the records instead could take `REFUSAL_WAIT` and a record's bound, longer than
-    /// `snapshot serve` waits for its server to stop (10 s) before it goes on without it.
+    /// and the records instead could take the server's wait and a record's bound, longer
+    /// than `snapshot serve` waits for its server to stop (10 s) before it goes on without it.
     async fn shutdown(&mut self) {
         if !self.tasks.is_empty() {
             info!(
@@ -8309,6 +8343,35 @@ mod tests {
         assert_vmm_was_killed(victim).await;
     }
 
+    /// The log lines written while it is a thread's subscriber's writer.
+    #[derive(Clone, Default)]
+    struct LogLines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogLines {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogLines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogLines {
+        type Writer = LogLines;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     /// What a test's stand-in for `record_failure` saw.
     #[derive(Default)]
     struct Recorded {
@@ -8532,13 +8595,42 @@ mod tests {
             recorded.pids().len() == 1
         })
         .await;
+        // What the server logs for the stop. This test's runtime has one thread, so the
+        // tasks dropped by the stop log through this thread's subscriber.
+        let log = LogLines::default();
+        let logged = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_ansi(false)
+                .finish(),
+        );
         tokio::time::timeout(Duration::from_secs(1), refusals.shutdown())
             .await
             .expect("stopping waited for a refusal that is recording and one that is waiting");
+        drop(logged);
         assert!(refusals.tasks.is_empty());
         assert_vmm_was_killed(recording).await;
         assert_vmm_was_killed(waiting).await;
         assert_eq!(recorded.pids(), [recording_pid]);
+        // The two kills are logged as what they are, with that as the kill's reason, and
+        // not as an admitted clone's task that ended abnormally.
+        let log = log.text();
+        assert_eq!(
+            log.matches(&format!("{REFUSAL_TASK_CANCELLED}; killing its VMM"))
+                .count(),
+            2,
+            "the stop does not log each cancelled refusal: {log}"
+        );
+        assert_eq!(
+            log.matches(&format!("reason={REFUSAL_TASK_CANCELLED}"))
+                .count(),
+            2,
+            "the kills do not give the cancelled refusal as their reason: {log}"
+        );
+        assert!(
+            !log.contains("admitted clone task"),
+            "a refusal killed at the stop is logged as an admitted clone's task: {log}"
+        );
 
         // The server's stop takes that path, before it waits for anything else.
         let source = include_str!("server.rs");
