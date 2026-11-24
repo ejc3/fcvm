@@ -1125,12 +1125,12 @@ class DirWatch:
 
 
 STATE_LAYOUT = "2"
-_BUCKET_NAME = re.compile(r"^[0-9a-f]{2}$")
+_BUCKET_NAME = re.compile(r"^[0-9a-f]$")
 
 
 def bucket_of(key: str) -> str:
     """fcvm's state bucket: the first byte of SHA-256 of the key (src/state/manager.rs)."""
-    return hashlib.sha256(key.encode()).hexdigest()[:2]
+    return hashlib.sha256(key.encode()).hexdigest()[:1]
 
 
 def vm_state_path(state_dir: str, vm_id: str) -> str:

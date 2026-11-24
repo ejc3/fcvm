@@ -53,7 +53,7 @@ case "$1 $2" in
       name=""; prev=""
       for a in "$@"; do [ "$prev" = --name ] && name="$a"; prev="$a"; done
       vm_id="vm-$(printf '%s' "$name" | sha256sum | cut -c1-32)"
-      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-2); mkdir -p "$STATE_DIR/vms/$bucket"
+      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1); mkdir -p "$STATE_DIR/vms/$bucket"
       state="$STATE_DIR/vms/$bucket/$vm_id.json"
       read -r st < /proc/$$/stat; st=${st##*) }; read -ra f <<< "$st"
       printf '{"vm_id":"%s","name":"%s","pid":%s,"pid_start_time":%s,"config":{"network":{"loopback_ip":"127.0.0.1"}}}\n' \

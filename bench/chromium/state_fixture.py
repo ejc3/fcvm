@@ -14,7 +14,7 @@ import reqbench
 # directory and prints the state path, the way fcvm's first write does.
 SH_STATE_PATH = r'''fixture_state_path() {
     local b
-    b=$(printf %s "$2" | sha256sum | cut -c1-2)
+    b=$(printf %s "$2" | sha256sum | cut -c1-1)
     mkdir -p "$1/vms/$b"
     printf '%s/vms/%s/%s.json' "$1" "$b" "$2"
 }

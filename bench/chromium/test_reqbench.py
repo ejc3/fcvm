@@ -7094,7 +7094,7 @@ case "$1 $2" in
       name=""; prev=""
       for a in "$@"; do [ "$prev" = --name ] && name="$a"; prev="$a"; done
       vm_id="vm-$(printf '%s' "$name" | sha256sum | cut -c1-32)"
-      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-2); mkdir -p "$STATE_DIR/vms/$bucket"
+      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1); mkdir -p "$STATE_DIR/vms/$bucket"
       state="$STATE_DIR/vms/$bucket/$vm_id.json"
       read -r st < /proc/$$/stat; st=${st##*) }; read -ra f <<< "$st"
       printf '{"vm_id":"%s","name":"%s","pid":%s,"pid_start_time":%s,"config":{"network":{"loopback_ip":"127.0.0.1"}}}\n' \
@@ -10489,14 +10489,14 @@ class StateLayoutReaders(unittest.TestCase):
         return state_fixture.make_store(os.path.join(tmp.name, "state"))
 
     def test_bucket_examples_from_the_contract(self):
-        self.assertEqual(reqbench.bucket_of(self.VM), "ae")
-        self.assertEqual(reqbench.bucket_of("vm-1"), "2d")
-        self.assertEqual(reqbench.bucket_of(str(4242)), "03")
-        self.assertEqual(reqbench.bucket_of("web"), "4b")
+        self.assertEqual(reqbench.bucket_of(self.VM), "a")
+        self.assertEqual(reqbench.bucket_of("vm-1"), "2")
+        self.assertEqual(reqbench.bucket_of(str(4242)), "0")
+        self.assertEqual(reqbench.bucket_of("web"), "4")
 
     def test_paths_follow_the_contract(self):
-        self.assertEqual(reqbench.vm_state_path("/s", self.VM), f"/s/vms/ae/{self.VM}.json")
-        self.assertEqual(reqbench.pid_bucket_dir("/s", 4242), "/s/pids/03")
+        self.assertEqual(reqbench.vm_state_path("/s", self.VM), f"/s/vms/a/{self.VM}.json")
+        self.assertEqual(reqbench.pid_bucket_dir("/s", 4242), "/s/pids/0")
 
     def test_store_without_layout_file_and_flat_states_is_refused(self):
         d = self.store()
@@ -10613,6 +10613,25 @@ class StateLayoutReaders(unittest.TestCase):
         watch.drain()  # adds the new bucket's watch
         state_fixture.write_vm_state(d, self.VM, {"vm_id": self.VM, "pid": None}, lock=False)
         self.assertTrue(watch.wait(2.0))
+
+    def test_exchange_publish_events_on_the_temp_name_do_not_hide_the_state(self):
+        d = self.store()
+        me = os.getpid()
+        start = reqbench.proc_stat_fields(me)[3]
+        watch = reqbench.StateWatch(d)
+        self.addCleanup(watch.close)
+        state = {"vm_id": self.VM, "name": "n", "pid": me, "pid_start_time": start}
+        path = state_fixture.write_vm_state(d, self.VM, state)
+        # A replace publishes by exchange: the old state is left in .json.tmp, then unlinked.
+        with open(path + ".tmp", "w") as f:
+            json.dump(state, f)
+        os.rename(path + ".tmp", path + ".x")
+        os.rename(path + ".x", path)
+        open(path + ".tmp", "w").close()
+        os.unlink(path + ".tmp")
+        watch.drain()
+        self.assertEqual(reqbench.list_state_paths(d), [path])
+        self.assertEqual(reqbench.scan_state(d, me, fcvm_start_time=start), (path, state))
 
     def test_serve_mode_ignores_a_stale_entry_and_finds_the_serve(self):
         d = self.store()
