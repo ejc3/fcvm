@@ -96,8 +96,8 @@ jobs:
       - name: Failing tiles to the job summary
         if: ${{ failure() }}
         run: |
-          { echo "### v4 viewer: failing checks"; echo; echo '| mode | tile | step | error |'; echo '|---|---|---|---|'
-            jq -r 'select(.ok == false or .status == "failed") | "| \(.mode // "-") | \(.tile // "-") | \(.step) | \(.error // .errorType) |"' "$RUNNER_TEMP/smoke.jsonl"
+          { echo "### v4 viewer: failing checks"; echo; echo '| mode | tile | step | error | fleet cause |'; echo '|---|---|---|---|---|'
+            jq -r 'select(.ok == false or .status == "failed") | "| \(.mode // "-") | \(.tile // "-") | \(.step) | \(.error // .errorType) | \(.cause // "-") |"' "$RUNNER_TEMP/smoke.jsonl"
           } >> "$GITHUB_STEP_SUMMARY"
 
   ipv6:
@@ -144,8 +144,8 @@ jobs:
       - name: Failing tiles to the job summary
         if: ${{ failure() }}
         run: |
-          { echo "### v6 viewer: failing checks"; echo; echo '| mode | tile | step | error |'; echo '|---|---|---|---|'
-            jq -r 'select(.ok == false or .status == "failed") | "| \(.mode // "-") | \(.tile // "-") | \(.step) | \(.error // .errorType) |"' "$RUNNER_TEMP/smoke.jsonl"
+          { echo "### v6 viewer: failing checks"; echo; echo '| mode | tile | step | error | fleet cause |'; echo '|---|---|---|---|---|'
+            jq -r 'select(.ok == false or .status == "failed") | "| \(.mode // "-") | \(.tile // "-") | \(.step) | \(.error // .errorType) | \(.cause // "-") |"' "$RUNNER_TEMP/smoke.jsonl"
           } >> "$GITHUB_STEP_SUMMARY"
 
   report:
