@@ -56,6 +56,7 @@ const BROKE: PotatoDrop = {
   detail: "player 1 was waking when player 0 threw (1 tries in 100 ms: connection timed out)",
   cause: null,
   cause_ms: null,
+  cpu_wait_ms: null,
   pace: null,
 };
 
@@ -572,6 +573,11 @@ describe("the chart and the ladder's bars", () => {
     expect(c.paceMax).toBe(9);
   });
 
+  it("draws no point for a lap without a pace", () => {
+    const p = dense({}, { laps: [{ lap: 0, pace: null, hold_ms: 400, cpus_peak: 2, cpus_busy: null }, { lap: 1, pace: 5, hold_ms: 200, cpus_peak: 3, cpus_busy: null }] });
+    expect(chartOf(p, p.round!)!.points).toEqual([{ pace: 5, cpus: 3 }]);
+  });
+
   it("has no chart before a lap reports its peak, or when the laps carry none", () => {
     const early = dense({}, { laps: [] });
     expect(chartOf(early, early.round!)).toBeNull();
@@ -622,7 +628,10 @@ describe("drops, the ladder and the records", () => {
   it("names each measured cause for the card and the late square", () => {
     expect(causeOf({ ...BROKE, cause: "waking", cause_ms: 84 })).toEqual({ tile: "84 ms late", line: "Still waking when the ball arrived; it accepted 84 ms later.", big: { value: "84 ms", word: "late" } });
     expect(causeOf({ ...BROKE, cause: "waking", cause_ms: null })).toMatchObject({ tile: "still waking", big: null });
-    expect(causeOf({ ...BROKE, cause: "cpu_wait", cause_ms: 131 })).toMatchObject({ tile: "waited 131 ms for a CPU", line: "Its wake had waited 131 ms for a CPU.", big: { value: "131 ms", word: "waiting for a CPU" } });
+    expect(causeOf({ ...BROKE, cause: "cpu_wait", cause_ms: 131 })).toMatchObject({ tile: "waited 131 ms for a CPU", line: "All CPUs were busy: its wake waited 131 ms for one.", big: { value: "131 ms", word: "waiting for a CPU" } });
+    // the drop of a real run: cpu_wait about half a second, the stage already awake; the late figure moves in when it arrives
+    expect(causeOf({ ...BROKE, stage: "awake", cause: "cpu_wait", cause_ms: 512 })).toMatchObject({ tile: "waited 512 ms for a CPU", big: { value: "512 ms", word: "waiting for a CPU" } });
+    expect(causeOf({ ...BROKE, cause: "cpu_wait", cause_ms: null, cpu_wait_ms: 480 })!.tile).toBe("waited 480 ms for a CPU");
     expect(causeOf({ ...BROKE, cause: "saving", cause_ms: 40 })).toMatchObject({ tile: "still saving", line: "Still saving, 40 ms in, when the ball arrived." });
     expect(causeOf({ ...BROKE, cause: "proof" })).toMatchObject({ tile: "proof failed" });
     expect(causeOf({ ...BROKE, cause: null })).toBeNull();

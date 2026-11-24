@@ -553,7 +553,7 @@ export interface ChartView {
 export function chartOf(p: Potato, r: PotatoRound): ChartView | null {
   const k = p.cpus;
   if (k === null || k <= 0) return null;
-  const points = r.laps.filter((l) => l.cpus_peak !== null).map((l) => ({ pace: l.pace, cpus: l.cpus_peak! }));
+  const points = r.laps.filter((l) => l.cpus_peak !== null && l.pace !== null).map((l) => ({ pace: l.pace!, cpus: l.cpus_peak! }));
   if (points.length === 0) return null;
   const now = r.pace !== null && r.cpus_in_use !== null ? { pace: r.pace, cpus: r.cpus_in_use } : null;
   // the pace axis runs on to the rung's record, or to well past the points, so a lone point is not floating
@@ -655,10 +655,13 @@ export function causeOf(d: PotatoDrop): { tile: string; line: string; big: { val
       return d.cause_ms === null
         ? { tile: "still waking", line: "Still waking when the ball arrived.", big: null }
         : { tile: `${fmtMs(d.cause_ms)} late`, line: `Still waking when the ball arrived; it accepted ${fmtMs(d.cause_ms)} later.`, big: { value: fmtMs(d.cause_ms), word: "late" } };
-    case "cpu_wait":
-      return d.cause_ms === null
+    case "cpu_wait": {
+      // the wait is in cause_ms, or in cpu_wait_ms while the cause was still "waking"
+      const w = d.cause_ms ?? d.cpu_wait_ms;
+      return w === null
         ? { tile: "waiting for a CPU", line: "Its wake was waiting for a CPU.", big: null }
-        : { tile: `waited ${fmtMs(d.cause_ms)} for a CPU`, line: `Its wake had waited ${fmtMs(d.cause_ms)} for a CPU.`, big: { value: fmtMs(d.cause_ms), word: "waiting for a CPU" } };
+        : { tile: `waited ${fmtMs(w)} for a CPU`, line: `All CPUs were busy: its wake waited ${fmtMs(w)} for one.`, big: { value: fmtMs(w), word: "waiting for a CPU" } };
+    }
     case "saving":
       return d.cause_ms === null
         ? { tile: "still saving", line: "Still saving when the ball arrived.", big: null }

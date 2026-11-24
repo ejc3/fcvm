@@ -576,7 +576,8 @@ export interface PotatoRound {
 
 export interface PotatoLap {
   lap: number;
-  pace: number;
+  /** Null when the lap's stamps put it faster than its holds allow: no point is drawn. */
+  pace: number | null;
   hold_ms: number | null;
   cpus_peak: number | null;
   cpus_busy: number | null;
@@ -626,6 +627,8 @@ export interface PotatoDrop {
   cause: string | null;
   /** The cause's measurement, ms (for `waking`, how long after the drop the catcher accepted). */
   cause_ms: number | null;
+  /** How long the catcher's wake had waited for a CPU, ms, when sent. */
+  cpu_wait_ms: number | null;
   /** The pace of the last completed lap when the ball dropped. */
   pace: number | null;
 }
@@ -1172,6 +1175,7 @@ function parsePotatoDrop(v: unknown, where: string): PotatoDrop | null {
     detail: strOrNull(v, "detail", where) ?? "",
     cause: strOrNull(v, "cause", where),
     cause_ms: numOrNull(v, "cause_ms", where),
+    cpu_wait_ms: numOrNull(v, "cpu_wait_ms", where),
     pace: numOrNull(v, "pace", where),
   };
 }
@@ -1223,7 +1227,7 @@ function parsePotatoRound(v: unknown): PotatoRound | null {
     laps: v["laps"] === undefined || v["laps"] === null ? [] : arr(v, "laps", w).map((l, i) => {
       const at = `${w}.laps[${i}]`;
       if (!isObj(l)) throw new ProtocolError(`${at} is not an object`);
-      return { lap: num(l, "lap", at), pace: num(l, "pace", at), hold_ms: numOrNull(l, "hold_ms", at), cpus_peak: numOrNull(l, "cpus_peak", at), cpus_busy: numOrNull(l, "cpus_busy", at) };
+      return { lap: num(l, "lap", at), pace: numOrNull(l, "pace", at), hold_ms: numOrNull(l, "hold_ms", at), cpus_peak: numOrNull(l, "cpus_peak", at), cpus_busy: numOrNull(l, "cpus_busy", at) };
     }),
     cpus_in_use: numOrNull(v, "cpus_in_use", w),
     cpus_peak: numOrNull(v, "cpus_peak", w),
