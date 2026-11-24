@@ -2094,10 +2094,11 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport, at: u64) {
     slot.observed.vm_stats = h
         .vm_stats
         .as_ref()
-        .filter(|v| v.cpu_pct.is_finite() && v.mem_mb.is_finite() && v.vcpus > 0)
+        .filter(|v| v.cpu_pct.is_finite() && v.cpu_pct >= 0.0 && v.vcpus > 0)
         .map(|v| VmStats {
+            cpu_pct: v.cpu_pct.min(100.0),
+            vcpus: v.vcpus,
             at: Some(at),
-            ..v.clone()
         });
     slot.observed.budget_fit = h.budget_fit.filter(|v| v.is_finite());
     slot.observed.render_ms_max = h.render_ms_max.filter(|v| v.is_finite());

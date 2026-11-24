@@ -8033,6 +8033,7 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
                 render_ms_max: None,
                 budget_every_pixel: None,
                 boot_id: None,
+                vm_stats: None,
             }))
             .unwrap();
     }
@@ -8096,6 +8097,7 @@ async fn a_tile_whose_fit_draws_every_pixel_is_granted_it() {
                 render_ms_max: None,
                 budget_every_pixel: Some(275_448.0),
                 boot_id: Some(format!("boot-{id}")),
+                vm_stats: None,
             }))
             .unwrap();
     }

@@ -165,7 +165,7 @@ export class MockPhones {
         frame_url_v4: p.phase === "running" ? this.host.renderers.frameUrlV4(p.slot) : null,
         gpu: { sbdf: `0000:${(0x30 + p.n).toString(16)}:00.0`, name: "Tesla T4" },
         gpu_stats: { temp_c: 52, power_w: 48, util_pct: 37, mem_used_mb: 648.3, mem_total_mb: 15360, at: this.host.now() },
-        vm_stats: { cpu_pct: 21.4, mem_mb: 1843.2, vcpus: 6, at: this.host.now() },
+        vm_stats: { cpu_pct: 21.4, vcpus: 6, at: this.host.now() },
         host: `g4dn.metal · mock-host-${1 + Math.floor((p.n - 1) / 8)}`,
         place: null,
         last_relaunch: p.lastRelaunch,

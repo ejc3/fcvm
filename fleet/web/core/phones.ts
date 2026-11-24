@@ -612,7 +612,6 @@ function vmStatsOf(vm: VmStats): PhoneStat[] {
   const n = `${vm.vcpus} vCPU${vm.vcpus === 1 ? "" : "s"}`;
   return [
     { key: "vm-cpu", term: "CPU", text: `${pad(vm.cpu_pct, 3)} %  ${n}`, fraction: clamp01(vm.cpu_pct / 100), meter: { name: "CPU", valuetext: `${Math.round(vm.cpu_pct)} percent of ${n}` } },
-    { key: "vm-mem", term: "Memory", text: `${pad(vm.mem_mb, 5)} MB`, fraction: null, meter: null },
   ];
 }
 

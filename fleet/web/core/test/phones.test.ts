@@ -128,11 +128,11 @@ describe("phones in the snapshot", () => {
     if (m.type !== "snapshot") throw new Error("not a snapshot");
     expect(m.state.phones!.tiles[1]!.gpu).toMatchObject({ util_pct: 30, mem_used_mb: 600, mem_total_mb: 15360, at: 1234 });
     expect(m.state.phones!.tiles[1]!.vm_stats).toBeNull();
-    state.phones.tiles[1]!["vm_stats"] = { cpu_pct: 12.5, mem_mb: 1800, vcpus: 6, at: 1234 };
+    state.phones.tiles[1]!["vm_stats"] = { cpu_pct: 12.5, vcpus: 6, at: 1234 };
     const withVm = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
     if (withVm.type !== "snapshot") throw new Error("not a snapshot");
-    expect(withVm.state.phones!.tiles[1]!.vm_stats).toEqual({ cpu_pct: 12.5, mem_mb: 1800, vcpus: 6, at: 1234 });
-    state.phones.tiles[1]!["vm_stats"] = { cpu_pct: 12.5, mem_mb: 1800, vcpus: 0 };
+    expect(withVm.state.phones!.tiles[1]!.vm_stats).toEqual({ cpu_pct: 12.5, vcpus: 6, at: 1234 });
+    state.phones.tiles[1]!["vm_stats"] = { cpu_pct: 12.5, vcpus: 0 };
     const bad = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
     if (bad.type !== "snapshot") throw new Error("not a snapshot");
     expect(bad.state.phones!.tiles[1]!.vm_stats).toBeNull();
@@ -430,38 +430,37 @@ describe("the panel of an opened phone", () => {
       expect(withGpu(null).stats).toEqual([]);
     });
 
-    it("shows the VM's CPU as a percent of its vCPUs and its memory, under the GPU rows", () => {
+    it("shows the VM's CPU as a percent of its vCPUs, under the GPU rows", () => {
       const ph = phonesOf(2);
-      ph.tiles[0] = { ...ph.tiles[0]!, gpu: { name: "Tesla T4", temp_c: 50, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: null }, vm_stats: { cpu_pct: 12.4, mem_mb: 1800.2, vcpus: 6, at: null } };
+      ph.tiles[0] = { ...ph.tiles[0]!, gpu: { name: "Tesla T4", temp_c: 50, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: null }, vm_stats: { cpu_pct: 12.4, vcpus: 6, at: null } };
       const p = panelOf(ph);
       expect(p.stats.map((r) => [r.term, r.text, r.fraction, r.meter])).toEqual([
         ["Temperature", "\u200750 \u00b0C", null, null],
         ["CPU", "\u200712 %  6 vCPUs", 0.124, { name: "CPU", valuetext: "12 percent of 6 vCPUs" }],
-        ["Memory", "\u20071800 MB", null, null],
       ]);
     });
 
     it("leaves out the VM rows when absent or stale, whatever the GPU says", () => {
       const srv = EPOCH + 30_000;
-      const vm = (at: number | null) => ({ cpu_pct: 5, mem_mb: 100, vcpus: 1, at });
+      const vm = (at: number | null) => ({ cpu_pct: 5, vcpus: 1, at });
       expect(statsOf(null, null, srv)).toEqual([]);
-      expect(statsOf(null, vm(srv - 1000), srv).map((r) => r.term)).toEqual(["CPU", "Memory"]);
+      expect(statsOf(null, vm(srv - 1000), srv).map((r) => r.term)).toEqual(["CPU"]);
       expect(statsOf(null, vm(srv - STATS_STALE_MS - 1), srv)).toEqual([]);
       expect(statsOf(null, vm(null), srv)[0]!.text).toBe("\u2007\u20075 %  1 vCPU");
     });
 
     it("does not drop readings on the page's own clock before the coordinator's clock is known", () => {
       const gpu = { name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: EPOCH };
-      const vm = { cpu_pct: 5, mem_mb: 100, vcpus: 2, at: EPOCH };
+      const vm = { cpu_pct: 5, vcpus: 2, at: EPOCH };
       // The page is 5 s ahead and has no clock sample: both stay.
-      expect(statsOf(gpu, vm, EPOCH + 5_000 + 1, false).map((r) => r.key)).toEqual(["gpu-temp", "vm-cpu", "vm-mem"]);
+      expect(statsOf(gpu, vm, EPOCH + 5_000 + 1, false).map((r) => r.key)).toEqual(["gpu-temp", "vm-cpu"]);
       // A receipt time hours off (a host with a skewed clock) does not blank the list either.
-      expect(statsOf({ ...gpu, at: EPOCH - 3_600_000 }, { ...vm, at: EPOCH + 3_600_000 }, EPOCH, false)).toHaveLength(3);
+      expect(statsOf({ ...gpu, at: EPOCH - 3_600_000 }, { ...vm, at: EPOCH + 3_600_000 }, EPOCH, false)).toHaveLength(2);
       // Through the panel: the state has no clock sample, the page's clock is 30 s past the receipt.
       const ph = phonesOf(2);
       ph.tiles[0] = { ...ph.tiles[0]!, gpu, vm_stats: vm };
       const p = phonesView(input(stateWith(ph), { openId: "phone:1", now: EPOCH + 30_000 })).panel!;
-      expect(p.stats.map((r) => r.key)).toEqual(["gpu-temp", "vm-cpu", "vm-mem"]);
+      expect(p.stats.map((r) => r.key)).toEqual(["gpu-temp", "vm-cpu"]);
     });
 
     it("drops readings older than the stale limit, and keeps fresh ones", () => {

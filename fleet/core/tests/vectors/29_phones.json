@@ -344,7 +344,6 @@
         "type": "health",
         "vm_stats": {
           "cpu_pct": 21.4,
-          "mem_mb": 1843.2,
           "vcpus": 6
         }
       },
@@ -972,7 +971,6 @@
           "vm_stats": {
             "at": 57600,
             "cpu_pct": 21.4,
-            "mem_mb": 1843.2,
             "vcpus": 6
           }
         }

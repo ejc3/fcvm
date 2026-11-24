@@ -1939,7 +1939,6 @@ fn a_phones_readings_carry_the_receipt_time_and_clear_with_the_phone() {
     );
     let vm = fleet_core::protocol::VmStats {
         cpu_pct: 12.5,
-        mem_mb: 1800.0,
         vcpus: 6,
         at: Some(1),
     };
@@ -1949,7 +1948,7 @@ fn a_phones_readings_carry_the_receipt_time_and_clear_with_the_phone() {
     assert_eq!(gpu["mem_used_mb"], 600.0);
     assert_eq!(
         vm,
-        serde_json::json!({"cpu_pct": 12.5, "mem_mb": 1800.0, "vcpus": 6, "at": 2000})
+        serde_json::json!({"cpu_pct": 12.5, "vcpus": 6, "at": 2000})
     );
 
     s = apply(s, &phone_health(3000, None));
@@ -1972,4 +1971,40 @@ fn a_phones_readings_carry_the_receipt_time_and_clear_with_the_phone() {
     );
     let (gpu, vm) = phone_stats(&s);
     assert!(gpu.is_null() && vm.is_null(), "{gpu} {vm}");
+}
+
+/// A `cpu_pct` over 100 is held at 100, and a negative or non-finite one leaves no reading.
+#[test]
+fn a_phones_cpu_is_held_to_0_to_100_and_a_bad_one_is_dropped() {
+    let mut s = State::new(config_with(serde_json::json!({})), 0);
+    s = apply(s, &phone_host(1000));
+    s = apply(
+        s,
+        &Event::Agent {
+            at: 1100,
+            host: "h1".into(),
+            msg: AgentMsg::Slot(SlotReport {
+                id: "phone-1".into(),
+                phase: "running".into(),
+                generation: 1,
+                ..Default::default()
+            }),
+        },
+    );
+    let report = |cpu_pct: f64, at: u64| {
+        phone_health(
+            at,
+            Some(fleet_core::protocol::VmStats {
+                cpu_pct,
+                vcpus: 2,
+                at: None,
+            }),
+        )
+    };
+    s = apply(s, &report(250.0, 2000));
+    assert_eq!(phone_stats(&s).1["cpu_pct"], 100.0);
+    for (i, bad) in [-1.0, f64::NAN, f64::INFINITY].into_iter().enumerate() {
+        s = apply(s, &report(bad, 3000 + i as u64));
+        assert!(phone_stats(&s).1.is_null(), "{bad}");
+    }
 }

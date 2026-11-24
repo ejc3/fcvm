@@ -46,10 +46,9 @@ export interface GpuInfo {
   at: number | null;
 }
 
-/** A phone VM's CPU (percent of its vCPUs) and memory in use, read on its host; `at` is the coordinator's receipt time. */
+/** A phone VM's CPU use (percent of its vCPUs), read on its host; `at` is the coordinator's receipt time. */
 export interface VmStats {
   cpu_pct: number;
-  mem_mb: number;
   vcpus: number;
   at: number | null;
 }
@@ -88,7 +87,7 @@ export interface Tile {
   /** The same renderer over IPv4 (`wss://<label>-v4.<zone>[:port]/frames`), null alike. */
   frame_url_v4: string | null;
   gpu: GpuInfo | null;
-  /** The phone VM's CPU and memory; null from a coordinator or agent that does not report them. */
+  /** The phone VM's CPU use; null from a coordinator or agent that does not report them. */
   vm_stats: VmStats | null;
   host: string | null;
   /** Where the tile runs, worded for a viewer (`EC2 in us-east-1`); null until the slot reports it. */
@@ -943,10 +942,9 @@ function parseGpu(v: unknown, stats: unknown, where: string): GpuInfo | null {
 function parseVmStats(v: unknown): VmStats | null {
   if (!isObj(v)) return null;
   const cpu = reading(v, "cpu_pct");
-  const mem = reading(v, "mem_mb");
   const vcpus = reading(v, "vcpus");
-  if (cpu === null || mem === null || vcpus === null || vcpus < 1) return null;
-  return { cpu_pct: cpu, mem_mb: mem, vcpus: Math.round(vcpus), at: reading(v, "at") };
+  if (cpu === null || vcpus === null || vcpus < 1) return null;
+  return { cpu_pct: cpu, vcpus: Math.round(vcpus), at: reading(v, "at") };
 }
 
 function parseLastRelaunch(v: unknown, where: string): LastRelaunch | null {

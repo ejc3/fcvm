@@ -221,14 +221,12 @@ pub fn place_label(region: &str) -> Option<String> {
     ok.then(|| format!("EC2 in {region}"))
 }
 
-/// A VM's CPU and memory, read on the host. The agent leaves `at` out; the coordinator
+/// A VM's CPU use, read on the host. The agent leaves `at` out; the coordinator
 /// stamps its receipt time (Unix ms) when it stores the reading.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VmStats {
     /// CPU use as a percent of the VM's vCPUs, 0..100.
     pub cpu_pct: f64,
-    /// Memory in use, MB.
-    pub mem_mb: f64,
     pub vcpus: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<u64>,

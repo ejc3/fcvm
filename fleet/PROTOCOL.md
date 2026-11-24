@@ -409,7 +409,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
       "generation": 3,
       "fps": 30.0,
       "gpu_stats": { ... },   // the renderer's /health gpu object plus "at", the coordinator's receipt time (Unix ms)
-      "vm_stats": {"cpu_pct": 12.5, "mem_mb": 1800.0, "vcpus": 6, "at": 1761134401000},  // phones only; "at" is the coordinator's receipt time (its clock), vcpus the VMM's vCPU thread count; absent when the agent has no reading
+      "vm_stats": {"cpu_pct": 12.5, "vcpus": 6, "at": 1761134401000},  // phones only; "at" is the coordinator's receipt time (its clock), vcpus the VMM's vCPU thread count; absent when the agent has no reading
       "error": null,
       "failure": null,
       "last_relaunch": {"clicked_at": 1761134400000, "by": "viewer:v-4", "first_frame_at": 1761134405200,
@@ -1638,7 +1638,7 @@ sandbox is stopped within a minute of it (the agent checks the image every minut
 coordinator logs a new warning, refusal or gold failure.
 
 ```json
-{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2, "vm_stats": {"cpu_pct": 12.5, "mem_mb": 1800.0, "vcpus": 6}}
+{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2, "vm_stats": {"cpu_pct": 12.5, "vcpus": 6}}
 ```
 
 Once a second per running slot: the renderer's `/health` `fps`, its GPU readings,
