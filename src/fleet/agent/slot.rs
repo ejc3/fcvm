@@ -245,10 +245,14 @@ impl SlotCtx {
     }
 
     async fn health(&self) -> Option<serde_json::Value> {
+        self.health_within(HEALTH_TIMEOUT).await
+    }
+
+    async fn health_within(&self, timeout: Duration) -> Option<serde_json::Value> {
         let r = self
             .http
             .get(self.health_url("/health"))
-            .timeout(Duration::from_secs(2))
+            .timeout(timeout)
             .send()
             .await
             .ok()?;
@@ -406,6 +410,20 @@ impl Backoff {
         self.next = self.min;
     }
 }
+
+/// How long one `/health` request to a renderer may take.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How a starting VM's renderer is probed (see [`super::probe`]): every 100 ms, with 100 ms
+/// for an attempt in the first second and up to [`HEALTH_TIMEOUT`] after it. One attempt is in
+/// flight at a time but for the instant one ends as the next starts. In the first second an
+/// attempt is over before the kernel would send its SYN again (1 s), so no lost attempt
+/// completes on a retransmit; after it one attempt at a time can, as before.
+pub(crate) const START_PACE: super::probe::Pace = super::probe::Pace {
+    every: Duration::from_millis(100),
+    fast_timeout: Duration::from_millis(100),
+    slow_timeout: HEALTH_TIMEOUT,
+};
 
 pub async fn supervise(
     ctx: SlotCtx,
@@ -778,8 +796,7 @@ async fn relaunch(
     let mut restored = vm.restored_watch();
     let deadline = tokio::time::sleep(ctx.cfg.start_timeout);
     tokio::pin!(deadline);
-    // Overlapping attempts: one the renderer has not answered yet does not hold the next.
-    let mut probes = super::probe::Probes::new(Duration::from_millis(100), || ctx.health());
+    let mut probes = super::probe::Probes::new(START_PACE, |timeout| ctx.health_within(timeout));
     let mut starting_at: Option<Instant> = None;
     let mut health_at: Option<Instant> = None;
     let mut baseline: Option<u64> = None;
@@ -837,8 +854,10 @@ async fn relaunch(
                         continue;
                     }
                     posted = Some(body);
-                    // Frames counted from here were drawn with this scene.
+                    // Frames counted from here were drawn with this scene. An answer sent
+                    // before the post describes the renderer without it.
                     baseline = frame_counter_of(&h, phone);
+                    probes.forget_in_flight();
                     continue;
                 }
                 if baseline.is_none() {

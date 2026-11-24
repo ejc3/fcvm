@@ -384,6 +384,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
             poll: Duration::from_millis(20),
+            up_attempt: minecraft::UP_PROBE_TIMEOUT,
             steady: 5,
         })
     } else {

@@ -196,6 +196,7 @@ fn mc_cfg(snaps: &Path) -> MinecraftCfg {
         ready_deadline: Duration::from_secs(20),
         snapshot_deadline: Duration::from_secs(20),
         poll: Duration::from_millis(20),
+        up_attempt: fcvm::fleet::agent::minecraft::UP_PROBE_TIMEOUT,
         steady: 2,
     }
 }
@@ -421,16 +422,29 @@ async fn the_gold_flow_runs_first_and_every_server_restores_from_it() {
     f.mc.stop().await;
 }
 
-/// A restored tile is reported up when its port starts answering, not one attempt timeout
-/// after the restore began. The tile's port answers nothing until its VM is up, some tens of
+/// A restored tile is reported up when its port starts answering, not when an attempt that
+/// was sent before then ends. The tile's port answers nothing until its VM is up, some tens of
 /// milliseconds after the spawn, so the wait's first attempts are lost, as they are against a
-/// real clone that is still being restored.
+/// real clone that is still being restored. An attempt may take 20 s here, so a wait that held
+/// its next attempt for a lost one would see the tile only when the kernel sends that
+/// attempt's SYN again, a second after the first: the bound is half of that.
 ///
-/// RED BEFORE THE FIX: the wait sent its next attempt only when the lost first one ended at its
-/// 250 ms timeout, and the report came about 200 ms after the port had opened.
+/// RED BEFORE THE FIX: the wait sent its next attempt only when the lost first one ended, at
+/// its 250 ms timeout then (226 ms after the port had opened), and at the SYN's retransmit with
+/// this test's 20 s (about 970 ms after).
 #[tokio::test]
 async fn a_restored_tile_is_reported_up_when_its_port_starts_answering() {
-    let mut f = fake_gated(&[("FAKE_UP_SECS", "0.02")], |_| {}, |_| {}, Some("mc-1")).await;
+    let attempt = Duration::from_secs(20);
+    let mut f = fake_gated(
+        &[("FAKE_UP_SECS", "0.02")],
+        |c| {
+            c.up_attempt = attempt;
+            c.ready_deadline = attempt * 2;
+        },
+        |_| {},
+        Some("mc-1"),
+    )
+    .await;
     f.mc.assign(&[assign("mc-1", 0, 1, None, None)]);
     f.report("mc-1", "running", 1).await;
     let seen = std::time::Instant::now();
@@ -442,10 +456,8 @@ async fn a_restored_tile_is_reported_up_when_its_port_starts_answering() {
         .unwrap()
         .expect("the port opened");
     let lag = seen.saturating_duration_since(opened);
-    // One 20 ms poll and the answer, with room for a busy test host; the old wait's lag was
-    // the 250 ms attempt timeout less the time the VM took to come up.
     assert!(
-        lag < Duration::from_millis(120),
+        lag < Duration::from_millis(500),
         "the tile was reported up {lag:?} after its port started answering"
     );
     f.mc.stop().await;

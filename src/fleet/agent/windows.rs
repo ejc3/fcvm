@@ -1405,10 +1405,14 @@ impl Sandbox {
     }
 
     async fn health(&self) -> Option<serde_json::Value> {
+        self.health_within(HEALTH_TIMEOUT).await
+    }
+
+    async fn health_within(&self, timeout: Duration) -> Option<serde_json::Value> {
         let r = self
             .http
             .get(self.url("/health"))
-            .timeout(Duration::from_secs(2))
+            .timeout(timeout)
             .send()
             .await
             .ok()?;
@@ -1545,8 +1549,13 @@ impl Sandbox {
             actions_done: 0,
             scene: None,
         };
-        // Overlapping attempts: one the bridge has not answered yet does not hold the next.
-        let mut probes = super::probe::Probes::new(self.cfg.poll, || self.health());
+        // As a renderer is probed (`slot::START_PACE`), at this sandbox's poll.
+        let pace = super::probe::Pace {
+            every: self.cfg.poll,
+            fast_timeout: self.cfg.poll,
+            slow_timeout: HEALTH_TIMEOUT,
+        };
+        let mut probes = super::probe::Probes::new(pace, |timeout| self.health_within(timeout));
         // The bridge is at the desktop: a deadline while it is, with no scene taken, is the
         // scene's, not Windows'.
         let mut at_desktop = false;
@@ -1612,6 +1621,9 @@ impl Sandbox {
         }
     }
 }
+
+/// How long one `/health` request to a bridge may take.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the bridge may take to carry out one action.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);

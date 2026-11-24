@@ -66,6 +66,9 @@ pub struct MinecraftCfg {
     pub ready_deadline: Duration,
     pub snapshot_deadline: Duration,
     pub poll: Duration,
+    /// The longest one `/health` attempt of a restore's wait may take
+    /// ([`UP_PROBE_TIMEOUT`]; a test sets it far above its own bound).
+    pub up_attempt: Duration,
     /// Polls in a row the gold server must be ready at 20 ticks a second.
     pub steady: u32,
 }
@@ -569,11 +572,15 @@ async fn health(http: &reqwest::Client, place: &Place) -> Option<Health> {
     health_within(http, place, Duration::from_secs(2)).await
 }
 
-/// How long one `/health` attempt of a restore's wait may take. The wait's first attempts go
-/// out while the clone is still being restored, and a SYN sent then is lost (nothing reads the
-/// tap yet), so those attempts end here with no answer. The wait does not hold the next attempt
-/// for them (see [`super::probe`]), so this bounds a slow answer, not how early the tile is seen.
+/// The longest one `/health` attempt of a restore's wait may take, once the wait has run past
+/// its first second (see [`super::probe`]).
 pub const UP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long one `/health` attempt may take in the first second of a restore's wait. The first
+/// attempts go out while the clone is still being restored, and a SYN sent then is lost
+/// (nothing reads the tap yet): each such attempt is over within this, and the next is
+/// already on its way.
+pub const UP_PROBE_FAST_TIMEOUT: Duration = Duration::from_millis(30);
 
 async fn health_within(http: &reqwest::Client, place: &Place, timeout: Duration) -> Option<Health> {
     let url = format!("http://{}/health", place.http);
@@ -817,8 +824,14 @@ impl Server {
     async fn wait_up(&self, vm: &mut Vm) -> std::result::Result<(), String> {
         let until = tokio::time::sleep(self.cfg.ready_deadline);
         tokio::pin!(until);
-        let mut probes = super::probe::Probes::new(self.cfg.poll, || {
-            health_within(&self.http, &self.place, UP_PROBE_TIMEOUT)
+        let pace = super::probe::Pace {
+            every: self.cfg.poll,
+            fast_timeout: UP_PROBE_FAST_TIMEOUT,
+            slow_timeout: self.cfg.up_attempt,
+        };
+        // Answers are read in the order their attempts were sent, so `last` is the newest.
+        let mut probes = super::probe::Probes::new(pace, |timeout| {
+            health_within(&self.http, &self.place, timeout)
         });
         let mut last = None;
         loop {
@@ -1206,6 +1219,7 @@ mod tests {
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
             poll: Duration::from_millis(20),
+            up_attempt: UP_PROBE_TIMEOUT,
             steady: 5,
         }
     }

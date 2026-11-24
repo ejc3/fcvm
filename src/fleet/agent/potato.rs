@@ -232,17 +232,24 @@ async fn ask(addr: Ipv6Addr, msg: &Inbound, deadline: Duration) -> Result<String
     .with_context(|| format!("[{addr}]:{BALL_PORT} did not answer in {deadline:?}"))?
 }
 
-/// Probe a player's ball port until it answers, up to `deadline`. A probe goes out every 5 ms
-/// whether or not the earlier ones were answered (see [`super::probe`]): one sent before the
-/// port answers is lost and ends only at its 250 ms timeout, and a wake that waited for it
-/// could not be seen before then.
+/// How a player's ball port is probed (see [`super::probe`]): every 10 ms with 25 ms for an
+/// attempt in the first second, which is 3 sockets and 100 SYNs at a player that does not
+/// answer, then one attempt at a time with up to the 250 ms an attempt had before.
+const LISTEN_PACE: super::probe::Pace = super::probe::Pace {
+    every: Duration::from_millis(10),
+    fast_timeout: Duration::from_millis(25),
+    slow_timeout: Duration::from_millis(250),
+};
+
+/// Probe a player's ball port until it answers, up to `deadline`. A probe sent before the port
+/// answers is lost and ends only at its timeout; the next does not wait for it in the first
+/// second of the wait.
 async fn until_listening(addr: Ipv6Addr, deadline: Duration) -> Result<Instant> {
     let probe = Inbound::Probe;
-    let mut probes = super::probe::Probes::new(Duration::from_millis(5), || {
-        ask(addr, &probe, Duration::from_millis(250))
-    });
+    let mut probes = super::probe::Probes::new(LISTEN_PACE, |timeout| ask(addr, &probe, timeout));
     let end = tokio::time::sleep(deadline);
     tokio::pin!(end);
+    // Answers are read in the order their probes were sent, so this is the newest.
     let mut last = String::new();
     loop {
         tokio::select! {
