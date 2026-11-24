@@ -148,17 +148,57 @@ class FleetField(unittest.TestCase):
 
     def test_every_committed_runs_time_to_all_up_is_rederived_from_its_log_excerpt(self):
         # A record keeps the lines of the coordinator's log its "all N up" figure is read from
-        # (coord-up.log): the figure in its summary.json is what those lines give.
+        # (coord-up.log): the figure in its summary.json is what those lines give, and the
+        # figure in the document's table (docs/fleet/minecraft.md) is that one.
         root = f"{HERE}/results/2026-11-24-fleet-path-c8g-metal-48xl"
-        seen = {}
-        for run in sorted(os.listdir(root)):
+        rows = {"256, root volume": "256-root-volume", "512, root volume, limit 1024": "512-root-volume-neighbour-limit-1024",
+                "512, root volume": "512-root-volume", "512, RAM": "512-ram", "256, RAM (100 s)": "256-ram"}
+        doc = open(f"{HERE}/../../../docs/fleet/minecraft.md").read()
+        table = doc[doc.index("| run | all N up, from the first restore's start |"):].split("\n\n")[0].splitlines()[2:]
+        said = {cells[1].strip(): cells[2].strip() for cells in (line.split("|") for line in table)}
+        self.assertEqual(sorted(said), sorted(rows))
+        self.assertEqual(sorted(rows.values()), sorted(os.listdir(root)))
+        for label, run in rows.items():
             summary = json.load(open(f"{root}/{run}/summary.json"))
             self.assertTrue(os.path.exists(f"{root}/{run}/coord-up.log"), run)
             got = json.loads(subprocess.run([sys.executable, f"{HERE}/fleetfield_summary.py", "--all-up", f"{root}/{run}", str(summary["servers"])],
                                             capture_output=True, text=True, check=True).stdout)
             self.assertEqual(got, summary["all_up_s"], run)
-            seen[run] = got and got["s"]
-        self.assertEqual(seen, {"256-ram": 6.9, "256-root-volume": 24.6, "512-ram": 29.9, "512-root-volume": 73.7, "512-root-volume-neighbour-limit-1024": None})
+            if got is None:
+                self.assertTrue(said[label].startswith("never"), (label, said[label]))
+            else:
+                self.assertEqual(said[label], f"{got['s']} s", label)
+
+    def test_the_documents_figures_for_a_hosts_other_vms_are_the_records(self):
+        # docs/fleet/minecraft.md, "What the host needs for hundreds of servers": what a routed
+        # VM and a potato ring held, read again from each run's neigh.log.
+        root = f"{HERE}/results/2026-11-24-neighbour-entries-other-vms-c8g-metal-48xl"
+        doc = " ".join(open(f"{HERE}/../../../docs/fleet/minecraft.md").read().split())
+
+        def rows(run):
+            with open(f"{root}/{run}/neigh.log") as f:
+                return [dict(pair.split("=") for pair in line.split()[1:]) | {"t": line.split()[0]} for line in f]
+
+        def most(rs, key):
+            return max(int(r[key]) for r in rs)
+
+        routed = rows("routed-vms")
+        idle = (int(routed[0]["ndisc"]), int(routed[0]["arp"]))
+        held = (most(routed, "ndisc"), most(routed, "arp"))
+        self.assertEqual(most(routed, "fc"), 32)
+        self.assertIn(f"held {held[0]} IPv6 and {held[1]} IPv4 entries over the idle host's {idle[0]} and {idle[1]}: "
+                      f"{(held[0] - idle[0]) / 32:.1f} and {(held[1] - idle[1]) / 32:.1f} each", doc)
+        long = rows("potato-ring-15min")
+        self.assertEqual(most(long, "fc"), 32)
+        thirds = [most(long[a * len(long) // 3:(a + 1) * len(long) // 3], "arp") for a in range(3)]
+        self.assertIn(f"the count reached {most(long, 'ndisc'):,} IPv6 and {most(long, 'arp'):,} IPv4 entries and levelled off "
+                      f"(the most IPv4 seen in each third of the run: {thirds[0]:,}, {thirds[1]:,}, {thirds[2]:,})", doc)
+        self.assertEqual([int(long[-1][k]) - int(long[0][k]) for k in ("ndisc_table_fulls", "arp_table_fulls")], [0, 0])
+        low = rows("potato-ring-limit-1024")
+        first = next(r for r in low if int(r["arp_table_fulls"]) > 0)
+        # the ring was started 10 s after the first sample
+        self.assertIn(f"{int(first['t']) - int(low[0]['t']) - 10} s after it started: {int(low[-1]['arp_table_fulls'])} entries were refused", doc)
+        self.assertEqual((int(low[-1]["ndisc_table_fulls"]), most(low, "ndisc") < 650), (0, True))
 
     def test_a_run_that_never_all_ran_says_where_it_stood(self):
         with tempfile.TemporaryDirectory() as d:

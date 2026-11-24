@@ -382,8 +382,8 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             "--minecraft needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)"
         );
         // Everything else this agent may run shares the host's neighbour tables: a wall tile
-        // for each place, the phones, the potato players and the sandboxes. They were not
-        // measured, so they refuse nothing and are only warned about.
+        // for each place, the phones, the potato players and the sandboxes. They refuse
+        // nothing and are only warned about.
         let other_vms = args.capacity.unwrap_or(gpus.len())
             + phones.len()
             + args.potato_players as usize

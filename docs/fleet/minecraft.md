@@ -247,11 +247,30 @@ namespace's):
   servers and their gold VM, and 64 for the host itself (an idle host held 25 and 4)
   (`check_neighbour_room`, `src/fleet/agent/minecraft.rs`). The error names the value the limit
   needs. On the kernel's limits that is 39 servers.
-- **A host's other VMs refuse nothing.** Wall tiles, phones, potato players and Windows
-  sandboxes use other network modes and their entries were not measured. If each of them held
-  what a Minecraft server does and a table would then be over its limit, the agent logs a
-  warning and starts: a host that ran 4 servers beside 64 potato players on the kernel's limits
-  still does.
+- **A host's other VMs**, counted the same way every 2 s on another boot of that instance type
+  the same day, kernel 7.0.0-1018-aws (the records are in
+  `fleet/minecraft/bench/results/2026-11-24-neighbour-entries-other-vms-c8g-metal-48xl/`):
+  - **A routed VM that stays up holds less than a Minecraft server.** 32 of them, each started
+    with a wall slot's network arguments (its own address in the host's prefix and a published
+    port; no GPU, which this host does not have), held 492 IPv6 and 66 IPv4 entries over the idle
+    host's 5 and 1: 15.2 and 2.0 each. All were gone within 2 s of the VMs' stop
+    (`routed-vms/`).
+  - **A potato ring's entries rise with its wakes, not with its players.**
+    `--potato-players 64 --potato-cpus 32` never had more than 32 player VMs running. In 15
+    minutes and 10,704 wakes at the host image's limits the count reached 1,656 IPv6 and 3,644
+    IPv4 entries and levelled off (the most IPv4 seen in each third of the run: 3,330, 3,574,
+    3,644); nothing was refused (`potato-ring-15min/`). The count includes entries the kernel
+    has not freed yet: it falls when the ring stops (2,991 IPv4 entries to 1,975 in the 29 s
+    the five-minute record `potato-ring/` runs on).
+  - **At the kernel's own limits (1024, both families) that ring overflowed the IPv4 table**
+    239 s after it started: 398 entries were refused in its last minute ("arp_cache: neighbor
+    table overflow!" in the kernel's log), while the IPv6 count stayed under 650 with none
+    refused (`potato-ring-limit-1024/`). Ubuntu's cloud image has the IPv4 limit at 16384, and
+    the host image both at 32768.
+  - Phones and Windows sandboxes were not counted.
+- **They refuse nothing.** If each of a host's other VMs held what a Minecraft server is
+  allowed and a table would then be over its limit, the agent logs a warning and starts. A
+  host with 4 servers beside 64 potato players on the kernel's limits still starts its agent.
 - **The host image** sets `gc_thresh1`, `gc_thresh2` and `gc_thresh3` to 8192, 28672 and 32768
   for both families (`fleet/ami/host/build.sh`): room for about 1,300 Minecraft servers by that
   allowance. The agent's unit keeps systemd's default dependencies, so it starts after

@@ -3148,6 +3148,9 @@ fn running_current(s: &Slot) -> bool {
 
 /// A server's new launch: its generation moves, timed from `at`, and any fork the old one
 /// was is over.
+/// Who a launch begun by a reset of every server is by.
+const RESET_ALL_BY: &str = "reset_all";
+
 fn bump_minecraft(slot: &mut Slot, by: &str, at: u64) {
     bump(slot, by, at);
     if let Some(m) = slot.minecraft.as_mut() {
@@ -3242,6 +3245,20 @@ fn observe_minecraft(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64)
                     rl.clicked_at = chunk.saturating_sub(took);
                     rl.first_frame_at = Some(chunk);
                 }
+            }
+        }
+        // A launch the last reset of every server began is back: that reset counts it, once.
+        if let (Some(rl), Some(all)) = (
+            slot.last_relaunch.as_ref(),
+            f.last_minecraft_reset_all.as_mut(),
+        ) {
+            let own = rl.by == RESET_ALL_BY
+                && rl.clicked_at == all.clicked_at
+                && rl.generation == r.generation;
+            if let (true, Some(back), Some(first)) = (own, all.back.as_mut(), rl.first_frame_at) {
+                *back += 1;
+                let took = first.saturating_sub(all.clicked_at);
+                all.took_ms = Some(all.took_ms.map_or(took, |t| t.max(took)));
             }
         }
     }
@@ -3422,7 +3439,7 @@ fn minecraft_reset(state: &mut State, c: &Ctx, slot: Option<&str>) -> Result<Str
                 if minecraft_claim(s).is_some() || host_draining(&hosts, s) {
                     continue;
                 }
-                bump_minecraft(s, "reset_all", at);
+                bump_minecraft(s, RESET_ALL_BY, at);
                 n += 1;
             }
             if n == 0 {
@@ -3434,6 +3451,8 @@ fn minecraft_reset(state: &mut State, c: &Ctx, slot: Option<&str>) -> Result<Str
                 clicked_at: at,
                 by: format!("viewer:{}", c.viewer),
                 servers: n,
+                back: Some(0),
+                took_ms: None,
             });
             Ok(format!("reset all {n} servers"))
         }

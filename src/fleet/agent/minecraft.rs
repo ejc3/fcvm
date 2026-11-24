@@ -1368,9 +1368,12 @@ pub fn read_neighbour_limit(path: &Path) -> Result<String> {
 /// [`NEIGH_LIMIT_V4`]'s text. At the kernel's default of 1024 IPv6 entries, 512 servers did
 /// not all start (docs/fleet/minecraft.md, "Many servers on one host").
 ///
-/// Only what was measured refuses. The host's `other_vms` (wall tiles, phones, potato players,
-/// Windows sandboxes) have other network modes and were not measured: they refuse nothing. If
-/// each of them held what a Minecraft server does and a table would then be over its limit, a
+/// Only the Minecraft fleet's own need refuses. The host's `other_vms` (wall tiles, phones,
+/// potato players, Windows sandboxes) refuse nothing: a routed VM that stays up was counted
+/// holding less than a Minecraft server (15.2 IPv6 and 2.0 IPv4 entries), a potato ring's
+/// entries rise with its wakes and not with its players, and phones and sandboxes were not
+/// counted (docs/fleet/minecraft.md, "What the host needs for hundreds of servers"). If each of
+/// them held what a Minecraft server is allowed and a table would then be over its limit, a
 /// warning says so, and the agent starts. The warnings are returned for the caller to log.
 pub fn check_neighbour_room(
     servers: u32,
@@ -1406,10 +1409,10 @@ pub fn check_neighbour_room(
         if with_others > limit {
             warnings.push(format!(
                 "this host may run {other_vms} other VMs beside its {servers} Minecraft servers. \
-                 Their {family} neighbour entries were not measured: at a Minecraft server's \
-                 {per} each the table would need {with_others} and the limit \
-                 ({key}.neigh.default.gc_thresh3) is {limit}. Watch the kernel log for \
-                 \"neighbor table overflow\""
+                 At a Minecraft server's {per} {family} neighbour entries each the table would \
+                 need {with_others} and the limit ({key}.neigh.default.gc_thresh3) is {limit}. \
+                 A potato ring's entries rise with its wakes and can pass that. Watch the kernel \
+                 log for \"neighbor table overflow\""
             ));
         }
     }
@@ -1515,8 +1518,8 @@ mod tests {
         assert!(check_neighbour_room(8, 0, "16384", "x").is_err());
     }
 
-    /// Only routed Minecraft servers were measured. A host that ran 4 servers beside 64 potato
-    /// players on the kernel's limits, with no overflow, must still start its agent.
+    /// Only the Minecraft fleet's own need refuses. A host with 4 servers beside 64 potato
+    /// players on the kernel's limits must still start its agent, with a warning.
     #[test]
     fn the_hosts_other_vms_are_warned_about_and_refuse_nothing() {
         let warnings = check_neighbour_room(4, 64, "1024", "1024").unwrap();
@@ -1526,7 +1529,7 @@ mod tests {
                 && warnings[0].contains("IPv6")
                 && warnings[0].contains("the table would need 1720")
                 && warnings[0].contains("is 1024")
-                && warnings[0].contains("not measured"),
+                && warnings[0].contains("A potato ring's entries rise with its wakes"),
             "{warnings:?}"
         );
         // however many: a warning for each table it could fill, never a refusal

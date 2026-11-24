@@ -1891,6 +1891,96 @@ fn minecraft_fleet(n: u64) -> Vec<serde_json::Value> {
     events
 }
 
+/// The coordinator counts a reset of every server itself: each server the reset was sent to,
+/// once, when the launch the reset began reports its first chunk, and the time from the click
+/// to the last of them. A server the reset did not touch (lent at the click) and one of its own
+/// that a viewer reset again before it was back are not counted, whatever they do later.
+#[test]
+fn a_reset_of_every_server_counts_the_servers_it_brought_back() {
+    let cfg = config_with(serde_json::json!({}));
+    let running = |at: u64, id: &str, generation: u64, chunk: u64| {
+        serde_json::json!({"type": "agent", "at": at, "host": "h1", "msg": {"type": "slot",
+            "id": id, "phase": "running", "generation": generation, "timings": {},
+            "frame_url": "ws://[2001:db8::1]:8080/view", "first_chunk_at": chunk}})
+    };
+    let reset =
+        |s: &State| serde_json::to_value(view(s)).unwrap()["minecraft"]["last_reset_all"].clone();
+    let step = |s: State, more: serde_json::Value| events(more).iter().fold(s, apply);
+    let mut e = minecraft_fleet(4);
+    e.extend([
+        serde_json::json!({"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"}),
+        serde_json::json!({"type": "viewer_joined", "at": 2100, "viewer": "v2", "client": "198.51.100.21"}),
+        serde_json::json!({"type": "intent", "at": 2200, "viewer": "v2", "client": "198.51.100.21", "id": "c1",
+            "name": "claim_minecraft", "args": {"slot": "mc-4"}}),
+        serde_json::json!({"type": "intent", "at": 10_000, "viewer": "v1", "client": "198.51.100.20", "id": "r1",
+            "name": "minecraft_reset", "args": {"all": true}}),
+    ]);
+    let s = events(serde_json::json!(e))
+        .iter()
+        .fold(State::new(cfg.clone(), 0), apply);
+    assert_eq!(
+        reset(&s),
+        serde_json::json!({"clicked_at": 10_000, "by": "viewer:v1", "servers": 3, "back": 0}),
+        "mc-4 is lent: the reset is of three, none back yet"
+    );
+    // mc-1's new launch: first chunk 4 s after the click
+    let s = step(s, serde_json::json!([running(14_100, "mc-1", 2, 14_000)]));
+    assert_eq!(reset(&s)["back"], 1);
+    assert_eq!(reset(&s)["took_ms"], 4000);
+    // the same launch reported again is not another server back
+    let s = step(s, serde_json::json!([running(15_100, "mc-1", 2, 14_000)]));
+    assert_eq!(reset(&s)["back"], 1);
+    // a viewer resets mc-2 before it is back: its next launch is that viewer's, not the reset's
+    let s = step(
+        s,
+        serde_json::json!([
+            {"type": "intent", "at": 16_000, "viewer": "v2", "client": "198.51.100.21", "id": "r2",
+                "name": "minecraft_reset", "args": {"slot": "mc-2"}},
+            running(18_100, "mc-2", 3, 18_000),
+        ]),
+    );
+    assert_eq!(reset(&s)["back"], 1, "{}", reset(&s));
+    // mc-4, which the reset never touched, is given back and relaunched: not counted either
+    let s = step(
+        s,
+        serde_json::json!([
+            {"type": "intent", "at": 19_000, "viewer": "v2", "client": "198.51.100.21", "id": "g1",
+                "name": "release_minecraft", "args": {}},
+            running(20_100, "mc-4", 2, 20_000),
+        ]),
+    );
+    assert_eq!(reset(&s)["back"], 1, "{}", reset(&s));
+    // mc-3 is the reset's: the last of its servers that will come back, 11.5 s after the click
+    let s = step(s, serde_json::json!([running(21_600, "mc-3", 2, 21_500)]));
+    assert_eq!(
+        reset(&s),
+        serde_json::json!({"clicked_at": 10_000, "by": "viewer:v1", "servers": 3, "back": 2, "took_ms": 11_500})
+    );
+    // mc-1 reset by itself afterwards takes nothing from the count, and adds nothing when it is back
+    let s = step(
+        s,
+        serde_json::json!([
+            {"type": "intent", "at": 40_000, "viewer": "v1", "client": "198.51.100.20", "id": "r3",
+                "name": "minecraft_reset", "args": {"slot": "mc-1"}},
+            running(43_100, "mc-1", 3, 43_000),
+        ]),
+    );
+    assert_eq!(reset(&s)["back"], 2);
+    assert_eq!(reset(&s)["took_ms"], 11_500);
+    // a state file written before the count holds a reset with none: it is published without one
+    let mut old = serde_json::to_value(&s).unwrap();
+    let all = old["fleet"]["last_minecraft_reset_all"]
+        .as_object_mut()
+        .unwrap();
+    all.remove("back");
+    all.remove("took_ms");
+    let old: State = serde_json::from_value(old).unwrap();
+    assert_eq!(
+        reset(&old),
+        serde_json::json!({"clicked_at": 10_000, "by": "viewer:v1", "servers": 3})
+    );
+}
+
 /// A fleet of up to `TILES_LISTED` servers is listed whole, as before. A larger one lists the
 /// first that many and every lent server as tiles, in an image of their own, and names every
 /// server in `field`: by host, in the order of the host's status rows, with its view URL.

@@ -1474,7 +1474,7 @@ The snapshot's `state.minecraft` is absent with no servers, else:
 {"server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
  "image_aspect": 2.0, "claim_secs": 120,
  "borrow": {"cap": 2, "lent": 1, "next_return_at": 1761134525000},
- "last_reset_all": {"clicked_at": 1761134400000, "by": "viewer:v-3", "servers": 4},
+ "last_reset_all": {"clicked_at": 1761134400000, "by": "viewer:v-3", "servers": 4, "back": 4, "took_ms": 6120},
  "last_fork": {"from": "mc-1", "to": "mc-2", "clicked_at": 1761134410000, "by": "viewer:v-5",
                "first_chunk_at": 1761134412300, "snapshot_ms": 640, "restore_ms": 1100, "total_ms": 2300},
  "tiles": [{"id": "mc:1", "slot": "mc-1", "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5}, "phase": "running",
@@ -1510,7 +1510,11 @@ of, null for a launch from the gold snapshot; it is cleared by the server's next
 `first_chunk_at` the copy's first chunk (kept as `first_frame_at` is), `snapshot_ms` the
 source's `fcvm snapshot create`, `restore_ms` the copy's `fcvm snapshot run` until its view
 answered, `total_ms` the click to the copy's first chunk. `last_reset_all` is the last committed
-`minecraft_reset` of every server, with how many it reset.
+`minecraft_reset` of every server, with how many it reset, and the coordinator's count of it:
+`back`, how many of those servers are back on the launch the reset began (a server reset again
+before that is never counted, nor one the reset did not touch), and once one is, `took_ms`, the
+click to the first chunk of the last of them. Both are absent from a record written before the
+coordinator counted.
 
 Intents:
 
