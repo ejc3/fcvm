@@ -8,11 +8,13 @@ pub mod joinguard;
 pub mod minecraft;
 pub mod ports;
 pub mod potato;
+pub mod ring_cpus;
 pub mod slot;
 pub mod sni;
 pub mod spot;
 pub mod tls;
 pub mod vm;
+pub mod vmstats;
 pub mod webproxy;
 pub mod windows;
 
@@ -305,6 +307,17 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             "--potato-players needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)",
         )?;
         prefix.player_address(args.potato_players - 1)?;
+        let cpus = ring_cpus::allotment(args.potato_cpus)?;
+        let cgroup = match ring_cpus::RingCgroup::for_this_agent(cpus) {
+            Ok(cgroup) => {
+                tracing::info!(cpus = ?cgroup.cpus(), "potato: the ring is confined to these CPUs");
+                Some(Arc::new(cgroup))
+            }
+            Err(reason) => {
+                tracing::warn!(cpus, %reason, "potato: the ring is not confined to host CPUs; the allotment only caps the machines not asleep");
+                None
+            }
+        };
         Some(potato::PotatoCfg {
             fcvm: fcvm.clone(),
             image: args.potato_image.clone(),
@@ -317,6 +330,8 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 0 => 2 * u64::from(args.potato_players) * u64::from(args.potato_mem),
                 cap => cap,
             },
+            cpus,
+            cgroup,
         })
     } else {
         None
@@ -600,6 +615,8 @@ where
         phones: agent.phones.clone(),
         phone_actions: vm::phone_actions(agent.cfg.phone.as_ref()),
         potato_players: agent.potato.as_ref().map_or(0, |p| p.players),
+        potato_cpus: agent.potato.as_ref().map_or(0, |p| p.cpus),
+        potato_confined: agent.potato.as_ref().is_some_and(|p| p.cgroup.is_some()),
         windows: agent.windows.as_ref().map_or(0, |w| w.count),
         windows_actions: agent
             .windows
@@ -805,11 +822,11 @@ where
     if let Some(a) = aggregator {
         a.abort();
     }
-    // the players' VMs stop with the driver: each Vm sends its fcvm SIGTERM when dropped
+    // The ring is told to stop here and waited for below, with the slots, the sandboxes and
+    // the servers. Its own wait (SIGTERM, then SIGKILL: `potato::run`) used to run first, and
+    // came out of the time the wall's and phones' VMs have to stop in before systemd kills
+    // them.
     drop(potato_tx);
-    if let Some(t) = potato_task {
-        let _ = t.await;
-    }
 
     tracing::info!(
         slots = slots.len(),
@@ -822,15 +839,35 @@ where
         drop(h.desired);
         retired.push(h.task);
     }
-    for t in retired {
-        let _ = t.await;
-    }
-    if let Some(w) = sandboxes {
-        w.stop().await;
-    }
-    if let Some(m) = servers {
-        m.stop().await;
-    }
+    // Every mode stops at once, each within its own time. Waited for one after the other,
+    // the sandboxes and the servers were told to stop only when the slots and the ring had
+    // gone, with what was left of the time systemd gives the unit.
+    let slots_stopped = async {
+        for t in retired {
+            let _ = t.await;
+        }
+    };
+    let ring_stopped = async {
+        if let Some(t) = potato_task {
+            let _ = t.await;
+        }
+    };
+    let sandboxes_stopped = async {
+        if let Some(w) = sandboxes {
+            w.stop().await;
+        }
+    };
+    let servers_stopped = async {
+        if let Some(m) = servers {
+            m.stop().await;
+        }
+    };
+    tokio::join!(
+        slots_stopped,
+        ring_stopped,
+        sandboxes_stopped,
+        servers_stopped
+    );
     drop(out);
     let _ = writer.await;
     Ok(())

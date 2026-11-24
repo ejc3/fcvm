@@ -52,6 +52,13 @@ export interface CoordinatorOptions {
   gpuScrub?: boolean;
   /** With no visible viewer for this long the fleet sleeps (0: never by itself). */
   sleepAfterSecs?: number;
+  /**
+   * The coordinator's `--sleep-without-new-viewer`, for the wake rule only (0, the default:
+   * no limit, so any visible page wakes a sleeping fleet). The mock does not sleep at it.
+   */
+  sleepWithoutNewViewerSecs?: number;
+  /** The coordinator's `--min-wake-remaining` (default 600). */
+  minWakeRemainingSecs?: number;
   /** How long a wake takes, from the first instance requested to every tile rendering. */
   wakeMs?: number;
   /** Where the recording's files are served from at /media (none: /media answers 404). */
@@ -311,11 +318,13 @@ export class MockCoordinator {
   private slept: { fcvm: number[]; ec2: number } | null = null;
   /**
    * Tests: stay asleep whoever watches, as the coordinator does once nobody new has arrived
-   * for an hour. A `wake` lifts it.
+   * for an hour. A `wake` lifts it. (`pageWakes` is the rule itself, with a limit set.)
    */
   private holdAsleep = false;
   /** The last arrival: a page connecting for the first time (no ticket, not returning) or a `wake`. */
   private lastArrivalAt: number | null = null;
+  /** With no arrival yet the limit counts from here, as the coordinator's does from its start. */
+  private readonly startedAt: number;
   private idleSince: number | null = null;
   /** The schedule's next beat, kept while the fleet sleeps. */
   private sleptRaceAt: number | null = null;
@@ -330,6 +339,7 @@ export class MockCoordinator {
   constructor(opts: CoordinatorOptions) {
     this.opts = opts;
     this.now = opts.now ?? Date.now;
+    this.startedAt = this.now();
     this.rand = rng(opts.seed ?? 1136);
     this.sitekey = opts.turnstileSitekey;
     this.gpuScrub = opts.gpuScrub ?? false;
@@ -498,7 +508,7 @@ export class MockCoordinator {
         max_tiles: 100,
         standby: [],
         // The mock does not run the hour without a new viewer by itself (tests put it to sleep).
-        power: { ...this.power, last_arrival_at: this.lastArrivalAt, sleep_without_arrival_at: null },
+        power: { ...this.power, last_arrival_at: this.lastArrivalAt, sleep_without_arrival_at: this.noArrivalDeadline() },
       },
       borrow: {
         cap: this.opts.borrowCap,
@@ -1254,7 +1264,25 @@ export class MockCoordinator {
         if (now - this.idleSince >= after) this.sleep();
       }
     }
-    if (this.power.state === "asleep" && visible > 0 && !this.holdAsleep) this.wake();
+    if (this.power.state === "asleep" && visible > 0 && !this.holdAsleep && this.pageWakes(now)) this.wake();
+  }
+
+  /** When the limit without a new viewer runs out; null with no limit. */
+  private noArrivalDeadline(): number | null {
+    const limit = (this.opts.sleepWithoutNewViewerSecs ?? 0) * 1000;
+    return limit > 0 ? (this.lastArrivalAt ?? this.startedAt) + limit : null;
+  }
+
+  /**
+   * Whether a visible page wakes a sleeping fleet, as the coordinator decides it
+   * (fleet/core `view::page_wakes`): at least the minimum of the limit remains, or there is
+   * no limit. An arrival (a new page, a `wake`) has the whole limit ahead.
+   */
+  private pageWakes(now: number): boolean {
+    const deadline = this.noArrivalDeadline();
+    if (deadline === null) return true;
+    const min = Math.min(this.opts.minWakeRemainingSecs ?? 600, this.opts.sleepWithoutNewViewerSecs ?? 0) * 1000;
+    return now < deadline && deadline - now >= min;
   }
 
   /**
@@ -1732,6 +1760,10 @@ export class MockCoordinator {
         body((b) => {
           if (typeof b["wake_ms"] === "number") this.opts.wakeMs = b["wake_ms"];
           if (typeof b["hold"] === "boolean") this.holdAsleep = b["hold"];
+          // The wake rule's limit and minimum, and how long ago the last arrival was.
+          if (typeof b["limit_secs"] === "number") this.opts.sleepWithoutNewViewerSecs = b["limit_secs"];
+          if (typeof b["min_wake_secs"] === "number") this.opts.minWakeRemainingSecs = b["min_wake_secs"];
+          if (typeof b["arrived_ms_ago"] === "number") this.lastArrivalAt = this.now() - b["arrived_ms_ago"];
           if (b["sleep"] === true) this.sleep();
           if (b["wake"] === true) {
             this.holdAsleep = false;

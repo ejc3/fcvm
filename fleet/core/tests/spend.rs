@@ -255,6 +255,8 @@ fn a_claim_at_the_trip_point_is_refused_not_committed_and_undone() {
                 phones: vec![],
                 phone_actions: vec![],
                 potato_players: 0,
+                potato_cpus: 0,
+                potato_confined: false,
                 windows: 0,
                 windows_actions: Vec::new(),
                 minecraft: 0,

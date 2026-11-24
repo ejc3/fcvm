@@ -40,6 +40,8 @@ pub struct TileView {
     pub generation: Option<u64>,
     pub fps: Option<f64>,
     pub gpu_stats: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_stats: Option<crate::protocol::VmStats>,
     pub error: Option<String>,
     /// Why the tile is not running when that is a fault.
     pub failure: Option<TileFailure>,
@@ -603,6 +605,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             generation: None,
             fps: None,
             gpu_stats: None,
+            vm_stats: None,
             error: None,
             failure: None,
             last_relaunch: None,
@@ -639,6 +642,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             generation: Some(s.generation),
             fps: s.observed.fps,
             gpu_stats: s.observed.gpu_stats.clone(),
+            vm_stats: s.observed.vm_stats.clone(),
             error: s.observed.error.as_deref().map(hide_account_ids),
             last_relaunch: s.last_relaunch.as_ref().map(|r| RelaunchView {
                 clicked_at: r.clicked_at,
@@ -1192,6 +1196,22 @@ pub fn no_arrival_deadline(p: &Power, c: &crate::state::Config) -> Option<u64> {
     }
     p.last_arrival_at
         .map(|t| t + c.sleep_without_new_viewer_secs * 1000)
+}
+
+/// Whether an active page wakes a sleeping fleet at `at`: the limit without a new viewer
+/// has at least `min_wake_remaining_secs` left (the whole limit, when the limit is shorter
+/// than that), or there is no limit. A wake with less left would launch hosts that the limit
+/// terminates minutes later, under the viewer they were launched for. An arrival sets the
+/// limit's start to `at` first, so it always wakes.
+pub fn page_wakes(p: &Power, c: &crate::state::Config, at: u64) -> bool {
+    let Some(deadline) = no_arrival_deadline(p, c) else {
+        return true;
+    };
+    let min = c
+        .min_wake_remaining_secs
+        .min(c.sleep_without_new_viewer_secs)
+        * 1000;
+    at < deadline && deadline - at >= min
 }
 
 fn relaunch_all(r: &Race) -> RelaunchAllView {
