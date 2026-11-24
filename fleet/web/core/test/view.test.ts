@@ -1013,7 +1013,7 @@ describe("seams and hover", () => {
 
     it("names a live tile's GPU, place and last launch from what the coordinator reported", () => {
       const l = label("ec2:2", (t) => {
-        t.gpu = { name: "Tesla T4", temp_c: 40, power_w: 50, util_pct: 90 };
+        t.gpu = { name: "Tesla T4", temp_c: 40, power_w: 50, util_pct: 90, mem_used_mb: null, mem_total_mb: null, at: null };
         t.place = "EC2 in us-east-1";
         t.host = "i-example-host";
         t.last_relaunch = { clicked_at: EPOCH, first_frame_at: EPOCH + 58_000, phases: {} };

@@ -16,6 +16,8 @@ import {
   PHONE_ASPECT,
   restoreText,
   screenYScale,
+  statsOf,
+  STATS_STALE_MS,
   tapPoint,
   TAP_BROWSER_NOTE,
   zoomProgressAt,
@@ -116,6 +118,18 @@ describe("phones in the snapshot", () => {
     expect(m.state.phones!.zoomed_out).toBe(true);
     expect(m.state.phones!.zoom_at).toBe(123_456);
     expect(m.state.phones!.tiles[1]!.borrowed).toEqual({ session: "phone-claim-3", viewer: "v-12", since: 1000, until: 31_000 });
+  });
+
+  it("reads GPU memory and the sample time from gpu_stats", () => {
+    const state = structuredClone(raw.views["29_phones"]!) as { phones: { tiles: Record<string, unknown>[] } };
+    state.phones.tiles[1]!["gpu_stats"] = { temp_c: 50, power_w: 40, util_pct: 30, mem_used_mb: 600, mem_total_mb: 15360, at: 1234 };
+    const m = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+    if (m.type !== "snapshot") throw new Error("not a snapshot");
+    expect(m.state.phones!.tiles[1]!.gpu).toMatchObject({ util_pct: 30, mem_used_mb: 600, mem_total_mb: 15360, at: 1234 });
+    state.phones.tiles[1]!["gpu_stats"] = { util_pct: 30 };
+    const old = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+    if (old.type !== "snapshot") throw new Error("not a snapshot");
+    expect(old.state.phones!.tiles[1]!.gpu).toMatchObject({ mem_used_mb: null, mem_total_mb: null, at: null });
   });
 
   it("has no phones when the coordinator sends none", () => {
@@ -372,6 +386,45 @@ describe("the panel of an opened phone", () => {
     expect(Object.fromEntries(p.rows.map((r) => [r.term, r.value]))).toMatchObject({ VM: "fleet-phone-1", "Restored in": "22.3 s", "Up for": "7 s" });
     expect(p.restoreTotal).toBe("22.3 s");
     expect(p.timeline.map((s) => s.label)).toEqual(["snapshot restored"]);
+  });
+
+  describe("live readings", () => {
+    const withGpu = (g: Partial<NonNullable<Tile["gpu"]>> | null) => {
+      const ph = phonesOf(2);
+      ph.tiles[0] = { ...ph.tiles[0]!, gpu: g === null ? null : { name: "Tesla T4", temp_c: null, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: null, ...g } };
+      return panelOf(ph);
+    };
+
+    it("formats each reading with fixed-width digits, units and a label", () => {
+      const p = withGpu({ util_pct: 7, temp_c: 52, power_w: 48.4, mem_used_mb: 648.3, mem_total_mb: 15360 });
+      expect(p.stats.map((r) => [r.key, r.text, r.fraction])).toEqual([
+        ["gpu-util", "\u2007\u20077 %", 0.07],
+        ["gpu-temp", "\u200752 \u00b0C", null],
+        ["gpu-power", "\u200748 W", null],
+        ["gpu-mem", "\u2007\u2007648 of 15360 MB", 648.3 / 15360],
+      ]);
+      expect(p.stats.map((r) => r.label)).toEqual([
+        "GPU utilisation 7 percent",
+        "GPU temperature 52 degrees Celsius",
+        "GPU power draw 48 watts",
+        "GPU memory in use 648 of 15360 megabytes",
+      ]);
+    });
+
+    it("leaves out a reading that is absent, and shows memory without a bar when the size is unknown", () => {
+      const p = withGpu({ util_pct: 0, mem_used_mb: 512 });
+      expect(p.stats.map((r) => r.key)).toEqual(["gpu-util", "gpu-mem"]);
+      expect(p.stats[0]!.fraction).toBe(0);
+      expect(p.stats[1]).toMatchObject({ text: "\u2007\u2007512 MB", fraction: null });
+      expect(withGpu({}).stats).toEqual([]);
+      expect(withGpu(null).stats).toEqual([]);
+    });
+
+    it("drops readings older than the stale limit, and keeps fresh ones", () => {
+      const srv = EPOCH + 30_000;
+      expect(statsOf({ name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: srv - STATS_STALE_MS + 1 }, srv)).toHaveLength(1);
+      expect(statsOf({ name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: srv - STATS_STALE_MS - 1 }, srv)).toEqual([]);
+    });
   });
 
   it("offers a free phone to take over", () => {

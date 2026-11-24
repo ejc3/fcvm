@@ -24,7 +24,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
           borrowed: null,
           frame_url: `ws://example-host:1/frames/${half}-${n}`,
           frame_url_v4: `ws://example-host-v4:1/frames/${half}-${n}`,
-          gpu: { name: "NVIDIA T4", temp_c: 61, power_w: 70.4, util_pct: 98 },
+          gpu: { name: "NVIDIA T4", temp_c: 61, power_w: 70.4, util_pct: 98, mem_used_mb: null, mem_total_mb: null, at: null },
           host: half === "fcvm" ? "g4dn.metal · example-region" : "g4dn.xlarge · example-region",
           place: "EC2 in example-region",
           last_relaunch: {
