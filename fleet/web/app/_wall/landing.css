@@ -30,3 +30,8 @@
 .lg-meter .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; background: var(--fcvm); }
 .lg-meter .need { position: absolute; top: -4px; bottom: -4px; width: 3px; background: var(--text); border-radius: 2px; }
 .lg-ball { position: absolute; right: -6px; top: -6px; width: 14px; height: 14px; border-radius: 50%; background: radial-gradient(circle at 35% 35%, #fff6cf, var(--p-ball) 60%); box-shadow: 0 0 0 2px var(--p-ball-edge); }
+
+/* In the wall's HUD the line is over the picture: give it the HUD's own backing so it reads on any frame. */
+.hud-top .landing-line { color: var(--text); background: rgba(11, 13, 16, 0.55); padding: 2px 8px; border-radius: 6px; }
+/* Narrow in the HUD, so the button stays on the left half and leaves the right half's tiles to the pointer. */
+.hud-top .landing { max-width: 420px; }
