@@ -381,14 +381,18 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ipv6_prefix.is_some(),
             "--minecraft needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)"
         );
+        // Everything else this agent may run shares the host's neighbour tables: the servers'
+        // gold VM, a wall tile for each place, the phones, the potato players and the sandboxes.
+        let other_vms = 1
+            + args.capacity.unwrap_or(gpus.len())
+            + phones.len()
+            + args.potato_players as usize
+            + args.windows as usize;
         minecraft::check_neighbour_room(
             args.minecraft,
-            &std::fs::read_to_string(minecraft::NEIGH_LIMIT).with_context(|| {
-                format!(
-                    "reading {}, the host's IPv6 neighbour limit",
-                    minecraft::NEIGH_LIMIT
-                )
-            })?,
+            u32::try_from(other_vms).unwrap_or(u32::MAX),
+            &minecraft::read_neighbour_limit(std::path::Path::new(minecraft::NEIGH_LIMIT))?,
+            &minecraft::read_neighbour_limit(std::path::Path::new(minecraft::NEIGH_LIMIT_V4))?,
         )?;
         let (image_id, server) =
             minecraft::inspect_image(&args.windows_podman, &args.minecraft_image).await?;

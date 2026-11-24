@@ -698,17 +698,32 @@ class PipelineTests(unittest.TestCase):
         self.assertLess(prep.index("sysctl -e -p"), prep.index('runuser -u "$U" -- unshare -U -r true'))
 
     def test_host_image_has_room_for_hundreds_of_routed_vms_neighbours(self):
-        # The IPv6 neighbour table is shared by every network namespace: at Ubuntu's 1024, 512
-        # routed Minecraft servers overflowed it (docs/fleet/minecraft.md). The agent refuses a
-        # fleet the limit has no room for, at 8 entries a server (src/fleet/agent/minecraft.rs).
+        # The neighbour tables, IPv6 and IPv4, are shared by every network namespace: at the
+        # kernel's 1024, 512 routed Minecraft servers overflowed the IPv6 one
+        # (docs/fleet/minecraft.md). The agent refuses a fleet a limit has no room for, at the
+        # entries a VM its constants name (src/fleet/agent/minecraft.rs), so the image's limits
+        # are checked against those constants: room for 512 servers and 64 other VMs, twice over.
         source = (HERE / "host/build.sh").read_text()
         conf = re.search(r"cat > /etc/sysctl\.d/99-fcvm\.conf <<'X'\n(.*?)\nX\n", source, re.S).group(1)
         keys = dict(line.split("=", 1) for line in conf.splitlines() if "=" in line and not line.startswith("#"))
-        limits = [int(keys[f"net.ipv6.neigh.default.gc_thresh{n}"]) for n in (1, 2, 3)]
-        self.assertEqual(limits, sorted(limits))
-        self.assertGreaterEqual(limits[2], 8 * 2048)
         agent = (HERE.parent.parent / "src/fleet/agent/minecraft.rs").read_text()
-        self.assertIn("pub const NEIGH_PER_SERVER: u64 = 8;", agent)
+        for family, const in (("ipv6", "NEIGH_PER_VM"), ("ipv4", "NEIGH_PER_VM_V4")):
+            per = int(re.search(rf"pub const {const}: u64 = (\d+);", agent).group(1))
+            limits = [int(keys[f"net.{family}.neigh.default.gc_thresh{n}"]) for n in (1, 2, 3)]
+            self.assertEqual(limits, sorted(limits), family)
+            self.assertGreaterEqual(limits[2], 2 * (512 + 64) * per, family)
+        # counted on a host: 16.5 IPv6 entries and 2.0 IPv4 entries a server
+        self.assertGreaterEqual(int(re.search(r"pub const NEIGH_PER_VM: u64 = (\d+);", agent).group(1)), 20)
+        self.assertGreaterEqual(int(re.search(r"pub const NEIGH_PER_VM_V4: u64 = (\d+);", agent).group(1)), 3)
+
+    def test_the_agent_starts_after_the_sysctls_are_applied(self):
+        # The agent reads the neighbour limits when it starts. /etc/sysctl.d is applied by
+        # systemd-sysctl before sysinit.target, and a unit with systemd's default dependencies
+        # is ordered after that target. A unit that opts out of them (as the store's does) is not.
+        unit = (HERE / "host/fcvm-fleet-agent.service").read_text()
+        settings = [line.split("=", 1)[0].strip() for line in unit.splitlines() if "=" in line and not line.lstrip().startswith("#")]
+        self.assertNotIn("DefaultDependencies", settings)
+        self.assertIn("DefaultDependencies=no", (HERE / "host/fcvm-fleet-store.service").read_text())
 
     def test_build_user_can_open_only_its_private_warm_log_under_the_actual_preamble(self):
         source = (HERE / "host/build.sh").read_text()
