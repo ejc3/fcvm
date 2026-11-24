@@ -84,9 +84,10 @@ fcvm's lockfile.
   dry land that has dry land all round it, and builds there in its wool (`plan.rs`): a wall of 4
   to 7 columns, the outline of a house 4 or 5 columns a side with a gap for its door, or a tower,
   each raised two blocks (a tower three). It walks to the place beside each column before it
-  raises it, and leaves out a column on water, on a tree, or off the level of the first. A bot
-  never chooses water: one that finds itself in it swims or walks to the nearest shore before
-  anything else. After a restore or a new scene a bot's first walk is at most 6 columns, so a
+  raises it, and leaves out a column on water, on a tree, or off the level of the first. A bot's
+  targets and standing places are dry columns, and one that is in water swims or walks to the
+  nearest shore before anything else; a walk between two of them can cross water, and that is
+  how it leaves again. After a restore or a new scene a bot's first walk is at most 6 columns, so a
   copy starts building, and differs from its source, within seconds. A restore keeps
   the bots connected: their connections to Pumpkin are loopback inside the guest, which fcvm's
   restore keeps (it retires only sockets whose peer is outside the guest). When the agent posts

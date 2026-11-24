@@ -401,6 +401,17 @@ fn near(bot: &Client, x: i32, z: i32, within: f64) -> bool {
     })
 }
 
+/// A bot that found no dry column in reach looks again this long after.
+const MISS_WAIT_MS: u64 = 1_000;
+
+/// What a bot does after it found no dry column in reach: nothing, for [`MISS_WAIT_MS`].
+fn after_miss(now: u64, near: bool) -> Pilot {
+    Pilot::Idle {
+        until: now + MISS_WAIT_MS,
+        near,
+    }
+}
+
 fn fly(tile: &Tile, bot: &Client, p: &mut Pilot, region: Region, rng: &mut impl Rng, now: u64) {
     let _ = region;
     match p.clone() {
@@ -410,11 +421,15 @@ fn fly(tile: &Tile, bot: &Client, p: &mut Pilot, region: Region, rng: &mut impl 
             let Some(grid) = grid.as_ref() else { return };
             // A bot in the water leaves it before anything else: half the time it swims
             // straight for the nearest shore, half the time the pathfinder takes it there (one
-            // gets it out where the other is stuck).
+            // gets it out where the other is stuck). The shore is looked for once.
             let wet = plan::in_water(grid, x, z);
-            if wet
+            let shore = if wet {
+                plan::nearest_land(grid, x, z, 64)
+            } else {
+                None
+            };
+            if let Some((tx, tz)) = shore
                 && rng.random::<bool>()
-                && let Some((tx, tz)) = plan::nearest_land(grid, x, z, 64)
             {
                 bot.stop_pathfinding();
                 *p = Pilot::Swim {
@@ -425,7 +440,7 @@ fn fly(tile: &Tile, bot: &Client, p: &mut Pilot, region: Region, rng: &mut impl 
                 return;
             }
             let target = if wet {
-                plan::nearest_land(grid, x, z, 64)
+                shore
             } else {
                 let reach = if short { NEAR_REACH } else { WALK_REACH };
                 let picks: Vec<(i32, i32)> = (0..24)
@@ -447,8 +462,11 @@ fn fly(tile: &Tile, bot: &Client, p: &mut Pilot, region: Region, rng: &mut impl 
                         until: now + 25_000,
                     };
                 }
-                // Already there (or nowhere dry to go): build where it stands.
-                _ => *p = Pilot::Walk { x, z, until: now },
+                // Already there: build where it stands.
+                Some(_) => *p = Pilot::Walk { x, z, until: now },
+                // Nothing dry in reach (the map still loading, a region of water, a driven bot
+                // far outside the map): look again in a while, not at the next tick.
+                None => *p = after_miss(now, short),
             }
         }
         Pilot::Idle { .. } => {}
@@ -726,6 +744,30 @@ fn status_tick(tile: &Tile, bots: &[Option<Client>], now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bot with nothing dry in reach (the map loading, a region of water, a driven bot far
+    /// outside the map) looked again at the very next tick, and each look was a whole search.
+    #[test]
+    fn a_bot_that_finds_no_dry_column_waits_before_it_looks_again() {
+        for near in [true, false] {
+            match after_miss(5_000, near) {
+                Pilot::Idle { until, near: n } => {
+                    assert_eq!((until, n), (5_000 + MISS_WAIT_MS, near));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(MISS_WAIT_MS >= 1_000);
+        // and a tick's decision looks for the shore once, and leaves the miss to that wait
+        let src = include_str!("bots.rs");
+        let fly = &src[src.find("fn fly(").unwrap()..src.find("fn map_tick(").unwrap()];
+        assert_eq!(
+            fly.matches("plan::nearest_land(").count(),
+            1,
+            "one search a tick"
+        );
+        assert!(fly.contains("None => *p = after_miss(now, short),"));
+    }
 
     /// A restore keeps the bots connected, so the session count stays; the copy's own scene is
     /// what changes the bots' choices, so a fork and its source do not walk the same paths.

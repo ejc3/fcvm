@@ -56,26 +56,49 @@ pub fn in_water(grid: &Grid, x: i32, z: i32) -> bool {
 
 /// The dry column nearest `(x, z)`, searched in growing squares up to `reach` columns away.
 pub fn nearest_land(grid: &Grid, x: i32, z: i32, reach: i32) -> Option<(i32, i32)> {
+    nearest_land_counted(grid, x, z, reach).0
+}
+
+/// [`nearest_land`], with how many columns it looked at. Each square is walked along its edge
+/// only (8r columns at r away), so a search that finds nothing costs `1 + 4 * reach * (reach + 1)`
+/// looks: 16,641 at a reach of 64. A caller that finds nothing waits before it looks again
+/// (`bots.rs`, `MISS_WAIT_MS`).
+pub fn nearest_land_counted(
+    grid: &Grid,
+    x: i32,
+    z: i32,
+    reach: i32,
+) -> (Option<(i32, i32)>, usize) {
+    let mut looked = 0;
     for r in 0..=reach {
         let mut best: Option<((i32, i32), i32)> = None;
-        for dz in -r..=r {
+        let mut look = |dx: i32, dz: i32| {
+            looked += 1;
+            if land(grid, x + dx, z + dz).is_some() {
+                let d = dx * dx + dz * dz;
+                if best.is_none_or(|(_, b)| d < b) {
+                    best = Some(((x + dx, z + dz), d));
+                }
+            }
+        };
+        if r == 0 {
+            look(0, 0);
+        } else {
+            // the two whole rows, then the two columns between them
             for dx in -r..=r {
-                if dx.abs().max(dz.abs()) != r {
-                    continue;
-                }
-                if land(grid, x + dx, z + dz).is_some() {
-                    let d = dx * dx + dz * dz;
-                    if best.is_none_or(|(_, b)| d < b) {
-                        best = Some(((x + dx, z + dz), d));
-                    }
-                }
+                look(dx, -r);
+                look(dx, r);
+            }
+            for dz in -r + 1..r {
+                look(-r, dz);
+                look(r, dz);
             }
         }
         if let Some((p, _)) = best {
-            return Some(p);
+            return (Some(p), looked);
         }
     }
-    None
+    (None, looked)
 }
 
 /// Where to walk next from `(x, z)`: a dry column within `reach` whose eight neighbours are dry
@@ -237,6 +260,23 @@ mod tests {
             .iter_mut()
             .for_each(|c| *c = Cell::new(palette::index("water"), 62));
         assert_eq!(nearest_land(&sea, 3, 3, 48), None);
+        // A search that finds nothing looks at each square's edge once, not at every square
+        // whole: 9,409 columns at a reach of 48 (whole squares were 156,849), 16,641 at the 64
+        // a bot in water uses.
+        assert_eq!(nearest_land_counted(&sea, 3, 3, 48), (None, 9_409));
+        assert_eq!(nearest_land_counted(&sea, 3, 3, 64).1, 16_641);
+        // far outside the map (a driven bot can be) it is the same bound, and finds the map's edge
+        let (far, looked) = nearest_land_counted(&g, -40, 3, 64);
+        assert_eq!(far.map(|(x, _)| x), Some(0));
+        assert!(looked <= 16_641);
+        // every column at exactly r away is looked at, and none twice
+        for r in 1..6 {
+            let before = nearest_land_counted(&sea, 3, 3, r - 1).1;
+            assert_eq!(
+                nearest_land_counted(&sea, 3, 3, r).1 - before,
+                8 * r as usize
+            );
+        }
     }
 
     #[test]
