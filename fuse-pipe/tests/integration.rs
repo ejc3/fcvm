@@ -301,6 +301,93 @@ fn test_rename_noreplace_returns_eexist() {
     drop(fuse);
     cleanup(&data_dir, &mount_dir);
 }
+/// A directory renamed onto a directory replaces it only when the target is empty or absent.
+/// fcvm's name claim rests on this (`StateManager::claim_name`): a claim is a directory
+/// holding the claimer's token, renamed onto the name's slot, and the slot of a name in use
+/// holds its holder's token. The state directory is mapped into nested guests through this
+/// filesystem, so the refusal has to come through it unchanged, with both directories as
+/// they were.
+#[test]
+fn test_rename_directory_onto_directory_needs_an_empty_target() {
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
+    let mount = fuse.mount_path();
+
+    let names = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let slot = mount.join("slot");
+    fs::create_dir(&slot).expect("mkdir slot");
+    fs::write(slot.join("holder"), "holder").expect("write the holder's token");
+    let claim = mount.join(".claim.second");
+    fs::create_dir(&claim).expect("mkdir claim");
+    fs::write(claim.join("second"), "second").expect("write the claimer's token");
+
+    // Onto a directory with an entry: refused, nothing moved.
+    let refused = fs::rename(&claim, &slot).expect_err("renamed onto a non-empty directory");
+    assert!(
+        matches!(
+            refused.raw_os_error(),
+            Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+        ),
+        "expected ENOTEMPTY, got {refused:?}"
+    );
+    assert_eq!(names(&slot), ["holder"]);
+    assert_eq!(names(&claim), ["second"]);
+    assert_eq!(
+        names(&data_dir.join("slot")),
+        ["holder"],
+        "on the host side"
+    );
+
+    // Onto an empty directory: it is replaced, and holds what the renamed one held.
+    fs::remove_file(slot.join("holder")).expect("unlink the holder's token");
+    fs::rename(&claim, &slot).expect("rename onto an empty directory");
+    assert_eq!(names(&slot), ["second"]);
+    assert!(
+        !claim.exists(),
+        "the renamed directory is still at its old name"
+    );
+    assert_eq!(
+        names(&data_dir.join("slot")),
+        ["second"],
+        "on the host side"
+    );
+    assert_eq!(fs::read_to_string(slot.join("second")).unwrap(), "second");
+
+    // Two claims at once: the one that renames second is refused by the first one's token.
+    let third = mount.join(".claim.third");
+    fs::create_dir(&third).expect("mkdir claim");
+    fs::write(third.join("third"), "third").expect("write the claimer's token");
+    let refused = fs::rename(&third, &slot).expect_err("renamed onto the winner's directory");
+    assert!(
+        matches!(
+            refused.raw_os_error(),
+            Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+        ),
+        "expected ENOTEMPTY, got {refused:?}"
+    );
+
+    // Onto no directory at all, after the holder released the name and removed its slot.
+    fs::remove_file(slot.join("second")).expect("unlink the token");
+    fs::remove_dir(&slot).expect("rmdir the empty slot");
+    fs::rename(&third, &slot).expect("rename onto an absent directory");
+    assert_eq!(names(&slot), ["third"]);
+
+    // An empty slot is removed only while it is empty.
+    let refused = fs::remove_dir(&slot).expect_err("removed a directory with an entry");
+    assert_eq!(refused.raw_os_error(), Some(libc::ENOTEMPTY), "{refused:?}");
+
+    let _ = fs::remove_dir_all(&slot);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
 #[test]
 fn test_lseek_supports_negative_offsets() {
     common::increase_ulimit();

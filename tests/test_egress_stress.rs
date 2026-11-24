@@ -469,7 +469,7 @@ async fn get_host_ip_from_state(pid: u32) -> Result<String> {
         .args([
             "-c",
             &format!(
-                "grep -l '\"pid\": {}' {}/*.json 2>/dev/null | head -1",
+                "grep -l '\"pid\": {}' {}/vms/*/*.json 2>/dev/null | head -1",
                 pid,
                 state_dir.display()
             ),
@@ -482,7 +482,7 @@ async fn get_host_ip_from_state(pid: u32) -> Result<String> {
         // Try alternative: list files and check each
         let output = tokio::process::Command::new("bash")
             .args(["-c", &format!(
-                "for f in {}/*.json; do if grep -q '\"pid\": {}' \"$f\" 2>/dev/null; then echo \"$f\"; break; fi; done",
+                "for f in {}/vms/*/*.json; do if grep -q '\"pid\": {}' \"$f\" 2>/dev/null; then echo \"$f\"; break; fi; done",
                 state_dir.display(), pid
             )])
             .output()

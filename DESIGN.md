@@ -2254,7 +2254,7 @@ This ensures automatic cache invalidation when any component changes.
 
 ### State Persistence
 
-**VM State** (`/mnt/fcvm-btrfs/state/{vm-id}.json`):
+**VM State** (`/mnt/fcvm-btrfs/state/vms/<bb>/{vm-id}.json`, `<bb>` the first byte of the vm-id's SHA-256):
 ```json
 {
   "schema_version": 1,

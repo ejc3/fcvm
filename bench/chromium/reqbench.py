@@ -1124,6 +1124,27 @@ class DirWatch:
             self.fd = -1
 
 
+def refuse_unconverted_state_layout(state_dir: str) -> None:
+    """Raise when ``state_dir`` holds a state layout this harness does not read.
+
+    fcvm marks a state directory with a ``layout`` file from layout 2 on, which keeps
+    each VM's state in a bucket (``vms/<bucket>/<vm_id>.json``) and its PID index entry
+    in ``pids/<bucket>/<pid>.<vm_id>``.  This harness lists ``<vm_id>.json`` in the state
+    directory itself, which is layout 1.  On a marked store that listing is empty, and an
+    empty listing reads as "no VM", so the harness refuses the store instead.
+    """
+    try:
+        with open(os.path.join(state_dir, "layout"), encoding="utf-8") as handle:
+            layout = handle.read().strip()
+    except FileNotFoundError:
+        return
+    raise RuntimeError(
+        f"{state_dir} holds fcvm state layout {layout!r} (states in vms/<bucket>/, "
+        "PID index in pids/<bucket>/); this harness reads the flat layout 1 and has "
+        "not been converted, so it would find no VM there"
+    )
+
+
 def state_path_baseline(state_dir: str) -> frozenset[str]:
     """Snapshot state paths that existed before a clone was spawned.
 
@@ -1133,6 +1154,7 @@ def state_path_baseline(state_dir: str) -> frozenset[str]:
     the directory watch but before ``Popen`` and permanently exclude every path
     in it from this clone's discovery and recovery scope.
     """
+    refuse_unconverted_state_layout(state_dir)
     try:
         return frozenset(
             os.path.join(state_dir, entry)
@@ -1162,6 +1184,7 @@ def scan_state(
     window. Pre-spawn paths are excluded because name alone is discovery, not
     ownership; destructive cleanup separately requires the exact PID start time.
     """
+    refuse_unconverted_state_layout(state_dir)
     try:
         names = os.listdir(state_dir)
     except OSError:
@@ -1258,6 +1281,7 @@ def find_state(
     actually changes: zero CPU while waiting, and it notices the file sooner than a
     poll loop would. `discover_ms` still records the wall cost.
     """
+    refuse_unconverted_state_layout(state_dir)
     own = watch is None
     if own:
         watch = DirWatch(state_dir)
@@ -1982,6 +2006,7 @@ def valid_guest_env(value) -> bool:
 
 def serve_uffd_mode(state_dir: str, serve_pid: int, snapshot_name: str) -> str:
     """Validate the exact live serve process and return its memory mode."""
+    refuse_unconverted_state_layout(state_dir)
     actual = proc_stat_fields(serve_pid)
     if actual is None:
         raise RuntimeError(f"serve PID {serve_pid} is not running")
@@ -4155,6 +4180,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     env = dict(os.environ, RUST_LOG=args.rust_log)
     # Watch registered BEFORE the spawn: a watch created afterwards can miss the
     # state file's creation and then block waiting for an event already past.
+    refuse_unconverted_state_layout(args.state_dir)
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
@@ -4439,6 +4465,7 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     rec: dict = {"arm": "noop-fast" if fast else "noop", "rep": rep, "name": name}
     cmd = clone_run_cmd(args, name)
     env = dict(os.environ, RUST_LOG=args.rust_log)
+    refuse_unconverted_state_layout(args.state_dir)
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
@@ -4584,6 +4611,7 @@ def run_exec_request(args, rep: int) -> dict:
     parent_fd = None
     kids: list[int] = []
     fds: list[int | None] = []
+    refuse_unconverted_state_layout(args.state_dir)
     watch = DirWatch(args.state_dir)
     fcvm_start_time = None
     try:

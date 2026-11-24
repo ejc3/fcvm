@@ -3195,8 +3195,9 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
         let serve_start_time = serve_state
             .pid_start_time
             .context("memory server state has no process start time")?;
-        serve_state_path =
-            Some(fcvm::paths::state_dir().join(format!("{}.json", serve_state.vm_id)));
+        serve_state_path = Some(
+            fcvm::state::StateManager::new(fcvm::paths::state_dir()).state_file(&serve_state.vm_id),
+        );
         serve_socket_path = Some(fcvm::uffd::UffdServer::socket_path_for(
             &fcvm::paths::data_dir(),
             &snapshot_name,

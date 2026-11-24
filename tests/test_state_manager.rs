@@ -111,7 +111,7 @@ async fn test_state_persistence() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let state_file = temp_dir.path().join("test-vm-1.json");
+        let state_file = manager.state_file("test-vm-1");
         let metadata = std::fs::metadata(&state_file).unwrap();
         let permissions = metadata.permissions();
         // Check permissions are world-readable (0o644) so non-root can list VMs
@@ -426,8 +426,8 @@ async fn list_vms_finds_a_vm_whose_state_file_is_replaced_during_the_scan() {
 
     // What update_state does, done by hand inside the scan's window: write the new state
     // file and rename it over the old one.
-    let state_file = temp_dir.path().join("vm-target.json");
-    let temp_file = temp_dir.path().join("vm-target.json.tmp");
+    let state_file = manager.state_file("vm-target");
+    let temp_file = state_file.with_extension("json.tmp");
     let replaced = std::fs::read_to_string(&state_file).unwrap();
     let vms = manager
         .list_vms_after_open(move || {
@@ -443,6 +443,29 @@ async fn list_vms_finds_a_vm_whose_state_file_is_replaced_during_the_scan() {
         vms.len()
     );
     assert_eq!(vms.len(), 71, "every VM is listed exactly once");
+}
+
+/// Where `manager` keeps VM `vm_id`'s state file, with its bucket made, for a test that
+/// writes the file itself.
+fn state_path_of(manager: &StateManager, vm_id: &str) -> std::path::PathBuf {
+    let path = manager.state_file(vm_id);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    path
+}
+
+/// Every directory under `root`, `root` included.
+fn dirs_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![root.to_path_buf()];
+    let mut next = 0;
+    while next < dirs.len() {
+        for entry in std::fs::read_dir(&dirs[next]).unwrap().flatten() {
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                dirs.push(entry.path());
+            }
+        }
+        next += 1;
+    }
+    dirs
 }
 
 fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
@@ -586,7 +609,7 @@ async fn test_stale_sweep_skips_locked_writer_and_rechecks_identity() {
 
     let temp_dir = TempDir::new().unwrap();
     let manager = StateManager::new(temp_dir.path().to_path_buf());
-    let state_path = temp_dir.path().join("vm-sweep.json");
+    let state_path = state_path_of(&manager, "vm-sweep");
     let temp_path = state_path.with_extension("json.tmp");
     let lock_path = state_path.with_extension("json.lock");
     manager
@@ -624,7 +647,7 @@ async fn test_stale_sweep_reaps_orphan_temps_but_preserves_live_or_unknown_state
     let temp_dir = TempDir::new().unwrap();
     let manager = StateManager::new(temp_dir.path().to_path_buf());
     for case in ["absent", "dead", "reused", "live", "unknown", "locked"] {
-        let path = temp_dir.path().join(format!("{case}.json"));
+        let path = state_path_of(&manager, case);
         std::fs::write(path.with_extension("json.tmp"), b"interrupted write").unwrap();
         if matches!(case, "dead" | "reused" | "live") {
             let pid = if case == "dead" {
@@ -641,7 +664,7 @@ async fn test_stale_sweep_reaps_orphan_temps_but_preserves_live_or_unknown_state
             std::fs::write(&path, b"unreadable state").unwrap();
         }
     }
-    let locked_path = temp_dir.path().join("locked.json.lock");
+    let locked_path = manager.lock_file("locked");
     let lock = Flock::lock(
         std::fs::File::create(&locked_path).unwrap(),
         FlockArg::LockExclusive,
@@ -650,21 +673,24 @@ async fn test_stale_sweep_reaps_orphan_temps_but_preserves_live_or_unknown_state
     assert!(manager.load_state_by_pid(u32::MAX - 1).await.is_err());
     for case in ["absent", "dead", "reused"] {
         assert!(
-            !temp_dir.path().join(format!("{case}.json.tmp")).exists(),
+            !manager.state_file(case).with_extension("json.tmp").exists(),
             "sweep left {case} temp behind"
         );
-        assert!(!temp_dir.path().join(format!("{case}.json")).exists());
-        assert!(!temp_dir.path().join(format!("{case}.json.lock")).exists());
+        assert!(!manager.state_file(case).exists());
+        assert!(!manager.lock_file(case).exists());
     }
     for case in ["live", "unknown", "locked"] {
         assert!(
-            temp_dir.path().join(format!("{case}.json.tmp")).exists(),
+            manager.state_file(case).with_extension("json.tmp").exists(),
             "sweep removed {case} temp"
         );
     }
     drop(lock);
     assert!(manager.load_state_by_pid(u32::MAX - 1).await.is_err());
-    assert!(!temp_dir.path().join("locked.json.tmp").exists());
+    assert!(!manager
+        .state_file("locked")
+        .with_extension("json.tmp")
+        .exists());
 }
 
 #[tokio::test]
@@ -731,15 +757,18 @@ async fn test_delete_state_then_update_does_not_resurrect() {
     );
 
     assert!(
-        !temp_dir.path().join("vm-deleted.json").exists(),
+        !cleanup.state_file("vm-deleted").exists(),
         "state file must not be resurrected after delete_state"
     );
     assert!(cleanup.list_vms().await.unwrap().is_empty());
 
     // delete_state also removes its lock and temp files, and the no-op update
     // must not recreate them.
-    assert!(!temp_dir.path().join("vm-deleted.json.lock").exists());
-    assert!(!temp_dir.path().join("vm-deleted.json.tmp").exists());
+    assert!(!cleanup.lock_file("vm-deleted").exists());
+    assert!(!cleanup
+        .state_file("vm-deleted")
+        .with_extension("json.tmp")
+        .exists());
 }
 
 #[tokio::test]
@@ -757,7 +786,7 @@ async fn test_load_state_by_pid_rejects_pid_reuse() {
     let json = serde_json::to_string_pretty(&stale).unwrap();
     // Write the file directly — save_state would overwrite pid_start_time with
     // the real value for the live process.
-    std::fs::write(temp_dir.path().join("vm-reused-pid.json"), json).unwrap();
+    std::fs::write(state_path_of(&manager, "vm-reused-pid"), json).unwrap();
 
     // The lookup must not trust the stale file even though /proc/<pid> exists.
     let err = manager
@@ -906,18 +935,20 @@ fn state_json_with_a_numeric_utc_offset_loads_with_the_same_instant() {
 /// host with that many VMs up has, and a sweep stamp saying the directory was just swept.
 fn many_other_vms(dir: &std::path::Path, count: usize) {
     let init_start = fcvm::utils::process_start_time(1);
+    let manager = StateManager::new(dir.to_path_buf());
     for i in 0..count {
         let mut state = make_vm_state(&format!("other-{i:05}"), &format!("other-{i}"), 1);
         state.pid_start_time = init_start;
-        let path = dir.join(format!("other-{i:05}.json"));
+        let path = state_path_of(&manager, &format!("other-{i:05}"));
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
         std::fs::write(path.with_extension("json.lock"), b"").unwrap();
     }
     std::fs::write(dir.join("sweep.stamp"), b"now").unwrap();
 }
 
-/// Watch `dir` for opens of files in it; `opens` drains the events and counts the opened
-/// names that start with `other-`. A queue overflow counts as an open: it means more
+/// Watch `dir` and every directory under it (the buckets the other VMs' states are in) for
+/// opens of files in them; `opens` drains the events and counts the opened names that start
+/// with `other-`. A queue overflow counts as an open: it means more
 /// opens than the queue holds.
 struct OpenWatch(nix::sys::inotify::Inotify);
 
@@ -925,7 +956,17 @@ impl OpenWatch {
     fn new(dir: &std::path::Path) -> Self {
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
         let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
-        inotify.add_watch(dir, AddWatchFlags::IN_OPEN).unwrap();
+        let watched = dirs_under(dir);
+        assert!(
+            watched.iter().any(|dir| std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("other-"))),
+            "no watched directory holds another VM's state, so this watch can see nothing"
+        );
+        for dir in watched {
+            inotify.add_watch(&dir, AddWatchFlags::IN_OPEN).unwrap();
+        }
         Self(inotify)
     }
 
@@ -1001,7 +1042,8 @@ async fn starting_a_vm_reads_no_other_vms_state() {
 
 /// Starting and stopping a VM truncates no lock file. Lock files hold nothing, and opening one
 /// with O_TRUNC takes the inode lock for writing and changes the file: at the teardown of
-/// 1000 clones, 1,075 waiters queued on `names.lock` for 6 s each (bench/start-rate).
+/// 1000 clones, 1,075 waiters queued on the host-wide name lock of the layout before this
+/// one for 6 s each (bench/start-rate).
 /// A truncation of an existing file is an IN_MODIFY event; creating one is not.
 #[tokio::test]
 async fn starting_and_stopping_a_vm_truncates_no_lock_file() {
@@ -1021,12 +1063,14 @@ async fn starting_and_stopping_a_vm_truncates_no_lock_file() {
             manager.delete_state(id).await.unwrap();
         }
     };
-    // The first start creates the shared lock files; the second opens them again.
+    // The first start creates the sweep's lock file; the second opens it again.
     start_and_stop("vm-first").await;
     let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
-    inotify
-        .add_watch(temp_dir.path(), AddWatchFlags::IN_MODIFY)
-        .unwrap();
+    // Every directory the first start made: the second uses the same ones (one name,
+    // one process) apart from its own state's bucket.
+    for dir in dirs_under(temp_dir.path()) {
+        inotify.add_watch(&dir, AddWatchFlags::IN_MODIFY).unwrap();
+    }
     start_and_stop("vm-second").await;
     let mut truncated = Vec::new();
     loop {
@@ -1167,13 +1211,12 @@ async fn rootless_launch_child() {
 /// Root and rootless launches share one state directory (CI runs the privileged tests as
 /// root beside the unprivileged ones in one data directory). A root launch must leave
 /// nothing in a state directory another user owns that the owner's next launch cannot
-/// write: the index directories it made, a temporary name entry a crashed root claim left,
-/// or the sweep's stamp. The owner's launch runs as uid 65534 through `setpriv`, from a
+/// write: the bucket directories it made, the slot of a name a root VM held when it was
+/// killed, or the sweep's stamp. The owner's launch runs as uid 65534 through `setpriv`, from a
 /// copy of this test binary that uid can read.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_directory() {
-    use sha2::Digest;
     use std::os::unix::fs::PermissionsExt;
 
     let base = TempDir::new().unwrap();
@@ -1190,14 +1233,17 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
     manager.claim_name(&mut root_vm).await.unwrap();
     manager.allocate_loopback_ip(&mut root_vm).await.unwrap();
     manager.save_state(&root_vm).await.unwrap();
-    // A root claim of the owner's name that died between writing its temporary entry and
-    // publishing it.
-    let digest = hex::encode(sha2::Sha256::digest(b"rootless"));
-    std::fs::write(
-        state.join("name").join(format!("{digest}.json.tmp")),
-        b"{\"name\":\"rootless\",\"vm_id\":\"vm-crashed\"}",
-    )
-    .unwrap();
+    // A root VM that held the owner's name and was killed: its slot, handed to the state
+    // directory's owner as a root claim hands it, with the dead VM's token in it. The
+    // owner's claim has to unlink that token.
+    let slot = manager.name_slot("rootless");
+    let gid = Some(nix::unistd::Gid::from_raw(65534));
+    // Its bucket may be the one root's own name made.
+    let _ = std::fs::create_dir(slot.parent().unwrap());
+    nix::unistd::chown(slot.parent().unwrap(), nobody, gid).unwrap();
+    std::fs::create_dir(&slot).unwrap();
+    nix::unistd::chown(&slot, nobody, gid).unwrap();
+    std::fs::write(slot.join("4000000000.1.vm-crashed"), b"").unwrap();
     // The sweep is due, so the owner's claim rewrites the stamp root's claim wrote.
     let stamp = state.join("sweep.stamp");
     let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
@@ -1234,14 +1280,14 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
 }
 
 /// A state that is published stays saved when its PID index entry cannot be written (here
-/// `pid` is a file, not the index): the index only speeds up lookups by PID, which scan when
+/// `pids` is a file, not the index): the index only speeds up lookups by PID, which scan when
 /// it has nothing, so `save_state` must not fail a launch whose state is already on disk.
 #[tokio::test]
 async fn an_unwritable_pid_index_does_not_fail_a_save() {
     let temp_dir = TempDir::new().unwrap();
     let manager = StateManager::new(temp_dir.path().to_path_buf());
     manager.init().await.unwrap();
-    std::fs::write(temp_dir.path().join("pid"), b"not the index").unwrap();
+    std::fs::write(temp_dir.path().join("pids"), b"not the index").unwrap();
     let state = make_vm_state("vm-unindexed", "unindexed", std::process::id());
 
     manager.save_state(&state).await.unwrap();
@@ -1257,11 +1303,10 @@ async fn an_unwritable_pid_index_does_not_fail_a_save() {
 }
 
 /// Deleting a VM whose PID index entry cannot be removed (here it is a directory with a
-/// file in it) still retires its lock and its name entry: the three are independent, and
-/// once the state is gone nothing would name the others again.
+/// file in it) still retires its lock and gives its name back: the three are independent,
+/// and once the state is gone nothing would name the others again.
 #[tokio::test]
 async fn a_pid_entry_that_cannot_be_removed_does_not_stop_the_rest_of_a_delete() {
-    use sha2::Digest;
     let temp_dir = TempDir::new().unwrap();
     let dir = temp_dir.path();
     let manager = StateManager::new(dir.to_path_buf());
@@ -1270,27 +1315,29 @@ async fn a_pid_entry_that_cannot_be_removed_does_not_stop_the_rest_of_a_delete()
     vm.name = Some("stuck".to_string());
     manager.claim_name(&mut vm).await.unwrap();
     let entry = dir
-        .join("pid")
+        .join("pids")
+        .join(fcvm::state::manager::bucket_of(
+            &std::process::id().to_string(),
+        ))
         .join(format!("{}.vm-stuck", std::process::id()));
     std::fs::remove_file(&entry).unwrap();
     std::fs::create_dir(&entry).unwrap();
     std::fs::write(entry.join("keep"), b"").unwrap();
 
     let deleted = manager.delete_state("vm-stuck").await;
-    let name_entry = dir.join("name").join(format!(
-        "{}.json",
-        hex::encode(sha2::Sha256::digest(b"stuck"))
-    ));
     assert!(deleted.is_ok(), "{deleted:?}");
     assert!(
-        !dir.join("vm-stuck.json.lock").exists(),
+        !manager.lock_file("vm-stuck").exists(),
         "the VM's lock was left behind"
     );
-    assert!(!name_entry.exists(), "the VM's name entry was left behind");
+    assert!(
+        !manager.name_slot("stuck").exists(),
+        "the VM's name slot was left behind"
+    );
 }
 
-/// A dead state written before the name index existed has no name entry, so a claim of its
-/// name does not remove it, and it stays until the next sweep. A lookup by that name must
+/// A dead state that holds no token (one saved without a claim) is not found by a claim of
+/// its name, so the claim does not remove it, and it stays until the next sweep. A lookup by that name must
 /// still find the one live VM, not report two.
 #[tokio::test]
 async fn a_dead_state_without_a_name_entry_does_not_hide_the_live_vm_by_name() {
@@ -1300,7 +1347,7 @@ async fn a_dead_state_without_a_name_entry_does_not_hide_the_live_vm_by_name() {
     // Above the kernel's PID_MAX_LIMIT, so no process has it.
     let dead = make_vm_state("vm-before-index", "web", 4_000_000_000);
     std::fs::write(
-        temp_dir.path().join("vm-before-index.json"),
+        state_path_of(&manager, "vm-before-index"),
         serde_json::to_vec(&dead).unwrap(),
     )
     .unwrap();
@@ -1310,11 +1357,123 @@ async fn a_dead_state_without_a_name_entry_does_not_hide_the_live_vm_by_name() {
     live.name = Some("web".to_string());
     manager.claim_name(&mut live).await.unwrap();
     assert!(
-        temp_dir.path().join("vm-before-index.json").exists(),
+        manager.state_file("vm-before-index").exists(),
         "the dead state is gone, so this test checks nothing"
     );
 
     let found = manager.load_state_by_name("web").await;
     manager.delete_state("vm-live").await.unwrap();
     assert_eq!(found.unwrap().vm_id, "vm-live");
+}
+
+/// What a writer killed between writing its temporary file and renaming it leaves: the
+/// last published state, and a temporary file beside it. Every reader still gets the
+/// published state, the next write replaces the temporary file, and a kill after the rename
+/// leaves the new state, which is the only other thing a write can leave.
+#[tokio::test]
+async fn a_write_killed_before_its_rename_leaves_the_last_published_state() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    let mut vm = VmState::new("vm-ack".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("ack".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+    manager
+        .update_health_status("vm-ack", HealthStatus::Healthy, None)
+        .await
+        .unwrap();
+
+    // The killed writer got as far as half of its temporary file.
+    let published = std::fs::read(manager.state_file("vm-ack")).unwrap();
+    let temp = manager.state_file("vm-ack").with_extension("json.tmp");
+    std::fs::write(&temp, &published[..published.len() / 2]).unwrap();
+
+    let me = std::process::id();
+    for (reader, state) in [
+        ("load_state", manager.load_state("vm-ack").await.unwrap()),
+        (
+            "load_state_by_pid",
+            manager.load_state_by_pid(me).await.unwrap(),
+        ),
+        (
+            "load_state_by_name",
+            manager.load_state_by_name("ack").await.unwrap(),
+        ),
+        ("list_vms", manager.list_vms().await.unwrap().remove(0)),
+    ] {
+        assert_eq!(state.vm_id, "vm-ack", "{reader}");
+        assert_eq!(state.name.as_deref(), Some("ack"), "{reader}");
+        assert!(
+            matches!(state.health_status, HealthStatus::Healthy),
+            "{reader} lost the acknowledged health status"
+        );
+    }
+    assert_eq!(manager.list_vms().await.unwrap().len(), 1);
+
+    // The next write is published whole, over what the killed one left.
+    manager
+        .update_health_status("vm-ack", HealthStatus::Stopped, Some(3))
+        .await
+        .unwrap();
+    assert!(!temp.exists(), "the next write left the temporary file");
+    assert_eq!(
+        manager.load_state("vm-ack").await.unwrap().exit_code,
+        Some(3)
+    );
+    manager.delete_state("vm-ack").await.unwrap();
+    assert!(!manager.state_file("vm-ack").exists() && !temp.exists());
+}
+
+/// While a VM's state is rewritten over and over, every reader gets a state that parses
+/// and carries the VM's name: a write is published by rename, never in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readers_never_see_a_state_being_written() {
+    let temp_dir = TempDir::new().unwrap();
+    let dir = temp_dir.path().to_path_buf();
+    let manager = StateManager::new(dir.clone());
+    let mut vm = VmState::new("vm-busy".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("busy".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (dir, stop) = (dir.clone(), stop.clone());
+        tokio::spawn(async move {
+            let manager = StateManager::new(dir);
+            let mut writes = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                manager
+                    .update_state("vm-busy", |state| state.exit_code = Some(writes as i32))
+                    .await
+                    .unwrap()
+                    .expect("the state is there");
+                writes += 1;
+            }
+            writes
+        })
+    };
+    let me = std::process::id();
+    let mut reads = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while std::time::Instant::now() < deadline {
+        let reader = StateManager::new(dir.clone());
+        let listed = reader.list_vms().await.unwrap();
+        assert_eq!(listed.len(), 1, "the VM vanished from a listing");
+        for state in [
+            listed.into_iter().next().unwrap(),
+            reader.load_state("vm-busy").await.unwrap(),
+            reader.load_state_by_pid(me).await.unwrap(),
+            reader.load_state_by_name("busy").await.unwrap(),
+        ] {
+            assert_eq!(state.vm_id, "vm-busy");
+            assert_eq!(state.name.as_deref(), Some("busy"));
+        }
+        reads += 1;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let writes = writer.await.unwrap();
+    assert!(
+        writes > 20 && reads > 20,
+        "only {writes} writes and {reads} reads raced: the test checked little"
+    );
+    manager.delete_state("vm-busy").await.unwrap();
 }

@@ -43,6 +43,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import json
 import os
@@ -114,6 +115,10 @@ class Harness:
         self.state_dir = self.data_root / "state"
         self.prepared_tags: set = set()
         self.records = []
+
+    def state_bucket(self, vm_id):
+        """The directory fcvm keeps this VM's state and lock in (src/state/manager.rs)."""
+        return self.state_dir / "vms" / hashlib.sha256(vm_id.encode()).hexdigest()[:2]
 
     # ---- infrastructure -------------------------------------------------
 
@@ -269,8 +274,8 @@ class Harness:
             leftovers = [
                 str(p)
                 for p in (
-                    self.state_dir / f"{vm_id}.json",
-                    self.state_dir / f"{vm_id}.json.lock",
+                    self.state_bucket(vm_id) / f"{vm_id}.json",
+                    self.state_bucket(vm_id) / f"{vm_id}.json.lock",
                     self.data_root / "vm-disks" / vm_id,
                 )
                 if p.exists()
