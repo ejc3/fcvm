@@ -82,6 +82,56 @@ async fn serve_tile(dir: &Path, name: &str) -> (SocketAddr, Scenes) {
     (addr, scenes)
 }
 
+/// When a gated tile's port started accepting.
+type Opened = Arc<Mutex<Option<std::time::Instant>>>;
+
+/// A tile whose port answers nothing until its VM is up (the fake fcvm wrote its sessions file),
+/// as a restored guest's does while nothing reads its tap: the listener's accept queue is full,
+/// and Linux drops a SYN that finds it full, so a connection attempt gets no answer at all.
+async fn serve_gated_tile(dir: &Path, name: &str) -> (SocketAddr, Scenes, Opened) {
+    use std::os::fd::AsRawFd;
+    let scenes: Scenes = Arc::default();
+    let opened: Opened = Arc::default();
+    let t = Tile {
+        dir: dir.to_path_buf(),
+        name: name.into(),
+        scenes: scenes.clone(),
+    };
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/scene", post(scene))
+        .with_state(t);
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    // A queue of one, then connections nobody accepts until one gets no answer.
+    assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 0) }, 0);
+    let mut fillers = Vec::new();
+    loop {
+        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            Ok(c) => fillers.push(c),
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+                break;
+            }
+        }
+        assert!(fillers.len() < 16, "the accept queue never filled");
+    }
+    let sessions = dir.join(format!("sessions-{name}"));
+    let at = opened.clone();
+    tokio::spawn(async move {
+        while !sessions.is_file() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(fillers);
+        assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 1024) }, 0);
+        l.set_nonblocking(true).unwrap();
+        let l = tokio::net::TcpListener::from_std(l).unwrap();
+        *at.lock().unwrap() = Some(std::time::Instant::now());
+        axum::serve(l, app).await.unwrap()
+    });
+    (addr, scenes, opened)
+}
+
 fn wrapper(dir: &Path, snaps: &Path, env: &[(&str, &str)]) -> PathBuf {
     let p = dir.join("fcvm");
     let mut script = format!(
@@ -159,6 +209,8 @@ struct Fake {
     rx: mpsc::UnboundedReceiver<AgentMsg>,
     /// Reports read while waiting for another.
     seen: Vec<SlotReport>,
+    /// When the gated tile's port started accepting, if one is gated.
+    opened: Option<Opened>,
     _scene: watch::Sender<Option<fleet_core::protocol::SharedScene>>,
 }
 
@@ -216,6 +268,16 @@ async fn fake_from(
     tweak: impl FnOnce(&mut MinecraftCfg),
     before: impl FnOnce(&Path),
 ) -> Fake {
+    fake_gated(env, tweak, before, None).await
+}
+
+/// As [`fake_from`], with the tile `gated` names served by [`serve_gated_tile`].
+async fn fake_gated(
+    env: &[(&str, &str)],
+    tweak: impl FnOnce(&mut MinecraftCfg),
+    before: impl FnOnce(&Path),
+    gated: Option<&str>,
+) -> Fake {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
     let snaps = path.join("snapshots");
@@ -224,8 +286,15 @@ async fn fake_from(
     let fcvm = wrapper(&path, &snaps, env);
     let mut places = Vec::new();
     let mut scenes = Vec::new();
+    let mut opened = None;
     for id in IDS {
-        let (addr, s) = serve_tile(&path, id).await;
+        let (addr, s) = if gated == Some(id) {
+            let (addr, s, at) = serve_gated_tile(&path, id).await;
+            opened = Some(at);
+            (addr, s)
+        } else {
+            serve_tile(&path, id).await
+        };
         places.push(Place {
             ipv6: None,
             http: addr,
@@ -266,6 +335,7 @@ async fn fake_from(
         mc,
         rx,
         seen: Vec::new(),
+        opened,
         _scene: scene_tx,
     }
 }
@@ -348,6 +418,36 @@ async fn the_gold_flow_runs_first_and_every_server_restores_from_it() {
     assert_eq!(body["generation"], 1);
     assert_eq!(body["admit_keys"][0], "ab".repeat(32));
     assert!(body["driver"].is_null());
+    f.mc.stop().await;
+}
+
+/// A restored tile is reported up when its port starts answering, not one attempt timeout
+/// after the restore began. The tile's port answers nothing until its VM is up, some tens of
+/// milliseconds after the spawn, so the wait's first attempts are lost, as they are against a
+/// real clone that is still being restored.
+///
+/// RED BEFORE THE FIX: the wait sent its next attempt only when the lost first one ended at its
+/// 250 ms timeout, and the report came about 200 ms after the port had opened.
+#[tokio::test]
+async fn a_restored_tile_is_reported_up_when_its_port_starts_answering() {
+    let mut f = fake_gated(&[("FAKE_UP_SECS", "0.02")], |_| {}, |_| {}, Some("mc-1")).await;
+    f.mc.assign(&[assign("mc-1", 0, 1, None, None)]);
+    f.report("mc-1", "running", 1).await;
+    let seen = std::time::Instant::now();
+    let opened = f
+        .opened
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .expect("the port opened");
+    let lag = seen.saturating_duration_since(opened);
+    // One 20 ms poll and the answer, with room for a busy test host; the old wait's lag was
+    // the 250 ms attempt timeout less the time the VM took to come up.
+    assert!(
+        lag < Duration::from_millis(120),
+        "the tile was reported up {lag:?} after its port started answering"
+    );
     f.mc.stop().await;
 }
 

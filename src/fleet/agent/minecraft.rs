@@ -571,9 +571,8 @@ async fn health(http: &reqwest::Client, place: &Place) -> Option<Health> {
 
 /// How long one `/health` attempt of a restore's wait may take. The wait's first attempts go
 /// out while the clone is still being restored, and a SYN sent then is lost (nothing reads the
-/// tap yet): with the 2 s of [`health`], every restore waited out that attempt and was timed at
-/// 2.0 s whatever it took. A short attempt, retried every poll, sees the tile as soon as it
-/// answers.
+/// tap yet), so those attempts end here with no answer. The wait does not hold the next attempt
+/// for them (see [`super::probe`]), so this bounds a slow answer, not how early the tile is seen.
 pub const UP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 async fn health_within(http: &reqwest::Client, place: &Place, timeout: Duration) -> Option<Health> {
@@ -818,12 +817,13 @@ impl Server {
     async fn wait_up(&self, vm: &mut Vm) -> std::result::Result<(), String> {
         let until = tokio::time::sleep(self.cfg.ready_deadline);
         tokio::pin!(until);
-        let mut tick = tokio::time::interval(self.cfg.poll);
+        let mut probes = super::probe::Probes::new(self.cfg.poll, || {
+            health_within(&self.http, &self.place, UP_PROBE_TIMEOUT)
+        });
         let mut last = None;
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    let h = health_within(&self.http, &self.place, UP_PROBE_TIMEOUT).await;
+                h = probes.next() => {
                     if h.as_ref().is_some_and(Health::up) {
                         return Ok(());
                     }

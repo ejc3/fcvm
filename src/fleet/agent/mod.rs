@@ -8,6 +8,7 @@ pub mod joinguard;
 pub mod minecraft;
 pub mod ports;
 pub mod potato;
+pub mod probe;
 pub mod slot;
 pub mod sni;
 pub mod spot;

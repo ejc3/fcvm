@@ -778,7 +778,8 @@ async fn relaunch(
     let mut restored = vm.restored_watch();
     let deadline = tokio::time::sleep(ctx.cfg.start_timeout);
     tokio::pin!(deadline);
-    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    // Overlapping attempts: one the renderer has not answered yet does not hold the next.
+    let mut probes = super::probe::Probes::new(Duration::from_millis(100), || ctx.health());
     let mut starting_at: Option<Instant> = None;
     let mut health_at: Option<Instant> = None;
     let mut baseline: Option<u64> = None;
@@ -802,8 +803,8 @@ async fn relaunch(
                 let e = fail(&vm, format!("fcvm exited ({status}) before the renderer's first frame"), starting_at.is_none());
                 return Err(e);
             }
-            _ = poll.tick() => {
-                let Some(h) = ctx.health().await else { continue };
+            h = probes.next() => {
+                let Some(h) = h else { continue };
                 // A renderer that restarted after the scene was posted lost it: post it
                 // again and count frames from there.
                 let b = boot_id(&h);

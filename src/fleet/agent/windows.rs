@@ -1545,7 +1545,8 @@ impl Sandbox {
             actions_done: 0,
             scene: None,
         };
-        let mut tick = tokio::time::interval(self.cfg.poll);
+        // Overlapping attempts: one the bridge has not answered yet does not hold the next.
+        let mut probes = super::probe::Probes::new(self.cfg.poll, || self.health());
         // The bridge is at the desktop: a deadline while it is, with no scene taken, is the
         // scene's, not Windows'.
         let mut at_desktop = false;
@@ -1558,8 +1559,8 @@ impl Sandbox {
         };
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    let Some(h) = self.health().await else { continue };
+                h = probes.next() => {
+                    let Some(h) = h else { continue };
                     r.scene = self.sync_scene(r.scene.take()).await;
                     let (state, times) = bridge_state(&h);
                     if state == Some("failed") {
