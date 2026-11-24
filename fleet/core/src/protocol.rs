@@ -28,9 +28,13 @@ pub enum ClientMsg {
     Verify {
         token: String,
     },
-    /// Whether the page is visible; a hidden page is not an active viewer.
+    /// Whether the page is visible; a hidden page is not an active viewer. `minecraft`: the
+    /// page shows Minecraft mode and takes the servers' status rows (`minecraft_status`), which
+    /// no other page is sent.
     Visibility {
         visible: bool,
+        #[serde(default)]
+        minecraft: bool,
     },
     /// The seat ticket a page kept from an earlier connection, as its first message (a URL
     /// would carry it into proxy and access logs). Later ones are ignored. `returning`: the
@@ -76,6 +80,14 @@ pub enum ServerMsg {
     },
     /// The answer to `verify`.
     Verified { ok: bool, reason: Option<String> },
+    /// Minecraft mode, to a page whose `visibility` said `minecraft`: one host's servers as
+    /// its agent last read them. `host` is the key the snapshot's `minecraft.field` lists the
+    /// host under; a row belongs to the server at the same place in that host's `servers`.
+    MinecraftStatus {
+        host: String,
+        #[serde(flatten)]
+        status: crate::minecraft::MinecraftStatus,
+    },
     /// The viewer's own GPU, to the claiming connection only, whenever it changes and once
     /// more when it ends.
     Claim { claim: ClaimMsg },
@@ -242,6 +254,12 @@ pub struct HealthReport {
     /// The renderer process's `boot_id`, so a grant names the renderer it was given to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
+    /// Minecraft mode: the state of every server on the host, about once a second, in a report
+    /// whose `id` is [`crate::minecraft::STATUS_ID`]. The coordinator passes it to the pages
+    /// that asked and keeps none of it: it is not part of the fleet's state, so it moves no
+    /// version and is never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minecraft: Option<crate::minecraft::MinecraftStatus>,
 }
 
 impl HealthReport {
@@ -259,6 +277,7 @@ impl HealthReport {
             render_ms_max: num(h.get("frames_2s").and_then(|f| f.get("render_ms_max"))),
             budget_every_pixel: num(h.get("budget_every_pixel")).filter(|v| *v > 0.0),
             boot_id: boot_id(h),
+            minecraft: None,
         }
     }
 }

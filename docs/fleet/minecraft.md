@@ -132,6 +132,19 @@ fcvm's lockfile.
   handling and timer, the mock coordinator's servers and a mock tile, and Playwright tests on
   desktop and phone layouts.
 
+### Many servers on one host
+
+A host can run hundreds of servers, far more than a page draws. The snapshot would grow with
+them (512 servers listed whole are 271,732 bytes, 525 a server, and every restore sends it
+again), so past 16 servers it lists 16 as tiles and names every server in `minecraft.field`
+(15,810 bytes at 512; `make fleet-snapshot-size`). What each server is doing travels outside
+the snapshot: the agent reads every server's `/health` once a second (64 at a time, 400 ms
+each) and sends one row of 8 bytes a server with the host's own CPU and memory readings; the
+coordinator keeps each host's latest rows, in no state and at no version, and passes them to
+the pages that asked (PROTOCOL.md, "Many servers: the field and the status rows"). A server
+whose `/health` did not answer has a row that says so, and a host that stops reporting leaves
+its servers unreported on the page, not at zero.
+
 ### Invariants (each becomes a test)
 
 1. Only the viewer the scene names as driver can move a bot; every other socket's drive is

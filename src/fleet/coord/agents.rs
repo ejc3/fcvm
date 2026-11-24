@@ -143,6 +143,10 @@ where
             bail!("refused the agent for {host}: {why}");
         }
     }
+    let host_name = match &hello {
+        AgentMsg::Hello { host, .. } => host.clone(),
+        _ => unreachable!("the first message is a hello"),
+    };
     let (tx, writer) = spawn_writer::<CoordMsg, _>(output, "agent");
     let (reply, accepted) = oneshot::channel();
     handle
@@ -161,6 +165,12 @@ where
     }
     let result = loop {
         match reader.next::<AgentMsg>().await {
+            // A host's Minecraft status rows go straight to the pages that asked: they are no
+            // part of the state, so the actor never sees them.
+            Ok(Some(AgentMsg::Health(fleet_core::protocol::HealthReport {
+                minecraft: Some(status),
+                ..
+            }))) => handle.minecraft_status.publish(&host_name, status),
             Ok(Some(msg)) => {
                 if handle.cmds.send(Cmd::AgentMsg { conn, msg }).await.is_err() {
                     break Ok(());
@@ -171,6 +181,7 @@ where
         }
     };
     let _ = handle.cmds.send(Cmd::AgentClosed { conn }).await;
+    handle.minecraft_status.forget(&host_name);
     writer.abort();
     result
 }

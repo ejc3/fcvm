@@ -1484,6 +1484,54 @@ leaves or the coordinator restarts is reset when its host reports it again, and 
 that reset until its fresh launch reports running, as a sandbox does. There is no drive intent:
 keys go from the page to the tile.
 
+#### Many servers: the field and the status rows
+
+A snapshot that listed every server of a large fleet as a tile would be large and would be sent
+again at every restore: measured with `make fleet-snapshot-size`, 512 servers on one host made
+a snapshot of 271,732 bytes (525 a server). So:
+
+- **`tiles` lists at most 16 servers** (`fleet_core::minecraft::TILES_LISTED`) once the fleet
+  runs more: the first 16 by number and every lent one (its holder's page needs its borrow), laid
+  out in an image of their own (`rect`, `image_aspect`), with their ids unchanged (`mc:<k>`, k
+  the server's place among all of them). A fleet of 16 or fewer is listed whole, as before.
+- **`field`** (absent with 16 servers or fewer) names every server:
+
+  ```json
+  "field": {"servers": 512,
+            "hosts": [{"key": "3f9a0c2b7d1e", "servers": [1, 2, 3, "..."],
+                       "frames": {"prefix": "wss://mc-", "suffix": ".mc.example.test/view",
+                                  "names": ["1-abcdefgh", null, "3-zyxwvuts", "..."]},
+                       "frames_v4": {"prefix": "...", "suffix": "...", "names": ["..."]}}]}
+  ```
+
+  A host's `servers` are its servers' numbers (`mc-<n>`) in the order of its status rows.
+  `frames` is each one's view URL (`frame_url`): `prefix + name + suffix`, null for a server with
+  none now; `frames_v4` the same for `frame_url_v4`, absent when no server has one. `key` is a
+  hash of the host's name, never the name. The field holds no state of any server, so a restore
+  changes it only when the server's URL changes. With it, the 512-server snapshot is 15,810
+  bytes.
+- **Status rows** carry the servers' state, outside the snapshot. A page that shows Minecraft
+  mode says so in its `visibility` message (`"minecraft": true`; absent or false for every other
+  page), and is then sent, for each host, about once a second:
+
+  ```json
+  {"type": "minecraft_status", "host": "3f9a0c2b7d1e", "t": 1761134400000,
+   "rows": "<base64>", "cpus": 192, "busy": 98.7, "mem_total_mib": 385024, "mem_used_mib": 20480}
+  ```
+
+  `rows` is 8 bytes for each of the host's servers, in the order of `field.hosts[].servers`:
+  the phase (0 not reported, 1 restoring, 2 forking, 3 running, 4 failed), ticks per second
+  times ten (255: none), players (255: none), a zero, then two little-endian 16-bit numbers:
+  seconds since this launch's first chunk, and the launch's milliseconds to that chunk (65535:
+  none; a larger value is 65534). "None" is what the host did not read, and a page draws
+  nothing for it, never a zero. `t` is the host's clock. `cpus`, `busy` (CPUs busy over the last
+  second) and the memory figures (`MemTotal`, and `MemTotal` less `MemAvailable`) are the whole
+  host's, whatever else it runs; each is absent when the host could not read it. A page whose
+  rows are not 8 bytes for each server of the host in its snapshot ignores them. The messages
+  are no part of the state: they move no version, nothing stores them, and a page that asks
+  later gets each host's latest at its next report. A page from before them sends no
+  `minecraft` and is sent none (it would refuse a message type it does not know).
+
 #### Agent messages (Minecraft mode)
 
 - Hello: `minecraft` (the servers the host runs, 0 or absent for none) and `minecraft_server`
@@ -1497,6 +1545,14 @@ keys go from the page to the tile.
 - Slot report: as a sandbox's, with the `mc-<n>` id, `phase` one of the above, `frame_url` the
   view socket, `timings` with `restore_ms`, `first_chunk_ms`, `total_ms` and for a fork
   `snapshot_ms`, and `first_chunk_at` (Unix ms, host clock) with `running`.
+- Status rows: about once a second, a health report whose `id` is `minecraft` and whose
+  `minecraft` field is the status message above without its `type` and `host`
+  (`{"type": "health", "id": "minecraft", "fps": 0, "minecraft": {"t", "rows", "cpus", "busy",
+  "mem_total_mib", "mem_used_mib"}}`). The agent asks each running server's `/health` (64 at a
+  time, 400 ms each; one that does not answer has no tick rate in that row) and reads
+  `/proc/stat` and `/proc/meminfo`. It rides in a health report because the coordinator closes
+  an agent's connection on a message it cannot parse: a coordinator from before the field reads
+  it as a health report for a slot it does not have, and drops it.
 
 ## Agent
 

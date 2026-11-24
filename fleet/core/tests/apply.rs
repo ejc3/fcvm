@@ -1868,3 +1868,177 @@ fn a_server_nobody_holds_is_reset_on_a_schedule() {
     .fold(s, apply);
     assert_eq!(gen(&s, "mc-1"), 3);
 }
+
+fn minecraft_fleet(n: u64) -> Vec<serde_json::Value> {
+    let mut events = vec![
+        serde_json::json!({"type": "agent", "at": 1000, "host": "h1", "msg": {"type": "hello",
+        "host": "h1", "arch": "aarch64", "gpus": [], "capacity": 0, "minecraft": n}}),
+    ];
+    for k in 1..=n {
+        events.push(
+            serde_json::json!({"type": "agent", "at": 2000, "host": "h1", "msg": {"type": "slot",
+            "id": format!("mc-{k}"), "phase": "running", "generation": 1,
+            "frame_url": format!("ws://[2001:db8::{k:x}]:8080/view"), "first_chunk_at": 1950}}),
+        );
+    }
+    events
+}
+
+/// A fleet of up to `TILES_LISTED` servers is listed whole, as before. A larger one lists the
+/// first that many and every lent server as tiles, in an image of their own, and names every
+/// server in `field`: by host, in the order of the host's status rows, with its view URL.
+#[test]
+fn a_large_minecraft_fleet_lists_some_servers_as_tiles_and_names_them_all_in_the_field() {
+    let listed = fleet_core::minecraft::TILES_LISTED as u64;
+    let cfg = config_with(serde_json::json!({}));
+    let state = |n: u64, more: serde_json::Value| {
+        let mut e = minecraft_fleet(n);
+        e.extend(more.as_array().unwrap().iter().cloned());
+        events(serde_json::json!(e))
+            .iter()
+            .fold(State::new(cfg.clone(), 0), apply)
+    };
+    let small = serde_json::to_value(view(&state(listed, serde_json::json!([])))).unwrap();
+    assert_eq!(
+        small["minecraft"]["tiles"].as_array().unwrap().len(),
+        listed as usize
+    );
+    assert!(
+        small["minecraft"].get("field").is_none(),
+        "{}",
+        small["minecraft"]
+    );
+
+    let n = listed + 4;
+    let v = serde_json::to_value(view(&state(n, serde_json::json!([])))).unwrap();
+    let m = &v["minecraft"];
+    let tiles = m["tiles"].as_array().unwrap();
+    assert_eq!(tiles.len(), listed as usize);
+    assert_eq!(tiles[0]["id"], "mc:1");
+    assert_eq!(tiles[15]["slot"], "mc-16");
+    // the listed tiles fill an image of their own: 16 are 4 by 4
+    let (rects, aspect) = fleet_core::minecraft::layout(listed as usize);
+    assert_eq!(m["image_aspect"], aspect);
+    assert_eq!(tiles[15]["rect"], serde_json::to_value(rects[15]).unwrap());
+    let field = &m["field"];
+    assert_eq!(field["servers"], n);
+    let host = &field["hosts"][0];
+    assert_eq!(field["hosts"].as_array().unwrap().len(), 1);
+    assert_eq!(host["key"], fleet_core::minecraft::host_key("h1"));
+    assert_ne!(host["key"], "h1");
+    assert_eq!(
+        host["servers"],
+        serde_json::json!((1..=n).collect::<Vec<u64>>())
+    );
+    assert!(host.get("frames_v4").is_none(), "{host}");
+    let url = |k: usize| {
+        format!(
+            "{}{}{}",
+            host["frames"]["prefix"].as_str().unwrap(),
+            host["frames"]["names"][k].as_str().unwrap(),
+            host["frames"]["suffix"].as_str().unwrap()
+        )
+    };
+    assert_eq!(url(0), "ws://[2001:db8::1]:8080/view");
+    assert_eq!(url(19), "ws://[2001:db8::14]:8080/view");
+    // the field carries no state of any server: a server that restarts moves nothing in it
+    let restarted = state(
+        n,
+        serde_json::json!([
+            {"type": "agent", "at": 3000, "host": "h1", "msg": {"type": "slot", "id": "mc-19",
+                "phase": "restoring", "generation": 1, "frame_url": "ws://[2001:db8::13]:8080/view"}}
+        ]),
+    );
+    assert_eq!(
+        serde_json::to_value(view(&restarted)).unwrap()["minecraft"]["field"],
+        *field
+    );
+
+    // a lent server beyond the first sixteen is a tile too: its holder's page needs its borrow
+    let lent = state(
+        n,
+        serde_json::json!([
+            {"type": "viewer_joined", "at": 2100, "viewer": "v1", "client": "198.51.100.20"},
+            {"type": "intent", "at": 2200, "viewer": "v1", "client": "198.51.100.20", "id": "c1",
+                "name": "claim_minecraft", "args": {"slot": "mc-19"}}
+        ]),
+    );
+    assert_eq!(lent.receipts["c1"].outcome, fleet_core::Outcome::Committed);
+    let v = serde_json::to_value(view(&lent)).unwrap();
+    let tiles = v["minecraft"]["tiles"].as_array().unwrap();
+    assert_eq!(tiles.len(), listed as usize + 1);
+    assert_eq!(tiles[16]["slot"], "mc-19");
+    assert_eq!(tiles[16]["id"], "mc:19");
+    assert_eq!(tiles[16]["borrowed"]["viewer"], "v1");
+}
+
+/// A host's status rows ride in a health report that names no slot. The coordinator passes
+/// them on and keeps none: applied as an event, the report changes nothing, so it moves no
+/// version and is never stored. A coordinator from before the field reads the same report as
+/// a health report for a slot it does not have.
+#[test]
+fn a_minecraft_status_report_is_not_part_of_the_state() {
+    let cfg = config_with(serde_json::json!({}));
+    let before = events(serde_json::json!(minecraft_fleet(3)))
+        .iter()
+        .fold(State::new(cfg, 0), apply);
+    let report = serde_json::json!({"type": "agent", "at": 5000, "host": "h1", "msg": {
+        "type": "health", "id": fleet_core::minecraft::STATUS_ID, "fps": 0.0,
+        "minecraft": {"t": 4990, "rows": "AwDIAw==", "cpus": 192, "busy": 4.9,
+            "mem_total_mib": 385024, "mem_used_mib": 20480}}});
+    let event: Event = serde_json::from_value(report.clone()).unwrap();
+    let after = apply(before.clone(), &event);
+    assert_eq!(after.version, before.version);
+    assert_eq!(
+        serde_json::to_value(view(&after)).unwrap(),
+        serde_json::to_value(view(&before)).unwrap()
+    );
+    // the report comes back out as it went in, and without the field it is an ordinary one
+    assert_eq!(
+        serde_json::to_value(&event).unwrap()["msg"]["minecraft"],
+        report["msg"]["minecraft"]
+    );
+    let plain: fleet_core::protocol::HealthReport =
+        serde_json::from_value(serde_json::json!({"id": "slot-1", "fps": 30.0})).unwrap();
+    assert_eq!(plain.minecraft, None);
+    assert!(serde_json::to_value(&plain)
+        .unwrap()
+        .get("minecraft")
+        .is_none());
+}
+
+#[test]
+fn the_status_message_and_the_pages_request_for_it_have_these_shapes() {
+    use fleet_core::protocol::{ClientMsg, ServerMsg};
+    let status: fleet_core::minecraft::MinecraftStatus =
+        serde_json::from_value(serde_json::json!({"t": 7, "rows": "AwDIAw=="})).unwrap();
+    assert_eq!(
+        serde_json::to_value(ServerMsg::MinecraftStatus {
+            host: "0123456789ab".into(),
+            status
+        })
+        .unwrap(),
+        serde_json::json!({"type": "minecraft_status", "host": "0123456789ab", "t": 7, "rows": "AwDIAw=="})
+    );
+    // a page from before the field sends no `minecraft`: it is not sent the rows
+    let old: ClientMsg =
+        serde_json::from_value(serde_json::json!({"type": "visibility", "visible": true})).unwrap();
+    assert!(matches!(
+        old,
+        ClientMsg::Visibility {
+            visible: true,
+            minecraft: false
+        }
+    ));
+    let new: ClientMsg = serde_json::from_value(
+        serde_json::json!({"type": "visibility", "visible": true, "minecraft": true}),
+    )
+    .unwrap();
+    assert!(matches!(
+        new,
+        ClientMsg::Visibility {
+            visible: true,
+            minecraft: true
+        }
+    ));
+}

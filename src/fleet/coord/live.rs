@@ -704,8 +704,13 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         })
     };
     let mut snapshots = app.handle.snapshot.clone();
+    // Minecraft status rows, for a page whose `visibility` asks for them.
+    let wants_minecraft = Arc::new(AtomicBool::new(false));
+    let mut statuses = app.handle.minecraft_status.subscribe();
+    let wants = wants_minecraft.clone();
     let writer = tokio::spawn(async move {
         let mut sent: Option<u64> = None;
+        let mut status_sent = 0u64;
         loop {
             let snap = snapshots.borrow_and_update().clone();
             if sent.is_none_or(|v| snap.version > v) && !snap.text.is_empty() {
@@ -732,6 +737,24 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     if changed.is_err() {
                         return;
                     }
+                }
+                changed = statuses.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let set = statuses.borrow_and_update().clone();
+                    // A page that does not show Minecraft mode is sent none, and one that
+                    // starts to is sent every host's latest.
+                    if !wants.load(Ordering::Relaxed) {
+                        status_sent = 0;
+                        continue;
+                    }
+                    for text in set.newer(status_sent) {
+                        if sink.send(Message::Text(text.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    status_sent = set.seq;
                 }
             }
         }
@@ -847,7 +870,8 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                 }
             }
             // An unverified connection is not a viewer, so it is neither active nor hidden.
-            Ok(ClientMsg::Visibility { visible }) => {
+            Ok(ClientMsg::Visibility { visible, minecraft }) => {
+                wants_minecraft.store(minecraft, Ordering::Relaxed);
                 if !verified.load(Ordering::SeqCst) {
                     visible_before_join = Some(visible);
                 } else {
