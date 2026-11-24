@@ -73,6 +73,15 @@ pub enum PotatoKind {
         proof: PotatoProof,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hold_us: Option<u64>,
+        /// What the agent counted when it read this catch; none from an agent without a CPU
+        /// allotment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ring: Option<RingStats>,
+        /// How long before the throw to it began the catcher was ready, in ms; negative when
+        /// the thrower had to wait. None for a round's first catch, and when the catch was
+        /// read before the catcher's wake had ended (its `woke` then carries it).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_margin_ms: Option<f64>,
     },
     /// The catcher accepted the ball; `seq` is the ball's new seq, `to` its catcher.
     Threw {
@@ -85,7 +94,8 @@ pub enum PotatoKind {
     },
     /// Nothing accepted the ball within its flight window. `catcher_phase` is what the agent
     /// was doing with the catcher then (`asleep`, `sleeping`, `waking`, `awake`), and
-    /// `catcher_phase_ms` how long it had been doing it.
+    /// `catcher_phase_ms` how long it had been doing it. `catcher_cpu_wait_ms`: the catcher
+    /// was asleep with its wake waiting for a free CPU, for this long.
     Dropped {
         round: u64,
         seq: u64,
@@ -94,6 +104,8 @@ pub enum PotatoKind {
         reason: String,
         catcher_phase: String,
         catcher_phase_ms: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catcher_cpu_wait_ms: Option<f64>,
     },
     /// The player is asleep: its snapshot is written and its fcvm has exited. `stages`
     /// splits `sleep_ms` (prepare, pause, save, disk, stop, in ms, as fcvm logs them).
@@ -104,19 +116,59 @@ pub enum PotatoKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         written_mib: Option<f64>,
     },
-    /// The agent started restoring the player.
-    Waking {},
+    /// The agent started restoring the player. `cpu_wait_ms`: the wake waited this long for
+    /// a free CPU first; none when it did not wait.
+    Waking {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_wait_ms: Option<f64>,
+    },
     /// The player's ball port accepts connections again, `wake_ms` after the restore
     /// started. `stages` splits it (network, disk, load, guest, listen).
+    /// `ready_margin_ms`: as a catch's, when the player's catch was read before this.
     Woke {
         wake_ms: f64,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         stages: BTreeMap<String, f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ready_margin_ms: Option<f64>,
     },
     /// The catcher of a dropped ball started accepting, `after_ms` after the ball dropped.
     Listening { round: u64, seq: u64, after_ms: f64 },
     /// A sleep, a wake or a first boot failed.
     Failed { stage: String, error: String },
+}
+
+/// The ring's CPUs as the agent counted them when it read a catch (its own ledger, not a
+/// reading of the coordinator's).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RingStats {
+    /// Machines not asleep: awake, waking, booting, or going to sleep until the save has
+    /// finished and the process has exited.
+    pub cpus_in_use: u32,
+    /// The most in use at any instant since the catch before this one.
+    pub cpus_peak: u32,
+    /// Players of the ring that are asleep.
+    pub asleep: u32,
+    /// How many catches ahead of the ball a sleeping player's wake is asked for.
+    pub lead: u32,
+    /// The slowest wake in the agent's window, ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowest_wake_ms: Option<f64>,
+    /// Which machine holds each CPU in use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<CpuSlot>,
+    /// The CPU time the ring's cpuset has used so far, microseconds; none when the ring is
+    /// not confined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usec: Option<u64>,
+}
+
+/// A machine that holds a CPU: `phase` is `ball` (caught and not yet thrown), `ready`,
+/// `waking`, `saving` or `booting`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuSlot {
+    pub player: u32,
+    pub phase: String,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -258,6 +310,12 @@ pub struct PlayerState {
     /// A hello one catch ahead, waiting for that catch's report to confirm it.
     #[serde(default)]
     pub ahead: Option<PotatoProof>,
+    /// How long its latest wake waited for a free CPU, ms; none when it did not wait.
+    #[serde(default)]
+    pub cpu_wait_ms: Option<f64>,
+    /// At its latest catch, how long before the throw to it began it was ready, ms.
+    #[serde(default)]
+    pub ready_margin_ms: Option<f64>,
 }
 
 /// The ball in the air: thrown by `from` to `to` at `at`.
@@ -318,6 +376,16 @@ pub struct Round {
     /// The fastest pace of a completed lap.
     #[serde(default)]
     pub best_pace: Option<f64>,
+    /// What the agent counted at the latest catch.
+    #[serde(default)]
+    pub ring_stats: Option<RingStats>,
+    /// The most CPUs in use during each lap not yet completed.
+    #[serde(default)]
+    pub lap_cpus_peak: BTreeMap<u64, u32>,
+    /// The host's time (ms) and the cpuset's CPU time (microseconds) at each catch not yet
+    /// behind a completed lap, and at the last catch of the latest completed lap.
+    #[serde(default)]
+    pub cpu_marks: BTreeMap<u64, (u64, u64)>,
 }
 
 /// The laps of a round the view keeps.
@@ -330,6 +398,12 @@ pub struct Lap {
     pub lap: u64,
     pub pace: f64,
     pub hold_ms: u64,
+    /// The most CPUs in use at any instant of the lap; none without an allotment.
+    #[serde(default)]
+    pub cpus_peak: Option<u32>,
+    /// Host CPUs the ring's cpuset used, averaged over the lap; none unless confined.
+    #[serde(default)]
+    pub cpus_busy: Option<f64>,
 }
 
 impl Round {
@@ -384,6 +458,21 @@ impl Round {
         (catches > 0).then(|| (catches as f64 * 100_000.0 / wall as f64).round() / 100.0)
     }
 
+    /// Host CPUs the ring used over completed lap `lap`: the cpuset's CPU time between the
+    /// catch before the lap's first (lap 0: its first) and its last, over the host's time
+    /// between them.
+    fn lap_busy(&self, lap: u64) -> Option<f64> {
+        let n = self.ring.len() as u64;
+        let (to_at, to_usec) = *self.cpu_marks.get(&((lap + 1) * n - 1))?;
+        let (from_at, from_usec) = *(lap * n)
+            .checked_sub(1)
+            .and_then(|s| self.cpu_marks.get(&s))
+            .or_else(|| self.cpu_marks.get(&(lap * n)))?;
+        let wall_ms = to_at.checked_sub(from_at).filter(|w| *w > 0)?;
+        let used = to_usec.checked_sub(from_usec)?;
+        Some((used as f64 / (wall_ms as f64 * 10.0)).round() / 100.0)
+    }
+
     /// When the next catch must have been reported by.
     pub fn deadline(&self, slack_ms: u64) -> Option<u64> {
         let seq = self.seq?;
@@ -415,6 +504,12 @@ pub struct Potato {
     pub host: Option<String>,
     #[serde(default)]
     pub capacity: u32,
+    /// The CPU allotment of the host that played the ladder last, and whether its ring was
+    /// confined to that many host CPUs. None from an agent that reports no allotment.
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    #[serde(default)]
+    pub confined: Option<bool>,
     #[serde(default)]
     pub next_round_at: Option<u64>,
     #[serde(default)]
@@ -471,7 +566,15 @@ impl Potato {
 
     /// An agent said hello. A host with players becomes the potato host (the first one
     /// that connects); its players are all new.
-    pub fn agent_hello(&mut self, host: &str, players: u32, at: u64, cfg: &PotatoConfig) {
+    pub fn agent_hello(
+        &mut self,
+        host: &str,
+        players: u32,
+        cpus: u32,
+        confined: bool,
+        at: u64,
+        cfg: &PotatoConfig,
+    ) {
         if players == 0 {
             if self.host.as_deref() == Some(host) {
                 self.agent_gone(host, at, cfg);
@@ -488,6 +591,8 @@ impl Potato {
         self.ensure_ladder(cfg);
         self.host = Some(host.to_string());
         self.capacity = players;
+        self.cpus = (cpus > 0).then_some(cpus);
+        self.confined = self.cpus.map(|_| confined);
         self.players.clear();
         self.next_round_at = Some(at + 1000);
     }
@@ -621,6 +726,9 @@ impl Potato {
             catch_at: BTreeMap::new(),
             laps: Vec::new(),
             best_pace: None,
+            ring_stats: None,
+            lap_cpus_peak: BTreeMap::new(),
+            cpu_marks: BTreeMap::new(),
         });
         self.next_round_at = None;
     }
@@ -775,6 +883,8 @@ impl Potato {
                                 sleep_stages: BTreeMap::new(),
                                 wake_stages: BTreeMap::new(),
                                 ahead: None,
+                                cpu_wait_ms: None,
+                                ready_margin_ms: None,
                             },
                         );
                     }
@@ -785,10 +895,13 @@ impl Potato {
                 seq,
                 proof,
                 hold_us,
+                ring,
+                ready_margin_ms,
             } => {
                 let Some(p) = self.players.get_mut(&e.player) else {
                     return;
                 };
+                p.ready_margin_ms = *ready_margin_ms;
                 let expected = Self::stepped(p, *round, *seq, colours);
                 let ok = expected.as_ref().is_some_and(|(colour, chain)| {
                     *colour == proof.colour
@@ -838,6 +951,14 @@ impl Potato {
                 let longest = r.lap_holds.entry(lap).or_insert(hold);
                 *longest = (*longest).max(hold);
                 r.catch_at.insert(*seq, at);
+                if let Some(stats) = ring {
+                    let peak = r.lap_cpus_peak.entry(lap).or_insert(0);
+                    *peak = (*peak).max(stats.cpus_peak).max(stats.cpus_in_use);
+                    if let Some(usec) = stats.cpu_usec {
+                        // the host's clock: both ends of the interval are its own
+                        r.cpu_marks.insert(*seq, (e.at, usec));
+                    }
+                }
                 // the catches verified without a gap; a lap counts once all of its are
                 r.verified_ahead.insert(*seq);
                 let mut completed = Vec::new();
@@ -859,8 +980,11 @@ impl Potato {
                         r.best_lap_hold_ms = Some(h);
                     }
                     let pace = r.lap_pace(l);
+                    let cpus_busy = r.lap_busy(l);
+                    let cpus_peak = r.lap_cpus_peak.remove(&l);
                     // the lap's last catch stays: the next lap is measured from it
                     r.catch_at.retain(|s, _| *s + 1 >= (l + 1) * n);
+                    r.cpu_marks.retain(|s, _| *s + 1 >= (l + 1) * n);
                     if let Some(pace) = pace {
                         if r.best_pace.is_none_or(|b| pace > b) {
                             r.best_pace = Some(pace);
@@ -869,6 +993,8 @@ impl Potato {
                             lap: l,
                             pace,
                             hold_ms: h,
+                            cpus_peak,
+                            cpus_busy,
                         });
                         if r.laps.len() > LAPS_KEPT {
                             let cut = r.laps.len() - LAPS_KEPT;
@@ -894,6 +1020,7 @@ impl Potato {
                     r.last_catch_at = Some(at);
                     r.flight = None;
                     r.kept_us = *hold_us;
+                    r.ring_stats = ring.clone();
                 }
             }
             PotatoKind::Threw { round, to, .. } => {
@@ -918,6 +1045,7 @@ impl Potato {
                 catcher_phase_ms,
                 reason,
                 attempts,
+                ..
             } => {
                 if self.round.as_ref().is_some_and(|r| r.id == *round) {
                     let detail = format!(
@@ -970,13 +1098,18 @@ impl Potato {
                     p.sleep_stages = stages.clone();
                 }
             }
-            PotatoKind::Waking {} => {
+            PotatoKind::Waking { cpu_wait_ms } => {
                 if let Some(p) = self.players.get_mut(&e.player) {
                     p.phase = "waking".into();
                     p.since = at;
+                    p.cpu_wait_ms = *cpu_wait_ms;
                 }
             }
-            PotatoKind::Woke { wake_ms, stages } => {
+            PotatoKind::Woke {
+                wake_ms,
+                stages,
+                ready_margin_ms,
+            } => {
                 let size = self.round.as_ref().map(|r| r.size);
                 if let Some(p) = self.players.get_mut(&e.player) {
                     // a player that caught and threw before its wake was reported done is
@@ -987,6 +1120,9 @@ impl Potato {
                     }
                     p.last_wake_ms = Some(*wake_ms);
                     p.wake_stages = stages.clone();
+                    if ready_margin_ms.is_some() {
+                        p.ready_margin_ms = *ready_margin_ms;
+                    }
                     if let (Some(sleep), Some(size), true) = (p.last_sleep_ms, size, in_ring) {
                         let cycle = sleep + wake_ms;
                         if self
@@ -1089,6 +1225,11 @@ pub struct PotatoView {
     pub colours: u32,
     /// The players the potato host runs; 0 while none is connected.
     pub capacity: u32,
+    /// K, the CPU allotment the ladder shown was played under, and whether the ring's
+    /// machines were confined to that many host CPUs (a cpuset) or only counted. Null from
+    /// an agent that reports no allotment.
+    pub cpus: Option<u32>,
+    pub confined: Option<bool>,
     /// The host running the players (its agent's name, as a tile's `host`); null while none is
     /// connected. The viewer-path smoke attributes its potato probe to it for the image
     /// release gate (fleet/coord/stage-smoke.py).
@@ -1123,6 +1264,18 @@ pub struct RoundView {
     pub best_pace: Option<f64>,
     /// The completed laps, oldest first, at most the last [`LAPS_KEPT`].
     pub laps: Vec<Lap>,
+    /// The agent's count at the latest catch: machines not asleep, the ring's players
+    /// asleep, the lead in catches, the slowest wake in its window, and which machine holds
+    /// each CPU. Null before a catch and from an agent without an allotment.
+    pub cpus_in_use: Option<u32>,
+    pub asleep: Option<u32>,
+    pub lead: Option<u32>,
+    pub slowest_wake_ms: Option<f64>,
+    pub cpu_slots: Option<Vec<CpuSlot>>,
+    /// Over the last completed lap: the most CPUs in use at any instant, and the host CPUs
+    /// the ring's cpuset used on average (null unless confined).
+    pub cpus_peak: Option<u32>,
+    pub cpus_busy: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1135,6 +1288,8 @@ pub struct PlayerView {
     pub since: u64,
     pub last_sleep_ms: Option<f64>,
     pub last_wake_ms: Option<f64>,
+    pub cpu_wait_ms: Option<f64>,
+    pub ready_margin_ms: Option<f64>,
 }
 
 impl Potato {
@@ -1165,6 +1320,13 @@ impl Potato {
                 pace: r.laps.last().map(|l| l.pace),
                 best_pace: r.best_pace,
                 laps: r.laps.clone(),
+                cpus_in_use: r.ring_stats.as_ref().map(|s| s.cpus_in_use),
+                asleep: r.ring_stats.as_ref().map(|s| s.asleep),
+                lead: r.ring_stats.as_ref().map(|s| s.lead),
+                slowest_wake_ms: r.ring_stats.as_ref().and_then(|s| s.slowest_wake_ms),
+                cpu_slots: r.ring_stats.as_ref().map(|s| s.slots.clone()),
+                cpus_peak: r.laps.last().and_then(|l| l.cpus_peak),
+                cpus_busy: r.laps.last().and_then(|l| l.cpus_busy),
             }
         });
         Some(PotatoView {
@@ -1186,6 +1348,8 @@ impl Potato {
                     since: p.since,
                     last_sleep_ms: p.last_sleep_ms,
                     last_wake_ms: p.last_wake_ms,
+                    cpu_wait_ms: p.cpu_wait_ms,
+                    ready_margin_ms: p.ready_margin_ms,
                 })
                 .collect(),
             records: self.records.clone(),
@@ -1193,6 +1357,8 @@ impl Potato {
             next_round_at: self.next_round_at,
             colours: self.round.as_ref().map_or(cfg.colours, |r| r.colours),
             capacity: self.capacity,
+            cpus: self.cpus,
+            confined: self.confined,
             host: self.host.clone(),
         })
     }
@@ -1216,6 +1382,8 @@ mod tests {
                     chain: "ab".into(),
                 },
                 hold_us: None,
+                ring: None,
+                ready_margin_ms: None,
             },
         };
         let s = serde_json::to_string(&e).unwrap();
@@ -1226,14 +1394,14 @@ mod tests {
         assert_eq!(serde_json::from_str::<PotatoEvent>(&s).unwrap(), e);
         let w: PotatoEvent =
             serde_json::from_str(r#"{"at":1,"player":0,"kind":"waking"}"#).unwrap();
-        assert_eq!(w.kind, PotatoKind::Waking {});
+        assert_eq!(w.kind, PotatoKind::Waking { cpu_wait_ms: None });
     }
 
     #[test]
     fn a_catch_not_reported_by_its_deadline_drops_the_ball() {
         let cfg = PotatoConfig::default();
         let mut g = Potato::default();
-        g.agent_hello("h", 2, 0, &cfg);
+        g.agent_hello("h", 2, 0, false, 0, &cfg);
         for n in 0..2 {
             g.event(
                 "h",
@@ -1279,6 +1447,8 @@ mod tests {
                         chain,
                     },
                     hold_us: None,
+                    ring: None,
+                    ready_margin_ms: None,
                 },
             },
             1100,
@@ -1301,7 +1471,7 @@ mod tests {
     fn game(n: u32) -> (Potato, PotatoConfig, Vec<PotatoProof>) {
         let cfg = PotatoConfig::default();
         let mut g = Potato::default();
-        g.agent_hello("h", n, 0, &cfg);
+        g.agent_hello("h", n, 0, false, 0, &cfg);
         let mut proofs = Vec::new();
         for p in 0..n {
             let proof = PotatoProof {
@@ -1385,6 +1555,8 @@ mod tests {
                 seq,
                 proof,
                 hold_us: None,
+                ring: None,
+                ready_margin_ms: None,
             },
         }
     }
@@ -1679,7 +1851,12 @@ mod tests {
             player: 1,
             kind,
         };
-        g.event("h", &ev(1050, PotatoKind::Waking {}), 1050, &cfg);
+        g.event(
+            "h",
+            &ev(1050, PotatoKind::Waking { cpu_wait_ms: None }),
+            1050,
+            &cfg,
+        );
         let c = catch(&mut proofs, 1, id, 1, 1100, false);
         g.event("h", &c, c.at, &cfg);
         let threw = PotatoKind::Threw {
@@ -1694,10 +1871,268 @@ mod tests {
         let woke = PotatoKind::Woke {
             wake_ms: 320.0,
             stages: BTreeMap::new(),
+            ready_margin_ms: None,
         };
         g.event("h", &ev(2010, woke), 2010, &cfg);
         let p = &g.players[&1];
         assert_eq!((p.phase.as_str(), p.since), ("sleeping", 2000));
         assert_eq!(p.last_wake_ms, Some(320.0));
+    }
+
+    /// A game on a host whose agent reports a CPU allotment.
+    fn game_on(n: u32, cpus: u32, confined: bool) -> (Potato, PotatoConfig, Vec<PotatoProof>) {
+        let (mut g, cfg, proofs) = game(n);
+        g.cpus = (cpus > 0).then_some(cpus);
+        g.confined = g.cpus.map(|_| confined);
+        (g, cfg, proofs)
+    }
+
+    fn stats(in_use: u32, peak: u32, cpu_usec: Option<u64>) -> RingStats {
+        RingStats {
+            cpus_in_use: in_use,
+            cpus_peak: peak,
+            asleep: 5,
+            lead: 2,
+            slowest_wake_ms: Some(310.5),
+            slots: vec![
+                CpuSlot {
+                    player: 1,
+                    phase: "ball".into(),
+                },
+                CpuSlot {
+                    player: 0,
+                    phase: "saving".into(),
+                },
+            ],
+            cpu_usec,
+        }
+    }
+
+    /// A catch with the agent's count, read by the host at `host_at`.
+    #[allow(clippy::too_many_arguments)]
+    fn counted(
+        proofs: &mut [PotatoProof],
+        id: u64,
+        seq: u64,
+        at: u64,
+        host_at: u64,
+        ring: RingStats,
+    ) -> PotatoEvent {
+        let mut e = catch(proofs, (seq % 2) as u32, id, seq, at, false);
+        e.at = host_at;
+        if let PotatoKind::Caught { ring: r, .. } = &mut e.kind {
+            *r = Some(ring);
+        }
+        e
+    }
+
+    /// The hello's allotment is published with the ladder, and stays when the host leaves.
+    #[test]
+    fn the_allotment_comes_from_the_hello() {
+        let cfg = PotatoConfig::default();
+        let mut g = Potato::default();
+        g.agent_hello("h", 4, 8, true, 0, &cfg);
+        let v = g.view(&cfg).unwrap();
+        assert_eq!((v.cpus, v.confined), (Some(8), Some(true)));
+        g.agent_gone("h", 10, &cfg);
+        let v = g.view(&cfg).unwrap();
+        assert_eq!((v.cpus, v.confined, v.capacity), (Some(8), Some(true), 0));
+        // an agent built before the allotment reports none: nothing is claimed for it
+        g.agent_hello("old", 4, 0, false, 20, &cfg);
+        let v = g.view(&cfg).unwrap();
+        assert_eq!((v.cpus, v.confined), (None, None));
+        g.agent_gone("old", 30, &cfg);
+        g.agent_hello("h", 4, 8, false, 40, &cfg);
+        let v = g.view(&cfg).unwrap();
+        assert_eq!(
+            (v.cpus, v.confined),
+            (Some(8), Some(false)),
+            "counted, not confined"
+        );
+    }
+
+    /// The round's CPU figures are the agent's count at the latest catch; a lap's peak is the
+    /// most any of its catches reported, and its CPUs busy the cpuset's CPU time over the
+    /// host's time between the catch before the lap and its last.
+    #[test]
+    fn the_rings_cpus_are_the_agents_count() {
+        let (mut g, cfg, mut proofs) = game_on(2, 8, true);
+        let id = g.round.as_ref().unwrap().id;
+        let view = |g: &Potato| g.view(&cfg).unwrap().round.unwrap();
+        let v = view(&g);
+        assert_eq!(
+            (v.cpus_in_use, v.cpu_slots.clone()),
+            (None, None),
+            "no catch yet"
+        );
+        // the coordinator reads each catch 5 s after the host did: only the host's times count
+        let e = counted(&mut proofs, id, 0, 6100, 1100, stats(3, 4, Some(1_000_000)));
+        g.event("h", &e, 6100, &cfg);
+        let v = view(&g);
+        assert_eq!(
+            (v.cpus_in_use, v.asleep, v.lead),
+            (Some(3), Some(5), Some(2))
+        );
+        assert_eq!(v.slowest_wake_ms, Some(310.5));
+        assert_eq!(v.cpu_slots.as_ref().map(Vec::len), Some(2));
+        assert_eq!(
+            (v.cpus_peak, v.cpus_busy),
+            (None, None),
+            "no lap is complete"
+        );
+        // read late by the coordinator: the lap took 200 ms on the host, whose CPU time it is
+        let e = counted(&mut proofs, id, 1, 6900, 1300, stats(2, 7, Some(1_300_000)));
+        g.event("h", &e, 6900, &cfg);
+        let v = view(&g);
+        assert_eq!(
+            v.cpus_peak,
+            Some(7),
+            "the most any catch of the lap reported"
+        );
+        assert_eq!(v.cpus_busy, Some(1.5), "300 ms of CPU in 200 ms");
+        assert_eq!(v.cpus_in_use, Some(2));
+        // lap 1 is measured from lap 0's last catch
+        let e = counted(&mut proofs, id, 2, 7000, 1400, stats(5, 5, Some(1_400_000)));
+        g.event("h", &e, 7000, &cfg);
+        let e = counted(&mut proofs, id, 3, 7100, 1500, stats(4, 6, Some(1_700_000)));
+        g.event("h", &e, 7100, &cfg);
+        let v = view(&g);
+        assert_eq!((v.cpus_peak, v.cpus_busy), (Some(6), Some(2.0)));
+        assert_eq!(
+            v.laps
+                .iter()
+                .map(|l| (l.lap, l.cpus_peak, l.cpus_busy))
+                .collect::<Vec<_>>(),
+            vec![(0, Some(7), Some(1.5)), (1, Some(6), Some(2.0))]
+        );
+        assert_eq!(g.round.as_ref().unwrap().cpu_marks.len(), 1);
+        assert!(g.round.as_ref().unwrap().lap_cpus_peak.is_empty());
+    }
+
+    /// Counted but not confined: no CPU time is reported, so no CPUs busy are claimed.
+    #[test]
+    fn a_ring_that_is_not_confined_claims_no_cpus_busy() {
+        let (mut g, cfg, mut proofs) = game_on(2, 8, false);
+        let id = g.round.as_ref().unwrap().id;
+        for seq in 0..2 {
+            let e = counted(
+                &mut proofs,
+                id,
+                seq,
+                1100 + seq * 100,
+                1100 + seq * 100,
+                stats(3, 3, None),
+            );
+            g.event("h", &e, e.at, &cfg);
+        }
+        let v = g.view(&cfg).unwrap().round.unwrap();
+        assert_eq!((v.cpus_peak, v.cpus_busy), (Some(3), None));
+        assert_eq!(v.pace, Some(10.0));
+    }
+
+    /// An agent without an allotment sends none of it: every figure it would carry is null,
+    /// and the game plays as before.
+    #[test]
+    fn an_agent_without_an_allotment_publishes_no_cpu_figures() {
+        let (mut g, cfg, mut proofs) = game(2);
+        let id = g.round.as_ref().unwrap().id;
+        for seq in 0..2 {
+            let e = catch(&mut proofs, seq as u32, id, seq, 1100 + seq * 100, false);
+            g.event("h", &e, e.at, &cfg);
+        }
+        let v = serde_json::to_value(g.view(&cfg).unwrap()).unwrap();
+        for null in [
+            "/cpus",
+            "/confined",
+            "/round/cpus_in_use",
+            "/round/cpus_peak",
+            "/round/cpus_busy",
+            "/round/asleep",
+            "/round/lead",
+            "/round/slowest_wake_ms",
+            "/round/cpu_slots",
+            "/round/laps/0/cpus_peak",
+            "/players/0/cpu_wait_ms",
+            "/players/0/ready_margin_ms",
+        ] {
+            assert_eq!(v.pointer(null), Some(&serde_json::Value::Null), "{null}");
+        }
+        assert_eq!(v.pointer("/round/pace"), Some(&serde_json::json!(10.0)));
+        // and its messages, which carry none of the new fields, are read
+        for old in [
+            serde_json::json!({"at": 1, "player": 0, "kind": "waking"}),
+            serde_json::json!({"at": 1, "player": 0, "kind": "woke", "wake_ms": 300.0}),
+            serde_json::json!({"at": 1, "player": 0, "kind": "dropped", "round": 1, "seq": 1, "to": 1,
+                "attempts": 2, "reason": "refused", "catcher_phase": "waking", "catcher_phase_ms": 90.0}),
+        ] {
+            let e: PotatoEvent = serde_json::from_value(old.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&e).unwrap(),
+                old,
+                "nothing is added to it"
+            );
+        }
+    }
+
+    /// A player's wait for a CPU is its latest wake's, and its margin its latest catch's.
+    #[test]
+    fn a_wakes_wait_and_a_catchs_margin_are_the_players() {
+        let (mut g, cfg, mut proofs) = game_on(2, 8, true);
+        let id = g.round.as_ref().unwrap().id;
+        let player = |g: &Potato, n: usize| g.view(&cfg).unwrap().players[n].clone();
+        let ev = |player, kind| PotatoEvent {
+            at: 1,
+            player,
+            kind,
+        };
+        g.event(
+            "h",
+            &ev(
+                1,
+                PotatoKind::Waking {
+                    cpu_wait_ms: Some(42.5),
+                },
+            ),
+            1050,
+            &cfg,
+        );
+        assert_eq!(player(&g, 1).cpu_wait_ms, Some(42.5));
+        let mut e = catch(&mut proofs, 0, id, 0, 1100, false);
+        g.event("h", &e, 1100, &cfg);
+        assert_eq!(player(&g, 0).ready_margin_ms, None, "a round's first catch");
+        e = catch(&mut proofs, 1, id, 1, 1200, false);
+        if let PotatoKind::Caught {
+            ready_margin_ms, ..
+        } = &mut e.kind
+        {
+            *ready_margin_ms = Some(212.0);
+        }
+        g.event("h", &e, 1200, &cfg);
+        assert_eq!(player(&g, 1).ready_margin_ms, Some(212.0));
+        // a catch read before its catcher's wake ended: the wake carries the margin
+        e = catch(&mut proofs, 0, id, 2, 1300, false);
+        g.event("h", &e, 1300, &cfg);
+        assert_eq!(player(&g, 0).ready_margin_ms, None);
+        let woke = |margin| PotatoKind::Woke {
+            wake_ms: 300.0,
+            stages: BTreeMap::new(),
+            ready_margin_ms: margin,
+        };
+        g.event("h", &ev(0, woke(Some(-12.0))), 1310, &cfg);
+        assert_eq!(player(&g, 0).ready_margin_ms, Some(-12.0));
+        g.event("h", &ev(1, woke(None)), 1320, &cfg);
+        assert_eq!(
+            player(&g, 1).ready_margin_ms,
+            Some(212.0),
+            "a wake without one changes nothing"
+        );
+        // its next wake did not wait
+        g.event(
+            "h",
+            &ev(1, PotatoKind::Waking { cpu_wait_ms: None }),
+            1400,
+            &cfg,
+        );
+        assert_eq!(player(&g, 1).cpu_wait_ms, None);
     }
 }

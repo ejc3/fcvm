@@ -299,6 +299,15 @@ pub enum AgentMsg {
         /// The most potato players the host runs (potato mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         potato_players: u32,
+        /// The CPU allotment of the potato ring: the agent never has more machines not asleep
+        /// than this. 0: none (an agent built before the allotment caps nothing).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        potato_cpus: u32,
+        /// Whether the ring's machines, and the fcvm commands that save and restore them, run
+        /// in a cpuset of exactly `potato_cpus` host CPUs. False: the allotment only counts
+        /// machines.
+        #[serde(default, skip_serializing_if = "is_false")]
+        potato_confined: bool,
         /// The Windows sandboxes the host runs (Windows mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         windows: u32,
@@ -544,6 +553,10 @@ pub enum CoordMsg {
     Potato {
         round: Option<crate::potato::PotatoRound>,
     },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero(n: &u32) -> bool {

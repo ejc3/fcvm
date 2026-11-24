@@ -460,6 +460,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     phones,
                     phone_actions,
                     potato_players,
+                    potato_cpus,
+                    potato_confined,
                     windows,
                     windows_actions,
                     minecraft,
@@ -469,10 +471,14 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     if named == host {
                         state.fleet.registrations.registered(host, at);
                         let cfg = state.config.potato.clone();
-                        state
-                            .fleet
-                            .potato
-                            .agent_hello(host, *potato_players, at, &cfg);
+                        state.fleet.potato.agent_hello(
+                            host,
+                            *potato_players,
+                            *potato_cpus,
+                            *potato_confined,
+                            at,
+                            &cfg,
+                        );
                         // A hello again on the same connection keeps the image it reported.
                         let image = state
                             .fleet
