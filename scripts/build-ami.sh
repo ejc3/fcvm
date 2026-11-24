@@ -290,8 +290,9 @@ set -Eeuo pipefail
 # CI cannot read this log, so the handler puts the failing line and command in the tag's
 # value. It is installed before anything can fail (-E carries it into functions). Until
 # the AWS CLI below is installed there is nothing to tag with, so a failure in that window
-# only stops the script: wait_for_build fails a builder still "starting" after 15 minutes,
-# and the CLI install is the only work in the window.
+# only stops the script. The window holds the two metadata requests, `apt-get update`,
+# `apt-get install -y unzip curl` and the CLI download and install; wait_for_build fails a
+# builder still "starting" after 20 minutes, which the bounds below stay inside.
 INSTANCE_ID=unknown
 tag_failed() {
   local reason
@@ -306,28 +307,54 @@ tag_failed() {
 }
 trap 'tag_failed "$LINENO" "$BASH_COMMAND"' ERR
 
-# Every apt call waits for the dpkg lock. `apt-get update` starts Ubuntu Pro's
-# esm-cache.service, whose own apt holds the frontend lock for some seconds afterwards, and
-# an apt call that meets a held lock fails at once. On 2026-11-24 the x64 builder's
+# Every apt call waits for the dpkg frontend lock. `apt-get update` starts Ubuntu Pro's
+# esm-cache.service, whose own apt holds that lock for some seconds afterwards, and an apt
+# call that meets a held lock fails at once. On 2026-11-24 the x64 builder's
 # `apt-get install -y unzip curl` met it 27 s after boot ("Could not get lock
 # /var/lib/dpkg/lock-frontend. It is held by process N (apt)"), before anything could be
 # tagged, and the arm64 builder stopped one apt call later. The apt setting covers the
-# calls inside the NodeSource and runner dependency scripts too, and is removed at the
-# end, so the image keeps apt's defaults. apt_get() also retries downloads and runs a
+# apt calls inside the NodeSource and runner dependency scripts too, and is removed at
+# the end, so the image keeps apt's defaults. apt_get() also retries downloads and runs a
 # failed call again: DPkg::Lock::Timeout does not cover the lists lock `update` takes.
+#
+# The bounds: a call waits 120 s for the lock and is made 3 times, 10 s apart, so one
+# that only ever meets a held lock gives up after 3 x 120 + 2 x 10 = 380 s. The two
+# calls before the "building" tag can therefore take 760 s, and with the boot, the CLI
+# download's retries (about 30 s of back-off) and its install that stays under the
+# 1200 s wait_for_build allows a builder that has not tagged itself.
 export DEBIAN_FRONTEND=noninteractive
-echo 'DPkg::Lock::Timeout "600";' > /etc/apt/apt.conf.d/99-fcvm-builder-lock-wait
+echo 'DPkg::Lock::Timeout "120";' > /etc/apt/apt.conf.d/99-fcvm-builder-lock-wait
 apt_get() {
   local attempt
-  for attempt in 1 2 3 4 5 6; do
-    if apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=5 "$@"; then
+  for attempt in 1 2 3; do
+    if apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=5 "$@"; then
       return 0
     fi
-    echo "apt-get $* failed (attempt $attempt of 6)"
-    sleep 20
+    echo "apt-get $* failed (attempt $attempt of 3)"
+    sleep 10
   done
   # Name the call that failed and its line in this script, not this function's `return`.
   tag_failed "${BASH_LINENO[0]}" "apt-get $*"
+}
+
+# dpkg run directly (the host kernel install calls `dpkg -i`) takes no apt option, so it
+# does not wait for the frontend lock. Wait here, for at most the given seconds, until no
+# process holds it. apt and dpkg lock that file with fcntl, which flock(1) does not see.
+wait_for_dpkg_lock() {
+  python3 - "${1:-/var/lib/dpkg/lock-frontend}" "${2:-120}" << 'PY'
+import fcntl, sys, time
+path, deadline = sys.argv[1], time.monotonic() + float(sys.argv[2])
+while True:
+    with open(path, "a") as lock:
+        try:
+            fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            sys.exit(0)
+        except OSError:
+            pass
+    if time.monotonic() >= deadline:
+        sys.exit("the dpkg frontend lock at %s is still held" % path)
+    time.sleep(2)
+PY
 }
 
 # Get IMDSv2 token and instance ID. Tracing starts after the token's last use: under
@@ -420,7 +447,8 @@ cd /tmp/fcvm
 mkdir -p /root/.config/fcvm
 cp rootfs-config.toml /root/.config/fcvm/
 
-# Build and install kernel using fcvm setup
+# Build and install kernel using fcvm setup. It installs the kernel package with dpkg.
+wait_for_dpkg_lock
 ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
 # The image must boot a kernel with the bridge teardown fix. The running kernel is still
@@ -482,10 +510,12 @@ USERDATA
 # Wait for instance build to complete
 # What the builder's user data printed last, from the instance's console. A builder that
 # stops before it can tag itself has no other voice: on 2026-11-24 the cause of a leg that
-# sat at "starting" was one apt error on its console, which this job could not read. Only
-# cloud-init's own lines are printed, without its network and SSH key tables, and with
-# host names, addresses and instance ids masked: this job's log is public. A console this
-# role cannot read is said so and changes nothing else.
+# sat at "starting" was one apt error on its console, which this job could not read. This
+# job's log is public and the lines are another machine's output, so: only cloud-init's
+# own lines are printed, without its network and SSH key tables; ARNs, account numbers,
+# host names, addresses and instance ids are masked; and every line carries a prefix, so
+# none can start with `::` and be read by the Actions runner as a workflow command. A
+# console this role cannot read is said so and changes nothing else.
 print_builder_console() {
   local instance_id="$1" output
   if ! output=$(aws ec2 get-console-output --region "$REGION" --instance-id "$instance_id" \
@@ -498,9 +528,14 @@ print_builder_console() {
     grep -E 'cloud-init\[[0-9]+\]: ' |
     grep -v -E 'ci-info|ssh-|SHA256|BEGIN |END |ec2: |[Ff]ingerprint|authorized_keys' |
     sed -E -e 's/^.*cloud-init\[[0-9]+\]: //' \
-      -e 's/ip-[0-9]+(-[0-9]+){3}[a-z0-9.-]*/<host>/g' \
+      -e 's/arn:aws[a-z-]*:[^[:space:]"'"'"',)]*/<arn>/g' \
+      -e 's/(ip|ec2)-[0-9]+(-[0-9]+){3}[a-z0-9.-]*/<host>/g' \
       -e 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/<address>/g' \
-      -e 's/i-[0-9a-f]{8,17}/<instance>/g' |
+      -e 's/(^|[^0-9A-Za-z:])([0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}/\1<address>/g' \
+      -e 's/(^|[^0-9A-Za-z:])([0-9A-Fa-f]{1,4}:){1,6}(:[0-9A-Fa-f]{1,4}){1,6}/\1<address>/g' \
+      -e 's/i-[0-9a-f]{8,17}/<instance>/g' \
+      -e 's/(^|[^0-9])[0-9]{12}([^0-9]|$)/\1<account>\2/g' \
+      -e 's/^/builder| /' |
     tail -n 30 || true
 }
 
@@ -509,9 +544,9 @@ wait_for_build() {
   local timeout="${2:-120}"  # 120 iterations * 30s = 60 minutes max
   # A builder tags itself "building" once it has installed the AWS CLI, about a minute
   # after launch. One still "starting" after this many 30 s polls stopped before it could
-  # tag anything, or never ran its user data: 15 minutes, which covers the 10 minutes an
-  # apt call waits for a lock.
-  local starting_limit=30
+  # tag anything, or never ran its user data: 20 minutes, above the 760 s its two apt
+  # calls before that tag can spend waiting for a lock (see apt_get in the user data).
+  local starting_limit=40
   local status i
 
   echo "Waiting for build to complete..."

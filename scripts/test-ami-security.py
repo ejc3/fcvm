@@ -10,8 +10,11 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
+import sys
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -98,6 +101,10 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
 [   27.139387] cloud-init[1469]: + apt-get install -y unzip curl
 [   27.145225] cloud-init[1469]: E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 2020 (apt)
 [   27.150000] cloud-init[1469]: + echo DRYRUN --resources i-0123456789abcdef0 from ip-192-0-2-42.us-west-1.compute.internal at 192.0.2.42
+[   27.160000] cloud-init[1469]: ::error::printed by a program on the builder
+[   27.170000] cloud-init[1469]:   ::add-mask::also after leading spaces
+[   27.180000] cloud-init[1469]: An error occurred (UnauthorizedOperation): User: arn:aws:sts::123456789012:assumed-role/example-role/i-0123456789abcdef0 is not authorized
+[   27.190000] cloud-init[1469]: reached ec2-192-0-2-42.us-west-1.compute.amazonaws.com over 2001:db8::42 and 2001:db8:0:0:0:0:0:42, account 123456789012.
 <14>Nov 24 19:15:06 cloud-init: 256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA root@ip-192-0-2-42 (ED25519)
 [   27.200000] cloud-init[1469]: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIexamplehostkeyexamplehostkeyexamplehost root@ip-192-0-2-42
 [   27.215462] cloud-init[1469]: Cloud-init v. 26.2 finished at Tue, 24 Nov 2026 19:15:06 +0000. Up 27.21 seconds
@@ -110,18 +117,26 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
                 self.assertEqual(result.returncode, 1)
                 printed = result.stdout.split("The builder's last cloud-init lines, from its console:\n", 1)
                 self.assertEqual(len(printed), 2, result.stdout)
-                lines = printed[1].splitlines()
+                self.assertTrue(all(line.startswith("builder| ") for line in printed[1].splitlines()))
+                lines = [line[len("builder| "):] for line in printed[1].splitlines()]
                 self.assertEqual(lines, [
                     "+ apt-get update",
                     "Fetched 38.5 MB in 5s (8236 kB/s)",
                     "+ apt-get install -y unzip curl",
                     "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 2020 (apt)",
                     "+ echo DRYRUN --resources <instance> from <host> at <address>",
+                    "::error::printed by a program on the builder",
+                    "  ::add-mask::also after leading spaces",
+                    "An error occurred (UnauthorizedOperation): User: <arn> is not authorized",
+                    "reached <host> over <address> and <address>, account <account>.",
                     "Cloud-init v. 26.2 finished at Tue, 24 Nov 2026 19:15:06 +0000. Up 27.21 seconds",
                 ])
+                # No line reaches the Actions runner as a workflow command: it reads one from a
+                # line whose first non-blank characters are `::`.
+                self.assertFalse([line for line in result.stdout.splitlines() if line.lstrip().startswith("::")])
         # a console this role may not read changes nothing but one line
         result, polls = self.wait_for_build('starting', 120)
-        self.assertEqual((result.returncode, polls), (1, 30))
+        self.assertEqual((result.returncode, polls), (1, 40))
         self.assertIn("(the builder's console could not be read)", result.stdout)
 
     def wait_for_build(self, status, polls, console=None):
@@ -144,14 +159,14 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
             recorded = [json.loads(line) for line in calls.read_text().splitlines()]
             return result, sum(call[1] == 'describe-tags' for call in recorded)
 
-    def test_a_builder_that_never_reports_fails_after_fifteen_minutes_not_an_hour(self):
+    def test_a_builder_that_never_reports_fails_after_twenty_minutes_not_an_hour(self):
         # A builder whose user data stops before the AWS CLI is installed can tag nothing and
         # stays "starting". On 2026-11-24 the x64 leg waited 44 minutes on one, and would have
         # waited the full hour. A builder that is building is still given the hour.
         result, polls = self.wait_for_build('starting', 120)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(polls, 30)
-        self.assertIn('the builder wrote no tag in 30 polls', result.stdout)
+        self.assertEqual(polls, 40)
+        self.assertIn('the builder wrote no tag in 40 polls', result.stdout)
         result, polls = self.wait_for_build('building', 120)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(polls, 120)
@@ -179,15 +194,19 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
             for name, body in settings.pop("commands", {}).items():
                 (directory / name).write_text(body)
                 (directory / name).chmod(0o755)
+            # Only the stand-ins and the few tools the block calls are on PATH, so a block
+            # that reaches for `aws` finds the stand-in or nothing, never a real CLI.
+            for tool in ["tr", "cut"]:
+                (directory / tool).symlink_to(shutil.which(tool))
             result = subprocess.run(
-                ["bash", "-c", "set -Eeuo pipefail\nsleep() { :; }\n" + block + "\n" + tail],
+                [shutil.which("bash"), "-c", "set -Eeuo pipefail\nsleep() { :; }\n" + block + "\n" + tail],
                 text=True, capture_output=True, timeout=20,
-                env={"PATH": f"{directory}:/usr/bin:/bin", "CALLS": str(calls), **settings},
+                env={"PATH": str(directory), "CALLS": str(calls), **settings},
             )
             recorded = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
             return result, recorded
 
-    RECORD = '#!/usr/bin/env python3\nimport json, os, sys\nopen(os.environ["CALLS"], "a").write(json.dumps(sys.argv[1:]) + "\\n")\n'
+    RECORD = '#!' + sys.executable + '\nimport json, os, sys\nopen(os.environ["CALLS"], "a").write(json.dumps(sys.argv[1:]) + "\\n")\n'
 
     def test_a_failed_step_puts_its_line_and_command_in_the_build_status_tag(self):
         start, end = "INSTANCE_ID=unknown\n", "trap 'tag_failed \"$LINENO\" \"$BASH_COMMAND\"' ERR\n"
@@ -210,6 +229,54 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
         self.assertIn("BUILD FAILED at line", result.stdout)
         self.assertEqual(calls, [])
 
+    def test_the_lock_setting_covers_the_whole_build_and_leaves_the_image(self):
+        lines = self.user_data().splitlines()
+        conf = "/etc/apt/apt.conf.d/99-fcvm-builder-lock-wait"
+        where = lambda text: [i for i, line in enumerate(lines) if text in line and not line.lstrip().startswith("#")]
+        written, removed = where(f"> {conf}"), where(f"rm -f {conf}")
+        self.assertEqual((len(written), len(removed)), (1, 1))
+        self.assertEqual(lines[written[0]], f"echo 'DPkg::Lock::Timeout \"120\";' > {conf}")
+        apt_calls = where("apt_get ") + where("setup_22.x") + where("installdependencies.sh")
+        self.assertLess(written[0], min(apt_calls))
+        self.assertGreater(removed[0], max(apt_calls))
+        # the image is taken after the "complete" tag: the setting is gone by then
+        complete = where("Key=BuildStatus,Value=complete")
+        self.assertEqual(len(complete), 1)
+        self.assertLess(removed[0], complete[0])
+
+    def test_the_kernel_install_waits_for_the_dpkg_lock(self):
+        user_data = self.user_data()
+        begin = user_data.index("wait_for_dpkg_lock() {")
+        helper = user_data[begin:user_data.index("\nPY\n}\n", begin) + len("\nPY\n}\n")]
+        # it runs right before the step that calls dpkg directly
+        self.assertIn("\nwait_for_dpkg_lock\n./target/release/fcvm setup --kernel-profile nested "
+                      "--build-kernels --install-host-kernel\n", user_data)
+        hold = ("import fcntl, sys, time\nlock = open(sys.argv[1], 'a')\nfcntl.lockf(lock, fcntl.LOCK_EX)\n"
+                "print('held', flush=True)\ntime.sleep(float(sys.argv[2]))\n")
+        for held_for, wait, status in [(0, 5, 0), (3, 30, 0), (30, 3, 1)]:
+            with self.subTest(held_for=held_for, wait=wait), \
+                    tempfile.TemporaryDirectory(prefix="ami-dpkg-lock-test-") as temporary:
+                lock = Path(temporary) / "lock-frontend"
+                holder = subprocess.Popen([sys.executable, "-c", hold, str(lock), str(held_for)],
+                                          stdout=subprocess.PIPE, text=True)
+                try:
+                    self.assertEqual(holder.stdout.readline().strip(), "held")
+                    if held_for == 0:
+                        holder.wait(timeout=10)
+                    started = time.monotonic()
+                    result = subprocess.run(
+                        ["bash", "-c", helper + f"\nwait_for_dpkg_lock {shlex.quote(str(lock))} {wait}\n"],
+                        text=True, capture_output=True, timeout=60)
+                    waited = time.monotonic() - started
+                finally:
+                    holder.kill()
+                    holder.wait()
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                if held_for == 3:
+                    self.assertGreaterEqual(waited, 2)
+                if status == 1:
+                    self.assertIn("still held", result.stderr)
+
     def test_the_failure_handler_is_installed_before_anything_can_fail(self):
         lines = self.user_data().splitlines()
         trap = next(i for i, line in enumerate(lines) if line.startswith("trap 'tag_failed"))
@@ -224,7 +291,7 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
     def test_every_apt_call_waits_for_the_lock_and_is_retried(self):
         user_data = self.user_data()
         helper = user_data[user_data.index("apt_get() {"):user_data.index("\n}\n", user_data.index("apt_get() {"))]
-        self.assertIn('apt-get -o DPkg::Lock::Timeout=600 -o Acquire::Retries=5 "$@"', helper)
+        self.assertIn('apt-get -o DPkg::Lock::Timeout=120 -o Acquire::Retries=5 "$@"', helper)
         outside = user_data.replace(helper, "")
         bare = [line for line in outside.splitlines()
                 if re.search(r"(^|[\s;&|(])apt-get\s", line) and not line.lstrip().startswith("#")]
@@ -234,7 +301,7 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
     def test_the_apt_helper_runs_a_failed_call_again(self):
         flaky = ('#!/bin/bash\necho "$*" >> "$CALLS.args"\nn=$(wc -l < "$CALLS.args")\n'
                  '[ "$n" -gt "${FAILURES:-0}" ]\n')
-        for failures, status, attempts in [(0, 0, 1), (2, 0, 3), (99, 1, 6)]:
+        for failures, status, attempts in [(0, 0, 1), (2, 0, 3), (99, 1, 3)]:
             with self.subTest(failures=failures):
                 with tempfile.TemporaryDirectory(prefix="ami-apt-test-") as temporary:
                     directory = Path(temporary)
@@ -259,7 +326,7 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
                         self.assertRegex(result.stdout, r"(?m)^TAG line \d+: apt-get install -y unzip curl$")
                     args = (directory / "calls.args").read_text().splitlines()
                     self.assertEqual(len(args), attempts)
-                    self.assertEqual(set(args), {"-o DPkg::Lock::Timeout=600 -o Acquire::Retries=5 install -y unzip curl"})
+                    self.assertEqual(set(args), {"-o DPkg::Lock::Timeout=120 -o Acquire::Retries=5 install -y unzip curl"})
 
     def test_cache_never_returns_pending_or_failed_images(self):
         script = Path(__file__).with_name("build-ami.sh").read_text()
