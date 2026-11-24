@@ -142,14 +142,16 @@ struct FirecrackerLogErrors {
 }
 
 impl FirecrackerLogErrors {
-    /// Reads what was appended since the last call and returns the ERROR lines to repeat. A
-    /// line is returned once it is complete, and only the first [`REPEATED_FIRECRACKER_ERRORS`]
-    /// are; later ones are counted in `counted`. A file shorter than what was read is read again
-    /// from its start.
+    /// Reads what was appended since the last call and adds the ERROR lines to repeat to
+    /// `lines`. A line is added once it is complete, and only the first
+    /// [`REPEATED_FIRECRACKER_ERRORS`] are; later ones are counted in `counted`. A file shorter
+    /// than what was read is read again from its start. A read that fails part way still adds
+    /// the lines it read before the failure.
     fn read_new<F: std::io::Read + std::io::Seek>(
         &mut self,
         file: &mut F,
-    ) -> std::io::Result<Vec<String>> {
+        lines: &mut Vec<String>,
+    ) -> std::io::Result<()> {
         use std::io::{Read, SeekFrom};
         let len = file.seek(SeekFrom::End(0))?;
         if len < self.offset {
@@ -158,12 +160,13 @@ impl FirecrackerLogErrors {
         }
         file.seek(SeekFrom::Start(self.offset))?;
         let mut appended = Vec::new();
-        file.take(FIRECRACKER_LOG_READ_MAX)
-            .read_to_end(&mut appended)?;
+        // On a failure, read_to_end keeps in `appended` what it read before it.
+        let read = file
+            .take(FIRECRACKER_LOG_READ_MAX)
+            .read_to_end(&mut appended);
         self.last_read = appended.len() as u64;
         self.offset += self.last_read;
         self.partial.extend_from_slice(&appended);
-        let mut lines = Vec::new();
         let mut start = 0;
         while let Some(end) = self.partial[start..].iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.partial[start..start + end]);
@@ -182,24 +185,21 @@ impl FirecrackerLogErrors {
         if self.partial.len() > FIRECRACKER_LOG_LINE_MAX {
             self.partial.clear();
         }
-        Ok(lines)
+        read.map(|_| ())
     }
 
     /// [`Self::read_new`] until the end of the file, in reads of at most
     /// [`FIRECRACKER_LOG_READ_MAX`], for the last read when the VMM has stopped. A failed read
-    /// ends it, and the lines of the reads before it are still returned.
+    /// ends it, and the lines read before the failure stay in `lines`.
     fn read_rest<F: std::io::Read + std::io::Seek>(
         &mut self,
         file: &mut F,
-    ) -> (Vec<String>, std::io::Result<()>) {
-        let mut lines = Vec::new();
+        lines: &mut Vec<String>,
+    ) -> std::io::Result<()> {
         loop {
-            match self.read_new(file) {
-                Ok(more) => lines.extend(more),
-                Err(error) => return (lines, Err(error)),
-            }
+            self.read_new(file, lines)?;
             if self.last_read < FIRECRACKER_LOG_READ_MAX {
-                return (lines, Ok(()));
+                return Ok(());
             }
         }
     }
@@ -227,6 +227,42 @@ fn clear_log_before_launch(path: &Path) -> Result<()> {
         .open(path)
         .and_then(|file| file.set_len(0))
         .with_context(|| format!("emptying {} before launching Firecracker", path.display()))
+}
+
+/// Opens the log `path` names for reading, or `None` while it does not exist. It is opened
+/// non-blocking and its type is read from the open descriptor, so a FIFO with no writer cannot
+/// block the caller (on the last poll, the thread stopping the VM), whatever replaced the file.
+/// Anything but a regular file is an error.
+fn open_regular_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(Some(file))
+}
+
+/// The messages for one read of Firecracker's log: each ERROR line it found, then, if the read
+/// failed, that the log cannot be read.
+fn read_messages(lines: Vec<String>, read: std::io::Result<()>) -> Vec<String> {
+    let mut messages: Vec<String> = lines
+        .into_iter()
+        .map(|line| format!("Firecracker logged an error: {line}"))
+        .collect();
+    if let Err(error) = read {
+        messages.push(format!(
+            "cannot read Firecracker's log ({error}), so its errors are no longer repeated here"
+        ));
+    }
+    messages
 }
 
 /// Repeats Firecracker's ERROR lines in fcvm's log while the VMM runs, under fcvm's own target,
@@ -265,34 +301,26 @@ impl FirecrackerLogFollower {
             return messages;
         }
         self.stopped = last;
-        // Only a regular file is opened: opening a FIFO with no writer would block this caller,
-        // which on the last poll is the thread stopping the VM.
         if !self.failed && self.file.is_none() {
-            self.file = std::fs::metadata(&self.path)
-                .is_ok_and(|meta| meta.is_file())
-                .then(|| std::fs::File::open(&self.path).ok())
-                .flatten();
+            match open_regular_file(&self.path) {
+                Ok(file) => self.file = file,
+                Err(error) => {
+                    self.failed = true;
+                    messages.push(format!(
+                        "cannot read Firecracker's log ({error}), so its errors are not repeated here"
+                    ));
+                }
+            }
         }
         if let (false, Some(file)) = (self.failed, self.file.as_mut()) {
-            let (lines, read) = if last {
-                self.errors.read_rest(file)
+            let mut lines = Vec::new();
+            let read = if last {
+                self.errors.read_rest(file, &mut lines)
             } else {
-                match self.errors.read_new(file) {
-                    Ok(lines) => (lines, Ok(())),
-                    Err(error) => (Vec::new(), Err(error)),
-                }
+                self.errors.read_new(file, &mut lines)
             };
-            messages.extend(
-                lines
-                    .into_iter()
-                    .map(|line| format!("Firecracker logged an error: {line}")),
-            );
-            if let Err(error) = read {
-                self.failed = true;
-                messages.push(format!(
-                    "cannot read Firecracker's log ({error}), so its errors are no longer repeated here"
-                ));
-            }
+            self.failed = read.is_err();
+            messages.extend(read_messages(lines, read));
         }
         if last && self.errors.counted > 0 {
             messages.push(format!(
@@ -1026,6 +1054,16 @@ mod tests {
     const BLOCK_ENOSPC: &str = "2026-11-23T00:09:21.211902195 [anonymous-instance:main:ERROR:src/vmm/src/devices/virtio/block/virtio/request.rs:121] Failed to execute Out virtio block request: FileEngine(Sync(Transfer(IOError(Os { code: 28, kind: StorageFull, message: \"No space left on device\" }))))";
     const INFO_LINE: &str = "2026-11-23T00:04:33.374854932 [anonymous-instance:main:INFO:src/vmm/src/devices/virtio/device.rs:228] [Block:rootfs] notifying queues";
 
+    /// The lines one [`FirecrackerLogErrors::read_new`] adds, for a read that must succeed.
+    fn read_new_lines<F: std::io::Read + std::io::Seek>(
+        errors: &mut FirecrackerLogErrors,
+        file: &mut F,
+    ) -> Vec<String> {
+        let mut lines = Vec::new();
+        errors.read_new(file, &mut lines).unwrap();
+        lines
+    }
+
     #[test]
     fn firecracker_error_lines_are_picked_by_their_level() {
         assert!(is_firecracker_error_line(BLOCK_ENOSPC));
@@ -1043,14 +1081,14 @@ mod tests {
         let mut errors = FirecrackerLogErrors::default();
         file.get_mut()
             .extend_from_slice(format!("{INFO_LINE}\n{}", &BLOCK_ENOSPC[..40]).as_bytes());
-        assert!(errors.read_new(&mut file).unwrap().is_empty());
+        assert!(read_new_lines(&mut errors, &mut file).is_empty());
         file.get_mut()
             .extend_from_slice(format!("{}\n{INFO_LINE}\n", &BLOCK_ENOSPC[40..]).as_bytes());
         assert_eq!(
-            errors.read_new(&mut file).unwrap(),
+            read_new_lines(&mut errors, &mut file),
             vec![BLOCK_ENOSPC.to_string()]
         );
-        assert!(errors.read_new(&mut file).unwrap().is_empty());
+        assert!(read_new_lines(&mut errors, &mut file).is_empty());
     }
 
     #[test]
@@ -1061,7 +1099,7 @@ mod tests {
         let mut file = std::io::Cursor::new(lines.into_bytes());
         let mut errors = FirecrackerLogErrors::default();
         assert_eq!(
-            errors.read_new(&mut file).unwrap().len(),
+            read_new_lines(&mut errors, &mut file).len(),
             REPEATED_FIRECRACKER_ERRORS
         );
         assert_eq!(errors.counted, 5);
@@ -1097,9 +1135,36 @@ mod tests {
             fail_at: FIRECRACKER_LOG_READ_MAX,
         };
         let mut errors = FirecrackerLogErrors::default();
-        let (lines, read) = errors.read_rest(&mut file);
+        let mut lines = Vec::new();
+        let read = errors.read_rest(&mut file, &mut lines);
         assert_eq!(lines, vec![BLOCK_ENOSPC.to_string()]);
         assert!(read.is_err());
+    }
+
+    #[test]
+    fn read_rest_keeps_the_errors_read_inside_the_piece_that_fails() {
+        let head = format!("{BLOCK_ENOSPC}\n");
+        let mut file = FailingLog {
+            inner: std::io::Cursor::new(format!("{head}{INFO_LINE}\n").into_bytes()),
+            fail_at: head.len() as u64,
+        };
+        let mut errors = FirecrackerLogErrors::default();
+        let mut lines = Vec::new();
+        let read = errors.read_rest(&mut file, &mut lines);
+        assert_eq!(lines, vec![BLOCK_ENOSPC.to_string()]);
+        assert!(read.is_err());
+    }
+
+    #[test]
+    fn the_follower_says_once_when_its_log_is_not_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::create_dir(&path).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path, "vm-test".to_string());
+        let first = follower.poll(false);
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].contains("not a regular file"), "{first:?}");
+        assert!(follower.poll(true).is_empty());
     }
 
     #[test]
@@ -1120,10 +1185,23 @@ mod tests {
                 .custom_flags(libc::O_NONBLOCK)
                 .open(&path);
         }
-        assert_eq!(
-            result.expect("polling a FIFO with no writer blocked"),
-            Vec::<String>::new()
+        let messages = result.expect("polling a FIFO with no writer blocked");
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(messages[0].contains("not a regular file"), "{messages:?}");
+    }
+
+    #[test]
+    fn a_failed_read_reports_its_errors_before_the_failure() {
+        let messages = read_messages(
+            vec![BLOCK_ENOSPC.to_string()],
+            Err(std::io::Error::other("injected read failure")),
         );
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(
+            messages[0],
+            format!("Firecracker logged an error: {BLOCK_ENOSPC}")
+        );
+        assert!(messages[1].starts_with("cannot read Firecracker's log (injected read failure)"));
     }
 
     #[test]
@@ -1144,11 +1222,11 @@ mod tests {
     fn firecracker_log_errors_read_rest_reads_a_log_that_shrank_from_its_start() {
         let mut file = std::io::Cursor::new(format!("{INFO_LINE}\n{INFO_LINE}\n").into_bytes());
         let mut errors = FirecrackerLogErrors::default();
-        assert!(errors.read_new(&mut file).unwrap().is_empty());
+        assert!(read_new_lines(&mut errors, &mut file).is_empty());
         let short = "t [i:main:ERROR:f.rs:1] x";
         *file.get_mut() = format!("{short}\n").into_bytes();
-        let (lines, read) = errors.read_rest(&mut file);
-        read.unwrap();
+        let mut lines = Vec::new();
+        errors.read_rest(&mut file, &mut lines).unwrap();
         assert_eq!(lines, vec![short.to_string()]);
     }
 
@@ -1199,7 +1277,10 @@ mod tests {
         std::io::Write::write_all(&mut log, format!("{short}\n").as_bytes()).unwrap();
         let mut errors = FirecrackerLogErrors::default();
         let mut file = std::fs::File::open(&path).unwrap();
-        assert_eq!(errors.read_new(&mut file).unwrap(), vec![short.to_string()]);
+        assert_eq!(
+            read_new_lines(&mut errors, &mut file),
+            vec![short.to_string()]
+        );
         clear_log_before_launch(&dir.path().join("missing.log")).unwrap();
         assert!(!dir.path().join("missing.log").exists());
     }
@@ -1229,12 +1310,15 @@ mod tests {
     fn firecracker_log_errors_reads_a_truncated_log_from_its_start() {
         let mut file = std::io::Cursor::new(format!("{INFO_LINE}\n{INFO_LINE}\n").into_bytes());
         let mut errors = FirecrackerLogErrors::default();
-        assert!(errors.read_new(&mut file).unwrap().is_empty());
+        assert!(read_new_lines(&mut errors, &mut file).is_empty());
         let short = "t [i:main:ERROR:f.rs:1] x";
         assert!(short.len() + 1 < 2 * (INFO_LINE.len() + 1));
         *file.get_mut() = format!("{short}\n").into_bytes();
         file.set_position(0);
-        assert_eq!(errors.read_new(&mut file).unwrap(), vec![short.to_string()]);
+        assert_eq!(
+            read_new_lines(&mut errors, &mut file),
+            vec![short.to_string()]
+        );
     }
 
     #[derive(Clone, Copy)]
