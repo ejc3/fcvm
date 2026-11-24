@@ -456,6 +456,41 @@ fn test_rename_exchange_swaps_two_names() {
     cleanup(&data_dir, &mount_dir);
 }
 
+/// A file is synced, renamed into place and its directory synced, through the mount. fcvm
+/// writes its state directory's layout marker that way (`write_layout_marker` in
+/// src/state/manager.rs), once per store, and a nested guest reaches the store through this
+/// filesystem: a directory fsync that failed here would fail the first fcvm command there.
+#[test]
+fn test_fsync_of_a_file_and_of_its_directory() {
+    use std::io::Write;
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
+    let mount = fuse.mount_path();
+
+    let state = mount.join("state");
+    fs::create_dir(&state).expect("mkdir");
+    let temp = state.join(".index-staging.layout.1");
+    let mut file = fs::File::create(&temp).expect("create the temporary");
+    file.write_all(b"2\n").expect("write");
+    file.sync_all().expect("fsync of the temporary");
+    drop(file);
+    fs::rename(&temp, state.join("layout")).expect("rename into place");
+    fs::File::open(&state)
+        .expect("open the directory")
+        .sync_all()
+        .expect("fsync of the directory");
+    assert_eq!(fs::read_to_string(state.join("layout")).unwrap(), "2\n");
+    assert_eq!(
+        fs::read_to_string(data_dir.join("state/layout")).unwrap(),
+        "2\n",
+        "on the host side"
+    );
+
+    let _ = fs::remove_dir_all(&state);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
 #[test]
 fn test_lseek_supports_negative_offsets() {
     common::increase_ulimit();
