@@ -94,7 +94,10 @@ reached 6.18.60. `every_host_kernel_pins_a_release_without_the_bridge_rcu_barrie
 fails if a host kernel pins an earlier release.
 `scripts/check-bridge-teardown-kernel.sh` applies the same rule to a `uname -r` release.
 Both runner images (`scripts/build-ami.sh`, arm64 and x64) install the host kernel of their
-architecture and run that check on the release they will boot. The x64 runners ran a stock
+architecture and run that check on the release GRUB will boot (`scripts/grub-boot-kernel.sh`).
+The image is then created as a candidate no launcher selects, one bare-metal instance boots
+from it and runs the check on its running kernel, and only an image that passes is tagged
+`Purpose=github-runner`. The x64 runners ran a stock
 6.14 kernel before the x64 image existed: on 2026-11-24 one of them stalled every network
 operation for 6.6 s and 5.9 s while namespaces died, and nine tests lost their namespace
 holder at its 5 s readiness deadline.

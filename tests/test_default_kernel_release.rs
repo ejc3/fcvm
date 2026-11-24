@@ -2657,6 +2657,7 @@ fn the_bridge_teardown_kernel_check_accepts_only_releases_with_the_fix() {
     };
     for release in [
         "6.18.60",
+        "6.18.60+",
         "6.18.61-fcvm-0123456789ab",
         "7.2.0",
         "7.3.3-fcvm-0123456789ab",
@@ -2671,13 +2672,21 @@ fn the_bridge_teardown_kernel_check_accepts_only_releases_with_the_fix() {
         "7.0.0-1013-aws",
         "7.0.0-1018-aws",
         "7.1.12",
-        "6.18",
         "unknown",
+        // not what `uname -r` prints: two components, four, leading zeros, a number that
+        // runs into its suffix
+        "6.18",
+        "7.2",
+        "6.18.60.1",
+        "06.18.060",
+        "7.3.3fcvm",
+        // an empty argument is not "no argument": it must not fall back to the running kernel
+        "",
     ] {
         let (status, message) = verdict(&[release]);
-        assert_eq!(status, Some(1), "{release} must fail");
+        assert_eq!(status, Some(1), "'{release}' must fail");
         assert!(
-            message.contains(&format!("kernel {release} lacks")),
+            message.contains(&format!("kernel '{release}' lacks")),
             "the failure must name the kernel: {message}"
         );
     }
@@ -2686,6 +2695,8 @@ fn the_bridge_teardown_kernel_check_accepts_only_releases_with_the_fix() {
     assert_eq!(verdict(&[backport, "7.0.0-1016-aws"]).0, Some(1));
     assert_eq!(verdict(&[backport, "7.0.0-1018-generic"]).0, Some(1));
     assert_eq!(verdict(&[backport, "6.18.59"]).0, Some(1));
+    assert_eq!(verdict(&[backport, "7.0.0-01017-aws"]).0, Some(1));
+    assert_eq!(verdict(&[backport, ""]).0, Some(1));
 
     let ami = std::fs::read_to_string(root.join("scripts/build-ami.sh")).unwrap();
     let install = ami
