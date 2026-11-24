@@ -1195,6 +1195,9 @@ async fn supervise(
             let _ = old.await;
         }
     }
+    // A task this one replaces may have reported after `assign` took its entry away (or been
+    // aborted above): nothing of it is on the board when this server starts its own reports.
+    ctx.board.lock().unwrap().remove(&ctx.index);
     let mut live: Option<Live> = None;
     // The generation whose fork failed once: its next attempt restores the gold snapshot.
     let mut fork_failed: Option<u64> = None;
@@ -1318,6 +1321,10 @@ async fn supervise(
     if let Some(mut l) = live.take() {
         ctx.stop(&mut l).await;
     }
+    // No longer supervised: a launch that was in flight when `assign` took the entry away
+    // reported after it, and the status rows must say nothing of a server that is gone. A
+    // replacement at this index reports only after this task has ended.
+    ctx.board.lock().unwrap().remove(&ctx.index);
 }
 
 /// The image's id and the servers' name from its labels (`podman image inspect`).
@@ -1549,6 +1556,28 @@ mod tests {
             .up(),
             "a tile that names no bots"
         );
+    }
+
+    /// A retired server's task can report after `assign` took its entry off the board (its
+    /// launch's last report and the removal can fall in one poll of its `select!`), and a task
+    /// its replacement aborts never reaches its own end: the status rows would go on calling a
+    /// stopped server running. `supervise` clears the entry at both ends. The interleaving has
+    /// no deterministic runtime test, so the two places are pinned in the source.
+    #[test]
+    fn supervise_clears_its_board_entry_at_both_ends() {
+        let src = include_str!("minecraft.rs");
+        let body = &src[src.find("async fn supervise(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let clear = "ctx.board.lock().unwrap().remove(&ctx.index);";
+        let first = body.find(clear).expect("cleared before its own reports");
+        let last = body.rfind(clear).unwrap();
+        assert!(first < last, "cleared at both ends");
+        // before any report of its own, once the tasks it replaces have ended
+        assert!(body.find("let _ = old.await;").unwrap() < first);
+        assert!(first < body.find("ctx.report(").unwrap());
+        // and last of all, after its VM is stopped
+        assert!(body.rfind("ctx.stop(&mut l).await;").unwrap() < last);
+        assert_eq!(body[last + clear.len()..].trim(), "");
     }
 
     #[test]
