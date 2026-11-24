@@ -679,6 +679,7 @@ mod confine_tests {
             no_seccomp: false,
             firecracker_args: None,
             core_pattern: Some("core".to_string()),
+            core_hard_limit: u64::MAX,
         }
     }
 

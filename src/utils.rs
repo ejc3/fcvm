@@ -1030,12 +1030,14 @@ pub fn install_namespace_pre_exec(
             "confining the VMM of {} needs it to enter a user namespace (rootless mode)",
             ns.vm_id
         );
-        Some(
+        Some((
             ns.tap_owner
                 .as_deref()
                 .map(crate::confine::TapName::new)
                 .transpose()?,
-        )
+            // Read before the fork: the child cannot raise the hard limit it inherits.
+            crate::confine::core_limit_for(crate::confine::core_hard_limit()),
+        ))
     } else {
         None
     };
@@ -1318,7 +1320,7 @@ pub fn install_namespace_pre_exec(
         }
     }
 
-    if let Some(tap) = confined_tap {
+    if let Some((tap, core_limit)) = confined_tap {
         // After the namespace step, which needs the capabilities this drops, and before
         // PR_SET_PDEATHSIG, which stays last. The TAP is owned while CAP_NET_ADMIN is held.
         // SAFETY: own_tap and apply_process_layer make raw syscalls only and do not
@@ -1328,7 +1330,7 @@ pub fn install_namespace_pre_exec(
                 if let Some(tap) = &tap {
                     crate::confine::own_tap(tap)?;
                 }
-                crate::confine::apply_process_layer()
+                crate::confine::apply_process_layer(core_limit)
             });
         }
     }

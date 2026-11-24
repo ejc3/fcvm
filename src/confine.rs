@@ -216,6 +216,9 @@ pub struct Host {
     pub firecracker_args: Option<String>,
     /// `/proc/sys/kernel/core_pattern`, or `None` when it cannot be read.
     pub core_pattern: Option<String>,
+    /// This process's hard RLIMIT_CORE, which the VMM inherits: an unprivileged process
+    /// cannot raise it.
+    pub core_hard_limit: u64,
 }
 
 /// The host's mode: the config's, tightened by `FCVM_CONFINE`.
@@ -256,6 +259,7 @@ impl Host {
             core_pattern: std::fs::read_to_string("/proc/sys/kernel/core_pattern")
                 .ok()
                 .map(|p| p.trim_end().to_string()),
+            core_hard_limit: core_hard_limit(),
             strace_fc: std::env::var_os("FCVM_STRACE_FC").is_some(),
             no_seccomp: std::env::var_os("FCVM_NO_SECCOMP").is_some(),
             firecracker_args: std::env::var("FCVM_FIRECRACKER_ARGS").ok(),
@@ -352,6 +356,15 @@ pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
     // The process layer sets RLIMIT_CORE to 1, which the kernel takes as "no dump" for a file
     // or a pipe core_pattern (fs/coredump.c). A socket core_pattern ("@...") ignores it.
     match host.core_pattern.as_deref() {
+        // A pipe ignores a core limit of 0; only 1 stops it, and an inherited hard limit
+        // of 0 cannot be raised to 1 without CAP_SYS_RESOURCE.
+        Some(pattern) if pattern.starts_with('|') && host.core_hard_limit < 1 => add(
+            Mechanism::Process,
+            format!(
+                "the host's core_pattern ({pattern}) pipes core dumps, which only a core limit \
+                 of 1 stops, and this process's hard core limit is 0, which it cannot raise"
+            ),
+        ),
         Some(pattern) if !pattern.starts_with('@') => {}
         Some(pattern) => add(
             Mechanism::Process,
@@ -368,6 +381,30 @@ pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
         ),
     }
     missing
+}
+
+/// This process's hard RLIMIT_CORE.
+pub(crate) fn core_hard_limit() -> u64 {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes the struct, which outlives the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut limit) } != 0 {
+        return 0;
+    }
+    limit.rlim_max
+}
+
+/// The core limit the process layer sets, given the inherited hard limit: 1, which the
+/// kernel takes as "no dump" for a pipe as well as a file, unless the hard limit is already
+/// 0, which cannot be raised and stops a file dump (a pipe one is refused in the preflight).
+pub(crate) fn core_limit_for(hard: u64) -> libc::rlim_t {
+    if hard >= 1 {
+        1
+    } else {
+        0
+    }
 }
 
 /// What in the extra Firecracker arguments `args` confinement refuses: the options that
@@ -508,7 +545,7 @@ pub(crate) fn own_tap(name: &TapName) -> std::io::Result<()> {
 ///
 /// Async-signal-safe: raw syscalls only, no allocation. No step changes a uid, gid or
 /// fsuid or raises a capability, so none clears the parent-death signal.
-pub(crate) fn apply_process_layer() -> std::io::Result<()> {
+pub(crate) fn apply_process_layer(core_limit: libc::rlim_t) -> std::io::Result<()> {
     // securebits (linux/securebits.h): NOROOT, NO_SETUID_FIXUP and NO_CAP_AMBIENT_RAISE on,
     // KEEP_CAPS off, all four locked. With NOROOT the exec as namespace uid 0 grants no
     // capabilities.
@@ -544,8 +581,8 @@ pub(crate) fn apply_process_layer() -> std::io::Result<()> {
     // where it ignores any other limit (fs/coredump.c, coredump_pipe); a file dump needs at
     // least a page.
     let no_core = libc::rlimit {
-        rlim_cur: 1,
-        rlim_max: 1,
+        rlim_cur: core_limit,
+        rlim_max: core_limit,
     };
     // SAFETY: setrlimit reads the struct, which outlives the call.
     check(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) })?;
@@ -610,6 +647,7 @@ mod tests {
             no_seccomp: false,
             firecracker_args: None,
             core_pattern: Some("core".to_string()),
+            core_hard_limit: u64::MAX,
         }
     }
 
@@ -682,6 +720,7 @@ mod tests {
             no_seccomp: true,
             firecracker_args: Some("--seccomp-filter /x.bpf".to_string()),
             core_pattern: Some("|/usr/lib/systemd/systemd-coredump %P".to_string()),
+            core_hard_limit: u64::MAX,
         };
         let mechanisms: Vec<Mechanism> = missing(&request, &host)
             .iter()
@@ -809,6 +848,27 @@ mod tests {
                 "{pattern}"
             );
         }
+    }
+
+    /// An inherited hard core limit of 0 cannot become 1: a pipe core_pattern then refuses
+    /// confinement up front, and a file one keeps the 0, which stops a file dump.
+    #[test]
+    fn an_inherited_zero_core_limit_is_kept_for_files_and_refused_for_pipes() {
+        let pipe = Host {
+            core_pattern: Some("|/usr/lib/systemd/systemd-coredump %P".to_string()),
+            core_hard_limit: 0,
+            ..host(Ok(11))
+        };
+        let error = decide(&request(true), &pipe).unwrap_err().to_string();
+        assert!(error.contains("hard core limit is 0"), "{error}");
+        let file = Host {
+            core_hard_limit: 0,
+            ..host(Ok(11))
+        };
+        assert!(decide(&request(true), &file).unwrap().is_some());
+        assert_eq!(core_limit_for(0), 0);
+        assert_eq!(core_limit_for(1), 1);
+        assert_eq!(core_limit_for(u64::MAX), 1);
     }
 
     /// The TUNSETIFF calls pass a mutable ifreq: the kernel writes it back.
