@@ -34,6 +34,8 @@ import {
   showsAbove,
   skyOf,
   viewProj,
+  VIEW_FAR,
+  wideCam,
   type McScene,
   type ScenePlayer,
 } from "../minecraft3d.ts";
@@ -61,6 +63,30 @@ const col = (s: McScene, x: number, z: number) => insts(s.tops).find((q) => q[0]
 const canopies = (s: McScene) => insts(s.tops).filter((q) => (q[5]! & FLAG_CANOPY) !== 0);
 const boxes = (s: McScene) => Array.from({ length: s.boxCount }, (_, k) => [...s.boxes.slice(k * BOX_FLOATS, (k + 1) * BOX_FLOATS)]);
 const bot = (x: number, z: number, y: number, yaw = 0, over: Partial<ScenePlayer> = {}): ScenePlayer => ({ name: "fcvm_bot1", x, y, z, yaw, bot: true, driven: false, ...over });
+
+describe("the wide view", () => {
+  it("keeps the middle of the world inside the fog and the far plane for every size a tile sends", () => {
+    // a tile's region is 32 to 512 blocks a side (mctile clamps it); the default is 128
+    for (const side of [32, 128, 256, 352, 448, 512]) {
+      const s = sceneOf(world({}, side), null);
+      for (const az of [0, 0.7, 2.6]) {
+        const cam = wideCam(s, az);
+        const d = Math.hypot(cam.eye[0] - cam.target[0], cam.eye[1] - cam.target[1], cam.eye[2] - cam.target[2]);
+        expect(d, `side ${side}`).toBeLessThan(cam.fog[1] - 60);
+        expect(d, `side ${side}`).toBeLessThan(VIEW_FAR);
+      }
+    }
+    // up to 256 a side the camera stands where it did: outside the region, 0.92 of its side from the middle
+    const cam = wideCam(sceneOf(world({}, 128), null), 0);
+    expect([cam.eye[0], cam.eye[2]]).toEqual([64 + 128 * 0.92, 64]);
+    // in a larger world it stands inside, and never under the ground there
+    const hill: Record<string, [number, number]> = {};
+    for (let x = 480; x < 512; x++) for (let z = 240; z < 272; z++) hill[`${x},${z}`] = [M("stone"), 250];
+    const high = wideCam(sceneOf(world(hill, 512), null), 0);
+    expect(high.eye[0]).toBe(256 + 240);
+    expect(high.eye[1]).toBeGreaterThan(250);
+  });
+});
 
 describe("a world as columns", () => {
   it("gives every column its material, its height and a base at its lowest neighbour", () => {

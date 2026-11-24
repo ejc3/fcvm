@@ -244,7 +244,7 @@ class TileSocket {
           // a fork's count of differing columns moves with either world
           this.owner.changed();
           const r = this.world!.region;
-          const columns = m.cells.map(([i]) => ({ x: r.x0 + (i % r.w), z: r.z0 + Math.floor(i / r.w) }));
+          const columns = [...changed].map((i) => ({ x: r.x0 + (i % r.w), z: r.z0 + Math.floor(i / r.w) }));
           this.owner.events?.delta(this.id, at, columns);
         }
         return;

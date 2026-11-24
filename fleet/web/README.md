@@ -155,7 +155,10 @@ Q then drive its first bot over the tile's socket (on-screen buttons on a touch 
 panel shows the time from a key to the first change it made. Escape or Give back returns it. The
 mock has none unless `FLEET_MOCK_MINECRAFT=<n>` is set, with `FLEET_MOCK_MINECRAFT_PORT` for the
 view sockets (`<block+3>` in `.env.ports`); the other `FLEET_MOCK_MINECRAFT_*` knobs are listed
-at the top of `mock/main.ts`.
+at the top of `mock/main.ts`. With more than 16 servers the snapshot lists the first 16 as tiles
+and names every server in `minecraft.field`, and the page draws the field: every server a cell,
+six of them in 3D tiles. `POST /mock/minecraft {"servers": 512, "per_host": 512}` runs that many
+in place of the ones there, and `{"status_off": true}` stops the hosts' status rows.
 
 `/?mode=potato` shows the hot potato game (PROTOCOL.md, "Potato mode"): a ring of CPU-only
 player VMs, each drawn in its colour, bright while awake, dim while asleep and with a bar while it

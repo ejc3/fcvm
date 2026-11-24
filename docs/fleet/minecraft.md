@@ -199,6 +199,38 @@ guard; pure and unit-tested) and `fleet/web/app/_wall/minecraft-gl.ts` and `mine
   and the source's world in. Otherwise, and when the copy fails, the tile keeps its own timer or
   error.
 
+### A field of servers
+
+A snapshot that carries `minecraft.field` (PROTOCOL.md, "Many servers: the field and the status
+rows") names more servers than the page can draw. The page then shows two things side by side
+(the field above the tiles on a phone):
+
+- **The field:** every server a cell on one canvas, with no element per cell, coloured by what
+  its host's last status row says: running at 19.5 TPS or more, running slower, restoring,
+  forking, failed. A server whose host has sent no row, or none for 5 s, is an outline: not
+  reported, never zero and never running. Hovering, tapping or the arrow keys give one cell's
+  line: its state, TPS, players, time since its restore and how long the restore took. A cell
+  is lighter for the first minute after its server's restore. The cells shrink to 9 px to fit;
+  under that the field scrolls.
+- **Six 3D tiles**, each a real view socket to one server. They cut to other running servers
+  every 12 s; a click or Enter on a cell brings that server into the first tile for a minute.
+  Only the six servers in tiles, and any lent one, have a socket and a world on the GPU.
+- **The headline** counts the servers and their states from the rows, and gives servers per busy
+  CPU and per GiB in use from the hosts' own readings (`busy`, `mem_used_mib`). With a host
+  silent, or a reading absent, that part is not shown.
+- **Reset all** is counted as it comes back: "Reset all: 212 of 512 back · 31.8 a second ·
+  6.7 s", then the whole time once every server the reset was sent to is back. A reset is over
+  then, or 180 s after its click (`WAVE_END_S`), whichever comes first: a reset that ends short
+  reads "509 of 512 back after 36 s". Before its end, with nothing being restored and none back
+  for 10 s the count reads as stopped, and runs again if more come back. The line goes a minute
+  after the reset is over. The count and the time are the coordinator's when the snapshot's
+  `last_reset_all` carries them (`back`, `took_ms`), and otherwise read from the rows, which do
+  not say which servers a reset was sent to. A cell flashes when its server returns.
+
+The page asks for the rows by sending `"minecraft": true` with its visibility; the other pages do
+not get them. The field's canvas is painted only when a cell, the cursor or the tiles change, or
+while a flash runs.
+
 ### Invariants (each becomes a test)
 
 1. Only the viewer the scene names as driver can move a bot; every other socket's drive is

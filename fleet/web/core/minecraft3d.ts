@@ -521,11 +521,20 @@ export function orbitCam(s: McScene, p: { x: number; z: number }, o: { az: numbe
   return { eye, target: [p.x, gy + (o.look ?? 2), p.z], fov: 0.9, fog: [60, 170], nearCut: r * 0.6, subject: [p.x, gy, p.z], subCut: o.cut ?? 8 };
 }
 
-/** The whole region from outside it. */
+/** The wide view's eye is never further than this from the middle of the world, blocks along the ground. */
+export const WIDE_MAX_R = 240;
+
+/**
+ * The whole region from outside it. A region over 260 blocks a side is seen from inside it: its
+ * middle must stay within the fog (which ends 330 blocks from the eye) and the far plane, and
+ * the eye above the ground it then stands over.
+ */
 export function wideCam(s: McScene, az: number): McCamera {
-  const r = Math.max(s.w, s.h) * 0.92;
+  const r = Math.min(Math.max(s.w, s.h) * 0.92, WIDE_MAX_R);
   const mid = groundAt(s, s.w / 2, s.h / 2);
-  return { eye: [s.w / 2 + Math.cos(az) * r, mid + 64, s.h / 2 + Math.sin(az) * r], target: [s.w / 2, mid + 2, s.h / 2], fov: 0.72, fog: [150, 330], nearCut: 0, subject: [0, 0, 0], subCut: 0 };
+  const eye: McVec3 = [s.w / 2 + Math.cos(az) * r, mid + 64, s.h / 2 + Math.sin(az) * r];
+  if (eye[0] >= 0 && eye[0] < s.w && eye[2] >= 0 && eye[2] < s.h) keepAbove(s, eye, 2.5);
+  return { eye, target: [s.w / 2, mid + 2, s.h / 2], fov: 0.72, fog: [150, 330], nearCut: 0, subject: [0, 0, 0], subCut: 0 };
 }
 
 export interface ShotInput {
@@ -610,10 +619,13 @@ const unit = (a: McVec3): McVec3 => {
   return [a[0] / l, a[1] / l, a[2] / l];
 };
 
+/** The far plane of every camera, blocks from the eye. */
+export const VIEW_FAR = 420;
+
 /** View times projection for `cam` on a rectangle of `aspect` (width over height). */
 export function viewProj(cam: McCamera, aspect: number): Float32Array {
   const near = 0.4;
-  const far = 420;
+  const far = VIEW_FAR;
   const f = 1 / Math.tan(cam.fov / 2);
   const fw = unit(sub(cam.target, cam.eye));
   const sd = unit(cross(fw, [0, 1, 0]));

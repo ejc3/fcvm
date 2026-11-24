@@ -56,6 +56,41 @@ export interface MockMinecraftOptions {
   publicHostV4?: string;
   /** With a zone, every server's `join` is `mc-<n>.<zone>`; without, null (a `ws://` frame URL). */
   joinZone?: string | null;
+  /** Servers on each host (8 unless said): one host holds hundreds when a test asks. */
+  perHost?: number;
+}
+
+/** With more servers than this the snapshot lists the first this many and every lent one as tiles, and names all in `field` (fleet_core::minecraft::TILES_LISTED). */
+export const TILES_LISTED = 16;
+/** A reset of many servers brings this many back a second: the mock's stand-in for a host's restore rate. */
+const RESTORES_PER_SEC = 32;
+
+/** The key a page knows a host by: 12 hex digits of a hash of its name (fleet_core::minecraft::host_key). */
+export function hostKey(name: string): string {
+  let h = 0xcbf29ce484222325n;
+  for (const b of Buffer.from(name)) h = ((h ^ BigInt(b)) * 0x100000001b3n) & 0xffffffffffffffffn;
+  return (h & 0xffffffffffffn).toString(16).padStart(12, "0");
+}
+
+/** URLs as what they share and what they do not (fleet_core::minecraft::squeeze). */
+export function squeeze(urls: readonly (string | null)[]): { prefix: string; suffix: string; names: (string | null)[] } {
+  const some = urls.filter((u): u is string => u !== null);
+  if (some.length === 0) return { prefix: "", suffix: "", names: urls.map(() => null) };
+  const first = some[0]!;
+  let pre = first.length;
+  let suf = first.length;
+  for (const u of some.slice(1)) {
+    let a = 0;
+    while (a < pre && a < u.length && first[a] === u[a]) a++;
+    pre = a;
+    let b = 0;
+    while (b < suf && b < u.length && first[first.length - 1 - b] === u[u.length - 1 - b]) b++;
+    suf = b;
+  }
+  const shortest = Math.min(...some.map((u) => u.length));
+  pre = Math.min(pre, shortest);
+  suf = Math.min(suf, shortest - pre);
+  return { prefix: first.slice(0, pre), suffix: first.slice(first.length - suf), names: urls.map((u) => (u === null ? null : u.slice(pre, u.length - suf))) };
 }
 
 export interface MinecraftHost {
@@ -243,7 +278,7 @@ const { cells: GOLD, ground: GOLD_GROUND } = goldLayers();
 const INTENTS = new Set(["minecraft_reset", "minecraft_fork", "claim_minecraft", "release_minecraft"]);
 
 export class MockMinecraft {
-  readonly opts: MockMinecraftOptions;
+  opts: MockMinecraftOptions;
   private servers: Server[] = [];
   private host: MinecraftHost;
   private claims = 0;
@@ -251,11 +286,12 @@ export class MockMinecraft {
   private lastReset = new Map<string, number>();
   private lastResetAll = new Map<string, number>();
   private lastForkBy = new Map<string, number>();
-  private resetAll: { clicked_at: number; by: string; servers: number } | null = null;
+  /** The last reset of every server, with the coordinator's own count of its servers back and the time to the last. */
+  private resetAll: { clicked_at: number; by: string; servers: number; back: number; took_ms?: number } | null = null;
   private lastFork: Record<string, unknown> | null = null;
   readonly intents: RecordedMinecraftIntent[] = [];
   readonly drives: RecordedDrive[] = [];
-  readonly aspect: number;
+  aspect: number;
   private http: http.Server;
   private wss: WebSocketServer;
   private tickTimer: NodeJS.Timeout | null = null;
@@ -265,36 +301,8 @@ export class MockMinecraft {
   constructor(opts: MockMinecraftOptions, host: MinecraftHost, epochNow: number) {
     this.opts = opts;
     this.host = host;
-    const g = minecraftGrid(opts.count);
-    this.aspect = g.aspect;
-    for (let i = 0; i < opts.count; i++) {
-      const n = i + 1;
-      const total = 1700 + n * 110;
-      const s: Server = {
-        n,
-        id: `mc:${n}`,
-        slot: `mc-${n}`,
-        host: `m5.metal · mock-host-${1 + Math.floor(i / 8)}`,
-        rect: { x: (i % g.cols) / g.cols, y: Math.floor(i / g.cols) / g.rows, w: 1 / g.cols, h: 1 / g.rows },
-        phase: "running",
-        generation: 1,
-        lastRelaunch: { clicked_at: epochNow - total - 3000, by: "start", first_frame_at: epochNow - 3000, phases: phasesOf(total) },
-        forkedFrom: null,
-        borrow: null,
-        timers: [],
-        world: GOLD.slice(),
-        ground: GOLD_GROUND.slice(),
-        dayFrom: { at: this.host.now(), tick: GOLD_DAY_TIME },
-        bots: [],
-        rng: mulberry32(n),
-        changed: new Set(),
-        seq: 1,
-        drive: null,
-        sockets: new Set(),
-      };
-      s.bots = spawnBots(s.rng);
-      this.servers.push(s);
-    }
+    this.aspect = 1;
+    this.build(opts.count, epochNow);
     this.http = http.createServer((_req, res) => res.writeHead(404).end());
     this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
     this.http.on("upgrade", (req, socket, head) => {
@@ -331,6 +339,59 @@ export class MockMinecraft {
       }
       this.wss.handleUpgrade(req, socket, head, (ws) => this.view(s, ws));
     });
+  }
+
+  /** The servers, as a fresh start leaves them. */
+  private build(count: number, epochNow: number): void {
+    const g = minecraftGrid(count);
+    this.aspect = g.aspect;
+    const perHost = this.opts.perHost ?? 8;
+    for (let i = 0; i < count; i++) {
+      const n = i + 1;
+      // each host's servers came up one after another
+      const total = 1700 + ((i % perHost % 8) + 1) * 110;
+      // a large fleet's servers are of every age up to the half hour after which each is reset
+      const back = count > TILES_LISTED ? 3000 + ((n * 37) % 1800) * 1000 : 3000;
+      const s: Server = {
+        n,
+        id: `mc:${n}`,
+        slot: `mc-${n}`,
+        host: `m5.metal · mock-host-${1 + Math.floor(i / perHost)}`,
+        rect: { x: (i % g.cols) / g.cols, y: Math.floor(i / g.cols) / g.rows, w: 1 / g.cols, h: 1 / g.rows },
+        phase: "running",
+        generation: 1,
+        lastRelaunch: { clicked_at: epochNow - total - back, by: "start", first_frame_at: epochNow - back, phases: phasesOf(total) },
+        forkedFrom: null,
+        borrow: null,
+        timers: [],
+        world: GOLD.slice(),
+        ground: GOLD_GROUND.slice(),
+        dayFrom: { at: this.host.now(), tick: GOLD_DAY_TIME },
+        bots: [],
+        rng: mulberry32(n),
+        changed: new Set(),
+        seq: 1,
+        drive: null,
+        sockets: new Set(),
+      };
+      s.bots = spawnBots(s.rng);
+      this.servers.push(s);
+    }
+  }
+
+  /** Tests: run `count` servers, `perHost` on each host, in place of the ones there. Their viewers' sockets close. */
+  resize(count: number, perHost?: number): void {
+    for (const s of this.servers) {
+      for (const t of s.timers) clearTimeout(t);
+      if (s.borrow) clearTimeout(s.borrow.timer);
+      this.dropSockets(s);
+    }
+    this.servers = [];
+    this.opts = { ...this.opts, count, ...(perHost === undefined ? {} : { perHost }) };
+    this.resetAll = null;
+    this.lastFork = null;
+    this.build(count, this.host.now());
+    this.host.markDirty();
   }
 
   listen(): Promise<void> {
@@ -397,19 +458,71 @@ export class MockMinecraft {
     this.v6Down = down;
   }
 
+  /** Tests: the hosts stop sending their status rows. */
+  statusOff = false;
+
+  private hosts(): Map<string, Server[]> {
+    const by = new Map<string, Server[]>();
+    for (const s of this.servers) by.set(s.host, [...(by.get(s.host) ?? []), s]);
+    return by;
+  }
+
+  /**
+   * Each host's status rows, as its agent sends them about once a second (PROTOCOL.md, "Many
+   * servers"): 8 bytes a server. The readings are a host of 192 CPUs, each server taking a fifth
+   * of one and 400 MiB.
+   */
+  statusMessages(): Record<string, unknown>[] {
+    if (this.statusOff) return [];
+    const now = this.host.now();
+    return [...this.hosts()].map(([host, servers]) => {
+      const rows = Buffer.alloc(servers.length * 8);
+      servers.forEach((s, i) => {
+        const running = s.phase === "running";
+        const up = s.lastRelaunch.first_frame_at;
+        const launch = s.lastRelaunch.phases["total_ms"];
+        rows[i * 8] = running ? 3 : s.phase === "forking" ? 2 : 1;
+        rows[i * 8 + 1] = running ? Math.round((19.95 + ((s.n * 7 + Math.floor(now / 1000)) % 6) / 100) * 10) : 255;
+        rows[i * 8 + 2] = running ? s.bots.length : 255;
+        rows.writeUInt16LE(running && up !== null ? Math.min(65534, Math.max(0, Math.floor((now - up) / 1000))) : 65535, i * 8 + 4);
+        rows.writeUInt16LE(running && launch !== undefined ? Math.min(65534, launch) : 65535, i * 8 + 6);
+      });
+      const running = servers.filter((s) => s.phase === "running").length;
+      return { type: "minecraft_status", host: hostKey(host), received_at: now, t: now, rows: rows.toString("base64"), cpus: 192, busy: Math.round(running * 1.9) / 10, mem_total_mib: 385_024, mem_used_mib: 20_480 + servers.length * 400 };
+    });
+  }
+
   state() {
     const lent = this.servers.filter((s) => s.borrow !== null);
+    // A large fleet lists its first servers and every lent one as tiles, in an image of their
+    // own, and names every server in `field`.
+    const many = this.servers.length > TILES_LISTED;
+    const listed = many ? this.servers.filter((s, i) => i < TILES_LISTED || s.borrow !== null) : this.servers;
+    const g = minecraftGrid(listed.length);
     return {
       server: MINECRAFT_SERVER,
-      image_aspect: this.aspect,
+      image_aspect: many ? g.aspect : this.aspect,
+      ...(many
+        ? {
+            field: {
+              servers: this.servers.length,
+              hosts: [...this.hosts()].map(([host, servers]) => ({
+                key: hostKey(host),
+                servers: servers.map((s) => s.n),
+                frames: squeeze(servers.map((s) => (s.phase === "running" ? this.frameUrl(s.slot) : null))),
+                frames_v4: squeeze(servers.map((s) => (s.phase === "running" ? this.frameUrlV4(s.slot) : null))),
+              })),
+            },
+          }
+        : {}),
       claim_secs: this.opts.claimSecs,
       borrow: { cap: this.opts.cap, lent: lent.length, next_return_at: lent.length === 0 ? null : Math.min(...lent.map((s) => s.borrow!.until)) },
       last_reset_all: this.resetAll,
       last_fork: this.lastFork,
-      tiles: this.servers.map((s) => ({
+      tiles: listed.map((s, k) => ({
         id: s.id,
         half: "fcvm",
-        rect: s.rect,
+        rect: many ? { x: (k % g.cols) / g.cols, y: Math.floor(k / g.cols) / g.rows, w: 1 / g.cols, h: 1 / g.rows } : s.rect,
         phase: s.phase,
         slot: s.slot,
         vm: `fleet-${s.slot}`,
@@ -483,8 +596,9 @@ export class MockMinecraft {
           const targets = this.servers.filter((s) => s.borrow === null);
           if (targets.length === 0) return h.refuse("no server can be reset now");
           this.lastResetAll.set(viewer, now);
-          this.resetAll = { clicked_at: now, by: `viewer:${viewer}`, servers: targets.length };
-          for (const s of targets) this.relaunch(s, "reset_all");
+          this.resetAll = { clicked_at: now, by: `viewer:${viewer}`, servers: targets.length, back: 0 };
+          // a host restores so many a second: a reset of hundreds comes back as a wave
+          targets.forEach((s, k) => this.relaunch(s, "reset_all", targets.length > TILES_LISTED ? Math.floor((k * 1000) / RESTORES_PER_SEC) : 0));
           return h.committed(`reset all (${targets.length} servers)`);
         }
         const last = this.lastReset.get(viewer);
@@ -578,24 +692,30 @@ export class MockMinecraft {
   }
 
   /** Restored from the gold snapshot: the gold world, the bots at the spawn, timed from the click to the first chunk. */
-  private relaunch(s: Server, by: string): void {
+  private relaunch(s: Server, by: string, waitMs = 0): void {
     const h = this.host;
     for (const t of s.timers) clearTimeout(t);
     s.timers = [];
     s.generation += 1;
     const gen = s.generation;
     const clicked = h.now();
-    const total = this.opts.restoreMs;
+    const total = this.opts.restoreMs + waitMs;
     s.phase = "restoring";
     s.forkedFrom = null;
     s.drive = null;
     s.lastRelaunch = { clicked_at: clicked, by, first_frame_at: null, phases: {} };
+    // a launch the reset of every server began is counted by that reset when it is back
+    const all = by === "reset_all" ? this.resetAll : null;
     this.dropSockets(s);
     h.markDirty();
     s.timers.push(
       h.later(total, () => {
         if (s.generation !== gen) return;
         const done = h.now();
+        if (all !== null && this.resetAll === all) {
+          all.back += 1;
+          all.took_ms = Math.max(all.took_ms ?? 0, done - all.clicked_at);
+        }
         s.world = GOLD.slice();
         s.ground = GOLD_GROUND.slice();
         s.dayFrom = { at: this.host.now(), tick: GOLD_DAY_TIME };
