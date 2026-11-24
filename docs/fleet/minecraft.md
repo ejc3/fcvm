@@ -142,8 +142,11 @@ the snapshot: the agent reads every server's `/health` once a second (64 at a ti
 each) and sends one row of 8 bytes a server with the host's own CPU and memory readings; the
 coordinator keeps each host's latest rows, in no state and at no version, and passes them to
 the pages that asked (PROTOCOL.md, "Many servers: the field and the status rows"). A server
-whose `/health` did not answer has a row that says so, and a host that stops reporting leaves
-its servers unreported on the page, not at zero.
+whose `/health` did not answer has a row that says so. A host that stops reporting leaves its
+servers unreported, not at zero and not as they last were: the coordinator stamps each report
+with when it came and sends rows older than 5 s to no page, and a host whose last server is
+unassigned says so in one last report. A lent server is always one of the tiles, whatever its
+number: its holder's page needs its borrow, its join address and its own view.
 
 ### Invariants (each becomes a test)
 

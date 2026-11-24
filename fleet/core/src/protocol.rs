@@ -83,8 +83,12 @@ pub enum ServerMsg {
     /// Minecraft mode, to a page whose `visibility` said `minecraft`: one host's servers as
     /// its agent last read them. `host` is the key the snapshot's `minecraft.field` lists the
     /// host under; a row belongs to the server at the same place in that host's `servers`.
+    /// `received_at` is the coordinator's clock (unix ms) when the report reached it: the
+    /// rows' age is the coordinator's time now less this, and past
+    /// [`crate::minecraft::STATUS_EXPIRE_MS`] they say nothing of the servers.
     MinecraftStatus {
         host: String,
+        received_at: u64,
         #[serde(flatten)]
         status: crate::minecraft::MinecraftStatus,
     },

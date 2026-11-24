@@ -1599,8 +1599,9 @@ a snapshot of 271,732 bytes (525 a server). So:
   page), and is then sent, for each host, about once a second:
 
   ```json
-  {"type": "minecraft_status", "host": "3f9a0c2b7d1e", "t": 1761134400000,
-   "rows": "<base64>", "cpus": 192, "busy": 98.7, "mem_total_mib": 385024, "mem_used_mib": 20480}
+  {"type": "minecraft_status", "host": "3f9a0c2b7d1e", "received_at": 1761134400310,
+   "t": 1761134400000, "rows": "<base64>", "cpus": 192, "busy": 98.7,
+   "mem_total_mib": 385024, "mem_used_mib": 20480}
   ```
 
   `rows` is 8 bytes for each of the host's servers, in the order of `field.hosts[].servers`:
@@ -1615,6 +1616,15 @@ a snapshot of 271,732 bytes (525 a server). So:
   are no part of the state: they move no version, nothing stores them, and a page that asks
   later gets each host's latest at its next report. A page from before them sends no
   `minecraft` and is sent none (it would refuse a message type it does not know).
+
+  Rows are a reading, and an old reading is none. `received_at` is the coordinator's clock when
+  the report reached it; rows older than 5 s (`STATUS_EXPIRE_MS`, five missed reports) are
+  sent to no page, and a page that holds them shows their servers as not reported, never as
+  they last were. A host whose last server is unassigned sends one report with every row not
+  reported and then none. The coordinator takes a report only from the host's current
+  connection, no more often than every 500 ms (an agent sends one a second), and only when
+  `rows` is base64 of whole rows for no more servers than the host's hello said it runs;
+  anything else is dropped.
 
 #### Agent messages (Minecraft mode)
 

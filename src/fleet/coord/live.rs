@@ -749,7 +749,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                         status_sent = 0;
                         continue;
                     }
-                    for text in set.newer(status_sent) {
+                    for text in set.newer(status_sent, std::time::Instant::now()) {
                         if sink.send(Message::Text(text.to_string().into())).await.is_err() {
                             return;
                         }

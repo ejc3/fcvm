@@ -2022,10 +2022,11 @@ fn the_status_message_and_the_pages_request_for_it_have_these_shapes() {
     assert_eq!(
         serde_json::to_value(ServerMsg::MinecraftStatus {
             host: "0123456789ab".into(),
+            received_at: 9000,
             status
         })
         .unwrap(),
-        serde_json::json!({"type": "minecraft_status", "host": "0123456789ab", "t": 7, "rows": "AwDIAw=="})
+        serde_json::json!({"type": "minecraft_status", "host": "0123456789ab", "received_at": 9000, "t": 7, "rows": "AwDIAw=="})
     );
     // a page from before the field sends no `minecraft`: it is not sent the rows
     let old: ClientMsg =

@@ -74,6 +74,49 @@ pub fn status_row(
     ]
 }
 
+/// How often an agent reports its host's status rows, ms.
+pub const STATUS_EVERY_MS: u64 = 1000;
+/// A host's rows older than this say nothing of its servers now: the coordinator sends them to
+/// no page, and a page that holds them shows the servers as not reported.
+pub const STATUS_EXPIRE_MS: u64 = 5000;
+
+/// Standard base64 with padding, back to bytes; `None` for anything else.
+pub fn unbase64(text: &str) -> Option<Vec<u8>> {
+    let b = text.as_bytes();
+    if !b.len().is_multiple_of(4) {
+        return None;
+    }
+    let val = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(b.len() / 4 * 3);
+    for (k, q) in b.chunks(4).enumerate() {
+        let last = k + 1 == b.len() / 4;
+        let pad = q.iter().rev().take_while(|c| **c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for c in &q[..4 - pad] {
+            n = n << 6 | val(*c)? as u32;
+        }
+        n <<= 6 * pad as u32;
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Standard base64, with padding.
 pub fn base64(bytes: &[u8]) -> String {
     const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -414,6 +457,16 @@ mod status_tests {
             assert_eq!(base64(plain.as_bytes()), coded);
         }
         assert_eq!(base64(&[0xfb, 0xff, 0xfe]), "+//+");
+        // and back: every length, and nothing that is not base64
+        for n in 0..40usize {
+            let bytes: Vec<u8> = (0..n).map(|i| (i * 37 + n) as u8).collect();
+            assert_eq!(unbase64(&base64(&bytes)).as_deref(), Some(&bytes[..]));
+        }
+        for bad in [
+            "A", "AAA", "A===", "=AAA", "AA=A", "AAAA=AAA", "AA*A", "AAAA\n",
+        ] {
+            assert_eq!(unbase64(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
