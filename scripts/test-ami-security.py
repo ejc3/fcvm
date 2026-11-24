@@ -8,6 +8,7 @@ are needed. The fixture fails closed on every unexpected AWS operation.
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tempfile
@@ -31,16 +32,23 @@ elif operation == "describe-security-groups":
 elif operation == "run-instances":
     if "--instance-market-options" in args and os.environ.get("AMI_TEST_SPOT_FAIL"):
         raise SystemExit("Error: no Spot capacity")
-    print("i-1234567890abcdef0")
+    # the builder, or the boot test launched from the image the build created
+    boot_test = args[args.index("--image-id") + 1] == "ami-1234567890abcdef0"
+    print("i-2234567890abcdef0" if boot_test else "i-1234567890abcdef0")
 elif operation == "describe-tags":
-    if "Name=key,Values=KernelVersion" in args:
+    if "Name=key,Values=KernelVersion" not in args:
+        print(os.environ.get("AMI_TEST_BUILD_STATUS", "boot-ok"))
+    elif "Name=resource-id,Values=i-2234567890abcdef0" in args:
         print(os.environ.get("AMI_TEST_KERNEL", "7.3.3-fcvm-0123456789ab"))
     else:
-        print(os.environ.get("AMI_TEST_BUILD_STATUS", "boot-ok"))
+        print(os.environ.get("AMI_TEST_BUILDER_KERNEL", "7.3.3-fcvm-0123456789ab"))
 elif operation == "create-image":
     print("ami-1234567890abcdef0")
 elif operation == "describe-images":
-    print(os.environ.get("AMI_TEST_IMAGE_STATE", "available"))
+    if "Name=tag:Purpose,Values=github-runner-candidate" in args:
+        print(os.environ.get("AMI_TEST_STALE", ""))
+    else:
+        print(os.environ.get("AMI_TEST_IMAGE_STATE", "available"))
 elif operation in {"create-tags", "terminate-instances"}:
     print("{}")
 else:
@@ -203,9 +211,11 @@ main
             "the instance reports the check failed": {"AMI_TEST_BUILD_STATUS": "boot-failed"},
             "the instance never reports": {"AMI_TEST_BUILD_STATUS": "starting"},
             "the instance reports no kernel": {"AMI_TEST_KERNEL": "None"},
-            # boot-ok from the instance is not enough: the release it reports is checked here too
+            # boot-ok from the instance is not enough: it must be running the release the
+            # builder resolved from the image's grub.cfg
             "it booted the base image's kernel": {"AMI_TEST_KERNEL": "7.0.0-1013-aws"},
             "it booted the stock kernel the old image had": {"AMI_TEST_KERNEL": "6.14.0-1018-aws"},
+            "it booted another kernel that has the fix": {"AMI_TEST_KERNEL": "7.3.3-fcvm-ba9876543210"},
         }
         for name, settings in cases.items():
             with self.subTest(name):
@@ -213,6 +223,56 @@ main
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.purpose_tags(calls), ["Key=Purpose,Value=github-runner-failed"])
                 self.assertNotIn("ami_id", self.outputs(result))
+
+    def test_no_image_is_created_unless_the_builder_reported_a_fixed_kernel(self):
+        # KernelVersion on the builder is the release it read from the image's grub.cfg. A
+        # builder that reported none, or one without the fix, must not become an image.
+        for reported in ["None", "unknown", "nested", "7.0.0-1013-aws"]:
+            with self.subTest(reported=reported):
+                result, calls = self.run_build(AMI_TEST_BUILDER_KERNEL=reported, AMI_TEST_KERNEL=reported)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(any(call[1] == "create-image" for call in calls))
+                self.assertNotIn("ami_id", self.outputs(result))
+
+    def test_candidates_of_earlier_runs_are_retired_before_anything_is_built(self):
+        stale = ["ami-0aaaaaaaaaaaaaaa1", "ami-0bbbbbbbbbbbbbbb2"]
+        for arch, ec2_arch in [("arm64", "arm64"), ("x64", "x86_64")]:
+            with self.subTest(arch=arch):
+                result, calls = self.run_build(AMI_ARCH=arch, AMI_TEST_STALE="\t".join(stale))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                listing = next(i for i, call in enumerate(calls)
+                               if "Name=tag:Purpose,Values=github-runner-candidate" in call)
+                # only this architecture's: the other leg's candidate may be under test right now
+                self.assertIn(f"Name=architecture,Values={ec2_arch}", calls[listing])
+                retired = {i: call for i, call in enumerate(calls)
+                           if call[1] == "create-tags" and call[call.index("--resources") + 1] in stale}
+                self.assertEqual([call[call.index("--resources") + 1] for call in retired.values()], stale)
+                for call in retired.values():
+                    self.assertEqual(self.flag(call, "--tags"), "Key=Purpose,Value=github-runner-failed")
+                first_launch = next(i for i, call in enumerate(calls) if call[1] == "run-instances")
+                self.assertLess(listing, min(retired))
+                self.assertLess(max(retired), first_launch)
+
+    def test_a_candidate_listing_that_cannot_be_trusted_stops_the_leg(self):
+        result, calls = self.run_build(AMI_TEST_STALE="not-an-image-id")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(any(call[1] in ("run-instances", "create-tags") for call in calls))
+
+    def test_user_data_never_traces_the_metadata_token(self):
+        # Under `set -x` a command that expands $TOKEN is written to the instance's log and
+        # console. Both scripts fetch the token, use it once, and only then turn tracing on.
+        script = Path(__file__).with_name("build-ami.sh").read_text()
+        build = script[script.index("\ncreate_user_data() {"):script.index("\nUSERDATA\n}")]
+        boot = script[script.index("\ncreate_boot_test_user_data() {"):script.index("\nBOOTTEST\n}")]
+        for name, user_data in [("build", build), ("boot test", boot)]:
+            with self.subTest(name):
+                lines = user_data.splitlines()
+                tracing = [i for i, line in enumerate(lines)
+                           if re.match(r"\s*set\s+-\w*x|\s*set\s+-o\s+xtrace", line)]
+                token = [i for i, line in enumerate(lines) if "TOKEN" in line]
+                self.assertTrue(tracing and token)
+                self.assertLess(max(token), min(tracing))
+                self.assertEqual(lines[max(token)].strip(), "unset TOKEN")
 
     def test_an_image_that_is_not_available_fails_and_is_never_booted_or_published(self):
         for state in ["pending", "failed"]:
@@ -248,6 +308,7 @@ main
         build = script[script.index("\ncreate_user_data() {"):script.index("\nUSERDATA\n}")]
         steps = ["--install-host-kernel\n", "\nupdate-grub\n", "\nBOOT_KERNEL=$(./scripts/grub-boot-kernel.sh)\n",
                  '\n./scripts/check-bridge-teardown-kernel.sh "$BOOT_KERNEL"\n',
+                 '\naws ec2 create-tags --resources $INSTANCE_ID --tags "Key=KernelVersion,Value=$BOOT_KERNEL" --region us-west-1\n',
                  f"\ninstall -m 0755 scripts/check-bridge-teardown-kernel.sh {baked}\n"]
         positions = [build.index(step) for step in steps]
         self.assertEqual(positions, sorted(positions))

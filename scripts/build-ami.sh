@@ -284,11 +284,14 @@ create_user_data() {
     -e "s#__FCVM_SOURCE_REMOTE__#$FCVM_SOURCE_REMOTE#g" << 'USERDATA'
 #!/bin/bash
 exec > >(tee /var/log/ami-build.log) 2>&1
-set -euxo pipefail
+set -euo pipefail
 
-# Get IMDSv2 token and instance ID
+# Get IMDSv2 token and instance ID. Tracing starts after the token's last use: under
+# `set -x` the token would be written to this log and to the instance's console.
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s)
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
+unset TOKEN
+set -x
 
 # One script provisions both architectures: the download names follow the machine.
 MACHINE=$(uname -m)
@@ -381,7 +384,6 @@ mkdir -p /root/.config/fcvm
 cp rootfs-config.toml /root/.config/fcvm/
 
 # Build and install kernel using fcvm setup
-aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=nested --region us-west-1
 ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
 # The image must boot a kernel with the bridge teardown fix. The running kernel is still
@@ -391,7 +393,9 @@ aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=nest
 update-grub
 BOOT_KERNEL=$(./scripts/grub-boot-kernel.sh)
 ./scripts/check-bridge-teardown-kernel.sh "$BOOT_KERNEL"
-# The boot test of the candidate image runs the same check on the kernel that booted.
+# Report that release: the boot test of the candidate image must find exactly it running.
+aws ec2 create-tags --resources $INSTANCE_ID --tags "Key=KernelVersion,Value=$BOOT_KERNEL" --region us-west-1
+# The boot test runs the same check on the kernel that booted.
 install -m 0755 scripts/check-bridge-teardown-kernel.sh /usr/local/sbin/check-bridge-teardown-kernel.sh
 
 # Firecracker
@@ -472,9 +476,12 @@ create_boot_test_user_data() {
   cat << 'BOOTTEST'
 #!/bin/bash
 exec > >(tee /var/log/ami-boot-test.log) 2>&1
-set -uxo pipefail
+set -uo pipefail
+# Tracing starts after the token's last use, as in the builder's user data.
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 600" -s)
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
+unset TOKEN
+set -x
 STATUS=boot-failed
 if /usr/local/sbin/check-bridge-teardown-kernel.sh; then
   STATUS=boot-ok
@@ -593,6 +600,34 @@ reject_candidate() {
     echo "WARNING: could not tag $ami_id failed; it keeps Purpose=github-runner-candidate" >&2
 }
 
+# A candidate left by an earlier run was never judged: the run was cancelled between
+# create-image and the verdict, or its publish failed. Tag every candidate of this
+# architecture failed before anything else, so it can no longer be boot-tested or
+# published. The workflow runs one leg per architecture at a time, so a candidate found
+# here is never one a running leg is testing. A listing or a tag change that fails stops
+# the leg: "no stale candidates" must be something this run saw.
+retire_stale_candidates() {
+  local stale id
+  if ! stale=$(aws ec2 describe-images --region "$REGION" --owners self \
+    --filters "Name=tag:Purpose,Values=github-runner-candidate" "Name=architecture,Values=$EC2_ARCH" \
+    --query 'Images[].ImageId' --output text); then
+    echo "ERROR: cannot list earlier candidate images" >&2
+    return 1
+  fi
+  for id in $stale; do
+    if [[ ! $id =~ ^ami-[0-9a-f]+$ ]]; then
+      echo "ERROR: unexpected image id '$id' among earlier candidates" >&2
+      return 1
+    fi
+    echo "Retiring stale candidate $id"
+    if ! aws ec2 create-tags --region "$REGION" --resources "$id" \
+      --tags Key=Purpose,Value=github-runner-failed; then
+      echo "ERROR: cannot retire stale candidate $id" >&2
+      return 1
+    fi
+  done
+}
+
 # Instances this run launched, terminated when it exits.
 LAUNCHED=()
 
@@ -617,6 +652,10 @@ main() {
     exit 1
   fi
   echo "Build hash: $hash"
+
+  if ! retire_stale_candidates; then
+    exit 1
+  fi
 
   # Check cache
   existing=$(check_existing_ami "$hash")
@@ -696,11 +735,16 @@ main() {
   # reboot is permitted on spot and gives the same filesystem consistency a
   # stopped instance would.
 
-  # Get kernel version from instance tags
+  # The release the builder resolved from the image's grub.cfg, from its tags. Nothing is
+  # created unless the builder reported one that has the fix.
   kernel_version=$(aws ec2 describe-tags \
     --region "$REGION" \
     --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=KernelVersion" \
     --query 'Tags[0].Value' --output text 2>/dev/null || echo "unknown")
+  if ! "$SCRIPT_DIR/check-bridge-teardown-kernel.sh" "$kernel_version"; then
+    echo "ERROR: the builder did not report a kernel with the fix (KernelVersion=$kernel_version)" >&2
+    exit 1
+  fi
 
   # Create the image as a CANDIDATE. The runner launcher takes the newest available
   # image tagged Purpose=github-runner of each architecture, so an image created with
@@ -709,14 +753,14 @@ main() {
   timestamp=$(date +%Y%m%d-%H%M)
   ami_name="fcvm-runner-${kernel_version}-${AMI_ARCH}-${timestamp}"
   local image_tags
-  image_tags=$(jq -cn --arg name "$ami_name" --arg kernel "${kernel_version}-nested" --arg hash "$hash" \
+  image_tags=$(jq -cn --arg name "$ami_name" --arg kernel "$kernel_version" --arg hash "$hash" \
     '[{ResourceType:"image",Tags:[{Key:"Name",Value:$name},{Key:"Kernel",Value:$kernel},{Key:"BuildHash",Value:$hash},{Key:"Purpose",Value:"github-runner-candidate"}]},{ResourceType:"snapshot",Tags:[{Key:"Purpose",Value:"github-runner"}]}]')
 
   ami_id=$(aws ec2 create-image \
     --region "$REGION" \
     --instance-id "$instance_id" \
     --name "$ami_name" \
-    --description "fcvm CI runner ($AMI_ARCH) with kernel ${kernel_version}-nested" \
+    --description "fcvm CI runner ($AMI_ARCH) with kernel $kernel_version" \
     --tag-specifications "$image_tags" \
     --query 'ImageId' --output text)
   if [[ ! $ami_id =~ ^ami-[0-9a-f]+$ ]]; then
@@ -731,8 +775,8 @@ main() {
   fi
 
   # Boot test: one instance from the candidate, on bare metal as the runners are. It
-  # must report that the kernel it is RUNNING passes the bridge teardown check, and the
-  # release it reports must pass the same check here.
+  # must report that the kernel it is RUNNING passes the bridge teardown check, and that
+  # kernel must be the one the builder resolved, which passed the same check above.
   local boot_user_data_file test_instance boot_kernel
   boot_user_data_file=$(mktemp)
   create_boot_test_user_data > "$boot_user_data_file"
@@ -743,8 +787,12 @@ main() {
   fi
   LAUNCHED+=("$test_instance")
   echo "Boot test instance: $test_instance ($BOOT_TEST_TYPE)"
-  if ! boot_kernel=$(wait_for_boot_test "$test_instance") ||
-    ! "$SCRIPT_DIR/check-bridge-teardown-kernel.sh" "$boot_kernel"; then
+  if ! boot_kernel=$(wait_for_boot_test "$test_instance"); then
+    reject_candidate "$ami_id"
+    exit 1
+  fi
+  if [ "$boot_kernel" != "$kernel_version" ]; then
+    echo "ERROR: the image booted $boot_kernel, not the $kernel_version the builder installed" >&2
     reject_candidate "$ami_id"
     exit 1
   fi
