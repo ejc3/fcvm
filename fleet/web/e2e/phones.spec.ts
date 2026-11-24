@@ -183,6 +183,7 @@ test("opening a phone shows its restore time and details beside it, other phones
   await expect(page.getByTestId("phone-rows")).toContainText("fleet-phone-2");
   await expect(page.getByTestId("phone-stats")).toContainText("648");
   await expect(page.getByRole("meter", { name: "GPU utilisation 37 percent" })).toBeVisible();
+  await expect(page.getByRole("meter", { name: "CPU 21 percent of 6 vCPUs" })).toBeVisible();
   await expect(page.getByTestId("timeline")).toContainText("snapshot restored");
   await expect(bezels(page)).toHaveCount(1);
   const v = await view(page);

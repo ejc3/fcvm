@@ -40,6 +40,8 @@ pub struct TileView {
     pub generation: Option<u64>,
     pub fps: Option<f64>,
     pub gpu_stats: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_stats: Option<crate::protocol::VmStats>,
     pub error: Option<String>,
     /// Why the tile is not running when that is a fault.
     pub failure: Option<TileFailure>,
@@ -603,6 +605,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             generation: None,
             fps: None,
             gpu_stats: None,
+            vm_stats: None,
             error: None,
             failure: None,
             last_relaunch: None,
@@ -639,6 +642,7 @@ fn tile(state: &State, id: String, half: Half, rect: Rect, slot: Option<&Slot>) 
             generation: Some(s.generation),
             fps: s.observed.fps,
             gpu_stats: s.observed.gpu_stats.clone(),
+            vm_stats: s.observed.vm_stats.clone(),
             error: s.observed.error.as_deref().map(hide_account_ids),
             last_relaunch: s.last_relaunch.as_ref().map(|r| RelaunchView {
                 clicked_at: r.clicked_at,

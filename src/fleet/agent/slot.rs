@@ -144,6 +144,8 @@ struct Running {
     boot: Option<String>,
     /// A phone: the last take-over action carried out (its `seq`).
     actions_done: u64,
+    /// A phone: reads of its Firecracker process for `vm_stats`.
+    sampler: super::vmstats::Sampler,
 }
 
 enum Failure {
@@ -570,7 +572,12 @@ pub async fn supervise(
                         r.budget_posted = None;
                         post_if_changed(&ctx, r, &desired, &mut scene, &mut budget).await;
                     }
-                    let _ = ctx.out.send(AgentMsg::Health(HealthReport::from_renderer(&ctx.id, &h)));
+                    let mut report = HealthReport::from_renderer(&ctx.id, &h);
+                    if desired.borrow().phone.is_some() {
+                        let vcpus = super::vm::PHONE_CPUS.parse().unwrap_or(0);
+                        report.vm_stats = r.sampler.poll(r.vm.pid, vcpus);
+                    }
+                    let _ = ctx.out.send(AgentMsg::Health(report));
                 }
             }
         }
@@ -911,6 +918,7 @@ async fn relaunch(
         budget_posted: None,
         boot,
         actions_done: 0,
+        sampler: Default::default(),
     });
     Ok(())
 }

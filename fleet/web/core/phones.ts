@@ -16,7 +16,7 @@ import { streamBitrate } from "./bandwidth.ts";
 import * as fmt from "./format.ts";
 import { frameSocketUrl, mirrorSocketUrl, streamUrl } from "./net.ts";
 import { megabytes, mbits } from "./meter.ts";
-import { sameViewer, type Admission, type GpuInfo, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
+import { sameViewer, type Admission, type GpuInfo, type VmStats, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
 import { serverNow } from "./clock.ts";
 import type { ClientState, Notice } from "./store.ts";
 import {
@@ -593,14 +593,29 @@ export const STATS_STALE_MS = 5000;
 const pad = (n: number, w: number) => String(Math.round(n)).padStart(w, "\u2007");
 
 /** The readings of a phone's GPU, in the order the panel shows them. */
-export function statsOf(g: GpuInfo | null, srvNow: number): PhoneStat[] {
+export function statsOf(g: GpuInfo | null, vm: VmStats | null, srvNow: number): PhoneStat[] {
+  const out: PhoneStat[] = [];
+  out.push(...gpuStats(g, srvNow), ...vmStatsOf(vm, srvNow));
+  return out;
+}
+
+function vmStatsOf(vm: VmStats | null, srvNow: number): PhoneStat[] {
+  if (vm === null || (vm.at !== null && srvNow - vm.at > STATS_STALE_MS)) return [];
+  const n = `${vm.vcpus} vCPU${vm.vcpus === 1 ? "" : "s"}`;
+  return [
+    { key: "vm-cpu", term: "CPU", text: `${pad(vm.cpu_pct, 3)} %  ${n}`, fraction: Math.min(1, Math.max(0, vm.cpu_pct / 100)), label: `CPU ${Math.round(vm.cpu_pct)} percent of ${n}` },
+    { key: "vm-mem", term: "Memory", text: `${pad(vm.mem_mb, 5)} MB`, fraction: null, label: `Memory ${Math.round(vm.mem_mb)} megabytes` },
+  ];
+}
+
+function gpuStats(g: GpuInfo | null, srvNow: number): PhoneStat[] {
   if (g === null) return [];
   if (g.at !== null && srvNow - g.at > STATS_STALE_MS) return [];
   const out: PhoneStat[] = [];
   const clamp = (x: number) => Math.min(1, Math.max(0, x));
-  if (g.util_pct !== null) out.push({ key: "gpu-util", term: "GPU use", text: `${pad(g.util_pct, 3)} %`, fraction: clamp(g.util_pct / 100), label: `GPU utilisation ${Math.round(g.util_pct)} percent` });
-  if (g.temp_c !== null) out.push({ key: "gpu-temp", term: "GPU temp", text: `${pad(g.temp_c, 3)} \u00b0C`, fraction: null, label: `GPU temperature ${Math.round(g.temp_c)} degrees Celsius` });
-  if (g.power_w !== null) out.push({ key: "gpu-power", term: "GPU power", text: `${pad(g.power_w, 3)} W`, fraction: null, label: `GPU power draw ${Math.round(g.power_w)} watts` });
+  if (g.util_pct !== null) out.push({ key: "gpu-util", term: "GPU", text: `${pad(g.util_pct, 3)} %`, fraction: clamp(g.util_pct / 100), label: `GPU utilisation ${Math.round(g.util_pct)} percent` });
+  if (g.temp_c !== null) out.push({ key: "gpu-temp", term: "Temperature", text: `${pad(g.temp_c, 3)} \u00b0C`, fraction: null, label: `GPU temperature ${Math.round(g.temp_c)} degrees Celsius` });
+  if (g.power_w !== null) out.push({ key: "gpu-power", term: "Power", text: `${pad(g.power_w, 3)} W`, fraction: null, label: `GPU power draw ${Math.round(g.power_w)} watts` });
   if (g.mem_used_mb !== null) {
     const total = g.mem_total_mb !== null && g.mem_total_mb > 0 ? g.mem_total_mb : null;
     out.push({
@@ -959,7 +974,7 @@ function panelOf(
   return {
     id: t.id,
     title: phoneName(t),
-    stats: running ? statsOf(g, srvNow) : [],
+    stats: running ? statsOf(g, t.vm_stats, srvNow) : [],
     state: running ? (restored && !restored.restoring ? restored.text : "streaming") : restored?.text ?? phaseText(t.phase),
     rows: [
       { term: "GPU", value: g?.name ?? "none yet" },

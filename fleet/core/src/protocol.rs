@@ -221,6 +221,19 @@ pub fn place_label(region: &str) -> Option<String> {
     ok.then(|| format!("EC2 in {region}"))
 }
 
+/// A VM's CPU and memory, read on the host. The agent leaves `at` out; the coordinator
+/// stamps its receipt time (Unix ms) when it stores the reading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VmStats {
+    /// CPU use as a percent of the VM's vCPUs, 0..100.
+    pub cpu_pct: f64,
+    /// Memory in use, MB.
+    pub mem_mb: f64,
+    pub vcpus: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthReport {
     pub id: String,
@@ -242,6 +255,9 @@ pub struct HealthReport {
     /// The renderer process's `boot_id`, so a grant names the renderer it was given to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
+    /// The VM's CPU and memory, from the host. An agent that cannot read them sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_stats: Option<VmStats>,
 }
 
 impl HealthReport {
@@ -259,6 +275,7 @@ impl HealthReport {
             render_ms_max: num(h.get("frames_2s").and_then(|f| f.get("render_ms_max"))),
             budget_every_pixel: num(h.get("budget_every_pixel")).filter(|v| *v > 0.0),
             boot_id: boot_id(h),
+            vm_stats: None,
         }
     }
 }

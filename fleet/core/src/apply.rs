@@ -4,7 +4,7 @@
 
 use crate::event::{Event, Intent};
 use crate::history;
-use crate::protocol::{AgentMsg, HealthReport, SlotReport};
+use crate::protocol::{AgentMsg, HealthReport, SlotReport, VmStats};
 use crate::scene::{drag, Keyframe, Light, Word, MAX_LIGHTS, MAX_WORDS};
 use crate::state::*;
 use crate::tiling::{bands, grid_in, sides, Half, Rect};
@@ -445,7 +445,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::Ec2Health { report, .. } | Event::LambdaHealth { report, .. } => {
-            health(&mut state.fleet, None, report);
+            health(&mut state.fleet, None, report, at);
             None
         }
         Event::Agent { host, msg, .. } => {
@@ -521,7 +521,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         observe_minecraft(&mut state.fleet, n, host, r, at);
                     }
                 }
-                AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h),
+                AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h, at),
                 AgentMsg::Draining { .. } => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.draining = true;
@@ -1925,6 +1925,7 @@ fn note_running(slot: &mut Slot, r: &SlotReport, at: u64) -> bool {
     if r.phase != "running" {
         slot.observed.fps = None;
         slot.observed.gpu_stats = None;
+        slot.observed.vm_stats = None;
         slot.observed.budget_fit = None;
         slot.observed.render_ms_max = None;
         slot.observed.budget_every_pixel = None;
@@ -2048,7 +2049,7 @@ fn finish_half(h: &mut HalfRace, started_at: u64, last: Option<String>, at: u64)
         .unwrap_or(0);
 }
 
-fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
+fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport, at: u64) {
     let slot = match host {
         Some(_) if h.id.starts_with("phone-") => {
             phone_number(&h.id).and_then(|n| f.phones.get_mut(&n))
@@ -2085,7 +2086,19 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
             }
         }
     }
-    slot.observed.gpu_stats = Some(h.gpu.clone());
+    let mut gpu = h.gpu.clone();
+    if let Some(o) = gpu.as_object_mut() {
+        o.insert("at".into(), at.into());
+    }
+    slot.observed.gpu_stats = Some(gpu);
+    slot.observed.vm_stats = h
+        .vm_stats
+        .as_ref()
+        .filter(|v| v.cpu_pct.is_finite() && v.mem_mb.is_finite() && v.vcpus > 0)
+        .map(|v| VmStats {
+            at: Some(at),
+            ..v.clone()
+        });
     slot.observed.budget_fit = h.budget_fit.filter(|v| v.is_finite());
     slot.observed.render_ms_max = h.render_ms_max.filter(|v| v.is_finite());
     slot.observed.budget_every_pixel = h.budget_every_pixel.filter(|v| v.is_finite() && *v > 0.0);

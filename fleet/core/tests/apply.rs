@@ -1868,3 +1868,108 @@ fn a_server_nobody_holds_is_reset_on_a_schedule() {
     .fold(s, apply);
     assert_eq!(gen(&s, "mc-1"), 3);
 }
+
+fn phone_host(at: u64) -> Event {
+    let gpu = Gpu {
+        sbdf: "0000:01:00.0".into(),
+        name: "Tesla T4".into(),
+    };
+    Event::Agent {
+        at,
+        host: "h1".into(),
+        msg: AgentMsg::Hello {
+            host: "h1".into(),
+            arch: "x86_64".into(),
+            gpus: vec![],
+            capacity: 8,
+            store_ready_at: None,
+            boot: Default::default(),
+            phones: vec![gpu],
+            phone_actions: vec![],
+            potato_players: 0,
+            windows: 0,
+            windows_actions: Vec::new(),
+            minecraft: 0,
+            minecraft_server: None,
+        },
+    }
+}
+
+fn phone_health(at: u64, vm: Option<fleet_core::protocol::VmStats>) -> Event {
+    let mut report = fleet_core::protocol::HealthReport::from_renderer(
+        "phone-1",
+        &serde_json::json!({"fps": 30.0, "gpu": {"name": "Tesla T4", "util_pct": 40, "mem_used_mb": 600.0}}),
+    );
+    report.vm_stats = vm;
+    Event::Agent {
+        at,
+        host: "h1".into(),
+        msg: AgentMsg::Health(report),
+    }
+}
+
+fn phone_stats(s: &State) -> (serde_json::Value, serde_json::Value) {
+    let v = serde_json::to_value(view(s)).unwrap();
+    let t = &v["phones"]["tiles"][0];
+    (
+        t.get("gpu_stats").cloned().unwrap_or_default(),
+        t.get("vm_stats").cloned().unwrap_or_default(),
+    )
+}
+
+/// The coordinator stamps its receipt time into the GPU readings and the VM's readings, a
+/// report without `vm_stats` (an old agent, or a failed read) leaves none, and a phone that is
+/// not running keeps neither.
+#[test]
+fn a_phones_readings_carry_the_receipt_time_and_clear_with_the_phone() {
+    let mut s = State::new(config_with(serde_json::json!({})), 0);
+    s = apply(s, &phone_host(1000));
+    s = apply(
+        s,
+        &Event::Agent {
+            at: 1100,
+            host: "h1".into(),
+            msg: AgentMsg::Slot(SlotReport {
+                id: "phone-1".into(),
+                phase: "running".into(),
+                generation: 1,
+                ..Default::default()
+            }),
+        },
+    );
+    let vm = fleet_core::protocol::VmStats {
+        cpu_pct: 12.5,
+        mem_mb: 1800.0,
+        vcpus: 6,
+        at: Some(1),
+    };
+    s = apply(s, &phone_health(2000, Some(vm)));
+    let (gpu, vm) = phone_stats(&s);
+    assert_eq!(gpu["at"], 2000);
+    assert_eq!(gpu["mem_used_mb"], 600.0);
+    assert_eq!(
+        vm,
+        serde_json::json!({"cpu_pct": 12.5, "mem_mb": 1800.0, "vcpus": 6, "at": 2000})
+    );
+
+    s = apply(s, &phone_health(3000, None));
+    let (gpu, vm) = phone_stats(&s);
+    assert_eq!(gpu["at"], 3000);
+    assert!(vm.is_null(), "{vm}");
+
+    s = apply(
+        s,
+        &Event::Agent {
+            at: 3100,
+            host: "h1".into(),
+            msg: AgentMsg::Slot(SlotReport {
+                id: "phone-1".into(),
+                phase: "restoring".into(),
+                generation: 2,
+                ..Default::default()
+            }),
+        },
+    );
+    let (gpu, vm) = phone_stats(&s);
+    assert!(gpu.is_null() && vm.is_null(), "{gpu} {vm}");
+}

@@ -122,10 +122,20 @@ describe("phones in the snapshot", () => {
 
   it("reads GPU memory and the sample time from gpu_stats", () => {
     const state = structuredClone(raw.views["29_phones"]!) as { phones: { tiles: Record<string, unknown>[] } };
+    state.phones.tiles[1]!["vm_stats"] = undefined;
     state.phones.tiles[1]!["gpu_stats"] = { temp_c: 50, power_w: 40, util_pct: 30, mem_used_mb: 600, mem_total_mb: 15360, at: 1234 };
     const m = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
     if (m.type !== "snapshot") throw new Error("not a snapshot");
     expect(m.state.phones!.tiles[1]!.gpu).toMatchObject({ util_pct: 30, mem_used_mb: 600, mem_total_mb: 15360, at: 1234 });
+    expect(m.state.phones!.tiles[1]!.vm_stats).toBeNull();
+    state.phones.tiles[1]!["vm_stats"] = { cpu_pct: 12.5, mem_mb: 1800, vcpus: 6, at: 1234 };
+    const withVm = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+    if (withVm.type !== "snapshot") throw new Error("not a snapshot");
+    expect(withVm.state.phones!.tiles[1]!.vm_stats).toEqual({ cpu_pct: 12.5, mem_mb: 1800, vcpus: 6, at: 1234 });
+    state.phones.tiles[1]!["vm_stats"] = { cpu_pct: 12.5, mem_mb: 1800, vcpus: 0 };
+    const bad = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+    if (bad.type !== "snapshot") throw new Error("not a snapshot");
+    expect(bad.state.phones!.tiles[1]!.vm_stats).toBeNull();
     state.phones.tiles[1]!["gpu_stats"] = { util_pct: 30 };
     const old = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
     if (old.type !== "snapshot") throw new Error("not a snapshot");
@@ -420,10 +430,30 @@ describe("the panel of an opened phone", () => {
       expect(withGpu(null).stats).toEqual([]);
     });
 
+    it("shows the VM's CPU as a percent of its vCPUs and its memory, under the GPU rows", () => {
+      const ph = phonesOf(2);
+      ph.tiles[0] = { ...ph.tiles[0]!, gpu: { name: "Tesla T4", temp_c: 50, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: null }, vm_stats: { cpu_pct: 12.4, mem_mb: 1800.2, vcpus: 6, at: null } };
+      const p = panelOf(ph);
+      expect(p.stats.map((r) => [r.term, r.text, r.fraction, r.label])).toEqual([
+        ["Temperature", "\u200750 \u00b0C", null, "GPU temperature 50 degrees Celsius"],
+        ["CPU", "\u200712 %  6 vCPUs", 0.124, "CPU 12 percent of 6 vCPUs"],
+        ["Memory", "\u20071800 MB", null, "Memory 1800 megabytes"],
+      ]);
+    });
+
+    it("leaves out the VM rows when absent or stale, whatever the GPU says", () => {
+      const srv = EPOCH + 30_000;
+      const vm = (at: number | null) => ({ cpu_pct: 5, mem_mb: 100, vcpus: 1, at });
+      expect(statsOf(null, null, srv)).toEqual([]);
+      expect(statsOf(null, vm(srv - 1000), srv).map((r) => r.term)).toEqual(["CPU", "Memory"]);
+      expect(statsOf(null, vm(srv - STATS_STALE_MS - 1), srv)).toEqual([]);
+      expect(statsOf(null, vm(null), srv)[0]!.text).toBe("\u2007\u20075 %  1 vCPU");
+    });
+
     it("drops readings older than the stale limit, and keeps fresh ones", () => {
       const srv = EPOCH + 30_000;
-      expect(statsOf({ name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: srv - STATS_STALE_MS + 1 }, srv)).toHaveLength(1);
-      expect(statsOf({ name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: srv - STATS_STALE_MS - 1 }, srv)).toEqual([]);
+      expect(statsOf({ name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: srv - STATS_STALE_MS + 1 }, null, srv)).toHaveLength(1);
+      expect(statsOf({ name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: srv - STATS_STALE_MS - 1 }, null, srv)).toEqual([]);
     });
   });
 
