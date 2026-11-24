@@ -124,6 +124,7 @@ fn slot_network(vm_id: String, pid_dir: PathBuf) -> PastaNetwork {
     PastaNetwork::new(vm_id, proto::TAP.to_string(), Vec::new())
         .with_pid_dir(pid_dir)
         .with_attached_tap()
+        .with_control_socket()
 }
 
 impl Namespace {
@@ -233,9 +234,9 @@ impl Namespace {
         proto::watch(offer.connection).context("watching the lease")
     }
 
-    /// After a lease: restart pasta, have the holder remove what a VM's use leaves, and
-    /// check the namespace against its fingerprint. An error means it must not be lent
-    /// again.
+    /// After a lease: have pasta forget the guest, have the holder remove what a VM's use
+    /// leaves, and check the namespace against its fingerprint. An error means it must not
+    /// be lent again.
     ///
     /// The lease's end is what says the VMM is gone. The TAP is attached by its holder
     /// for the namespace's whole life, so its carrier cannot say whether a VMM still has the
@@ -243,15 +244,20 @@ impl Namespace {
     /// together with the lease, and is close-on-exec in every other process.
     async fn reset(&mut self) -> Result<()> {
         failpoint::hit_async("pool.pre_reset").await;
-        self.network.cleanup().await.context("stopping pasta")?;
+        // The namespace first, pasta second. A frame of the last tenant can still be in
+        // the kernel on its way to pasta when the lease ends; one that reaches a pasta
+        // already reset opens a new flow, and the host's answer would be framed to the
+        // next guest. With pasta reset last, such a frame has the whole of the holder's
+        // reset to arrive in and be forgotten with the rest. That is a margin, not a
+        // proof: nothing here waits for the kernel's queues to be empty.
         self.agent
             .reset()
             .await
             .context("resetting the namespace")?;
         self.network
-            .post_start(self.holder_pid)
+            .reset_pasta()
             .await
-            .context("starting pasta again")?;
+            .context("resetting pasta")?;
         let deadline = tokio::time::Instant::now() + VERIFY_BUDGET;
         let mut pause = Duration::from_millis(2);
         loop {

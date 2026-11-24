@@ -907,6 +907,9 @@ pub struct PastaNetwork {
     // Where pasta's PID file goes when not in the VM's runtime directory: a pooled
     // namespace is no VM's.
     pid_dir: Option<PathBuf>,
+    // pasta is started with a control socket and without its neighbour listener
+    // (`with_control_socket`): the pastas a pool keeps.
+    control: bool,
     // The VMM's TAP is made attached and its queue kept by the holder (`with_attached_tap`):
     // the namespaces a pool builds.
     attached_tap: bool,
@@ -1029,10 +1032,57 @@ impl PastaNetwork {
             isolated: false,
             dns_server: None,
             pid_dir: None,
+            control: false,
             attached_tap: false,
             pooling: false,
             lease: None,
         }
+    }
+
+    /// Start pasta with a control socket beside its PID file (`pasta -c`), over which
+    /// [`Self::reset_pasta`] has it forget one guest for the next, and without its
+    /// listener for the host's neighbour table (`--no-neigh-notify`): the kernel visits
+    /// every such listener on the host for each link event of any namespace, under
+    /// `rtnl_mutex`. Both are options of the patches fcvm carries
+    /// (`scripts/passt-*.patch`). Needs [`Self::with_pid_dir`].
+    pub fn with_control_socket(mut self) -> Self {
+        self.control = true;
+        self
+    }
+
+    /// `args` with what a pooled pasta gets beside an unpooled one's: its control socket and
+    /// no neighbour listener. They go before the last argument, which names the namespace,
+    /// and are not part of [`Self::pool_key`]: a clone asks for a namespace by what it would
+    /// build for itself.
+    fn with_control_args(mut args: Vec<OsString>, control: &Path) -> Vec<OsString> {
+        let at = args.len().saturating_sub(1);
+        args.splice(
+            at..at,
+            [
+                OsString::from("-c"),
+                control.as_os_str().to_os_string(),
+                OsString::from("--no-neigh-notify"),
+            ],
+        );
+        args
+    }
+
+    /// Where this network's pasta listens for control connections, when it was started
+    /// with one.
+    fn control_socket(&self) -> Result<PathBuf> {
+        let dir = self
+            .pid_dir
+            .as_ref()
+            .context("a pasta with a control socket needs a directory of its own")?;
+        Ok(dir.join("pasta.ctl"))
+    }
+
+    /// Have the running pasta forget its guest: every flow closed with nothing sent to the
+    /// guest's side, the guest's MAC and addresses as pasta started with them
+    /// ([`super::pesto::reset`]). pasta keeps running and stays attached to its TAP, so
+    /// nothing changes a link.
+    pub async fn reset_pasta(&self) -> Result<()> {
+        super::pesto::reset(&self.control_socket()?).await
     }
 
     /// Build the namespace with the VMM's TAP attached, its queue held by the holder
@@ -1696,12 +1746,30 @@ impl PastaNetwork {
         let pasta_bin = crate::setup::get_pasta_for_config(config.pasta.as_ref())?;
         info!(pasta_bin = %pasta_bin.display(), "resolved pasta binary");
 
-        let args = self.build_pasta_args(
+        let mut args = self.build_pasta_args(
             &pid_file,
             namespace_pid,
             host_ipv6.as_deref(),
             nix::unistd::geteuid().is_root(),
         );
+        if self.control {
+            let control = self.control_socket()?;
+            // pasta binds the path and refuses one that exists; `sun_path` holds 107 bytes.
+            anyhow::ensure!(
+                control.as_os_str().len() < 108,
+                "the control socket path {} is too long for a UNIX socket",
+                control.display()
+            );
+            match tokio::fs::remove_file(&control).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing a stale {}", control.display()))
+                }
+            }
+            args = Self::with_control_args(args, &control);
+        }
         debug!(pasta_args = ?args, "pasta arguments");
         let mut cmd = pasta_command(&pasta_bin, &args);
         debug!(cmd = ?cmd, "pasta command");
@@ -3499,6 +3567,30 @@ mod tests {
     /// The pool builds its namespaces from a network with the pool's TAP name and no
     /// loopback address. A default restored clone's key is that network's: neither the
     /// TAP's name nor the clone's loopback address is part of what the namespace is.
+    /// A pooled pasta's extra arguments sit before the namespace's PID, which pasta takes
+    /// last, and a network that asks for them has the key of one that does not.
+    #[test]
+    fn a_pooled_pasta_gets_its_control_socket_before_the_namespace() {
+        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
+        let args = net.build_pasta_args(Path::new("/run/p.pid"), 4242, None, false);
+        let with = PastaNetwork::with_control_args(args.clone(), Path::new("/run/pasta.ctl"));
+        assert_eq!(with.len(), args.len() + 3);
+        assert_eq!(with.last(), Some(&OsString::from("4242")));
+        let tail: Vec<&str> = with[with.len() - 4..]
+            .iter()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(tail, ["-c", "/run/pasta.ctl", "--no-neigh-notify", "4242"]);
+        assert_eq!(with[..args.len() - 1], args[..args.len() - 1]);
+
+        let plain = PastaNetwork::new("a".to_string(), "tap-a".to_string(), vec![]);
+        let pooled = PastaNetwork::new("b".to_string(), "tap-b".to_string(), vec![])
+            .with_pid_dir("/run/pool/0".into())
+            .with_attached_tap()
+            .with_control_socket();
+        assert_eq!(plain.with_restore_mode().pool_key(), pooled.pool_key());
+    }
+
     #[test]
     fn a_default_restored_clone_has_the_key_of_a_pooled_namespace() {
         let pooled = PastaNetwork::new("slot".into(), "tap-pool".into(), vec![]);
