@@ -2070,6 +2070,32 @@ mod power_tests {
         ])));
     }
 
+    /// The two limits of the arrival rule come from their flags, or from the environment
+    /// (the coordinator's task definition sets variables, not arguments), with the flag first.
+    #[test]
+    fn the_arrival_limits_are_read_from_the_environment() {
+        let a = coord(&[]);
+        assert_eq!(
+            (a.sleep_without_new_viewer, a.min_wake_remaining),
+            (3600, 600)
+        );
+        // The only test of this binary that sets or reads these two variables.
+        std::env::set_var("FLEET_SLEEP_WITHOUT_NEW_VIEWER", "7200");
+        std::env::set_var("FLEET_MIN_WAKE_REMAINING", "900");
+        let a = coord(&[]);
+        assert_eq!(
+            (a.sleep_without_new_viewer, a.min_wake_remaining),
+            (7200, 900)
+        );
+        let a = coord(&["--min-wake-remaining", "0"]);
+        assert_eq!(
+            (a.sleep_without_new_viewer, a.min_wake_remaining),
+            (7200, 0)
+        );
+        std::env::remove_var("FLEET_SLEEP_WITHOUT_NEW_VIEWER");
+        std::env::remove_var("FLEET_MIN_WAKE_REMAINING");
+    }
+
     /// A race launches every EC2 tile, so more EC2 tiles than the viewers' launch budget would
     /// leave `restart_now` refused for ever: such a count is refused when the coordinator starts.
     #[test]

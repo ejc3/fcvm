@@ -577,7 +577,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
   fixed host, a test box); without either it stays `awake`. After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), or
-  after `--sleep-without-new-viewer` seconds (default 3600, 0 never) with no arrival, even
+  after `--sleep-without-new-viewer` seconds (default 3600, 0 never; also
+  `FLEET_SLEEP_WITHOUT_NEW_VIEWER`) with no arrival, even
   while viewers stay connected and visible, and never while a claim (a wall GPU or a phone)
   is active or a race is running, the fleet goes `asleep` (`asleep_since`). A claim or race
   that outlasts either limit holds the fleet awake until it ends, and it sleeps then. An
@@ -596,7 +597,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now`, `claim_gpu` and `claim_phone` are refused. Hosts that leave then are not reclaimed. When an active viewer
-  is there and at least `--min-wake-remaining` seconds (default 600) of the limit remain
+  is there and at least `--min-wake-remaining` seconds (default 600; also
+  `FLEET_MIN_WAKE_REMAINING`) of the limit remain
   (a new viewer arrived or a page sent `wake`, each of which has the whole limit ahead, or
   a hidden page turned visible again, or a page reconnected, that long before the limit
   runs out) it is `waking`

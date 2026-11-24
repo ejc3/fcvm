@@ -555,7 +555,7 @@ pub struct FleetCoordArgs {
     /// Seconds of --sleep-without-new-viewer that must remain for a connected page that
     /// becomes active (shown again, or reconnecting) to wake a sleeping fleet. With less
     /// left the page's Wake button wakes it.
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, env = "FLEET_MIN_WAKE_REMAINING", default_value_t = 600)]
     pub min_wake_remaining: u64,
 
     /// The most the fleet may spend in one UTC day, in USD. The coordinator meters what the
