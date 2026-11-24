@@ -5738,8 +5738,9 @@ mod tests {
             read_file_as(&env, &file, 3).await.is_err(),
             "over the limit"
         );
+        // With room for the reader's own error, as the id file's read has.
         let missing = prefix(&["env", "fcvm-test-no-such-program"]);
-        let error = read_file_as(&missing, &file, 16)
+        let error = read_file_as(&missing, &file, 256)
             .await
             .expect_err("a reader that could not run read as an absent file");
         assert!(format!("{error:#}").contains("exited"), "{error:#}");
