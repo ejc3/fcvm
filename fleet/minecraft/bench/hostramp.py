@@ -87,6 +87,35 @@ def post(url, body, timeout=3.0):
         return repr(e)
 
 
+# A scene post that gets no answer in its time is sent again, this many sends at most.
+SCENE_SENDS = 3
+
+
+def post_scene(url, body, timeout=3.0):
+    """Post a tile its scene. With no answer in `timeout` s it is sent again, as the fleet's agent
+    offers a scene again to a tile that did not take it; a scene the tile already has changes
+    nothing in it. Any answer ends it, 200 or not. Returns the last send's result and how many
+    sends it took."""
+    for sends in range(1, SCENE_SENDS + 1):
+        status = post(url, body, timeout)
+        if not (isinstance(status, str) and "timed out" in status):
+            break
+    return status, sends
+
+
+# How long an fcvm command the harness waits on may take: far above what either takes on a
+# healthy host (in the record a whole extra restore at 768 servers, its `fcvm ls` calls
+# included, was ready in under 2 s). A command that takes longer raises
+# subprocess.TimeoutExpired, which ends the run through the step's teardown.
+LS_TIMEOUT_S = 60
+SNAPSHOT_TIMEOUT_S = 300
+
+
+def fcvm_snapshot_create(pid, tag_):
+    return subprocess.run([FCVM, "snapshot", "create", "--pid", str(pid), "--tag", tag_, "--stop"], text=True, capture_output=True, env=env(),
+                          timeout=SNAPSHOT_TIMEOUT_S)
+
+
 def in_use(procs):
     """What already runs on the host that a run must not share it with: `procs` is each process's
     command line. A VMM of any kind, and the fleet's agent or coordinator."""
@@ -116,7 +145,7 @@ def refuse_a_host_in_use():
 
 
 def vms():
-    out = subprocess.run([FCVM, "ls", "--json"], text=True, capture_output=True).stdout or "[]"
+    out = subprocess.run([FCVM, "ls", "--json"], text=True, capture_output=True, timeout=LS_TIMEOUT_S).stdout or "[]"
     try:
         return {v.get("name"): v for v in json.loads(out)}
     except json.JSONDecodeError:
@@ -270,7 +299,7 @@ def cmd_gold(bots):
             raise RuntimeError(f"gold not ready: {h}")
         ready_s = time.monotonic() - t0
         tc = time.monotonic()
-        r = subprocess.run([FCVM, "snapshot", "create", "--pid", str(pid), "--tag", tag(bots), "--stop"], text=True, capture_output=True, env=env())
+        r = fcvm_snapshot_create(pid, tag(bots))
         if r.returncode:
             raise RuntimeError(f"snapshot create failed: {r.stdout[-1500:]} {r.stderr[-1500:]}")
         print(json.dumps({"gold": tag(bots), "boot_to_ready_s": round(ready_s, 1), "snapshot_s": round(time.monotonic() - tc, 2), "health": h}), flush=True)
@@ -334,10 +363,11 @@ def step(bots, k, out, batch):
             rec["why"] = "not every server came up"
             return rec
         # Each clone its own scene, as the agent posts it: the tile reseeds its bots from it.
-        scene = list(POOL.map(lambda a: post(f"http://{ips[a[1]]}:8080/scene", {"tile": f"mc-{a[0] + 1}", "generation": 1, "admit_keys": [], "driver": None, "driver_until": None}), enumerate(names)))
-        rec["scene_ok"] = sum(1 for s in scene if s == 200)
+        scene = list(POOL.map(lambda a: post_scene(f"http://{ips[a[1]]}:8080/scene", {"tile": f"mc-{a[0] + 1}", "generation": 1, "admit_keys": [], "driver": None, "driver_until": None}), enumerate(names)))
+        rec["scene_ok"] = sum(1 for s, _ in scene if s == 200)
+        rec["scene_sent_again"] = sum(1 for _, sends in scene if sends > 1)
         if rec["scene_ok"] < k:
-            rec["scene_first_error"] = str(next(s for s in scene if s != 200))
+            rec["scene_first_error"] = str(next(s for s, _ in scene if s != 200))
         log(f"b{bots} k={k}: up in {rec['start_wall_s']} s, scenes {rec['scene_ok']}; warm {WARM} s")
         time.sleep(WARM)
         cpu0, idle0 = host_cpu()

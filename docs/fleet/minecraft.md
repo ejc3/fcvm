@@ -261,11 +261,12 @@ routed), and the store was a btrfs image in RAM (the host's only disk is a 30 Gi
 volume), so the store's speed bounds nothing here and its contents come out of the host's
 memory.
 
-- **A step** restores K servers from one gold snapshot (the tile ready, 20 TPS for 10 s, then
-  `snapshot create --stop`) with 16 restores in flight, gives each its own scene (so its bots are
-  reseeded), waits 30 s, then reads every tile's `/health` every 5 s for 60 s. A reading counts
-  only with three bots online and a game time under 3 s old, else it is 0. A step holds when
-  every reading is 19.5 or more and every server took its scene.
+- **A step** restores K servers from one gold snapshot (taken once the tile is ready and ten
+  readings a second apart are each 19.5 TPS or more, with `snapshot create --stop`) with 16
+  restores in flight, gives each its own scene (so its bots are reseeded), waits 30 s, then
+  reads every tile's `/health` every 5 s for 60 s. A reading counts only with three bots online
+  and a game time under 3 s old, else it is 0. A step holds when every reading is 19.5 or more
+  and every server took its scene.
 
 The steps in the order they ran, each torn down before the next. The first five ran back to
 back; the last ran half an hour later, after the 48-core steps and the first of the two steps
@@ -282,12 +283,15 @@ to 21:47 UTC):
 | 512, again at the end | 19.76 | 98.6 (0.193) | 55.0 s | 880 to 967 ms | 310 |
 
 - **512 held its tick rate both times, and by the step's rule held once.** In the first run
-  every one of the 6,144 readings was 19.86 or more, but 66 of the 512 scene posts timed out
-  (the harness gives a post 3 s and does not send it again), so those servers' bots kept the
-  gold snapshot's seed and the step does not count as held. Its restores were the slowest of
-  the two runs too (90.4 s, the slowest single one 13.4 s, against 55.0 s and 3.1 s). It began
-  the moment the 256 step's teardown returned; the second run began on a host that had run no
-  VM for a minute, and held, every scene set. Why the first was slower was not measured.
+  every one of the 6,144 readings was 19.86 or more, but 66 of the 512 scene posts timed out, so
+  those servers' bots kept the gold snapshot's seed and the step does not count as held. That
+  count is the harness's rule and not the servers' doing: it gave a post 3 s and did not send
+  it again, where the fleet's agent offers a scene again to a tile that did not take it. The
+  harness sends a post that times out again now, three sends at most; these records were taken
+  before that. The first run's restores were the slowest of the two as well (90.4 s, the
+  slowest single one 13.4 s, against 55.0 s and 3.1 s). It began the moment the 256 step's
+  teardown returned; the second run began on a host that had run no VM for a minute, and held,
+  every scene set. What made the first run's restores slower was not measured.
 - **768 did not hold:** 5 servers had a reading under 19.5 (the 1st percentile of the 9,216
   readings was 19.89), with 154 of the 192 cores busy and 68 GiB of memory available
   afterwards. No count between 512 and 768 was run.
@@ -303,9 +307,12 @@ to 21:47 UTC):
   Bots connected but standing still were not measured.
 - **Start rate.** With 16 restores in flight: 17.8 servers a second at 64, 15.2 at 256, 5.7 and
   9.3 at 512 (the two runs), 4.3 at 768. The "one more restore" column is `fcvm snapshot run` to
-  a ready `/health`, polled every 20 ms; at the high counts it includes the harness's own
-  `fcvm ls --json` over every VM.
-- **Memory** is each step's reading about two minutes after its servers start, and a server
+  a ready `/health`, polled every 20 ms, three times; at the high counts it includes the
+  harness's own `fcvm ls --json` over every VM. Each of the three stays up until the step is
+  torn down, so they were restored with K, K+1 and K+2 servers running.
+- **Memory** is read once, about 90 s after the step's last server came up (the 30 s wait and the
+  60 s of readings), so the servers' ages at the reading differ by the time the restores took:
+  3.6 s at 64, 179.4 s at 768, where the first servers were four and a half minutes old. A server
   grows after that. Memory against a server's age was not measured with this harness.
 
 ## Stack of PRs
