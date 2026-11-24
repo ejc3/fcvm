@@ -814,9 +814,19 @@ mod tests {
     /// The TUNSETIFF calls pass a mutable ifreq: the kernel writes it back.
     #[test]
     fn tunsetiff_gets_a_mutable_ifreq() {
-        let here = include_str!("confine.rs");
-        assert_eq!(here.matches("&mut request as *mut IfReq").count(), 2);
-        assert!(!here.contains(concat!("TUNSETIFF as _, &", "request)")));
+        let code = non_test(include_str!("confine.rs"));
+        let tests = &include_str!("confine.rs")[code.len()..];
+        // own_tap in the code, attach_tap in the probe.
+        assert_eq!(
+            code.matches("TUNSETIFF as _, &mut request as *mut IfReq")
+                .count(),
+            1
+        );
+        assert_eq!(
+            tests.matches("as _, &mut request as *mut IfReq) }").count(),
+            1
+        );
+        assert!(!code.contains(concat!("TUNSETIFF as _, &", "request)")));
     }
 
     /// Each restore path and the setup VM resolve before their first host side effect.
@@ -1048,8 +1058,8 @@ mod tests {
         let tests_at = here.find("\n#[cfg(test)]\nmod tests").unwrap();
         assert_eq!(
             here[..tests_at].matches("Decision(").count(),
-            2,
-            "the type and resolve"
+            3,
+            "the type and resolve's two returns"
         );
     }
 
