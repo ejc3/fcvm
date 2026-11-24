@@ -1,12 +1,28 @@
 #!/bin/bash
 # Build GitHub runner AMI with custom kernel
 # Called from CI workflow - requires AWS credentials
+#
+# AMI_ARCH selects the image: arm64 (the default) or x64. Both install the host kernel of
+# their [kernel_profiles.nested.<arch>.host_kernel] table.
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-west-1}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 FCVM_SOURCE_REMOTE="${FCVM_SOURCE_REMOTE:-https://github.com/ejc3/fcvm.git}"
+
+# Canonical's name for the architecture in its image names, EC2's name for it, and the
+# builder's instance type (each has local NVMe for the kernel build; the builder role in
+# ejc3/aws github-ami-builder.tf allows exactly these two types).
+AMI_ARCH="${AMI_ARCH:-arm64}"
+case "$AMI_ARCH" in
+  arm64) UBUNTU_ARCH=arm64 EC2_ARCH=arm64 BUILDER_TYPE=c7gd.8xlarge ;;
+  x64) UBUNTU_ARCH=amd64 EC2_ARCH=x86_64 BUILDER_TYPE=c5d.9xlarge ;;
+  *)
+    echo "ERROR: AMI_ARCH must be arm64 or x64, got '$AMI_ARCH'" >&2
+    exit 1
+    ;;
+esac
 
 # Prove the cloud builder can perform the exact fetch rendered below before an
 # EC2 instance is allocated. A local HEAD can identify a perfectly valid but
@@ -105,18 +121,30 @@ compute_hash() {
   # symlink produced a valid-looking hash computed over FEWER inputs. That is the
   # stale-AMI bug this function exists to prevent, wearing a different hat:
   # check_existing_ami would match an image built from a different kernel.
+  # The image's architecture picks the host kernel table and the nested guest config.
+  # It is part of the key, so the two images never share one.
+  local ami_arch="${AMI_ARCH:-arm64}" host_section nested_conf
+  case "$ami_arch" in
+    arm64) host_section="[kernel_profiles.nested.arm64.host_kernel]" nested_conf=nested.conf ;;
+    x64) host_section="[kernel_profiles.nested.amd64.host_kernel]" nested_conf=nested-x86.conf ;;
+    *)
+      echo "ERROR: AMI_ARCH must be arm64 or x64, got '$ami_arch'" >&2
+      return 1
+      ;;
+  esac
+
   # The host kernel's patch set is the patches_dir its own table names, which can
   # differ from the guest's (#659 ran a 7.3 host from its own set under 6.18 guests),
   # so read it from that table rather than assume a directory.
   local host_patches_dir
-  if ! host_patches_dir=$(awk '
-      /^\[/ { in_section = ($0 == "[kernel_profiles.nested.arm64.host_kernel]") }
+  if ! host_patches_dir=$(awk -v section="$host_section" '
+      /^\[/ { in_section = ($0 == section) }
       in_section && /^patches_dir[[:space:]]*=/ {
         v = $0; sub(/^[^=]*=[[:space:]]*"/, "", v); sub(/".*$/, "", v); print v; found = 1
       }
       END { exit(found ? 0 : 1) }
     ' "$repo_root/rootfs-config.toml") || [ -z "$host_patches_dir" ]; then
-    echo "ERROR: [kernel_profiles.nested.arm64.host_kernel] has no patches_dir;" >&2
+    echo "ERROR: $host_section has no patches_dir;" >&2
     echo "       the AMI cache key cannot find the host kernel's patches." >&2
     return 1
   fi
@@ -138,23 +166,23 @@ compute_hash() {
   # Only the host kernel this AMI bakes. rootfs-config.toml carries many
   # kernel_version assignments, so a bare grep also invalidated the key whenever
   # an unrelated profile (btrfs.arm64, nested.amd64, ...) changed, forcing a full
-  # EC2 rebuild. The builder always selects [kernel_profiles.nested.arm64.host_kernel]
-  # on ARM64. Resolved HERE, not inside the `{ ... } | sha256sum` group below,
+  # EC2 rebuild. The builder selects the host_kernel table of its own architecture.
+  # Resolved HERE, not inside the `{ ... } | sha256sum` group below,
   # because `exit` inside that group leaves only the subshell — sha256sum would
   # still hash the partial input and emit a plausible key.
   local host_kernel_version
-  if ! host_kernel_version=$(awk '
-      /^\[/ { in_section = ($0 == "[kernel_profiles.nested.arm64.host_kernel]") }
+  if ! host_kernel_version=$(awk -v section="$host_section" '
+      /^\[/ { in_section = ($0 == section) }
       in_section && /^kernel_version[[:space:]]*=/ { print; found = 1 }
       END { exit(found ? 0 : 1) }
     ' "$repo_root/rootfs-config.toml"); then
-    echo "ERROR: [kernel_profiles.nested.arm64.host_kernel] has no kernel_version;" >&2
+    echo "ERROR: $host_section has no kernel_version;" >&2
     echo "       the AMI cache key cannot identify the host kernel." >&2
     return 1
   fi
 
   local f
-  for f in "$KERNEL_DIR/nested.conf" "$repo_root/rootfs-config.toml" \
+  for f in "$KERNEL_DIR/$nested_conf" "$repo_root/rootfs-config.toml" \
     "$SCRIPT_DIR/build-passt.sh" "$SCRIPT_DIR/install-runner-disk-guard.sh" \
     "$SCRIPT_DIR/runner-disk-preflight.sh" \
     "$SCRIPT_DIR/prune-cargo-target.sh" \
@@ -186,9 +214,10 @@ compute_hash() {
   fi
 
   {
-    cat "$KERNEL_DIR/nested.conf"
+    printf 'arch=%s\n' "$ami_arch"
+    cat "$KERNEL_DIR/$nested_conf"
     # The HOST kernel baked into this AMI is built from the patches_dir of
-    # [kernel_profiles.nested.arm64.host_kernel], NOT kernel/patches. Most of the files
+    # its host_kernel table, NOT kernel/patches. Most of the files
     # there were never in kernel/patches (the NV2 and debug patches of the time),
     # so they were invisible to this hash, so changing one produced an identical AMI hash and the
     # builder reused a stale image carrying the OLD host kernel.
@@ -225,12 +254,12 @@ check_existing_ami() {
     --query 'Images[0].ImageId' --output text
 }
 
-# Get latest Ubuntu 24.04 ARM64 AMI
+# Get latest Ubuntu 24.04 AMI of the image's architecture
 get_base_ami() {
   aws ec2 describe-images \
     --region "$REGION" \
     --owners 099720109477 \
-    --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*" \
+    --filters "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-${UBUNTU_ARCH}-server-*" \
     --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
     --output text
 }
@@ -253,10 +282,17 @@ set -euxo pipefail
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s)
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
 
+# One script provisions both architectures: the download names follow the machine.
+MACHINE=$(uname -m)
+case "$MACHINE" in
+  aarch64) RUNNER_ARCH=arm64 ;;
+  x86_64) RUNNER_ARCH=x64 ;;
+esac
+
 # Install AWS CLI first (needed for tagging)
 apt-get update
 apt-get install -y unzip curl
-curl --fail "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "/tmp/awscliv2.zip"
+curl --fail "https://awscli.amazonaws.com/awscli-exe-linux-${MACHINE}.zip" -o "/tmp/awscliv2.zip"
 unzip -q /tmp/awscliv2.zip -d /tmp
 /tmp/aws/install
 
@@ -340,15 +376,22 @@ cp rootfs-config.toml /root/.config/fcvm/
 aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=nested --region us-west-1
 ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
+# The image must boot a kernel with the bridge teardown fix. The running kernel is still
+# the base image's, so check the release fcvm selected for the next boot.
+BOOT_KERNEL=$(sed -n 's/^GRUB_DEFAULT="Advanced options for Ubuntu>Ubuntu, with Linux \(.*\)"$/\1/p' /etc/default/grub)
+test -n "$BOOT_KERNEL"
+test -e "/boot/vmlinuz-$BOOT_KERNEL"
+./scripts/check-bridge-teardown-kernel.sh "$BOOT_KERNEL"
+
 # Firecracker
 FIRECRACKER_VERSION="v1.14.0"
 curl --fail -L -o /tmp/firecracker.tgz \
-  "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-aarch64.tgz"
+  "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-${MACHINE}.tgz"
 tar -xzf /tmp/firecracker.tgz -C /usr/local/bin --strip-components=1 \
-  "release-${FIRECRACKER_VERSION}-aarch64/firecracker-${FIRECRACKER_VERSION}-aarch64" \
-  "release-${FIRECRACKER_VERSION}-aarch64/jailer-${FIRECRACKER_VERSION}-aarch64"
-mv "/usr/local/bin/firecracker-${FIRECRACKER_VERSION}-aarch64" /usr/local/bin/firecracker
-mv "/usr/local/bin/jailer-${FIRECRACKER_VERSION}-aarch64" /usr/local/bin/jailer
+  "release-${FIRECRACKER_VERSION}-${MACHINE}/firecracker-${FIRECRACKER_VERSION}-${MACHINE}" \
+  "release-${FIRECRACKER_VERSION}-${MACHINE}/jailer-${FIRECRACKER_VERSION}-${MACHINE}"
+mv "/usr/local/bin/firecracker-${FIRECRACKER_VERSION}-${MACHINE}" /usr/local/bin/firecracker
+mv "/usr/local/bin/jailer-${FIRECRACKER_VERSION}-${MACHINE}" /usr/local/bin/jailer
 
 # Podman rootless
 echo "ubuntu:100000:65536" >> /etc/subuid
@@ -361,7 +404,7 @@ echo "user_allow_other" > /etc/fuse.conf
 mkdir -p /opt/actions-runner
 RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/v//')
 curl --fail -o /tmp/actions-runner.tar.gz -L \
-  "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-arm64-${RUNNER_VERSION}.tar.gz"
+  "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-${RUNNER_ARCH}-${RUNNER_VERSION}.tar.gz"
 tar xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner
 chown -R ubuntu:ubuntu /opt/actions-runner
 /opt/actions-runner/bin/installdependencies.sh
@@ -464,10 +507,12 @@ main() {
     exit 1
   fi
 
-  # Clean up any orphaned builder instances (from cancelled runs)
+  # Clean up any orphaned builder instances (from cancelled runs). Only this
+  # architecture's: the other image's builder may be running beside this one.
   orphans=$(aws ec2 describe-instances \
     --region "$REGION" \
-    --filters "Name=tag:Name,Values=ami-builder-temp" "Name=instance-state-name,Values=running,pending" \
+    --filters "Name=tag:Name,Values=ami-builder-temp" "Name=architecture,Values=$EC2_ARCH" \
+    "Name=instance-state-name,Values=running,pending" \
     --query 'Reservations[].Instances[].InstanceId' --output text)
   if [ -n "$orphans" ]; then
     echo "Cleaning up orphaned instances: $orphans"
@@ -489,7 +534,7 @@ main() {
   local -a launch_args=(
     --region "$REGION"
     --image-id "$base_ami"
-    --instance-type c7gd.8xlarge
+    --instance-type "$BUILDER_TYPE"
     --subnet-id "$builder_subnet"
     --security-group-ids "$builder_security_group"
     --iam-instance-profile Name=ami-builder-profile
@@ -540,7 +585,7 @@ main() {
 
   # Create AMI
   timestamp=$(date +%Y%m%d-%H%M)
-  ami_name="fcvm-runner-${kernel_version}-${timestamp}"
+  ami_name="fcvm-runner-${kernel_version}-${AMI_ARCH}-${timestamp}"
   local image_tags
   image_tags=$(jq -cn --arg name "$ami_name" --arg kernel "${kernel_version}-nested" --arg hash "$hash" \
     '[{ResourceType:"image",Tags:[{Key:"Name",Value:$name},{Key:"Kernel",Value:$kernel},{Key:"BuildHash",Value:$hash},{Key:"Purpose",Value:"github-runner"}]},{ResourceType:"snapshot",Tags:[{Key:"Purpose",Value:"github-runner"}]}]')
@@ -549,7 +594,7 @@ main() {
     --region "$REGION" \
     --instance-id "$instance_id" \
     --name "$ami_name" \
-    --description "fcvm CI runner with kernel ${kernel_version}-nested" \
+    --description "fcvm CI runner ($AMI_ARCH) with kernel ${kernel_version}-nested" \
     --tag-specifications "$image_tags" \
     --query 'ImageId' --output text)
   echo "Created AMI: $ami_id ($ami_name)"

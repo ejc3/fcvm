@@ -92,6 +92,12 @@ waited up to 1.86 s; without the barrier no hold passed 50 ms and the longest
 creation took 180 ms (#1563). fcvm carried the commit as a patch until the pin
 reached 6.18.60. `every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier`
 fails if a host kernel pins an earlier release.
+`scripts/check-bridge-teardown-kernel.sh` applies the same rule to a `uname -r` release.
+Both runner images (`scripts/build-ami.sh`, arm64 and x64) install the host kernel of their
+architecture and run that check on the release they will boot. The x64 runners ran a stock
+6.14 kernel before the x64 image existed: on 2026-11-24 one of them stalled every network
+operation for 6.6 s and 5.9 s while namespaces died, and nine tests lost their namespace
+holder at its 5 s readiness deadline.
 
 `kernel/patches-arm64-host/vgic-v3-keep-hcr-on-quiet-exits.patch` gives back most of what
 6.19's vgic rework added to every KVM exit (#659). Since Linux 6.19 (the vgic-lr-overflow

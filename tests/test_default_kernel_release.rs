@@ -2637,6 +2637,69 @@ fn every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier() {
     );
 }
 
+/// scripts/check-bridge-teardown-kernel.sh is the one statement of which kernel releases have
+/// that fix. The runner image build runs it on the release it installed, and it passes Ubuntu's
+/// AWS 7.0 backport only when asked, because a runner boots fcvm's own host kernel.
+#[test]
+fn the_bridge_teardown_kernel_check_accepts_only_releases_with_the_fix() {
+    let root = repo_root();
+    let script = root.join("scripts/check-bridge-teardown-kernel.sh");
+    let verdict = |arguments: &[&str]| {
+        let output = Command::new("bash")
+            .arg(&script)
+            .args(arguments)
+            .output()
+            .expect("run check-bridge-teardown-kernel.sh");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    for release in [
+        "6.18.60",
+        "6.18.61-fcvm-0123456789ab",
+        "7.2.0",
+        "7.3.3-fcvm-0123456789ab",
+        "8.0.1",
+    ] {
+        assert_eq!(verdict(&[release]).0, Some(0), "{release} has the fix");
+    }
+    for release in [
+        "6.14.0-1018-aws",
+        "6.18.59",
+        "6.19.9",
+        "7.0.0-1013-aws",
+        "7.0.0-1018-aws",
+        "7.1.12",
+        "6.18",
+        "unknown",
+    ] {
+        let (status, message) = verdict(&[release]);
+        assert_eq!(status, Some(1), "{release} must fail");
+        assert!(
+            message.contains(&format!("kernel {release} lacks")),
+            "the failure must name the kernel: {message}"
+        );
+    }
+    let backport = "--accept-ubuntu-backport";
+    assert_eq!(verdict(&[backport, "7.0.0-1017-aws"]).0, Some(0));
+    assert_eq!(verdict(&[backport, "7.0.0-1016-aws"]).0, Some(1));
+    assert_eq!(verdict(&[backport, "7.0.0-1018-generic"]).0, Some(1));
+    assert_eq!(verdict(&[backport, "6.18.59"]).0, Some(1));
+
+    let ami = std::fs::read_to_string(root.join("scripts/build-ami.sh")).unwrap();
+    let install = ami
+        .find("--install-host-kernel\n")
+        .expect("build-ami.sh installs the host kernel");
+    let check = ami
+        .find("./scripts/check-bridge-teardown-kernel.sh \"$BOOT_KERNEL\"\n")
+        .expect("build-ami.sh checks the kernel the image will boot");
+    assert!(
+        install < check,
+        "the image build must check the kernel after installing it"
+    );
+}
+
 /// With CONFIG_WEXT_CORE=y every netdev notifier event walks every network namespace under RTNL
 /// (wext_netdev_notifier_call -> wireless_nlevent_flush -> for_each_net): 3.3 to 3.6 ms of hold
 /// per VM namespace life with 2000 to 3000 namespaces alive (#2034). WEXT_CORE is def_bool on
@@ -2938,7 +3001,8 @@ fn the_release_check_outlasts_two_dropped_requests() {
 
 /// #957: Build Runner AMI ran only after a fully successful Build Kernels run,
 /// so one failed x86_64 leg skipped the arm64 image. It now starts on any run
-/// that was not cancelled and first checks the one release it takes.
+/// that was not cancelled, and each leg first checks the one release it takes:
+/// the nested kernel of its own architecture.
 #[test]
 fn the_runner_image_waits_for_its_own_kernel_not_the_whole_run() {
     let path = repo_root().join(".github/workflows/build-runner-ami.yml");
@@ -2951,14 +3015,31 @@ fn the_runner_image_waits_for_its_own_kernel_not_the_whole_run() {
             && !condition.contains("conclusion == 'success'"),
         "build-ami must start on every finished Build Kernels run: {condition}"
     );
+    let legs: Vec<(&str, &str)> = job["strategy"]["matrix"]["include"]
+        .as_sequence()
+        .expect("build-ami has one leg per image")
+        .iter()
+        .map(|leg| {
+            (
+                leg["arch"].as_str().unwrap(),
+                leg["config_arch"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(legs, [("arm64", "arm64"), ("x64", "amd64")]);
+    assert_eq!(
+        job["strategy"]["fail-fast"].as_bool(),
+        Some(false),
+        "one image's failure must not cancel the other's build"
+    );
     let steps = job["steps"].as_sequence().unwrap();
     let check = steps
         .iter()
         .position(|step| {
             run_script(step).trim()
-                == "python3 scripts/verify-kernel-releases.py --leg nested arm64"
+                == "python3 scripts/verify-kernel-releases.py --leg nested ${{ matrix.config_arch }}"
         })
-        .expect("build-ami checks the arm64 nested release it downloads");
+        .expect("build-ami checks the nested release its leg downloads");
     let build = steps
         .iter()
         .position(|step| run_script(step).contains("scripts/build-ami.sh"))
@@ -2966,6 +3047,11 @@ fn the_runner_image_waits_for_its_own_kernel_not_the_whole_run() {
     assert!(
         check < build,
         "the release check must come before the image build"
+    );
+    assert_eq!(
+        steps[build]["env"]["AMI_ARCH"].as_str(),
+        Some("${{ matrix.arch }}"),
+        "each leg must build the image of its own architecture"
     );
     let ami = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh")).unwrap();
     assert!(
