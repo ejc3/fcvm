@@ -2573,9 +2573,22 @@ both.
   is written like a lock file (0666). Nothing is made world-writable.
 - **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
   by every command while a VM of it is running: the error lists each one's name and PID,
-  and they are stopped with the fcvm that started them. With none running, what it left is
-  removed (`check_layout`). An older fcvm pointed at a layout 2 store sees no VMs and
-  cannot tell, so do not run two fcvm builds of different layouts on one store.
+  and they are stopped with the fcvm that started them. A command that only reads decides
+  refuse or proceed and writes nothing (`check_layout_for_read`), so `fcvm ls` needs no
+  write access and removes nothing of an older launch in progress. A launch
+  (`check_layout_for_write`) removes what layout 1 left with no VM running, under layout
+  1's own `names.lock`, held across a second scan and the removal, and writes the marker;
+  the lock file stays, so an older launch and a conversion always exclude each other.
+  The marker's content is read: anything but this layout's number is refused. An older
+  fcvm pointed at a layout 2 store sees no VMs and cannot tell, so do not run two fcvm
+  builds of different layouts on one store.
+- **Liveness is read from the caller's own /proc** (`process_liveness`): a state directory
+  is used from one PID namespace, which holds because each nesting level has its own data
+  directory. Only "no such process" (or a zombie, or another start time) is dead; a /proc
+  read that fails for another reason fails a name claim and removes nothing.
+- **A state file a host crash left empty or cut short** is removed by the sweep when it
+  was written before this boot (`/proc/stat` btime), and warned about once per process
+  otherwise. Nothing on the state path is synced.
 
 No master state file: `list_vms()` reads every bucket of `vms/`.
 

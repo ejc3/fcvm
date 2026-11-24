@@ -388,6 +388,74 @@ fn test_rename_directory_onto_directory_needs_an_empty_target() {
     cleanup(&data_dir, &mount_dir);
 }
 
+/// `RENAME_EXCHANGE` swaps two names atomically through the mount. fcvm publishes a VM's
+/// state that way (`publish_state` in src/state/manager.rs): the new file is exchanged with
+/// the published one, and the old one is unlinked from the temporary name.
+#[test]
+fn test_rename_exchange_swaps_two_names() {
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
+    let mount = fuse.mount_path();
+
+    let state = mount.join("vm.json");
+    let temp = mount.join("vm.json.tmp");
+    fs::write(&state, "old state").expect("write state");
+    fs::write(&temp, "new state").expect("write temp");
+    let state_name = std::ffi::CString::new(state.to_str().unwrap()).unwrap();
+    let temp_name = std::ffi::CString::new(temp.to_str().unwrap()).unwrap();
+    // SAFETY: both are NUL-terminated paths that outlive the call.
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp_name.as_ptr(),
+            libc::AT_FDCWD,
+            state_name.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    assert_eq!(
+        ret,
+        0,
+        "renameat2 RENAME_EXCHANGE: {:?}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(fs::read_to_string(&state).unwrap(), "new state");
+    assert_eq!(fs::read_to_string(&temp).unwrap(), "old state");
+    assert_eq!(
+        fs::read_to_string(data_dir.join("vm.json")).unwrap(),
+        "new state",
+        "on the host side"
+    );
+    assert_eq!(
+        fs::read_to_string(data_dir.join("vm.json.tmp")).unwrap(),
+        "old state",
+        "on the host side"
+    );
+
+    // With nothing at the second name there is nothing to exchange with.
+    fs::remove_file(&temp).expect("unlink the replaced state");
+    // SAFETY: as above.
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp_name.as_ptr(),
+            libc::AT_FDCWD,
+            state_name.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    assert_eq!(ret, -1, "exchanged with a name that does not exist");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOENT)
+    );
+    assert_eq!(fs::read_to_string(&state).unwrap(), "new state");
+
+    let _ = fs::remove_file(&state);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
 #[test]
 fn test_lseek_supports_negative_offsets() {
     common::increase_ulimit();
