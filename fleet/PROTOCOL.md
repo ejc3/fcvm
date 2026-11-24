@@ -3788,8 +3788,10 @@ rules (`SCENE_TOKEN_FILE` is not used; `TLS_CERT_FILE` and its `scene_token`, re
     page lights every world at mid-morning.
 
   `ground` and `day_time` are optional: without them the page guesses the forest floor and the
-  lake's bed and lights every world at mid-morning. No tile sends them yet; the page's mock
-  sends both from every other server.
+  lake's bed and lights every world at mid-morning. The tile sends `ground` in every `map`, and
+  in a `delta` when the ground changed. No tile sends `day_time`: Pumpkin 3ea7d281's time
+  packets carried no day clock that moved (none in 150 s on five servers, 2026-11-24), so every
+  world keeps the one sky. The page's mock sends both from every other server.
   - `{"type": "drive_ack", "seq": 12, "ok": true, "at": <unix ms>}` or `{"ok": false,
     "reason": "..."}`, for each drive message.
 
