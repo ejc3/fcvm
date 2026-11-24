@@ -1084,8 +1084,22 @@ class ViewerPathFlowTests(unittest.TestCase):
             claimed_at=claimed_at)
         self.assertEqual(failed, 0, lines)
         self.assertEqual(sent, ["claim_minecraft", "claim_minecraft", "release_minecraft"])
-        self.assertGreaterEqual(claimed_at[1] - claimed_at[0], smoke.minecraft_claim_cooldown_seconds())
+        # What the receipt said was left, plus the clock skew; and the passing line says so.
+        self.assertGreaterEqual(claimed_at[1] - claimed_at[0], 11 + smoke.CLOCK_SKEW_SECONDS)
+        self.assertLess(claimed_at[1] - claimed_at[0], smoke.minecraft_claim_cooldown_seconds())
         self.assertEqual([(m, i) for m, i, a, t in probed if t], [("minecraft", "t:4")])
+        self.assertEqual([l.get("claimWaitedS") for l in lines if l.get("tile") == "t:4 take-over"],
+                         [11 + smoke.CLOCK_SKEW_SECONDS])
+
+    def test_a_cooldown_refusal_that_names_no_time_waits_the_whole_cooldown(self):
+        claimed_at = []
+        failed, sent, _, lines = self.run_flow(
+            claims=[("refused", "your last server was returned recently; borrow again in a while")],
+            claimed_at=claimed_at)
+        self.assertEqual(failed, 0, lines)
+        self.assertEqual(sent, ["claim_minecraft", "claim_minecraft", "release_minecraft"])
+        self.assertGreaterEqual(claimed_at[1] - claimed_at[0],
+                                smoke.minecraft_claim_cooldown_seconds() + smoke.CLOCK_SKEW_SECONDS)
 
     def test_a_refused_take_over_says_why_and_claims_once_for_anything_but_the_cooldown(self):
         failed, sent, _, lines = self.run_flow(
@@ -1104,18 +1118,16 @@ class ViewerPathFlowTests(unittest.TestCase):
         self.assertIn("the coordinator refused the take-over: no server is running and free",
                       {l.get("error") for l in lines if l.get("ok") is False})
 
-    def test_every_claim_refusal_in_the_core_has_a_category(self):
-        # claim_minecraft's own refusals, and the intent gate's: each maps to fixed text.
+    def test_every_claim_refusal_category_is_still_a_core_refusal(self):
+        # Each matched text is still what claim_minecraft, the asleep gate of the claims or
+        # spend::SPENT says; a text the core stopped using would fall to "an unlisted reason".
         source = (Path(smoke.__file__).resolve().parent.parent / "core/src/apply.rs").read_text()
         body = source.split("fn claim_minecraft(", 1)[1].split("\n}\n", 1)[0]
-        self.assertTrue(body)
-        for text, _ in smoke.CLAIM_REFUSALS:
-            if text in ("GPUs are asleep", "budget is spent"):
-                continue
-            self.assertIn(text, body, f"{text!r} is no longer a claim_minecraft refusal")
-        self.assertIn("the GPUs are asleep", source)
+        gate = source.split("| Intent::ClaimMinecraft { .. }\n            if state.fleet.power.state == \"asleep\" =>", 1)[1][:200]
         spend = (Path(smoke.__file__).resolve().parent.parent / "core/src/spend.rs").read_text()
-        self.assertIn("budget is spent", spend)
+        where = {"GPUs are asleep": gate, "budget is spent": spend}
+        for text, _ in smoke.CLAIM_REFUSALS:
+            self.assertIn(text, where.get(text, body), f"{text!r} is no longer a refusal of a claim")
 
 
 class FleetCauseTests(unittest.TestCase):
@@ -1147,11 +1159,25 @@ class FleetCauseTests(unittest.TestCase):
 
     def test_another_scale_failure_and_none_are_told_apart(self):
         other = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "restoring"}],
-                 "failures": [{"kind": "coordinator_degraded", "component": "scale", "reason": "us-east-1: timed out"},
+                 "failures": [{"kind": "coordinator_degraded", "component": "scale",
+                               "reason": "us-east-1: listing hosts: timed out VcpuLimitExceeded"},
                               {"kind": "coordinator_degraded", "component": "text_check", "reason": "VcpuLimitExceeded"}]}
-        self.assertEqual({l.get("cause") for l in self.lines(other)}, {"the coordinator could not launch a GPU host"})
+        self.assertEqual({l.get("cause") for l in self.lines(other)}, {"the coordinator's GPU host scaling is degraded"})
         plain = {"tiles": [{"id": "fcvm:1", "half": "fcvm", "phase": "restoring"}]}
         self.assertTrue(all("cause" not in l for l in self.lines(plain)))
+
+    def test_the_gpu_hosts_are_no_cause_for_an_ec2_tile_and_the_budget_is(self):
+        quota = {"kind": "coordinator_degraded", "component": "scale",
+                 "reason": "us-east-1 on-demand: VcpuLimitExceeded: You have requested more vCPU capacity"}
+        tiles = [{"id": "ec2:1", "half": "ec2", "phase": "starting"}, {"id": "phone:1", "phase": "restoring"}]
+        state = {"tiles": tiles[:1], "phones": {"tiles": tiles[1:]}, "failures": [quota]}
+        causes = {l["tile"]: l.get("cause") for l in self.lines(state)}
+        self.assertEqual(causes, {"ec2:1": None, "phone:1": "EC2 refused a GPU host launch for the account's quota"})
+        state["fleet"] = {"power": {"state": "asleep", "reason": "budget"}}
+        self.assertEqual({l.get("cause") for l in self.lines(state)}, {"the day's spend ceiling holds the fleet asleep"})
+
+    def test_the_quota_codes_are_the_coordinators(self):
+        self.assertEqual(smoke.quota_codes(), ("VcpuLimitExceeded", "MaxSpotInstanceCountExceeded"))
 
     def test_the_job_summaries_show_the_cause(self):
         root = Path(smoke.__file__).resolve().parent.parent.parent
