@@ -12,6 +12,7 @@
 //! excludes hugetlb pages, and a pinned guest's figure would be its configured size.
 
 use fleet_core::protocol::VmStats;
+use std::path::Path;
 use std::time::Instant;
 
 /// A process: its pid and its start time in clock ticks since boot, which together name
@@ -95,7 +96,11 @@ pub fn is_firecracker_comm(comm: &str) -> bool {
 /// Reads one process, None when it is gone or is not a Firecracker. With `expect`, also None
 /// when the process at that pid started at another time.
 pub fn read(pid: u32, expect: Option<Identity>) -> Option<Raw> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    read_in(Path::new("/proc"), pid, expect)
+}
+
+fn read_in(proc: &Path, pid: u32, expect: Option<Identity>) -> Option<Raw> {
+    let stat = std::fs::read_to_string(proc.join(format!("{pid}/stat"))).ok()?;
     let (comm, ticks, start) = parse_stat(&stat)?;
     let who = Identity { pid, start };
     if !is_firecracker_comm(&comm) || expect.is_some_and(|e| e != who) {
@@ -108,26 +113,47 @@ pub fn read(pid: u32, expect: Option<Identity>) -> Option<Raw> {
     })
 }
 
+/// What a search for the VMM found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Found {
+    Vmm(Identity),
+    /// The fcvm process has no Firecracker child (yet).
+    None,
+    /// No thread's `children` file could be read: the kernel lacks `CONFIG_PROC_CHILDREN`
+    /// (or the process is gone), so no search can succeed.
+    NoChildrenFile,
+}
+
 /// The Firecracker child of the fcvm process `fcvm_pid`, from the `children` list of each of
 /// its threads.
-pub fn find_vmm(fcvm_pid: u32) -> Option<Identity> {
-    for task in std::fs::read_dir(format!("/proc/{fcvm_pid}/task"))
-        .ok()?
-        .flatten()
-    {
+pub fn find_vmm(fcvm_pid: u32) -> Found {
+    find_vmm_in(Path::new("/proc"), fcvm_pid)
+}
+
+fn find_vmm_in(proc: &Path, fcvm_pid: u32) -> Found {
+    let Ok(tasks) = std::fs::read_dir(proc.join(format!("{fcvm_pid}/task"))) else {
+        return Found::None;
+    };
+    let mut readable = false;
+    for task in tasks.flatten() {
         let Ok(kids) = std::fs::read_to_string(task.path().join("children")) else {
             continue;
         };
+        readable = true;
         for pid in kids
             .split_whitespace()
             .filter_map(|p| p.parse::<u32>().ok())
         {
-            if let Some(raw) = read(pid, None) {
-                return Some(raw.who);
+            if let Some(raw) = read_in(proc, pid, None) {
+                return Found::Vmm(raw.who);
             }
         }
     }
-    None
+    if readable {
+        Found::None
+    } else {
+        Found::NoChildrenFile
+    }
 }
 
 pub fn clk_tck() -> u64 {
@@ -140,6 +166,7 @@ pub fn clk_tck() -> u64 {
 pub struct Sampler {
     who: Option<Identity>,
     prev: Option<Raw>,
+    warned: bool,
 }
 
 impl Sampler {
@@ -147,7 +174,19 @@ impl Sampler {
     pub fn poll(&mut self, fcvm_pid: u32) -> Option<VmStats> {
         let cur = self.who.and_then(|w| read(w.pid, Some(w))).or_else(|| {
             self.prev = None;
-            self.who = find_vmm(fcvm_pid);
+            self.who = match find_vmm(fcvm_pid) {
+                Found::Vmm(who) => Some(who),
+                Found::None => None,
+                Found::NoChildrenFile => {
+                    if !std::mem::replace(&mut self.warned, true) {
+                        tracing::warn!(
+                            fcvm_pid,
+                            "no /proc/<pid>/task/<tid>/children to read (kernel without CONFIG_PROC_CHILDREN?): VM CPU readings are off for this slot"
+                        );
+                    }
+                    None
+                }
+            };
             self.who.and_then(|w| read(w.pid, Some(w)))
         });
         let Some(cur) = cur else {
@@ -254,6 +293,32 @@ mod tests {
         ];
         assert_eq!(count_vcpus(comms), 3);
         assert_eq!(count_vcpus(["fc_api"]), 0);
+    }
+
+    #[test]
+    fn a_proc_tree_without_children_files_says_so_and_one_with_them_finds_the_vmm() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let task = root.join("10/task/10");
+        std::fs::create_dir_all(&task).unwrap();
+        assert_eq!(find_vmm_in(root, 10), Found::NoChildrenFile);
+        assert_eq!(find_vmm_in(root, 99), Found::None, "no such process");
+        std::fs::write(task.join("children"), "").unwrap();
+        assert_eq!(find_vmm_in(root, 10), Found::None, "readable but childless");
+        std::fs::create_dir_all(root.join("11")).unwrap();
+        std::fs::write(
+            root.join("11/stat"),
+            "11 (firecracker-def) S 1 2 3 4 5 6 7 8 9 10 40 2 0 0 20 0 1 0 777 5",
+        )
+        .unwrap();
+        std::fs::write(task.join("children"), "11\n").unwrap();
+        assert_eq!(
+            find_vmm_in(root, 10),
+            Found::Vmm(Identity {
+                pid: 11,
+                start: 777
+            })
+        );
     }
 
     #[test]

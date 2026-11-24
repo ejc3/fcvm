@@ -57,32 +57,34 @@ async fn sample_idle_then_busy(fcvm_pid: u32) -> Result<()> {
     let idle_max = idle.iter().cloned().fold(0.0, f64::max);
     assert!(idle_max < 25.0, "an idle VM read {idle:?}");
 
-    // One busy loop per vCPU for ten seconds.
+    // One busy loop per vCPU, long enough to outlast a slow exec start. Poll until a window
+    // shows the load, with a deadline, instead of sampling at fixed offsets.
     let busy = tokio::spawn(async move {
         common::exec_in_vm(
             fcvm_pid,
-            &["for i in 1 2; do timeout 10 sh -c 'while :; do :; done' & done; wait"],
+            &["for i in 1 2; do timeout 90 sh -c 'while :; do :; done' & done; wait"],
         )
         .await
     });
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    sampler.poll(fcvm_pid);
+    let deadline = std::time::Instant::now() + Duration::from_secs(75);
     let mut loaded = Vec::new();
-    for _ in 0..3 {
+    let loaded_max = loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let s = sampler
-            .poll(fcvm_pid)
-            .context("no reading while the guest burns CPU")?;
-        assert_eq!(s.vcpus, VCPUS);
-        assert!(s.cpu_pct <= 100.0, "{s:?}");
-        loaded.push(s.cpu_pct);
-    }
-    let loaded_max = loaded.iter().cloned().fold(0.0, f64::max);
-    assert!(
-        loaded_max > 50.0 && loaded_max > idle_max + 25.0,
-        "a VM running {VCPUS} busy loops read {loaded:?} against idle {idle:?} (busy loops: {:?})",
-        busy.is_finished()
-    );
-    let _ = busy.await;
+        if let Some(s) = sampler.poll(fcvm_pid) {
+            assert_eq!(s.vcpus, VCPUS);
+            assert!(s.cpu_pct <= 100.0, "{s:?}");
+            loaded.push(s.cpu_pct);
+            if s.cpu_pct > 50.0 && s.cpu_pct > idle_max + 25.0 {
+                break s.cpu_pct;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{VCPUS} busy loops never showed: windows {loaded:?} against idle {idle:?} (exec finished: {})",
+            busy.is_finished()
+        );
+    };
+    println!("vmstats idle {idle:?} loaded {loaded:?} (peak {loaded_max})");
+    busy.abort();
     Ok(())
 }
