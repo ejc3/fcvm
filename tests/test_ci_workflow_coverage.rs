@@ -408,7 +408,10 @@ fn tree_wide_guards_run_on_every_pull_request() {
         .get("jobs")
         .and_then(|j| j.get("actionlint"))
         .expect("ci.yml has no `actionlint` job");
-    let condition = job.get("if").and_then(Value::as_str).expect("`actionlint` has no `if:`");
+    let condition = job
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("`actionlint` has no `if:`");
     assert!(
         condition.contains("needs.changes.outputs.run == 'true'") && !condition.contains("outputs.code") && !condition.contains("outputs.bench"),
         "`actionlint` must run on every pull request that runs CI, not on a path filter ({condition:?})"
@@ -422,7 +425,10 @@ fn tree_wide_guards_run_on_every_pull_request() {
         .filter_map(|s| s.get("run").and_then(Value::as_str))
         .find(|r| r.contains("NoHostIdentifiersInTree"))
         .expect("no step of the always-running `actionlint` job runs `NoHostIdentifiersInTree`: a pull request that touches no bench path skips the guard");
-    assert!(guard.contains("unittest"), "the tree-wide guard step does not run the test: {guard:?}");
+    assert!(
+        guard.contains("unittest"),
+        "the tree-wide guard step does not run the test: {guard:?}"
+    );
 }
 
 /// A failing browser test leaves its Playwright trace (`trace: "retain-on-failure"` in
