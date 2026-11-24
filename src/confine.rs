@@ -137,6 +137,8 @@ pub enum Mechanism {
     Network,
     /// A debugging setting that needs the VMM unconfined.
     Debugging,
+    /// The process layer itself.
+    Process,
     /// The command itself.
     Command,
 }
@@ -148,6 +150,7 @@ impl std::fmt::Display for Mechanism {
             Mechanism::Backend => "backend",
             Mechanism::Network => "network",
             Mechanism::Debugging => "debugging",
+            Mechanism::Process => "process",
             Mechanism::Command => "command",
         })
     }
@@ -211,19 +214,48 @@ pub struct Host {
     pub no_seccomp: bool,
     /// `FCVM_FIRECRACKER_ARGS`.
     pub firecracker_args: Option<String>,
+    /// `/proc/sys/kernel/core_pattern`, or `None` when it cannot be read.
+    pub core_pattern: Option<String>,
+}
+
+/// The host's mode: the config's, tightened by `FCVM_CONFINE`.
+pub fn read_mode() -> anyhow::Result<Mode> {
+    let env = mode_env(std::env::var(MODE_ENV))?;
+    host_mode(
+        config_mode(CONFIG_MODE.get().copied(), load_config_mode)?,
+        env.as_deref(),
+    )
+}
+
+/// `FCVM_CONFINE` as read: unset is `None`; a value that is not valid UTF-8 is an error,
+/// never taken as unset.
+fn mode_env(var: Result<String, std::env::VarError>) -> anyhow::Result<Option<String>> {
+    match var {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{MODE_ENV} is set to a value that is not valid UTF-8")
+        }
+    }
+}
+
+/// Whether a start needs the rest of the host read (the Landlock probe among it): only one
+/// that asks for confinement or runs on a host that requires it. An unconfined start on an
+/// `off` host makes no Landlock syscall at all.
+fn needs_host_read(flag: bool, mode: Mode) -> bool {
+    flag || mode != Mode::Off
 }
 
 impl Host {
-    /// Read this host: the config's mode, `FCVM_CONFINE`, the kernel's Landlock ABI and the
-    /// debugging environment variables.
-    pub fn read() -> anyhow::Result<Self> {
-        let env = std::env::var(MODE_ENV).ok();
+    /// Read this host for a start under `mode`: the kernel's Landlock ABI, the core
+    /// pattern and the debugging environment variables.
+    pub fn read(mode: Mode) -> anyhow::Result<Self> {
         Ok(Host {
-            mode: host_mode(
-                config_mode(CONFIG_MODE.get().copied(), load_config_mode)?,
-                env.as_deref(),
-            )?,
+            mode,
             landlock_abi: landlock_abi(),
+            core_pattern: std::fs::read_to_string("/proc/sys/kernel/core_pattern")
+                .ok()
+                .map(|p| p.trim_end().to_string()),
             strace_fc: std::env::var_os("FCVM_STRACE_FC").is_some(),
             no_seccomp: std::env::var_os("FCVM_NO_SECCOMP").is_some(),
             firecracker_args: std::env::var("FCVM_FIRECRACKER_ARGS").ok(),
@@ -313,16 +345,39 @@ pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
         .into_iter()
         .flatten()
     {
-        for arg in ["--no-seccomp", "--seccomp-filter"] {
-            if args.split_whitespace().any(|a| a == arg) {
-                add(
-                    Mechanism::Debugging,
-                    format!("the extra Firecracker arguments set {arg}, which confinement owns"),
-                );
-            }
+        for detail in overriding_args(args) {
+            add(Mechanism::Debugging, detail);
         }
     }
+    // The process layer sets RLIMIT_CORE to 1, which the kernel takes as "no dump" for a file
+    // or a pipe core_pattern (fs/coredump.c). A socket core_pattern ("@...") ignores it.
+    match host.core_pattern.as_deref() {
+        Some(pattern) if !pattern.starts_with('@') => {}
+        Some(pattern) => add(
+            Mechanism::Process,
+            format!(
+                "the host's core_pattern ({pattern}) sends core dumps to a socket, which \
+                 ignores RLIMIT_CORE, so a crashed VMM's memory could leave the process"
+            ),
+        ),
+        None => add(
+            Mechanism::Process,
+            "the host's core_pattern cannot be read, so whether a crashed VMM's memory \
+             could be dumped cannot be told"
+                .to_string(),
+        ),
+    }
     missing
+}
+
+/// What in the extra Firecracker arguments `args` confinement refuses: the options that
+/// turn seccomp off or set a filter of their own.
+pub fn overriding_args(args: &str) -> Vec<String> {
+    ["--no-seccomp", "--seccomp-filter"]
+        .iter()
+        .filter(|arg| args.split_whitespace().any(|a| a == **arg))
+        .map(|arg| format!("the extra Firecracker arguments set {arg}, which confinement owns"))
+        .collect()
 }
 
 /// Decide whether this start is confined. `Ok(None)` is an unconfined start the host
@@ -352,7 +407,11 @@ pub fn decide(request: &Request<'_>, host: &Host) -> anyhow::Result<Option<Confi
 
 /// [`decide`] on this host.
 pub fn resolve(request: &Request<'_>) -> anyhow::Result<Decision> {
-    let host = Host::read()?;
+    let mode = read_mode()?;
+    if !needs_host_read(request.flag, mode) {
+        return Ok(Decision(None));
+    }
+    let host = Host::read(mode)?;
     let decided = decide(request, &host)?;
     if let Some(confinement) = &decided {
         tracing::info!(
@@ -417,7 +476,7 @@ pub(crate) fn own_tap(name: &TapName) -> std::io::Result<()> {
         flags: libc::c_short,
         pad: [u8; 22],
     }
-    let request = IfReq {
+    let mut request = IfReq {
         name: name.0,
         flags: 0x0002 | 0x1000, // IFF_TAP | IFF_NO_PI
         pad: [0; 22],
@@ -430,7 +489,7 @@ pub(crate) fn own_tap(name: &TapName) -> std::io::Result<()> {
     // SAFETY: `request` is a struct ifreq that outlives the call; TUNSETOWNER takes the uid
     // by value; `fd` is ours to close.
     let result = unsafe {
-        if libc::ioctl(fd, TUNSETIFF as _, &request) != 0
+        if libc::ioctl(fd, TUNSETIFF as _, &mut request as *mut IfReq) != 0
             || libc::ioctl(fd, TUNSETOWNER as _, libc::geteuid() as libc::c_ulong) != 0
         {
             Err(std::io::Error::last_os_error())
@@ -481,9 +540,12 @@ pub(crate) fn apply_process_layer() -> std::io::Result<()> {
         }
     };
 
+    // 1, not 0: the kernel takes a limit of 1 as "no dump" for a pipe core_pattern too,
+    // where it ignores any other limit (fs/coredump.c, coredump_pipe); a file dump needs at
+    // least a page.
     let no_core = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
+        rlim_cur: 1,
+        rlim_max: 1,
     };
     // SAFETY: setrlimit reads the struct, which outlives the call.
     check(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) })?;
@@ -538,6 +600,7 @@ pub(crate) fn apply_process_layer() -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::hypervisor::Backend;
+    use std::os::unix::ffi::OsStringExt;
 
     fn host(abi: Result<u32, i32>) -> Host {
         Host {
@@ -546,6 +609,7 @@ mod tests {
             strace_fc: false,
             no_seccomp: false,
             firecracker_args: None,
+            core_pattern: Some("core".to_string()),
         }
     }
 
@@ -617,6 +681,7 @@ mod tests {
             strace_fc: true,
             no_seccomp: true,
             firecracker_args: Some("--seccomp-filter /x.bpf".to_string()),
+            core_pattern: Some("|/usr/lib/systemd/systemd-coredump %P".to_string()),
         };
         let mechanisms: Vec<Mechanism> = missing(&request, &host)
             .iter()
@@ -695,6 +760,117 @@ mod tests {
             .to_string();
         assert!(error.contains("cannot loosen"), "{error}");
         assert!(host_mode(Mode::Off, Some("on")).is_err());
+    }
+
+    #[test]
+    fn a_non_utf8_mode_variable_is_an_error_not_unset() {
+        assert_eq!(mode_env(Err(std::env::VarError::NotPresent)).unwrap(), None);
+        assert_eq!(
+            mode_env(Ok("required".to_string())).unwrap(),
+            Some("required".to_string())
+        );
+        let bad = std::ffi::OsString::from_vec(vec![0xff, b'x']);
+        let error = mode_env(Err(std::env::VarError::NotUnicode(bad)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("FCVM_CONFINE"), "{error}");
+    }
+
+    /// An unconfined start on an off host reads no more of the host: no Landlock syscall.
+    #[test]
+    fn an_unconfined_start_on_an_off_host_makes_no_landlock_probe() {
+        assert!(!needs_host_read(false, Mode::Off));
+        assert!(needs_host_read(true, Mode::Off));
+        assert!(needs_host_read(false, Mode::Required));
+    }
+
+    /// RLIMIT_CORE 1 stops file and pipe dumps; a socket core_pattern ignores it, and an
+    /// unreadable one cannot be checked, so both refuse confinement.
+    #[test]
+    fn a_core_pattern_that_ignores_the_core_limit_refuses_confinement() {
+        for pattern in [Some("@/run/systemd/coredump"), None] {
+            let host = Host {
+                core_pattern: pattern.map(str::to_string),
+                ..host(Ok(11))
+            };
+            let error = decide(&request(true), &host).unwrap_err().to_string();
+            assert!(
+                error.contains("process: the host's core_pattern"),
+                "{error}"
+            );
+        }
+        for pattern in ["core", "|/usr/lib/systemd/systemd-coredump %P"] {
+            let host = Host {
+                core_pattern: Some(pattern.to_string()),
+                ..host(Ok(11))
+            };
+            assert!(
+                decide(&request(true), &host).unwrap().is_some(),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// The TUNSETIFF calls pass a mutable ifreq: the kernel writes it back.
+    #[test]
+    fn tunsetiff_gets_a_mutable_ifreq() {
+        let here = include_str!("confine.rs");
+        assert_eq!(here.matches("&mut request as *mut IfReq").count(), 2);
+        assert!(!here.contains(concat!("TUNSETIFF as _, &", "request)")));
+    }
+
+    /// Each restore path and the setup VM resolve before their first host side effect.
+    #[test]
+    fn confinement_is_resolved_before_any_host_side_effect() {
+        let snapshot = include_str!("commands/snapshot.rs");
+        let body = |source: &'static str, name: &str| -> &'static str {
+            let start = source.find(name).unwrap();
+            let rest = &source[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let inner = body(snapshot, "async fn cmd_snapshot_run_inner(");
+        let resolve = inner.find("crate::confine::resolve(").unwrap();
+        for effect in [
+            "reclaim_abandoned()",
+            "Owner::begin(",
+            "EarlyPrefill::start(",
+        ] {
+            assert!(
+                resolve < inner.find(effect).unwrap(),
+                "restore: {effect} first"
+            );
+        }
+        let raw = body(snapshot, "async fn cmd_snapshot_run_raw(");
+        let resolve = raw.find("crate::confine::resolve(").unwrap();
+        for effect in ["reclaim_abandoned()", "Owner::begin("] {
+            assert!(
+                resolve < raw.find(effect).unwrap(),
+                "raw restore: {effect} first"
+            );
+        }
+        let setup = body(
+            include_str!("setup/rootfs.rs"),
+            "async fn boot_vm_for_setup(",
+        );
+        let resolve = setup.find("crate::confine::resolve(").unwrap();
+        for effect in ["remove_dir_all(", "create_dir_all(", "File::create("] {
+            assert!(
+                resolve < setup.find(effect).unwrap(),
+                "setup VM: {effect} first"
+            );
+        }
+    }
+
+    /// The last pre_exec step arms the parent-death signal and then checks that fcvm is
+    /// still the parent: one that exited before the signal was armed sends none.
+    #[test]
+    fn the_vmm_exits_if_its_parent_died_before_the_death_signal_was_armed() {
+        let utils = include_str!("utils.rs");
+        let arm = utils
+            .find("libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL)")
+            .unwrap();
+        let check = utils[arm..].find("libc::getppid() != parent").unwrap();
+        assert!(utils[arm + check..].find("libc::_exit(1)").is_some());
     }
 
     /// A mode nothing recorded is read from the config, never taken as off: a library
@@ -974,7 +1150,7 @@ mod tests {
             std::io::Error::last_os_error()
         );
         // SAFETY: `request` is a struct ifreq that outlives the call.
-        let rc = unsafe { libc::ioctl(fd, 0x4004_54ca as _, &request) };
+        let rc = unsafe { libc::ioctl(fd, 0x4004_54ca as _, &mut request as *mut IfReq) };
         let errno = if rc == 0 {
             0
         } else {
@@ -1140,7 +1316,7 @@ mod tests {
                 no_new_privs: "1".to_string(),
                 net_sysctl_errno: libc::EACCES,
                 unshare_errno: libc::EPERM,
-                core_limit: 0,
+                core_limit: 1,
                 tap_attach_errno: 0,
             }
         );

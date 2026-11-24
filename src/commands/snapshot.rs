@@ -3223,6 +3223,23 @@ async fn cmd_snapshot_run_inner(
         "loaded snapshot configuration"
     );
 
+    let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
+        &args,
+        snapshot_config.metadata.kernel_profile.as_deref(),
+        snapshot_config.metadata.firecracker_bin.as_deref(),
+    )
+    .await?;
+    // Before any host state changes (reclaim, the clone's owner record, a GPU prefill): a
+    // restore that must be confined and cannot be is refused here. The Firecracker
+    // arguments are the ones the restore will launch with, a kernel profile's included.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: snapshot_config.metadata.hypervisor,
+        network: snapshot_config.metadata.network_mode.into(),
+        firecracker_args: runtime_config.effective_firecracker_args().as_deref(),
+        unsupported: None,
+    })?;
+
     // Generate VM ID and name. Restored VMs always get a FRESH vm_id and a
     // fresh state file (vsock_epoch starts at 0) — including the podman-run
     // snapshot-miss path, which tears its throwaway VM down (deleting its
@@ -3238,12 +3255,6 @@ async fn cmd_snapshot_run_inner(
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
         path: paths::vm_runtime_dir(&vm_id),
     })?;
-    let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
-        &args,
-        snapshot_config.metadata.kernel_profile.as_deref(),
-        snapshot_config.metadata.firecracker_bin.as_deref(),
-    )
-    .await?;
     // A GPU restore's hugepage prefill starts here, as soon as the restore's Firecracker is
     // known, beside the checks and the clone's setup (its state, volume servers and network);
     // the memory backend below waits for it. Only a direct Firecracker restore prefills. GPUs
@@ -3318,13 +3329,6 @@ async fn cmd_snapshot_run_inner(
         args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
     );
     vm_state.name = Some(vm_name.clone());
-    let decision = crate::confine::resolve(&crate::confine::Request {
-        flag: args.confine,
-        backend: snapshot_config.metadata.hypervisor,
-        network: snapshot_config.metadata.network_mode.into(),
-        firecracker_args: args.firecracker_args.as_deref(),
-        unsupported: None,
-    })?;
     vm_state.confinement = decision.confinement().cloned();
 
     // Save snapshot tracking info in clone state
@@ -6171,6 +6175,14 @@ async fn cmd_snapshot_run_raw(
 ) -> Result<()> {
     let meta = &snapshot_config.metadata;
     ensure_raw_restore_supported(&args, meta)?;
+    // Before any host state changes. Refused when asked for, or when the host requires it: this path does not confine.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: crate::hypervisor::Backend::Firecracker,
+        network: crate::confine::Network::Rootless,
+        firecracker_args: args.firecracker_args.as_deref(),
+        unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
+    })?;
     anyhow::ensure!(
         port_mappings.is_empty(),
         "the raw VM's snapshot records published ports ({port_mappings:?}); raw VMs publish none"
@@ -6196,14 +6208,6 @@ async fn cmd_snapshot_run_raw(
     validate_vm_name(&vm_name).context("invalid VM name")?;
     paths::check_socket_path_budget(&vm_id)?;
 
-    // Refused when asked for, or when the host requires it: this path does not confine.
-    let decision = crate::confine::resolve(&crate::confine::Request {
-        flag: args.confine,
-        backend: crate::hypervisor::Backend::Firecracker,
-        network: crate::confine::Network::Rootless,
-        firecracker_args: args.firecracker_args.as_deref(),
-        unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
-    })?;
     let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
     let mut vm_state = VmState::new(

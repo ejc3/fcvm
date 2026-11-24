@@ -423,7 +423,7 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
                 held.vm_id.clone(),
                 dir.join("firecracker.sock"),
                 None,
-                vmm_decision(),
+                vmm_decision()?,
             );
             vmm.set_user_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/user")));
             vmm.set_net_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/net")));
@@ -488,7 +488,7 @@ async fn restore(args: &PieceArgs, held: &mut Held, stages: &mut Stages) -> Resu
         held.vm_id.clone(),
         dir.join("firecracker.sock"),
         None,
-        vmm_decision(),
+        vmm_decision()?,
     );
     vmm.set_user_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/user")));
     vmm.set_net_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/net")));
@@ -649,15 +649,60 @@ mod state_order_tests {
     }
 }
 
-/// The pieces' VMMs are fcvm's unconfined clones; the decision is made as fcvm makes it, so
-/// a host whose mode is `required` refuses them.
-fn vmm_decision() -> fcvm::confine::Decision {
-    fcvm::confine::resolve(&fcvm::confine::Request {
+/// The pieces measure fcvm's unconfined VMMs: confinement is refused for them, so a host
+/// whose mode is `required` refuses the harness rather than running it confined.
+fn vmm_request() -> fcvm::confine::Request<'static> {
+    fcvm::confine::Request {
         flag: false,
         backend: fcvm::hypervisor::Backend::Firecracker,
         network: fcvm::confine::Network::Rootless,
         firecracker_args: None,
-        unsupported: None,
-    })
-    .expect("deciding a piece VMM's confinement")
+        unsupported: Some("the start-rate pieces harness measures unconfined VMMs"),
+    }
+}
+
+/// The decision for a piece's VMM, as an error the caller's teardown path handles, not a
+/// panic that skips it.
+fn vmm_decision() -> Result<fcvm::confine::Decision> {
+    fcvm::confine::resolve(&vmm_request()).context("deciding a piece VMM's confinement")
+}
+
+#[cfg(test)]
+mod confine_tests {
+    use fcvm::confine::{decide, Host, Mode};
+
+    fn host(mode: Mode) -> Host {
+        Host {
+            mode,
+            landlock_abi: Ok(11),
+            strace_fc: false,
+            no_seccomp: false,
+            firecracker_args: None,
+            core_pattern: Some("core".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_required_host_refuses_the_pieces_and_an_off_host_runs_them_unconfined() {
+        let error = decide(&super::vmm_request(), &host(Mode::Required))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("measures unconfined VMMs"), "{error}");
+        assert_eq!(
+            decide(&super::vmm_request(), &host(Mode::Off)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_refused_decision_is_an_error_not_a_panic() {
+        let source = include_str!("pieces.rs");
+        let start = source.find("fn vmm_decision()").unwrap();
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        assert!(
+            body.contains("-> Result<fcvm::confine::Decision>"),
+            "{body}"
+        );
+        assert!(!body.contains(".expect("), "{body}");
+    }
 }

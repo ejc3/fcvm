@@ -150,7 +150,7 @@ async fn test_confine_rootless_vm() -> Result<()> {
             .find(|l| l.starts_with("Max core file size"))
             .context("no core limit in /proc/<pid>/limits")?;
         anyhow::ensure!(
-            core.split_whitespace().skip(4).take(2).eq(["0", "0"]),
+            core.split_whitespace().skip(4).take(2).eq(["1", "1"]),
             "core limit: {core}"
         );
 

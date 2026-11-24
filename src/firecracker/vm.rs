@@ -508,6 +508,20 @@ impl VmManager {
         config_override: Option<&Path>,
         firecracker_args: Option<&str>,
     ) -> Result<()> {
+        // A confined VMM never launches with arguments that turn its seccomp off or replace
+        // its filter, whatever the caller's resolve saw: checked on the arguments this
+        // launch uses, before anything is cleared or removed.
+        if self.decision.confinement().is_some() {
+            let refused = firecracker_args
+                .map(crate::confine::overriding_args)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                refused.is_empty(),
+                "the VMM of {} is confined: {}",
+                self.vm_id,
+                refused.join("; ")
+            );
+        }
         // A relaunch is another VMM process, and it maps no snapshot the previous one did.
         self.memory_in_use = None;
         self.stop_log_follower();
@@ -1037,6 +1051,38 @@ fn log_firecracker_line(clean: &str, is_stderr: bool) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A confined manager refuses launch arguments that turn seccomp off or set a filter,
+    /// before it touches its log or socket, whatever the caller resolved.
+    #[tokio::test]
+    async fn a_confined_launch_refuses_arguments_that_override_seccomp() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("firecracker.log");
+        std::fs::write(&log, "kept").unwrap();
+        let mut vm = VmManager::new(
+            "confined-args".to_string(),
+            dir.path().join("api.sock"),
+            Some(log.clone()),
+            crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+                landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+                layers: vec![crate::confine::Layer::Process],
+            })),
+        );
+        for args in ["--no-seccomp", "--enable-nv2 --seccomp-filter /x.bpf"] {
+            let error = vm
+                .start(
+                    std::path::Path::new("/nonexistent/firecracker"),
+                    None,
+                    Some(args),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("which confinement owns"), "{args}: {error}");
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "kept");
+    }
+
     use super::*;
     use crate::utils::DirEventSource;
     use std::future::{poll_fn, Future};

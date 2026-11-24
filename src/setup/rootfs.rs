@@ -2733,6 +2733,10 @@ async fn boot_vm_for_setup(
     use std::time::Duration;
     use tokio::time::timeout;
 
+    // The setup VM does not support confinement: under a host's `required` mode it is
+    // refused here, before this function creates anything.
+    let decision = crate::confine::resolve(&layer2_setup_confinement_request())?;
+
     // Create a temporary directory for this setup VM
     // Use UID in path to avoid permission conflicts between root and non-root
     let uid = unsafe { libc::getuid() };
@@ -2783,9 +2787,6 @@ async fn boot_vm_for_setup(
     // that died without running its cleanup (SIGKILL, a cancelled CI job) orphaned a
     // live Firecracker to init. No namespaces here — the setup VM runs on the host
     // network — so the helper installs only the parent-death hook.
-    // The setup VM does not support confinement: under `--confine` (`podman run --setup`)
-    // or a host's `required` mode it is refused here, before it starts.
-    let decision = crate::confine::resolve(&layer2_setup_confinement_request())?;
     crate::utils::install_namespace_pre_exec(
         &mut fc_cmd,
         &crate::utils::NamespaceParams::new("layer2-setup", decision),
