@@ -254,7 +254,7 @@ test("the header switch: the wall links to the potato page, which links back to 
 test("potato: the line under the title and the What is this? control", async ({ page }) => {
   await openPotato(page);
   await expectLanding(page, { stage: "potato-stage", phone: false });
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 360, height: 800 });
   await expectLanding(page, { stage: "potato-stage", phone: true });
 });
 

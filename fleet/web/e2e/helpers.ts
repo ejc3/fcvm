@@ -313,21 +313,25 @@ export async function wholeWithin(page: Page, id: string, within: string): Promi
  * below the title and clear of the stage, the control opens and closes by keyboard and by a click
  * outside, focus returns to it, and on a phone the line is at most two lines high.
  */
-export async function expectLanding(page: Page, opts: { stage?: string | null; phone: boolean }): Promise<void> {
+export async function expectLanding(page: Page, o: { stage?: string | null; phone: boolean }): Promise<void> {
+  const opts = { ...o, phone: (page.viewportSize()?.width ?? 1024) <= 700 };
   const line = page.getByTestId("landing-line");
   await expect(line).toBeVisible();
   const h1 = await page.locator("h1").first().boundingBox();
   const l = (await line.boundingBox())!;
-  expect(l.y, "the line sits below the title").toBeGreaterThanOrEqual(h1!.y + h1!.height - 1);
+  // the Wall hides its title on a phone; where there is one, the line sits below it
+  if (h1) expect(l.y, "the line sits below the title").toBeGreaterThanOrEqual(h1.y + h1.height - 1);
   if (opts.stage) {
     const s = await page.getByTestId(opts.stage).boundingBox();
     const apart = l.y + l.height <= s!.y + 1 || s!.y + s!.height <= l.y + 1 || l.x + l.width <= s!.x + 1 || s!.x + s!.width <= l.x + 1;
     expect(apart, "the line does not overlap the stage").toBe(true);
   }
-  if (opts.phone) {
-    const lines = await line.evaluate((el) => el.getBoundingClientRect().height / parseFloat(getComputedStyle(el).lineHeight));
-    expect(lines, "at most two lines on a phone").toBeLessThanOrEqual(2.05);
-  }
+  // The words are never cut: no clamp, so all of it is visible; two lines on a desktop, three on a narrow phone.
+  const m = await line.evaluate((el) => ({ lines: (el.getBoundingClientRect().height - parseFloat(getComputedStyle(el).paddingTop) - parseFloat(getComputedStyle(el).paddingBottom)) / parseFloat(getComputedStyle(el).lineHeight), clamp: getComputedStyle(el).webkitLineClamp, overflow: getComputedStyle(el).overflow }));
+  expect(m.clamp, "no line clamp").toBe("none");
+  expect(m.overflow).toBe("visible");
+  expect(m.lines, opts.phone ? "at most four lines on a 360 px phone" : "at most two lines on a desktop").toBeLessThanOrEqual(opts.phone ? 4.25 : 2.15);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), "no sideways scroll").toBeLessThanOrEqual(0);
   const btn = page.getByTestId("landing-button");
   await btn.focus();
   await expect(btn).toHaveAttribute("aria-expanded", "false");
@@ -335,11 +339,21 @@ export async function expectLanding(page: Page, opts: { stage?: string | null; p
   await expect(btn).toHaveAttribute("aria-expanded", "true");
   const panel = page.getByTestId("landing-panel");
   await expect(panel).toContainText("fcvm starts virtual machines from saved snapshots instead of booting them.");
+  await expect(panel).toHaveAttribute("aria-label", "About this page");
+  await expect(panel.getByTestId("landing-close")).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(panel).toHaveCount(0);
   await expect(btn).toBeFocused();
   await btn.click();
   await expect(panel).toBeVisible();
-  await page.mouse.click(2, 2);
+  await panel.getByTestId("landing-close").click();
+  await expect(panel).toHaveCount(0);
+  await expect(btn).toBeFocused();
+  await btn.click();
+  await expect(panel).toBeVisible();
+  const pb = (await panel.boundingBox())!;
+  const vp = page.viewportSize()!;
+  // a point outside the panel, on the page
+  await page.mouse.click(pb.y + pb.height / 2 > vp.height / 2 ? 2 : vp.width - 2, pb.y + pb.height / 2 > vp.height / 2 ? 2 : vp.height - 2);
   await expect(panel).toHaveCount(0);
 }
