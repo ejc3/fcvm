@@ -4344,9 +4344,11 @@ mod tests {
         let source = include_str!("mod.rs");
         let prepare = &source[source.find("pub async fn cmd_podman_prepare(").unwrap()..];
         let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
-        assert!(prepare.contains("let confine = args.run.confine;"));
+        assert!(prepare.contains("confine: args.run.confine,"));
         assert_eq!(
-            prepare.matches("ready_timeout, confine, &cancel").count(),
+            prepare
+                .matches("record_working_set(&prepared.output.snapshot_key, &recording, &cancel)")
+                .count(),
             2
         );
     }
