@@ -5,7 +5,7 @@
 // draws the view model core/potato.ts computes; every word on it comes from there.
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { potatoColour, potatoView, SITE, type Box, type PotatoButton, type PotatoView } from "../../core/index.ts";
+import { potatoColour, potatoView, SITE, type Box, type PotatoButton, type RingTile, type PotatoView } from "../../core/index.ts";
 import { WallClient } from "./wall-client.ts";
 import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
@@ -16,6 +16,28 @@ import "./potato.css";
 
 /** The legend's squares: one sample hue, since the legend says what a phase looks like and not whose it is. */
 const SWATCH = potatoColour(8, 12);
+/** One player's readout, beside its tile on the side away from the ring's centre so the ring and the ball's arc stay clear, kept inside the stage. */
+function Readout({ tile, centre, stage }: { tile: RingTile | null; centre: { x: number; y: number }; stage: Box | null }) {
+  if (tile === null || stage === null) return null;
+  const cx = tile.box.x + tile.box.w / 2;
+  const cy = tile.box.y + tile.box.h / 2;
+  const dx = cx - centre.x;
+  const dy = cy - centre.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const gap = Math.max(tile.box.w, tile.box.h) / 2 + 8;
+  const x = Math.min(Math.max(cx + (dx / len) * gap, 8), stage.w - 8);
+  const y = Math.min(Math.max(cy + (dy / len) * gap, 8), stage.h - 8);
+  // Anchor the card's near corner or edge at that point: it grows away from the ring.
+  const tx = Math.abs(dx / len) < 0.35 ? "-50%" : dx < 0 ? "-100%" : "0";
+  const ty = Math.abs(dy / len) < 0.35 ? "-50%" : dy < 0 ? "-100%" : "0";
+  return (
+    <div className="potato-readout" data-testid="potato-readout" aria-hidden="true" style={{ left: x, top: y, transform: `translate(${tx}, ${ty})` }}>
+      <span className="head">{tile.readout.head}</span>
+      {tile.readout.detail ? <span className="detail">{tile.readout.detail}</span> : null}
+    </div>
+  );
+}
+
 const localNow = () => performance.timeOrigin + performance.now();
 
 declare global {
@@ -105,6 +127,20 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   // Room for the legend beside the ring: the page is in its two-column layout and the measured stage is not small.
   const twoColumns = useMedia("(min-width: 901px)");
   const legendOnPage = twoColumns && stage !== null && stage.w >= 360 && stage.h >= 360;
+  // The readout follows the pointer, the keyboard focus or a long press on touch; the text is re-read from the view, so it ticks.
+  const [pointed, setPointed] = useState<number | null>(null);
+  const [focused, setFocused] = useState<number | null>(null);
+  const [pressed, setPressed] = useState<number | null>(null);
+  const pressTimer = useRef(0);
+  const pressStart = (player: number) => {
+    window.clearTimeout(pressTimer.current);
+    pressTimer.current = window.setTimeout(() => setPressed(player), 350);
+  };
+  const pressEnd = () => {
+    window.clearTimeout(pressTimer.current);
+    setPressed(null);
+  };
+  const shown = pressed ?? pointed ?? focused;
   const ring = view.ring;
   const needsVerifyPrompt = view.verify.prompt;
 
@@ -161,7 +197,17 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                     data-player={t.player}
                     data-phase={t.phase}
                     data-holder={t.holder ? "true" : undefined}
-                    title={t.ariaLabel}
+                    role="group"
+                    aria-label={t.ariaLabel}
+                    tabIndex={0}
+                    onPointerEnter={(e) => e.pointerType !== "touch" && setPointed(t.player)}
+                    onPointerLeave={(e) => e.pointerType !== "touch" && setPointed((p) => (p === t.player ? null : p))}
+                    onFocus={() => setFocused(t.player)}
+                    onBlur={() => setFocused((p) => (p === t.player ? null : p))}
+                    onPointerDown={(e) => e.pointerType === "touch" && pressStart(t.player)}
+                    onPointerUp={pressEnd}
+                    onPointerCancel={pressEnd}
+                    onContextMenu={(e) => e.preventDefault()}
                     style={{ ...at(t.box), ["--c" as string]: t.colour }}
                   >
                     {t.number !== null ? <span className="num">{t.number}</span> : null}
@@ -182,6 +228,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                   ) : null,
                 )
               : null}
+            {shown !== null && ring ? <Readout tile={ring.tiles.find((t) => t.player === shown) ?? null} centre={ring.geometry.centre} stage={stage} /> : null}
             {ring?.ball ? (
               <div
                 className="potato-ball"

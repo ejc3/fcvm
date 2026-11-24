@@ -23,6 +23,7 @@ import {
   recordsOf,
   ringGeometry,
   type PotatoInput,
+  tileReadout,
 } from "../potato.ts";
 import { parseServerMsg, ProtocolError, type Potato, type PotatoDrop, type PotatoRound } from "../protocol.ts";
 import { initialState, reduce, type ClientState } from "../store.ts";
@@ -190,10 +191,17 @@ describe("the ring", () => {
     expect(tiles.map((t) => t.holder)).toEqual([false, false, true, false]);
     // waking: 200 ms of a last wake of 400
     expect(tiles[1]!.wake).toEqual({ fraction: 0.5, text: "200 ms" });
-    expect(tiles[1]!.ariaLabel).toBe("Player 1, waking for 200 ms; its last wake took 400 ms, 30 catches");
-    expect(tiles[0]!.ariaLabel).toBe("Player 0, asleep for 600 ms, 31 catches");
-    expect(tiles[2]!.ariaLabel).toBe("Player 2, awake, 31 catches, holding the ball");
+    expect(tiles.map((t) => t.readout)).toEqual([
+      { head: "Player 0 · asleep 600 ms", detail: "31 catches · last sleep 330 ms · last wake 355 ms" },
+      { head: "Player 1 · waking 200 ms", detail: "30 catches · last sleep 340 ms · last wake 400 ms" },
+      { head: "Player 2 · has the ball", detail: "31 catches · last sleep 300 ms · last wake 360 ms" },
+      { head: "Player 3 · failed", detail: "30 catches" },
+    ]);
     expect(v.ring!.caption).toBe("Ring of 4: player 2 has the ball, catch 7");
+  });
+
+  it("reads a player that has not started without a detail line", () => {
+    expect(tileReadout(5, "not started", false, null)).toEqual({ head: "Player 5 · not started", detail: "" });
   });
 
   it("shows a player that threw as going to sleep until its sleep is done", () => {
@@ -202,7 +210,8 @@ describe("the ring", () => {
     const t = potatoView(input(stateWith(p))).ring!.tiles[2]!;
     expect(t.phase).toBe("sleeping");
     expect(t.line).toBe("going to sleep");
-    expect(t.ariaLabel).toContain("going to sleep for 120 ms");
+    expect(t.readout.head).toBe("Player 2 · going to sleep 120 ms · has the ball");
+    expect(t.ariaLabel).toBe(`${t.readout.head}. ${t.readout.detail}`);
   });
 
   it("caps the wake bar at its end, has no bar without a last wake, and shows a ring member that has not said hello as not started", () => {

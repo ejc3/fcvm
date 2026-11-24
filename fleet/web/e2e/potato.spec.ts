@@ -281,3 +281,31 @@ test("potato: the legend is on the page with room, in the panel without, and nev
   await expect(inPanel).toContainText("a snapshot on disk; no CPU or memory");
   await expect(inPanel).toContainText("slowest player");
 });
+
+test("potato: hovering a tile shows its readout beside it, and it leaves with the pointer", async ({ page }) => {
+  await startAt(8);
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await openPotato(page);
+  const tile = tiles(page).first();
+  const readout = page.getByTestId("potato-readout");
+  await expect(readout).toHaveCount(0);
+  await tile.hover();
+  await expect(readout).toBeVisible();
+  const label = (await tile.getAttribute("aria-label"))!;
+  await expect(readout.locator(".head")).toHaveText(label.split(". ")[0]!);
+  await expect(tile).not.toHaveAttribute("title", /.+/);
+  // Clear of the tile it describes, and inside the stage.
+  const r = (await readout.boundingBox())!;
+  const t = (await tile.boundingBox())!;
+  const s = (await page.getByTestId("potato-stage").boundingBox())!;
+  expect(r.x + r.width <= t.x + 1 || t.x + t.width <= r.x + 1 || r.y + r.height <= t.y + 1 || t.y + t.height <= r.y + 1).toBe(true);
+  expect(r.x).toBeGreaterThanOrEqual(s.x - 1);
+  expect(r.x + r.width).toBeLessThanOrEqual(s.x + s.width + 1);
+  await page.mouse.move(2, 2);
+  await expect(readout).toHaveCount(0);
+  // The same on keyboard focus.
+  await tile.focus();
+  await expect(readout).toBeVisible();
+  await tile.blur();
+  await expect(readout).toHaveCount(0);
+});

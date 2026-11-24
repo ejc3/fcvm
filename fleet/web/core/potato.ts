@@ -97,6 +97,8 @@ export interface RingTile {
   /** While it wakes: how far, against its last wake, and the milliseconds so far. */
   wake: { fraction: number; text: string } | null;
   holder: boolean;
+  /** What hovering, focusing or long-pressing the tile shows; the aria label is these two joined. */
+  readout: { head: string; detail: string };
   ariaLabel: string;
 }
 
@@ -136,22 +138,22 @@ function tileOf(p: Potato, n: number, box: Box, now: number, holder: boolean): R
   switch (phase) {
     case "absent":
       line = "not started";
-      state = "not started yet";
+      state = "not started";
       break;
     case "sleeping":
       line = "going to sleep";
-      state = `going to sleep for ${ms(Math.max(0, now - pl!.since))}`;
+      state = `going to sleep ${ms(Math.max(0, now - pl!.since))}`;
       break;
     case "asleep":
       line = "asleep";
-      state = `asleep for ${ms(Math.max(0, now - pl!.since))}`;
+      state = `asleep ${ms(Math.max(0, now - pl!.since))}`;
       break;
     case "waking": {
       const el = Math.max(0, now - pl!.since);
       const last = pl!.last_wake_ms;
       wake = { fraction: last !== null && last > 0 ? Math.min(1, el / last) : 0, text: ms(el) };
       line = `waking ${ms(el)}`;
-      state = `waking for ${ms(el)}${last !== null ? `; its last wake took ${ms(last)}` : ""}`;
+      state = `waking ${ms(el)}`;
       break;
     }
     case "failed":
@@ -160,9 +162,9 @@ function tileOf(p: Potato, n: number, box: Box, now: number, holder: boolean): R
       break;
     default:
       line = holder ? "has the ball" : "awake";
-      state = "awake";
+      state = holder ? "has the ball" : "awake";
   }
-  const catches = pl === null ? "" : `, ${plural(pl.counter, "catch", "catches")}`;
+  const readout = tileReadout(n, state, phase !== "awake" && holder, pl);
   return {
     player: n,
     box,
@@ -172,8 +174,19 @@ function tileOf(p: Potato, n: number, box: Box, now: number, holder: boolean): R
     line: box.w >= LINE_MIN_TILE ? line : null,
     wake,
     holder,
-    ariaLabel: `Player ${n}, ${state}${catches}${holder ? ", holding the ball" : ""}`,
+    readout,
+    ariaLabel: `${readout.head}. ${readout.detail}`,
   };
+}
+
+/** The tile's readout: "Player 7 · asleep 312 ms", then its catches and last sleep and wake. The one source of the tile's text on hover and for screen readers. */
+export function tileReadout(n: number, state: string, holdsAsWell: boolean, pl: PotatoPlayer | null): { head: string; detail: string } {
+  const head = `Player ${n} · ${state}${holdsAsWell ? " · has the ball" : ""}`;
+  if (pl === null) return { head, detail: "" };
+  const parts = [plural(pl.counter, "catch", "catches")];
+  if (pl.last_sleep_ms !== null) parts.push(`last sleep ${ms(pl.last_sleep_ms)}`);
+  if (pl.last_wake_ms !== null) parts.push(`last wake ${ms(pl.last_wake_ms)}`);
+  return { head, detail: parts.join(" · ") };
 }
 
 /** The ball's size, CSS px: a share of a tile, at least 12 px so it is seen on a ring of 96. */
