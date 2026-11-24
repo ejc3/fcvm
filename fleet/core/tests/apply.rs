@@ -1894,6 +1894,8 @@ fn phone_host(at: u64) -> Event {
             phones: vec![gpu],
             phone_actions: vec![],
             potato_players: 0,
+            potato_cpus: 0,
+            potato_confined: false,
             windows: 0,
             windows_actions: Vec::new(),
             minecraft: 0,
