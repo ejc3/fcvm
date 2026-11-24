@@ -1182,6 +1182,16 @@ impl WorkingSetStore {
         added
     }
 
+    #[cfg(test)]
+    pub(crate) fn sidecar_path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sidecar_lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+
     /// Add one clone's observations to the in-process union without touching the filesystem.
     #[cfg(test)]
     fn remember(&self, observed: &PageSet) -> u64 {

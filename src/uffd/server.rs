@@ -3309,6 +3309,14 @@ impl VmState {
             return;
         };
         let Some(observed) = self.recorded.take() else {
+            // Recorded already, at its window's close. If the sidecar was busy then, no tick
+            // may come before this clone's handler ends: retry here, or the recording stays
+            // only in memory.
+            if at_exit {
+                if let Some(persistence) = &sink.persistence {
+                    persistence.retry_if_unpublished(vm_id);
+                }
+            }
             return;
         };
         match &sink.persistence {
@@ -6686,6 +6694,75 @@ mod tests {
             store.to_prefetch().len(),
             3,
             "faults inside the window must still be learned"
+        );
+    }
+
+    /// A recording whose publication a busy sidecar skipped at its window's close is
+    /// published when its clone exits, even with no progress tick in between.
+    #[test]
+    fn a_skipped_publication_is_retried_when_the_clone_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_path = dir.path().join("memory.bin");
+        let config_path = dir.path().join("config.json");
+        let generation_lock_path = dir.path().join("generation.lock");
+        let mem_len = 16 * 4096u64;
+        std::fs::write(&memory_path, vec![0u8; mem_len as usize]).unwrap();
+        std::fs::write(&config_path, b"generation-1").unwrap();
+        let store = Arc::new(
+            WorkingSetStore::open(&memory_path, mem_len, &config_path, &generation_lock_path)
+                .unwrap(),
+        );
+        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
+        let started = std::time::Instant::now();
+        let window = Duration::from_secs(1);
+        let mut clone = VmState {
+            fault_count: 0,
+            fault_around: FaultAroundStats::default(),
+            parked_faults: ParkedFaults::default(),
+            removed: RemovedPages::default(),
+            given_back: GivenBackStats::default(),
+            hole_zero_filled: 0,
+            zero_page_refused: false,
+            replaying: false,
+            read_batch: READ_BATCH,
+            fault_workers: None,
+            replay_progress: None,
+            replay_limit: ReplayLimit::NONE,
+            recorded: store.admit_recorder(),
+            recording_sink: Some(RecordingSink {
+                store: Arc::clone(&store),
+                persistence: Some(persistence.clone()),
+            }),
+            record_until: started.checked_add(window),
+            started,
+            trace: None,
+        };
+        let (recorder, stamp) = clone.fault_recorder(started).unwrap();
+        recorder.insert_range_at(0, 4096, stamp);
+        // The window closes while another holder has the sidecar lock: the publication is
+        // skipped.
+        let held = Flock::lock(
+            std::fs::File::options()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(store.sidecar_lock_path())
+                .unwrap(),
+            FlockArg::LockExclusive,
+        )
+        .map_err(|(_, e)| e)
+        .unwrap();
+        clone.finish_recording("vm-busy", started + window, false);
+        assert!(persistence.drain(Duration::from_secs(10)));
+        assert!(!store.sidecar_path().exists());
+        drop(held);
+        // The clone exits before the next progress tick.
+        clone.finish_recording("vm-busy", started + window * 2, true);
+        assert!(persistence.drain(Duration::from_secs(10)));
+        assert!(
+            store.sidecar_path().exists(),
+            "the recording stayed only in memory"
         );
     }
 
