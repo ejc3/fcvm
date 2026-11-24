@@ -552,6 +552,26 @@ mod tests {
         unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
     }
 
+    /// A generation replaced after the mapping matched (only `config.json` changes, so the
+    /// VMM still maps the same image) records nothing and marks nothing: the next clone of
+    /// the generation it restored may still record. Reached through the generation check in
+    /// `record`, after `written_runs` found the mapping.
+    #[test]
+    fn a_generation_changed_after_the_mapping_matched_records_nothing() {
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        let bytes = map(&memory, 0, 8, &[1], &[]);
+        let recording = target.claim(std::process::id()).unwrap().unwrap();
+        std::fs::write(&config, r#"{"generation":2}"#).unwrap();
+        let error = recording.record().unwrap_err().to_string();
+        assert!(error.contains("generation changed"), "{error}");
+        assert!(!target.marked_unrecordable());
+        assert!(!target.sidecar().exists());
+        assert!(target.claim(std::process::id()).unwrap().is_some());
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
+    }
+
     /// A set is named for its snapshot generation: another generation whose memory image has
     /// the same length and the same modification time, to the nanosecond, but another
     /// `config.json` gets another name, so its clones never apply this set; the same

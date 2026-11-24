@@ -1467,6 +1467,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         power_managed: power_managed(&args),
         idle_scale_down_secs: args.idle_scale_down,
         sleep_without_new_viewer_secs: args.sleep_without_new_viewer,
+        min_wake_remaining_secs: args.min_wake_remaining,
         daily_spend_usd: args.daily_spend_usd,
         warm_hours: args.warm_hours.clone(),
         history_idle_secs: args.history_idle,
@@ -2072,6 +2073,57 @@ mod power_tests {
             "--host-subnet",
             "us-east-1:subnet-0123456789abcdef0"
         ])));
+    }
+
+    /// The two limits of the arrival rule come from their flags or from the environment (the
+    /// coordinator's task definition sets variables, not arguments). Which variable each
+    /// reads, and its default, are read from the argument definitions: a test here does not
+    /// set a variable in its own process (`crate::test_env`).
+    #[test]
+    fn the_arrival_limits_name_their_environment_variables_and_defaults() {
+        let cli = <Cli as clap::CommandFactory>::command();
+        let coord_cmd = cli
+            .find_subcommand("fleet")
+            .and_then(|f| f.find_subcommand("coord"))
+            .expect("the fleet coord subcommand");
+        for (id, long, env, default) in [
+            (
+                "sleep_without_new_viewer",
+                "sleep-without-new-viewer",
+                "FLEET_SLEEP_WITHOUT_NEW_VIEWER",
+                "3600",
+            ),
+            (
+                "min_wake_remaining",
+                "min-wake-remaining",
+                "FLEET_MIN_WAKE_REMAINING",
+                "600",
+            ),
+        ] {
+            let arg = coord_cmd
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("no argument {id}"));
+            assert_eq!(arg.get_long(), Some(long));
+            assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env), "{id}");
+            let defaults: Vec<_> = arg
+                .get_default_values()
+                .iter()
+                .map(|v| v.to_str())
+                .collect();
+            assert_eq!(defaults, [Some(default)], "{id}");
+        }
+        // The flags reach the fields the coordinator's config is built from.
+        let a = coord(&[
+            "--sleep-without-new-viewer",
+            "7200",
+            "--min-wake-remaining",
+            "0",
+        ]);
+        assert_eq!(
+            (a.sleep_without_new_viewer, a.min_wake_remaining),
+            (7200, 0)
+        );
     }
 
     /// A race launches every EC2 tile, so more EC2 tiles than the viewers' launch budget would

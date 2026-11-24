@@ -1953,7 +1953,8 @@ test("asleep: the recording plays over the poster with its badge, the scores are
 
 test("asleep with this page connected: the card's Wake button wakes the fleet", async ({ page }) => {
   await openWall(page, 15);
-  // Held asleep, as the coordinator holds a fleet nobody new has arrived at for an hour.
+  // Held asleep, as the coordinator holds a fleet nobody new has arrived at for an hour, or
+  // one its page is shown to again with less than --min-wake-remaining of that hour left.
   await sleepNow();
   const arrived = async () => ((await mockState()).state as unknown as { fleet: { power: { last_arrival_at: number | null } } }).fleet.power.last_arrival_at;
   try {
