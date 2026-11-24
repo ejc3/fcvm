@@ -2570,9 +2570,19 @@ struct BoundedOutput {
 /// completes, and past this bound the restore fails closed rather than wait.
 const RUN_BOUNDED_REAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the output of a command that has exited is still read. Its own
+/// output is in the pipes by then and is read at once; the wait is only ever
+/// spent when a process the command left behind holds the pipes open.
+const EXITED_OUTPUT_DRAIN: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Run `argv` with a budget. The child is killed when the budget ends (and when
 /// this future is dropped), and at most `RESTORE_HOOK_OUTPUT_LIMIT` bytes of each
 /// stream are kept.
+///
+/// The run ends when the child exits. A process the child left running keeps
+/// running; the pipes it inherited are closed here, so what it writes to them
+/// later fails (or ends it, by SIGPIPE), as it does to a process a `podman exec`
+/// session left behind once the session has returned.
 async fn run_bounded(argv: &[String], budget: std::time::Duration) -> Result<BoundedOutput> {
     run_bounded_keeping(argv, budget, RESTORE_HOOK_OUTPUT_LIMIT).await
 }
@@ -2597,19 +2607,41 @@ async fn run_bounded_keeping(
     let run = async {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let (read_out, read_err) = tokio::join!(
-            async {
-                (&mut stdout).take(limit).read_to_end(&mut out).await?;
-                tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await
-            },
-            async {
-                (&mut stderr).take(limit).read_to_end(&mut err).await?;
-                tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await
-            }
-        );
-        read_out.context("reading the hook's stdout")?;
-        read_err.context("reading the hook's stderr")?;
-        let status = child.wait().await.context("waiting for the hook")?;
+        let (status, streams) = {
+            let reads = async {
+                tokio::join!(
+                    async {
+                        (&mut stdout).take(limit).read_to_end(&mut out).await?;
+                        tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await
+                    },
+                    async {
+                        (&mut stderr).take(limit).read_to_end(&mut err).await?;
+                        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await
+                    }
+                )
+            };
+            tokio::pin!(reads);
+            // The command is over when its process exits, not when its output ends: a
+            // process it left running (a hook that starts a daemon) holds the pipes open
+            // for as long as it lives.
+            let (exited, streams) = tokio::select! {
+                exited = child.wait() => (exited, None),
+                streams = &mut reads => (child.wait().await, Some(streams)),
+            };
+            let streams = match streams {
+                Some(streams) => Some(streams),
+                // What the process wrote before it exited is in the pipes already.
+                None => tokio::time::timeout(EXITED_OUTPUT_DRAIN, &mut reads)
+                    .await
+                    .ok(),
+            };
+            (exited, streams)
+        };
+        let status = status.context("waiting for the hook")?;
+        if let Some((read_out, read_err)) = streams {
+            read_out.context("reading the hook's stdout")?;
+            read_err.context("reading the hook's stderr")?;
+        }
         Ok::<_, anyhow::Error>(BoundedOutput {
             status,
             stdout: out,
@@ -2892,13 +2924,29 @@ fn exec_process(
     Ok(process.to_string())
 }
 
+/// What the reader run as the container's user exits with when the file does
+/// not exist. Not a status `env`, `runuser`, `sh` or `cat` gives for a failure
+/// of their own (1, 2, 125, 126, 127).
+const FILE_ABSENT_STATUS: i32 = 66;
+
 /// Read a file the container's podman or its runtime wrote; `None` when it does
 /// not exist. Root's podman writes where only root does, and the agent reads the
 /// file itself. A user's podman writes in that user's runtime directory, and
-/// there the read runs as that user (`cat` under the prefix podman runs under),
-/// so the agent opens nothing as root at a path the user controls.
+/// there the read runs as that user, so the agent opens nothing as root at a
+/// path the user controls.
 async fn read_container_file(path: &std::path::Path, limit: u64) -> Result<Option<Vec<u8>>> {
-    let prefix = crate::container::podman_cmd_prefix();
+    read_file_as(crate::container::podman_cmd_prefix(), path, limit).await
+}
+
+/// [`read_container_file`], under `prefix` (empty: read as root, directly).
+/// Under a prefix the file is absent only when the reader says so with
+/// [`FILE_ABSENT_STATUS`]; any other failure, a prefix that cannot run
+/// included, is an error and never reads as "no such file".
+async fn read_file_as(
+    prefix: &[String],
+    path: &std::path::Path,
+    limit: u64,
+) -> Result<Option<Vec<u8>>> {
     if prefix.is_empty() {
         return match tokio::fs::read(path).await {
             Ok(bytes) if bytes.len() as u64 > limit => {
@@ -2910,7 +2958,11 @@ async fn read_container_file(path: &std::path::Path, limit: u64) -> Result<Optio
         };
     }
     let mut argv = prefix.to_vec();
-    argv.extend(["cat".to_string(), "--".to_string()]);
+    argv.extend(["sh".to_string(), "-c".to_string()]);
+    argv.push(format!(
+        r#"[ -e "$1" ] || exit {FILE_ABSENT_STATUS}; exec cat -- "$1""#
+    ));
+    argv.push("sh".to_string());
     argv.push(path.to_string_lossy().into_owned());
     // One byte past the limit is kept, to tell a file at the limit from one over it.
     let output = run_bounded_keeping(&argv, HOOK_INSPECT_BUDGET, limit + 1)
@@ -2922,15 +2974,14 @@ async fn read_container_file(path: &std::path::Path, limit: u64) -> Result<Optio
         }
         return Ok(Some(output.stdout));
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("No such file or directory") {
+    if output.status.code() == Some(FILE_ABSENT_STATUS) {
         return Ok(None);
     }
     bail!(
-        "reading {}: cat exited {}: {}",
+        "reading {}: the reader exited {}: {}",
         path.display(),
         output.status,
-        stderr.trim()
+        String::from_utf8_lossy(&output.stderr).trim()
     )
 }
 
@@ -5495,6 +5546,96 @@ mod tests {
                 "did not finish within 300ms; killed pid ?, and waiting for it failed: "
             ),
             "{text}"
+        );
+    }
+
+    /// A command is over when its process exits. One that leaves a process
+    /// running with its pipes (a hook that starts a daemon) returns then, with
+    /// what it wrote itself; what the process it left writes later is not waited
+    /// for.
+    ///
+    /// RED BEFORE THE FIX: the run waited for the end of the output, which the
+    /// process left behind holds off for as long as it lives, so the run ended at
+    /// its budget and failed.
+    #[tokio::test]
+    async fn a_command_that_leaves_a_process_running_ends_at_its_own_exit() {
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            "sleep 60 & echo left $!; (sleep 0.3; echo late) & echo started",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let output = run_bounded(&argv, std::time::Duration::from_secs(20)).await;
+        let output = output.expect("the run waited for the process the command left behind");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        // The sleeper is this test's to end, whatever the assertions say.
+        let left: Option<i32> = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("left ")?.trim().parse().ok());
+        let alive = left.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+        if let Some(pid) = left {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(output.status.success(), "{:?}", output.status);
+        assert!(
+            stdout.contains("started") && !stdout.contains("late"),
+            "{stdout:?}"
+        );
+        assert!(
+            alive,
+            "the process the command left running was not left running"
+        );
+    }
+
+    /// Read as the container's user, a file is absent only when the reader says
+    /// so. A reader that cannot run fails the read, even when its error says "No
+    /// such file or directory", as a prefix whose program is missing does.
+    ///
+    /// RED BEFORE THE FIX: any stderr holding "No such file or directory" read as
+    /// an absent file, which skipped the hook.
+    #[tokio::test]
+    async fn a_reader_that_cannot_run_is_not_an_absent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("id");
+        std::fs::write(&file, "abc\n").unwrap();
+        let prefix =
+            |words: &[&str]| -> Vec<String> { words.iter().map(|w| w.to_string()).collect() };
+        let env = prefix(&["env"]);
+        assert_eq!(
+            read_file_as(&env, &file, 16).await.unwrap().as_deref(),
+            Some(&b"abc\n"[..])
+        );
+        assert_eq!(
+            read_file_as(&env, &dir.path().join("absent"), 16)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            read_file_as(&env, &file, 3).await.is_err(),
+            "over the limit"
+        );
+        let missing = prefix(&["env", "fcvm-test-no-such-program"]);
+        let error = read_file_as(&missing, &file, 16)
+            .await
+            .expect_err("a reader that could not run read as an absent file");
+        assert!(format!("{error:#}").contains("exited"), "{error:#}");
+        assert!(
+            read_file_as(&env, dir.path(), 16).await.is_err(),
+            "a directory was read"
+        );
+        // As root, directly: the same three answers.
+        assert_eq!(
+            read_file_as(&[], &file, 16).await.unwrap().as_deref(),
+            Some(&b"abc\n"[..])
+        );
+        assert_eq!(
+            read_file_as(&[], &dir.path().join("absent"), 16)
+                .await
+                .unwrap(),
+            None
         );
     }
 
