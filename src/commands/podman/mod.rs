@@ -918,6 +918,23 @@ fn publish_prepared_snapshot(prepared: &PreparedSnapshot) -> Result<()> {
 /// True when the VM's kernel profile enables ARM64 NV2 nested virtualization
 /// (the profile's firecracker_args carry --enable-nv2). Drives the
 /// miss-path-converges-on-restore behavior, which exists for NV2 guests only.
+/// Whether `--setup` may build the rootfs, which boots fcvm setup's unconfined VM: never
+/// for a confined run.
+fn setup_may_boot_its_vm(setup: bool, decision: &crate::confine::Decision) -> bool {
+    setup && decision.confinement().is_none()
+}
+
+/// The Firecracker arguments `args`'s kernel profile adds, for the confinement preflight,
+/// which refuses a profile that turns seccomp off or sets its own filter. A profile that
+/// cannot be read adds none here; the boot itself reads it again and fails on it.
+fn profile_firecracker_args(args: &RunArgs) -> Option<String> {
+    let name = args.kernel_profile.as_deref().unwrap_or("default");
+    crate::setup::get_kernel_profile(name)
+        .ok()
+        .flatten()
+        .and_then(|profile| profile.firecracker_args)
+}
+
 fn nv2_profile(kernel_profile: &Option<String>) -> bool {
     let Some(name) = kernel_profile.as_deref() else {
         return false;
@@ -1625,11 +1642,12 @@ async fn prepare_vm_for_lifecycle(
     // Every podman launch, the library's start_vm and prepare_vm included, comes here first.
     crate::cgroup::require_swap_disabled(args.no_swap)?;
     // Before any side effect: a start that must be confined and cannot be is refused here.
-    let confinement = crate::confine::resolve(&crate::confine::Request {
+    let decision = crate::confine::resolve(&crate::confine::Request {
         flag: args.confine,
         backend: args.hypervisor.into(),
         network: args.network.into(),
-        firecracker_args: None,
+        // A kernel profile's arguments as well as FCVM_FIRECRACKER_ARGS, which Host reads.
+        firecracker_args: profile_firecracker_args(&args).as_deref(),
         unsupported: None,
     })?;
     info!(
@@ -1785,9 +1803,21 @@ async fn prepare_vm_for_lifecycle(
     // content-addressed base rootfs. create_cow_disk reflinks whatever it's given.
     let base_rootfs = match &args.rootfs_override {
         Some(p) => p.clone(),
-        None => crate::setup::ensure_rootfs(args.setup, rootfs_type.as_deref())
-            .await
-            .context("setting up rootfs")?,
+        // Building the rootfs boots fcvm setup's VM, which does not support confinement:
+        // a confined run uses a rootfs that exists and never builds one.
+        None => crate::setup::ensure_rootfs(
+            setup_may_boot_its_vm(args.setup, &decision),
+            rootfs_type.as_deref(),
+        )
+        .await
+        .with_context(|| {
+            if decision.confinement().is_some() {
+                "setting up rootfs: a confined run does not build one, because fcvm setup's \
+                 VM does not support confinement; run fcvm setup without --confine first"
+            } else {
+                "setting up rootfs"
+            }
+        })?,
     };
     let initrd_path = crate::setup::ensure_fc_agent_initrd(args.setup)
         .await
@@ -2196,7 +2226,7 @@ async fn prepare_vm_for_lifecycle(
     // Instead, env is passed directly to MMDS at VM start time
     let mut vm_state = VmState::new(vm_id.clone(), args.image.clone(), args.cpu, args.mem);
     vm_state.name = Some(vm_name.clone());
-    vm_state.confinement = confinement;
+    vm_state.confinement = decision.confinement().cloned();
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
@@ -2626,6 +2656,7 @@ async fn prepare_vm_for_lifecycle(
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
         VmSetupParams {
+            decision: decision.clone(),
             args: &args,
             vm_id: &vm_id,
             data_dir: &data_dir,
@@ -4244,6 +4275,20 @@ pub(crate) fn launch_ipv6_prefix(args: &RunArgs) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `--setup` never boots fcvm setup's unconfined VM for a confined run.
+    #[test]
+    fn a_confined_run_never_builds_the_rootfs() {
+        let confined = crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+            landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+            layers: vec![crate::confine::Layer::Process],
+        }));
+        let unconfined = crate::confine::Decision::for_test(None);
+        assert!(!super::setup_may_boot_its_vm(true, &confined));
+        assert!(super::setup_may_boot_its_vm(true, &unconfined));
+        assert!(!super::setup_may_boot_its_vm(false, &unconfined));
+    }
+
     use super::*;
     use crate::cli::args::{ImageMode as CliImageMode, NetworkMode};
     use crate::firecracker::ImageMode;

@@ -3318,13 +3318,14 @@ async fn cmd_snapshot_run_inner(
         args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
     );
     vm_state.name = Some(vm_name.clone());
-    vm_state.confinement = crate::confine::resolve(&crate::confine::Request {
+    let decision = crate::confine::resolve(&crate::confine::Request {
         flag: args.confine,
         backend: snapshot_config.metadata.hypervisor,
         network: snapshot_config.metadata.network_mode.into(),
         firecracker_args: args.firecracker_args.as_deref(),
         unsupported: None,
     })?;
+    vm_state.confinement = decision.confinement().cloned();
 
     // Save snapshot tracking info in clone state
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
@@ -4364,6 +4365,7 @@ async fn cmd_snapshot_run_inner(
     setup.restore_completion_rx = Some(restore_completion_rx);
 
     let restore_params = RestoreParams {
+        decision: decision.clone(),
         vm_id: &vm_id,
         vm_name: &vm_name,
         data_dir: &data_dir,
@@ -6195,7 +6197,7 @@ async fn cmd_snapshot_run_raw(
     paths::check_socket_path_budget(&vm_id)?;
 
     // Refused when asked for, or when the host requires it: this path does not confine.
-    crate::confine::resolve(&crate::confine::Request {
+    let decision = crate::confine::resolve(&crate::confine::Request {
         flag: args.confine,
         backend: crate::hypervisor::Backend::Firecracker,
         network: crate::confine::Network::Rootless,
@@ -6305,6 +6307,7 @@ async fn cmd_snapshot_run_raw(
     let restore_started = std::time::Instant::now();
     let restored = super::common::restore_from_snapshot_ch(
         RestoreParams {
+            decision,
             vm_id: &vm_id,
             vm_name: &vm_name,
             data_dir: &data_dir,
@@ -6406,7 +6409,7 @@ async fn cmd_snapshot_run_disk_only(
         .unwrap_or_else(|| default_clone_name(&snapshot_name, &generate_vm_id()));
     validate_vm_name(&vm_name).context("invalid VM name")?;
 
-    let run_args = run_args_from_snapshot_metadata(
+    let mut run_args = run_args_from_snapshot_metadata(
         meta,
         &port_mappings,
         vm_name,
@@ -6430,6 +6433,9 @@ async fn cmd_snapshot_run_disk_only(
         ),
         args.host_ipv6,
     );
+    // The request's --confine, which the snapshot's metadata does not carry: the disk-only
+    // restore boots through `podman run`, which resolves confinement from these arguments.
+    run_args.confine = args.confine;
     let run_args = RunArgs {
         publish_limit_per_source: args.publish_limit_per_source,
         ..run_args

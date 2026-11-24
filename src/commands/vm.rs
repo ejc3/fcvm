@@ -428,6 +428,8 @@ impl NsHelper {
         vm_id: &str,
         data_dir: &Path,
         rdp_port: u16,
+        // The VM's decision: the helper runs in the VM's namespaces, spawned as its VMM is.
+        decision: &crate::confine::Decision,
     ) -> Result<NsHelper> {
         use tokio::io::AsyncBufReadExt;
         let exe = std::env::current_exe().context("finding this fcvm binary")?;
@@ -448,10 +450,9 @@ impl NsHelper {
         crate::utils::install_namespace_pre_exec(
             &mut command,
             &crate::utils::NamespaceParams {
-                vm_id: vm_id.to_string(),
                 user_namespace_path: Some(user_ns.to_path_buf()),
                 net_namespace_path: Some(net_ns.to_path_buf()),
-                ..Default::default()
+                ..crate::utils::NamespaceParams::new(vm_id, decision.clone())
             },
         )?;
         // The parent died between the fork and the prctl above: no signal will come.
@@ -587,7 +588,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
     })?;
     paths::check_socket_path_budget(&vm_id)?;
     // Refused when the host requires confinement: this command does not confine.
-    crate::confine::resolve(&crate::confine::Request {
+    let decision = crate::confine::resolve(&crate::confine::Request {
         flag: false,
         backend: crate::hypervisor::Backend::Firecracker,
         network: args.network.into(),
@@ -664,6 +665,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         &mut holder_slot,
         &mut helper_slot,
         &mut boot_slot,
+        &decision,
     )
     .await;
     if let Err(e) = booted {
@@ -720,6 +722,7 @@ async fn boot_raw_vm(
     holder_slot: &mut Option<tokio::process::Child>,
     helper_slot: &mut Option<NsHelper>,
     boot_slot: &mut Option<RawBoot>,
+    decision: &crate::confine::Decision,
 ) -> Result<()> {
     let vm_id = vm_state.vm_id.clone();
     // The disk is the VM's own reflink copy, at the path every VM's disk has, which is
@@ -752,6 +755,7 @@ async fn boot_raw_vm(
         vm_id.clone(),
         data_dir.join("firecracker.sock"),
         Some(data_dir.join("firecracker.log")),
+        decision.clone(),
     )) as Box<dyn Hypervisor>);
     backend
         .spawn(&process_spec)
@@ -769,8 +773,17 @@ async fn boot_raw_vm(
         .zip(process_spec.net_namespace_path.as_deref())
         .context("the rootless namespace has no namespace paths")?;
     write_generation(data_dir, &vm_id, 0)?;
-    *helper_slot =
-        Some(NsHelper::start(user_ns, net_ns, &vm_id, data_dir, args.health_port).await?);
+    *helper_slot = Some(
+        NsHelper::start(
+            user_ns,
+            net_ns,
+            &vm_id,
+            data_dir,
+            args.health_port,
+            decision,
+        )
+        .await?,
+    );
 
     *boot_slot = Some(RawBoot {
         ch_bin: ch_bin.to_path_buf(),

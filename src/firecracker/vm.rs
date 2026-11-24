@@ -328,7 +328,7 @@ pub struct VmManager {
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
     mount_redirects: Option<crate::utils::MountRedirects>, // mount namespace for a restored clone
     keep_fds: Vec<std::os::fd::RawFd>,   // descriptors left open across the VMM's exec
-    confinement: Option<crate::confine::Confinement>, // `--confine` (crate::confine)
+    decision: crate::confine::Decision,  // confined or not, from confine::resolve
     tap_owner: Option<String>,           // confined: the TAP its pre_exec makes the VMM's own
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
@@ -355,7 +355,14 @@ pub struct VmManager {
 }
 
 impl VmManager {
-    pub fn new(vm_id: String, socket_path: PathBuf, log_path: Option<PathBuf>) -> Self {
+    /// `decision` comes from the caller's [`crate::confine::resolve`]; every launch of this
+    /// manager, a guest-reboot relaunch included, spawns the VMM under it.
+    pub fn new(
+        vm_id: String,
+        socket_path: PathBuf,
+        log_path: Option<PathBuf>,
+        decision: crate::confine::Decision,
+    ) -> Self {
         Self {
             vm_id,
             vm_name: None,
@@ -368,7 +375,7 @@ impl VmManager {
             net_namespace_path: None,
             mount_redirects: None,
             keep_fds: Vec::new(),
-            confinement: None,
+            decision,
             tap_owner: None,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
@@ -446,11 +453,6 @@ impl VmManager {
     /// ([`crate::utils::NamespaceParams::tap_owner`]). Kept across relaunches.
     pub fn set_tap_owner(&mut self, tap: Option<String>) {
         self.tap_owner = tap;
-    }
-
-    /// Confine the VMM ([`crate::confine`]). Kept across relaunches.
-    pub fn set_confinement(&mut self, confinement: Option<crate::confine::Confinement>) {
-        self.confinement = confinement;
     }
 
     /// Set user namespace path for rootless clones
@@ -581,7 +583,7 @@ impl VmManager {
         // build is for the gnu target, whose default policy allows every syscall of the
         // native architecture (rootfs-config.toml, [firecracker]).
         // Set FCVM_NO_SECCOMP=1 to install none, for debugging.
-        if self.confinement.is_some()
+        if self.decision.confinement().is_some()
             && (std::env::var_os("FCVM_NO_SECCOMP").is_some()
                 || std::env::var_os("FCVM_STRACE_FC").is_some())
         {
@@ -655,8 +657,8 @@ impl VmManager {
                 net_namespace_path: self.net_namespace_path.clone(),
                 mount_redirects: self.mount_redirects.clone(),
                 keep_fds: self.keep_fds.clone(),
-                confine: self.confinement.is_some(),
-                tap_owner: self.confinement.as_ref().and(self.tap_owner.clone()),
+                decision: self.decision.clone(),
+                tap_owner: self.tap_owner.clone(),
             },
         )?;
 
@@ -1289,7 +1291,12 @@ mod tests {
             .stderr(std::process::Stdio::null());
         let child = command.spawn().expect("spawn live child");
 
-        let mut vm = VmManager::new("wait-test".to_string(), socket_path, None);
+        let mut vm = VmManager::new(
+            "wait-test".to_string(),
+            socket_path,
+            None,
+            crate::confine::Decision::for_test(None),
+        );
         vm.process = Some(child);
         vm
     }
@@ -1379,6 +1386,7 @@ mod tests {
             "refused-test".to_string(),
             dir.path().join("api.sock"),
             None,
+            crate::confine::Decision::for_test(None),
         );
         vm.process = Some(child);
 
@@ -1435,7 +1443,12 @@ mod tests {
             .expect("chmod fake firecracker");
 
         let socket_path = dir.path().join("api.sock");
-        let mut vm = VmManager::new("test-vm".to_string(), socket_path, None);
+        let mut vm = VmManager::new(
+            "test-vm".to_string(),
+            socket_path,
+            None,
+            crate::confine::Decision::for_test(None),
+        );
 
         let err = vm
             .start(&fake_fc, None, None)
@@ -1492,6 +1505,7 @@ mod tests {
             "test-vm".to_string(),
             dir.path().join("api.sock"),
             Some(dir.path().join("firecracker.log")),
+            crate::confine::Decision::for_test(None),
         );
         vm.firecracker_log_level = requested.map(str::to_string);
         let started = vm.start(&fake_fc, None, None).await;
@@ -1713,7 +1727,12 @@ mod tests {
     async fn a_memory_mark_needs_a_running_vmm() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let memory = memory_file(dir.path());
-        let mut vm = VmManager::new("mark-test".to_string(), dir.path().join("api.sock"), None);
+        let mut vm = VmManager::new(
+            "mark-test".to_string(),
+            dir.path().join("api.sock"),
+            None,
+            crate::confine::Decision::for_test(None),
+        );
         vm.mark_memory_in_use(&memory)
             .await
             .expect_err("a mark without a VMM process");

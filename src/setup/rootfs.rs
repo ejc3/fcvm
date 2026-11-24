@@ -901,6 +901,37 @@ fn fcvm_config_dir_from(
 /// Writes the embedded default config to `$FCVM_CONFIG_DIR/fcvm/rootfs-config.toml`
 /// when the override is set (per-run test isolation), otherwise to the platform
 /// default (`~/.config/fcvm/rootfs-config.toml` on Linux).
+/// The embedded config to write over `existing`, keeping a `[confine] mode = "required"` it
+/// sets: `make build` regenerates the config, and a build must never turn a host's required
+/// confinement off. A config that does not parse is refused rather than overwritten, since
+/// whether it requires confinement cannot be told.
+fn config_keeping_confinement(existing: Option<&str>) -> Result<String> {
+    const OFF: &str = "[confine]\nmode = \"off\"\n";
+    let required = match existing {
+        None => false,
+        Some(text) => {
+            let value: toml::Value = toml::from_str(text).context(
+                "the existing config is not valid TOML, so whether its [confine] mode is \
+                 required cannot be told; fix or remove it",
+            )?;
+            value
+                .get("confine")
+                .and_then(|c| c.get("mode"))
+                .and_then(|m| m.as_str())
+                == Some("required")
+        }
+    };
+    anyhow::ensure!(
+        EMBEDDED_CONFIG.matches(OFF).count() == 1,
+        "the embedded config has no single [confine] mode = \"off\" to set"
+    );
+    Ok(if required {
+        EMBEDDED_CONFIG.replace(OFF, "[confine]\nmode = \"required\"\n")
+    } else {
+        EMBEDDED_CONFIG.to_string()
+    })
+}
+
 pub fn generate_config(force: bool) -> Result<PathBuf> {
     let config_dir = fcvm_config_dir()?;
     let config_dir = config_dir.as_path();
@@ -914,9 +945,18 @@ pub fn generate_config(force: bool) -> Result<PathBuf> {
         );
     }
 
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", config_path.display()));
+        }
+    };
+    let contents = config_keeping_confinement(existing.as_deref())
+        .with_context(|| format!("regenerating {}", config_path.display()))?;
     std::fs::create_dir_all(config_dir)
         .with_context(|| format!("creating config directory: {}", config_dir.display()))?;
-    std::fs::write(&config_path, EMBEDDED_CONFIG)
+    std::fs::write(&config_path, contents)
         .with_context(|| format!("writing config file: {}", config_path.display()))?;
 
     info!("Generated config at {}", config_path.display());
@@ -2728,12 +2768,12 @@ async fn boot_vm_for_setup(
     // that died without running its cleanup (SIGKILL, a cancelled CI job) orphaned a
     // live Firecracker to init. No namespaces here — the setup VM runs on the host
     // network — so the helper installs only the parent-death hook.
+    // The setup VM does not support confinement: under `--confine` (`podman run --setup`)
+    // or a host's `required` mode it is refused here, before it starts.
+    let decision = crate::confine::resolve(&layer2_setup_confinement_request())?;
     crate::utils::install_namespace_pre_exec(
         &mut fc_cmd,
-        &crate::utils::NamespaceParams {
-            vm_id: "layer2-setup".to_string(),
-            ..Default::default()
-        },
+        &crate::utils::NamespaceParams::new("layer2-setup", decision),
     )?;
     let mut fc_process = fc_cmd.spawn().context("starting Firecracker")?;
 
@@ -2902,8 +2942,49 @@ fn path_to_str(path: &Path) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("path contains invalid UTF-8: {:?}", path))
 }
 
+/// The setup VM's confinement request: never asked for by a flag, and refused under a
+/// host's `required` mode, with what to do instead.
+#[cfg(test)]
+pub(crate) fn layer2_setup_request_for_test() -> crate::confine::Request<'static> {
+    layer2_setup_confinement_request()
+}
+
+fn layer2_setup_confinement_request() -> crate::confine::Request<'static> {
+    crate::confine::Request {
+        flag: false,
+        backend: crate::hypervisor::Backend::Firecracker,
+        network: crate::confine::Network::Rootless,
+        firecracker_args: None,
+        unsupported: Some(
+            "fcvm setup's Layer 2 VM runs unconfined; run fcvm setup with confinement off \
+             first (it is a one-time step), then start VMs confined",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Regenerating the config (`make build` runs `fcvm setup --generate-config --force`)
+    /// keeps a host's required confinement and otherwise writes the embedded config.
+    #[test]
+    fn regenerating_the_config_never_turns_required_confinement_off() {
+        let required = EMBEDDED_CONFIG.replace(
+            "[confine]\nmode = \"off\"\n",
+            "[confine]\nmode = \"required\"\n",
+        );
+        let written = super::config_keeping_confinement(Some(&required)).unwrap();
+        let plan: Plan = toml::from_str(&written).unwrap();
+        assert_eq!(plan.confine.mode, crate::confine::Mode::Required);
+        let off = super::config_keeping_confinement(Some(EMBEDDED_CONFIG)).unwrap();
+        assert_eq!(off, EMBEDDED_CONFIG);
+        assert_eq!(
+            super::config_keeping_confinement(None).unwrap(),
+            EMBEDDED_CONFIG
+        );
+        assert!(super::config_keeping_confinement(Some("[confine\n")).is_err());
+    }
+
     use super::*;
 
     /// Every profile whose guest kernel builds KVM (`CONFIG_KVM=y` or `=m`) runs VMs inside

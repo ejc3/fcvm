@@ -787,7 +787,8 @@ pub async fn run_streaming(
 ///
 /// VMM-neutral: both Firecracker and Cloud Hypervisor run as a child process inside the
 /// same namespaces with the same parent-death signal. See [`install_namespace_pre_exec`].
-#[derive(Debug, Clone, Default)]
+/// No `Default`: every spawn site names its [`Self::decision`].
+#[derive(Debug, Clone)]
 pub struct NamespaceParams {
     /// VM id, for log context only.
     pub vm_id: String,
@@ -812,13 +813,31 @@ pub struct NamespaceParams {
     /// while it holds the lease (and again from the same lease after a guest reboot), and
     /// drops the lease only after the VMM has exited.
     pub keep_fds: Vec<std::os::fd::RawFd>,
-    /// Apply [`crate::confine::Layer::Process`] after the namespaces are entered. Needs
-    /// `user_namespace_path`: the layer drops capabilities held in that namespace.
-    pub confine: bool,
-    /// With `confine`: the namespace's persistent TAP, made owned by the VMM's uid before
+    /// Whether the VMM is confined, from [`crate::confine::resolve`]. Confined, the
+    /// process layer runs after the namespaces are entered; it needs
+    /// `user_namespace_path`, because it drops capabilities held in that namespace.
+    pub decision: crate::confine::Decision,
+    /// When confined: the namespace's persistent TAP, made owned by the VMM's uid before
     /// its capabilities are dropped ([`crate::confine::own_tap`]), so the VMM can attach
     /// to it without CAP_NET_ADMIN. Only an unpooled namespace, which is this VM's alone.
     pub tap_owner: Option<String>,
+}
+
+impl NamespaceParams {
+    /// No namespace, no redirect, no kept descriptor: what a site adds to with struct update
+    /// syntax. The decision cannot be left out.
+    pub fn new(vm_id: impl Into<String>, decision: crate::confine::Decision) -> Self {
+        Self {
+            vm_id: vm_id.into(),
+            namespace_id: None,
+            user_namespace_path: None,
+            net_namespace_path: None,
+            mount_redirects: None,
+            keep_fds: Vec::new(),
+            decision,
+            tap_owner: None,
+        }
+    }
 }
 
 /// The mount namespace that gives a restored clone's VMM its own directories at the
@@ -1281,7 +1300,7 @@ pub fn install_namespace_pre_exec(
         }
     }
 
-    if ns.confine {
+    if ns.decision.confinement().is_some() {
         anyhow::ensure!(
             ns.user_namespace_path.is_some(),
             "confining the VMM of {} needs it to enter a user namespace (rootless mode)",
@@ -1680,7 +1699,11 @@ mod tests {
         let interrupt = TerminalInterrupt::arm();
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("60").stdin(Stdio::null()).kill_on_drop(true);
-        install_namespace_pre_exec(&mut cmd, &NamespaceParams::default()).unwrap();
+        install_namespace_pre_exec(
+            &mut cmd,
+            &NamespaceParams::new("vm-test", crate::confine::Decision::for_test(None)),
+        )
+        .unwrap();
         let mut vmm = cmd.spawn().expect("spawning the stand-in VMM");
         interrupt.assert_misses(&mut vmm, "the VMM").await;
     }
@@ -1760,7 +1783,7 @@ mod tests {
                     keep: vec![other.clone(), view.join("gone")],
                     keep_files: vec![disk.clone(), view.join("gone.raw")],
                 }),
-                ..Default::default()
+                ..NamespaceParams::new("vm-test", crate::confine::Decision::for_test(None))
             },
         )
         .unwrap();

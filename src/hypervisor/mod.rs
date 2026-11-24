@@ -131,9 +131,7 @@ pub struct ProcessSpec {
     /// Descriptors the VMM keeps open across its exec
     /// ([`crate::utils::NamespaceParams::keep_fds`]).
     pub keep_fds: Vec<std::os::fd::RawFd>,
-    /// Confine the VMM ([`crate::confine`]). `None` keeps what an earlier spawn set.
-    pub confinement: Option<crate::confine::Confinement>,
-    /// With `confinement`: the VM's own (unpooled) TAP, made the VMM's before its
+    /// When the backend's decision is confined: the VM's own (unpooled) TAP, made the VMM's before its
     /// capabilities are dropped. `None` keeps what an earlier spawn set.
     pub tap_owner: Option<String>,
 }

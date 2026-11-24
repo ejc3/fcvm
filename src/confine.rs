@@ -71,6 +71,24 @@ pub fn set_config_mode(mode: Mode) {
     let _ = CONFIG_MODE.set(mode);
 }
 
+/// The config's mode: the one [`set_config_mode`] recorded, or, when nothing did (a library
+/// embedder, a command that set its paths another way), the one `load` reads from the config
+/// file. An unset mode is never taken as off.
+fn config_mode(
+    recorded: Option<Mode>,
+    load: impl FnOnce() -> anyhow::Result<Mode>,
+) -> anyhow::Result<Mode> {
+    match recorded {
+        Some(mode) => Ok(mode),
+        None => load().map_err(|e| e.context("reading the fcvm config's [confine] mode")),
+    }
+}
+
+fn load_config_mode() -> anyhow::Result<Mode> {
+    let (config, _, _) = crate::setup::rootfs::load_config(None)?;
+    Ok(config.confine.mode)
+}
+
 /// The environment variable that can make a host's mode stricter than its config.
 pub const MODE_ENV: &str = "FCVM_CONFINE";
 
@@ -202,7 +220,7 @@ impl Host {
         let env = std::env::var(MODE_ENV).ok();
         Ok(Host {
             mode: host_mode(
-                CONFIG_MODE.get().copied().unwrap_or_default(),
+                config_mode(CONFIG_MODE.get().copied(), load_config_mode)?,
                 env.as_deref(),
             )?,
             landlock_abi: landlock_abi(),
@@ -333,7 +351,7 @@ pub fn decide(request: &Request<'_>, host: &Host) -> anyhow::Result<Option<Confi
 }
 
 /// [`decide`] on this host.
-pub fn resolve(request: &Request<'_>) -> anyhow::Result<Option<Confinement>> {
+pub fn resolve(request: &Request<'_>) -> anyhow::Result<Decision> {
     let host = Host::read()?;
     let decided = decide(request, &host)?;
     if let Some(confinement) = &decided {
@@ -343,7 +361,27 @@ pub fn resolve(request: &Request<'_>) -> anyhow::Result<Option<Confinement>> {
             "the VMM will be confined"
         );
     }
-    Ok(decided)
+    Ok(Decision(decided))
+}
+
+/// Whether a VMM is confined, as [`resolve`] decided it. It is the only way to get one: it
+/// has no public constructor and no `Default`, and every VMM spawn takes one
+/// ([`crate::utils::NamespaceParams::decision`]), so no VMM starts without the decision
+/// the host's mode and the start's request make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision(Option<Confinement>);
+
+impl Decision {
+    /// How the VMM is confined, or `None` when [`resolve`] decided it runs unconfined.
+    pub fn confinement(&self) -> Option<&Confinement> {
+        self.0.as_ref()
+    }
+
+    /// A decision for tests that spawn a process through the VMM pre_exec directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(confinement: Option<Confinement>) -> Self {
+        Self(confinement)
+    }
 }
 
 const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
@@ -659,6 +697,149 @@ mod tests {
         assert!(host_mode(Mode::Off, Some("on")).is_err());
     }
 
+    /// A mode nothing recorded is read from the config, never taken as off: a library
+    /// embedder or a command that set its paths another way still honours `required`.
+    #[test]
+    fn an_unrecorded_mode_is_loaded_from_the_config_not_taken_as_off() {
+        assert_eq!(
+            config_mode(None, || Ok(Mode::Required)).unwrap(),
+            Mode::Required
+        );
+        assert_eq!(
+            config_mode(Some(Mode::Off), || panic!(
+                "a recorded mode is not reloaded"
+            ))
+            .unwrap(),
+            Mode::Off
+        );
+        let error = config_mode(None, || anyhow::bail!("no config file"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[confine] mode"), "{error}");
+    }
+
+    /// Every source file under `src/`, as (path, text).
+    fn sources() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src"
+        ))];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let rel = path
+                        .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                        .unwrap()
+                        .display()
+                        .to_string();
+                    out.push((rel, text));
+                }
+            }
+        }
+        out
+    }
+
+    /// The code of `text` before its `#[cfg(test)]` module, if it has one.
+    fn non_test(text: &str) -> &str {
+        text.find("\n#[cfg(test)]\nmod tests")
+            .map_or(text, |at| &text[..at])
+    }
+
+    /// Every place outside tests that spawns a process through the VMM pre_exec. Each one
+    /// passes a [`Decision`], which only [`resolve`] makes; a new site must be added here
+    /// after it is checked to resolve its VM's confinement first.
+    #[test]
+    fn every_vmm_spawn_site_is_known() {
+        let mut sites: Vec<(String, usize)> = sources()
+            .into_iter()
+            .map(|(path, text)| {
+                let calls = non_test(&text)
+                    .matches("install_namespace_pre_exec(")
+                    .count()
+                    - usize::from(path == "src/utils.rs");
+                (path, calls)
+            })
+            .filter(|(_, calls)| *calls > 0)
+            .collect();
+        sites.sort();
+        assert_eq!(
+            sites,
+            vec![
+                ("src/commands/vm.rs".to_string(), 1),
+                ("src/firecracker/vm.rs".to_string(), 1),
+                ("src/hypervisor/cloud_hypervisor/mod.rs".to_string(), 1),
+                ("src/setup/rootfs.rs".to_string(), 1),
+            ],
+            "a VMM spawn site was added or removed: check that it resolves its decision"
+        );
+    }
+
+    /// Only this module makes a [`Decision`]: no code elsewhere builds one, so the only
+    /// way to one is [`resolve`].
+    #[test]
+    fn a_decision_is_made_only_here() {
+        for (path, text) in sources() {
+            if path == "src/confine.rs" {
+                continue;
+            }
+            for pattern in ["Decision(", "Decision {"] {
+                assert!(
+                    !text.contains(pattern),
+                    "{path} builds a confine::Decision ({pattern})"
+                );
+            }
+        }
+        let here = include_str!("confine.rs");
+        let tests_at = here.find("\n#[cfg(test)]\nmod tests").unwrap();
+        assert_eq!(
+            here[..tests_at].matches("Decision(").count(),
+            2,
+            "the type and resolve"
+        );
+    }
+
+    /// fcvm setup's VM is refused under a host's `required` mode, and it resolves before it
+    /// spawns. (Before this, it spawned with no decision at all.)
+    #[test]
+    fn the_setup_vm_resolves_before_it_spawns_and_is_refused_under_required() {
+        let source = include_str!("setup/rootfs.rs");
+        let resolve = source
+            .find("crate::confine::resolve(&layer2_setup_confinement_request())")
+            .expect("the setup VM resolves its confinement");
+        let spawn = source.find("install_namespace_pre_exec(").unwrap();
+        assert!(resolve < spawn, "the setup VM resolves before it spawns");
+        let required = Host {
+            mode: Mode::Required,
+            ..host(Ok(11))
+        };
+        let error = decide(
+            &crate::setup::rootfs::layer2_setup_request_for_test(),
+            &required,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("command: fcvm setup's Layer 2 VM runs unconfined"),
+            "{error}"
+        );
+    }
+
+    /// A disk-only restore boots through `podman run` with arguments it builds from the
+    /// snapshot's metadata, which has no --confine: it must carry the request's.
+    #[test]
+    fn a_disk_only_restore_carries_the_confine_request() {
+        let source = include_str!("commands/snapshot.rs");
+        let start = source.find("async fn cmd_snapshot_run_disk_only(").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("run_args.confine = args.confine;"), "{body}");
+    }
+
     #[test]
     fn the_config_key_parses_and_defaults_to_off() {
         #[derive(Deserialize)]
@@ -807,12 +988,16 @@ mod tests {
         crate::utils::install_namespace_pre_exec(
             &mut cmd,
             &crate::utils::NamespaceParams {
-                vm_id: "confine-probe".to_string(),
                 user_namespace_path: Some(format!("/proc/{holder_pid}/ns/user").into()),
                 net_namespace_path: Some(format!("/proc/{holder_pid}/ns/net").into()),
-                confine,
                 tap_owner: confine.then(|| PROBE_TAP.to_string()),
-                ..Default::default()
+                ..crate::utils::NamespaceParams::new(
+                    "confine-probe",
+                    Decision::for_test(confine.then(|| Confinement {
+                        landlock_abi: LANDLOCK_ABI_FLOOR,
+                        layers: vec![Layer::Process],
+                    })),
+                )
             },
         )
         .unwrap();

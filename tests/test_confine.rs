@@ -8,8 +8,9 @@ mod common;
 
 use anyhow::{Context, Result};
 
-/// Every thread of `pid`: (name, CapEff, CapBnd, NoNewPrivs) from its status.
-fn thread_credentials(pid: u32) -> Result<Vec<(String, String, String, String)>> {
+/// Every thread of `pid`: its name, then CapEff, CapPrm, CapInh, CapBnd, CapAmb and
+/// NoNewPrivs, from its status.
+fn thread_credentials(pid: u32) -> Result<Vec<(String, Vec<String>)>> {
     let mut threads = Vec::new();
     for task in std::fs::read_dir(format!("/proc/{pid}/task"))? {
         let status = std::fs::read_to_string(task?.path().join("status"))?;
@@ -20,12 +21,18 @@ fn thread_credentials(pid: u32) -> Result<Vec<(String, String, String, String)>>
                 .map(|v| v.trim().to_string())
                 .with_context(|| format!("{name} in the status of a thread of {pid}"))
         };
-        threads.push((
-            field("Name")?,
-            field("CapEff")?,
-            field("CapBnd")?,
-            field("NoNewPrivs")?,
-        ));
+        let mut values = Vec::new();
+        for name in [
+            "CapEff",
+            "CapPrm",
+            "CapInh",
+            "CapBnd",
+            "CapAmb",
+            "NoNewPrivs",
+        ] {
+            values.push(field(name)?);
+        }
+        threads.push((field("Name")?, values));
     }
     Ok(threads)
 }
@@ -122,12 +129,30 @@ async fn test_confine_rootless_vm() -> Result<()> {
         );
         let threads = thread_credentials(firecrackers[0])?;
         println!("firecracker threads: {threads:?}");
-        for (name, eff, bnd, nnp) in &threads {
+        let zero = "0000000000000000".to_string();
+        let expected = vec![
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero,
+            "1".to_string(),
+        ];
+        for (name, values) in &threads {
             anyhow::ensure!(
-                eff == "0000000000000000" && bnd == "0000000000000000" && nnp == "1",
-                "thread {name}: CapEff {eff} CapBnd {bnd} NoNewPrivs {nnp}"
+                values == &expected,
+                "thread {name}: CapEff, CapPrm, CapInh, CapBnd, CapAmb, NoNewPrivs = {values:?}"
             );
         }
+        let limits = std::fs::read_to_string(format!("/proc/{}/limits", firecrackers[0]))?;
+        let core = limits
+            .lines()
+            .find(|l| l.starts_with("Max core file size"))
+            .context("no core limit in /proc/<pid>/limits")?;
+        anyhow::ensure!(
+            core.split_whitespace().skip(4).take(2).eq(["0", "0"]),
+            "core limit: {core}"
+        );
 
         let ls = tokio::process::Command::new(common::find_fcvm_binary()?)
             .args(["ls", "--json"])

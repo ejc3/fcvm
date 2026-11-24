@@ -1153,6 +1153,8 @@ pub(crate) async fn cleanup_nfs_exports(vm_id: &str) -> Result<()> {
 
 /// Parameters for VM setup, grouping the many read-only inputs.
 pub(super) struct VmSetupParams<'a> {
+    /// From the run's [`crate::confine::resolve`]; the VMM is spawned under it.
+    pub decision: crate::confine::Decision,
     pub args: &'a RunArgs,
     pub vm_id: &'a str,
     pub data_dir: &'a std::path::Path,
@@ -1844,6 +1846,7 @@ async fn run_vm_setup_inner(
     bootplan_handle_slot: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Result<()> {
     let VmSetupParams {
+        decision,
         args,
         vm_id,
         data_dir,
@@ -1922,10 +1925,8 @@ async fn run_vm_setup_inner(
         binary: vmm_bin.clone(),
         extra_args: vmm_extra_args.clone(),
         vm_name: Some(vm_name),
-        confinement: vm_state.confinement.clone(),
-        tap_owner: vm_state
-            .confinement
-            .as_ref()
+        tap_owner: decision
+            .confinement()
             .map(|_| network.tap_device().to_string()),
         ..Default::default()
     };
@@ -1958,11 +1959,13 @@ async fn run_vm_setup_inner(
             vm_id.to_string(),
             socket_path.to_path_buf(),
             Some(vmm_log_path),
+            decision.clone(),
         )) as Box<dyn Hypervisor>,
         Backend::CloudHypervisor => Box::new(CloudHypervisorBackend::new(
             vm_id.to_string(),
             socket_path.to_path_buf(),
             Some(vmm_log_path),
+            decision.clone(),
         )) as Box<dyn Hypervisor>,
     });
 
