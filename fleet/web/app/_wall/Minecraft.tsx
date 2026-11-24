@@ -122,7 +122,7 @@ function JoinLine({ join }: { join: { label: string; address: string } }) {
       <button type="button" className="btn mini" onClick={copy} data-testid="mc-join-copy">
         {copied ? "Copied" : "Copy"}
       </button>
-      <span className="hint">Each server's own address is under its tile.</span>
+      <span className="mc-hint" data-testid="mc-join-hint">Each server's own address is under its tile.</span>
     </p>
   );
 }
