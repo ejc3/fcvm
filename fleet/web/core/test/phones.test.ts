@@ -346,6 +346,21 @@ describe("the page's view", () => {
     expect(phonesView(input(initialState())).empty).toBe("Connecting to the fleet.");
   });
 
+  it("does not say the fleet runs no phones before a GPU host is up", () => {
+    // The coordinator lists phones only once the host that runs them has connected: a viewer
+    // who woke the fleet read "This fleet runs no phones." for about a minute (2026-11-24).
+    const base = stateWith(null);
+    const st = base.accepted!;
+    const withFleet = (fleet: typeof st.fleet) =>
+      phonesView(input(reduce(base, { type: "message", text: snapshotText(2, { ...st, fleet }), at: EPOCH }))).empty;
+    const power = (state: "asleep" | "waking" | "awake") => ({ ...st.fleet.power, state, asleep_since: state === "asleep" ? EPOCH - 1000 : null, woke_at: state === "waking" ? EPOCH - 1000 : null });
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("asleep") })).toBe("The phones start when the fleet wakes.");
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("waking") })).toBe("The fleet is waking. The phones start when a GPU host is up.");
+    // awake by its EC2 half, or a GPU host refused for capacity: still no host
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("awake") })).toBe("No GPU host is up yet. The phones start when one is.");
+    expect(withFleet({ ...st.fleet, power: power("awake") })).toBe("This fleet runs no phones.");
+  });
+
   it("follows the shared zoom in the button, not a local choice", () => {
     expect(phonesView(input(stateWith(phonesOf(2)))).zoom).toEqual({ label: "Zoom out", out: false, disabled: false });
     expect(phonesView(input(stateWith(phonesOf(2, { zoomed_out: true })))).zoom).toEqual({ label: "Zoom in", out: true, disabled: false });
