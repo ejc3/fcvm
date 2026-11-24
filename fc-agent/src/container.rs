@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -790,10 +790,10 @@ pub fn write_provisioned_marker() {
     }
 }
 
-/// Whether a container named `fcvm-container` already exists in podman storage.
+/// The id of the container named `fcvm-container` in podman storage, if there is one.
 /// On a clone boot the container is already created — we start it rather than
 /// `podman run` a fresh one, preserving its writable layer (the captured work).
-pub fn container_exists(cmd_prefix: &[String]) -> bool {
+pub fn existing_container_id(cmd_prefix: &[String]) -> Option<String> {
     let mut cmd = if cmd_prefix.is_empty() {
         std::process::Command::new("podman")
     } else {
@@ -802,10 +802,153 @@ pub fn container_exists(cmd_prefix: &[String]) -> bool {
         c.arg("podman");
         c
     };
-    cmd.args(["container", "exists", "fcvm-container"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let out = cmd
+        .args([
+            "container",
+            "inspect",
+            "--format",
+            "{{.Id}}",
+            "fcvm-container",
+        ])
+        .output()
+        .ok()?;
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && is_container_id(&id)).then_some(id)
+}
+
+/// Whether `id` is a full container id as podman and crun write it: 64 lowercase hex
+/// digits. An id read from a file is checked before it becomes a path or an argument.
+pub fn is_container_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Where the OCI runtime keeps `fcvm-container`, for what reaches the container without
+/// podman: the restore hook, which calls crun where it would otherwise pay for a podman
+/// client's start-up in a just-restored guest, twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerRuntime {
+    /// Where podman writes the container's id when `podman run` creates the container
+    /// (`--cidfile`). Absent until then, and removed before every launch, so it never
+    /// names a container of an earlier launch. A captured container that a clone's cold
+    /// boot starts has its id in [`captured_container_id`] instead.
+    pub id_file: PathBuf,
+    /// crun's state root, which podman leaves at crun's default: `/run/crun` as root, and
+    /// `crun` under the runtime directory podman runs with (`XDG_RUNTIME_DIR`) as a user.
+    pub crun_root: PathBuf,
+    /// The uid and gid rootless podman runs as; None when podman runs as root.
+    pub owner: Option<(u32, u32)>,
+    /// What podman's exec sessions of the container leave out of its own process.
+    pub session: ExecSession,
+}
+
+/// The two things in which a `podman exec` session differs from the process in the
+/// container's `config.json`, and what decides each (podman 4.9, `prepareProcessExec`
+/// against `generateSpec`). podman builds a session from the spec in its database; the
+/// `config.json` is that spec after the start added to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecSession {
+    /// Whether the container was created with a user: the image's USER, or the user
+    /// rootless podman keeps (`--userns=keep-id`). With one, the start adds the user's
+    /// primary group to its supplementary groups and a session does not. With none, the
+    /// start adds the groups the image's `/etc/group` gives root, and a session has no
+    /// supplementary groups. None: the image's user is unknown.
+    pub user_set: Option<bool>,
+    /// Whether the image or the plan sets `HOSTNAME`. When neither does, the start adds
+    /// the variable and a session has none. None: the image's environment is unknown.
+    pub hostname_set: Option<bool>,
+}
+
+impl ExecSession {
+    /// From what the agent gives podman: the plan's environment, whether podman runs
+    /// rootless, and the image's facts when the inspect returned them.
+    pub fn of(plan: &Plan, rootless: bool, image: Option<&ImageFacts>) -> Self {
+        let image_user = image.and_then(|facts| facts.user.as_deref());
+        let image_env = image.and_then(|facts| facts.env.as_deref());
+        Self {
+            user_set: if rootless {
+                Some(true)
+            } else {
+                image_user.map(|user| !user.is_empty())
+            },
+            hostname_set: if plan.env.contains_key("HOSTNAME") {
+                Some(true)
+            } else {
+                image_env.map(|env| env.iter().any(|var| var.starts_with("HOSTNAME=")))
+            },
+        }
+    }
+}
+
+impl ContainerRuntime {
+    /// For podman run as root (`runtime_dir` None) or as the user whose runtime directory
+    /// is `runtime_dir`. The id file is in that directory because the user's podman
+    /// creates it.
+    pub fn new(runtime_dir: Option<&str>, owner: Option<(u32, u32)>) -> Self {
+        match runtime_dir {
+            Some(dir) => Self {
+                id_file: Path::new(dir).join("fcvm-container.cid"),
+                crun_root: Path::new(dir).join("crun"),
+                owner,
+                session: ExecSession::default(),
+            },
+            None => Self {
+                id_file: PathBuf::from("/run/fcvm-container.cid"),
+                crun_root: PathBuf::from("/run/crun"),
+                owner: None,
+                session: ExecSession::default(),
+            },
+        }
+    }
+}
+
+/// Set when the agent is about to launch the container, never before: with no record
+/// the agent has started no container in this boot.
+static CONTAINER_RUNTIME: OnceLock<ContainerRuntime> = OnceLock::new();
+
+/// The id of the captured container a clone's cold boot starts with `podman start`, which
+/// writes no id file.
+static CAPTURED_CONTAINER_ID: OnceLock<String> = OnceLock::new();
+
+/// Record the id of the captured container this boot is about to start.
+pub fn record_captured_container(id: String) {
+    let _ = CAPTURED_CONTAINER_ID.set(id);
+}
+
+/// The captured container this boot started, if it started one.
+pub fn captured_container_id() -> Option<&'static str> {
+    CAPTURED_CONTAINER_ID.get().map(String::as_str)
+}
+
+/// Whether the podman client that ran the container has returned.
+static CONTAINER_EXITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record where the container about to be launched will be kept, and remove an id file an
+/// earlier launch left (podman refuses to overwrite one, and a stale one would name a
+/// container that is gone).
+pub fn begin_container_launch(runtime: ContainerRuntime) -> &'static ContainerRuntime {
+    if let Err(e) = std::fs::remove_file(&runtime.id_file) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "[fc-agent] WARNING: removing {} failed: {e}",
+                runtime.id_file.display()
+            );
+        }
+    }
+    CONTAINER_RUNTIME.get_or_init(|| runtime)
+}
+
+/// Where the launched container is kept; None before the agent launches it.
+pub fn container_runtime() -> Option<&'static ContainerRuntime> {
+    CONTAINER_RUNTIME.get()
+}
+
+/// Whether podman reported the container started (its READY=1) and its client has not
+/// returned since. It never decides that a restore hook runs, only that a runtime with no
+/// record of such a container is an error and not a container that has yet to start.
+pub fn container_reported_running() -> bool {
+    use std::sync::atomic::Ordering;
+    CONTAINER_START.load(Ordering::Acquire) != NOT_STARTED
+        && !CONTAINER_EXITED.load(Ordering::Acquire)
 }
 
 /// Build the argv to start (and attach to) the captured `fcvm-container`.
@@ -1138,10 +1281,17 @@ pub struct ImageFacts {
     /// Whether the image defines a HEALTHCHECK. Sent with the start notification, so
     /// the host runs `podman healthcheck` only for images that have one.
     pub healthcheck: bool,
+    /// The image's USER (empty when it sets none), or None when the inspect did not
+    /// print it. With the image's environment below, this is what podman builds an exec
+    /// session from and the container's `config.json` does not show (see
+    /// [`ExecSession`]).
+    pub user: Option<String>,
+    /// The image's environment, or None when the inspect did not print it.
+    pub env: Option<Vec<String>>,
 }
 
-/// Get the digest of a pulled image and whether it defines a HEALTHCHECK, in one
-/// `podman image inspect`.
+/// Get the digest of a pulled image, whether it defines a HEALTHCHECK, and its user and
+/// environment, in one `podman image inspect`.
 pub async fn get_image_facts(image: &str, cmd_prefix: &[String]) -> Result<ImageFacts> {
     let (cmd, mut args) = if cmd_prefix.is_empty() {
         ("podman".to_string(), vec![])
@@ -1154,7 +1304,7 @@ pub async fn get_image_facts(image: &str, cmd_prefix: &[String]) -> Result<Image
         "image".to_string(),
         "inspect".to_string(),
         "--format".to_string(),
-        "{{.Digest}}\n{{json .HealthCheck}}".to_string(),
+        "{{.Digest}}\n{{json .HealthCheck}}\n{{json .User}}\n{{json .Config.Env}}".to_string(),
         image.to_string(),
     ]);
 
@@ -1172,11 +1322,14 @@ pub async fn get_image_facts(image: &str, cmd_prefix: &[String]) -> Result<Image
     parse_image_facts(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Parse the output of `podman image inspect --format '{{.Digest}}\n{{json .HealthCheck}}'`.
+/// Parse the output of `podman image inspect --format
+/// '{{.Digest}}\n{{json .HealthCheck}}\n{{json .User}}\n{{json .Config.Env}}'`.
 ///
 /// `HEALTHCHECK NONE` is stored as a test of `["NONE"]`, and podman runs no check for it.
+/// A user or environment line that is missing or does not parse leaves that fact unknown
+/// and fails nothing: the digest and the healthcheck are what a boot needs.
 fn parse_image_facts(stdout: &str) -> Result<ImageFacts> {
-    let mut lines = stdout.trim().splitn(2, '\n');
+    let mut lines = stdout.trim().lines();
     let digest = lines.next().unwrap_or_default().trim().to_string();
     if digest.is_empty() {
         anyhow::bail!("podman image inspect printed no digest: {stdout:?}");
@@ -1192,9 +1345,19 @@ fn parse_image_facts(stdout: &str) -> Result<ImageFacts> {
         .and_then(|test| test.first())
         .and_then(|first| first.as_str())
         .is_some_and(|first| first != "NONE");
+    let user = lines
+        .next()
+        .and_then(|json| serde_json::from_str::<String>(json.trim()).ok());
+    let env = lines.next().and_then(|json| {
+        serde_json::from_str::<Option<Vec<String>>>(json.trim())
+            .ok()
+            .map(Option::unwrap_or_default)
+    });
     Ok(ImageFacts {
         digest,
         healthcheck,
+        user,
+        env,
     })
 }
 
@@ -1751,6 +1914,12 @@ pub fn build_podman_args(
         "run".to_string(),
         "--name".to_string(),
         "fcvm-container".to_string(),
+        // The container's id, for what reaches it through the OCI runtime (the restore hook).
+        "--cidfile".to_string(),
+        ContainerRuntime::new(user_info.map(|(_, runtime_dir)| runtime_dir), None)
+            .id_file
+            .to_string_lossy()
+            .into_owned(),
     ];
 
     // Always use host networking inside the VM. The VM already has its own
@@ -2250,6 +2419,7 @@ pub async fn run_tty(
         plan.interactive,
     )
     .await;
+    CONTAINER_EXITED.store(true, std::sync::atomic::Ordering::Release);
     start_watch.abort();
 
     vsock::notify_container_exit(exit_code);
@@ -2318,6 +2488,7 @@ pub async fn run_async(
     });
 
     let status = child.wait().await?;
+    CONTAINER_EXITED.store(true, std::sync::atomic::Ordering::Release);
     start_watch.abort();
     let exit_code = status.code().unwrap_or(1);
 
@@ -2603,6 +2774,95 @@ mod tests {
         assert!(super::parse_image_facts("\n").is_err());
         assert!(super::parse_image_facts(&format!("{digest}\n")).is_err());
         assert!(super::parse_image_facts(&format!("{digest}\nnot json")).is_err());
+    }
+
+    /// The same inspect carries the image's user and environment, which decide what a
+    /// podman exec session leaves out of the container's own process. A line that is
+    /// missing or malformed leaves its fact unknown and does not fail the inspect.
+    #[test]
+    fn image_facts_carry_the_user_and_environment() {
+        let digest = "sha256:4b9a4e0196b9ec48c209f98d6e7cea3241bfc402262bf1b0500ea4dbb1002c45";
+        let facts =
+            |rest: &str| super::parse_image_facts(&format!("{digest}\nnull\n{rest}")).unwrap();
+        let f = facts("\"\"\n[\"PATH=/bin\",\"NGINX_VERSION=1.29\"]\n");
+        assert_eq!(f.user.as_deref(), Some(""));
+        assert_eq!(f.env.as_deref().map(<[String]>::len), Some(2));
+        let f = facts("\"101:101\"\nnull\n");
+        assert_eq!(f.user.as_deref(), Some("101:101"));
+        assert_eq!(f.env, Some(Vec::new()));
+        let f = facts("");
+        assert_eq!((f.user, f.env), (None, None));
+        let f = facts("<no value>\n<no value>\n");
+        assert_eq!((f.user, f.env), (None, None));
+
+        let plan = |env: &str| -> crate::types::Plan {
+            serde_json::from_str(&format!(r#"{{"image": "alpine", "env": {env}}}"#)).unwrap()
+        };
+        let image = |user: &str, env: &[&str]| super::ImageFacts {
+            digest: digest.to_string(),
+            healthcheck: false,
+            user: Some(user.to_string()),
+            env: Some(env.iter().map(|v| v.to_string()).collect()),
+        };
+        let session = |user_set, hostname_set| super::ExecSession {
+            user_set,
+            hostname_set,
+        };
+        // Root podman: the image decides both.
+        assert_eq!(
+            super::ExecSession::of(&plan("{}"), false, Some(&image("", &["PATH=/bin"]))),
+            session(Some(false), Some(false))
+        );
+        assert_eq!(
+            super::ExecSession::of(&plan("{}"), false, Some(&image("nginx", &["HOSTNAME=web"]))),
+            session(Some(true), Some(true))
+        );
+        // The plan's HOSTNAME is the container's whatever the image holds; rootless
+        // podman always keeps a user.
+        assert_eq!(
+            super::ExecSession::of(&plan(r#"{"HOSTNAME": "tile"}"#), true, None),
+            session(Some(true), Some(true))
+        );
+        assert_eq!(
+            super::ExecSession::of(&plan("{}"), false, None),
+            session(None, None)
+        );
+    }
+
+    /// podman leaves the new container's id where the restore hook looks for it: in
+    /// /run as root, and as a user in that user's runtime directory, which is where
+    /// that user's crun keeps its state too.
+    #[test]
+    fn podman_run_leaves_the_container_id_for_the_runtime() {
+        let plan: crate::types::Plan = serde_json::from_str(r#"{"image": "alpine"}"#).unwrap();
+        for (user, id_file, crun_root) in [
+            (None, "/run/fcvm-container.cid", "/run/crun"),
+            (
+                Some(("fcvm-user", "/run/user/1000")),
+                "/run/user/1000/fcvm-container.cid",
+                "/run/user/1000/crun",
+            ),
+        ] {
+            let args = super::build_podman_args(&plan, "alpine", user, &[]);
+            let cidfile = args
+                .windows(2)
+                .position(|w| w[0] == "--cidfile" && w[1] == id_file)
+                .unwrap_or_else(|| panic!("{args:?}"));
+            assert!(cidfile < args.iter().position(|a| a == "alpine").unwrap());
+            let runtime = super::ContainerRuntime::new(user.map(|(_, dir)| dir), None);
+            assert_eq!(runtime.id_file, std::path::Path::new(id_file));
+            assert_eq!(runtime.crun_root, std::path::Path::new(crun_root));
+        }
+        assert!(super::is_container_id(&"0f".repeat(32)));
+        for bad in [
+            "",
+            "fcvm-container",
+            &"0f".repeat(31),
+            &"0F".repeat(32),
+            &"0g".repeat(32),
+        ] {
+            assert!(!super::is_container_id(bad), "{bad:?}");
+        }
     }
 
     #[test]
