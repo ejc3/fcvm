@@ -7943,12 +7943,19 @@ const CONTAINER_INIT_VIEW: &str = r#"echo "cgroup=$(cat /proc/1/cgroup)"; for n 
 /// Boot `image` with `run_args`, snapshot it, and restore two clones: one whose
 /// hook records [`HOOK_SELF_VIEW`], and one whose hook fails. Returns the hook's
 /// record, the same view taken through `podman exec` (`fcvm exec` in the
-/// container) in that clone, the view of the container's first process, and the
-/// failing clone's exit status and log.
+/// container) in that clone, the view of the container's first process, the
+/// failing clone's exit status and log, and the first clone's log.
 async fn restore_hook_views(
     prefix: &str,
     run_args: &[&str],
-) -> anyhow::Result<(String, String, String, std::process::ExitStatus, String)> {
+) -> anyhow::Result<(
+    String,
+    String,
+    String,
+    std::process::ExitStatus,
+    String,
+    String,
+)> {
     let (vm_name, clone_name, snap_tag, _) = common::unique_names(prefix);
     let failing_name = format!("{clone_name}-failing");
     let mut args = vec!["podman", "run", "--name", &vm_name];
@@ -7959,7 +7966,7 @@ async fn restore_hook_views(
         common::poll_health(&mut child, 300).await?;
         common::create_snapshot_by_pid(pid, &snap_tag).await?;
 
-        let (mut clone, clone_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+        let (mut clone, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
             &[
                 "snapshot",
                 "run",
@@ -7985,6 +7992,7 @@ async fn restore_hook_views(
         common::kill_process(clone_pid).await;
         let _ = clone.wait().await;
         let (by_hook, by_podman, init) = views?;
+        let clone_log = std::fs::read_to_string(&clone_log)?;
 
         let (status, log) = restore_with_failing_hook(
             &snap_tag,
@@ -7992,7 +8000,7 @@ async fn restore_hook_views(
             "echo hook-said-out; echo hook-said-err >&2; exit 7",
         )
         .await?;
-        anyhow::Ok((by_hook, by_podman, init, status, log))
+        anyhow::Ok((by_hook, by_podman, init, status, log, clone_log))
     }
     .await;
     common::kill_process(pid).await;
@@ -8009,14 +8017,28 @@ fn view_lines<'a>(view: &'a str, prefixes: &[&str]) -> Vec<&'a str> {
 }
 
 fn assert_restore_hook_views(
-    (by_hook, by_podman, init, status, log): (
+    (by_hook, by_podman, init, status, log, clone_log): (
         String,
         String,
         String,
         std::process::ExitStatus,
         String,
+        String,
     ),
 ) {
+    // The container was running when the snapshot was taken, and podman had said
+    // so: the hook's command is run without a read of the runtime's state, and a
+    // hook that fails is not followed by one either (its failure is its own).
+    assert!(
+        clone_log.contains("restore hook") && clone_log.contains("exited 0 in"),
+        "the first clone's log does not show its hook"
+    );
+    for (which, log) in [("ran", &clone_log), ("failed", &log)] {
+        assert!(
+            !log.contains("the restore hook returned"),
+            "the hook that {which}, in a container podman reported running, came with a state read"
+        );
+    }
     // The hook is the process a `podman exec` session is: every line it reports of
     // itself is the line a session reports.
     assert_eq!(
