@@ -1124,25 +1124,149 @@ class DirWatch:
             self.fd = -1
 
 
-def refuse_unconverted_state_layout(state_dir: str) -> None:
-    """Raise when ``state_dir`` holds a state layout this harness does not read.
+STATE_LAYOUT = "2"
+_BUCKET_NAME = re.compile(r"^[0-9a-f]{2}$")
 
-    fcvm marks a state directory with a ``layout`` file from layout 2 on, which keeps
-    each VM's state in a bucket (``vms/<bucket>/<vm_id>.json``) and its PID index entry
-    in ``pids/<bucket>/<pid>.<vm_id>``.  This harness lists ``<vm_id>.json`` in the state
-    directory itself, which is layout 1.  On a marked store that listing is empty, and an
-    empty listing reads as "no VM", so the harness refuses the store instead.
+
+def bucket_of(key: str) -> str:
+    """fcvm's state bucket: the first byte of SHA-256 of the key (src/state/manager.rs)."""
+    return hashlib.sha256(key.encode()).hexdigest()[:2]
+
+
+def vm_state_path(state_dir: str, vm_id: str) -> str:
+    return os.path.join(state_dir, "vms", bucket_of(vm_id), f"{vm_id}.json")
+
+
+def pid_bucket_dir(state_dir: str, pid: int) -> str:
+    return os.path.join(state_dir, "pids", bucket_of(str(pid)))
+
+
+def require_state_layout(state_dir: str) -> None:
+    """Raise unless ``state_dir`` is empty or holds fcvm state layout 2.
+
+    Layout 2 keeps a VM's state in ``vms/<bucket>/<vm_id>.json`` and marks the store
+    with a ``layout`` file.  A store without that file and with layout 1 entries
+    (``<vm_id>.json``, ``name/``, ``pid/`` in the directory itself) would read as "no
+    VM" here, so it is refused.  A store that does not exist yet, or is empty, is fine:
+    the first fcvm command makes it.
     """
     try:
         with open(os.path.join(state_dir, "layout"), encoding="utf-8") as handle:
             layout = handle.read().strip()
     except FileNotFoundError:
+        try:
+            entries = os.listdir(state_dir)
+        except FileNotFoundError:
+            return
+        flat = [
+            e for e in entries
+            if e.endswith((".json", ".json.lock")) or e in ("name", "pid", "names.lock")
+        ]
+        if flat:
+            raise RuntimeError(
+                f"{state_dir} has no 'layout' file and holds fcvm state layout 1 "
+                f"entries ({flat[0]!r}); these harnesses read layout {STATE_LAYOUT} "
+                "(states in vms/<bucket>/) and need an fcvm that writes it"
+            )
         return
-    raise RuntimeError(
-        f"{state_dir} holds fcvm state layout {layout!r} (states in vms/<bucket>/, "
-        "PID index in pids/<bucket>/); this harness reads the flat layout 1 and has "
-        "not been converted, so it would find no VM there"
-    )
+    if layout != STATE_LAYOUT:
+        raise RuntimeError(
+            f"{state_dir} holds fcvm state layout {layout!r}; these harnesses read "
+            f"layout {STATE_LAYOUT} and need a matching fcvm"
+        )
+
+
+def read_state_file(path: str):
+    """A state file's object, or None when it vanished, is unreadable or is not an object."""
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _list_dir(path: str) -> list[str]:
+    try:
+        return os.listdir(path)
+    except FileNotFoundError:
+        return []
+
+
+def list_state_paths(state_dir: str) -> list[str]:
+    """Every VM's state path: the union of ``*.json`` and ``*.json.lock`` ids.
+
+    A temp file is skipped.  A lock without a state (a VM starting or exiting) names a
+    path that may not exist, and a listing that overlaps a rename can miss the state
+    name but not the lock's, so the caller opens each path and treats a missing one as
+    gone.  A missing ``vms/`` or bucket directory lists nothing.
+    """
+    out = []
+    vms = os.path.join(state_dir, "vms")
+    for bucket in sorted(_list_dir(vms)):
+        if not _BUCKET_NAME.match(bucket):
+            continue
+        ids = set()
+        for entry in _list_dir(os.path.join(vms, bucket)):
+            if entry.endswith(".json.lock"):
+                ids.add(entry[: -len(".json.lock")])
+            elif entry.endswith(".json"):
+                ids.add(entry[: -len(".json")])
+        out.extend(os.path.join(vms, bucket, f"{vm_id}.json") for vm_id in sorted(ids))
+    return out
+
+
+def pid_state_paths(state_dir: str, pid: int) -> list[str]:
+    """State paths the PID index names for fcvm process ``pid`` (entries may be stale)."""
+    prefix = f"{pid}."
+    return [
+        vm_state_path(state_dir, entry[len(prefix):])
+        for entry in sorted(_list_dir(pid_bucket_dir(state_dir, pid)))
+        if entry.startswith(prefix) and len(entry) > len(prefix)
+    ]
+
+
+def candidate_state_paths(state_dir: str, pid: int = 0) -> list[str]:
+    """The PID index's states first, then every other state, without duplicates.
+
+    The index lags a state by a moment and only names states saved with a PID, so a
+    caller that has not found its VM through it still lists every bucket.
+    """
+    first = pid_state_paths(state_dir, pid) if pid else []
+    seen = set(first)
+    return first + [p for p in list_state_paths(state_dir) if p not in seen]
+
+
+class StateWatch(DirWatch):
+    """inotify watch over a layout 2 store: the root, ``vms/``, ``pids/`` and each bucket.
+
+    A bucket directory is made by the first write that needs it, so ``drain()`` adds a
+    watch for every bucket that exists by then.  Scan after ``drain()``: a bucket made
+    before its watch was added shows no event, but the scan sees what it holds.
+    """
+
+    def __init__(self, path: str):
+        super().__init__(path)
+        self._state_dir = path
+        self._sync()
+
+    def _add(self, path: str) -> bool:
+        return _libc.inotify_add_watch(
+            self.fd, path.encode(), IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE
+        ) >= 0
+
+    def _sync(self) -> None:
+        for sub in ("vms", "pids"):
+            parent = os.path.join(self._state_dir, sub)
+            if self._add(parent):
+                for bucket in _list_dir(parent):
+                    if _BUCKET_NAME.match(bucket):
+                        self._add(os.path.join(parent, bucket))
+
+    def drain(self) -> None:
+        super().drain()
+        if self.fd >= 0:
+            self._sync()
 
 
 def state_path_baseline(state_dir: str) -> frozenset[str]:
@@ -1154,13 +1278,9 @@ def state_path_baseline(state_dir: str) -> frozenset[str]:
     the directory watch but before ``Popen`` and permanently exclude every path
     in it from this clone's discovery and recovery scope.
     """
-    refuse_unconverted_state_layout(state_dir)
+    require_state_layout(state_dir)
     try:
-        return frozenset(
-            os.path.join(state_dir, entry)
-            for entry in os.listdir(state_dir)
-            if entry.endswith(".json")
-        )
+        return frozenset(list_state_paths(state_dir))
     except OSError as error:
         raise RuntimeError(f"cannot snapshot state directory {state_dir}: {error}")
 
@@ -1184,21 +1304,16 @@ def scan_state(
     window. Pre-spawn paths are excluded because name alone is discovery, not
     ownership; destructive cleanup separately requires the exact PID start time.
     """
-    refuse_unconverted_state_layout(state_dir)
+    require_state_layout(state_dir)
     try:
-        names = os.listdir(state_dir)
+        paths = candidate_state_paths(state_dir, fcvm_pid)
     except OSError:
         return None, None
-    for fname in names:
-        if not fname.endswith(".json"):
-            continue
-        path = os.path.join(state_dir, fname)
+    for path in paths:
         if path in excluded_paths:
             continue
-        try:
-            with open(path) as f:
-                st = json.load(f)
-        except (OSError, ValueError):
+        st = read_state_file(path)
+        if st is None:
             continue
         if name:
             # A numeric PID can be reused while a stale state file still names
@@ -1281,10 +1396,10 @@ def find_state(
     actually changes: zero CPU while waiting, and it notices the file sooner than a
     poll loop would. `discover_ms` still records the wall cost.
     """
-    refuse_unconverted_state_layout(state_dir)
+    require_state_layout(state_dir)
     own = watch is None
     if own:
-        watch = DirWatch(state_dir)
+        watch = StateWatch(state_dir)
     pid_fd = pidfd_open(fcvm_pid) if proc is not None else None
     poller = select.poll()
     poller.register(watch.fd, select.POLLIN)
@@ -2006,25 +2121,18 @@ def valid_guest_env(value) -> bool:
 
 def serve_uffd_mode(state_dir: str, serve_pid: int, snapshot_name: str) -> str:
     """Validate the exact live serve process and return its memory mode."""
-    refuse_unconverted_state_layout(state_dir)
+    require_state_layout(state_dir)
     actual = proc_stat_fields(serve_pid)
     if actual is None:
         raise RuntimeError(f"serve PID {serve_pid} is not running")
     candidates = []
     try:
-        names = os.listdir(state_dir)
+        paths = candidate_state_paths(state_dir, serve_pid)
     except OSError as error:
         raise RuntimeError(f"cannot inspect serve state in {state_dir}: {error}")
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        path = os.path.join(state_dir, name)
-        try:
-            with open(path) as f:
-                state = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if state.get("pid") == serve_pid:
+    for path in paths:
+        state = read_state_file(path)
+        if state is not None and state.get("pid") == serve_pid:
             candidates.append((path, state))
     exact = [
         (path, state)
@@ -4180,8 +4288,8 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     env = dict(os.environ, RUST_LOG=args.rust_log)
     # Watch registered BEFORE the spawn: a watch created afterwards can miss the
     # state file's creation and then block waiting for an event already past.
-    refuse_unconverted_state_layout(args.state_dir)
-    watch = DirWatch(args.state_dir)
+    require_state_layout(args.state_dir)
+    watch = StateWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
     # reqscale times each request of an open-loop run from these monotonic
@@ -4465,8 +4573,8 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     rec: dict = {"arm": "noop-fast" if fast else "noop", "rep": rep, "name": name}
     cmd = clone_run_cmd(args, name)
     env = dict(os.environ, RUST_LOG=args.rust_log)
-    refuse_unconverted_state_layout(args.state_dir)
-    watch = DirWatch(args.state_dir)
+    require_state_layout(args.state_dir)
+    watch = StateWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
     state_path = data_dir = None
@@ -4611,8 +4719,8 @@ def run_exec_request(args, rep: int) -> dict:
     parent_fd = None
     kids: list[int] = []
     fds: list[int | None] = []
-    refuse_unconverted_state_layout(args.state_dir)
-    watch = DirWatch(args.state_dir)
+    require_state_layout(args.state_dir)
+    watch = StateWatch(args.state_dir)
     fcvm_start_time = None
     try:
         pre_spawn_state_paths = state_path_baseline(args.state_dir)

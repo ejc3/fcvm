@@ -3026,14 +3026,10 @@ class UffdServe:
         ]
 
     def start(self) -> int:
-        reqbench.refuse_unconverted_state_layout(self.args.state_dir)
-        watch = reqbench.DirWatch(self.args.state_dir)
+        reqbench.require_state_layout(self.args.state_dir)
+        watch = reqbench.StateWatch(self.args.state_dir)
         try:
-            baseline = {
-                os.path.join(self.args.state_dir, name)
-                for name in os.listdir(self.args.state_dir)
-                if name.endswith(".json")
-            }
+            baseline = set(reqbench.list_state_paths(self.args.state_dir))
             self.log_stream = open(self.log_path, "xb")
             self.proc = subprocess.Popen(
                 guarded_command(self.cgroup_path, self.command()),
@@ -3051,14 +3047,13 @@ class UffdServe:
             try:
                 while True:
                     watch.drain()
-                    for name in os.listdir(self.args.state_dir):
-                        path = os.path.join(self.args.state_dir, name)
-                        if not name.endswith(".json") or path in baseline:
+                    for path in reqbench.candidate_state_paths(
+                        self.args.state_dir, self.proc.pid
+                    ):
+                        if path in baseline:
                             continue
-                        try:
-                            with open(path) as stream:
-                                state = json.load(stream)
-                        except (OSError, ValueError):
+                        state = reqbench.read_state_file(path)
+                        if state is None:
                             continue
                         if (
                             state.get("pid") == self.proc.pid

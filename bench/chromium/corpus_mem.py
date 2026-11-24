@@ -50,6 +50,8 @@ from reqbench import (
     DEVTOOLS_VERSION_REQUEST,
     host_facts,
     host_identity,
+    list_state_paths,
+    require_state_layout,
     snapshot_generation,
     valid_snapshot_name,
 )
@@ -612,31 +614,12 @@ def spawn_in_cgroup(cg_path, argv, log_path, env=None):
                             stdout=handle, stderr=subprocess.STDOUT, env=env)
 
 
-def refuse_unconverted_state_layout(state_dir):
-    """Raise when ``state_dir`` holds a state layout this harness does not read.
-
-    fcvm marks a state directory with a ``layout`` file from layout 2 on, which keeps
-    each VM's state in a bucket (``vms/<bucket>/<vm_id>.json``) and its PID index entry
-    in ``pids/<bucket>/<pid>.<vm_id>``.  This harness lists ``<vm_id>.json`` in the state
-    directory itself, which is layout 1.  On a marked store that listing is empty, and an
-    empty listing reads as "no VM", so the harness refuses the store instead.
-    """
-    try:
-        with open(os.path.join(state_dir, "layout"), encoding="utf-8") as handle:
-            layout = handle.read().strip()
-    except FileNotFoundError:
-        return
-    raise RuntimeError(
-        f"{state_dir} holds fcvm state layout {layout!r} (states in vms/<bucket>/, "
-        "PID index in pids/<bucket>/); this harness reads the flat layout 1 and has "
-        "not been converted, so it would find no VM there"
-    )
-
-
 def state_files(state_dir):
-    refuse_unconverted_state_layout(state_dir)
+    require_state_layout(state_dir)
     try:
-        return [os.path.join(state_dir, f) for f in os.listdir(state_dir) if f.endswith(".json")]
+        # A store that is not there cannot prove a clone gone; a missing bucket can.
+        os.stat(state_dir)
+        return list_state_paths(state_dir)
     except OSError as exc:
         raise CloneStateReadError(
             f"cannot enumerate clone state directory {state_dir}: {exc}"
