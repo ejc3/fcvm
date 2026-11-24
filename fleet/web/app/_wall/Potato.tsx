@@ -248,13 +248,13 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                   <path d={`M${ring.arc.from.x} ${ring.arc.from.y}A${ring.arc.radius} ${ring.arc.radius} 0 ${ring.arc.large ? 1 : 0} 1 ${ring.arc.to.x} ${ring.arc.to.y}`} markerEnd="url(#potato-arrow)" />
                 </svg>
                 <span className="potato-arc-label" data-testid="potato-arc-label" style={{ left: ring.arc.labelAt.x, top: ring.arc.labelAt.y }}>
-                  {ring.arc.label}
+                  {ring.arc.label.replace("woken ", "woken\n")}
                 </span>
               </>
             ) : null}
             {slotsInRing && view.cpuSlots && ring && layout ? (
               <div className="potato-centre" style={{ left: ring.geometry.centre.x, top: ring.geometry.centre.y }}>
-                <CpuSlots slots={view.cpuSlots} form={layout.form as "full" | "compact"} rows={layout.rows} />
+                <CpuSlots slots={view.cpuSlots} form={layout.form as "full" | "compact"} rows={layout.rows} chip={layout.chip} />
               </div>
             ) : null}
             {shown !== null && ring ? <Readout tile={ring.tiles.find((t) => t.player === shown) ?? null} centre={ring.geometry.centre} stage={stage} /> : null}

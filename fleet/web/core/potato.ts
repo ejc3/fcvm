@@ -404,17 +404,27 @@ export function cpuSlotsOf(p: Potato, r: PotatoRound): CpuSlotsView | null {
   };
 }
 
-const LABEL_HALF_W = 56;
-const LABEL_HALF_H = 10;
+const LABEL_HALF_W = 32;
+const LABEL_HALF_H = 18;
 /** The arc runs along the ring just inside the tiles. */
 function arcRadius(g: RingGeometry): number {
   return Math.max(0, g.radius - g.tile * 0.5 - 6);
 }
-/** The width of a box `height` tall, centred in the ring, that the arc's line and its label leave free. */
-export function centreRoom(g: RingGeometry, height: number): number {
-  const free = arcRadius(g) - 2 * LABEL_HALF_W - 4;
-  const h = height / 2;
-  return free <= h ? 0 : 2 * Math.sqrt(free * free - h * h);
+/** Whether a box w by h centred in the ring sits inside the arc and clear of the arc's label wherever the label lands (sampled every 3 degrees). */
+export function centreClear(g: RingGeometry, w: number, h: number): boolean {
+  const rho = arcRadius(g);
+  if (Math.hypot(w / 2, h / 2) > rho - 10) return false;
+  for (let deg = 0; deg < 360; deg += 3) {
+    const t = (deg * Math.PI) / 180;
+    const c = Math.cos(t);
+    const s = Math.sin(t);
+    const depth = LABEL_HALF_W * Math.abs(c) + LABEL_HALF_H * Math.abs(s) + 6;
+    const lx = (rho - depth) * c;
+    const ly = (rho - depth) * s;
+    const apart = lx - LABEL_HALF_W >= w / 2 + 4 || lx + LABEL_HALF_W <= -w / 2 - 4 || ly - LABEL_HALF_H >= h / 2 + 2 || ly + LABEL_HALF_H <= -h / 2 - 2;
+    if (!apart) return false;
+  }
+  return true;
 }
 
 export type SlotsForm = "full" | "compact" | "below";
@@ -422,18 +432,35 @@ export interface SlotsLayout {
   form: SlotsForm;
   /** Rows of chips: 1 or 2 in the compact form. */
   rows: number;
+  /** A chip's side, px: 24 to 40 in the full form, 20 in the compact one. */
+  chip: number;
+  /** The block's size, px. */
+  w: number;
+  h: number;
 }
-const FULL_CHIP = 36;
+const CHIP_GAP = 4;
+const GROUP_GAP = 6;
 const COMPACT_CHIP = 23;
-const COMPACT_MIN_W = 150;
+/** The heading "4 of 8 CPUs in use" in 20 px type; the busy figure is a line of its own. */
+const HEADING_W = 200;
 
-/** Where the K CPUs go: labelled in the ring's centre when it is wide, else one or two rows of small chips in the centre, else under the ring. */
+/**
+ * Where the K CPUs go: labelled at the largest chip from 40 to 24 px that fits the ring's centre
+ * (the arc and its label kept clear), else small unlabelled chips in one or two rows there, else
+ * under the ring.
+ */
 export function slotsLayout(g: RingGeometry, k: number): SlotsLayout {
-  if (centreRoom(g, 110) >= Math.max(240, k * FULL_CHIP + 56)) return { form: "full", rows: 1 };
-  for (const rows of [1, 2]) {
-    if (centreRoom(g, 26 + rows * 24) >= Math.max(COMPACT_MIN_W, Math.ceil(k / rows) * COMPACT_CHIP)) return { form: "compact", rows };
+  for (let chip = 40; chip >= 24; chip -= 2) {
+    const w = Math.max(HEADING_W, k * (chip + CHIP_GAP) + 4 * GROUP_GAP);
+    const h = chip + 104;
+    if (centreClear(g, w, h)) return { form: "full", rows: 1, chip, w, h };
   }
-  return { form: "below", rows: 1 };
+  for (const rows of [1, 2]) {
+    const w = Math.max(150, Math.ceil(k / rows) * COMPACT_CHIP);
+    const h = 44 + rows * 24;
+    if (centreClear(g, w, h)) return { form: "compact", rows, chip: 20, w, h };
+  }
+  return { form: "below", rows: 1, chip: 36, w: 0, h: 0 };
 }
 
 export interface ArcView {

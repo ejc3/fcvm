@@ -12,17 +12,16 @@ const SLOT_PHASE: Record<Exclude<SlotGroupKey, "free">, "awake" | "waking" | "sl
  * The K CPUs as slots, each holding the chip of the machine that holds it. "full": grouped and
  * labelled; "compact": small chips in one or two rows, the group labels spoken and shown on hover.
  */
-export function CpuSlots({ slots, form = "full", rows = 1 }: { slots: CpuSlotsView; form?: "full" | "compact"; rows?: number }) {
+export function CpuSlots({ slots, form = "full", rows = 1, chip = 36 }: { slots: CpuSlotsView; form?: "full" | "compact"; rows?: number; chip?: number }) {
   const compact = form === "compact";
   const cols = Math.ceil(slots.k / rows);
   return (
-    <div className={`potato-cpus${compact ? " compact" : ""}`} data-testid="potato-cpus" data-form={form}>
+    <div className={`potato-cpus${compact ? " compact" : ""}`} data-testid="potato-cpus" data-form={form} style={{ ["--chip" as string]: `${chip}px` } as CSSProperties}>
       <p className="cpus-heading" data-testid="potato-cpus-heading">
         {slots.heading}
         {slots.busy ? (
           <span className="busy" data-testid="potato-cpus-busy">
-            {" "}
-            · {slots.busy}
+            {slots.busy}
           </span>
         ) : null}
       </p>

@@ -14,7 +14,7 @@ import {
   ladderBarsOf,
   perCpu,
   slotsLayout,
-  centreRoom,
+  centreClear,
   dropCard,
   dropHeadline,
   LINE_MIN_TILE,
@@ -520,10 +520,13 @@ describe("the arc's label and the slots' room", () => {
           p.players = ring.map((i) => ({ ...p.players[0]!, player: i, colour: i % 12, phase: i === (holder + ahead) % n ? "waking" : "asleep" }));
           const v = potatoView(input(stateWith(p), { stage }));
           const arc = v.ring!.arc!;
-          const label = { x: arc.labelAt.x - 56, y: arc.labelAt.y - 10, w: 112, h: 20 };
+          const label = { x: arc.labelAt.x - 32, y: arc.labelAt.y - 18, w: 64, h: 36 };
           for (const t of v.ring!.tiles) expect(clear(label, t.box), `n=${n} holder=${holder} ahead=${ahead}`).toBe(true);
-          const w = centreRoom(v.ring!.geometry, 110);
-          if (w > 0) expect(clear(label, { x: v.ring!.geometry.centre.x - w / 2, y: v.ring!.geometry.centre.y - 55, w, h: 110 })).toBe(true);
+          const lay = slotsLayout(v.ring!.geometry, 8);
+          if (lay.form !== "below") {
+            const c = v.ring!.geometry.centre;
+            expect(clear(label, { x: c.x - lay.w / 2, y: c.y - lay.h / 2, w: lay.w, h: lay.h }), `the label is outside the ${lay.form} slots`).toBe(true);
+          }
         }
       }
     }
@@ -532,13 +535,29 @@ describe("the arc's label and the slots' room", () => {
 
 describe("where the CPU slots go", () => {
   const geo = (w: number, h: number, n: number) => ringGeometry({ x: 0, y: 0, w, h }, n);
-  it("labels them in the centre on a very large screen, as small chips on a laptop, and under the ring when nothing fits", () => {
-    expect(slotsLayout(geo(1000, 760, 32), 8).form).toBe("full");
-    // 1440x900 and 1280x800: the ring's stage is about 710 and 610 tall
-    expect(slotsLayout(geo(880, 710, 32), 8)).toEqual({ form: "compact", rows: 1 });
-    expect(slotsLayout(geo(800, 610, 32), 8)).toEqual({ form: "compact", rows: 1 });
-    expect(slotsLayout(geo(800, 610, 16), 8)).toEqual({ form: "compact", rows: 2 });
-    expect(slotsLayout(geo(358, 358, 32), 8).form).toBe("below");
+  it("labels them in the centre on a laptop, with the largest chip that fits, between 24 and 40 px", () => {
+    // 1440x900: the ring's stage is about 880x710; 1280x800: about 800x610
+    for (const n of [16, 32]) {
+      const l = slotsLayout(geo(880, 710, n), 8);
+      expect(l.form, `1440x900 ring of ${n}`).toBe("full");
+      expect(l.chip).toBeGreaterThanOrEqual(24);
+      expect(l.chip).toBeLessThanOrEqual(40);
+    }
+    expect(slotsLayout(geo(800, 610, 32), 8).form).toBe("full");
+    // the interior of a ring of 16 on 1280x800 is 428 px across, and the arc's label takes about 70 of it on each side
+    expect(slotsLayout(geo(800, 610, 16), 8).form).not.toBe("full");
+    expect(slotsLayout(geo(1000, 760, 32), 8).chip).toBe(40);
+  });
+
+  it("drops the labels, then the centre, as the ring shrinks, and never packs the box where it would cross the arc", () => {
+    const forms = [700, 600, 520, 460, 400, 358].map((w) => slotsLayout(geo(w, w, 32), 8).form);
+    // never the labelled form again once it has been dropped
+    expect(forms.join()).toMatch(/^(full,)*(compact,)*(below,?)*$/);
+    expect(forms.at(-1)).toBe("below");
+    const g = geo(880, 710, 32);
+    const l = slotsLayout(g, 8);
+    expect(centreClear(g, l.w, l.h)).toBe(true);
+    expect(centreClear(g, 2 * g.radius, 20)).toBe(false);
   });
 });
 

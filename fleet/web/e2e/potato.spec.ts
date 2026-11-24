@@ -308,7 +308,7 @@ test("density: the CPU slots hold the machines that are not asleep, grouped and 
   await startDense(8);
   await openPotato(page);
   const heading = page.getByTestId("potato-cpus-heading");
-  await expect(heading).toHaveText(/^\d of 3 CPUs in use( · [\d.]+ busy)?$/);
+  await expect(heading).toContainText(/^\d of 3 CPUs in use/);
   const slots = page.getByTestId("potato-slot");
   for (let i = 0; i < 25; i++) {
     expect(await slots.count(), "chips and free slots add up to the allotment").toBe(CPUS);
@@ -344,26 +344,35 @@ test("density: the slots stand in the ring's centre on a large screen, clear of 
 
 for (const [vw, vh] of [[1440, 900], [1280, 800]] as const) {
   for (const size of [32, 16]) {
-    test(`density: on a ${vw} by ${vh} laptop the slots are small chips inside the ring of ${size}, clear of the tiles and the arc`, async ({ page }) => {
+    // The interior of a ring of 16 on 1280 by 800 is 428 px across and the arc's label takes about 70 of it each side.
+    const labelled = !(vw === 1280 && size === 16);
+    test(`density: on a ${vw} by ${vh} laptop the slots in the ring of ${size} are ${labelled ? "labelled" : "small chips or under the ring"}, clear of the tiles and the arc`, async ({ page }) => {
       await startDense(size, { cpus: 8, players: 32 });
       await page.setViewportSize({ width: vw, height: vh });
       await openPotato(page);
-      const centre = page.locator(".potato-centre");
-      await expect(centre).toBeVisible();
-      await expect(page.getByTestId("potato-cpus")).toHaveAttribute("data-form", "compact");
-      await expect(page.getByTestId("potato-cpus-heading")).toHaveText(/^\d of 8 CPUs in use/);
+      const cpus = page.getByTestId("potato-cpus");
+      await expect(cpus).toBeVisible();
+      await expect(page.getByTestId("potato-cpus-heading")).toContainText(/^\d of 8 CPUs in use/);
       expect(await page.getByTestId("potato-slot").count()).toBe(8);
-      // the group labels are text for a screen reader, not drawn
-      await expect(page.locator(".potato-cpus .sr-only").first()).toHaveText(/^(ball|ready|waking|saving|free)$/);
-      await expect(page.locator(".potato-cpus .slot-label")).toHaveCount(0);
+      if (labelled) {
+        await expect(cpus).toHaveAttribute("data-form", "full");
+        await expect(page.locator(".potato-centre")).toBeVisible();
+        await expect(page.locator(".potato-cpus .slot-label").first()).toBeVisible();
+        await expect(page.locator(".potato-cpus .cpus-asleep")).toHaveText(new RegExp(`^\\d+ of ${size} asleep$`));
+        const chip = (await page.locator(".potato-cpus .potato-swatch").first().boundingBox())!;
+        expect(chip.width).toBeGreaterThanOrEqual(24);
+      } else {
+        await expect(cpus).toHaveAttribute("data-form", /^(compact|full)$/);
+      }
       for (let i = 0; i < 10; i++) {
         const boxes = await tiles(page).evaluateAll((els) => els.map((e) => e.getBoundingClientRect().toJSON() as Rect));
-        const c = (await centre.boundingBox())!;
-        for (const t of boxes) expect(apart(c, t), "the slots clear every tile").toBe(true);
+        const c = (await cpus.boundingBox())!;
+        const inRing = (await page.locator(".potato-centre").count()) > 0;
+        if (inRing) for (const t of boxes) expect(apart(c, t), "the slots clear every tile").toBe(true);
         const label = page.getByTestId("potato-arc-label");
         if (await label.count()) {
           const l = (await label.boundingBox())!;
-          expect(apart(l, c), "the arc's label clears the slots").toBe(true);
+          if (inRing) expect(apart(l, c), "the arc's label clears the slots").toBe(true);
           for (const t of boxes) expect(apart(l, t), "the arc's label clears the tiles").toBe(true);
         }
         await page.waitForTimeout(150);
