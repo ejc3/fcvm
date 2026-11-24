@@ -648,9 +648,11 @@ MINECRAFT_JAVA_VERSION ?= 26.3
 # The podman that builds it. The fleet host recipe builds into root's store with
 # MINECRAFT_PODMAN="sudo podman" (fleet/ami/host/build.sh).
 MINECRAFT_PODMAN ?= podman
+# The build raises the open file limit: cargo runs one rustc per core, and on a 192-core host the
+# Pumpkin build failed under podman's default with "Too many open files (os error 24)".
 .PHONY: minecraft-image test-minecraft
 minecraft-image:
-	$(MINECRAFT_PODMAN) build $(PODMAN_BUILD_PROXY) --squash-all --build-arg PUMPKIN_COMMIT=$(PUMPKIN_COMMIT) --build-arg PUMPKIN_SHORT=$(shell printf %.8s $(PUMPKIN_COMMIT)) \
+	$(MINECRAFT_PODMAN) build $(PODMAN_BUILD_PROXY) --ulimit nofile=65536:65536 --squash-all --build-arg PUMPKIN_COMMIT=$(PUMPKIN_COMMIT) --build-arg PUMPKIN_SHORT=$(shell printf %.8s $(PUMPKIN_COMMIT)) \
 	  --build-arg MINECRAFT_JAVA_VERSION=$(MINECRAFT_JAVA_VERSION) -t $(MINECRAFT_IMAGE) -f fleet/minecraft/Containerfile fleet/minecraft
 
 # mctile's unit tests on this host (needs rustup; the toolchain is fleet/minecraft's), and the
