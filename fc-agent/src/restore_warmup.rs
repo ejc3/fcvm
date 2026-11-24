@@ -2,10 +2,9 @@
 //! they are in the guest's page cache when its memory is captured.
 //!
 //! A restore restarts journald and chronyd and runs `systemctl` and `chronyc`. The snapshot's
-//! guest has usually never run them, so every clone read them from its own disk: 8.0 MiB per
-//! clone (`system.journal` 2.1 MiB, `systemctl` 1.4 MiB, `libcrypto`, `libsystemd-core`,
-//! `chronyd`, ...), the same bytes in every clone, and each clone's disk is its own file on
-//! the host. Read here, they come back with the snapshot's memory instead.
+//! guest has usually never run them, so every clone read them, their libraries and the
+//! journal from its own disk: the same bytes in every clone, and each clone's disk is its own
+//! file on the host. Read here, they come back with the snapshot's memory instead.
 //!
 //! This only reads. It starts, stops, flushes and writes nothing, so it is not a change to the
 //! source VM (CLAUDE.md, "Suspending a VM does not disturb it"): a page-cache read is what any
