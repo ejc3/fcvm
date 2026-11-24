@@ -2000,6 +2000,23 @@ async fn minecraft_status_rows_reach_the_pages_that_asked_and_move_no_version() 
             .await;
         v.receipt("after-visibility").await;
     }
+    // A receipt comes before the snapshot that holds its intent is published: wait for the one
+    // with both pages' arrival and the refused intent, after which nothing sent so far is still
+    // to come. (Read at once, the version was still to move by three when the whole binary ran.)
+    let settled = |text: &str| {
+        let v: Value = serde_json::from_str(text).unwrap();
+        v["state"]["viewers"]["count"] == 2
+            && v["state"]["actions"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| x["id"] == "after-visibility"))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !settled(&handle.snapshot.borrow().text) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the snapshot with both pages' arrival and the intent within 10 s");
     let before = handle.snapshot.borrow().version;
     agent.to_coord.send(rows(1000)).unwrap();
     let got = asked.message("minecraft_status").await;
