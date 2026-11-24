@@ -1,9 +1,11 @@
 // Platform glue for Minecraft mode: one WebSocket per tile to its view socket (PROTOCOL.md,
-// "Minecraft tile"), the world each one describes, and drawing it on the tile's canvas. Every rule
-// lives in core/minecraft.ts; this file only moves messages in and pixels out.
+// "Minecraft tile"), the world each one describes, and the flat map of it on the tile's canvas
+// (the 3D view is minecraft-stage.ts). Every rule lives in core; this file only moves messages in
+// and pixels out.
 
 import {
   applyDelta,
+  countDiff,
   markersOf,
   MC_BACKGROUND,
   parseViewMsg,
@@ -32,6 +34,19 @@ export interface TileEvents {
   ack(id: string, ack: AckMsg): void;
 }
 
+/** What the 3D view reads of a tile. */
+export interface TileState {
+  readonly key: string;
+  readonly world: McWorld | null;
+  readonly remap: Uint8Array | null;
+  readonly players: readonly McPlayer[];
+  readonly botNames: readonly string[];
+  readonly dayTime: number | null;
+  readonly lastChange: { i: number; at: number } | null;
+  readonly recent: Map<number, number>;
+  readonly rev: number;
+}
+
 /** One tile's socket, its world, and what the page last drew of it. */
 class TileSocket {
   ws: WebSocket | null = null;
@@ -46,6 +61,7 @@ class TileSocket {
   world: McWorld | null = null;
   players: McPlayer[] = [];
   tps: number | null = null;
+  bots = 0;
   /** Messages the page could not read, for the test hook. */
   errors = 0;
   /** Connection attempts that ended without opening since the socket last opened. */
@@ -54,6 +70,14 @@ class TileSocket {
   connectingSince: number | null = now();
   /** Something changed since the last draw. */
   dirty = true;
+  /** Counts every change to the world or the players: the 3D view redraws a still tile when it moves. */
+  rev = 0;
+  /** The game's ticks of the day, when the tile sends them. */
+  dayTime: number | null = null;
+  /** The column that last changed, and when (local ms). */
+  lastChange: { i: number; at: number } | null = null;
+  /** Columns that changed in the last moments, by index, with when. */
+  recent = new Map<number, number>();
   /** The world shaded into a canvas of one pixel per column, and the world seq it shows. */
   image: HTMLCanvasElement | null = null;
   imageSeq = -1;
@@ -126,7 +150,11 @@ class TileSocket {
       this.world = null;
       this.players = [];
       this.tps = null;
+      this.dayTime = null;
+      this.lastChange = null;
+      this.recent.clear();
       this.dirty = true;
+      this.rev++;
       this.owner.changed();
       this.retry();
     };
@@ -184,15 +212,21 @@ class TileSocket {
         this.owner.changed();
         return;
       case "map": {
-        const had = this.world !== null;
         this.world = worldFromMap(m);
         this.dirty = true;
-        if (!had) this.owner.changed();
+        this.rev++;
+        this.owner.changed();
         return;
       }
       case "delta":
         if (applyDelta(this.world, m) > 0) {
           this.dirty = true;
+          this.rev++;
+          const last = m.cells.at(-1);
+          if (last) this.lastChange = { i: last[0], at };
+          for (const [i] of m.cells) this.recent.set(i, at);
+          // a fork's count of differing columns moves with either world
+          this.owner.changed();
           const r = this.world!.region;
           const columns = m.cells.map(([i]) => ({ x: r.x0 + (i % r.w), z: r.z0 + Math.floor(i / r.w) }));
           this.owner.events?.delta(this.id, at, columns);
@@ -200,10 +234,13 @@ class TileSocket {
         return;
       case "status": {
         this.players = m.players;
+        this.dayTime = m.day_time;
         this.dirty = true;
+        this.rev++;
         const tps = m.tps === null ? null : Math.round(m.tps * 10) / 10;
-        if (tps !== this.tps) {
+        if (tps !== this.tps || m.players.length !== this.bots) {
           this.tps = tps;
+          this.bots = m.players.length;
           this.owner.changed();
         }
         this.owner.events?.status(this.id, m.players, at);
@@ -304,12 +341,16 @@ export class McTiles {
   private sockets = new Map<string, TileSocket>();
   private listeners = new Set<() => void>();
   private snap: Record<string, McTileLive> = {};
+  /** For a fork's copy (by tile id): the tile whose world it was copied from. */
+  private forks = new Map<string, string>();
   events: TileEvents | null = null;
 
   /** Open what is asked for, close what is not; a changed `key` replaces a tile's socket. */
-  sync(wanted: readonly { id: string; socket: { url: string; first: string; key: string } | null }[]): void {
+  sync(wanted: readonly { id: string; socket: { url: string; first: string; key: string } | null; forkOf?: string | null }[]): void {
     const keep = new Set<string>();
+    this.forks.clear();
     for (const w of wanted) {
+      if (w.forkOf) this.forks.set(w.id, w.forkOf);
       if (w.socket === null) continue;
       keep.add(w.id);
       const cur = this.sockets.get(w.id);
@@ -360,10 +401,25 @@ export class McTiles {
 
   changed(): void {
     const next: Record<string, McTileLive> = {};
-    for (const [id, s] of this.sockets) next[id] = { open: s.open, viewer: s.viewer, tps: s.tps, hasMap: s.world !== null, failures: s.failures, connectingSince: s.connectingSince };
+    for (const [id, s] of this.sockets) {
+      const from = this.source(id);
+      next[id] = { open: s.open, viewer: s.viewer, tps: s.tps, hasMap: s.world !== null, failures: s.failures, connectingSince: s.connectingSince, bots: s.world === null ? 0 : s.bots, diff: from === null ? null : countDiff(from.cells, s.world!.cells) };
+    }
     if (JSON.stringify(next) === JSON.stringify(this.snap)) return;
     this.snap = next;
     for (const f of this.listeners) f();
+  }
+
+  /** The world tile `id`'s world was forked from, while the page holds both and they are one size. */
+  source(id: string): McWorld | null {
+    const mine = this.sockets.get(id)?.world ?? null;
+    const from = this.sockets.get(this.forks.get(id) ?? "")?.world ?? null;
+    return mine !== null && from !== null && from.cells.length === mine.cells.length ? from : null;
+  }
+
+  /** What tile `id`'s socket holds now, for the 3D view. */
+  peek(id: string): TileState | null {
+    return this.sockets.get(id) ?? null;
   }
 
   subscribe = (f: () => void): (() => void) => {

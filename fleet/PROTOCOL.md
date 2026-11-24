@@ -3681,13 +3681,23 @@ rules (`SCENE_TOKEN_FILE` is not used; `TLS_CERT_FILE` and its `scene_token`, re
   - `{"type": "map", "seq": 41, "region": {"x0", "z0", "w", "h"}, "cells": "<base64>"}`: every
     column, row by row (z then x), two bytes each: its top block's material (an index into
     `materials`) and its height (`y + 64`, held to 0..255). Sent on connect, when the region
-    changes, and to a socket that fell behind.
+    changes, and to a socket that fell behind. Optional `"ground": "<base64>"`, in the same
+    layout and of the same length (the page refuses another length): for each column the highest
+    block that is not leaves, a plant or water. The page reads it only under those three; without
+    it the page guesses the forest floor and the lake's bed from the columns beside them.
   - `{"type": "delta", "seq": 42, "cells": [[index, material, height], ...]}`: the columns that
-    changed, at most every 200 ms.
+    changed, at most every 200 ms. Optional `"ground": [[index, material, height], ...]`, the
+    ground that changed, read only by a page that holds a `map.ground`.
   - `{"type": "status", "t": <unix ms>, "tps": 19.98 | null, "players": [{"name", "x", "y",
     "z", "yaw", "bot", "driven"}], "drive": {"seq": 12, "moved_at": <unix ms>} | null}`, ten a
     second. `drive` is the last drive message whose effect the tile saw (the driven bot moved
-    or turned), on the tile's clock.
+    or turned), on the tile's clock. Optional `"day_time": 0..23999`, the game's tick of the day
+    (0 sunrise, 6000 noon, 12000 sunset, 18000 midnight), for the world's sky; without it the
+    page lights every world at mid-morning.
+
+  `ground` and `day_time` are additions an older page ignores and a newer page does without. No
+  tile sends them yet; the page and its mock have them (the mock sends both from every other
+  server).
   - `{"type": "drive_ack", "seq": 12, "ok": true, "at": <unix ms>}` or `{"ok": false,
     "reason": "..."}`, for each drive message.
 

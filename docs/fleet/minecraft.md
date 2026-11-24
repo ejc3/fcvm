@@ -14,8 +14,13 @@ of a running server next to its source.
 ## What a viewer sees
 
 - `?mode=minecraft` opens it; without the parameter the wall is unchanged.
-- **The tiles.** Every server is a tile showing its world from above, drawn by the page: one
-  flat colour per block material, shaded by height, with each player as a marker and its name.
+- **The tiles.** Every server is a tile showing its world in 3D, drawn by the page from the top
+  block of each column: plain boxes, one flat colour per block material, with each player as a
+  block figure and its name. Each tile's camera flies through its own world, cutting every 10 s
+  between a bot, something the bots built and the whole region, and to a column that just
+  changed. A fork's picture flies from its source to the tile taking the copy for as long as the
+  fork runs, and the copy then outlines and counts the columns that differ from its source. A
+  browser with no WebGL2 gets the map from above, and the tile says so ("The page in 3D" below).
   Three bots walk about each world and build small towers of their own colour. A tile is
   labelled with its slot (`mc-3`), its ticks per second, and "Up in X.XX s": the time from the
   click that asked for a fresh server to the first chunk its bots received.
@@ -128,9 +133,50 @@ fcvm's lockfile.
   `minecraft_fork`. The borrow rules are `claim_windows`'s. Every event goes through
   `fleet_core::apply`, so it replays. Driving is not an intent: it goes from the page to the tile.
 - **The page.** A view model in `fleet/web/core` from the snapshot's `minecraft` section, the
-  tile renderer (a canvas per tile from its view socket), the take-over panel with its key
+  tile renderer (3D on one WebGL2 canvas from the tiles' view sockets), the take-over panel with its key
   handling and timer, the mock coordinator's servers and a mock tile, and Playwright tests on
   desktop and phone layouts.
+
+### The page in 3D
+
+`fleet/web/core/minecraft3d.ts` (the geometry, the cameras, the sky, the fork's flight, the frame
+guard; pure and unit-tested) and `fleet/web/app/_wall/minecraft-gl.ts` and `minecraft-stage.ts`
+(WebGL2, no library).
+
+- **One context.** One WebGL2 canvas the size of the stage sits under the tiles. Each world is
+  drawn into its tile's rectangle with viewport and scissor, in six draw calls: sky, the columns'
+  tops, their sides, the world's boxes, the figures, water. The canvas is held to 2.5 M device
+  pixels.
+- **A world on the GPU** is three lists of column instances of 8 bytes (x, z, material, height,
+  how far down its sides reach, flags): a top for every column and every canopy column, sides
+  only for the ones that stand above a neighbour (the two that face the camera are drawn), and
+  the water's surface. Trunks, plants, lone trees and the figures are boxes of 44 bytes. It is
+  rebuilt and uploaded when a delta arrives (at most every 200 ms).
+- **What one block per column cannot say is guessed**: a cliff is solid down to its lowest
+  neighbour; the ground under leaves is taken from the columns beside them that are not leaves,
+  spreading inward, with a trunk under each canopy's top; a lake's bed deepens up to 4 blocks from
+  its shore; a plant is a small box on the block under it. The optional `map.ground`
+  (fleet/PROTOCOL.md, "Minecraft tile") replaces each guess.
+- **The camera** keeps above the ground, leaves out the canopy between it and what it looks at,
+  and circles from a side its subject can be seen from when a hill is in the way.
+- **The sky** is the world's time of day when the tile sends `status.day_time`, else mid-morning.
+- **Within a device's means.** Frame times on a laptop's and a phone's GPU are not measured. The
+  page draws no frame while the GPU is still drawing the last (a fence sync), so a slow renderer
+  is never queued behind, and it carries a guard (`FrameBudget`): each frame's time until the GPU
+  had drawn it is sampled, and when the median of 20 is over 40 ms, or three in a row are over
+  160 ms, the page
+  gives up a level: first detail (one column for every 2 x 2 blocks), then frames (10 a second),
+  then the flight (one still view a second, a column for every 4 x 4 blocks). After 20 s of
+  frames under 20 ms it tries one level up. A software renderer starts at the last level. The floor, measured on Chromium's software renderer
+  (the kind CI has) on a shared development host: four tiles in a 1232 x 541 canvas took 1.8 s a
+  frame at full detail, the guard reached its last level, and a frame there took 0.16 s.
+- **What it holds.** A tile off the screen and a hidden tab hold no buffers on the GPU; they are
+  uploaded again when next drawn. A lost context, or no WebGL2, is the flat map with "Flat map:
+  no WebGL2 in this browser." on each tile.
+- **Reduced motion:** one still wide view per tile, each from its own side, drawn again (at most
+  four times a second) only when its world or its players change; no flight for a fork.
+- **Opening a tile** (a click, or Enter on it) gives one server the whole stage; Escape or "All
+  servers" brings the wall back. The other servers keep their sockets.
 
 ### Invariants (each becomes a test)
 
