@@ -500,6 +500,10 @@ export interface MinecraftResetAll {
   /** `viewer:<id>`, or whatever else the coordinator names. */
   by: string;
   servers: number;
+  /** How many of those servers are back from this reset; absent from a coordinator that does not count them. */
+  back?: number;
+  /** The click to the last of them back, ms; null while none is. */
+  took_ms?: number | null;
 }
 
 /** The last fork that reached `running`, with the agent's times. */
@@ -1121,7 +1125,12 @@ function parseWindows(v: unknown): Windows | null {
 function parseMinecraftResetAll(v: unknown, where: string): MinecraftResetAll | null {
   if (v === null || v === undefined) return null;
   if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
-  return { clicked_at: num(v, "clicked_at", where), by: str(v, "by", where), servers: num(v, "servers", where) };
+  const r: MinecraftResetAll = { clicked_at: num(v, "clicked_at", where), by: str(v, "by", where), servers: num(v, "servers", where) };
+  if (v["back"] !== undefined && v["back"] !== null) {
+    r.back = num(v, "back", where);
+    r.took_ms = numOrNull(v, "took_ms", where);
+  }
+  return r;
 }
 
 function parseMinecraftFork(v: unknown, where: string): MinecraftFork | null {

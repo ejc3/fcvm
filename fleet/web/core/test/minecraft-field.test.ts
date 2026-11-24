@@ -18,6 +18,7 @@ import {
   moveCursor,
   PIN_MS,
   resetWave,
+  WAVE_END_S,
   SAMPLE_MS,
   scrollTo,
   stepSample,
@@ -80,11 +81,10 @@ describe("the field's cells", () => {
         { key: "aaaaaaaaaaaa", servers: [1, 7], frames: ["x1", "x7"], frames_v4: [null, null] },
       ],
     };
-    const listed = [{ id: "mc:1", slot: "mc-1" }];
-    const cells = fieldCells(f, { bbbbbbbbbbbb: status([row(3, 198), row(4)], { host: "bbbbbbbbbbbb" }) }, NOW, listed);
-    // a listed tile keeps its own id; every other server has the page's key, from its number
+    const cells = fieldCells(f, { bbbbbbbbbbbb: status([row(3, 198), row(4)], { host: "bbbbbbbbbbbb" }) }, NOW);
+    // every server has the page's key, from its number
     expect(cells.map((c) => [c.n, c.id, c.phase, c.frame, c.frameV4])).toEqual([
-      [1, "mc:1", "none", "x1", null],
+      [1, "field:1", "none", "x1", null],
       [3, "field:3", "running", "x3", null],
       [4, "field:4", "failed", null, "y4"],
       [7, "field:7", "none", "x7", null],
@@ -92,13 +92,10 @@ describe("the field's cells", () => {
     // The keys do not move when the field stops naming every server (one with no host yet is
     // counted and listed by no host), or names them all again: a tile whose key moved would be
     // closed and reopened, and an opened server put back in the wall.
-    const keys = (field: MinecraftField) => fieldCells(field, {}, NOW, listed).map((c) => c.id);
+    const keys = (field: MinecraftField) => fieldCells(field, {}, NOW).map((c) => c.id);
     expect(keys({ ...f, servers: 5 })).toEqual(keys(f));
     const fewer: MinecraftField = { servers: 4, hosts: [f.hosts[0]!, { ...f.hosts[1]!, servers: [1], frames: ["x1"], frames_v4: [null] }] };
-    expect(keys(fewer)).toEqual(["mc:1", "field:3", "field:4"]);
-    // a listed tile whose id is not its place, and no two servers under one key
-    const odd = fieldCells(f, {}, NOW, [{ id: "mc:9", slot: "mc-3" }]).map((c) => c.id);
-    expect(odd).toEqual(["field:1", "mc:9", "field:4", "field:7"]);
+    expect(keys(fewer)).toEqual(["field:1", "field:3", "field:4"]);
   });
 
   it("says what a cell is, and colours it by its state and its tick rate", () => {
@@ -444,7 +441,7 @@ describe("a reset of every server", () => {
     const b = wave([11, 13], 32_510, 32_600)!;
     expect([a.tookS, b.tookS]).toEqual([21, 22]);
     expect([a.settled, a.text]).toEqual([true, "Reset all: 2 servers back in 21 s (0.1 a second)"]);
-    expect(a.frozen).toEqual({ clicked_at: CLICKED, back: 2, total: 2, done: true, tookS: 21, at: CLICKED + 21_490 });
+    expect(a.frozen).toEqual({ clicked_at: CLICKED, back: 2, total: 2, done: true, tookS: 21, at: CLICKED + 21_490, final: true });
     // the page hands back what it showed, and that stands
     const stood = resetWave(cellsAt([11, 13], 32_510), { clicked_at: CLICKED, servers: 2 }, CLICKED + 32_600, a.frozen)!;
     expect([stood.text, stood.frozen]).toEqual([a.text, a.frozen]);
@@ -461,12 +458,12 @@ describe("a reset of every server", () => {
     // itself and is back: its row is a launch after the click, as every row is.
     const later = [264, 270, 280, 2] as const;
     // the page that watched kept the finished reset: its minute is long over, and it stays over
-    const kept = { clicked_at: CLICKED, back: 4, total: 4, done: true, tookS: 36, at: CLICKED + 36_000 };
+    const kept = { clicked_at: CLICKED, back: 4, total: 4, done: true, tookS: 36, at: CLICKED + 36_000, final: true };
     expect(resetWave(cellsAt([...later], 300_000), { clicked_at: CLICKED, servers: 4 }, CLICKED + 300_500, kept)).toBeNull();
     // and through its minute what it showed did not move, whatever came back meanwhile
     expect(resetWave(cellsAt([44, 50, 60, 2], 80_000), { clicked_at: CLICKED, servers: 4 }, CLICKED + 80_500, kept)!.text).toBe("Reset all: 4 servers back in 36 s (0.1 a second)");
     // a page opened only now has the rows alone: the late launch came more than a minute after
-    // the one before it, so it is not the reset's, and the reset's last server is long back
+    // the one before it, so it is not the reset's, and the reset's end is long past
     expect(wave([...later], 300_000, 300_500)).toBeNull();
     // the same while that one server is still being restored
     expect(wave([264, 270, 280, null], 299_000, 299_500)).toBeNull();
@@ -480,11 +477,15 @@ describe("a reset of every server", () => {
     // The lent server is given back and relaunched two minutes on. With what the page kept,
     // and from the rows alone, it is not the reset's fourth: the reset never reads as whole.
     const rows = cellsAt([134, 139, 130, "f", 3], 141_000);
-    expect(resetWave(rows, { clicked_at: CLICKED, servers: 4 }, CLICKED + 141_300, stopped.frozen)).toBeNull();
-    expect(resetWave(rows, { clicked_at: CLICKED, servers: 4 }, CLICKED + 141_300)).toBeNull();
-    // 40 s on, inside the kept line's minute: still three of four
+    expect(resetWave(rows, { clicked_at: CLICKED, servers: 4 }, CLICKED + 141_300, stopped.frozen)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    expect(resetWave(rows, { clicked_at: CLICKED, servers: 4 }, CLICKED + 141_300)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    // Relaunched within a minute of the reset's last server instead, the rows alone cannot tell
+    // it from the fourth coming back late; the coordinator's count can.
     const soon = cellsAt([54, 59, 50, "f", 3], 61_000);
-    expect(resetWave(soon, { clicked_at: CLICKED, servers: 4 }, CLICKED + 61_300, stopped.frozen)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    expect(resetWave(soon, { clicked_at: CLICKED, servers: 4 }, CLICKED + 61_300, stopped.frozen)!.text).toBe("Reset all: 4 servers back in 58 s (0.1 a second)");
+    expect(resetWave(soon, { clicked_at: CLICKED, servers: 4, back: 3, took_ms: 11_000 }, CLICKED + 61_300, stopped.frozen)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    // and a launch after the reset's end is not the reset's, however soon after the one before it
+    expect(wave([190, 142, 92, 42, 7], 192_000, 192_300)!.text).toBe("Reset all: 4 of 5 back after 150 s");
   });
 
   it("counts against the servers the reset was sent to, and stops when the rest are not coming", () => {
@@ -496,13 +497,70 @@ describe("a reset of every server", () => {
     const stopped = wave([14, 19, 10, "f"], 21_000, 21_300)!;
     expect([stopped.done, stopped.text]).toEqual([false, "Reset all: 3 of 4 back after 11 s"]);
     expect(wave([44, 49, 40, "f"], 51_000, 51_300)!.text).toBe("Reset all: 3 of 4 back after 11 s");
-    expect(wave([65, 70, 61, "f"], 72_000, 72_300)).toBeNull();
+    // the line stays to the reset's end (WAVE_END_S after the click) and a minute more, then goes
+    expect(wave([65, 70, 61, "f"], 72_000, 72_300)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    expect(wave([232, 237, 228, "f"], 239_000, 239_300)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    expect(wave([234, 239, 230, "f"], 241_000, 241_300)).toBeNull();
     // while any server is still being restored the count goes on, however long since the last one back
     expect(wave([40, 45, 36, null], 47_000, 47_300)!.text).toBe("Reset all: 3 of 4 back · 0.1 a second · 47.3 s");
     // servers on a silent host: the same end, and never a count of them as back
     expect(wave([14, 19, 10, "n"], 21_000, 21_300)!.text).toBe("Reset all: 3 of 4 back after 11 s");
     // more launches after the click than the reset's own (a single reset since): never more than its total
     expect(wave([13, 18, 5, 2, 1], 20_000, 20_300, 4)!.back).toBe(4);
+  });
+
+  it("goes on when a reset that paused resumes, and never counts down", () => {
+    // Three of four back 11 s in, the fourth failed and nothing restoring: 10 s later it reads as stopped.
+    const stopped = wave([14, 19, 10, "f"], 21_000, 21_300)!;
+    expect([stopped.text, stopped.frozen?.final]).toEqual(["Reset all: 3 of 4 back after 11 s", false]);
+    // The fourth is restored again: the count runs again, from what the page kept.
+    const again = resetWave(cellsAt([24, 29, 20, null], 31_000), { clicked_at: CLICKED, servers: 4 }, CLICKED + 31_300, stopped.frozen)!;
+    expect([again.settled, again.text]).toEqual([false, "Reset all: 3 of 4 back · 0.1 a second · 31.3 s"]);
+    // It is back 38 s after the click: the reset is whole, and that is kept for good.
+    const whole = resetWave(cellsAt([33, 38, 29, 2], 40_000), { clicked_at: CLICKED, servers: 4 }, CLICKED + 40_300, stopped.frozen)!;
+    expect([whole.done, whole.text, whole.frozen?.final]).toEqual([true, "Reset all: 4 servers back in 38 s (0.1 a second)", true]);
+    // One of the three is reset by itself while the reset is stopped: the count does not drop.
+    const one = resetWave(cellsAt([24, 29, "f", "f"], 31_000), { clicked_at: CLICKED, servers: 4 }, CLICKED + 31_300, stopped.frozen)!;
+    expect(one.text).toBe("Reset all: 3 of 4 back after 11 s");
+  });
+
+  it("ends WAVE_END_S after the click with what came back, however long a restore hangs", () => {
+    expect(WAVE_END_S).toBe(180);
+    // Three of four back 11 s in, the fourth restoring and never done: the count runs to the end.
+    expect(wave([92, 97, 88, null], 99_000, 99_300)!.text).toBe("Reset all: 3 of 4 back · 0.0 a second · 99.3 s");
+    expect(wave([172, 177, 168, null], 179_000, 179_300)!.settled).toBe(false);
+    const ended = wave([173, 178, 169, null], 180_000, 180_300)!;
+    expect([ended.settled, ended.done, ended.text]).toEqual([true, false, "Reset all: 3 of 4 back after 11 s"]);
+    expect(ended.frozen).toEqual({ clicked_at: CLICKED, back: 3, total: 4, done: false, tookS: 11, at: CLICKED + 180_000, final: true });
+    // for a minute, then it goes; and it is not the fourth's when that one is back at last
+    const late = cellsAt([203, 208, 199, 2], 210_000);
+    expect(resetWave(late, { clicked_at: CLICKED, servers: 4 }, CLICKED + 210_300, ended.frozen)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    expect(resetWave(late, { clicked_at: CLICKED, servers: 4 }, CLICKED + 210_300)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    expect(resetWave(cellsAt([234, 239, 230, 33], 241_000), { clicked_at: CLICKED, servers: 4 }, CLICKED + 241_300, ended.frozen)).toBeNull();
+    expect(wave([234, 239, 230, 33], 241_000, 241_300)).toBeNull();
+    // None back and one always restoring: the count does not run for ever.
+    expect(wave([null, null], 99_000, 99_300)!.text).toBe("Reset all: 0 of 2 back · 0.0 a second · 99.3 s");
+    expect(wave([null, null], 180_000, 180_300)!.text).toBe("Reset all: 0 of 2 back");
+    expect(wave([null, null], 241_000, 241_300)).toBeNull();
+  });
+
+  it("takes the count and the time from the coordinator when it sends them", () => {
+    const at = (back: number, took_ms: number | null) => ({ clicked_at: CLICKED, servers: 4, back, took_ms });
+    // while it runs
+    expect(resetWave(cellsAt([3, 8, null, null], 10_000), at(2, 7_400), CLICKED + 10_200)!.text).toBe("Reset all: 2 of 4 back · 0.2 a second · 10.2 s");
+    // A reset of four that took 36.4 s. One of the four is reset by itself 50 s after the click
+    // and is being restored: the rows alone would say three of four and still running.
+    const rows = cellsAt([20, 25, 14, null], 50_000);
+    expect(resetWave(rows, { clicked_at: CLICKED, servers: 4 }, CLICKED + 50_300)!.text).toBe("Reset all: 3 of 4 back · 0.1 a second · 50.3 s");
+    expect(resetWave(rows, at(4, 36_400), CLICKED + 50_300)!.text).toBe("Reset all: 4 servers back in 36 s (0.1 a second)");
+    // and a page opened after its minute shows nothing, whatever is restoring
+    expect(resetWave(cellsAt([70, 75, 64, null], 100_000), at(4, 36_400), CLICKED + 100_300)).toBeNull();
+    // A server outside the reset relaunched 30 s in: the rows alone would count it as the fourth.
+    const outside = cellsAt([34, 39, 30, "f", 10], 41_000);
+    expect(resetWave(outside, { clicked_at: CLICKED, servers: 4 }, CLICKED + 41_300)!.text).toBe("Reset all: 4 servers back in 31 s (0.1 a second)");
+    expect(resetWave(outside, at(3, 11_000), CLICKED + 41_300)!.text).toBe("Reset all: 3 of 4 back after 11 s");
+    // none back yet has no time
+    expect(resetWave(cellsAt([null, null, null, null], 5_000), at(0, null), CLICKED + 5_000)!.text).toBe("Reset all: 0 of 4 back · 0.0 a second · 5.0 s");
   });
 });
 

@@ -120,6 +120,15 @@ describe("minecraft in the snapshot", () => {
     const got = snap(base(m));
     if (got.type !== "snapshot") throw new Error("not a snapshot");
     expect(got.state.minecraft).toEqual(m);
+    // a coordinator that counts the reset sends how many are back and, once one is, the time to the last
+    const counted = (r: Record<string, unknown>) => {
+      const g = snap(base({ ...m, last_reset_all: { clicked_at: 1, by: "viewer:v-3", servers: 4, ...r } }));
+      if (g.type !== "snapshot") throw new Error("not a snapshot");
+      return g.state.minecraft!.last_reset_all;
+    };
+    expect(counted({ back: 0 })).toEqual({ clicked_at: 1, by: "viewer:v-3", servers: 4, back: 0, took_ms: null });
+    expect(counted({ back: 4, took_ms: 6120 })).toEqual({ clicked_at: 1, by: "viewer:v-3", servers: 4, back: 4, took_ms: 6120 });
+    expect(() => counted({ back: "4" })).toThrow(/last_reset_all\.back is not a number/);
   });
 
   it("has no servers when the coordinator sends none, or says null; a server name may be null", () => {
@@ -1115,11 +1124,34 @@ describe("a fleet with a field", () => {
     expect(new Set(v.cards.map((c) => c.id)).size).toBe(v.cards.length);
   });
 
+  it("keeps a server under one key whether the coordinator lists it as a tile or not", () => {
+    const st = statuses();
+    // Server 300 is no listed tile: this viewer opened it under the page's key.
+    const before = viewOf(big(), { statuses: st, renderer: "3d", opened: "field:300" });
+    expect([before.opened, before.cards.find((c) => c.slot === "mc-300")!.id]).toEqual(["mc-300", "field:300"]);
+    // Another viewer takes it: the coordinator lists it now, under its own id. Its key here does
+    // not move, so the opened server stays open and its tile's socket stays as it is.
+    const base = big();
+    const taken: Minecraft = {
+      ...base,
+      tiles: [...base.tiles, { ...base.tiles[0]!, id: "mc:300", slot: "mc-300", vm: "fleet-mc-300", borrowed: { session: "minecraft-claim-9", viewer: "v-9", since: NOW, until: NOW + 60_000 } }],
+    };
+    const after = viewOf(taken, { statuses: st, renderer: "3d", opened: "field:300" });
+    expect([after.openedGone, after.opened, after.cards.find((c) => c.slot === "mc-300")!.id]).toEqual([false, "mc-300", "field:300"]);
+    expect(after.cards.find((c) => c.slot === "mc-300")!.box).not.toBeNull();
+    // and a server among the first sixteen, listed all along, has the same kind of key
+    const third = viewOf(big(), { statuses: st, renderer: "3d", pins: [{ n: 3, at: NOW - 1000 }] });
+    expect(third.cards.find((c) => c.slot === "mc-3")!.id).toBe("field:3");
+    expect(new Set(after.cards.map((c) => c.id)).size).toBe(after.cards.length);
+    // without a field the coordinator's ids are the keys, as before
+    expect(viewOf(minecraftOf(4), {}).cards.map((c) => c.id)).toEqual(["mc:1", "mc:2", "mc:3", "mc:4"]);
+  });
+
   it("forgets an opened server that is no server any more, and keeps one that is", () => {
     const st = statuses();
     // a server of the field that no tile lists, opened: it is there
     expect(viewOf(big(), { statuses: st, renderer: "3d", opened: "field:300" }).openedGone).toBe(false);
-    expect(viewOf(big(), { statuses: st, renderer: "3d", opened: "mc:3" }).openedGone).toBe(false);
+    expect(viewOf(big(), { statuses: st, renderer: "3d", opened: "field:3" }).openedGone).toBe(false);
     expect(viewOf(big(), { statuses: st, renderer: "3d" }).openedGone).toBe(false);
     // the fleet shrank and it is gone: the page is told to forget it, so the id used again does not open by itself
     expect(viewOf(big(), { statuses: st, renderer: "3d", opened: "field:900" }).openedGone).toBe(true);

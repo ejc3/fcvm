@@ -1539,9 +1539,15 @@ describe("mock minecraft", () => {
     expect(await send(b, "minecraft_reset", {})).toMatchObject({ outcome: "refused", reason: "args must name a slot or say all" });
     expect(await send(b, "minecraft_reset", { slot: "mc-9" })).toMatchObject({ outcome: "refused", reason: 'no server "mc-9"' });
     expect(await send(b, "minecraft_reset", { all: true })).toMatchObject({ outcome: "committed" });
-    expect(mcNow().last_reset_all).toMatchObject({ servers: 3 });
+    // the coordinator counts the reset's own servers back: none yet
+    expect(mcNow().last_reset_all).toEqual({ clicked_at: expect.any(Number), by: expect.stringMatching(/^viewer:/), servers: 3, back: 0 });
     expect(mcNow().tiles.map((t) => t.last_relaunch.by)).toEqual(["reset_all", "reset_all", "reset_all"]);
     expect(await send(b, "minecraft_reset", { all: true })).toMatchObject({ outcome: "refused", reason: "one reset all per 10 s per client" });
+    // all three, and the time from the click to the last of them
+    await until(() => mcNow().tiles.every((t) => t.phase === "running"), 8000);
+    const all = mcNow().last_reset_all as unknown as { clicked_at: number; back: number; took_ms: number };
+    expect(all.back).toBe(3);
+    expect(all.took_ms).toBe(Math.max(...mcNow().tiles.map((t) => t.last_relaunch.first_frame_at!)) - all.clicked_at);
     a.ws.close();
     b.ws.close();
   });

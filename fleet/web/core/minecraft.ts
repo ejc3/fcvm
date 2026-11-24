@@ -17,6 +17,7 @@ import { hundredthsText, layoutCaptioned, medianMs, type CaptionSizes } from "./
 import {
   FIELD_TILES,
   fieldCells,
+  fieldKeyOfSlot,
   fieldHeadline,
   fieldLayout,
   PIN_MS,
@@ -1175,6 +1176,8 @@ function seatsFull(reason: string | null, seatFree: boolean): string {
 export function minecraftView(inp: MinecraftInput): MinecraftView {
   const s = inp.state;
   let m = s.accepted?.minecraft ?? null;
+  // With a field every tile is keyed by its server's number, a listed tile too (fieldKeyOfSlot).
+  if (m !== null && m.field !== null) m = { ...m, tiles: m.tiles.map((t) => ({ ...t, id: fieldKeyOfSlot(t.slot) ?? t.id })) };
   const online = s.connection === "open";
   const srvNow = serverNow(s.clock, inp.now);
   const common = {
@@ -1211,7 +1214,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
   // A fleet with a field: its cells, and the servers drawn in 3D. The cards below are those
   // servers' (a listed tile as the coordinator sent it, any other made from its cell), plus
   // every lent tile, which is how this viewer's own server is found.
-  const cells = m.field === null ? null : fieldCells(m.field, inp.statuses ?? {}, inp.now, m.tiles);
+  const cells = m.field === null ? null : fieldCells(m.field, inp.statuses ?? {}, inp.now);
   // The opened server keeps its tile until the viewer closes it.
   const openedCell = cells?.find((c) => c.id === (inp.opened ?? null)) ?? null;
   const slots = cells === null ? null : stepSample(inp.sample ?? [], cells, FIELD_TILES, inp.now, { pins: inp.pins ?? [], held: held === null ? (openedCell?.n ?? null) : null, still: inp.reducedMotion === true });

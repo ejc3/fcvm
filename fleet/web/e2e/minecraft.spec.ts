@@ -42,33 +42,46 @@ async function viewer(browser: Browser): Promise<Page> {
 /**
  * How much of a tile's picture is not the page's background (#06080b), and how many colours it
  * holds: its rectangle of the 3D view's one WebGL canvas, or its own canvas with the flat map.
+ * The rectangle is copied onto the background colour, so a pixel nothing was drawn on (outside
+ * the source, or never painted) reads as background, and a transparent pixel is never a drawn one.
+ * `blank` reads where nothing is drawn instead (beside the WebGL canvas's bitmap, or a canvas of
+ * the tile's size that nobody painted), which must read as no picture: the helper's own check.
  */
-async function drawnShare(page: Page, slot: string): Promise<{ share: number; colours: number }> {
-  return page.getByTestId(`mc-canvas-${slot}`).evaluate((c: HTMLCanvasElement) => {
+async function drawnShare(page: Page, slot: string, blank = false): Promise<{ share: number; colours: number }> {
+  return page.getByTestId(`mc-canvas-${slot}`).evaluate((c: HTMLCanvasElement, blank: boolean) => {
     const gl = document.querySelector<HTMLCanvasElement>('[data-renderer="3d"] [data-testid="mc-gl"]');
-    let d: Uint8ClampedArray;
+    const copy = document.createElement("canvas");
+    let src: HTMLCanvasElement = c;
+    let sx = 0;
+    let sy = 0;
     if (gl) {
       // with ?debug=1 the WebGL canvas keeps its drawing buffer, so it can be copied out
       const r = c.getBoundingClientRect();
       const g = gl.getBoundingClientRect();
       const k = gl.width / g.width;
-      const copy = document.createElement("canvas");
       copy.width = Math.max(1, Math.round(r.width * k));
       copy.height = Math.max(1, Math.round(r.height * k));
-      const ctx = copy.getContext("2d")!;
-      ctx.drawImage(gl, Math.round((r.left - g.left) * k), Math.round((r.top - g.top) * k), copy.width, copy.height, 0, 0, copy.width, copy.height);
-      d = ctx.getImageData(0, 0, copy.width, copy.height).data;
+      src = gl;
+      sx = blank ? gl.width + 16 : Math.round((r.left - g.left) * k);
+      sy = Math.round((r.top - g.top) * k);
     } else {
-      d = c.getContext("2d")!.getImageData(0, 0, c.width, c.height).data;
+      copy.width = c.width;
+      copy.height = c.height;
+      if (blank) src = Object.assign(document.createElement("canvas"), { width: c.width, height: c.height });
     }
+    const ctx = copy.getContext("2d")!;
+    ctx.fillStyle = "#06080b";
+    ctx.fillRect(0, 0, copy.width, copy.height);
+    ctx.drawImage(src, sx, sy, copy.width, copy.height, 0, 0, copy.width, copy.height);
+    const d = ctx.getImageData(0, 0, copy.width, copy.height).data;
     let drawn = 0;
     const colours = new Set<number>();
     for (let i = 0; i < d.length; i += 4) {
-      if (Math.abs(d[i]! - 6) + Math.abs(d[i + 1]! - 8) + Math.abs(d[i + 2]! - 11) > 12) drawn++;
+      if (d[i + 3] !== 0 && Math.abs(d[i]! - 6) + Math.abs(d[i + 1]! - 8) + Math.abs(d[i + 2]! - 11) > 12) drawn++;
       if (i % 64 === 0) colours.add((d[i]! << 16) | (d[i + 1]! << 8) | d[i + 2]!);
     }
     return { share: drawn / (d.length / 4), colours: colours.size };
-  });
+  }, blank);
 }
 
 const stageNow = (page: Page) => page.evaluate(() => window.__minecraft!.stage());
@@ -93,6 +106,8 @@ test("each tile draws its world from its own view socket, and says its slot, tic
   await openMinecraft(page);
   const v = await view(page);
   expect(v.title).toBe("Minecraft");
+  // where nothing is drawn the sampling reads no picture, so a share below is a picture's
+  expect(await drawnShare(page, SLOTS[0]!, true)).toEqual({ share: 0, colours: 1 });
   for (const slot of SLOTS) {
     // the world is drawn, in many colours, over nearly the whole tile
     await expect.poll(async () => (await drawnShare(page, slot)).share, { message: slot }).toBeGreaterThan(0.9);
@@ -560,6 +575,7 @@ test("a browser with no WebGL2 gets the flat map, and every tile says so", async
   await expect(page.getByTestId("mc-gl")).toHaveCount(0);
   expect(await stageNow(page)).toBeNull();
   await expect(page.getByTestId("mc-drawn")).toHaveCount(0);
+  expect(await drawnShare(page, SLOTS[0]!, true)).toEqual({ share: 0, colours: 1 });
   for (const slot of SLOTS) {
     await expect(page.getByTestId(`mc-note-${slot}`)).toHaveText("Flat map: no WebGL2 in this browser.");
     await expect(page.getByTestId(`mc-desc-${slot}`)).toHaveText(new RegExp(`^${slot}, running.*, flat map$`));
@@ -984,15 +1000,13 @@ test.describe("a fleet of hundreds of servers on one host", () => {
     const said = await page.getByTestId("mc-wave").textContent();
     await page.waitForTimeout(1500);
     await expect(page.getByTestId("mc-wave")).toHaveText(said!);
-    // A page opened only now reads the reset's time from the rows, not how long ago it looked:
-    // the same to the second (a row's age is in whole seconds, so one second either way).
-    const took = (text: string | null) => Number(/back in (\d+) s/.exec(text ?? "")![1]);
+    // A page opened only now has the coordinator's count and time of the reset, not how long
+    // ago it looked: the same line.
     await page.waitForTimeout(4000);
     const context = await browser.newContext({ ...info.project.use });
     const late = await context.newPage();
     await openField(late, 512);
-    await expect(late.getByTestId("mc-wave")).toHaveText(/^Reset all: 512 servers back in \d+ s \(\d+\.\d a second\)$/);
-    expect(Math.abs(took(await late.getByTestId("mc-wave").textContent()) - took(said))).toBeLessThanOrEqual(1);
+    await expect(late.getByTestId("mc-wave")).toHaveText(said!);
     await context.close();
   });
 

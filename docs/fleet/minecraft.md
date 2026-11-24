@@ -219,8 +219,13 @@ rows") names more servers than the page can draw. The page then shows two things
   CPU and per GiB in use from the hosts' own readings (`busy`, `mem_used_mib`). With a host
   silent, or a reading absent, that part is not shown.
 - **Reset all** is counted as it comes back: "Reset all: 212 of 512 back · 31.8 a second ·
-  6.7 s", then the whole time once every server has reported running again. A cell flashes when
-  its server returns.
+  6.7 s", then the whole time once every server the reset was sent to is back. A reset is over
+  then, or 180 s after its click (`WAVE_END_S`), whichever comes first: a reset that ends short
+  reads "509 of 512 back after 36 s". Before its end, with nothing being restored and none back
+  for 10 s the count reads as stopped, and runs again if more come back. The line goes a minute
+  after the reset is over. The count and the time are the coordinator's when the snapshot's
+  `last_reset_all` carries them (`back`, `took_ms`), and otherwise read from the rows, which do
+  not say which servers a reset was sent to. A cell flashes when its server returns.
 
 The page asks for the rows by sending `"minecraft": true` with its visibility; the other pages do
 not get them. The field's canvas is painted only when a cell, the cursor or the tiles change, or

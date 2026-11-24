@@ -31,9 +31,8 @@ export interface FieldCell {
   n: number;
   slot: string;
   /**
-   * The page's key for its tile, sockets and world: a listed tile's own id (`mc:<k>`), and for
-   * every other server `field:<n>`, which is no coordinator's id and does not change while the
-   * server exists. Never sent: an action names its server by `slot`.
+   * The page's key for its tile, sockets and world: `field:<n>`, which is no coordinator's id
+   * and does not change while the server exists. Never sent: an action names its server by `slot`.
    */
   id: string;
   frame: string | null;
@@ -69,15 +68,23 @@ export function statusRows(status: { rows: string }, servers: number): Uint8Arra
   return bytes.length === servers * STATUS_ROW_BYTES ? bytes : null;
 }
 
+/** The page's key for server `n` of a field: the same whether the coordinator lists it as a tile or not. */
+export const fieldKey = (n: number): string => `field:${n}`;
+
 /**
- * Every server of the field, by number, with what its host last read of it. `listed` is the
- * snapshot's tiles (id and server name): a listed server keeps its tile's id. The coordinator's
- * id of any other server is its place among all servers, which the page could only work out
- * while the field names every server; a key that is worked out some of the time changes when
- * that stops being so, and a tile whose key changes is closed and reopened. So a server that
- * is not a listed tile always has a key of the page's own, from its number.
+ * A field server's key from its name (`mc-<n>`); null for a name that is not a server's. The
+ * coordinator lists some servers as tiles (the first sixteen and every lent one) under ids of
+ * its own, and a server joins or leaves that list when a viewer takes it or gives it back. A
+ * tile whose key changed then would be closed and reopened, and an opened server put back in
+ * the wall, so with a field no tile is keyed by the coordinator's id.
  */
-export function fieldCells(field: MinecraftField, statuses: Readonly<Record<string, FieldStatus>>, now: number, listed: readonly { id: string; slot: string | null }[] = []): FieldCell[] {
+export function fieldKeyOfSlot(slot: string | null): string | null {
+  const m = slot === null ? null : /^mc-(\d+)$/.exec(slot);
+  return m ? fieldKey(Number(m[1])) : null;
+}
+
+/** Every server of the field, by number, with what its host last read of it. */
+export function fieldCells(field: MinecraftField, statuses: Readonly<Record<string, FieldStatus>>, now: number): FieldCell[] {
   const out: FieldCell[] = [];
   for (const h of field.hosts) {
     const st = statuses[h.key];
@@ -89,7 +96,7 @@ export function fieldCells(field: MinecraftField, statuses: Readonly<Record<stri
       out.push({
         n,
         slot: `mc-${n}`,
-        id: "",
+        id: fieldKey(n),
         frame: h.frames[i] ?? null,
         frameV4: h.frames_v4[i] ?? null,
         phase,
@@ -102,8 +109,6 @@ export function fieldCells(field: MinecraftField, statuses: Readonly<Record<stri
     });
   }
   out.sort((a, b) => a.n - b.n);
-  const ids = new Map(listed.filter((t) => t.slot !== null).map((t) => [t.slot!, t.id]));
-  for (const c of out) c.id = ids.get(c.slot) ?? `field:${c.n}`;
   return out;
 }
 
@@ -438,31 +443,45 @@ export interface WaveFrozen {
 }
 
 export interface ResetWave {
-  /** Servers back from this reset: running, on a launch whose first chunk came after the click. */
+  /** Servers back from this reset. */
   back: number;
   /** The servers the reset was sent to, as the coordinator published it. */
   total: number;
   /**
    * "Reset all: 312 of 512 back · 14.2 a second · 22.0 s" while it runs; "Reset all: 512 servers
    * back in 36 s (14.2 a second)" once done; "Reset all: 510 of 512 back after 36 s" when the
-   * rest are not coming.
+   * rest are not coming, or have not by the reset's end.
    */
   text: string;
   done: boolean;
-  /** Over: done, or the rest are not coming. */
+  /** Not counting now: done, stopped with nothing being restored, or past the reset's end. */
   settled: boolean;
-  /** Seconds from the click to the last server back, once settled; null when the rows cannot say. */
+  /** Seconds from the click to the last server back, once settled; null when nothing says. */
   tookS: number | null;
-  /** Once settled: what the page keeps and hands back, so the reset is never read from later rows. */
+  /** What the page keeps and hands back; null while the count runs. */
   frozen: WaveFrozen | null;
 }
 
-/** With no server being restored and none back for this long, the rest of a reset are not coming, seconds. */
+/**
+ * What a page keeps of a reset it showed as settled. `final`: the reset is over (every server
+ * back, or its end passed) and these figures stand whatever the rows say later; `at` is then
+ * when it ended, and the line goes WAVE_SHOWN_S after. Not final: the count stopped with
+ * `back` servers, the last of them at `at`; it goes on if more come back, and never drops.
+ */
+export interface WaveFrozen { clicked_at: number; back: number; total: number; done: boolean; tookS: number | null; at: number; final: boolean }
+
+/** With no server being restored and none back for this long, a reset reads as stopped, seconds. */
 export const WAVE_STALL_S = 10;
 /**
- * A reset's line stays this long after its last server came back, seconds. A server that comes
- * back later than this after the one before it is not of the reset: a reset ends at its first
- * minute with no server back.
+ * A reset's end, seconds after its click: what is back by then is the reset's count, and a
+ * server back later is not the reset's. 512 servers were back 64.8 s after the click on a store
+ * in RAM (docs/fleet/minecraft.md, "Reset all"); this is nearly three times that.
+ */
+export const WAVE_END_S = 180;
+/**
+ * A reset's line stays this long after the reset is over (its last server back, or its end),
+ * seconds. Read from the rows, a server back later than this after the one before it is not
+ * counted: it is another reset's or a fork's.
  */
 export const WAVE_SHOWN_S = 60;
 
@@ -471,59 +490,85 @@ function waveText(back: number, total: number, done: boolean, tookS: number | nu
   return `Reset all: ${back} of ${total} back${tookS === null ? "" : ` after ${tookS} s`}`;
 }
 
+/** How many of a reset's servers are back, when the last came (coordinator's clock, ms) and the whole seconds that took. */
+interface WaveRead { back: number; lastAt: number | null; tookS: number | null }
+
+/** The coordinator's own count: it sent the resets, so it knows which launches are the reset's. */
+function coordinatorRead(reset: WaveReset): WaveRead | null {
+  if (reset.back === undefined) return null;
+  const back = Math.min(reset.back, reset.servers);
+  const took = back > 0 ? (reset.took_ms ?? null) : null;
+  return { back, lastAt: took === null ? null : reset.clicked_at + took, tookS: took === null ? null : Math.max(1, Math.round(took / 1000)) };
+}
+
 /**
- * A reset of every server (`reset`: the snapshot's `last_reset_all`; `srvNow` on the
- * coordinator's clock, as its `clicked_at` is), while it runs and for a minute after its last
- * server is back.
- *
- * The rows do not say which servers a reset was sent to, so the reset's own are taken to be
- * the first `reset.servers` launches whose first chunk came after the click (the time the
+ * The same from the rows, for a coordinator that does not count. The rows do not say which
+ * servers a reset was sent to, so the reset's own are taken to be the first `reset.servers`
+ * launches whose first chunk came between the click and the reset's end (the time the
  * coordinator received the row, less its age), each within WAVE_SHOWN_S of the one before it.
- * A launch after such a gap is another reset's or a fork's and is not counted. Once the reset
- * is over (every one of its servers back, or the rest not coming) the page keeps what it showed
- * (`frozen`) and hands it back: its count and its time are then never read from the rows again,
- * and when its minute is up it does not come back whatever is launched later. A page opened
- * after the reset reads the same rows by the same rule, and shows nothing once the reset's last
- * server has been back a minute.
- *
- * The rows give whole seconds, so the finished time is in whole seconds; from a coordinator
- * that does not say when a row came, no time is given.
+ * That is wrong when a server outside the reset relaunches within that minute, and when one of
+ * the reset's is reset again before this page looks; the coordinator's count is neither.
  */
-export function resetWave(cells: readonly FieldCell[], reset: { clicked_at: number; servers: number }, srvNow: number, frozen: WaveFrozen | null = null): ResetWave | null {
-  const elapsed = srvNow - reset.clicked_at;
-  const total = reset.servers;
-  if (elapsed < 0 || total <= 0) return null;
-  if (frozen !== null && frozen.clicked_at === reset.clicked_at) {
-    if (srvNow - frozen.at > WAVE_SHOWN_S * 1000) return null;
-    return { back: frozen.back, total: frozen.total, text: waveText(frozen.back, frozen.total, frozen.done, frozen.tookS), done: frozen.done, settled: true, tookS: frozen.tookS, frozen };
-  }
+function rowsRead(cells: readonly FieldCell[], reset: WaveReset, srvNow: number): WaveRead {
+  const endAt = reset.clicked_at + WAVE_END_S * 1000;
   const firstChunkAt = (c: FieldCell) => (c.seenAt ?? srvNow) - c.ageS! * 1000;
   const fresh = cells
-    .filter((c) => c.phase === "running" && c.ageS !== null && firstChunkAt(c) >= reset.clicked_at)
+    .filter((c) => c.phase === "running" && c.ageS !== null && firstChunkAt(c) >= reset.clicked_at && firstChunkAt(c) <= endAt)
     .map((c) => ({ at: firstChunkAt(c), timed: c.seenAt !== null }))
     .sort((a, b) => a.at - b.at);
-  // The reset's own: in the order they came back, until its count is full or a minute passes with none.
   const own: typeof fresh = [];
   let prev = reset.clicked_at;
   for (const f of fresh) {
-    if (own.length >= total || f.at - prev > WAVE_SHOWN_S * 1000) break;
+    if (own.length >= reset.servers || f.at - prev > WAVE_SHOWN_S * 1000) break;
     own.push(f);
     prev = f.at;
   }
   const back = own.length;
-  const done = back >= total;
   const lastAt = back === 0 ? null : own[back - 1]!.at;
-  const sinceLastS = lastAt === null ? null : (srvNow - lastAt) / 1000;
-  const read = back > 0 && own.every((f) => f.timed) ? Math.max(1, Math.round((lastAt! - reset.clicked_at) / 1000)) : null;
+  // The rows give whole seconds; from a coordinator that does not say when a row came, no time is given.
+  const tookS = back > 0 && own.every((f) => f.timed) ? Math.max(1, Math.round((lastAt! - reset.clicked_at) / 1000)) : null;
+  return { back, lastAt, tookS };
+}
+
+/** The snapshot's `last_reset_all`: `back` and `took_ms` from a coordinator that counts the reset itself. */
+export interface WaveReset { clicked_at: number; servers: number; back?: number; took_ms?: number | null }
+
+/**
+ * A reset of every server (`srvNow` on the coordinator's clock, as `clicked_at` is): the count
+ * while it runs, then one line that says how it ended.
+ *
+ * A reset is over when every server it was sent to is back, or WAVE_END_S after its click,
+ * whichever comes first. Until then the count runs while any server is being restored; with
+ * none being restored and none back for WAVE_STALL_S it reads as stopped ("510 of 512 back
+ * after 36 s"), and runs again if a restore starts or another server comes back. Once over,
+ * the line says how many came back and in what time, stays WAVE_SHOWN_S and goes.
+ *
+ * The count and the time are the coordinator's when it sends them, and otherwise read from the
+ * rows (`rowsRead`). The page hands back what it showed as settled (`frozen`): a reset that is
+ * over is then never read again, and a stopped count never drops.
+ */
+export function resetWave(cells: readonly FieldCell[], reset: WaveReset, srvNow: number, frozen: WaveFrozen | null = null): ResetWave | null {
+  const elapsed = srvNow - reset.clicked_at;
+  const total = reset.servers;
+  if (elapsed < 0 || total <= 0) return null;
+  const over = (k: WaveFrozen): ResetWave | null =>
+    srvNow - k.at > WAVE_SHOWN_S * 1000 ? null : { back: k.back, total: k.total, text: waveText(k.back, k.total, k.done, k.tookS), done: k.done, settled: true, tookS: k.tookS, frozen: k };
+  const mine = frozen !== null && frozen.clicked_at === reset.clicked_at ? frozen : null;
+  if (mine?.final === true) return over(mine);
+  let r = coordinatorRead(reset) ?? rowsRead(cells, reset, srvNow);
+  if (mine !== null && r.back <= mine.back) r = { back: mine.back, lastAt: mine.back > 0 ? mine.at : null, tookS: mine.tookS };
+  const { back, lastAt, tookS } = r;
+  const done = back >= total;
+  const endAt = reset.clicked_at + WAVE_END_S * 1000;
+  if (done) return over({ clicked_at: reset.clicked_at, back, total, done, tookS, at: lastAt ?? reset.clicked_at, final: true });
+  if (srvNow >= endAt) return over({ clicked_at: reset.clicked_at, back, total, done, tookS, at: endAt, final: true });
   const inFlight = cells.some((c) => c.phase === "restoring" || c.phase === "forking");
-  // Not coming: nothing is being restored and none came back for a while, or a whole minute passed with none back.
-  const stalled = !done && (sinceLastS === null ? !inFlight && elapsed >= WAVE_SHOWN_S * 1000 : sinceLastS > WAVE_SHOWN_S || (!inFlight && sinceLastS >= WAVE_STALL_S));
-  const settled = done || stalled;
-  if (settled && (sinceLastS === null || sinceLastS > WAVE_SHOWN_S)) return null;
-  if (settled) {
-    const kept: WaveFrozen = { clicked_at: reset.clicked_at, back, total, done, tookS: read, at: lastAt ?? reset.clicked_at };
-    return { back, total, text: waveText(back, total, done, read), done, settled, tookS: read, frozen: kept };
+  // Stopped: nothing is being restored, and none came back for a while (or, with none back at all, for a minute).
+  const stopped = !inFlight && (lastAt === null ? elapsed >= WAVE_SHOWN_S * 1000 : srvNow - lastAt >= WAVE_STALL_S * 1000);
+  if (stopped) {
+    const kept: WaveFrozen = { clicked_at: reset.clicked_at, back, total, done, tookS, at: lastAt ?? reset.clicked_at, final: false };
+    return { back, total, text: waveText(back, total, done, tookS), done, settled: true, tookS, frozen: kept };
   }
   const text = `Reset all: ${back} of ${total} back · ${(elapsed > 0 ? back / (elapsed / 1000) : 0).toFixed(1)} a second · ${(elapsed / 1000).toFixed(1)} s`;
-  return { back, total, text, done, settled, tookS: null, frozen: null };
+  return { back, total, text, done, settled: false, tookS: null, frozen: null };
 }

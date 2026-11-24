@@ -286,7 +286,8 @@ export class MockMinecraft {
   private lastReset = new Map<string, number>();
   private lastResetAll = new Map<string, number>();
   private lastForkBy = new Map<string, number>();
-  private resetAll: { clicked_at: number; by: string; servers: number } | null = null;
+  /** The last reset of every server, with the coordinator's own count of its servers back and the time to the last. */
+  private resetAll: { clicked_at: number; by: string; servers: number; back: number; took_ms?: number } | null = null;
   private lastFork: Record<string, unknown> | null = null;
   readonly intents: RecordedMinecraftIntent[] = [];
   readonly drives: RecordedDrive[] = [];
@@ -595,7 +596,7 @@ export class MockMinecraft {
           const targets = this.servers.filter((s) => s.borrow === null);
           if (targets.length === 0) return h.refuse("no server can be reset now");
           this.lastResetAll.set(viewer, now);
-          this.resetAll = { clicked_at: now, by: `viewer:${viewer}`, servers: targets.length };
+          this.resetAll = { clicked_at: now, by: `viewer:${viewer}`, servers: targets.length, back: 0 };
           // a host restores so many a second: a reset of hundreds comes back as a wave
           targets.forEach((s, k) => this.relaunch(s, "reset_all", targets.length > TILES_LISTED ? Math.floor((k * 1000) / RESTORES_PER_SEC) : 0));
           return h.committed(`reset all (${targets.length} servers)`);
@@ -703,12 +704,18 @@ export class MockMinecraft {
     s.forkedFrom = null;
     s.drive = null;
     s.lastRelaunch = { clicked_at: clicked, by, first_frame_at: null, phases: {} };
+    // a launch the reset of every server began is counted by that reset when it is back
+    const all = by === "reset_all" ? this.resetAll : null;
     this.dropSockets(s);
     h.markDirty();
     s.timers.push(
       h.later(total, () => {
         if (s.generation !== gen) return;
         const done = h.now();
+        if (all !== null && this.resetAll === all) {
+          all.back += 1;
+          all.took_ms = Math.max(all.took_ms ?? 0, done - all.clicked_at);
+        }
         s.world = GOLD.slice();
         s.ground = GOLD_GROUND.slice();
         s.dayFrom = { at: this.host.now(), tick: GOLD_DAY_TIME };

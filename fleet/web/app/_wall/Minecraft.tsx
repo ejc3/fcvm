@@ -261,8 +261,8 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   const [pins, setPins] = useState<{ n: number; at: number }[]>([]);
   const [cursor, setCursor] = useState<number | null>(null);
   const sample = useRef<SampleSlot[]>([]);
-  // A reset of all once it is over, as it was shown then: kept until another reset, so later
-  // launches (one server reset, a fork) never bring its line back or change its time.
+  // A reset of all as it was last shown settled: kept until another reset, so later launches
+  // (one server reset, a fork) never bring a finished one back, change its time or lower a count.
   const waveFrozen = useRef<WaveFrozen | null>(null);
   const fieldScroll = useRef<HTMLDivElement | null>(null);
   // A mouse picks with its click; a finger's tap only points (the cells are smaller than a finger), and Show picks.
@@ -408,7 +408,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   const resetAt = state.accepted?.minecraft?.last_reset_all?.clicked_at ?? null;
   const kept = view.field?.wave?.frozen ?? null;
   if (waveFrozen.current !== null && waveFrozen.current.clicked_at !== resetAt) waveFrozen.current = null;
-  if (kept !== null && waveFrozen.current === null) waveFrozen.current = kept;
+  if (kept !== null) waveFrozen.current = kept;
   const cursorRef = useRef<number | null>(null);
   cursorRef.current = cursor;
   // The boxes in `view` were laid out in this stage: the 3D view draws into the same one.
