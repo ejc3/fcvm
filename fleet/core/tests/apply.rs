@@ -26,6 +26,8 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
             phones: vec![],
             phone_actions: vec![],
             potato_players: 0,
+            potato_cpus: 0,
+            potato_confined: false,
             windows: 0,
             windows_actions: Vec::new(),
             minecraft: 0,
@@ -343,6 +345,8 @@ fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
             phones: vec![],
             phone_actions: vec![],
             potato_players: 0,
+            potato_cpus: 0,
+            potato_confined: false,
             windows: 0,
             windows_actions: Vec::new(),
             minecraft: 0,
@@ -714,6 +718,8 @@ fn phone_gpus_take_no_place_on_the_wall() {
                 phones: (6..8).map(gpu).collect(),
                 phone_actions: vec![],
                 potato_players: 0,
+                potato_cpus: 0,
+                potato_confined: false,
                 windows: 0,
                 windows_actions: Vec::new(),
                 minecraft: 0,
@@ -1521,18 +1527,19 @@ fn the_potato_ladder_and_records_survive_a_coordinator_restart() {
     let all = events(vector["events"].clone());
     // through the proof drop (event 13): size 2 holds a record and the ladder moved to 4
     let state = all[..14].iter().fold(State::new(config.clone(), 0), apply);
-    assert_eq!(state.fleet.potato.ladder[0].record_hold_ms, Some(2000));
+    assert_eq!(state.fleet.potato.ladder[0].record_pace, Some(0.5));
     let saved = serde_json::to_string(&state).unwrap();
     let restored: State = serde_json::from_str(&saved).unwrap();
     let resumed = restored.resumed(config, 20_000);
     let p = &resumed.fleet.potato;
-    assert_eq!(p.ladder[0].record_hold_ms, Some(2000));
+    assert_eq!(p.ladder[0].record_pace, Some(0.5));
     assert_eq!(
         p.ladder[0].broke.as_ref().map(|d| d.reason.as_str()),
         Some("proof")
     );
     assert_eq!(
-        p.ladder[p.rung].size, 4,
+        p.next_size,
+        Some(4),
         "the ladder resumes at the size it was on"
     );
     assert_eq!(p.records.longest_round.as_ref().map(|r| r.value), Some(3.0));
@@ -1867,4 +1874,146 @@ fn a_server_nobody_holds_is_reset_on_a_schedule() {
     .iter()
     .fold(s, apply);
     assert_eq!(gen(&s, "mc-1"), 3);
+}
+
+fn phone_host(at: u64) -> Event {
+    let gpu = Gpu {
+        sbdf: "0000:01:00.0".into(),
+        name: "Tesla T4".into(),
+    };
+    Event::Agent {
+        at,
+        host: "h1".into(),
+        msg: AgentMsg::Hello {
+            host: "h1".into(),
+            arch: "x86_64".into(),
+            gpus: vec![],
+            capacity: 8,
+            store_ready_at: None,
+            boot: Default::default(),
+            phones: vec![gpu],
+            phone_actions: vec![],
+            potato_players: 0,
+            potato_cpus: 0,
+            potato_confined: false,
+            windows: 0,
+            windows_actions: Vec::new(),
+            minecraft: 0,
+            minecraft_server: None,
+        },
+    }
+}
+
+fn phone_health(at: u64, vm: Option<fleet_core::protocol::VmStats>) -> Event {
+    let mut report = fleet_core::protocol::HealthReport::from_renderer(
+        "phone-1",
+        &serde_json::json!({"fps": 30.0, "gpu": {"name": "Tesla T4", "util_pct": 40, "mem_used_mb": 600.0}}),
+    );
+    report.vm_stats = vm;
+    Event::Agent {
+        at,
+        host: "h1".into(),
+        msg: AgentMsg::Health(report),
+    }
+}
+
+fn phone_stats(s: &State) -> (serde_json::Value, serde_json::Value) {
+    let v = serde_json::to_value(view(s)).unwrap();
+    let t = &v["phones"]["tiles"][0];
+    (
+        t.get("gpu_stats").cloned().unwrap_or_default(),
+        t.get("vm_stats").cloned().unwrap_or_default(),
+    )
+}
+
+/// The coordinator stamps its receipt time into the GPU readings and the VM's readings, a
+/// report without `vm_stats` (an old agent, or a failed read) leaves none, and a phone that is
+/// not running keeps neither.
+#[test]
+fn a_phones_readings_carry_the_receipt_time_and_clear_with_the_phone() {
+    let mut s = State::new(config_with(serde_json::json!({})), 0);
+    s = apply(s, &phone_host(1000));
+    s = apply(
+        s,
+        &Event::Agent {
+            at: 1100,
+            host: "h1".into(),
+            msg: AgentMsg::Slot(SlotReport {
+                id: "phone-1".into(),
+                phase: "running".into(),
+                generation: 1,
+                ..Default::default()
+            }),
+        },
+    );
+    let vm = fleet_core::protocol::VmStats {
+        cpu_pct: 12.5,
+        vcpus: 6,
+        at: Some(1),
+    };
+    s = apply(s, &phone_health(2000, Some(vm)));
+    let (gpu, vm) = phone_stats(&s);
+    assert_eq!(gpu["at"], 2000);
+    assert_eq!(gpu["mem_used_mb"], 600.0);
+    assert_eq!(
+        vm,
+        serde_json::json!({"cpu_pct": 12.5, "vcpus": 6, "at": 2000})
+    );
+
+    s = apply(s, &phone_health(3000, None));
+    let (gpu, vm) = phone_stats(&s);
+    assert_eq!(gpu["at"], 3000);
+    assert!(vm.is_null(), "{vm}");
+
+    s = apply(
+        s,
+        &Event::Agent {
+            at: 3100,
+            host: "h1".into(),
+            msg: AgentMsg::Slot(SlotReport {
+                id: "phone-1".into(),
+                phase: "restoring".into(),
+                generation: 2,
+                ..Default::default()
+            }),
+        },
+    );
+    let (gpu, vm) = phone_stats(&s);
+    assert!(gpu.is_null() && vm.is_null(), "{gpu} {vm}");
+}
+
+/// A `cpu_pct` over 100 is held at 100, and a negative or non-finite one leaves no reading.
+#[test]
+fn a_phones_cpu_is_held_to_0_to_100_and_a_bad_one_is_dropped() {
+    let mut s = State::new(config_with(serde_json::json!({})), 0);
+    s = apply(s, &phone_host(1000));
+    s = apply(
+        s,
+        &Event::Agent {
+            at: 1100,
+            host: "h1".into(),
+            msg: AgentMsg::Slot(SlotReport {
+                id: "phone-1".into(),
+                phase: "running".into(),
+                generation: 1,
+                ..Default::default()
+            }),
+        },
+    );
+    let report = |cpu_pct: f64, at: u64| {
+        phone_health(
+            at,
+            Some(fleet_core::protocol::VmStats {
+                cpu_pct,
+                vcpus: 2,
+                at: None,
+            }),
+        )
+    };
+    s = apply(s, &report(250.0, 2000));
+    assert_eq!(phone_stats(&s).1["cpu_pct"], 100.0);
+    for (i, bad) in [-1.0, f64::NAN, f64::INFINITY].into_iter().enumerate() {
+        s = apply(s, &report(bad, 3000 + i as u64));
+        assert!(phone_stats(&s).1.is_null(), "{bad}");
+    }
 }

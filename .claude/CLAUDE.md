@@ -2573,9 +2573,22 @@ both.
   is written like a lock file (0666). Nothing is made world-writable.
 - **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
   by every command while a VM of it is running: the error lists each one's name and PID,
-  and they are stopped with the fcvm that started them. With none running, what it left is
-  removed (`check_layout`). An older fcvm pointed at a layout 2 store sees no VMs and
-  cannot tell, so do not run two fcvm builds of different layouts on one store.
+  and they are stopped with the fcvm that started them. A command that only reads decides
+  refuse or proceed and writes nothing (`check_layout_for_read`), so `fcvm ls` needs no
+  write access and removes nothing of an older launch in progress. A launch
+  (`check_layout_for_write`) removes what layout 1 left with no VM running, under layout
+  1's own `names.lock`, held across a second scan and the removal, and writes the marker;
+  the lock file stays, so an older launch and a conversion always exclude each other.
+  The marker's content is read: anything but this layout's number is refused. An older
+  fcvm pointed at a layout 2 store sees no VMs and cannot tell, so do not run two fcvm
+  builds of different layouts on one store.
+- **Liveness is read from the caller's own /proc** (`process_liveness`): a state directory
+  is used from one PID namespace, which holds because each nesting level has its own data
+  directory. Only "no such process" (or a zombie, or another start time) is dead; a /proc
+  read that fails for another reason fails a name claim and removes nothing.
+- **A state file a host crash left empty or cut short** is removed by the sweep when it
+  was written before this boot (`/proc/stat` btime), and warned about once per process
+  otherwise. Nothing on the state path is synced.
 
 No master state file: `list_vms()` reads every bucket of `vms/`.
 
@@ -2726,7 +2739,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Port forwarding via pasta CLI flags (-t/-u)
 - The holder builds every link over netlink in one `build` request from fcvm (`netns_agent::build`, `src/network/rtnl.rs`); both TAPs are persistent, so the VMM and pasta attach to devices that exist. The bridge takes four netlink requests (create, MTU and `addrgenmode none` while it is down, up after its ports have joined, address) and each TAP one
 - IPv6 supported with `--enable-ipv6` and native DNS proxying
-- `fcvm netpool serve --slots N` (`src/netpool/`) keeps N such namespaces and lends each to one restored clone at a time. The lease is the clone's connection to the pool, which the VMM inherits; the pool resets a returned namespace, checks it against the fingerprint taken at build (`src/network/fingerprint.rs`) and destroys one that differs. A clone with a published port, a cold boot and a clone with no pool build their own. A pooled clone's `holder_pid` is the pool's process: never signal it from a clone
+- `fcvm netpool serve --slots N` (`src/netpool/`) keeps N such namespaces and lends each to one restored clone at a time. The lease is the clone's connection to the pool, which the VMM inherits; the pool resets a returned namespace, checks it against the fingerprint taken at build (`src/network/fingerprint.rs`) and destroys one that differs. A pooled namespace's TAP is attached once, by its holder, and the VMM uses it through the queue it inherits (`NetworkConfig::tap_fd`, Firecracker's `host_dev_fd`): nothing may attach to a pooled TAP by name, and a VMM that takes no queue (Cloud Hypervisor, a Firecracker without `tap-fd` in its version) is never pooled. A clone with a published port, a cold boot and a clone with no pool build their own. A pooled clone's `holder_pid` is the pool's process: never signal it from a clone
 
 **Routed Architecture** (`src/network/routed.rs`):
 - veth pair connects VM namespace to host with native IPv6 kernel routing (no userspace proxy)

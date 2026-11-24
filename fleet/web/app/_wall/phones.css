@@ -25,6 +25,13 @@
 /* Over the held phone's video and GPU mirror (z-index 2): a click there is a tap on the phone. */
 .phone-taps { position: fixed; inset: 0; z-index: 3; pointer-events: none; }
 .phone-taps > .phone-tap { position: absolute; cursor: pointer; pointer-events: auto; }
+/* A phone the viewer does not hold: a click on its screen sends nothing, and points at the line under it and the take-over button. */
+.phone-taps > .phone-tap.locked { cursor: default; }
+.phone-label .tap-note.asked { color: var(--text); font-weight: 600; animation: tap-asked 0.9s ease-out; }
+@keyframes tap-asked { from { background: var(--fcvm); color: #06080b; } to { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { .phone-label .tap-note.asked { animation: none; } }
+/* Not the focus ring (wall.css, :focus-visible): dashed, further out, and in place of it on this button, so there is never a second ring. */
+.phone-sheet .btn[data-asked="true"] { outline: 2px dashed var(--text); outline-offset: 4px; }
 .phone-label span { padding: 2px 9px; border-radius: 6px; background: var(--plate); font: 500 14px var(--mono); color: var(--text); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 
 .phones-banner, .phones-empty, .phones-notice { position: fixed; z-index: 4; left: 50%; transform: translateX(-50%); width: max-content; max-width: min(560px, 92vw); padding: 10px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); font-size: 15px; }
@@ -68,3 +75,7 @@
   .phones-stage { margin: 0 8px 8px; }
   .phone-label span { font-size: 12px; padding: 1px 4px; }
 }
+/* Live readings share the card's rows grid; digits are padded to a fixed width so values do not shift. */
+.phone-sheet dd .stat { display: inline-flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; white-space: pre; }
+.phone-sheet dd .bar { display: inline-block; width: 72px; height: 5px; border-radius: 3px; background: rgba(255, 255, 255, 0.12); overflow: hidden; }
+.phone-sheet dd .bar i { display: block; height: 100%; background: var(--fcvm); }

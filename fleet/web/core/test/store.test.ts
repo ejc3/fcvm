@@ -20,7 +20,7 @@ describe("protocol parsing", () => {
     st.tiles[0]!["gpu"] = "NVIDIA T4";
     const m = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state: st }));
     if (m.type !== "snapshot") throw new Error("not a snapshot");
-    expect(m.state.tiles[0]!.gpu).toEqual({ name: "NVIDIA T4", temp_c: null, power_w: null, util_pct: null });
+    expect(m.state.tiles[0]!.gpu).toEqual({ name: "NVIDIA T4", temp_c: null, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: null });
   });
 
   it.each([

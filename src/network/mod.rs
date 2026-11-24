@@ -5,6 +5,7 @@ pub mod names;
 pub mod namespace;
 pub mod netns_agent;
 pub mod pasta;
+pub mod pesto;
 pub mod portmap;
 pub mod relay_socket;
 pub mod routed;

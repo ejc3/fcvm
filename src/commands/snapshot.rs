@@ -3783,15 +3783,21 @@ async fn cmd_snapshot_run_inner(
             // --dns 10.0.2.2 restores with pasta's DNS special case off, so its
             // guests keep reaching the host loopback service the golden was
             // recorded against.
-            // A Firecracker clone may run in a pooled namespace (`crate::netpool`). The
-            // Cloud Hypervisor restore has not been run in one.
+            // A clone may run in a pooled namespace (`crate::netpool`) when its VMM takes the
+            // namespace's TAP as an inherited queue: a pooled TAP is attached once, by its
+            // holder, and cannot be attached by name. That is Firecracker built from
+            // ejc3/firecracker with `tap-fd` in its version.
+            let vmm_takes_a_tap_queue = super::common::vmm_takes_a_tap_queue(
+                snapshot_config.metadata.hypervisor,
+                super::common::find_firecracker_with_version(&runtime_config)
+                    .ok()
+                    .map(|(_, version)| version),
+            );
             let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                 .with_loopback_ip(loopback_ip)
                 .with_dns_server(resolvers.mode_server.clone())
                 .with_restore_mode()
-                .with_pooling(
-                    snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker,
-                );
+                .with_pooling(vmm_takes_a_tap_queue);
             Box::new(net)
         }
     };

@@ -186,6 +186,7 @@ impl Hypervisor for FirecrackerBackend {
                 api::NetworkInterface {
                     iface_id: iface.iface_id.clone(),
                     host_dev_name: iface.host_dev_name.clone(),
+                    host_dev_fd: iface.host_dev_fd,
                     guest_mac: iface.guest_mac.clone(),
                     rx_rate_limiter: None,
                     tx_rate_limiter: None,

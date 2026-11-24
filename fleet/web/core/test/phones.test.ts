@@ -16,8 +16,14 @@ import {
   PHONE_ASPECT,
   restoreText,
   screenYScale,
+  statsOf,
+  STATS_STALE_MS,
   tapPoint,
+  askTap,
+  RECONNECTING_NOTE,
+  tapAsked,
   TAP_BROWSER_NOTE,
+  TAP_TAKE_OVER_NOTE,
   zoomProgressAt,
   type PhoneLayout,
   type PhonesInput,
@@ -116,6 +122,28 @@ describe("phones in the snapshot", () => {
     expect(m.state.phones!.zoomed_out).toBe(true);
     expect(m.state.phones!.zoom_at).toBe(123_456);
     expect(m.state.phones!.tiles[1]!.borrowed).toEqual({ session: "phone-claim-3", viewer: "v-12", since: 1000, until: 31_000 });
+  });
+
+  it("reads GPU memory and the sample time from gpu_stats", () => {
+    const state = structuredClone(raw.views["29_phones"]!) as { phones: { tiles: Record<string, unknown>[] } };
+    state.phones.tiles[1]!["vm_stats"] = undefined;
+    state.phones.tiles[1]!["gpu_stats"] = { temp_c: 50, power_w: 40, util_pct: 30, mem_used_mb: 600, mem_total_mb: 15360, at: 1234 };
+    const m = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+    if (m.type !== "snapshot") throw new Error("not a snapshot");
+    expect(m.state.phones!.tiles[1]!.gpu).toMatchObject({ util_pct: 30, mem_used_mb: 600, mem_total_mb: 15360, at: 1234 });
+    expect(m.state.phones!.tiles[1]!.vm_stats).toBeNull();
+    state.phones.tiles[1]!["vm_stats"] = { cpu_pct: 12.5, vcpus: 6, at: 1234 };
+    const withVm = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+    if (withVm.type !== "snapshot") throw new Error("not a snapshot");
+    expect(withVm.state.phones!.tiles[1]!.vm_stats).toEqual({ cpu_pct: 12.5, vcpus: 6, at: 1234 });
+    state.phones.tiles[1]!["vm_stats"] = { cpu_pct: 12.5, vcpus: 0 };
+    const bad = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+    if (bad.type !== "snapshot") throw new Error("not a snapshot");
+    expect(bad.state.phones!.tiles[1]!.vm_stats).toBeNull();
+    state.phones.tiles[1]!["gpu_stats"] = { util_pct: 30 };
+    const old = parseServerMsg(JSON.stringify({ type: "snapshot", version: 1, state }));
+    if (old.type !== "snapshot") throw new Error("not a snapshot");
+    expect(old.state.phones!.tiles[1]!.gpu).toMatchObject({ mem_used_mb: null, mem_total_mb: null, at: null });
   });
 
   it("has no phones when the coordinator sends none", () => {
@@ -346,6 +374,21 @@ describe("the page's view", () => {
     expect(phonesView(input(initialState())).empty).toBe("Connecting to the fleet.");
   });
 
+  it("does not say the fleet runs no phones before a GPU host is up", () => {
+    // The coordinator lists phones only once the host that runs them has connected: a viewer
+    // who woke the fleet read "This fleet runs no phones." for about a minute (2026-11-24).
+    const base = stateWith(null);
+    const st = base.accepted!;
+    const withFleet = (fleet: typeof st.fleet) =>
+      phonesView(input(reduce(base, { type: "message", text: snapshotText(2, { ...st, fleet }), at: EPOCH }))).empty;
+    const power = (state: "asleep" | "waking" | "awake") => ({ ...st.fleet.power, state, asleep_since: state === "asleep" ? EPOCH - 1000 : null, woke_at: state === "waking" ? EPOCH - 1000 : null });
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("asleep") })).toBe("The phones start when the fleet wakes.");
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("waking") })).toBe("The fleet is waking. The phones start when a GPU host is up.");
+    // awake by its EC2 half, or a GPU host refused for capacity: still no host
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("awake") })).toBe("No GPU host is up yet. The phones start when one is.");
+    expect(withFleet({ ...st.fleet, power: power("awake") })).toBe("This fleet runs no phones.");
+  });
+
   it("follows the shared zoom in the button, not a local choice", () => {
     expect(phonesView(input(stateWith(phonesOf(2)))).zoom).toEqual({ label: "Zoom out", out: false, disabled: false });
     expect(phonesView(input(stateWith(phonesOf(2, { zoomed_out: true })))).zoom).toEqual({ label: "Zoom in", out: true, disabled: false });
@@ -354,7 +397,9 @@ describe("the page's view", () => {
   it("gives each phone a card with its label", () => {
     const v = phonesView(input(stateWith(phonesOf(2)), { progress: 1 }));
     expect(v.cards.map((c) => c.label)).toEqual(["Phone 1 · restored in 22.3 s", "Phone 2 · restored in 22.3 s"]);
-    expect(v.cards[0]!.ariaLabel).toBe("Phone 1, streaming. Open its details.");
+    // in the overview a phone is one button that opens it, whatever part of its picture is clicked
+    expect(v.cards[0]!.ariaLabel).toBe("Open Phone 1: streaming.");
+    expect(v.cards.map((c) => c.title)).toEqual(["Open Phone 1", "Open Phone 2"]);
   });
 
   it("opens no panel for a phone that is not there", () => {
@@ -372,6 +417,78 @@ describe("the panel of an opened phone", () => {
     expect(Object.fromEntries(p.rows.map((r) => [r.term, r.value]))).toMatchObject({ VM: "fleet-phone-1", "Restored in": "22.3 s", "Up for": "7 s" });
     expect(p.restoreTotal).toBe("22.3 s");
     expect(p.timeline.map((s) => s.label)).toEqual(["snapshot restored"]);
+  });
+
+  describe("live readings", () => {
+    const withGpu = (g: Partial<NonNullable<Tile["gpu"]>> | null) => {
+      const ph = phonesOf(2);
+      ph.tiles[0] = { ...ph.tiles[0]!, gpu: g === null ? null : { name: "Tesla T4", temp_c: null, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: null, ...g } };
+      return panelOf(ph);
+    };
+
+    it("formats each reading with fixed-width digits, units and a label", () => {
+      const p = withGpu({ util_pct: 7, temp_c: 52, power_w: 48.4, mem_used_mb: 648.3, mem_total_mb: 15360 });
+      expect(p.stats.map((r) => [r.key, r.text, r.fraction])).toEqual([
+        ["gpu-util", "\u2007\u20077 %", 0.07],
+        ["gpu-temp", "\u200752 \u00b0C", null],
+        ["gpu-power", "\u200748 W", null],
+        ["gpu-mem", "\u2007\u2007648 of 15360 MB", 648.3 / 15360],
+      ]);
+      expect(p.stats.map((r) => r.meter)).toEqual([
+        { name: "GPU utilisation", valuetext: "7 percent" },
+        null,
+        null,
+        { name: "GPU memory", valuetext: "0.6 of 15 GB" },
+      ]);
+    });
+
+    it("leaves out a reading that is absent, and shows memory without a bar when the size is unknown", () => {
+      const p = withGpu({ util_pct: 0, mem_used_mb: 512 });
+      expect(p.stats.map((r) => r.key)).toEqual(["gpu-util", "gpu-mem"]);
+      expect(p.stats[0]!.fraction).toBe(0);
+      expect(p.stats[1]).toMatchObject({ text: "\u2007\u2007512 MB", fraction: null });
+      expect(withGpu({}).stats).toEqual([]);
+      expect(withGpu(null).stats).toEqual([]);
+    });
+
+    it("shows the VM's CPU as a percent of its vCPUs, under the GPU rows", () => {
+      const ph = phonesOf(2);
+      ph.tiles[0] = { ...ph.tiles[0]!, gpu: { name: "Tesla T4", temp_c: 50, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: null }, vm_stats: { cpu_pct: 12.4, vcpus: 6, at: null } };
+      const p = panelOf(ph);
+      expect(p.stats.map((r) => [r.term, r.text, r.fraction, r.meter])).toEqual([
+        ["Temperature", "\u200750 \u00b0C", null, null],
+        ["CPU", "\u200712 %  6 vCPUs", 0.124, { name: "CPU", valuetext: "12 percent of 6 vCPUs" }],
+      ]);
+    });
+
+    it("leaves out the VM rows when absent or stale, whatever the GPU says", () => {
+      const srv = EPOCH + 30_000;
+      const vm = (at: number | null) => ({ cpu_pct: 5, vcpus: 1, at });
+      expect(statsOf(null, null, srv)).toEqual([]);
+      expect(statsOf(null, vm(srv - 1000), srv).map((r) => r.term)).toEqual(["CPU"]);
+      expect(statsOf(null, vm(srv - STATS_STALE_MS - 1), srv)).toEqual([]);
+      expect(statsOf(null, vm(null), srv)[0]!.text).toBe("\u2007\u20075 %  1 vCPU");
+    });
+
+    it("does not drop readings on the page's own clock before the coordinator's clock is known", () => {
+      const gpu = { name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: EPOCH };
+      const vm = { cpu_pct: 5, vcpus: 2, at: EPOCH };
+      // The page is 5 s ahead and has no clock sample: both stay.
+      expect(statsOf(gpu, vm, EPOCH + 5_000 + 1, false).map((r) => r.key)).toEqual(["gpu-temp", "vm-cpu"]);
+      // A receipt time hours off (a host with a skewed clock) does not blank the list either.
+      expect(statsOf({ ...gpu, at: EPOCH - 3_600_000 }, { ...vm, at: EPOCH + 3_600_000 }, EPOCH, false)).toHaveLength(2);
+      // Through the panel: the state has no clock sample, the page's clock is 30 s past the receipt.
+      const ph = phonesOf(2);
+      ph.tiles[0] = { ...ph.tiles[0]!, gpu, vm_stats: vm };
+      const p = phonesView(input(stateWith(ph), { openId: "phone:1", now: EPOCH + 30_000 })).panel!;
+      expect(p.stats.map((r) => r.key)).toEqual(["gpu-temp", "vm-cpu"]);
+    });
+
+    it("drops readings older than the stale limit, and keeps fresh ones", () => {
+      const srv = EPOCH + 30_000;
+      expect(statsOf({ name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: srv - STATS_STALE_MS + 1 }, null, srv)).toHaveLength(1);
+      expect(statsOf({ name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: srv - STATS_STALE_MS - 1 }, null, srv)).toEqual([]);
+    });
   });
 
   it("offers a free phone to take over", () => {
@@ -583,7 +700,7 @@ describe("taps on the held phone's screen", () => {
     const s = held();
     const v = viewOf(s, { takeover: "video" });
     const box = v.layout!.phones.find((p) => p.id === "phone:1")!.box!;
-    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [{ name: "video", box, yScale: 1 }], note: null });
+    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [{ name: "video", box, yScale: 1 }], note: null, locked: null });
     const both = viewOf(s, { takeover: "both", mirrorPicture: { id: "phone:1", w: 720, h: 1280, banded: true } });
     expect(both.taps!.targets.map((t) => t.name)).toEqual(["video", "mirror"]);
     expect(both.taps!.targets[1]!.box).toEqual(both.mirror!.box);
@@ -601,7 +718,7 @@ describe("taps on the held phone's screen", () => {
 
   it("takes no tap with the browser in front, and says so under the screen", () => {
     const v = viewOf(held({ front: "browser" }));
-    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [], note: TAP_BROWSER_NOTE });
+    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [], note: TAP_BROWSER_NOTE, locked: null });
     expect(TAP_BROWSER_NOTE).toBe("Taps reach the phone only in Robot Park.");
   });
 
@@ -615,8 +732,92 @@ describe("taps on the held phone's screen", () => {
   it("takes no tap on a phone that is restoring, another viewer's, or not opened", () => {
     expect(viewOf(held({ phase: "relaunching" })).taps!.targets).toEqual([]);
     expect(viewOf(held({ phase: "relaunching" })).taps!.note).toBeNull();
-    expect(viewOf(held({ borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-9" } })).taps).toBeNull();
+    expect(viewOf(held({ borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-9" } })).taps!.targets).toEqual([]);
     expect(phonesView(input(held(), { openId: null })).taps).toBeNull();
+  });
+
+  describe("on an opened phone the viewer does not hold", () => {
+    const free = (over: Partial<PhoneTile> = {}, phones: Partial<Phones> = {}) => {
+      const ph = phonesOf(2, phones);
+      ph.tiles[0] = { ...ph.tiles[0]!, actions: WITH_TAP, ...over };
+      return stateWith(ph);
+    };
+    const boxOf = (v: ReturnType<typeof phonesView>) => v.layout!.phones.find((p) => p.id === "phone:1")!.box!;
+
+    it("says under the screen that taps need a take-over, and sends none", () => {
+      const v = viewOf(free());
+      expect(TAP_TAKE_OVER_NOTE).toBe("Take over this phone to tap its screen.");
+      expect(v.taps).toEqual({ tileId: "phone:1", session: null, targets: [], note: TAP_TAKE_OVER_NOTE, locked: { box: boxOf(v), takeable: true } });
+    });
+
+    it("says why it cannot be taken over now, in the panel's own words", () => {
+      // another viewer holds it
+      const lent = viewOf(free({ borrowed: { until: EPOCH + 60_000, viewer: "v-9" } }));
+      if (lent.panel!.borrow.kind !== "lent") throw new Error(lent.panel!.borrow.kind);
+      expect(lent.taps).toMatchObject({ session: null, targets: [], note: lent.panel!.borrow.text, locked: { takeable: false } });
+      expect(lent.taps!.note).toMatch(/^Borrowed by another viewer until /);
+      // it is still restoring
+      const restoring = viewOf(free({ phase: "relaunching" }));
+      expect(restoring.taps).toMatchObject({ note: "It can be borrowed once it has restored.", locked: { takeable: false } });
+      expect(restoring.panel!.borrow).toMatchObject({ kind: "free", note: "It can be borrowed once it has restored." });
+      // every phone that may be lent is lent
+      const full = viewOf(free({}, { borrow: { cap: 2, lent: 2, next_return_at: null } }));
+      expect(full.taps).toMatchObject({ note: "2 of 2 lent now.", locked: { takeable: false } });
+      expect(full.panel!.borrow).toMatchObject({ kind: "free", note: expect.stringMatching(/ 2 of 2 lent now\.$/) });
+      // the viewer holds another phone
+      const ph = phonesOf(2);
+      ph.tiles[0] = { ...ph.tiles[0]!, actions: WITH_TAP };
+      ph.tiles[1] = { ...ph.tiles[1]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
+      expect(viewOf(stateWith(ph)).taps).toMatchObject({ note: "You are using Phone 2. Give it back to take another.", locked: { takeable: false } });
+    });
+
+    it("says the page is reconnecting while the coordinator's connection is down, as the banner does", () => {
+      const v = viewOf(reduce(free(), { type: "socket", status: "closed", at: EPOCH }));
+      expect(v.panel!.borrow).toMatchObject({ kind: "free", button: { disabled: true } });
+      expect(RECONNECTING_NOTE).toBe("Reconnecting to the coordinator.");
+      expect(v.banner).toBe(`${RECONNECTING_NOTE} The picture still streams straight from the phones; the controls are paused until it is back.`);
+      expect(v.taps).toMatchObject({ session: null, targets: [], note: RECONNECTING_NOTE, locked: { takeable: false } });
+    });
+
+    it("promises no taps with the browser in front: it says what a holder is told", () => {
+      const v = viewOf(free({ front: "browser" }));
+      expect(v.taps).toMatchObject({ session: null, targets: [], note: TAP_BROWSER_NOTE, locked: { takeable: true } });
+      // a reason the phone cannot be taken over comes first
+      const lent = viewOf(free({ front: "browser", borrowed: { until: EPOCH + 60_000, viewer: "v-9" } }));
+      expect(lent.taps!.note).toMatch(/^Borrowed by another viewer until /);
+    });
+
+    it("marks the line a click pointed at only while that line and its button stand", () => {
+      const open = viewOf(free()).taps;
+      const ask = askTap(null, open)!;
+      expect(ask).toEqual({ tileId: "phone:1", note: TAP_TAKE_OVER_NOTE, takeable: true, n: 1 });
+      expect(tapAsked(ask, open)).toBe(1);
+      // each further click on the same line counts, so the page restarts its mark
+      expect(askTap(ask, open)!.n).toBe(2);
+      expect(tapAsked(null, open)).toBe(0);
+      // the line says something else, or the phone stopped being takeable: the mark is over
+      const over: [string, ClientState][] = [
+        ["another viewer took it", free({ borrowed: { until: EPOCH + 60_000, viewer: "v-9" } })],
+        ["it restarted", free({ phase: "relaunching" })],
+        ["the last phone was lent", free({}, { borrow: { cap: 2, lent: 2, next_return_at: null } })],
+        ["the connection dropped", reduce(free(), { type: "socket", status: "closed", at: EPOCH })],
+        ["the browser came to the front", free({ front: "browser" })],
+        ["the viewer took it over", free({ borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } })],
+      ];
+      for (const [why, s] of over) expect(tapAsked(ask, viewOf(s).taps), why).toBe(0);
+      expect(tapAsked(ask, phonesView(input(free(), { openId: null })).taps), "closed").toBe(0);
+      expect(tapAsked({ ...ask, tileId: "phone:2" }, open), "another phone").toBe(0);
+      // a click after the change marks the new line, counted from one
+      const lent = viewOf(over[0]![1]).taps;
+      expect(askTap(ask, lent)).toMatchObject({ takeable: false, n: 1 });
+      // a held phone's screen is not locked: nothing to mark
+      expect(askTap(ask, viewOf(over[5]![1]).taps)).toBeNull();
+    });
+
+    it("says nothing about taps on a host that does not list them, or with no phone opened", () => {
+      expect(viewOf(free({ actions: ACTIONS })).taps).toBeNull();
+      expect(phonesView(input(free(), { openId: null })).taps).toBeNull();
+    });
   });
 
   it("tells a viewer about to borrow that taps reach Robot Park", () => {

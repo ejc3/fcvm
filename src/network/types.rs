@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 pub struct NetworkConfig {
     #[serde(default)]
     pub tap_device: String,
+    /// The queue `tap_device` is attached by, open in this process, when the VM runs in a
+    /// pooled namespace: the VMM inherits it and uses the device through it instead of
+    /// attaching by name. A descriptor means something only in the process that holds it,
+    /// so it is never written to a VM's state.
+    #[serde(skip)]
+    pub tap_fd: Option<std::os::fd::RawFd>,
     #[serde(default)]
     pub guest_mac: String,
     #[serde(default)]

@@ -28,6 +28,12 @@ EnvironmentFile=/etc/fcvm-fleet/agent.env
 EnvironmentFile=-/etc/fcvm-fleet/phone.env
 EnvironmentFile=-/etc/fcvm-fleet/windows.env
 ExecStart=/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS $PHONE_AGENT_ARGS $WINDOWS_AGENT_ARGS
+# Potato mode confines its ring to --potato-cpus host CPUs with a cpuset of its own
+# (src/fleet/agent/ring_cpus.rs): the unit's cgroup is delegated, and the agent runs in a
+# subgroup of it so the cpuset controller can be enabled for the ring's cgroup beside it.
+# Without these two lines the agent only counts the ring's machines and says so.
+Delegate=yes
+DelegateSubgroup=agent
 LimitMEMLOCK=infinity
 LimitNOFILE=65536
 Restart=on-failure

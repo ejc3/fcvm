@@ -20,6 +20,8 @@ pub struct Lease {
     connection: AsyncFd<UnixStream>,
     user_namespace: OwnedFd,
     net_namespace: OwnedFd,
+    /// The queue the namespace's TAP is attached by. The VMM inherits it.
+    tap: OwnedFd,
     /// This process's channel to the namespace's holder, for sockets in the namespace.
     pub agent: Arc<netns_agent::Client>,
     pub grant: Grant,
@@ -36,6 +38,12 @@ impl Lease {
     /// ([`crate::utils::NamespaceParams::keep_fds`]).
     pub fn fd(&self) -> RawFd {
         self.connection.get_ref().as_raw_fd()
+    }
+
+    /// The queue of the namespace's TAP, for the VMM to inherit and use the device through
+    /// ([`crate::network::rtnl::add_attached_tap`]).
+    pub fn tap_fd(&self) -> RawFd {
+        self.tap.as_raw_fd()
     }
 
     /// A path that names the namespace's user namespace for as long as this lease is held:
@@ -181,6 +189,7 @@ pub async fn claim_at(socket: &std::path::Path, key: &str) -> Result<Option<Leas
             fds.len()
         );
     }
+    let tap = fds.pop().unwrap();
     let agent = UnixStream::from(fds.pop().unwrap());
     let net_namespace = fds.pop().unwrap();
     let user_namespace = fds.pop().unwrap();
@@ -188,6 +197,7 @@ pub async fn claim_at(socket: &std::path::Path, key: &str) -> Result<Option<Leas
         connection,
         user_namespace,
         net_namespace,
+        tap,
         agent: Arc::new(netns_agent::Client::new(agent).context("registering the holder channel")?),
         grant,
     }))

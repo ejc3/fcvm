@@ -667,6 +667,15 @@ describe("what there is to show, and where", () => {
     expect(minecraftView(input(s0)).empty).toBe("Connecting to the fleet.");
     const v = viewOf(null);
     expect(v.empty).toBe("This fleet runs no Minecraft servers.");
+    // none listed before a GPU host is up says nothing about the fleet (core/view.ts noneListedText)
+    const waking = stateWith(null);
+    const st = waking.accepted!;
+    const noHost = reduce(waking, {
+      type: "message",
+      text: snapshotText(2, { ...st, fleet: { ...st.fleet, hosts: [], power: { ...st.fleet.power, state: "waking", woke_at: EPOCH - 1000 } } }),
+      at: EPOCH,
+    });
+    expect(minecraftView(input(noHost)).empty).toBe("The fleet is waking. The Minecraft servers start when a GPU host is up.");
     expect([v.header, v.cards]).toEqual([null, []]);
   });
 
