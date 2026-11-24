@@ -279,56 +279,6 @@ server took 136, 347 and 444 ms). A fork is `fcvm snapshot create` of a running 
 bots (373, 1331 and 865 ms) and the copy's restore to its first chunk; the source's first bot
 was never disconnected (its login count did not change).
 
-### Servers on one host
-
-How many servers one host runs in the fleet's own shape: each server a VM of 1 vCPU and 1024 MiB
-with its three bots inside it, as `fcvm fleet agent --minecraft N` starts them. Measured
-2026-11-24 on a bare-metal arm64 host (c8g.metal-48xl, 192 vCPUs, 377 GiB), one boot, fcvm and the
-tile image built from main at `ad8c28e8c`, with `fleet/minecraft/bench/hostramp.py` and
-`hostgrow.py`; the records are in `fleet/minecraft/bench/results/2026-11-24-c8g-metal-48xl/`.
-Two things differ from the fleet: networking was bridged (the fleet's is routed), and the store
-was a btrfs image in RAM, so the store's speed bounds nothing here and about 20 GiB of the
-host's memory held it.
-
-- **A step** restores K servers from one gold snapshot (the tile ready, 20 TPS for 10 s, then
-  `snapshot create --stop`) with 16 restores in flight, gives each its own scene (so its bots are
-  reseeded), waits 30 s, then reads every tile's `/health` every 5 s for 60 s. A reading counts
-  only with three bots online and a game time under 3 s old, else it is 0. A step holds when
-  every reading is 19.5 or more.
-
-| servers | lowest reading, TPS | host cores busy (per server) | K restores | one more restore, to ready | anonymous MiB per server after the step |
-|---|---|---|---|---|---|
-| 8 | 19.96 | 1.2 (0.155) | 0.8 s | 345 to 386 ms | 256 |
-| 32 | 19.91 | 4.9 (0.154) | 1.9 s | 376 to 417 ms | 246 |
-| 64 | 19.90 | 10.4 (0.163) | 3.5 s | 413 to 434 ms | 246 |
-| 128 | 19.89 | 22.9 (0.179) | 7.4 s | 461 to 500 ms | 254 |
-| 256 | 19.88 | 48.1 (0.188) | 16.3 s | 645 to 655 ms | 263 |
-| 384 | 19.79 | 74.6 (0.194) | 44.2 s | 764 to 817 ms | 305 |
-| 512 | 19.84 | 98.7 (0.193) | 83.9 s | 812 to 906 ms | 342 |
-| 768 | 19.81 | 153.3 (0.200) | 158.0 s | 1363 to 1824 ms | 374 |
-
-- **Every step held.** 896 was not run: after the 768 step the host had 57 GiB available, and a
-  server grows to 414 MiB (below).
-- **Cores.** With the VMs' cgroup held to 48 cores (`MC_CORES=48`), 192 and 240 servers held
-  (lowest readings 19.88 and 19.86, 42.9 cores busy at 240) and 288 did not (193 of the 288 had a
-  reading under 19.5): between 5.0 and 6.0 servers a core.
-- **Memory against age** (`hostgrow.py`, 64 servers for 31 minutes; a server is reset after 30):
-  anonymous memory per server was 193 MiB after 1 minute, 360 after 3, 399 after 10, 409 after 20
-  and 414 after 30; the cgroup's `memory.current` was 514 MiB per server at 30 minutes, 85 MiB of
-  it page cache. No reading in the 31 minutes was under 19.92. At 768 servers a VMM's resident
-  memory averaged 635 MiB and its proportional share 376 MiB: the rest is the snapshot's memory
-  image, which the servers share.
-- **Without bots** (`MCTILE_BOTS=0`, an empty server; a bot measures the tick rate, so there is
-  none to read): 256 servers used 1.1 cores, 0.004 each, and 85 MiB of anonymous memory each.
-  Bots connected but standing still were not measured.
-- **Start rate.** With 16 restores in flight: 15.7 servers a second up to 256, 8.7 at 384, 6.1 at
-  512, 4.9 at 768. The "one more restore" column is `fcvm snapshot run` to a ready `/health`,
-  polled every 20 ms; at the high counts it includes the harness's own `fcvm ls --json` over every
-  VM.
-- **What bounds that host:** memory first, about 850 servers at 414 MiB each, then cores, about
-  960 at 5.0 a core. The fleet's GPU host (96 vCPUs, 384 GiB, shared with the other modes) was not
-  measured.
-
 ## Stack of PRs
 
 1. This design, `fleet/minecraft` (mctile, the image, its tests) and the density bench.
