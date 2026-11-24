@@ -21,6 +21,7 @@ import { serverNow } from "./clock.ts";
 import type { ClientState, Notice } from "./store.ts";
 import {
   COLORS,
+  noneListedText,
   phaseText,
   REDUCED_MOTION_DARK_FADE_MS,
   sleepView,
@@ -751,7 +752,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
   if (phones === null || s.accepted === null) {
     return {
       ...common,
-      empty: s.accepted === null ? (s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet.") : NO_PHONES,
+      empty: s.accepted === null ? (s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet.") : noneListedText(s.accepted, NO_PHONES, "phones"),
       banner,
       zoom,
       layout: null,
