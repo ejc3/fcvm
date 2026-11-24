@@ -145,7 +145,6 @@ test("the ball moves from tile to tile, and players sleep and wake", async ({ pa
 test("Faster caps the hold a fifth lower, then waits 2 s", async ({ page }) => {
   await startAt(8);
   await openPotato(page);
-  await expect(page.getByTestId("potato-hold")).toHaveText(/^\d+ ms$/);
   const faster = page.getByTestId("potato-faster");
   await expect(faster).toBeEnabled();
   await expect(page.getByTestId("potato-faster-note")).toHaveText(/^cuts the hold to \d+ ms$/);
@@ -154,9 +153,6 @@ test("Faster caps the hold a fifth lower, then waits 2 s", async ({ page }) => {
   await expect.poll(async () => (await mockPotato()).round?.pace_ms ?? null).not.toBeNull();
   const pace = (await mockPotato()).round!.pace_ms!;
   expect(pace).toBeLessThanOrEqual(before - Math.floor(before / 5));
-  await expect(page.getByTestId("potato-pace-cap")).toHaveText(`Faster: holds capped at ${pace} ms`);
-  const shown = Number((await page.getByTestId("potato-hold").textContent())!.replace(" ms", ""));
-  expect(shown).toBeLessThanOrEqual(pace);
   await expect(faster).toBeDisabled();
   await expect(page.getByTestId("potato-faster-note")).toHaveText(/^again in [12] s$/);
   await expect(faster).toBeEnabled({ timeout: 5000 });
@@ -189,9 +185,7 @@ test("a drop: the card names the player and the late stage, the ladder fills in,
   await expect(page.getByTestId("potato-drop-headline")).toHaveText(/^Player [01] was still (asleep|going to sleep|waking)(,| when)/);
   await expect(page.getByTestId("potato-drop-next")).toHaveText(/^Next: a ring of 4 in \d s$/);
   await expect(page.getByTestId("potato-ball")).toHaveAttribute("data-dropped", "true");
-  const row2 = page.getByTestId("potato-rung-2");
-  await expect(row2.getByTestId("potato-rung-record")).toHaveText(/^(\d+ ms|no lap completed)$/);
-  await expect(row2.getByTestId("potato-rung-broke")).toHaveText(/^player [01] still (asleep|going to sleep|waking) \(\d+ ms\), lap \d+ at \d+ ms$/);
+  await expect(page.getByTestId("potato-rung-2")).toContainText("2 machines");
   await expect(page.getByTestId("potato-rung-4")).toHaveAttribute("aria-current", "true");
   await expect(page.getByTestId("potato-record-longest-round")).toContainText(/\d+ catch(es)? a ring of 2/);
   // The ring of 4 starts after the 3 s pause, and the card goes.
@@ -229,7 +223,7 @@ for (const scheme of ["light", "dark"] as const) {
     await page.emulateMedia({ colorScheme: scheme });
     await openPotato(page);
     await expect(tiles(page)).toHaveCount(8);
-    await expect(page.getByTestId("potato-pace")).toBeVisible();
+    await expect(page.getByTestId("potato-density")).toBeVisible();
     // with a player asleep, so its dimmed tile's number is checked too
     await expect(page.locator('[data-testid="potato-tile"][data-phase="asleep"]').first()).toBeAttached({ timeout: 10_000 });
     const bg = await page.getByTestId("potato").evaluate((e) => getComputedStyle(e).backgroundColor);
@@ -258,28 +252,19 @@ test("potato: the line under the title and the What is this? control", async ({ 
   await expectLanding(page, { stage: "potato-stage", phone: true });
 });
 
-test("potato: the legend is on the page with room, in the panel without, and never over the ring or the cards", async ({ page }) => {
+test("potato: the legend is in the panel at any width, and the page has no separate strip", async ({ page }) => {
   await startAt(8);
   await page.setViewportSize({ width: 1280, height: 800 });
   await openPotato(page);
-  const legend = page.getByTestId("potato-legend");
-  await expect(legend).toBeVisible();
-  await expect(legend.getByRole("heading", { name: "Legend" })).toBeVisible();
-  const apart = (a: { x: number; y: number; width: number; height: number }, b: typeof a) => a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1;
-  const lg = (await legend.boundingBox())!;
-  expect(apart(lg, (await page.getByTestId("potato-stage").boundingBox())!), "legend clear of the ring's stage").toBe(true);
-  for (const c of await page.locator(".potato-side > .card").all()) {
-    if ((await c.getAttribute("data-testid")) === "potato-legend") continue;
-    expect(apart(lg, (await c.boundingBox())!), "legend clear of the other cards").toBe(true);
-  }
-  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
-  await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByTestId("potato-legend")).toHaveCount(0);
-  await page.getByTestId("landing-button").click();
-  const inPanel = page.getByTestId("landing-panel").getByTestId("potato-legend");
-  await expect(inPanel).toBeVisible();
-  await expect(inPanel).toContainText("saved as a snapshot; uses no CPU");
-  await expect(inPanel).toContainText("slowest player");
+  for (const size of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(size);
+    await page.getByTestId("landing-button").click();
+    const inPanel = page.getByTestId("landing-panel").getByTestId("potato-legend");
+    await expect(inPanel.getByRole("heading", { name: "Legend" })).toBeVisible();
+    await expect(inPanel).toContainText("saved as a snapshot; uses no CPU");
+    await page.keyboard.press("Escape");
+  }
 });
 
 test("potato: hovering a tile shows its readout beside it, and it leaves with the pointer", async ({ page }) => {
@@ -308,4 +293,113 @@ test("potato: hovering a tile shows its readout beside it, and it leaves with th
   await expect(readout).toBeVisible();
   await tile.blur();
   await expect(readout).toHaveCount(0);
+});
+
+// ---- the density page: a mock host with an allotment of 3 CPUs for its 8 players ----
+
+const CPUS = 3;
+async function startDense(size: number, over: Record<string, number> = {}): Promise<void> {
+  await admin("/mock/potato", { cpus: CPUS, size, next_in_ms: 500, ...over });
+  await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(size);
+}
+type Rect = { x: number; y: number; width: number; height: number };
+const apart = (a: Rect, b: Rect) => a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1;
+
+test("density: the CPU slots hold the machines that are not asleep, grouped and labelled, never more than the allotment", async ({ page }) => {
+  await startDense(8);
+  await openPotato(page);
+  const heading = page.getByTestId("potato-cpus-heading");
+  await expect(heading).toHaveText(/^\d of 3 CPUs in use$/);
+  const slots = page.getByTestId("potato-slot");
+  for (let i = 0; i < 25; i++) {
+    expect(await slots.count(), "chips and free slots add up to the allotment").toBe(CPUS);
+    const groups = await page.locator(".slot-group").evaluateAll((els) => els.map((e) => e.getAttribute("data-group")));
+    const order = ["ball", "ready", "waking", "saving", "free"];
+    expect(groups.map((g) => order.indexOf(g!))).toEqual([...groups].map((g) => order.indexOf(g!)).sort((a, b) => a - b));
+    await page.waitForTimeout(120);
+  }
+  await expect(page.locator(".slot-label").first()).toBeVisible();
+});
+
+test("density: the slots stand in the ring's centre on a large screen, clear of the tiles and the arc", async ({ page }) => {
+  await startDense(8);
+  await page.setViewportSize({ width: 1600, height: 1100 });
+  await openPotato(page);
+  await expect(page.locator(".potato-centre")).toBeVisible();
+  const stage = (await page.getByTestId("potato-stage").boundingBox())!;
+  for (let i = 0; i < 12; i++) {
+    const boxes = await tiles(page).evaluateAll((els) => els.map((e) => e.getBoundingClientRect().toJSON() as Rect));
+    const centre = (await page.locator(".potato-centre").boundingBox())!;
+    for (const t of boxes) expect(apart(centre, t), "the slots clear every tile").toBe(true);
+    expect(centre.x).toBeGreaterThanOrEqual(stage.x);
+    expect(centre.x + centre.width).toBeLessThanOrEqual(stage.x + stage.width);
+    const label = page.getByTestId("potato-arc-label");
+    if (await label.count()) {
+      const l = (await label.boundingBox())!;
+      expect(apart(l, centre), "the arc's label clears the slots").toBe(true);
+      for (const t of boxes) expect(apart(l, t), "the arc's label clears the tiles").toBe(true);
+    }
+    await page.waitForTimeout(150);
+  }
+});
+
+test("density: machines per CPU, the figures, the chart with its limit, and one bar per rung", async ({ page }) => {
+  await startDense(8);
+  await openPotato(page);
+  await expect(page.getByTestId("potato-big")).toHaveText("2.7");
+  await expect(page.getByTestId("potato-machines")).toHaveText("8 machines · 3 CPUs");
+  await expect(page.getByTestId("potato-figure-asleep")).toContainText(/^\d+%asleep$/);
+  // after the first lap: the pace, the chart and its limit line
+  await expect(page.getByTestId("potato-figure-pace")).toContainText("catches / s", { timeout: 30_000 });
+  await expect(page.getByTestId("potato-chart")).toContainText("no CPU for the next wake");
+  await expect(page.getByTestId("potato-chart").getByRole("img")).toHaveAttribute("aria-label", /laps, 3 CPUs is the limit$/);
+  const rungs = page.getByTestId("potato-ladder").locator("li");
+  await expect(rungs).toHaveCount(2);
+  await expect(rungs.nth(0)).toContainText("2 per CPU");
+  await expect(rungs.nth(1)).toContainText("2.7 per CPU");
+  await expect(rungs.nth(1)).toHaveAttribute("aria-current", "true");
+  // the cards sit apart from the ring
+  const side = (await page.locator(".potato-side").boundingBox())!;
+  expect(apart((await page.getByTestId("potato-stage").boundingBox())!, side)).toBe(true);
+});
+
+test("density: a drop outlines the late square with its measured cause", async ({ page }) => {
+  await startDense(8, { slow_wake_ms: 3000 });
+  await openPotato(page);
+  await expect(page.getByTestId("potato-drop")).toBeVisible({ timeout: 40_000 });
+  const late = page.getByTestId("potato-late");
+  await expect(late).toHaveCount(1);
+  await expect(late).toHaveText(/^(\d+ ms late|waited \d+ ms for a CPU|still saving|still waking)$/);
+  await expect(page.locator('[data-testid="potato-tile"][data-late]')).toHaveCount(1);
+  const tile = (await page.locator('[data-testid="potato-tile"][data-late]').boundingBox())!;
+  expect(apart(tile, (await late.boundingBox())!), "the label sits clear of its square").toBe(true);
+});
+
+test("density: on a phone the slots sit under the ring, the cards fit, and nothing scrolls sideways", async ({ browser }) => {
+  await startDense(8);
+  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 });
+  const page = await ctx.newPage();
+  await openPotato(page);
+  await expect(page.getByTestId("potato-cpus")).toBeVisible();
+  await expect(page.locator(".potato-centre")).toHaveCount(0);
+  const stage = (await page.getByTestId("potato-stage").boundingBox())!;
+  expect(apart(stage, (await page.getByTestId("potato-cpus").boundingBox())!), "the slots are under the ring, not on it").toBe(true);
+  await expect(page.getByTestId("potato-density")).toBeVisible();
+  const sideways = await page.evaluate(() => Math.max(document.documentElement.scrollWidth - window.innerWidth, document.querySelector('[data-testid="potato"]')!.scrollWidth - document.querySelector('[data-testid="potato"]')!.clientWidth));
+  expect(sideways).toBeLessThanOrEqual(0);
+  expect(await textProblems(page)).toEqual([]);
+  await ctx.close();
+});
+
+test("density: with no allotment (an old agent) the page shows the ring, the machine count and the ladder, and no CPU figure", async ({ page }) => {
+  await admin("/mock/potato", { cpus: 0, size: 8, next_in_ms: 500 });
+  await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(8);
+  await openPotato(page);
+  await expect(page.getByTestId("potato-big")).toHaveText("8");
+  await expect(page.getByTestId("potato-machines")).toHaveCount(0);
+  await expect(page.getByTestId("potato-cpus")).toHaveCount(0);
+  await expect(page.getByTestId("potato-figure-asleep")).toHaveCount(0);
+  await expect(page.getByTestId("potato-chart")).toHaveCount(0);
+  await expect(page.getByTestId("potato-rung-8")).toContainText("8 machines");
+  await expect(page.locator("body")).not.toContainText(/\b0 (CPUs|machines)\b/);
 });

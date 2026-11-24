@@ -555,6 +555,37 @@ export interface PotatoRound {
   flight: PotatoFlight | null;
   /** The shortest hold of a lap this round completed. */
   best_lap_hold_ms: number | null;
+  /**
+   * What the coordinator and the host agent measure for the density page. Every one is null or
+   * empty when the coordinator or the agent does not send it, and the page then draws nothing for
+   * it (fleet POTATO-FIELDS): catches per second over the last lap, the best of the round,
+   * the completed laps, and the agent's CPU counts.
+   */
+  pace: number | null;
+  best_pace: number | null;
+  laps: PotatoLap[];
+  cpus_in_use: number | null;
+  cpus_peak: number | null;
+  asleep: number | null;
+  lead: number | null;
+  slowest_wake_ms: number | null;
+  cpus_busy: number | null;
+  /** Which machine holds each CPU, as of the latest catch. */
+  cpu_slots: PotatoSlot[] | null;
+}
+
+export interface PotatoLap {
+  lap: number;
+  pace: number;
+  hold_ms: number | null;
+  cpus_peak: number | null;
+  cpus_busy: number | null;
+}
+
+export interface PotatoSlot {
+  player: number;
+  /** `ball`, `ready`, `waking`, `saving` or `booting`. */
+  phase: string;
 }
 
 export interface PotatoPlayer {
@@ -567,6 +598,9 @@ export interface PotatoPlayer {
   since: number;
   last_sleep_ms: number | null;
   last_wake_ms: number | null;
+  /** How long its latest wake waited for a free CPU, and how long before its catch it was ready; null when not sent. */
+  cpu_wait_ms: number | null;
+  ready_margin_ms: number | null;
 }
 
 export interface PotatoDrop {
@@ -588,13 +622,22 @@ export interface PotatoDrop {
   sleep_stages: Record<string, number>;
   wake_stages: Record<string, number>;
   detail: string;
+  /** What was measured: `waking`, `cpu_wait`, `saving` or `proof`; null when none of these. */
+  cause: string | null;
+  /** The cause's measurement, ms (for `waking`, how long after the drop the catcher accepted). */
+  cause_ms: number | null;
+  /** The pace of the last completed lap when the ball dropped. */
+  pace: number | null;
 }
 
 export interface PotatoRung {
   size: number;
-  /** The shortest hold of a lap a round of this size completed, ever. */
+  /** The shortest hold of a lap a round of this size completed, ever (a coordinator before the density page). */
   record_hold_ms: number | null;
   record_at: number | null;
+  /** The fastest pace held for a full lap on `cpus` CPUs, and when. */
+  record_pace: number | null;
+  record_pace_at: number | null;
   /** What ended its latest round. */
   broke: PotatoDrop | null;
   rounds: number;
@@ -620,6 +663,10 @@ export interface Potato {
   colours: number;
   /** The players the potato host runs; 0 while none is connected. */
   capacity: number;
+  /** The CPU allotment the ladder was played under; null when the agent reports none. */
+  cpus: number | null;
+  /** True: a cpuset of exactly `cpus` host CPUs. False: only a cap on machines not asleep. */
+  confined: boolean | null;
 }
 
 export interface FleetState {
@@ -1121,6 +1168,9 @@ function parsePotatoDrop(v: unknown, where: string): PotatoDrop | null {
     sleep_stages: msMap(v["sleep_stages"], `${where}.sleep_stages`),
     wake_stages: msMap(v["wake_stages"], `${where}.wake_stages`),
     detail: strOrNull(v, "detail", where) ?? "",
+    cause: strOrNull(v, "cause", where),
+    cause_ms: numOrNull(v, "cause_ms", where),
+    pace: numOrNull(v, "pace", where),
   };
 }
 
@@ -1166,6 +1216,27 @@ function parsePotatoRound(v: unknown): PotatoRound | null {
     last_catch_at: numOrNull(v, "last_catch_at", w),
     flight,
     best_lap_hold_ms: numOrNull(v, "best_lap_hold_ms", w),
+    pace: numOrNull(v, "pace", w),
+    best_pace: numOrNull(v, "best_pace", w),
+    laps: v["laps"] === undefined || v["laps"] === null ? [] : arr(v, "laps", w).map((l, i) => {
+      const at = `${w}.laps[${i}]`;
+      if (!isObj(l)) throw new ProtocolError(`${at} is not an object`);
+      return { lap: num(l, "lap", at), pace: num(l, "pace", at), hold_ms: numOrNull(l, "hold_ms", at), cpus_peak: numOrNull(l, "cpus_peak", at), cpus_busy: numOrNull(l, "cpus_busy", at) };
+    }),
+    cpus_in_use: numOrNull(v, "cpus_in_use", w),
+    cpus_peak: numOrNull(v, "cpus_peak", w),
+    asleep: numOrNull(v, "asleep", w),
+    lead: numOrNull(v, "lead", w),
+    slowest_wake_ms: numOrNull(v, "slowest_wake_ms", w),
+    cpus_busy: numOrNull(v, "cpus_busy", w),
+    cpu_slots:
+      v["cpu_slots"] === undefined || v["cpu_slots"] === null
+        ? null
+        : arr(v, "cpu_slots", w).map((x, i) => {
+            const at = `${w}.cpu_slots[${i}]`;
+            if (!isObj(x)) throw new ProtocolError(`${at} is not an object`);
+            return { player: num(x, "player", at), phase: str(x, "phase", at) };
+          }),
   };
 }
 
@@ -1182,6 +1253,8 @@ function parsePotato(v: unknown): Potato | null {
       size: num(r, "size", at),
       record_hold_ms: numOrNull(r, "record_hold_ms", at),
       record_at: numOrNull(r, "record_at", at),
+      record_pace: numOrNull(r, "record_pace", at),
+      record_pace_at: numOrNull(r, "record_pace_at", at),
       broke: parsePotatoDrop(r["broke"], `${at}.broke`),
       rounds: numOrNull(r, "rounds", at) ?? 0,
     };
@@ -1197,6 +1270,8 @@ function parsePotato(v: unknown): Potato | null {
       since: num(p, "since", at),
       last_sleep_ms: numOrNull(p, "last_sleep_ms", at),
       last_wake_ms: numOrNull(p, "last_wake_ms", at),
+      cpu_wait_ms: numOrNull(p, "cpu_wait_ms", at),
+      ready_margin_ms: numOrNull(p, "ready_margin_ms", at),
     };
   });
   const rec = isObj(v["records"]) ? v["records"] : {};
@@ -1213,6 +1288,8 @@ function parsePotato(v: unknown): Potato | null {
     next_round_at: numOrNull(v, "next_round_at", w),
     colours,
     capacity: numOrNull(v, "capacity", w) ?? 0,
+    cpus: numOrNull(v, "cpus", w),
+    confined: v["confined"] === true ? true : v["confined"] === false ? false : null,
   };
 }
 

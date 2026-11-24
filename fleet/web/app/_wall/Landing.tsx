@@ -9,21 +9,6 @@ import "./landing.css";
 
 /** A legend mark, drawn with the Potato tiles' own phase styles. */
 function Mark({ m, colour }: { m: LegendEntry["mark"]; colour: string }) {
-  if (m.kind === "hold-bar") {
-    return (
-      <span className="lg-meter" aria-hidden="true">
-        <span className="fill" style={{ width: "62%" }} />
-      </span>
-    );
-  }
-  if (m.kind === "hold-tick") {
-    return (
-      <span className="lg-meter" aria-hidden="true">
-        <span className="fill" style={{ width: "62%" }} />
-        <span className="need" style={{ left: "80%" }} />
-      </span>
-    );
-  }
   return (
     <span className="potato-swatch" data-phase={m.phase} data-holder={m.holder ? "true" : undefined} style={{ ["--c" as string]: colour } as CSSProperties} aria-hidden="true">
       {m.wake !== undefined ? (
@@ -45,62 +30,31 @@ function Label({ e }: { e: LegendEntry }) {
   );
 }
 
-/** The legend: a strip cut from the ring and a small diagram of the Hold meter, or the same entries as a list. */
-export function PotatoLegend({ legend, form, colour, id }: { legend: NonNullable<LandingView["legend"]>; form: "strip" | "list"; colour: string; id?: string }) {
+/** The legend as a list, for the "What is this?" panel: the phases' tints and what a colour step means. */
+export function PotatoLegend({ legend, colour, id }: { legend: NonNullable<LandingView["legend"]>; colour: string; id?: string }) {
   const h = useId();
-  if (form === "list") {
-    return (
-      <section className="lg lg-list" aria-labelledby={h} data-testid="potato-legend" id={id}>
-        <h2 id={h}>{legend.title}</h2>
-        <ul>
-          {[...legend.strip, ...legend.hold].map((e) => (
-            <li key={e.key}>
-              <Mark m={e.mark} colour={colour} />
-              <span className="lg-text">
-                <Label e={e} />
-              </span>
-            </li>
-          ))}
-          <li>
-            <span className="lg-text">{legend.catchNote}</span>
-          </li>
-        </ul>
-      </section>
-    );
-  }
   return (
-    <section className="card lg lg-strip" aria-labelledby={h} data-testid="potato-legend" id={id}>
+    <section className="lg lg-list" aria-labelledby={h} data-testid="potato-legend" id={id}>
       <h2 id={h}>{legend.title}</h2>
-      <ol className="lg-row lg-ring">
+      <ul>
         {legend.strip.map((e) => (
           <li key={e.key}>
             <Mark m={e.mark} colour={colour} />
-            {e.label !== null ? <span className="lg-label">{e.label}</span> : <span className="sr-only">{e.sr}</span>}
+            <span className="lg-text">
+              <Label e={e} />
+            </span>
           </li>
         ))}
-      </ol>
-      {legend.strip
-        .filter((e) => e.detail)
-        .map((e) => (
-          <p key={e.key} className="lg-note">
-            {e.label}: {e.detail}
-          </p>
-        ))}
-      <p className="lg-note">{legend.catchNote}</p>
-      <ol className="lg-row lg-hold">
-        {legend.hold.map((e) => (
-          <li key={e.key}>
-            <Mark m={e.mark} colour={colour} />
-            <Label e={e} />
-          </li>
-        ))}
-      </ol>
+        <li>
+          <span className="lg-text">{legend.catchNote}</span>
+        </li>
+      </ul>
     </section>
   );
 }
 
 /** The page's line, and the "What is this?" button with its panel (a popover on a wide screen, a bottom sheet on a phone). */
-export function Landing({ landing, legendInPanel, colour, children }: { landing: LandingView; legendInPanel?: boolean; colour: string; children?: ReactNode }) {
+export function Landing({ landing, colour, children }: { landing: LandingView; colour: string; children?: ReactNode }) {
   const [open, setOpen] = useState(false);
   const [clamped, setClamped] = useState(false);
   const lineRef = useRef<HTMLParagraphElement | null>(null);
@@ -155,7 +109,7 @@ export function Landing({ landing, legendInPanel, colour, children }: { landing:
           {text.map((t) => (
             <p key={t}>{t}</p>
           ))}
-          {legendInPanel && landing.legend ? <PotatoLegend legend={landing.legend} form="list" colour={colour} /> : null}
+          {landing.legend ? <PotatoLegend legend={landing.legend} colour={colour} /> : null}
         </div>
       ) : null}
       {children}

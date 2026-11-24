@@ -97,6 +97,8 @@ export interface RingTile {
   /** While it wakes: how far, against its last wake, and the milliseconds so far. */
   wake: { fraction: number; text: string } | null;
   holder: boolean;
+  /** On a drop, the catcher that was not ready: "84 ms late", "waited 131 ms for a CPU", "still saving", "proof failed". */
+  late: string | null;
   /** What hovering, focusing or long-pressing the tile shows; the aria label is these two joined. */
   readout: { head: string; detail: string };
   ariaLabel: string;
@@ -118,6 +120,10 @@ export interface RingView {
   /** One line over the ring. */
   caption: string;
   ariaLabel: string;
+  /** From the ball to the furthest machine being woken, drawn inside the ring. */
+  arc: { centre: Point; radius: number; from: Point; to: Point; large: boolean; labelAt: Point; label: string; ahead: number } | null;
+  /** This round just set the ring's record: the track flashes once. */
+  flash: boolean;
 }
 
 function playerOf(p: Potato, n: number): PotatoPlayer | null {
@@ -174,6 +180,7 @@ function tileOf(p: Potato, n: number, box: Box, now: number, holder: boolean): R
     line: box.w >= LINE_MIN_TILE ? line : null,
     wake,
     holder,
+    late: null,
     readout,
     ariaLabel: `${readout.head}. ${readout.detail}`,
   };
@@ -285,6 +292,24 @@ function ringOf(p: Potato, area: Box | null, now: number, reducedMotion: boolean
       ball = { at: { x: g.centre.x + (c.x - g.centre.x) * 0.25, y: g.centre.y + (c.y - g.centre.y) * 0.25 }, size: ballSize(g), flying: false, dropped: true };
     }
   }
+  if (drop && drop.player !== null) {
+    const late = causeOf(drop)?.tile ?? null;
+    const t = tiles.find((x) => x.player === drop.player);
+    if (t) t.late = late;
+  }
+  let arc: RingView["arc"] = null;
+  const a = r ? arcOf(r, p) : null;
+  if (a) {
+    // along the ring, clockwise, just inside the tiles: it never crosses the slots in the centre
+    const n = players.length;
+    const rho = Math.max(0, g.radius - g.tile * 0.75 - 6);
+    const a0 = -Math.PI / 2 + (2 * Math.PI * a.fromIndex) / n;
+    const sweep = (2 * Math.PI * a.ahead) / n;
+    const at = (ang: number, rad: number) => ({ x: g.centre.x + rad * Math.cos(ang), y: g.centre.y + rad * Math.sin(ang) });
+    arc = { centre: g.centre, radius: rho, from: at(a0, rho), to: at(a0 + sweep, rho), large: sweep > Math.PI, labelAt: at(a0 + sweep / 2, rho - 14), label: a.label, ahead: a.ahead };
+  }
+  const ladderRung = r ? p.ladder.find((x) => x.size === r.size) : undefined;
+  const flash = r !== null && ladderRung?.record_pace_at != null && now - ladderRung.record_pace_at < 2500 && ladderRung.record_pace_at >= r.started_at;
   const caption = r
     ? r.seq === null
       ? `Ring of ${r.size}: waiting for the first catch`
@@ -292,82 +317,230 @@ function ringOf(p: Potato, area: Box | null, now: number, reducedMotion: boolean
     : drop
       ? `Ring of ${drop.size}: the ball dropped`
       : `Next: a ring of ${players.length}`;
-  return { geometry: g, tiles, ball, caption, ariaLabel: `${caption}. ${plural(players.length, "player", "players")} on a circle.` };
+  return { geometry: g, tiles, ball, arc, flash, caption, ariaLabel: `${caption}. ${plural(players.length, "player", "players")} on a circle.` };
 }
 
-// ---- the pace --------------------------------------------------------------------
+// ---- the density: CPU slots, the figures, the chart and the ladder ----------------------
 
-export interface PaceView {
-  hold: string;
-  /** "Lap 2 · ring of 4 · catch 7". */
-  where: string;
-  /** The meter: the time each player has to sleep and wake, against the slowest sleep and wake in the ring. */
-  meter: {
-    /** 0 to 1 of the track. */
-    turnaround: number;
-    need: number | null;
-    turnaroundText: string;
-    needText: string | null;
-    /** The slowest player needs more than it has: the next lap can drop the ball. */
-    short: boolean;
-  };
-  /** "Faster: holds capped at 479 ms", or null. */
-  pace: string | null;
-  start: string;
+/** A duration for the new figures: milliseconds, then seconds from one second up. */
+export function fmtMs(v: number): string {
+  return v >= 1000 ? `${(Math.round(v / 10) / 100).toFixed(2)} s` : `${Math.round(v)} ms`;
+}
+const oneDecimal = (v: number) => (Math.round(v * 10) / 10).toFixed(1);
+/** Machines per CPU: a whole number plain, else one decimal. */
+export function perCpu(machines: number, cpus: number): string {
+  const q = Math.round((machines / cpus) * 10) / 10;
+  return Number.isInteger(q) ? String(q) : q.toFixed(1);
 }
 
-/** The slowest last sleep plus last wake among the ring's players, or null before any has done both. */
-export function slowestCycleMs(p: Potato, ring: readonly number[]): number | null {
-  let worst: number | null = null;
-  for (const n of ring) {
-    const pl = playerOf(p, n);
-    if (pl === null || pl.last_sleep_ms === null || pl.last_wake_ms === null) continue;
-    const c = pl.last_sleep_ms + pl.last_wake_ms;
-    if (worst === null || c > worst) worst = c;
+export type SlotGroupKey = "ball" | "ready" | "waking" | "saving" | "free";
+export const SLOT_GROUP_LABEL: Record<SlotGroupKey, string> = { ball: "ball", ready: "ready", waking: "waking", saving: "saving", free: "free" };
+const SLOT_ORDER: SlotGroupKey[] = ["ball", "ready", "waking", "saving", "free"];
+
+export interface SlotView {
+  /** The machine holding this CPU; null for a free one. */
+  player: number | null;
+  colour: string | null;
+  number: string | null;
+}
+export interface SlotGroupView {
+  key: SlotGroupKey;
+  label: string;
+  slots: SlotView[];
+}
+export interface CpuSlotsView {
+  /** "6 of 8 CPUs in use"; "CPU slots" when the agent only caps the count. */
+  heading: string;
+  groups: SlotGroupView[];
+  /** "26 of 32 asleep", when the coordinator says. */
+  asleep: string | null;
+}
+
+/** Which group a machine's CPU is in: from the agent's slot list when it sends one, else from the players' phases. */
+function slotGroups(p: Potato, r: PotatoRound): { key: SlotGroupKey; player: number }[] {
+  if (r.cpu_slots !== null) {
+    return r.cpu_slots.map((x) => ({ key: x.phase === "ball" ? "ball" : x.phase === "ready" ? "ready" : x.phase === "saving" ? "saving" : "waking", player: x.player }));
   }
-  return worst;
+  const out: { key: SlotGroupKey; player: number }[] = [];
+  for (const n of r.ring) {
+    const pl = playerOf(p, n);
+    if (pl === null) continue;
+    if (pl.phase === "sleeping") out.push({ key: "saving", player: n });
+    else if (pl.phase === "waking") out.push({ key: "waking", player: n });
+    else if (pl.phase === "awake") out.push({ key: n === r.holder ? "ball" : "ready", player: n });
+  }
+  return out;
 }
 
-export function paceOf(p: Potato, r: PotatoRound): PaceView {
-  const need = slowestCycleMs(p, r.ring);
-  const scale = Math.max(1, r.turnaround_ms, need ?? 0) * 1.15;
-  const holds = r.size - 1;
+/** The K CPUs as slots, each holding the chip of the machine that holds it. Null without an allotment. */
+export function cpuSlotsOf(p: Potato, r: PotatoRound): CpuSlotsView | null {
+  const k = p.cpus;
+  if (k === null || k <= 0) return null;
+  const held = slotGroups(p, r);
+  const by = new Map<SlotGroupKey, SlotView[]>();
+  for (const h of held) {
+    const pl = playerOf(p, h.player);
+    const list = by.get(h.key) ?? [];
+    list.push({ player: h.player, colour: potatoColour(pl?.colour ?? 0, p.colours), number: String(h.player) });
+    by.set(h.key, list);
+  }
+  const free = Math.max(0, k - held.length);
+  by.set("free", Array.from({ length: free }, () => ({ player: null, colour: null, number: null })));
+  const noun = p.confined === false ? "CPU slots" : "CPUs";
+  const groups = SLOT_ORDER.map((key) => ({ key, label: SLOT_GROUP_LABEL[key], slots: by.get(key) ?? [] })).filter((g) => g.slots.length > 0);
   return {
-    hold: ms(r.hold_ms),
-    where: [`Lap ${r.lap + 1}`, `ring of ${r.size}`, r.seq === null ? "no catch yet" : `catch ${r.seq + 1}`].join(" · "),
-    meter: {
-      turnaround: r.turnaround_ms / scale,
-      need: need === null ? null : need / scale,
-      turnaroundText: `${ms(r.turnaround_ms)} for each player to sleep and wake (${plural(holds, "hold", "holds")})`,
-      needText: need === null ? null : `slowest sleep and wake in the ring: ${ms(need)}`,
-      short: need !== null && need > r.turnaround_ms,
-    },
-    pace: r.pace_ms === null ? null : `Faster: holds capped at ${ms(r.pace_ms)}`,
-    start: `Started at ${ms(r.start_hold_ms)}, a tenth shorter each lap; floor ${ms(r.min_hold_ms)}`,
+    heading: `${held.length} of ${k} ${noun} in use`,
+    groups,
+    asleep: r.asleep === null ? null : `${r.asleep} of ${r.size} asleep`,
+  };
+}
+
+export interface ArcView {
+  /** The ball's tile and the furthest machine being woken, as ring places (indices into the ring's tiles). */
+  fromIndex: number;
+  toIndex: number;
+  /** "woken 4 ahead". */
+  label: string;
+  ahead: number;
+}
+
+/** From the ball to the furthest machine ahead of it that is being woken. Null with no ball or nobody waking. */
+export function arcOf(r: PotatoRound, p: Potato): ArcView | null {
+  if (r.holder === null) return null;
+  const n = r.ring.length;
+  const at = r.ring.indexOf(r.holder);
+  if (at < 0 || n < 2) return null;
+  let far = 0;
+  let to = -1;
+  for (let i = 0; i < n; i++) {
+    const pl = playerOf(p, r.ring[i]!);
+    if (pl === null || pl.phase !== "waking") continue;
+    const d = (i - at + n) % n;
+    if (d > far) {
+      far = d;
+      to = i;
+    }
+  }
+  if (to < 0) return null;
+  return { fromIndex: at, toIndex: to, label: `woken ${far} ahead`, ahead: far };
+}
+
+export interface DensityFigure {
+  key: "asleep" | "pace" | "slowest";
+  value: string;
+  label: string;
+}
+export interface DensityView {
+  /** "Machines per CPU", or "Machines" without an allotment. */
+  heading: string;
+  /** The large figure: machines per CPU, or the machine count without an allotment. */
+  big: string;
+  /** "32 machines · 8 CPUs"; empty without an allotment. */
+  machines: string;
+  where: string;
+  figures: DensityFigure[];
+  /** This round holds the fastest pace the ring has held at its size. */
+  record: boolean;
+}
+
+export function densityOf(p: Potato, r: PotatoRound): DensityView {
+  const k = p.cpus !== null && p.cpus > 0 ? p.cpus : null;
+  const noun = p.confined === false ? "CPU slots" : "CPUs";
+  const figures: DensityFigure[] = [];
+  if (r.asleep !== null) figures.push({ key: "asleep", value: `${Math.round((r.asleep / r.size) * 100)}%`, label: "asleep" });
+  if (r.pace !== null) figures.push({ key: "pace", value: oneDecimal(r.pace), label: "catches / s" });
+  if (r.slowest_wake_ms !== null) figures.push({ key: "slowest", value: fmtMs(r.slowest_wake_ms), label: "slowest wake" });
+  const rung = p.ladder.find((g) => g.size === r.size);
+  return {
+    heading: k === null ? "Machines" : p.confined === false ? "Machines per CPU slot" : "Machines per CPU",
+    big: k === null ? String(r.size) : perCpu(r.size, k),
+    machines: k === null ? "" : `${r.size} machines · ${k} ${noun}`,
+    where: [`ring of ${r.size}`, `lap ${r.lap + 1}`].join(" · "),
+    figures,
+    record: rung?.record_pace_at != null && rung.record_pace_at >= r.started_at,
+  };
+}
+
+export interface ChartPoint {
+  pace: number;
+  cpus: number;
+}
+export interface ChartView {
+  title: string;
+  /** One point per completed lap of this round, oldest first. */
+  points: ChartPoint[];
+  /** Where the round is now, when the agent and the coordinator both say. */
+  now: ChartPoint | null;
+  /** The axes' ends: pace from 0, CPUs from 0 to the allotment. */
+  paceMax: number;
+  cpusMax: number;
+  k: number;
+  kLabel: string;
+  noun: string;
+}
+
+/** CPUs in use against pace over this round's laps, with the allotment as the line the machines cannot pass. */
+export function chartOf(p: Potato, r: PotatoRound): ChartView | null {
+  const k = p.cpus;
+  if (k === null || k <= 0) return null;
+  const points = r.laps.filter((l) => l.cpus_peak !== null).map((l) => ({ pace: l.pace, cpus: l.cpus_peak! }));
+  if (points.length === 0) return null;
+  const now = r.pace !== null && r.cpus_in_use !== null ? { pace: r.pace, cpus: r.cpus_in_use } : null;
+  const top = Math.max(...points.map((x) => x.pace), now?.pace ?? 0);
+  return {
+    title: "CPUs in use as the pace rises",
+    points,
+    now,
+    paceMax: Math.max(1, Math.ceil(top * 1.15)),
+    cpusMax: k,
+    k,
+    kLabel: "no CPU for the next wake",
+    noun: p.confined === false ? "CPU slots" : "CPUs",
+  };
+}
+
+export interface LadderBar {
+  size: number;
+  /** "4 per CPU", or "32 machines" without an allotment. */
+  label: string;
+  /** The fastest pace held, as text; "none yet" before a lap completes. */
+  value: string;
+  /** 0 to 1 of the longest bar; null without a pace to draw. */
+  length: number | null;
+  current: boolean;
+  /** Larger than the host runs: skipped. */
+  skipped: boolean;
+}
+export interface LadderBarsView {
+  title: string;
+  unit: string;
+  rows: LadderBar[];
+}
+
+/** One bar per rung: its length is the fastest pace held on that ring. */
+export function ladderBarsOf(p: Potato): LadderBarsView {
+  const k = p.cpus !== null && p.cpus > 0 ? p.cpus : null;
+  const top = Math.max(0, ...p.ladder.map((g) => g.record_pace ?? 0));
+  return {
+    title: k === null ? "Fastest pace held" : `Fastest pace held on ${k} ${p.confined === false ? "CPU slots" : "CPUs"}`,
+    unit: "catches / s",
+    rows: p.ladder.map((g) => {
+      const skipped = p.capacity > 0 && g.size > p.capacity;
+      const pace = g.record_pace;
+      const hold = pace === null && g.record_hold_ms !== null ? g.record_hold_ms : null;
+      return {
+        size: g.size,
+        label: k === null ? `${g.size} machines` : `${perCpu(g.size, k)} per CPU`,
+        value: pace !== null ? oneDecimal(pace) : hold !== null ? `${fmtMs(hold)} hold` : skipped ? "skipped" : "none yet",
+        length: pace !== null && top > 0 ? pace / top : null,
+        current: g.size === p.size,
+        skipped,
+      };
+    }),
   };
 }
 
 // ---- drops, the ladder and the records ---------------------------------------------
-
-const STAGE_WORD: Record<string, string> = { asleep: "asleep", sleeping: "going to sleep", waking: "waking" };
-
-/** What ended a round, in a short phrase for the ladder: "player 1 still waking (90 ms)". */
-export function brokeText(d: PotatoDrop): string {
-  const who = d.player === null ? "a player" : `player ${d.player}`;
-  switch (d.reason) {
-    case "not_listening":
-      return `${who} still ${STAGE_WORD[d.stage] ?? d.stage} (${ms(d.stage_ms)})`;
-    case "proof":
-      return `${who}'s proof did not match`;
-    case "deadline":
-      return "no catch reported in time";
-    case "host_gone":
-      return "the host disconnected";
-    default:
-      if (d.reason.endsWith("_failed")) return `${who}'s ${d.reason.slice(0, -"_failed".length)} failed`;
-      return d.reason.replace(/_/g, " ");
-  }
-}
 
 /** The drop in a sentence: which player, the late stage and its milliseconds. */
 export function dropHeadline(d: PotatoDrop): string {
@@ -403,11 +576,34 @@ function stagesText(stages: Record<string, number>): string {
     .join(", ");
 }
 
+/** What a drop measured, in the words of the ring's tile, the card's big figure and its line. Null when the reason names no measured cause. */
+export function causeOf(d: PotatoDrop): { tile: string; line: string; big: { value: string; word: string } | null } | null {
+  switch (d.cause) {
+    case "waking":
+      return d.cause_ms === null
+        ? { tile: "still waking", line: "Still waking when the ball arrived.", big: null }
+        : { tile: `${fmtMs(d.cause_ms)} late`, line: `Still waking when the ball arrived; it accepted ${fmtMs(d.cause_ms)} later.`, big: { value: fmtMs(d.cause_ms), word: "late" } };
+    case "cpu_wait":
+      return d.cause_ms === null
+        ? { tile: "waiting for a CPU", line: "Its wake was waiting for a CPU.", big: null }
+        : { tile: `waited ${fmtMs(d.cause_ms)} for a CPU`, line: `Its wake had waited ${fmtMs(d.cause_ms)} for a CPU.`, big: { value: fmtMs(d.cause_ms), word: "waiting for a CPU" } };
+    case "saving":
+      return d.cause_ms === null
+        ? { tile: "still saving", line: "Still saving when the ball arrived.", big: null }
+        : { tile: "still saving", line: `Still saving, ${fmtMs(d.cause_ms)} in, when the ball arrived.`, big: null };
+    case "proof":
+      return { tile: "proof failed", line: "Its colour, count or chain was not the step of its last catch.", big: null };
+    default:
+      return null;
+  }
+}
+
 export interface DropCard {
   title: string;
+  /** The measured cause when there is one, else the reason in a sentence. */
   headline: string;
-  /** "It started accepting 84 ms after the ball dropped.", when the agent reported it. */
-  listening: string | null;
+  /** "84 ms" and "late", when the cause has a figure. */
+  big: { value: string; word: string } | null;
   context: string;
   stages: string[];
   next: string;
@@ -419,51 +615,15 @@ export function dropCard(p: Potato, d: PotatoDrop, now: number): DropCard {
   if (Object.keys(d.sleep_stages).length > 0) stages.push(`Its last sleep: ${stagesText(d.sleep_stages)}`);
   if (Object.keys(d.wake_stages).length > 0) stages.push(`Its last wake: ${stagesText(d.wake_stages)}`);
   const next = p.size ?? d.size;
+  const cause = causeOf(d);
   return {
     title: "The ball dropped",
-    headline: dropHeadline(d),
-    listening: d.listening_after_ms === null ? null : `It started accepting ${ms(d.listening_after_ms)} after the ball dropped.`,
-    context: `Ring of ${d.size}, lap ${d.lap + 1}, at a hold of ${ms(d.hold_ms)}, after ${plural(d.seq, "catch", "catches")}.`,
+    headline: cause?.line ?? dropHeadline(d),
+    big: cause?.big ?? null,
+    context: [`Ring of ${d.size}`, `lap ${d.lap + 1}`, d.pace === null ? null : `${oneDecimal(d.pace)} catches / s`].filter((x) => x !== null).join(" · "),
     stages,
     next: p.next_round_at === null ? "" : `Next: a ring of ${next} in ${seconds(p.next_round_at - now)}`,
     detail: d.detail,
-  };
-}
-
-export interface LadderRow {
-  size: number;
-  players: string;
-  record: string;
-  broke: string;
-  rounds: string;
-  /** The size being played, or the next. */
-  current: boolean;
-  /** Larger than the host runs: skipped. */
-  skipped: boolean;
-}
-
-export interface LadderView {
-  caption: string;
-  head: { players: string; record: string; broke: string; rounds: string };
-  rows: LadderRow[];
-}
-
-export function ladderOf(p: Potato): LadderView {
-  return {
-    caption: "Ring sizes, smallest first. A record is the shortest hold of a lap that completed.",
-    head: { players: "Ring", record: "Record hold", broke: "What ended its last round", rounds: "Rounds" },
-    rows: p.ladder.map((g) => {
-      const skipped = p.capacity > 0 && g.size > p.capacity;
-      return {
-        size: g.size,
-        players: String(g.size),
-        record: g.record_hold_ms === null ? (g.rounds > 0 ? "no lap completed" : "--") : ms(g.record_hold_ms),
-        broke: g.broke ? `${brokeText(g.broke)}, lap ${g.broke.lap + 1} at ${ms(g.broke.hold_ms)}` : skipped ? `skipped: the host runs ${p.capacity} players` : "",
-        rounds: String(g.rounds),
-        current: g.size === p.size,
-        skipped,
-      };
-    }),
   };
 }
 
@@ -570,9 +730,11 @@ export interface PotatoView {
   empty: string | null;
   banner: string | null;
   ring: RingView | null;
-  pace: PaceView | null;
+  density: DensityView | null;
+  cpuSlots: CpuSlotsView | null;
+  chart: ChartView | null;
   drop: DropCard | null;
-  ladder: LadderView | null;
+  ladder: LadderBarsView | null;
   records: RecordRow[];
   faster: PotatoButton;
   restart: PotatoButton;
@@ -601,7 +763,9 @@ export function potatoView(inp: PotatoInput): PotatoView {
       ...common,
       empty: s.accepted === null ? (s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet.") : NO_POTATO,
       ring: null,
-      pace: null,
+      density: null,
+      cpuSlots: null,
+      chart: null,
       drop: null,
       ladder: null,
       records: [],
@@ -614,9 +778,11 @@ export function potatoView(inp: PotatoInput): PotatoView {
     ...common,
     empty: p.round === null && p.capacity === 0 ? NO_HOST : null,
     ring: ringOf(p, inp.stage, now, inp.reducedMotion),
-    pace: p.round ? paceOf(p, p.round) : null,
+    density: p.round ? densityOf(p, p.round) : null,
+    cpuSlots: p.round ? cpuSlotsOf(p, p.round) : null,
+    chart: p.round ? chartOf(p, p.round) : null,
     drop,
-    ladder: ladderOf(p),
+    ladder: ladderBarsOf(p),
     records: recordsOf(p),
     faster: potatoFasterButton(s, p, now),
     restart: potatoRestartButton(s, p, now),

@@ -5,15 +5,20 @@ import {
   arcPoint,
   ballAnchor,
   ballOf,
-  brokeText,
+  causeOf,
+  chartOf,
+  cpuSlotsOf,
+  densityOf,
+  arcOf,
+  fmtMs,
+  ladderBarsOf,
+  perCpu,
   dropCard,
   dropHeadline,
-  ladderOf,
   LINE_MIN_TILE,
   MAX_TILE,
   NO_HOST,
   NO_POTATO,
-  paceOf,
   potatoColour,
   potatoFasterButton,
   potatoHue,
@@ -48,6 +53,9 @@ const BROKE: PotatoDrop = {
   round: 7,
   size: 2,
   detail: "player 1 was waking when player 0 threw (1 tries in 100 ms: connection timed out)",
+  cause: null,
+  cause_ms: null,
+  pace: null,
 };
 
 function round(over: Partial<PotatoRound> = {}): PotatoRound {
@@ -68,6 +76,16 @@ function round(over: Partial<PotatoRound> = {}): PotatoRound {
     last_catch_at: T - 900,
     flight: { from: 2, to: 3, at: T - 300 },
     best_lap_hold_ms: 666,
+    pace: null,
+    best_pace: null,
+    laps: [],
+    cpus_in_use: null,
+    cpus_peak: null,
+    asleep: null,
+    lead: null,
+    slowest_wake_ms: null,
+    cpus_busy: null,
+    cpu_slots: null,
     ...over,
   };
 }
@@ -77,18 +95,20 @@ function potato(over: Partial<Potato> = {}): Potato {
     size: 4,
     colours: 12,
     capacity: 96,
+    cpus: null,
+    confined: null,
     next_round_at: null,
     ladder: [
-      { size: 2, record_hold_ms: 1458, record_at: T - 30_000, rounds: 3, broke: BROKE },
-      { size: 4, record_hold_ms: null, record_at: null, broke: null, rounds: 0 },
-      { size: 8, record_hold_ms: null, record_at: null, broke: null, rounds: 0 },
+      { size: 2, record_hold_ms: 1458, record_at: T - 30_000, record_pace: null, record_pace_at: null, rounds: 3, broke: BROKE },
+      { size: 4, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+      { size: 8, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
     ],
     round: round(),
     players: [
-      { player: 0, colour: 5, counter: 31, phase: "asleep", since: T - 600, last_sleep_ms: 330.1, last_wake_ms: 355.3 },
-      { player: 1, colour: 6, counter: 30, phase: "waking", since: T - 200, last_sleep_ms: 340, last_wake_ms: 400 },
-      { player: 2, colour: 7, counter: 31, phase: "awake", since: T - 5000, last_sleep_ms: 300, last_wake_ms: 360 },
-      { player: 3, colour: 11, counter: 30, phase: "failed", since: T - 50, last_sleep_ms: null, last_wake_ms: null },
+      { player: 0, colour: 5, counter: 31, phase: "asleep", since: T - 600, last_sleep_ms: 330.1, last_wake_ms: 355.3, cpu_wait_ms: null, ready_margin_ms: null },
+      { player: 1, colour: 6, counter: 30, phase: "waking", since: T - 200, last_sleep_ms: 340, last_wake_ms: 400, cpu_wait_ms: null, ready_margin_ms: null },
+      { player: 2, colour: 7, counter: 31, phase: "awake", since: T - 5000, last_sleep_ms: 300, last_wake_ms: 360, cpu_wait_ms: null, ready_margin_ms: null },
+      { player: 3, colour: 11, counter: 30, phase: "failed", since: T - 50, last_sleep_ms: null, last_wake_ms: null, cpu_wait_ms: null, ready_margin_ms: null },
     ],
     records: {
       fastest_cycle_ms: { value: 650.0, size: 2, player: 0, at: T - 30_000 },
@@ -138,6 +158,17 @@ describe("potato in the snapshot", () => {
   it("reads PROTOCOL.md's example with a round in play", () => {
     const st = parse({ ...raw.views["01_intent_idempotency"], potato: potato() });
     expect(st.potato).toEqual(potato());
+  });
+
+  it("reads the density fields when the coordinator sends them, and nulls when it does not", () => {
+    const full = dense({}, { cpu_slots: [{ player: 2, phase: "ball" }] });
+    expect(parse({ ...raw.views["01_intent_idempotency"], potato: full }).potato).toEqual(full);
+    // a coordinator from before the density page: none of the new keys at all
+    const bare = JSON.parse(JSON.stringify(potato())) as Record<string, unknown>;
+    const drop = (o: Record<string, unknown>, keys: string[]) => Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
+    const old = { ...drop(bare, ["cpus", "confined"]), round: drop(bare["round"] as Record<string, unknown>, ["pace", "best_pace", "laps", "cpus_in_use", "cpus_peak", "asleep", "lead", "slowest_wake_ms", "cpus_busy", "cpu_slots"]) };
+    const got = parse({ ...raw.views["01_intent_idempotency"], potato: old }).potato!;
+    expect([got.cpus, got.confined, got.round!.pace, got.round!.laps, got.round!.cpu_slots, got.ladder[0]!.record_pace]).toEqual([null, null, null, [], null, null]);
   });
 
   it("refuses a ring that names a player twice, and colours that are not a positive whole number", () => {
@@ -217,8 +248,8 @@ describe("the ring", () => {
   it("caps the wake bar at its end, has no bar without a last wake, and shows a ring member that has not said hello as not started", () => {
     const p = potato({
       players: [
-        { player: 0, colour: 0, counter: 0, phase: "waking", since: T - 900, last_sleep_ms: null, last_wake_ms: 400 },
-        { player: 1, colour: 0, counter: 0, phase: "waking", since: T - 100, last_sleep_ms: null, last_wake_ms: null },
+        { player: 0, colour: 0, counter: 0, phase: "waking", since: T - 900, last_sleep_ms: null, last_wake_ms: 400, cpu_wait_ms: null, ready_margin_ms: null },
+        { player: 1, colour: 0, counter: 0, phase: "waking", since: T - 100, last_sleep_ms: null, last_wake_ms: null, cpu_wait_ms: null, ready_margin_ms: null },
       ],
     });
     const tiles = potatoView(input(stateWith(p))).ring!.tiles;
@@ -246,7 +277,7 @@ describe("colours", () => {
   });
 
   it("steps a tile's colour with its player's colour index", () => {
-    const at = (c: number) => potatoView(input(stateWith(potato({ players: [{ player: 0, colour: c, counter: 1, phase: "awake", since: T, last_sleep_ms: null, last_wake_ms: null }] })))).ring!.tiles[0]!.colour;
+    const at = (c: number) => potatoView(input(stateWith(potato({ players: [{ player: 0, colour: c, counter: 1, phase: "awake", since: T, last_sleep_ms: null, last_wake_ms: null, cpu_wait_ms: null, ready_margin_ms: null }] })))).ring!.tiles[0]!.colour;
     expect(new Set([0, 1, 2, 3].map(at)).size).toBe(4);
     expect(at(12)).toBe(at(0));
   });
@@ -318,27 +349,193 @@ describe("the ball", () => {
   });
 });
 
-describe("the pace", () => {
-  it("meters each player's time to sleep and wake against the slowest sleep and wake in the ring", () => {
-    const v = paceOf(potato(), round());
-    expect(v.hold).toBe("599 ms");
-    expect(v.where).toBe("Lap 2 · ring of 4 · catch 7");
-    expect(v.meter.turnaroundText).toBe("1797 ms for each player to sleep and wake (3 holds)");
-    // players 0, 1 and 2 have both: 685.4, 740 and 660 ms
-    expect(v.meter.needText).toBe("slowest sleep and wake in the ring: 740 ms");
-    expect(v.meter.short).toBe(false);
-    expect(v.meter.turnaround).toBeCloseTo(1797 / (1797 * 1.15), 6);
-    expect(v.meter.need).toBeCloseTo(740 / (1797 * 1.15), 6);
-    expect(v.pace).toBeNull();
-    expect(v.start).toBe("Started at 666 ms, a tenth shorter each lap; floor 2 ms");
+/** A ring of 8 on 4 CPUs mid-round: machines 0 and 1 asleep, 2 holds the ball, 3 and 4 are ready, 5 is waking, 6 is saving, 7 waits for the ball's next lap. */
+function dense(over: Partial<Potato> = {}, rOver: Partial<PotatoRound> = {}): Potato {
+  const mk = (player: number, phase: string, o: object = {}) => ({ player, colour: player % 12, counter: 5, phase, since: T - 100, last_sleep_ms: 300, last_wake_ms: 310, cpu_wait_ms: null, ready_margin_ms: null, ...o });
+  return potato({
+    cpus: 4,
+    confined: true,
+    size: 8,
+    capacity: 8,
+    round: round({
+      size: 8,
+      ring: [0, 1, 2, 3, 4, 5, 6, 7],
+      holder: 2,
+      seq: 9,
+      lap: 1,
+      pace: 5.24,
+      best_pace: 5.3,
+      asleep: 4,
+      slowest_wake_ms: 310,
+      cpus_in_use: 4,
+      laps: [
+        { lap: 0, pace: 2.5, hold_ms: 400, cpus_peak: 2, cpus_busy: null },
+        { lap: 1, pace: 5, hold_ms: 200, cpus_peak: 3, cpus_busy: null },
+      ],
+      ...rOver,
+    }),
+    players: [mk(0, "asleep"), mk(1, "asleep"), mk(2, "awake"), mk(3, "awake"), mk(4, "asleep"), mk(5, "waking"), mk(6, "sleeping"), mk(7, "asleep")],
+    ladder: [
+      { size: 8, record_hold_ms: null, record_at: null, record_pace: 5.3, record_pace_at: T - 1000, broke: null, rounds: 2 },
+      { size: 16, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+    ],
+    ...over,
+  });
+}
+
+describe("the density figures", () => {
+  it("states machines per CPU, whole or to one decimal", () => {
+    expect(perCpu(32, 8)).toBe("4");
+    expect(perCpu(8, 3)).toBe("2.7");
+    expect(perCpu(96, 8)).toBe("12");
   });
 
-  it("says when the hold leaves a player less than it needs, and the viewers' cap", () => {
-    const v = paceOf(potato(), round({ hold_ms: 200, turnaround_ms: 600, pace_ms: 200, seq: null }));
-    expect(v.meter.short).toBe(true);
-    expect(v.meter.need).toBeCloseTo(1 / 1.15, 6);
-    expect(v.pace).toBe("Faster: holds capped at 200 ms");
-    expect(v.where).toBe("Lap 2 · ring of 4 · no catch yet");
+  it("puts machines per CPU in the large type, with the machines and CPUs, percent asleep, pace and the slowest wake", () => {
+    const d = densityOf(dense(), dense().round!);
+    expect(d.heading).toBe("Machines per CPU");
+    expect(d.big).toBe("2");
+    expect(d.machines).toBe("8 machines · 4 CPUs");
+    expect(d.where).toBe("ring of 8 · lap 2");
+    expect(d.figures).toEqual([
+      { key: "asleep", value: "50%", label: "asleep" },
+      { key: "pace", value: "5.2", label: "catches / s" },
+      { key: "slowest", value: "310 ms", label: "slowest wake" },
+    ]);
+    expect(d.record).toBe(true);
+  });
+
+  it("says CPU slots, not CPUs, when the agent only caps the count", () => {
+    const p = dense({ confined: false });
+    expect(densityOf(p, p.round!).machines).toBe("8 machines · 4 CPU slots");
+    expect(densityOf(p, p.round!).heading).toBe("Machines per CPU slot");
+    expect(cpuSlotsOf(p, p.round!)!.heading).toBe("4 of 4 CPU slots in use");
+  });
+
+  it("draws no figure whose field is absent, and the machine count alone with no allotment (an old coordinator or agent)", () => {
+    const old = potato();
+    const d = densityOf(old, old.round!);
+    expect(d.heading).toBe("Machines");
+    expect(d.big).toBe("4");
+    expect(d.machines).toBe("");
+    expect(d.figures).toEqual([]);
+    expect(d.record).toBe(false);
+    const paceOnly = potato({ round: round({ pace: 3.14159 }) });
+    expect(densityOf(paceOnly, paceOnly.round!).figures).toEqual([{ key: "pace", value: "3.1", label: "catches / s" }]);
+    expect(cpuSlotsOf(old, old.round!)).toBeNull();
+    expect(chartOf(old, old.round!)).toBeNull();
+  });
+
+  it("formats durations in seconds from a second up", () => {
+    expect(fmtMs(310.4)).toBe("310 ms");
+    expect(fmtMs(1254)).toBe("1.25 s");
+  });
+});
+
+describe("the CPU slots", () => {
+  it("holds a chip for each machine not asleep, grouped ball, ready, waking, saving, then the free ones", () => {
+    const p = dense();
+    const v = cpuSlotsOf(p, p.round!)!;
+    // 2 has the ball, 3 is ready, 5 is waking, 6 is saving: four machines on four CPUs
+    expect(v.heading).toBe("4 of 4 CPUs in use");
+    expect(v.groups.map((g) => [g.key, g.label, g.slots.map((x) => x.number)])).toEqual([
+      ["ball", "ball", ["2"]],
+      ["ready", "ready", ["3"]],
+      ["waking", "waking", ["5"]],
+      ["saving", "saving", ["6"]],
+    ]);
+    expect(v.groups[0]!.slots[0]!.colour).toBe(potatoColour(2, 12));
+    expect(v.asleep).toBe("4 of 8 asleep");
+  });
+
+  it("shows the free CPUs after the others, and does not count a sleeping machine", () => {
+    const p = dense({ cpus: 6 });
+    const v = cpuSlotsOf(p, p.round!)!;
+    expect(v.heading).toBe("4 of 6 CPUs in use");
+    expect(v.groups.at(-1)).toMatchObject({ key: "free", label: "free" });
+    expect(v.groups.at(-1)!.slots).toHaveLength(2);
+    expect(v.groups.at(-1)!.slots.every((x) => x.player === null && x.number === null)).toBe(true);
+  });
+
+  it("takes the agent's slot list when it sends one, in its phases, and counts booting as waking", () => {
+    const p = dense({}, { cpu_slots: [{ player: 4, phase: "ball" }, { player: 1, phase: "ready" }, { player: 0, phase: "booting" }] });
+    const v = cpuSlotsOf(p, p.round!)!;
+    expect(v.heading).toBe("3 of 4 CPUs in use");
+    expect(v.groups.map((g) => [g.key, g.slots.map((x) => x.number)])).toEqual([
+      ["ball", ["4"]],
+      ["ready", ["1"]],
+      ["waking", ["0"]],
+      ["free", [null]],
+    ]);
+  });
+});
+
+describe("the arc from the ball to the furthest machine being woken", () => {
+  it("spans the ring places from the ball to the farthest waking machine ahead of it", () => {
+    const p = dense();
+    // the ball is at index 2, the waking machine at 5: three ahead
+    expect(arcOf(p.round!, p)).toEqual({ fromIndex: 2, toIndex: 5, label: "woken 3 ahead", ahead: 3 });
+    const wrap = dense({}, { holder: 6 });
+    // from 6 round the ring to 5: seven ahead
+    expect(arcOf(wrap.round!, wrap)!.ahead).toBe(7);
+  });
+
+  it("is absent with nobody waking or no ball, and is drawn inside the ring clockwise on the view", () => {
+    const quiet = dense();
+    quiet.players = quiet.players.map((x) => (x.phase === "waking" ? { ...x, phase: "awake" } : x));
+    expect(arcOf(quiet.round!, quiet)).toBeNull();
+    const none = dense({}, { holder: null });
+    expect(arcOf(none.round!, none)).toBeNull();
+    const v = potatoView(input(stateWith(dense())));
+    const arc = v.ring!.arc!;
+    expect(arc.label).toBe("woken 3 ahead");
+    expect(arc.radius).toBeLessThan(v.ring!.geometry.radius);
+    expect(arc.large).toBe(false);
+  });
+});
+
+describe("the chart and the ladder's bars", () => {
+  it("plots CPUs in use against pace for the round's laps, with the allotment as the line", () => {
+    const p = dense();
+    const c = chartOf(p, p.round!)!;
+    expect(c.points).toEqual([{ pace: 2.5, cpus: 2 }, { pace: 5, cpus: 3 }]);
+    expect(c.now).toEqual({ pace: 5.24, cpus: 4 });
+    expect([c.k, c.cpusMax, c.kLabel]).toEqual([4, 4, "no CPU for the next wake"]);
+    expect(c.paceMax).toBe(7);
+  });
+
+  it("has no chart before a lap reports its peak, or when the laps carry none", () => {
+    const early = dense({}, { laps: [] });
+    expect(chartOf(early, early.round!)).toBeNull();
+    const old = dense({}, { laps: [{ lap: 0, pace: 2, hold_ms: 100, cpus_peak: null, cpus_busy: null }] });
+    expect(chartOf(old, old.round!)).toBeNull();
+  });
+
+  it("draws one bar per rung, long by the fastest pace held, with the current rung marked", () => {
+    const l = ladderBarsOf(dense({ ladder: [
+      { size: 16, record_hold_ms: null, record_at: null, record_pace: 12.1, record_pace_at: T, broke: null, rounds: 1 },
+      { size: 32, record_hold_ms: null, record_at: null, record_pace: 6.05, record_pace_at: T, broke: null, rounds: 1 },
+      { size: 64, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+    ], size: 32, capacity: 96 }));
+    expect(l.title).toBe("Fastest pace held on 4 CPUs");
+    expect(l.rows.map((r) => [r.size, r.label, r.value, r.length === null ? null : Math.round(r.length * 100) / 100, r.current])).toEqual([
+      [16, "4 per CPU", "12.1", 1, false],
+      [32, "8 per CPU", "6.1", 0.5, true],
+      [64, "16 per CPU", "none yet", null, false],
+    ]);
+  });
+
+  it("falls back to the machine count and the old hold record when there is no allotment or no pace", () => {
+    const l = ladderBarsOf(potato({ capacity: 4, ladder: [
+      { size: 2, record_hold_ms: 1458, record_at: T, record_pace: null, record_pace_at: null, broke: null, rounds: 3 },
+      { size: 4, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+      { size: 8, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+    ] }));
+    expect(l.title).toBe("Fastest pace held");
+    expect(l.rows.map((r) => [r.label, r.value, r.length, r.skipped])).toEqual([
+      ["2 machines", "1.46 s hold", null, false],
+      ["4 machines", "none yet", null, false],
+      ["8 machines", "skipped", null, true],
+    ]);
   });
 });
 
@@ -351,38 +548,45 @@ describe("drops, the ladder and the records", () => {
     expect(dropHeadline({ ...BROKE, reason: "wake_failed", stage: "wake" })).toBe("Player 1's wake failed.");
     expect(dropHeadline({ ...BROKE, reason: "deadline", stage: "report" })).toBe("No catch was reported in time; player 1 was next.");
     expect(dropHeadline({ ...BROKE, reason: "host_gone", player: null })).toBe("The host running the players disconnected.");
-    expect(brokeText(BROKE)).toBe("player 1 still waking (90 ms)");
-    expect(brokeText({ ...BROKE, reason: "sleep_failed" })).toBe("player 1's sleep failed");
   });
 
-  it("shows the drop card while the next round is pending, with when the catcher started accepting", () => {
+  it("names each measured cause for the card and the late square", () => {
+    expect(causeOf({ ...BROKE, cause: "waking", cause_ms: 84 })).toEqual({ tile: "84 ms late", line: "Still waking when the ball arrived; it accepted 84 ms later.", big: { value: "84 ms", word: "late" } });
+    expect(causeOf({ ...BROKE, cause: "waking", cause_ms: null })).toMatchObject({ tile: "still waking", big: null });
+    expect(causeOf({ ...BROKE, cause: "cpu_wait", cause_ms: 131 })).toMatchObject({ tile: "waited 131 ms for a CPU", line: "Its wake had waited 131 ms for a CPU.", big: { value: "131 ms", word: "waiting for a CPU" } });
+    expect(causeOf({ ...BROKE, cause: "saving", cause_ms: 40 })).toMatchObject({ tile: "still saving", line: "Still saving, 40 ms in, when the ball arrived." });
+    expect(causeOf({ ...BROKE, cause: "proof" })).toMatchObject({ tile: "proof failed" });
+    expect(causeOf({ ...BROKE, cause: null })).toBeNull();
+  });
+
+  it("outlines the late square with its cause on the ring, and uses the old sentence when no cause is measured", () => {
+    const withCause = dense({ round: null, next_round_at: T + 2500, last_drop: { ...BROKE, size: 8, player: 5, cause: "waking", cause_ms: 84 } });
+    const v = potatoView(input(stateWith(withCause)));
+    expect(v.ring!.tiles.filter((t) => t.late !== null).map((t) => [t.player, t.late])).toEqual([[5, "84 ms late"]]);
+    expect(v.drop!.big).toEqual({ value: "84 ms", word: "late" });
+    expect(v.drop!.headline).toBe("Still waking when the ball arrived; it accepted 84 ms later.");
+    const plain = potatoView(input(stateWith(dense({ round: null, next_round_at: T + 2500, last_drop: { ...BROKE, size: 8, player: 5 } }))));
+    expect(plain.ring!.tiles.every((t) => t.late === null)).toBe(true);
+    expect(plain.drop!.big).toBeNull();
+    expect(plain.drop!.headline).toBe("Player 5 was still waking, 90 ms into its wake, when the ball dropped.");
+  });
+
+  it("shows the drop card while the next round is pending", () => {
     const p = potato({ round: null, size: 4, next_round_at: T + 2500 });
     const v = potatoView(input(stateWith(p)));
     expect(v.drop).toEqual({
       title: "The ball dropped",
       headline: "Player 1 was still waking, 90 ms into its wake, when the ball dropped.",
-      listening: "It started accepting 84 ms after the ball dropped.",
-      context: "Ring of 2, lap 6, at a hold of 1182 ms, after 11 catches.",
+      big: null,
+      context: "Ring of 2 · lap 6",
       stages: ["Its last sleep: prepare 17.6 ms, pause 0.5 ms, save 74.5 ms, disk 114.7 ms, stop 106.7 ms", "Its last wake: restore 352 ms, ack 201 ms, listen 355.3 ms"],
       next: "Next: a ring of 4 in 3 s",
       detail: BROKE.detail,
     });
-    expect(dropCard(p, { ...BROKE, listening_after_ms: null, sleep_stages: {}, wake_stages: {} }, T).listening).toBeNull();
+    expect(dropCard(p, { ...BROKE, pace: 8.41 }, T).context).toBe("Ring of 2 · lap 6 · 8.4 catches / s");
     // Not during a round, nor when no next round is due.
     expect(potatoView(input(stateWith(potato()))).drop).toBeNull();
     expect(potatoView(input(stateWith(potato({ round: null, next_round_at: null })))).drop).toBeNull();
-  });
-
-  it("fills the ladder: each size's record, what broke it, its rounds, the current size and sizes the host skips", () => {
-    const l = ladderOf(potato({ capacity: 4 }));
-    expect(l.head).toEqual({ players: "Ring", record: "Record hold", broke: "What ended its last round", rounds: "Rounds" });
-    expect(l.rows.map((r) => [r.players, r.record, r.broke, r.rounds, r.current, r.skipped])).toEqual([
-      ["2", "1458 ms", "player 1 still waking (90 ms), lap 6 at 1182 ms", "3", false, false],
-      ["4", "--", "", "0", true, false],
-      ["8", "--", "skipped: the host runs 4 players", "0", false, true],
-    ]);
-    const tried = ladderOf(potato({ ladder: [{ size: 2, record_hold_ms: null, record_at: null, broke: { ...BROKE, lap: 0 }, rounds: 1 }] }));
-    expect(tried.rows[0]!.record).toBe("no lap completed");
   });
 
   it("states the records", () => {
@@ -463,7 +667,7 @@ describe("the view", () => {
     expect(v.ring!.tiles).toHaveLength(8);
     expect(v.ring!.caption).toBe("Next: a ring of 8");
     expect(v.ring!.ball).toBeNull();
-    expect(v.pace).toBeNull();
+    expect(v.density).toBeNull();
     expect(potatoView(input(stateWith(potato()), { stage: null })).ring).toBeNull();
   });
 

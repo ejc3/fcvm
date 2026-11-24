@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { landingPanelText, landingView, POTATO_HOLD, POTATO_STRIP, SHARED_LINE, type LandingPage } from "../landing.ts";
+import { landingPanelText, landingView, POTATO_STRIP, SHARED_LINE, type LandingPage } from "../landing.ts";
 
 const LINES: Record<LandingPage, string> = {
   wall: "Each square is a virtual machine with its own NVIDIA GPU. About half are restored by fcvm; the rest are EC2 GPUs started normally.",
@@ -41,6 +41,5 @@ describe("landing text", () => {
     expect(l.strip.map((e) => e.label ?? e.sr)).toEqual(["asleep", "going to sleep", "has the ball", "awake", "waking", "asleep"]);
     expect(l.strip.filter((e) => e.detail).map((e) => e.detail)).toEqual(["saved as a snapshot; uses no CPU"]);
     expect(l.catchNote).toBe("Colour steps on each catch: proof its memory survived.");
-    expect(POTATO_HOLD.map((e) => e.label)).toEqual(["time to sleep and wake", "slowest player"]);
   });
 });

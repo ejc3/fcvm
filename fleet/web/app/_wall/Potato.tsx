@@ -9,7 +9,8 @@ import { potatoColour, potatoView, SITE, type Box, type PotatoButton, type RingT
 import { WallClient } from "./wall-client.ts";
 import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
-import { Landing, PotatoLegend } from "./Landing.tsx";
+import { Landing } from "./Landing.tsx";
+import { ChartCard, CpuSlots, DensityCard, LadderBars } from "./PotatoCards.tsx";
 import { WakeCard } from "./Overlays.tsx";
 import { useMedia } from "./hooks.ts";
 import "./potato.css";
@@ -124,9 +125,6 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
     }
   }, [client]);
 
-  // Room for the legend beside the ring: the page is in its two-column layout and the measured stage is not small.
-  const twoColumns = useMedia("(min-width: 901px)");
-  const legendOnPage = twoColumns && stage !== null && stage.w >= 360 && stage.h >= 360;
   // The readout follows the pointer, the keyboard focus or a long press on touch; the text is re-read from the view, so it ticks.
   const [pointed, setPointed] = useState<number | null>(null);
   const [focused, setFocused] = useState<number | null>(null);
@@ -142,6 +140,9 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   };
   const shown = pressed ?? pointed ?? focused;
   const ring = view.ring;
+  // The slots go in the ring's centre when the room inside the arc and its label is wide enough; else under the ring.
+  const centreWidth = ring ? 2 * (ring.geometry.radius - ring.geometry.tile * 0.75 - 6 - 64) : 0;
+  const slotsInRing = view.cpuSlots !== null && centreWidth >= 240;
   const needsVerifyPrompt = view.verify.prompt;
 
   return (
@@ -152,7 +153,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
             <span className="site">{SITE}</span>
             <h1>{view.title}</h1>
           </div>
-          <Landing landing={view.landing} colour={SWATCH} legendInPanel={!legendOnPage} />
+          <Landing landing={view.landing} colour={SWATCH} />
           <ModeSwitch current="potato" />
         </div>
         <div className="potato-actions" role="group" aria-label="Game">
@@ -183,7 +184,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
           <div ref={stageRef} className="potato-stage" data-testid="potato-stage" role="img" aria-label={ring?.ariaLabel ?? view.empty ?? ""}>
             {ring && ring.geometry.radius > 0 ? (
               <span
-                className="potato-track"
+                className={`potato-track${ring.flash ? " flash" : ""}`}
                 aria-hidden="true"
                 style={{ left: ring.geometry.centre.x - ring.geometry.radius, top: ring.geometry.centre.y - ring.geometry.radius, width: 2 * ring.geometry.radius, height: 2 * ring.geometry.radius }}
               />
@@ -197,6 +198,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                     data-player={t.player}
                     data-phase={t.phase}
                     data-holder={t.holder ? "true" : undefined}
+                    data-late={t.late !== null ? "true" : undefined}
                     role="group"
                     aria-label={t.ariaLabel}
                     tabIndex={0}
@@ -228,6 +230,35 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                   ) : null,
                 )
               : null}
+            {ring?.arc ? (
+              <>
+                <svg className="potato-arc" width={stage?.w ?? 0} height={stage?.h ?? 0} aria-hidden="true">
+                  <defs>
+                    <marker id="potato-arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                      <path d="M0 0L10 5L0 10z" fill="currentColor" />
+                    </marker>
+                  </defs>
+                  <path d={`M${ring.arc.from.x} ${ring.arc.from.y}A${ring.arc.radius} ${ring.arc.radius} 0 ${ring.arc.large ? 1 : 0} 1 ${ring.arc.to.x} ${ring.arc.to.y}`} markerEnd="url(#potato-arrow)" />
+                </svg>
+                <span className="potato-arc-label" data-testid="potato-arc-label" style={{ left: ring.arc.labelAt.x, top: ring.arc.labelAt.y }}>
+                  {ring.arc.label}
+                </span>
+              </>
+            ) : null}
+            {ring
+              ? ring.tiles.map((t) =>
+                  t.late !== null ? (
+                    <span key={`late${t.player}`} className="potato-late" data-testid="potato-late" style={{ left: t.box.x + t.box.w / 2, top: t.box.y + t.box.h + 4 }}>
+                      {t.late}
+                    </span>
+                  ) : null,
+                )
+              : null}
+            {slotsInRing && view.cpuSlots && ring ? (
+              <div className="potato-centre" style={{ left: ring.geometry.centre.x, top: ring.geometry.centre.y, width: centreWidth }}>
+                <CpuSlots slots={view.cpuSlots} />
+              </div>
+            ) : null}
             {shown !== null && ring ? <Readout tile={ring.tiles.find((t) => t.player === shown) ?? null} centre={ring.geometry.centre} stage={stage} /> : null}
             {ring?.ball ? (
               <div
@@ -240,16 +271,24 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
               />
             ) : null}
           </div>
+          {!slotsInRing && view.cpuSlots ? (
+            <div className="card potato-cpus-card">
+              <CpuSlots slots={view.cpuSlots} />
+            </div>
+          ) : null}
         </section>
         <div className="potato-side">
-          {legendOnPage && view.landing.legend ? <PotatoLegend legend={view.landing.legend} form="strip" colour={SWATCH} /> : null}
           {view.drop ? (
             <section className="card potato-drop" role="status" aria-labelledby="potato-drop-h" data-testid="potato-drop">
               <h2 id="potato-drop-h">{view.drop.title}</h2>
+              {view.drop.big ? (
+                <p className="big-late" data-testid="potato-drop-big">
+                  <span className="v">{view.drop.big.value}</span> {view.drop.big.word}
+                </p>
+              ) : null}
               <p className="headline" data-testid="potato-drop-headline">
                 {view.drop.headline}
               </p>
-              {view.drop.listening ? <p data-testid="potato-drop-listening">{view.drop.listening}</p> : null}
               <p className="muted">{view.drop.context}</p>
               {view.drop.stages.map((x) => (
                 <p key={x} className="muted">
@@ -264,55 +303,14 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
               ) : null}
             </section>
           ) : null}
-          {view.pace ? (
-            <section className="card potato-pace" aria-labelledby="potato-pace-h" data-testid="potato-pace">
-              <div className="head">
-                <h2 id="potato-pace-h">Hold</h2>
-                <span className="hold" data-testid="potato-hold">
-                  {view.pace.hold}
-                </span>
-              </div>
-              <p className="where" data-testid="potato-where">
-                {view.pace.where}
-              </p>
-              <div className={`meter${view.pace.meter.short ? " short" : ""}`} aria-hidden="true">
-                <span className="fill" style={{ width: `${(view.pace.meter.turnaround * 100).toFixed(1)}%` }} />
-                {view.pace.meter.need !== null ? <span className="need" style={{ left: `${(view.pace.meter.need * 100).toFixed(1)}%` }} /> : null}
-              </div>
-              <p>{view.pace.meter.turnaroundText}</p>
-              {view.pace.meter.needText ? <p className="muted">{view.pace.meter.needText}</p> : null}
-              {view.pace.pace ? (
-                <p className="pace" data-testid="potato-pace-cap">
-                  {view.pace.pace}
-                </p>
-              ) : null}
-              <p className="muted">{view.pace.start}</p>
-            </section>
-          ) : null}
-          {view.ladder ? (
+          {view.density ? <DensityCard d={view.density} /> : null}
+          {view.chart || view.ladder ? (
             <section className="card potato-ladder" aria-labelledby="potato-ladder-h">
-              <h2 id="potato-ladder-h">The ladder</h2>
-              <table data-testid="potato-ladder">
-                <caption>{view.ladder.caption}</caption>
-                <thead>
-                  <tr>
-                    <th scope="col">{view.ladder.head.players}</th>
-                    <th scope="col">{view.ladder.head.record}</th>
-                    <th scope="col">{view.ladder.head.broke}</th>
-                    <th scope="col">{view.ladder.head.rounds}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {view.ladder.rows.map((r) => (
-                    <tr key={r.size} aria-current={r.current ? "true" : undefined} data-skipped={r.skipped ? "true" : undefined} data-testid={`potato-rung-${r.size}`}>
-                      <th scope="row">{r.players}</th>
-                      <td data-testid="potato-rung-record">{r.record}</td>
-                      <td data-testid="potato-rung-broke">{r.broke}</td>
-                      <td>{r.rounds}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <h2 id="potato-ladder-h" className="sr-only">
+                Pace and the ladder
+              </h2>
+              {view.chart ? <ChartCard c={view.chart} /> : null}
+              {view.ladder ? <LadderBars l={view.ladder} /> : null}
             </section>
           ) : null}
           {view.records.length > 0 ? (
