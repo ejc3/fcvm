@@ -48,6 +48,27 @@ pub fn parse_stat(text: &str) -> Option<(String, u64)> {
     Some((comm, ticks))
 }
 
+/// How many of a VMM's thread names (`/proc/<pid>/task/*/comm`) are vCPU threads, which is
+/// the VM's configured vCPU count (Firecracker names them `fc_vcpu <n>`).
+pub fn count_vcpus<'a>(comms: impl IntoIterator<Item = &'a str>) -> u32 {
+    comms
+        .into_iter()
+        .filter(|c| c.trim().starts_with("fc_vcpu"))
+        .count() as u32
+}
+
+/// The vCPU count of the VMM `pid`, from its threads.
+pub fn read_vcpus(pid: u32) -> Option<u32> {
+    let mut comms = Vec::new();
+    for t in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+    {
+        comms.push(std::fs::read_to_string(t.path().join("comm")).unwrap_or_default());
+    }
+    Some(count_vcpus(comms.iter().map(String::as_str))).filter(|n| *n > 0)
+}
+
 /// The resident pages of `/proc/<pid>/statm` (its second field).
 pub fn parse_statm_rss_pages(text: &str) -> Option<u64> {
     text.split_whitespace().nth(1)?.parse().ok()
@@ -95,7 +116,7 @@ pub struct Sampler {
 
 impl Sampler {
     /// One reading of the VM run by `fcvm_pid`; None while there is nothing to report.
-    pub fn poll(&mut self, fcvm_pid: u32, vcpus: u32) -> Option<VmStats> {
+    pub fn poll(&mut self, fcvm_pid: u32) -> Option<VmStats> {
         let cur = self.pid.and_then(read).or_else(|| {
             self.prev = None;
             self.pid = find_vmm(fcvm_pid);
@@ -106,6 +127,7 @@ impl Sampler {
             self.pid = None;
             return None;
         };
+        let vcpus = self.pid.and_then(read_vcpus).unwrap_or(0);
         let out = sample(self.prev.as_ref(), &cur, vcpus, clk_tck());
         self.prev = Some(cur);
         out
@@ -169,6 +191,20 @@ mod tests {
         assert_eq!(parse_stat("123 (x) S 1 2"), None);
         assert_eq!(parse_statm_rss_pages("100 25 3 0 0 5 0"), Some(25));
         assert_eq!(parse_statm_rss_pages("100"), None);
+    }
+
+    #[test]
+    fn vcpus_are_the_vcpu_threads() {
+        let comms = [
+            "firecracker\n",
+            "fc_vcpu 0\n",
+            "fc_vcpu 1\n",
+            "fc_vcpu 5\n",
+            "fc_api\n",
+            "vmm\n",
+        ];
+        assert_eq!(count_vcpus(comms), 3);
+        assert_eq!(count_vcpus(["fc_api"]), 0);
     }
 
     #[test]

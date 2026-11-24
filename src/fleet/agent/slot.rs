@@ -574,8 +574,7 @@ pub async fn supervise(
                     }
                     let mut report = HealthReport::from_renderer(&ctx.id, &h);
                     if desired.borrow().phone.is_some() {
-                        let vcpus = super::vm::PHONE_CPUS.parse().unwrap_or(0);
-                        report.vm_stats = r.sampler.poll(r.vm.pid, vcpus);
+                        report.vm_stats = r.sampler.poll(r.vm.pid);
                     }
                     let _ = ctx.out.send(AgentMsg::Health(report));
                 }

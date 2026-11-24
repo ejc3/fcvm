@@ -413,11 +413,11 @@ describe("the panel of an opened phone", () => {
         ["gpu-power", "\u200748 W", null],
         ["gpu-mem", "\u2007\u2007648 of 15360 MB", 648.3 / 15360],
       ]);
-      expect(p.stats.map((r) => r.label)).toEqual([
-        "GPU utilisation 7 percent",
-        "GPU temperature 52 degrees Celsius",
-        "GPU power draw 48 watts",
-        "GPU memory in use 648 of 15360 megabytes",
+      expect(p.stats.map((r) => r.meter)).toEqual([
+        { name: "GPU utilisation", valuetext: "7 percent" },
+        null,
+        null,
+        { name: "GPU memory", valuetext: "0.6 of 15 GB" },
       ]);
     });
 
@@ -434,10 +434,10 @@ describe("the panel of an opened phone", () => {
       const ph = phonesOf(2);
       ph.tiles[0] = { ...ph.tiles[0]!, gpu: { name: "Tesla T4", temp_c: 50, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: null }, vm_stats: { cpu_pct: 12.4, mem_mb: 1800.2, vcpus: 6, at: null } };
       const p = panelOf(ph);
-      expect(p.stats.map((r) => [r.term, r.text, r.fraction, r.label])).toEqual([
-        ["Temperature", "\u200750 \u00b0C", null, "GPU temperature 50 degrees Celsius"],
-        ["CPU", "\u200712 %  6 vCPUs", 0.124, "CPU 12 percent of 6 vCPUs"],
-        ["Memory", "\u20071800 MB", null, "Memory 1800 megabytes"],
+      expect(p.stats.map((r) => [r.term, r.text, r.fraction, r.meter])).toEqual([
+        ["Temperature", "\u200750 \u00b0C", null, null],
+        ["CPU", "\u200712 %  6 vCPUs", 0.124, { name: "CPU", valuetext: "12 percent of 6 vCPUs" }],
+        ["Memory", "\u20071800 MB", null, null],
       ]);
     });
 
@@ -448,6 +448,20 @@ describe("the panel of an opened phone", () => {
       expect(statsOf(null, vm(srv - 1000), srv).map((r) => r.term)).toEqual(["CPU", "Memory"]);
       expect(statsOf(null, vm(srv - STATS_STALE_MS - 1), srv)).toEqual([]);
       expect(statsOf(null, vm(null), srv)[0]!.text).toBe("\u2007\u20075 %  1 vCPU");
+    });
+
+    it("does not drop readings on the page's own clock before the coordinator's clock is known", () => {
+      const gpu = { name: "x", temp_c: 40, power_w: null, util_pct: null, mem_used_mb: null, mem_total_mb: null, at: EPOCH };
+      const vm = { cpu_pct: 5, mem_mb: 100, vcpus: 2, at: EPOCH };
+      // The page is 5 s ahead and has no clock sample: both stay.
+      expect(statsOf(gpu, vm, EPOCH + 5_000 + 1, false).map((r) => r.key)).toEqual(["gpu-temp", "vm-cpu", "vm-mem"]);
+      // A receipt time hours off (a host with a skewed clock) does not blank the list either.
+      expect(statsOf({ ...gpu, at: EPOCH - 3_600_000 }, { ...vm, at: EPOCH + 3_600_000 }, EPOCH, false)).toHaveLength(3);
+      // Through the panel: the state has no clock sample, the page's clock is 30 s past the receipt.
+      const ph = phonesOf(2);
+      ph.tiles[0] = { ...ph.tiles[0]!, gpu, vm_stats: vm };
+      const p = phonesView(input(stateWith(ph), { openId: "phone:1", now: EPOCH + 30_000 })).panel!;
+      expect(p.stats.map((r) => r.key)).toEqual(["gpu-temp", "vm-cpu", "vm-mem"]);
     });
 
     it("drops readings older than the stale limit, and keeps fresh ones", () => {
