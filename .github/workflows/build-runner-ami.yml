@@ -74,6 +74,9 @@ jobs:
           scripts/build-ami.sh
 
       - name: Summary
+        env:
+          BOOT_KERNEL: ${{ steps.build.outputs.boot_kernel }}
+          BOOT_TEST_TYPE: ${{ steps.build.outputs.boot_test_type }}
         run: |
           if [ "${{ steps.build.outputs.cached }}" = "true" ]; then
             echo "## Runner AMI ${{ matrix.arch }} (Cached)" >> $GITHUB_STEP_SUMMARY
@@ -83,7 +86,8 @@ jobs:
             echo "## Runner AMI ${{ matrix.arch }} Built" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**AMI ID:** \`${{ steps.build.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "**Kernel:** \`${{ steps.build.outputs.kernel_version }}-nested\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Kernel:** \`${{ steps.build.outputs.kernel_version }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Boot test:** the image booted \`$BOOT_KERNEL\` on \`$BOOT_TEST_TYPE\` before it was published" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "No terraform change is needed. The image carries Purpose=github-runner; the AMI replicator copies it to the runner regions and the autoscaler launches runners from the newest copy." >> $GITHUB_STEP_SUMMARY
           fi

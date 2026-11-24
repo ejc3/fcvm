@@ -171,14 +171,14 @@ fn read_line(conn: &TcpStream) -> Option<String> {
 }
 
 /// Throw `ball` to its next catcher, trying until `flight` has passed since the first try.
+/// It tries once however short the flight window is.
 fn throw(player: u32, ball: Ball, flight: Duration, tx: &Sender<Msg>) {
     let to = ball.ring[(ball.seq % ball.ring.len() as u64) as usize].clone();
     let line = serde_json::to_string(&Inbound::Ball(ball.clone())).unwrap();
     let start = Instant::now();
     let deadline = start + flight;
     let mut attempts = 0u32;
-    let mut last_err = String::from("no attempt");
-    while Instant::now() < deadline {
+    let last_err = loop {
         attempts += 1;
         let t = Instant::now();
         let left = deadline
@@ -213,11 +213,13 @@ fn throw(player: u32, ball: Ball, flight: Duration, tx: &Sender<Msg>) {
                 return;
             }
             Err(e) => {
-                last_err = e.to_string();
+                if Instant::now() + Duration::from_millis(2) >= deadline {
+                    break e.to_string();
+                }
                 thread::sleep(Duration::from_millis(2));
             }
         }
-    }
+    };
     send(
         tx,
         &Report::Dropped {
@@ -393,6 +395,8 @@ fn handle(mut conn: TcpStream, shared: &Shared) {
             };
             let _ = writeln!(conn, "{{\"type\":\"ok\"}}");
             drop(conn);
+            // a pace caps this hold only; the ball keeps its own schedule
+            let hold_us = ball.kept_us(pace);
             send(
                 &shared.tx,
                 &Report::Caught {
@@ -400,16 +404,12 @@ fn handle(mut conn: TcpStream, shared: &Shared) {
                     round: ball.round,
                     seq: ball.seq,
                     proof,
+                    hold_us: Some(hold_us),
                 },
             );
-            // a pace caps this hold only; the ball keeps its own schedule
-            let hold_ms = match pace {
-                Some(p) => ball.hold_ms.min(p.max(ball.min_hold_ms)),
-                None => ball.hold_ms,
-            };
             let next = ball.thrown(colour);
-            let flight = Duration::from_millis(ball.flight_ms);
-            thread::sleep(Duration::from_millis(hold_ms).saturating_sub(caught_at.elapsed()));
+            let flight = Duration::from_micros(ball.flight_us(hold_us));
+            thread::sleep(Duration::from_micros(hold_us).saturating_sub(caught_at.elapsed()));
             // a throw of a round that is over is abandoned; only a throw makes the player go to
             // sleep, so an abandoned one leaves it catching
             let over = {

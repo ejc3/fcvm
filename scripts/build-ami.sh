@@ -11,13 +11,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KERNEL_DIR="$(dirname "$SCRIPT_DIR")/kernel"
 FCVM_SOURCE_REMOTE="${FCVM_SOURCE_REMOTE:-https://github.com/ejc3/fcvm.git}"
 
-# Canonical's name for the architecture in its image names, EC2's name for it, and the
-# builder's instance type (each has local NVMe for the kernel build; the builder role in
-# ejc3/aws github-ami-builder.tf allows exactly these two types).
+# Canonical's name for the architecture in its image names, EC2's name for it, the
+# builder's instance type (each has local NVMe for the kernel build) and the type the
+# candidate image is boot-tested on: bare metal of a family the runner launcher uses.
+#
+# The builder role (ejc3/aws github-ami-builder.tf) decides what this script may launch,
+# tag and publish. It allowed one type, c7gd.8xlarge, and images created already tagged
+# Purpose=github-runner; the x64 leg and the candidate step below need the grants of
+# ejc3/aws#1031. Until that is applied a run fails closed, publishing nothing.
 AMI_ARCH="${AMI_ARCH:-arm64}"
 case "$AMI_ARCH" in
-  arm64) UBUNTU_ARCH=arm64 EC2_ARCH=arm64 BUILDER_TYPE=c7gd.8xlarge ;;
-  x64) UBUNTU_ARCH=amd64 EC2_ARCH=x86_64 BUILDER_TYPE=c5d.9xlarge ;;
+  arm64) UBUNTU_ARCH=arm64 EC2_ARCH=arm64 BUILDER_TYPE=c7gd.8xlarge BOOT_TEST_TYPE=c7gd.metal ;;
+  x64) UBUNTU_ARCH=amd64 EC2_ARCH=x86_64 BUILDER_TYPE=c5d.9xlarge BOOT_TEST_TYPE=c5d.metal ;;
   *)
     echo "ERROR: AMI_ARCH must be arm64 or x64, got '$AMI_ARCH'" >&2
     exit 1
@@ -244,13 +249,16 @@ compute_hash() {
   } | sha256sum | cut -c1-12
 }
 
-# Check for existing AMI with matching hash
+# Check for an existing PUBLISHED image of this architecture with a matching hash. A
+# candidate that was never boot-tested, or one that failed its test, carries the same
+# BuildHash and another Purpose: reusing it would publish what the boot test exists to stop.
 check_existing_ami() {
   local hash="$1"
   aws ec2 describe-images \
     --region "$REGION" \
     --owners self \
     --filters "Name=tag:BuildHash,Values=$hash" "Name=state,Values=available" \
+    "Name=tag:Purpose,Values=github-runner" "Name=architecture,Values=$EC2_ARCH" \
     --query 'Images[0].ImageId' --output text
 }
 
@@ -276,11 +284,14 @@ create_user_data() {
     -e "s#__FCVM_SOURCE_REMOTE__#$FCVM_SOURCE_REMOTE#g" << 'USERDATA'
 #!/bin/bash
 exec > >(tee /var/log/ami-build.log) 2>&1
-set -euxo pipefail
+set -euo pipefail
 
-# Get IMDSv2 token and instance ID
+# Get IMDSv2 token and instance ID. Tracing starts after the token's last use: under
+# `set -x` the token would be written to this log and to the instance's console.
 TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" -s)
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
+unset TOKEN
+set -x
 
 # One script provisions both architectures: the download names follow the machine.
 MACHINE=$(uname -m)
@@ -373,15 +384,19 @@ mkdir -p /root/.config/fcvm
 cp rootfs-config.toml /root/.config/fcvm/
 
 # Build and install kernel using fcvm setup
-aws ec2 create-tags --resources $INSTANCE_ID --tags Key=KernelVersion,Value=nested --region us-west-1
 ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
 # The image must boot a kernel with the bridge teardown fix. The running kernel is still
-# the base image's, so check the release fcvm selected for the next boot.
-BOOT_KERNEL=$(sed -n 's/^GRUB_DEFAULT="Advanced options for Ubuntu>Ubuntu, with Linux \(.*\)"$/\1/p' /etc/default/grub)
-test -n "$BOOT_KERNEL"
-test -e "/boot/vmlinuz-$BOOT_KERNEL"
+# the base image's, so check the release GRUB will boot: regenerate grub.cfg (fcvm setup
+# only warns when update-grub fails; here that fails the build) and read the default
+# entry's kernel from it, which must be in /boot with its initrd.
+update-grub
+BOOT_KERNEL=$(./scripts/grub-boot-kernel.sh)
 ./scripts/check-bridge-teardown-kernel.sh "$BOOT_KERNEL"
+# Report that release: the boot test of the candidate image must find exactly it running.
+aws ec2 create-tags --resources $INSTANCE_ID --tags "Key=KernelVersion,Value=$BOOT_KERNEL" --region us-west-1
+# The boot test runs the same check on the kernel that booted.
+install -m 0755 scripts/check-bridge-teardown-kernel.sh /usr/local/sbin/check-bridge-teardown-kernel.sh
 
 # Firecracker
 FIRECRACKER_VERSION="v1.14.0"
@@ -454,6 +469,168 @@ wait_for_build() {
   return 1
 }
 
+# User data of the boot test: the candidate image's own first boot reports the kernel it
+# is running through the instance's tags, the one channel the builder profile may write.
+# boot-ok only when the check baked into the image passes on that running kernel.
+create_boot_test_user_data() {
+  cat << 'BOOTTEST'
+#!/bin/bash
+exec > >(tee /var/log/ami-boot-test.log) 2>&1
+set -uo pipefail
+# Tracing starts after the token's last use, as in the builder's user data.
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 600" -s)
+INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
+unset TOKEN
+set -x
+STATUS=boot-failed
+if /usr/local/sbin/check-bridge-teardown-kernel.sh; then
+  STATUS=boot-ok
+fi
+/usr/local/bin/aws ec2 create-tags --resources "$INSTANCE_ID" --region us-west-1 \
+  --tags "Key=KernelVersion,Value=$(uname -r)" "Key=BuildStatus,Value=$STATUS"
+BOOTTEST
+}
+
+# Launch one instance with the builder's constraints: spot first, on-demand when spot
+# fails. Prints the instance id. All resources created by RunInstances need the scoped
+# name tag. Keep one argument array so the on-demand fallback cannot silently regain
+# privileges.
+launch_instance() {
+  local image="$1" instance_type="$2" user_data_file="$3" subnet="$4" security_group="$5"
+  local launch_tags instance_id
+  launch_tags='[{"ResourceType":"instance","Tags":[{"Key":"Name","Value":"ami-builder-temp"},{"Key":"BuildStatus","Value":"starting"}]},{"ResourceType":"volume","Tags":[{"Key":"Name","Value":"ami-builder-temp"}]},{"ResourceType":"network-interface","Tags":[{"Key":"Name","Value":"ami-builder-temp"}]}]'
+  local -a launch_args=(
+    --region "$REGION"
+    --image-id "$image"
+    --instance-type "$instance_type"
+    --subnet-id "$subnet"
+    --security-group-ids "$security_group"
+    --iam-instance-profile Name=ami-builder-profile
+    --associate-public-ip-address
+    --metadata-options "HttpTokens=required,HttpPutResponseHopLimit=1"
+    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","Encrypted":true,"DeleteOnTermination":true}}]'
+    --tag-specifications "$launch_tags"
+    --user-data "file://$user_data_file"
+    --query 'Instances[0].InstanceId'
+    --output text
+  )
+  echo "Trying spot instance ($instance_type)..." >&2
+  if ! instance_id=$(aws ec2 run-instances "${launch_args[@]}" \
+    --instance-market-options '{"MarketType":"spot"}'); then
+    echo "Spot failed, using on-demand..." >&2
+    if ! instance_id=$(aws ec2 run-instances "${launch_args[@]}"); then
+      echo "ERROR: could not launch $instance_type from $image" >&2
+      return 1
+    fi
+  fi
+  if [[ ! $instance_id =~ ^i-[0-9a-f]+$ ]]; then
+    echo "ERROR: RunInstances did not return exactly one instance ID" >&2
+    return 1
+  fi
+  printf '%s\n' "$instance_id"
+}
+
+# Wait until an image is available (custom loop: the default waiter times out on large
+# disks). A failed image fails, and so does one still pending when the wait ends:
+# publication depends on the image, so "not failed yet" is not success.
+wait_for_image() {
+  local ami_id="$1"
+  local timeout="${2:-60}" # 60 iterations * 30s = 30 minutes max
+  local state i
+
+  echo "Waiting for AMI to be available..."
+  for i in $(seq 1 "$timeout"); do
+    state=$(aws ec2 describe-images --region "$REGION" --image-ids "$ami_id" \
+      --query 'Images[0].State' --output text) || state=unknown
+    echo "[$i/$timeout] AMI state: $state"
+    if [ "$state" = "available" ]; then
+      return 0
+    fi
+    if [ "$state" = "failed" ]; then
+      echo "AMI creation failed!"
+      return 1
+    fi
+    sleep 30
+  done
+  echo "AMI $ami_id is not available after $timeout checks"
+  return 1
+}
+
+# Wait for the boot test instance to report (create_boot_test_user_data) and print the
+# kernel it is running. An instance that reports boot-failed fails, and so does one that
+# never reports before the wait ends: a kernel that does not boot, or boots without
+# network, cannot say so.
+wait_for_boot_test() {
+  local instance_id="$1"
+  local timeout="${2:-60}" # 60 iterations * 30s = 30 minutes max: bare metal boots slowly
+  local status kernel i
+
+  echo "Waiting for the boot test to report..." >&2
+  for i in $(seq 1 "$timeout"); do
+    status=$(aws ec2 describe-tags \
+      --region "$REGION" \
+      --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=BuildStatus" \
+      --query 'Tags[0].Value' --output text) || status=unknown
+    echo "[$i/$timeout] Boot test status: $status (instance: $instance_id)" >&2
+    if [ "$status" = "boot-ok" ] || [ "$status" = "boot-failed" ]; then
+      kernel=$(aws ec2 describe-tags \
+        --region "$REGION" \
+        --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=KernelVersion" \
+        --query 'Tags[0].Value' --output text) || kernel=""
+      if [ "$status" = "boot-failed" ] || [ -z "$kernel" ] || [ "$kernel" = "None" ]; then
+        echo "Boot test failed: the image booted kernel '${kernel:-unknown}'" >&2
+        return 1
+      fi
+      printf '%s\n' "$kernel"
+      return 0
+    fi
+    sleep 30
+  done
+  echo "Boot test timeout: the instance never reported its kernel" >&2
+  return 1
+}
+
+# A candidate that cannot be published stays registered (this role cannot deregister),
+# tagged so that it is plainly not a runner image. No launcher selects either value.
+reject_candidate() {
+  local ami_id="$1"
+  echo "Rejecting candidate $ami_id: it is tagged Purpose=github-runner-failed and not published"
+  aws ec2 create-tags --region "$REGION" --resources "$ami_id" \
+    --tags Key=Purpose,Value=github-runner-failed ||
+    echo "WARNING: could not tag $ami_id failed; it keeps Purpose=github-runner-candidate" >&2
+}
+
+# A candidate left by an earlier run was never judged: the run was cancelled between
+# create-image and the verdict, or its publish failed. Tag every candidate of this
+# architecture failed before this run launches anything, so it can no longer be
+# boot-tested or published. The workflow runs one leg per architecture at a time, so a candidate found
+# here is never one a running leg is testing. A listing or a tag change that fails stops
+# the leg: "no stale candidates" must be something this run saw.
+retire_stale_candidates() {
+  local stale id
+  if ! stale=$(aws ec2 describe-images --region "$REGION" --owners self \
+    --filters "Name=tag:Purpose,Values=github-runner-candidate" "Name=architecture,Values=$EC2_ARCH" \
+    --query 'Images[].ImageId' --output text); then
+    echo "ERROR: cannot list earlier candidate images" >&2
+    return 1
+  fi
+  for id in $stale; do
+    if [[ ! $id =~ ^ami-[0-9a-f]+$ ]]; then
+      echo "ERROR: unexpected image id '$id' among earlier candidates" >&2
+      return 1
+    fi
+    echo "Retiring stale candidate $id"
+    if ! aws ec2 create-tags --region "$REGION" --resources "$id" \
+      --tags Key=Purpose,Value=github-runner-failed; then
+      echo "ERROR: cannot retire stale candidate $id" >&2
+      return 1
+    fi
+  done
+}
+
+# Instances this run launched, terminated when it exits.
+LAUNCHED=()
+
 # Main
 main() {
   local hash repo_root source_commit
@@ -485,12 +662,20 @@ main() {
     exit 0
   fi
 
+  # A commit the builder cannot fetch is refused here, before this run changes anything
+  # in AWS: the cache lookup above only reads.
   if ! verify_source_commit_fetchable \
     "$repo_root" "$source_commit" "$FCVM_SOURCE_REMOTE"; then
     exit 1
   fi
 
   echo "No cached AMI, building..."
+
+  # The first write of a run that will build. A cache hit builds nothing and leaves an
+  # earlier candidate to the pruner in ejc3/aws, which removes it a day after its creation.
+  if ! retire_stale_candidates; then
+    exit 1
+  fi
 
   # Terraform's builder role permits only the isolated runner VPC. Discover its
   # current IDs instead of inheriting the administration/dev network or profile.
@@ -527,43 +712,20 @@ main() {
   user_data_file=$(mktemp)
   create_user_data "$source_commit" > "$user_data_file"
 
-  # All resources created by RunInstances need the scoped name tag. Keep one
-  # argument array so the on-demand fallback cannot silently regain privileges.
-  local launch_tags
-  launch_tags='[{"ResourceType":"instance","Tags":[{"Key":"Name","Value":"ami-builder-temp"},{"Key":"BuildStatus","Value":"starting"}]},{"ResourceType":"volume","Tags":[{"Key":"Name","Value":"ami-builder-temp"}]},{"ResourceType":"network-interface","Tags":[{"Key":"Name","Value":"ami-builder-temp"}]}]'
-  local -a launch_args=(
-    --region "$REGION"
-    --image-id "$base_ami"
-    --instance-type "$BUILDER_TYPE"
-    --subnet-id "$builder_subnet"
-    --security-group-ids "$builder_security_group"
-    --iam-instance-profile Name=ami-builder-profile
-    --associate-public-ip-address
-    --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1
-    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","Encrypted":true,"DeleteOnTermination":true}}]'
-    --tag-specifications "$launch_tags"
-    --user-data "file://$user_data_file"
-    --query 'Instances[0].InstanceId'
-    --output text
-  )
-  echo "Trying spot instance..."
-  if ! instance_id=$(aws ec2 run-instances "${launch_args[@]}" \
-    --instance-market-options '{"MarketType":"spot"}'); then
-    echo "Spot failed, using on-demand..."
-    instance_id=$(aws ec2 run-instances "${launch_args[@]}")
-  fi
-  if [[ ! $instance_id =~ ^i-[0-9a-f]+$ ]]; then
-    echo "ERROR: RunInstances did not return exactly one instance ID" >&2
-    exit 1
-  fi
-  echo "Launched instance: $instance_id"
-
-  # Cleanup function
   cleanup() {
-    echo "Cleaning up instance $instance_id..."
-    aws ec2 terminate-instances --region "$REGION" --instance-ids "$instance_id" || true
+    if [ "${#LAUNCHED[@]}" -gt 0 ]; then
+      echo "Cleaning up instances ${LAUNCHED[*]}..."
+      aws ec2 terminate-instances --region "$REGION" --instance-ids "${LAUNCHED[@]}" || true
+    fi
   }
   trap cleanup EXIT
+
+  if ! instance_id=$(launch_instance "$base_ami" "$BUILDER_TYPE" "$user_data_file" \
+    "$builder_subnet" "$builder_security_group"); then
+    exit 1
+  fi
+  LAUNCHED+=("$instance_id")
+  echo "Launched instance: $instance_id"
 
   # Wait for build
   if ! wait_for_build "$instance_id"; then
@@ -577,46 +739,81 @@ main() {
   # reboot is permitted on spot and gives the same filesystem consistency a
   # stopped instance would.
 
-  # Get kernel version from instance tags
+  # The release the builder resolved from the image's grub.cfg, from its tags. Nothing is
+  # created unless the builder reported one that has the fix.
   kernel_version=$(aws ec2 describe-tags \
     --region "$REGION" \
     --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=KernelVersion" \
     --query 'Tags[0].Value' --output text 2>/dev/null || echo "unknown")
+  if ! "$SCRIPT_DIR/check-bridge-teardown-kernel.sh" "$kernel_version"; then
+    echo "ERROR: the builder did not report a kernel with the fix (KernelVersion=$kernel_version)" >&2
+    exit 1
+  fi
 
-  # Create AMI
+  # Create the image as a CANDIDATE. The runner launcher takes the newest available
+  # image tagged Purpose=github-runner of each architecture, so an image created with
+  # that tag replaces the working one for the whole pool before anything has booted
+  # it. The candidate value is one no launcher selects.
   timestamp=$(date +%Y%m%d-%H%M)
   ami_name="fcvm-runner-${kernel_version}-${AMI_ARCH}-${timestamp}"
   local image_tags
-  image_tags=$(jq -cn --arg name "$ami_name" --arg kernel "${kernel_version}-nested" --arg hash "$hash" \
-    '[{ResourceType:"image",Tags:[{Key:"Name",Value:$name},{Key:"Kernel",Value:$kernel},{Key:"BuildHash",Value:$hash},{Key:"Purpose",Value:"github-runner"}]},{ResourceType:"snapshot",Tags:[{Key:"Purpose",Value:"github-runner"}]}]')
+  image_tags=$(jq -cn --arg name "$ami_name" --arg kernel "$kernel_version" --arg hash "$hash" \
+    '[{ResourceType:"image",Tags:[{Key:"Name",Value:$name},{Key:"Kernel",Value:$kernel},{Key:"BuildHash",Value:$hash},{Key:"Purpose",Value:"github-runner-candidate"}]},{ResourceType:"snapshot",Tags:[{Key:"Purpose",Value:"github-runner"}]}]')
 
   ami_id=$(aws ec2 create-image \
     --region "$REGION" \
     --instance-id "$instance_id" \
     --name "$ami_name" \
-    --description "fcvm CI runner ($AMI_ARCH) with kernel ${kernel_version}-nested" \
+    --description "fcvm CI runner ($AMI_ARCH) with kernel $kernel_version" \
     --tag-specifications "$image_tags" \
     --query 'ImageId' --output text)
-  echo "Created AMI: $ami_id ($ami_name)"
+  if [[ ! $ami_id =~ ^ami-[0-9a-f]+$ ]]; then
+    echo "ERROR: CreateImage did not return exactly one image ID" >&2
+    exit 1
+  fi
+  echo "Created candidate AMI: $ami_id ($ami_name)"
 
-  # Wait for AMI (custom loop - default waiter times out on large disks)
-  echo "Waiting for AMI to be available..."
-  for i in $(seq 1 60); do  # 60 * 30s = 30 min max
-    state=$(aws ec2 describe-images --region "$REGION" --image-ids "$ami_id" --query 'Images[0].State' --output text)
-    echo "[$i/60] AMI state: $state"
-    if [ "$state" = "available" ]; then
-      break
-    elif [ "$state" = "failed" ]; then
-      echo "AMI creation failed!"
-      exit 1
-    fi
-    sleep 30
-  done
+  if ! wait_for_image "$ami_id"; then
+    reject_candidate "$ami_id"
+    exit 1
+  fi
+
+  # Boot test: one instance from the candidate, on bare metal as the runners are. It
+  # must report that the kernel it is RUNNING passes the bridge teardown check, and that
+  # kernel must be the one the builder resolved, which passed the same check above.
+  local boot_user_data_file test_instance boot_kernel
+  boot_user_data_file=$(mktemp)
+  create_boot_test_user_data > "$boot_user_data_file"
+  if ! test_instance=$(launch_instance "$ami_id" "$BOOT_TEST_TYPE" "$boot_user_data_file" \
+    "$builder_subnet" "$builder_security_group"); then
+    reject_candidate "$ami_id"
+    exit 1
+  fi
+  LAUNCHED+=("$test_instance")
+  echo "Boot test instance: $test_instance ($BOOT_TEST_TYPE)"
+  if ! boot_kernel=$(wait_for_boot_test "$test_instance"); then
+    reject_candidate "$ami_id"
+    exit 1
+  fi
+  if [ "$boot_kernel" != "$kernel_version" ]; then
+    echo "ERROR: the image booted $boot_kernel, not the $kernel_version the builder installed" >&2
+    reject_candidate "$ami_id"
+    exit 1
+  fi
+  echo "Boot test passed: $ami_id booted $boot_kernel on $BOOT_TEST_TYPE"
+
+  # Publish: from here the launcher selects the image.
+  aws ec2 create-tags --region "$REGION" --resources "$ami_id" \
+    --tags Key=Purpose,Value=github-runner
 
   echo "SUCCESS: $ami_id"
-  echo "ami_id=$ami_id" >> "${GITHUB_OUTPUT:-/dev/null}"
-  echo "kernel_version=$kernel_version" >> "${GITHUB_OUTPUT:-/dev/null}"
-  echo "cached=false" >> "${GITHUB_OUTPUT:-/dev/null}"
+  {
+    echo "ami_id=$ami_id"
+    echo "kernel_version=$kernel_version"
+    echo "boot_kernel=$boot_kernel"
+    echo "boot_test_type=$BOOT_TEST_TYPE"
+    echo "cached=false"
+  } >> "${GITHUB_OUTPUT:-/dev/null}"
 }
 
 main "$@"
