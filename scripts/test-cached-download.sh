@@ -44,6 +44,71 @@ wait
 for i in 1 2 3 4; do cmp -s "$dir/src/b.tgz" "$dir/par$i" || fail "concurrent run $i wrote the wrong bytes: $(cat "$dir/par$i.log")"; done
 [ "$(ls -A "$dir/cache3")" = "$shb-b.tgz" ] || fail "concurrent runs left: $(ls -A "$dir/cache3")"
 
+# A run that replaces the cache entry while another copies it: cp stats its source and then opens
+# it, and coreutils skips a source that changed in between. The shim renames a fresh copy of the
+# entry over it at the moment cp opens it, which is the interleaving a concurrent run's publish
+# produces. First prove the shim does that to a plain cp of the entry, then that the script's
+# output survives it.
+if command -v cc >/dev/null; then
+  mkdir -p "$dir/shim" "$dir/race-cache"
+  cat > "$dir/shim/shim.c" <<'C'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int openat(int dirfd, const char *path, int flags, ...) {
+  static int (*real)(int, const char *, int, ...);
+  if (!real) real = dlsym(RTLD_NEXT, "openat");
+  const char *entry = getenv("SHIM_ENTRY"), *fresh = getenv("SHIM_FRESH");
+  if (entry && fresh && strcmp(path, entry) == 0 && access(fresh, F_OK) == 0) rename(fresh, entry);
+  mode_t mode = 0;
+  if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+  return real(dirfd, path, flags, mode);
+}
+int open(const char *path, int flags, ...) {
+  mode_t mode = 0;
+  if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+  return openat(AT_FDCWD, path, flags, mode);
+}
+int open64(const char *path, int flags, ...) {
+  mode_t mode = 0;
+  if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+  return openat(AT_FDCWD, path, flags, mode);
+}
+int openat64(int dirfd, const char *path, int flags, ...) {
+  mode_t mode = 0;
+  if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
+  return openat(dirfd, path, flags, mode);
+}
+C
+  if cc -shared -fPIC -o "$dir/shim/shim.so" "$dir/shim/shim.c" -ldl 2>/dev/null; then
+    printf '#!/bin/sh\nLD_PRELOAD=%s exec /bin/cp "$@"\n' "$dir/shim/shim.so" > "$dir/shim/cp"
+    chmod +x "$dir/shim/cp"
+    shr="$dir/src/c.tgz"; head -c 300000 /dev/urandom > "$shr"
+    shc=$(sha256sum "$shr" | cut -d' ' -f1)
+    entry="$dir/race-cache/$shc-c.tgz"
+    "$dl" "file://$shr" "$shc" "$dir/race0" "$dir/race-cache" >/dev/null 2>&1 || fail "race setup run failed"
+    cp "$entry" "$dir/race-cache/.fresh"
+    if SHIM_ENTRY=$entry SHIM_FRESH=$dir/race-cache/.fresh "$dir/shim/cp" "$entry" "$dir/race-probe" 2>"$dir/probe.log" \
+        && ! grep -q 'replaced while being copied' "$dir/probe.log"; then
+      fail "the replace shim did not interrupt a plain cp of the entry"
+    fi
+    cp "$entry" "$dir/race-cache/.fresh"
+    SHIM_ENTRY=$entry SHIM_FRESH=$dir/race-cache/.fresh PATH="$dir/shim:$PATH" \
+      "$dl" "file://$shr" "$shc" "$dir/race1" "$dir/race-cache" > "$dir/race1.log" 2>&1 \
+      || fail "a run whose entry was replaced mid-copy failed: $(cat "$dir/race1.log")"
+    cmp -s "$shr" "$dir/race1" || fail "a run whose entry was replaced mid-copy wrote the wrong bytes: $(cat "$dir/race1.log")"
+  else
+    fail "cc cannot build the replace shim"
+  fi
+else
+  fail "no C compiler for the replace shim"
+fi
+
 # Every GitHub release URL in a workflow goes through cached-download.sh (it is its argument,
 # on the same line or within the two lines before): a step that curls one directly fails the
 # job whenever GitHub answers 5xx. WORKFLOWS points the check at another tree's workflows.
