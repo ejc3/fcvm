@@ -22,7 +22,7 @@
       "start_floor_ms": 250
     }
   },
-  "description": "Potato mode (docs/fleet/ARCHITECTURE.md, \"Potato mode\"): a host with players starts the ladder at its smallest size; catches step each player's colour, counter and chain and the coordinator checks every step; a lap completed sets the size's record, the pace measured over it; a wrong colour drops the ball as a proof mismatch; a catcher still waking drops it with the late stage and its time, and the time it did start accepting; each drop moves up the ladder, which wraps to the smallest size; faster and restart are rate limited; the ladder and its records stay when the host goes.",
+  "description": "Potato mode (docs/fleet/ARCHITECTURE.md, \"Potato mode\"): a host with players starts the ladder at its smallest size; catches step each player's colour, counter and chain and the coordinator checks every step; a lap completed sets the size's record, the pace measured over it by the agent's monotonic stamps; a wrong colour drops the ball as a proof mismatch; a catcher still waking drops it with the late stage and its time, and the time it did start accepting; each drop moves up the ladder, which wraps to the smallest size; faster and restart are rate limited; the ladder and its records stay when the host goes.",
   "events": [
     {
       "at": 1000,
@@ -114,6 +114,7 @@
         "colour": 4,
         "counter": 1,
         "kind": "caught",
+        "mono_us": 1100000,
         "player": 0,
         "round": 1,
         "seq": 0,
@@ -147,6 +148,7 @@
         "colour": 8,
         "counter": 1,
         "kind": "caught",
+        "mono_us": 3101000,
         "player": 1,
         "round": 1,
         "seq": 1,
@@ -205,6 +207,7 @@
         "colour": 5,
         "counter": 2,
         "kind": "caught",
+        "mono_us": 5101000,
         "player": 0,
         "round": 1,
         "seq": 2,
@@ -221,6 +224,7 @@
         "colour": 10,
         "counter": 2,
         "kind": "caught",
+        "mono_us": 6901000,
         "player": 1,
         "round": 1,
         "seq": 3,
@@ -245,6 +249,7 @@
         "colour": 6,
         "counter": 3,
         "kind": "caught",
+        "mono_us": 12100000,
         "player": 0,
         "round": 2,
         "seq": 0,

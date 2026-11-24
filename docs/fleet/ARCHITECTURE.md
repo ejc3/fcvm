@@ -1873,13 +1873,18 @@ player then draws its first colour from the guest's random pool.
    ball, rounded, for a player built before `hold_us`. The pace the page shows is measured:
    the catches of the last completed lap divided by the time from the catch before the
    lap's first to the lap's last (lap 0 has no catch before it: its last catch minus its
-   first, over one catch fewer). The times are the host agent's stamps of the catch reports
-   (`at`, which every agent has sent since the first), not the coordinator's: the
-   coordinator stamps a message when it applies it, and a connection that stalls delivers a
-   lap's catches in one burst. The pace is also bounded by the game: every catcher keeps
-   the ball for its hold before the next can catch, so a lap whose stamps span less than
-   nine tenths of the holds its catchers kept (the agent read its reports late, in a burst)
-   has no pace, sets no record and is published with a null pace.
+   first, over one catch fewer). The times are the host agent's stamps of the catch
+   reports, not the coordinator's: the coordinator stamps a message when it applies it, and
+   a connection that stalls delivers a lap's catches in one burst. The agent stamps each
+   catch twice: `mono_us`, its monotonic clock in microseconds since it started, and `at`,
+   its wall clock, which can step. A lap is timed by the monotonic stamps when every catch
+   of it has one, and by the wall clock otherwise (an agent built before `mono_us`; every
+   agent has sent `at` since the first). The pace is also bounded by the game: every
+   catcher keeps the ball for its hold before the next can catch, so a lap cannot have
+   taken less than the holds its catchers kept. On the monotonic clock a lap that spans
+   less than all of them, less 1 ms for the stamps, has no pace (its first stamp was read
+   late); on the wall clock nine tenths are accepted. A lap without a pace sets no record
+   and is published with a null pace.
 
 The ball drops when the thrower's flight window runs out (the catcher was asleep, waking,
 or not yet accepting), when a proof does not match, when a wake fails, or when no catch is
@@ -2027,52 +2032,19 @@ kept: reflinking a diff's memory file into an ordinary directory (a sleep's p99 
 from btrfs into the agent). These runs predate the guest image without maintenance timers,
 whose fwupd OOMs stalled a few sleeps further.
 
-### Measured: the ladder on 8 CPUs (2026-11-24)
+### The edge on K CPUs
 
-96 players with `--potato-cpus 8` on a c8g.metal-24xl (96 vCPU, Linux 7.0), the stack at
-29789bae, a coordinator on loopback with the host's agent as its agent, 30 minutes an arm:
-`confined` in a delegated unit (the ring's cpuset on 8 CPUs) and `counted` without. The store
-was a btrfs image in RAM (the box has no instance NVMe), so the sleep and wake times are for
-that store, not for a fleet host. Each arm played 69 rounds.
+A catcher holds a CPU from the start of its wake to the end of its save, so at a pace p the
+ring holds about p x (wake + sleep) + 1 CPUs (the one more holds the ball), and the pace K
+CPUs carry is about (K - 1) / (wake + sleep). The wake is the whole of it, up to the ball
+port answering the agent, not the restore alone. For example, a 250 ms wake and a 250 ms
+sleep give 14 catches a second on 8 CPUs.
 
-| ring | machines per CPU | best lap pace, catches/s | median pace at the drop | median hold at the drop, ms | asleep, % | CPU wait p50 / max, ms |
-|---|---|---|---|---|---|---|
-| 16 | 2 | 16.5 / 13.7 | 13.9 / 12.6 | 62.5 / 70 | 50 | 187 / 318, 187 / 362 |
-| 32 | 4 | 13.6 / 13.5 | 12.7 / 11.9 | 68 / 75 | 75 | 182 / 312, 181 / 309 |
-| 64 | 8 | 13.2 / 13.1 | 12.3 / 11.8 | 73 / 74 | 87.5 | 178 / 301, 178 / 336 |
-| 96 | 12 | 13.3 / 13.0 | 12.3 / 11.4 | 73 / 79 | 91.7 | 176 / 302, 173 / 358 |
-
-Each cell is confined / counted.
-
-- **The cap held.** The agent's count of machines not asleep peaked at 8 on every rung of
-  both arms and never passed it; 61% of the sampled catches found all 8 held, and the
-  share asleep was (N - 8) / N throughout. The count is the agent's ledger; no process
-  count was taken beside it.
-- **CPUs busy** (the cpuset's `cpu.stat`, confined arm): a median of 3.2 to 3.3 of the 8,
-  and 4.0 to 5.0 on each rung's best lap.
-- **Wake** p50 91 to 98 ms and p95 278 to 287 ms; **sleep** p50 255 to 264 ms, p95 303 to
-  317 ms confined and 327 to 336 ms counted.
-- **Drops:** 135 of the 138 were a catcher still waking, late by a median of 22 to 58 ms;
-  two were wakes that failed, and one had no cause (the catcher's wake was reported 0.1 ms
-  before the drop was read, which the cause rules above now name).
-- **Confinement cost nothing measurable:** the confined arm's median pace at the drop was
-  3 to 10% above the counted arm's, which started with the load average still at 3.6 from
-  the arm before it.
-- **The edge.** A catcher holds a CPU from the start of its wake to the end of its save, so
-  at a pace p the ring holds about p x (wake + sleep) + 1 CPUs, and the pace K CPUs carry
-  is about (K - 1) / (wake + sleep). An earlier estimate of 9 catches a second for 8 CPUs
-  at a 250 ms wake and a 250 ms sleep was low: the same figures give 14. Here the median
-  wake and sleep (92 and 255 ms) give 20, and the measured 12 to 14 is what the slower
-  cluster of wakes gives (282 and 255 ms: 13).
-- **Why the wakes are in two clusters.** 10,921 of the confined arm's 12,217 wakes took
-  under 200 ms, 1,271 took 250 to 350 ms, and 23 fell between. The slow ones spend the
-  same 84 ms restoring and about 200 ms more waiting for the ball port: the agent's probe
-  of the port (`until_listening`) gives each try 250 ms, and a try sent before the port
-  answers waits all of it. Every drop's catcher had been waking 180 to 375 ms. A third,
-  10 minute arm with that timeout at 25 ms had 1 wake of 200 ms or more in 2,895 and
-  dropped at holds of 39, 49 and 49 ms on rings of 16, 32 and 64 (17 to 18.5 catches a
-  second; one round a rung). The probe is being changed for every mode of the agent at
-  once, outside this section's commit; until then the edge sits at 12 to 14.
+No measured ladder at a fixed K is in this document yet. The first run of 96 players on 8
+CPUs was on a host kernel whose network namespace cleanup stalls every network operation
+when namespaces die together (fixed upstream in 6.18.60 and 7.2), and every sleep of a
+player ends a namespace, so that run's wake, sleep and pace figures are not shown. The run
+follows on a kernel with the fix, which is the kernel the fleet's hosts run.
 
 ### The ladder and where a round starts
 

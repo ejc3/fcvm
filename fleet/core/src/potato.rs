@@ -82,6 +82,11 @@ pub enum PotatoKind {
         /// read before the catcher's wake had ended (its `woke` then carries it).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ready_margin_ms: Option<f64>,
+        /// When the agent read the report, on its monotonic clock: microseconds since the
+        /// agent started. `at` is its wall clock, which can step. None from an agent built
+        /// before it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mono_us: Option<u64>,
     },
     /// The catcher accepted the ball; `seq` is the ball's new seq, `to` its catcher.
     Threw {
@@ -425,11 +430,10 @@ pub struct Round {
     #[serde(default)]
     pub kept_us: Option<u64>,
     /// Each catch not yet behind a completed lap, by seq, and the last catch of the latest
-    /// completed lap: when the host's agent read it (the event's own `at`, ms on the host's
-    /// clock) and the hold its catcher kept (microseconds). What a lap's pace is measured
-    /// from, and bounded by.
+    /// completed lap: when the host's agent read it and the hold its catcher kept. What a
+    /// lap's pace is measured from, and bounded by.
     #[serde(default)]
-    pub catch_marks: BTreeMap<u64, (u64, u64)>,
+    pub catch_stamps: BTreeMap<u64, CatchStamp>,
     /// The completed laps, oldest first, at most the last [`LAPS_KEPT`].
     #[serde(default)]
     pub laps: Vec<Lap>,
@@ -451,15 +455,29 @@ pub struct Round {
     pub beat_record: bool,
 }
 
+/// When the host's agent read a catch, and the hold its catcher kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatchStamp {
+    /// The agent's wall clock, ms (the event's `at`). It can step.
+    pub at: u64,
+    /// The agent's monotonic clock, microseconds since it started; none from an agent built
+    /// before it sent one.
+    #[serde(default)]
+    pub mono_us: Option<u64>,
+    /// The hold the catcher kept, microseconds.
+    pub hold_us: u64,
+}
+
 /// The laps of a round the view keeps.
 pub const LAPS_KEPT: usize = 60;
 
-/// A lap's catches are stamped when the host's agent reads their reports, and a report read
-/// late shortens the interval after it. A lap is timed only if its stamps span at least this
-/// share of the holds its catchers kept, in tenths; flight between the holds only adds time.
-const PACE_HOLD_TENTHS: u64 = 9;
-/// The stamps are whole milliseconds.
-const PACE_STAMP_SLACK_MS: u64 = 1;
+/// A lap timed by the agent's wall clock (an agent that sends no monotonic stamp) is accepted
+/// when its stamps span at least this share of the holds its catchers kept, in tenths: that
+/// clock can step, and a report read late shortens the interval after it. A lap timed by the
+/// monotonic clock must span all of them.
+const PACE_WALL_TENTHS: u64 = 9;
+/// What a lap may fall short of its bound by: the stamps' granularity, microseconds.
+const PACE_SLACK_US: u64 = 1000;
 
 /// A completed lap: its measured pace, in catches per second, and the longest hold a catch
 /// of it carried.
@@ -519,33 +537,51 @@ impl Round {
     /// read its catches: the lap's catches over the time from the catch before its first to
     /// its last. Lap 0 has no catch before it: its last minus its first, over one catch fewer.
     ///
-    /// The host's clock, not the coordinator's: the coordinator stamps a message when it
-    /// applies it, and a connection that stalls delivers a lap's catches in one burst. Every
-    /// agent has stamped its events since the first, so no agent lacks the stamp.
+    /// The host's clocks, not the coordinator's: the coordinator stamps a message when it
+    /// applies it, and a connection that stalls delivers a lap's catches in one burst. When
+    /// every catch of the lap carries the agent's monotonic stamp the lap is timed by that;
+    /// otherwise (an agent built before it) by the agent's wall clock, which every agent has
+    /// sent since the first.
     ///
     /// Bounded by the game itself: each catcher keeps the ball for its hold before the next
-    /// can catch, so the lap cannot have taken less than the holds its catchers kept. A lap
-    /// whose stamps say it did (the agent read its reports late, in a burst) has no pace.
+    /// can catch, so the lap cannot have taken less than the holds its catchers kept. On
+    /// the monotonic clock a lap that spans less than all of them (less 1 ms for the stamps)
+    /// has no pace: its first stamp was read late. On the wall clock, which can also step,
+    /// nine tenths are accepted, as before the monotonic stamp existed.
     fn lap_pace(&self, lap: u64) -> Option<f64> {
         let n = self.ring.len() as u64;
         let last = (lap + 1) * n - 1;
         let first = lap * n;
         let from = first
             .checked_sub(1)
-            .filter(|s| self.catch_marks.contains_key(s))
+            .filter(|s| self.catch_stamps.contains_key(s))
             .unwrap_or(first);
-        let (from_at, _) = *self.catch_marks.get(&from)?;
-        let (to_at, _) = *self.catch_marks.get(&last)?;
+        let stamps = (from..=last)
+            .map(|s| self.catch_stamps.get(&s))
+            .collect::<Option<Vec<_>>>()?;
+        let (start, end) = (stamps.first()?, stamps.last()?);
         let catches = last - from;
-        let wall_ms = to_at.checked_sub(from_at).filter(|w| *w > 0)?;
         // every catcher from `from` to the last but one held the ball before the next caught
-        let held_us = (from..last)
-            .map(|s| self.catch_marks.get(&s).map(|m| m.1))
-            .sum::<Option<u64>>()?;
-        if (wall_ms + PACE_STAMP_SLACK_MS) * 10_000 < held_us * PACE_HOLD_TENTHS {
-            return None;
-        }
-        (catches > 0).then(|| (catches as f64 * 100_000.0 / wall_ms as f64).round() / 100.0)
+        let held_us: u64 = stamps[..stamps.len() - 1].iter().map(|s| s.hold_us).sum();
+        let monotonic = stamps.iter().map(|s| s.mono_us).collect::<Option<Vec<_>>>();
+        let wall_us = match monotonic {
+            Some(_) => {
+                let wall_us = end.mono_us?.checked_sub(start.mono_us?)?;
+                if wall_us + PACE_SLACK_US < held_us {
+                    return None;
+                }
+                wall_us
+            }
+            None => {
+                let wall_us = end.at.checked_sub(start.at)? * 1000;
+                if (wall_us + PACE_SLACK_US) * 10 < held_us * PACE_WALL_TENTHS {
+                    return None;
+                }
+                wall_us
+            }
+        };
+        (catches > 0 && wall_us > 0)
+            .then(|| (catches as f64 * 100_000_000.0 / wall_us as f64).round() / 100.0)
     }
 
     /// Host CPUs the ring used over completed lap `lap`: the cpuset's CPU time between the
@@ -930,7 +966,7 @@ impl Potato {
             verified_ahead: Default::default(),
             lap_holds: BTreeMap::new(),
             kept_us: None,
-            catch_marks: BTreeMap::new(),
+            catch_stamps: BTreeMap::new(),
             laps: Vec::new(),
             best_pace: None,
             ring_stats: None,
@@ -1103,6 +1139,7 @@ impl Potato {
                 hold_us,
                 ring,
                 ready_margin_ms,
+                mono_us,
             } => {
                 let Some(p) = self.players.get_mut(&e.player) else {
                     return;
@@ -1156,9 +1193,15 @@ impl Potato {
                 };
                 let longest = r.lap_holds.entry(lap).or_insert(hold);
                 *longest = (*longest).max(hold);
-                // the host's stamp: both ends of every interval are its own clock's
-                r.catch_marks
-                    .insert(*seq, (e.at, hold_us.unwrap_or(hold * 1000)));
+                // the host's stamps: both ends of every interval are its own clock's
+                r.catch_stamps.insert(
+                    *seq,
+                    CatchStamp {
+                        at: e.at,
+                        mono_us: *mono_us,
+                        hold_us: hold_us.unwrap_or(hold * 1000),
+                    },
+                );
                 if let Some(stats) = ring {
                     let peak = r.lap_cpus_peak.entry(lap).or_insert(0);
                     *peak = (*peak).max(stats.cpus_peak).max(stats.cpus_in_use);
@@ -1192,7 +1235,7 @@ impl Potato {
                     let cpus_busy = pace.and_then(|_| r.lap_busy(l));
                     let cpus_peak = r.lap_cpus_peak.remove(&l);
                     // the lap's last catch stays: the next lap is measured from it
-                    r.catch_marks.retain(|s, _| *s + 1 >= (l + 1) * n);
+                    r.catch_stamps.retain(|s, _| *s + 1 >= (l + 1) * n);
                     r.cpu_marks.retain(|s, _| *s + 1 >= (l + 1) * n);
                     if let Some(pace) = pace {
                         if r.best_pace.is_none_or(|b| pace > b) {
@@ -1671,6 +1714,7 @@ mod tests {
                 hold_us: None,
                 ring: None,
                 ready_margin_ms: None,
+                mono_us: None,
             },
         };
         let s = serde_json::to_string(&e).unwrap();
@@ -1736,6 +1780,7 @@ mod tests {
                     hold_us: None,
                     ring: None,
                     ready_margin_ms: None,
+                    mono_us: None,
                 },
             },
             1100,
@@ -1844,6 +1889,7 @@ mod tests {
                 hold_us: None,
                 ring: None,
                 ready_margin_ms: None,
+                mono_us: None,
             },
         }
     }
@@ -2008,10 +2054,122 @@ mod tests {
         assert_eq!((v.pace, v.best_pace), (Some(2.0), Some(10.0)));
         assert_eq!(g.ladder[0].record_pace, Some(10.0));
         assert_eq!(
-            g.round.as_ref().unwrap().catch_marks.len(),
+            g.round.as_ref().unwrap().catch_stamps.len(),
             1,
             "only the last lap's last catch is kept to measure the next from"
         );
+    }
+
+    /// The catch `e`, read by the agent `ms` after it started, by its monotonic clock.
+    fn mono(mut e: PotatoEvent, ms: u64) -> PotatoEvent {
+        if let PotatoKind::Caught { mono_us, .. } = &mut e.kind {
+            *mono_us = Some(ms * 1000);
+        }
+        e
+    }
+
+    /// With the agent's monotonic stamps a lap must span all of the holds its catchers kept.
+    /// A lap whose first stamp was read late by a tenth of it used to pass the wall clock's
+    /// nine tenths and set a record 11% above what the holds allow.
+    #[test]
+    fn a_lap_read_a_tenth_late_at_its_start_sets_no_record() {
+        let (mut g, cfg, mut proofs) = ladder_game(4, 8);
+        let id = g.round.as_ref().unwrap().id;
+        let mut play = |g: &mut Potato, seq: u64, at: u64| {
+            let e = held(
+                catch(&mut proofs, (seq % 4) as u32, id, seq, at, false),
+                100,
+            );
+            let e = mono(e, at - 1000);
+            g.event("h", &e, at, &cfg);
+        };
+        let rung = |g: &Potato| g.view(&cfg).unwrap().ladder[0].record_pace;
+        // lap 0 as played: a catch every 100 ms
+        for (seq, at) in [(0, 1100), (1, 1200), (2, 1300)] {
+            play(&mut g, seq, at);
+        }
+        // its last catch happened at 1400 and is read 40 ms late
+        play(&mut g, 3, 1440);
+        assert_eq!(
+            rung(&g),
+            Some(8.82),
+            "3 catches in 340 ms: slower, and true to the stamps"
+        );
+        // lap 1 is measured from that late stamp: 360 ms for 400 ms of holds
+        for (seq, at) in [(4, 1500), (5, 1600), (6, 1700), (7, 1800)] {
+            play(&mut g, seq, at);
+        }
+        let v = g.view(&cfg).unwrap();
+        let r = v.round.as_ref().unwrap();
+        assert_eq!(
+            r.laps[1].pace, None,
+            "not 11.11 catches a second at 100 ms holds"
+        );
+        assert_eq!((r.pace, r.best_pace), (None, Some(8.82)));
+        assert_eq!(rung(&g), Some(8.82));
+        // a lap that spans its holds, to the millisecond, is timed
+        for (seq, at) in [(8, 1900), (9, 2000), (10, 2100), (11, 2200)] {
+            play(&mut g, seq, at);
+        }
+        assert_eq!(g.view(&cfg).unwrap().round.unwrap().pace, Some(10.0));
+        assert_eq!(rung(&g), Some(10.0));
+    }
+
+    /// The agent's wall clock steps back in the middle of a lap (NTP). The monotonic stamps
+    /// are right, and the lap has its true pace; by the wall clock it would have none, or a
+    /// wrong one.
+    #[test]
+    fn a_backward_step_of_the_wall_clock_leaves_the_pace_true() {
+        let (mut g, cfg, mut proofs) = ladder_game(4, 8);
+        let id = g.round.as_ref().unwrap().id;
+        // a catch every 100 ms by the monotonic clock; the wall clock steps back 5 s after
+        // the second, and forward 250 ms before the last of lap 1
+        let wall = [
+            1100, 1200, 300, 400, // lap 0: its last stamp is before its first
+            500, 600, 700, 1050, // lap 1: 650 ms by the wall clock, 400 ms in truth
+        ];
+        for (seq, wall_at) in wall.into_iter().enumerate() {
+            let seq = seq as u64;
+            let e = held(
+                catch(&mut proofs, (seq % 4) as u32, id, seq, wall_at, false),
+                100,
+            );
+            let e = mono(e, 100 + seq * 100);
+            g.event("h", &e, 9000 + seq, &cfg);
+        }
+        let r = g.view(&cfg).unwrap().round.unwrap();
+        assert_eq!(
+            r.laps.iter().map(|l| l.pace).collect::<Vec<_>>(),
+            vec![Some(10.0), Some(10.0)],
+            "3 catches in 300 ms, then 4 in 400 ms"
+        );
+    }
+
+    /// An agent that sends no monotonic stamp is timed by its wall clock under the rule from
+    /// before the stamp existed, and a lap with a catch that has none falls back to it.
+    #[test]
+    fn a_lap_without_monotonic_stamps_keeps_the_wall_clocks_rule() {
+        let (mut g, cfg, mut proofs) = ladder_game(4, 8);
+        let id = g.round.as_ref().unwrap().id;
+        for (seq, at) in [(0u64, 1100), (1, 1200), (2, 1300), (3, 1440)] {
+            let e = held(
+                catch(&mut proofs, (seq % 4) as u32, id, seq, at, false),
+                100,
+            );
+            g.event("h", &e, at, &cfg);
+        }
+        // 360 ms for 400 ms of holds: within the wall clock's nine tenths
+        for (seq, at) in [(4u64, 1500), (5, 1600), (6, 1700), (7, 1800)] {
+            let e = held(
+                catch(&mut proofs, (seq % 4) as u32, id, seq, at, false),
+                100,
+            );
+            // one catch of the lap with a monotonic stamp does not make the lap monotonic
+            let e = if seq == 6 { mono(e, 5) } else { e };
+            g.event("h", &e, at, &cfg);
+        }
+        let r = g.view(&cfg).unwrap().round.unwrap();
+        assert_eq!(r.laps[1].pace, Some(11.11));
     }
 
     /// A lap cannot be faster than the holds its catchers kept. One whose stamps say it was

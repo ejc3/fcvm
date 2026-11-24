@@ -510,6 +510,7 @@ pub async fn run(
         ready.is_ok()
     });
     let mut d = Driver {
+        epoch: Instant::now(),
         cfg: cfg.clone(),
         ops: Arc::new(FcvmOps {
             cfg: cfg.clone(),
@@ -1069,6 +1070,8 @@ impl Ops for FcvmOps {
 }
 
 struct Driver {
+    /// When this agent's potato mode started: the zero of the monotonic stamps it sends.
+    epoch: Instant,
     cfg: Arc<PotatoCfg>,
     ops: Arc<dyn Ops>,
     out: mpsc::UnboundedSender<AgentMsg>,
@@ -1114,6 +1117,11 @@ impl Driver {
         if !matches!(phase, Phase::Awake | Phase::Waking | Phase::Booting) {
             p.ready_at = None;
             p.margin_due = None;
+        }
+        // A wake's wait for a CPU is that wake's: it ends with the life the wake began, when
+        // the player sleeps, is lost or is booted again. `wake` sets it for the next.
+        if !matches!(phase, Phase::Waking | Phase::Awake) {
+            p.cpu_waited_ms = None;
         }
     }
 
@@ -1532,6 +1540,8 @@ impl Driver {
                         hold_us,
                         ring,
                         ready_margin_ms,
+                        // `at` is the wall clock, which can step: laps are timed by this
+                        mono_us: Some(read.saturating_duration_since(self.epoch).as_micros() as u64),
                     },
                 );
             }
@@ -1883,6 +1893,7 @@ mod tests {
         let (done, _done_rx) = mpsc::unbounded_channel();
         std::mem::forget(_done_rx);
         let d = Driver {
+            epoch: Instant::now(),
             cfg: Arc::new(PotatoCfg {
                 fcvm: "fcvm".into(),
                 image: "img".into(),
@@ -2708,6 +2719,86 @@ mod tests {
             ("awake".into(), None, Some(0.0)),
             "ready inside the window, after the thrower's last try"
         );
+    }
+
+    /// A player whose wake waited for a CPU and then failed is booted again from the gold. A
+    /// drop on it afterwards reports no wait: the wait was the lost wake's, not this life's.
+    #[test]
+    fn a_player_booted_again_reports_no_wait_of_an_earlier_wake() {
+        let (mut d, rec, mut out) = asleep(2, 300.0);
+        d.order(Some(round(1, vec![0, 1], 1000)));
+        d.done(Done::Woke(0, Ok(ready()), 300.0));
+        // player 1's wake has waited 20 ms for a CPU when the catch asks for it again
+        let Some(waiting_since) = Instant::now().checked_sub(Duration::from_millis(20)) else {
+            return;
+        };
+        d.players[1].wanted_since = Some(waiting_since);
+        d.heard(caught(0, 1, 0));
+        assert_eq!(rec.take(), vec!["wake 0", "kick 1", "wake 1"]);
+        assert!(d.players[1].cpu_waited_ms.is_some_and(|w| w >= 20.0));
+        // the wake fails, and the player is restored from the gold
+        d.done(Done::Woke(1, Err(unstarted(anyhow::anyhow!("gone"))), 0.0));
+        d.advance();
+        assert_eq!(rec.take(), vec!["boot 1"]);
+        d.done(Done::Booted(1, Ok(ready())));
+        assert_eq!(
+            d.players[1].phase,
+            Phase::Awake,
+            "the next catcher stays awake"
+        );
+        sent(&mut out);
+        d.heard(heard(Report::Dropped {
+            player: 0,
+            round: 1,
+            seq: 1,
+            to: addr(1),
+            attempts: 3,
+            reason: "refused".into(),
+        }));
+        let wait = sent(&mut out).into_iter().find_map(|e| match e.kind {
+            PotatoKind::Dropped {
+                catcher_phase,
+                catcher_cpu_wait_ms,
+                ..
+            } => Some((catcher_phase, catcher_cpu_wait_ms)),
+            _ => None,
+        });
+        assert_eq!(wait, Some(("awake".to_string(), None)));
+    }
+
+    /// A catch carries when the agent read it on its monotonic clock, counted from the
+    /// agent's start: the wall clock in `at` can step.
+    #[test]
+    fn a_catch_carries_the_agents_monotonic_stamp() {
+        let (mut d, _rec, mut out) = asleep(2, 300.0);
+        d.order(Some(round(1, vec![0, 1], 1000)));
+        d.done(Done::Woke(0, Ok(ready()), 300.0));
+        sent(&mut out);
+        let stamps: Vec<Option<u64>> = [250u64, 1250]
+            .into_iter()
+            .enumerate()
+            .map(|(seq, after_ms)| {
+                d.heard(Heard {
+                    report: Report::Caught {
+                        player: seq as u32,
+                        round: 1,
+                        seq: seq as u64,
+                        proof: proof(),
+                        hold_us: None,
+                    },
+                    at: 1,
+                    read: d.epoch + Duration::from_millis(after_ms),
+                });
+                sent(&mut out)
+                    .into_iter()
+                    .find_map(|e| match e.kind {
+                        PotatoKind::Caught { mono_us, .. } => Some(mono_us),
+                        _ => None,
+                    })
+                    .expect("the catch is sent on")
+            })
+            .collect();
+        assert_eq!(stamps, vec![Some(250_000), Some(1_250_000)]);
     }
 
     /// While the ball is in play a boot leaves a CPU for the next wake. A player whose sleep

@@ -1287,9 +1287,12 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   completed lap, measured: the lap's catches divided by the time from the catch before its
   first to its last, by the host agent's stamps of the catch reports (lap 0: its last catch
   minus its first, over size - 1 catches); null before a lap completes, and never computed
-  from the hold. A lap whose stamps span less than nine tenths of the holds its catchers
-  kept was read in a burst and did not happen at that speed: its `pace` is null, it sets no
-  record and is not the round's best, and a page does not draw it. `best_pace` is the
+  from the hold. The stamps are the agent's monotonic ones (`mono_us`, below) when every
+  catch of the lap has one, and its wall clock (`at`) otherwise. A lap cannot have taken
+  less than the holds its catchers kept: one whose monotonic stamps span less than all of
+  them (less 1 ms), or whose wall stamps span less than nine tenths, was read late or in a
+  burst and did not happen at that speed. Its `pace` is null, it sets no record and is not
+  the round's best, and a page does not draw it. `best_pace` is the
   fastest of the round's laps, and `laps` the completed laps, oldest first, at most the last
   60, each with its pace (null as above) and the longest hold a catch of it carried.
   A page that does not know `pace`, `best_pace` or `laps` ignores them, and one that does
@@ -1759,7 +1762,7 @@ cpuset of that many host CPUs; absent means false). `kind` is one of:
 | kind | fields | when |
 |------|--------|------|
 | `hello` | `colour`, `counter`, `chain`, `colours`, `connections`, `last_round`, `last_seq` | the player opened a report connection: once when new (`connections` 1, `counter` 0), and once after each wake. `last_round`/`last_seq` name its last catch |
-| `caught` | `round`, `seq`, `colour`, `counter`, `chain`, `hold_us`, `ring`, `ready_margin_ms` | it caught the ball. `ring` is the agent's count when it read the catch, `{"cpus_in_use", "cpus_peak" (the most since the catch before), "asleep", "lead", "slowest_wake_ms", "slots": [{"player", "phase"}], "cpu_usec" (the cpuset's `usage_usec`, absent when not confined)}`; `ready_margin_ms` is how long before the throw to it began the catcher was ready, absent for a round's first catch and when the catch was read before the end of the catcher's wake. Both are absent from an agent without an allotment. `hold_us` is the hold it will keep, in microseconds, after any pace cap; absent from a player built before it, and the coordinator then computes the hold as those players do (a tenth off per lap in whole milliseconds) |
+| `caught` | `round`, `seq`, `colour`, `counter`, `chain`, `hold_us`, `ring`, `ready_margin_ms`, `mono_us` | it caught the ball. `ring` is the agent's count when it read the catch, `{"cpus_in_use", "cpus_peak" (the most since the catch before), "asleep", "lead", "slowest_wake_ms", "slots": [{"player", "phase"}], "cpu_usec" (the cpuset's `usage_usec`, absent when not confined)}`; `ready_margin_ms` is how long before the throw to it began the catcher was ready, absent for a round's first catch and when the catch was read before the end of the catcher's wake. Both are absent from an agent without an allotment. `mono_us` is when the agent read the report on its monotonic clock, in microseconds since the agent started (`at` is its wall clock, which can step); laps are timed by it, and an agent built before it sends none. `hold_us` is the hold it will keep, in microseconds, after any pace cap; absent from a player built before it, and the coordinator then computes the hold as those players do (a tenth off per lap in whole milliseconds) |
 | `threw` | `round`, `seq` (the ball's new seq), `to`, `attempts`, `wait_ms`, `send_ms` | the next player accepted the ball |
 | `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms`, `catcher_cpu_wait_ms`, `catcher_late_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to`. `catcher_cpu_wait_ms`, when present, is how long `to`'s wake has waited for a free CPU (it is still `asleep`) or waited before it started (`waking`, `awake`). `catcher_late_ms`, present when `to` is `awake` by the time the drop is read, is how long after the end of the thrower's flight window it was ready (0: between the thrower's last try and that end) |
 | `slept` | `sleep_ms`, `stages`, `written_mib` | its snapshot is written and its fcvm has exited. `stages` splits `sleep_ms` into the agent's steps, `ask_ms` (telling the player its round is over), `create_ms` (`fcvm snapshot create --stop`) and `reap_ms` (waiting for the player's fcvm to exit), and splits `create_ms` with fcvm's own: `stage_ms` (the new generation's directory and memory file), `prepare_ms`, `pause_ms`, `save_ms`, `disk_ms`, `publish_ms` (installing it and removing the old one) and `stop_ms` |
