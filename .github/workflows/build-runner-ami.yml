@@ -7,10 +7,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cancel in-progress runs when a new run is triggered
+# One image build at a time, and a build in flight is never cancelled. Every finished
+# Build Kernels run starts a run of this workflow, including one whose only job is then
+# skipped, and with cancel-in-progress that run cancelled a build 44 minutes in on
+# 2026-11-24, leaving its builder running. A newer run waits for the one in flight, and
+# replaces an older run that is still waiting.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   AWS_REGION: us-west-1

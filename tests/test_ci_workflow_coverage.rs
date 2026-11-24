@@ -104,6 +104,45 @@ fn main_runs_are_not_cancelled_by_the_next_merge() {
     );
 }
 
+/// An image build in flight must be allowed to finish.
+///
+/// Build Runner AMI starts after every finished Build Kernels run, and a run whose only job
+/// is skipped still enters the concurrency group. With `cancel-in-progress: true` such a run
+/// cancelled a build 44 minutes in on 2026-11-24: nothing was published and the builder was
+/// left running for the reaper. One group per ref keeps builds one at a time, so a later run
+/// starts after the earlier one has published or failed, and the launcher takes the newer
+/// image.
+#[test]
+fn an_image_build_in_flight_is_not_cancelled_by_a_newer_run() {
+    let workflow = parse_workflow("build-runner-ami.yml");
+    let concurrency = workflow
+        .get("concurrency")
+        .expect("build-runner-ami.yml has no `concurrency`");
+    assert_eq!(
+        concurrency
+            .get("cancel-in-progress")
+            .and_then(Value::as_bool),
+        Some(false),
+        "a newer Build Runner AMI run must wait for the build in flight, not cancel it"
+    );
+    let group: String = concurrency["group"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        group, "${{github.workflow}}-${{github.ref}}",
+        "one group per ref: two image builds must never run side by side"
+    );
+    assert!(
+        workflow_job(&workflow, "build-ami")
+            .get("concurrency")
+            .is_none(),
+        "a job-level group would let the two legs of one run cancel or queue behind each other"
+    );
+}
+
 /// Marking a draft ready must start a CI run.
 ///
 /// With the default `pull_request` types a ready flip fires no event, so a PR whose
