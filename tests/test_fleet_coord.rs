@@ -2007,16 +2007,18 @@ async fn minecraft_status_rows_reach_the_pages_that_asked_and_move_no_version() 
     assert!(!got.to_string().contains("mc-host"), "{got}");
     assert_eq!(got["t"], 1000);
     assert_eq!(got["rows"], "A8gDAAkAnAEB//8A/////w==");
+    // stamped with the coordinator's clock when it came, for the rows' age
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let at = got["received_at"].as_u64().unwrap();
+    assert!(at <= now && now - at < 10_000, "{at} {now}");
     assert_eq!((&got["cpus"], &got["busy"]), (&json!(192), &json!(1.5)));
     assert_eq!(
         (&got["mem_total_mib"], &got["mem_used_mib"]),
         (&json!(385_024), &json!(20_480))
     );
-    // a later report replaces it
-    agent.to_coord.send(rows(2000)).unwrap();
-    asked
-        .message_where("minecraft_status", |m| m["t"] == 2000)
-        .await;
     // the page that did not ask was sent none, though its socket is live
     other
         .send(json!({"type": "ping", "client_unix_ms": 2.0}))
@@ -2031,6 +2033,14 @@ async fn minecraft_status_rows_reach_the_pages_that_asked_and_move_no_version() 
     );
     // and nothing in the state moved
     assert_eq!(handle.snapshot.borrow().version, before);
+    // a later report replaces it (a host is heard no more than twice a period: an agent sends
+    // one a second)
+    let gap = fcvm::fleet::coord::minecraft_status::MIN_GAP + Duration::from_millis(100);
+    tokio::time::sleep(gap).await;
+    agent.to_coord.send(rows(2000)).unwrap();
+    asked
+        .message_where("minecraft_status", |m| m["t"] == 2000)
+        .await;
     // a page that asks later gets the host's latest at the next report, not every one before it
     other
         .send(json!({"type": "visibility", "visible": true, "minecraft": true}))
@@ -2041,6 +2051,7 @@ async fn minecraft_status_rows_reach_the_pages_that_asked_and_move_no_version() 
     other
         .message_where("clock", |m| m["client_unix_ms"] == 3.0)
         .await;
+    tokio::time::sleep(gap).await;
     agent.to_coord.send(rows(3000)).unwrap();
     let late = other.message("minecraft_status").await;
     assert_eq!(late["t"], 3000);

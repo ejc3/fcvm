@@ -143,8 +143,10 @@ where
             bail!("refused the agent for {host}: {why}");
         }
     }
-    let host_name = match &hello {
-        AgentMsg::Hello { host, .. } => host.clone(),
+    let (host_name, minecraft_servers) = match &hello {
+        AgentMsg::Hello {
+            host, minecraft, ..
+        } => (host.clone(), *minecraft),
         _ => unreachable!("the first message is a hello"),
     };
     let (tx, writer) = spawn_writer::<CoordMsg, _>(output, "agent");
@@ -165,7 +167,9 @@ where
     }
     // This connection is the host's from now on: a connection it replaced, still open, no
     // longer publishes the host's Minecraft status rows or takes them away when it closes.
-    handle.minecraft_status.claim(&host_name, conn);
+    handle
+        .minecraft_status
+        .claim(&host_name, conn, minecraft_servers);
     let result = loop {
         match reader.next::<AgentMsg>().await {
             // A host's Minecraft status rows go straight to the pages that asked: they are no

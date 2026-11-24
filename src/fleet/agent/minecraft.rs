@@ -381,7 +381,7 @@ struct Seen {
 }
 
 /// How often the host reads its servers for the status rows (`MinecraftStatus`).
-const STATUS_EVERY: Duration = Duration::from_secs(1);
+const STATUS_EVERY: Duration = Duration::from_millis(fleet_core::minecraft::STATUS_EVERY_MS);
 /// How many tiles are asked at once, and how long one may take: a tile that does not answer in
 /// time has no tick rate in that second's row.
 const STATUS_PARALLEL: usize = 64;
@@ -465,15 +465,19 @@ async fn status_loop(
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .ok();
+    // Whether the last report named a server: when the board then empties, one more report
+    // says so (every row "not reported"), and after that the host is silent.
+    let mut reporting = false;
     loop {
         tokio::select! {
             _ = tick.tick() => {}
             _ = stopping(stop.clone()) => return,
         }
         let seen = board.lock().unwrap().clone();
-        if seen.is_empty() {
+        if seen.is_empty() && !reporting {
             continue;
         }
+        reporting = !seen.is_empty();
         let mut asks = Vec::with_capacity(places.len());
         for (i, place) in places.iter().enumerate() {
             let running = seen.get(&(i as u32)).is_some_and(|s| s.phase == "running");
