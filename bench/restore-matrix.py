@@ -118,7 +118,7 @@ class Harness:
 
     def state_bucket(self, vm_id):
         """The directory fcvm keeps this VM's state and lock in (src/state/manager.rs)."""
-        return self.state_dir / "vms" / hashlib.sha256(vm_id.encode()).hexdigest()[:2]
+        return self.state_dir / "vms" / hashlib.sha256(vm_id.encode()).hexdigest()[:1]
 
     # ---- infrastructure -------------------------------------------------
 

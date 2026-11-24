@@ -15,14 +15,14 @@ const LAYOUT_FILE: &str = "layout";
 ///
 /// ```text
 /// layout                                      this number
-/// vms/<bb>/<vm_id>.json  .json.tmp  .json.lock
-/// names/<bb>/<sha256(name)>/<pid>.<start>.<vm_id>     a name slot and its one token
-/// names/<bb>/.claim.<pid>.<start>.<vm_id>/            a claim being built
-/// pids/<bb>/<pid>.<vm_id>
+/// vms/<b>/<vm_id>.json  .json.tmp  .json.lock
+/// names/<b>/<sha256(name)>/<pid>.<start>.<vm_id>     a name slot and its one token
+/// names/<b>/.claim.<pid>.<start>.<vm_id>/            a claim being built
+/// pids/<b>/<pid>.<vm_id>
 /// sweep.lock  sweep.stamp
 /// ```
 ///
-/// `<bb>` is a bucket (`bucket_of`), so no directory takes every VM's writes: a create or a
+/// `<b>` is a bucket (`bucket_of`), so no directory takes every VM's writes: a create or a
 /// rename holds its directory's lock exclusively, and with every VM's state in one directory
 /// that lock was what a thousand clones starting together waited on. Layout 1 kept
 /// `<vm_id>.json` in the state directory itself, with `name/`, `pid/` and a host-wide
@@ -48,17 +48,26 @@ const CLAIM_PREFIX: &str = ".claim.";
 /// retry means another claimer took the slot in between, and that one is live.
 const CLAIM_ATTEMPTS: usize = 16;
 
-/// The bucket of `key`: two hex digits, the first byte of its SHA-256. The same in every
-/// process and every build, which a hasher keyed per process would not be: two fcvm
-/// processes must look for one VM in one directory.
+/// The bucket of `key`: one hex digit, the first of its SHA-256. The same in every process
+/// and every build, which a hasher keyed per process would not be: two fcvm processes must
+/// look for one VM in one directory.
+///
+/// Sixteen buckets, by measurement (1000 clones of one snapshot, 128 and 512 starting at
+/// once): a start waited 0.5 and 13.6 ms for its state bucket's lock with 16 buckets, 0.1
+/// and 11.3 ms with 64, 0.1 and 0.0 ms with 256, against 58 and 11 ms plus 34 and 221 ms
+/// for the host-wide name lock with every state in one directory. A listing opens every
+/// bucket, at about 0.13 ms each: `fcvm ls` on an empty store took 4.9 ms with 16 buckets,
+/// 12.9 ms with 64 and 40 ms with 256, and 4.5 ms with one directory. At 70 starts a second
+/// the busiest of 16 buckets was locked 2.9% of the time, so the count is due for another
+/// look near ten times that rate.
 pub fn bucket_of(key: &str) -> String {
     use sha2::Digest;
-    format!("{:02x}", sha2::Sha256::digest(key.as_bytes())[0])
+    format!("{:x}", sha2::Sha256::digest(key.as_bytes())[0] >> 4)
 }
 
 /// Whether `name` is a bucket directory's name.
 fn is_bucket(name: &str) -> bool {
-    name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
+    name.len() == 1 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// How often a claim sweeps the state directory for what SIGKILLed VMs left
@@ -444,7 +453,7 @@ const LIST_CHUNK: usize = 32;
 
 /// `work` over `items`, on up to `LIST_THREADS` threads when there are enough of them,
 /// with the results in the items' order. A listing opens and reads every bucket and then
-/// every state file: read one after another, 256 buckets and 1000 states took 115 ms.
+/// every state file. Read one after another, 1000 states took 67 ms; on threads, 54 ms.
 fn on_listing_threads<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
     let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
     let threads = LIST_THREADS.min(cores).min(items.len() / LIST_CHUNK).max(1);
@@ -785,7 +794,7 @@ impl StateManager {
 
     /// Write a new VM's first state, under its name, while no other live VM has that name.
     ///
-    /// A name in use is a directory, its slot (`names/<bb>/<sha256(name)>`), holding one
+    /// A name in use is a directory, its slot (`names/<b>/<sha256(name)>`), holding one
     /// file, the token of the VM that has it. A claim builds a directory of its own with its
     /// token inside and renames it onto the slot. The kernel lets a directory replace
     /// another only when the other is absent or empty, so of any number of launches with one
@@ -2167,37 +2176,37 @@ mod tests {
         }
     }
 
-    /// The bucket of a key is the first byte of its SHA-256, in every process and every
+    /// The bucket of a key is the first hex digit of its SHA-256, in every process and every
     /// build. A hasher keyed per process would send two fcvm processes to two directories
     /// for one VM.
     #[test]
     fn a_key_has_one_bucket_in_every_process() {
         for (key, bucket) in [
-            ("vm-1", "2d"),
-            ("vm-0123456789abcdef0123456789abcdef", "ae"),
-            ("web", "4b"),
-            ("4242", "03"),
-            ("", "e3"),
+            ("vm-1", "2"),
+            ("vm-0123456789abcdef0123456789abcdef", "a"),
+            ("web", "4"),
+            ("4242", "0"),
+            ("", "e"),
         ] {
             assert_eq!(bucket_of(key), bucket, "bucket of {key:?}");
         }
         let manager = StateManager::new(PathBuf::from("/s"));
         assert_eq!(
             manager.state_file("vm-1"),
-            PathBuf::from("/s/vms/2d/vm-1.json")
+            PathBuf::from("/s/vms/2/vm-1.json")
         );
         assert_eq!(
             manager.lock_file("vm-1"),
-            PathBuf::from("/s/vms/2d/vm-1.json.lock")
+            PathBuf::from("/s/vms/2/vm-1.json.lock")
         );
         assert_eq!(
             manager.pid_entry(4242, "vm-1"),
-            PathBuf::from("/s/pids/03/4242.vm-1")
+            PathBuf::from("/s/pids/0/4242.vm-1")
         );
         assert_eq!(
             manager.name_slot("web"),
             PathBuf::from(
-                "/s/names/4b/4b5e57f6eb2f42b9039b3d1e13929295f231749c510cbe341cd68036d9af97e2"
+                "/s/names/4/4b5e57f6eb2f42b9039b3d1e13929295f231749c510cbe341cd68036d9af97e2"
             )
         );
     }

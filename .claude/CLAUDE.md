@@ -2535,17 +2535,20 @@ waited 0.3 to 0.5 s for that lock and 0.5 to 0.8 s for the directory (bench/star
 ```
 /mnt/fcvm-btrfs/state/
 ├── layout                              # "2"
-├── vms/<bb>/vm-abc123.json             # { vm_id, pid, pid_start_time, name, ... }
-├── vms/<bb>/vm-abc123.json.lock        # per-VM flock; .json.tmp while a write runs
-├── names/<bb>/<sha256 of name>/        # a name slot: a directory with one token in it
+├── vms/<b>/vm-abc123.json             # { vm_id, pid, pid_start_time, name, ... }
+├── vms/<b>/vm-abc123.json.lock        # per-VM flock; .json.tmp while a write runs
+├── names/<b>/<sha256 of name>/        # a name slot: a directory with one token in it
 │   └── 5000.12345.vm-abc123            # the holder's <pid>.<start time>.<vm_id>
-├── names/<bb>/.claim.<pid>.<start>.<vm_id>/   # a claim being built
-├── pids/<bb>/5000.vm-abc123            # PID index entry (empty)
+├── names/<b>/.claim.<pid>.<start>.<vm_id>/   # a claim being built
+├── pids/<b>/5000.vm-abc123            # PID index entry (empty)
 └── sweep.lock, sweep.stamp
 ```
 
-- `<bb>` is the first byte of the SHA-256 of the key (vm_id, name, PID) in hex
-  (`bucket_of`): the same in every process and build.
+- `<b>` is the first hex digit of the SHA-256 of the key (vm_id, name, PID)
+  (`bucket_of`): the same in every process and build. Sixteen buckets, by measurement:
+  a start waits 0.5 ms for its bucket's lock at C=128 and 13.6 ms at C=512, and every
+  listing opens every bucket (about 0.13 ms each), so `fcvm ls` on an empty store took
+  4.9 ms with 16 buckets and 40 ms with 256.
 - **A name is claimed by renaming a directory onto its slot** (`claim_name()`): the claim
   directory holds the claimer's token, and the kernel replaces a directory only with one
   that is absent or empty, so of any number of concurrent claims exactly one rename
@@ -2555,7 +2558,7 @@ waited 0.3 to 0.5 s for that lock and 0.5 to 0.8 s for the directory (bench/star
   the slot if empty. Every step is conditional in the kernel, so it holds through a
   fuse-pipe mount, where a flock would not
   (`test_rename_directory_onto_directory_needs_an_empty_target`).
-- `pids/<bb>/<pid>.<vm_id>` is written by `save_state()` under the VM's state lock;
+- `pids/<b>/<pid>.<vm_id>` is written by `save_state()` under the VM's state lock;
   `load_state_by_pid()` reads the states its bucket names and scans everything only on a
   miss.
 - The only flock on the start path is the VM's own `<vm_id>.json.lock`.
@@ -3486,7 +3489,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
-├── state/vms/<bb>/{vm_id}.json   # VM state files, in buckets
+├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
 ├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy

@@ -513,7 +513,7 @@ fn race_gym_only_run_owned_locks_make_a_pair_infeasible() {
         "vm-disks/vm-#",
         "vm-#/snapshot.lock",
         "state/vms/#/vm-#.json.lock",
-        "state/vms/ae/vm-#.json.lock",
+        "state/vms/a/vm-#.json.lock",
     ] {
         assert!(race_gym::run_owned_lock(owned), "{owned}");
     }
