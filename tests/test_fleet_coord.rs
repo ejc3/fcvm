@@ -1291,6 +1291,8 @@ fn bare_hello(host: &str) -> AgentMsg {
         phones: vec![],
         phone_actions: vec![],
         potato_players: 0,
+        potato_cpus: 0,
+        potato_confined: false,
         windows: 0,
         windows_actions: Vec::new(),
         minecraft: 0,
@@ -1507,6 +1509,8 @@ async fn the_agent_socket_answers_pings() {
         phones: vec![],
         phone_actions: vec![],
         potato_players: 0,
+        potato_cpus: 0,
+        potato_confined: false,
         windows: 0,
         windows_actions: Vec::new(),
         minecraft: 0,
@@ -1558,6 +1562,8 @@ impl FakeAgent {
                 phones: vec![],
                 phone_actions: vec![],
                 potato_players: 0,
+                potato_cpus: 0,
+                potato_confined: false,
                 windows: 0,
                 windows_actions: Vec::new(),
                 minecraft: 0,
@@ -1772,6 +1778,8 @@ fn minecraft_hello(host: &str, n: u32) -> AgentMsg {
         phones: vec![],
         phone_actions: vec![],
         potato_players: 0,
+        potato_cpus: 0,
+        potato_confined: false,
         windows: 0,
         windows_actions: Vec::new(),
         minecraft: n,
@@ -4882,6 +4890,76 @@ async fn a_restart_keeps_the_hosts_it_finds() {
     .await;
     assert!(launches(&fake).is_empty(), "{:?}", fake.calls());
     assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
+/// A page shown again wakes a sleeping fleet only while `min_wake_remaining_secs` of the
+/// limit without a new viewer remain (fleet/PROTOCOL.md, `fleet.power`). With less, the
+/// coordinator launches no host for it: the page stays on the sleep card, and its Wake
+/// button, an arrival, launches them for the whole limit.
+#[tokio::test]
+async fn a_page_shown_again_near_the_limit_launches_no_host_and_its_wake_does() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    // The coordinator applies its rules once a second, so the times are seconds apart.
+    const LIMIT_MS: u64 = 8000;
+    const MIN_MS: u64 = 5000;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        sleep_without_new_viewer_secs: LIMIT_MS / 1000,
+        min_wake_remaining_secs: MIN_MS / 1000,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    let mut v = page_viewer(&handle).await;
+    let s = v.until(|s| s["viewers"]["active"] == 1).await;
+    let arrived = s["fleet"]["power"]["last_arrival_at"].as_u64().unwrap();
+    until_hosts(&fake, "the awake fleet's host", |f| launches(f).len() == 1).await;
+    // Hidden: asleep after the idle second, and the host goes.
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "the host terminated", |f| {
+        f.calls().iter().any(|c| c.starts_with("terminate"))
+    })
+    .await;
+    // Shown again with less than the minimum of the limit left, and well before its end.
+    let late = arrived + LIMIT_MS - MIN_MS + 500;
+    tokio::time::sleep(Duration::from_millis(late.saturating_sub(now_ms()))).await;
+    let shown = now_ms();
+    assert!(shown + 2000 < arrived + LIMIT_MS, "shown too late to tell");
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    let s = v.until(|s| s["viewers"]["active"] == 1).await;
+    assert_eq!(s["fleet"]["power"]["state"], "asleep", "{s}");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let power = serde_json::from_str::<Value>(&handle.snapshot.borrow().text).unwrap()["state"]
+        ["fleet"]["power"]
+        .clone();
+    assert_eq!(power["state"], "asleep", "{power}");
+    assert_eq!(power["last_arrival_at"], arrived);
+    assert_eq!(launches(&fake).len(), 1, "{:?}", fake.calls());
+    // The Wake button: an arrival, a host, and the whole limit from the press.
+    v.intent("w1", "wake", json!({})).await;
+    assert_eq!(v.receipt("w1").await["outcome"], "committed");
+    let s = v.until(|s| s["fleet"]["power"]["state"] != "asleep").await;
+    let woke = s["fleet"]["power"]["last_arrival_at"].as_u64().unwrap();
+    assert!(woke >= shown, "{s}");
+    assert_eq!(
+        s["fleet"]["power"]["sleep_without_arrival_at"],
+        woke + LIMIT_MS
+    );
+    until_hosts(&fake, "the host the wake launched", |f| {
+        launches(f).len() == 2
+    })
+    .await;
 }
 
 /// Two awake hosts in `us-east-1`, spread over three zones and running, with an agent of
@@ -8033,6 +8111,7 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
                 render_ms_max: None,
                 budget_every_pixel: None,
                 boot_id: None,
+                vm_stats: None,
             }))
             .unwrap();
     }
@@ -8096,6 +8175,7 @@ async fn a_tile_whose_fit_draws_every_pixel_is_granted_it() {
                 render_ms_max: None,
                 budget_every_pixel: Some(275_448.0),
                 boot_id: Some(format!("boot-{id}")),
+                vm_stats: None,
             }))
             .unwrap();
     }
