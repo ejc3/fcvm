@@ -53,7 +53,8 @@ def main():
             if b and b["round"] not in ended:
                 ended[b["round"]] = b
                 print(f"round {b['round']} size {b['size']}: {b['reason']} at lap {b['lap']}, hold {b['hold_ms']} ms; "
-                      f"player {b['player']} {b['stage']} {b['stage_ms']} ms; record {rung.get('record_hold_ms')}", flush=True)
+                      f"player {b['player']} {b['stage']} {b['stage_ms']} ms; cause {b.get('cause')}; "
+                      f"record {rung.get('record_pace')} catches/s", flush=True)
                 if b["reason"] == "proof":
                     failures.append(f"round {b['round']} ended on a proof mismatch: {b['detail']}")
         r = p.get("round")

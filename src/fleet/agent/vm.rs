@@ -514,6 +514,11 @@ impl Vm {
         s
     }
 
+    /// Whether fcvm has printed anything yet.
+    pub fn has_tail(&self) -> bool {
+        !self.tail.lock().unwrap().is_empty()
+    }
+
     /// The last lines fcvm printed, for a failure report.
     pub fn tail(&self) -> String {
         let t = self.tail.lock().unwrap();

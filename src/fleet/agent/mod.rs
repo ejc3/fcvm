@@ -822,11 +822,11 @@ where
     if let Some(a) = aggregator {
         a.abort();
     }
-    // the players' VMs stop with the driver: each Vm sends its fcvm SIGTERM when dropped
+    // The ring is told to stop here and waited for below, with the slots, the sandboxes and
+    // the servers. Its own wait (SIGTERM, then SIGKILL: `potato::run`) used to run first, and
+    // came out of the time the wall's and phones' VMs have to stop in before systemd kills
+    // them.
     drop(potato_tx);
-    if let Some(t) = potato_task {
-        let _ = t.await;
-    }
 
     tracing::info!(
         slots = slots.len(),
@@ -839,15 +839,35 @@ where
         drop(h.desired);
         retired.push(h.task);
     }
-    for t in retired {
-        let _ = t.await;
-    }
-    if let Some(w) = sandboxes {
-        w.stop().await;
-    }
-    if let Some(m) = servers {
-        m.stop().await;
-    }
+    // Every mode stops at once, each within its own time. Waited for one after the other,
+    // the sandboxes and the servers were told to stop only when the slots and the ring had
+    // gone, with what was left of the time systemd gives the unit.
+    let slots_stopped = async {
+        for t in retired {
+            let _ = t.await;
+        }
+    };
+    let ring_stopped = async {
+        if let Some(t) = potato_task {
+            let _ = t.await;
+        }
+    };
+    let sandboxes_stopped = async {
+        if let Some(w) = sandboxes {
+            w.stop().await;
+        }
+    };
+    let servers_stopped = async {
+        if let Some(m) = servers {
+            m.stop().await;
+        }
+    };
+    tokio::join!(
+        slots_stopped,
+        ring_stopped,
+        sandboxes_stopped,
+        servers_stopped
+    );
     drop(out);
     let _ = writer.await;
     Ok(())

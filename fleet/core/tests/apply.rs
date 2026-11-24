@@ -1527,18 +1527,19 @@ fn the_potato_ladder_and_records_survive_a_coordinator_restart() {
     let all = events(vector["events"].clone());
     // through the proof drop (event 13): size 2 holds a record and the ladder moved to 4
     let state = all[..14].iter().fold(State::new(config.clone(), 0), apply);
-    assert_eq!(state.fleet.potato.ladder[0].record_hold_ms, Some(2000));
+    assert_eq!(state.fleet.potato.ladder[0].record_pace, Some(0.5));
     let saved = serde_json::to_string(&state).unwrap();
     let restored: State = serde_json::from_str(&saved).unwrap();
     let resumed = restored.resumed(config, 20_000);
     let p = &resumed.fleet.potato;
-    assert_eq!(p.ladder[0].record_hold_ms, Some(2000));
+    assert_eq!(p.ladder[0].record_pace, Some(0.5));
     assert_eq!(
         p.ladder[0].broke.as_ref().map(|d| d.reason.as_str()),
         Some("proof")
     );
     assert_eq!(
-        p.ladder[p.rung].size, 4,
+        p.next_size,
+        Some(4),
         "the ladder resumes at the size it was on"
     );
     assert_eq!(p.records.longest_round.as_ref().map(|r| r.value), Some(3.0));
