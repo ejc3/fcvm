@@ -25,6 +25,12 @@
 /* Over the held phone's video and GPU mirror (z-index 2): a click there is a tap on the phone. */
 .phone-taps { position: fixed; inset: 0; z-index: 3; pointer-events: none; }
 .phone-taps > .phone-tap { position: absolute; cursor: pointer; pointer-events: auto; }
+/* A phone the viewer does not hold: a click on its screen sends nothing, and points at the line under it and the take-over button. */
+.phone-taps > .phone-tap.locked { cursor: default; }
+.phone-label .tap-note.asked { color: var(--text); font-weight: 600; animation: tap-asked 0.9s ease-out; }
+@keyframes tap-asked { from { background: var(--fcvm); color: #06080b; } to { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { .phone-label .tap-note.asked { animation: none; } }
+.phone-sheet .btn[data-asked="true"] { outline: 2px solid var(--fcvm); outline-offset: 2px; }
 .phone-label span { padding: 2px 9px; border-radius: 6px; background: var(--plate); font: 500 14px var(--mono); color: var(--text); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 
 .phones-banner, .phones-empty, .phones-notice { position: fixed; z-index: 4; left: 50%; transform: translateX(-50%); width: max-content; max-width: min(560px, 92vw); padding: 10px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); font-size: 15px; }

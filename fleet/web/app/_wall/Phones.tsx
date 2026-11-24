@@ -81,6 +81,8 @@ function PanelView({
   backRef,
   onView,
   onAction,
+  takeRef,
+  takeAsked,
 }: {
   panel: PhonePanel;
   narrow: boolean;
@@ -91,6 +93,10 @@ function PanelView({
   backRef: React.RefObject<HTMLButtonElement | null>;
   onView: (v: TakeoverView) => void;
   onAction: (action: string, claim: string) => void;
+  /** The take-over button, which a click on a screen that is not held moves focus to. */
+  takeRef: React.RefObject<HTMLButtonElement | null>;
+  /** That click happened on this phone: the button is outlined. */
+  takeAsked: boolean;
 }) {
   const b = panel.borrow;
   return (
@@ -125,7 +131,7 @@ function PanelView({
             <>
               <h2 id="borrow-h">Take over</h2>
               <p className="note">{b.note}</p>
-              <button type="button" className="btn primary" style={{ justifyContent: "center" }} disabled={b.button.disabled} onClick={() => client.act("claim_phone", slot === null ? {} : { phone: slot })} data-testid="phone-take">
+              <button ref={takeRef} type="button" className="btn primary" style={{ justifyContent: "center" }} disabled={b.button.disabled} onClick={() => client.act("claim_phone", slot === null ? {} : { phone: slot })} data-asked={takeAsked ? "true" : undefined} data-testid="phone-take">
                 {b.button.label}
               </button>
             </>
@@ -511,7 +517,7 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   const nextTapAt = useRef(0);
   const onTap = (target: TapTarget, e: React.MouseEvent<HTMLDivElement>) => {
     const taps = viewRef.current?.taps;
-    if (!taps) return;
+    if (!taps || taps.session === null) return;
     const p = tapPoint(target, e.clientX, e.clientY);
     if (p === null) return;
     const t = localNow();
@@ -519,6 +525,24 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
     nextTapAt.current = t + TAP_INTERVAL_MS + 10;
     client.act("phone_action", { action: TAP, x: p.x, y: p.y, claim: taps.session });
   };
+
+  // A click on the screen of an opened phone this viewer does not hold sends nothing: the
+  // line under the screen says why, and the click points at it and at the take-over button.
+  // `asked` counts those clicks on the phone it names, so each one restarts the line's pulse.
+  const takeRef = useRef<HTMLButtonElement | null>(null);
+  const [asked, setAsked] = useState<{ id: string; n: number } | null>(null);
+  const onLockedTap = () => {
+    const taps = viewRef.current?.taps;
+    if (!taps?.locked) return;
+    setAsked((a) => ({ id: taps.tileId, n: a?.id === taps.tileId ? a.n + 1 : 1 }));
+    if (taps.locked.takeable) takeRef.current?.focus();
+  };
+  const lockedId = view.taps?.locked ? view.taps.tileId : null;
+  const askedHere = asked !== null && asked.id === lockedId ? asked.n : 0;
+  // the mark ends with the state it was made in: the phone closed, taken over or lent
+  useEffect(() => {
+    if (lockedId === null) setAsked(null);
+  }, [lockedId]);
 
   // ---- opening a phone -------------------------------------------------------------
 
@@ -614,6 +638,7 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                   className="phone-hit"
                   style={at(c.bezel)}
                   aria-label={c.ariaLabel}
+                  title={c.title}
                   data-testid={`phone-hit-${c.id}`}
                   onClick={() => open(c.id)}
                 />
@@ -625,7 +650,7 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
             <div key={c.id} className="phone-label" style={{ ...at(c.labelBox), opacity: c.bezelOpacity }} data-testid={`phone-label-${c.id}`}>
               <span>{c.label}</span>
               {view.taps?.tileId === c.id && view.taps.note ? (
-                <span className="tap-note" data-testid="phone-tap-note">
+                <span key={askedHere} className={`tap-note${askedHere > 0 ? " asked" : ""}`} data-testid="phone-tap-note">
                   {view.taps.note}
                 </span>
               ) : null}
@@ -639,9 +664,10 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
         {view.taps?.targets.map((t) => (
           <div key={t.name} className="phone-tap" style={at(t.box)} aria-hidden="true" data-testid={`phone-tap-${t.name}`} onClick={(e) => onTap(t, e)} />
         ))}
+        {view.taps?.locked ? <div className="phone-tap locked" style={at(view.taps.locked.box)} aria-hidden="true" data-testid="phone-tap-locked" onClick={onLockedTap} /> : null}
       </div>
       {view.panel ? (
-        <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} onAction={actPhone} />
+        <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} onAction={actPhone} takeRef={takeRef} takeAsked={askedHere > 0} />
       ) : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.verify.title}>

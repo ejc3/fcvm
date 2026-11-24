@@ -295,6 +295,8 @@ export const ACTION_LABELS: Record<string, string> = {
 export const TAP = "tap";
 export const TAP_INTERVAL_MS = 200;
 export const TAP_BROWSER_NOTE = "Taps reach the phone only in Robot Park.";
+/** Under an opened phone the viewer does not hold, whose host takes taps: its screen takes them only from its holder. */
+export const TAP_TAKE_OVER_NOTE = "Take over this phone to tap its screen.";
 
 const PHONE_INTENTS = new Set(["claim_phone", "release_phone", "phone_action", "phones_zoom"]);
 
@@ -416,7 +418,10 @@ export interface PhoneCard {
   bezelOpacity: number;
   labelBox: Box | null;
   dark: boolean;
+  /** The overview button's name: it opens the phone, wherever on its picture the click lands. */
   ariaLabel: string;
+  /** The same in short, for the button's tooltip: "Open Phone 2". */
+  title: string;
   /** This viewer holds it. */
   mine: boolean;
   /** Someone else holds it. */
@@ -531,7 +536,13 @@ export interface ReadoutRow {
 }
 
 export type PhoneBorrowView =
-  | { kind: "free"; button: { label: string; disabled: boolean }; note: string }
+  | {
+      kind: "free";
+      button: { label: string; disabled: boolean };
+      note: string;
+      /** Why it cannot be taken over now, in the note's own words; null when it can. */
+      blocked: string | null;
+    }
   | {
       kind: "yours";
       session: string;
@@ -630,14 +641,21 @@ export interface TapTarget {
   yScale: number;
 }
 
-/** Taps on the phone this viewer holds and has opened, when its host takes them. */
+/** Taps on the phone this viewer has opened, when its host takes them: sent only from a phone it holds. */
 export interface TapView {
   tileId: string;
-  session: string;
+  /** The borrow the taps are sent with; null on a phone this viewer does not hold. */
+  session: string | null;
   /** Empty while the phone takes no taps (the browser in front, not running, offline). */
   targets: TapTarget[];
   /** One line under the screen, when there is something to say. */
   note: string | null;
+  /**
+   * On a phone this viewer does not hold: its screen, where a click sends nothing and the page
+   * points at `note` and, when the phone can be taken over now, at the take-over button. Null
+   * on a held phone.
+   */
+  locked: { box: Box; takeable: boolean } | null;
 }
 
 /** The drawn picture's height over the whole screen's: `height` after the stream's crop, `fullHeight` before it. */
@@ -809,7 +827,8 @@ export function phonesView(inp: PhonesInput): PhonesView {
       bezelOpacity: p?.bezelOpacity ?? 0,
       labelBox: p?.label ?? null,
       dark: t.phase !== "running",
-      ariaLabel: `${phoneName(t)}, ${state}${mine(t) ? ", your phone" : lentToOther ? ", borrowed" : ""}. Open its details.`,
+      ariaLabel: `Open ${phoneName(t)}: ${state}${mine(t) ? ", your phone" : lentToOther ? ", borrowed" : ""}.`,
+      title: `Open ${phoneName(t)}`,
       mine: mine(t),
       lent: lentToOther,
     };
@@ -843,7 +862,25 @@ export function phonesView(inp: PhonesInput): PhonesView {
         targets.push({ name: "mirror", box: mirror.box, yScale: pic ? shown(pic) / pic.h : 1 });
       }
     }
-    taps = { tileId: heldTile.id, session: heldTile.borrowed.session, targets, note };
+    taps = { tileId: heldTile.id, session: heldTile.borrowed.session, targets, note, locked: null };
+  }
+  const panel =
+    openTile === null
+      ? null
+      : panelOf(s, phones, openTile, srvNow, online, takeover, inp.readouts ?? { video: null, mirror: null }, inp.mirrorUnavailable ?? null);
+  // Not held: the screen takes no tap, and the line under it says what would let it, or why
+  // the phone cannot be taken over now (the panel's own words).
+  const openBox = openTile === null ? undefined : placed.get(openTile.id)?.box;
+  if (taps === null && openTile !== null && panel !== null && panel.borrow.kind !== "yours" && openTile.actions.includes(TAP) && openBox) {
+    const b = panel.borrow;
+    const blocked = b.kind === "lent" ? b.text : b.blocked;
+    taps = {
+      tileId: openTile.id,
+      session: null,
+      targets: [],
+      note: blocked ?? TAP_TAKE_OVER_NOTE,
+      locked: { box: openBox, takeable: blocked === null && b.kind === "free" && !b.button.disabled },
+    };
   }
   return {
     ...common,
@@ -852,10 +889,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
     zoom,
     layout,
     cards,
-    panel:
-      openTile === null
-        ? null
-        : panelOf(s, phones, openTile, srvNow, online, takeover, inp.readouts ?? { video: null, mirror: null }, inp.mirrorUnavailable ?? null),
+    panel,
     plan: layout
       ? phonesPlan({ state: s, phones, layout, dpr: inp.dpr, reducedMotion: inp.reducedMotion, noVideo: mirrorView === "mirror" ? heldTile!.id : null })
       : BLANK_PLAN(s, inp.dpr),
@@ -907,14 +941,19 @@ function panelOf(
   } else if (b !== null) {
     borrow = { kind: "lent", text: `Borrowed by another viewer until ${fmt.utcClock(b.until)} UTC` };
   } else if (youHold !== null) {
-    borrow = { kind: "free", button: { label: "Take over this phone", disabled: true }, note: `You are using ${phoneName(youHold)}. Give it back to take another.` };
+    const note = `You are using ${phoneName(youHold)}. Give it back to take another.`;
+    borrow = { kind: "free", button: { label: "Take over this phone", disabled: true }, note, blocked: note };
   } else if (!running) {
-    borrow = { kind: "free", button: { label: "Take over this phone", disabled: true }, note: "It can be borrowed once it has restored." };
+    const note = "It can be borrowed once it has restored.";
+    borrow = { kind: "free", button: { label: "Take over this phone", disabled: true }, note, blocked: note };
   } else {
+    const lentNow = `${phones.borrow.lent} of ${phones.borrow.cap} lent now.`;
     borrow = {
       kind: "free",
       button: { label: "Take over this phone", disabled: !online },
-      note: `${t.actions.includes(TAP) ? "Fixed actions, and taps on the screen in Robot Park" : "Fixed actions only"}, for ${fmt.span(phones.claim_secs * 1000)}. ${phones.borrow.lent} of ${phones.borrow.cap} lent now.`,
+      note: `${t.actions.includes(TAP) ? "Fixed actions, and taps on the screen in Robot Park" : "Fixed actions only"}, for ${fmt.span(phones.claim_secs * 1000)}. ${lentNow}`,
+      // the coordinator lends no more than the cap, and refuses a claim past it
+      blocked: phones.borrow.lent >= phones.borrow.cap ? lentNow : null,
     };
   }
   const g = t.gpu;
