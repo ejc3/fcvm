@@ -1358,6 +1358,23 @@ pub fn install_namespace_pre_exec(
     Ok(())
 }
 
+/// Writes `line` and its newline to `out` with one `write_all`.
+///
+/// A caller that sends stdout and stderr to the same file (`> log 2>&1`) reads
+/// whatever order the two streams' write calls landed in. `writeln!` on stderr,
+/// which is unbuffered, writes the text and the newline as two calls, and on
+/// stdout a line longer than its 1 KiB buffer is flushed in pieces. Either way a
+/// line from the other stream can land inside this one: a restored record that
+/// a harness reads from the start of a line ended up after a container stderr
+/// line that was still waiting for its newline, and the harness never saw it.
+pub fn write_whole_line(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    let mut whole = Vec::with_capacity(line.len() + 1);
+    whole.extend_from_slice(line.as_bytes());
+    whole.push(b'\n');
+    out.write_all(&whole)?;
+    out.flush()
+}
+
 /// Ctrl+C as a terminal sends it, SIGINT to this test process's whole process group, for
 /// asserting that a child does not get it.
 #[cfg(test)]
@@ -1428,6 +1445,80 @@ impl TerminalInterrupt {
 
 #[cfg(test)]
 mod tests {
+
+    /// A writer that records each `write` call, as an unbuffered stderr would
+    /// turn each into its own syscall.
+    struct CallRecorder(Vec<Vec<u8>>);
+
+    impl std::io::Write for CallRecorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn forwarded_lines_and_records_are_written_whole() {
+        // The whole file: it has production code after its first test module.
+        let listeners = include_str!("commands/podman/listeners.rs");
+        for split in ["writeln!(std::io::stdout()", "writeln!(std::io::stderr()"] {
+            assert!(
+                !listeners.contains(split),
+                "listeners.rs forwards a line with {split}"
+            );
+        }
+        let snapshot = include_str!("commands/snapshot.rs");
+        let snapshot = snapshot.split("#[cfg(test)]").next().unwrap();
+        for record in ["serve_ready_record(", "restored_record("] {
+            let calls: Vec<usize> = snapshot
+                .match_indices(record)
+                .map(|(i, _)| i)
+                .filter(|&i| !snapshot[..i].ends_with("fn "))
+                .collect();
+            assert!(!calls.is_empty(), "no call to {record}");
+            for i in calls {
+                let mut start = i.saturating_sub(120);
+                while !snapshot.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let before = &snapshot[start..i];
+                assert!(
+                    before.contains("write_whole_line("),
+                    "{record} is printed some other way"
+                );
+                // A record a caller waits for: a failed write is reported, not dropped.
+                assert!(
+                    !before.contains("let _ ="),
+                    "the result of writing {record} is discarded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_line_is_one_write() {
+        // Longer than stdout's 1 KiB line buffer, as a restored record with its
+        // guest phases is.
+        let line = format!(
+            "{{\"status\":\"restored\",\"pad\":\"{}\"}}",
+            "x".repeat(3000)
+        );
+        let mut out = CallRecorder(Vec::new());
+
+        super::write_whole_line(&mut out, &line).unwrap();
+
+        // Sizes first, so a split prints as two lengths rather than 3 KB of bytes.
+        let sizes: Vec<usize> = out.0.iter().map(Vec::len).collect();
+        assert_eq!(
+            sizes,
+            vec![line.len() + 1],
+            "one write of the line and its newline"
+        );
+        assert_eq!(out.0[0], format!("{line}\n").into_bytes());
+    }
 
     /// A confined spawn that cannot be set up (no user namespace) fails before it creates
     /// its mount targets.
