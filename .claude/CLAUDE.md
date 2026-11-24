@@ -3242,9 +3242,13 @@ separately.
 - **Replay trades memory for latency.** A replaying clone materialises the recorded set at
   restore instead of faulting it in as it runs. Commit 86a05b9a reports, from a Chromium run
   that is not committed, that 98% of faults arrived within 750 ms. The set is a union over
-  the recording windows of a generation's first few clones (above). The bound's effect on per-clone memory and start rate is measured with three waves
-  of 1000 clones per snapshot at C=128, held past the 300 s window (#2056); figures follow
-  from a host kernel with the RTNL fix. In copy mode every replayed page is a private
+  the recording windows of a generation's first few clones (above). Measured with three waves of 1000 rootless nginx clones (256 MiB guests) per
+  snapshot at C=128, each held 330 s, past the 300 s window (m8gd.metal-24xl, Ubuntu's
+  7.0.0-1018-aws, btrfs on NVMe, #2056): the set held 68 MiB with every clone's window
+  unioned and 66 MiB with the bound, and wave 3's private memory was 68.5 and 69.9 MB per
+  clone. With the guest's 120 s boot burst gone (#2052) these clones' windows record the
+  same pages, so on this workload the bound changes nothing; it bounds growth where windows
+  differ. In copy mode every replayed page is a private
   copy, so a clone also holds pages it would never have touched, including a clone that is
   created and destroyed at once. On one 128 GiB guest the set grew from 3.7M pages after one
   clone to 9.4M after six (issue #955). PR #956 measured two clones on that guest at first
