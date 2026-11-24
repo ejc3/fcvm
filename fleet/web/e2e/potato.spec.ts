@@ -344,3 +344,21 @@ test("potato: the stage is a labelled group that owns the named tiles", async ({
   for (const t of await tiles(page).all()) await expect(t).toHaveAttribute("aria-label", /^Player \d/);
 });
 
+test("potato: a card does not come back after its tile left the ring and the ring grew back", async ({ page }) => {
+  await startAt(8);
+  await openPotato(page);
+  const readout = page.getByTestId("potato-readout");
+  await tiles(page).nth(7).focus();
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowRight");
+  await expect(tiles(page).nth(7)).toBeFocused();
+  await expect(readout).toBeVisible();
+  // the ring shrinks to 2 (tile 7 is gone), then grows back to 8
+  await admin("/mock/potato", { cpus: 0, players: 8, size: 2, next_in_ms: 300 });
+  await expect(tiles(page)).toHaveCount(2, { timeout: 10_000 });
+  await admin("/mock/potato", { cpus: 0, players: 8, size: 8, next_in_ms: 300 });
+  await expect(tiles(page)).toHaveCount(8, { timeout: 10_000 });
+  await page.waitForTimeout(500);
+  await expect(readout, "nothing is focused, so no card").toHaveCount(0);
+});
+

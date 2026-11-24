@@ -155,6 +155,14 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   // A card is shown for a tile that is still in the ring; Escape dismisses it; a timer does not outlive the page.
   const present = (n: number | null) => (n !== null && ring?.tiles.some((t) => t.player === n) ? n : null);
   const shown = present(pressed) ?? present(pointed) ?? present(focused);
+  // A state that names a tile no longer in the ring is dropped, so the card does not come back when the ring does.
+  useEffect(() => {
+    if (ring === null) return;
+    const gone = (n: number | null) => n !== null && !ring.tiles.some((t) => t.player === n);
+    if (gone(pointed)) setPointed(null);
+    if (gone(focused)) setFocused(null);
+    if (gone(pressed)) setPressed(null);
+  }, [ring, pointed, focused, pressed]);
   useEffect(() => {
     if (shown === null) return;
     const esc = (e: KeyboardEvent) => {
