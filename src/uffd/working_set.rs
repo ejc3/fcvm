@@ -1135,8 +1135,7 @@ impl WorkingSetStore {
     /// [`finish_recording`](Self::finish_recording).
     ///
     /// Before this bound every clone's recording window was unioned in, so the set grew with
-    /// every clone (issue #955): one snapshot's replay grew from 33 to 177 MiB per clone over
-    /// four 1000-clone runs, and 2000 UFFD clones then ran the host out of memory.
+    /// every clone (issue #955).
     pub fn admit_recorder(&self) -> Option<PageSet> {
         use std::sync::atomic::Ordering::SeqCst;
         let in_flight = self.in_flight.fetch_add(1, SeqCst);

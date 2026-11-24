@@ -3017,8 +3017,7 @@ separately.
   at the clone's UFFD handshake and defaults to 300 s (`--uffd-prefetch-record-window` /
   `FCVM_UFFD_PREFETCH_RECORD_WINDOW`; 0 records nothing; issue #858). Later faults are
   served but not recorded. Only a few clones record (#955; before, every clone's window was
-  unioned in, and one snapshot's replay grew from 33 to 177 MiB per clone over four
-  1000-clone runs, until 2000 UFFD clones ran the host out of memory): at most
+  unioned in, so the set grew with every clone of a snapshot): at most
   `RECORDING_CLONES` (4) clones of a server record at once, and a set whose sidecar counts
   four complete recordings is frozen. A recording is complete when its window closed and it
   saw a page; a clone killed before then, or one that never faulted, merges what it saw and
@@ -3243,12 +3242,9 @@ separately.
 - **Replay trades memory for latency.** A replaying clone materialises the recorded set at
   restore instead of faulting it in as it runs. Commit 86a05b9a reports, from a Chromium run
   that is not committed, that 98% of faults arrived within 750 ms. The set is a union over
-  the recording windows of a generation's first few clones (above). Measured at C=128 with
-  1000 rootless nginx clones per wave (256 MiB guests, one snapshot per arm, three waves each
-  held 330 s, past the 300 s window), the bound to four complete recordings held the set at
-  65 MiB where every clone's window gave 106 to 112 MiB, and wave 3's private memory at 71.5
-  MB per clone against 106.3 (#2056). Its waves 2 and 3 started 75.8 and 71.4 clones/s against
-  61.6 and 63.8, with resume to fc-agent p99 51 to 81 ms against 720 to 886 ms. In copy mode every replayed page is a private
+  the recording windows of a generation's first few clones (above). The bound's effect on per-clone memory and start rate is measured with three waves
+  of 1000 clones per snapshot at C=128, held past the 300 s window (#2056); figures follow
+  from a host kernel with the RTNL fix. In copy mode every replayed page is a private
   copy, so a clone also holds pages it would never have touched, including a clone that is
   created and destroyed at once. On one 128 GiB guest the set grew from 3.7M pages after one
   clone to 9.4M after six (issue #955). PR #956 measured two clones on that guest at first
