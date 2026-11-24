@@ -367,6 +367,15 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ipv6_prefix.is_some(),
             "--minecraft needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)"
         );
+        minecraft::check_neighbour_room(
+            args.minecraft,
+            &std::fs::read_to_string(minecraft::NEIGH_LIMIT).with_context(|| {
+                format!(
+                    "reading {}, the host's IPv6 neighbour limit",
+                    minecraft::NEIGH_LIMIT
+                )
+            })?,
+        )?;
         let (image_id, server) =
             minecraft::inspect_image(&args.windows_podman, &args.minecraft_image).await?;
         Some(minecraft::MinecraftCfg {

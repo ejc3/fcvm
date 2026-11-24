@@ -697,6 +697,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(applies, ["sysctl -e -p /etc/sysctl.d/99-fcvm.conf"])
         self.assertLess(prep.index("sysctl -e -p"), prep.index('runuser -u "$U" -- unshare -U -r true'))
 
+    def test_host_image_has_room_for_hundreds_of_routed_vms_neighbours(self):
+        # The IPv6 neighbour table is shared by every network namespace: at Ubuntu's 1024, 512
+        # routed Minecraft servers overflowed it (docs/fleet/minecraft.md). The agent refuses a
+        # fleet the limit has no room for, at 8 entries a server (src/fleet/agent/minecraft.rs).
+        source = (HERE / "host/build.sh").read_text()
+        conf = re.search(r"cat > /etc/sysctl\.d/99-fcvm\.conf <<'X'\n(.*?)\nX\n", source, re.S).group(1)
+        keys = dict(line.split("=", 1) for line in conf.splitlines() if "=" in line and not line.startswith("#"))
+        limits = [int(keys[f"net.ipv6.neigh.default.gc_thresh{n}"]) for n in (1, 2, 3)]
+        self.assertEqual(limits, sorted(limits))
+        self.assertGreaterEqual(limits[2], 8 * 2048)
+        agent = (HERE.parent.parent / "src/fleet/agent/minecraft.rs").read_text()
+        self.assertIn("pub const NEIGH_PER_SERVER: u64 = 8;", agent)
+
     def test_build_user_can_open_only_its_private_warm_log_under_the_actual_preamble(self):
         source = (HERE / "host/build.sh").read_text()
         preamble, _ = source.split('\ncase "$PHASE" in\n', 1)

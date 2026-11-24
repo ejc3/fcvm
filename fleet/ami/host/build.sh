@@ -124,6 +124,13 @@ vm.unprivileged_userfaultfd=1
 # kernel forwards IPv6 only with this set. systemd-networkd handles the uplink's router
 # advertisements itself (the kernel's accept_ra is 0 there), so its default route stays.
 net.ipv6.conf.all.forwarding=1
+# The kernel's IPv6 neighbour table is one for every network namespace on the host, and every
+# routed VM adds to it: 512 Minecraft servers left 3,651 entries in the host's namespace alone.
+# At gc_thresh3 the kernel drops packets ("neighbor table overflow"). Ubuntu's cloud image
+# raises the IPv4 limits to these values and leaves IPv6 at 128, 512 and 1024.
+net.ipv6.neigh.default.gc_thresh1=8192
+net.ipv6.neigh.default.gc_thresh2=15360
+net.ipv6.neigh.default.gc_thresh3=16384
 X
   # -e: fcvm's host kernel, which a revised image already boots, has neither Ubuntu's
   # apparmor key nor Debian's userns_clone key; both only open user namespaces, checked here.

@@ -132,6 +132,24 @@ fcvm's lockfile.
   handling and timer, the mock coordinator's servers and a mock tile, and Playwright tests on
   desktop and phone layouts.
 
+### What the host needs for hundreds of servers
+
+Every routed VM adds entries to the kernel's IPv6 neighbour table, which is one table for every
+network namespace on the host, limited by `net.ipv6.neigh.default.gc_thresh3` (1024 on Ubuntu,
+which raises only the IPv4 limits). Measured on a c8g.metal-48xl (kernel 7.0.0-1018-aws,
+2026-11-24) through a coordinator and its agent:
+
+| servers | limit | what happened |
+|---|---|---|
+| 256 | 1024 | the kernel logged "neighbor table overflow" while the 256 were restored and for 80 s after the first, then not again in 29 minutes; every server started and ran |
+| 512 | 1024 | the kernel logged it from the first second to the run's end; 347 s in, 10 servers had not started, and 325 of the 500 running ones did not answer the agent's status read in 400 ms; the host had 102 of 192 CPUs busy and 230 of 377 GiB in use |
+| 512 | 16384 | every server running 75 s after the first restore began; the host's own namespace held 3,651 entries |
+
+So the agent refuses `--minecraft N` when the limit leaves no room for 8 entries a server
+(`check_neighbour_room`, `src/fleet/agent/minecraft.rs`), and the fleet's host image sets
+`gc_thresh1`, `gc_thresh2` and `gc_thresh3` to 8192, 15360 and 16384
+(`fleet/ami/host/build.sh`), the values Ubuntu's image gives IPv4.
+
 ### Invariants (each becomes a test)
 
 1. Only the viewer the scene names as driver can move a bot; every other socket's drive is

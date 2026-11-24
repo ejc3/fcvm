@@ -1132,6 +1132,33 @@ async fn supervise(
     }
 }
 
+/// The kernel's limit on IPv6 neighbour entries: one table for every network namespace on the
+/// host. At it the kernel drops packets ("neighbour: ndisc_cache: neighbor table overflow!").
+pub const NEIGH_LIMIT: &str = "/proc/sys/net/ipv6/neigh/default/gc_thresh3";
+/// IPv6 neighbour entries the limit must leave room for, for each routed server. 512 servers
+/// left 3,651 entries in the host's own namespace (7.1 a server; c8g.metal-48xl, kernel
+/// 7.0.0-1018-aws, 2026-11-24), and each server's namespace holds a few more.
+pub const NEIGH_PER_SERVER: u64 = 8;
+
+/// Refuse a fleet of `count` servers the host's IPv6 neighbour table has no room for
+/// (`limit` is [`NEIGH_LIMIT`]'s text). At Ubuntu's default of 1024, 512 servers overflowed
+/// it: 304 of 496 status reads went unanswered and 10 servers never started, with the host's
+/// CPUs and memory half used. With 256 the table overflowed only while they were restored.
+pub fn check_neighbour_room(count: u32, limit: &str) -> Result<()> {
+    let limit: u64 = limit
+        .trim()
+        .parse()
+        .with_context(|| format!("{NEIGH_LIMIT} holds {limit:?}, not a number"))?;
+    let need = u64::from(count) * NEIGH_PER_SERVER;
+    anyhow::ensure!(
+        limit >= need,
+        "--minecraft {count} needs room for {need} IPv6 neighbour entries and the host's limit \
+         is {limit}. Set net.ipv6.neigh.default.gc_thresh3 to {need} or more, and gc_thresh2 \
+         and gc_thresh1 below it (in /etc/sysctl.d/ to keep them)"
+    );
+    Ok(())
+}
+
 /// The image's id and the servers' name from its labels (`podman image inspect`).
 pub async fn inspect_image(podman: &Path, image: &str) -> Result<(String, Option<String>)> {
     let out = child(podman)
@@ -1189,6 +1216,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_fleet_is_refused_when_the_neighbour_table_has_no_room_for_it() {
+        // Ubuntu's default limit holds today's fleets and not hundreds of servers.
+        assert!(check_neighbour_room(8, "1024\n").is_ok());
+        assert!(check_neighbour_room(128, "1024\n").is_ok());
+        let err = check_neighbour_room(512, "1024\n").unwrap_err().to_string();
+        assert!(
+            err.contains("--minecraft 512 needs room for 4096 IPv6 neighbour entries")
+                && err.contains("limit is 1024")
+                && err.contains("net.ipv6.neigh.default.gc_thresh3"),
+            "{err}"
+        );
+        // the fleet host image's limit (fleet/ami/host/build.sh) holds 512 and more
+        assert!(check_neighbour_room(512, "16384\n").is_ok());
+        assert!(check_neighbour_room(2048, "16384").is_ok());
+        assert!(check_neighbour_room(2049, "16384").is_err());
+        // a limit that cannot be read is not room
+        assert!(check_neighbour_room(8, "").is_err());
+    }
 
     fn cfg() -> MinecraftCfg {
         MinecraftCfg {
