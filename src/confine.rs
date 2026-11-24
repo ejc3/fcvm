@@ -779,6 +779,80 @@ mod tests {
         );
     }
 
+    /// The functions that build a `Command` from a Firecracker or Cloud Hypervisor binary
+    /// path, and whether each also calls `install_namespace_pre_exec` (which takes the
+    /// [`Decision`]). A VMM spawn that skips the helper starts with no decision at all, so
+    /// every such function must be known and must call it.
+    ///
+    /// What it finds: `Command::new(<arg>)` outside tests where `<arg>` names a VMM binary
+    /// path (`firecracker_bin`, `fc_bin`, `ch_bin`, `cloud_hypervisor`, a spec's `binary`).
+    /// What it cannot see: a VMM binary whose path reaches `Command::new` under another name
+    /// (a string built elsewhere, a variable called something else), or a VMM passed as an
+    /// argument to another program (the nsenter and strace wrappers in
+    /// `VmManager::start`, which that function's own helper call covers).
+    fn vmm_command_sites() -> Vec<(String, String, bool)> {
+        let command = regex::Regex::new(r"Command::new\(([^)]*)\)").unwrap();
+        let vmm = regex::Regex::new(r"(?i)firecracker|fc_bin|ch_bin|cloud_hypervisor|\bbinary\b")
+            .unwrap();
+        let function =
+            regex::Regex::new(r"\n\s*(?:pub(?:\([a-z]+\))? )?(?:async )?fn (\w+)").unwrap();
+        let mut sites = Vec::new();
+        for (path, text) in sources() {
+            let code = non_test(&text);
+            let starts: Vec<(usize, String)> = function
+                .captures_iter(code)
+                .map(|c| (c.get(0).unwrap().start(), c[1].to_string()))
+                .collect();
+            for call in command.captures_iter(code) {
+                if !vmm.is_match(&call[1]) {
+                    continue;
+                }
+                let at = call.get(0).unwrap().start();
+                let Some(index) = starts.iter().rposition(|(start, _)| *start < at) else {
+                    continue;
+                };
+                let end = starts
+                    .get(index + 1)
+                    .map_or(code.len(), |(start, _)| *start);
+                let body = &code[starts[index].0..end];
+                sites.push((
+                    path.clone(),
+                    starts[index].1.clone(),
+                    body.contains("install_namespace_pre_exec("),
+                ));
+            }
+        }
+        sites.sort();
+        sites.dedup();
+        sites
+    }
+
+    #[test]
+    fn every_vmm_binary_is_spawned_through_the_helper() {
+        assert_eq!(
+            vmm_command_sites(),
+            vec![
+                (
+                    "src/firecracker/vm.rs".to_string(),
+                    "start".to_string(),
+                    true
+                ),
+                (
+                    "src/hypervisor/cloud_hypervisor/mod.rs".to_string(),
+                    "spawn".to_string(),
+                    true
+                ),
+                (
+                    "src/setup/rootfs.rs".to_string(),
+                    "boot_vm_for_setup".to_string(),
+                    true
+                ),
+            ],
+            "a function builds a Command from a VMM binary: it must be listed here and spawn \
+             through install_namespace_pre_exec with a resolved decision"
+        );
+    }
+
     /// Only this module makes a [`Decision`]: no code elsewhere builds one, so the only
     /// way to one is [`resolve`].
     #[test]

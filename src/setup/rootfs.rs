@@ -914,11 +914,26 @@ fn config_keeping_confinement(existing: Option<&str>) -> Result<String> {
                 "the existing config is not valid TOML, so whether its [confine] mode is \
                  required cannot be told; fix or remove it",
             )?;
-            value
-                .get("confine")
-                .and_then(|c| c.get("mode"))
-                .and_then(|m| m.as_str())
-                == Some("required")
+            match value.get("confine") {
+                None => false,
+                Some(confine) => {
+                    let table = confine.as_table().context(
+                        "the existing config's [confine] is not a table, so whether it requires \
+                         confinement cannot be told; fix it",
+                    )?;
+                    match table.get("mode") {
+                        None => false,
+                        Some(mode) => match mode.as_str() {
+                            Some("off") => false,
+                            Some("required") => true,
+                            _ => anyhow::bail!(
+                                "the existing config's [confine] mode is {mode:?}, which is neither \
+                                 \"off\" nor \"required\"; fix it rather than have it replaced"
+                            ),
+                        },
+                    }
+                }
+            }
         }
     };
     anyhow::ensure!(
@@ -2983,6 +2998,23 @@ mod tests {
             EMBEDDED_CONFIG
         );
         assert!(super::config_keeping_confinement(Some("[confine\n")).is_err());
+        // A mode that is neither "off" nor "required" fails closed when loaded; replacing it
+        // with the embedded "off" would turn that host unconfined.
+        for bad in [
+            "[confine]\nmode = \"Required\"\n",
+            "[confine]\nmode = \"on\"\n",
+            "[confine]\nmode = 1\n",
+            "confine = \"required\"\n",
+        ] {
+            assert!(
+                super::config_keeping_confinement(Some(bad)).is_err(),
+                "{bad:?} was replaced"
+            );
+        }
+        assert_eq!(
+            super::config_keeping_confinement(Some("[confine]\n")).unwrap(),
+            EMBEDDED_CONFIG
+        );
     }
 
     use super::*;
