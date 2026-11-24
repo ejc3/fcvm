@@ -151,18 +151,24 @@ its servers unreported on the page, not at zero.
 a VM of 1 vCPU and 1024 MiB with its three bots, routed networking) and a client that reads the
 status rows as a page does (`fleet/minecraft/bench/fleetfield.sh`). The records are in
 `fleet/minecraft/bench/results/2026-11-24-fleet-path-c8g-metal-48xl/`, one directory a run, and
-every number in the table is from a run's `summary.json`. The store was a btrfs image: on the host's
+every number in the table is from a run's `summary.json` (the run that never had every server
+running also keeps its `samples.jsonl`, whose last line is its row). The store was a btrfs image: on the host's
 30 GiB root volume (network storage) for the first three runs, in RAM for the last two. The
 IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
 
-| run | all N running, from the first restore | busy CPUs a server, minute 1 / 5 / 29 | MiB a server at 5 / 30 min | readings under 19.5 TPS or unanswered |
+| run | all N up, from the first restore's start | busy CPUs a server, minute 1 / 5 / 29 | MiB a server at 5 / 30 min | readings under 19.5 TPS or unanswered |
 |---|---|---|---|---|
-| 256, root volume | 24.0 s | 0.195 / 0.206 / 0.165 | 412 / 441 | 327 of 89,344, all between 5.2 and 6.5 min |
-| 512, root volume, limit 1024 | never: 10 had not started after 347 s | | | 325 of the 500 running unanswered at 347 s |
-| 512, root volume | 75.0 s | 0.193 / 0.193 / stalled | 432 / stalled | stalled at 14.6 min (below) |
-| 512, RAM | 12.2 s | 0.262 / 0.245 / 0.199 | 492 / 543 | 43 of 179,200, all in the first 18 s |
-| 256, RAM (100 s) | 6.0 s | 0.201 | | 0 of 5,120 |
+| 256, root volume | 24.6 s | 0.195 / 0.206 / 0.165 | 412 / 441 | 327 of 89,344, all between 5.2 and 6.5 min |
+| 512, root volume, limit 1024 | never: at 347 s, 500 ran, 2 were restoring and 10 had failed | | | 325 of the 500 running unanswered at 347 s |
+| 512, root volume | 73.7 s | 0.193 / 0.193 / stalled | 432 / stalled | stalled at 14.6 min (below) |
+| 512, RAM | 29.9 s | 0.262 / 0.245 / 0.199 | 492 / 543 | 43 of 179,200, all in the first 18 s |
+| 256, RAM (100 s) | 6.9 s | 0.201 | | 0 of 5,120 |
 
+- **All N up** is from the coordinator's own log (`all_up_s` in a run's summary): from the gold
+  snapshot being made (the 512 RAM run made it) or, where it was already there, from the agent's
+  hello, to the last server's first "server up". The client's own figure (`restore_all_s`)
+  starts when it first sees a restoring server, and in the 512 RAM run its first rows came
+  21.7 s after the gold was made: it read 12.2 s there.
 - **A reading** is one server's tick rate in its status row, read every 5 s from when every
   server ran until the run's reset of all; a running server whose row has no rate is
   unanswered. Busy CPUs are the host's (`/proc/stat`), and memory is the VMMs' proportional
@@ -174,7 +180,7 @@ IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
   rest holding the store and the build tree in RAM.
 - **Reset all.** 512 servers were back 64.8 s after the click: none at 10 s, 2 at 20 s, 55 at
   30 s, 184 at 40 s, 364 at 50 s, 479 at 60 s. 256 took 16.0 s.
-- **The store decides more than the count does.** On the root volume the worlds' first saves
+- **The store.** On the root volume the worlds' first saves
   showed in the tick rate (256 servers: every low or unanswered reading fell in two windows at
   5.2 and 6.4 minutes; outside them the lowest was 19.8), restores took four to six times as
   long, and 512 servers stalled: 14.6 minutes in, status reads began to go unanswered, and at
@@ -185,8 +191,7 @@ IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
   in RAM. Servers on the faster store also used more CPU and memory at the same age.
 - **What bounds N**, in the order the runs met them:
   1. The IPv6 neighbour table (`net.ipv6.neigh.default.gc_thresh3`, 1024 on Ubuntu): 512 routed
-     servers overflowed it and did not all start. The host's own namespace held 3,651 entries
-     with 512 running.
+     servers overflowed it and did not all start.
   2. The store's size and speed, as above.
   3. Memory: 543 MiB a server at 30 minutes, when the coordinator resets it. This host's
      377 GiB hold about 610 with the store in RAM and about 660 with it on a disk.

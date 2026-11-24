@@ -10,6 +10,10 @@
   "nvme0n1 Amazon Elastic Block Store   30G",
   "tree 2f89b1c976751e116c4274e1c3c36801452c1a0c plus 14 changed files"
  ],
+ "all_up_s": {
+  "from": "agent hello",
+  "s": 24.6
+ },
  "restore_all_s": 24.0,
  "launch_ms_first_wave": {
   "n": 256,

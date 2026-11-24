@@ -10,6 +10,10 @@
   "nvme1n1 Amazon Elastic Block Store  100G",
   "nvme0n1 Amazon Elastic Block Store   30G"
  ],
+ "all_up_s": {
+  "from": "agent hello",
+  "s": 6.9
+ },
  "restore_all_s": 6.0,
  "launch_ms_first_wave": {
   "n": 256,

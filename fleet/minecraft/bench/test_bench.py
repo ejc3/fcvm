@@ -95,7 +95,8 @@ class FleetField(unittest.TestCase):
                     f.write(json.dumps({"since_all_up": since, "tps": {"n": 128 - silent, "min": lo, "below_19_5": below, "no_answer": silent},
                                         "wire": {"snapshots": 4, "snap_bytes": 4000, "statuses": 10, "status_bytes": 5000}}) + "\n")
             with open(f"{d}/disk.log", "w") as f:
-                f.write("100 store_mib=5000 load=1 2 3 fc=0\n115 store_mib=8840 load=1 2 3 fc=128 io_full_avg10=0.00\n")
+                f.write("100 store_mib=5000 load=1 2 3 fc=0\n115 store_mib=8840 load=1 2 3 fc=128 io_full_avg10=0.00 ndisc=960 arp=300\n"
+                        "120 store_mib=8000 load=1 2 3 fc=128 ndisc=1280 arp=290\n")
             with open(f"{d}/host.txt", "w") as f:
                 f.write("kernel example\n")
             out = json.loads(subprocess.run([sys.executable, f"{HERE}/fleetfield_summary.py", d], capture_output=True, text=True, check=True).stdout)
@@ -108,7 +109,63 @@ class FleetField(unittest.TestCase):
         self.assertEqual((out["readings"], out["readings_under_19_5"], out["readings_unanswered"]), (256, 4, 2))
         self.assertEqual(out["low_or_unanswered"], [[10.0, 12.5, 4, 2]])
         self.assertEqual(out["store_mib"]["per_server_at_max"], 30.0)
+        # the kernel's neighbour entries over every namespace: the most seen, and per server
+        self.assertEqual(out["neighbour_entries_max"], {"ipv6": 1280, "ipv4": 300, "ipv6_per_server": 10.0})
+        self.assertNotIn("never_all_running", out)
         self.assertEqual(out["wire"], {"snapshots": 4, "snapshot_bytes_mean": 1000, "status_msgs": 10, "status_bytes_mean": 500})
+        # no coordinator's log beside the run: no time from it
+        self.assertNotIn("all_up_s", out)
+
+    def test_the_time_to_all_servers_up_is_read_from_the_coordinators_log(self):
+        # The client first saw a restoring server late (at 35.4 s here), so its own figure is
+        # short: the coordinator's log has when the gold was made and when each server came up.
+        def summary(log, n=3):
+            with tempfile.TemporaryDirectory() as d:
+                with open(f"{d}/run.jsonl", "w") as f:
+                    for e in ({"event": "start", "n": n}, {"event": "first_restoring", "at": 35.4},
+                              {"event": "all_running", "at": 47.6, "restore_all_s": 12.2, "summary": {"launch_ms": {"p50": 22000}}}):
+                        f.write(json.dumps(e) + "\n")
+                with open(f"{d}/samples.jsonl", "w") as f:
+                    f.write(json.dumps({"since_all_up": 5.0, "tps": {"n": n, "min": 20.0, "below_19_5": 0, "no_answer": 0},
+                                        "wire": {"snapshots": 1, "snap_bytes": 1, "statuses": 1, "status_bytes": 1}}) + "\n")
+                with open(f"{d}/disk.log", "w") as f:
+                    f.write("100 store_mib=5000 load=1 2 3 fc=0\n")
+                with open(f"{d}/host.txt", "w") as f:
+                    f.write("kernel example\n")
+                with open(f"{d}/coord.log", "w") as f:
+                    f.write(log)
+                return json.loads(subprocess.run([sys.executable, f"{HERE}/fleetfield_summary.py", d], capture_output=True, text=True, check=True).stdout)
+        up = lambda at, name, gen=1: f"2026-01-02T03:04:{at}Z  INFO fcvm::fleet::minecraft: server up server={name} generation={gen} forked=false\n"
+        hello = "2026-01-02T03:04:05.450000Z  INFO fcvm::fleet::coord: agent hello host=example-host conn=1\n"
+        gold = "2026-01-02T03:04:19.250000Z  INFO fcvm::fleet::minecraft: gold snapshot made tag=example secs=13\n"
+        servers = up("40.000000", "mc-1") + up("44.000000", "mc-2") + up("49.150000", "mc-3")
+        made = summary("not a log line\n" + hello + gold + servers + up("58.000000", "mc-1", 2))
+        self.assertEqual((made["restore_all_s"], made["all_up_s"]), (12.2, {"from": "gold snapshot made", "s": 29.9}))
+        # the gold was already there: from the agent's hello
+        self.assertEqual(summary(hello + servers)["all_up_s"], {"from": "agent hello", "s": 43.7})
+        # not every server came up: no time
+        self.assertIsNone(summary(hello + gold + servers, n=4)["all_up_s"])
+
+    def test_a_run_that_never_all_ran_says_where_it_stood(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(f"{d}/run.jsonl", "w") as f:
+                f.write(json.dumps({"event": "start", "n": 512}) + "\n")
+            with open(f"{d}/samples.jsonl", "w") as f:
+                for at, running, failed, silent in ((5.0, 80, 0, 0), (347.0, 500, 10, 325)):
+                    f.write(json.dumps({"at": at, "since_all_up": None, "phases": {"running": running, "restoring": 512 - running - failed, "failed": failed},
+                                        "tps": {"n": running - silent, "min": 19.9, "below_19_5": 0, "no_answer": silent}, "host": {"busy": 101.7},
+                                        "wire": {"snapshots": 1, "snap_bytes": 1, "statuses": 1, "status_bytes": 1}}) + "\n")
+            with open(f"{d}/disk.log", "w") as f:
+                f.write("100 store_mib=5000 load=1 2 3 fc=0\n")
+            with open(f"{d}/host.txt", "w") as f:
+                f.write("kernel example\n")
+            out = json.loads(subprocess.run([sys.executable, f"{HERE}/fleetfield_summary.py", d], capture_output=True, text=True, check=True).stdout)
+        self.assertNotIn("restore_all_s", out)
+        self.assertEqual(out["never_all_running"], {"at_s": 347.0, "phases": {"running": 500, "restoring": 2, "failed": 10},
+                                                    "running_unanswered": 325, "running_with_a_rate": 175, "host": {"busy": 101.7}})
+        # no steady state, so no steady readings
+        self.assertEqual((out["samples_all_up"], out["readings"]), (0, 0))
+        self.assertNotIn("neighbour_entries_max", out)
 
 
 if __name__ == "__main__":
