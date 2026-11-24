@@ -1029,9 +1029,13 @@ describe("a fleet with a field", () => {
     // rows that stopped coming: the same, with how long ago
     const gone = minecraftView(input(stateWith(big()), { statuses: statuses(), renderer: "3d", now: NOW + 9000 }));
     expect(gone.header!.up).toBe("512 servers, no report for 9 s");
-    // some servers reported: a count of those, as before
+    // Some servers reported: the count is over those, and the rest are named as not reported
+    // (they are not down: "500 of 512 servers up" would say twelve were).
     const some = viewOf(big(), { statuses: statuses(Array.from({ length: N }, (_, i) => (i < 500 ? row(3, 200, 3, 100, 410) : row(0)))), renderer: "3d" });
-    expect([some.header!.up, some.field!.headline.states]).toEqual(["500 of 512 servers up", "500 running · 12 not reported"]);
+    expect([some.header!.up, some.field!.headline.states]).toEqual(["500 of 500 servers up, 12 not reported", "500 running · 12 not reported"]);
+    // one host of two reporting, some of its servers restoring
+    const half = viewOf(big(), { statuses: statuses(Array.from({ length: N }, (_, i) => (i < 250 ? row(3, 200, 3, 100, 410) : i < 256 ? row(1) : row(0)))), renderer: "3d" });
+    expect(half.header!.up).toBe("250 of 256 servers up, 256 not reported");
   });
 
   it("puts a server the viewer picked into one tile, marks it, and moves no other", () => {
@@ -1109,6 +1113,18 @@ describe("a fleet with a field", () => {
     const card = v.cards.find((c) => c.slot === "mc-300")!;
     expect([card.id, card.slot, card.reset.disabled]).toEqual(["field:300", "mc-300", false]);
     expect(new Set(v.cards.map((c) => c.id)).size).toBe(v.cards.length);
+  });
+
+  it("forgets an opened server that is no server any more, and keeps one that is", () => {
+    const st = statuses();
+    // a server of the field that no tile lists, opened: it is there
+    expect(viewOf(big(), { statuses: st, renderer: "3d", opened: "field:300" }).openedGone).toBe(false);
+    expect(viewOf(big(), { statuses: st, renderer: "3d", opened: "mc:3" }).openedGone).toBe(false);
+    expect(viewOf(big(), { statuses: st, renderer: "3d" }).openedGone).toBe(false);
+    // the fleet shrank and it is gone: the page is told to forget it, so the id used again does not open by itself
+    expect(viewOf(big(), { statuses: st, renderer: "3d", opened: "field:900" }).openedGone).toBe(true);
+    expect(viewOf(minecraftOf(4), { opened: "mc:9" }).openedGone).toBe(true);
+    expect(viewOf(minecraftOf(4), { opened: "mc:3" }).openedGone).toBe(false);
   });
 
   it("counts a reset of every server as its servers come back", () => {

@@ -58,11 +58,11 @@ describe("the field's cells", () => {
     const f = field(4);
     const cells = fieldCells(f, { aaaaaaaaaaaa: status([row(3, 200, 3, 125, 412), row(1), row(0), row(3)]) }, NOW);
     expect(cells.map((c) => [c.slot, c.id, c.phase, c.tps, c.players, c.ageS, c.launchMs])).toEqual([
-      ["mc-1", "mc:1", "running", 20, 3, 125, 412],
-      ["mc-2", "mc:2", "restoring", null, null, null, null],
-      ["mc-3", "mc:3", "none", null, null, null, null],
+      ["mc-1", "field:1", "running", 20, 3, 125, 412],
+      ["mc-2", "field:2", "restoring", null, null, null, null],
+      ["mc-3", "field:3", "none", null, null, null, null],
       // running, but its tile did not answer: no tick rate, not zero
-      ["mc-4", "mc:4", "running", null, null, null, null],
+      ["mc-4", "field:4", "running", null, null, null, null],
     ]);
     expect(cells[0]!.frame).toBe("ws://[2001:db8::2]:8080/view");
     // no rows yet, rows too old, rows for another count of servers, rows that are not base64: every server is not reported
@@ -72,7 +72,7 @@ describe("the field's cells", () => {
     expect(statusRows({ rows: Buffer.from(row(3)).toString("base64") }, 2)).toBeNull();
   });
 
-  it("orders servers by number across hosts, and gives each the id the coordinator gives its tile", () => {
+  it("orders servers by number across hosts, each under a key that does not change", () => {
     const f: MinecraftField = {
       servers: 4,
       hosts: [
@@ -80,37 +80,25 @@ describe("the field's cells", () => {
         { key: "aaaaaaaaaaaa", servers: [1, 7], frames: ["x1", "x7"], frames_v4: [null, null] },
       ],
     };
-    const cells = fieldCells(f, { bbbbbbbbbbbb: status([row(3, 198), row(4)], { host: "bbbbbbbbbbbb" }) }, NOW);
+    const listed = [{ id: "mc:1", slot: "mc-1" }];
+    const cells = fieldCells(f, { bbbbbbbbbbbb: status([row(3, 198), row(4)], { host: "bbbbbbbbbbbb" }) }, NOW, listed);
+    // a listed tile keeps its own id; every other server has the page's key, from its number
     expect(cells.map((c) => [c.n, c.id, c.phase, c.frame, c.frameV4])).toEqual([
       [1, "mc:1", "none", "x1", null],
-      [3, "mc:2", "running", "x3", null],
-      [4, "mc:3", "failed", null, "y4"],
-      [7, "mc:4", "none", "x7", null],
+      [3, "field:3", "running", "x3", null],
+      [4, "field:4", "failed", null, "y4"],
+      [7, "field:7", "none", "x7", null],
     ]);
-  });
-
-  it("keeps a listed tile's own id, and makes up no coordinator's id when the field does not name every server", () => {
-    // The coordinator's id is a server's place among all servers. Here it counts five, and one
-    // (mc-2, with no host yet) is in no host's list: places worked out from the lists would be
-    // off by one from mc-3 on, and mc-4's would be the listed mc-3's own id.
-    const f: MinecraftField = { servers: 5, hosts: [{ key: "aaaaaaaaaaaa", servers: [1, 3, 4, 5], frames: [null, null, null, null], frames_v4: [null, null, null, null] }] };
-    const listed = [
-      { id: "mc:1", slot: "mc-1" },
-      { id: "mc:3", slot: "mc-3" },
-    ];
-    const cells = fieldCells(f, {}, NOW, listed);
-    expect(cells.map((c) => [c.slot, c.id])).toEqual([
-      ["mc-1", "mc:1"],
-      ["mc-3", "mc:3"],
-      ["mc-4", "field:4"],
-      ["mc-5", "field:5"],
-    ]);
-    expect(new Set(cells.map((c) => c.id)).size).toBe(4);
-    // every server named, but a listed tile whose id is not its place: the same care
-    const whole = fieldCells(field(4), {}, NOW, [{ id: "mc:9", slot: "mc-2" }]);
-    expect(whole.map((c) => c.id)).toEqual(["field:1", "mc:9", "field:3", "field:4"]);
-    // the ordinary fleet: every server named and the listed tiles at their places
-    expect(fieldCells(field(4), {}, NOW, [{ id: "mc:2", slot: "mc-2" }]).map((c) => c.id)).toEqual(["mc:1", "mc:2", "mc:3", "mc:4"]);
+    // The keys do not move when the field stops naming every server (one with no host yet is
+    // counted and listed by no host), or names them all again: a tile whose key moved would be
+    // closed and reopened, and an opened server put back in the wall.
+    const keys = (field: MinecraftField) => fieldCells(field, {}, NOW, listed).map((c) => c.id);
+    expect(keys({ ...f, servers: 5 })).toEqual(keys(f));
+    const fewer: MinecraftField = { servers: 4, hosts: [f.hosts[0]!, { ...f.hosts[1]!, servers: [1], frames: ["x1"], frames_v4: [null] }] };
+    expect(keys(fewer)).toEqual(["mc:1", "field:3", "field:4"]);
+    // a listed tile whose id is not its place, and no two servers under one key
+    const odd = fieldCells(f, {}, NOW, [{ id: "mc:9", slot: "mc-3" }]).map((c) => c.id);
+    expect(odd).toEqual(["field:1", "mc:9", "field:4", "field:7"]);
   });
 
   it("says what a cell is, and colours it by its state and its tick rate", () => {
@@ -456,12 +444,47 @@ describe("a reset of every server", () => {
     const b = wave([11, 13], 32_510, 32_600)!;
     expect([a.tookS, b.tookS]).toEqual([21, 22]);
     expect([a.settled, a.text]).toEqual([true, "Reset all: 2 servers back in 21 s (0.1 a second)"]);
+    expect(a.frozen).toEqual({ clicked_at: CLICKED, back: 2, total: 2, done: true, tookS: 21, at: CLICKED + 21_490 });
     // the page hands back what it showed, and that stands
-    const stood = resetWave(cellsAt([11, 13], 32_510), { clicked_at: CLICKED, servers: 2 }, CLICKED + 32_600, a.tookS)!;
-    expect(stood.text).toBe(a.text);
-    // while the reset runs nothing stands: the clock is the coordinator's
-    const running = resetWave(cellsAt([3, null], 10_000), { clicked_at: CLICKED, servers: 2 }, CLICKED + 10_200, 99)!;
-    expect([running.settled, running.tookS, running.text]).toEqual([false, null, "Reset all: 1 of 2 back · 0.1 a second · 10.2 s"]);
+    const stood = resetWave(cellsAt([11, 13], 32_510), { clicked_at: CLICKED, servers: 2 }, CLICKED + 32_600, a.frozen)!;
+    expect([stood.text, stood.frozen]).toEqual([a.text, a.frozen]);
+    // while the reset runs nothing is kept: the clock is the coordinator's
+    const running = resetWave(cellsAt([3, null], 10_000), { clicked_at: CLICKED, servers: 2 }, CLICKED + 10_200)!;
+    expect([running.settled, running.tookS, running.frozen, running.text]).toEqual([false, null, null, "Reset all: 1 of 2 back · 0.1 a second · 10.2 s"]);
+    // what was kept for another reset is not this one's
+    const other = resetWave(cellsAt([3, null], 10_000), { clicked_at: CLICKED, servers: 2 }, CLICKED + 10_200, { ...a.frozen!, clicked_at: CLICKED - 5 })!;
+    expect(other.text).toBe(running.text);
+  });
+
+  it("does not come back when one server is reset minutes after it finished", () => {
+    // A reset of four that took 36 s. Five minutes after the click one of the four is reset by
+    // itself and is back: its row is a launch after the click, as every row is.
+    const later = [264, 270, 280, 2] as const;
+    // the page that watched kept the finished reset: its minute is long over, and it stays over
+    const kept = { clicked_at: CLICKED, back: 4, total: 4, done: true, tookS: 36, at: CLICKED + 36_000 };
+    expect(resetWave(cellsAt([...later], 300_000), { clicked_at: CLICKED, servers: 4 }, CLICKED + 300_500, kept)).toBeNull();
+    // and through its minute what it showed did not move, whatever came back meanwhile
+    expect(resetWave(cellsAt([44, 50, 60, 2], 80_000), { clicked_at: CLICKED, servers: 4 }, CLICKED + 80_500, kept)!.text).toBe("Reset all: 4 servers back in 36 s (0.1 a second)");
+    // a page opened only now has the rows alone: the late launch came more than a minute after
+    // the one before it, so it is not the reset's, and the reset's last server is long back
+    expect(wave([...later], 300_000, 300_500)).toBeNull();
+    // the same while that one server is still being restored
+    expect(wave([264, 270, 280, null], 299_000, 299_500)).toBeNull();
+  });
+
+  it("does not count a server outside the reset that relaunches later", () => {
+    // Five servers, the reset sent to four of them (one was lent), and one of the four failed:
+    // three of four back, and it stops there.
+    const stopped = wave([14, 19, 10, "f", 900], 21_000, 21_300, 4)!;
+    expect([stopped.done, stopped.text]).toEqual([false, "Reset all: 3 of 4 back after 11 s"]);
+    // The lent server is given back and relaunched two minutes on. With what the page kept,
+    // and from the rows alone, it is not the reset's fourth: the reset never reads as whole.
+    const rows = cellsAt([134, 139, 130, "f", 3], 141_000);
+    expect(resetWave(rows, { clicked_at: CLICKED, servers: 4 }, CLICKED + 141_300, stopped.frozen)).toBeNull();
+    expect(resetWave(rows, { clicked_at: CLICKED, servers: 4 }, CLICKED + 141_300)).toBeNull();
+    // 40 s on, inside the kept line's minute: still three of four
+    const soon = cellsAt([54, 59, 50, "f", 3], 61_000);
+    expect(resetWave(soon, { clicked_at: CLICKED, servers: 4 }, CLICKED + 61_300, stopped.frozen)!.text).toBe("Reset all: 3 of 4 back after 11 s");
   });
 
   it("counts against the servers the reset was sent to, and stops when the rest are not coming", () => {

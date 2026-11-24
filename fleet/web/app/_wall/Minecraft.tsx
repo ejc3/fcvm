@@ -22,6 +22,7 @@ import {
   moveCursor,
   scrollTo,
   type SampleSlot,
+  type WaveFrozen,
   Driver,
   minecraftView,
   SITE,
@@ -260,8 +261,9 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   const [pins, setPins] = useState<{ n: number; at: number }[]>([]);
   const [cursor, setCursor] = useState<number | null>(null);
   const sample = useRef<SampleSlot[]>([]);
-  // The time shown for a reset of all once it is over: it stands, though the rows' whole seconds would move it.
-  const waveStood = useRef<{ clicked_at: number; s: number } | null>(null);
+  // A reset of all once it is over, as it was shown then: kept until another reset, so later
+  // launches (one server reset, a fork) never bring its line back or change its time.
+  const waveFrozen = useRef<WaveFrozen | null>(null);
   const fieldScroll = useRef<HTMLDivElement | null>(null);
   // A mouse picks with its click; a finger's tap only points (the cells are smaller than a finger), and Show picks.
   const lastPointer = useRef("mouse");
@@ -397,18 +399,16 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
         statuses: state.minecraftStatus,
         pins,
         sample: sample.current,
-        waveStood: waveStood.current,
+        waveFrozen: waveFrozen.current,
       }),
     [state, now, dpr, stage, narrow, touch, live, samples, refused, released, renderer, opened, lost, reduced, reducedMotion, pins],
   );
   viewRef.current = view;
   sample.current = view.field?.slots ?? [];
   const resetAt = state.accepted?.minecraft?.last_reset_all?.clicked_at ?? null;
-  const over = view.field?.wave?.settled === true ? view.field.wave.tookS : null;
-  if (resetAt === null || over === null) {
-    // not over (or over with no time to give): nothing stands, and a reset that goes on again is read afresh
-    if (view.field?.wave?.settled !== true) waveStood.current = null;
-  } else if (waveStood.current?.clicked_at !== resetAt) waveStood.current = { clicked_at: resetAt, s: over };
+  const kept = view.field?.wave?.frozen ?? null;
+  if (waveFrozen.current !== null && waveFrozen.current.clicked_at !== resetAt) waveFrozen.current = null;
+  if (kept !== null && waveFrozen.current === null) waveFrozen.current = kept;
   const cursorRef = useRef<number | null>(null);
   cursorRef.current = cursor;
   // The boxes in `view` were laid out in this stage: the 3D view draws into the same one.
@@ -553,6 +553,11 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   const onPointerUp = () => {
     dragFrom.current = null;
   };
+
+  // An opened server that is no server any more is forgotten: its id used again later does not open by itself.
+  useEffect(() => {
+    if (view.openedGone) setOpened(null);
+  }, [view.openedGone]);
 
   // Escape puts an opened server back in the wall (with a panel open, Escape gives the server back).
   useEffect(() => {

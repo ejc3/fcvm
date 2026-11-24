@@ -29,6 +29,7 @@ import {
   type FieldStatus,
   type ResetWave,
   type SampleSlot,
+  type WaveFrozen,
 } from "./minecraft-field.ts";
 
 export const MINECRAFT_TITLE = "Minecraft";
@@ -1038,8 +1039,8 @@ export interface MinecraftInput {
   pins?: readonly { n: number; at: number }[];
   /** The view's last `field.slots`: which server each 3D tile showed, and since when. */
   sample?: readonly SampleSlot[];
-  /** The time the page showed for the last reset of all once it was over (`field.wave.tookS`), for the reset clicked at `clicked_at`: it stands. */
-  waveStood?: { clicked_at: number; s: number } | null;
+  /** The last reset of all as the page showed it once it was over (`field.wave.frozen`): it stands, and is not read from later rows. */
+  waveFrozen?: WaveFrozen | null;
   /** The tile (by id) opened to the whole stage. */
   opened?: string | null;
 }
@@ -1057,6 +1058,8 @@ export interface MinecraftView {
   renderer: McRenderer | null;
   /** The slot opened to the whole stage; null: the wall. */
   opened: string | null;
+  /** The server the page holds as opened (`opened` of the input) is no server any more: the page forgets it, so it does not open by itself if the id is used again. */
+  openedGone: boolean;
   /** With more servers than are listed as tiles: every server as a cell, six of them in the 3D tiles. */
   field: MinecraftFieldView | null;
   verify: ReturnType<typeof verifyView>;
@@ -1133,6 +1136,7 @@ function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: Mc
   const median = medianMs(times);
   const up = cells === null ? m.tiles.filter((t) => t.phase === "running").length : cells.filter((c) => c.phase === "running").length;
   const total = cells === null ? m.tiles.length : cells.length;
+  const unreportedCount = cells === null ? 0 : cells.filter((c) => c.phase === "none").length;
   const servers = total === 1 ? "server" : "servers";
   const recent = (at: number) => srvNow - at <= HEADER_RECENT_MS;
   const f = m.last_fork;
@@ -1149,7 +1153,8 @@ function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: Mc
   const version = javaVersion(m.server);
   return {
     // with no server of a field reported there is no count to give: never a zero nobody read
-    up: silent !== null ? `${total} ${servers}, ${silent}` : `${up} of ${total} ${servers} up`,
+    // and servers nobody reported are not down: the count is over the reported ones, and they are named beside it
+    up: silent !== null ? `${total} ${servers}, ${silent}` : unreportedCount > 0 ? `${up} of ${total - unreportedCount} ${total - unreportedCount === 1 ? "server" : "servers"} up, ${unreportedCount} not reported` : `${up} of ${total} ${servers} up`,
     server: m.server,
     median: `Median restore to first chunk ${median === null ? "--" : hundredthsText(median)}`,
     slowest: `Slowest ${times.length === 0 ? "--" : hundredthsText(Math.max(...times))}`,
@@ -1197,6 +1202,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
       cards: [],
       panel: null,
       opened: null,
+      openedGone: false,
       field: null,
     };
   }
@@ -1390,6 +1396,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     cards,
     panel,
     opened: opened === null ? null : serverName(opened),
+    openedGone: (inp.opened ?? null) !== null && !all.some((t) => t.id === inp.opened) && !(cells?.some((c) => c.id === inp.opened) ?? false),
     field:
       cells === null || m.field === null
         ? null
@@ -1402,7 +1409,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
             slots: slots!,
             pinned: (inp.pins ?? []).filter((p) => inp.now - p.at < PIN_MS && sample!.includes(p.n)).map((p) => p.n),
             headline: fieldHeadline(m.field, cells, inp.statuses ?? {}, inp.now),
-            wave: m.last_reset_all === null ? null : resetWave(cells, m.last_reset_all, srvNow, inp.waveStood?.clicked_at === m.last_reset_all.clicked_at ? inp.waveStood.s : null),
+            wave: m.last_reset_all === null ? null : resetWave(cells, m.last_reset_all, srvNow, inp.waveFrozen ?? null),
             ariaLabel: fieldAria(m.field, cells, inp.statuses ?? {}, inp.now),
           },
   };
