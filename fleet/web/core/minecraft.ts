@@ -11,7 +11,7 @@ import { ProtocolError, sameViewer, type Minecraft, type MinecraftTile } from ".
 import type { ClientState, Notice } from "./store.ts";
 import { streamUrl } from "./net.ts";
 import { openedArea, tenths } from "./phones.ts";
-import { sleepView, verifyView, type SleepView } from "./view.ts";
+import { noneListedText, sleepView, verifyView, type SleepView } from "./view.ts";
 import { hundredthsText, layoutCaptioned, medianMs, type CaptionSizes } from "./windows.ts";
 
 export const MINECRAFT_TITLE = "Minecraft";
@@ -980,7 +980,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
   if (m === null || s.accepted === null) {
     return {
       ...common,
-      empty: s.accepted === null ? (s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet.") : NO_MINECRAFT,
+      empty: s.accepted === null ? (s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet.") : noneListedText(s.accepted, NO_MINECRAFT, "Minecraft servers"),
       banner,
       header: null,
       resetAll: { label: "Reset all", disabled: true },

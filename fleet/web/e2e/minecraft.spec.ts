@@ -101,6 +101,13 @@ test("each tile draws its world from its own view socket, and says its slot, tic
   if (!isPhone(info)) {
     expect(await page.getByTestId("mc-join").evaluate((el) => el.getBoundingClientRect().height)).toBeLessThan(40);
   }
+  // its hint sits in that line, not over the tiles (it once took the wall's centred .hint style)
+  const inRow = await page.getByTestId("mc-join-hint").evaluate((el) => {
+    const h = el.getBoundingClientRect();
+    const row = el.parentElement!.getBoundingClientRect();
+    return getComputedStyle(el).position === "static" && h.top >= row.top - 1 && h.bottom <= row.bottom + 1;
+  });
+  expect(inRow).toBe(true);
   // the tab says which mode it is, and a mode that is not one keeps the wall's title
   await expect(page).toHaveTitle("Minecraft");
   const other = await page.context().newPage();
