@@ -312,7 +312,7 @@ function ringOf(p: Potato, area: Box | null, now: number, reducedMotion: boolean
     arc = { centre: g.centre, radius: rho, from: at(a0, rho), to: at(a0 + sweep, rho), large: sweep > Math.PI, labelAt: at(mid, rho - depth), label: a.label, ahead: a.ahead };
   }
   const ladderRung = r ? p.ladder.find((x) => x.size === r.size) : undefined;
-  const flash = r !== null && ladderRung?.record_pace_at != null && now - ladderRung.record_pace_at < 2500 && ladderRung.record_pace_at >= r.started_at;
+  const flash = r !== null && ladderRung?.record_pace_at != null && ladderRung.record_prev_pace != null && now - ladderRung.record_pace_at < 2500 && ladderRung.record_pace_at >= r.started_at;
   const caption = r
     ? r.seq === null
       ? `Ring of ${r.size}: waiting for the first catch`
@@ -354,6 +354,10 @@ export interface SlotGroupView {
 export interface CpuSlotsView {
   /** "6 of 8 CPUs in use"; "CPU slots" when the agent only caps the count. */
   heading: string;
+  /** "2.1 busy": the CPU the ring really burned over the last lap, when the agent measures it. */
+  busy: string | null;
+  /** The CPUs: slots drawn, held or free. */
+  k: number;
   groups: SlotGroupView[];
   /** "26 of 32 asleep", when the coordinator says. */
   asleep: string | null;
@@ -393,6 +397,8 @@ export function cpuSlotsOf(p: Potato, r: PotatoRound): CpuSlotsView | null {
   const groups = SLOT_ORDER.map((key) => ({ key, label: SLOT_GROUP_LABEL[key], slots: by.get(key) ?? [] })).filter((g) => g.slots.length > 0);
   return {
     heading: `${held.length} of ${k} ${noun} in use`,
+    busy: r.cpus_busy === null ? null : `${oneDecimal(r.cpus_busy)} busy`,
+    k: groups.reduce((n, g) => n + g.slots.length, 0),
     groups,
     asleep: r.asleep === null ? null : `${r.asleep} of ${r.size} asleep`,
   };
@@ -404,10 +410,30 @@ const LABEL_HALF_H = 10;
 function arcRadius(g: RingGeometry): number {
   return Math.max(0, g.radius - g.tile * 0.5 - 6);
 }
-/** The width of the box in the ring's centre that the arc's line and its label leave free for the CPU slots. */
-export function slotsRoom(g: RingGeometry): number {
+/** The width of a box `height` tall, centred in the ring, that the arc's line and its label leave free. */
+export function centreRoom(g: RingGeometry, height: number): number {
   const free = arcRadius(g) - 2 * LABEL_HALF_W - 4;
-  return free <= 55 ? 0 : 2 * Math.sqrt(free * free - 55 * 55);
+  const h = height / 2;
+  return free <= h ? 0 : 2 * Math.sqrt(free * free - h * h);
+}
+
+export type SlotsForm = "full" | "compact" | "below";
+export interface SlotsLayout {
+  form: SlotsForm;
+  /** Rows of chips: 1 or 2 in the compact form. */
+  rows: number;
+}
+const FULL_CHIP = 36;
+const COMPACT_CHIP = 23;
+const COMPACT_MIN_W = 150;
+
+/** Where the K CPUs go: labelled in the ring's centre when it is wide, else one or two rows of small chips in the centre, else under the ring. */
+export function slotsLayout(g: RingGeometry, k: number): SlotsLayout {
+  if (centreRoom(g, 110) >= Math.max(240, k * FULL_CHIP + 56)) return { form: "full", rows: 1 };
+  for (const rows of [1, 2]) {
+    if (centreRoom(g, 26 + rows * 24) >= Math.max(COMPACT_MIN_W, Math.ceil(k / rows) * COMPACT_CHIP)) return { form: "compact", rows };
+  }
+  return { form: "below", rows: 1 };
 }
 
 export interface ArcView {
@@ -441,7 +467,7 @@ export function arcOf(r: PotatoRound, p: Potato): ArcView | null {
 }
 
 export interface DensityFigure {
-  key: "asleep" | "pace" | "slowest";
+  key: "asleep" | "pace" | "slowest" | "fastest";
   value: string;
   label: string;
 }
@@ -454,8 +480,8 @@ export interface DensityView {
   machines: string;
   where: string;
   figures: DensityFigure[];
-  /** This round holds the fastest pace the ring has held at its size. */
-  record: boolean;
+  /** This round set the rung's record and the one before it is known: "9.8", else null (no pill). */
+  record: { was: string } | null;
 }
 
 export function densityOf(p: Potato, r: PotatoRound): DensityView {
@@ -465,6 +491,8 @@ export function densityOf(p: Potato, r: PotatoRound): DensityView {
   if (r.asleep !== null) figures.push({ key: "asleep", value: `${Math.round((r.asleep / r.size) * 100)}%`, label: "asleep" });
   if (r.pace !== null) figures.push({ key: "pace", value: oneDecimal(r.pace), label: "catches / s" });
   if (r.slowest_wake_ms !== null) figures.push({ key: "slowest", value: fmtMs(r.slowest_wake_ms), label: "slowest wake" });
+  const fastest = p.records.fastest_cycle_ms;
+  if (fastest !== null) figures.push({ key: "fastest", value: fmtMs(fastest.value), label: "fastest sleep and wake" });
   const rung = p.ladder.find((g) => g.size === r.size);
   return {
     heading: k === null ? "Machines" : p.confined === false ? "Machines per CPU slot" : "Machines per CPU",
@@ -472,7 +500,7 @@ export function densityOf(p: Potato, r: PotatoRound): DensityView {
     machines: k === null ? "" : `${r.size} machines · ${k} ${noun}`,
     where: [`ring of ${r.size}`, `lap ${r.lap + 1}`].join(" · "),
     figures,
-    record: rung?.record_pace_at != null && rung.record_pace_at >= r.started_at,
+    record: rung?.record_pace_at != null && rung.record_pace_at >= r.started_at && rung.record_prev_pace != null ? { was: oneDecimal(rung.record_prev_pace) } : null,
   };
 }
 
@@ -501,12 +529,14 @@ export function chartOf(p: Potato, r: PotatoRound): ChartView | null {
   const points = r.laps.filter((l) => l.cpus_peak !== null).map((l) => ({ pace: l.pace, cpus: l.cpus_peak! }));
   if (points.length === 0) return null;
   const now = r.pace !== null && r.cpus_in_use !== null ? { pace: r.pace, cpus: r.cpus_in_use } : null;
-  const top = Math.max(...points.map((x) => x.pace), now?.pace ?? 0);
+  // the pace axis runs on to the rung's record, or to well past the points, so a lone point is not floating
+  const rung = p.ladder.find((g) => g.size === r.size);
+  const top = Math.max(Math.max(...points.map((x) => x.pace), now?.pace ?? 0) * 1.6, rung?.record_pace ?? 0);
   return {
     title: "CPUs in use as the pace rises",
     points,
     now,
-    paceMax: Math.max(1, Math.ceil(top * 1.15)),
+    paceMax: Math.max(1, Math.ceil(top)),
     cpusMax: k,
     k,
     kLabel: "no CPU for the next wake",
@@ -642,32 +672,6 @@ export function dropCard(p: Potato, d: PotatoDrop, now: number): DropCard {
   };
 }
 
-export interface RecordRow {
-  name: string;
-  label: string;
-  value: string;
-  note: string;
-}
-
-export function recordsOf(p: Potato): RecordRow[] {
-  const f = p.records.fastest_cycle_ms;
-  const l = p.records.longest_round;
-  return [
-    {
-      name: "fastest-cycle",
-      label: "Fastest sleep and wake",
-      value: f === null ? "--" : tenthsMs(f.value),
-      note: f === null ? "none yet" : `${f.player === null ? "a player" : `player ${f.player}`} in a ring of ${f.size}`,
-    },
-    {
-      name: "longest-round",
-      label: "Longest round",
-      value: l === null ? "--" : plural(Math.round(l.value), "catch", "catches"),
-      note: l === null ? "none yet" : `a ring of ${l.size}`,
-    },
-  ];
-}
-
 // ---- the two buttons ---------------------------------------------------------------
 
 export interface PotatoButton {
@@ -694,9 +698,8 @@ export function potatoFasterButton(s: ClientState, p: Potato, now: number): Pota
   if (s.pending.some((x) => x.intent.name === "potato_faster")) return { label: "Faster requested", disabled: true, note: "" };
   const last = s.accepted ? lastMineAt(s.accepted, s.you, "potato_faster") : null;
   if (last !== null && now < last + FASTER_INTERVAL_MS) return { label, disabled: true, note: `again in ${seconds(last + FASTER_INTERVAL_MS - now)}` };
-  if (r.hold_ms <= r.min_hold_ms) return { label, disabled: true, note: "the hold is at its floor" };
-  const next = Math.max(r.min_hold_ms, r.hold_ms - Math.floor(r.hold_ms / 5));
-  return { label, disabled: false, note: `cuts the hold to ${ms(next)}` };
+  if (r.hold_ms <= r.min_hold_ms) return { label, disabled: true, note: "as fast as it goes" };
+  return { label, disabled: false, note: "" };
 }
 
 export function potatoRestartButton(s: ClientState, p: Potato, now: number): PotatoButton {
@@ -711,7 +714,7 @@ export function potatoRestartButton(s: ClientState, p: Potato, now: number): Pot
     return { label, disabled: true, note: `possible ${seconds(RESTART_INTERVAL_MS)} into a round, in ${seconds(r.started_at + RESTART_INTERVAL_MS - now)}` };
   }
   const size = r?.size ?? p.size;
-  return { label, disabled: false, note: size === null ? "starts the ring again" : `starts the ring of ${size} again` };
+  return { label, disabled: false, note: size === null ? "" : `ring of ${size} again` };
 }
 
 const POTATO_INTENTS: Record<string, string> = { potato_faster: "Faster", potato_restart: "Restart" };
@@ -750,7 +753,6 @@ export interface PotatoView {
   chart: ChartView | null;
   drop: DropCard | null;
   ladder: LadderBarsView | null;
-  records: RecordRow[];
   faster: PotatoButton;
   restart: PotatoButton;
   notice: string | null;
@@ -783,7 +785,6 @@ export function potatoView(inp: PotatoInput): PotatoView {
       chart: null,
       drop: null,
       ladder: null,
-      records: [],
       faster: { ...off, label: "Faster" },
       restart: { ...off, label: "Restart" },
     };
@@ -798,7 +799,6 @@ export function potatoView(inp: PotatoInput): PotatoView {
     chart: p.round ? chartOf(p, p.round) : null,
     drop,
     ladder: ladderBarsOf(p),
-    records: recordsOf(p),
     faster: potatoFasterButton(s, p, now),
     restart: potatoRestartButton(s, p, now),
   };

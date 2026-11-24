@@ -13,7 +13,8 @@ import {
   fmtMs,
   ladderBarsOf,
   perCpu,
-  slotsRoom,
+  slotsLayout,
+  centreRoom,
   dropCard,
   dropHeadline,
   LINE_MIN_TILE,
@@ -26,7 +27,6 @@ import {
   potatoNotice,
   potatoRestartButton,
   potatoView,
-  recordsOf,
   ringGeometry,
   type PotatoInput,
   tileReadout,
@@ -100,9 +100,9 @@ function potato(over: Partial<Potato> = {}): Potato {
     confined: null,
     next_round_at: null,
     ladder: [
-      { size: 2, record_hold_ms: 1458, record_at: T - 30_000, record_pace: null, record_pace_at: null, rounds: 3, broke: BROKE },
-      { size: 4, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
-      { size: 8, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+      { size: 2, record_hold_ms: 1458, record_at: T - 30_000, record_pace: null, record_pace_at: null, record_prev_pace: null, rounds: 3, broke: BROKE },
+      { size: 4, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 },
+      { size: 8, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 },
     ],
     round: round(),
     players: [
@@ -377,8 +377,8 @@ function dense(over: Partial<Potato> = {}, rOver: Partial<PotatoRound> = {}): Po
     }),
     players: [mk(0, "asleep"), mk(1, "asleep"), mk(2, "awake"), mk(3, "awake"), mk(4, "asleep"), mk(5, "waking"), mk(6, "sleeping"), mk(7, "asleep")],
     ladder: [
-      { size: 8, record_hold_ms: null, record_at: null, record_pace: 5.3, record_pace_at: T - 1000, broke: null, rounds: 2 },
-      { size: 16, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+      { size: 8, record_hold_ms: null, record_at: null, record_pace: 5.3, record_pace_at: T - 1000, record_prev_pace: null, broke: null, rounds: 2 },
+      { size: 16, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 },
     ],
     ...over,
   });
@@ -401,8 +401,15 @@ describe("the density figures", () => {
       { key: "asleep", value: "50%", label: "asleep" },
       { key: "pace", value: "5.2", label: "catches / s" },
       { key: "slowest", value: "310 ms", label: "slowest wake" },
+      { key: "fastest", value: "650 ms", label: "fastest sleep and wake" },
     ]);
-    expect(d.record).toBe(true);
+    // the record's pill needs the record before it: none is sent, so none is drawn
+    expect(d.record).toBeNull();
+    const rung = (prev: number | null) => dense({ ladder: [{ size: 8, record_hold_ms: null, record_at: null, record_pace: 5.3, record_pace_at: T - 1000, record_prev_pace: prev, broke: null, rounds: 2 }] });
+    expect(densityOf(rung(4.94), rung(4.94).round!).record).toEqual({ was: "4.9" });
+    expect(densityOf(rung(null), rung(null).round!).record).toBeNull();
+    const earlier = dense({ ladder: [{ size: 8, record_hold_ms: null, record_at: null, record_pace: 5.3, record_pace_at: T - 90_000, record_prev_pace: 4.9, broke: null, rounds: 2 }] });
+    expect(densityOf(earlier, earlier.round!).record).toBeNull();
   });
 
   it("says CPU slots, not CPUs, when the agent only caps the count", () => {
@@ -418,10 +425,10 @@ describe("the density figures", () => {
     expect(d.heading).toBe("Machines");
     expect(d.big).toBe("4");
     expect(d.machines).toBe("");
-    expect(d.figures).toEqual([]);
-    expect(d.record).toBe(false);
+    expect(d.figures).toEqual([{ key: "fastest", value: "650 ms", label: "fastest sleep and wake" }]);
+    expect(d.record).toBeNull();
     const paceOnly = potato({ round: round({ pace: 3.14159 }) });
-    expect(densityOf(paceOnly, paceOnly.round!).figures).toEqual([{ key: "pace", value: "3.1", label: "catches / s" }]);
+    expect(densityOf(paceOnly, paceOnly.round!).figures.map((f) => f.key)).toEqual(["pace", "fastest"]);
     expect(cpuSlotsOf(old, old.round!)).toBeNull();
     expect(chartOf(old, old.round!)).toBeNull();
   });
@@ -455,6 +462,13 @@ describe("the CPU slots", () => {
     expect(v.groups.at(-1)).toMatchObject({ key: "free", label: "free" });
     expect(v.groups.at(-1)!.slots).toHaveLength(2);
     expect(v.groups.at(-1)!.slots.every((x) => x.player === null && x.number === null)).toBe(true);
+  });
+
+  it("shows the CPU the ring really burned beside the count, when the agent measures it", () => {
+    const p = dense({}, { cpus_busy: 2.14 });
+    expect(cpuSlotsOf(p, p.round!)!.busy).toBe("2.1 busy");
+    expect(cpuSlotsOf(dense(), dense().round!)!.busy).toBeNull();
+    expect(cpuSlotsOf(p, p.round!)!.k).toBe(4);
   });
 
   it("takes the agent's slot list when it sends one, in its phases, and counts booting as waking", () => {
@@ -508,11 +522,23 @@ describe("the arc's label and the slots' room", () => {
           const arc = v.ring!.arc!;
           const label = { x: arc.labelAt.x - 56, y: arc.labelAt.y - 10, w: 112, h: 20 };
           for (const t of v.ring!.tiles) expect(clear(label, t.box), `n=${n} holder=${holder} ahead=${ahead}`).toBe(true);
-          const w = slotsRoom(v.ring!.geometry);
+          const w = centreRoom(v.ring!.geometry, 110);
           if (w > 0) expect(clear(label, { x: v.ring!.geometry.centre.x - w / 2, y: v.ring!.geometry.centre.y - 55, w, h: 110 })).toBe(true);
         }
       }
     }
+  });
+});
+
+describe("where the CPU slots go", () => {
+  const geo = (w: number, h: number, n: number) => ringGeometry({ x: 0, y: 0, w, h }, n);
+  it("labels them in the centre on a very large screen, as small chips on a laptop, and under the ring when nothing fits", () => {
+    expect(slotsLayout(geo(1000, 760, 32), 8).form).toBe("full");
+    // 1440x900 and 1280x800: the ring's stage is about 710 and 610 tall
+    expect(slotsLayout(geo(880, 710, 32), 8)).toEqual({ form: "compact", rows: 1 });
+    expect(slotsLayout(geo(800, 610, 32), 8)).toEqual({ form: "compact", rows: 1 });
+    expect(slotsLayout(geo(800, 610, 16), 8)).toEqual({ form: "compact", rows: 2 });
+    expect(slotsLayout(geo(358, 358, 32), 8).form).toBe("below");
   });
 });
 
@@ -523,7 +549,8 @@ describe("the chart and the ladder's bars", () => {
     expect(c.points).toEqual([{ pace: 2.5, cpus: 2 }, { pace: 5, cpus: 3 }]);
     expect(c.now).toEqual({ pace: 5.24, cpus: 4 });
     expect([c.k, c.cpusMax, c.kLabel]).toEqual([4, 4, "no CPU for the next wake"]);
-    expect(c.paceMax).toBe(7);
+    // the axis runs 1.6 times past the furthest point, or on to the rung's record
+    expect(c.paceMax).toBe(9);
   });
 
   it("has no chart before a lap reports its peak, or when the laps carry none", () => {
@@ -535,9 +562,9 @@ describe("the chart and the ladder's bars", () => {
 
   it("draws one bar per rung, long by the fastest pace held, with the current rung marked", () => {
     const l = ladderBarsOf(dense({ ladder: [
-      { size: 16, record_hold_ms: null, record_at: null, record_pace: 12.1, record_pace_at: T, broke: null, rounds: 1 },
-      { size: 32, record_hold_ms: null, record_at: null, record_pace: 6.05, record_pace_at: T, broke: null, rounds: 1 },
-      { size: 64, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+      { size: 16, record_hold_ms: null, record_at: null, record_pace: 12.1, record_pace_at: T, record_prev_pace: null, broke: null, rounds: 1 },
+      { size: 32, record_hold_ms: null, record_at: null, record_pace: 6.05, record_pace_at: T, record_prev_pace: null, broke: null, rounds: 1 },
+      { size: 64, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 },
     ], size: 32, capacity: 96 }));
     expect(l.title).toBe("Fastest pace held on 4 CPUs");
     expect(l.rows.map((r) => [r.size, r.label, r.value, r.length === null ? null : Math.round(r.length * 100) / 100, r.current])).toEqual([
@@ -549,9 +576,9 @@ describe("the chart and the ladder's bars", () => {
 
   it("falls back to the machine count and the old hold record when there is no allotment or no pace", () => {
     const l = ladderBarsOf(potato({ capacity: 4, ladder: [
-      { size: 2, record_hold_ms: 1458, record_at: T, record_pace: null, record_pace_at: null, broke: null, rounds: 3 },
-      { size: 4, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
-      { size: 8, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 },
+      { size: 2, record_hold_ms: 1458, record_at: T, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 3 },
+      { size: 4, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 },
+      { size: 8, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 },
     ] }));
     expect(l.title).toBe("Fastest pace held");
     expect(l.rows.map((r) => [r.label, r.value, r.length, r.skipped])).toEqual([
@@ -612,26 +639,16 @@ describe("drops, the ladder and the records", () => {
     expect(potatoView(input(stateWith(potato({ round: null, next_round_at: null })))).drop).toBeNull();
   });
 
-  it("states the records", () => {
-    expect(recordsOf(potato()).map((r) => [r.label, r.value, r.note])).toEqual([
-      ["Fastest sleep and wake", "650 ms", "player 0 in a ring of 2"],
-      ["Longest round", "151 catches", "a ring of 64"],
-    ]);
-    expect(recordsOf(potato({ records: { fastest_cycle_ms: null, longest_round: null } })).map((r) => [r.value, r.note])).toEqual([
-      ["--", "none yet"],
-      ["--", "none yet"],
-    ]);
-  });
 });
 
 describe("Faster and Restart", () => {
   const committed = (name: string, at: number, viewer = "v-1") => ({ at, viewer, id: `${name}-${at}`, name, args: {}, summary: name, outcome: "committed" });
 
-  it("Faster says what it cuts the hold to, and is off without a round, at the floor, while pending, and for 2 s after this viewer's last", () => {
-    expect(potatoFasterButton(stateWith(potato()), potato(), T)).toEqual({ label: "Faster", disabled: false, note: "cuts the hold to 480 ms" });
+  it("Faster has no note when it is ready, and is off without a round, at the floor, while pending, and for 2 s after this viewer's last", () => {
+    expect(potatoFasterButton(stateWith(potato()), potato(), T)).toEqual({ label: "Faster", disabled: false, note: "" });
     expect(potatoFasterButton(stateWith(potato()), potato({ round: null }), T)).toEqual({ label: "Faster", disabled: true, note: "works while a round is being played" });
     const floor = potato({ round: round({ hold_ms: 2 }) });
-    expect(potatoFasterButton(stateWith(floor), floor, T).note).toBe("the hold is at its floor");
+    expect(potatoFasterButton(stateWith(floor), floor, T).note).toBe("as fast as it goes");
     const mine = stateWith(potato(), "v-1", [committed("potato_faster", T - 600)]);
     expect(potatoFasterButton(mine, potato(), T)).toEqual({ label: "Faster", disabled: true, note: "again in 2 s" });
     expect(potatoFasterButton(mine, potato(), T + 1000).note).toBe("again in 1 s");
@@ -644,11 +661,11 @@ describe("Faster and Restart", () => {
     expect(potatoFasterButton(pending, potato(), T)).toEqual({ label: "Faster requested", disabled: true, note: "" });
   });
 
-  it("Restart waits 10 s into a round and 10 s after this viewer's last, and says which ring it starts again", () => {
+  it("Restart waits 10 s into a round and 10 s after this viewer's last, and names the ring it plays again", () => {
     const fresh = potato({ round: round({ started_at: T - 4000 }) });
     expect(potatoRestartButton(stateWith(fresh), fresh, T)).toEqual({ label: "Restart", disabled: true, note: "possible 10 s into a round, in 6 s" });
     const old = potato({ round: round({ started_at: T - 60_000 }) });
-    expect(potatoRestartButton(stateWith(old), old, T)).toEqual({ label: "Restart", disabled: false, note: "starts the ring of 4 again" });
+    expect(potatoRestartButton(stateWith(old), old, T)).toEqual({ label: "Restart", disabled: false, note: "ring of 4 again" });
     const mine = stateWith(old, "v-1", [committed("potato_restart", T - 1000)]);
     expect(potatoRestartButton(mine, old, T)).toEqual({ label: "Restart", disabled: true, note: "again in 9 s" });
     const gone = potato({ round: null, capacity: 0 });

@@ -8,20 +8,31 @@ import type { ChartView, CpuSlotsView, DensityView, LadderBarsView, SlotGroupKey
 
 const SLOT_PHASE: Record<Exclude<SlotGroupKey, "free">, "awake" | "waking" | "sleeping"> = { ball: "awake", ready: "awake", waking: "waking", saving: "sleeping" };
 
-/** The K CPUs as slots, each holding the chip of the machine that holds it, grouped and labelled. */
-export function CpuSlots({ slots }: { slots: CpuSlotsView }) {
+/**
+ * The K CPUs as slots, each holding the chip of the machine that holds it. "full": grouped and
+ * labelled; "compact": small chips in one or two rows, the group labels spoken and shown on hover.
+ */
+export function CpuSlots({ slots, form = "full", rows = 1 }: { slots: CpuSlotsView; form?: "full" | "compact"; rows?: number }) {
+  const compact = form === "compact";
+  const cols = Math.ceil(slots.k / rows);
   return (
-    <div className="potato-cpus" data-testid="potato-cpus">
+    <div className={`potato-cpus${compact ? " compact" : ""}`} data-testid="potato-cpus" data-form={form}>
       <p className="cpus-heading" data-testid="potato-cpus-heading">
         {slots.heading}
+        {slots.busy ? (
+          <span className="busy" data-testid="potato-cpus-busy">
+            {" "}
+            · {slots.busy}
+          </span>
+        ) : null}
       </p>
-      <ol className="slot-groups">
+      <ol className="slot-groups" style={compact ? { width: cols * 23 } : undefined}>
         {slots.groups.map((g) => (
           <li key={g.key} className="slot-group" data-group={g.key}>
             <span className="slot-row">
               {g.slots.map((s, i) =>
                 s.player === null ? (
-                  <span key={i} className="slot free" data-testid="potato-slot" data-group="free" />
+                  <span key={i} className="slot free" data-testid="potato-slot" data-group="free" data-label={compact ? g.label : undefined} />
                 ) : (
                   <span
                     key={s.player}
@@ -30,6 +41,7 @@ export function CpuSlots({ slots }: { slots: CpuSlotsView }) {
                     data-group={g.key}
                     data-phase={SLOT_PHASE[g.key as Exclude<SlotGroupKey, "free">]}
                     data-holder={g.key === "ball" ? "true" : undefined}
+                    data-label={compact ? `${g.label}: player ${s.number}` : undefined}
                     style={{ ["--c" as string]: s.colour } as CSSProperties}
                   >
                     <span className="num">{s.number}</span>
@@ -37,11 +49,11 @@ export function CpuSlots({ slots }: { slots: CpuSlotsView }) {
                 ),
               )}
             </span>
-            <span className="slot-label">{g.label}</span>
+            <span className={compact ? "sr-only" : "slot-label"}>{g.label}</span>
           </li>
         ))}
       </ol>
-      {slots.asleep ? <p className="cpus-asleep">{slots.asleep}</p> : null}
+      {slots.asleep && !compact ? <p className="cpus-asleep">{slots.asleep}</p> : null}
     </div>
   );
 }
@@ -67,7 +79,7 @@ export function DensityCard({ d }: { d: DensityView }) {
         ) : null}
         {d.record ? (
           <span className="record-pill" data-testid="potato-record">
-            record
+            record <span className="was">was {d.record.was}</span>
           </span>
         ) : null}
       </div>
@@ -108,6 +120,7 @@ export function ChartCard({ c }: { c: ChartView }) {
           {c.kLabel}
         </text>
         <path className="steps" d={d} />
+        {pts.length > 0 ? <line className="drop-line" x1={x(pts[0]!.pace)} y1={y(pts[0]!.cpus)} x2={x(pts[0]!.pace)} y2={y(0)} /> : null}
         {pts.map((p) => (
           <circle key={`${p.pace}-${p.cpus}`} className="dot" cx={x(p.pace)} cy={y(p.cpus)} r="3" />
         ))}

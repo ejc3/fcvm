@@ -5,7 +5,7 @@
 // draws the view model core/potato.ts computes; every word on it comes from there.
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { potatoColour, potatoView, slotsRoom, SITE, type Box, type PotatoButton, type RingTile, type PotatoView } from "../../core/index.ts";
+import { potatoColour, potatoView, slotsLayout, SITE, type Box, type PotatoButton, type RingTile, type PotatoView } from "../../core/index.ts";
 import { WallClient } from "./wall-client.ts";
 import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
@@ -140,9 +140,9 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   };
   const shown = pressed ?? pointed ?? focused;
   const ring = view.ring;
-  // The slots go in the ring's centre when the room inside the arc and its label is wide enough; else under the ring.
-  const centreWidth = ring ? slotsRoom(ring.geometry) : 0;
-  const slotsInRing = view.cpuSlots !== null && centreWidth >= 240;
+  // The slots go in the ring's centre, labelled or as small chips, by the room inside the arc and its label; else under the ring.
+  const layout = ring && view.cpuSlots ? slotsLayout(ring.geometry, view.cpuSlots.k) : null;
+  const slotsInRing = layout !== null && layout.form !== "below";
   const needsVerifyPrompt = view.verify.prompt;
 
   return (
@@ -178,7 +178,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
       ) : null}
       <div className="potato-body">
         <section className="potato-ring-wrap" aria-label="The ring">
-          <p className="potato-caption" data-testid="potato-caption">
+          <p className="potato-caption sr-only" data-testid="potato-caption">
             {ring?.caption ?? view.empty ?? ""}
           </p>
           <div ref={stageRef} className="potato-stage" data-testid="potato-stage" role="img" aria-label={ring?.ariaLabel ?? view.empty ?? ""}>
@@ -252,9 +252,9 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                 </span>
               </>
             ) : null}
-            {slotsInRing && view.cpuSlots && ring ? (
-              <div className="potato-centre" style={{ left: ring.geometry.centre.x, top: ring.geometry.centre.y, width: centreWidth }}>
-                <CpuSlots slots={view.cpuSlots} />
+            {slotsInRing && view.cpuSlots && ring && layout ? (
+              <div className="potato-centre" style={{ left: ring.geometry.centre.x, top: ring.geometry.centre.y }}>
+                <CpuSlots slots={view.cpuSlots} form={layout.form as "full" | "compact"} rows={layout.rows} />
               </div>
             ) : null}
             {shown !== null && ring ? <Readout tile={ring.tiles.find((t) => t.player === shown) ?? null} centre={ring.geometry.centre} stage={stage} /> : null}
@@ -309,21 +309,6 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
               </h2>
               {view.chart ? <ChartCard c={view.chart} /> : null}
               {view.ladder ? <LadderBars l={view.ladder} /> : null}
-            </section>
-          ) : null}
-          {view.records.length > 0 ? (
-            <section className="card potato-records" aria-labelledby="potato-records-h">
-              <h2 id="potato-records-h">Records</h2>
-              <dl data-testid="potato-records">
-                {view.records.map((r) => (
-                  <div key={r.name} data-testid={`potato-record-${r.name}`}>
-                    <dt>{r.label}</dt>
-                    <dd>
-                      <span className="v">{r.value}</span> <span className="muted">{r.note}</span>
-                    </dd>
-                  </div>
-                ))}
-              </dl>
             </section>
           ) : null}
         </div>

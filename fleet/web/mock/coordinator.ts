@@ -1673,6 +1673,7 @@ export class MockCoordinator {
             ...(typeof b["next_in_ms"] === "number" ? { next_in_ms: b["next_in_ms"] } : {}),
             ...(typeof b["slow_wake_ms"] === "number" ? { slow_wake_ms: b["slow_wake_ms"] } : {}),
             ...(typeof b["cpus"] === "number" ? { cpus: b["cpus"] } : {}),
+            ...(typeof b["players"] === "number" ? { players: b["players"] } : {}),
           });
           return { ok: true };
         });

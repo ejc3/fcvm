@@ -104,6 +104,7 @@ interface Rung {
   record_at: number | null;
   record_pace: number | null;
   record_pace_at: number | null;
+  record_prev_pace: number | null;
   broke: Drop | null;
   rounds: number;
 }
@@ -182,7 +183,7 @@ export class MockPotato {
     this.host = host;
     this.rand = rng(opts.seed ?? 4096);
     this.cpus = opts.cpus ?? null;
-    this.ladder = this.rungs().map((size) => ({ size, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 }));
+    this.ladder = this.rungs().map((size) => ({ size, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 }));
     // the host says hello: the first round starts a second later, as the coordinator's tick starts it
     this.scheduleStart(1000);
   }
@@ -284,7 +285,7 @@ export class MockPotato {
       asleep: ring.length - held.length,
       lead: Math.max(1, Math.ceil(this.leadMs() / hold)),
       slowest_wake_ms: this.recentWakes.length === 0 ? null : Math.max(...this.recentWakes),
-      cpus_busy: null,
+      cpus_busy: Math.round(Math.min(this.cpus ?? 0, slots.length * 0.7) * 10) / 10,
       cpu_slots: slots,
     };
   }
@@ -435,6 +436,7 @@ export class MockPotato {
     if (r.bestPace === null || pace > r.bestPace) r.bestPace = pace;
     const rung = this.ladder.find((g) => g.size === r.size);
     if (rung && this.cpus !== null && (rung.record_pace === null || pace > rung.record_pace)) {
+      rung.record_prev_pace = rung.record_pace;
       rung.record_pace = pace;
       rung.record_pace_at = this.host.now();
     }
@@ -699,7 +701,7 @@ export class MockPotato {
    * Tests: start over at a size (the ladder's records and the rate limits cleared), the next
    * round `nextInMs` from now, and optionally make the next wake take `slowWakeMs`.
    */
-  reset(over: { size?: number; next_in_ms?: number; slow_wake_ms?: number; cpus?: number | null }): void {
+  reset(over: { size?: number; next_in_ms?: number; slow_wake_ms?: number; cpus?: number | null; players?: number }): void {
     if (this.round) this.endRound(this.round);
     for (const p of this.players.values()) {
       if (p.timer) clearTimeout(p.timer);
@@ -707,9 +709,10 @@ export class MockPotato {
     }
     this.players.clear();
     this.cpuQueue = [];
+    if (over.players !== undefined) this.opts.players = over.players;
     if (over.cpus !== undefined) this.cpus = over.cpus === null || over.cpus <= 0 ? null : over.cpus;
-    this.ladder = (over.cpus === undefined ? this.ladder.map((g) => g.size) : this.rungs()).map((size) => ({ size, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, broke: null, rounds: 0 }));
-    if (over.cpus !== undefined) this.rung = 0;
+    this.ladder = (over.cpus === undefined && over.players === undefined ? this.ladder.map((g) => g.size) : this.rungs()).map((size) => ({ size, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 }));
+    if (over.cpus !== undefined || over.players !== undefined) this.rung = 0;
     this.records = { fastest_cycle_ms: null, longest_round: null };
     this.lastDrop = null;
     this.recentWakes = [];

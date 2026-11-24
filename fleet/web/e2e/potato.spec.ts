@@ -15,7 +15,7 @@ const tiles = (page: Page) => page.getByTestId("potato-tile");
 
 /** Start the game over at a size, its first round half a second from now. */
 async function startAt(size: number): Promise<void> {
-  await admin("/mock/potato", { size, next_in_ms: 500 });
+  await admin("/mock/potato", { cpus: 0, players: 8, size, next_in_ms: 500 });
   await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(size);
 }
 
@@ -147,7 +147,7 @@ test("Faster caps the hold a fifth lower, then waits 2 s", async ({ page }) => {
   await openPotato(page);
   const faster = page.getByTestId("potato-faster");
   await expect(faster).toBeEnabled();
-  await expect(page.getByTestId("potato-faster-note")).toHaveText(/^cuts the hold to \d+ ms$/);
+  await expect(page.getByTestId("potato-faster-note")).toHaveCount(0);
   const before = (await mockPotato()).round!.hold_ms;
   await faster.click();
   await expect.poll(async () => (await mockPotato()).round?.pace_ms ?? null).not.toBeNull();
@@ -166,7 +166,7 @@ test("Restart waits 10 s into a round, then starts the same size again without a
   await expect(page.getByTestId("potato-restart-note")).toHaveText(/^possible 10 s into a round, in \d+ s$/);
   const id = (await mockPotato()).round!.id;
   await expect(restart).toBeEnabled({ timeout: 15_000 });
-  await expect(page.getByTestId("potato-restart-note")).toHaveText("starts the ring of 8 again");
+  await expect(page.getByTestId("potato-restart-note")).toHaveText("ring of 8 again");
   await restart.click();
   await expect.poll(async () => (await mockPotato()).round?.id ?? null, { timeout: 10_000 }).toBe(id + 1);
   const p = await mockPotato();
@@ -187,7 +187,6 @@ test("a drop: the card names the player and the late stage, the ladder fills in,
   await expect(page.getByTestId("potato-ball")).toHaveAttribute("data-dropped", "true");
   await expect(page.getByTestId("potato-rung-2")).toContainText("2 machines");
   await expect(page.getByTestId("potato-rung-4")).toHaveAttribute("aria-current", "true");
-  await expect(page.getByTestId("potato-record-longest-round")).toContainText(/\d+ catch(es)? a ring of 2/);
   // The ring of 4 starts after the 3 s pause, and the card goes.
   await expect(tiles(page)).toHaveCount(4, { timeout: 10_000 });
   await expect(card).toHaveCount(0);
@@ -299,7 +298,7 @@ test("potato: hovering a tile shows its readout beside it, and it leaves with th
 
 const CPUS = 3;
 async function startDense(size: number, over: Record<string, number> = {}): Promise<void> {
-  await admin("/mock/potato", { cpus: CPUS, size, next_in_ms: 500, ...over });
+  await admin("/mock/potato", { cpus: CPUS, players: 8, size, next_in_ms: 500, ...over });
   await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(size);
 }
 type Rect = { x: number; y: number; width: number; height: number };
@@ -309,7 +308,7 @@ test("density: the CPU slots hold the machines that are not asleep, grouped and 
   await startDense(8);
   await openPotato(page);
   const heading = page.getByTestId("potato-cpus-heading");
-  await expect(heading).toHaveText(/^\d of 3 CPUs in use$/);
+  await expect(heading).toHaveText(/^\d of 3 CPUs in use( · [\d.]+ busy)?$/);
   const slots = page.getByTestId("potato-slot");
   for (let i = 0; i < 25; i++) {
     expect(await slots.count(), "chips and free slots add up to the allotment").toBe(CPUS);
@@ -342,6 +341,36 @@ test("density: the slots stand in the ring's centre on a large screen, clear of 
     await page.waitForTimeout(150);
   }
 });
+
+for (const [vw, vh] of [[1440, 900], [1280, 800]] as const) {
+  for (const size of [32, 16]) {
+    test(`density: on a ${vw} by ${vh} laptop the slots are small chips inside the ring of ${size}, clear of the tiles and the arc`, async ({ page }) => {
+      await startDense(size, { cpus: 8, players: 32 });
+      await page.setViewportSize({ width: vw, height: vh });
+      await openPotato(page);
+      const centre = page.locator(".potato-centre");
+      await expect(centre).toBeVisible();
+      await expect(page.getByTestId("potato-cpus")).toHaveAttribute("data-form", "compact");
+      await expect(page.getByTestId("potato-cpus-heading")).toHaveText(/^\d of 8 CPUs in use/);
+      expect(await page.getByTestId("potato-slot").count()).toBe(8);
+      // the group labels are text for a screen reader, not drawn
+      await expect(page.locator(".potato-cpus .sr-only").first()).toHaveText(/^(ball|ready|waking|saving|free)$/);
+      await expect(page.locator(".potato-cpus .slot-label")).toHaveCount(0);
+      for (let i = 0; i < 10; i++) {
+        const boxes = await tiles(page).evaluateAll((els) => els.map((e) => e.getBoundingClientRect().toJSON() as Rect));
+        const c = (await centre.boundingBox())!;
+        for (const t of boxes) expect(apart(c, t), "the slots clear every tile").toBe(true);
+        const label = page.getByTestId("potato-arc-label");
+        if (await label.count()) {
+          const l = (await label.boundingBox())!;
+          expect(apart(l, c), "the arc's label clears the slots").toBe(true);
+          for (const t of boxes) expect(apart(l, t), "the arc's label clears the tiles").toBe(true);
+        }
+        await page.waitForTimeout(150);
+      }
+    });
+  }
+}
 
 test("density: machines per CPU, the figures, the chart with its limit, and one bar per rung", async ({ page }) => {
   await startDense(8);
@@ -392,7 +421,7 @@ test("density: on a phone the slots sit under the ring, the cards fit, and nothi
 });
 
 test("density: with no allotment (an old agent) the page shows the ring, the machine count and the ladder, and no CPU figure", async ({ page }) => {
-  await admin("/mock/potato", { cpus: 0, size: 8, next_in_ms: 500 });
+  await admin("/mock/potato", { cpus: 0, players: 8, size: 8, next_in_ms: 500 });
   await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(8);
   await openPotato(page);
   await expect(page.getByTestId("potato-big")).toHaveText("8");

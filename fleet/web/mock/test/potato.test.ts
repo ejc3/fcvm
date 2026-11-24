@@ -133,7 +133,7 @@ describe("mock potato", () => {
       /^round\.(pace|best_pace|laps|cpus_in_use|cpus_peak|asleep|lead|slowest_wake_ms|cpus_busy|cpu_slots)$/.test(p) ||
       /^round\.(laps|cpu_slots)\[\]/.test(p) ||
       /^players\[\]\.(cpu_wait_ms|ready_margin_ms)$/.test(p) ||
-      /^ladder\[\]\.(record_pace|record_pace_at)$/.test(p) ||
+      /^ladder\[\]\.(record_pace|record_pace_at|record_prev_pace)$/.test(p) ||
       /(last_drop|broke)\.(cause|cause_ms|pace)$/.test(p);
     start({ slowWakeChance: 0.2 });
     const mock = new Set<string>();

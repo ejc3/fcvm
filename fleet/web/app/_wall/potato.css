@@ -67,7 +67,7 @@
 /* The ring on the left, the cards beside it; one column on a narrow screen. */
 .potato-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 440px); gap: 24px; align-items: start; }
 .potato-ring-wrap { min-width: 0; position: sticky; top: 8px; }
-.potato-caption { font: 500 15px var(--mono); color: var(--text); min-height: 22px; margin-bottom: 6px; }
+.potato-caption { margin: 0; }
 .potato-stage { position: relative; width: 100%; height: min(calc(100dvh - 190px), 760px); min-height: 320px; }
 /* The circle the tiles stand on. */
 .potato-track { position: absolute; border-radius: 50%; border: 2px solid var(--p-ring); pointer-events: none; }
@@ -95,7 +95,7 @@
 
 .potato-side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .potato-side .card p { font-size: 15px; overflow-wrap: anywhere; }
-.potato-side .card .muted, .potato-records .muted { color: var(--muted); }
+.potato-side .card .muted { color: var(--muted); }
 .potato-drop { border-color: var(--refused); }
 .potato-drop h2 { color: var(--refused); }
 .potato-drop .headline { font-size: 17px; font-weight: 600; }
@@ -159,10 +159,6 @@
 .potato-drop .big-late { margin: 0; font: 600 20px var(--mono); color: var(--refused); }
 .potato-drop .big-late .v { font-size: 44px; }
 
-.potato-records dl { display: flex; flex-direction: column; gap: 8px; margin: 0; font-size: 15px; }
-.potato-records dt { color: var(--muted); }
-.potato-records dd { margin: 0; }
-.potato-records .v { font: 600 17px var(--mono); }
 
 @media (max-width: 900px) {
   .potato-body { grid-template-columns: minmax(0, 1fr); }
@@ -178,3 +174,16 @@
   .potato-tile { transition: none; }
   .potato-track.flash { animation: none; }
 }
+
+/* Compact slots: small chips in one or two rows, labelled on hover. */
+.potato-cpus.compact { gap: 4px; }
+.potato-cpus.compact .cpus-heading { font-size: 14px; font-weight: 600; white-space: nowrap; }
+.potato-cpus .busy { font-weight: 400; color: var(--muted); }
+.potato-cpus.compact .slot-groups { gap: 2px 6px; flex-wrap: wrap; justify-content: center; }
+.potato-cpus.compact .slot-row { gap: 3px; }
+.potato-cpus.compact .potato-swatch.sm, .potato-cpus.compact .slot.free { width: 20px; height: 20px; }
+.potato-cpus.compact .potato-swatch .num { font-size: 14px; padding: 0 1px; background: none; color: #0b0d10; }
+.potato-cpus.compact [data-label] { position: relative; }
+.potato-cpus.compact [data-label]:hover::after { content: attr(data-label); position: absolute; left: 50%; top: 100%; transform: translateX(-50%); margin-top: 4px; padding: 2px 8px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line); color: var(--text); font: 400 14px var(--sans); white-space: nowrap; z-index: 6; pointer-events: none; }
+.record-pill .was { font-weight: 400; margin-left: 4px; }
+.potato-chart .drop-line { stroke: var(--p-track); stroke-width: 1.5; stroke-dasharray: 2 3; }

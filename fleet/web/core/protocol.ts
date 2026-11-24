@@ -638,6 +638,8 @@ export interface PotatoRung {
   /** The fastest pace held for a full lap on `cpus` CPUs, and when. */
   record_pace: number | null;
   record_pace_at: number | null;
+  /** The record before the current one; null for a first record or when not sent. */
+  record_prev_pace: number | null;
   /** What ended its latest round. */
   broke: PotatoDrop | null;
   rounds: number;
@@ -1255,6 +1257,7 @@ function parsePotato(v: unknown): Potato | null {
       record_at: numOrNull(r, "record_at", at),
       record_pace: numOrNull(r, "record_pace", at),
       record_pace_at: numOrNull(r, "record_pace_at", at),
+      record_prev_pace: numOrNull(r, "record_prev_pace", at),
       broke: parsePotatoDrop(r["broke"], `${at}.broke`),
       rounds: numOrNull(r, "rounds", at) ?? 0,
     };
