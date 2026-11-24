@@ -57,6 +57,11 @@ pub const TCP_QUERIES: usize = 64;
 pub const TCP_IDLE: Duration = Duration::from_secs(10);
 /// Source prefixes tracked per second by the rate limit; past it, new prefixes are limited.
 pub const RATE_PREFIXES: usize = 16384;
+/// How many source prefixes (as [`RateLimit`] counts them) a launch name's first query is
+/// logged for. The coordinator's broadcast aggregator looks a fresh name up (through its VPC
+/// resolver) the moment it is published, so the first query alone never showed a public
+/// resolver's.
+pub const ASKED_SOURCES: usize = 4;
 
 /// What `_acme-challenge.<apex>` answers.
 #[derive(Debug, Clone, PartialEq)]
@@ -729,15 +734,15 @@ impl Verdict {
     }
 }
 
-/// When each name of the zone appeared in the zone this server answers from, until its first
-/// query is logged. `serve` refreshes it whenever the zone changes, so the time is the name's
-/// publication; a name that leaves the zone is forgotten, so this holds at most the zone's
-/// names.
+/// When each name of the zone appeared in the zone this server answers from, and the source
+/// prefixes its first queries came from. `serve` refreshes it whenever the zone changes, so
+/// the time is the name's publication; a name that leaves the zone is forgotten, so this holds
+/// at most the zone's names, each with at most [`ASKED_SOURCES`] prefixes.
 #[derive(Default)]
 pub struct Asked {
     serial: Option<u32>,
-    /// Name to (when this server first had it, whether its first query was logged).
-    names: HashMap<String, (Instant, bool)>,
+    /// Name to (when this server first had it, the prefixes whose first query was logged).
+    names: HashMap<String, (Instant, Vec<(bool, u128)>)>,
 }
 
 impl Asked {
@@ -754,12 +759,14 @@ impl Asked {
             zone.a.keys().chain(zone.aaaa.keys()).collect();
         self.names.retain(|n, _| held.contains(n));
         for n in held {
-            self.names.entry(n.clone()).or_insert((now, false));
+            self.names.entry(n.clone()).or_insert((now, Vec::new()));
         }
     }
 
-    /// Note a query for `name` (lower case, no trailing dot) of `qtype` and what was done with
-    /// it; logs the first one for each name the zone holds.
+    /// Note a query for `name` (lower case, no trailing dot) of `qtype` from `source` and what
+    /// was done with it; logs the first one from each of the first [`ASKED_SOURCES`] source
+    /// prefixes for each name the zone holds.
+    #[allow(clippy::too_many_arguments)]
     pub fn note(
         &mut self,
         zone: &Zone,
@@ -767,26 +774,39 @@ impl Asked {
         qtype: u16,
         transport: &str,
         verdict: Verdict,
+        source: IpAddr,
         now: Instant,
     ) {
         // The zone watcher in `serve` normally took this zone already; this covers a query
         // that arrives before it runs.
         self.refresh(zone, now);
-        let Some((since, logged)) = self.names.get_mut(name) else {
+        let Some((since, sources)) = self.names.get_mut(name) else {
             return;
         };
-        if *logged {
+        let prefix = RateLimit::prefix(source);
+        if sources.len() >= ASKED_SOURCES || sources.contains(&prefix) {
             return;
         }
-        *logged = true;
+        sources.push(prefix);
         tracing::info!(
             name,
             qtype,
             transport,
             verdict = verdict.name(),
+            source = %show_prefix(prefix),
+            nth_source = sources.len(),
             in_zone_ms = now.duration_since(*since).as_millis() as u64,
             "launch name first asked"
         );
+    }
+}
+
+/// A [`RateLimit`] prefix as text: `a.b.c.0/24` or an IPv6 /56.
+fn show_prefix((v4, bits): (bool, u128)) -> String {
+    if v4 {
+        format!("{}/24", Ipv4Addr::from(bits as u32))
+    } else {
+        format!("{}/56", Ipv6Addr::from(bits))
     }
 }
 
@@ -999,7 +1019,7 @@ impl Authority {
                 asked
                     .lock()
                     .unwrap()
-                    .note(&zone, &name, qtype, "udp", verdict, now);
+                    .note(&zone, &name, qtype, "udp", verdict, peer.ip(), now);
             }
             let out = match verdict {
                 Verdict::Answer => respond(&self.cfg, &zone, m, false),
@@ -1017,7 +1037,7 @@ impl Authority {
     async fn tcp(self, listener: tokio::net::TcpListener, asked: Arc<std::sync::Mutex<Asked>>) {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_TCP));
         loop {
-            let (stream, _) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(error = %e, "DNS TCP accept failed");
@@ -1032,7 +1052,7 @@ impl Authority {
             let asked = asked.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = me.connection(stream, asked).await;
+                let _ = me.connection(stream, peer.ip(), asked).await;
             });
         }
     }
@@ -1040,6 +1060,7 @@ impl Authority {
     async fn connection(
         &self,
         mut s: tokio::net::TcpStream,
+        peer: IpAddr,
         asked: Arc<std::sync::Mutex<Asked>>,
     ) -> Result<()> {
         let mut buf = vec![0u8; MAX_QUERY];
@@ -1057,6 +1078,7 @@ impl Authority {
                     qtype,
                     "tcp",
                     Verdict::Answer,
+                    peer,
                     Instant::now(),
                 );
             }
@@ -1170,6 +1192,58 @@ mod tests {
         );
     }
 
+    /// One UDP query to `server` sent from `from`; the answer, or None within 500 ms.
+    async fn ask_udp_from(from: &str, server: SocketAddr, q: &[u8]) -> Option<Vec<u8>> {
+        let s = tokio::net::UdpSocket::bind(from).await.unwrap();
+        s.send_to(q, server).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_millis(500), s.recv(&mut buf))
+            .await
+            .ok()?
+            .unwrap();
+        Some(buf[..n].to_vec())
+    }
+
+    /// The first query from each source prefix is logged, up to ASKED_SOURCES of them. On
+    /// 2026-11-24 a relaunched tile's fresh name got no answer from 1.1.1.1 within 2 s, and the
+    /// only line for it was the query of the coordinator's aggregator 18 ms after publication:
+    /// whether 1.1.1.1's queries arrived was not logged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launch_names_first_query_from_each_source_is_logged() {
+        let (logs, _guard) = Logs::capture();
+        let (tx, rx) = watch::channel(Arc::new(Zone::default()));
+        let served = Authority {
+            cfg: Arc::new(cfg()),
+            zone: rx,
+        }
+        .serve("127.0.0.1:0".parse().unwrap(), 1000)
+        .await
+        .unwrap();
+        tx.send(Arc::new(zone())).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let name = "slot-1-abcdefgh.tiles.fcvm.example";
+        let q = query(name, T_AAAA, Some(1232));
+        // The aggregator's resolver, twice, then another resolver: two lines.
+        for from in ["127.0.0.1:0", "127.0.0.1:0", "127.0.1.1:0"] {
+            assert!(ask_udp_from(from, served.udp, &q).await.is_some());
+        }
+        let lines = logs.lines("launch name first asked");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("source=127.0.0.0/24"), "{}", lines[0]);
+        assert!(lines[0].contains("nth_source=1"), "{}", lines[0]);
+        assert!(lines[1].contains("source=127.0.1.0/24"), "{}", lines[1]);
+        assert!(lines[1].contains("nth_source=2"), "{}", lines[1]);
+        // At most ASKED_SOURCES prefixes are logged for one name.
+        for i in 2..=ASKED_SOURCES + 1 {
+            ask_udp_from(&format!("127.0.{i}.1:0"), served.udp, &q).await;
+        }
+        assert_eq!(
+            logs.lines("launch name first asked").len(),
+            ASKED_SOURCES,
+            "bounded per name"
+        );
+    }
+
     /// A query task can hold an older zone than the one the zone watcher already recorded
     /// (Codex on #2005): refreshing with it must not forget a name the newer zone published,
     /// or that name's first query is logged with the wrong time in the zone.
@@ -1194,6 +1268,7 @@ mod tests {
             T_AAAA,
             "udp",
             Verdict::Answer,
+            "127.0.0.1".parse().unwrap(),
             t0 + Duration::from_secs(2),
         );
         let first = logs.lines("launch name first asked");
