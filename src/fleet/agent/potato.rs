@@ -370,7 +370,10 @@ async fn run_fcvm(
     let mut cmd = tokio::process::Command::new(fcvm);
     cmd.args(args)
         .env("RUST_LOG", "fcvm=info")
-        .stdin(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null())
+        // an operation that is aborted takes its command with it: no fcvm the agent started
+        // runs on without the agent
+        .kill_on_drop(true);
     if let Some(cgroup) = cgroup {
         cgroup.confine(cmd.as_std_mut());
     }
@@ -509,15 +512,18 @@ pub async fn run(
         }
         ready.is_ok()
     });
+    let ops = Arc::new(FcvmOps {
+        cfg: cfg.clone(),
+        sleep_memory,
+        boot_slots: Arc::new(Semaphore::new(BOOT_PARALLEL)),
+        tasks: Default::default(),
+        saves: Default::default(),
+        aborted: Default::default(),
+    });
     let mut d = Driver {
         epoch: Instant::now(),
         cfg: cfg.clone(),
-        ops: Arc::new(FcvmOps {
-            cfg: cfg.clone(),
-            sleep_memory,
-            boot_slots: Arc::new(Semaphore::new(BOOT_PARALLEL)),
-            tasks: Default::default(),
-        }),
+        ops: ops.clone(),
         out,
         done: done_tx,
         players: (0..cfg.players).map(|_| Player::new()).collect(),
@@ -543,12 +549,19 @@ pub async fn run(
         }
     }
     tracing::info!("potato mode stopping: every player's VM goes with the agent");
-    // in-flight work first (a boot waiting for a slot would start a VM after this): an aborted
-    // operation drops the VM it holds, which sends its fcvm SIGTERM
+    // in-flight work first (a boot waiting for a slot would start a VM after this); a save
+    // goes on, and the ring's stop gives it the ring's time to finish
     d.ops.shutdown();
     let vms: Vec<Vm> = d.players.iter_mut().filter_map(|p| p.vm.take()).collect();
     drop(d);
-    stop_ring(vms, cfg.cgroup.as_deref(), RING_STOP_GRACE, RING_KILL_WAIT).await;
+    stop_ring(
+        Some(&ops),
+        vms,
+        cfg.cgroup.as_deref(),
+        RING_STOP_GRACE,
+        RING_KILL_WAIT,
+    )
+    .await;
     Ok(())
 }
 
@@ -557,11 +570,17 @@ pub async fn run(
 /// time systemd gives its unit, or systemd kills every VM of the host, the wall's and the
 /// phones' included, without their teardown.
 ///
-/// `vms` are the VMs the players held. A VM inside an operation that was aborted (a wake, a
-/// boot, a sleep) got SIGTERM when the operation dropped it and has no handle left; where
-/// the ring has a cgroup, whatever is still in it after `grace` is killed through it. A ring
-/// without a cgroup has no hold on those.
+/// Every fcvm the agent started for the ring ends here, by the agent's own handle on it:
+/// - `vms`, the VMs the players held;
+/// - the VMs of the operations `shutdown` aborted (a wake or a boot in flight), which the
+///   operations hand over instead of dropping;
+/// - the saves in flight: each has until `grace` to finish as it would have. One still running
+///   then is aborted, which kills its `fcvm snapshot create`, and its VM gets `kill_wait`
+///   after its SIGTERM before it is killed too.
+///
+/// Where the ring has a cgroup, whatever is still in it after that is killed through it.
 async fn stop_ring(
+    ops: Option<&FcvmOps>,
     vms: Vec<Vm>,
     cgroup: Option<&RingCgroup>,
     grace: Duration,
@@ -569,10 +588,21 @@ async fn stop_ring(
 ) {
     let end = tokio::time::Instant::now() + grace;
     let mut stops = tokio::task::JoinSet::new();
-    for mut vm in vms {
+    let mut stop = |mut vm: Vm, grace: Duration| {
         stops.spawn(async move {
             vm.stop(grace).await;
         });
+    };
+    for vm in vms {
+        stop(vm, grace);
+    }
+    if let Some(ops) = ops {
+        for vm in ops.end_aborted().await {
+            stop(vm, grace);
+        }
+        for vm in ops.end_saves(end).await {
+            stop(vm, kill_wait);
+        }
     }
     while stops.join_next().await.is_some() {}
     let Some(cgroup) = cgroup else { return };
@@ -753,9 +783,49 @@ pub(crate) struct FcvmOps {
     /// None: sleeps keep their memory on the store.
     sleep_memory: Option<Arc<SleepMemory>>,
     boot_slots: Arc<Semaphore>,
-    /// Every operation in flight, so a shutdown can abort them: an aborted task drops the VM it
-    /// holds, which sends its fcvm SIGTERM, and a boot still waiting for a slot starts nothing.
+    /// Every operation in flight but the saves, so a shutdown can abort them: a boot still
+    /// waiting for a slot starts nothing, and a VM an aborted operation held goes to `aborted`.
     tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// The saves in flight. A shutdown does not abort them: the ring's stop waits for them.
+    saves: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// The VMs of operations that were aborted, for the ring's stop to end by their handles.
+    aborted: Arc<std::sync::Mutex<Vec<Vm>>>,
+}
+
+/// A VM an operation holds. An operation that is aborted drops what it holds, and a `Vm`
+/// that is dropped gets a SIGTERM nobody follows: its fcvm can outlive the agent. This hands
+/// the VM to the ring's stop instead, which waits for it and kills it if it has to.
+struct Held {
+    vm: Option<Vm>,
+    aborted: Arc<std::sync::Mutex<Vec<Vm>>>,
+}
+
+impl Held {
+    /// The VM, for an operation that ends: it waits for the exit itself, or gives the VM on.
+    fn into_vm(mut self) -> Vm {
+        self.vm.take().expect("a held VM is taken once")
+    }
+}
+
+impl std::ops::Deref for Held {
+    type Target = Vm;
+    fn deref(&self) -> &Vm {
+        self.vm.as_ref().expect("a held VM is taken once")
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Vm {
+        self.vm.as_mut().expect("a held VM is taken once")
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(vm) = self.vm.take() {
+            self.aborted.lock().unwrap().push(vm);
+        }
+    }
 }
 
 impl FcvmOps {
@@ -763,6 +833,46 @@ impl FcvmOps {
         let mut tasks = self.tasks.lock().unwrap();
         while tasks.try_join_next().is_some() {}
         tasks.spawn(f);
+    }
+
+    fn spawn_save(&self, f: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut saves = self.saves.lock().unwrap();
+        while saves.try_join_next().is_some() {}
+        saves.spawn(f);
+    }
+
+    fn hold(&self, vm: Vm) -> Held {
+        Held {
+            vm: Some(vm),
+            aborted: self.aborted.clone(),
+        }
+    }
+
+    /// Abort every operation but the saves, wait until they have ended, and return the VMs
+    /// they held.
+    async fn end_aborted(&self) -> Vec<Vm> {
+        let mut tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        std::mem::take(&mut *self.aborted.lock().unwrap())
+    }
+
+    /// Wait for the saves in flight until `end`, abort those still running then (which kills
+    /// their `fcvm snapshot create`), and return the VMs they held.
+    async fn end_saves(&self, end: tokio::time::Instant) -> Vec<Vm> {
+        let mut saves = std::mem::take(&mut *self.saves.lock().unwrap());
+        let finished =
+            tokio::time::timeout_at(end, async { while saves.join_next().await.is_some() {} })
+                .await;
+        if finished.is_err() {
+            tracing::warn!(
+                left = saves.len(),
+                "potato: saves were still running when the ring's time to stop ran out; ending them"
+            );
+        }
+        saves.abort_all();
+        while saves.join_next().await.is_some() {}
+        std::mem::take(&mut *self.aborted.lock().unwrap())
     }
 }
 
@@ -809,6 +919,7 @@ fn unstarted(error: anyhow::Error) -> Failed {
 }
 
 impl Ops for FcvmOps {
+    /// Abort every operation but the saves; [`stop_ring`] ends those and the VMs of these.
     fn shutdown(&self) {
         self.tasks.lock().unwrap().abort_all();
     }
@@ -816,11 +927,19 @@ impl Ops for FcvmOps {
     /// The gold snapshot: an unassigned player, booted and put to sleep.
     fn make_gold(&self, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
+        let aborted = self.aborted.clone();
         self.spawn(async move {
             let started = cfg.gold_args().and_then(|args| {
                 let addr: Ipv6Addr =
                     args[args.iter().position(|a| a == "--ipv6-address").unwrap() + 1].parse()?;
-                Ok((start_vm(&cfg, &args, GOLD)?, addr))
+                let vm = start_vm(&cfg, &args, GOLD)?;
+                Ok((
+                    Held {
+                        vm: Some(vm),
+                        aborted,
+                    },
+                    addr,
+                ))
             });
             let (mut gold, addr) = match started {
                 Ok(x) => x,
@@ -850,7 +969,7 @@ impl Ops for FcvmOps {
                 .map(|_| ())
             }
             .await;
-            let exited = Exited::of(gold, STOP_GRACE).await;
+            let exited = Exited::of(gold.into_vm(), STOP_GRACE).await;
             let _ = done.send(Done::Gold(created, exited));
         });
     }
@@ -858,12 +977,16 @@ impl Ops for FcvmOps {
     fn boot(&self, n: u32, colours: u32, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
         let slots = self.boot_slots.clone();
+        let aborted = self.aborted.clone();
         self.spawn(async move {
             let r = async {
                 let _slot = slots.acquire().await.map_err(|e| unstarted(e.into()))?;
                 let addr = cfg.prefix.player_address(n).map_err(unstarted)?;
                 let args = cfg.restore_args(GOLD, n).map_err(unstarted)?;
-                let mut vm = start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?;
+                let mut vm = Held {
+                    vm: Some(start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?),
+                    aborted,
+                };
                 let assigned = while_running(&mut vm, &PotatoCfg::tag(n), async {
                     until_listening(addr, BOOT_DEADLINE).await?;
                     let answer = ask(
@@ -883,14 +1006,14 @@ impl Ops for FcvmOps {
                 .await;
                 match assigned {
                     Ok(at) => Ok(Ready {
-                        vm: Some(vm),
+                        vm: Some(vm.into_vm()),
                         stages: BTreeMap::new(),
                         at,
                     }),
                     // the CPU it held is free only once its fcvm is gone
                     Err(error) => Err(Failed {
                         error,
-                        exited: Exited::of(vm, STOP_GRACE).await,
+                        exited: Exited::of(vm.into_vm(), STOP_GRACE).await,
                     }),
                 }
             }
@@ -902,7 +1025,9 @@ impl Ops for FcvmOps {
     fn sleep(&self, n: u32, vm: Option<Vm>, stop: Option<u64>, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
         let sleep_memory = self.sleep_memory.clone();
-        self.spawn(async move {
+        // held from before the save is a task: one aborted before it first runs hands it over too
+        let vm = vm.map(|vm| self.hold(vm));
+        self.spawn_save(async move {
             let started = Instant::now();
             if let (Some(round), Ok(addr)) = (stop, cfg.prefix.player_address(n)) {
                 if let Err(e) = ask(addr, &Inbound::Stop { round }, Duration::from_secs(2)).await {
@@ -943,7 +1068,7 @@ impl Ops for FcvmOps {
                 tracing::warn!(player = n, "potato: a slept player's fcvm had not exited after {REAP_DEADLINE:?}; stopping it");
             }
             // exited already, or stopped now: the player's CPU is free only once it is gone
-            let exited = Exited::of(vm, STOP_GRACE).await;
+            let exited = Exited::of(vm.into_vm(), STOP_GRACE).await;
             let reaped = reap.elapsed();
             let steps = SleepSteps {
                 ask_ms: ms(asked),
@@ -965,12 +1090,16 @@ impl Ops for FcvmOps {
 
     fn wake(&self, n: u32, round: Option<u64>, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
+        let aborted = self.aborted.clone();
         self.spawn(async move {
             let started = Instant::now();
             let r = async {
                 let args = cfg.restore_args(&PotatoCfg::tag(n), n).map_err(unstarted)?;
                 let addr = cfg.prefix.player_address(n).map_err(unstarted)?;
-                let mut vm = start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?;
+                let mut vm = Held {
+                    vm: Some(start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?),
+                    aborted,
+                };
                 let listening = while_running(&mut vm, &PotatoCfg::tag(n), async {
                     let probed = until_listening(addr, WAKE_DEADLINE).await?;
                     // it catches only once told it woke: a report connection can fail for other
@@ -1001,7 +1130,7 @@ impl Ops for FcvmOps {
                         }
                         stages.insert("listen_ms".to_string(), ms(at.duration_since(started)));
                         Ok(Ready {
-                            vm: Some(vm),
+                            vm: Some(vm.into_vm()),
                             stages,
                             at,
                         })
@@ -1009,7 +1138,7 @@ impl Ops for FcvmOps {
                     // the CPU it held is free only once its fcvm is gone
                     Err(error) => Err(Failed {
                         error,
-                        exited: Exited::of(vm, STOP_GRACE).await,
+                        exited: Exited::of(vm.into_vm(), STOP_GRACE).await,
                     }),
                 }
             }
@@ -2510,6 +2639,8 @@ mod tests {
             sleep_memory: None,
             boot_slots: Arc::new(Semaphore::new(0)),
             tasks: Default::default(),
+            saves: Default::default(),
+            aborted: Default::default(),
         };
         let (done, mut rx) = mpsc::unbounded_channel();
         ops.boot(0, 12, done);
@@ -2850,6 +2981,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let started = Instant::now();
         stop_ring(
+            None,
             vec![vm],
             None,
             Duration::from_millis(300),
@@ -2868,8 +3000,181 @@ mod tests {
         );
     }
 
-    /// What the players' handles do not reach (a VM inside an operation that was aborted) is
-    /// killed through the ring's cgroup when it is still there after the grace.
+    /// A stand-in for fcvm in `dir`. `snapshot create` and `snapshot run` each write their pid
+    /// to `create.pid` or `run.pid` and then behave as `create` and `run` say (shell). Every
+    /// process it leaves ends by itself within 30 s.
+    fn fake_fcvm(dir: &std::path::Path, create: &str, run: &str) -> Arc<FcvmOps> {
+        use std::os::unix::fs::PermissionsExt;
+        let fcvm = dir.join("fcvm");
+        std::fs::write(
+            &fcvm,
+            format!(
+                "#!/bin/sh\nd=$(dirname \"$0\")\ncase \"$1 $2\" in\n\
+                 'snapshot create') echo $$ > \"$d/create.pid\"; {create} ;;\n\
+                 'snapshot run') echo $$ > \"$d/run.pid\"; {run} ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fcvm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Arc::new(FcvmOps {
+            cfg: Arc::new(PotatoCfg {
+                fcvm,
+                image: "img".into(),
+                players: 4,
+                prefix: Prefix::parse("2001:db8::/80").unwrap(),
+                mem_mib: 256,
+                sleep_memory_dir: None,
+                sleep_memory_cap_mib: 0,
+                cpus: 8,
+                cgroup: None,
+            }),
+            sleep_memory: None,
+            boot_slots: Arc::new(Semaphore::new(BOOT_PARALLEL)),
+            tasks: Default::default(),
+            saves: Default::default(),
+            aborted: Default::default(),
+        })
+    }
+
+    /// The pid a stand-in wrote to `file`, once it has.
+    async fn pid_in(file: &std::path::Path) -> nix::unistd::Pid {
+        for _ in 0..500 {
+            if let Some(pid) = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                // and it has had time to ignore the signal and become its sleep
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                return nix::unistd::Pid::from_raw(pid);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} was not written", file.display());
+    }
+
+    fn gone(pid: nix::unistd::Pid) -> bool {
+        nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH)
+    }
+
+    /// A save still running when the ring's time to stop runs out is ended by the agent's own
+    /// handles: its `fcvm snapshot create` is killed, and so is the VM it was saving, whether
+    /// or not the ring has a cgroup. Both used to be left to run on without the agent.
+    #[tokio::test]
+    async fn a_save_that_outlives_the_rings_stop_is_killed_with_its_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let stuck = "trap '' TERM; exec sleep 30";
+        let ops = fake_fcvm(dir.path(), stuck, "exit 0");
+        let vm = Vm::spawn_args(
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), stuck.to_string()],
+            "test",
+        )
+        .unwrap();
+        let vm_pid = nix::unistd::Pid::from_raw(vm.pid as i32);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ops.sleep(0, Some(vm), None, tx);
+        let create = pid_in(&dir.path().join("create.pid")).await;
+        assert!(!gone(create) && !gone(vm_pid));
+        let started = Instant::now();
+        ops.shutdown();
+        assert!(!gone(create), "a shutdown does not abort a save");
+        stop_ring(
+            Some(&ops),
+            Vec::new(),
+            None,
+            Duration::from_millis(400),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the save had the ring's time to finish"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            gone(vm_pid),
+            "the VM being saved is gone when the stop returns"
+        );
+        // the command was killed when its save was aborted; tokio reaps it a moment later
+        for _ in 0..200 {
+            if gone(create) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone(create),
+            "fcvm snapshot create does not run on without the agent"
+        );
+    }
+
+    /// A save that finishes within the ring's time is left to finish: its snapshot is whole,
+    /// and nothing is killed.
+    #[tokio::test]
+    async fn a_save_in_flight_finishes_within_the_rings_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = fake_fcvm(dir.path(), "sleep 0.3; echo saved > \"$d/saved\"", "exit 0");
+        // the VM stops by itself, as one saved with --stop does
+        let vm = Vm::spawn_args(
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), "sleep 0.5".to_string()],
+            "test",
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ops.sleep(0, Some(vm), None, tx);
+        pid_in(&dir.path().join("create.pid")).await;
+        ops.shutdown();
+        stop_ring(
+            Some(&ops),
+            Vec::new(),
+            None,
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(
+            dir.path().join("saved").exists(),
+            "the save was not cut short"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(Done::Slept(0, Ok(_), _, _))),
+            "and it ended as a save does"
+        );
+    }
+
+    /// A wake in flight when the agent stops is aborted, and the VM it had started is ended by
+    /// its handle: SIGTERM, then SIGKILL. It used to get the SIGTERM alone, and an fcvm that
+    /// was slow to go outlived the agent.
+    #[tokio::test]
+    async fn a_wake_in_flight_is_ended_by_its_handle_when_the_agent_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = fake_fcvm(dir.path(), "exit 0", "trap '' TERM; exec sleep 30");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ops.wake(1, None, tx);
+        let run = pid_in(&dir.path().join("run.pid")).await;
+        assert!(!gone(run));
+        ops.shutdown();
+        stop_ring(
+            Some(&ops),
+            Vec::new(),
+            None,
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(
+            gone(run),
+            "the waking VM's fcvm is gone when the stop returns"
+        );
+    }
+
+    /// What the players' handles do not reach is killed through the ring's cgroup when it is
+    /// still there after the grace.
     #[tokio::test]
     async fn a_ring_cgroup_still_populated_after_the_grace_is_killed() {
         let root = tempfile::tempdir().unwrap();
@@ -2891,11 +3196,11 @@ mod tests {
         // empty within the grace: nothing is killed
         std::fs::write(&events, "populated 0\nfrozen 0\n").unwrap();
         let wait = Duration::from_millis(100);
-        stop_ring(Vec::new(), Some(&ring), wait, wait).await;
+        stop_ring(None, Vec::new(), Some(&ring), wait, wait).await;
         assert!(!killed.exists());
         // a process that outlives the grace
         std::fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
-        stop_ring(Vec::new(), Some(&ring), wait, wait).await;
+        stop_ring(None, Vec::new(), Some(&ring), wait, wait).await;
         assert_eq!(std::fs::read_to_string(&killed).unwrap(), "1");
     }
 
@@ -3245,6 +3550,8 @@ mod tests {
             sleep_memory: None,
             boot_slots: Arc::new(Semaphore::new(BOOT_PARALLEL)),
             tasks: Default::default(),
+            saves: Default::default(),
+            aborted: Default::default(),
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         ops.make_gold(tx.clone());

@@ -2210,12 +2210,16 @@ machines those K serve: N / K machines per CPU.
   stays free for the next wake. Before the first throw the boots take every CPU.
 - **When the agent stops** it tells the ring to stop first and waits for it last, after the
   slots have been told too, so the ring's wait does not come out of the time the wall's and
-  the phones' VMs have to stop in. The ring stops within its own time: SIGTERM to every
-  player's VM at once, SIGKILL after 20 s to one that has not exited, and after that
-  `cgroup.kill` on the ring's cgroup for what no handle reaches (a VM inside an operation
-  that was aborted), with 5 s for it to be gone. That is inside the unit's 60 s. A ring
-  without a cgroup has no hold on those last. The ring's cgroup is inside the agent's
-  unit, so systemd kills whatever is still there with the unit.
+  the phones' VMs have to stop in. The ring stops within its own time, and every fcvm the
+  agent started for it ends by the agent's own handle on it: SIGTERM to every player's VM at
+  once and SIGKILL after 20 s to one that has not exited; the same for the VM of a wake or
+  a boot that was in flight, which the aborted operation hands over instead of dropping; a
+  save in flight has those 20 s to finish as it would have, and one still running then has
+  its `fcvm snapshot create` killed and its VM killed 5 s after its SIGTERM. Where the ring
+  has a cgroup, `cgroup.kill` follows for whatever is still in it, with 5 s for it to be
+  gone. That is inside the unit's 60 s. An operation that is aborted used to drop its VM
+  with a SIGTERM nobody followed, and its `fcvm snapshot create` ran on: without a cgroup
+  an fcvm could outlive the agent.
 
 ### Components
 
