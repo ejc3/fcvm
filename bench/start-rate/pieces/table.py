@@ -61,7 +61,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("roots", nargs="+")
     ap.add_argument("--cores", type=float, default=132.0,
-                    help="cores left for starts (192 less ~60 for 1000 idle clones)")
+                    help="cores left for starts: the host's cores less what its idle clones use "
+                         "(RESULTS.md, 'What 1000 idle clones cost')")
     ap.add_argument("--ref-c", type=int, default=128)
     args = ap.parse_args()
     cells = load(args.roots)
