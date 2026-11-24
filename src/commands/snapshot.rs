@@ -6409,7 +6409,7 @@ async fn cmd_snapshot_run_disk_only(
         .unwrap_or_else(|| default_clone_name(&snapshot_name, &generate_vm_id()));
     validate_vm_name(&vm_name).context("invalid VM name")?;
 
-    let mut run_args = run_args_from_snapshot_metadata(
+    let run_args = run_args_from_snapshot_metadata(
         meta,
         &port_mappings,
         vm_name,
@@ -6433,10 +6433,11 @@ async fn cmd_snapshot_run_disk_only(
         ),
         args.host_ipv6,
     );
-    // The request's --confine, which the snapshot's metadata does not carry: the disk-only
-    // restore boots through `podman run`, which resolves confinement from these arguments.
-    run_args.confine = args.confine;
     let run_args = RunArgs {
+        // The request's --confine, which the snapshot's metadata does not carry: the
+        // disk-only restore boots through `podman run`, which resolves confinement from
+        // these arguments.
+        confine: args.confine,
         publish_limit_per_source: args.publish_limit_per_source,
         ..run_args
     };

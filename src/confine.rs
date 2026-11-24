@@ -837,7 +837,7 @@ mod tests {
         let start = source.find("async fn cmd_snapshot_run_disk_only(").unwrap();
         let body = &source[start..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        assert!(body.contains("run_args.confine = args.confine;"), "{body}");
+        assert!(body.contains("confine: args.confine,"), "{body}");
     }
 
     #[test]
