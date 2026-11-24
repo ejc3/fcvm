@@ -8,6 +8,7 @@ pub mod joinguard;
 pub mod minecraft;
 pub mod ports;
 pub mod potato;
+pub mod probe;
 pub mod ring_cpus;
 pub mod slot;
 pub mod sni;
@@ -398,6 +399,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
             poll: Duration::from_millis(20),
+            up_attempt: minecraft::UP_PROBE_TIMEOUT,
             steady: 5,
         })
     } else {
