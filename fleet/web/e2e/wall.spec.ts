@@ -2186,3 +2186,15 @@ test("the line under the title and the What is this? control", async ({ page }) 
   await page.setViewportSize({ width: 360, height: 800 });
   await expectLanding(page, { phone: true });
 });
+
+test("a tap on a tile with the About panel open only closes the panel", async ({ page }) => {
+  await openWall(page, 1);
+  await page.getByTestId("landing-button").click();
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  const t = await page.evaluate(() => window.__fleet!.view().tiles.find((x) => x.box !== null)!.box!);
+  await page.mouse.click(t.x + t.w / 2, t.y + t.h / 2);
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await page.waitForTimeout(400);
+  await expect(page.getByTestId("focus"), "the tile under the tap did not open").toHaveCount(0);
+});
+

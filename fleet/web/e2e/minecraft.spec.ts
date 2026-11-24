@@ -331,7 +331,7 @@ test("the held server is the large view, with the others off the stage, and Give
   await expect(page.getByTestId("mc-panel")).toBeVisible();
   const big = (await page.getByTestId("mc-tile-mc-2").boundingBox())!;
   // on a desktop it fills the room beside the panel; on a phone the half of the screen above it
-  expect(big.width).toBeGreaterThan((isPhone(info) ? 1.0 : 1.3) * small.width);
+  expect(big.width).toBeGreaterThan((isPhone(info) ? 1.05 : 1.3) * small.width);
   for (const slot of ["mc-1", "mc-3", "mc-4"]) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(0);
   // the panel does not cover the held view
   const sheet = (await page.getByTestId("mc-panel").boundingBox())!;
@@ -429,18 +429,50 @@ test("minecraft: the line under the title and the What is this? control", async 
   await expectLanding(page, { stage: "mc-stage", phone: true });
 });
 
-test("minecraft: Escape closes the About panel and nothing under it", async ({ page }) => {
+test("minecraft: Escape closes the About panel and releases nothing under it", async ({ page }, info) => {
+  // On a phone the line and its control step aside while something is held (the held view takes the room), so there is no panel to close then.
+  test.skip(info.project.name === "phone", "the control is hidden while something is held on a phone");
+  const sent: string[] = [];
+  page.on("websocket", (ws) => ws.on("framesent", (e) => sent.push(String(e.payload))));
   await openMinecraft(page);
   await page.getByTestId("mc-take-mc-2").click();
-  const under = page.getByTestId("mc-panel");
-  await expect(under).toBeVisible();
-  const btn = page.getByTestId("landing-button");
-  await btn.focus();
+  await expect(page.getByTestId("mc-panel")).toBeVisible();
+  await page.getByTestId("landing-button").focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("landing-panel")).toBeVisible();
+  const before = sent.length;
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("landing-panel")).toHaveCount(0);
-  await page.waitForTimeout(300);
-  await expect(under, "the layer under it stays").toBeVisible();
+  await expect(page.getByTestId("mc-panel"), "the layer under it stays").toBeVisible();
+  await page.waitForTimeout(500);
+  expect(sent.slice(before).filter((t) => /release_|"close"/.test(t)), "no release or close intent was sent").toEqual([]);
 });
 
+test("minecraft: a tap on the held view with the About panel open only closes the panel", async ({ page }, info) => {
+  // On a phone the bottom sheet covers the held view and the pad; the Wall test covers the backdrop there.
+  test.skip(isPhone(info), "the sheet covers the held view on a phone");
+  await openMinecraft(page);
+  await page.getByTestId("mc-take-mc-2").click();
+  await expect(page.getByTestId("mc-panel")).toBeVisible();
+  const view = page.getByTestId("mc-canvas-mc-2");
+  await expect(view).toBeVisible();
+  // count the pointer sequence that reaches the held view
+  await view.evaluate((el) => {
+    const w = window as unknown as { __seen: string[] };
+    w.__seen = [];
+    for (const t of ["pointerdown", "pointerup", "click"]) el.addEventListener(t, () => w.__seen.push(t));
+  });
+  const seen = () => page.evaluate(() => (window as unknown as { __seen: string[] }).__seen.length);
+  const box = (await view.boundingBox())!;
+  const at = { x: box.x + box.width * 0.5, y: box.y + box.height * 0.5 };
+  await page.mouse.click(at.x, at.y);
+  expect(await seen(), "the control: a click reaches the held view").toBeGreaterThan(0);
+  const before = await seen();
+  await page.getByTestId("landing-button").focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  await page.mouse.click(at.x, at.y);
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await page.waitForTimeout(300);
+  expect(await seen(), "none of the sequence reached the held view").toBe(before);
+});
