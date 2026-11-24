@@ -351,6 +351,9 @@ pub struct Observed {
     pub error: Option<String>,
     pub fps: Option<f64>,
     pub gpu_stats: Option<serde_json::Value>,
+    /// The VM's CPU use, stamped with the coordinator's receipt time.
+    #[serde(default)]
+    pub vm_stats: Option<crate::protocol::VmStats>,
     /// From the renderer's health: its budget fit and newest frame's scene time.
     #[serde(default)]
     pub budget_fit: Option<f64>,

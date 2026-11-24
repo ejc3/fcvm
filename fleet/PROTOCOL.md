@@ -408,7 +408,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
       "vm": "fleet-slot-1",
       "generation": 3,
       "fps": 30.0,
-      "gpu_stats": { ... },   // the renderer's /health gpu object; the page reads temp_c, power_w, util_pct, mem_used_mb, and mem_total_mb and at (Unix ms of the sample) when present
+      "gpu_stats": { ... },   // the renderer's /health gpu object plus "at", the coordinator's receipt time (Unix ms)
+      "vm_stats": {"cpu_pct": 12.5, "vcpus": 6, "at": 1761134401000},  // phones only; "at" is the coordinator's receipt time (its clock), vcpus the VMM's vCPU thread count; absent when the agent has no reading
       "error": null,
       "failure": null,
       "last_relaunch": {"clicked_at": 1761134400000, "by": "viewer:v-4", "first_frame_at": 1761134405200,
@@ -1637,7 +1638,7 @@ sandbox is stopped within a minute of it (the agent checks the image every minut
 coordinator logs a new warning, refusal or gold failure.
 
 ```json
-{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2}
+{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2, "vm_stats": {"cpu_pct": 12.5, "vcpus": 6}}
 ```
 
 Once a second per running slot: the renderer's `/health` `fps`, its GPU readings,
@@ -2881,7 +2882,7 @@ pixel in both, drawn identically.
 
 ```json
 {"fps":30.0,"heights":[240],"streams":[{"h":240,"q":"std"}],
- "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3,
+ "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3,"mem_total_mb":15360.0,
         "clock_mhz":1590,"app_clock_mhz":1590,"max_clock_mhz":1590},
  "t":1234.5,"frame":5678,"boot_id":"9f0c2a6e41d84b7c8e2f5a1b3c4d6e7f",
  "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"checkerboard":1,"hold":false,"hold_samples":0,"slots_missed":0,

@@ -129,26 +129,22 @@ function PanelView({
                 <dd>{r.value}</dd>
               </div>
             ))}
+            {panel.stats.map((r) => (
+              <div key={r.key} style={{ display: "contents" }} data-testid="phone-stat">
+                <dt>{r.term}</dt>
+                <dd data-testid={`stat-${r.key}`}>
+                  <span className="stat">
+                    <span className="num">{r.text}</span>
+                    {r.meter !== null && r.fraction !== null && (
+                      <span className="bar" role="meter" aria-label={r.meter.name} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(r.fraction * 100)} aria-valuetext={r.meter.valuetext}>
+                        <i style={{ width: `${(r.fraction * 100).toFixed(0)}%` }} />
+                      </span>
+                    )}
+                  </span>
+                </dd>
+              </div>
+            ))}
           </dl>
-          {panel.stats.length > 0 && (
-            <dl className="stats" data-testid="phone-stats">
-              {panel.stats.map((r) => (
-                <div key={r.key} style={{ display: "contents" }}>
-                  <dt>{r.term}</dt>
-                  <dd data-testid={`stat-${r.key}`}>
-                    <span role={r.fraction === null ? "img" : "meter"} aria-label={r.label} aria-valuemin={r.fraction === null ? undefined : 0} aria-valuemax={r.fraction === null ? undefined : 100} aria-valuenow={r.fraction === null ? undefined : Math.round(r.fraction * 100)}>
-                      <span className="num">{r.text}</span>
-                      {r.fraction !== null && (
-                        <span className="bar" aria-hidden="true">
-                          <i style={{ width: `${(r.fraction * 100).toFixed(0)}%` }} />
-                        </span>
-                      )}
-                    </span>
-                  </dd>
-                </div>
-              ))}
-            </dl>
-          )}
         </section>
         <section className="card" aria-labelledby="borrow-h" data-testid="phone-borrow" data-kind={b.kind}>
           {b.kind === "free" ? (

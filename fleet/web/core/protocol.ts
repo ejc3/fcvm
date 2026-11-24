@@ -46,6 +46,13 @@ export interface GpuInfo {
   at: number | null;
 }
 
+/** A phone VM's CPU use (percent of its vCPUs), read on its host; `at` is the coordinator's receipt time. */
+export interface VmStats {
+  cpu_pct: number;
+  vcpus: number;
+  at: number | null;
+}
+
 /** Why a tile is not running when that is a fault: `relaunch_failed` (the VM did not come back; the agent retries at `retry_at`). */
 export interface Failure {
   kind: string;
@@ -80,6 +87,8 @@ export interface Tile {
   /** The same renderer over IPv4 (`wss://<label>-v4.<zone>[:port]/frames`), null alike. */
   frame_url_v4: string | null;
   gpu: GpuInfo | null;
+  /** The phone VM's CPU use; null from a coordinator or agent that does not report them. */
+  vm_stats: VmStats | null;
   host: string | null;
   /** Where the tile runs, worded for a viewer (`EC2 in us-east-1`); null until the slot reports it. */
   place: string | null;
@@ -930,6 +939,14 @@ function parseGpu(v: unknown, stats: unknown, where: string): GpuInfo | null {
   };
 }
 
+function parseVmStats(v: unknown): VmStats | null {
+  if (!isObj(v)) return null;
+  const cpu = reading(v, "cpu_pct");
+  const vcpus = reading(v, "vcpus");
+  if (cpu === null || vcpus === null || vcpus < 1) return null;
+  return { cpu_pct: cpu, vcpus: Math.round(vcpus), at: reading(v, "at") };
+}
+
 function parseLastRelaunch(v: unknown, where: string): LastRelaunch | null {
   if (v === null || v === undefined) return null;
   if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
@@ -963,6 +980,7 @@ function parseTile(v: unknown, i: number): Tile {
     frame_url: strOrNull(v, "frame_url", where),
     frame_url_v4: strOrNull(v, "frame_url_v4", where),
     gpu: parseGpu(v["gpu"], v["gpu_stats"], `${where}.gpu`),
+    vm_stats: parseVmStats(v["vm_stats"]),
     host: strOrNull(v, "host", where),
     place: strOrNull(v, "place", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),

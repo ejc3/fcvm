@@ -13,6 +13,7 @@ pub mod sni;
 pub mod spot;
 pub mod tls;
 pub mod vm;
+pub mod vmstats;
 pub mod webproxy;
 pub mod windows;
 
