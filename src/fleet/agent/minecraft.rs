@@ -66,7 +66,7 @@ pub struct MinecraftCfg {
     pub ready_deadline: Duration,
     pub snapshot_deadline: Duration,
     pub poll: Duration,
-    /// The longest one `/health` attempt of a restore's wait may take
+    /// How long one `/health` attempt of a restore's wait may wait for its answer
     /// ([`UP_PROBE_TIMEOUT`]; a test sets it far above its own bound).
     pub up_attempt: Duration,
     /// Polls in a row the gold server must be ready at 20 ticks a second.
@@ -572,15 +572,30 @@ async fn health(http: &reqwest::Client, place: &Place) -> Option<Health> {
     health_within(http, place, Duration::from_secs(2)).await
 }
 
-/// The longest one `/health` attempt of a restore's wait may take, once the wait has run past
-/// its first second (see [`super::probe`]).
+/// How long a `/health` attempt of a restore's wait that has reached the tile may wait for
+/// its answer, and the longest its connect may take once the wait has run past its first
+/// second (see [`super::probe`]).
 pub const UP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// How long one `/health` attempt may take in the first second of a restore's wait. The first
-/// attempts go out while the clone is still being restored, and a SYN sent then is lost
-/// (nothing reads the tap yet): each such attempt is over within this, and the next is
-/// already on its way.
-pub const UP_PROBE_FAST_TIMEOUT: Duration = Duration::from_millis(30);
+/// How long the connect of one `/health` attempt may take in the first second of a restore's
+/// wait. The first attempts go out while the clone is still being restored, and a SYN sent
+/// then is lost (nothing reads the tap yet): each such connect is over within this, and the
+/// next is already on its way.
+pub const UP_PROBE_FAST_CONNECT: Duration = Duration::from_millis(30);
+
+/// One `/health` attempt of a restore's wait: the connect first, on its own, because the
+/// HTTP client does not say when its connect completes, then the request.
+async fn probe_health(
+    http: &reqwest::Client,
+    place: &Place,
+    budget: super::probe::Budget,
+    connected: super::probe::Connected,
+) -> Option<Health> {
+    if !super::probe::reach(place.http, budget, &connected).await {
+        return None;
+    }
+    health_within(http, place, budget.answer).await
+}
 
 async fn health_within(http: &reqwest::Client, place: &Place, timeout: Duration) -> Option<Health> {
     let url = format!("http://{}/health", place.http);
@@ -826,12 +841,12 @@ impl Server {
         tokio::pin!(until);
         let pace = super::probe::Pace {
             every: self.cfg.poll,
-            fast_timeout: UP_PROBE_FAST_TIMEOUT,
-            slow_timeout: self.cfg.up_attempt,
+            fast_connect: UP_PROBE_FAST_CONNECT,
+            answer: self.cfg.up_attempt,
         };
         // Answers are read in the order their attempts were sent, so `last` is the newest.
-        let mut probes = super::probe::Probes::new(pace, |timeout| {
-            health_within(&self.http, &self.place, timeout)
+        let mut probes = super::probe::Probes::new(pace, |budget, connected| {
+            probe_health(&self.http, &self.place, budget, connected)
         });
         let mut last = None;
         loop {

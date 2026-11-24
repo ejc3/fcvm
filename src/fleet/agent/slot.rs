@@ -243,7 +243,12 @@ impl SlotCtx {
     }
 
     fn health_url(&self, path: &str) -> String {
-        format!("http://{}:{}{path}", self.cfg.health_host(), self.port)
+        format!("http://{}{path}", self.health_addr())
+    }
+
+    /// The host and port the renderer's `/health` is reached at.
+    fn health_addr(&self) -> String {
+        format!("{}:{}", self.cfg.health_host(), self.port)
     }
 
     async fn health(&self) -> Option<serde_json::Value> {
@@ -417,14 +422,15 @@ impl Backoff {
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How a starting VM's renderer is probed (see [`super::probe`]): every 100 ms, with 100 ms
-/// for an attempt in the first second and up to [`HEALTH_TIMEOUT`] after it. One attempt is in
-/// flight at a time but for the instant one ends as the next starts. In the first second an
-/// attempt is over before the kernel would send its SYN again (1 s), so no lost attempt
-/// completes on a retransmit; after it one attempt at a time can, as before.
+/// for a connect in the first second, under the kernel's 1 s SYN retransmit, so no lost
+/// connect completes on a retransmit there. An attempt that connected has [`HEALTH_TIMEOUT`]
+/// for its answer, as before, and no other starts while it waits. Where the port is a host
+/// forwarder's, the connect completes at once whatever the guest does, and the wait is the
+/// one-at-a-time wait it was.
 pub(crate) const START_PACE: super::probe::Pace = super::probe::Pace {
     every: Duration::from_millis(100),
-    fast_timeout: Duration::from_millis(100),
-    slow_timeout: HEALTH_TIMEOUT,
+    fast_connect: Duration::from_millis(100),
+    answer: HEALTH_TIMEOUT,
 };
 
 pub async fn supervise(
@@ -802,7 +808,12 @@ async fn relaunch(
     let mut restored = vm.restored_watch();
     let deadline = tokio::time::sleep(ctx.cfg.start_timeout);
     tokio::pin!(deadline);
-    let mut probes = super::probe::Probes::new(START_PACE, |timeout| ctx.health_within(timeout));
+    let mut probes = super::probe::Probes::new(START_PACE, |budget, connected| async move {
+        if !super::probe::reach(ctx.health_addr(), budget, &connected).await {
+            return None;
+        }
+        ctx.health_within(budget.answer).await
+    });
     let mut starting_at: Option<Instant> = None;
     let mut health_at: Option<Instant> = None;
     let mut baseline: Option<u64> = None;

@@ -1552,10 +1552,19 @@ impl Sandbox {
         // As a renderer is probed (`slot::START_PACE`), at this sandbox's poll.
         let pace = super::probe::Pace {
             every: self.cfg.poll,
-            fast_timeout: self.cfg.poll,
-            slow_timeout: HEALTH_TIMEOUT,
+            fast_connect: self.cfg.poll,
+            answer: HEALTH_TIMEOUT,
         };
-        let mut probes = super::probe::Probes::new(pace, |timeout| self.health_within(timeout));
+        let addr = format!("{}:{}", self.agent.health_host(), self.place.port);
+        let mut probes = super::probe::Probes::new(pace, |budget, connected| {
+            let addr = addr.as_str();
+            async move {
+                if !super::probe::reach(addr, budget, &connected).await {
+                    return None;
+                }
+                self.health_within(budget.answer).await
+            }
+        });
         // The bridge is at the desktop: a deadline while it is, with no scene taken, is the
         // scene's, not Windows'.
         let mut at_desktop = false;
