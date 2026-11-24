@@ -1,6 +1,6 @@
 /* The line under a title and its "What is this?" control. Muted and small; the line clamps to
    two lines. The panel is a popover under the line on a wide screen and a bottom sheet on a phone. */
-.landing { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; max-width: 72ch; min-width: 0; text-shadow: none; }
+.landing { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; max-width: min(72ch, calc(100vw - 32px)); min-width: 0; text-shadow: none; }
 .landing-line { margin: 0; flex: 0 1 auto; min-width: 0; font-size: 14px; line-height: 1.4; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .landing-btn { min-height: 44px; padding: 0 4px; background: none; border: 0; color: var(--fcvm); font: 500 14px var(--sans); text-decoration: underline; cursor: pointer; pointer-events: auto; }
 .landing-panel { position: absolute; top: 100%; left: 0; z-index: 30; width: min(420px, calc(100vw - 32px)); max-height: 70dvh; overflow-y: auto; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font-size: 14px; display: flex; flex-direction: column; gap: 8px; pointer-events: auto; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45); }

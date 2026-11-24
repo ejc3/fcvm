@@ -13,6 +13,7 @@ import {
   fmtMs,
   ladderBarsOf,
   perCpu,
+  slotsRoom,
   dropCard,
   dropHeadline,
   LINE_MIN_TILE,
@@ -490,6 +491,28 @@ describe("the arc from the ball to the furthest machine being woken", () => {
     expect(arc.label).toBe("woken 3 ahead");
     expect(arc.radius).toBeLessThan(v.ring!.geometry.radius);
     expect(arc.large).toBe(false);
+  });
+});
+
+describe("the arc's label and the slots' room", () => {
+  const clear = (a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) => a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y;
+  it("keeps the label clear of every tile and of the box left for the slots, at every holder and span", () => {
+    const stage = { x: 0, y: 0, w: 1000, h: 760 };
+    for (const n of [8, 16, 32]) {
+      for (let holder = 0; holder < n; holder += 3) {
+        for (const ahead of [1, 3, Math.floor(n / 2) - 1]) {
+          const ring = Array.from({ length: n }, (_, i) => i);
+          const p = dense({ size: n }, { size: n, ring, holder, seq: 5 });
+          p.players = ring.map((i) => ({ ...p.players[0]!, player: i, colour: i % 12, phase: i === (holder + ahead) % n ? "waking" : "asleep" }));
+          const v = potatoView(input(stateWith(p), { stage }));
+          const arc = v.ring!.arc!;
+          const label = { x: arc.labelAt.x - 56, y: arc.labelAt.y - 10, w: 112, h: 20 };
+          for (const t of v.ring!.tiles) expect(clear(label, t.box), `n=${n} holder=${holder} ahead=${ahead}`).toBe(true);
+          const w = slotsRoom(v.ring!.geometry);
+          if (w > 0) expect(clear(label, { x: v.ring!.geometry.centre.x - w / 2, y: v.ring!.geometry.centre.y - 55, w, h: 110 })).toBe(true);
+        }
+      }
+    }
   });
 });
 

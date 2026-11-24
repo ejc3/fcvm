@@ -302,11 +302,14 @@ function ringOf(p: Potato, area: Box | null, now: number, reducedMotion: boolean
   if (a) {
     // along the ring, clockwise, just inside the tiles: it never crosses the slots in the centre
     const n = players.length;
-    const rho = Math.max(0, g.radius - g.tile * 0.75 - 6);
+    const rho = arcRadius(g);
     const a0 = -Math.PI / 2 + (2 * Math.PI * a.fromIndex) / n;
     const sweep = (2 * Math.PI * a.ahead) / n;
     const at = (ang: number, rad: number) => ({ x: g.centre.x + rad * Math.cos(ang), y: g.centre.y + rad * Math.sin(ang) });
-    arc = { centre: g.centre, radius: rho, from: at(a0, rho), to: at(a0 + sweep, rho), large: sweep > Math.PI, labelAt: at(a0 + sweep / 2, rho - 14), label: a.label, ahead: a.ahead };
+    // the label sits inside the arc, far enough in that its own box (about 112 by 20 px) clears the tiles
+    const mid = a0 + sweep / 2;
+    const depth = LABEL_HALF_W * Math.abs(Math.cos(mid)) + LABEL_HALF_H * Math.abs(Math.sin(mid)) + 6;
+    arc = { centre: g.centre, radius: rho, from: at(a0, rho), to: at(a0 + sweep, rho), large: sweep > Math.PI, labelAt: at(mid, rho - depth), label: a.label, ahead: a.ahead };
   }
   const ladderRung = r ? p.ladder.find((x) => x.size === r.size) : undefined;
   const flash = r !== null && ladderRung?.record_pace_at != null && now - ladderRung.record_pace_at < 2500 && ladderRung.record_pace_at >= r.started_at;
@@ -393,6 +396,18 @@ export function cpuSlotsOf(p: Potato, r: PotatoRound): CpuSlotsView | null {
     groups,
     asleep: r.asleep === null ? null : `${r.asleep} of ${r.size} asleep`,
   };
+}
+
+const LABEL_HALF_W = 56;
+const LABEL_HALF_H = 10;
+/** The arc runs along the ring just inside the tiles. */
+function arcRadius(g: RingGeometry): number {
+  return Math.max(0, g.radius - g.tile * 0.5 - 6);
+}
+/** The width of the box in the ring's centre that the arc's line and its label leave free for the CPU slots. */
+export function slotsRoom(g: RingGeometry): number {
+  const free = arcRadius(g) - 2 * LABEL_HALF_W - 4;
+  return free <= 55 ? 0 : 2 * Math.sqrt(free * free - 55 * 55);
 }
 
 export interface ArcView {

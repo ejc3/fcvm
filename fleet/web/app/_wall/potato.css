@@ -152,7 +152,7 @@
 .potato-arc { position: absolute; left: 0; top: 0; pointer-events: none; color: var(--text); }
 .potato-arc path { fill: none; stroke: currentColor; stroke-width: 2; }
 .potato-arc-label { position: absolute; transform: translate(-50%, -50%); font: 600 14px var(--sans); white-space: nowrap; pointer-events: none; }
-.potato-late { position: absolute; transform: translateX(-50%); font: 600 14px var(--mono); color: var(--refused); white-space: nowrap; pointer-events: none; }
+.potato-line.late { font: 600 14px var(--mono); color: var(--refused); }
 .potato-tile[data-late] { box-shadow: 0 0 0 3px var(--refused), inset 0 0 0 1px var(--p-tile-edge); }
 .potato-track.flash { animation: track-flash 1.2s ease-out 1; }
 @keyframes track-flash { 0% { border-color: var(--fcvm); border-width: 5px; } 100% { border-color: var(--p-ring); border-width: 2px; } }

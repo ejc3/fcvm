@@ -5,7 +5,7 @@
 // draws the view model core/potato.ts computes; every word on it comes from there.
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { potatoColour, potatoView, SITE, type Box, type PotatoButton, type RingTile, type PotatoView } from "../../core/index.ts";
+import { potatoColour, potatoView, slotsRoom, SITE, type Box, type PotatoButton, type RingTile, type PotatoView } from "../../core/index.ts";
 import { WallClient } from "./wall-client.ts";
 import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
@@ -141,7 +141,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   const shown = pressed ?? pointed ?? focused;
   const ring = view.ring;
   // The slots go in the ring's centre when the room inside the arc and its label is wide enough; else under the ring.
-  const centreWidth = ring ? 2 * (ring.geometry.radius - ring.geometry.tile * 0.75 - 6 - 64) : 0;
+  const centreWidth = ring ? slotsRoom(ring.geometry) : 0;
   const slotsInRing = view.cpuSlots !== null && centreWidth >= 240;
   const needsVerifyPrompt = view.verify.prompt;
 
@@ -223,9 +223,16 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
               : null}
             {ring
               ? ring.tiles.map((t) =>
-                  t.line !== null ? (
-                    <span key={`l${t.player}`} className="potato-line" data-phase={t.phase} style={{ left: t.box.x + t.box.w / 2, top: t.box.y + t.box.h + 4 }} aria-hidden="true">
-                      {t.line}
+                  t.line !== null || t.late !== null ? (
+                    <span
+                      key={`l${t.player}`}
+                      className={`potato-line${t.late !== null ? " late" : ""}`}
+                      data-phase={t.phase}
+                      data-testid={t.late !== null ? "potato-late" : undefined}
+                      style={{ left: t.box.x + t.box.w / 2, top: t.box.y + t.box.h + 4 }}
+                      aria-hidden="true"
+                    >
+                      {t.late ?? t.line}
                     </span>
                   ) : null,
                 )
@@ -245,15 +252,6 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                 </span>
               </>
             ) : null}
-            {ring
-              ? ring.tiles.map((t) =>
-                  t.late !== null ? (
-                    <span key={`late${t.player}`} className="potato-late" data-testid="potato-late" style={{ left: t.box.x + t.box.w / 2, top: t.box.y + t.box.h + 4 }}>
-                      {t.late}
-                    </span>
-                  ) : null,
-                )
-              : null}
             {slotsInRing && view.cpuSlots && ring ? (
               <div className="potato-centre" style={{ left: ring.geometry.centre.x, top: ring.geometry.centre.y, width: centreWidth }}>
                 <CpuSlots slots={view.cpuSlots} />
