@@ -131,6 +131,9 @@ pub struct ProcessSpec {
     /// Descriptors the VMM keeps open across its exec
     /// ([`crate::utils::NamespaceParams::keep_fds`]).
     pub keep_fds: Vec<std::os::fd::RawFd>,
+    /// When the backend's decision is confined: the VM's own (unpooled) TAP, made the VMM's before its
+    /// capabilities are dropped. `None` keeps what an earlier spawn set.
+    pub tap_owner: Option<String>,
 }
 
 /// A block device to attach (rootfs or data disk), VMM-neutral.
@@ -156,6 +159,8 @@ pub struct PmemSpec {
 pub struct NetIfaceSpec {
     pub iface_id: String,
     pub host_dev_name: String,
+    /// A queue of `host_dev_name` the VMM inherited ([`crate::network::NetworkConfig::tap_fd`]).
+    pub host_dev_fd: Option<std::os::fd::RawFd>,
     pub guest_mac: Option<String>,
 }
 

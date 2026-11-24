@@ -1,0 +1,491 @@
+conf, flow: reset over the control socket, and a status reply
+
+Two additions to the configuration protocol (pesto), for a caller that keeps
+one pasta and its namespace and lends them to one guest after another.
+
+- A client may send PESTO_RESET (0xff) in place of a pif id before its
+  tables. passt then closes every flow (TCP, spliced TCP, UDP, ping) without
+  sending anything to the tap, and puts back the guest MAC and the guest
+  addresses it had before any traffic (guest_mac, ip4.addr_seen,
+  ip6.addr_seen, ip6.addr_ll_seen), which it otherwise learns from the
+  guest's frames. Until now the only way to drop that state was to restart
+  pasta, which costs a TAP detach and attach under the host's rtnl_mutex.
+  The flows are closed in flow_defer_handler(), at the end of the epoll
+  cycle the request arrived in, because an event of the same batch may still
+  name one of them.
+- After applying a client's tables passt answers with one status byte before
+  it closes the connection: bit 0 (PESTO_STATUS_LISTEN_FAILED) says a rule
+  could not be bound. fwd_listen_switch() returns that instead of only
+  logging it. For a reset the byte is sent once the flows are closed. A
+  client that does not read it (pesto) is not affected.
+
+- The transaction on the control socket is synchronous (conf_accept() has a
+  FIXME for it), so a client that sends part of a message holds the
+  forwarding loop in a read. Each read and write on the accepted socket now
+  gives up after one second (SO_RCVTIMEO, SO_SNDTIMEO) and the transaction
+  fails. This bounds one call, not a whole message: a client that sends a
+  byte a second can still hold the loop. The socket is in a directory only
+  the pool's user can enter.
+
+Carried by fcvm for its pooled namespaces. Not submitted upstream yet.
+
+diff --git a/conf.c b/conf.c
+index ecb50d7..5251657 100644
+--- a/conf.c
++++ b/conf.c
+@@ -2006,6 +2006,33 @@ void conf(struct ctx *c, int argc, char **argv)
+ 
+ static void conf_accept(struct ctx *c);
+ 
++/* What passt knew of the guest before any traffic, kept by conf_guest_save() for
++ * a PESTO_RESET to put back
++ */
++static struct {
++	unsigned char mac[ETH_ALEN];
++	struct in_addr addr4;
++	struct in6_addr addr6, addr6_ll;
++} conf_guest;
++
++/* A reset was asked for and conf_defer_handler() has not finished it */
++static bool conf_reset_wanted;
++
++/* Status byte owed to the control client once the reset is finished, or -1 */
++static int conf_reset_status = -1;
++
++/**
++ * conf_guest_save() - Record the guest addresses configured at start
++ * @c:		Execution context
++ */
++void conf_guest_save(const struct ctx *c)
++{
++	memcpy(conf_guest.mac, c->guest_mac, ETH_ALEN);
++	conf_guest.addr4 = c->ip4.addr_seen;
++	conf_guest.addr6 = c->ip6.addr_seen;
++	conf_guest.addr6_ll = c->ip6.addr_ll_seen;
++}
++
+ /**
+  * conf_send_rules() - Send current forwarding rules to config client (pesto)
+  * @c:		Execution context
+@@ -2056,10 +2083,11 @@ static int conf_send_rules(const struct ctx *c, int fd)
+  * conf_recv_rules() - Receive forwarding rules from configuration client
+  * @c:		Execution context
+  * @fd:		Socket to the client
++ * @reset:	Set if the client also asked to forget the guest (PESTO_RESET)
+  *
+  * Return: 0 on success, -1 on failure
+  */
+-static int conf_recv_rules(const struct ctx *c, int fd)
++static int conf_recv_rules(const struct ctx *c, int fd, bool *reset)
+ {
+ 	while (1) {
+ 		struct fwd_table *fwd;
+@@ -2074,6 +2102,11 @@ static int conf_recv_rules(const struct ctx *c, int fd)
+ 		if (pif == PIF_NONE)
+ 			break;
+ 
++		if (pif == PESTO_RESET) {
++			*reset = true;
++			continue;
++		}
++
+ 		if (pif >= ARRAY_SIZE(c->fwd_pending) ||
+ 		    !(fwd = c->fwd_pending[pif])) {
+ 			err("Received rules for non-existent table");
+@@ -2120,6 +2153,38 @@ static void conf_close(struct ctx *c)
+ 	c->fd_control = -1;
+ }
+ 
++/**
++ * conf_defer_handler() - Finish a reset once its flows are closed
++ * @c:		Execution context
++ *
++ * Runs after flow_defer_handler(). Puts back the guest addresses passt started
++ * with, in place of the ones it learned from the last guest's traffic, then
++ * sends the client its status.
++ */
++void conf_defer_handler(struct ctx *c)
++{
++	if (!conf_reset_wanted || !flow_reset_done())
++		return;
++	conf_reset_wanted = false;
++
++	memcpy(c->guest_mac, conf_guest.mac, ETH_ALEN);
++	proto_update_l2_buf(c->guest_mac);
++	c->ip4.addr_seen = conf_guest.addr4;
++	c->ip6.addr_seen = conf_guest.addr6;
++	c->ip6.addr_ll_seen = conf_guest.addr6_ll;
++	info("Reset: flows closed, guest addresses as at start");
++
++	if (conf_reset_status < 0)
++		return;		/* The client hung up: conf_handler() closed it */
++
++	if (write_u8(c->fd_control, conf_reset_status) < 0)
++		debug("Configuration client left before its status");
++	conf_reset_status = -1;
++
++	conf_close(c);
++	conf_accept(c);
++}
++
+ /**
+  * conf_listen_handler() - Handle events on configuration listening socket
+  * @c:		Execution context
+@@ -2155,6 +2220,7 @@ static void conf_accept(struct ctx *c)
+ 		.ifnamsiz = htonl(IFNAMSIZ),
+ 	};
+ 	union epoll_ref ref = { .type = EPOLL_TYPE_CONF };
++	const struct timeval tv = { .tv_sec = 1 };
+ 	struct ucred uc = { 0 };
+ 	socklen_t len = sizeof(uc);
+ 	int fd, rc;
+@@ -2177,6 +2243,16 @@ retry:
+ 	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &uc, &len) < 0)
+ 		warn_perror("Can't get configuration client credentials");
+ 
++	/* The transaction is synchronous (see above), so a client that sends
++	 * part of a message would hold the forwarding loop in a read. Each
++	 * read and write on this socket gives up after a second instead: the
++	 * transaction fails and the connection is closed. This bounds one
++	 * call, not a whole message.
++	 */
++	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) ||
++	    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)))
++		warn_perror("Can't bound configuration socket reads and writes");
++
+ 	c->fd_control = ref.fd = fd;
+ 	rc = epoll_add(c->epollfd, EPOLLIN | EPOLLET, ref);
+ 	if (rc < 0) {
+@@ -2213,7 +2289,19 @@ fail:
+  */
+ void conf_handler(struct ctx *c, uint32_t events)
+ {
++	if (conf_reset_status >= 0) {
++		/* A reset's reply is owed, by conf_defer_handler(). A client that
++		 * hung up meanwhile gets none; the reset happens all the same.
++		 */
++		if (!(events & (EPOLLHUP | EPOLLERR)))
++			return;
++		conf_reset_status = -1;
++		goto close;
++	}
++
+ 	if (events & EPOLLIN) {
++		uint8_t status = 0;
++		bool reset = false;
+ 		unsigned pif;
+ 
+ 		/* Clear pending tables */
+@@ -2223,7 +2311,7 @@ void conf_handler(struct ctx *c, uint32_t events)
+ 		/* FIXME: this could block indefinitely if the client doesn't
+ 		 * write as much as it should
+ 		 */
+-		if (conf_recv_rules(c, c->fd_control) < 0)
++		if (conf_recv_rules(c, c->fd_control, &reset) < 0)
+ 			goto close;
+ 
+ 		for (pif = 0; pif < PIF_NUM_TYPES; pif++) {
+@@ -2237,7 +2325,18 @@ void conf_handler(struct ctx *c, uint32_t events)
+ 				       "    ", "");
+ 		}
+ 
+-		fwd_listen_switch(c);
++		if (fwd_listen_switch(c) < 0)
++			status |= PESTO_STATUS_LISTEN_FAILED;
++
++		if (reset) {
++			flow_reset();
++			conf_reset_wanted = true;
++			conf_reset_status = status;
++			return;
++		}
++
++		if (write_u8(c->fd_control, status) < 0)
++			debug("Configuration client left before its status");
+ 	}
+ 
+ 	if (events & EPOLLHUP) {
+diff --git a/conf.h b/conf.h
+index 19bf9bc..42eca54 100644
+--- a/conf.h
++++ b/conf.h
+@@ -11,5 +11,7 @@ int conf_tap_fd(int argc, char **argv);
+ void conf(struct ctx *c, int argc, char **argv);
+ void conf_listen_handler(struct ctx *c, uint32_t events);
+ void conf_handler(struct ctx *c, uint32_t events);
++void conf_defer_handler(struct ctx *c);
++void conf_guest_save(const struct ctx *c);
+ 
+ #endif /* CONF_H */
+diff --git a/flow.c b/flow.c
+index 71918b7..a197e8c 100644
+--- a/flow.c
++++ b/flow.c
+@@ -145,6 +145,9 @@ static_assert(ARRAY_SIZE(flow_hashtab) >= 2 * FLOW_MAX,
+ /* Last time the flow timers ran */
+ static struct timespec flow_timer_run;
+ 
++/* Set by flow_reset(): the next flow_defer_handler() closes every flow */
++static bool flow_reset_pending;
++
+ /** flowside_from_af() - Initialise flowside from addresses
+  * @side:	flowside to initialise
+  * @af:		Address family (AF_INET or AF_INET6)
+@@ -880,6 +883,27 @@ flow_sidx_t flow_lookup_sa(const struct ctx *c, uint8_t proto, uint8_t pif,
+ 	return flowside_lookup(c, proto, pif, &side);
+ }
+ 
++/**
++ * flow_reset() - Close every flow at the next flow_defer_handler()
++ *
++ * Flows are closed there and not here because an event of the current epoll batch
++ * may still name one.
++ */
++void flow_reset(void)
++{
++	flow_reset_pending = true;
++}
++
++/**
++ * flow_reset_done() - Check whether a requested reset has closed every flow
++ *
++ * Return: true if no reset is pending
++ */
++bool flow_reset_done(void)
++{
++	return !flow_reset_pending;
++}
++
+ /**
+  * flow_defer_handler() - Handler for per-flow deferred and timed tasks
+  * @c:		Execution context
+@@ -906,6 +930,31 @@ void flow_defer_handler(const struct ctx *c, const struct timespec *now)
+ 	flow_foreach(flow) {
+ 		bool closed = false;
+ 
++		if (flow_reset_pending) {
++			/* Nothing is sent to the tap: the guest these belong to
++			 * is gone.
++			 */
++			switch (flow->f.type) {
++			case FLOW_TCP:
++				tcp_flow_reset(c, &flow->tcp, now);
++				break;
++			case FLOW_TCP_SPLICE:
++				tcp_splice_flow_reset(&flow->tcp_splice);
++				break;
++			case FLOW_PING4:
++			case FLOW_PING6:
++				icmp_ping_close(c, &flow->ping);
++				to_free[FLOW_IDX(flow)] = true;
++				continue;
++			case FLOW_UDP:
++				udp_flow_close(c, &flow->udp);
++				flow->udp.flush0 = flow->udp.flush1 = false;
++				break;
++			default:
++				;
++			}
++		}
++
+ 		switch (flow->f.type) {
+ 		case FLOW_TYPE_NONE:
+ 			assert(false);
+@@ -935,6 +984,7 @@ void flow_defer_handler(const struct ctx *c, const struct timespec *now)
+ 
+ 		to_free[FLOW_IDX(flow)] = closed;
+ 	}
++	flow_reset_pending = false;
+ 
+ 	/* Second step: actually free the flows */
+ 	flow_foreach_slot(flow) {
+diff --git a/flow.h b/flow.h
+index db02845..ce3294f 100644
+--- a/flow.h
++++ b/flow.h
+@@ -270,6 +270,8 @@ void flow_epollid_set(struct flow_common *f, int epollid);
+ int flow_epoll_set(const struct flow_common *f, int command, uint32_t events,
+ 		   int fd, unsigned int sidei);
+ void flow_epollid_register(int epollid, int epollfd);
++void flow_reset(void);
++bool flow_reset_done(void);
+ void flow_defer_handler(const struct ctx *c, const struct timespec *now);
+ int flow_migrate_source_early(struct ctx *c, const struct migrate_stage *stage,
+ 			      int fd);
+diff --git a/fwd.c b/fwd.c
+index 7152169..6d9e0fa 100644
+--- a/fwd.c
++++ b/fwd.c
+@@ -530,9 +530,11 @@ int fwd_listen_init(const struct ctx *c)
+ 
+ /**
+  * fwd_listen_switch() - Switch from current to pending rules table
++ *
++ * Return: 0 on success, -1 if a rule of the new tables could not be bound
+  * @c:		Execution context
+  */
+-void fwd_listen_switch(struct ctx *c)
++int fwd_listen_switch(struct ctx *c)
+ {
+ 	struct fwd_table *tmp[PIF_NUM_TYPES];
+ 	unsigned i;
+@@ -558,8 +560,12 @@ void fwd_listen_switch(struct ctx *c)
+ 	memcpy((void *)c->fwd_pending, &tmp, sizeof(c->fwd_pending));
+ 
+ 	/* Start listening on the new tables */
+-	if (fwd_listen_init(c) < 0)
++	if (fwd_listen_init(c) < 0) {
+ 		err("Error switching to new forwarding rules");
++		return -1;
++	}
++
++	return 0;
+ }
+ 
+ /* See enum in kernel's include/net/tcp_states.h */
+diff --git a/fwd.h b/fwd.h
+index b60697d..a6c7bd8 100644
+--- a/fwd.h
++++ b/fwd.h
+@@ -61,7 +61,7 @@ int fwd_listen_sync(const struct ctx *c, uint8_t pif,
+ 		    const struct fwd_scan *tcp, const struct fwd_scan *udp);
+ void fwd_listen_close(const struct fwd_table *fwd);
+ int fwd_listen_init(const struct ctx *c);
+-void fwd_listen_switch(struct ctx *c);
++int fwd_listen_switch(struct ctx *c);
+ 
+ bool nat_inbound(const struct ctx *c, const union inany_addr *addr,
+ 		 union inany_addr *translated);
+diff --git a/icmp.c b/icmp.c
+index 0fe2366..54f05f5 100644
+--- a/icmp.c
++++ b/icmp.c
+@@ -152,8 +152,7 @@ unexpected:
+  * @c:		Execution context
+  * @pingf:	ping flow entry to close
+  */
+-static void icmp_ping_close(const struct ctx *c,
+-			    const struct icmp_ping_flow *pingf)
++void icmp_ping_close(const struct ctx *c, const struct icmp_ping_flow *pingf)
+ {
+ 	epoll_del(flow_epollfd(&pingf->f), pingf->sock);
+ 	close(pingf->sock);
+diff --git a/icmp_flow.h b/icmp_flow.h
+index 3af98be..7172db7 100644
+--- a/icmp_flow.h
++++ b/icmp_flow.h
+@@ -25,6 +25,7 @@ struct icmp_ping_flow {
+ 	time_t ts;
+ };
+ 
++void icmp_ping_close(const struct ctx *c, const struct icmp_ping_flow *pingf);
+ bool icmp_ping_timer(const struct ctx *c, const struct icmp_ping_flow *pingf,
+ 		     const struct timespec *now);
+ 
+diff --git a/passt.c b/passt.c
+index ad8703f..0a6ef5c 100644
+--- a/passt.c
++++ b/passt.c
+@@ -115,6 +115,7 @@ static void post_handler(struct ctx *c, const struct timespec *now)
+ 		tcp_defer_handler(c, now);
+ 
+ 	flow_defer_handler(c, now);
++	conf_defer_handler(c);
+ 	fwd_scan_ports_timer(c, now);
+ 
+ 	if (!c->no_ndp)
+@@ -451,6 +452,8 @@ int main(int argc, char **argv)
+ 
+ 	timer_init(c, &now);
+ 
++	conf_guest_save(c);
++
+ loop:
+ 	/* NOLINTBEGIN(bugprone-branch-clone): intervals can be the same */
+ 	/* cppcheck-suppress [duplicateValueTernary, unmatchedSuppression] */
+diff --git a/pesto.h b/pesto.h
+index 8db701b..6dcca77 100644
+--- a/pesto.h
++++ b/pesto.h
+@@ -21,6 +21,17 @@
+  */
+ #define PESTO_PROTOCOL_VERSION	2
+ 
++/* Sent by a client in place of a pif id, before the tables: also forget the guest.
++ * The server closes every flow and takes back the guest addresses it learned from
++ * traffic, so the next guest on the same tap sees nothing of the last one's.
++ */
++#define PESTO_RESET		0xff
++
++/* After the client's tables, the server answers with one byte of these flags and
++ * closes the connection. For a PESTO_RESET the byte is sent once every flow is closed.
++ */
++#define PESTO_STATUS_LISTEN_FAILED	0x01	/* a rule could not be bound */
++
+ /* Maximum size of a pif name, including \0 */
+ #define	PIF_NAME_SIZE	(128)
+ #define PIF_NONE	0
+diff --git a/tcp.c b/tcp.c
+index 3b78d2e..0ffb758 100644
+--- a/tcp.c
++++ b/tcp.c
+@@ -887,6 +887,18 @@ static int tcp_opt_get(const char *opts, size_t len, uint8_t type_find,
+ 	return -1;
+ }
+ 
++/**
++ * tcp_flow_reset() - Close a connection, sending nothing to the tap
++ * @c:		Execution context
++ * @conn:	Connection to close
++ * @now:	Current timestamp
++ */
++void tcp_flow_reset(const struct ctx *c, struct tcp_tap_conn *conn,
++		    const struct timespec *now)
++{
++	conn_event(c, conn, CLOSED, now);
++}
++
+ /**
+  * tcp_flow_defer() - Deferred per-flow handling (clean up closed connections)
+  * @conn:	Connection to handle
+diff --git a/tcp_conn.h b/tcp_conn.h
+index e3c5534..ed856bf 100644
+--- a/tcp_conn.h
++++ b/tcp_conn.h
+@@ -242,6 +242,8 @@ extern int init_sock_pool6	[TCP_SOCK_POOL_SIZE];
+ void tcp_linger0_(const struct flow_common *f, int s);
+ #define tcp_linger0(flow_, s_)	tcp_linger0_(&(flow_)->f, (s_))
+ 
++void tcp_flow_reset(const struct ctx *c, struct tcp_tap_conn *conn,
++		    const struct timespec *now);
+ bool tcp_flow_defer(const struct tcp_tap_conn *conn);
+ 
+ int tcp_flow_repair_on(struct ctx *c, const struct tcp_tap_conn *conn);
+@@ -258,6 +260,7 @@ int tcp_flow_migrate_target_ext(struct ctx *c, struct tcp_tap_conn *conn,
+ 
+ bool tcp_flow_is_established(const struct tcp_tap_conn *conn);
+ 
++void tcp_splice_flow_reset(struct tcp_splice_conn *conn);
+ bool tcp_splice_flow_defer(struct tcp_splice_conn *conn);
+ void tcp_splice_timer(struct tcp_splice_conn *conn);
+ int tcp_conn_pool_sock(int pool[]);
+diff --git a/tcp_splice.c b/tcp_splice.c
+index 4b01f1a..5a7d513 100644
+--- a/tcp_splice.c
++++ b/tcp_splice.c
+@@ -256,6 +256,15 @@ static void tcp_splice_rst(struct tcp_splice_conn *conn)
+ 	conn_flag(conn, CLOSING);
+ }
+ 
++/**
++ * tcp_splice_flow_reset() - Mark a spliced connection for closing
++ * @conn:	Connection to close
++ */
++void tcp_splice_flow_reset(struct tcp_splice_conn *conn)
++{
++	conn_flag(conn, CLOSING);
++}
++
+ /**
+  * tcp_splice_flow_defer() - Deferred per-flow handling (clean up closed)
+  * @conn:	Connection entry to handle

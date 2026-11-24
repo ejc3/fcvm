@@ -129,6 +129,21 @@ function PanelView({
                 <dd>{r.value}</dd>
               </div>
             ))}
+            {panel.stats.map((r) => (
+              <div key={r.key} style={{ display: "contents" }} data-testid="phone-stat">
+                <dt>{r.term}</dt>
+                <dd data-testid={`stat-${r.key}`}>
+                  <span className="stat">
+                    <span className="num">{r.text}</span>
+                    {r.meter !== null && r.fraction !== null && (
+                      <span className="bar" role="meter" aria-label={r.meter.name} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(r.fraction * 100)} aria-valuetext={r.meter.valuetext}>
+                        <i style={{ width: `${(r.fraction * 100).toFixed(0)}%` }} />
+                      </span>
+                    )}
+                  </span>
+                </dd>
+              </div>
+            ))}
           </dl>
         </section>
         <section className="card" aria-labelledby="borrow-h" data-testid="phone-borrow" data-kind={b.kind}>

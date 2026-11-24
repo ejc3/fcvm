@@ -152,22 +152,6 @@ fn cstr(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes.split(|b| *b == 0).next().unwrap_or(&[])).into_owned()
 }
 
-/// Whether the link `name` of the calling process's network namespace has a carrier
-/// (`IFF_LOWER_UP`). A TAP has one from the moment a process attaches to it until the last
-/// one detaches; the flag does not wait for the kernel's link watch worker.
-pub fn has_carrier(name: &str) -> Result<bool> {
-    let mut rtnl = Rtnl::open().context("opening a netlink socket")?;
-    for link in rtnl
-        .dump(RTM_GETLINK, &[0u8; 16])
-        .context("listing links")?
-    {
-        if attr(&link, 16, IFLA_IFNAME).map(cstr).as_deref() == Some(name) {
-            return Ok(u32_at(&link.payload, 8) & 0x1_0000 != 0);
-        }
-    }
-    anyhow::bail!("the namespace has no link {name}")
-}
-
 /// The fingerprint of the calling process's network namespace. `tap` is the VMM's TAP: a
 /// forwarding entry the bridge learned on it belongs to a guest, so it is listed.
 pub fn fingerprint(tap: &str) -> Result<String> {

@@ -787,7 +787,8 @@ pub async fn run_streaming(
 ///
 /// VMM-neutral: both Firecracker and Cloud Hypervisor run as a child process inside the
 /// same namespaces with the same parent-death signal. See [`install_namespace_pre_exec`].
-#[derive(Debug, Clone, Default)]
+/// No `Default`: every spawn site names its [`Self::decision`].
+#[derive(Debug, Clone)]
 pub struct NamespaceParams {
     /// VM id, for log context only.
     pub vm_id: String,
@@ -812,6 +813,31 @@ pub struct NamespaceParams {
     /// while it holds the lease (and again from the same lease after a guest reboot), and
     /// drops the lease only after the VMM has exited.
     pub keep_fds: Vec<std::os::fd::RawFd>,
+    /// Whether the VMM is confined, from [`crate::confine::resolve`]. Confined, the
+    /// process layer runs after the namespaces are entered; it needs
+    /// `user_namespace_path`, because it drops capabilities held in that namespace.
+    pub decision: crate::confine::Decision,
+    /// When confined: the namespace's persistent TAP, made owned by the VMM's uid before
+    /// its capabilities are dropped ([`crate::confine::own_tap`]), so the VMM can attach
+    /// to it without CAP_NET_ADMIN. Only an unpooled namespace, which is this VM's alone.
+    pub tap_owner: Option<String>,
+}
+
+impl NamespaceParams {
+    /// No namespace, no redirect, no kept descriptor: what a site adds to with struct update
+    /// syntax. The decision cannot be left out.
+    pub fn new(vm_id: impl Into<String>, decision: crate::confine::Decision) -> Self {
+        Self {
+            vm_id: vm_id.into(),
+            namespace_id: None,
+            user_namespace_path: None,
+            net_namespace_path: None,
+            mount_redirects: None,
+            keep_fds: Vec::new(),
+            decision,
+            tap_owner: None,
+        }
+    }
 }
 
 /// The mount namespace that gives a restored clone's VMM its own directories at the
@@ -995,6 +1021,27 @@ pub fn install_namespace_pre_exec(
     ns: &NamespaceParams,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
+
+    // Confinement is checked before anything is created or registered: a confined spawn
+    // that cannot be set up fails before its mount targets exist.
+    let confined_tap = if let Some(confinement) = ns.decision.confinement() {
+        anyhow::ensure!(
+            ns.user_namespace_path.is_some(),
+            "confining the VMM of {} needs it to enter a user namespace (rootless mode)",
+            ns.vm_id
+        );
+        Some((
+            ns.tap_owner
+                .as_deref()
+                .map(crate::confine::TapName::new)
+                .transpose()?,
+            // The limit the preflight validated; installing it fails the spawn if the hard
+            // limit has since dropped below it.
+            confinement.core_limit,
+        ))
+    } else {
+        None
+    };
 
     if !ns.keep_fds.is_empty() {
         let keep_fds = ns.keep_fds.clone();
@@ -1274,14 +1321,35 @@ pub fn install_namespace_pre_exec(
         }
     }
 
+    if let Some((tap, core_limit)) = confined_tap {
+        // After the namespace step, which needs the capabilities this drops, and before
+        // PR_SET_PDEATHSIG, which stays last. The TAP is owned while CAP_NET_ADMIN is held.
+        // SAFETY: own_tap and apply_process_layer make raw syscalls only and do not
+        // allocate; the name was built before the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Some(tap) = &tap {
+                    crate::confine::own_tap(tap)?;
+                }
+                crate::confine::apply_process_layer(core_limit)
+            });
+        }
+    }
+
     own_process_group(cmd);
 
     // Kill the VMM if the parent (fcvm) dies, even from SIGKILL. Unconditional; must be the
     // LAST pre_exec so it runs AFTER setns(CLONE_NEWUSER), which clears pdeath_signal.
+    // A parent that exited before the signal was armed sends none, so the child checks that
+    // fcvm is still its parent and exits rather than exec an orphaned VMM.
+    let parent = std::process::id() as libc::pid_t;
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(1);
             }
             Ok(())
         });
@@ -1442,6 +1510,47 @@ mod tests {
         );
         assert_eq!(out.0[0], format!("{line}\n").into_bytes());
     }
+
+    /// A confined spawn that cannot be set up (no user namespace) fails before it creates
+    /// its mount targets.
+    #[test]
+    fn a_confined_spawn_is_checked_before_its_mount_targets_are_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = dir.path().join("view");
+        // Outside the view: create_mount_targets makes such a mountpoint on the host.
+        let target = dir.path().join("outside").join("vm");
+        let mut cmd = tokio::process::Command::new("true");
+        let error = install_namespace_pre_exec(
+            &mut cmd,
+            &NamespaceParams {
+                mount_redirects: Some(MountRedirects {
+                    view: view.clone(),
+                    pairs: vec![(target.clone(), dir.path().to_path_buf())],
+                    keep: Vec::new(),
+                    keep_files: Vec::new(),
+                }),
+                ..NamespaceParams::new(
+                    "confined-no-userns",
+                    crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+                        landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+                        layers: vec![crate::confine::Layer::Process],
+                        core_limit: 1,
+                    })),
+                )
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("needs it to enter a user namespace"),
+            "{error}"
+        );
+        assert!(
+            !dir.path().join("outside").exists(),
+            "the mount targets were made before the check"
+        );
+    }
+
     use super::thread_sample;
 
     /// Every thread of a process is named with its state and where it sleeps.
@@ -1730,7 +1839,11 @@ mod tests {
         let interrupt = TerminalInterrupt::arm();
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("60").stdin(Stdio::null()).kill_on_drop(true);
-        install_namespace_pre_exec(&mut cmd, &NamespaceParams::default()).unwrap();
+        install_namespace_pre_exec(
+            &mut cmd,
+            &NamespaceParams::new("vm-test", crate::confine::Decision::for_test(None)),
+        )
+        .unwrap();
         let mut vmm = cmd.spawn().expect("spawning the stand-in VMM");
         interrupt.assert_misses(&mut vmm, "the VMM").await;
     }
@@ -1810,7 +1923,7 @@ mod tests {
                     keep: vec![other.clone(), view.join("gone")],
                     keep_files: vec![disk.clone(), view.join("gone.raw")],
                 }),
-                ..Default::default()
+                ..NamespaceParams::new("vm-test", crate::confine::Decision::for_test(None))
             },
         )
         .unwrap();

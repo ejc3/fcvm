@@ -918,6 +918,23 @@ fn publish_prepared_snapshot(prepared: &PreparedSnapshot) -> Result<()> {
 /// True when the VM's kernel profile enables ARM64 NV2 nested virtualization
 /// (the profile's firecracker_args carry --enable-nv2). Drives the
 /// miss-path-converges-on-restore behavior, which exists for NV2 guests only.
+/// Whether `--setup` may build the rootfs, which boots fcvm setup's unconfined VM: never
+/// for a confined run.
+fn setup_may_boot_its_vm(setup: bool, decision: &crate::confine::Decision) -> bool {
+    setup && decision.confinement().is_none()
+}
+
+/// The Firecracker arguments `args`'s kernel profile adds, for the confinement preflight,
+/// which refuses a profile that turns seccomp off or sets its own filter. A profile that
+/// cannot be read adds none here; the boot itself reads it again and fails on it.
+fn profile_firecracker_args(args: &RunArgs) -> Option<String> {
+    let name = args.kernel_profile.as_deref().unwrap_or("default");
+    crate::setup::get_kernel_profile(name)
+        .ok()
+        .flatten()
+        .and_then(|profile| profile.firecracker_args)
+}
+
 fn nv2_profile(kernel_profile: &Option<String>) -> bool {
     let Some(name) = kernel_profile.as_deref() else {
         return false;
@@ -1073,6 +1090,7 @@ fn snapshot_restore_args(
         exec: None,
         no_dirty_tracking: false, // podman needs dirty tracking for later snapshots
         no_swap: args.no_swap,
+        confine: args.confine,
         vsock_dir: args.vsock_dir.clone(),
         publish: if args.publish.is_empty() {
             vec![crate::commands::snapshot::PUBLISH_NONE.to_string()]
@@ -1623,6 +1641,15 @@ async fn prepare_vm_for_lifecycle(
 ) -> Result<VmPreparation> {
     // Every podman launch, the library's start_vm and prepare_vm included, comes here first.
     crate::cgroup::require_swap_disabled(args.no_swap)?;
+    // Before any side effect: a start that must be confined and cannot be is refused here.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: args.hypervisor.into(),
+        network: args.network.into(),
+        // A kernel profile's arguments as well as FCVM_FIRECRACKER_ARGS, which Host reads.
+        firecracker_args: profile_firecracker_args(&args).as_deref(),
+        unsupported: None,
+    })?;
     info!(
         lifecycle = ?lifecycle,
         "Starting fcvm podman lifecycle"
@@ -1776,9 +1803,21 @@ async fn prepare_vm_for_lifecycle(
     // content-addressed base rootfs. create_cow_disk reflinks whatever it's given.
     let base_rootfs = match &args.rootfs_override {
         Some(p) => p.clone(),
-        None => crate::setup::ensure_rootfs(args.setup, rootfs_type.as_deref())
-            .await
-            .context("setting up rootfs")?,
+        // Building the rootfs boots fcvm setup's VM, which does not support confinement:
+        // a confined run uses a rootfs that exists and never builds one.
+        None => crate::setup::ensure_rootfs(
+            setup_may_boot_its_vm(args.setup, &decision),
+            rootfs_type.as_deref(),
+        )
+        .await
+        .with_context(|| {
+            if decision.confinement().is_some() {
+                "setting up rootfs: a confined run does not build one, because fcvm setup's \
+                 VM does not support confinement; run fcvm setup without --confine first"
+            } else {
+                "setting up rootfs"
+            }
+        })?,
     };
     let initrd_path = crate::setup::ensure_fc_agent_initrd(args.setup)
         .await
@@ -2187,6 +2226,7 @@ async fn prepare_vm_for_lifecycle(
     // Instead, env is passed directly to MMDS at VM start time
     let mut vm_state = VmState::new(vm_id.clone(), args.image.clone(), args.cpu, args.mem);
     vm_state.name = Some(vm_name.clone());
+    vm_state.confinement = decision.confinement().cloned();
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
@@ -2616,6 +2656,7 @@ async fn prepare_vm_for_lifecycle(
     // Run the main VM setup in a helper to ensure cleanup on error
     let setup_result = run_vm_setup(
         VmSetupParams {
+            decision: decision.clone(),
             args: &args,
             vm_id: &vm_id,
             data_dir: &data_dir,
@@ -4029,7 +4070,12 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     spawn_lifecycle_signal_handler("cancelling podman prepare")?;
 
     let record = !args.no_record_working_set;
+    // The recording clone is another VMM start: it asks for the prepare's confinement.
     let ready_timeout = std::time::Duration::from_secs(args.ready_timeout);
+    let recording = Recording {
+        timeout: ready_timeout,
+        confine: args.run.confine,
+    };
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,
         force: args.force,
@@ -4038,7 +4084,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     match prepare_vm_for_lifecycle(args.run, lifecycle.clone()).await? {
         VmPreparation::Prepared(prepared) => {
             if record {
-                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
+                record_working_set(&prepared.output.snapshot_key, &recording, &cancel).await;
             }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -4074,7 +4120,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
             };
             let prepared = finish_prepare(operation, cleanup)?;
             if record {
-                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
+                record_working_set(&prepared.output.snapshot_key, &recording, &cancel).await;
             }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -4090,11 +4136,17 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
 /// `snapshot run --exec true` through a memory server (`FCVM_FORCE_UFFD`), whose server
 /// writes the clone's faults beside the snapshot when it stops, and the clone is torn down.
 /// A recording that fails is logged and the prepare still succeeds: the set is a hint.
-async fn record_working_set(
-    snapshot_key: &str,
+/// How a prepare's working-set recording clone runs.
+#[derive(Clone, Copy)]
+struct Recording {
+    /// How long the clone has to become ready.
     timeout: std::time::Duration,
-    cancel: &CancellationToken,
-) {
+    /// The prepare's --confine, which the clone, another VMM start, asks for too.
+    confine: bool,
+}
+
+async fn record_working_set(snapshot_key: &str, recording: &Recording, cancel: &CancellationToken) {
+    let Recording { timeout, confine } = *recording;
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
     if recorded_pages(&snapshot_dir) > 0 {
         info!(
@@ -4104,7 +4156,7 @@ async fn record_working_set(
         return;
     }
     let started = std::time::Instant::now();
-    match recording_restore(snapshot_key, timeout, cancel).await {
+    match recording_restore(snapshot_key, timeout, confine, cancel).await {
         Ok(()) if recorded_pages(&snapshot_dir) > 0 => info!(
             snapshot_key,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -4130,10 +4182,11 @@ async fn record_working_set(
 async fn recording_restore(
     snapshot_key: &str,
     timeout: std::time::Duration,
+    confine: bool,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("locating the fcvm binary")?;
-    let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name());
+    let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name(), confine);
     run_recording(&mut command, timeout, cancel).await
 }
 
@@ -4188,6 +4241,7 @@ fn recording_restore_command(
     exe: &std::path::Path,
     snapshot_key: &str,
     name: &str,
+    confine: bool,
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(exe);
     command
@@ -4200,6 +4254,7 @@ fn recording_restore_command(
             name,
         ])
         .args(["--exec", "true"])
+        .args(confine.then_some("--confine"))
         .env("FCVM_FORCE_UFFD", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -4234,6 +4289,21 @@ pub(crate) fn launch_ipv6_prefix(args: &RunArgs) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `--setup` never boots fcvm setup's unconfined VM for a confined run.
+    #[test]
+    fn a_confined_run_never_builds_the_rootfs() {
+        let confined = crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+            landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+            layers: vec![crate::confine::Layer::Process],
+            core_limit: 1,
+        }));
+        let unconfined = crate::confine::Decision::for_test(None);
+        assert!(!super::setup_may_boot_its_vm(true, &confined));
+        assert!(super::setup_may_boot_its_vm(true, &unconfined));
+        assert!(!super::setup_may_boot_its_vm(false, &unconfined));
+    }
+
     use super::*;
     use crate::cli::args::{ImageMode as CliImageMode, NetworkMode};
     use crate::firecracker::ImageMode;
@@ -4259,13 +4329,39 @@ mod tests {
         );
     }
 
+    /// A confined prepare's working-set recording clone is another VMM start: it asks for
+    /// the same confinement.
+    #[test]
+    fn a_confined_prepare_records_with_a_confined_clone() {
+        let args = |confine| -> Vec<String> {
+            recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap", confine)
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(args(true).last().map(String::as_str), Some("--confine"));
+        assert!(!args(false).iter().any(|a| a == "--confine"));
+        let source = include_str!("mod.rs");
+        let prepare = &source[source.find("pub async fn cmd_podman_prepare(").unwrap()..];
+        let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
+        assert!(prepare.contains("confine: args.run.confine,"));
+        assert_eq!(
+            prepare
+                .matches("record_working_set(&prepared.output.snapshot_key, &recording, &cancel)")
+                .count(),
+            2
+        );
+    }
+
     /// The recording restore is `snapshot run --snapshot <key> --exec true` of this binary
     /// through a memory server, with its stdout discarded, and a prepare runs it before it
     /// publishes, on a cache hit and after a cold or restored boot alike, unless told not
     /// to (#955).
     #[test]
     fn a_prepare_records_its_snapshots_working_set_before_it_publishes() {
-        let command = recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap");
+        let command =
+            recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap", false);
         let std = command.as_std();
         let args: Vec<_> = std
             .get_args()
@@ -4463,6 +4559,7 @@ mod tests {
             pmem_devices: vec![],
             resolved_extra_disks: None,
             no_swap: false,
+            confine: false,
         }
     }
 

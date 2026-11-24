@@ -328,6 +328,8 @@ pub struct VmManager {
     net_namespace_path: Option<PathBuf>, // Net namespace path for rootless clones (enter via setns in pre_exec)
     mount_redirects: Option<crate::utils::MountRedirects>, // mount namespace for a restored clone
     keep_fds: Vec<std::os::fd::RawFd>,   // descriptors left open across the VMM's exec
+    decision: crate::confine::Decision,  // confined or not, from confine::resolve
+    tap_owner: Option<String>,           // confined: the TAP its pre_exec makes the VMM's own
     process: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>, // last few Firecracker stderr lines, for launch failure errors
     // Reader task for the child's stderr pipe. Awaited (bounded) before rendering
@@ -353,7 +355,14 @@ pub struct VmManager {
 }
 
 impl VmManager {
-    pub fn new(vm_id: String, socket_path: PathBuf, log_path: Option<PathBuf>) -> Self {
+    /// `decision` comes from the caller's [`crate::confine::resolve`]; every launch of this
+    /// manager, a guest-reboot relaunch included, spawns the VMM under it.
+    pub fn new(
+        vm_id: String,
+        socket_path: PathBuf,
+        log_path: Option<PathBuf>,
+        decision: crate::confine::Decision,
+    ) -> Self {
         Self {
             vm_id,
             vm_name: None,
@@ -366,6 +375,8 @@ impl VmManager {
             net_namespace_path: None,
             mount_redirects: None,
             keep_fds: Vec::new(),
+            decision,
+            tap_owner: None,
             process: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
             stderr_reader: None,
@@ -438,6 +449,12 @@ impl VmManager {
         self.keep_fds = fds;
     }
 
+    /// The unpooled TAP a confined VMM's pre_exec makes its own
+    /// ([`crate::utils::NamespaceParams::tap_owner`]). Kept across relaunches.
+    pub fn set_tap_owner(&mut self, tap: Option<String>) {
+        self.tap_owner = tap;
+    }
+
     /// Set user namespace path for rootless clones
     ///
     /// When set along with mount_redirects, pre_exec will enter this user namespace
@@ -491,6 +508,20 @@ impl VmManager {
         config_override: Option<&Path>,
         firecracker_args: Option<&str>,
     ) -> Result<()> {
+        // A confined VMM never launches with arguments that turn its seccomp off or replace
+        // its filter, whatever the caller's resolve saw: checked on the arguments this
+        // launch uses, before anything is cleared or removed.
+        if self.decision.confinement().is_some() {
+            let refused = firecracker_args
+                .map(crate::confine::overriding_args)
+                .unwrap_or_default();
+            anyhow::ensure!(
+                refused.is_empty(),
+                "the VMM of {} is confined: {}",
+                self.vm_id,
+                refused.join("; ")
+            );
+        }
         // A relaunch is another VMM process, and it maps no snapshot the previous one did.
         self.memory_in_use = None;
         self.stop_log_follower();
@@ -566,6 +597,16 @@ impl VmManager {
         // build is for the gnu target, whose default policy allows every syscall of the
         // native architecture (rootfs-config.toml, [firecracker]).
         // Set FCVM_NO_SECCOMP=1 to install none, for debugging.
+        if self.decision.confinement().is_some()
+            && (std::env::var_os("FCVM_NO_SECCOMP").is_some()
+                || std::env::var_os("FCVM_STRACE_FC").is_some())
+        {
+            anyhow::bail!(
+                "the VMM of {} is confined, and FCVM_NO_SECCOMP or FCVM_STRACE_FC would \
+                 undo that; unset them",
+                self.vm_id
+            );
+        }
         if std::env::var("FCVM_NO_SECCOMP").is_ok() {
             warn!("Seccomp disabled via FCVM_NO_SECCOMP - reduced security");
             cmd.arg("--no-seccomp");
@@ -630,6 +671,8 @@ impl VmManager {
                 net_namespace_path: self.net_namespace_path.clone(),
                 mount_redirects: self.mount_redirects.clone(),
                 keep_fds: self.keep_fds.clone(),
+                decision: self.decision.clone(),
+                tap_owner: self.tap_owner.clone(),
             },
         )?;
 
@@ -1008,6 +1051,39 @@ fn log_firecracker_line(clean: &str, is_stderr: bool) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A confined manager refuses launch arguments that turn seccomp off or set a filter,
+    /// before it touches its log or socket, whatever the caller resolved.
+    #[tokio::test]
+    async fn a_confined_launch_refuses_arguments_that_override_seccomp() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("firecracker.log");
+        std::fs::write(&log, "kept").unwrap();
+        let mut vm = VmManager::new(
+            "confined-args".to_string(),
+            dir.path().join("api.sock"),
+            Some(log.clone()),
+            crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+                landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+                layers: vec![crate::confine::Layer::Process],
+                core_limit: 1,
+            })),
+        );
+        for args in ["--no-seccomp", "--enable-nv2 --seccomp-filter /x.bpf"] {
+            let error = vm
+                .start(
+                    std::path::Path::new("/nonexistent/firecracker"),
+                    None,
+                    Some(args),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("which confinement owns"), "{args}: {error}");
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "kept");
+    }
+
     use super::*;
     use crate::utils::DirEventSource;
     use std::future::{poll_fn, Future};
@@ -1262,7 +1338,12 @@ mod tests {
             .stderr(std::process::Stdio::null());
         let child = command.spawn().expect("spawn live child");
 
-        let mut vm = VmManager::new("wait-test".to_string(), socket_path, None);
+        let mut vm = VmManager::new(
+            "wait-test".to_string(),
+            socket_path,
+            None,
+            crate::confine::Decision::for_test(None),
+        );
         vm.process = Some(child);
         vm
     }
@@ -1352,6 +1433,7 @@ mod tests {
             "refused-test".to_string(),
             dir.path().join("api.sock"),
             None,
+            crate::confine::Decision::for_test(None),
         );
         vm.process = Some(child);
 
@@ -1408,7 +1490,12 @@ mod tests {
             .expect("chmod fake firecracker");
 
         let socket_path = dir.path().join("api.sock");
-        let mut vm = VmManager::new("test-vm".to_string(), socket_path, None);
+        let mut vm = VmManager::new(
+            "test-vm".to_string(),
+            socket_path,
+            None,
+            crate::confine::Decision::for_test(None),
+        );
 
         let err = vm
             .start(&fake_fc, None, None)
@@ -1465,6 +1552,7 @@ mod tests {
             "test-vm".to_string(),
             dir.path().join("api.sock"),
             Some(dir.path().join("firecracker.log")),
+            crate::confine::Decision::for_test(None),
         );
         vm.firecracker_log_level = requested.map(str::to_string);
         let started = vm.start(&fake_fc, None, None).await;
@@ -1686,7 +1774,12 @@ mod tests {
     async fn a_memory_mark_needs_a_running_vmm() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let memory = memory_file(dir.path());
-        let mut vm = VmManager::new("mark-test".to_string(), dir.path().join("api.sock"), None);
+        let mut vm = VmManager::new(
+            "mark-test".to_string(),
+            dir.path().join("api.sock"),
+            None,
+            crate::confine::Decision::for_test(None),
+        );
         vm.mark_memory_in_use(&memory)
             .await
             .expect_err("a mark without a VMM process");

@@ -40,6 +40,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
         lifecycle_ready: false,
         holder_pid: None,
         netpool: None,
+        confinement: None,
         vsock_epoch: 0,
         created_at: now,
         last_updated: now,
@@ -114,6 +115,7 @@ async fn test_health_monitor_behaviors() {
         4194305,
         NetworkConfig {
             tap_device: "tap-test".to_string(),
+            tap_fd: None,
             guest_mac: "02:00:00:00:00:01".to_string(),
             guest_ip: Some("192.168.1.100".to_string()),
             host_ip: Some("192.168.1.1".to_string()),

@@ -552,6 +552,12 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_SLEEP_WITHOUT_NEW_VIEWER", default_value_t = 3600)]
     pub sleep_without_new_viewer: u64,
 
+    /// Seconds of --sleep-without-new-viewer that must remain for a connected page that
+    /// becomes active (shown again, or reconnecting) to wake a sleeping fleet. With less
+    /// left the page's Wake button wakes it.
+    #[arg(long, env = "FLEET_MIN_WAKE_REMAINING", default_value_t = 600)]
+    pub min_wake_remaining: u64,
+
     /// The most the fleet may spend in one UTC day, in USD. The coordinator meters what the
     /// fleet's GPU hosts and EC2 tiles cost (spot at the spot price, on demand at the
     /// on-demand rate) and, at this less 15 minutes of the current burn, sleeps the fleet
@@ -868,6 +874,16 @@ pub struct FleetAgentArgs {
     /// every player has its own address in it.
     #[arg(long, default_value_t = 0)]
     pub potato_players: u32,
+
+    /// Potato mode: the ring's CPU allotment. A player that is not asleep (awake, waking,
+    /// booting, or going to sleep until its save has finished and its fcvm has exited) holds
+    /// one CPU, and the agent never has more than this many such players: a wake that finds
+    /// none free waits for one. At least 3: one player holds the ball, one is saving and one
+    /// must be waking. Where the agent runs in a delegated systemd unit with the cpuset
+    /// controller (`Delegate=yes`, `DelegateSubgroup=`), the players' VMs and the fcvm
+    /// commands that save and restore them are also confined to this many host CPUs.
+    #[arg(long, default_value_t = 8)]
+    pub potato_cpus: u32,
 
     /// The potato player image (`make potato-image`)
     #[arg(long, default_value = "localhost/fcvm-potato:fleet")]
@@ -1586,6 +1602,16 @@ pub struct RunArgs {
     /// refuses to start without it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
+    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
+    /// for one, make a new user namespace and hold capabilities there), files or sockets;
+    /// later layers do. Rootless mode and the Firecracker backend only, on a
+    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
+    /// never run unconfined. The host's `[confine] mode = "required"` (or
+    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    #[arg(long)]
+    pub confine: bool,
 }
 
 // ============================================================================
@@ -1854,6 +1880,16 @@ pub struct SnapshotRunArgs {
     /// refuses to start without it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
+    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
+    /// for one, make a new user namespace and hold capabilities there), files or sockets;
+    /// later layers do. Rootless mode and the Firecracker backend only, on a
+    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
+    /// never run unconfined. The host's `[confine] mode = "required"` (or
+    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    #[arg(long)]
+    pub confine: bool,
 
     /// Place the clone's vsock control socket at DIR/vsock.sock instead of its
     /// runtime directory (predictable path for external tooling). The snapshot

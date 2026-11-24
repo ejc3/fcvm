@@ -228,16 +228,43 @@ fn subordinate_range_granted_to_root(text: &str) -> bool {
 }
 
 /// What decides the id maps of a holder this process would start, as text: its own uid and
-/// gid and, for a root run started with sudo, the invoker's (`setup_namespace_mappings`).
-/// Two processes with the same text start holders whose user namespaces map the same ids.
+/// gid, for a root run started with sudo the invoker's, and the subordinate id files, which
+/// decide between the extended and the single layout (`setup_namespace_mappings`: a root
+/// run reads them itself, any other run through newuidmap and newgidmap). Two processes
+/// with the same text start holders whose user namespaces map the same ids. The files are
+/// read at each call: a pool lives for days, and a clone that starts after an edit to
+/// either file would build a namespace the pool's are not.
 pub(crate) fn holder_id_inputs() -> String {
-    let invoker = crate::setup::sudo_invoker()
-        .map(|user| format!("{}:{}", user.uid.as_raw(), user.gid.as_raw()))
-        .unwrap_or_else(|| "none".to_string());
-    format!(
-        "uid={} gid={} invoker={invoker}",
+    let invoker = crate::setup::sudo_invoker().map(|user| (user.uid.as_raw(), user.gid.as_raw()));
+    holder_id_inputs_of(
         nix::unistd::getuid().as_raw(),
-        nix::unistd::getgid().as_raw()
+        nix::unistd::getgid().as_raw(),
+        invoker,
+        std::fs::read("/etc/subuid").as_deref().ok(),
+        std::fs::read("/etc/subgid").as_deref().ok(),
+    )
+}
+
+/// [`holder_id_inputs`] of the ids and of the two files' contents (`None`: unreadable).
+fn holder_id_inputs_of(
+    uid: u32,
+    gid: u32,
+    invoker: Option<(u32, u32)>,
+    subuid: Option<&[u8]>,
+    subgid: Option<&[u8]>,
+) -> String {
+    use sha2::Digest;
+    let invoker = invoker
+        .map(|(uid, gid)| format!("{uid}:{gid}"))
+        .unwrap_or_else(|| "none".to_string());
+    let digest = |file: Option<&[u8]>| match file {
+        Some(text) => hex::encode(&sha2::Sha256::digest(text)[..8]),
+        None => "unreadable".to_string(),
+    };
+    format!(
+        "uid={uid} gid={gid} invoker={invoker} subuid={} subgid={}",
+        digest(subuid),
+        digest(subgid)
     )
 }
 
@@ -398,6 +425,69 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a namespace holder's start is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderStep {
+    /// The agent to exec, unshare its user and network namespaces and say so.
+    Unsharing,
+    /// This process to write the agent's UID and GID maps.
+    Mapping,
+    /// The agent to see its maps and say it is ready.
+    Confirming,
+}
+
+/// What is known of a holder whose start missed its deadline: the step it was in, the
+/// host's load, and the holder process's own state, read before it is killed. A deadline
+/// miss says only that the answer did not arrive; this is what says where it was.
+///
+/// `stack` is readable by root alone and `wchan` by a process allowed to trace the holder,
+/// which after its unshare is in a user namespace of its own; a field that cannot be read
+/// says so.
+fn holder_wait_diagnosis(holder_pid: u32, step: HolderStep, waited: std::time::Duration) -> String {
+    let waiting_for = match step {
+        HolderStep::Unsharing => {
+            "the agent to exec and unshare (it has not said `unshared`: it is before or \
+             inside unshare(CLONE_NEWUSER | CLONE_NEWNET))"
+        }
+        HolderStep::Mapping => "its UID and GID maps to be written (the agent has unshared)",
+        HolderStep::Confirming => {
+            "the agent to confirm its maps (it has unshared and the maps are written)"
+        }
+    };
+    let read = |path: String| {
+        std::fs::read_to_string(&path)
+            .map(|text| text.trim().to_string())
+            .unwrap_or_else(|error| format!("unreadable ({})", error.kind()))
+    };
+    let stat = read(format!("/proc/{holder_pid}/stat"));
+    // Fields after the last ')': the state letter, then from field 14 the CPU times in
+    // clock ticks.
+    // A holder that is gone has no stat: the text then is why it could not be read.
+    let (state, cpu_ticks) = match stat.rsplit_once(')') {
+        Some((_, rest)) if !stat.starts_with("unreadable") => {
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            (
+                fields.first().copied().unwrap_or("?").to_string(),
+                format!(
+                    "utime={} stime={}",
+                    fields.get(11).copied().unwrap_or("?"),
+                    fields.get(12).copied().unwrap_or("?")
+                ),
+            )
+        }
+        _ => (stat.clone(), "?".to_string()),
+    };
+    let stack = read(format!("/proc/{holder_pid}/stack"));
+    let stack = stack.lines().take(8).collect::<Vec<_>>().join(" < ");
+    format!(
+        "holder PID {holder_pid}, {} ms after its spawn, waiting for {waiting_for}; \
+         loadavg [{}]; holder state {state} ({cpu_ticks} ticks), wchan [{}], stack [{stack}]",
+        waited.as_millis(),
+        read("/proc/loadavg".to_string()),
+        read(format!("/proc/{holder_pid}/wchan")),
+    )
+}
+
 /// One attempt at a namespace holder: the agent process, its PID, and this process's end of
 /// its channel once the agent has said it is ready.
 async fn start_namespace_agent(
@@ -449,26 +539,43 @@ async fn start_namespace_agent(
         info!(holder_pid, "namespace holder started");
     }
 
+    // Which step the start has reached, and when each ended: a start that misses its
+    // deadline says where it was, and one that makes it logs how long each step took.
+    let spawned = std::time::Instant::now();
+    let step = std::cell::Cell::new(HolderStep::Unsharing);
+    let (unshared_ms, mapped_ms) = (std::cell::Cell::new(0u64), std::cell::Cell::new(0u64));
     let start = async {
         let client =
             netns_agent::Client::new(owner_end).context("registering the agent channel")?;
         client.unshared().await?;
+        unshared_ms.set(spawned.elapsed().as_millis() as u64);
+        step.set(HolderStep::Mapping);
         // The agent is in its new user namespace and waits: the maps can be written.
         setup_namespace_mappings(holder_pid)
             .await
             .context("setting up namespace mappings")?;
+        mapped_ms.set(spawned.elapsed().as_millis() as u64);
+        step.set(HolderStep::Confirming);
         client.mapped().await?;
         Ok::<_, anyhow::Error>(client)
     };
     let started = match tokio::time::timeout_at(deadline, start).await {
         Ok(Ok(client)) => {
             netns_agent::register(holder_pid, std::sync::Arc::new(client));
+            info!(
+                holder_pid,
+                holder_ready_ms = spawned.elapsed().as_millis() as u64,
+                unshared_ms = unshared_ms.get(),
+                mapped_ms = mapped_ms.get(),
+                "namespace holder ready"
+            );
             return Ok((child, holder_pid));
         }
         Ok(Err(error)) => error,
+        // Before the kill below, which would leave nothing of the holder to read.
         Err(_) => anyhow::anyhow!(
-            "namespace not ready within {HOLDER_RETRY_TIMEOUT:?} (holder PID {holder_pid}; \
-             likely CPU scheduling pressure with many concurrent VMs)"
+            "namespace not ready within {HOLDER_RETRY_TIMEOUT:?}: {}",
+            holder_wait_diagnosis(holder_pid, step.get(), spawned.elapsed())
         ),
     };
     // The channel is closed by now (`start` owned it), which is the agent's order to exit;
@@ -1694,6 +1801,7 @@ pub(crate) fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersi
         drive_overrides: build.first() == Some(&"fcvm") && build.contains(&"drive-overrides"),
         numa_window: build.first() == Some(&"fcvm") && build.contains(&"numa-window"),
         write_set: build.first() == Some(&"fcvm") && build.contains(&"write-set"),
+        tap_fd: build.first() == Some(&"fcvm") && build.contains(&"tap-fd"),
     })
 }
 
@@ -1712,6 +1820,9 @@ pub(crate) struct FirecrackerVersion {
     /// Whether a File-backend load takes `mem_backend.write_set_path` (`+fcvm.…write-set`).
     /// Earlier builds refuse the field.
     pub write_set: bool,
+    /// Whether the build metadata says a net device takes `host_dev_fd`, a TAP queue the
+    /// VMM inherited (`tap-fd` after `+fcvm.`, ejc3/firecracker).
+    pub tap_fd: bool,
 }
 
 /// The context of a snapshot load that failed. A restore that died under its memory server
@@ -1734,6 +1845,38 @@ impl FirecrackerVersion {
     fn at_least(&self, min: (u32, u32, u32)) -> bool {
         self.release > min || (self.release == min && !self.prerelease)
     }
+}
+
+/// Whether a clone restored by `backend` gets its TAP as a queue it inherits, which is what
+/// lets it run in a pooled namespace (`crate::netpool`): a pooled TAP is attached once, by
+/// its namespace's holder, and nothing can attach to it by name. `firecracker` is the
+/// version of the binary the restore runs, when the backend is Firecracker and the binary
+/// could be read.
+pub(crate) fn vmm_takes_a_tap_queue(
+    backend: crate::hypervisor::Backend,
+    firecracker: Option<FirecrackerVersion>,
+) -> bool {
+    backend == crate::hypervisor::Backend::Firecracker
+        && firecracker.is_some_and(|version| version.tap_fd)
+}
+
+/// A clone that was lent a pooled namespace hands its VMM the TAP's queue, and only a
+/// Firecracker whose version says `tap-fd` takes one. The claim was made for a binary that
+/// does ([`vmm_takes_a_tap_queue`]); this is the same question asked of the binary the
+/// restore is about to run, so a mismatch between the two is named here and not by the
+/// snapshot load refusing a field it does not know.
+pub(crate) fn tap_queue_needs_its_capability(
+    tap_fd: Option<std::os::fd::RawFd>,
+    firecracker: FirecrackerVersion,
+) -> Result<()> {
+    if tap_fd.is_some() && !firecracker.tap_fd {
+        bail!(
+            "this clone was lent a pooled namespace, whose TAP is a queue the VMM inherits, and \
+             the Firecracker that restores it does not take one (no `tap-fd` in its version): \
+             the binary the claim was made for is not the one the restore runs"
+        );
+    }
+    Ok(())
 }
 
 /// Save VM state with complete network configuration
@@ -3038,6 +3181,8 @@ pub async fn load_vm_state(
 
 /// Parameters for snapshot restore, grouping the many read-only inputs.
 pub struct RestoreParams<'a> {
+    /// From the restore's [`crate::confine::resolve`]; the VMM is spawned under it.
+    pub decision: crate::confine::Decision,
     pub vm_id: &'a str,
     pub vm_name: &'a str,
     pub data_dir: &'a Path,
@@ -3619,14 +3764,12 @@ async fn prepare_clone_substrate(
     vm_state: &mut VmState,
     // What the snapshot load overrides, so needs no redirect.
     overrides: LoadOverrides,
+    decision: &crate::confine::Decision,
 ) -> Result<CloneSubstrate> {
     let vm_dir = data_dir.join("disks");
     let mut holder_child: Option<tokio::process::Child> = None;
     let mut holder_pid_for_post_start: Option<u32> = None;
-    let mut namespace = crate::utils::NamespaceParams {
-        vm_id: vm_id.to_string(),
-        ..Default::default()
-    };
+    let mut namespace = crate::utils::NamespaceParams::new(vm_id, decision.clone());
 
     // rootfs_path is set by either the bridged, rootless, or routed branch.
     let rootfs_path: PathBuf;
@@ -3676,7 +3819,9 @@ async fn prepare_clone_substrate(
         );
         namespace.user_namespace_path = Some(lease.user_namespace_path());
         namespace.net_namespace_path = Some(lease.net_namespace_path());
-        namespace.keep_fds = vec![lease.fd()];
+        // The lease, and the queue of the namespace's TAP: the VMM uses the device through
+        // it and attaches nothing.
+        namespace.keep_fds = vec![lease.fd(), lease.tap_fd()];
         vm_state.holder_pid = Some(lease.grant.holder_pid);
         vm_state.netpool = Some(crate::state::PooledNamespace {
             slot: lease.grant.slot,
@@ -3911,6 +4056,7 @@ pub async fn restore_from_snapshot(
     vm_state: &mut VmState,
 ) -> Result<RestoredVmm<FirecrackerBackend>> {
     let RestoreParams {
+        decision,
         vm_id,
         vm_name,
         data_dir,
@@ -3948,6 +4094,7 @@ pub async fn restore_from_snapshot(
     // pure validation and must not create a process that a later `?` can detach.
     let (firecracker_bin, firecracker_version) =
         restore_firecracker_bin(runtime_config, &firecracker_choice, vm_state)?;
+    tap_queue_needs_its_capability(network_config.tap_fd, firecracker_version)?;
     let clone_vsock_socket_path = vm_state
         .config
         .vsock_socket_path
@@ -3986,6 +4133,7 @@ pub async fn restore_from_snapshot(
         data_dir,
         vm_state,
         load_overrides,
+        &decision,
     )
     .await?;
     failpoint::hit_async("restore.post_clone_disk").await;
@@ -4006,6 +4154,7 @@ pub async fn restore_from_snapshot(
         vm_id.to_string(),
         socket_path.to_path_buf(),
         Some(fc_log_path),
+        decision.clone(),
     );
     vm_manager.set_vm_name(vm_name.to_string());
     // Apply the substrate's namespace/mount isolation to the Firecracker VmManager (the
@@ -4021,6 +4170,13 @@ pub async fn restore_from_snapshot(
         vm_manager.set_net_namespace_path(p.clone());
     }
     vm_manager.set_keep_fds(ns.keep_fds.clone());
+    // A confined clone never runs in a pooled namespace (`clone_may_pool`), so this TAP is
+    // its own.
+    vm_manager.set_tap_owner(
+        decision
+            .confinement()
+            .map(|_| network.tap_device().to_string()),
+    );
     if let Some(redirects) = &ns.mount_redirects {
         vm_manager.set_mount_redirects(redirects.clone());
     }
@@ -4164,6 +4320,7 @@ pub async fn restore_from_snapshot(
                 network_overrides: Some(vec![NetworkOverride {
                     iface_id: "eth0".to_string(),
                     host_dev_name: network_config.tap_device.clone(),
+                    host_dev_fd: network_config.tap_fd,
                 }]),
                 vsock_override: vsock_override.clone(),
                 drive_overrides: drive_overrides.clone(),
@@ -4502,10 +4659,15 @@ pub async fn restore_from_snapshot_ch(
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<RestoredVmm<crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend>> {
+    anyhow::ensure!(
+        params.decision.confinement().is_none(),
+        "confinement supports the Firecracker backend only"
+    );
     use crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend;
     use crate::hypervisor::{Hypervisor, ProcessSpec};
 
     let RestoreParams {
+        decision,
         vm_id,
         vm_name,
         data_dir,
@@ -4571,6 +4733,7 @@ pub async fn restore_from_snapshot_ch(
         data_dir,
         vm_state,
         LoadOverrides::None,
+        &decision,
     )
     .await?;
 
@@ -4622,8 +4785,12 @@ pub async fn restore_from_snapshot_ch(
         }
     };
     let log_path = data_dir.join("firecracker.log");
-    let mut backend =
-        CloudHypervisorBackend::new(vm_id.to_string(), socket_path.to_path_buf(), Some(log_path));
+    let mut backend = CloudHypervisorBackend::new(
+        vm_id.to_string(),
+        socket_path.to_path_buf(),
+        Some(log_path),
+        decision.clone(),
+    );
 
     // Restore paused, then resume after network post-start (mirrors the FC load/resume split).
     let restore_args = format!(
@@ -4641,6 +4808,7 @@ pub async fn restore_from_snapshot_ch(
         net_namespace_path: substrate.namespace.net_namespace_path.clone(),
         mount_redirects: substrate.namespace.mount_redirects.clone(),
         keep_fds: substrate.namespace.keep_fds.clone(),
+        tap_owner: None,
     };
     if let Err(error) = backend
         .spawn(&spec)
@@ -4688,8 +4856,10 @@ pub async fn restore_from_snapshot_ch(
                 .health_port
                 .context("a raw VM's state names no health port")?;
             *slot = Some(
-                crate::commands::vm::NsHelper::start(user_ns, net_ns, vm_id, data_dir, rdp_port)
-                    .await?,
+                crate::commands::vm::NsHelper::start(
+                    user_ns, net_ns, vm_id, data_dir, rdp_port, &decision,
+                )
+                .await?,
             );
         }
 
@@ -7396,10 +7566,6 @@ mod tests {
         assert!(built.contains("link tap-fc "), "{built}");
         assert!(built.contains("sockets sockstat: TCP=0 "), "{built}");
         assert!(!built.contains("cached route"), "{built}");
-        // Nothing is attached to the TAP; loopback is up and has a carrier.
-        assert!(!agent.carrier("tap-fc").await.expect("the TAP's carrier"));
-        assert!(agent.carrier("lo").await.expect("loopback's carrier"));
-        assert!(agent.carrier("no-such-link").await.is_err());
 
         let mac = "02:00:00:00:00:99";
         in_namespace(
@@ -8659,6 +8825,29 @@ mod tests {
                 .lifecycle_ready,
             "cancellation that wins the lifecycle gate must leave persisted readiness false"
         );
+    }
+
+    /// What a pool key holds of the holder's id maps changes with every input that decides
+    /// them: the ids, the sudo invoker, and each subordinate id file.
+    #[test]
+    fn the_holders_id_inputs_follow_the_subordinate_id_files() {
+        let grants = b"root:100000:65536\n";
+        let other = b"someone:100000:65536\n";
+        let base = holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(grants));
+        assert_eq!(
+            base,
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(grants))
+        );
+        for changed in [
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(other), Some(grants)),
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), Some(grants), Some(other)),
+            holder_id_inputs_of(0, 0, Some((1000, 1000)), None, Some(grants)),
+            holder_id_inputs_of(0, 0, Some((1001, 1000)), Some(grants), Some(grants)),
+            holder_id_inputs_of(0, 0, None, Some(grants), Some(grants)),
+            holder_id_inputs_of(1000, 1000, None, Some(grants), Some(grants)),
+        ] {
+            assert_ne!(base, changed);
+        }
     }
 
     /// The holder namespace's id maps: unchanged without a sudo invoker, and with one, the
@@ -10529,6 +10718,148 @@ mod tests {
         assert!(dev.prerelease && dev.drive_overrides);
     }
 
+    /// Only a Firecracker whose version says `tap-fd` is given a pooled namespace: any
+    /// other VMM would attach to the TAP by name, and a pooled TAP is already attached.
+    #[test]
+    fn only_a_vmm_that_takes_a_tap_queue_is_pooled() {
+        use crate::hypervisor::Backend;
+        let version = |output: &str| Some(parse_firecracker_version(output).unwrap());
+        let takes =
+            version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set.tap-fd\n");
+        assert!(takes.unwrap().tap_fd && takes.unwrap().drive_overrides);
+        assert!(vmm_takes_a_tap_queue(Backend::Firecracker, takes));
+        assert!(vmm_takes_a_tap_queue(
+            Backend::Firecracker,
+            version("Firecracker v1.17.0+fcvm.drive-overrides.tap-fd.fuzzing")
+        ));
+        for other in [
+            "Firecracker v1.17.0",
+            "Firecracker v1.17.0+fcvm.drive-overrides",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window",
+            "Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set",
+            "Firecracker v1.17.0+other.tap-fd",
+        ] {
+            assert!(
+                !vmm_takes_a_tap_queue(Backend::Firecracker, version(other)),
+                "{other}"
+            );
+        }
+        assert!(!vmm_takes_a_tap_queue(Backend::Firecracker, None));
+        assert!(!vmm_takes_a_tap_queue(Backend::CloudHypervisor, takes));
+    }
+
+    /// A holder that misses its deadline is reported with where its start was, the host's
+    /// load and the holder's own state: enough to tell a holder that never ran from one
+    /// waiting in the kernel. The holder here is a program that never speaks.
+    #[tokio::test]
+    async fn a_holder_that_misses_its_deadline_says_where_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = tempfile::tempdir().unwrap();
+        let silent = scratch.path().join("silent-holder");
+        std::fs::write(&silent, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&silent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        let error = start_namespace_agent(&silent, deadline, 1)
+            .await
+            .expect_err("a holder that never speaks was called ready");
+        let text = format!("{error:#}");
+        for part in [
+            "namespace not ready within",
+            "waiting for the agent to exec and unshare",
+            "loadavg [",
+            "holder state ",
+            "wchan [",
+            "stack [",
+        ] {
+            assert!(text.contains(part), "no {part:?} in: {text}");
+        }
+        assert!(!text.contains("likely"), "the error guesses: {text}");
+
+        // The diagnosis of each step, and of a holder that is gone.
+        let own = std::process::id();
+        let waited = std::time::Duration::from_millis(5600);
+        let mapping = holder_wait_diagnosis(own, HolderStep::Mapping, waited);
+        assert!(mapping.contains("5600 ms after its spawn"), "{mapping}");
+        assert!(mapping.contains("maps to be written"), "{mapping}");
+        // This process's main thread, which is running or asleep.
+        assert!(
+            mapping.contains("holder state R") || mapping.contains("holder state S"),
+            "{mapping}"
+        );
+        let confirming = holder_wait_diagnosis(own, HolderStep::Confirming, waited);
+        assert!(
+            confirming.contains("the agent to confirm its maps"),
+            "{confirming}"
+        );
+        let gone = holder_wait_diagnosis(2_000_000_003, HolderStep::Unsharing, waited);
+        assert!(
+            gone.contains("holder state unreadable (entity not found)"),
+            "{gone}"
+        );
+    }
+
+    /// The queue is left open in a VMM only together with the lease: the pool lends a
+    /// namespace again when its lease reads end-of-file, so a process that had the queue
+    /// and not the lease would still be on the TAP when the next VM runs. The one place
+    /// that names the queue for the VMM's exec names the lease with it.
+    #[test]
+    fn the_queue_is_kept_open_only_where_the_lease_is() {
+        let all = include_str!("common.rs");
+        let production = &all[..all.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let keeps: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains("keep_fds") && line.contains("tap_fd()"))
+            .collect();
+        assert_eq!(
+            keeps.iter().map(|line| line.trim()).collect::<Vec<_>>(),
+            ["namespace.keep_fds = vec![lease.fd(), lease.tap_fd()];"]
+        );
+        // Nothing else in this file hands the queue's number to a child.
+        assert_eq!(production.matches(".tap_fd()").count(), 1);
+    }
+
+    /// A queue goes only to a Firecracker that takes one, and the restore asks before it
+    /// starts anything: before the clone's disk and namespace, the VMM and the snapshot load.
+    #[test]
+    fn a_queue_is_refused_before_the_load_when_the_binary_does_not_take_one() {
+        let version = |output: &str| parse_firecracker_version(output).unwrap();
+        let takes =
+            version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set.tap-fd");
+        let lacks = version("Firecracker v1.17.0+fcvm.drive-overrides.numa-window.write-set");
+        assert!(tap_queue_needs_its_capability(Some(7), takes).is_ok());
+        assert!(tap_queue_needs_its_capability(None, lacks).is_ok());
+        let refused = tap_queue_needs_its_capability(Some(7), lacks).unwrap_err();
+        assert!(format!("{refused:#}").contains("no `tap-fd` in its version"));
+
+        let source = include_str!("common.rs");
+        let start = source
+            .find("pub async fn restore_from_snapshot(")
+            .expect("no Firecracker restore");
+        let end = source[start..]
+            .find("pub async fn restore_from_snapshot_ch(")
+            .expect("no Cloud Hypervisor restore after the Firecracker one");
+        let body = &source[start..start + end];
+        let steps = [
+            "restore_firecracker_bin(",
+            "tap_queue_needs_its_capability(network_config.tap_fd, firecracker_version)?",
+            "prepare_clone_substrate(",
+            ".start(&firecracker_bin",
+            ".load_snapshot(",
+            "host_dev_fd: network_config.tap_fd",
+        ];
+        let offsets: Vec<usize> = steps
+            .iter()
+            .map(|step| {
+                body.find(step)
+                    .unwrap_or_else(|| panic!("the restore has no `{step}`"))
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "the restore's steps are out of order: {steps:?} at {offsets:?}"
+        );
+    }
+
     /// A load overrides the drives only when the binary takes the field, the vsock path is
     /// overridden too, and the vmstate names nothing else under a source directory.
     #[test]
@@ -10539,6 +10870,7 @@ mod tests {
             drive_overrides: true,
             numa_window: false,
             write_set: false,
+            tap_fd: false,
         };
         let source = PathBuf::from("/data/vm-disks/vm-source");
         let sources = vec![source.clone()];
