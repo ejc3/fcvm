@@ -205,14 +205,19 @@ where
         loop {
             let may_start = self.may_start();
             tokio::select! {
-                // Checked again: an attempt may have connected while this tick was awaited.
-                _ = self.tick.tick(), if may_start => if self.may_start() { self.start() },
+                // An attempt that ends at the instant a tick is due is read first: read
+                // second, it would still count as in flight when the tick asks whether an
+                // attempt may start, and past the first second that tick would be spent
+                // on nothing and the next attempt would start an interval late.
+                biased;
                 Some((seq, answer)) = self.in_flight.next() => {
                     if seq > self.answered {
                         self.answered = seq;
                         return answer;
                     }
                 }
+                // Checked again: an attempt may have connected while this tick was awaited.
+                _ = self.tick.tick(), if may_start => if self.may_start() { self.start() },
             }
         }
     }
@@ -361,6 +366,20 @@ mod tests {
         }
     }
 
+    /// A renderer's attempts of the first second each end at the instant the next tick is
+    /// due, and so does the last of them at the turn to the slow phase. Whichever the wait
+    /// reads first, the slow phase's first attempt starts at that instant.
+    ///
+    /// RED BEFORE THE FIX: the wait read the two in an order drawn at random; reading the
+    /// tick first spent it, and the first slow attempt started 100 ms late in about half
+    /// of all runs (7 attempts in the nine seconds after the first, or 8).
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_that_ends_on_a_tick_does_not_cost_the_tick() {
+        for _ in 0..200 {
+            assert_eq!(cost_of_silence(RENDERER, false).await, (1, 10, 8));
+        }
+    }
+
     /// What ten seconds of a guest that never answers cost: the most sockets open at once
     /// and the attempts sent, in the first second and in the nine after it. `listens`: the
     /// guest accepts connections (and answers nothing); otherwise its SYNs are lost.
@@ -388,7 +407,10 @@ mod tests {
                 answer
             }
         });
-        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        // Half a millisecond past the ten seconds: every attempt here starts and ends on a
+        // whole millisecond, so none is tied with the end of the count.
+        let window = Duration::from_secs(10) + Duration::from_micros(500);
+        let _ = tokio::time::timeout(window, async {
             loop {
                 probes.next().await;
             }
