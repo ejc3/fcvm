@@ -360,6 +360,8 @@ test("potato: a card does not come back after its tile left the ring and the rin
   await expect(tiles(page)).toHaveCount(8, { timeout: 10_000 });
   await page.waitForTimeout(500);
   await expect(readout, "nothing is focused, so no card").toHaveCount(0);
+});
+
 test("potato: the legend's marks keep their colours in the panel, in the dark and the light scheme", async ({ page }) => {
   await startAt(8);
   for (const scheme of ["dark", "light"] as const) {
