@@ -159,14 +159,13 @@ impl FirecrackerLogErrors {
             self.partial.clear();
         }
         file.seek(SeekFrom::Start(self.offset))?;
-        let mut appended = Vec::new();
-        // On a failure, read_to_end keeps in `appended` what it read before it.
+        // On a failure, read_to_end keeps in `partial` what it read before it.
+        let held = self.partial.len();
         let read = file
             .take(FIRECRACKER_LOG_READ_MAX)
-            .read_to_end(&mut appended);
-        self.last_read = appended.len() as u64;
+            .read_to_end(&mut self.partial);
+        self.last_read = (self.partial.len() - held) as u64;
         self.offset += self.last_read;
-        self.partial.extend_from_slice(&appended);
         let mut start = 0;
         while let Some(end) = self.partial[start..].iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.partial[start..start + end]);
@@ -232,12 +231,12 @@ fn clear_log_before_launch(path: &Path) -> Result<()> {
 /// Opens the log `path` names for reading, or `None` while it does not exist. It is opened
 /// non-blocking and its type is read from the open descriptor, so a FIFO with no writer cannot
 /// block the caller (on the last poll, the thread stopping the VM), whatever replaced the file.
-/// Anything but a regular file is an error.
+/// Anything but a regular file is an error of kind [`std::io::ErrorKind::InvalidInput`].
 fn open_regular_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
     {
         Ok(file) => file,
@@ -245,7 +244,10 @@ fn open_regular_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
         Err(error) => return Err(error),
     };
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("not a regular file"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
     Ok(Some(file))
 }
@@ -272,8 +274,11 @@ struct FirecrackerLogFollower {
     vm_id: String,
     file: Option<std::fs::File>,
     errors: FirecrackerLogErrors,
-    /// Whether a read failed, after which nothing more is read.
+    /// Whether a read failed or the log is not a regular file, after which nothing more is read.
     failed: bool,
+    /// Whether an open that may succeed later (any refusal but "not a regular file") was
+    /// reported. The follower keeps trying it and reports it once.
+    open_refusal_reported: bool,
     /// Whether the last poll ran. A read the follower's task queued before it was stopped can
     /// run after it, when the log may already hold the next process's lines.
     stopped: bool,
@@ -287,6 +292,7 @@ impl FirecrackerLogFollower {
             file: None,
             errors: FirecrackerLogErrors::default(),
             failed: false,
+            open_refusal_reported: false,
             stopped: false,
         }
     }
@@ -304,12 +310,24 @@ impl FirecrackerLogFollower {
         if !self.failed && self.file.is_none() {
             match open_regular_file(&self.path) {
                 Ok(file) => self.file = file,
-                Err(error) => {
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
                     self.failed = true;
-                    messages.push(format!(
-                        "cannot read Firecracker's log ({error}), so its errors are not repeated here"
-                    ));
+                    messages.extend(read_messages(Vec::new(), Err(error)));
                 }
+                Err(error) => {
+                    if !self.open_refusal_reported {
+                        self.open_refusal_reported = true;
+                        messages.push(format!(
+                            "cannot open Firecracker's log ({error}); fcvm keeps trying"
+                        ));
+                    }
+                }
+            }
+            if last && !self.failed && self.file.is_none() && !self.open_refusal_reported {
+                messages.push(
+                    "Firecracker's log was never created, so none of its errors were repeated here"
+                        .to_string(),
+                );
             }
         }
         if let (false, Some(file)) = (self.failed, self.file.as_mut()) {
@@ -1156,6 +1174,42 @@ mod tests {
     }
 
     #[test]
+    fn the_follower_keeps_trying_a_log_it_could_not_open() {
+        if nix::unistd::geteuid().is_root() {
+            // Root opens a mode-000 file, so the refusal this test needs cannot happen.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut follower = FirecrackerLogFollower::new(path.clone(), "vm-test".to_string());
+        let refused = follower.poll(false);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            follower.poll(false).is_empty(),
+            "the refusal is reported once"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&path, format!("{BLOCK_ENOSPC}\n")).unwrap();
+        assert_eq!(
+            follower.poll(true),
+            vec![format!("Firecracker logged an error: {BLOCK_ENOSPC}")]
+        );
+    }
+
+    #[test]
+    fn the_last_poll_says_when_the_log_never_appeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut follower =
+            FirecrackerLogFollower::new(dir.path().join("firecracker.log"), "vm-test".to_string());
+        assert!(follower.poll(false).is_empty());
+        let last = follower.poll(true);
+        assert_eq!(last.len(), 1, "{last:?}");
+        assert!(last[0].contains("never created"), "{last:?}");
+    }
+
+    #[test]
     fn the_follower_says_once_when_its_log_is_not_a_regular_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("firecracker.log");
@@ -1168,7 +1222,7 @@ mod tests {
     }
 
     #[test]
-    fn the_follower_does_not_open_a_fifo() {
+    fn the_follower_reports_a_fifo_without_blocking_on_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("firecracker.log");
         nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
@@ -1179,7 +1233,7 @@ mod tests {
         });
         let result = polled.recv_timeout(Duration::from_secs(5));
         if result.is_err() {
-            // Release the blocked open so the thread can finish.
+            // A regression that blocks in open: release it so the thread can finish.
             let _ = std::fs::OpenOptions::new()
                 .write(true)
                 .custom_flags(libc::O_NONBLOCK)
