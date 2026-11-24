@@ -12,6 +12,9 @@ this file is the other shape: bots outside the VMs, and the VMs held to a few co
 
 MC_CORES holds the VMs' cgroup to that many cores (the edge in servers per core); MC_SUFFIX names
 the record. A reading counts only with every bot online and a game time under 3 s old, else it is 0.
+
+It refuses a host that already runs a VM or a fleet agent: it kills what it started by name, moves
+VMs into its own cgroup, and its CPU and memory figures are the whole host's.
 """
 import concurrent.futures as cf
 import json, os, signal, subprocess, sys, time, urllib.request
@@ -80,6 +83,34 @@ def post(url, body, timeout=3.0):
         return f"{e.code} {e.read()[:200]!r}"
     except Exception as e:
         return repr(e)
+
+
+def in_use(procs):
+    """What already runs on the host that a run must not share it with: `procs` is each process's
+    command line. A VMM of any kind, and the fleet's agent or coordinator."""
+    found = []
+    for argv in procs:
+        if not argv:
+            continue
+        exe = os.path.basename(argv[0])
+        if exe in ("firecracker", "cloud-hypervisor"):
+            found.append(exe)
+        elif exe == "fcvm" and argv[1:3] in (["fleet", "agent"], ["fleet", "coord"]):
+            found.append(" ".join([exe] + argv[1:3]))
+    return found
+
+
+def refuse_a_host_in_use():
+    procs = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            procs.append(open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0"))
+        except OSError:
+            pass
+    found = in_use(procs)
+    if found:
+        names = ", ".join(f"{found.count(n)} {n}" for n in sorted(set(found)))
+        sys.exit(f"hostramp.py: this host already runs {names}; it measures a host that runs nothing else")
 
 
 def vms():
@@ -373,6 +404,7 @@ def cmd_ramp(bots, out, counts, batch):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    refuse_a_host_in_use()
     try:
         if sys.argv[1] == "gold":
             cmd_gold(int(sys.argv[2]))

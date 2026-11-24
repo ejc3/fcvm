@@ -1,0 +1,8 @@
+kernel 7.0.0-1018-aws
+cpus 192
+MemTotal:       395386980 kB
+store /dev/loop3 btrfs   96G /mnt/ram/store.img on tmpfs
+tree 375c8969b75e20746f5415640f52c1d2fa580777 (branch minecraft-fleet-record: main with the fleet's status rows, which this harness does not run; fleet/minecraft is main's)
+vm cgroup cpuset.cpus.effective 0-191
+net.ipv6.neigh.default.gc_thresh3 = 16384
+2026-11-24T17:43:22Z ramp-b0, 17:46:28Z to 18:03:41Z ramp-b3 (three steps, alternating with three of another tile image)

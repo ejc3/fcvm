@@ -240,51 +240,20 @@ source to check that the tile's viewer socket still responds and TCP/25565 is cl
 
 ## Density
 
-The headline is servers per vCPU: how many server VMs share one vCPU while every server keeps its
-tick rate at 19.5 or more with three bots playing on it. Measured on a bare-metal arm64 host
-(c8gd.metal-24xl, 96 vCPUs, 188 GiB; never the shared dev host), 2026-11-08, one boot, with
-`fleet/minecraft/bench/mcbench.py`; the records are in
-`fleet/minecraft/bench/results/2026-11-08-c8gd-metal-24xl/`, and the table below is its
-`summary.json` (`summarize.py` over `ladder.jsonl`, `restore.jsonl` and `fork.jsonl`).
-`sweep.jsonl` is the first sweep of the same boot, which found each server's edge; its readings
-had no freshness check (below), so no number here comes from it.
-
-- **The shape.** Every server VM has 1 vCPU and 3 GiB (Paper ran out of memory in 2 GiB), bridged
-  networking, and is restored from its arm's gold snapshot: the server booted, three bots
-  joined, the 128 x 128 map around the spawn loaded, and ten readings in a row at 19.5 or more.
-  All the server VMs run in one cgroup whose cpuset holds 4 vCPUs. The bots run on the host's
-  other cores, one `mctile bots` process per server, so the 4 vCPUs hold only the servers.
-- **A run** restores K servers, joins three bots to each, waits 30 s, then reads every server's
-  tick rate about every 5 s for 60 s. A reading counts only while all three bots are online and
-  the server's last game time is under 3 s old; otherwise it is a 0. A count holds when every
-  reading of every server in every run of it is 19.5 or more, and below the lowest count that
-  did not hold.
-- **The servers.** Pumpkin 3ea7d281 (Java Edition 26.3), Mojang's vanilla server 26.3 and Paper
-  26.3 build 244, each with the same seed, view and simulation distance 6, offline and creative;
-  the Java servers with a 1.5 GiB heap on Java 25. Pumpkin does not implement all of vanilla's
-  mechanics, so this compares the servers on this workload, not on the whole game.
-
-| | servers on 4 vCPUs that held in every run | per vCPU | the next count | MiB per added server | restore to first chunk, p50 | fork, p50 |
-|---|---|---|---|---|---|---|
-| Pumpkin | 24 (3 of 3 runs) | 6.0 | 25: 1 of 3 runs | 348 | 870 ms | 1116 ms |
-| vanilla | 6 (3 of 3) | 1.5 | 7: 2 of 3 | 1349 | 775 ms | 2217 ms |
-| Paper | 10 (3 of 3) | 2.5 | 11: 1 of 3 | 1301 | 1175 ms | 1991 ms |
-
-Pumpkin fits four times as many servers on a vCPU as the vanilla server and 2.4 times as many as
-Paper, in about a quarter of the memory. Near each edge the result varies from run to run: Pumpkin held
-26 servers in 3 of 3 runs but 25 in 1 of 3. Memory is the least-squares slope of the VMs'
-cgroup anonymous memory over the counts that held below the first that failed. Restore to first chunk is from `fcvm snapshot
-run` to a new bot process's first chunk, bot start-up included (a new bot joining the same warm
-server took 136, 347 and 444 ms). A fork is `fcvm snapshot create` of a running server with its
-bots (373, 1331 and 865 ms) and the copy's restore to its first chunk; the source's first bot
-was never disconnected (its login count did not change).
+How many servers one host runs. A table that stood here (2026-11-08: servers per vCPU for
+Pumpkin, Mojang's vanilla server and Paper, with the VMs held to 4 vCPUs and the bots outside
+them) was measured on kernel 7.0.0-1013-aws, which has a known defect. It and its records are
+removed, and the section below supersedes it. The harness for that shape
+(`fleet/minecraft/bench/mcbench.py`, `summarize.py`) remains; the three-server comparison has not
+been run on a kernel with the fix.
 
 ### Servers on one host
 
 How many servers one host runs in the fleet's own shape: each server a VM of 1 vCPU and 1024 MiB
 with its three bots inside it, as `fcvm fleet agent --minecraft N` starts them. Measured
 2026-11-24 on a bare-metal arm64 host (c8g.metal-48xl, 192 vCPUs, 377 GiB, no local disk),
-kernel 7.0.0-1018-aws, one boot, the tile image built from main at `2f89b1c97` and fcvm from the
+kernel 7.0.0-1018-aws, one boot (the step without bots is from a second, as it says), the tile
+image built from main at `2f89b1c97` and fcvm from the
 same commit with a change to the fleet's agent and coordinator that this harness does not run,
 with `fleet/minecraft/bench/hostramp.py`; the records are in
 `fleet/minecraft/bench/results/2026-11-24-c8g-metal-48xl/`. Two things differ from the fleet:
@@ -313,11 +282,13 @@ contents come out of the host's memory.
   (lowest readings 19.83 and 19.83, 43.0 cores busy at 240) and 288 did not (200 of the 288 had a
   reading under 19.5): between 5.0 and 6.0 servers a core.
 - **Without bots** (`MCTILE_BOTS=0`, an empty server; a bot measures the tick rate, so there is
-  none to read): 256 servers used 1.2 cores, 0.005 each, and 93 MiB of anonymous memory each.
-  Bots connected but standing still were not measured. This step ran after the 48-core steps
-  with the VMs still held to those 48 cores: the harness did not give the cgroup its CPUs back
-  (fixed since, with a test), and its record's `vm_cores_allowed` of 192 is what was asked for,
-  not what was so. The servers used 1.2 of the 48.
+  none to read): 256 servers used 1.2 cores, 0.005 each, and 94 MiB of anonymous memory each.
+  This step is from a second boot of the same instance type the same day (the same kernel, the
+  store again a btrfs image in RAM; `second-boot/` in the records), with that boot's own
+  256-server step with bots beside it, run three times: 49.5, 51.6 and 52.2 cores busy (0.200 a
+  server; 48.9 on the first boot), lowest readings 19.82, 19.86 and 19.85. Those three steps
+  alternated with three of another tile image (#2108's comparison), each step torn down before
+  the next. Bots connected but standing still were not measured.
 - **Start rate.** With 16 restores in flight: 17.3 servers a second at 64, 14.2 at 256, 6.4 at
   512, 4.1 at 768. The "one more restore" column is `fcvm snapshot run` to a ready `/health`,
   polled every 20 ms; at the high counts it includes the harness's own `fcvm ls --json` over every

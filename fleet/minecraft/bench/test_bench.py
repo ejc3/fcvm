@@ -71,6 +71,15 @@ class HostRamp(unittest.TestCase):
         import hostramp
         cls.R = hostramp
 
+    def test_a_host_that_already_runs_vms_or_a_fleet_agent_is_in_use(self):
+        R = self.R
+        quiet = [["/usr/sbin/sshd", "-D"], [""], [], ["python3", "hostramp.py", "ramp", "3", "/out", "256"],
+                 ["/usr/bin/grep", "firecracker"], ["/opt/fcvm", "ls", "--json"], ["fcvm", "fleet", "pick"]]
+        self.assertEqual(R.in_use(quiet), [])
+        busy = quiet + [["/usr/local/bin/firecracker", "--api-sock", "/x"], ["firecracker"], ["/opt/cloud-hypervisor", "--api-socket", "/y"],
+                        ["/opt/fcvm", "fleet", "agent", "--stdio"], ["fcvm", "fleet", "coord", "--listen", "127.0.0.1:1"]]
+        self.assertEqual(R.in_use(busy), ["firecracker", "firecracker", "cloud-hypervisor", "fcvm fleet agent", "fcvm fleet coord"])
+
     def test_a_run_without_a_core_limit_does_not_keep_an_earlier_runs(self):
         R = self.R
         root, cores = R.CGROOT, os.environ.pop("MC_CORES", None)
