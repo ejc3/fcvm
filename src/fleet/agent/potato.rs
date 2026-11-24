@@ -190,14 +190,16 @@ struct Playing {
 }
 
 impl Playing {
-    /// The hold the ball carries at `seq`.
+    /// The hold the ball carries at `seq`, as the players compute it (in microseconds), in ms.
     fn hold_ms(&self) -> u64 {
         let o = &self.order;
         let laps = self.seq / o.ring.len().max(1) as u64;
-        let mut h = o.hold_ms;
-        for _ in 0..laps.min(1000) {
-            h = fleet_potato::shrink(h, o.shrink_permille, o.min_hold_ms);
-        }
+        let h = fleet_potato::ms_of(fleet_potato::hold_us_after(
+            o.hold_ms,
+            o.shrink_permille,
+            o.min_hold_ms,
+            laps,
+        ));
         match o.pace_ms {
             Some(p) => h.min(p.max(o.min_hold_ms)),
             None => h,
@@ -778,11 +780,13 @@ impl Ops for FcvmOps {
                     .iter()
                     .map(|n| Ok(format!("[{}]:{BALL_PORT}", cfg.prefix.player_address(*n)?)))
                     .collect::<Result<Vec<_>>>()?;
+                let hold_ms = o.pace_ms.map_or(o.hold_ms, |p| o.hold_ms.min(p));
                 let ball = fleet_potato::Ball {
                     round: o.round,
                     seq: 0,
                     ring,
-                    hold_ms: o.pace_ms.map_or(o.hold_ms, |p| o.hold_ms.min(p)),
+                    hold_ms,
+                    hold_us: Some(hold_ms * 1000),
                     shrink_permille: o.shrink_permille,
                     min_hold_ms: o.min_hold_ms,
                     flight_ms: o.flight_ms,
@@ -1071,6 +1075,7 @@ impl Driver {
                 round,
                 seq,
                 proof: p,
+                hold_us,
             } => {
                 send(
                     self,
@@ -1079,6 +1084,7 @@ impl Driver {
                         round,
                         seq,
                         proof: proof(&p),
+                        hold_us,
                     },
                 );
                 if let Some(pl) = self.playing.as_mut().filter(|pl| pl.order.round == round) {
@@ -1435,6 +1441,7 @@ mod tests {
             round,
             seq,
             proof: proof(),
+            hold_us: None,
         })
     }
 
@@ -1724,6 +1731,29 @@ mod tests {
         assert_eq!(p.hold_ms(), 500);
         p.order.pace_ms = Some(10);
         assert_eq!(p.hold_ms(), 50, "never below the floor");
+    }
+
+    /// The agent computes the hold the players keep: a tenth off each lap from 400 ms must
+    /// reach the 2 ms floor (cut in whole milliseconds it stops at 9 ms).
+    #[test]
+    fn the_hold_the_agent_expects_reaches_its_floor() {
+        let p = Playing {
+            order: PotatoRound {
+                round: 1,
+                ring: vec![0, 1],
+                hold_ms: 400,
+                shrink_permille: 100,
+                min_hold_ms: 2,
+                flight_ms: 100,
+                colours: 12,
+                pace_ms: None,
+            },
+            seq: 400,
+            caught: true,
+            kicked: true,
+            over: false,
+        };
+        assert_eq!(p.hold_ms(), 2);
     }
 
     #[test]

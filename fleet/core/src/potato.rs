@@ -64,11 +64,15 @@ pub enum PotatoKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_seq: Option<u64>,
     },
+    /// `hold_us` is the hold the catcher keeps before it throws, in microseconds, after any
+    /// pace cap; a player built before it reports none.
     Caught {
         round: u64,
         seq: u64,
         #[serde(flatten)]
         proof: PotatoProof,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_us: Option<u64>,
     },
     /// The catcher accepted the ball; `seq` is the ball's new seq, `to` its catcher.
     Threw {
@@ -300,18 +304,52 @@ pub struct Round {
     /// leaves the lap credited with its slower holds).
     #[serde(default)]
     pub lap_holds: BTreeMap<u64, u64>,
+    /// The hold the latest catcher reported it keeps, in microseconds; none from players
+    /// built before they reported it.
+    #[serde(default)]
+    pub kept_us: Option<u64>,
+    /// When the coordinator read each catch not yet behind a completed lap, by seq, and the
+    /// last catch of the latest completed lap: what a lap's pace is measured from.
+    #[serde(default)]
+    pub catch_at: BTreeMap<u64, u64>,
+    /// The completed laps, oldest first, at most the last [`LAPS_KEPT`].
+    #[serde(default)]
+    pub laps: Vec<Lap>,
+    /// The fastest pace of a completed lap.
+    #[serde(default)]
+    pub best_pace: Option<f64>,
+}
+
+/// The laps of a round the view keeps.
+pub const LAPS_KEPT: usize = 60;
+
+/// A completed lap: its measured pace, in catches per second, and the longest hold a catch
+/// of it carried.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Lap {
+    pub lap: u64,
+    pub pace: f64,
+    pub hold_ms: u64,
 }
 
 impl Round {
-    /// The hold the ball carries when caught at `seq`: shrunk once per lap, capped by a
-    /// viewers' pace, never under the floor. The same arithmetic as `fleet_potato::Ball`.
+    /// The hold the ball carries, in ms, capped by a viewers' pace: the hold the latest
+    /// catcher reported it keeps. Players built before they reported it (`hold_us`) shrink
+    /// the hold a tenth per lap in whole milliseconds, and for them this is that arithmetic
+    /// at `seq`: it stops at 9 ms, as those players do.
     pub fn hold_at(&self, seq: u64) -> u64 {
-        let laps = seq / self.ring.len().max(1) as u64;
-        let mut h = self.start_hold_ms;
-        for _ in 0..laps.min(10_000) {
-            let cut = h * u64::from(self.shrink_permille.min(1000)) / 1000;
-            h = (h - cut).max(self.min_hold_ms);
-        }
+        let h = match self.kept_us {
+            Some(us) => fleet_potato::ms_of(us),
+            None => {
+                let laps = seq / self.ring.len().max(1) as u64;
+                let mut h = self.start_hold_ms;
+                for _ in 0..laps.min(10_000) {
+                    let cut = h * u64::from(self.shrink_permille.min(1000)) / 1000;
+                    h = (h - cut).max(self.min_hold_ms);
+                }
+                h
+            }
+        };
         match self.pace_ms {
             Some(p) => h.min(p.max(self.min_hold_ms)),
             None => h,
@@ -320,6 +358,30 @@ impl Round {
 
     pub fn lap(&self, seq: u64) -> u64 {
         seq / self.ring.len().max(1) as u64
+    }
+
+    /// How long a thrower retries for, in ms: the flight window, or its hold when it reports
+    /// one and that is shorter.
+    pub fn flight_window_ms(&self) -> u64 {
+        match self.kept_us {
+            Some(us) => self.flight_ms.min(fleet_potato::ms_of(us)),
+            None => self.flight_ms,
+        }
+    }
+
+    /// The pace of completed lap `lap`, in catches per second, from the times the coordinator
+    /// read its catches: the lap's catches over the time from the catch before its first to
+    /// its last. Lap 0 has no catch before it: its last minus its first, over one catch fewer.
+    fn lap_pace(&self, lap: u64) -> Option<f64> {
+        let n = self.ring.len() as u64;
+        let last = *self.catch_at.get(&((lap + 1) * n - 1))?;
+        let before = (lap * n).checked_sub(1).and_then(|s| self.catch_at.get(&s));
+        let (from, catches) = match before {
+            Some(t) => (*t, n),
+            None => (*self.catch_at.get(&(lap * n))?, n - 1),
+        };
+        let wall = last.checked_sub(from).filter(|w| *w > 0)?;
+        (catches > 0).then(|| (catches as f64 * 100_000.0 / wall as f64).round() / 100.0)
     }
 
     /// When the next catch must have been reported by.
@@ -555,6 +617,10 @@ impl Potato {
             verified_through: None,
             verified_ahead: Default::default(),
             lap_holds: BTreeMap::new(),
+            kept_us: None,
+            catch_at: BTreeMap::new(),
+            laps: Vec::new(),
+            best_pace: None,
         });
         self.next_round_at = None;
     }
@@ -714,7 +780,12 @@ impl Potato {
                     }
                 }
             }
-            PotatoKind::Caught { round, seq, proof } => {
+            PotatoKind::Caught {
+                round,
+                seq,
+                proof,
+                hold_us,
+            } => {
                 let Some(p) = self.players.get_mut(&e.player) else {
                     return;
                 };
@@ -758,9 +829,15 @@ impl Potato {
                 let r = self.round.as_mut().unwrap();
                 let n = r.ring.len() as u64;
                 let lap = r.lap(*seq);
-                let hold = r.hold_at(*seq);
+                // the hold this catcher keeps: what it reports, or the arithmetic of players
+                // that report none
+                let hold = match hold_us {
+                    Some(us) => fleet_potato::ms_of(*us),
+                    None => r.hold_at(*seq),
+                };
                 let longest = r.lap_holds.entry(lap).or_insert(hold);
                 *longest = (*longest).max(hold);
+                r.catch_at.insert(*seq, at);
                 // the catches verified without a gap; a lap counts once all of its are
                 r.verified_ahead.insert(*seq);
                 let mut completed = Vec::new();
@@ -781,6 +858,23 @@ impl Potato {
                     if r.best_lap_hold_ms.is_none_or(|b| h < b) {
                         r.best_lap_hold_ms = Some(h);
                     }
+                    let pace = r.lap_pace(l);
+                    // the lap's last catch stays: the next lap is measured from it
+                    r.catch_at.retain(|s, _| *s + 1 >= (l + 1) * n);
+                    if let Some(pace) = pace {
+                        if r.best_pace.is_none_or(|b| pace > b) {
+                            r.best_pace = Some(pace);
+                        }
+                        r.laps.push(Lap {
+                            lap: l,
+                            pace,
+                            hold_ms: h,
+                        });
+                        if r.laps.len() > LAPS_KEPT {
+                            let cut = r.laps.len() - LAPS_KEPT;
+                            r.laps.drain(..cut);
+                        }
+                    }
                     // a size's record is acknowledged as soon as the lap is: it stays in the
                     // state file even if the coordinator restarts before the ball drops
                     let size = r.size;
@@ -799,6 +893,7 @@ impl Potato {
                     r.holder = Some(e.player);
                     r.last_catch_at = Some(at);
                     r.flight = None;
+                    r.kept_us = *hold_us;
                 }
             }
             PotatoKind::Threw { round, to, .. } => {
@@ -828,7 +923,7 @@ impl Potato {
                     let detail = format!(
                         "player {to} was {catcher_phase} when player {} threw ({attempts} tries in {} ms: {reason})",
                         e.player,
-                        self.round.as_ref().map_or(0, |r| r.flight_ms)
+                        self.round.as_ref().map_or(0, |r| r.flight_window_ms())
                     );
                     self.drop_ball(
                         at,
@@ -1021,6 +1116,13 @@ pub struct RoundView {
     pub last_catch_at: Option<u64>,
     pub flight: Option<Flight>,
     pub best_lap_hold_ms: Option<u64>,
+    /// Catches per second over the last completed lap, measured from the times the
+    /// coordinator read the catches; null before a lap completes.
+    pub pace: Option<f64>,
+    /// The fastest pace of a completed lap of this round.
+    pub best_pace: Option<f64>,
+    /// The completed laps, oldest first, at most the last [`LAPS_KEPT`].
+    pub laps: Vec<Lap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1060,6 +1162,9 @@ impl Potato {
                 last_catch_at: r.last_catch_at,
                 flight: r.flight.clone(),
                 best_lap_hold_ms: r.best_lap_hold_ms,
+                pace: r.laps.last().map(|l| l.pace),
+                best_pace: r.best_pace,
+                laps: r.laps.clone(),
             }
         });
         Some(PotatoView {
@@ -1110,6 +1215,7 @@ mod tests {
                     counter: 4,
                     chain: "ab".into(),
                 },
+                hold_us: None,
             },
         };
         let s = serde_json::to_string(&e).unwrap();
@@ -1172,6 +1278,7 @@ mod tests {
                         counter: 1,
                         chain,
                     },
+                    hold_us: None,
                 },
             },
             1100,
@@ -1273,7 +1380,12 @@ mod tests {
         PotatoEvent {
             at,
             player: p,
-            kind: PotatoKind::Caught { round, seq, proof },
+            kind: PotatoKind::Caught {
+                round,
+                seq,
+                proof,
+                hold_us: None,
+            },
         }
     }
 
@@ -1392,6 +1504,108 @@ mod tests {
             g.event("h", &e, e.at, &cfg);
         }
         assert_eq!(g.round.as_ref().unwrap().best_lap_hold_ms, Some(start));
+    }
+
+    /// The pace is what the catch times say, not 1000 / hold: a ring of 2 at a 2000 ms hold
+    /// whose catches were read 200 ms apart ran at 5 catches a second.
+    #[test]
+    fn pace_is_measured_from_the_catch_times() {
+        let (mut g, cfg, mut proofs) = game(2);
+        let id = g.round.as_ref().unwrap().id;
+        let view = |g: &Potato| g.view(&cfg).unwrap().round.unwrap();
+        let mut play = |g: &mut Potato, seq: u64, at: u64| {
+            let e = catch(&mut proofs, (seq % 2) as u32, id, seq, at, false);
+            g.event("h", &e, e.at, &cfg);
+        };
+        play(&mut g, 0, 1100);
+        assert_eq!(view(&g).pace, None, "no lap is complete");
+        assert!(view(&g).laps.is_empty());
+        play(&mut g, 1, 1300);
+        let v = view(&g);
+        assert_eq!(v.hold_ms, 2000);
+        assert_eq!(v.pace, Some(5.0), "one catch after the first, 200 ms later");
+        // lap 1 at twice the speed: 2 catches in the 200 ms after lap 0's last
+        play(&mut g, 2, 1400);
+        play(&mut g, 3, 1500);
+        let v = view(&g);
+        assert_eq!((v.pace, v.best_pace), (Some(10.0), Some(10.0)));
+        assert_eq!(
+            v.laps
+                .iter()
+                .map(|l| (l.lap, l.pace, l.hold_ms))
+                .collect::<Vec<_>>(),
+            vec![(0, 5.0, 2000), (1, 10.0, 1800)]
+        );
+        // a slower lap is the pace now, and not the round's best
+        play(&mut g, 4, 2000);
+        play(&mut g, 5, 2500);
+        let v = view(&g);
+        assert_eq!((v.pace, v.best_pace), (Some(2.0), Some(10.0)));
+        assert_eq!(
+            g.round.as_ref().unwrap().catch_at.len(),
+            1,
+            "only the last lap's last catch is kept to measure the next from"
+        );
+    }
+
+    /// A lap is credited with the hold its catchers report they kept, in microseconds. The
+    /// arithmetic of players that report none (a tenth off in whole ms) says 2000 here.
+    #[test]
+    fn a_lap_is_credited_with_the_hold_its_catchers_reported() {
+        let (mut g, cfg, mut proofs) = game(2);
+        let id = g.round.as_ref().unwrap().id;
+        for (seq, us) in [(0, 9_400), (1, 9_400), (2, 8_460)] {
+            let mut e = catch(
+                &mut proofs,
+                (seq % 2) as u32,
+                id,
+                seq,
+                1100 + seq * 100,
+                false,
+            );
+            if let PotatoKind::Caught { hold_us, .. } = &mut e.kind {
+                *hold_us = Some(us);
+            }
+            g.event("h", &e, e.at, &cfg);
+        }
+        let r = g.round.as_ref().unwrap();
+        assert_eq!(r.best_lap_hold_ms, Some(9));
+        assert_eq!(g.ladder[0].record_hold_ms, Some(9));
+        let v = g.view(&cfg).unwrap().round.unwrap();
+        assert_eq!(
+            (v.hold_ms, v.turnaround_ms),
+            (8, 8),
+            "the latest catcher's hold"
+        );
+        assert_eq!(
+            r.flight_window_ms(),
+            8,
+            "a thrower retries for its hold when shorter"
+        );
+        assert_eq!(r.deadline(cfg.report_slack_ms), Some(1300 + 8 + 100 + 3000));
+    }
+
+    /// A player built before `hold_us` reports none: its catch still parses, and the hold is
+    /// the one those players compute.
+    #[test]
+    fn a_catch_without_a_reported_hold_is_read() {
+        let e: PotatoEvent = serde_json::from_value(serde_json::json!({
+            "at": 1, "player": 0, "kind": "caught", "round": 1, "seq": 0,
+            "colour": 1, "counter": 1, "chain": "00"
+        }))
+        .unwrap();
+        assert!(matches!(e.kind, PotatoKind::Caught { hold_us: None, .. }));
+        assert!(!serde_json::to_string(&e).unwrap().contains("hold_us"));
+        let (g, _, _) = game(2);
+        let mut r = g.round.clone().unwrap();
+        r.start_hold_ms = 400;
+        assert_eq!(
+            r.hold_at(2 * 400),
+            9,
+            "where whole-millisecond shrinking stops"
+        );
+        r.kept_us = Some(2_000);
+        assert_eq!(r.hold_at(2 * 400), 2);
     }
 
     /// The host's clock can be behind the coordinator's: a catch on time by the coordinator's

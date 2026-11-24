@@ -1251,7 +1251,8 @@ The snapshot's `state.potato` is absent until a host has run players, else:
  "round": {"id": 8, "size": 4, "ring": [0, 1, 2, 3], "started_at": 1762317005000, "seq": 6, "lap": 1,
            "hold_ms": 599, "start_hold_ms": 666, "min_hold_ms": 2, "flight_ms": 100, "pace_ms": null,
            "turnaround_ms": 1797, "holder": 2, "last_catch_at": 1762317009100,
-           "flight": {"from": 2, "to": 3, "at": 1762317009700}, "best_lap_hold_ms": 666},
+           "flight": {"from": 2, "to": 3, "at": 1762317009700}, "best_lap_hold_ms": 666,
+           "pace": 1.5, "best_pace": 1.5, "laps": [{"lap": 0, "pace": 1.5, "hold_ms": 666}]},
  "players": [{"player": 0, "colour": 5, "counter": 31, "phase": "asleep", "since": 1762317009400,
               "last_sleep_ms": 330.1, "last_wake_ms": 355.3}],
  "records": {"fastest_cycle_ms": {"value": 650.0, "size": 2, "player": 0, "at": 1762317000000},
@@ -1267,6 +1268,15 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   next starts). `hold_ms` is the hold the ball carries now; `turnaround_ms` is (size - 1)
   holds, the time a player has between its throw and its next catch to sleep and wake.
   `flight` is the ball in the air (thrown by `from` to `to` at `at`), null once caught.
+  `flight_ms` is the most a thrower retries for; a thrower that reports its hold (`hold_us`,
+  below) retries for that hold when it is shorter. `pace` is catches per second over the last
+  completed lap, measured: the lap's catches divided by the time from the catch before its
+  first to its last, by the times the coordinator read them (lap 0: its last catch minus its
+  first, over size - 1 catches); null before a lap completes, and never computed from the
+  hold. `best_pace` is the fastest of the round's laps, and `laps` the completed laps, oldest
+  first, at most the last 60, each with its pace and the longest hold a catch of it carried.
+  A page that does not know `pace`, `best_pace` or `laps` ignores them, and one that does
+  shows nothing for a field that is null or absent (an older coordinator sends none).
 - `host`: the potato host, by its agent's name (as a tile's `host`); null while none is
   connected. The viewer-path smoke attributes its potato probe to it for the image release
   gate.
@@ -1695,7 +1705,7 @@ that happened to player `player`, at `at` on the host's clock. `kind` is one of:
 | kind | fields | when |
 |------|--------|------|
 | `hello` | `colour`, `counter`, `chain`, `colours`, `connections`, `last_round`, `last_seq` | the player opened a report connection: once when new (`connections` 1, `counter` 0), and once after each wake. `last_round`/`last_seq` name its last catch |
-| `caught` | `round`, `seq`, `colour`, `counter`, `chain` | it caught the ball |
+| `caught` | `round`, `seq`, `colour`, `counter`, `chain`, `hold_us` | it caught the ball. `hold_us` is the hold it will keep, in microseconds, after any pace cap; absent from a player built before it, and the coordinator then computes the hold as those players do (a tenth off per lap in whole milliseconds) |
 | `threw` | `round`, `seq` (the ball's new seq), `to`, `attempts`, `wait_ms`, `send_ms` | the next player accepted the ball |
 | `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to` |
 | `slept` | `sleep_ms`, `stages`, `written_mib` | its snapshot is written and its fcvm has exited. `stages` splits `sleep_ms` into the agent's steps, `ask_ms` (telling the player its round is over), `create_ms` (`fcvm snapshot create --stop`) and `reap_ms` (waiting for the player's fcvm to exit), and splits `create_ms` with fcvm's own: `stage_ms` (the new generation's directory and memory file), `prepare_ms`, `pause_ms`, `save_ms`, `disk_ms`, `publish_ms` (installing it and removing the old one) and `stop_ms` |
@@ -1868,7 +1878,8 @@ agent reconciles to it as to an assignment. A round it has not played starts: it
 player it does not have from its player snapshot, wakes the players within reach of the ball,
 and throws the first ball to `ring[0]` once that player accepts; a round it no longer gets
 ends, and every awake player sleeps, so a ball still in the air drops. A new `pace_ms` in the
-same round goes to the awake players, whose next throws hold no longer than it.
+same round goes to the awake players, whose next throws hold no longer than it. `flight_ms`
+is the most a thrower retries for: a player retries for its hold when that is shorter.
 
 ### Grid budget
 
