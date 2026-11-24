@@ -2868,19 +2868,18 @@ mod tests {
         assert!(lock < finish.find("self.local_completed.fetch_add").unwrap());
     }
 
-    /// A publication that fails (here: a sidecar directory that cannot be written) is not
-    /// retried every tick; only a busy sidecar is.
+    /// A publication that fails (here: a directory stands where the sidecar goes, which root
+    /// cannot write over either) is not retried every tick; only a busy sidecar is.
     #[test]
     fn a_failed_publication_is_not_retried() {
-        use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::Ordering::SeqCst;
-        let (dir, mem, config, lock, mem_len) = bound_fixture();
+        let (_dir, mem, config, lock, mem_len) = bound_fixture();
         let store = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+        std::fs::create_dir(&store.path).unwrap();
+        std::fs::write(store.path.join("occupied"), b"").unwrap();
         let recorder = store.admit_recorder().unwrap();
         store.finish_recording(&one_page(recorder, 0), true);
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let result = store.try_persist_known();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err(), "{result:?}");
         assert!(!store.unpublished.load(SeqCst));
     }
