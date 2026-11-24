@@ -2040,11 +2040,52 @@ CPUs carry is about (K - 1) / (wake + sleep). The wake is the whole of it, up to
 port answering the agent, not the restore alone. For example, a 250 ms wake and a 250 ms
 sleep give 14 catches a second on 8 CPUs.
 
-No measured ladder at a fixed K is in this document yet. The first run of 96 players on 8
-CPUs was on a host kernel whose network namespace cleanup stalls every network operation
-when namespaces die together (fixed upstream in 6.18.60 and 7.2), and every sleep of a
-player ends a namespace, so that run's wake, sleep and pace figures are not shown. The run
-follows on a kernel with the fix, which is the kernel the fleet's hosts run.
+### Measured: the ladder on 8 CPUs (2026-11-24)
+
+96 players with `--potato-cpus 8`, one host, 30 minutes an arm: `confined` (the agent in a
+delegated unit, the ring's cpuset on 8 CPUs) and `counted` (the ledger only).
+c8gd.metal-24xl (96 vCPU), `uname -r` 7.0.0-1018-aws (Ubuntu's kernel with the upstream fix
+for namespace cleanup under RTNL; not the repo's host kernel), the store btrfs on a RAID0 of
+the box's three instance NVMe disks, sleeping players' memory in the default tmpfs, the
+stack at 1d6f94bc. Each arm started with the 1 minute load under 1.0. The confined arm
+played 61 rounds and the counted arm 63. Each cell is confined / counted.
+
+| ring | machines per CPU | best lap pace, catches/s | median pace at the drop | median hold at the drop, ms | asleep, % | CPU wait p50 / max, ms |
+|---|---|---|---|---|---|---|
+| 16 | 2 | 15.7 / 14.5 | 13.0 / 12.7 | 67.5 / 68 | 50 | 198 / 573, 200 / 624 |
+| 32 | 4 | 12.4 / 13.1 | 11.9 / 11.5 | 75 / 80 | 75 | 192 / 614, 195 / 482 |
+| 64 | 8 | 12.2 / 12.3 | 9.7 / 11.3 | 93 / 79 | 87.5 | 154 / 551, 198 / 532 |
+| 96 | 12 | 11.8 / 11.9 | 10.3 / 9.9 | 87 / 97 | 91.7 | 180 / 582, 147 / 601 |
+
+- **The cap held.** The agent's count of machines not asleep peaked at 8 on every rung of
+  both arms and never passed it; 62% of the sampled catches found all 8 held, and the share
+  asleep was (N - 8) / N. The count is the agent's ledger; no process count was taken beside
+  it.
+- **The CPUs are what ends a round.** All 61 drops of the confined arm and 62 of the counted
+  arm's 63 have the cause `cpu_wait`: the catcher's wake had waited for a free CPU, by a
+  median of 506 and 449 ms and never less than 202 ms. In 32 of those 123 the wake had not
+  started when the ball arrived. The other drop was a wake that failed.
+- **`cpus_busy`** (the cpuset's `cpu.stat`, confined arm): a median of 2.8 to 3.3 of the 8
+  across the rungs, and 4.0 to 5.1 on each rung's best lap. A machine holds its CPU slot
+  through its whole wake and save, most of which is not CPU time.
+- **Wake** p50 88.5 and 87.8 ms, p95 278.6 and 278.4 ms. **Sleep** p50 282 and 286 ms, p95
+  355 and 354 ms.
+- **Against the model.** (K - 1) / (wake + sleep) gives 18.9 catches a second at the
+  confined arm's median wake and sleep and 11.0 at their 95th percentiles. The measured pace at the drop, 9.7 to
+  13.0, is at the figure the tail gives: a round needs every catcher on time.
+- **The wakes are in two clusters.** 10,141 of the confined arm's 11,219 wakes took under
+  200 ms and 1,078 took 250 ms or more, with none between 200 and 250. The agent's probe of
+  a waking player's ball port gives each try 250 ms, and a try sent before the port answers
+  waits all of it. That probe is being changed for every mode of the agent (#2092); it had
+  not merged when this was run, so no arm with it is here, and the tail above, and with it
+  the edge, includes that step.
+- **Confinement cost nothing measurable:** the two arms' median pace at the drop differ by
+  0.3 to 1.6 catches a second, in both directions.
+- 178 and 177 laps completed, and every one had a pace the holds allow.
+
+An earlier run on the box's stock kernel (7.0.0-1013-aws) is not shown: that kernel's
+network namespace cleanup stalls every network operation when namespaces die together,
+and every sleep of a player ends a namespace.
 
 ### The ladder and where a round starts
 
