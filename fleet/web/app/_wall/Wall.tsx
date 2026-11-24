@@ -6,6 +6,7 @@
 // drawer. The page measures the screen, forwards input as actions, and draws the
 // view model core/ computes. It computes nothing itself.
 
+import { Landing } from "./Landing.tsx";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   CLICK_SLOP_PX,
@@ -848,6 +849,7 @@ export function Wall({ coordUrl, directUrl, mediaUrl }: { coordUrl: string; dire
           </span>
         ) : null}
       </div>
+      <Landing landing={view.landing} colour="" />
       {phone ? null : <ModeSwitch current="wall" stream={view.streamMode} onStream={view.play ? (el) => openDrawer("play", el) : undefined} />}
     </div>
   );

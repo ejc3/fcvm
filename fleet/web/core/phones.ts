@@ -2,6 +2,7 @@
 // bezels, and the panel of one opened phone. Pure: the page measures the stage and passes
 // it in, and draws what comes back (PROTOCOL.md, "Phones mode").
 
+import { landingView, type LandingView } from "./landing.ts";
 import {
   easeZoom,
   fitContain,
@@ -35,7 +36,6 @@ import {
 } from "./view.ts";
 
 export const PHONES_TITLE = "Phones";
-export const PHONES_SENTENCE = "Each phone is an Android emulator in its own virtual machine, drawing on its own NVIDIA GPU. Zoom out to see the phones apart.";
 export const NO_PHONES = "This fleet runs no phones.";
 
 /** A phone's screen, width over height (720 x 1280). */
@@ -677,7 +677,7 @@ export interface MirrorPlacement {
 
 export interface PhonesView {
   title: string;
-  sentence: string;
+  landing: LandingView;
   online: boolean;
   /** Why there is nothing to show, when there is nothing. */
   empty: string | null;
@@ -734,7 +734,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
   const srvNow = serverNow(s.clock, inp.now);
   const common = {
     title: PHONES_TITLE,
-    sentence: PHONES_SENTENCE,
+    landing: landingView("phones"),
     online,
     verify: verifyView(s),
     notice: phoneNotice(s.notices),

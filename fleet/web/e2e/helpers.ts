@@ -307,3 +307,39 @@ export async function wholeWithin(page: Page, id: string, within: string): Promi
     [id, within] as const,
   );
 }
+
+/**
+ * The landing line and its "What is this?" control, on the page as it stands: the line is visible
+ * below the title and clear of the stage, the control opens and closes by keyboard and by a click
+ * outside, focus returns to it, and on a phone the line is at most two lines high.
+ */
+export async function expectLanding(page: Page, opts: { stage?: string | null; phone: boolean }): Promise<void> {
+  const line = page.getByTestId("landing-line");
+  await expect(line).toBeVisible();
+  const h1 = await page.locator("h1").first().boundingBox();
+  const l = (await line.boundingBox())!;
+  expect(l.y, "the line sits below the title").toBeGreaterThanOrEqual(h1!.y + h1!.height - 1);
+  if (opts.stage) {
+    const s = await page.getByTestId(opts.stage).boundingBox();
+    const apart = l.y + l.height <= s!.y + 1 || s!.y + s!.height <= l.y + 1 || l.x + l.width <= s!.x + 1 || s!.x + s!.width <= l.x + 1;
+    expect(apart, "the line does not overlap the stage").toBe(true);
+  }
+  if (opts.phone) {
+    const lines = await line.evaluate((el) => el.getBoundingClientRect().height / parseFloat(getComputedStyle(el).lineHeight));
+    expect(lines, "at most two lines on a phone").toBeLessThanOrEqual(2.05);
+  }
+  const btn = page.getByTestId("landing-button");
+  await btn.focus();
+  await expect(btn).toHaveAttribute("aria-expanded", "false");
+  await page.keyboard.press("Enter");
+  await expect(btn).toHaveAttribute("aria-expanded", "true");
+  const panel = page.getByTestId("landing-panel");
+  await expect(panel).toContainText("fcvm starts virtual machines from saved snapshots instead of booting them.");
+  await page.keyboard.press("Escape");
+  await expect(panel).toHaveCount(0);
+  await expect(btn).toBeFocused();
+  await btn.click();
+  await expect(panel).toBeVisible();
+  await page.mouse.click(2, 2);
+  await expect(panel).toHaveCount(0);
+}

@@ -4,7 +4,7 @@
 // fixed actions, and that nothing on the page sends anything but the four Windows intents.
 
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { COORD, admin, mockState } from "./helpers.ts";
+import { COORD, admin, mockState, expectLanding } from "./helpers.ts";
 
 const SANDBOXES = 4;
 const SLOTS = ["win-1", "win-2", "win-3", "win-4"];
@@ -371,4 +371,11 @@ test.describe("on a 390 px phone", () => {
     await page.getByTestId("win-give-back").click();
     await expect(page.getByTestId("win-panel")).toHaveCount(0);
   });
+});
+
+test("windows: the line under the title and the What is this? control", async ({ page }) => {
+  await openWindows(page);
+  await expectLanding(page, { stage: "win-stage", phone: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectLanding(page, { stage: "win-stage", phone: true });
 });

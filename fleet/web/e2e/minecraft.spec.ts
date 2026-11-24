@@ -5,7 +5,7 @@
 // first change, and giving it back.
 
 import { expect, test, type Browser, type Page, type TestInfo } from "@playwright/test";
-import { COORD, admin, mockState } from "./helpers.ts";
+import { COORD, admin, mockState, expectLanding } from "./helpers.ts";
 
 const SLOTS = ["mc-1", "mc-2", "mc-3", "mc-4"];
 const SERVER = "Pumpkin 3ea7d281 (Java Edition 26.3)";
@@ -420,4 +420,11 @@ test("the page sends only the four intents and, on a view socket, its admission 
   }
   expect(onView.filter((m) => "admit" in m).length).toBeGreaterThanOrEqual(4);
   expect((await record()).intents.map((i) => [i.name, i.outcome])).toEqual([["claim_minecraft", "committed"], ["release_minecraft", "committed"]]);
+});
+
+test("minecraft: the line under the title and the What is this? control", async ({ page }) => {
+  await openMinecraft(page);
+  await expectLanding(page, { stage: "mc-stage", phone: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectLanding(page, { stage: "mc-stage", phone: true });
 });

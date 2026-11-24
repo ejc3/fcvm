@@ -1,0 +1,32 @@
+/* The line under a title and its "What is this?" control. Muted and small; the line clamps to
+   two lines. The panel is a popover under the line on a wide screen and a bottom sheet on a phone. */
+.landing { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; max-width: 72ch; min-width: 0; text-shadow: none; }
+.landing-line { margin: 0; flex: 0 1 auto; min-width: 0; font-size: 14px; line-height: 1.4; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.landing-btn { min-height: 44px; padding: 0 4px; background: none; border: 0; color: var(--fcvm); font: 500 14px var(--sans); text-decoration: underline; cursor: pointer; pointer-events: auto; }
+.landing-panel { position: absolute; top: 100%; left: 0; z-index: 30; width: min(420px, calc(100vw - 32px)); max-height: 70dvh; overflow-y: auto; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font-size: 14px; display: flex; flex-direction: column; gap: 8px; pointer-events: auto; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45); }
+.landing-panel:focus { outline: none; }
+.landing-panel p { margin: 0; }
+@media (max-width: 700px) {
+  .landing-panel { position: fixed; left: 0; right: 0; top: auto; bottom: 0; width: auto; max-height: 60dvh; border-radius: 12px 12px 0 0; padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
+}
+
+/* Legend: marks use the potato tiles' phase styles (potato.css lists .potato-swatch beside .potato-tile). */
+.lg h2 { font-size: 14px; font-weight: 600; margin: 0; }
+.lg ol, .lg ul { list-style: none; margin: 0; padding: 0; }
+.lg .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.lg-row { display: flex; flex-wrap: wrap; gap: 12px 14px; align-items: flex-start; }
+.lg-row li { position: relative; display: flex; flex-direction: column; align-items: center; gap: 4px; width: 84px; text-align: center; }
+.lg-label { font-size: 14px; color: var(--text); }
+.lg-detail { font-size: 14px; color: var(--muted); line-height: 1.3; }
+.lg-note { margin: 0; font-size: 14px; color: var(--muted); }
+.lg-ring { flex-wrap: nowrap; gap: 6px; }
+.lg-ring li { flex: 1 1 0; min-width: 0; width: auto; }
+.lg-hold li { width: 150px; }
+.lg-list ul { display: flex; flex-direction: column; gap: 8px; }
+.lg-list li { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.lg-list .lg-text { display: flex; flex-direction: column; text-align: left; }
+.lg-list .potato-swatch, .lg-list .lg-meter { flex: 0 0 auto; }
+.lg-meter { position: relative; width: 56px; height: 12px; border-radius: 6px; background: var(--p-track); }
+.lg-meter .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 6px; background: var(--fcvm); }
+.lg-meter .need { position: absolute; top: -4px; bottom: -4px; width: 3px; background: var(--text); border-radius: 2px; }
+.lg-ball { position: absolute; right: -6px; top: -6px; width: 14px; height: 14px; border-radius: 50%; background: radial-gradient(circle at 35% 35%, #fff6cf, var(--p-ball) 60%); box-shadow: 0 0 0 2px var(--p-ball-edge); }

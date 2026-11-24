@@ -3,6 +3,7 @@
 // mode"; PROTOCOL.md, "Potato mode"). Pure: the page measures the stage, passes the time in
 // and draws what comes back. The coordinator is never drawn.
 
+import { landingView, type LandingView } from "./landing.ts";
 import type { Box } from "./layout.ts";
 import { serverNow } from "./clock.ts";
 import { sameViewer, type FleetState, type IntentName, type Potato, type PotatoDrop, type PotatoPlayer, type PotatoRound } from "./protocol.ts";
@@ -10,8 +11,6 @@ import type { ClientState, Notice } from "./store.ts";
 import { sleepView, verifyView, type SleepView } from "./view.ts";
 
 export const POTATO_TITLE = "Hot potato";
-export const POTATO_SENTENCE =
-  "Each tile is a CPU-only virtual machine. A player that has thrown the ball goes to sleep (a snapshot, and its process exits) and has to wake before the ball comes round again.";
 export const NO_POTATO = "No host has run potato players yet.";
 export const NO_HOST = "No host is running players now. The ladder and the records are kept.";
 
@@ -552,7 +551,7 @@ export interface PotatoInput {
 
 export interface PotatoView {
   title: string;
-  sentence: string;
+  landing: LandingView;
   online: boolean;
   /** Why there is nothing to show, when there is nothing. */
   empty: string | null;
@@ -577,7 +576,7 @@ export function potatoView(inp: PotatoInput): PotatoView {
   const off: PotatoButton = { label: "", disabled: true, note: "" };
   const common = {
     title: POTATO_TITLE,
-    sentence: POTATO_SENTENCE,
+    landing: landingView("potato"),
     online,
     verify: verifyView(s),
     notice: potatoNotice(s.notices),

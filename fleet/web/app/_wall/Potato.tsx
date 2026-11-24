@@ -5,14 +5,17 @@
 // draws the view model core/potato.ts computes; every word on it comes from there.
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { potatoView, SITE, type Box, type PotatoButton, type PotatoView } from "../../core/index.ts";
+import { potatoColour, potatoView, SITE, type Box, type PotatoButton, type PotatoView } from "../../core/index.ts";
 import { WallClient } from "./wall-client.ts";
 import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
+import { Landing, PotatoLegend } from "./Landing.tsx";
 import { WakeCard } from "./Overlays.tsx";
 import { useMedia } from "./hooks.ts";
 import "./potato.css";
 
+/** The legend's squares: one sample hue, since the legend says what a phase looks like and not whose it is. */
+const SWATCH = potatoColour(8, 12);
 const localNow = () => performance.timeOrigin + performance.now();
 
 declare global {
@@ -99,6 +102,9 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
     }
   }, [client]);
 
+  // Room for the legend beside the ring: the page is in its two-column layout and the measured stage is not small.
+  const twoColumns = useMedia("(min-width: 901px)");
+  const legendOnPage = twoColumns && stage !== null && stage.w >= 360 && stage.h >= 360;
   const ring = view.ring;
   const needsVerifyPrompt = view.verify.prompt;
 
@@ -110,6 +116,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
             <span className="site">{SITE}</span>
             <h1>{view.title}</h1>
           </div>
+          <Landing landing={view.landing} colour={SWATCH} legendInPanel={!legendOnPage} />
           <ModeSwitch current="potato" />
         </div>
         <div className="potato-actions" role="group" aria-label="Game">
@@ -117,7 +124,6 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
           <ActionButton b={view.restart} name="restart" onClick={() => void client.act("potato_restart")} />
         </div>
       </header>
-      <p className="potato-sentence">{view.sentence}</p>
       {view.banner ? (
         <p className="potato-banner" role="status" data-testid="potato-banner">
           {view.banner}
@@ -189,6 +195,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
           </div>
         </section>
         <div className="potato-side">
+          {legendOnPage && view.landing.legend ? <PotatoLegend legend={view.landing.legend} form="strip" colour={SWATCH} /> : null}
           {view.drop ? (
             <section className="card potato-drop" role="status" aria-labelledby="potato-drop-h" data-testid="potato-drop">
               <h2 id="potato-drop-h">{view.drop.title}</h2>

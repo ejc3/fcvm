@@ -4,7 +4,7 @@ import { DETAIL_TILE_PX, layoutMosaic, neighbour, readingOrder, streamHeightFor,
 import { ZOOM_DIM_NEAR, ZOOM_SHEET_W, zoomInsetsFor } from "../core/view.ts";
 import { IVS_PLAYER_URL } from "../core/broadcast.ts";
 import { streamBitrate } from "../core/bandwidth.ts";
-import { COORD, SEAM_MIN_PAIRS, admin, fleetNow, focusError, holdSeamCamera, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
+import { COORD, SEAM_MIN_PAIRS, admin, expectLanding, fleetNow, focusError, holdSeamCamera, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
 const view = (page: Page) =>
   page.evaluate(() => {
@@ -2178,4 +2178,11 @@ test("a probe that lands while the renderers are not accepting yet tries again: 
   await page.waitForFunction(() => window.__fleet?.client.getState().net.family != null, undefined, { timeout: 10_000 });
   expect((await page.evaluate(() => window.__fleet!.client.getState().net)).family).toBe("v6");
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
+});
+
+test("the line under the title and the What is this? control", async ({ page }) => {
+  await openWall(page, 1);
+  await expectLanding(page, { phone: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectLanding(page, { phone: true });
 });

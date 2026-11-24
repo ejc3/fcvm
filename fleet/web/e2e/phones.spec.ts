@@ -3,7 +3,7 @@
 // phone, taking it over and its fixed actions. The wall at `/` keeps its own suite.
 
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { COORD, admin, mockState } from "./helpers.ts";
+import { COORD, admin, mockState, expectLanding } from "./helpers.ts";
 
 const PHONES = 4;
 
@@ -521,4 +521,11 @@ test("pictures: seamless, zoomed out, and a phone taken over", async ({ page }) 
   await page.waitForTimeout(800);
   await shot("phones-taken-over");
   await page.getByTestId("phone-give-back").click();
+});
+
+test("phones: the line under the title and the What is this? control", async ({ page }) => {
+  await openPhones(page);
+  await expectLanding(page, { stage: "phones-stage", phone: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectLanding(page, { stage: "phones-stage", phone: true });
 });

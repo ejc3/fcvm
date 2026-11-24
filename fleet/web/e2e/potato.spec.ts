@@ -4,7 +4,7 @@
 
 import { expect, test, type Page } from "@playwright/test";
 import { potatoColour } from "../core/potato.ts";
-import { admin, mockState } from "./helpers.ts";
+import { admin, mockState, expectLanding } from "./helpers.ts";
 
 type MockRound = { id: number; size: number; started_at: number; hold_ms: number; pace_ms: number | null; holder: number | null };
 type MockPotato = { size: number; round: MockRound | null; next_round_at: number | null; ladder: { size: number; rounds: number; record_hold_ms: number | null }[] };
@@ -249,4 +249,35 @@ test("the header switch: the wall links to the potato page, which links back to 
   await expect(page.getByTestId("mode-potato")).toHaveAttribute("aria-current", "page");
   await expect(page.getByTestId("mode-wall")).toHaveAttribute("href", "/?debug=1");
   await expect(page.getByTestId("mode-phones")).toHaveAttribute("href", "/?debug=1&mode=phones");
+});
+
+test("potato: the line under the title and the What is this? control", async ({ page }) => {
+  await openPotato(page);
+  await expectLanding(page, { stage: "potato-stage", phone: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expectLanding(page, { stage: "potato-stage", phone: true });
+});
+
+test("potato: the legend is on the page with room, in the panel without, and never over the ring or the cards", async ({ page }) => {
+  await startAt(8);
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await openPotato(page);
+  const legend = page.getByTestId("potato-legend");
+  await expect(legend).toBeVisible();
+  await expect(legend.getByRole("heading", { name: "Legend" })).toBeVisible();
+  const apart = (a: { x: number; y: number; width: number; height: number }, b: typeof a) => a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1;
+  const lg = (await legend.boundingBox())!;
+  expect(apart(lg, (await page.getByTestId("potato-stage").boundingBox())!), "legend clear of the ring's stage").toBe(true);
+  for (const c of await page.locator(".potato-side > .card").all()) {
+    if ((await c.getAttribute("data-testid")) === "potato-legend") continue;
+    expect(apart(lg, (await c.boundingBox())!), "legend clear of the other cards").toBe(true);
+  }
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByTestId("potato-legend")).toHaveCount(0);
+  await page.getByTestId("landing-button").click();
+  const inPanel = page.getByTestId("landing-panel").getByTestId("potato-legend");
+  await expect(inPanel).toBeVisible();
+  await expect(inPanel).toContainText("a snapshot on disk; no CPU or memory");
+  await expect(inPanel).toContainText("slowest player");
 });

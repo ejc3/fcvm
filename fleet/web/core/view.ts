@@ -35,10 +35,10 @@ import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
 import { ownAutopilot, type ClientState, type FrameStats, type GpuSample, type Notice, type StreamMode, type TileFrameStats } from "./store.ts";
 import { sceneAgeMs } from "./lag.ts";
+import { landingView, type LandingView } from "./landing.ts";
 
 export const SITE = "fcvm.dev";
 export const TITLE = "Every GPU, live";
-export const SENTENCE = "Each square is its own virtual machine with its own NVIDIA GPU. Restart them all and watch which side comes back.";
 /** The tag on each half of the image: who it is, and how its VMs start. */
 export const SIDE_TAGS: Record<Half, { tag: string; text: string }> = {
   fcvm: { tag: "FCVM", text: "restored from a snapshot" },
@@ -1452,7 +1452,7 @@ export interface Banner {
 export interface WallView {
   title: string;
   site: string;
-  sentence: string;
+  landing: LandingView;
   ready: boolean;
   version: number;
   online: boolean;
@@ -1750,7 +1750,7 @@ export function wallView(input: WallInput): WallView {
   const common = {
     title: TITLE,
     site: SITE,
-    sentence: SENTENCE,
+    landing: landingView("wall", { lambda: s.accepted?.tiles.some((t) => t.half === "lambda") === true }),
     version: s.version,
     online,
     banners,
