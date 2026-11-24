@@ -17,7 +17,11 @@ import {
   MATERIALS,
   MC_UNKNOWN,
   minecraftNotice,
+  MC_DRAWN_NOTE,
   MC_FLAT_NOTE,
+  MC_MAX_COLUMNS,
+  MC_MAX_SIDE,
+  sameGrid,
   minecraftView,
   parseViewMsg,
   remapOf,
@@ -800,6 +804,30 @@ describe("the 3D view's words", () => {
     expect(status({})).toMatchObject({ day_time: null });
   });
 
+  it("takes only a grid it can build: each side within 16 bits' reach and the whole within the cap, and a delta's indices inside it", () => {
+    const grid = (w: number, h: number) => JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: Buffer.alloc(Math.min(w * h * 2, 16)).toString("base64") });
+    expect([MC_MAX_SIDE, MC_MAX_COLUMNS]).toEqual([1024, 65_536]);
+    expect(() => parseViewMsg(grid(MC_MAX_SIDE + 1, 1))).toThrow(/not a grid/);
+    expect(() => parseViewMsg(grid(1, MC_MAX_SIDE + 1))).toThrow(/not a grid/);
+    expect(() => parseViewMsg(grid(1024, 128))).toThrow(/not a grid/);
+    expect(() => parseViewMsg(grid(1024, 64))).not.toThrow(/not a grid/);
+    expect(() => parseViewMsg(grid(2, 4))).not.toThrow(/not a grid/);
+    const delta = (cells: unknown) => JSON.stringify({ type: "delta", seq: 2, cells });
+    expect(() => parseViewMsg(delta([[MC_MAX_COLUMNS, 1, 1]]))).toThrow(ProtocolError);
+    expect(parseViewMsg(delta([[MC_MAX_COLUMNS - 1, 1, 1]]))).toMatchObject({ type: "delta" });
+  });
+
+  it("compares a copy with its source only when both are the same grid of the same materials", () => {
+    const w = (x0: number, side = 2): McWorld => ({ region: { x0, z0: 0, w: side, h: side }, cells: new Uint8Array(side * side * 2), seq: 1 });
+    const mats = remapOf([...MATERIALS]);
+    expect(sameGrid(w(0), mats, w(0), remapOf([...MATERIALS]))).toBe(true);
+    expect(sameGrid(w(0), mats, w(8), mats)).toBe(false);
+    expect(sameGrid(w(0), mats, w(0, 4), mats)).toBe(false);
+    expect(sameGrid(w(0), mats, w(0), remapOf(["unknown", "grass", "water"]))).toBe(false);
+    expect(sameGrid(w(0), mats, w(0), null)).toBe(false);
+    expect(sameGrid(w(0), null, w(0), null)).toBe(true);
+  });
+
   it("says on the tile that it is a flat map when the browser has no WebGL2, and nothing when it is 3D", () => {
     const flat = viewOf(minecraftOf(2), { renderer: "flat" });
     expect(flat.renderer).toBe("flat");
@@ -812,9 +840,21 @@ describe("the 3D view's words", () => {
     expect(gl.cards[0]!.ariaLabel).toBe("mc-1, running");
     // unsaid, the page has not looked yet: nothing claims a flat map
     expect(viewOf(minecraftOf(2)).cards[0]!.note).toBeNull();
+    // a 3D view that was lost says so, not that the browser has none
+    const lost = viewOf(minecraftOf(2), { renderer: "flat", lost: true }).cards[0]!;
+    expect(lost.note).toBe("3D view lost; showing the flat map.");
+    expect(lost.ariaLabel).toBe("mc-1, running, flat map");
+    // a view the page draws with less detail to keep up says so
+    const reduced = viewOf(minecraftOf(2), { renderer: "3d", reduced: true }).cards[0]!;
+    expect(reduced.note).toBe("Reduced detail");
+    expect(reduced.ariaLabel).toBe("mc-1, running, reduced detail");
+    // what is drawn from data and what is filled in, said once, with the 3D view only
+    expect(gl.header!.drawn).toBe(MC_DRAWN_NOTE);
+    expect(MC_DRAWN_NOTE).toBe("Drawn from each column's top block; trunks, the forest floor and lake beds are filled in.");
+    expect(flat.header!.drawn).toBeNull();
   });
 
-  it("names a copy's source, counts the columns that differ since the fork, and flies the copy while it is taken", () => {
+  it("names a copy's source, counts the columns that differ from its source's world now, and flies the copy while it is taken", () => {
     const forked = with1(minecraftOf(4), 1, { forked_from: "mc-1" });
     const live = { ...LIVE(4), "mc:2": { ...LIVE(4)["mc:2"]!, diff: 4, bots: 3 } };
     const c = viewOf(forked, { live }).cards[1]!;
@@ -829,15 +869,28 @@ describe("the 3D view's words", () => {
     expect(viewOf(minecraftOf(4), { live }).cards[1]!.diff).toBeNull();
     expect(viewOf(minecraftOf(4), { live }).cards[1]!.forkOf).toBeNull();
     // while the copy is taken, its picture flies from the source
-    const taking = viewOf(with1(forked, 1, { phase: "forking", last_relaunch: { clicked_at: NOW - 1200, first_frame_at: null, phases: {} } }), { live }).cards[1]!;
+    const forking = with1(forked, 1, { phase: "forking", last_relaunch: { clicked_at: NOW - 1200, first_frame_at: null, phases: {} } });
+    const taking = viewOf(forking, { live, renderer: "3d" }).cards[1]!;
     expect(taking.flight).toEqual({ from: "mc:1", elapsedMs: 1200 });
     expect(taking.diff).toBeNull();
+    // the flight is the tile's picture only when it can be drawn: in 3D, with motion, the source on the stage with its world in
+    expect(viewOf(forking, { live }).cards[1]!.flight).toBeNull();
+    expect(viewOf(forking, { live, renderer: "flat" }).cards[1]!.flight).toBeNull();
+    expect(viewOf(forking, { live, renderer: "3d", reducedMotion: true }).cards[1]!.flight).toBeNull();
+    expect(viewOf(forking, { live: { ...live, "mc:1": { ...LIVE(4)["mc:1"]!, hasMap: false } }, renderer: "3d" }).cards[1]!.flight).toBeNull();
+    expect(viewOf(forking, { live, renderer: "3d", opened: "mc:2" }).cards[1]!.flight).toBeNull();
+    // and without it the tile keeps its own timer
+    expect(viewOf(forking, { live, renderer: "flat" }).cards[1]!.timer).toBe("Forking 1.2 s");
+    // a fork that failed flies nothing: the tile says why
+    const failed = viewOf(with1(forking, 1, { phase: "failed", error: "the copy's restore failed" }), { live, renderer: "3d" }).cards[1]!;
+    expect(failed.flight).toBeNull();
+    expect(failed.error).toContain("the copy's restore failed");
     // a source relaunched since the fork is another world: nothing to compare with
     const relaunched = with1(with1(forked, 1, { last_relaunch: { clicked_at: EPOCH + 1000, first_frame_at: EPOCH + 2000, phases: {} } }), 0, { last_relaunch: { clicked_at: EPOCH + 5000, first_frame_at: EPOCH + 6000, phases: {} } });
     expect(viewOf(relaunched, { live }).cards[1]!.forkOf).toBeNull();
     expect(viewOf(relaunched, { live }).cards[1]!.diff).toBeNull();
     // a source that has left the fleet is no source
-    expect(viewOf(with1(minecraftOf(4), 1, { forked_from: "mc-9", phase: "forking" })).cards[1]!.flight).toBeNull();
+    expect(viewOf(with1(minecraftOf(4), 1, { forked_from: "mc-9", phase: "forking" }), { renderer: "3d" }).cards[1]!.flight).toBeNull();
   });
 
   it("opens one server to the whole stage and puts the rest away, unless this viewer holds one", () => {
@@ -848,6 +901,10 @@ describe("the 3D view's words", () => {
     expect(c.box!.w).toBe(STAGE.h - 104);
     expect(c.box!.w).toBe(c.box!.h);
     expect(c.opened).toBe(true);
+    // the opened 3D view says what is drawn and what is filled in; the flat map draws only data
+    expect(c.about).toBeNull();
+    expect(viewOf(minecraftOf(4), { opened: "mc:3", renderer: "3d" }).cards.map((x) => x.about)).toEqual([null, null, MC_DRAWN_NOTE, null]);
+    expect(viewOf(minecraftOf(4), { opened: "mc:3", renderer: "flat" }).cards[2]!.about).toBeNull();
     // every other server keeps its socket: the worlds are there when the wall comes back
     expect(v.cards.every((x) => x.socket !== null)).toBe(true);
     const wall = viewOf(minecraftOf(4));

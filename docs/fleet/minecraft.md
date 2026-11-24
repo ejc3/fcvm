@@ -151,7 +151,10 @@ guard; pure and unit-tested) and `fleet/web/app/_wall/minecraft-gl.ts` and `mine
   how far down its sides reach, flags): a top for every column and every canopy column, sides
   only for the ones that stand above a neighbour (the two that face the camera are drawn), and
   the water's surface. Trunks, plants, lone trees and the figures are boxes of 44 bytes. It is
-  rebuilt and uploaded when a delta arrives (at most every 200 ms).
+  rebuilt and uploaded when the world, its fork's source or its glowing columns change, at most
+  every 200 ms a tile (`REBUILD_MIN_MS`; a new launch or a new level of detail is built at
+  once). The page takes a grid of at most 65,536 columns, 1,024 a side: a rebuild took 4 ms for
+  the tile's 128 x 128 and 16 ms for 256 x 256 (node, a shared development host).
 - **What one block per column cannot say is guessed**: a cliff is solid down to its lowest
   neighbour; the ground under leaves is taken from the columns beside them that are not leaves,
   spreading inward, with a trunk under each canopy's top; a lake's bed deepens up to 4 blocks from
@@ -166,17 +169,30 @@ guard; pure and unit-tested) and `fleet/web/app/_wall/minecraft-gl.ts` and `mine
   had drawn it is sampled, and when the median of 20 is over 40 ms, or three in a row are over
   160 ms, the page
   gives up a level: first detail (one column for every 2 x 2 blocks), then frames (10 a second),
-  then the flight (one still view a second, a column for every 4 x 4 blocks). After 20 s of
-  frames under 20 ms it tries one level up. A software renderer starts at the last level. The floor, measured on Chromium's software renderer
+  then the flight (one still view a second, a column for every 4 x 4 blocks). A reduced view says
+  "Reduced detail" on its tile, and a coarse column is outlined when any column it stands for
+  differs from the fork's source, so the outline agrees with the count. After 20 s of frames
+  that keep up with the display (done by its next tick, whatever its rate) the page tries one
+  level up; a recovery that fails doubles the wait before the next, to 320 s, and one that holds
+  starts it over. A frame the GPU never reports done is drawn past after 5 s and counted. A
+  software renderer starts at the last level. The floor, measured on Chromium's software renderer
   (the kind CI has) on a shared development host: four tiles in a 1232 x 541 canvas took 1.8 s a
   frame at full detail, the guard reached its last level, and a frame there took 0.16 s.
 - **What it holds.** A tile off the screen and a hidden tab hold no buffers on the GPU; they are
-  uploaded again when next drawn. A lost context, or no WebGL2, is the flat map with "Flat map:
-  no WebGL2 in this browser." on each tile.
+  uploaded again when next drawn. No WebGL2 is the flat map with "Flat map: no WebGL2 in this
+  browser." on each tile; a lost context is the flat map with "3D view lost; showing the flat
+  map.", and the 3D view returns when the browser restores the context.
+- **What is drawn from data and what is filled in** is said once under the header: "Drawn from
+  each column's top block; trunks, the forest floor and lake beds are filled in." The sky does not
+  move until a server sends its clock.
 - **Reduced motion:** one still wide view per tile, each from its own side, drawn again (at most
   four times a second) only when its world or its players change; no flight for a fork.
 - **Opening a tile** (a click, or Enter on it) gives one server the whole stage; Escape or "All
-  servers" brings the wall back. The other servers keep their sockets.
+  servers" brings the wall back, and focus goes to "All servers" and back to the tile. The other
+  servers keep their sockets.
+- **A fork's flight** is drawn only when it can be: in 3D, with motion, both tiles on the stage
+  and the source's world in. Otherwise, and when the copy fails, the tile keeps its own timer or
+  error.
 
 ### Invariants (each becomes a test)
 

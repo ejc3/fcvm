@@ -105,6 +105,11 @@ function Caption({ c, onReset, onFork, onTake, onClose }: { c: MinecraftCard; on
           {c.note}
         </p>
       ) : null}
+      {c.about ? (
+        <p className="about" data-testid={`mc-about-${c.slot}`}>
+          {c.about}
+        </p>
+      ) : null}
       {!c.compact && c.lentText ? (
         <p className="lent" data-testid={`mc-lent-${c.slot}`}>
           {c.lentText}
@@ -239,6 +244,11 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   // What draws the worlds: unknown until the page has asked for a WebGL2 context.
   const [renderer, setRenderer] = useState<McRenderer | null>(null);
   const [opened, setOpened] = useState<string | null>(null);
+  // The flat map is shown because the 3D view was lost; the 3D view is drawn with less detail.
+  const [lost, setLost] = useState(false);
+  const [reduced, setReduced] = useState(false);
+  const stageBox = useRef<Box | null>(null);
+  const wasOpened = useRef<string | null>(null);
   const glRef = useRef<HTMLCanvasElement | null>(null);
   const flightsRef = useRef<HTMLDivElement | null>(null);
   const stage3d = useRef<McStage | null>(null);
@@ -259,7 +269,10 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   // Clock and connection. The tiles' timers count tenths of a second.
   useEffect(() => {
     setNow(localNow());
-    const id = setInterval(() => setNow(localNow()), 100);
+    const id = setInterval(() => {
+      setNow(localNow());
+      setReduced(stage3d.current?.reduced ?? false);
+    }, 100);
     client.start();
     return () => {
       clearInterval(id);
@@ -273,13 +286,27 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
     const canvas = glRef.current;
     if (!canvas) return;
     const debug = new URLSearchParams(window.location.search).get("debug") === "1";
-    const st = McStage.create(canvas, tiles, debug, () => {
-      stage3d.current = null;
-      setRenderer("flat");
-    });
-    stage3d.current = st;
-    setRenderer(st === null ? "flat" : "3d");
+    let st: McStage | null = null;
+    const start = () => {
+      st = McStage.create(canvas, tiles, debug, () => {
+        // The context is gone: the flat map takes over, and says why. The canvas stays, so the
+        // browser can give the context back.
+        st?.dispose();
+        st = stage3d.current = null;
+        setLost(true);
+        setRenderer("flat");
+      });
+      stage3d.current = st;
+      setRenderer(st === null ? "flat" : "3d");
+      if (st !== null) setLost(false);
+    };
+    start();
+    const restored = () => {
+      if (st === null) start();
+    };
+    canvas.addEventListener("webglcontextrestored", restored);
     return () => {
+      canvas.removeEventListener("webglcontextrestored", restored);
       st?.dispose();
       stage3d.current = null;
     };
@@ -316,10 +343,12 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   }, [narrow]);
 
   const view = useMemo(
-    () => minecraftView({ state, now: now || 0, dpr, stage, narrow, touch, live, drive: { samples, refused }, released, renderer, opened }),
-    [state, now, dpr, stage, narrow, touch, live, samples, refused, released, renderer, opened],
+    () => minecraftView({ state, now: now || 0, dpr, stage, narrow, touch, live, drive: { samples, refused }, released, renderer, opened, lost, reduced, reducedMotion }),
+    [state, now, dpr, stage, narrow, touch, live, samples, refused, released, renderer, opened, lost, reduced, reducedMotion],
   );
   viewRef.current = view;
+  // The boxes in `view` were laid out in this stage: the 3D view draws into the same one.
+  stageBox.current = stage;
   const panel = view.panel;
 
   // The sockets the view asks for.
@@ -471,6 +500,14 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
     return () => window.removeEventListener("keydown", onDown);
   }, [opened, panel === null]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Focus follows: to "All servers" when a server opens, back to its tile when the wall returns.
+  const openedNow = view.opened === null ? null : opened;
+  useEffect(() => {
+    if (openedNow !== null) document.querySelector<HTMLElement>('[data-testid="mc-close"]')?.focus();
+    else if (wasOpened.current !== null) canvases.current.get(wasOpened.current)?.focus();
+    wasOpened.current = openedNow;
+  }, [openedNow]);
+
   // Draw: the 3D view every frame its guard allows; the flat map when a tile's world or players
   // changed, or its box moved.
   useEffect(() => {
@@ -480,12 +517,12 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
       const v = viewRef.current;
       const st = stage3d.current;
       if (v && renderer === "3d" && st) {
-        const area = boxOf(stageRef.current);
+        const area = stageBox.current;
         if (area && document.visibilityState === "visible") {
           st.frame(localNow(), {
             stage: area,
             dpr,
-            tiles: v.cards.map((c, index) => ({ id: c.id, slot: c.slot, index, box: c.box, forkOf: c.forkOf, flight: c.flight, timer: c.timer })),
+            tiles: v.cards.map((c, index) => ({ id: c.id, slot: c.slot, index, box: c.box, forkOf: c.forkOf, flight: c.flight, timer: c.timer, dark: c.dark })),
             reducedMotion,
             labels: (tid) => canvases.current.get(tid),
             flights: flightsRef.current,
@@ -557,6 +594,11 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
             </div>
           ) : null}
           {h?.join ? <JoinLine join={h.join} /> : null}
+          {h?.drawn ? (
+            <p className="mc-drawn" data-testid="mc-drawn">
+              {h.drawn}
+            </p>
+          ) : null}
         </header>
         <div ref={stageRef} className="win-stage" data-testid="mc-stage" />
       </main>
@@ -577,12 +619,12 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
       ) : null}
       <div className="win-layer mc-layer" data-renderer={renderer ?? undefined} data-testid="mc-layer">
         {/* one WebGL canvas under every tile: each world is drawn into its tile's rectangle */}
-        {renderer !== "flat" ? <canvas ref={glRef} className="mc-gl" aria-hidden="true" style={stage ? at(stage) : { display: "none" }} data-testid="mc-gl" /> : null}
+        {renderer !== "flat" || lost ? <canvas ref={glRef} className="mc-gl" aria-hidden="true" style={stage && renderer !== "flat" ? at(stage) : { display: "none" }} data-testid="mc-gl" /> : null}
         {view.cards.map((c) =>
           c.box ? (
             <div
               key={c.id}
-              className={`mc-tile${c.mine ? " mine" : ""}${renderer === "3d" ? " gl" : ""}${c.flight && renderer === "3d" && !reducedMotion ? " taking" : ""}`}
+              className={`mc-tile${c.mine ? " mine" : ""}${renderer === "3d" ? " gl" : ""}${c.flight ? " taking" : ""}`}
               style={at(c.box)}
               data-testid={`mc-tile-${c.slot}`}
               data-phase={c.dark ? "dark" : "live"}
@@ -592,6 +634,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
                 role={!c.dark && !c.mine && !c.opened ? "button" : "img"}
                 tabIndex={!c.dark && !c.mine && !c.opened ? 0 : undefined}
                 title={!c.dark && !c.mine && !c.opened ? `Open ${c.slot}` : undefined}
+                aria-describedby={!c.dark && !c.mine && !c.opened ? `mc-desc-${c.slot}` : undefined}
                 onClick={!c.dark && !c.mine && !c.opened ? () => setOpened(c.id) : undefined}
                 onKeyDown={
                   !c.dark && !c.mine && !c.opened
@@ -602,7 +645,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
                       }
                     : undefined
                 }
-                aria-label={c.ariaLabel}
+                aria-label={!c.dark && !c.mine && !c.opened ? `Open ${c.slot}` : c.ariaLabel}
                 ref={(el) => {
                   if (el) canvases.current.set(c.id, el);
                   else canvases.current.delete(c.id);
@@ -616,6 +659,10 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
                 onPointerUp={c.mine ? onPointerUp : undefined}
                 onPointerCancel={c.mine ? onPointerUp : undefined}
               />
+              {/* what the tile shows, for a screen reader: the canvas names its action when it is a button */}
+              <span id={`mc-desc-${c.slot}`} className="sr-only" data-testid={`mc-desc-${c.slot}`}>
+                {c.ariaLabel}
+              </span>
               {/* a copy's count of the columns that differ from its source, in the colour they are outlined in */}
               {!c.dark && c.diff ? (
                 <span className="diff" data-testid={`mc-diff-${c.slot}`}>

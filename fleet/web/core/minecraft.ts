@@ -129,6 +129,15 @@ export function remapOf(materials: readonly string[]): Uint8Array {
 
 // ---- the view socket ------------------------------------------------------------------------
 
+/**
+ * The largest grid the page takes: a column's place is packed into 16 bits each way, and a
+ * rebuild of the 3D geometry is a pass over every column, at most every 200 ms. Measured with
+ * node on a shared development host: 4 ms for the tile's 128 x 128, 16 ms for 256 x 256, 66 ms
+ * for 512 x 512. The cap is the 16 ms one.
+ */
+export const MC_MAX_SIDE = 1024;
+export const MC_MAX_COLUMNS = 65_536;
+
 export interface McRegion {
   x0: number;
   z0: number;
@@ -244,7 +253,7 @@ export function parseViewMsg(text: string): ViewMsg | null {
       const r = v["region"];
       if (!isObj(r)) throw new ProtocolError("map.region is not an object");
       const region = { x0: n(r, "x0", "map.region"), z0: n(r, "z0", "map.region"), w: n(r, "w", "map.region"), h: n(r, "h", "map.region") };
-      if (!Number.isInteger(region.w) || !Number.isInteger(region.h) || region.w <= 0 || region.h <= 0 || region.w * region.h > 1 << 20) {
+      if (!Number.isInteger(region.w) || !Number.isInteger(region.h) || region.w <= 0 || region.h <= 0 || region.w > MC_MAX_SIDE || region.h > MC_MAX_SIDE || region.w * region.h > MC_MAX_COLUMNS) {
         throw new ProtocolError("map.region is not a grid this page draws");
       }
       const cells = decodeBase64(s(v, "cells", w));
@@ -258,7 +267,7 @@ export function parseViewMsg(text: string): ViewMsg | null {
       const w = "delta";
       const triples = (k: string) =>
         list(v, k, w).map((c, i) => {
-          if (!Array.isArray(c) || c.length !== 3 || c.some((x) => typeof x !== "number" || !Number.isInteger(x) || x < 0)) {
+          if (!Array.isArray(c) || c.length !== 3 || c.some((x) => typeof x !== "number" || !Number.isInteger(x) || x < 0) || c[0] >= MC_MAX_COLUMNS) {
             throw new ProtocolError(`delta.${k}[${i}] is not [index, material, height]`);
           }
           return c as [number, number, number];
@@ -310,6 +319,18 @@ export interface McWorld {
   seq: number;
   /** The ground under each column, in the cells' layout, when the tile sends it. */
   ground?: Uint8Array | null;
+}
+
+/**
+ * Whether two worlds are the same grid of the same materials (each with its tile's material
+ * table as `remapOf` made it): only then do their cells compare column by column.
+ */
+export function sameGrid(a: McWorld, remapA: Uint8Array | null, b: McWorld, remapB: Uint8Array | null): boolean {
+  const r = a.region;
+  const q = b.region;
+  if (r.x0 !== q.x0 || r.z0 !== q.z0 || r.w !== q.w || r.h !== q.h || a.cells.length !== b.cells.length) return false;
+  if (remapA === null || remapB === null) return remapA === remapB;
+  return remapA.length === remapB.length && remapA.every((v, i) => v === remapB[i]);
 }
 
 /** The world after a `map`: the whole grid, replaced. */
@@ -847,15 +868,23 @@ export interface MinecraftCard {
   forkOf: string | null;
   /** How a copy differs from its source now, said on its picture: "4 columns differ". */
   diff: string | null;
-  /** While the copy is being taken: its picture flies here from that tile, and has since the fork's click. */
+  /** While the copy is being taken and the page can draw it: its picture flies here from that tile, and has since the fork's click. The tile's own overlay and timer give way to it. */
   flight: { from: string; elapsedMs: number } | null;
   /** The one server on the stage, opened from the wall. */
   opened: boolean;
+  /** On an opened 3D view: what is drawn from data and what is filled in (a phone has no room for it in the header). */
+  about: string | null;
 }
 
 /** How the page draws the worlds: "flat" is the map from above, for a browser with no WebGL2. */
 export type McRenderer = "3d" | "flat";
 export const MC_FLAT_NOTE = "Flat map: no WebGL2 in this browser.";
+/** The browser had a WebGL2 context and lost it; the 3D view comes back if the browser restores it. */
+export const MC_LOST_NOTE = "3D view lost; showing the flat map.";
+/** The page draws fewer columns, or frames, to keep up (FrameBudget). */
+export const MC_REDUCED_NOTE = "Reduced detail";
+/** What is drawn from the servers' data and what the page fills in, said once. */
+export const MC_DRAWN_NOTE = "Drawn from each column's top block; trunks, the forest floor and lake beds are filled in.";
 
 function diffText(k: number): string {
   return k === 0 ? "same so far" : `${k} column${k === 1 ? " differs" : "s differ"}`;
@@ -872,6 +901,8 @@ export interface MinecraftHeader {
   lastResetAll: string | null;
   /** For Java Edition players: the client to use, and one tile's address and port to copy, when tiles have one. */
   join: { label: string; address: string } | null;
+  /** With the 3D view: what is drawn from data and what is filled in. */
+  drawn: string | null;
 }
 
 /**
@@ -923,6 +954,12 @@ export interface MinecraftInput {
   released?: string | null;
   /** What the page draws with; unsaid until it has looked. */
   renderer?: McRenderer | null;
+  /** The flat map is shown because a 3D view was lost, not because the browser has none. */
+  lost?: boolean;
+  /** The 3D view is drawn with less detail to keep up. */
+  reduced?: boolean;
+  /** The viewer asked for reduced motion: nothing flies. */
+  reducedMotion?: boolean;
   /** The tile (by id) opened to the whole stage. */
   opened?: string | null;
 }
@@ -971,7 +1008,7 @@ export function heldLayout(area: Box, id: string, narrow: boolean, dpr: number):
   return { id, box: { x, y: area.y, w: side, h: side }, caption: { x, y: area.y + side, w: side, h: capH }, compact: narrow };
 }
 
-function headerOf(m: Minecraft, you: string | null, srvNow: number): MinecraftHeader {
+function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: McRenderer | null): MinecraftHeader {
   const times = upTimes(m.tiles);
   const median = medianMs(times);
   const up = m.tiles.filter((t) => t.phase === "running").length;
@@ -997,6 +1034,7 @@ function headerOf(m: Minecraft, you: string | null, srvNow: number): MinecraftHe
     lastFork,
     lastResetAll,
     join: joinable === undefined ? null : { label: `Join with Java Edition${version ? ` ${version}` : ""}:`, address: `${joinable.join}:${MINECRAFT_JOIN_PORT}` },
+    drawn: renderer === "3d" ? MC_DRAWN_NOTE : null,
   };
 }
 
@@ -1101,12 +1139,17 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     const source = from !== null && (from.last_relaunch?.clicked_at ?? 0) <= (t.last_relaunch?.clicked_at ?? 0) ? from : null;
     const differ = running && source !== null ? (live?.diff ?? null) : null;
     const flat = inp.renderer === "flat";
+    const reduced = inp.renderer === "3d" && inp.reduced === true;
+    // The copy's picture flies in from its source only when the page can draw that: in 3D, with
+    // motion, both tiles on the stage and the source's world in. Otherwise the tile keeps its own
+    // overlay and timer.
+    const flies = t.phase === "forking" && source !== null && inp.renderer === "3d" && inp.reducedMotion !== true && p !== undefined && placed.has(source.id) && inp.live[source.id]?.hasMap === true;
     const said = [
       `${slot}, ${state}`,
       mine(t) ? "yours to drive" : lentToOther ? "lent" : null,
       running && (live?.bots ?? 0) > 0 ? `${live!.bots} bot${live!.bots === 1 ? "" : "s"}` : null,
       differ !== null ? `copy of ${t.forked_from}, ${differ} column${differ === 1 ? " differs" : "s differ"}` : null,
-      flat ? "flat map" : null,
+      flat ? "flat map" : reduced ? "reduced detail" : null,
     ];
     return {
       id: t.id,
@@ -1133,11 +1176,12 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
       mine: mine(t),
       lent: lentToOther,
       ariaLabel: said.filter((x) => x !== null).join(", "),
-      note: flat ? MC_FLAT_NOTE : null,
+      note: flat ? (inp.lost === true ? MC_LOST_NOTE : MC_FLAT_NOTE) : reduced ? MC_REDUCED_NOTE : null,
       forkOf: source?.id ?? null,
       diff: differ === null ? null : diffText(differ),
-      flight: t.phase === "forking" && source !== null ? { from: source.id, elapsedMs: Math.max(0, srvNow - (t.last_relaunch?.clicked_at ?? srvNow)) } : null,
+      flight: flies ? { from: source.id, elapsedMs: Math.max(0, srvNow - (t.last_relaunch?.clicked_at ?? srvNow)) } : null,
       opened: opened?.id === t.id,
+      about: opened?.id === t.id && inp.renderer === "3d" ? MC_DRAWN_NOTE : null,
     };
   });
   let panel: MinecraftPanel | null = null;
@@ -1176,7 +1220,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     ...common,
     empty: null,
     banner,
-    header: headerOf(m, s.you, srvNow),
+    header: headerOf(m, s.you, srvNow, inp.renderer ?? null),
     resetAll: { label: "Reset all", disabled: !online || m.tiles.length === 0 },
     cards,
     panel,

@@ -445,9 +445,20 @@ test("the worlds are drawn in 3D on one WebGL canvas, each tile from its own mov
   await openMinecraft(page);
   expect(await renderer(page)).toBe("3d");
   await expect(page.getByTestId("mc-gl")).toHaveCount(1);
-  for (const slot of SLOTS) await expect(page.getByTestId(`mc-note-${slot}`)).toHaveCount(0);
+  // what is drawn from data and what is filled in: under the header where there is a line for it, else under an opened server
+  await expect(page.getByTestId("mc-drawn")).toHaveText("Drawn from each column's top block; trunks, the forest floor and lake beds are filled in.");
+  if (isPhone(test.info())) await expect(page.getByTestId("mc-drawn")).toBeHidden();
+  else await expect(page.getByTestId("mc-drawn")).toBeVisible();
   await expect.poll(async () => (await stageNow(page))!.held).toBe(SLOTS.length);
   const st = (await stageNow(page))!;
+  // a renderer that draws on the CPU starts at the guard's last level, and every tile says the view is reduced
+  if (st.software) {
+    expect(st.level).toBeGreaterThan(0);
+    for (const slot of SLOTS) {
+      await expect(page.getByTestId(`mc-note-${slot}`)).toHaveText("Reduced detail");
+      await expect(page.getByTestId(`mc-desc-${slot}`)).toHaveText(/, reduced detail$/);
+    }
+  }
   // six draw calls a world
   expect(st.calls).toBe(SLOTS.length * 6);
   // no two tiles look from the same place
@@ -455,6 +466,8 @@ test("the worlds are drawn in 3D on one WebGL canvas, each tile from its own mov
   expect(new Set(eyes).size).toBe(SLOTS.length);
   // the camera flies: with the frame-time guard off (this renderer is software), a tile's eye moves
   await page.evaluate(() => window.__minecraft!.setBudget(false));
+  // at full detail nothing is said
+  for (const slot of SLOTS) await expect(page.getByTestId(`mc-note-${slot}`)).toHaveCount(0);
   const eye = async () => (await stageNow(page))!.shots["mc:1"]!.eye.join();
   const first = await eye();
   await expect.poll(eye).not.toBe(first);
@@ -503,9 +516,13 @@ test("a browser with no WebGL2 gets the flat map, and every tile says so", async
   expect(await renderer(page)).toBe("flat");
   await expect(page.getByTestId("mc-gl")).toHaveCount(0);
   expect(await stageNow(page)).toBeNull();
+  await expect(page.getByTestId("mc-drawn")).toHaveCount(0);
   for (const slot of SLOTS) {
     await expect(page.getByTestId(`mc-note-${slot}`)).toHaveText("Flat map: no WebGL2 in this browser.");
-    await expect(page.getByTestId(`mc-canvas-${slot}`)).toHaveAttribute("aria-label", new RegExp(`^${slot}, running.*, flat map$`));
+    await expect(page.getByTestId(`mc-desc-${slot}`)).toHaveText(new RegExp(`^${slot}, running.*, flat map$`));
+    // the canvas is a button that says what it does; what it shows is its description
+    await expect(page.getByTestId(`mc-canvas-${slot}`)).toHaveAttribute("aria-label", `Open ${slot}`);
+    await expect(page.getByTestId(`mc-canvas-${slot}`)).toHaveAttribute("aria-describedby", `mc-desc-${slot}`);
     await expect.poll(async () => (await drawnShare(page, slot)).share, { message: slot }).toBeGreaterThan(0.9);
     expect((await drawnShare(page, slot)).colours, slot).toBeGreaterThan(8);
   }
@@ -520,11 +537,16 @@ test("with reduced motion every tile is one still 3D view, drawn again only when
   await expect.poll(async () => Object.keys((await stageNow(page))!.shots).length).toBe(SLOTS.length);
   const a = (await stageNow(page))!;
   expect(Object.values(a.shots).map((s) => s.kind)).toEqual(SLOTS.map(() => "wide"));
-  await page.waitForTimeout(1500);
+  // never more than four frames a second
+  expect(a.everyMs).toBeGreaterThanOrEqual(250);
+  // the bots move and the page draws them again, from the same place
+  const where = async () => JSON.stringify((await tilesNow(page))["mc:1"]!.players.map((p) => [p.x, p.z]));
+  const before = await where();
+  await expect.poll(where, { timeout: 30_000 }).not.toBe(before);
+  await expect.poll(async () => (await stageNow(page))!.frames).toBeGreaterThan(a.frames);
   const b = (await stageNow(page))!;
   for (const id of Object.keys(a.shots)) expect(b.shots[id]!.eye, id).toEqual(a.shots[id]!.eye);
-  // at most four frames a second, not sixty
-  expect(b.frames - a.frames).toBeLessThanOrEqual(8);
+  expect(b.everyMs).toBeGreaterThanOrEqual(250);
   for (const slot of SLOTS) expect((await drawnShare(page, slot)).share, slot).toBeGreaterThan(0.9);
   await context.close();
 });
@@ -561,7 +583,7 @@ test("a fork's picture flies from its source to the copy's tile, and the copy th
   // the copy starts as its source and the two then diverge as their bots build
   await expect(page.getByTestId("mc-diff-mc-2")).toHaveText(/^(same so far|\d+ columns? differs?)$/);
   await expect(page.getByTestId("mc-diff-mc-2")).toHaveText(/^\d+ columns? differs?$/, { timeout: 60_000 });
-  await expect(page.getByTestId("mc-canvas-mc-2")).toHaveAttribute("aria-label", /copy of mc-1, \d+ columns? differs?/);
+  await expect(page.getByTestId("mc-desc-mc-2")).toHaveText(/copy of mc-1, \d+ columns? differs?/);
   // resetting the source ends the comparison: it is another world now
   await page.getByTestId("mc-reset-mc-1").click();
   await expect(page.getByTestId("mc-diff-mc-2")).toHaveCount(0);
@@ -572,6 +594,9 @@ test("a click or Enter opens one server to the whole stage, and Escape or All se
   const small = (await page.getByTestId("mc-tile-mc-3").boundingBox())!;
   await page.getByTestId("mc-canvas-mc-3").click();
   await expect(page.getByTestId("mc-close")).toBeVisible();
+  // focus goes with the view: to All servers, and back to the tile when the wall returns
+  await expect(page.getByTestId("mc-close")).toBeFocused();
+  await expect(page.getByTestId("mc-about-mc-3")).toHaveText("Drawn from each column's top block; trunks, the forest floor and lake beds are filled in.");
   for (const slot of ["mc-1", "mc-2", "mc-4"]) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(0);
   const big = (await page.getByTestId("mc-tile-mc-3").boundingBox())!;
   expect(big.width).toBeGreaterThan(1.05 * small.width);
@@ -581,9 +606,49 @@ test("a click or Enter opens one server to the whole stage, and Escape or All se
   expect(Object.values(await tilesNow(page)).filter((t) => t.open)).toHaveLength(SLOTS.length);
   await page.keyboard.press("Escape");
   for (const slot of SLOTS) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(1);
+  await expect(page.getByTestId("mc-canvas-mc-3")).toBeFocused();
   await page.getByTestId("mc-canvas-mc-2").focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("mc-tile-mc-1")).toHaveCount(0);
   await page.getByTestId("mc-close").click();
   for (const slot of SLOTS) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(1);
+});
+
+test("a fork in flight ends when its tiles leave the stage or the copy fails, and the tile shows its own timer when nothing flies", async ({ page }) => {
+  await openMinecraft(page);
+  await page.getByTestId("mc-fork-mc-3").click();
+  // while the picture flies, the tile taking the copy shows the flight, not a second timer
+  await expect(page.getByTestId("mc-flight-mc-4")).toBeVisible();
+  await expect(page.getByTestId("mc-tile-mc-4")).toHaveClass(/\btaking\b/);
+  // opening another server takes both tiles off the stage: no frame is left over it
+  await page.getByTestId("mc-canvas-mc-1").click();
+  await expect(page.getByTestId("mc-close")).toBeVisible();
+  await expect(page.locator(".mc-flight")).toHaveCount(0);
+  expect((await stageNow(page))!.flights).toEqual([]);
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("mc-tile-mc-4")).toHaveAttribute("data-phase", "live", { timeout: 15_000 });
+  await expect(page.locator(".mc-flight")).toHaveCount(0);
+});
+
+test("a lost WebGL context gives the flat map and says the 3D view was lost; a restored one brings the 3D view back", async ({ page }) => {
+  await openMinecraft(page);
+  expect(await renderer(page)).toBe("3d");
+  // lose it mid-fork: the flight's frame goes with the view
+  await page.getByTestId("mc-fork-mc-1").click();
+  await expect(page.getByTestId("mc-flight-mc-2")).toBeVisible();
+  await page.getByTestId("mc-gl").evaluate((c: HTMLCanvasElement) => {
+    (window as unknown as { __lose: WEBGL_lose_context }).__lose = c.getContext("webgl2")!.getExtension("WEBGL_lose_context")!;
+    (window as unknown as { __lose: WEBGL_lose_context }).__lose.loseContext();
+  });
+  await expect.poll(() => renderer(page)).toBe("flat");
+  await expect(page.locator(".mc-flight")).toHaveCount(0);
+  await expect(page.getByTestId("mc-note-mc-1")).toHaveText("3D view lost; showing the flat map.");
+  await expect.poll(async () => (await drawnShare(page, "mc-1")).share).toBeGreaterThan(0.9);
+  // the tile taking the copy shows its own timer, or the world once it runs: never nothing
+  await expect(page.getByTestId("mc-tile-mc-2")).not.toHaveClass(/\btaking\b/);
+  await page.evaluate(() => (window as unknown as { __lose: WEBGL_lose_context }).__lose.restoreContext());
+  await expect.poll(() => renderer(page), { timeout: 15_000 }).toBe("3d");
+  await expect.poll(async () => (await stageNow(page))?.held ?? 0, { timeout: 15_000 }).toBeGreaterThan(0);
+  await expect(page.getByText("3D view lost; showing the flat map.")).toHaveCount(0);
+  await expect.poll(async () => (await drawnShare(page, "mc-1")).share).toBeGreaterThan(0.9);
 });

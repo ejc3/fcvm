@@ -114,6 +114,9 @@ void main() {
   o = vec4(c, 1.0);
 }`;
 
+/** How long the page waits for the GPU to finish a frame before it draws the next anyway. */
+const FENCE_WAIT_MS = 5000;
+
 interface Program {
   p: WebGLProgram;
   u: Record<string, WebGLUniformLocation | null>;
@@ -180,12 +183,16 @@ export class McGl {
   private readonly cubeGeo: WebGLBuffer;
   private readonly palette: WebGLTexture;
   private readonly skyVao: WebGLVertexArrayObject;
+  private readonly skyGeo: WebGLBuffer;
   private readonly figVao: WebGLVertexArrayObject;
   private readonly figBuf: WebGLBuffer;
   private readonly worlds = new Map<string, GpuWorld>();
   private scale = 1;
   /** Signals when the GPU has finished the last frame. */
   private fence: WebGLSync | null = null;
+  private fencedAt = 0;
+  /** Frames whose fence never signalled within FENCE_WAIT_MS: drawn past, and counted. */
+  stalls = 0;
   private readonly onLost: (e: Event) => void;
 
   /** Null when the browser gives no WebGL2 context or cannot build the shaders. */
@@ -228,7 +235,8 @@ export class McGl {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     this.skyVao = gl.createVertexArray();
     gl.bindVertexArray(this.skyVao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer(new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1])));
+    this.skyGeo = this.buffer(new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1]));
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.skyGeo);
     gl.enableVertexAttribArray(0);
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     this.figBuf = gl.createBuffer();
@@ -322,10 +330,11 @@ export class McGl {
   }
 
   /** End a frame: leave a marker the GPU reaches when it has drawn it. */
-  end(): void {
+  end(now: number): void {
     const gl = this.gl;
     if (this.fence) gl.deleteSync(this.fence);
     this.fence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    this.fencedAt = now;
     gl.flush();
   }
 
@@ -334,11 +343,15 @@ export class McGl {
    * a renderer slower than the page would otherwise fall ever further behind, and the time a frame
    * really took is what the frame guard needs.
    */
-  busy(): boolean {
+  busy(now: number): boolean {
     if (this.fence === null || this.lost) return false;
     const gl = this.gl;
     const r = gl.clientWaitSync(this.fence, 0, 0);
-    if (r === gl.TIMEOUT_EXPIRED) return true;
+    if (r === gl.TIMEOUT_EXPIRED) {
+      if (now - this.fencedAt < FENCE_WAIT_MS) return true;
+      // A fence that never signals must not freeze the view: draw past it, and count it.
+      this.stalls++;
+    }
     gl.deleteSync(this.fence);
     this.fence = null;
     return false;
@@ -481,6 +494,13 @@ export class McGl {
   dispose(): void {
     this.canvas.removeEventListener("webglcontextlost", this.onLost);
     this.releaseAll();
+    const gl = this.gl;
+    if (this.fence) gl.deleteSync(this.fence);
+    this.fence = null;
+    for (const p of [this.column, this.box, this.sky]) gl.deleteProgram(p.p);
+    for (const b of [this.columnGeo, this.cubeGeo, this.skyGeo, this.figBuf]) gl.deleteBuffer(b);
+    for (const v of [this.skyVao, this.figVao]) gl.deleteVertexArray(v);
+    gl.deleteTexture(this.palette);
     this.lost = true;
   }
 }

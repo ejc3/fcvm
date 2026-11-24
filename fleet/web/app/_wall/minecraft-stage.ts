@@ -15,6 +15,8 @@ import {
   MATERIALS,
   BOT_DYES,
   onScreen,
+  REBUILD_MIN_MS,
+  RECENT_GLOW_MS,
   pixelScale,
   sceneOf,
   scenePlayer,
@@ -28,8 +30,6 @@ import {
 import { McGl } from "./minecraft-gl.ts";
 import type { McTiles, TileState } from "./minecraft-tiles.ts";
 
-/** A changed column glows this long. */
-const RECENT_GLOW_MS = 1200;
 /** With reduced motion a tile is redrawn at most this often, and only when it changed. */
 const STILL_REDRAW_MS = 250;
 /** A landed copy keeps its source's camera this long, so the picture that flew in is the one that stays. */
@@ -47,10 +47,15 @@ export interface StageTile {
   flight: { from: string; elapsedMs: number } | null;
   /** The running timer of a tile that is restoring or taking a copy. */
   timer: string | null;
+  /** Not running: restoring, taking a copy, or failed. */
+  dark: boolean;
 }
 
+/** A flight waits this long for the copy's world after the copy runs, then gives the tile back. */
+const LANDING_WAIT_MS = 5000;
+
 export interface StageFrame {
-  /** The stage's box in the viewport: the canvas covers it. */
+  /** The stage's box, as the tiles' boxes were laid out in it: the canvas covers it. */
   stage: Box;
   dpr: number;
   tiles: readonly StageTile[];
@@ -68,11 +73,14 @@ interface Held {
   from: Uint8Array | null;
   fromSeq: number;
   scene: McScene;
+  builtAt: number;
 }
 
 interface Flight {
   from: string;
   startedAt: number;
+  /** When the copy stopped being taken (it runs now), while the flight waits for its world. */
+  ranAt: number | null;
   landedAt: number | null;
   el: HTMLElement | null;
 }
@@ -96,6 +104,14 @@ export interface StageDebug {
   software: boolean;
   /** Median time the page's own code spent on one of them, ms. */
   scriptMs: number | null;
+  /** The least time between drawn frames now, ms. */
+  everyMs: number;
+  /** Frames the GPU never reported done, drawn past after a wait. */
+  stalls: number;
+  /** Times a tile's geometry was built. */
+  rebuilds: number;
+  /** Times a tile's names were drawn. */
+  nameDraws: number;
 }
 
 function botColor(p: ScenePlayer, names: readonly string[]): readonly [number, number, number] {
@@ -122,11 +138,35 @@ export class McStage {
   private costs: number[] = [];
   private script: number[] = [];
   private frames = 0;
+  private rebuilds = 0;
+  private nameDraws = 0;
+  private everyMs = 33;
+  /** What each tile's name canvas shows now: it is drawn again only when this changes. */
+  private named = new WeakMap<HTMLCanvasElement, string>();
+  /** The last animation frames' spacing: the display's tick. */
+  private lastTick = Number.NaN;
+  private ticks: number[] = [];
 
   /** Null when the browser has no WebGL2. `lost` is called if the context is lost later. */
   static create(canvas: HTMLCanvasElement, tiles: McTiles, preserve: boolean, lost: () => void): McStage | null {
-    const gl = McGl.create(canvas, preserve, lost);
-    return gl === null ? null : new McStage(gl, tiles);
+    let stage: McStage | null = null;
+    const gl = McGl.create(canvas, preserve, () => {
+      // nothing more is drawn: a flight's frame must not stay where it was last put
+      stage?.clearFlights();
+      lost();
+    });
+    stage = gl === null ? null : new McStage(gl, tiles);
+    return stage;
+  }
+
+  /** The view is drawn with less detail, or fewer frames, to keep up. */
+  get reduced(): boolean {
+    return this.budgetOn && this.budget.level > 0;
+  }
+
+  private clearFlights(): void {
+    for (const fl of this.flights.values()) fl.el?.remove();
+    this.flights.clear();
   }
 
   private constructor(gl: McGl, tiles: McTiles) {
@@ -135,7 +175,11 @@ export class McStage {
     this.budget = new FrameBudget(gl.software);
   }
 
-  /** The tile's world as instances, rebuilt when the world, its fork's source or its glowing columns changed. */
+  /**
+   * The tile's world as instances: rebuilt when the world, its fork's source, its glowing columns
+   * or the detail changed, and at most every REBUILD_MIN_MS (a new launch or a new detail is
+   * built at once).
+   */
   private scene(t: StageTile, s: TileState, now: number, glow: boolean, step: number): McScene {
     const w = s.world!;
     for (const [i, at] of s.recent) if (now - at > RECENT_GLOW_MS) s.recent.delete(i);
@@ -143,9 +187,13 @@ export class McStage {
     const from = t.forkOf === null ? null : this.tiles.source(t.id);
     const fromSeq = from?.seq ?? -1;
     const cur = this.scenes.get(t.id);
-    if (cur && cur.seq === w.seq && cur.key === s.key && cur.recentSig === recentSig && cur.from === (from?.cells ?? null) && cur.fromSeq === fromSeq && cur.scene.step === step) return cur.scene;
+    if (cur && cur.key === s.key && cur.scene.step === step && cur.scene.w === w.region.w && cur.scene.h === w.region.h) {
+      const same = cur.seq === w.seq && cur.recentSig === recentSig && cur.from === (from?.cells ?? null) && cur.fromSeq === fromSeq;
+      if (same || now - cur.builtAt < REBUILD_MIN_MS) return cur.scene;
+    }
     const scene = sceneOf(w, s.remap, { ground: w.ground ?? null, diffFrom: from?.cells ?? null, recent: glow && s.recent.size > 0 ? new Set(s.recent.keys()) : null, step });
-    this.scenes.set(t.id, { seq: w.seq, key: s.key, recentSig, from: from?.cells ?? null, fromSeq, scene });
+    this.scenes.set(t.id, { seq: w.seq, key: s.key, recentSig, from: from?.cells ?? null, fromSeq, scene, builtAt: now });
+    this.rebuilds++;
     return scene;
   }
 
@@ -157,14 +205,21 @@ export class McStage {
 
   /** One animation frame at `now` (local ms). Draws when its turn has come; returns whether it drew. */
   frame(now: number, f: StageFrame): boolean {
-    if (this.gl.lost || this.gl.busy()) return false;
+    if (this.gl.lost) return false;
+    // The display's tick, from the spacing of the animation frames themselves.
+    if (Number.isFinite(this.lastTick) && now > this.lastTick) {
+      this.ticks.push(now - this.lastTick);
+      if (this.ticks.length > 30) this.ticks.shift();
+    }
+    this.lastTick = now;
+    if (this.gl.busy(now)) return false;
     if (this.lastDrew) {
       // What the last drawn frame cost: the time until the GPU had drawn it, to the animation
       // frame that found it done.
       const cost = now - this.lastDrawAt;
       this.costs.push(cost);
       if (this.costs.length > 20) this.costs.shift();
-      if (this.budgetOn) this.budget.sample(cost, now);
+      if (this.budgetOn) this.budget.sample(cost, now, Math.max(4, Math.min(100, Math.min(...this.ticks, 100))));
       this.lastDrew = false;
     }
     const still = f.reducedMotion || (this.budgetOn && this.budget.still);
@@ -172,6 +227,7 @@ export class McStage {
     // A fork in flight is drawn at least ten times a second, whatever the pace.
     const paced = Math.min(this.budgetOn ? this.budget.everyMs : 33, this.flights.size > 0 ? 100 : Number.POSITIVE_INFINITY);
     const every = f.reducedMotion ? Math.max(STILL_REDRAW_MS, paced) : paced;
+    this.everyMs = every;
     const step = this.budgetOn ? this.budget.step : 1;
     // A tile that moved is drawn in its new place at once, whatever the pace.
     const layout = `${f.stage.x},${f.stage.y},${f.stage.w},${f.stage.h},${f.dpr}|${f.tiles.map((t) => (t.box ? `${t.id}:${t.box.x},${t.box.y},${t.box.w}` : "")).join()}`;
@@ -206,7 +262,7 @@ export class McStage {
     // What is no longer drawn gives its buffers back (a flight's picture goes with its flight, below).
     for (const id of [...this.scenes.keys()]) if (!seen.has(id) && !id.includes(">")) this.drop(id);
     this.drawFlights(now, f, still, step);
-    gl.end();
+    gl.end(now);
     this.script.push(performance.timeOrigin + performance.now() - now);
     if (this.script.length > 20) this.script.shift();
     this.frames++;
@@ -235,10 +291,15 @@ export class McStage {
     return shot;
   }
 
-  /** The bots' names, on the tile's own canvas over the 3D picture. */
+  /** The bots' names, on the tile's own canvas over the 3D picture: drawn again only when a name or its place changed. */
   private names(canvas: HTMLCanvasElement, box: Box | null, dpr: number, labels: readonly { name: string; x: number; y: number; driven: boolean }[]): void {
     const W = Math.max(1, Math.round((box?.w ?? 1) * dpr));
     const H = Math.max(1, Math.round((box?.h ?? 1) * dpr));
+    const shown = box === null || box.w < 120 ? [] : labels;
+    const sig = `${W}x${H}|${shown.map((l) => `${l.name}@${Math.round(l.x * dpr)},${Math.round(l.y * dpr)}${l.driven ? "!" : ""}`).join()}`;
+    if (this.named.get(canvas) === sig && canvas.width === W && canvas.height === H) return;
+    this.named.set(canvas, sig);
+    this.nameDraws++;
     if (canvas.width !== W || canvas.height !== H) {
       canvas.width = W;
       canvas.height = H;
@@ -247,13 +308,13 @@ export class McStage {
     if (!ctx) return;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, W, H);
-    if (box === null || box.w < 120) return;
+    if (shown.length === 0 || box === null) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.font = `600 ${box.w >= 480 ? 13 : 10}px "IBM Plex Mono", ui-monospace, monospace`;
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
     ctx.lineJoin = "round";
-    for (const l of labels) {
+    for (const l of shown) {
       ctx.lineWidth = 3;
       ctx.strokeStyle = "rgba(0, 0, 0, 0.8)";
       ctx.strokeText(l.name, l.x, l.y);
@@ -262,24 +323,33 @@ export class McStage {
     }
   }
 
-  /** Start a flight when a tile begins taking a copy, land it when the copy's world is in, drop it when the copy fails. */
+  /**
+   * A flight starts when the view says a copy's picture flies (the page can draw it), lands when
+   * the copy runs and its world is in, and ends at once when it can no longer be drawn or the
+   * copy failed: the tile then shows its own timer or error again.
+   */
   private trackFlights(now: number, f: StageFrame): void {
     const live = new Map(f.tiles.map((t) => [t.id, t]));
     for (const t of f.tiles) {
       // The flight began with the fork's click, however late this page first draws it.
-      if (t.flight !== null && !this.flights.has(t.id) && !f.reducedMotion) this.flights.set(t.id, { from: t.flight.from, startedAt: now - t.flight.elapsedMs, landedAt: null, el: null });
+      if (t.flight !== null && !this.flights.has(t.id)) this.flights.set(t.id, { from: t.flight.from, startedAt: now - t.flight.elapsedMs, ranAt: null, landedAt: null, el: null });
     }
     for (const [id, fl] of this.flights) {
       const t = live.get(id);
-      const gone = !t || f.reducedMotion || (t.flight === null && t.forkOf !== fl.from);
+      const from = live.get(fl.from);
       const done = fl.landedAt !== null && now - fl.landedAt >= FLIGHT_LAND_MS;
-      if (gone || done) {
+      // Still being taken: the view decides (it ends the flight when the source leaves the stage).
+      const flying = t?.flight?.from === fl.from;
+      // Taken: it runs as a copy of that source, both tiles are on the stage, and its world is awaited.
+      const landing = !flying && t !== undefined && !t.dark && t.forkOf === fl.from && t.box !== null && from?.box != null && !f.reducedMotion;
+      if (landing) fl.ranAt ??= now;
+      if (done || !(flying || landing) || (fl.landedAt === null && fl.ranAt !== null && now - fl.ranAt > LANDING_WAIT_MS)) {
         fl.el?.remove();
         this.flights.delete(id);
-        if (done && t) this.landed.set(id, { at: now, seed: live.get(fl.from)?.index ?? t.index });
+        if (done && t) this.landed.set(id, { at: now, seed: from?.index ?? t.index });
         continue;
       }
-      if (t.flight === null && fl.landedAt === null && this.tiles.peek(id)?.world != null) fl.landedAt = now;
+      if (landing && fl.landedAt === null && this.tiles.peek(id)?.world != null) fl.landedAt = now;
     }
   }
 
@@ -290,7 +360,11 @@ export class McStage {
       const to = by.get(id);
       const from = by.get(fl.from);
       const s = this.tiles.peek(fl.from);
-      if (!to?.box || !from?.box || !s || s.world === null) continue;
+      if (!to?.box || !from?.box || !s || s.world === null) {
+        // Nothing to draw this frame (the source's world is between sockets): no frame round nothing.
+        if (fl.el) fl.el.style.display = "none";
+        continue;
+      }
       const rect = flightBox(from.box, to.box, flightProgress(now - fl.startedAt, fl.landedAt === null ? null : now - fl.landedAt));
       this.draw({ ...from, id: `${fl.from}>${id}`, forkOf: null }, s, now, rect, f, still, from.index, step);
       if (f.flights) {
@@ -301,6 +375,7 @@ export class McStage {
           fl.el.append(document.createElement("span"), document.createElement("span"));
           f.flights.append(fl.el);
         }
+        fl.el.style.display = "";
         fl.el.style.transform = `translate(${rect.x}px, ${rect.y}px)`;
         fl.el.style.width = `${rect.w}px`;
         fl.el.style.height = `${rect.h}px`;
@@ -333,12 +408,15 @@ export class McStage {
       frameMs: sorted.length === 0 ? null : sorted[sorted.length >> 1]!,
       software: this.gl.software,
       scriptMs: script.length === 0 ? null : script[script.length >> 1]!,
+      everyMs: this.everyMs,
+      stalls: this.gl.stalls,
+      rebuilds: this.rebuilds,
+      nameDraws: this.nameDraws,
     };
   }
 
   dispose(): void {
-    for (const fl of this.flights.values()) fl.el?.remove();
-    this.flights.clear();
+    this.clearFlights();
     this.gl.dispose();
   }
 }

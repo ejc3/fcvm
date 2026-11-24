@@ -6,6 +6,8 @@
 import {
   applyDelta,
   countDiff,
+  RECENT_GLOW_MS,
+  sameGrid,
   markersOf,
   MC_BACKGROUND,
   parseViewMsg,
@@ -222,9 +224,15 @@ class TileSocket {
         if (applyDelta(this.world, m) > 0) {
           this.dirty = true;
           this.rev++;
-          const last = m.cells.at(-1);
-          if (last) this.lastChange = { i: last[0], at };
-          for (const [i] of m.cells) this.recent.set(i, at);
+          // Only columns of this grid are remembered, and only for as long as they glow: a tile
+          // nobody draws (the flat map, off the screen) must not collect them for ever.
+          const inGrid = this.world!.region.w * this.world!.region.h;
+          for (const [i, seen] of this.recent) if (at - seen > RECENT_GLOW_MS) this.recent.delete(i);
+          for (const [i] of m.cells) {
+            if (i >= inGrid) continue;
+            this.recent.set(i, at);
+            this.lastChange = { i, at };
+          }
           // a fork's count of differing columns moves with either world
           this.owner.changed();
           const r = this.world!.region;
@@ -410,11 +418,12 @@ export class McTiles {
     for (const f of this.listeners) f();
   }
 
-  /** The world tile `id`'s world was forked from, while the page holds both and they are one size. */
+  /** The world tile `id`'s world was forked from, while the page holds both and they are the same grid of the same materials. */
   source(id: string): McWorld | null {
-    const mine = this.sockets.get(id)?.world ?? null;
-    const from = this.sockets.get(this.forks.get(id) ?? "")?.world ?? null;
-    return mine !== null && from !== null && from.cells.length === mine.cells.length ? from : null;
+    const mine = this.sockets.get(id);
+    const from = this.sockets.get(this.forks.get(id) ?? "");
+    if (!mine?.world || !from?.world) return null;
+    return sameGrid(mine.world, mine.remap, from.world, from.remap) ? from.world : null;
   }
 
   /** What tile `id`'s socket holds now, for the 3D view. */

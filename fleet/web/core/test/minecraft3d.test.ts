@@ -177,6 +177,18 @@ describe("a world as columns", () => {
     expect(sceneOf(w, null, { step: 3 }).step).toBe(1);
   });
 
+  it("outlines a coarse cell when any column in it differs from the fork's source, so the outline agrees with the count", () => {
+    const src = world();
+    // (5, 5) is not the first column of its 2 x 2 or 4 x 4 square, and holds nothing the bots built
+    const copy = world({ "5,5": [M("stone"), 131] });
+    for (const step of [2, 4]) {
+      const s = sceneOf(copy, null, { diffFrom: src.cells, step });
+      expect(s.diff, String(step)).toBe(1);
+      const flagged = insts(s.tops).filter((q) => (q[5]! & FLAG_DIFF) !== 0);
+      expect(flagged.map((q) => [q[0], q[1]]), String(step)).toEqual([[4, 4]]);
+    }
+  });
+
   it("names where the bots built, the most built-up place first", () => {
     const s = sceneOf(world({ "2,2": [M("red"), 134], "3,2": [M("red"), 133], "2,3": [M("blue"), 132], "13,13": [M("yellow"), 133] }, 32), null);
     expect(s.sites).toHaveLength(2);
@@ -366,7 +378,7 @@ describe("a fork's flight", () => {
 });
 
 describe("drawing within a device's means", () => {
-  it("gives up detail, then frames, then the flight when frames run long, and tries again after 20 s of short frames", () => {
+  it("gives up detail, then frames, then the flight when frames run long", () => {
     const b = new FrameBudget();
     expect([b.level, b.everyMs, b.step, b.still]).toEqual([0, 33, 1, false]);
     for (let k = 0; k < 19; k++) b.sample(FRAME_BUDGET_MS * 2, k);
@@ -379,16 +391,6 @@ describe("drawing within a device's means", () => {
     expect([b.level, b.everyMs, b.step, b.still]).toEqual([3, 1000, 4, true]);
     for (let k = 0; k < 20; k++) b.sample(FRAME_BUDGET_MS * 2, 300 + k);
     expect(b.level).toBe(3);
-    // short frames, but too soon
-    for (let k = 0; k < 20; k++) b.sample(5, 1000 + k);
-    expect(b.level).toBe(3);
-    for (let k = 0; k < 20; k++) b.sample(5, 30_000 + k);
-    expect(b.level).toBe(2);
-    // a software renderer starts at the last level, and earns its way up
-    const soft = new FrameBudget(true);
-    expect([soft.level, soft.still]).toEqual([3, true]);
-    for (let k = 0; k < 20; k++) soft.sample(5, 100 + k);
-    expect(soft.level).toBe(2);
     // one long frame among short ones changes nothing
     const c = new FrameBudget();
     for (let k = 0; k < 20; k++) c.sample(k === 3 ? 500 : 10, k);
@@ -406,6 +408,64 @@ describe("drawing within a device's means", () => {
     // nor do short frames before them (a page that starts with nothing to draw) hide them
     for (const cost of [FRAME_BUDGET_MS * 5, FRAME_BUDGET_MS * 5]) e.sample(cost, 2);
     expect(e.level).toBe(1);
+  });
+
+  /** Twenty frames of `cost` ending at `at` ms. */
+  const run = (b: FrameBudget, cost: number, at: number, display = 16.7) => {
+    for (let k = 19; k >= 0; k--) b.sample(cost, at - k, display);
+  };
+
+  it("tries one level up after 20 s of frames that keep up with the display, whatever its rate", () => {
+    const soft = new FrameBudget(true);
+    expect([soft.level, soft.still]).toEqual([3, true]);
+    run(soft, 5, 1000);
+    expect(soft.level).toBe(3); // too soon
+    run(soft, 5, 30_000);
+    expect(soft.level).toBe(2);
+    // a 30 Hz display finds every frame done at its next tick, 33 ms on: that is keeping up
+    const thirty = new FrameBudget(true);
+    run(thirty, 34, 1000, 33.3);
+    run(thirty, 34, 30_000, 33.3);
+    expect(thirty.level).toBe(2);
+    // on a 60 Hz display the same 34 ms is a frame that missed a tick: it stays
+    const sixty = new FrameBudget(true);
+    run(sixty, 34, 1000, 16.7);
+    run(sixty, 34, 30_000, 16.7);
+    expect(sixty.level).toBe(3);
+  });
+
+  it("waits twice as long before each recovery that follows a failed one, and starts over once one holds", () => {
+    const b = new FrameBudget();
+    run(b, 90, 1000);
+    expect(b.level).toBe(1);
+    // fast at the lower level, slow at the higher: without a backoff it would go up every 20 s for ever
+    let t = 1000;
+    const waits: number[] = [];
+    for (let round = 0; round < 5; round++) {
+      const from = t;
+      while (b.level === 1) {
+        t += 1000;
+        run(b, 5, t);
+        if (t - from > 1_000_000) throw new Error("never recovered");
+      }
+      waits.push(t - from);
+      t += 100;
+      run(b, 90, t); // the recovery fails at once
+      expect(b.level).toBe(1);
+    }
+    expect(waits).toEqual([20_000, 40_000, 80_000, 160_000, 320_000]);
+    // capped at 320 s
+    let from = t;
+    while (b.level === 1) run(b, 5, (t += 1000));
+    expect(t - from).toBe(320_000);
+    // this one holds (fast at the higher level for longer than the wait): the next failure starts over at 20 s
+    run(b, 5, (t += 400_000));
+    expect(b.level).toBe(0);
+    run(b, 90, (t += 100));
+    expect(b.level).toBe(1);
+    from = t;
+    while (b.level === 1) run(b, 5, (t += 1000));
+    expect(t - from).toBe(20_000);
   });
 
   it("holds the stage's canvas to a pixel cap, and knows a tile that is off the screen", () => {

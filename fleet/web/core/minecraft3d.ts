@@ -48,6 +48,68 @@ function hash2(x: number, z: number): number {
   return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }
 
+/** Instances written into one typed array that grows, not into a plain array spread element by element. */
+class Bytes {
+  private buf: Uint8Array;
+  private n = 0;
+  constructor(room: number) {
+    this.buf = new Uint8Array(Math.max(64, room));
+  }
+  put(x: number, z: number, m: number, y: number, base: number, flags: number): void {
+    if (this.n + COLUMN_BYTES > this.buf.length) {
+      const next = new Uint8Array(this.buf.length * 2);
+      next.set(this.buf);
+      this.buf = next;
+    }
+    const b = this.buf;
+    const o = this.n;
+    b[o] = x & 255;
+    b[o + 1] = x >> 8;
+    b[o + 2] = z & 255;
+    b[o + 3] = z >> 8;
+    b[o + 4] = m;
+    b[o + 5] = y;
+    b[o + 6] = base;
+    b[o + 7] = flags;
+    this.n = o + COLUMN_BYTES;
+  }
+  done(): Uint8Array {
+    return this.buf.slice(0, this.n);
+  }
+}
+
+class Boxes {
+  private buf: Float32Array;
+  private n = 0;
+  constructor(room: number) {
+    this.buf = new Float32Array(Math.max(BOX_FLOATS * 16, room));
+  }
+  put(x: number, y: number, z: number, sx: number, sy: number, sz: number, yaw: number, rgb: readonly [number, number, number], kind: number, tint = 1): void {
+    if (this.n + BOX_FLOATS > this.buf.length) {
+      const next = new Float32Array(this.buf.length * 2);
+      next.set(this.buf);
+      this.buf = next;
+    }
+    const b = this.buf;
+    const o = this.n;
+    b[o] = x;
+    b[o + 1] = y;
+    b[o + 2] = z;
+    b[o + 3] = sx;
+    b[o + 4] = sy;
+    b[o + 5] = sz;
+    b[o + 6] = yaw;
+    b[o + 7] = rgb[0] * tint;
+    b[o + 8] = rgb[1] * tint;
+    b[o + 9] = rgb[2] * tint;
+    b[o + 10] = kind;
+    this.n = o + BOX_FLOATS;
+  }
+  done(): Float32Array {
+    return this.buf.slice(0, this.n);
+  }
+}
+
 export interface McScene {
   w: number;
   h: number;
@@ -184,22 +246,27 @@ export function sceneOf(world: McWorld, remap: Uint8Array | null, opts: SceneOpt
   const dw = Math.ceil(w / step);
   const dh = Math.ceil(h / step);
   const rep = new Int32Array(dw * dh);
+  // Whether any column a drawn cell stands for differs or just changed: the outline and the
+  // glow then agree with the count, whatever the detail.
+  const cellDiff = new Uint8Array(dw * dh);
+  const cellRecent = new Uint8Array(dw * dh);
   for (let dz = 0; dz < dh; dz++) {
     for (let dx = 0; dx < dw; dx++) {
+      const d = dz * dw + dx;
       let pick = dz * step * w + dx * step;
-      if (step > 1) {
-        let best = -1;
-        for (let z = dz * step; z < Math.min(h, (dz + 1) * step); z++) {
-          for (let x = dx * step; x < Math.min(w, (dx + 1) * step); x++) {
-            const i = z * w + x;
-            if (top[i]! >= FIRST_DYE && c[i * 2 + 1]! > best) {
-              best = c[i * 2 + 1]!;
-              pick = i;
-            }
+      let best = -1;
+      for (let z = dz * step; z < Math.min(h, (dz + 1) * step); z++) {
+        for (let x = dx * step; x < Math.min(w, (dx + 1) * step); x++) {
+          const i = z * w + x;
+          if (differs[i]) cellDiff[d] = 1;
+          if (opts.recent?.has(i)) cellRecent[d] = 1;
+          if (step > 1 && top[i]! >= FIRST_DYE && c[i * 2 + 1]! > best) {
+            best = c[i * 2 + 1]!;
+            pick = i;
           }
         }
       }
-      rep[dz * dw + dx] = pick;
+      rep[d] = pick;
     }
   }
   const bedOf = (d: number) => gh[rep[d]!]! - depth[rep[d]!]!;
@@ -207,15 +274,15 @@ export function sceneOf(world: McWorld, remap: Uint8Array | null, opts: SceneOpt
   const crownOf = (d: number) => c[rep[d]! * 2 + 1]!;
   /** Where a canopy's underside is: a few blocks under its crown, clear of the ground. */
   const underOf = (d: number) => Math.max(gh[rep[d]!]! + 2, crownOf(d) - 3);
-  const tops: number[] = [];
-  const sides: number[] = [];
-  const water: number[] = [];
-  const boxes: number[] = [];
+  const cells = dw * dh;
+  const tops = new Bytes(cells * COLUMN_BYTES * 2);
+  const sides = new Bytes(cells * COLUMN_BYTES);
+  const water = new Bytes((cells * COLUMN_BYTES) >> 2);
+  const boxes = new Boxes(cells * BOX_FLOATS >> 3);
   const put = (x: number, z: number, m: number, y: number, base: number, flags: number) => {
-    const inst = [x & 255, x >> 8, z & 255, z >> 8, m, y, base, flags];
-    tops.push(...inst);
-    if (base < y) sides.push(...inst);
-    if (m === WATER && (flags & FLAG_CANOPY) === 0) water.push(...inst);
+    tops.put(x, z, m, y, base, flags);
+    if (base < y) sides.put(x, z, m, y, base, flags);
+    if (m === WATER && (flags & FLAG_CANOPY) === 0) water.put(x, z, m, y, base, flags);
   };
   for (let d = 0; d < dw * dh; d++) {
     const dx = d % dw;
@@ -229,16 +296,15 @@ export function sceneOf(world: McWorld, remap: Uint8Array | null, opts: SceneOpt
     let higher = 0;
     for (const v of nb) if (v > y) higher++;
     let flags = Math.min(3, higher) | (depth[i]! << 2);
-    if (opts.recent?.has(i)) flags |= FLAG_RECENT;
-    if (differs[i]) flags |= FLAG_DIFF;
+    if (cellRecent[d]) flags |= FLAG_RECENT;
+    if (cellDiff[d]) flags |= FLAG_DIFF;
     const unknown = top[i] === 0 && c[i * 2 + 1] === 0;
     const bed = y - depth[i]!;
     put(x, z, gm[i]!, unknown ? floor : y, unknown ? floor : Math.max(floor, Math.min(bed, ...nb)), flags);
     const t = top[i]!;
     if (SMALL.has(t) && step === 1) {
       const v = hash2(x, z);
-      const rgb = MATERIAL_RGB01[t]!;
-      boxes.push(x + 0.3 + v * 0.4, y, z + 0.3 + hash2(z, x) * 0.4, 0.28, t === PLANT ? 0.55 : 0.4, 0.28, v * 3, rgb[0], rgb[1], rgb[2], 0);
+      boxes.put(x + 0.3 + v * 0.4, y, z + 0.3 + hash2(z, x) * 0.4, 0.28, t === PLANT ? 0.55 : 0.4, 0.28, v * 3, MATERIAL_RGB01[t]!, 0);
     }
     if (t !== LEAVES) continue;
     const crown = crownOf(d);
@@ -253,10 +319,11 @@ export function sceneOf(world: McWorld, remap: Uint8Array | null, opts: SceneOpt
     if (!around.some((j) => j >= 0 && isLeaf(j)) && step === 1) {
       // A lone column of leaves is a small tree: a trunk and a crown wider than a block.
       const v = hash2(x, z);
-      const leaf = MATERIAL_RGB01[LEAVES]!.map((q) => q * (0.82 + 0.34 * v)) as [number, number, number];
-      boxes.push(x + 0.5, y, z + 0.5, 0.42, under - y + 0.5, 0.42, 0, wood[0], wood[1], wood[2], BOX_TRUNK);
-      boxes.push(x + 0.5, under, z + 0.5, 1.9 + v * 0.5, crown - under - 0.9, 1.9 + v * 0.5, v * 1.5, ...leaf, BOX_CANOPY);
-      boxes.push(x + 0.5, crown - 0.9, z + 0.5, 1.1, 0.9, 1.1, v * 1.5, ...leaf, BOX_CANOPY);
+      const leaf = MATERIAL_RGB01[LEAVES]!;
+      const tint = 0.82 + 0.34 * v;
+      boxes.put(x + 0.5, y, z + 0.5, 0.42, under - y + 0.5, 0.42, 0, wood, BOX_TRUNK);
+      boxes.put(x + 0.5, under, z + 0.5, 1.9 + v * 0.5, crown - under - 0.9, 1.9 + v * 0.5, v * 1.5, leaf, BOX_CANOPY, tint);
+      boxes.put(x + 0.5, crown - 0.9, z + 0.5, 1.1, 0.9, 1.1, v * 1.5, leaf, BOX_CANOPY, tint);
       continue;
     }
     // Part of a wide canopy: its top, and its sides down to the canopy beside it or its own underside.
@@ -277,18 +344,19 @@ export function sceneOf(world: McWorld, remap: Uint8Array | null, opts: SceneOpt
         }
       }
     }
-    if (peak) boxes.push(x + mid, y, z + mid, 0.5, under - y, 0.5, 0, wood[0], wood[1], wood[2], BOX_TRUNK);
+    if (peak) boxes.put(x + mid, y, z + mid, 0.5, under - y, 0.5, 0, wood, BOX_TRUNK);
   }
+  const boxArray = boxes.done();
   return {
     w,
     h,
     ground: gh,
     step,
-    tops: new Uint8Array(tops),
-    sides: new Uint8Array(sides),
-    water: new Uint8Array(water),
-    boxes: new Float32Array(boxes),
-    boxCount: boxes.length / BOX_FLOATS,
+    tops: tops.done(),
+    sides: sides.done(),
+    water: water.done(),
+    boxes: boxArray,
+    boxCount: boxArray.length / BOX_FLOATS,
     floor,
     sites: sitesOf(builds, w),
     diff,
@@ -657,18 +725,29 @@ export const FRAME_LEVELS: readonly { everyMs: number; step: number }[] = [
 export const FRAME_BUDGET_MS = 40;
 const BUDGET_WINDOW = 20;
 const BUDGET_RECOVER_MS = 20_000;
+const BUDGET_RECOVER_MAX_MS = 320_000;
+
+/** How long a changed column glows, and so how long the page remembers that it changed. */
+export const RECENT_GLOW_MS = 1200;
+/** A tile's geometry is rebuilt at most this often, however fast its deltas, glows and source change. */
+export const REBUILD_MIN_MS = 200;
 
 /**
  * Slows the drawing down when frames run long, rather than stutter: the page gives it the time
- * each drawn frame took to reach the screen. When the median of the last 20 is over
+ * each drawn frame took until the GPU had drawn it. When the median of the last 20 is over
  * FRAME_BUDGET_MS, or the last three each took over four times that, it goes down a level
- * (FRAME_LEVELS). After 20 s of frames under half the budget it tries one level up. A software
- * renderer starts at the last level.
+ * (FRAME_LEVELS). It tries one level up after 20 s of frames that keep up with the display (done
+ * by the display's next tick, whatever its rate). A recovery that fails doubles the wait before
+ * the next (to 320 s), so a device between two levels settles on the lower; one that holds
+ * starts the wait over. A software renderer starts at the last level.
  */
 export class FrameBudget {
   level: number;
   private costs: number[] = [];
-  private changedAt = Number.NEGATIVE_INFINITY;
+  private changedAt: number | null = null;
+  private wait = BUDGET_RECOVER_MS;
+  /** When the last step up was made, until a step down judges it. */
+  private triedUpAt: number | null = null;
 
   /** `slow`: start at the last level and work up (a software renderer), not at the first and down. */
   constructor(slow = false) {
@@ -689,19 +768,25 @@ export class FrameBudget {
     return this.level === FRAME_LEVELS.length - 1;
   }
 
-  sample(costMs: number, nowMs: number): void {
+  /** `displayMs`: the time between the display's ticks (16.7 at 60 Hz), as the page measured it. */
+  sample(costMs: number, nowMs: number, displayMs = 16.7): void {
+    this.changedAt ??= nowMs;
     this.costs.push(costMs);
     const far = this.costs.length >= 3 && this.costs.slice(-3).every((x) => x > FRAME_BUDGET_MS * 4);
     if (this.costs.length < BUDGET_WINDOW && !far) return;
     const sorted = [...this.costs].sort((a, b) => a - b);
     const median = sorted[sorted.length >> 1]!;
     this.costs = [];
+    const keepsUp = median <= FRAME_BUDGET_MS && median <= Math.max(FRAME_BUDGET_MS / 2, displayMs * 1.25);
     if (median > FRAME_BUDGET_MS && this.level < FRAME_LEVELS.length - 1) {
+      if (this.triedUpAt !== null) this.wait = nowMs - this.triedUpAt < this.wait ? Math.min(this.wait * 2, BUDGET_RECOVER_MAX_MS) : BUDGET_RECOVER_MS;
+      this.triedUpAt = null;
       this.level++;
       this.changedAt = nowMs;
-    } else if (median < FRAME_BUDGET_MS / 2 && this.level > 0 && nowMs - this.changedAt >= BUDGET_RECOVER_MS) {
+    } else if (keepsUp && this.level > 0 && nowMs - this.changedAt >= this.wait) {
       this.level--;
       this.changedAt = nowMs;
+      this.triedUpAt = nowMs;
     }
   }
 }
