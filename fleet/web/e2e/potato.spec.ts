@@ -278,6 +278,6 @@ test("potato: the legend is on the page with room, in the panel without, and nev
   await page.getByTestId("landing-button").click();
   const inPanel = page.getByTestId("landing-panel").getByTestId("potato-legend");
   await expect(inPanel).toBeVisible();
-  await expect(inPanel).toContainText("a snapshot on disk; no CPU or memory");
+  await expect(inPanel).toContainText("saved as a snapshot; uses no CPU");
   await expect(inPanel).toContainText("slowest player");
 });

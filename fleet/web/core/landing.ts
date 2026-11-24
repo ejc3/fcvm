@@ -46,7 +46,7 @@ export interface LegendEntry {
 /** The Potato legend: a strip cut from the ring, in the order the ball meets the players. */
 export const POTATO_LEGEND_TITLE = "Legend";
 export const POTATO_STRIP: readonly LegendEntry[] = [
-  { key: "asleep-done", mark: { kind: "tile", phase: "asleep" }, label: "asleep", detail: "a snapshot on disk; no CPU or memory" },
+  { key: "asleep-done", mark: { kind: "tile", phase: "asleep" }, label: "asleep", detail: "saved as a snapshot; uses no CPU" },
   { key: "sleeping", mark: { kind: "tile", phase: "sleeping" }, label: "going to sleep" },
   { key: "holder", mark: { kind: "tile", phase: "awake", holder: true }, label: null, sr: "has the ball" },
   { key: "awake", mark: { kind: "tile", phase: "awake" }, label: "awake" },
