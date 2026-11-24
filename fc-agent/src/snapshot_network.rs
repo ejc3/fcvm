@@ -2684,7 +2684,8 @@ fn timeout_message(
 /// are thin over the runtime:
 ///
 /// - `inspect`'s `.State.Running` is podman's reading of `crun state`, which the
-///   hook reads itself.
+///   hook reads itself, before the command or after it fails
+///   ([`state_read_comes_first`]).
 /// - `exec` hands `crun exec` an OCI process made from the container's own
 ///   (environment, working directory, user, capabilities, rlimits, labels) with
 ///   the command in place of the container's. crun then joins every namespace of
@@ -3002,13 +3003,9 @@ impl ContainerRestoreHook {
         args
     }
 
-    /// Whether the hook has a running container, and its id when it has.
-    async fn running_container(
-        &self,
-        runtime: &crate::container::ContainerRuntime,
-    ) -> Result<Option<String>> {
-        let reported_running = crate::container::container_reported_running();
-        let settle = |eligibility: HookEligibility| match eligibility {
+    /// Skip or fail as the decision says; whether the hook runs.
+    fn settle(&self, eligibility: HookEligibility) -> Result<bool> {
+        match eligibility {
             HookEligibility::Run => Ok(true),
             HookEligibility::Skip(reason) => {
                 eprintln!("[fc-agent] restore hook skipped: {reason}");
@@ -3018,42 +3015,78 @@ impl ContainerRestoreHook {
                 "restore hook {:?} cannot tell whether the container runs; {reason}",
                 self.command
             )),
-        };
+        }
+    }
+
+    /// The decision from `crun state`, read `when` ("before" the hook, or "after" an
+    /// exec that did not succeed).
+    async fn read_state(
+        &self,
+        runtime: &crate::container::ContainerRuntime,
+        id: &str,
+        reported_running: bool,
+        when: &str,
+    ) -> Result<HookEligibility> {
         // Timed either way: a read that ran out says how long it waited, and one that
         // finished gives the healthy distribution to compare a starved one against.
         let read_started = std::time::Instant::now();
-        let recorded = match crate::container::captured_container_id() {
-            Some(id) => Ok(Some(id.to_string())),
-            None => read_container_file(&runtime.id_file, 256)
-                .await
-                .map(|id| id.map(|id| String::from_utf8_lossy(&id).into_owned()))
-                .map_err(|error| format!("{error:#}")),
-        };
-        let id = match hook_container_id(recorded, reported_running) {
-            Ok(id) => id,
-            Err(eligibility) => {
-                settle(eligibility)?;
-                return Ok(None);
-            }
-        };
-        let state = run_bounded(&Self::state_argv(runtime, &id), HOOK_INSPECT_BUDGET)
+        let state = run_bounded(&Self::state_argv(runtime, id), HOOK_INSPECT_BUDGET)
             .await
             .with_context(|| {
                 format!(
-                    "reading fcvm-container's state before the restore hook (elapsed_ms={:.0})",
+                    "reading fcvm-container's state {when} the restore hook (elapsed_ms={:.0})",
                     crate::restore::elapsed_ms(read_started)
                 )
             })?;
         eprintln!(
-            "[fc-agent] crun state before the restore hook returned code={} elapsed_ms={:.0}",
+            "[fc-agent] crun state {when} the restore hook returned code={} elapsed_ms={:.0}",
             state
                 .status
                 .code()
                 .map_or_else(|| "signal".to_string(), |code| code.to_string()),
             crate::restore::elapsed_ms(read_started)
         );
-        Ok(settle(hook_eligibility(&state, reported_running))?.then_some(id))
+        Ok(hook_eligibility(&state, reported_running))
     }
+
+    /// Run the command in the container `id` names: `crun exec` of the process
+    /// made from the config crun holds for it.
+    async fn exec(
+        &self,
+        runtime: &crate::container::ContainerRuntime,
+        id: &str,
+    ) -> Result<BoundedOutput> {
+        let config_path = runtime.crun_root.join(id).join("config.json");
+        let config = read_container_file(&config_path, HOOK_CONFIG_LIMIT)
+            .await?
+            .with_context(|| format!("{} does not exist", config_path.display()))?;
+        let process = exec_process(&config, &self.args(), runtime.session)?;
+        let process_file = write_hook_process(&process, runtime.owner)?;
+        let output = run_bounded(
+            &Self::exec_argv(runtime, id, &process_file),
+            RESTORE_HOOK_BUDGET,
+        )
+        .await;
+        let _ = std::fs::remove_file(&process_file);
+        output
+    }
+}
+
+/// Whether the runtime's state is read before the hook's exec. Not when podman
+/// has reported the container started and its client is still attached
+/// (`reported_running`): the container was running when the snapshot was taken,
+/// a restore resumes it as it was, and `crun exec` itself refuses a container
+/// that is not running, so the read would start one more process in a
+/// just-restored guest to learn what the exec is about to say. An exec that does not succeed there is
+/// followed by the read, which decides as it would have before: the container
+/// stopped or paused skips the hook, the runtime holding no such container
+/// fails the restore, and a running container means the failure is the hook's.
+///
+/// Without podman's report (a snapshot taken while the container was starting,
+/// or after it exited) the read comes first, as the report alone never runs or
+/// skips a hook: the container can be running with its `READY=1` still unread.
+fn state_read_comes_first(reported_running: bool) -> bool {
+    !reported_running
 }
 
 impl RestoreHook for ContainerRestoreHook {
@@ -3064,27 +3097,53 @@ impl RestoreHook for ContainerRestoreHook {
             eprintln!("[fc-agent] restore hook skipped: the agent has not launched fcvm-container");
             return Ok(());
         };
-        let Some(id) = self.running_container(runtime).await? else {
-            return Ok(());
+        let reported_running = crate::container::container_reported_running();
+        let recorded = match crate::container::captured_container_id() {
+            Some(id) => Ok(Some(id.to_string())),
+            None => read_container_file(&runtime.id_file, 256)
+                .await
+                .map(|id| id.map(|id| String::from_utf8_lossy(&id).into_owned()))
+                .map_err(|error| format!("{error:#}")),
         };
+        let id = match hook_container_id(recorded, reported_running) {
+            Ok(id) => id,
+            Err(eligibility) => {
+                self.settle(eligibility)?;
+                return Ok(());
+            }
+        };
+        let state_first = state_read_comes_first(reported_running);
+        if state_first {
+            let eligibility = self
+                .read_state(runtime, &id, reported_running, "before")
+                .await?;
+            if !self.settle(eligibility)? {
+                return Ok(());
+            }
+        }
         let started = std::time::Instant::now();
-        let config_path = runtime.crun_root.join(&id).join("config.json");
-        let config = read_container_file(&config_path, HOOK_CONFIG_LIMIT)
-            .await
-            .and_then(|config| {
-                config.with_context(|| format!("{} does not exist", config_path.display()))
-            })
-            .with_context(|| format!("restore hook {:?}", self.command))?;
-        let process = exec_process(&config, &self.args(), runtime.session)
-            .with_context(|| format!("restore hook {:?}", self.command))?;
-        let process_file = write_hook_process(&process, runtime.owner)
-            .with_context(|| format!("restore hook {:?}", self.command))?;
-        let output = run_bounded(
-            &Self::exec_argv(runtime, &id, &process_file),
-            RESTORE_HOOK_BUDGET,
-        )
-        .await;
-        let _ = std::fs::remove_file(&process_file);
+        let output = self.exec(runtime, &id).await;
+        let succeeded = matches!(&output, Ok(output) if output.status.success());
+        if !state_first && !succeeded {
+            // The runtime says whether this is the hook failing in a running
+            // container (reported below, as it is when the read came first) or
+            // an exec that had no running container to enter.
+            let eligibility = self
+                .read_state(runtime, &id, reported_running, "after")
+                .await
+                .with_context(|| match &output {
+                    Ok(output) => format!(
+                        "restore hook {:?} exited {}; stderr: {}",
+                        self.command,
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                    Err(error) => format!("restore hook {:?}: {error:#}", self.command),
+                })?;
+            if !self.settle(eligibility)? {
+                return Ok(());
+            }
+        }
         let output = output.with_context(|| format!("restore hook {:?}", self.command))?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5693,6 +5752,47 @@ mod tests {
         assert!(matches!(
             hook_eligibility(&created, true),
             HookEligibility::Skip(_)
+        ));
+    }
+
+    /// The state read comes before the exec unless podman has reported the
+    /// container started and is still attached. Then the exec goes first and the
+    /// read follows only an exec that did not succeed, where it decides what it
+    /// would have decided before: a container that is not running skips the hook,
+    /// a runtime that holds none fails the restore, a running one leaves the
+    /// failure the hook's own.
+    ///
+    /// RED BEFORE THE FIX: every hook was preceded by a `crun state`.
+    #[test]
+    fn the_state_read_follows_a_failed_exec_when_podman_reported_the_container_running() {
+        assert!(state_read_comes_first(false));
+        assert!(!state_read_comes_first(true));
+        use std::os::unix::process::ExitStatusExt;
+        let state = |code: i32, stdout: &str, stderr: &str| BoundedOutput {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            hook_eligibility(&state(0, r#"{"status": "running"}"#, ""), true),
+            HookEligibility::Run
+        );
+        for status in ["stopped", "paused", "created"] {
+            assert!(matches!(
+                hook_eligibility(&state(0, &format!(r#"{{"status": "{status}"}}"#), ""), true),
+                HookEligibility::Skip(_)
+            ));
+        }
+        assert!(matches!(
+            hook_eligibility(
+                &state(
+                    1,
+                    "",
+                    "error opening file `/run/crun/abab/status`: No such file or directory"
+                ),
+                true
+            ),
+            HookEligibility::Fail(_)
         ));
     }
 
