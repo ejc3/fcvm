@@ -1,0 +1,142 @@
+{
+ "servers": 256,
+ "host": [
+  "kernel 7.0.0-1018-aws",
+  "cpus 192",
+  "MemTotal:       395386980 kB",
+  "store /dev/loop3 btrfs   21G backed by /var/fcvm-btrfs.img on /dev/nvme0n1p1 ext4",
+  "NAME    MODEL                       SIZE",
+  "nvme1n1 Amazon Elastic Block Store  100G",
+  "nvme0n1 Amazon Elastic Block Store   30G",
+  "tree 2f89b1c976751e116c4274e1c3c36801452c1a0c plus 14 changed files"
+ ],
+ "restore_all_s": 24.0,
+ "launch_ms_first_wave": {
+  "n": 256,
+  "p50": 5137,
+  "p90": 13722,
+  "max": 24553
+ },
+ "mark_300s": {
+  "since_all_up_s": 300.0,
+  "oldest_age_s": null,
+  "tps": {
+   "n": 256,
+   "min": 20.0,
+   "p01": 20.0,
+   "p10": 20.0,
+   "p50": 20.0,
+   "below_19_5": 0,
+   "no_answer": 0
+  },
+  "busy_cpus": 47.4,
+  "busy_per_server": 0.185,
+  "per_server_mib": {
+   "host_used_delta": 409.2,
+   "pss": 413.6,
+   "pss_anon": 412.4,
+   "rss": 640.2
+  },
+  "host_used_mib": 122011,
+  "meminfo": {
+   "MemTotal": 386120,
+   "MemAvailable": 264072,
+   "Cached": 39700,
+   "Dirty": 1957,
+   "AnonPages": 106395,
+   "Shmem": 7729
+  }
+ },
+ "mark_late": {
+  "since_all_up_s": 1745.9,
+  "oldest_age_s": 1770,
+  "tps": {
+   "n": 256,
+   "min": 20.0,
+   "p01": 20.0,
+   "p10": 20.0,
+   "p50": 20.0,
+   "below_19_5": 0,
+   "no_answer": 0
+  },
+  "busy_cpus": 43.3,
+  "busy_per_server": 0.169,
+  "per_server_mib": {
+   "host_used_delta": 436.8,
+   "pss": 442.0,
+   "pss_anon": 440.8,
+   "rss": 669.6
+  },
+  "host_used_mib": 129110,
+  "meminfo": {
+   "MemTotal": 386120,
+   "MemAvailable": 257005,
+   "Cached": 45069,
+   "Dirty": 16,
+   "AnonPages": 113669,
+   "Shmem": 7729
+  }
+ },
+ "reset_sent_s_after_all_ran": null,
+ "samples_all_up": 349,
+ "readings": 89344,
+ "readings_under_19_5": 101,
+ "readings_unanswered": 226,
+ "low_or_unanswered": [
+  [
+   311.8,
+   20.0,
+   0,
+   147
+  ],
+  [
+   316.8,
+   2.2,
+   25,
+   0
+  ],
+  [
+   321.8,
+   8.8,
+   56,
+   0
+  ],
+  [
+   381.9,
+   20.0,
+   0,
+   79
+  ],
+  [
+   386.9,
+   12.7,
+   20,
+   0
+  ]
+ ],
+ "busy_cpus_per_server_by_minute": {
+  "0": 0.206,
+  "1": 0.195,
+  "5": 0.206,
+  "10": 0.182,
+  "15": 0.175,
+  "20": 0.173,
+  "25": 0.168,
+  "29": 0.165
+ },
+ "samples_with_a_reading_under_19_5": 3,
+ "lowest_tps_reading": 2.2,
+ "readings_no_answer_max": 147,
+ "store_mib": {
+  "start": 4923,
+  "max": 12338,
+  "end": 11927,
+  "per_server_at_max": 29.0
+ },
+ "wire": {
+  "snapshots": 1379,
+  "snapshot_bytes_mean": 26624,
+  "status_msgs": 1765,
+  "status_bytes_mean": 2892
+ }
+}

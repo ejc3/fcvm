@@ -1,0 +1,8 @@
+kernel 7.0.0-1018-aws
+cpus 192
+MemTotal:       395386980 kB
+store /dev/loop3 btrfs   24G
+/dev/loop3: [66306]:481 (/var/fcvm-btrfs.img)
+NAME    MODEL                       SIZE
+nvme1n1 Amazon Elastic Block Store  100G
+nvme0n1 Amazon Elastic Block Store   30G

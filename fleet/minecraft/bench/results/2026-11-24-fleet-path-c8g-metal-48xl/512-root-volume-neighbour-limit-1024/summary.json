@@ -1,0 +1,34 @@
+{
+ "servers": 512,
+ "host": [
+  "kernel 7.0.0-1018-aws",
+  "cpus 192",
+  "MemTotal:       395386980 kB",
+  "store /dev/loop3 btrfs   24G",
+  "/dev/loop3: [66306]:481 (/var/fcvm-btrfs.img)",
+  "NAME    MODEL                       SIZE",
+  "nvme1n1 Amazon Elastic Block Store  100G",
+  "nvme0n1 Amazon Elastic Block Store   30G"
+ ],
+ "reset_sent_s_after_all_ran": null,
+ "samples_all_up": 0,
+ "readings": 0,
+ "readings_under_19_5": 0,
+ "readings_unanswered": 0,
+ "low_or_unanswered": [],
+ "samples_with_a_reading_under_19_5": 0,
+ "lowest_tps_reading": null,
+ "readings_no_answer_max": null,
+ "store_mib": {
+  "start": 4946,
+  "max": 14921,
+  "end": 14921,
+  "per_server_at_max": 19.5
+ },
+ "wire": {
+  "snapshots": 756,
+  "snapshot_bytes_mean": 29256,
+  "status_msgs": 128,
+  "status_bytes_mean": 5624
+ }
+}

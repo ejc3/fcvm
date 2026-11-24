@@ -1,0 +1,2 @@
+{"event": "start", "n": 512, "meminfo": {"MemTotal": 386120, "MemAvailable": 363813, "Cached": 22656, "Dirty": 244, "AnonPages": 6169, "Shmem": 10388}, "ncpu": 192}
+{"event": "first_restoring", "at": 0.8021941184997559}
