@@ -22,6 +22,8 @@ class Bookkeeping(unittest.TestCase):
         # 1000 ms shrinking a tenth a lap in a ring of 2: seq 2 opens lap 1
         self.assertEqual([pb.hold_at(1000, 100, 2, 2, s) for s in range(5)], [1000, 1000, 900, 900, 810])
         self.assertEqual(pb.hold_at(10, 500, 4, 2, 10), 4, "never below the floor")
+        self.assertEqual(pb.hold_at(400, 100, 2, 2, 400), 2, "and the floor is reached")
+        self.assertEqual(pb.hold_at(400, 100, 2, 2, 6), 291.6, "in microseconds, not whole ms")
 
     def test_a_catch_must_carry_the_stepped_chain(self):
         good = {"round": 1, "seq": 0, "colour": 4, "counter": 1, "chain": pb.chain_step(ZERO, 1, 0, 4)}

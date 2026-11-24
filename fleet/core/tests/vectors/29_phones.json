@@ -326,6 +326,28 @@
       "name": "release_phone",
       "type": "intent",
       "viewer": "v3"
+    },
+    {
+      "at": 57600,
+      "host": "h1",
+      "msg": {
+        "fps": 30.0,
+        "gpu": {
+          "mem_total_mb": 15360.0,
+          "mem_used_mb": 648.3,
+          "name": "Tesla T4",
+          "power_w": 48.0,
+          "temp_c": 52,
+          "util_pct": 37
+        },
+        "id": "phone-2",
+        "type": "health",
+        "vm_stats": {
+          "cpu_pct": 21.4,
+          "vcpus": 6
+        }
+      },
+      "type": "agent"
     }
   ],
   "expect": [
@@ -905,7 +927,7 @@
           "borrowed": null,
           "error": null,
           "failure": null,
-          "fps": null,
+          "fps": 30.0,
           "frame_url": "ws://h1:20102/frames",
           "frame_url_v4": null,
           "front": "app",
@@ -914,7 +936,15 @@
             "name": "Tesla T4",
             "sbdf": "0000:03:00.0"
           },
-          "gpu_stats": null,
+          "gpu_stats": {
+            "at": 57600,
+            "mem_total_mb": 15360.0,
+            "mem_used_mb": 648.3,
+            "name": "Tesla T4",
+            "power_w": 48.0,
+            "temp_c": 52,
+            "util_pct": 37
+          },
           "half": "fcvm",
           "host": "h1",
           "id": "phone:2",
@@ -937,7 +967,12 @@
             "y": 0.0
           },
           "slot": "phone-2",
-          "vm": "fleet-phone-2"
+          "vm": "fleet-phone-2",
+          "vm_stats": {
+            "at": 57600,
+            "cpu_pct": 21.4,
+            "vcpus": 6
+          }
         }
       ],
       "zoom_at": 54500,

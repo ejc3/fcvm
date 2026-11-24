@@ -75,3 +75,7 @@
   .phones-stage { margin: 0 8px 8px; }
   .phone-label span { font-size: 12px; padding: 1px 4px; }
 }
+/* Live readings share the card's rows grid; digits are padded to a fixed width so values do not shift. */
+.phone-sheet dd .stat { display: inline-flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; white-space: pre; }
+.phone-sheet dd .bar { display: inline-block; width: 72px; height: 5px; border-radius: 3px; background: rgba(255, 255, 255, 0.12); overflow: hidden; }
+.phone-sheet dd .bar i { display: block; height: 100%; background: var(--fcvm); }
