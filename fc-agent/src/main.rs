@@ -29,6 +29,7 @@ mod payload_freeze;
 mod proxy;
 mod relay_socket;
 mod restore;
+mod restore_warmup;
 mod retired_address;
 mod snapshot_network;
 mod system;
@@ -105,6 +106,16 @@ async fn main() {
     let one_shot = std::env::args().nth(1);
     let one_shot_result = match one_shot.as_deref() {
         Some("--prepare-snapshot-network") => {
+            // Read what a clone's restore will execute into the page cache first, so the
+            // snapshot's memory holds it and no clone reads it from its own disk. Reads only,
+            // before the container is frozen (restore_warmup).
+            let started = std::time::Instant::now();
+            let (files, bytes) = restore_warmup::warm();
+            eprintln!(
+                "[fc-agent] read {files} files ({} KiB) a restore runs into the page cache in {} ms",
+                bytes / 1024,
+                started.elapsed().as_millis()
+            );
             // The container is frozen first, so it opens no socket and faults no page
             // while the boundary closes, and a restored clone starts with it frozen
             // (payload_freeze). A failed prepare thaws it again: the host resumes the
