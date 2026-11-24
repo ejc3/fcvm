@@ -938,14 +938,14 @@ export const FIELD_SHARE = 0.4;
 export const FIELD_SHARE_NARROW = 0.38;
 /**
  * Room in the field for its words (above the cells), and below them for the row that says what
- * one cell is and steps to the next (a finger's height on a phone) and the line that says what
- * the marks mean.
+ * one cell is and steps to the next (a finger's height on a phone) and the two lines that say
+ * what the marks mean.
  */
 export const FIELD_TEXT_H = 92;
 export const FIELD_TEXT_H_NARROW = 58;
 export const FIELD_READOUT_H = 30;
 export const FIELD_READOUT_H_NARROW = 44;
-export const FIELD_LEGEND_H = 18;
+export const FIELD_LEGEND_H = 34;
 const FIELD_GAP = 12;
 
 /** How the page draws the worlds: "flat" is the map from above, for a browser with no WebGL2. */

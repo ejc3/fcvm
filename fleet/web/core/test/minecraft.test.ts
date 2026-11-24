@@ -977,7 +977,7 @@ describe("a fleet with a field", () => {
     // the field takes its share of the stage and the tiles the rest, and they do not overlap
     expect(f.box).toEqual({ x: STAGE.x, y: STAGE.y, w: STAGE.w * FIELD_SHARE, h: STAGE.h });
     // its cells have the room between its words and the rows under them (what one cell is, and what the marks mean), and all 512 fit there
-    expect(f.grid).toEqual({ x: STAGE.x, y: STAGE.y + 92, w: STAGE.w * FIELD_SHARE, h: STAGE.h - 92 - 30 - 18 });
+    expect(f.grid).toEqual({ x: STAGE.x, y: STAGE.y + 92, w: STAGE.w * FIELD_SHARE, h: STAGE.h - 92 - 30 - 34 });
     expect(f.layout!.scrolls).toBe(false);
     expect(f.layout!.cell).toBe(16);
     // on a phone the cells keep a size a finger can pick, and scroll

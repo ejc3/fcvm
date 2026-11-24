@@ -199,7 +199,7 @@ export const FIELD_LEGEND: readonly { key: string; rgb: Rgb | null; text: string
 ];
 /** The two marks that are not a state. */
 export const FIELD_LEGEND_RING = "ringed: in 3D";
-export const FIELD_LEGEND_YOUNG = "lighter: up under a minute";
+export const FIELD_LEGEND_YOUNG = "lighter: just up";
 
 /** A cell's colour: its state, and for a running server how its tick rate stands. */
 export function cellColor(c: FieldCell): Rgb {

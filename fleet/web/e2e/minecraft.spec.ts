@@ -742,7 +742,13 @@ test.describe("a fleet of hundreds of servers on one host", () => {
     expect(under.legendBottom).toBeLessThanOrEqual(under.fieldBottom + 0.5);
     expect(under.readoutBottom).toBeLessThanOrEqual(under.legendTop + 0.5);
     expect(under.scrollBottom).toBeLessThanOrEqual(under.legendTop + 0.5);
-    await expect(page.getByTestId("mc-field-legend")).toHaveText("20 TPSslowerrestoringforkingfailednot reportedringed: in 3Dlighter: up under a minute");
+    await expect(page.getByTestId("mc-field-legend")).toHaveText("20 TPSslowerrestoringforkingfailednot reportedringed: in 3Dlighter: just up");
+    // every word of it is inside its room: none cut at the right edge or pushed below
+    const legend = await page.getByTestId("mc-field-legend").evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      return [...el.children].map((c) => c.getBoundingClientRect()).every((r) => r.left >= box.left - 0.5 && r.right <= box.right + 0.5 && r.bottom <= box.bottom + 0.5);
+    });
+    expect(legend).toBe(true);
     // one canvas for every cell: a paint draws all 512, and only when something changed
     await expect(page.locator(".mc-field canvas")).toHaveCount(1);
     const a = await page.evaluate(() => window.__minecraft!.field());
