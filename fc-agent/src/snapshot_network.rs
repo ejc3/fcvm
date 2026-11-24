@@ -939,21 +939,56 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
             unreachable,
         ]));
     }
-    rules.extend([owned(&[
-        "-p",
-        "tcp",
-        "-m",
-        "conntrack",
-        "--ctstate",
-        "NEW",
-        "-j",
-        "REJECT",
-        "--reject-with",
-        "tcp-reset",
-    ])]);
+    rules.push(owned(&TCP_NEW_FLOW_REJECT));
     rules.push(owned(&["-j", "RETURN"]));
     rules
 }
+
+/// The gate's TCP rule in both chains and both families: a SYN without ACK is
+/// answered with a reset. That segment is what begins a TCP connection in
+/// either direction, so the rule reads the packet and asks connection tracking
+/// nothing.
+///
+/// It used to be `-m conntrack --ctstate NEW`, which has two faults (#2106):
+///
+/// - A SYN on a tuple the guest still tracks as ESTABLISHED is not NEW. It
+///   passed the closed gate, the listener accepted it, and a restored clone
+///   answered a client before publication. A guest holds such entries because
+///   the rule itself was what attached connection tracking: a connection open
+///   when the gate's chains are removed keeps its entry with nobody tracking
+///   its FIN, for the 5 days an established flow may idle, and every later
+///   snapshot of that guest carries it.
+/// - With tracking attached only for the gate, a segment of a connection that
+///   was already open is the first the tracker sees of it, which makes it NEW:
+///   on the VM being snapshotted, a live connection that carried data while
+///   the gate was closed was reset.
+///
+/// Matching the flags closes both, and nothing in these chains uses connection
+/// tracking any more, so closing the gate no longer attaches it: a snapshot
+/// leaves the source's tracking table as it found it. The restored clone's UDP
+/// rule (`udp_ingress_rule_args`) is the one that still does, on the restore
+/// side only.
+///
+/// The reject stays a TCP reset in both directions. On ingress a client must
+/// see a definitive refusal at once, not a SYN that times out; on egress it is
+/// the reset `restore_boundary_with` describes, which is why that half opens
+/// before the stale sockets are retired. The match is SYN set and ACK clear
+/// whatever else is set, so a SYN that also carries FIN or RST, which a
+/// listener drops anyway, is refused too. A first fragment too short to hold
+/// the flags is dropped by the `tcp` match itself.
+const TCP_NEW_FLOW_REJECT: [&str; 11] = [
+    "-p",
+    "tcp",
+    "-m",
+    "tcp",
+    "--tcp-flags",
+    "SYN,ACK",
+    "SYN",
+    "-j",
+    "REJECT",
+    "--reject-with",
+    "tcp-reset",
+];
 
 /// Ask chronyd to measure now: four polls, four answers needed. Run once the
 /// gate's egress half is open, because a poll the gate rejected leaves chronyd
@@ -1000,6 +1035,27 @@ fn port_unreachable(loopback_network: &str) -> &'static str {
 /// the guest's own outbound UDP are reply-direction and pass; OUTPUT gates no
 /// UDP but NTP (`gate_chain_rules`), so DNS works throughout. Removed with the
 /// chain when ingress opens.
+///
+/// What this does and does not promise. UDP has no segment that begins a flow,
+/// so unlike the TCP rule (`TCP_NEW_FLOW_REJECT`) this one cannot be read off
+/// the packet, and it is the one rule of the gate that needs connection
+/// tracking:
+///
+/// - Refused until publication: a datagram that begins a flow from outside,
+///   and a datagram on a flow a client began, however long ago, because a
+///   stale entry for that flow still has the client as its origin.
+/// - Passed: a datagram from an address and port the guest itself sent to from
+///   that local port within the tracker's timeout (30 s, or 120 s once both
+///   sides have sent), measured in guest run time, so an exchange shortly
+///   before the snapshot counts. That is what a reply is, and the rule cannot
+///   tell a late reply from a peer speaking again.
+/// - Not gated at all, on either side: ICMP and every protocol other than TCP
+///   and UDP. The boundary's claim is about TCP sockets (the cookie manifest
+///   holds nothing else), plus this rule and the NTP one for UDP.
+///
+/// Because it uses tracking, the tracker is attached in a restored clone from
+/// this rule's insertion until the ingress chain is removed, and connections
+/// open at that moment keep their entries. The snapshot side has no such rule.
 fn udp_ingress_rule_args(loopback_network: &str) -> [&'static str; 10] {
     let unreachable = port_unreachable(loopback_network);
     [
@@ -3563,7 +3619,7 @@ mod tests {
                 [
                     local.as_str(),
                     ntp.as_str(),
-                    "-p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset",
+                    "-p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with tcp-reset",
                     "-j RETURN",
                 ],
                 "{program}'s OUTPUT gate chain:\n{calls}"
@@ -3763,10 +3819,10 @@ mod tests {
         assert!(calls
             .contains("iptables-restore< -A FCVM_SNAPSHOT_OUT -p tcp -d 127.0.0.0/8 -j RETURN"));
         assert!(calls.contains(
-            "iptables-restore< -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT"
+            "iptables-restore< -A FCVM_SNAPSHOT_IN -p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT"
         ));
         assert!(calls.contains(
-            "iptables-restore< -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT"
+            "iptables-restore< -A FCVM_SNAPSHOT_OUT -p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT"
         ));
         assert!(
             !calls.contains("10.0.2.") && !calls.contains("fd00:"),
@@ -3831,6 +3887,255 @@ mod tests {
         );
     }
 
+    /// What the tracker would say of a packet, for the rules that ask it.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Tracked {
+        /// The first packet the tracker sees of its flow.
+        New,
+        /// The tracker holds an entry for the tuple and has seen both sides.
+        Established,
+    }
+
+    /// A packet as the gate's rules can see it.
+    #[derive(Clone, Copy, Debug)]
+    struct Packet {
+        protocol: &'static str,
+        /// TCP flags that are set, as iptables names them.
+        flags: &'static [&'static str],
+        loopback_peer: bool,
+        on_lo: bool,
+        destination_port: u16,
+        tracked: Tracked,
+        /// Whether the packet runs the way its flow began.
+        original_direction: bool,
+    }
+
+    const SYN: Packet = Packet {
+        protocol: "tcp",
+        flags: &["SYN"],
+        loopback_peer: false,
+        on_lo: false,
+        destination_port: 7070,
+        tracked: Tracked::New,
+        original_direction: true,
+    };
+
+    #[derive(PartialEq, Debug)]
+    enum Verdict {
+        Rejected(String),
+        Passed,
+    }
+
+    /// Run `packet` through a gate chain's rules as iptables would: the first
+    /// rule whose every match holds decides. Every token of every rule has to be
+    /// one this model knows, so a rule added to the gate has to be taught here
+    /// before these tests can pass.
+    fn through(rules: &[Vec<String>], loopback_flag: &str, packet: Packet) -> Verdict {
+        for rule in rules {
+            let mut tokens = rule.iter().map(String::as_str);
+            let mut matches = true;
+            let mut target = None;
+            let mut reject_with = String::new();
+            while let Some(token) = tokens.next() {
+                let mut value = || tokens.next().expect("a value for the option");
+                match token {
+                    "-p" => matches &= value() == packet.protocol,
+                    "-s" | "-d" => {
+                        assert_eq!(token, loopback_flag, "the chain's own end is its loopback");
+                        value();
+                        matches &= packet.loopback_peer;
+                    }
+                    "-i" => matches &= value() == "lo" && packet.on_lo,
+                    "-m" => {
+                        value();
+                    }
+                    "--tcp-flags" => {
+                        let examined: Vec<&str> = value().split(',').collect();
+                        let set: Vec<&str> = value().split(',').collect();
+                        matches &= examined
+                            .iter()
+                            .all(|flag| packet.flags.contains(flag) == set.contains(flag));
+                    }
+                    "--dport" => matches &= value() == packet.destination_port.to_string(),
+                    "--ctstate" => {
+                        matches &= match value() {
+                            "NEW" => packet.tracked == Tracked::New,
+                            other => panic!("the model does not know --ctstate {other}"),
+                        }
+                    }
+                    "--ctdir" => {
+                        matches &= match value() {
+                            "ORIGINAL" => packet.original_direction,
+                            other => panic!("the model does not know --ctdir {other}"),
+                        }
+                    }
+                    "-j" => target = Some(value().to_string()),
+                    "--reject-with" => reject_with = value().to_string(),
+                    other => panic!("the model does not know {other} in {rule:?}"),
+                }
+            }
+            if !matches {
+                continue;
+            }
+            match target.as_deref() {
+                Some("RETURN") => return Verdict::Passed,
+                Some("REJECT") => return Verdict::Rejected(reject_with),
+                other => panic!("the model does not know the target {other:?}"),
+            }
+        }
+        Verdict::Passed
+    }
+
+    /// Both chains of both families: (chain name, its loopback flag, its rules).
+    fn gate_chains() -> Vec<(String, &'static str, Vec<Vec<String>>)> {
+        let mut chains = Vec::new();
+        for network in [IPV4_LOOPBACK, IPV6_LOOPBACK] {
+            for (name, flag) in [("INPUT", "-s"), ("OUTPUT", "-d")] {
+                chains.push((
+                    format!("{name} of {network}"),
+                    flag,
+                    gate_chain_rules(flag, network),
+                ));
+            }
+        }
+        chains
+    }
+
+    /// #2106: a SYN begins a connection whatever the tracker remembers of its
+    /// tuple. A guest keeps ESTABLISHED entries for connections whose end it never
+    /// tracked, and a SYN on such a tuple is not NEW, so the rule that asked the
+    /// tracker let it through the closed gate and a restored clone answered a
+    /// client before publication.
+    ///
+    /// RED BEFORE THE FIX: with `--ctstate NEW` the tracked SYN passed all four
+    /// chains.
+    #[test]
+    fn a_syn_is_refused_whatever_the_tracker_holds_for_its_tuple() {
+        let reset = Verdict::Rejected("tcp-reset".to_string());
+        for (chain, flag, rules) in gate_chains() {
+            for tracked in [Tracked::New, Tracked::Established] {
+                let syn = Packet { tracked, ..SYN };
+                assert_eq!(through(&rules, flag, syn), reset, "{chain}, {tracked:?}");
+                // garbage a listener drops is refused as well, not passed to it
+                for flags in [&["SYN", "FIN"][..], &["SYN", "RST"], &["SYN", "PSH", "URG"]] {
+                    let odd = Packet { flags, ..syn };
+                    assert_eq!(through(&rules, flag, odd), reset, "{chain}, {flags:?}");
+                }
+            }
+        }
+    }
+
+    /// A segment of a connection that is already open is not a new flow, and the
+    /// gate passes it whether or not the tracker has ever seen the connection.
+    /// With tracking attached only while the gate was closed, the first segment
+    /// it saw of a live connection was NEW, and the snapshot reset a connection
+    /// of the VM it was taken from.
+    ///
+    /// RED BEFORE THE FIX: every untracked segment below was rejected.
+    #[test]
+    fn a_segment_of_an_open_connection_passes_untracked() {
+        for (chain, flag, rules) in gate_chains() {
+            for flags in [
+                &["ACK"][..],
+                &["ACK", "PSH"],
+                &["ACK", "FIN"],
+                &["RST"],
+                &["SYN", "ACK"],
+            ] {
+                let segment = Packet {
+                    flags,
+                    tracked: Tracked::New,
+                    ..SYN
+                };
+                assert_eq!(
+                    through(&rules, flag, segment),
+                    Verdict::Passed,
+                    "{chain}, {flags:?}"
+                );
+            }
+        }
+    }
+
+    /// The guest talking to itself is not gated: a SYN to or from loopback
+    /// passes both chains, and one entering on `lo` passes INPUT.
+    #[test]
+    fn loopback_connections_pass_the_closed_gate() {
+        for (chain, flag, rules) in gate_chains() {
+            let own = Packet {
+                loopback_peer: true,
+                ..SYN
+            };
+            assert_eq!(through(&rules, flag, own), Verdict::Passed, "{chain}");
+            if flag == "-s" {
+                let redirected = Packet { on_lo: true, ..SYN };
+                assert_eq!(
+                    through(&rules, flag, redirected),
+                    Verdict::Passed,
+                    "{chain}"
+                );
+            }
+        }
+    }
+
+    /// Closing the gate must not attach connection tracking: no rule of the
+    /// chains a snapshot installs names it. The restored clone's UDP rule is
+    /// the one rule that does, and it is not among them.
+    ///
+    /// RED BEFORE THE FIX: the TCP rule of every chain was `-m conntrack`.
+    #[test]
+    fn no_rule_the_snapshot_side_installs_uses_connection_tracking() {
+        for network in [IPV4_LOOPBACK, IPV6_LOOPBACK] {
+            let input = gate_chains_restore_input(network);
+            assert!(
+                !input.contains("conntrack") && !input.contains("--ct"),
+                "closing the gate attaches connection tracking:\n{input}"
+            );
+            assert!(
+                udp_ingress_rule_args(network).contains(&"conntrack"),
+                "the model below assumes the UDP rule is the tracked one"
+            );
+        }
+    }
+
+    /// What the restored clone's UDP rule refuses and what it passes, with the
+    /// rule in its place in the INPUT chain. A datagram from outside is refused
+    /// whether its flow is new or one a client began before the snapshot; a
+    /// datagram on a flow the guest began passes, which is what a reply is.
+    #[test]
+    fn the_udp_rule_refuses_by_direction_and_passes_replies() {
+        for network in [IPV4_LOOPBACK, IPV6_LOOPBACK] {
+            let mut rules = gate_chain_rules("-s", network);
+            rules.insert(
+                2,
+                udp_ingress_rule_args(network).map(str::to_string).to_vec(),
+            );
+            let datagram = Packet {
+                protocol: "udp",
+                flags: &[],
+                ..SYN
+            };
+            let unreachable = Verdict::Rejected(port_unreachable(network).to_string());
+            for tracked in [Tracked::New, Tracked::Established] {
+                let from_a_client = Packet {
+                    tracked,
+                    ..datagram
+                };
+                assert_eq!(through(&rules, "-s", from_a_client), unreachable);
+            }
+            let reply = Packet {
+                tracked: Tracked::Established,
+                original_direction: false,
+                ..datagram
+            };
+            assert_eq!(through(&rules, "-s", reply), Verdict::Passed);
+            let own = Packet {
+                on_lo: true,
+                ..datagram
+            };
+            assert_eq!(through(&rules, "-s", own), Verdict::Passed);
+        }
+    }
+
     /// Runner that answers `-S` with a canned dump and records every call.
     #[derive(Clone)]
     struct ScriptedRunner {
@@ -3884,17 +4189,19 @@ mod tests {
         -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
         -A FCVM_SNAPSHOT_IN -s 127.0.0.0/8 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
-        -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_IN -p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d 127.0.0.0/8 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p udp -m udp --dport 123 -j REJECT --reject-with icmp-port-unreachable\n\
-        -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_OUT -p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_OUT -j RETURN\n";
 
     /// Same capture for the IPv6 family (`-d ::1/128 -p tcp -j RETURN` etc.).
     /// The NTP lines of both dumps are iptables 1.8.10's rendering, legacy and
     /// nf_tables alike, of the rule as `gate_chain_rules` appends it (with
-    /// `-m udp`); the rest of each dump is the capture described above.
+    /// `-m udp`), and the TCP reject lines are its nf_tables rendering of
+    /// `TCP_NEW_FLOW_REJECT`, read back in a guest in both families; the rest of
+    /// each dump is the capture described above.
     const ARMED_V6_DUMP: &str = "-P INPUT ACCEPT\n\
         -P FORWARD ACCEPT\n\
         -P OUTPUT ACCEPT\n\
@@ -3904,11 +4211,11 @@ mod tests {
         -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
         -A FCVM_SNAPSHOT_IN -s ::1/128 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
-        -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_IN -p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d ::1/128 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p udp -m udp --dport 123 -j REJECT --reject-with icmp6-port-unreachable\n\
-        -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_OUT -p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_OUT -j RETURN\n";
 
     #[test]
