@@ -3223,6 +3223,23 @@ async fn cmd_snapshot_run_inner(
         "loaded snapshot configuration"
     );
 
+    let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
+        &args,
+        snapshot_config.metadata.kernel_profile.as_deref(),
+        snapshot_config.metadata.firecracker_bin.as_deref(),
+    )
+    .await?;
+    // Before any host state changes (reclaim, the clone's owner record, a GPU prefill): a
+    // restore that must be confined and cannot be is refused here. The Firecracker
+    // arguments are the ones the restore will launch with, a kernel profile's included.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: snapshot_config.metadata.hypervisor,
+        network: snapshot_config.metadata.network_mode.into(),
+        firecracker_args: runtime_config.effective_firecracker_args().as_deref(),
+        unsupported: None,
+    })?;
+
     // Generate VM ID and name. Restored VMs always get a FRESH vm_id and a
     // fresh state file (vsock_epoch starts at 0) — including the podman-run
     // snapshot-miss path, which tears its throwaway VM down (deleting its
@@ -3238,12 +3255,6 @@ async fn cmd_snapshot_run_inner(
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
         path: paths::vm_runtime_dir(&vm_id),
     })?;
-    let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
-        &args,
-        snapshot_config.metadata.kernel_profile.as_deref(),
-        snapshot_config.metadata.firecracker_bin.as_deref(),
-    )
-    .await?;
     // A GPU restore's hugepage prefill starts here, as soon as the restore's Firecracker is
     // known, beside the checks and the clone's setup (its state, volume servers and network);
     // the memory backend below waits for it. Only a direct Firecracker restore prefills. GPUs
@@ -3318,6 +3329,7 @@ async fn cmd_snapshot_run_inner(
         args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
     );
     vm_state.name = Some(vm_name.clone());
+    vm_state.confinement = decision.confinement().cloned();
 
     // Save snapshot tracking info in clone state
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
@@ -3797,7 +3809,10 @@ async fn cmd_snapshot_run_inner(
                 .with_loopback_ip(loopback_ip)
                 .with_dns_server(resolvers.mode_server.clone())
                 .with_restore_mode()
-                .with_pooling(vmm_takes_a_tap_queue);
+                .with_pooling(clone_may_pool(
+                    vmm_takes_a_tap_queue,
+                    vm_state.confinement.is_some(),
+                ));
             Box::new(net)
         }
     };
@@ -4354,6 +4369,7 @@ async fn cmd_snapshot_run_inner(
     setup.restore_completion_rx = Some(restore_completion_rx);
 
     let restore_params = RestoreParams {
+        decision: decision.clone(),
         vm_id: &vm_id,
         vm_name: &vm_name,
         data_dir: &data_dir,
@@ -6022,6 +6038,7 @@ fn run_args_from_snapshot_metadata(
         // The VM's cgroup, and its swap setting, were entered from the snapshot run's own
         // --no-swap before this runs (`crate::cgroup`).
         no_swap: false,
+        confine: false,
     }
 }
 
@@ -6158,6 +6175,14 @@ async fn cmd_snapshot_run_raw(
 ) -> Result<()> {
     let meta = &snapshot_config.metadata;
     ensure_raw_restore_supported(&args, meta)?;
+    // Before any host state changes. Refused when asked for, or when the host requires it: this path does not confine.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: crate::hypervisor::Backend::Firecracker,
+        network: crate::confine::Network::Rootless,
+        firecracker_args: args.firecracker_args.as_deref(),
+        unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
+    })?;
     anyhow::ensure!(
         port_mappings.is_empty(),
         "the raw VM's snapshot records published ports ({port_mappings:?}); raw VMs publish none"
@@ -6286,6 +6311,7 @@ async fn cmd_snapshot_run_raw(
     let restore_started = std::time::Instant::now();
     let restored = super::common::restore_from_snapshot_ch(
         RestoreParams {
+            decision,
             vm_id: &vm_id,
             vm_name: &vm_name,
             data_dir: &data_dir,
@@ -6412,6 +6438,10 @@ async fn cmd_snapshot_run_disk_only(
         args.host_ipv6,
     );
     let run_args = RunArgs {
+        // The request's --confine, which the snapshot's metadata does not carry: the
+        // disk-only restore boots through `podman run`, which resolves confinement from
+        // these arguments.
+        confine: args.confine,
         publish_limit_per_source: args.publish_limit_per_source,
         ..run_args
     };
@@ -6586,8 +6616,24 @@ async fn record_diff_parent(
         .map(|opt| opt.map(|_| ()))
 }
 
+/// Whether a clone may take its namespace from the pool (`crate::netpool`): its VMM must
+/// take the slot's TAP queue (`vmm_takes_a_tap_queue`), and it must not be confined. A
+/// confined VMM on a pooled slot would use that inherited queue too, which needs no attach
+/// and so no CAP_NET_ADMIN, but no test runs a confined clone on a pool yet, so a confined
+/// clone builds its own namespace until one does.
+fn clone_may_pool(vmm_takes_a_tap_queue: bool, confined: bool) -> bool {
+    vmm_takes_a_tap_queue && !confined
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_confined_clone_builds_its_own_namespace() {
+        assert!(super::clone_may_pool(true, false));
+        assert!(!super::clone_may_pool(true, true));
+        assert!(!super::clone_may_pool(false, false));
+    }
+
     /// Only the File backend carries a write set: its sidecar is named in the branch that
     /// chooses the File backend, after the implicit UFFD server that hugepage and NV2
     /// snapshots restore through (direct_restore_memory, pinned by the tests of that
@@ -8472,6 +8518,7 @@ mod tests {
             prepare: None,
             no_dirty_tracking: false,
             no_swap: false,
+            confine: false,
             vsock_dir: None,
             publish: vec![],
             publish_limit_per_source: None,
@@ -8960,6 +9007,7 @@ mod tests {
             prepare: None,
             no_dirty_tracking: false,
             no_swap: false,
+            confine: false,
             vsock_dir: None,
             publish: vec![],
             publish_limit_per_source: None,
