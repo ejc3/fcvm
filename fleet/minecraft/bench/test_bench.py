@@ -146,6 +146,20 @@ class FleetField(unittest.TestCase):
         # not every server came up: no time
         self.assertIsNone(summary(hello + gold + servers, n=4)["all_up_s"])
 
+    def test_every_committed_runs_time_to_all_up_is_rederived_from_its_log_excerpt(self):
+        # A record keeps the lines of the coordinator's log its "all N up" figure is read from
+        # (coord-up.log): the figure in its summary.json is what those lines give.
+        root = f"{HERE}/results/2026-11-24-fleet-path-c8g-metal-48xl"
+        seen = {}
+        for run in sorted(os.listdir(root)):
+            summary = json.load(open(f"{root}/{run}/summary.json"))
+            self.assertTrue(os.path.exists(f"{root}/{run}/coord-up.log"), run)
+            got = json.loads(subprocess.run([sys.executable, f"{HERE}/fleetfield_summary.py", "--all-up", f"{root}/{run}", str(summary["servers"])],
+                                            capture_output=True, text=True, check=True).stdout)
+            self.assertEqual(got, summary["all_up_s"], run)
+            seen[run] = got and got["s"]
+        self.assertEqual(seen, {"256-ram": 6.9, "256-root-volume": 24.6, "512-ram": 29.9, "512-root-volume": 73.7, "512-root-volume-neighbour-limit-1024": None})
+
     def test_a_run_that_never_all_ran_says_where_it_stood(self):
         with tempfile.TemporaryDirectory() as d:
             with open(f"{d}/run.jsonl", "w") as f:
