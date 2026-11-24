@@ -1,7 +1,13 @@
 kernel 7.0.0-1018-aws
 cpus 192
-MemTotal:       395386980 kB
-store /dev/loop3 btrfs   96G /mnt/ram/store.img on tmpfs  tmpfs
-tree 2f89b1c976751e116c4274e1c3c36801452c1a0c
+MemTotal:       395386984 kB
+store /dev/loop3 btrfs   96G /mnt/ram/store.img on tmpfs
+tree 86b7414e8d5840f0254bafa168f00ea4e3779976
 net.ipv6.neigh.default.gc_thresh3 = 16384
-2026-11-24T12:41:37Z
+net.ipv4.neigh.default.gc_thresh3 = 16384
+2026-11-24T21:06:59Z
+cpuset after: 0-47
+2026-11-24T21:35:16Z
+from here hostramp.py with the cpuset reset fix (sha256 42bfdaf349df4a0c)
+cpuset after the repeated steps: 0-191
+2026-11-24T21:54:42Z

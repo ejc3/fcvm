@@ -249,56 +249,64 @@ been run on a kernel with the fix.
 
 ### Servers on one host
 
-How many servers one host runs in the fleet's own shape, from two boots of one instance type
-(c8g.metal-48xl: 192 vCPUs, 377 GiB, no local disk), both on kernel 7.0.0-1018-aws on
-2026-11-24: the table and the 48-core steps are the first boot's, the step without bots and the
-three 256-server steps beside it the second's (`second-boot/` in the records; no row of the
-table was run again there, and the one count both ran, 256 with bots, read 48.9 cores busy on
-the first and 49.5 to 52.2 on the second). Each server is a VM of 1 vCPU and 1024 MiB with its
-three bots inside it, as `fcvm fleet agent --minecraft N` starts them. The tile image was built
-from main at `2f89b1c97` and fcvm from the same commit with a change to the fleet's agent and
-coordinator that this harness does not run (the second boot: `second-boot/host.txt`), with
+How many servers one host runs in the fleet's own shape, from one boot of one bare-metal arm64
+host (c8g.metal-48xl: 192 vCPUs, 377 GiB, no local disk) on kernel 7.0.0-1018-aws, 2026-11-24.
+Each server is a VM of 1 vCPU and 1024 MiB with its three bots inside it, as
+`fcvm fleet agent --minecraft N` starts them. fcvm and the tile image were built from this
+branch at `86b7414e8` (main at `c083d7ec6` with this harness), and the steps run with
 `fleet/minecraft/bench/hostramp.py`; the records are in
-`fleet/minecraft/bench/results/2026-11-24-c8g-metal-48xl/`. Two things differ from the fleet:
-networking was bridged (the fleet's is routed), and the store was a btrfs image in RAM (the
-host's only disk is a 30 GiB network volume), so the store's speed bounds nothing here and its
-contents come out of the host's memory.
+`fleet/minecraft/bench/results/2026-11-24-c8g-metal-48xl/` (`host.txt` names the kernel, the
+store and the tree). Two things differ from the fleet: networking was bridged (the fleet's is
+routed), and the store was a btrfs image in RAM (the host's only disk is a 30 GiB network
+volume), so the store's speed bounds nothing here and its contents come out of the host's
+memory.
 
 - **A step** restores K servers from one gold snapshot (the tile ready, 20 TPS for 10 s, then
   `snapshot create --stop`) with 16 restores in flight, gives each its own scene (so its bots are
   reseeded), waits 30 s, then reads every tile's `/health` every 5 s for 60 s. A reading counts
   only with three bots online and a game time under 3 s old, else it is 0. A step holds when
-  every reading is 19.5 or more.
+  every reading is 19.5 or more and every server took its scene.
+
+The steps in the order they ran, each torn down before the next. The first five ran back to
+back; the last ran half an hour later, after the 48-core steps and the first of the two steps
+without bots below (and after the same host had run other VMs for another record, from 21:35
+to 21:47 UTC):
 
 | servers | lowest reading, TPS | host cores busy (per server) | K restores | one more restore, to ready | anonymous MiB per server after the step |
 |---|---|---|---|---|---|
-| 8 | 19.89 | 1.3 (0.168) | 0.9 s | 367 to 407 ms | 268 |
-| 64 | 19.87 | 11.3 (0.177) | 3.7 s | 457 to 474 ms | 259 |
-| 256 | 19.84 | 48.9 (0.191) | 18.0 s | 696 to 737 ms | 272 |
-| 512 | 19.88 | 90.4 (0.177) | 80.2 s | 888 to 918 ms | 330 |
-| 768 | 15.43 | 146.7 (0.191) | 188.5 s | 1668 to 2228 ms | 354 |
+| 8 | 19.89 | 1.3 (0.159) | 0.8 s | 345 to 365 ms | 265 |
+| 64 | 19.86 | 11.6 (0.182) | 3.6 s | 433 to 436 ms | 264 |
+| 256 | 19.88 | 48.9 (0.191) | 16.8 s | 621 to 673 ms | 271 |
+| 512 | 19.86 | 103.0 (0.201) | 90.4 s | 969 to 1037 ms | 350 |
+| 768 | 0.00 | 153.6 (0.200) | 179.4 s | 1485 to 1640 ms | 362 |
+| 512, again at the end | 19.76 | 98.6 (0.193) | 55.0 s | 880 to 967 ms | 310 |
 
-- **512 held and 768 did not:** at 768, 24 servers had a reading under 19.5 (the 1st percentile
-  of the 9,216 readings was 19.91), with 147 of the 192 cores busy and 60 GiB of memory
-  available afterwards. No count between the two was run.
+- **512 held its tick rate both times, and by the step's rule held once.** In the first run
+  every one of the 6,144 readings was 19.86 or more, but 66 of the 512 scene posts timed out
+  (the harness gives a post 3 s and does not send it again), so those servers' bots kept the
+  gold snapshot's seed and the step does not count as held. Its restores were the slowest of
+  the two runs too (90.4 s, the slowest single one 13.4 s, against 55.0 s and 3.1 s). It began
+  the moment the 256 step's teardown returned; the second run began on a host that had run no
+  VM for a minute, and held, every scene set. Why the first was slower was not measured.
+- **768 did not hold:** 5 servers had a reading under 19.5 (the 1st percentile of the 9,216
+  readings was 19.89), with 154 of the 192 cores busy and 68 GiB of memory available
+  afterwards. No count between 512 and 768 was run.
 - **Cores.** With the VMs' cgroup held to 48 cores (`MC_CORES=48`), 192 and 240 servers held
-  (lowest readings 19.83 and 19.83, 43.0 cores busy at 240) and 288 did not (200 of the 288 had a
+  (lowest readings 19.87 and 19.59, 43.8 cores busy at 240) and 288 did not (232 of the 288 had a
   reading under 19.5): between 5.0 and 6.0 servers a core.
 - **Without bots** (`MCTILE_BOTS=0`, an empty server; a bot measures the tick rate, so there is
-  none to read): 256 servers used 1.2 cores, 0.005 each, and 94 MiB of anonymous memory each.
-  This step is from a second boot of the same instance type the same day (the same kernel, the
-  store again a btrfs image in RAM; `second-boot/` in the records), with that boot's own
-  256-server step with bots beside it, run three times: 49.5, 51.6 and 52.2 cores busy (0.200 a
-  server; 48.9 on the first boot), lowest readings 19.82, 19.86 and 19.85. Those three steps
-  alternated with three of another tile image (#2108's comparison), each step torn down before
-  the next. Bots connected but standing still were not measured.
-- **Start rate.** With 16 restores in flight: 17.3 servers a second at 64, 14.2 at 256, 6.4 at
-  512, 4.1 at 768. The "one more restore" column is `fcvm snapshot run` to a ready `/health`,
-  polled every 20 ms; at the high counts it includes the harness's own `fcvm ls --json` over every
-  VM.
+  none to read): 256 servers used 1.2 cores, 0.005 each, and 84 MiB of anonymous memory each.
+  The record holds this step twice. The first ran straight after the 48-core steps and was
+  itself held to those 48 cores (`vm_cores_allowed` 48; 1.3 cores busy): the harness's reset of
+  the cgroup wrote no bytes, which the kernel never sees. With that fixed the step ran again at
+  the end of the boot on all 192 (`host.txt` has the cgroup's CPUs after each).
+  Bots connected but standing still were not measured.
+- **Start rate.** With 16 restores in flight: 17.8 servers a second at 64, 15.2 at 256, 5.7 and
+  9.3 at 512 (the two runs), 4.3 at 768. The "one more restore" column is `fcvm snapshot run` to
+  a ready `/health`, polled every 20 ms; at the high counts it includes the harness's own
+  `fcvm ls --json` over every VM.
 - **Memory** is each step's reading about two minutes after its servers start, and a server
-  grows after that. Memory against a server's age was not measured in this session with this
-  harness.
+  grows after that. Memory against a server's age was not measured with this harness.
 
 ## Stack of PRs
 

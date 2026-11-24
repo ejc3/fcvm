@@ -91,10 +91,12 @@ class HostRamp(unittest.TestCase):
                 cpus = f"{d}/{R.CG}/cpuset.cpus"
                 self.assertEqual(open(cpus).read(), "0-47")
                 # The group outlives the run. The next run, with no limit, must not be held to
-                # those 48: empty gives the group its parent's CPUs again.
+                # those 48: an empty line gives the group its parent's CPUs again. The kernel
+                # never sees a write of no bytes (on 7.0.0-1018-aws the group then kept 0-47, and
+                # a step without bots ran on 48 cores), so what is written is a line.
                 del os.environ["MC_CORES"]
                 R.cg_setup()
-                self.assertEqual(open(cpus).read(), "")
+                self.assertEqual(open(cpus).read(), "\n")
                 # What a record says the VMs were allowed is what the kernel says, not what was asked.
                 with open(f"{d}/{R.CG}/cpuset.cpus.effective", "w") as f:
                     f.write("0-23,96-119\n")

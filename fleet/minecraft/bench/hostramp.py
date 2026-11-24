@@ -23,6 +23,8 @@ FCVM = os.environ["FCVM"]
 IMAGE = os.environ.get("MC_IMAGE", "localhost/fcvm-minecraft:dev")
 MEM = int(os.environ.get("MC_MEM", "1024"))
 CG = "mcramp"
+# What clears a cgroup's cpuset.cpus.
+CPUS_OF_PARENT = "\n"
 CGROOT = "/sys/fs/cgroup"
 HOLD = 19.5
 WARM = int(os.environ.get("MC_WARM", "30"))
@@ -138,9 +140,11 @@ def cg_setup():
             f.write(f"0-{int(cores) - 1}")
     elif os.path.exists(cpus):
         # The group outlives a run: one held to MC_CORES leaves its CPUs here, and a later run
-        # without it would still be held to them. Empty gives the group its parent's CPUs again.
+        # without it would still be held to them. An empty line gives the group its parent's CPUs
+        # again. It must be a line: a write of no bytes never reaches the kernel, and the group
+        # keeps its CPUs.
         with open(cpus, "w") as f:
-            f.write("")
+            f.write(CPUS_OF_PARENT)
     with open(f"{CGROOT}/{CG}/cgroup.subtree_control", "w") as f:
         f.write(ctl)
 
