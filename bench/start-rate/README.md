@@ -38,10 +38,17 @@ caps the store at the loop device's request queue (128 requests). Each clone's `
 inode of its own, so no clone finds another's reads of its disk in the page cache.
 
 To compare stores, read the device's requests in flight (`/sys/block/<dev>/inflight`) and its read
-await (`iostat -x 1`) during a run, and each clone's Firecracker `read_bytes` from
-`/proc/<pid>/io`. Figures for both stores follow, measured on a host kernel with the RTNL fix
-(upstream 6.18.60 and 7.2): the pboxes' stock 7.0 kernel holds RTNL in its namespace cleanup
-worker, so start numbers measured on it are not published.
+await (`iostat -x 1`) during a run. Both stores on one host, Ubuntu's 7.0.0-1018-aws,
+m8gd.metal-24xl (96 cores, 377 GiB), 2026-11-24, main at 9d7b6f94f; one cell each, 1000 UFFD
+clones at C=512 held 10 s, from a fresh snapshot:
+
+| store | clones/s | spawn to healthy p50 / p99 ms | store reads per clone | most requests in flight | read await, ms |
+|---|---|---|---|---|---|
+| btrfs on NVMe RAID0 (3 members of 127) | 81.6 | 5790 / 6803 | 43.6 MiB | 29 | 0.21 |
+| btrfs on a loop file in tmpfs (queue 128) | 79.2 | 5486 / 7884 | 40.6 MiB | 96 | 0.34 |
+
+The loop device's queue held up to 96 of its 128 requests, against at most 29 across the NVMe
+members, and its reads waited 60% longer; at this load the start rate is the same on both.
 
 `host.json` records the store's device, its backing file and that file's filesystem, and the
 `nr_requests` of the device, or of each member when it has members (an md RAID0).
