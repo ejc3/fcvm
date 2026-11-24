@@ -108,7 +108,7 @@ sleep() { :; }
 git() { printf '%040d\n' 0; }
 compute_pinned_hash() { echo test-build-hash; }
 check_existing_ami() { echo None; }
-verify_source_commit_fetchable() { return 0; }
+verify_source_commit_fetchable() { return "${AMI_TEST_UNFETCHABLE:-0}"; }
 get_base_ami() { echo ami-00000000000000000; }
 create_user_data() { echo '#!/bin/bash'; }
 wait_for_build() { return 0; }
@@ -252,6 +252,13 @@ main
                 first_launch = next(i for i, call in enumerate(calls) if call[1] == "run-instances")
                 self.assertLess(listing, min(retired))
                 self.assertLess(max(retired), first_launch)
+
+    def test_an_unfetchable_source_commit_is_refused_before_any_aws_call(self):
+        # The refusal needs nothing from AWS, so it comes before the run's first write: an
+        # earlier candidate is not retired by a run that was never going to build.
+        result, calls = self.run_build(AMI_TEST_UNFETCHABLE="1", AMI_TEST_STALE="ami-0aaaaaaaaaaaaaaa1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, [])
 
     def test_a_candidate_listing_that_cannot_be_trusted_stops_the_leg(self):
         result, calls = self.run_build(AMI_TEST_STALE="not-an-image-id")

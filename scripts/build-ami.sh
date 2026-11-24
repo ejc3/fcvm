@@ -602,8 +602,8 @@ reject_candidate() {
 
 # A candidate left by an earlier run was never judged: the run was cancelled between
 # create-image and the verdict, or its publish failed. Tag every candidate of this
-# architecture failed before anything else, so it can no longer be boot-tested or
-# published. The workflow runs one leg per architecture at a time, so a candidate found
+# architecture failed before this run launches anything, so it can no longer be
+# boot-tested or published. The workflow runs one leg per architecture at a time, so a candidate found
 # here is never one a running leg is testing. A listing or a tag change that fails stops
 # the leg: "no stale candidates" must be something this run saw.
 retire_stale_candidates() {
@@ -653,10 +653,6 @@ main() {
   fi
   echo "Build hash: $hash"
 
-  if ! retire_stale_candidates; then
-    exit 1
-  fi
-
   # Check cache
   existing=$(check_existing_ami "$hash")
   if [ "$existing" != "None" ] && [ -n "$existing" ]; then
@@ -666,12 +662,20 @@ main() {
     exit 0
   fi
 
+  # A commit the builder cannot fetch is refused here, before this run changes anything
+  # in AWS: the cache lookup above only reads.
   if ! verify_source_commit_fetchable \
     "$repo_root" "$source_commit" "$FCVM_SOURCE_REMOTE"; then
     exit 1
   fi
 
   echo "No cached AMI, building..."
+
+  # The first write of a run that will build. A cache hit builds nothing and leaves an
+  # earlier candidate to the pruner in ejc3/aws, which removes it a day after its creation.
+  if ! retire_stale_candidates; then
+    exit 1
+  fi
 
   # Terraform's builder role permits only the isolated runner VPC. Discover its
   # current IDs instead of inheriting the administration/dev network or profile.
