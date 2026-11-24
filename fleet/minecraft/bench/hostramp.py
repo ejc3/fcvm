@@ -100,12 +100,41 @@ def cg_setup():
     with open(f"{CGROOT}/cgroup.subtree_control", "w") as f:
         f.write(ctl)
     os.makedirs(f"{CGROOT}/{CG}", exist_ok=True)
+    cpus = f"{CGROOT}/{CG}/cpuset.cpus"
     if cores:
         # The VMs share this many cores: the edge in servers per core.
-        with open(f"{CGROOT}/{CG}/cpuset.cpus", "w") as f:
+        with open(cpus, "w") as f:
             f.write(f"0-{int(cores) - 1}")
+    elif os.path.exists(cpus):
+        # The group outlives a run: one held to MC_CORES leaves its CPUs here, and a later run
+        # without it would still be held to them. Empty gives the group its parent's CPUs again.
+        with open(cpus, "w") as f:
+            f.write("")
     with open(f"{CGROOT}/{CG}/cgroup.subtree_control", "w") as f:
         f.write(ctl)
+
+
+def cpus_allowed():
+    """How many CPUs the VMs' cgroup may run on, as the kernel says it (not as this run asked)."""
+    try:
+        spans = open(f"{CGROOT}/{CG}/cpuset.cpus.effective").read().strip()
+    except OSError:
+        return NCPU
+    n = 0
+    for span in filter(None, spans.split(",")):
+        lo, _, hi = span.partition("-")
+        n += int(hi or lo) - int(lo) + 1
+    return n or NCPU
+
+
+def qualify(readings, bots, scene_ok, k):
+    """A step's tick-rate summary and whether it held: every reading of every server at HOLD or
+    more (compared before rounding), every server given its scene, and bots to measure with."""
+    flat = sorted(v for r in readings.values() for v in r)
+    mins = sorted(min(r) for r in readings.values())
+    tps = {"min": round(flat[0], 2), "p01": round(flat[len(flat) // 100], 2), "p50": round(flat[len(flat) // 2], 2), "readings": len(flat),
+           "servers_below_hold": sum(1 for m in mins if m < HOLD)}
+    return tps, bool(bots) and flat[0] >= HOLD and scene_ok == k
 
 
 def cg_stat():
@@ -229,7 +258,7 @@ def is_up(h, bots):
 def step(bots, k, out, batch):
     logdir = f"{out}/logs/b{bots}-{k}"
     os.makedirs(logdir, exist_ok=True)
-    rec = {"bots": bots, "servers": k, "mem_mib": MEM, "ncpu": NCPU, "batch": batch, "vm_cores_allowed": int(os.environ.get("MC_CORES", NCPU))}
+    rec = {"bots": bots, "servers": k, "mem_mib": MEM, "ncpu": NCPU, "batch": batch, "vm_cores_allowed": cpus_allowed()}
     procs, names, started, up_at, ips = [], [], {}, {}, {}
     cg0 = cg_stat()
     mi0 = meminfo()
@@ -284,18 +313,14 @@ def step(bots, k, out, batch):
         while time.monotonic() - tm0 < MEASURE:
             ts = time.monotonic()
             for n, h in zip(names, POOL.map(lambda n: health(ips[n]), names)):
-                readings[n].append(round(reading(h, bots), 2) if bots else (1.0 if h else 0.0))
+                readings[n].append(reading(h, bots) if bots else (1.0 if h else 0.0))
             load.append(open("/proc/loadavg").read().split()[0])
             time.sleep(max(0.0, 5 - (time.monotonic() - ts)))
         dt = time.monotonic() - tm0
         cpu1, idle1 = host_cpu()
         cg2 = cg_stat()
         mi1 = meminfo()
-        flat = sorted(v for r in readings.values() for v in r)
-        mins = sorted(min(r) for r in readings.values())
-        rec["tps"] = {"min": flat[0], "p01": flat[len(flat) // 100], "p50": flat[len(flat) // 2], "readings": len(flat),
-                      "servers_below_hold": sum(1 for m in mins if m < HOLD)}
-        rec["held"] = bool(bots) and flat[0] >= HOLD
+        rec["tps"], rec["held"] = qualify(readings, bots, rec["scene_ok"], k)
         rec["host_busy_cores"] = round((1 - (idle1 - idle0) / max(1, cpu1 - cpu0)) * NCPU, 2)
         rec["vm_cgroup_cores"] = round((cg2["cpu_usec"] - cg1["cpu_usec"]) / 1e6 / dt, 2)
         rec["loadavg_1m"] = load

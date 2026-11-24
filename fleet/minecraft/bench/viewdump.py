@@ -8,7 +8,10 @@ key = base64.b64encode(os.urandom(16)).decode()
 s.sendall(f"GET /view HTTP/1.1\r\nHost: {ip}:8080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
 buf = b""
 while b"\r\n\r\n" not in buf:
-    buf += s.recv(65536)
+    d = s.recv(65536)
+    if not d:
+        sys.exit(f"closed before the upgrade's headers: {buf[:200]!r}")
+    buf += d
 head, buf = buf.split(b"\r\n\r\n", 1)
 if b" 101 " not in head.split(b"\r\n")[0]:
     sys.exit(f"no upgrade: {head[:200]!r}")
@@ -54,7 +57,12 @@ mask = os.urandom(4)
 s.sendall(bytes([0x81, 0x80 | len(p)]) + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(p)))
 out, end = {}, time.time() + 20
 while time.time() < end and not all(k in out for k in ("hello", "map", "status")):
-    m = json.loads(message())
+    # A tile that goes quiet ends the collection, and what came before is still printed.
+    s.settimeout(max(0.1, end - time.time()))
+    try:
+        m = json.loads(message())
+    except socket.timeout:
+        break
     if m.get("type") in ("hello", "map"):
         out[m["type"]] = m
     elif m.get("type") == "status" and m.get("players"):

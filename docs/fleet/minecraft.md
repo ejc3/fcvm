@@ -314,7 +314,10 @@ contents come out of the host's memory.
   reading under 19.5): between 5.0 and 6.0 servers a core.
 - **Without bots** (`MCTILE_BOTS=0`, an empty server; a bot measures the tick rate, so there is
   none to read): 256 servers used 1.2 cores, 0.005 each, and 93 MiB of anonymous memory each.
-  Bots connected but standing still were not measured.
+  Bots connected but standing still were not measured. This step ran after the 48-core steps
+  with the VMs still held to those 48 cores: the harness did not give the cgroup its CPUs back
+  (fixed since, with a test), and its record's `vm_cores_allowed` of 192 is what was asked for,
+  not what was so. The servers used 1.2 of the 48.
 - **Start rate.** With 16 restores in flight: 17.3 servers a second at 64, 14.2 at 256, 6.4 at
   512, 4.1 at 768. The "one more restore" column is `fcvm snapshot run` to a ready `/health`,
   polled every 20 ms; at the high counts it includes the harness's own `fcvm ls --json` over every

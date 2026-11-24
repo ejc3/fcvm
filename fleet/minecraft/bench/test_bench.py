@@ -61,5 +61,58 @@ class Forks(unittest.TestCase):
         self.assertFalse(a["fork_source_kept_its_bots"])
 
 
+class HostRamp(unittest.TestCase):
+    """hostramp.py's rules that do not need a host: which CPUs the VMs' cgroup is left with, and
+    when a step holds."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("FCVM", "fcvm")
+        import hostramp
+        cls.R = hostramp
+
+    def test_a_run_without_a_core_limit_does_not_keep_an_earlier_runs(self):
+        R = self.R
+        root, cores = R.CGROOT, os.environ.pop("MC_CORES", None)
+        with tempfile.TemporaryDirectory() as d:
+            R.CGROOT = d
+            try:
+                os.environ["MC_CORES"] = "48"
+                R.cg_setup()
+                cpus = f"{d}/{R.CG}/cpuset.cpus"
+                self.assertEqual(open(cpus).read(), "0-47")
+                # The group outlives the run. The next run, with no limit, must not be held to
+                # those 48: empty gives the group its parent's CPUs again.
+                del os.environ["MC_CORES"]
+                R.cg_setup()
+                self.assertEqual(open(cpus).read(), "")
+                # What a record says the VMs were allowed is what the kernel says, not what was asked.
+                with open(f"{d}/{R.CG}/cpuset.cpus.effective", "w") as f:
+                    f.write("0-23,96-119\n")
+                self.assertEqual(R.cpus_allowed(), 48)
+                os.remove(f"{d}/{R.CG}/cpuset.cpus.effective")
+                self.assertEqual(R.cpus_allowed(), R.NCPU)
+            finally:
+                R.CGROOT = root
+                os.environ.pop("MC_CORES", None)
+                if cores is not None:
+                    os.environ["MC_CORES"] = cores
+
+    def test_a_step_holds_on_unrounded_readings_and_only_with_every_scene_set(self):
+        R = self.R
+        ok = {"a": [20.0, 19.98], "b": [19.97, 20.01]}
+        tps, held = R.qualify(ok, 3, 2, 2)
+        self.assertTrue(held)
+        self.assertEqual((tps["min"], tps["servers_below_hold"], tps["readings"]), (19.97, 0, 4))
+        # 19.496 is under 19.5 and shows as 19.5: it must not hold
+        tps, held = R.qualify({"a": [20.0, 19.496], "b": [19.97, 20.01]}, 3, 2, 2)
+        self.assertFalse(held)
+        self.assertEqual((tps["min"], tps["servers_below_hold"]), (19.5, 1))
+        # a server that was not given its scene is not the workload the step is for
+        self.assertFalse(R.qualify(ok, 3, 1, 2)[1])
+        # without bots there is no tick rate to hold
+        self.assertFalse(R.qualify({"a": [1.0], "b": [1.0]}, 0, 2, 2)[1])
+
+
 if __name__ == "__main__":
     unittest.main()
