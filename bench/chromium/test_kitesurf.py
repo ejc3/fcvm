@@ -222,6 +222,23 @@ class ReplayKeepAlive(unittest.TestCase):
         self.assertEqual(replies[0][1], replies[2][1])
         self.assertIn(b"Example Domain", replies[0][1])
 
+    def test_a_kept_connection_answers_without_the_delayed_ack_stall(self):
+        """Headers and body go out as two writes. With Nagle's algorithm on, the
+        second waits for the client's delayed ACK of the first, about 40 ms on
+        Linux, on every request after a connection's first."""
+        times = []
+        with ReplayServer("--http11") as s:
+            with socket.create_connection(("127.0.0.1", s.http), timeout=10) as conn:
+                for _ in range(8):
+                    started = time.monotonic()
+                    conn.sendall(self.GET)
+                    status, body = self.read_reply(conn)
+                    times.append((time.monotonic() - started) * 1000)
+                    self.assertEqual(status, "HTTP/1.1 200 OK")
+                    self.assertIn(b"Example Domain", body)
+        times.sort()
+        self.assertLess(times[len(times) // 2], 20.0, times)
+
     def test_default_closes_after_one_reply(self):
         replies = self.replies_on_one_connection([self.GET, self.GET])
         self.assertEqual(replies[0][0], "HTTP/1.0 200 OK")

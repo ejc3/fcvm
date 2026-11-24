@@ -1106,6 +1106,10 @@ def main():
             ap.error("--http11 keeps connections open; --connection-close closes each one")
         Handler.keep_alive = True
         Handler.protocol_version = "HTTP/1.1"
+        # A reply is two writes, headers then body. On a kept connection Nagle's
+        # algorithm holds the body until the client acknowledges the headers, and
+        # the client delays that ACK: 41 ms per request on Linux loopback.
+        Handler.disable_nagle_algorithm = True
     print(f"loaded {len(Handler.exact)} urls", flush=True)
 
     dns_log = JsonlLog(args.dns_log) if args.dns_log else None
