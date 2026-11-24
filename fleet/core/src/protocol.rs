@@ -233,6 +233,17 @@ pub fn place_label(region: &str) -> Option<String> {
     ok.then(|| format!("EC2 in {region}"))
 }
 
+/// A VM's CPU use, read on the host. The agent leaves `at` out; the coordinator
+/// stamps its receipt time (Unix ms) when it stores the reading.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VmStats {
+    /// CPU use as a percent of the VM's vCPUs, 0..100.
+    pub cpu_pct: f64,
+    pub vcpus: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthReport {
     pub id: String,
@@ -260,6 +271,9 @@ pub struct HealthReport {
     /// version and is never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minecraft: Option<crate::minecraft::MinecraftStatus>,
+    /// The VM's CPU and memory, from the host. An agent that cannot read them sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_stats: Option<VmStats>,
 }
 
 impl HealthReport {
@@ -278,6 +292,7 @@ impl HealthReport {
             budget_every_pixel: num(h.get("budget_every_pixel")).filter(|v| *v > 0.0),
             boot_id: boot_id(h),
             minecraft: None,
+            vm_stats: None,
         }
     }
 }
@@ -318,6 +333,15 @@ pub enum AgentMsg {
         /// The most potato players the host runs (potato mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         potato_players: u32,
+        /// The CPU allotment of the potato ring: the agent never has more machines not asleep
+        /// than this. 0: none (an agent built before the allotment caps nothing).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        potato_cpus: u32,
+        /// Whether the ring's machines, and the fcvm commands that save and restore them, run
+        /// in a cpuset of exactly `potato_cpus` host CPUs. False: the allotment only counts
+        /// machines.
+        #[serde(default, skip_serializing_if = "is_false")]
+        potato_confined: bool,
         /// The Windows sandboxes the host runs (Windows mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         windows: u32,
@@ -563,6 +587,10 @@ pub enum CoordMsg {
     Potato {
         round: Option<crate::potato::PotatoRound>,
     },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero(n: &u32) -> bool {

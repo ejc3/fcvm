@@ -522,6 +522,7 @@ async fn status_loop(
             budget_every_pixel: None,
             boot_id: None,
             minecraft: Some(status),
+            vm_stats: None,
         };
         if out.send(AgentMsg::Health(report)).is_err() {
             return;

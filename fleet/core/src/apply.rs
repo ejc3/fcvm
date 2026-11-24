@@ -4,7 +4,7 @@
 
 use crate::event::{Event, Intent};
 use crate::history;
-use crate::protocol::{AgentMsg, HealthReport, SlotReport};
+use crate::protocol::{AgentMsg, HealthReport, SlotReport, VmStats};
 use crate::scene::{drag, Keyframe, Light, Word, MAX_LIGHTS, MAX_WORDS};
 use crate::state::*;
 use crate::tiling::{bands, grid_in, sides, Half, Rect};
@@ -445,7 +445,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::Ec2Health { report, .. } | Event::LambdaHealth { report, .. } => {
-            health(&mut state.fleet, None, report);
+            health(&mut state.fleet, None, report, at);
             None
         }
         Event::Agent { host, msg, .. } => {
@@ -460,6 +460,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     phones,
                     phone_actions,
                     potato_players,
+                    potato_cpus,
+                    potato_confined,
                     windows,
                     windows_actions,
                     minecraft,
@@ -469,10 +471,14 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     if named == host {
                         state.fleet.registrations.registered(host, at);
                         let cfg = state.config.potato.clone();
-                        state
-                            .fleet
-                            .potato
-                            .agent_hello(host, *potato_players, at, &cfg);
+                        state.fleet.potato.agent_hello(
+                            host,
+                            *potato_players,
+                            *potato_cpus,
+                            *potato_confined,
+                            at,
+                            &cfg,
+                        );
                         // A hello again on the same connection keeps the image it reported.
                         let image = state
                             .fleet
@@ -521,7 +527,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         observe_minecraft(&mut state.fleet, n, host, r, at);
                     }
                 }
-                AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h),
+                AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h, at),
                 AgentMsg::Draining { .. } => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.draining = true;
@@ -691,8 +697,9 @@ fn image_complete(f: &Fleet) -> bool {
 
 /// Sleep after `idle_scale_down_secs` with no active viewer, or once no viewer has arrived
 /// for `sleep_without_new_viewer_secs` (never during a claim, a race or a warm window); wake
-/// on an active viewer while a viewer has arrived within that limit, and at once inside a
-/// warm window (`crate::warm`); be awake once the image is complete.
+/// on an active viewer while at least `min_wake_remaining_secs` of that limit remain
+/// (`crate::view::page_wakes`), and at once inside a warm window (`crate::warm`); be awake
+/// once the image is complete.
 fn power_step(state: &mut State, at: u64) {
     // Read from the clock and the configured windows, and false while the day's budget is
     // spent, so the warm rule stands down for the budget.
@@ -711,6 +718,7 @@ fn power_step(state: &mut State, at: u64) {
     let interval = state.config.race_interval_secs;
     let no_arrival = crate::view::no_arrival_deadline(&state.fleet.power, &state.config)
         .is_some_and(|t| at >= t);
+    let page_wakes = crate::view::page_wakes(&state.fleet.power, &state.config, at);
     let f = &mut state.fleet;
     let active = f.viewers.keys().filter(|v| !f.hidden.contains(*v)).count();
     if active > 0 {
@@ -725,8 +733,9 @@ fn power_step(state: &mut State, at: u64) {
         || f.minecraft.values().any(|s| minecraft_claim(s).is_some());
     let racing = race_running(f);
     if f.power.state == "asleep" {
-        // Connected pages do not wake it once the limit has run out: an arrival does.
-        if (active > 0 && !no_arrival) || warm {
+        // Connected pages wake it only while enough of the limit remains for the wake to be
+        // worth its hosts; with less, or none, an arrival does (a new viewer, or `wake`).
+        if (active > 0 && page_wakes) || warm {
             f.power.state = "waking".into();
             f.power.woke_at = Some(at);
             f.power.asleep_since = None;
@@ -1925,6 +1934,7 @@ fn note_running(slot: &mut Slot, r: &SlotReport, at: u64) -> bool {
     if r.phase != "running" {
         slot.observed.fps = None;
         slot.observed.gpu_stats = None;
+        slot.observed.vm_stats = None;
         slot.observed.budget_fit = None;
         slot.observed.render_ms_max = None;
         slot.observed.budget_every_pixel = None;
@@ -2048,7 +2058,7 @@ fn finish_half(h: &mut HalfRace, started_at: u64, last: Option<String>, at: u64)
         .unwrap_or(0);
 }
 
-fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
+fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport, at: u64) {
     let slot = match host {
         Some(_) if h.id.starts_with("phone-") => {
             phone_number(&h.id).and_then(|n| f.phones.get_mut(&n))
@@ -2085,7 +2095,20 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
             }
         }
     }
-    slot.observed.gpu_stats = Some(h.gpu.clone());
+    let mut gpu = h.gpu.clone();
+    if let Some(o) = gpu.as_object_mut() {
+        o.insert("at".into(), at.into());
+    }
+    slot.observed.gpu_stats = Some(gpu);
+    slot.observed.vm_stats = h
+        .vm_stats
+        .as_ref()
+        .filter(|v| v.cpu_pct.is_finite() && v.cpu_pct >= 0.0 && v.vcpus > 0)
+        .map(|v| VmStats {
+            cpu_pct: v.cpu_pct.min(100.0),
+            vcpus: v.vcpus,
+            at: Some(at),
+        });
     slot.observed.budget_fit = h.budget_fit.filter(|v| v.is_finite());
     slot.observed.render_ms_max = h.render_ms_max.filter(|v| v.is_finite());
     slot.observed.budget_every_pixel = h.budget_every_pixel.filter(|v| v.is_finite() && *v > 0.0);
