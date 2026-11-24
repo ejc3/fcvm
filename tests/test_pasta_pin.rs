@@ -28,6 +28,22 @@ const ARCHIVE_SHA256: &str = "ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe0971
 const PATCH_FILE: &str = "scripts/passt-udp-sock-errs-null-flow.patch";
 const PATCH_SHA256: &str = "6ba39e5c7945fd84545c3e5c1c60ab4ab2f48f7f6b282a608064b48463335019";
 
+/// Every carried patch, in the order both builds apply them, pinned by content. The last
+/// two serve the pastas of a namespace pool (`fcvm netpool serve`): an option to run
+/// without the neighbour listener, and a reset and a status reply on the control socket
+/// (`src/network/pesto.rs` is the client).
+const PATCHES: &[(&str, &str)] = &[
+    (PATCH_FILE, PATCH_SHA256),
+    (
+        "scripts/passt-no-neigh-notify.patch",
+        "cfe88631a30c71a7ed7872b9505348253f69d5be2e1fbf35b78c4be7e5058bf8",
+    ),
+    (
+        "scripts/passt-control-reset-status.patch",
+        "e9597ffcc9e5cd93b37c0e432bccf9e7c9e2b0130d655fe8a7d716c483fb4c55",
+    ),
+];
+
 fn in_manifest(path: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
@@ -67,22 +83,35 @@ fn both_pasta_builds_pin_the_same_upstream_commit_and_patch() {
         );
     }
 
-    // The carried patch: pinned by content, and applied by both build paths.
-    let patch_basename = PATCH_FILE.rsplit('/').next().unwrap();
-    let patch = read(PATCH_FILE);
-    assert_eq!(
-        sha256_hex(patch.as_bytes()),
-        PATCH_SHA256,
-        "{PATCH_FILE} changed; re-review it and update PATCH_SHA256"
-    );
-    assert!(
-        script.contains(patch_basename),
-        "scripts/build-passt.sh must apply {patch_basename}"
-    );
+    // The carried patches: pinned by content, and applied by both build paths in one
+    // order.
     let setup = read("src/setup/pasta.rs");
-    assert!(
-        setup.contains(&format!("scripts/{patch_basename}")),
-        "src/setup/pasta.rs must embed and apply {patch_basename}"
+    let (mut script_at, mut setup_at) = (0, 0);
+    for (file, sha256) in PATCHES {
+        let basename = file.rsplit('/').next().unwrap();
+        assert_eq!(
+            sha256_hex(read(file).as_bytes()),
+            *sha256,
+            "{file} changed; re-review it and update its hash"
+        );
+        let in_script = script[script_at..]
+            .find(&format!("\"$SCRIPT_DIR/{basename}\""))
+            .unwrap_or_else(|| panic!("scripts/build-passt.sh must apply {basename}, in order"));
+        script_at += in_script + 1;
+        let in_setup = setup[setup_at..]
+            .find(&format!("include_str!(\"../../scripts/{basename}\")"))
+            .unwrap_or_else(|| panic!("src/setup/pasta.rs must embed {basename}, in order"));
+        setup_at += in_setup + 1;
+    }
+    let carried = std::fs::read_dir(in_manifest("scripts"))
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter(|name| name.starts_with("passt-") && name.ends_with(".patch"))
+        .count();
+    assert_eq!(
+        carried,
+        PATCHES.len(),
+        "a scripts/passt-*.patch no build applies"
     );
 
     // The addr_seen fix that this repo once carried is in the pin; its patch

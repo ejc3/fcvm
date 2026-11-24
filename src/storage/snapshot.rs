@@ -1160,6 +1160,7 @@ mod tests {
                 memory_mib: 512,
                 network_config: NetworkConfig {
                     tap_device: "tap-abc123".to_string(),
+                    tap_fd: None,
                     guest_mac: "AA:BB:CC:DD:EE:FF".to_string(),
                     guest_ip: Some("172.30.0.2".to_string()),
                     host_ip: Some("172.30.0.1".to_string()),
@@ -1377,6 +1378,7 @@ mod tests {
                 memory_mib: 512,
                 network_config: NetworkConfig {
                     tap_device: "tap-test".to_string(),
+                    tap_fd: None,
                     guest_mac: "AA:BB:CC:DD:EE:FF".to_string(),
                     guest_ip: Some("172.30.0.2".to_string()),
                     host_ip: Some("172.30.0.1".to_string()),
@@ -1477,6 +1479,7 @@ mod tests {
                     memory_mib: 256,
                     network_config: NetworkConfig {
                         tap_device: "tap".to_string(),
+                        tap_fd: None,
                         guest_mac: "00:00:00:00:00:00".to_string(),
                         guest_ip: None,
                         host_ip: None,
@@ -1564,6 +1567,7 @@ mod tests {
                 memory_mib: 256,
                 network_config: NetworkConfig {
                     tap_device: "tap".to_string(),
+                    tap_fd: None,
                     guest_mac: "00:00:00:00:00:00".to_string(),
                     guest_ip: None,
                     host_ip: None,
@@ -1776,6 +1780,7 @@ mod tests {
                 memory_mib: 256,
                 network_config: NetworkConfig {
                     tap_device: "tap".to_string(),
+                    tap_fd: None,
                     guest_mac: "00:00:00:00:00:00".to_string(),
                     guest_ip: None,
                     host_ip: None,
