@@ -21,7 +21,8 @@ of a running server next to its source.
   changed. A fork's picture flies from its source to the tile taking the copy for as long as the
   fork runs, and the copy then outlines and counts the columns that differ from its source. A
   browser with no WebGL2 gets the map from above, and the tile says so ("The page in 3D" below).
-  Three bots walk about each world and build small towers of their own colour. A tile is
+  Three bots walk about each world's dry land and build walls, the outlines of houses and
+  towers of their own colour. A tile is
   labelled with its slot (`mc-3`), its ticks per second, and "Up in X.XX s": the time from the
   click that asked for a fresh server to the first chunk its bots received.
 - **The header.** Servers up, the server's name and version, the median and slowest time to
@@ -79,8 +80,14 @@ fcvm's lockfile.
   the swing bug in the issue and the particles bug in
   [a comment](https://github.com/azalea-rs/azalea/issues/404#issuecomment-6841991366); once
   upstream fixes both, the pin moves back to azalea-rs/azalea. Three bots join over
-  the guest's loopback. A bot that nobody drives walks to a random column of the map's region
-  with azalea's pathfinder and builds a tower of 3 to 5 blocks of its wool there. A restore keeps
+  the guest's loopback. A bot that nobody drives walks with azalea's pathfinder to a column of
+  dry land that has dry land all round it, and builds there in its wool (`plan.rs`): a wall of 4
+  to 7 columns, the outline of a house 4 or 5 columns a side with a gap for its door, or a tower,
+  each raised two blocks (a tower three). It walks to the place beside each column before it
+  raises it, and leaves out a column on water, on a tree, or off the level of the first. A bot
+  never chooses water: one that finds itself in it swims or walks to the nearest shore before
+  anything else. After a restore or a new scene a bot's first walk is at most 6 columns, so a
+  copy starts building, and differs from its source, within seconds. A restore keeps
   the bots connected: their connections to Pumpkin are loopback inside the guest, which fcvm's
   restore keeps (it retires only sockets whose peer is outside the guest). When the agent posts
   the copy's scene, the program reseeds its choices from the guest's random pool, the tile's
@@ -90,7 +97,11 @@ fcvm's lockfile.
   sends, then the block below the first empty one) and turns its registry name into one of 48
   materials of our own (`palette.rs`: water, grass, sand, wood, leaves, the 16 dye colours and
   so on). The page holds the colours. No texture, colour table, sound or other asset of the game
-  is used anywhere.
+  is used anywhere. Beside each top block the map carries the column's ground: the highest block
+  that is not leaves, a plant or water, up to 48 blocks down, so the page draws the forest floor
+  under a canopy and a lake's bed from what is there. A column whose top block has not changed
+  keeps the ground it had; one row in 16 is read again each time, so a block placed under a
+  canopy shows within 3.2 s.
 - **Ticks per second**, as a client measures them: the server's game time in its `set_time`
   packets against the program's own clock over 10 s.
 - **The view socket** (`GET /view`, fleet/PROTOCOL.md "Minecraft tile"): the page's only route to
