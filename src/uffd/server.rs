@@ -1802,13 +1802,15 @@ impl UffdServer {
             }
         }
         // Every handler has scheduled its clone's faults by now. Give the writer a bounded
-        // time to publish them before the process exits with them only in memory.
+        // time to publish them before the process exits with them only in memory, and retry
+        // once a publication the busy sidecar skipped after the last handler's own retry.
         if let Some(persistence) = self.working_set_persistence.clone() {
             let started = std::time::Instant::now();
-            let drained =
-                tokio::task::spawn_blocking(move || persistence.drain(WORKING_SET_DRAIN_TIMEOUT))
-                    .await
-                    .unwrap_or(false);
+            let drained = tokio::task::spawn_blocking(move || {
+                persistence.drain_and_retry("shutdown", WORKING_SET_DRAIN_TIMEOUT)
+            })
+            .await
+            .unwrap_or(false);
             if drained {
                 debug!(
                     target: "uffd",
@@ -6846,6 +6848,11 @@ mod tests {
         );
         // And its progress tick retries a publication a busy sidecar skipped.
         assert!(serve.contains("persistence.retry_if_unpublished(ctx.vm_id);"));
+        // And a stopping server retries once more after the last handler has gone.
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(
+            code.contains("persistence.drain_and_retry(\"shutdown\", WORKING_SET_DRAIN_TIMEOUT)")
+        );
     }
 
     /// The implicit-restore socket must fit in `sun_path` under the LONGEST path fcvm

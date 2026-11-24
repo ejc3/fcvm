@@ -738,6 +738,27 @@ impl WorkingSetPersistence {
         self.pending.wait(timeout)
     }
 
+    /// [`Self::drain`], then, when the last publication was skipped because the sidecar was
+    /// busy, one more publication, drained within what is left of `timeout`. A publication
+    /// that was queued or still running when the last clone's handler exited can find the
+    /// sidecar busy after that handler's own retry, and with no clone left nothing else would
+    /// try again before the process exits. True when nothing is left to write.
+    pub(crate) fn drain_and_retry(&self, vm_id: &str, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        if !self.drain(timeout) {
+            return false;
+        }
+        if !self
+            .store
+            .unpublished
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return true;
+        }
+        self.prompt(vm_id, 0, 0);
+        self.drain(deadline.saturating_duration_since(std::time::Instant::now()))
+    }
+
     /// Merge `observed` into memory and non-blockingly prompt the worker to publish it.
     #[cfg(test)]
     pub(crate) fn schedule(&self, vm_id: &str, observed: PageSet) {
@@ -756,7 +777,8 @@ impl WorkingSetPersistence {
 
     /// Prompt the worker again when its last publication did not land: a busy sidecar skips
     /// a publication, and without a retry the fourth recording's count would wait for the
-    /// shutdown drain. The fault handler calls this on its progress tick.
+    /// next serve. The fault handler calls this on its progress tick and when its clone
+    /// exits, and a stopping server through [`Self::drain_and_retry`].
     pub(crate) fn retry_if_unpublished(&self, vm_id: &str) {
         if self
             .store
@@ -879,7 +901,7 @@ pub struct WorkingSetStore {
     /// so servers that record at the same time sum their recordings.
     local_completed: std::sync::atomic::AtomicU64,
     published: std::sync::atomic::AtomicU64,
-    /// The last publication attempt did not land (the sidecar was busy or the write failed);
+    /// The last publication attempt was skipped because the sidecar was busy;
     /// [`WorkingSetPersistence::retry_if_unpublished`] tries again.
     unpublished: std::sync::atomic::AtomicBool,
     /// `known` split by first-touch tier, for replay. Splitting a large set scans every
@@ -2835,6 +2857,56 @@ mod tests {
         assert!(!store.unpublished.load(SeqCst));
         let next = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
         assert_eq!(next.completed.load(SeqCst), 1);
+    }
+
+    /// The two exit orders the clone's own retry misses: a recording finished at exit whose
+    /// publication finds the sidecar busy, and a window-close publication still running when
+    /// the handler made its exit retry. Either leaves the flag set with nothing queued once the
+    /// last clone has gone; the shutdown drain publishes it once the sidecar is free.
+    #[test]
+    fn shutdown_publishes_what_a_busy_sidecar_skipped_after_the_last_exit() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for retry_at_exit in [false, true] {
+            let (_dir, mem, config, lock, mem_len) = bound_fixture();
+            let store = Arc::new(WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap());
+            let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
+            let held = Flock::lock(
+                File::options()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&store.lock_path)
+                    .unwrap(),
+                FlockArg::LockExclusive,
+            )
+            .map_err(|(_, e)| e)
+            .unwrap();
+            let recorder = store.admit_recorder().unwrap();
+            persistence.finish("vm-exit", one_page(recorder, 0), true);
+            if retry_at_exit {
+                // The handler's exit retry, made while the publication is still in flight.
+                persistence.retry_if_unpublished("vm-exit");
+            }
+            // The skip lands after the handler has gone; nothing prompts the writer again.
+            let waited = std::time::Instant::now();
+            while !store.unpublished.load(SeqCst) {
+                assert!(waited.elapsed() < Duration::from_secs(10), "no skip");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(held);
+            assert!(persistence.drain_and_retry("shutdown", Duration::from_secs(10)));
+            assert!(
+                !store.unpublished.load(SeqCst),
+                "retry_at_exit={retry_at_exit}"
+            );
+            let next = WorkingSetStore::open(&mem, mem_len, &config, &lock).unwrap();
+            assert_eq!(
+                next.completed.load(SeqCst),
+                1,
+                "retry_at_exit={retry_at_exit}"
+            );
+        }
     }
 
     /// A count read from a sidecar is clamped to the bound, so a corrupt one cannot overflow
