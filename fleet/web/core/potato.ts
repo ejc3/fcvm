@@ -175,7 +175,7 @@ function tileOf(p: Potato, n: number, box: Box, now: number, holder: boolean): R
     wake,
     holder,
     readout,
-    ariaLabel: `${readout.head}. ${readout.detail}`,
+    ariaLabel: readout.detail === "" ? readout.head : `${readout.head}. ${readout.detail}`,
   };
 }
 
@@ -187,6 +187,39 @@ export function tileReadout(n: number, state: string, holdsAsWell: boolean, pl: 
   if (pl.last_sleep_ms !== null) parts.push(`last sleep ${ms(pl.last_sleep_ms)}`);
   if (pl.last_wake_ms !== null) parts.push(`last wake ${ms(pl.last_wake_ms)}`);
   return { head, detail: parts.join(" · ") };
+}
+
+/**
+ * Where a readout card of `size` goes: beside the tile on the side away from the ring's centre, or on the
+ * centre's side when it does not fit there, and always wholly inside the stage.
+ */
+export function placeReadout(tile: Box, centre: Point, size: { w: number; h: number }, stage: { w: number; h: number }): Point {
+  const M = 4;
+  const w = Math.min(size.w, stage.w - 2 * M);
+  const h = Math.min(size.h, stage.h - 2 * M);
+  const cx = tile.x + tile.w / 2;
+  const cy = tile.y + tile.h / 2;
+  const dx = cx - centre.x;
+  const dy = cy - centre.y;
+  const gap = 8;
+  const fits = (p: Point) => p.x >= M && p.y >= M && p.x + w <= stage.w - M && p.y + h <= stage.h - M;
+  const clampP = (p: Point): Point => ({ x: Math.min(Math.max(p.x, M), stage.w - w - M), y: Math.min(Math.max(p.y, M), stage.h - h - M) });
+  // the candidates, outward first: along the dominant axis, then the other axis, each outward and then inward
+  const horizontal = Math.abs(dx) >= Math.abs(dy);
+  const side = (axis: "x" | "y", dir: number): Point =>
+    axis === "x"
+      ? { x: dir > 0 ? tile.x + tile.w + gap : tile.x - gap - w, y: cy - h / 2 }
+      : { x: cx - w / 2, y: dir > 0 ? tile.y + tile.h + gap : tile.y - gap - h };
+  const sx = dx >= 0 ? 1 : -1;
+  const sy = dy >= 0 ? 1 : -1;
+  const order: Point[] = horizontal ? [side("x", sx), side("y", sy), side("x", -sx), side("y", -sy)] : [side("y", sy), side("x", sx), side("y", -sy), side("x", -sx)];
+  for (const c of order) {
+    const p = clampP(c);
+    // clamping along the side's own axis keeps it beside the tile; accept a card that stayed clear of the tile
+    const clear = p.x + w <= tile.x || p.x >= tile.x + tile.w || p.y + h <= tile.y || p.y >= tile.y + tile.h;
+    if (clear && (fits(c) || Math.abs(p.x - c.x) + Math.abs(p.y - c.y) < Math.max(w, h))) return p;
+  }
+  return clampP(order[0]!);
 }
 
 /** The ball's size, CSS px: a share of a tile, at least 12 px so it is seen on a ring of 96. */

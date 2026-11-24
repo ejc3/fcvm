@@ -309,3 +309,38 @@ test("potato: hovering a tile shows its readout beside it, and it leaves with th
   await tile.blur();
   await expect(readout).toHaveCount(0);
 });
+
+test("potato: the ring is one tab stop; arrows, Home and End move between tiles; a click shows no card, the keyboard does, Escape dismisses it", async ({ page }) => {
+  await startAt(8);
+  await openPotato(page);
+  const tabbable = await tiles(page).evaluateAll((els) => els.filter((e) => (e as HTMLElement).tabIndex === 0).length);
+  expect(tabbable).toBe(1);
+  const readout = page.getByTestId("potato-readout");
+  await tiles(page).nth(3).click();
+  await page.mouse.move(2, 2);
+  await expect(readout, "a click does not leave a card").toHaveCount(0);
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  // some tab stop reached the ring's one tile (or passed it); focus it directly and use the keys
+  await tiles(page).first().focus();
+  await page.keyboard.press("Tab").catch(() => {});
+  await page.keyboard.press("Shift+Tab");
+  await tiles(page).first().focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(tiles(page).nth(1)).toBeFocused();
+  await expect(readout).toBeVisible();
+  await page.keyboard.press("End");
+  await expect(tiles(page).nth(7)).toBeFocused();
+  await page.keyboard.press("Home");
+  await expect(tiles(page).first()).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(readout).toHaveCount(0);
+});
+
+test("potato: the stage is a labelled group that owns the named tiles", async ({ page }) => {
+  await startAt(8);
+  await openPotato(page);
+  await expect(page.getByTestId("potato-stage")).toHaveAttribute("role", "group");
+  for (const t of await tiles(page).all()) await expect(t).toHaveAttribute("aria-label", /^Player \d/);
+});
+

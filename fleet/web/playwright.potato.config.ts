@@ -9,9 +9,13 @@ const viewport = base.use!.viewport!;
 
 export default defineConfig({
   ...base,
-  testMatch: "potato.spec.ts",
+  testMatch: "potato*.spec.ts",
   testIgnore: undefined,
-  projects: [{ name: "potato", use: { ...devices["Desktop Chrome"], viewport, deviceScaleFactor: 1 } }],
+  projects: [
+    { name: "potato", testIgnore: /potato-touch\.spec\.ts/, use: { ...devices["Desktop Chrome"], viewport, deviceScaleFactor: 1 } },
+    // A 360 px touch screen: a long press, the card inside a narrow stage.
+    { name: "phone", testMatch: /potato-touch\.spec\.ts/, use: { ...devices["Pixel 5"], viewport: { width: 360, height: 760 }, deviceScaleFactor: 1 } },
+  ],
   webServer: {
     ...mockServer,
     url: `http://localhost:${PORTS.web}/`,

@@ -4,8 +4,8 @@
 // last drop and the records. The page measures the ring's stage, ticks the clock once a frame and
 // draws the view model core/potato.ts computes; every word on it comes from there.
 
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
-import { potatoColour, potatoView, SITE, type Box, type PotatoButton, type RingTile, type PotatoView } from "../../core/index.ts";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { placeReadout, potatoColour, potatoView, SITE, type Box, type PotatoButton, type RingTile, type PotatoView } from "../../core/index.ts";
 import { WallClient } from "./wall-client.ts";
 import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
@@ -16,22 +16,20 @@ import "./potato.css";
 
 /** The legend's squares: one sample hue, since the legend says what a phase looks like and not whose it is. */
 const SWATCH = potatoColour(8, 12);
-/** One player's readout, beside its tile on the side away from the ring's centre so the ring and the ball's arc stay clear, kept inside the stage. */
+/** One player's readout, placed from its measured size so it sits wholly inside the stage, on the side of its tile that keeps the ring and the ball's arc clear. */
 function Readout({ tile, centre, stage }: { tile: RingTile | null; centre: { x: number; y: number }; stage: Box | null }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [at, setAt] = useState<{ x: number; y: number } | null>(null);
+  const head = tile?.readout.head;
+  const detail = tile?.readout.detail;
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || !tile || !stage) return;
+    setAt(placeReadout(tile.box, centre, { w: el.offsetWidth, h: el.offsetHeight }, stage));
+  }, [tile?.box.x, tile?.box.y, tile?.box.w, head, detail, centre.x, centre.y, stage?.w, stage?.h]);
   if (tile === null || stage === null) return null;
-  const cx = tile.box.x + tile.box.w / 2;
-  const cy = tile.box.y + tile.box.h / 2;
-  const dx = cx - centre.x;
-  const dy = cy - centre.y;
-  const len = Math.hypot(dx, dy) || 1;
-  const gap = Math.max(tile.box.w, tile.box.h) / 2 + 8;
-  const x = Math.min(Math.max(cx + (dx / len) * gap, 8), stage.w - 8);
-  const y = Math.min(Math.max(cy + (dy / len) * gap, 8), stage.h - 8);
-  // Anchor the card's near corner or edge at that point: it grows away from the ring.
-  const tx = Math.abs(dx / len) < 0.35 ? "-50%" : dx < 0 ? "-100%" : "0";
-  const ty = Math.abs(dy / len) < 0.35 ? "-50%" : dy < 0 ? "-100%" : "0";
   return (
-    <div className="potato-readout" data-testid="potato-readout" aria-hidden="true" style={{ left: x, top: y, transform: `translate(${tx}, ${ty})` }}>
+    <div ref={ref} className="potato-readout" data-testid="potato-readout" aria-hidden="true" style={{ left: at?.x ?? 0, top: at?.y ?? 0, maxWidth: Math.max(80, stage.w - 8), visibility: at ? "visible" : "hidden" }}>
       <span className="head">{tile.readout.head}</span>
       {tile.readout.detail ? <span className="detail">{tile.readout.detail}</span> : null}
     </div>
@@ -140,8 +138,35 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
     window.clearTimeout(pressTimer.current);
     setPressed(null);
   };
-  const shown = pressed ?? pointed ?? focused;
   const ring = view.ring;
+  const lastPointer = useRef("mouse");
+  // One tab stop for the ring: arrows, Home and End move between the tiles.
+  const [roving, setRoving] = useState<number | null>(null);
+  const rover = ring && ring.tiles.some((t) => t.player === roving) ? roving : (ring?.tiles[0]?.player ?? null);
+  const onRingKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const els = [...e.currentTarget.querySelectorAll<HTMLElement>('[data-testid="potato-tile"]')];
+    const i = els.indexOf(document.activeElement as HTMLElement);
+    if (i < 0 || els.length === 0) return;
+    const to = e.key === "ArrowRight" || e.key === "ArrowDown" ? (i + 1) % els.length : e.key === "ArrowLeft" || e.key === "ArrowUp" ? (i - 1 + els.length) % els.length : e.key === "Home" ? 0 : e.key === "End" ? els.length - 1 : -1;
+    if (to < 0) return;
+    e.preventDefault();
+    els[to]!.focus();
+  };
+  // A card is shown for a tile that is still in the ring; Escape dismisses it; a timer does not outlive the page.
+  const present = (n: number | null) => (n !== null && ring?.tiles.some((t) => t.player === n) ? n : null);
+  const shown = present(pressed) ?? present(pointed) ?? present(focused);
+  useEffect(() => {
+    if (shown === null) return;
+    const esc = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setPointed(null);
+      setFocused(null);
+      setPressed(null);
+    };
+    window.addEventListener("keydown", esc);
+    return () => window.removeEventListener("keydown", esc);
+  }, [shown]);
+  useEffect(() => () => window.clearTimeout(pressTimer.current), []);
   const needsVerifyPrompt = view.verify.prompt;
 
   return (
@@ -180,7 +205,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
           <p className="potato-caption" data-testid="potato-caption">
             {ring?.caption ?? view.empty ?? ""}
           </p>
-          <div ref={stageRef} className="potato-stage" data-testid="potato-stage" role="img" aria-label={ring?.ariaLabel ?? view.empty ?? ""}>
+          <div ref={stageRef} className="potato-stage" data-testid="potato-stage" role="group" aria-label={ring?.ariaLabel ?? view.empty ?? ""} onKeyDown={onRingKey}>
             {ring && ring.geometry.radius > 0 ? (
               <span
                 className="potato-track"
@@ -199,15 +224,22 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                     data-holder={t.holder ? "true" : undefined}
                     role="group"
                     aria-label={t.ariaLabel}
-                    tabIndex={0}
+                    tabIndex={t.player === rover ? 0 : -1}
                     onPointerEnter={(e) => e.pointerType !== "touch" && setPointed(t.player)}
                     onPointerLeave={(e) => e.pointerType !== "touch" && setPointed((p) => (p === t.player ? null : p))}
-                    onFocus={() => setFocused(t.player)}
+                    onFocus={(e) => {
+                      setRoving(t.player);
+                      // keyboard focus only: a click or a tap focuses the tile without showing the card
+                      if (e.currentTarget.matches(":focus-visible")) setFocused(t.player);
+                    }}
                     onBlur={() => setFocused((p) => (p === t.player ? null : p))}
-                    onPointerDown={(e) => e.pointerType === "touch" && pressStart(t.player)}
+                    onPointerDown={(e) => {
+                      lastPointer.current = e.pointerType;
+                      if (e.pointerType === "touch") pressStart(t.player);
+                    }}
                     onPointerUp={pressEnd}
                     onPointerCancel={pressEnd}
-                    onContextMenu={(e) => e.preventDefault()}
+                    onContextMenu={(e) => lastPointer.current === "touch" && e.preventDefault()}
                     style={{ ...at(t.box), ["--c" as string]: t.colour }}
                   >
                     {t.number !== null ? <span className="num">{t.number}</span> : null}
