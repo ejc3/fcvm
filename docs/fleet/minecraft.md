@@ -164,8 +164,9 @@ guard; pure and unit-tested) and `fleet/web/app/_wall/minecraft-gl.ts` and `mine
   the water's surface. Trunks, plants, lone trees and the figures are boxes of 44 bytes. It is
   rebuilt and uploaded when the world, its fork's source or its glowing columns change, at most
   every 200 ms a tile (`REBUILD_MIN_MS`; a new launch or a new level of detail is built at
-  once). The page takes a grid of at most 65,536 columns, 1,024 a side: a rebuild took 4 ms for
-  the tile's 128 x 128 and 16 ms for 256 x 256 (node, a shared development host).
+  once). The page takes a grid of at most 262,144 columns, 1,024 a side, which is the
+  largest region a tile serves (512 x 512): a rebuild took 4 ms for the tile's 128 x 128, 16 ms
+  for 256 x 256 and 66 ms for 512 x 512 (node, a shared development host).
 - **What one block per column cannot say is guessed**: a cliff is solid down to its lowest
   neighbour; the ground under leaves is taken from the columns beside them that are not leaves,
   spreading inward, with a trunk under each canopy's top; a lake's bed deepens up to 4 blocks from

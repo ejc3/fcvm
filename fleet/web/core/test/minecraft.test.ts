@@ -829,19 +829,21 @@ describe("the 3D view's words", () => {
 
   it("takes only a grid it can build: each side within 16 bits' reach and the whole within the cap, and a delta's indices inside it", () => {
     const grid = (w: number, h: number) => JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: Buffer.alloc(Math.min(w * h * 2, 16)).toString("base64") });
-    expect([MC_MAX_SIDE, MC_MAX_COLUMNS]).toEqual([1024, 65_536]);
-    // the largest map a tile sends is one the page draws: mctile holds its region to this side
-    const tile = readFileSync(new URL("../../../minecraft/src/main.rs", import.meta.url), "utf8");
-    const side = Number(/const MAX_REGION: u32 = (\d+);/.exec(tile)![1]);
-    expect(tile).toContain("c.region.clamp(32, MAX_REGION)");
-    expect(side * side).toBeLessThanOrEqual(MC_MAX_COLUMNS);
-    expect(side).toBeLessThanOrEqual(MC_MAX_SIDE);
+    // The cap is the tile server's own largest region: whatever side a server is started with,
+    // its map is one this page draws.
+    const serverSide = /region_side: c\.region\.clamp\((\d+), (\d+)\)/.exec(readFileSync(new URL("../../../minecraft/src/main.rs", import.meta.url), "utf8"))!;
+    const most = Number(serverSide[2]);
+    expect(most).toBe(512);
+    expect([MC_MAX_SIDE, MC_MAX_COLUMNS]).toEqual([1024, most * most]);
     expect(() => parseViewMsg(grid(MC_MAX_SIDE + 1, 1))).toThrow(/not a grid/);
     expect(() => parseViewMsg(grid(1, MC_MAX_SIDE + 1))).toThrow(/not a grid/);
-    expect(() => parseViewMsg(grid(1024, 128))).toThrow(/not a grid/);
-    // a whole map at the cap parses, and so does a small one
+    // a whole map at the cap parses (the server's largest, and the same columns the long way),
+    // one column more does not, and a small one does
     const whole = (w: number, h: number) => JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: Buffer.alloc(w * h * 2).toString("base64") });
-    expect(parseViewMsg(whole(1024, 64))).toMatchObject({ type: "map", region: { w: 1024, h: 64 } });
+    expect(parseViewMsg(whole(most, most))).toMatchObject({ type: "map", region: { w: most, h: most } });
+    expect(parseViewMsg(whole(1024, 256))).toMatchObject({ type: "map", region: { w: 1024, h: 256 } });
+    expect(() => parseViewMsg(grid(most + 1, most))).toThrow(/not a grid/);
+    expect(() => parseViewMsg(grid(1024, 257))).toThrow(/not a grid/);
     expect(parseViewMsg(whole(256, 256))).toMatchObject({ type: "map", region: { w: 256, h: 256 } });
     expect(parseViewMsg(whole(2, 4))).toMatchObject({ type: "map" });
     const delta = (cells: unknown) => JSON.stringify({ type: "delta", seq: 2, cells });

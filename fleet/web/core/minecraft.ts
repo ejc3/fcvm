@@ -130,13 +130,15 @@ export function remapOf(materials: readonly string[]): Uint8Array {
 // ---- the view socket ------------------------------------------------------------------------
 
 /**
- * The largest grid the page takes: a column's place is packed into 16 bits each way, and a
- * rebuild of the 3D geometry is a pass over every column, at most every 200 ms. Measured with
- * node on a shared development host: 4 ms for the tile's 128 x 128, 16 ms for 256 x 256, 66 ms
- * for 512 x 512. The cap is the 16 ms one.
+ * The largest grid the page takes: a column's place is packed into 16 bits each way, and the
+ * whole is the largest region a tile server serves (512 x 512: `--region` in
+ * fleet/minecraft/src/main.rs, which a test here reads), so no map a server sends is refused
+ * for its size. A rebuild of the 3D geometry is a pass over every column, at most every 200 ms.
+ * Measured with node on a shared development host: 4 ms for the tile's 128 x 128, 16 ms for
+ * 256 x 256, 66 ms for 512 x 512.
  */
 export const MC_MAX_SIDE = 1024;
-export const MC_MAX_COLUMNS = 65_536;
+export const MC_MAX_COLUMNS = 512 * 512;
 
 export interface McRegion {
   x0: number;

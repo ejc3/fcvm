@@ -501,10 +501,20 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   }, [opened, panel === null]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Focus follows: to "All servers" when a server opens, back to its tile when the wall returns.
+  // A tile that cannot take it then (its server is restoring, lent, or gone: its picture is no
+  // button) passes it to the first tile that can, and with none to this view's link in the mode
+  // bar, so it is never left on nothing.
   const openedNow = view.opened === null ? null : opened;
   useEffect(() => {
     if (openedNow !== null) document.querySelector<HTMLElement>('[data-testid="mc-close"]')?.focus();
-    else if (wasOpened.current !== null) canvases.current.get(wasOpened.current)?.focus();
+    else if (wasOpened.current !== null) {
+      const own = canvases.current.get(wasOpened.current);
+      const to =
+        own && own.tabIndex >= 0
+          ? own
+          : (document.querySelector<HTMLElement>('canvas.mc-canvas[tabindex="0"]') ?? document.querySelector<HTMLElement>('[data-testid="mode-minecraft"]'));
+      to?.focus();
+    }
     wasOpened.current = openedNow;
   }, [openedNow]);
 

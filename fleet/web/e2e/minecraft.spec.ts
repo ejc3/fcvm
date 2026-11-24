@@ -535,18 +535,23 @@ test("with reduced motion every tile is one still 3D view, drawn again only when
   await openMinecraft(page);
   expect(await renderer(page)).toBe("3d");
   await expect.poll(async () => Object.keys((await stageNow(page))!.shots).length).toBe(SLOTS.length);
-  const a = (await stageNow(page))!;
+  // the stage's count of frames drawn, with the page's own clock at that moment
+  const drawn = () => page.evaluate(() => ({ st: window.__minecraft!.stage()!, at: performance.now() }));
+  const { st: a, at: aAt } = await drawn();
   expect(Object.values(a.shots).map((s) => s.kind)).toEqual(SLOTS.map(() => "wide"));
-  // never more than four frames a second
-  expect(a.everyMs).toBeGreaterThanOrEqual(250);
   // the bots move and the page draws them again, from the same place
   const where = async () => JSON.stringify((await tilesNow(page))["mc:1"]!.players.map((p) => [p.x, p.z]));
   const before = await where();
   await expect.poll(where, { timeout: 30_000 }).not.toBe(before);
   await expect.poll(async () => (await stageNow(page))!.frames).toBeGreaterThan(a.frames);
-  const b = (await stageNow(page))!;
+  // long enough to count frames against time
+  await expect.poll(async () => (await drawn()).at - aAt, { timeout: 10_000 }).toBeGreaterThan(3000);
+  const { st: b, at: bAt } = await drawn();
   for (const id of Object.keys(a.shots)) expect(b.shots[id]!.eye, id).toEqual(a.shots[id]!.eye);
-  expect(b.everyMs).toBeGreaterThanOrEqual(250);
+  // never more than four frames a second: the frames drawn over the page's own elapsed time
+  // (the pacer lets a frame go 4 ms early, so 246 ms apart; one more for a frame at either end)
+  expect(b.frames - a.frames).toBeLessThanOrEqual(Math.ceil((bAt - aAt) / 246) + 1);
+  expect(b.frames - a.frames).toBeGreaterThan(0);
   for (const slot of SLOTS) expect((await drawnShare(page, slot)).share, slot).toBeGreaterThan(0.9);
   await context.close();
 });
@@ -607,6 +612,18 @@ test("a click or Enter opens one server to the whole stage, and Escape or All se
   await page.keyboard.press("Escape");
   for (const slot of SLOTS) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(1);
   await expect(page.getByTestId("mc-canvas-mc-3")).toBeFocused();
+  // A tile that cannot take the focus back (its server is restoring, so its picture is no
+  // button) passes it to the first tile that can: it is never left on the page's body.
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("mc-close")).toBeFocused();
+  await page.getByTestId("mc-reset-mc-3").click();
+  await expect(page.getByTestId("mc-tile-mc-3")).toHaveAttribute("data-phase", "dark");
+  await page.getByTestId("mc-close").focus();
+  await page.keyboard.press("Enter");
+  for (const slot of SLOTS) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(1);
+  await expect(page.getByTestId("mc-tile-mc-3")).toHaveAttribute("data-phase", "dark");
+  await expect(page.getByTestId("mc-canvas-mc-1")).toBeFocused();
+  await expect(page.getByTestId("mc-tile-mc-3")).toHaveAttribute("data-phase", "live", { timeout: 15_000 });
   await page.getByTestId("mc-canvas-mc-2").focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("mc-tile-mc-1")).toHaveCount(0);
