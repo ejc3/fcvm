@@ -2529,8 +2529,8 @@ On serve process exit (SIGTERM/SIGINT):
 
 **Layout** (`src/state/manager.rs`, layout 2). No directory takes every VM's writes and no
 lock is host-wide: a create or a rename holds its directory's lock exclusively, and with
-every state in one directory under one `names.lock`, 128 clones starting together each
-waited 0.3 to 0.5 s for that lock and 0.5 to 0.8 s for the directory (bench/start-rate).
+every state in one directory under one `names.lock`, clones starting together queued on
+both.
 
 ```
 /mnt/fcvm-btrfs/state/
@@ -2545,10 +2545,9 @@ waited 0.3 to 0.5 s for that lock and 0.5 to 0.8 s for the directory (bench/star
 ```
 
 - `<b>` is the first hex digit of the SHA-256 of the key (vm_id, name, PID)
-  (`bucket_of`): the same in every process and build. Sixteen buckets, by measurement:
-  a start waits 0.5 ms for its bucket's lock at C=128 and 13.6 ms at C=512, and every
-  listing opens every bucket (about 0.13 ms each), so `fcvm ls` on an empty store took
-  4.9 ms with 16 buckets and 40 ms with 256.
+  (`bucket_of`): the same in every process and build. Sixteen buckets: more would cut
+  the wait between starts further, but every listing opens every bucket, and with 256
+  an `fcvm ls` on an empty store spent more than half its time in 281 `openat` calls.
 - **A name is claimed by renaming a directory onto its slot** (`claim_name()`): the claim
   directory holds the claimer's token, and the kernel replaces a directory only with one
   that is absent or empty, so of any number of concurrent claims exactly one rename
@@ -2565,8 +2564,8 @@ waited 0.3 to 0.5 s for that lock and 0.5 to 0.8 s for the directory (bench/star
 - **A state is published by exchange, not by a rename over the old one** (`publish_state`):
   `RENAME_EXCHANGE` of `<vm_id>.json.tmp` with `<vm_id>.json`, then the old state is
   unlinked. btrfs starts writing a file's data out inside a rename that replaces another
-  file, with the directory locked; with 128 clones starting together each such rename
-  took 55 to 108 ms. An exchange starts no I/O.
+  file, with the directory locked, and with many clones starting together each such
+  rename slept in the block layer. An exchange starts no I/O.
 - `list_vms()` opens and reads the buckets and the state files on up to 8 threads.
 - Root and the state directory's owner share one state directory (privileged tests run as
   root beside unprivileged ones), so a directory root makes (`shared_dir`, a claim

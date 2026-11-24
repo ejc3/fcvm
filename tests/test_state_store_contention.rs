@@ -2,10 +2,9 @@
 //! that every VM takes.
 //!
 //! With every state file in the state directory itself and a host-wide lock around each
-//! name claim, 128 clones starting together each waited 0.3 to 0.5 s for that lock and 0.5
-//! to 0.8 s for the directory's own lock, which a create or a rename holds exclusively
-//! (bench/start-rate). These tests use only what a launch calls, so they fail on a layout
-//! that puts either back.
+//! name claim, clones starting together queued on that lock and on the directory's own
+//! lock, which a create or a rename holds exclusively. These tests use only what a launch
+//! calls, so they fail on a layout that puts either back.
 
 use fcvm::state::{HealthStatus, StateManager, VmState, VmStatus};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
@@ -149,10 +148,10 @@ fn state_and_temp_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 /// A write that replaces a state swaps the old state out of its name and unlinks it; it does
 /// not rename the new file over the old one. btrfs starts writing a file's data out inside
-/// a rename that replaces another file, with the directory locked, and with 128 clones
-/// starting together each such rename took 55 to 108 ms behind the VMs' disk reads
-/// (bench/start-rate). The exchange is seen from outside as the old state arriving at the
-/// temporary name.
+/// a rename that replaces another file, with the directory locked, so with many clones
+/// starting together each such rename waited on the block device behind the VMs' disk
+/// reads. The exchange is seen from outside as the old state arriving at the temporary
+/// name.
 #[tokio::test]
 async fn a_write_that_replaces_a_state_starts_no_write_out_in_its_rename() {
     let temp_dir = TempDir::new().unwrap();

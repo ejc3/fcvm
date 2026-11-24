@@ -52,14 +52,14 @@ const CLAIM_ATTEMPTS: usize = 16;
 /// and every build, which a hasher keyed per process would not be: two fcvm processes must
 /// look for one VM in one directory.
 ///
-/// Sixteen buckets, by measurement (1000 clones of one snapshot, 128 and 512 starting at
-/// once): a start waited 0.5 and 13.6 ms for its state bucket's lock with 16 buckets, 0.1
-/// and 11.3 ms with 64, 0.1 and 0.0 ms with 256, against 58 and 11 ms plus 34 and 221 ms
-/// for the host-wide name lock with every state in one directory. A listing opens every
-/// bucket, at about 0.13 ms each: `fcvm ls` on an empty store took 4.9 ms with 16 buckets,
-/// 12.9 ms with 64 and 40 ms with 256, and 4.5 ms with one directory. At 70 starts a second
-/// the busiest of 16 buckets was locked 2.9% of the time, so the count is due for another
-/// look near ten times that rate.
+/// Sixteen buckets, between two costs. A start's creates and renames lock its bucket, so
+/// more buckets mean less waiting between starts. A listing opens every bucket, and that
+/// cost is paid by every `fcvm ls` whatever the number of VMs: on an empty store a listing
+/// of 256 buckets was 281 `openat` calls, more than half of the command's time, and took
+/// several times as long as a listing of one directory, while 16 buckets cost no more
+/// than one. With 16, the wait for a bucket's lock with 128 or 512 clones starting at once
+/// was a small fraction of what one directory and the host-wide name lock cost. The count
+/// is due for another look when the start rate is several times higher.
 pub fn bucket_of(key: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(key.as_bytes())[0] >> 4)
@@ -116,9 +116,9 @@ fn hand_to_state_dir_owner(state_dir: &Path, dir: &Path) {
 /// unlinked. A plain rename over an existing file would publish the same way, but btrfs
 /// answers it by starting the write-out of the new file's data inside the rename ("we're
 /// using rename to replace one file with another, start IO on it now"), with the directory
-/// locked. A state is rewritten four times in a start, and with 128 clones starting
-/// together each of those renames took 55 to 108 ms, the block layer holding back the
-/// writes behind the VMs' own disk reads (bench/start-rate). An exchange starts no I/O:
+/// locked. A state is rewritten four times in a start, and with many clones starting
+/// together each of those renames slept in the block layer, which held the writes back
+/// behind the VMs' own disk reads. An exchange starts no I/O:
 /// the data goes out with the filesystem's periodic writeback, or never, when the state is
 /// replaced or its VM exits first.
 ///
@@ -453,7 +453,7 @@ const LIST_CHUNK: usize = 32;
 
 /// `work` over `items`, on up to `LIST_THREADS` threads when there are enough of them,
 /// with the results in the items' order. A listing opens and reads every bucket and then
-/// every state file. Read one after another, 1000 states took 67 ms; on threads, 54 ms.
+/// every state file, which is most of what `fcvm ls` costs with a thousand VMs up.
 fn on_listing_threads<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
     let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
     let threads = LIST_THREADS.min(cores).min(items.len() / LIST_CHUNK).max(1);
