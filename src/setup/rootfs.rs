@@ -3395,11 +3395,19 @@ branch = "agent/nv2"
             plan.services.disable.iter().any(|s| s == unit),
             "{unit} is not in [services] disable"
         );
-        assert!(
-            script.contains(&format!(
+        let removal = script
+            .find(&format!(
                 "find /etc/systemd/system -name '{unit}' -type l -delete"
-            )),
-            "the setup script does not remove {unit}'s enablement"
+            ))
+            .unwrap_or_else(|| panic!("the setup script does not remove {unit}'s enablement"));
+        // `systemctl enable systemd-networkd` links the wait back in, so the removal must
+        // come after every enable.
+        let last_enable = script
+            .rfind("systemctl enable")
+            .expect("the setup script enables services");
+        assert!(
+            removal > last_enable,
+            "the setup script removes {unit}'s enablement before an enable that re-creates it"
         );
     }
 
