@@ -624,6 +624,14 @@ fleet-program: cargo-target-link
 	@test -n "$(OUT)" || { echo "fleet-program needs OUT=FILE" >&2; exit 2; }
 	CARGO_TARGET_DIR=target $(CARGO) run --locked --release -q -p fleet-core --example program -- $(or $(SEED),1) $(or $(SECS),600) > $(OUT)
 
+# The coordinator's snapshot with N Minecraft servers on one host: its size, and the time one
+# encode takes (docs/fleet/minecraft.md, "Many servers on one host").
+# make fleet-snapshot-size COUNTS="8 64 256 512"
+.PHONY: fleet-snapshot-size
+fleet-snapshot-size: private SHELL := $(TARGET_LEASE_SHELL)
+fleet-snapshot-size: cargo-target-link
+	CARGO_TARGET_DIR=target $(CARGO) run --locked --release -q -p fleet-core --example snapshot_size -- $(COUNTS)
+
 # The hot potato player (fleet/potato): a static binary in a small image, one per player VM.
 POTATO_IMAGE ?= localhost/fcvm-potato:dev
 .PHONY: potato-image

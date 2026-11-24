@@ -295,6 +295,9 @@ pub struct Health {
     pub tile: String,
     #[serde(default)]
     pub bots: Option<BotCount>,
+    /// Players on the server, the bots among them.
+    #[serde(default)]
+    pub players: Option<u64>,
 }
 
 /// A tile's bots: connected, and how many it runs.
@@ -365,6 +368,172 @@ pub enum GoldState {
 /// The running servers' fcvm pids and addresses, by index: what a fork snapshots.
 type Running = Arc<Mutex<HashMap<u32, (u32, Place)>>>;
 
+/// What each server (by its place on the host) last reported, for the host's status rows.
+type Board = Arc<Mutex<BTreeMap<u32, Seen>>>;
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Seen {
+    phase: String,
+    /// When this launch's bots got their first chunk (Unix ms), with `running`.
+    first_chunk_at: Option<u64>,
+    /// The launch's time to that chunk (`first_chunk_ms`).
+    launch_ms: Option<u64>,
+}
+
+/// How often the host reads its servers for the status rows (`MinecraftStatus`).
+const STATUS_EVERY: Duration = Duration::from_millis(fleet_core::minecraft::STATUS_EVERY_MS);
+/// How many tiles are asked at once, and how long one may take: a tile that does not answer in
+/// time has no tick rate in that second's row.
+const STATUS_PARALLEL: usize = 64;
+const STATUS_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// The host's CPU times from `/proc/stat`'s first line: (busy, total), in ticks.
+fn cpu_times(stat: &str) -> Option<(u64, u64)> {
+    let mut f = stat.lines().next()?.split_ascii_whitespace();
+    if f.next()? != "cpu" {
+        return None;
+    }
+    let v: Vec<u64> = f.take(8).filter_map(|x| x.parse().ok()).collect();
+    if v.len() < 5 {
+        return None;
+    }
+    let total: u64 = v.iter().sum();
+    // idle and iowait are the time nothing ran
+    Some((total - v[3] - v[4], total))
+}
+
+/// `MemTotal` and what is in use (`MemTotal` less `MemAvailable`) from `/proc/meminfo`, in MiB.
+fn mem_mib(meminfo: &str) -> Option<(u64, u64)> {
+    let kb = |key: &str| {
+        meminfo.lines().find_map(|l| {
+            l.strip_prefix(key)?
+                .split_ascii_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    let (total, available) = (kb("MemTotal:")?, kb("MemAvailable:")?);
+    Some((total / 1024, total.saturating_sub(available) / 1024))
+}
+
+/// One second's status rows: a row per place, from what each server last reported and what
+/// its tile answered (only a running one is asked).
+fn status_rows(
+    places: usize,
+    seen: &BTreeMap<u32, Seen>,
+    healths: &[Option<Health>],
+    now: u64,
+) -> Vec<u8> {
+    let mut rows = Vec::with_capacity(places * fleet_core::minecraft::STATUS_ROW_BYTES);
+    for i in 0..places {
+        let s = seen.get(&(i as u32));
+        let h = healths.get(i).and_then(Option::as_ref);
+        let running = s.is_some_and(|s| s.phase == "running");
+        rows.extend(fleet_core::minecraft::status_row(
+            s.map_or("", |s| s.phase.as_str()),
+            h.and_then(|h| h.tps),
+            h.and_then(|h| h.players.or(h.bots.as_ref().map(|b| b.online))),
+            s.filter(|_| running)
+                .and_then(|s| s.first_chunk_at)
+                .map(|t| now.saturating_sub(t) / 1000),
+            s.and_then(|s| s.launch_ms),
+        ));
+    }
+    rows
+}
+
+/// Read every server once a second and send the host's status rows. The coordinator passes
+/// them to the pages that show Minecraft mode; nothing else depends on them.
+async fn status_loop(
+    places: Vec<Place>,
+    board: Board,
+    out: mpsc::UnboundedSender<AgentMsg>,
+    http: reqwest::Client,
+    stop: watch::Receiver<bool>,
+) {
+    use futures_util::StreamExt;
+    let mut tick = tokio::time::interval(STATUS_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let read_cpu = || {
+        std::fs::read_to_string("/proc/stat")
+            .ok()
+            .as_deref()
+            .and_then(cpu_times)
+    };
+    let mut cpu = read_cpu();
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .ok();
+    // Whether the last report named a server: when the board then empties, one more report
+    // says so (every row "not reported"), and after that the host is silent.
+    let mut reporting = false;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = stopping(stop.clone()) => return,
+        }
+        let seen = board.lock().unwrap().clone();
+        if seen.is_empty() && !reporting {
+            continue;
+        }
+        reporting = !seen.is_empty();
+        let mut asks = Vec::with_capacity(places.len());
+        for (i, place) in places.iter().enumerate() {
+            let running = seen.get(&(i as u32)).is_some_and(|s| s.phase == "running");
+            let (http, place) = (http.clone(), *place);
+            asks.push(async move {
+                if running {
+                    health_within(&http, &place, STATUS_TIMEOUT).await
+                } else {
+                    None
+                }
+            });
+        }
+        let healths: Vec<Option<Health>> = futures_util::stream::iter(asks)
+            .buffered(STATUS_PARALLEL)
+            .collect()
+            .await;
+        let now = unix_ms();
+        let next = read_cpu();
+        let busy = match (cpu, next, cpus) {
+            (Some((b0, t0)), Some((b1, t1)), Some(n)) if t1 > t0 => Some(
+                ((b1.saturating_sub(b0)) as f64 / (t1 - t0) as f64 * n as f64 * 10.0).round()
+                    / 10.0,
+            ),
+            _ => None,
+        };
+        cpu = next;
+        let mem = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(mem_mib);
+        let status = fleet_core::minecraft::MinecraftStatus {
+            t: now,
+            rows: fleet_core::minecraft::base64(&status_rows(places.len(), &seen, &healths, now)),
+            cpus,
+            busy,
+            mem_total_mib: mem.map(|m| m.0),
+            mem_used_mib: mem.map(|m| m.1),
+        };
+        let report = fleet_core::protocol::HealthReport {
+            id: fleet_core::minecraft::STATUS_ID.to_string(),
+            fps: 0.0,
+            gpu: serde_json::Value::Null,
+            budget_fit: None,
+            t: None,
+            render_ms_max: None,
+            budget_every_pixel: None,
+            boot_id: None,
+            minecraft: Some(status),
+            vm_stats: None,
+        };
+        if out.send(AgentMsg::Health(report)).is_err() {
+            return;
+        }
+    }
+}
+
 struct Handle {
     index: u32,
     desired: watch::Sender<Desired>,
@@ -383,10 +552,12 @@ pub struct Minecraft {
     gold: watch::Receiver<GoldState>,
     scene: watch::Receiver<Option<SharedScene>>,
     running: Running,
+    board: Board,
     servers: BTreeMap<String, Handle>,
     retired: Vec<(u32, JoinHandle<()>)>,
     stop: watch::Sender<bool>,
     flow: JoinHandle<()>,
+    status: JoinHandle<()>,
 }
 
 async fn stopping(mut stop: watch::Receiver<bool>) {
@@ -442,6 +613,14 @@ impl Minecraft {
                 }
             })
         };
+        let board = Board::default();
+        let status = tokio::spawn(status_loop(
+            places.clone(),
+            board.clone(),
+            out.clone(),
+            http.clone(),
+            stop.subscribe(),
+        ));
         Minecraft {
             cfg,
             agent,
@@ -453,10 +632,12 @@ impl Minecraft {
             gold,
             scene,
             running: Arc::default(),
+            board,
             servers: BTreeMap::new(),
             retired: Vec::new(),
             stop,
             flow,
+            status,
         }
     }
 
@@ -475,6 +656,7 @@ impl Minecraft {
             .collect();
         for id in gone {
             let h = self.servers.remove(&id).unwrap();
+            self.board.lock().unwrap().remove(&h.index);
             drop(h.desired);
             self.retired.push((h.index, h.task));
         }
@@ -515,6 +697,7 @@ impl Minecraft {
                 http: self.http.clone(),
                 scene: self.scene.clone(),
                 running: self.running.clone(),
+                board: self.board.clone(),
             };
             let (before, kept) = std::mem::take(&mut self.retired)
                 .into_iter()
@@ -536,6 +719,7 @@ impl Minecraft {
     /// Stop every server and the gold flow, and wait until each VM has exited.
     pub async fn stop(mut self) {
         self.stop.send_replace(true);
+        self.status.abort();
         for (_, h) in std::mem::take(&mut self.servers) {
             drop(h.desired);
             self.retired.push((h.index, h.task));
@@ -722,6 +906,7 @@ struct Server {
     http: reqwest::Client,
     scene: watch::Receiver<Option<SharedScene>>,
     running: Running,
+    board: Board,
 }
 
 struct Live {
@@ -749,6 +934,14 @@ impl Server {
         retry_in: Option<Duration>,
         first_chunk_at: Option<u64>,
     ) {
+        self.board.lock().unwrap().insert(
+            self.index,
+            Seen {
+                phase: phase.to_string(),
+                first_chunk_at,
+                launch_ms: timings.get("first_chunk_ms").copied(),
+            },
+        );
         let (ipv4, v4_port) = self.place.v4_path(self.agent.public_ipv4.as_deref());
         let _ = self.out.send(AgentMsg::Slot(SlotReport {
             id: self.id.clone(),
@@ -1007,6 +1200,9 @@ async fn supervise(
             let _ = old.await;
         }
     }
+    // A task this one replaces may have reported after `assign` took its entry away (or been
+    // aborted above): nothing of it is on the board when this server starts its own reports.
+    ctx.board.lock().unwrap().remove(&ctx.index);
     let mut live: Option<Live> = None;
     // The generation whose fork failed once: its next attempt restores the gold snapshot.
     let mut fork_failed: Option<u64> = None;
@@ -1130,6 +1326,10 @@ async fn supervise(
     if let Some(mut l) = live.take() {
         ctx.stop(&mut l).await;
     }
+    // No longer supervised: a launch that was in flight when `assign` took the entry away
+    // reported after it, and the status rows must say nothing of a server that is gone. A
+    // replacement at this index reports only after this task has ended.
+    ctx.board.lock().unwrap().remove(&ctx.index);
 }
 
 /// The kernel's limit on IPv6 neighbour entries: one table for every network namespace on the
@@ -1408,6 +1608,87 @@ mod tests {
             .up(),
             "a tile that names no bots"
         );
+    }
+
+    /// A retired server's task can report after `assign` took its entry off the board (its
+    /// launch's last report and the removal can fall in one poll of its `select!`), and a task
+    /// its replacement aborts never reaches its own end: the status rows would go on calling a
+    /// stopped server running. `supervise` clears the entry at both ends. The interleaving has
+    /// no deterministic runtime test, so the two places are pinned in the source.
+    #[test]
+    fn supervise_clears_its_board_entry_at_both_ends() {
+        let src = include_str!("minecraft.rs");
+        let body = &src[src.find("async fn supervise(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let clear = "ctx.board.lock().unwrap().remove(&ctx.index);";
+        let first = body.find(clear).expect("cleared before its own reports");
+        let last = body.rfind(clear).unwrap();
+        assert!(first < last, "cleared at both ends");
+        // before any report of its own, once the tasks it replaces have ended
+        assert!(body.find("let _ = old.await;").unwrap() < first);
+        assert!(first < body.find("ctx.report(").unwrap());
+        // and last of all, after its VM is stopped
+        assert!(body.rfind("ctx.stop(&mut l).await;").unwrap() < last);
+        assert_eq!(body[last + clear.len()..].trim(), "");
+    }
+
+    #[test]
+    fn the_host_readings_come_from_proc() {
+        let stat = "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 1 2 3 4 5 6 7 8 9 10\n";
+        assert_eq!(cpu_times(stat), Some((150, 1000)));
+        assert_eq!(cpu_times("intr 1 2 3"), None);
+        assert_eq!(cpu_times(""), None);
+        let meminfo =
+            "MemTotal:       395264000 kB\nMemFree:        1000 kB\nMemAvailable:   374784000 kB\n";
+        assert_eq!(mem_mib(meminfo), Some((386000, 20000)));
+        assert_eq!(mem_mib("MemTotal: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn a_status_row_says_only_what_was_read() {
+        let seen: BTreeMap<u32, Seen> = [
+            (
+                0,
+                Seen {
+                    phase: "running".into(),
+                    first_chunk_at: Some(100_000),
+                    launch_ms: Some(412),
+                },
+            ),
+            (
+                1,
+                Seen {
+                    phase: "restoring".into(),
+                    first_chunk_at: None,
+                    launch_ms: None,
+                },
+            ),
+            // running, but its tile did not answer this second
+            (
+                3,
+                Seen {
+                    phase: "running".into(),
+                    first_chunk_at: Some(90_000),
+                    launch_ms: Some(700),
+                },
+            ),
+        ]
+        .into();
+        let answered = Health {
+            ready: true,
+            tps: Some(20.0),
+            players: Some(3),
+            ..Default::default()
+        };
+        let rows = status_rows(4, &seen, &[Some(answered), None, None, None], 225_000);
+        assert_eq!(rows.len(), 4 * fleet_core::minecraft::STATUS_ROW_BYTES);
+        assert_eq!(rows[..8], [3, 200, 3, 0, 125, 0, 156, 1]);
+        // restoring: no tick rate, no players, no age
+        assert_eq!(rows[8..16], [1, 255, 255, 0, 255, 255, 255, 255]);
+        // a place whose server has reported nothing
+        assert_eq!(rows[16..24], [0, 255, 255, 0, 255, 255, 255, 255]);
+        // no answer is no tick rate, not zero; its age and launch time are the agent's own
+        assert_eq!(rows[24..32], [3, 255, 255, 0, 135, 0, 188, 2]);
     }
 
     #[test]

@@ -1365,6 +1365,14 @@ describe("asleep and waking", () => {
     expect(view(stateWith(waking), EPOCH).sleep!.wake).toBeNull();
   });
 
+  it("asleep under this page with part of the hour left: the same card, and Wake is offered", () => {
+    // The coordinator does not wake for a page shown again with less than its minimum of
+    // the hour left (fleet/PROTOCOL.md, `fleet.power`; here 167 s), so the card cannot wait
+    // for a wake that will not come: it says to press Wake, and the button works.
+    const st = sleeping({ state: "asleep", asleep_since: EPOCH - 600_000, last_arrival_at: EPOCH - 3_433_000, sleep_without_arrival_at: EPOCH + 167_000 });
+    expect(view(stateWith(st), EPOCH).sleep).toEqual({ state: "asleep", title: "Asleep.", line: "The GPUs start when you press Wake.", clock: "", steps: [], wake: { label: "Wake", disabled: false } });
+  });
+
   it("asleep for the day's GPU budget: rests until 00:00 UTC, says why, and offers no Wake button", () => {
     const st = sleeping({ state: "asleep", asleep_since: EPOCH - 600_000, reason: "budget" });
     const v = view(stateWith(st), EPOCH);

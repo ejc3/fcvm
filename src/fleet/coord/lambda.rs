@@ -1223,6 +1223,7 @@ mod tests {
             lambda: watch::channel(Vec::new()).1,
             ec2_layout: watch::channel(None).1,
             broadcast_layout: watch::channel(None).1,
+            minecraft_status: Default::default(),
         }
     }
 

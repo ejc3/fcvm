@@ -1291,6 +1291,8 @@ fn bare_hello(host: &str) -> AgentMsg {
         phones: vec![],
         phone_actions: vec![],
         potato_players: 0,
+        potato_cpus: 0,
+        potato_confined: false,
         windows: 0,
         windows_actions: Vec::new(),
         minecraft: 0,
@@ -1507,6 +1509,8 @@ async fn the_agent_socket_answers_pings() {
         phones: vec![],
         phone_actions: vec![],
         potato_players: 0,
+        potato_cpus: 0,
+        potato_confined: false,
         windows: 0,
         windows_actions: Vec::new(),
         minecraft: 0,
@@ -1558,6 +1562,8 @@ impl FakeAgent {
                 phones: vec![],
                 phone_actions: vec![],
                 potato_players: 0,
+                potato_cpus: 0,
+                potato_confined: false,
                 windows: 0,
                 windows_actions: Vec::new(),
                 minecraft: 0,
@@ -1772,6 +1778,8 @@ fn minecraft_hello(host: &str, n: u32) -> AgentMsg {
         phones: vec![],
         phone_actions: vec![],
         potato_players: 0,
+        potato_cpus: 0,
+        potato_confined: false,
         windows: 0,
         windows_actions: Vec::new(),
         minecraft: n,
@@ -1947,6 +1955,116 @@ async fn a_minecraft_hosts_servers_reach_the_snapshot_and_its_assignment() {
 
 /// With published names, a server's frame URL is its launch's view socket under the subzone,
 /// and players join that name.
+/// A host's status rows reach only the pages that asked for them (`visibility` with
+/// `minecraft`), each host's latest and under a key that is not the host's name, and they move
+/// no version: they are not part of the state.
+#[tokio::test]
+async fn minecraft_status_rows_reach_the_pages_that_asked_and_move_no_version() {
+    let (url, handle) = coordinator(allow_all()).await;
+    let mut agent = FakeAgent::connect_hello(&handle, minecraft_hello("mc-host", 2));
+    agent.assign().await;
+    let rows = |t: u64| {
+        AgentMsg::Health(fleet_core::protocol::HealthReport {
+            id: fleet_core::minecraft::STATUS_ID.into(),
+            fps: 0.0,
+            gpu: Value::Null,
+            budget_fit: None,
+            t: None,
+            render_ms_max: None,
+            budget_every_pixel: None,
+            boot_id: None,
+            minecraft: Some(fleet_core::minecraft::MinecraftStatus {
+                t,
+                rows: fleet_core::minecraft::base64(&[
+                    3, 200, 3, 0, 9, 0, 156, 1, 1, 255, 255, 0, 255, 255, 255, 255,
+                ]),
+                cpus: Some(192),
+                busy: Some(1.5),
+                mem_total_mib: Some(385_024),
+                mem_used_mib: Some(20_480),
+            }),
+            vm_stats: None,
+        })
+    };
+    let mut asked = Viewer::connect(&url).await;
+    let mut other = Viewer::connect(&url).await;
+    asked
+        .send(json!({"type": "visibility", "visible": true, "minecraft": true}))
+        .await;
+    other
+        .send(json!({"type": "visibility", "visible": true}))
+        .await;
+    // both pages' visibility is applied before the rows come: an intent after it has its receipt
+    for v in [&mut asked, &mut other] {
+        v.intent("after-visibility", "no_such_intent", json!({}))
+            .await;
+        v.receipt("after-visibility").await;
+    }
+    let before = handle.snapshot.borrow().version;
+    agent.to_coord.send(rows(1000)).unwrap();
+    let got = asked.message("minecraft_status").await;
+    assert_eq!(got["host"], fleet_core::minecraft::host_key("mc-host"));
+    assert!(!got.to_string().contains("mc-host"), "{got}");
+    assert_eq!(got["t"], 1000);
+    assert_eq!(got["rows"], "A8gDAAkAnAEB//8A/////w==");
+    // stamped with the coordinator's clock when it came, for the rows' age
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let at = got["received_at"].as_u64().unwrap();
+    assert!(at <= now && now - at < 10_000, "{at} {now}");
+    assert_eq!((&got["cpus"], &got["busy"]), (&json!(192), &json!(1.5)));
+    assert_eq!(
+        (&got["mem_total_mib"], &got["mem_used_mib"]),
+        (&json!(385_024), &json!(20_480))
+    );
+    // the page that did not ask was sent none, though its socket is live
+    other
+        .send(json!({"type": "ping", "client_unix_ms": 2.0}))
+        .await;
+    other
+        .message_where("clock", |m| m["client_unix_ms"] == 2.0)
+        .await;
+    assert!(
+        other.other.iter().all(|m| m["type"] != "minecraft_status"),
+        "{:?}",
+        other.other
+    );
+    // and nothing in the state moved
+    assert_eq!(handle.snapshot.borrow().version, before);
+    // a later report replaces it (a host is heard no more than twice a period: an agent sends
+    // one a second)
+    let gap = fcvm::fleet::coord::minecraft_status::MIN_GAP + Duration::from_millis(100);
+    tokio::time::sleep(gap).await;
+    agent.to_coord.send(rows(2000)).unwrap();
+    asked
+        .message_where("minecraft_status", |m| m["t"] == 2000)
+        .await;
+    // a page that asks later gets the host's latest at the next report, not every one before it
+    other
+        .send(json!({"type": "visibility", "visible": true, "minecraft": true}))
+        .await;
+    other
+        .send(json!({"type": "ping", "client_unix_ms": 3.0}))
+        .await;
+    other
+        .message_where("clock", |m| m["client_unix_ms"] == 3.0)
+        .await;
+    tokio::time::sleep(gap).await;
+    agent.to_coord.send(rows(3000)).unwrap();
+    let late = other.message("minecraft_status").await;
+    assert_eq!(late["t"], 3000);
+    assert_eq!(
+        other
+            .other
+            .iter()
+            .filter(|m| m["type"] == "minecraft_status")
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn a_minecraft_servers_published_name_is_its_view_socket_and_join_address() {
     let (names, zone) = subzone_names();
@@ -2713,6 +2831,7 @@ fn recording_handle() -> (Handle, Arc<std::sync::Mutex<Vec<SlotReport>>>) {
             lambda: tokio::sync::watch::channel(Vec::new()).1,
             ec2_layout,
             broadcast_layout: tokio::sync::watch::channel(None).1,
+            minecraft_status: Default::default(),
         },
         reports,
     )
@@ -3590,6 +3709,7 @@ async fn a_failed_state_write_is_retried_while_the_state_is_unchanged() {
         lambda: tokio::sync::watch::channel(Vec::new()).1,
         ec2_layout: ec2_layout_rx,
         broadcast_layout: tokio::sync::watch::channel(None).1,
+        minecraft_status: Default::default(),
     };
     let before = handle.snapshot.borrow().version;
     handle
@@ -4882,6 +5002,76 @@ async fn a_restart_keeps_the_hosts_it_finds() {
     .await;
     assert!(launches(&fake).is_empty(), "{:?}", fake.calls());
     assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
+/// A page shown again wakes a sleeping fleet only while `min_wake_remaining_secs` of the
+/// limit without a new viewer remain (fleet/PROTOCOL.md, `fleet.power`). With less, the
+/// coordinator launches no host for it: the page stays on the sleep card, and its Wake
+/// button, an arrival, launches them for the whole limit.
+#[tokio::test]
+async fn a_page_shown_again_near_the_limit_launches_no_host_and_its_wake_does() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    // The coordinator applies its rules once a second, so the times are seconds apart.
+    const LIMIT_MS: u64 = 8000;
+    const MIN_MS: u64 = 5000;
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        sleep_without_new_viewer_secs: LIMIT_MS / 1000,
+        min_wake_remaining_secs: MIN_MS / 1000,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeHosts::default());
+    *fake.launch_state.lock().unwrap() = Some("running".into());
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    let mut v = page_viewer(&handle).await;
+    let s = v.until(|s| s["viewers"]["active"] == 1).await;
+    let arrived = s["fleet"]["power"]["last_arrival_at"].as_u64().unwrap();
+    until_hosts(&fake, "the awake fleet's host", |f| launches(f).len() == 1).await;
+    // Hidden: asleep after the idle second, and the host goes.
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
+    until_hosts(&fake, "the host terminated", |f| {
+        f.calls().iter().any(|c| c.starts_with("terminate"))
+    })
+    .await;
+    // Shown again with less than the minimum of the limit left, and well before its end.
+    let late = arrived + LIMIT_MS - MIN_MS + 500;
+    tokio::time::sleep(Duration::from_millis(late.saturating_sub(now_ms()))).await;
+    let shown = now_ms();
+    assert!(shown + 2000 < arrived + LIMIT_MS, "shown too late to tell");
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    let s = v.until(|s| s["viewers"]["active"] == 1).await;
+    assert_eq!(s["fleet"]["power"]["state"], "asleep", "{s}");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let power = serde_json::from_str::<Value>(&handle.snapshot.borrow().text).unwrap()["state"]
+        ["fleet"]["power"]
+        .clone();
+    assert_eq!(power["state"], "asleep", "{power}");
+    assert_eq!(power["last_arrival_at"], arrived);
+    assert_eq!(launches(&fake).len(), 1, "{:?}", fake.calls());
+    // The Wake button: an arrival, a host, and the whole limit from the press.
+    v.intent("w1", "wake", json!({})).await;
+    assert_eq!(v.receipt("w1").await["outcome"], "committed");
+    let s = v.until(|s| s["fleet"]["power"]["state"] != "asleep").await;
+    let woke = s["fleet"]["power"]["last_arrival_at"].as_u64().unwrap();
+    assert!(woke >= shown, "{s}");
+    assert_eq!(
+        s["fleet"]["power"]["sleep_without_arrival_at"],
+        woke + LIMIT_MS
+    );
+    until_hosts(&fake, "the host the wake launched", |f| {
+        launches(f).len() == 2
+    })
+    .await;
 }
 
 /// Two awake hosts in `us-east-1`, spread over three zones and running, with an agent of
@@ -8033,6 +8223,7 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
                 render_ms_max: None,
                 budget_every_pixel: None,
                 boot_id: None,
+                minecraft: None,
                 vm_stats: None,
             }))
             .unwrap();
@@ -8097,6 +8288,7 @@ async fn a_tile_whose_fit_draws_every_pixel_is_granted_it() {
                 render_ms_max: None,
                 budget_every_pixel: Some(275_448.0),
                 boot_id: Some(format!("boot-{id}")),
+                minecraft: None,
                 vm_stats: None,
             }))
             .unwrap();

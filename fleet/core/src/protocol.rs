@@ -28,9 +28,13 @@ pub enum ClientMsg {
     Verify {
         token: String,
     },
-    /// Whether the page is visible; a hidden page is not an active viewer.
+    /// Whether the page is visible; a hidden page is not an active viewer. `minecraft`: the
+    /// page shows Minecraft mode and takes the servers' status rows (`minecraft_status`), which
+    /// no other page is sent.
     Visibility {
         visible: bool,
+        #[serde(default)]
+        minecraft: bool,
     },
     /// The seat ticket a page kept from an earlier connection, as its first message (a URL
     /// would carry it into proxy and access logs). Later ones are ignored. `returning`: the
@@ -76,6 +80,18 @@ pub enum ServerMsg {
     },
     /// The answer to `verify`.
     Verified { ok: bool, reason: Option<String> },
+    /// Minecraft mode, to a page whose `visibility` said `minecraft`: one host's servers as
+    /// its agent last read them. `host` is the key the snapshot's `minecraft.field` lists the
+    /// host under; a row belongs to the server at the same place in that host's `servers`.
+    /// `received_at` is the coordinator's clock (unix ms) when the report reached it: the
+    /// rows' age is the coordinator's time now less this, and past
+    /// [`crate::minecraft::STATUS_EXPIRE_MS`] they say nothing of the servers.
+    MinecraftStatus {
+        host: String,
+        received_at: u64,
+        #[serde(flatten)]
+        status: crate::minecraft::MinecraftStatus,
+    },
     /// The viewer's own GPU, to the claiming connection only, whenever it changes and once
     /// more when it ends.
     Claim { claim: ClaimMsg },
@@ -253,6 +269,12 @@ pub struct HealthReport {
     /// The renderer process's `boot_id`, so a grant names the renderer it was given to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
+    /// Minecraft mode: the state of every server on the host, about once a second, in a report
+    /// whose `id` is [`crate::minecraft::STATUS_ID`]. The coordinator passes it to the pages
+    /// that asked and keeps none of it: it is not part of the fleet's state, so it moves no
+    /// version and is never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minecraft: Option<crate::minecraft::MinecraftStatus>,
     /// The VM's CPU and memory, from the host. An agent that cannot read them sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_stats: Option<VmStats>,
@@ -273,6 +295,7 @@ impl HealthReport {
             render_ms_max: num(h.get("frames_2s").and_then(|f| f.get("render_ms_max"))),
             budget_every_pixel: num(h.get("budget_every_pixel")).filter(|v| *v > 0.0),
             boot_id: boot_id(h),
+            minecraft: None,
             vm_stats: None,
         }
     }
@@ -314,6 +337,15 @@ pub enum AgentMsg {
         /// The most potato players the host runs (potato mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         potato_players: u32,
+        /// The CPU allotment of the potato ring: the agent never has more machines not asleep
+        /// than this. 0: none (an agent built before the allotment caps nothing).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        potato_cpus: u32,
+        /// Whether the ring's machines, and the fcvm commands that save and restore them, run
+        /// in a cpuset of exactly `potato_cpus` host CPUs. False: the allotment only counts
+        /// machines.
+        #[serde(default, skip_serializing_if = "is_false")]
+        potato_confined: bool,
         /// The Windows sandboxes the host runs (Windows mode); 0 runs none.
         #[serde(default, skip_serializing_if = "is_zero")]
         windows: u32,
@@ -559,6 +591,10 @@ pub enum CoordMsg {
     Potato {
         round: Option<crate::potato::PotatoRound>,
     },
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_zero(n: &u32) -> bool {
