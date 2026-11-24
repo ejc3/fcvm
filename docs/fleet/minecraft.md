@@ -249,13 +249,16 @@ been run on a kernel with the fix.
 
 ### Servers on one host
 
-How many servers one host runs in the fleet's own shape: each server a VM of 1 vCPU and 1024 MiB
-with its three bots inside it, as `fcvm fleet agent --minecraft N` starts them. Measured
-2026-11-24 on a bare-metal arm64 host (c8g.metal-48xl, 192 vCPUs, 377 GiB, no local disk),
-kernel 7.0.0-1018-aws, one boot (the step without bots is from a second, as it says), the tile
-image built from main at `2f89b1c97` and fcvm from the
-same commit with a change to the fleet's agent and coordinator that this harness does not run,
-with `fleet/minecraft/bench/hostramp.py`; the records are in
+How many servers one host runs in the fleet's own shape, from two boots of one instance type
+(c8g.metal-48xl: 192 vCPUs, 377 GiB, no local disk), both on kernel 7.0.0-1018-aws on
+2026-11-24: the table and the 48-core steps are the first boot's, the step without bots and the
+three 256-server steps beside it the second's (`second-boot/` in the records; no row of the
+table was run again there, and the one count both ran, 256 with bots, read 48.9 cores busy on
+the first and 49.5 to 52.2 on the second). Each server is a VM of 1 vCPU and 1024 MiB with its
+three bots inside it, as `fcvm fleet agent --minecraft N` starts them. The tile image was built
+from main at `2f89b1c97` and fcvm from the same commit with a change to the fleet's agent and
+coordinator that this harness does not run (the second boot: `second-boot/host.txt`), with
+`fleet/minecraft/bench/hostramp.py`; the records are in
 `fleet/minecraft/bench/results/2026-11-24-c8g-metal-48xl/`. Two things differ from the fleet:
 networking was bridged (the fleet's is routed), and the store was a btrfs image in RAM (the
 host's only disk is a 30 GiB network volume), so the store's speed bounds nothing here and its
