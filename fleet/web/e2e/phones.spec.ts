@@ -181,6 +181,8 @@ test("opening a phone shows its restore time and details beside it, other phones
   await expect(panel.getByRole("heading", { name: "Phone 2" })).toBeVisible();
   await expect(page.getByTestId("phone-state")).toHaveText(/^Phone restored in \d+\.\d s$/);
   await expect(page.getByTestId("phone-rows")).toContainText("fleet-phone-2");
+  await expect(page.getByTestId("phone-stats")).toContainText("648");
+  await expect(page.getByRole("meter", { name: "GPU utilisation 37 percent" })).toBeVisible();
   await expect(page.getByTestId("timeline")).toContainText("snapshot restored");
   await expect(bezels(page)).toHaveCount(1);
   const v = await view(page);

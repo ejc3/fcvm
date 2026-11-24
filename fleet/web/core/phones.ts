@@ -16,7 +16,7 @@ import { streamBitrate } from "./bandwidth.ts";
 import * as fmt from "./format.ts";
 import { frameSocketUrl, mirrorSocketUrl, streamUrl } from "./net.ts";
 import { megabytes, mbits } from "./meter.ts";
-import { sameViewer, type Admission, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
+import { sameViewer, type Admission, type GpuInfo, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
 import { serverNow } from "./clock.ts";
 import type { ClientState, Notice } from "./store.ts";
 import {
@@ -622,11 +622,49 @@ export function readoutRows(view: TakeoverView, video: StreamReadout | null, mir
   return rows;
 }
 
+/** One live reading: `text` has fixed-width digits, `fraction` (0..1) drives a bar, `label` is what a screen reader says. */
+export interface PhoneStat {
+  key: string;
+  term: string;
+  text: string;
+  fraction: number | null;
+  label: string;
+}
+
+/** A reading older than this is dropped (the renderer is sampled about once a second). */
+export const STATS_STALE_MS = 5000;
+
+const pad = (n: number, w: number) => String(Math.round(n)).padStart(w, "\u2007");
+
+/** The readings of a phone's GPU, in the order the panel shows them. */
+export function statsOf(g: GpuInfo | null, srvNow: number): PhoneStat[] {
+  if (g === null) return [];
+  if (g.at !== null && srvNow - g.at > STATS_STALE_MS) return [];
+  const out: PhoneStat[] = [];
+  const clamp = (x: number) => Math.min(1, Math.max(0, x));
+  if (g.util_pct !== null) out.push({ key: "gpu-util", term: "GPU use", text: `${pad(g.util_pct, 3)} %`, fraction: clamp(g.util_pct / 100), label: `GPU utilisation ${Math.round(g.util_pct)} percent` });
+  if (g.temp_c !== null) out.push({ key: "gpu-temp", term: "GPU temp", text: `${pad(g.temp_c, 3)} \u00b0C`, fraction: null, label: `GPU temperature ${Math.round(g.temp_c)} degrees Celsius` });
+  if (g.power_w !== null) out.push({ key: "gpu-power", term: "GPU power", text: `${pad(g.power_w, 3)} W`, fraction: null, label: `GPU power draw ${Math.round(g.power_w)} watts` });
+  if (g.mem_used_mb !== null) {
+    const total = g.mem_total_mb !== null && g.mem_total_mb > 0 ? g.mem_total_mb : null;
+    out.push({
+      key: "gpu-mem",
+      term: "GPU memory",
+      text: total === null ? `${pad(g.mem_used_mb, 5)} MB` : `${pad(g.mem_used_mb, 5)} of ${pad(total, 5)} MB`,
+      fraction: total === null ? null : clamp(g.mem_used_mb / total),
+      label: total === null ? `GPU memory in use ${Math.round(g.mem_used_mb)} megabytes` : `GPU memory in use ${Math.round(g.mem_used_mb)} of ${Math.round(total)} megabytes`,
+    });
+  }
+  return out;
+}
+
 export interface PhonePanel {
   id: string;
   title: string;
   state: string;
   rows: { term: string; value: string }[];
+  /** Live readings, one row each; a reading the phone does not report has no row. */
+  stats: PhoneStat[];
   restoreTitle: string;
   restoreTotal: string;
   restoreNote: string;
@@ -995,6 +1033,7 @@ function panelOf(
   return {
     id: t.id,
     title: phoneName(t),
+    stats: running ? statsOf(g, srvNow) : [],
     state: running ? (restored && !restored.restoring ? restored.text : "streaming") : restored?.text ?? phaseText(t.phase),
     rows: [
       { term: "GPU", value: g?.name ?? "none yet" },

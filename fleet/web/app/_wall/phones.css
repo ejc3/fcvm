@@ -75,3 +75,9 @@
   .phones-stage { margin: 0 8px 8px; }
   .phone-label span { font-size: 12px; padding: 1px 4px; }
 }
+/* Live readings: tabular digits padded to a fixed width so the values do not shift as they change. */
+.phone-sheet .card dl.stats { margin-top: 6px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
+.phone-sheet dl.stats dd { margin: 0; font: 13px var(--mono); font-variant-numeric: tabular-nums; white-space: pre; }
+.phone-sheet dl.stats dd > span { display: inline-flex; align-items: center; gap: 8px; }
+.phone-sheet dl.stats .bar { display: inline-block; width: 72px; height: 5px; border-radius: 3px; background: rgba(255, 255, 255, 0.12); overflow: hidden; }
+.phone-sheet dl.stats .bar i { display: block; height: 100%; background: var(--fcvm); }

@@ -408,7 +408,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
       "vm": "fleet-slot-1",
       "generation": 3,
       "fps": 30.0,
-      "gpu_stats": { ... },
+      "gpu_stats": { ... },   // the renderer's /health gpu object; the page reads temp_c, power_w, util_pct, mem_used_mb, and mem_total_mb and at (Unix ms of the sample) when present
       "error": null,
       "failure": null,
       "last_relaunch": {"clicked_at": 1761134400000, "by": "viewer:v-4", "first_frame_at": 1761134405200,
