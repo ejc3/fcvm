@@ -34,20 +34,15 @@ make bench-start-rate-teardown PREP=/mnt/fcvm-btrfs/sr/prep/prep.json
 
 Measure with `/mnt/fcvm-btrfs` on local NVMe: a pbox `kvm-96` with `--local-nvme`, btrfs on the
 instance-store RAID0 (`/dev/md127`). A btrfs image on a loop device, even one whose file is in tmpfs,
-caps the store at the loop device's request queue (128). At C=1024 to 2000 alive (UFFD, main at
-bcf21750, stock 7.0.0-1013-aws) the store served 74 to 90 GiB of reads per run of 2000 clones on both
-layouts. In a run of 200 clones after `drop_caches`, each clone's Firecracker read 42.2 MiB (its
-`/proc/<pid>/io` `read_bytes`). Each clone's `rootfs.raw` is an inode of its own, so no clone finds
-another's reads in the page cache; which guest reads these are is not yet measured.
+caps the store at the loop device's request queue (128 requests). Each clone's `rootfs.raw` is an
+inode of its own, so no clone finds another's reads of its disk in the page cache.
 
-| store | host, 2026-11-23 | in flight, most | read await | state-file creates and renames blocked > 20 ms, start window |
-|---|---|---|---|---|
-| btrfs on a loop file in tmpfs | c8g.metal-48xl (192 cores) | 124 to 126 of 128 | 6.3 ms | 1,573 creates, 768 s; 1,158 renames, 412 s |
-| btrfs on NVMe RAID0 (3 members) | c8gd.metal-24xl (96 cores) | at most 25 per member, of 127 each | 0.31 ms | 1,474 creates, 126 s; 785 renames, 54 s |
+To compare stores, read the device's requests in flight (`/sys/block/<dev>/inflight`) and its read
+await (`iostat -x 1`) during a run, and each clone's Firecracker `read_bytes` from
+`/proc/<pid>/io`. Figures for both stores follow, measured on a host kernel with the RTNL fix
+(upstream 6.18.60 and 7.2): the pboxes' stock 7.0 kernel holds RTNL in its namespace cleanup
+worker, so start numbers measured on it are not published.
 
-The two rows come from different hosts, so only the queue occupancy and read await describe the
-store: the loop device's queue was full and its reads waited 20 times longer. The blocked-time
-column also differs in core count and in what else ran, and is not attributed to the store alone.
 `host.json` records the store's device, its backing file and that file's filesystem, and the
 `nr_requests` of the device, or of each member when it has members (an md RAID0).
 
