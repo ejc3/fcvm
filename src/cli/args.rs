@@ -875,6 +875,16 @@ pub struct FleetAgentArgs {
     #[arg(long, default_value_t = 0)]
     pub potato_players: u32,
 
+    /// Potato mode: the ring's CPU allotment. A player that is not asleep (awake, waking,
+    /// booting, or going to sleep until its save has finished and its fcvm has exited) holds
+    /// one CPU, and the agent never has more than this many such players: a wake that finds
+    /// none free waits for one. At least 3: one player holds the ball, one is saving and one
+    /// must be waking. Where the agent runs in a delegated systemd unit with the cpuset
+    /// controller (`Delegate=yes`, `DelegateSubgroup=`), the players' VMs and the fcvm
+    /// commands that save and restore them are also confined to this many host CPUs.
+    #[arg(long, default_value_t = 8)]
+    pub potato_cpus: u32,
+
     /// The potato player image (`make potato-image`)
     #[arg(long, default_value = "localhost/fcvm-potato:fleet")]
     pub potato_image: String,

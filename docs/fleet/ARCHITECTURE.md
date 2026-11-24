@@ -1855,8 +1855,9 @@ player then draws its first colour from the guest's random pool.
    acknowledgement was lost and the thrower tried again) counts it once.
 3. **Sleep.** Once the ball has left, the agent puts the thrower to sleep with
    `fcvm snapshot create --stop`: the VM is paused, saved, never resumed, and its fcvm
-   exits. A sleeping player holds no CPU and no memory, only its snapshot on the instance
-   store. Plain `snapshot create` resumes the VM it saved; a ball that reaches the player
+   exits. A sleeping player holds no CPU. Its snapshot's disk is on the instance store and
+   its memory file in a tmpfs by default (`--potato-sleep-memory-dir`), so it does hold
+   RAM; nothing here claims otherwise. Plain `snapshot create` resumes the VM it saved; a ball that reaches the player
    between that resume and its teardown is caught by a VM whose state no snapshot holds,
    and the catch is lost. The first ladder run lost one that way, and in the same window
    another player threw a second time from the VM being stopped.
@@ -2047,6 +2048,60 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
   is not caught by a player restored long after its turn, and never longer than the hold
   the round claims.
 
+### The CPU allotment
+
+The ring runs on K CPUs (`--potato-cpus`, default 8), and what the page shows is how many
+machines those K serve: N / K machines per CPU.
+
+- **The rule.** A machine that is not asleep holds one CPU: a player that is awake, waking,
+  booting, or going to sleep until its save has finished and its fcvm has exited, and the
+  gold VM while the player snapshot is made. The agent never has more than K of them. A
+  wake or boot that finds no CPU free does not start; it starts when one is given back, and
+  the wake reports how long it waited (`cpu_wait_ms`). Fewer than 3 CPUs are refused at
+  start: one machine holds the ball, one is saving and one must be waking.
+- **One count.** The driver keeps a ledger of who holds a CPU (`Cpus`,
+  `src/fleet/agent/ring_cpus.rs`). The driver is one task, and `Driver::set`, the one place a
+  player's phase changes, is the ledger's only writer for players; nothing recomputes the
+  count from flags. `boot` and `wake` take the CPU before they start anything and return
+  without starting when there is none.
+- **A CPU comes back only when the process is gone.** Every operation's end carries a proof
+  that its fcvm exited (`Exited`): a failed wake or boot stops its VM and waits for the exit
+  before it reports, and a sleep whose fcvm has not exited 40 s after `snapshot create
+  --stop` stops it and waits. Before this a failed wake dropped its VM with SIGTERM and
+  reported at once.
+- **K is physical where the host allows it.** Under a delegated systemd unit
+  (`Delegate=yes`, `DelegateSubgroup=agent`, in `fcvm-fleet-agent.service`) the agent makes
+  a cgroup beside its own, `<unit>/potato`, sets its `cpuset.cpus` to the K highest-numbered
+  CPUs the unit may use, and reads back `cpuset.cpus.effective`: the ring is confined only
+  if the kernel says exactly those K. Every process the agent starts for the ring joins
+  `<unit>/potato/tools` after the fork and before it executes (a process that cannot join
+  is not started), and fcvm makes each VM's scope under `<unit>/potato`
+  (`FCVM_CGROUP_PARENT`). So the players' VMMs, the restores and the `fcvm snapshot create`
+  commands run on those K CPUs. The CPUs are logical ones, as Linux numbers them, and they
+  are not reserved: the wall's and the phones' VMs are not pinned and may run there too. The
+  agent's own task, which reads reports and starts the commands, is outside the cpuset.
+  A host where any step fails (no delegation, no cpuset controller, fewer than K CPUs)
+  keeps the ledger alone and says `confined: false`; the page then says "CPU slots".
+- **What is measured.** Each catch's report carries the agent's count at that moment:
+  machines not asleep, the most there were since the catch before, the ring's players
+  asleep, the lead, the slowest wake in the window, which machine holds each CPU and in
+  which phase (ball, ready, waking, saving, booting), and the cpuset's CPU time
+  (`cpu.stat`, `usage_usec`). The coordinator turns the last into CPUs busy over a lap.
+- **The lead.** A sleeping player's wake is asked for when the ball is `lead` catches away:
+  the 95th percentile of the wakes of the last 30 s plus a 150 ms margin, in holds, and one
+  more (1.5 s is assumed before any wake). It is never more than K - 2, since asking for
+  more would only make wakes wait for a CPU the agent took itself. Wakes go nearest the
+  ball first.
+- **The margin.** For each catch the agent reports how long before the throw to the catcher
+  began its wake had ended (`ready_margin_ms`): the read time of the catch before, plus the
+  hold that catcher kept, less the wake's end. Negative means the thrower waited.
+- **New players.** A round boots its missing players K at a time, those the ball reaches
+  last first: each sleeps once booted and its CPU goes to the next. Those within the lead
+  boot last and stay awake, and the first ball is thrown when every player exists.
+- **When the agent stops** it waits up to 30 s for the ring's cgroup to empty. That cgroup
+  is inside the agent's unit, so systemd kills what is left with SIGKILL, and an fcvm
+  killed that way leaves its VM's network behind.
+
 ### Components
 
 - **The player** (`fleet/potato`): the program above, a static musl binary in an alpine image
@@ -2055,8 +2110,8 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
 - **The agent** (`fcvm fleet agent --potato-players N`): runs the host's players. It reads
   every player's reports on `127.0.0.1:7071` (each VM forwards that port to the host), puts
   a player to sleep once it has thrown, and wakes each sleeping player when the ball is
-  `lead` catches away, `lead` being the slowest of its recent wakes plus a margin, in holds.
-  A finished sleep checks the lead again. It serves a new round's first ball to its first
+  `lead` catches away and a CPU is free ("The CPU allotment"). A finished sleep gives its
+  CPU back and checks the lead again. It serves a new round's first ball to its first
   player, the only time the ball leaves anything but a player. Every report goes to the
   coordinator with the host's timestamps and the stage timings of the sleep or wake it
   ends. All players are clones of one snapshot of an unassigned player, so a new player is
@@ -2096,7 +2151,13 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
     published pace comes from catch times
     (`the_hold_reaches_its_floor`, `a_throw_does_not_retry_past_the_hold`,
     `pace_is_measured_from_the_catch_times`).
-11. A player that has thrown refuses the ball until the agent wakes it; a repeated ball counts
+11. No oversubscription: at every instant the machines not asleep are at most K, the ledger
+    agrees with the operations the driver started, no CPU idles while a wake waits for one,
+    and a CPU is freed only by an operation whose fcvm has exited
+    (`machines_not_asleep_never_exceed_the_cpus_in_any_interleaving`, which drives the
+    driver through every order of its events, and
+    `a_failed_operation_reports_after_its_fcvm_has_exited`).
+12. A player that has thrown refuses the ball until the agent wakes it; a repeated ball counts
     once; a stopped round's throw is abandoned; a connection that sends nothing never holds
     up the ball (`fleet/potato/tests/player.rs`).
 
@@ -2112,6 +2173,8 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
 | the coordinator restarts | the agent's round is replaced by a new one at the same size; records stay |
 | the fleet sleeps | the host goes with it; the next host boots new players (new colours) and the ladder continues from its size |
 | a sleeping player's memory file is gone (the host rebooted, or the memory directory was cleared) | `snapshot run` refuses it, naming the missing file; the wake fails as above, the round restarts, and the player is booted fresh |
+| every CPU of the ring is held when a player's wake is due | the wake waits for one and reports the wait; if the ball arrives first it drops, and the drop names the wait |
+| the host cannot give the ring a cpuset | the allotment still caps the machines not asleep; the agent reports `confined: false` and no CPUs busy |
 | the sleep memory directory is at its cap (`--potato-sleep-memory-cap-mib`) | that sleep keeps its memory on the store, at the store's speed |
 
 ### Cheaper sleep

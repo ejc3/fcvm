@@ -702,6 +702,8 @@
     "potato": {
       "capacity": 0,
       "colours": 12,
+      "confined": null,
+      "cpus": null,
       "host": null,
       "ladder": [
         {

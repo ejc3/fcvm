@@ -1225,7 +1225,8 @@ in front.
 
 `?mode=potato` on the page shows the hot potato game (design: `docs/fleet/ARCHITECTURE.md`,
 "Potato mode"). An agent started with `--potato-players N` runs up to N CPU-only player
-VMs and says so in its hello (`potato_players`, below); the first such host to connect is
+VMs and says so in its hello (`potato_players`, below), with the ring's CPU allotment
+(`potato_cpus`, from `--potato-cpus`, and `potato_confined`); the first such host to connect is
 the potato host. The ball goes from player VM to player VM and never through the
 coordinator; the coordinator reads what the agent reports, checks every player's proof,
 and keeps the ladder.
@@ -1240,7 +1241,8 @@ Intents:
 The snapshot's `state.potato` is absent until a host has run players, else:
 
 ```json
-{"size": 4, "colours": 12, "capacity": 96, "host": "<host name>", "next_round_at": null,
+{"size": 4, "colours": 12, "capacity": 96, "cpus": 8, "confined": true, "host": "<host name>",
+ "next_round_at": null,
  "ladder": [{"size": 2, "record_hold_ms": 1458, "record_at": 1762317000000, "rounds": 3,
              "broke": {"reason": "not_listening", "player": 1, "thrower": 0, "seq": 11, "lap": 5,
                        "hold_ms": 1182, "stage": "waking", "stage_ms": 90.0, "listening_after_ms": 84.0,
@@ -1252,9 +1254,15 @@ The snapshot's `state.potato` is absent until a host has run players, else:
            "hold_ms": 599, "start_hold_ms": 666, "min_hold_ms": 2, "flight_ms": 100, "pace_ms": null,
            "turnaround_ms": 1797, "holder": 2, "last_catch_at": 1762317009100,
            "flight": {"from": 2, "to": 3, "at": 1762317009700}, "best_lap_hold_ms": 666,
-           "pace": 1.5, "best_pace": 1.5, "laps": [{"lap": 0, "pace": 1.5, "hold_ms": 666}]},
+           "pace": 1.5, "best_pace": 1.5,
+           "laps": [{"lap": 0, "pace": 1.5, "hold_ms": 666, "cpus_peak": 3, "cpus_busy": 1.42}],
+           "cpus_in_use": 3, "cpus_peak": 3, "cpus_busy": 1.42, "asleep": 1, "lead": 2,
+           "slowest_wake_ms": 355.3,
+           "cpu_slots": [{"player": 2, "phase": "ball"}, {"player": 3, "phase": "waking"},
+                         {"player": 1, "phase": "saving"}]},
  "players": [{"player": 0, "colour": 5, "counter": 31, "phase": "asleep", "since": 1762317009400,
-              "last_sleep_ms": 330.1, "last_wake_ms": 355.3}],
+              "last_sleep_ms": 330.1, "last_wake_ms": 355.3, "cpu_wait_ms": null,
+              "ready_margin_ms": 212.0}],
  "records": {"fastest_cycle_ms": {"value": 650.0, "size": 2, "player": 0, "at": 1762317000000},
              "longest_round": {"value": 151.0, "size": 64, "player": null, "at": 1762317000000}},
  "last_drop": {...}}
@@ -1277,6 +1285,27 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   first, at most the last 60, each with its pace and the longest hold a catch of it carried.
   A page that does not know `pace`, `best_pace` or `laps` ignores them, and one that does
   shows nothing for a field that is null or absent (an older coordinator sends none).
+- `cpus` is K, the CPU allotment of the host that played the ladder last: its agent never has
+  more than K machines not asleep. `confined` says whether those machines, and the fcvm
+  commands that save and restore them, run in a cpuset of exactly K host CPUs (true), or
+  are only counted (false: a page says "CPU slots", not "CPUs"). Both are null from an agent
+  that reports no allotment, and both stay after the host disconnects, as the ladder does.
+- The round's CPU fields are the agent's own count, taken when it read the latest catch, so
+  they move once per catch: `cpus_in_use` (machines not asleep: awake, waking, booting, or
+  going to sleep until the save has finished and the process has exited), `asleep` (the
+  ring's players asleep; one whose wake waits for a CPU is asleep), `lead` (how many catches
+  ahead of the ball a wake is asked for), `slowest_wake_ms` (over the agent's 30 s window)
+  and `cpu_slots`: one entry per machine not asleep, so as many as `cpus_in_use`, each with
+  its `phase`, `ball` (caught and not yet thrown), `ready`, `waking`, `saving` or `booting`,
+  in that order and in ring order within a phase. `cpus_peak` is the most in use at any
+  instant of the last completed lap, and `cpus_busy` the host CPUs the ring's cpuset used on
+  average over it (`cpu.stat`), null unless `confined`. Each of `laps` carries its own
+  `cpus_peak` and `cpus_busy`. All are null before the first catch (the lap ones before the
+  first lap) and from an agent without an allotment; a page shows nothing for a null or
+  absent field, never zero.
+- A player's `cpu_wait_ms` is how long its latest wake waited for a free CPU (null: it did
+  not wait), and `ready_margin_ms` how long before the throw to it began it was ready at its
+  latest catch (negative: the thrower waited; null for a round's first catch).
 - `host`: the potato host, by its agent's name (as a tile's `host`); null while none is
   connected. The viewer-path smoke attributes its potato probe to it for the image release
   gate.
@@ -1700,21 +1729,28 @@ the same GPU quarantines it again.
 ```
 
 Potato mode (`--potato-players N`, which the hello reports as `potato_players`): one thing
-that happened to player `player`, at `at` on the host's clock. `kind` is one of:
+that happened to player `player`, at `at` on the host's clock. The hello also carries
+`potato_cpus` (`--potato-cpus`, the ring's CPU allotment; absent or 0 from an agent built
+before it, which caps nothing) and `potato_confined` (true when the ring's processes run in a
+cpuset of that many host CPUs; absent means false). `kind` is one of:
 
 | kind | fields | when |
 |------|--------|------|
 | `hello` | `colour`, `counter`, `chain`, `colours`, `connections`, `last_round`, `last_seq` | the player opened a report connection: once when new (`connections` 1, `counter` 0), and once after each wake. `last_round`/`last_seq` name its last catch |
-| `caught` | `round`, `seq`, `colour`, `counter`, `chain`, `hold_us` | it caught the ball. `hold_us` is the hold it will keep, in microseconds, after any pace cap; absent from a player built before it, and the coordinator then computes the hold as those players do (a tenth off per lap in whole milliseconds) |
+| `caught` | `round`, `seq`, `colour`, `counter`, `chain`, `hold_us`, `ring`, `ready_margin_ms` | it caught the ball. `ring` is the agent's count when it read the catch, `{"cpus_in_use", "cpus_peak" (the most since the catch before), "asleep", "lead", "slowest_wake_ms", "slots": [{"player", "phase"}], "cpu_usec" (the cpuset's `usage_usec`, absent when not confined)}`; `ready_margin_ms` is how long before the throw to it began the catcher was ready, absent for a round's first catch and when the catch was read before the end of the catcher's wake. Both are absent from an agent without an allotment. `hold_us` is the hold it will keep, in microseconds, after any pace cap; absent from a player built before it, and the coordinator then computes the hold as those players do (a tenth off per lap in whole milliseconds) |
 | `threw` | `round`, `seq` (the ball's new seq), `to`, `attempts`, `wait_ms`, `send_ms` | the next player accepted the ball |
-| `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to` |
+| `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms`, `catcher_cpu_wait_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to`, and `catcher_cpu_wait_ms`, when present, how long `to`'s wake had waited for a free CPU |
 | `slept` | `sleep_ms`, `stages`, `written_mib` | its snapshot is written and its fcvm has exited. `stages` splits `sleep_ms` into the agent's steps, `ask_ms` (telling the player its round is over), `create_ms` (`fcvm snapshot create --stop`) and `reap_ms` (waiting for the player's fcvm to exit), and splits `create_ms` with fcvm's own: `stage_ms` (the new generation's directory and memory file), `prepare_ms`, `pause_ms`, `save_ms`, `disk_ms`, `publish_ms` (installing it and removing the old one) and `stop_ms` |
-| `waking` | | its restore started |
-| `woke` | `wake_ms`, `stages` (`restore_ms`, `ack_ms`, `listen_ms`) | its ball port accepts again |
+| `waking` | `cpu_wait_ms` | its restore started; `cpu_wait_ms`, when present, is how long it waited for a free CPU first |
+| `woke` | `wake_ms`, `stages` (`restore_ms`, `ack_ms`, `listen_ms`), `ready_margin_ms` | its ball port accepts again; `ready_margin_ms` as a catch's, when the player's catch was read before this |
 | `listening` | `round`, `seq`, `after_ms` | the catcher of a dropped ball accepted, `after_ms` after the drop |
 | `failed` | `stage` (`boot`, `sleep`, `wake`, `kickoff`), `error` | a step failed |
 
 The ball itself is never reported: the players throw it to each other.
+
+Every addition to these messages is an optional field. The coordinator closes an agent's
+connection on a message it cannot parse, so a new `kind` or a new message type from an agent
+would disconnect it from a coordinator built before it; an unknown field is ignored.
 
 ### Coordinator to agent
 

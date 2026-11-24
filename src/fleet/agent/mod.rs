@@ -8,6 +8,7 @@ pub mod joinguard;
 pub mod minecraft;
 pub mod ports;
 pub mod potato;
+pub mod ring_cpus;
 pub mod slot;
 pub mod sni;
 pub mod spot;
@@ -306,6 +307,17 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             "--potato-players needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)",
         )?;
         prefix.player_address(args.potato_players - 1)?;
+        let cpus = ring_cpus::allotment(args.potato_cpus)?;
+        let cgroup = match ring_cpus::RingCgroup::for_this_agent(cpus) {
+            Ok(cgroup) => {
+                tracing::info!(cpus = ?cgroup.cpus(), "potato: the ring is confined to these CPUs");
+                Some(Arc::new(cgroup))
+            }
+            Err(reason) => {
+                tracing::warn!(cpus, %reason, "potato: the ring is not confined to host CPUs; the allotment only caps the machines not asleep");
+                None
+            }
+        };
         Some(potato::PotatoCfg {
             fcvm: fcvm.clone(),
             image: args.potato_image.clone(),
@@ -318,6 +330,8 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 0 => 2 * u64::from(args.potato_players) * u64::from(args.potato_mem),
                 cap => cap,
             },
+            cpus,
+            cgroup,
         })
     } else {
         None
@@ -601,6 +615,8 @@ where
         phones: agent.phones.clone(),
         phone_actions: vm::phone_actions(agent.cfg.phone.as_ref()),
         potato_players: agent.potato.as_ref().map_or(0, |p| p.players),
+        potato_cpus: agent.potato.as_ref().map_or(0, |p| p.cpus),
+        potato_confined: agent.potato.as_ref().is_some_and(|p| p.cgroup.is_some()),
         windows: agent.windows.as_ref().map_or(0, |w| w.count),
         windows_actions: agent
             .windows
