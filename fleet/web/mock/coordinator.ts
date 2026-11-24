@@ -1654,7 +1654,7 @@ export class MockCoordinator {
       return;
     }
     if (req.method === "GET" && url.pathname === "/mock/minecraft-record") {
-      json(200, { intents: this.minecraft?.intents ?? [], drives: this.minecraft?.drives ?? [] });
+      json(200, { intents: this.minecraft?.intents ?? [], drives: this.minecraft?.drives ?? [], held: this.minecraft?.held ?? [] });
       return;
     }
     if (req.method === "GET" && url.pathname === "/mock/windows-actions") {
@@ -1700,6 +1700,8 @@ export class MockCoordinator {
             ...(typeof b["size"] === "number" ? { size: b["size"] } : {}),
             ...(typeof b["next_in_ms"] === "number" ? { next_in_ms: b["next_in_ms"] } : {}),
             ...(typeof b["slow_wake_ms"] === "number" ? { slow_wake_ms: b["slow_wake_ms"] } : {}),
+            ...(typeof b["cpus"] === "number" ? { cpus: b["cpus"] } : {}),
+            ...(typeof b["players"] === "number" ? { players: b["players"] } : {}),
           });
           return { ok: true };
         });
