@@ -1792,8 +1792,10 @@ a conductor that pings each VM and VMs that throw to each other, "thrower is bet
   bright while its VM runs, dim while it sleeps (no process exists for it), and shows a bar
   filling while it wakes, labelled with the restore's milliseconds. The ball arcs from the
   thrower's tile to the catcher's. Nothing on the page stands for the coordinator.
-- **The pace.** The hold (how long a player keeps the ball before it throws), the lap and the
-  ring's size, and a meter of the hold against the sleep-and-wake time it leaves a player.
+- **The pace.** Catches per second over the last completed lap, measured from the times the
+  coordinator read the catches, never computed from the hold. Beside it the hold (how long a
+  player keeps the ball before it throws), the lap and the ring's size, and a meter of the
+  hold against the sleep-and-wake time it leaves a player.
 - **The ladder.** Rings of 2, 4, 8, 16, 32, 64 and 96 players. Each size reached shows its
   record (the shortest hold that completed a lap) and what broke it. The current size and
   pace are live. After 96 breaks, the ladder starts again at 2.
@@ -1819,16 +1821,20 @@ of an unassigned player; the agent gives a new clone its number over its ball po
 player then draws its first colour from the guest's random pool.
 
 1. **Catch.** The ball arrives over TCP from the previous player's VM, one JSON line:
-   `{"type": "ball", round, seq, ring, hold_ms, shrink_permille, min_hold_ms, flight_ms,
-   trail}`. The catcher steps its colour forward one, increments its counter, extends its
+   `{"type": "ball", round, seq, ring, hold_ms, hold_us, shrink_permille, min_hold_ms,
+   flight_ms, trail}`. The catcher steps its colour forward one, increments its counter, extends its
    chain (`sha256("fcvm-potato-v1" || chain || round || seq || colour)`, with `chain` the 32
    bytes, `round` and `seq` 8-byte and `colour` 4-byte little-endian integers:
    `fleet_potato::chain_step`), acknowledges the ball and reports the catch with its new
-   colour, counter and chain.
-2. **Throw.** After `hold_ms` it connects to the next address in `ring` and sends the ball
+   colour, counter and chain, and with the hold it will keep, in microseconds (`hold_us`:
+   the ball's hold, capped by a viewers' pace).
+2. **Throw.** After the hold it connects to the next address in `ring` and sends the ball
    with its colour on the trail. Nothing relays the ball: the agent and the coordinator only
    read reports. If the connection is refused or not answered, the thrower tries again every
-   2 ms until `flight_ms` has passed since the first try, then reports the ball dropped.
+   2 ms until the flight window has passed since the first try, then reports the ball
+   dropped. The window is `flight_ms` or the hold the thrower kept, whichever is shorter: a
+   thrower that retried for 100 ms at a 10 ms hold would complete laps at a pace its throws
+   did not keep.
    From the moment it throws until it is woken, a player refuses the ball: it is going to
    sleep, and a ball it caught in the few milliseconds before the snapshot pauses it (or
    the 1.8 s a slow btrfs commit can add) would be held by a VM that nobody wakes for it.
@@ -1859,7 +1865,13 @@ player then draws its first colour from the guest's random pool.
    (the hello names its last catch, and the step is checked from it). Any other difference
    means a player's memory did not survive the sleep.
 6. **Pace.** Each round starts at a hold set for its size and shrinks it by a tenth every
-   lap, down to a floor, until the ball drops.
+   lap, down to a floor, until the ball drops. The ball carries its hold in microseconds
+   (`hold_us`) and the shrink is computed on that: in whole milliseconds a tenth of 9 ms is
+   0, so the hold stopped at 9 ms and never reached the 2 ms floor. `hold_ms` stays on the
+   ball, rounded, for a player built before `hold_us`. The pace the page shows is measured:
+   the catches of the last completed lap divided by the time from the catch before the
+   lap's first to the lap's last, on the coordinator's clock (lap 0 has no catch before it:
+   its last catch minus its first, over one catch fewer).
 
 The ball drops when the thrower's flight window runs out (the catcher was asleep, waking,
 or not yet accepting), when a proof does not match, when a wake fails, or when no catch is
@@ -2017,9 +2029,10 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
 - From 8 players up the measured edge is near 165 to 257 ms, set by the host, so `2000 /
   (size - 1)` would start below it; 400 ms starts each above its measured break and gives it
   a few laps to find it. At 96 players a lap at 400 ms is 38 s.
-- The flight window is 100 ms: long enough for a thrower to retry a few times against a
-  catcher that is opening its port, short enough that a ball is not caught by a player
-  restored long after its turn.
+- The flight window is 100 ms, or the hold when that is shorter: long enough for a thrower
+  to retry a few times against a catcher that is opening its port, short enough that a ball
+  is not caught by a player restored long after its turn, and never longer than the hold
+  the round claims.
 
 ### Components
 
@@ -2066,6 +2079,10 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
 9. The ball drops on each of: the flight window running out, a proof mismatch, a failed wake
    and a missed deadline.
 10. "Faster" never shortens the hold below the floor, and both buttons are rate limited.
+    The shrink reaches the floor, a throw is retried for no longer than its hold, and the
+    published pace comes from catch times
+    (`the_hold_reaches_its_floor`, `a_throw_does_not_retry_past_the_hold`,
+    `pace_is_measured_from_the_catch_times`).
 11. A player that has thrown refuses the ball until the agent wakes it; a repeated ball counts
     once; a stopped round's throw is abandoned; a connection that sends nothing never holds
     up the ball (`fleet/potato/tests/player.rs`).
@@ -2074,7 +2091,7 @@ Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth
 
 | failure | what happens |
 |---|---|
-| the catcher is not accepting when the ball arrives | the thrower retries within `flight_ms`, then reports the drop; the agent reports when the catcher did start accepting |
+| the catcher is not accepting when the ball arrives | the thrower retries within the flight window (`flight_ms`, or its hold when shorter), then reports the drop; the agent reports when the catcher did start accepting |
 | a woken player's hello does not match | the ball is dropped as a proof mismatch naming the player; the coordinator takes what it reported as its state from then on |
 | `fcvm snapshot create` or `snapshot run` fails | the round ends with a failed sleep or wake naming the player; the player is booted fresh |
 | no catch reported by the deadline | the round ends as a missed deadline; the agent sleeps every awake player, so a ball still in the air drops |
