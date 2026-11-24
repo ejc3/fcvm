@@ -423,6 +423,7 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
                 held.vm_id.clone(),
                 dir.join("firecracker.sock"),
                 None,
+                vmm_decision(),
             );
             vmm.set_user_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/user")));
             vmm.set_net_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/net")));
@@ -483,8 +484,12 @@ async fn restore(args: &PieceArgs, held: &mut Held, stages: &mut Stages) -> Resu
     let disk = held.disk_path.clone().context("no disk")?;
     let dir = fcvm::paths::vm_runtime_dir(&held.vm_id);
     let t = Instant::now();
-    let mut vmm =
-        fcvm::firecracker::VmManager::new(held.vm_id.clone(), dir.join("firecracker.sock"), None);
+    let mut vmm = fcvm::firecracker::VmManager::new(
+        held.vm_id.clone(),
+        dir.join("firecracker.sock"),
+        None,
+        vmm_decision(),
+    );
     vmm.set_user_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/user")));
     vmm.set_net_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/net")));
     let started = vmm.start(firecracker, None, None).await;
@@ -642,4 +647,17 @@ mod state_order_tests {
         assert!(held < arm.find("allocate_loopback_ip").unwrap());
         assert!(held < arm.find("update_state").unwrap());
     }
+}
+
+/// The pieces' VMMs are fcvm's unconfined clones; the decision is made as fcvm makes it, so
+/// a host whose mode is `required` refuses them.
+fn vmm_decision() -> fcvm::confine::Decision {
+    fcvm::confine::resolve(&fcvm::confine::Request {
+        flag: false,
+        backend: fcvm::hypervisor::Backend::Firecracker,
+        network: fcvm::confine::Network::Rootless,
+        firecracker_args: None,
+        unsupported: None,
+    })
+    .expect("deciding a piece VMM's confinement")
 }
