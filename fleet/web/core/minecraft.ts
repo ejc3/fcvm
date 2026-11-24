@@ -1113,6 +1113,7 @@ function tileOfCell(c: FieldCell): MinecraftTile {
     gpu: null,
     host: null,
     place: null,
+    vm_stats: null,
     // its launch's time to the first chunk, as its row says it ("Up in 0.41 s")
     last_relaunch: c.launchMs === null || c.phase !== "running" ? null : { clicked_at: 0, first_frame_at: c.launchMs, phases: { total_ms: c.launchMs } },
     borrowed: null,
