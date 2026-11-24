@@ -52,5 +52,5 @@
   .phones-top { padding-top: 8px; padding-bottom: 8px; min-height: 0; }
 }
 @media (max-width: 700px) { .win-page .win-top .brand h1 { line-height: 1.05; } .landing-row .landing-line { line-height: 1.1; } }
-/* While a server, a desktop or a phone is held on a phone, its view takes the room the line used. */
-@media (max-width: 700px) { body:has(.win-sheet, .phone-sheet) .landing-row .landing { display: none; } }
+/* While a server or a desktop is held on a phone, its view takes the room the line used. */
+@media (max-width: 700px) { body:has(.win-sheet) .landing-row .landing { display: none; } }
