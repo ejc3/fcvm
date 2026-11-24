@@ -10645,6 +10645,38 @@ class StateLayoutReaders(unittest.TestCase):
             "config": {"process_type": "serve", "snapshot_name": "snap", "uffd_mode": "minor"}})
         self.assertEqual(reqbench.serve_uffd_mode(d, me, "snap"), "minor")
 
+class AssertVmArtifactsAbsent(unittest.TestCase):
+    """reqbench.sh's leak check must look where layout 2 keeps a VM's files."""
+
+    VM = "vm-0123456789abcdef0123456789abcdef"
+
+    def run_check(self, state_dir, data_root):
+        script = open(os.path.join(HERE, "reqbench.sh")).read()
+        start = script.index("assert_vm_artifacts_absent() {")
+        body = script[start:script.index("\n}\n", start) + 3]
+        return subprocess.run(
+            ["bash", "-c", f"log() {{ echo \"$*\" >&2; }}\n{body}\n"
+             f"assert_vm_artifacts_absent {self.VM}"],
+            env=dict(os.environ, STATE_DIR=state_dir, DATA_ROOT=data_root),
+            capture_output=True, text=True)
+
+    def test_each_leftover_is_reported_and_a_clean_store_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = state_fixture.make_store(os.path.join(d, "state"))
+            self.assertEqual(self.run_check(state_dir, d).returncode, 0)
+            path = reqbench.vm_state_path(state_dir, self.VM)
+            os.makedirs(os.path.dirname(path))
+            for suffix in ("", ".lock", ".tmp"):
+                with self.subTest(suffix=suffix):
+                    open(path + suffix, "w").close()
+                    result = self.run_check(state_dir, d)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(path + suffix, result.stderr)
+                    os.remove(path + suffix)
+            os.makedirs(os.path.join(d, "vm-disks", self.VM))
+            self.assertEqual(self.run_check(state_dir, d).returncode, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

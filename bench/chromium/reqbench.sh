@@ -488,11 +488,12 @@ assert_vm_artifacts_absent() {
     local vm_id="$1" left=0 path bucket
     [[ "$vm_id" =~ ^vm-[0-9a-f]{32}$ ]] \
         || { log "refusing artifact check for invalid vm_id $vm_id"; return 1; }
-    # State layout 2: vms/<bucket>/<vm_id>.json, bucket = first byte of sha256(vm_id).
+    # State layout 2: vms/<bucket>/<vm_id>.json, bucket = first hex digit of sha256(vm_id).
     bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1)
     for path in \
         "$STATE_DIR/vms/$bucket/$vm_id.json" \
         "$STATE_DIR/vms/$bucket/$vm_id.json.lock" \
+        "$STATE_DIR/vms/$bucket/$vm_id.json.tmp" \
         "$DATA_ROOT/vm-disks/$vm_id"; do
         if [ -e "$path" ] || [ -L "$path" ]; then
             log "cleanup left exact artifact $path"

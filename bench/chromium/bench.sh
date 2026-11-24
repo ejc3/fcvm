@@ -189,7 +189,7 @@ cleanup() {
     log "cleanup (rc=$rc)"
     [ -n "${LOAD_PID:-}" ] && kill "$LOAD_PID" 2>/dev/null || true
     # our clones / baselines still alive (state file names carry the run id)
-    for f in "$STATE_DIR"/*.json; do
+    for f in "$STATE_DIR"/vms/*/*.json; do
         [ -e "$f" ] || continue
         local nm pid
         nm=$(jq -r '.name // ""' "$f" 2>/dev/null) || continue
@@ -312,12 +312,12 @@ fx() {  # fx <sudoflag> <args...>
 }
 
 state_pid_by_name() {  # $1 vm name -> pid or empty
-    jq -r --arg n "$1" 'select(.name==$n) | .pid // empty' "$STATE_DIR"/*.json 2>/dev/null | head -1
+    jq -r --arg n "$1" 'select(.name==$n) | .pid // empty' "$STATE_DIR"/vms/*/*.json 2>/dev/null | head -1
 }
 
 serve_pid_by_snap() {  # $1 snapshot tag
     jq -r --arg s "$1" 'select(.config.process_type=="serve" and .config.snapshot_name==$s) | .pid // empty' \
-        "$STATE_DIR"/*.json 2>/dev/null | head -1
+        "$STATE_DIR"/vms/*/*.json 2>/dev/null | head -1
 }
 
 wait_state_gone() {  # $1 name, $2 timeout_s
@@ -937,7 +937,7 @@ wait_clones_gone() {  # $1 timeout
     while :; do
         local n
         n=$(jq -r --arg p "cb-$RUNID" 'select((.name // "") | startswith($p)) | .name' \
-            "$STATE_DIR"/*.json 2>/dev/null | grep -c '' || true)
+            "$STATE_DIR"/vms/*/*.json 2>/dev/null | grep -c '' || true)
         [ "${n:-0}" = 0 ] && return 0
         [ $((SECONDS - t0)) -ge "$1" ] && { log "WARN: $n clones still up after ${1}s"; return 1; }
         sleep 1
