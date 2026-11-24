@@ -122,21 +122,8 @@ export function Landing({ landing, legendInPanel, colour, sheet = "bottom", chil
       e.preventDefault();
       close(true);
     };
-    // A tap outside only closes: the click that follows it is swallowed.
-    const down = (e: PointerEvent) => {
-      const t = e.target as Node;
-      if (panelRef.current?.contains(t) || btnRef.current?.contains(t)) return;
-      const swallow = (c: Event) => c.stopPropagation();
-      window.addEventListener("click", swallow, { capture: true, once: true });
-      window.setTimeout(() => window.removeEventListener("click", swallow, true), 400);
-      close(false);
-    };
     window.addEventListener("keydown", key, true);
-    window.addEventListener("pointerdown", down, true);
-    return () => {
-      window.removeEventListener("keydown", key, true);
-      window.removeEventListener("pointerdown", down, true);
-    };
+    return () => window.removeEventListener("keydown", key, true);
   }, [open]);
 
   const text = landingPanelText(landing);
@@ -154,7 +141,10 @@ export function Landing({ landing, legendInPanel, colour, sheet = "bottom", chil
       </p>
       {open && typeof document !== "undefined"
         ? createPortal(
-        <div ref={panelRef} id={panelId} className="landing-panel" data-sheet={sheet} role="dialog" aria-label="About this page" tabIndex={-1} data-testid="landing-panel" style={{ ["--lx" as string]: `${Math.min(anchor?.x ?? 0, Math.max(0, window.innerWidth - 436))}px`, ["--ly" as string]: `${anchor?.y ?? 0}px` }}>
+        <>
+        {/* A tap outside takes the whole pointer sequence (down, up, click) and only closes the panel: nothing under it sees it. */}
+        <div className="landing-backdrop" data-testid="landing-backdrop" onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); setOpen(false); }} />
+        <div ref={panelRef} id={panelId} className="landing-panel" data-sheet={sheet} role="dialog" aria-label="What this page shows" tabIndex={-1} data-testid="landing-panel" style={{ ["--lx" as string]: `${Math.min(anchor?.x ?? 0, Math.max(0, window.innerWidth - 436))}px`, ["--ly" as string]: `${anchor?.y ?? 0}px` }}>
           <button type="button" className="landing-close" aria-label="Close" data-testid="landing-close" onClick={() => { setOpen(false); btnRef.current?.focus(); }}>
             Close
           </button>
@@ -162,8 +152,9 @@ export function Landing({ landing, legendInPanel, colour, sheet = "bottom", chil
             <p key={t}>{t}</p>
           ))}
           {legendInPanel && landing.legend ? <PotatoLegend legend={landing.legend} form="list" colour={colour} /> : null}
-        </div>,
-        document.body,
+        </div>
+        </>,
+        (btnRef.current?.closest("[data-landing-root]") as HTMLElement | null) ?? document.body,
       )
         : null}
       {children}

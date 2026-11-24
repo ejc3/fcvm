@@ -360,5 +360,40 @@ test("potato: a card does not come back after its tile left the ring and the rin
   await expect(tiles(page)).toHaveCount(8, { timeout: 10_000 });
   await page.waitForTimeout(500);
   await expect(readout, "nothing is focused, so no card").toHaveCount(0);
+test("potato: the legend's marks keep their colours in the panel, in the dark and the light scheme", async ({ page }) => {
+  await startAt(8);
+  for (const scheme of ["dark", "light"] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.setViewportSize({ width: 360, height: 800 });
+    await openPotato(page);
+    await page.getByTestId("landing-button").click();
+    const panel = page.getByTestId("landing-panel");
+    await expect(panel).toBeVisible();
+    const sw = panel.locator(".potato-swatch").first();
+    const colours = await sw.evaluate((el) => ({ bg: getComputedStyle(el).backgroundColor, edge: getComputedStyle(el).boxShadow }));
+    expect(colours.bg, `${scheme}: the swatch has a fill`).not.toBe("rgba(0, 0, 0, 0)");
+    expect(colours.edge, `${scheme}: the tile edge`).not.toBe("none");
+    const holder = panel.locator('.potato-swatch[data-holder="true"]').first();
+    if (await holder.count()) expect(await holder.evaluate((el) => getComputedStyle(el).boxShadow), `${scheme}: the holder's ring`).toMatch(/rgb/);
+    const ball = panel.locator(".lg-ball").first();
+    if (await ball.count()) expect(await ball.evaluate((el) => getComputedStyle(el).backgroundImage), `${scheme}: the ball has a fill`).toMatch(/gradient/);
+    // the panel's own colours follow the page's scheme
+    const panelBg = await panel.evaluate((el) => getComputedStyle(el).backgroundColor);
+    const [r, g, b] = panelBg.match(/\d+/g)!.map(Number) as [number, number, number];
+    if (scheme === "light") expect(Math.min(r, g, b), "a light panel").toBeGreaterThan(200);
+    else expect(Math.max(r, g, b), "a dark panel").toBeLessThan(60);
+    await page.keyboard.press("Escape");
+  }
+});
+
+test("potato: at 360 by 640 with the line at four lines, Faster and Restart are on screen", async ({ page }) => {
+  await startAt(8);
+  await page.setViewportSize({ width: 360, height: 640 });
+  await openPotato(page);
+  for (const id of ["potato-faster", "potato-restart"]) {
+    const b = (await page.getByTestId(id).boundingBox())!;
+    expect(b.y + b.height, id).toBeLessThanOrEqual(640);
+    expect(b.x + b.width, id).toBeLessThanOrEqual(360);
+  }
 });
 

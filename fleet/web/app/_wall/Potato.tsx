@@ -178,7 +178,7 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
   const needsVerifyPrompt = view.verify.prompt;
 
   return (
-    <main className="potato-page" data-testid="potato">
+    <main className="potato-page" data-testid="potato" data-landing-root="">
       <header className="potato-top">
         <div className="masthead">
           <div className="brand">
