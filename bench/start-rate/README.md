@@ -30,6 +30,30 @@ make bench-start-rate-teardown PREP=/mnt/fcvm-btrfs/sr/prep/prep.json
 - `LAUNCHERS=` is the number of harness threads spawning clones (default 4); `popen_ms` in the summary
   shows whether spawning itself limits the rate.
 
+## The store
+
+Measure with `/mnt/fcvm-btrfs` on local NVMe: a pbox `kvm-96` with `--local-nvme`, btrfs on the
+instance-store RAID0 (`/dev/md127`). A btrfs image on a loop device, even one whose file is in tmpfs,
+caps the store at the loop device's request queue (128 requests). Each clone's `rootfs.raw` is an
+inode of its own, so no clone finds another's reads of its disk in the page cache.
+
+To compare stores, read the device's requests in flight (`/sys/block/<dev>/inflight`) and its read
+await (`iostat -x 1`) during a run. Both stores on one host, Ubuntu's 7.0.0-1018-aws,
+m8gd.metal-24xl (96 cores, 377 GiB), 2026-11-24, main at 9d7b6f94f; one cell each, 1000 UFFD
+clones at C=512 held 10 s, from a fresh snapshot:
+
+| store | clones/s | spawn to healthy p50 / p99 ms | store reads per clone | most requests in flight | read await, ms |
+|---|---|---|---|---|---|
+| btrfs on NVMe RAID0 (3 members of 127) | 81.6 | 5790 / 6803 | 43.6 MiB | 29 | 0.21 |
+| btrfs on a loop file in tmpfs (queue 128) | 79.2 | 5486 / 7884 | 40.6 MiB | 96 | 0.34 |
+
+The loop device's queue held up to 96 of its 128 requests, against at most 29 across the NVMe
+members, and its reads waited 60% longer; at this load the start rate is the same on both.
+
+`host.json` records the store's device, its backing file and that file's filesystem, and the
+`nr_requests` of the device, or of each member when it has members (an md RAID0).
+
+
 ## Churn: starts and stops at one rate
 
 `run` measures a ramp: every clone stays up, so nothing is torn down while clones start and
@@ -90,7 +114,7 @@ counters every second), `host.tsv`.
 
 | file | what |
 |---|---|
-| `host.json` | instance type, kernel, CPUs, memory, the store's filesystem and backing, source revision, run config |
+| `host.json` | instance type, kernel, CPUs, memory, the store's filesystem, device, backing file and its filesystem, and queue depth, source revision, run config |
 | `samples.jsonl` | one row per clone: spawn time, time to healthy, the receive time of each stage marker, error |
 | `clones/<name>.log` | the clone's own output, each line prefixed with ms since its spawn |
 | `host.tsv` | once a second: load average, running and blocked tasks, MemAvailable |
