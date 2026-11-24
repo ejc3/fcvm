@@ -54,9 +54,10 @@ const STOP_GRACE: Duration = Duration::from_secs(30);
 /// How long an fcvm that exited is given for its last lines to be read into its failure.
 const TAIL_WAIT: Duration = Duration::from_millis(100);
 /// How long the ring's VMs have to exit after SIGTERM when the agent stops; what is left is
-/// killed. With [`RING_KILL_WAIT`] it stays well inside the agent unit's 60 s to stop.
+/// killed.
 const RING_STOP_GRACE: Duration = Duration::from_secs(20);
-/// How long a killed ring is given to be gone.
+/// How long a killed ring is given to be gone. The ring's stop returns [`RING_STOP_GRACE`]
+/// plus this after it began, whatever is left: well inside the agent unit's 60 s to stop.
 const RING_KILL_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -223,12 +224,6 @@ impl Player {
 pub(crate) struct Exited(());
 
 impl Exited {
-    /// Stop `vm` and wait for its fcvm to exit: SIGTERM, then SIGKILL after `grace`.
-    async fn of(mut vm: Vm, grace: Duration) -> Exited {
-        vm.stop(grace).await;
-        Exited(())
-    }
-
     /// No fcvm was started, or its exit was awaited where this is called.
     fn none() -> Exited {
         Exited(())
@@ -565,20 +560,21 @@ pub async fn run(
     Ok(())
 }
 
-/// Stop the ring's VMs within the ring's own time: SIGTERM to each at once, SIGKILL to one
-/// that has not exited after `grace`. One stuck player VM must not hold the agent past the
-/// time systemd gives its unit, or systemd kills every VM of the host, the wall's and the
-/// phones' included, without their teardown.
+/// Stop the ring's VMs within the ring's own time. One stuck player VM must not hold the
+/// agent past the time systemd gives its unit, or systemd kills every VM of the host, the
+/// wall's and the phones' included, without their teardown. So the whole stop has one
+/// deadline, `grace` plus `kill_wait` from now, and returns by it whatever is left, naming
+/// by pid the fcvm that had not exited.
 ///
 /// Every fcvm the agent started for the ring ends here, by the agent's own handle on it:
-/// - `vms`, the VMs the players held;
-/// - the VMs of the operations `shutdown` aborted (a wake or a boot in flight), which the
-///   operations hand over instead of dropping;
+/// - `vms`, the VMs the players held, and the VMs of the operations `shutdown` aborted (a
+///   wake or a boot in flight), which those hand over instead of dropping: SIGTERM to each
+///   at once, SIGKILL to one that has not exited after `grace`;
 /// - the saves in flight: each has until `grace` to finish as it would have. One still running
-///   then is aborted, which kills its `fcvm snapshot create`, and its VM gets `kill_wait`
-///   after its SIGTERM before it is killed too.
+///   then is aborted, which kills its `fcvm snapshot create`, and its VM gets half of
+///   `kill_wait` after its SIGTERM before it is killed too.
 ///
-/// Where the ring has a cgroup, whatever is still in it after that is killed through it.
+/// Where the ring has a cgroup, whatever is still in it then is killed through it.
 async fn stop_ring(
     ops: Option<&FcvmOps>,
     vms: Vec<Vm>,
@@ -587,39 +583,73 @@ async fn stop_ring(
     kill_wait: Duration,
 ) {
     let end = tokio::time::Instant::now() + grace;
+    let last = end + kill_wait;
+    let stopping = std::sync::Mutex::new(Vec::new());
+    let all = stop_ring_by(ops, vms, cgroup, end, last, &stopping);
+    tokio::pin!(all);
+    if tokio::time::timeout_at(last, &mut all).await.is_ok() {
+        return;
+    }
+    // before the stops are dropped: a pid is its fcvm's while the handle on it is held
+    let left: Vec<u32> = stopping
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|pid| nix::sys::signal::kill(nix::unistd::Pid::from_raw(*pid as i32), None).is_ok())
+        .collect();
+    tracing::error!(
+        ?left,
+        "potato: the ring was not stopped {:?} after it was told to; the agent goes on without it. \
+         `left` are the fcvm that had not exited, by pid",
+        grace + kill_wait
+    );
+}
+
+/// [`stop_ring`] without its deadline: SIGKILL at `end`, everything gone by `last`. Every
+/// fcvm it is stopping is in `stopping`, by pid.
+async fn stop_ring_by(
+    ops: Option<&FcvmOps>,
+    vms: Vec<Vm>,
+    cgroup: Option<&RingCgroup>,
+    end: tokio::time::Instant,
+    last: tokio::time::Instant,
+    stopping: &std::sync::Mutex<Vec<u32>>,
+) {
+    let until =
+        |at: tokio::time::Instant| at.saturating_duration_since(tokio::time::Instant::now());
+    // when what was only told to stop at `end` is killed
+    let kill_at = end + (last - end) / 2;
     let mut stops = tokio::task::JoinSet::new();
-    let mut stop = |mut vm: Vm, grace: Duration| {
+    let mut stop = |mut vm: Vm, kill_at: tokio::time::Instant| {
+        stopping.lock().unwrap().push(vm.pid);
         stops.spawn(async move {
+            let grace = kill_at.saturating_duration_since(tokio::time::Instant::now());
             vm.stop(grace).await;
         });
     };
     for vm in vms {
-        stop(vm, grace);
+        stop(vm, end);
     }
     if let Some(ops) = ops {
         for vm in ops.end_aborted().await {
-            stop(vm, grace);
+            stop(vm, end);
         }
         for vm in ops.end_saves(end).await {
-            stop(vm, kill_wait);
+            stop(vm, kill_at);
         }
     }
     while stops.join_next().await.is_some() {}
     let Some(cgroup) = cgroup else { return };
-    let left = end.saturating_duration_since(tokio::time::Instant::now());
-    if cgroup.emptied(left).await {
+    if cgroup.emptied(until(kill_at)).await {
         return;
     }
-    tracing::warn!(
-        "potato: processes are left in the ring's cgroup {grace:?} after SIGTERM; killing them"
-    );
+    tracing::warn!("potato: processes are left in the ring's cgroup after SIGTERM; killing them");
     if let Err(e) = cgroup.kill() {
         tracing::warn!(error = %e, "potato: the ring's cgroup could not be killed");
     }
-    if !cgroup.emptied(kill_wait).await {
-        tracing::warn!(
-            "potato: the ring's cgroup is still populated {kill_wait:?} after it was killed"
-        );
+    if !cgroup.emptied(until(last)).await {
+        tracing::warn!("potato: the ring's cgroup is still populated after it was killed");
     }
 }
 
@@ -792,18 +822,49 @@ pub(crate) struct FcvmOps {
     aborted: Arc<std::sync::Mutex<Vec<Vm>>>,
 }
 
-/// A VM an operation holds. An operation that is aborted drops what it holds, and a `Vm`
-/// that is dropped gets a SIGTERM nobody follows: its fcvm can outlive the agent. This hands
-/// the VM to the ring's stop instead, which waits for it and kills it if it has to.
+/// Where the VMs an operation held go when it ends without ending them.
+#[derive(Clone)]
+struct Handover {
+    /// For an operation that was aborted: the ring's stop ends these.
+    aborted: Arc<std::sync::Mutex<Vec<Vm>>>,
+    /// For an operation that panicked: [`FcvmOps::spawn_op`] ends these and fails the
+    /// operation. One list an operation, so each failure waits for its own VM.
+    lost: Arc<std::sync::Mutex<Vec<Vm>>>,
+    /// The operation panicked. Its future is dropped after that is known, and what it still
+    /// holds then goes to `lost` too.
+    panicked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Handover {
+    fn hold(&self, vm: Vm) -> Held {
+        Held {
+            vm: Some(vm),
+            holder: self.clone(),
+        }
+    }
+}
+
+/// A VM an operation holds. An operation that is aborted or panics drops what it holds, and
+/// a `Vm` that is dropped gets a SIGTERM nobody follows: its fcvm can outlive the agent, and
+/// the player's CPU would be counted free with the machine still there. This hands the VM on
+/// instead, to whoever waits for it and kills it if it has to.
 struct Held {
     vm: Option<Vm>,
-    aborted: Arc<std::sync::Mutex<Vec<Vm>>>,
+    holder: Handover,
 }
 
 impl Held {
-    /// The VM, for an operation that ends: it waits for the exit itself, or gives the VM on.
+    /// The VM, for an operation that gives it on running.
     fn into_vm(mut self) -> Vm {
         self.vm.take().expect("a held VM is taken once")
+    }
+
+    /// Stop the VM and wait for its fcvm to exit: SIGTERM, then SIGKILL after `grace`. An
+    /// operation aborted while it waits here still hands the VM on.
+    async fn ended(mut self, grace: Duration) -> Exited {
+        self.stop(grace).await;
+        drop(self.into_vm());
+        Exited(())
     }
 }
 
@@ -822,30 +883,108 @@ impl std::ops::DerefMut for Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        if let Some(vm) = self.vm.take() {
-            self.aborted.lock().unwrap().push(vm);
+        let Some(vm) = self.vm.take() else { return };
+        let panicked = std::thread::panicking()
+            || self
+                .holder
+                .panicked
+                .load(std::sync::atomic::Ordering::SeqCst);
+        let to = if panicked {
+            &self.holder.lost
+        } else {
+            &self.holder.aborted
+        };
+        // a poisoned list still takes the VM: it must not be dropped here
+        to.lock().unwrap_or_else(|e| e.into_inner()).push(vm);
+    }
+}
+
+/// What a panic carried, as text.
+fn panic_text(panic: Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic that carried no text".into())
+}
+
+/// Reap the tasks of `set` that have ended. A panic that reached one is said at error: an
+/// operation's own panic is caught in its task ([`FcvmOps::spawn_op`]) and never gets here.
+fn reap_ended(set: &mut tokio::task::JoinSet<()>) {
+    while let Some(ended) = set.try_join_next() {
+        match ended {
+            Err(panic) if panic.is_panic() => {
+                tracing::error!(%panic, "potato: a task of the ring panicked")
+            }
+            _ => {}
         }
     }
 }
 
 impl FcvmOps {
+    /// A task that holds no VM and ends no operation (telling a player a pace).
     fn spawn(&self, f: impl std::future::Future<Output = ()> + Send + 'static) {
         let mut tasks = self.tasks.lock().unwrap();
-        while tasks.try_join_next().is_some() {}
+        reap_ended(&mut tasks);
         tasks.spawn(f);
     }
 
-    fn spawn_save(&self, f: impl std::future::Future<Output = ()> + Send + 'static) {
-        let mut saves = self.saves.lock().unwrap();
-        while saves.try_join_next().is_some() {}
-        saves.spawn(f);
+    fn holder(&self) -> Handover {
+        Handover {
+            aborted: self.aborted.clone(),
+            lost: Default::default(),
+            panicked: Default::default(),
+        }
     }
 
-    fn hold(&self, vm: Vm) -> Held {
-        Held {
-            vm: Some(vm),
-            aborted: self.aborted.clone(),
-        }
+    /// Run the operation `op`, which reports its own end on `done`. If it panics instead, it
+    /// has reported nothing: the driver would wait for it for ever, its player Booting,
+    /// Waking or Sleeping with a CPU. So the panic is said at error, the VM the operation
+    /// held (through `holder`) is ended as a failure path ends one, and `failed` makes the
+    /// operation's failure, which goes to `done` once that VM is gone.
+    fn spawn_op(
+        &self,
+        save: bool,
+        what: String,
+        holder: Handover,
+        done: mpsc::UnboundedSender<Done>,
+        failed: impl FnOnce(anyhow::Error, Exited) -> Done + Send + 'static,
+        op: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        use futures_util::FutureExt;
+        let task = async move {
+            let mut run = Box::pin(std::panic::AssertUnwindSafe(op).catch_unwind());
+            let Err(panic) = run.as_mut().await else {
+                return;
+            };
+            let panic = panic_text(panic);
+            tracing::error!(operation = %what, %panic,
+                "potato: an operation panicked; ending its VM and failing the operation");
+            // whatever the operation still holds goes to `lost` when its future is dropped
+            holder
+                .panicked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(run);
+            let lost = std::mem::take(&mut *holder.lost.lock().unwrap_or_else(|e| e.into_inner()));
+            // held again, as an operation that has not panicked: if the agent stops while
+            // they are ended here, they go to the ring's stop
+            let again = Handover {
+                aborted: holder.aborted.clone(),
+                lost: Default::default(),
+                panicked: Default::default(),
+            };
+            let held: Vec<Held> = lost.into_iter().map(|vm| again.hold(vm)).collect();
+            for vm in held {
+                vm.ended(STOP_GRACE).await;
+            }
+            let _ = done.send(failed(
+                anyhow::anyhow!("the {what} panicked: {panic}"),
+                Exited::none(),
+            ));
+        };
+        let mut set = if save { &self.saves } else { &self.tasks }.lock().unwrap();
+        reap_ended(&mut set);
+        set.spawn(task);
     }
 
     /// Abort every operation but the saves, wait until they have ended, and return the VMs
@@ -927,107 +1066,120 @@ impl Ops for FcvmOps {
     /// The gold snapshot: an unassigned player, booted and put to sleep.
     fn make_gold(&self, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
-        let aborted = self.aborted.clone();
-        self.spawn(async move {
-            let started = cfg.gold_args().and_then(|args| {
-                let addr: Ipv6Addr =
-                    args[args.iter().position(|a| a == "--ipv6-address").unwrap() + 1].parse()?;
-                let vm = start_vm(&cfg, &args, GOLD)?;
-                Ok((
-                    Held {
-                        vm: Some(vm),
-                        aborted,
-                    },
-                    addr,
-                ))
-            });
-            let (mut gold, addr) = match started {
-                Ok(x) => x,
-                Err(e) => {
-                    let _ = done.send(Done::Gold(Err(e), Exited::none()));
-                    return;
+        let holder = self.holder();
+        let failed = |error, exited| Done::Gold(Err(error), exited);
+        let op = "making of the player snapshot".to_string();
+        self.spawn_op(
+            false,
+            op,
+            holder.clone(),
+            done.clone(),
+            failed,
+            async move {
+                let started = cfg.gold_args().and_then(|args| {
+                    let addr: Ipv6Addr = args
+                        [args.iter().position(|a| a == "--ipv6-address").unwrap() + 1]
+                        .parse()?;
+                    Ok((holder.hold(start_vm(&cfg, &args, GOLD)?), addr))
+                });
+                let (mut gold, addr) = match started {
+                    Ok(x) => x,
+                    Err(e) => {
+                        let _ = done.send(Done::Gold(Err(e), Exited::none()));
+                        return;
+                    }
+                };
+                let listening =
+                    while_running(&mut gold, GOLD, until_listening(addr, BOOT_DEADLINE)).await;
+                let created = async {
+                    listening?;
+                    run_fcvm(
+                        &cfg.fcvm,
+                        &[
+                            "snapshot".into(),
+                            "create".into(),
+                            "--pid".into(),
+                            gold.pid.to_string(),
+                            "--tag".into(),
+                            GOLD.into(),
+                            "--stop".into(),
+                        ],
+                        cfg.cgroup.as_deref(),
+                    )
+                    .await
+                    .map(|_| ())
                 }
-            };
-            let listening =
-                while_running(&mut gold, GOLD, until_listening(addr, BOOT_DEADLINE)).await;
-            let created = async {
-                listening?;
-                run_fcvm(
-                    &cfg.fcvm,
-                    &[
-                        "snapshot".into(),
-                        "create".into(),
-                        "--pid".into(),
-                        gold.pid.to_string(),
-                        "--tag".into(),
-                        GOLD.into(),
-                        "--stop".into(),
-                    ],
-                    cfg.cgroup.as_deref(),
-                )
-                .await
-                .map(|_| ())
-            }
-            .await;
-            let exited = Exited::of(gold.into_vm(), STOP_GRACE).await;
-            let _ = done.send(Done::Gold(created, exited));
-        });
+                .await;
+                let exited = gold.ended(STOP_GRACE).await;
+                let _ = done.send(Done::Gold(created, exited));
+            },
+        );
     }
 
     fn boot(&self, n: u32, colours: u32, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
         let slots = self.boot_slots.clone();
-        let aborted = self.aborted.clone();
-        self.spawn(async move {
-            let r = async {
-                let _slot = slots.acquire().await.map_err(|e| unstarted(e.into()))?;
-                let addr = cfg.prefix.player_address(n).map_err(unstarted)?;
-                let args = cfg.restore_args(GOLD, n).map_err(unstarted)?;
-                let mut vm = Held {
-                    vm: Some(start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?),
-                    aborted,
-                };
-                let assigned = while_running(&mut vm, &PotatoCfg::tag(n), async {
-                    until_listening(addr, BOOT_DEADLINE).await?;
-                    let answer = ask(
-                        addr,
-                        &Inbound::Assign {
-                            player: n,
-                            colours: Some(colours),
-                        },
-                        Duration::from_secs(5),
-                    )
-                    .await?;
-                    if let Err(e) = fleet_potato::Reply::ok(&answer) {
-                        bail!("player {n} refused its number: {e}");
+        let holder = self.holder();
+        let failed = move |error, exited| Done::Booted(n, Err(Failed { error, exited }));
+        let op = format!("boot of player {n}");
+        self.spawn_op(
+            false,
+            op,
+            holder.clone(),
+            done.clone(),
+            failed,
+            async move {
+                let r = async {
+                    let _slot = slots.acquire().await.map_err(|e| unstarted(e.into()))?;
+                    let addr = cfg.prefix.player_address(n).map_err(unstarted)?;
+                    let args = cfg.restore_args(GOLD, n).map_err(unstarted)?;
+                    let mut vm =
+                        holder.hold(start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?);
+                    let assigned = while_running(&mut vm, &PotatoCfg::tag(n), async {
+                        until_listening(addr, BOOT_DEADLINE).await?;
+                        let answer = ask(
+                            addr,
+                            &Inbound::Assign {
+                                player: n,
+                                colours: Some(colours),
+                            },
+                            Duration::from_secs(5),
+                        )
+                        .await?;
+                        if let Err(e) = fleet_potato::Reply::ok(&answer) {
+                            bail!("player {n} refused its number: {e}");
+                        }
+                        Ok(Instant::now())
+                    })
+                    .await;
+                    match assigned {
+                        Ok(at) => Ok(Ready {
+                            vm: Some(vm.into_vm()),
+                            stages: BTreeMap::new(),
+                            at,
+                        }),
+                        // the CPU it held is free only once its fcvm is gone
+                        Err(error) => Err(Failed {
+                            error,
+                            exited: vm.ended(STOP_GRACE).await,
+                        }),
                     }
-                    Ok(Instant::now())
-                })
-                .await;
-                match assigned {
-                    Ok(at) => Ok(Ready {
-                        vm: Some(vm.into_vm()),
-                        stages: BTreeMap::new(),
-                        at,
-                    }),
-                    // the CPU it held is free only once its fcvm is gone
-                    Err(error) => Err(Failed {
-                        error,
-                        exited: Exited::of(vm.into_vm(), STOP_GRACE).await,
-                    }),
                 }
-            }
-            .await;
-            let _ = done.send(Done::Booted(n, r));
-        });
+                .await;
+                let _ = done.send(Done::Booted(n, r));
+            },
+        );
     }
 
     fn sleep(&self, n: u32, vm: Option<Vm>, stop: Option<u64>, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
         let sleep_memory = self.sleep_memory.clone();
+        let holder = self.holder();
         // held from before the save is a task: one aborted before it first runs hands it over too
-        let vm = vm.map(|vm| self.hold(vm));
-        self.spawn_save(async move {
+        let vm = vm.map(|vm| holder.hold(vm));
+        let failed = move |error, exited| Done::Slept(n, Err(error), 0.0, exited);
+        let op = format!("save of player {n}");
+        self.spawn_op(true, op, holder, done.clone(), failed, async move {
             let started = Instant::now();
             if let (Some(round), Ok(addr)) = (stop, cfg.prefix.player_address(n)) {
                 if let Err(e) = ask(addr, &Inbound::Stop { round }, Duration::from_secs(2)).await {
@@ -1068,7 +1220,7 @@ impl Ops for FcvmOps {
                 tracing::warn!(player = n, "potato: a slept player's fcvm had not exited after {REAP_DEADLINE:?}; stopping it");
             }
             // exited already, or stopped now: the player's CPU is free only once it is gone
-            let exited = Exited::of(vm.into_vm(), STOP_GRACE).await;
+            let exited = vm.ended(STOP_GRACE).await;
             let reaped = reap.elapsed();
             let steps = SleepSteps {
                 ask_ms: ms(asked),
@@ -1090,66 +1242,78 @@ impl Ops for FcvmOps {
 
     fn wake(&self, n: u32, round: Option<u64>, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
-        let aborted = self.aborted.clone();
-        self.spawn(async move {
-            let started = Instant::now();
-            let r = async {
-                let args = cfg.restore_args(&PotatoCfg::tag(n), n).map_err(unstarted)?;
-                let addr = cfg.prefix.player_address(n).map_err(unstarted)?;
-                let mut vm = Held {
-                    vm: Some(start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?),
-                    aborted,
-                };
-                let listening = while_running(&mut vm, &PotatoCfg::tag(n), async {
-                    let probed = until_listening(addr, WAKE_DEADLINE).await?;
-                    // it catches only once told it woke: a report connection can fail for other
-                    // reasons, and a probe answers before the gate's last half opens
-                    let answer = ask(addr, &Inbound::Wake { round }, Duration::from_secs(5))
-                        .await
-                        .with_context(|| {
-                            format!(
+        let holder = self.holder();
+        let failed = move |error, exited| Done::Woke(n, Err(Failed { error, exited }), 0.0);
+        let op = format!("wake of player {n}");
+        self.spawn_op(
+            false,
+            op,
+            holder.clone(),
+            done.clone(),
+            failed,
+            async move {
+                let started = Instant::now();
+                let r = async {
+                    let args = cfg.restore_args(&PotatoCfg::tag(n), n).map_err(unstarted)?;
+                    let addr = cfg.prefix.player_address(n).map_err(unstarted)?;
+                    let mut vm =
+                        holder.hold(start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?);
+                    let listening = while_running(&mut vm, &PotatoCfg::tag(n), async {
+                        let probed = until_listening(addr, WAKE_DEADLINE).await?;
+                        // it catches only once told it woke: a report connection can fail for other
+                        // reasons, and a probe answers before the gate's last half opens
+                        let answer = ask(addr, &Inbound::Wake { round }, Duration::from_secs(5))
+                            .await
+                            .with_context(|| {
+                                format!(
                                 "the wake message, {:.1} ms after the ball port answered a probe",
                                 ms(probed.elapsed())
                             )
-                        })?;
-                    if let Err(e) = fleet_potato::Reply::ok(&answer) {
-                        bail!("player {n} refused its wake: {e}");
-                    }
-                    Ok(Instant::now())
-                })
-                .await;
-                match listening {
-                    Ok(at) => {
-                        let mut stages = BTreeMap::new();
-                        if let Some(r) = vm.restored() {
-                            stages
-                                .insert("restore_ms".to_string(), ms(r.at.duration_since(started)));
-                            if let Some(a) = r.ack_ms {
-                                stages.insert("ack_ms".to_string(), a as f64);
-                            }
+                            })?;
+                        if let Err(e) = fleet_potato::Reply::ok(&answer) {
+                            bail!("player {n} refused its wake: {e}");
                         }
-                        stages.insert("listen_ms".to_string(), ms(at.duration_since(started)));
-                        Ok(Ready {
-                            vm: Some(vm.into_vm()),
-                            stages,
-                            at,
-                        })
+                        Ok(Instant::now())
+                    })
+                    .await;
+                    match listening {
+                        Ok(at) => {
+                            let mut stages = BTreeMap::new();
+                            if let Some(r) = vm.restored() {
+                                stages.insert(
+                                    "restore_ms".to_string(),
+                                    ms(r.at.duration_since(started)),
+                                );
+                                if let Some(a) = r.ack_ms {
+                                    stages.insert("ack_ms".to_string(), a as f64);
+                                }
+                            }
+                            stages.insert("listen_ms".to_string(), ms(at.duration_since(started)));
+                            Ok(Ready {
+                                vm: Some(vm.into_vm()),
+                                stages,
+                                at,
+                            })
+                        }
+                        // the CPU it held is free only once its fcvm is gone
+                        Err(error) => Err(Failed {
+                            error,
+                            exited: vm.ended(STOP_GRACE).await,
+                        }),
                     }
-                    // the CPU it held is free only once its fcvm is gone
-                    Err(error) => Err(Failed {
-                        error,
-                        exited: Exited::of(vm.into_vm(), STOP_GRACE).await,
-                    }),
                 }
-            }
-            .await;
-            let _ = done.send(Done::Woke(n, r, ms(started.elapsed())));
-        });
+                .await;
+                let _ = done.send(Done::Woke(n, r, ms(started.elapsed())));
+            },
+        );
     }
 
     fn kick(&self, o: PotatoRound, done: mpsc::UnboundedSender<Done>) {
         let cfg = self.cfg.clone();
-        self.spawn(async move {
+        let round = o.round;
+        let failed = move |error, _exited| Done::Kicked(round, Err(error));
+        let op = format!("first throw of round {round}");
+        self.spawn_op(false, op, self.holder(), done.clone(), failed, async move {
             let r = async {
                 let ring = o
                     .ring
@@ -3204,10 +3368,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&killed).unwrap(), "1");
     }
 
-    /// The agent tells the ring to stop before the slots and waits for it after them, so the
-    /// ring's wait does not come out of the time the slots' VMs have to stop in.
+    /// The agent tells the ring to stop before the slots, and waits for every mode at once:
+    /// the slots, the ring, the sandboxes and the servers. No mode's wait comes out of
+    /// another's time to stop in.
     #[test]
-    fn the_ring_is_waited_for_after_the_slots_are_told_to_stop() {
+    fn every_mode_is_told_to_stop_before_any_is_waited_for() {
         let agent = include_str!("mod.rs");
         let at = |what: &str| {
             agent
@@ -3216,14 +3381,176 @@ mod tests {
         };
         let told = at("drop(potato_tx);");
         let slots_told = at("\"coordinator closed the connection; stopping every VM\"");
-        let slots_waited = at("for t in retired {");
-        let ring_waited = at("if let Some(t) = potato_task {");
         assert!(told < slots_told, "the ring is told first");
-        assert!(
-            slots_told < ring_waited,
-            "and waited for once the slots are told"
+        let after = &agent[slots_told..];
+        let joined = &after[after
+            .find("tokio::join!(")
+            .expect("the modes' stops are awaited together")..];
+        let joined = &joined[..joined.find(");").unwrap()];
+        for mode in [
+            "slots_stopped",
+            "ring_stopped",
+            "sandboxes_stopped",
+            "servers_stopped",
+        ] {
+            assert!(
+                joined.contains(mode),
+                "{mode} is not awaited with the others"
+            );
+        }
+        for sequential in [
+            "w.stop().await;\n    }\n    if",
+            "let _ = t.await;\n    }\n    if",
+        ] {
+            assert!(
+                !after.contains(sequential),
+                "a mode is waited for before the next is told"
+            );
+        }
+    }
+
+    /// An operation that panics has reported nothing: its player would stay Booting, Waking
+    /// or Sleeping with a CPU for ever, and its VM would run on. Its VM is ended, and then the
+    /// operation fails as any other does: the player is lost, its CPU is back, and the next
+    /// round restores it from the gold.
+    #[tokio::test]
+    async fn an_operation_that_panics_is_failed_once_its_vm_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = fake_fcvm(dir.path(), "exit 0", "exit 0");
+        // slow to stop: 0.3 s after SIGTERM, taking its own child with it
+        let slow = "trap 'sleep 0.3; kill $!; exit 0' TERM; sleep 30 & wait";
+        let vm = Vm::spawn_args(
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), slow.to_string()],
+            "test",
+        )
+        .unwrap();
+        let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
+        // let the shell install its trap
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let holder = ops.holder();
+        let held = holder.hold(vm);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let failed = |error, exited| Done::Woke(1, Err(Failed { error, exited }), 0.0);
+        ops.spawn_op(
+            false,
+            "wake of player 1".into(),
+            holder,
+            tx,
+            failed,
+            async move {
+                let _vm = held;
+                tokio::task::yield_now().await;
+                panic!("the port answered nonsense");
+            },
         );
-        assert!(slots_waited < ring_waited);
+        let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("an operation that panicked still ends")
+            .unwrap();
+        assert!(gone(pid), "its VM is gone when its failure is reported");
+        let Done::Woke(1, Err(wake), _) = &done else {
+            panic!("the panic is not the wake's failure");
+        };
+        let error = format!("{:#}", wake.error);
+        assert!(
+            error.contains("wake of player 1 panicked: the port answered nonsense"),
+            "{error}"
+        );
+        // the driver takes it as any failed wake
+        let (mut d, rec, _out) = asleep(2, 300.0);
+        d.order(Some(round(1, vec![0, 1], 1000)));
+        d.done(Done::Woke(0, Ok(ready()), 300.0));
+        d.heard(caught(0, 1, 0));
+        assert_eq!(d.players[1].phase, Phase::Waking);
+        assert!(d.cpus.holds(Holder::Player(1)));
+        d.done(done);
+        assert_eq!(d.players[1].phase, Phase::Missing);
+        assert!(!d.cpus.holds(Holder::Player(1)), "its CPU is back");
+        d.order(None);
+        rec.take();
+        d.order(Some(round(2, vec![0, 1], 1000)));
+        let next = rec.take();
+        assert!(
+            next.contains(&"boot 1".to_string()),
+            "the game goes on: {next:?}"
+        );
+    }
+
+    /// An operation aborted while it ends a VM (a wake that failed, as the agent stops) hands
+    /// the VM to the ring's stop like any other it held.
+    #[tokio::test]
+    async fn an_operation_aborted_while_it_ends_its_vm_hands_the_vm_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = fake_fcvm(dir.path(), "exit 0", "exit 0");
+        let vm = Vm::spawn_args(
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), "trap '' TERM; exec sleep 30".to_string()],
+            "test",
+        )
+        .unwrap();
+        let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
+        // let the shell ignore the signal and become the sleep
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let held = ops.holder().hold(vm);
+        let ending = tokio::spawn(async move {
+            held.ended(Duration::from_secs(60)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ending.abort();
+        let _ = ending.await;
+        assert!(!gone(pid));
+        assert_eq!(
+            ops.aborted.lock().unwrap().len(),
+            1,
+            "the VM is the ring's stop's to end"
+        );
+        stop_ring(
+            Some(&ops),
+            Vec::new(),
+            None,
+            Duration::from_millis(300),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(gone(pid));
+    }
+
+    /// The ring's stop returns by its one deadline, the grace and the wait after the kill,
+    /// whatever has not ended: here a save that never comes back to the runtime, so aborting
+    /// it does nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_rings_stop_returns_by_its_deadline_whatever_is_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = fake_fcvm(dir.path(), "exit 0", "exit 0");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let failed = |error, exited| Done::Slept(0, Err(error), 0.0, exited);
+        ops.spawn_op(
+            true,
+            "save of player 0".into(),
+            ops.holder(),
+            tx,
+            failed,
+            async {
+                std::thread::sleep(Duration::from_secs(3));
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        stop_ring(
+            Some(&ops),
+            Vec::new(),
+            None,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        )
+        .await;
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(400), "{took:?}");
+        assert!(
+            took < Duration::from_millis(1500),
+            "the stop waited for the stuck save: {took:?}"
+        );
     }
 
     /// A wake that did not wait says nothing of a wait, and a dropped ball names how long the
@@ -3460,7 +3787,8 @@ mod tests {
         let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
         // let the shell install its trap
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let _exited: Exited = Exited::of(vm, Duration::from_secs(10)).await;
+        let ops = fake_fcvm(tempfile::tempdir().unwrap().path(), "exit 0", "exit 0");
+        let _exited: Exited = ops.holder().hold(vm).ended(Duration::from_secs(10)).await;
         assert_eq!(
             nix::sys::signal::kill(pid, None),
             Err(nix::errno::Errno::ESRCH),

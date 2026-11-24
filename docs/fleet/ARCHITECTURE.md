@@ -2208,18 +2208,26 @@ machines those K serve: N / K machines per CPU.
   snapshot and is booted again in the middle of a round, and a boot can hold its CPU for as
   long as a restore is given. After the first throw a boot takes a CPU only if another
   stays free for the next wake. Before the first throw the boots take every CPU.
-- **When the agent stops** it tells the ring to stop first and waits for it last, after the
-  slots have been told too, so the ring's wait does not come out of the time the wall's and
-  the phones' VMs have to stop in. The ring stops within its own time, and every fcvm the
-  agent started for it ends by the agent's own handle on it: SIGTERM to every player's VM at
-  once and SIGKILL after 20 s to one that has not exited; the same for the VM of a wake or
-  a boot that was in flight, which the aborted operation hands over instead of dropping; a
-  save in flight has those 20 s to finish as it would have, and one still running then has
-  its `fcvm snapshot create` killed and its VM killed 5 s after its SIGTERM. Where the ring
-  has a cgroup, `cgroup.kill` follows for whatever is still in it, with 5 s for it to be
-  gone. That is inside the unit's 60 s. An operation that is aborted used to drop its VM
-  with a SIGTERM nobody followed, and its `fcvm snapshot create` ran on: without a cgroup
-  an fcvm could outlive the agent.
+- **When the agent stops** it tells the ring to stop first and then waits for every mode at
+  once (the slots, the ring, the sandboxes and the servers), so no mode's wait comes out of
+  another's time to stop in. The ring stops within its own time, and every fcvm the agent
+  started for it ends by the agent's own handle on it: SIGTERM to every player's VM at once
+  and SIGKILL after 20 s to one that has not exited; the same for the VM of a wake or a boot
+  that was in flight, which the aborted operation hands over instead of dropping; a save in
+  flight has those 20 s to finish as it would have, and one still running then has its
+  `fcvm snapshot create` killed and its VM killed 2.5 s after its SIGTERM. Where the ring
+  has a cgroup, `cgroup.kill` follows for whatever is still in it. The whole stop has one
+  deadline, 25 s after it began: it returns then whatever is left, naming by pid at error
+  the fcvm that had not exited. That is inside the unit's 60 s. An operation that is aborted
+  used to drop its VM with a SIGTERM nobody followed, and its `fcvm snapshot create` ran on:
+  without a cgroup an fcvm could outlive the agent.
+- **An operation that panics fails.** A panic in a boot, a wake, a save, the making of the
+  gold or a first throw is caught in the operation's task and said at error. The VM the
+  operation held is ended as a failed operation ends one (SIGTERM, SIGKILL after 30 s, and
+  its exit awaited), and only then is the operation reported failed, so the player goes
+  missing, its CPU comes back with the machine gone, and the next round restores it from
+  the gold. A panic used to leave the player Booting, Waking or Sleeping with a CPU for as
+  long as the agent ran, with nothing in the log.
 
 ### Components
 
