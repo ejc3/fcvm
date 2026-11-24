@@ -22,7 +22,7 @@
       "start_floor_ms": 250
     }
   },
-  "description": "Potato mode (docs/fleet/ARCHITECTURE.md, \"Potato mode\"): a host with players starts the ladder at its smallest size; catches step each player's colour, counter and chain and the coordinator checks every step; a lap completed sets the size's record; a wrong colour drops the ball as a proof mismatch; a catcher still waking drops it with the late stage and its time, and the time it did start accepting; each drop moves up the ladder, which wraps to the smallest size; faster and restart are rate limited; the ladder and its records stay when the host goes.",
+  "description": "Potato mode (docs/fleet/ARCHITECTURE.md, \"Potato mode\"): a host with players starts the ladder at its smallest size; catches step each player's colour, counter and chain and the coordinator checks every step; a lap completed sets the size's record, the pace measured over it; a wrong colour drops the ball as a proof mismatch; a catcher still waking drops it with the late stage and its time, and the time it did start accepting; each drop moves up the ladder, which wraps to the smallest size; faster and restart are rate limited; the ladder and its records stay when the host goes.",
   "events": [
     {
       "at": 1000,
@@ -375,11 +375,13 @@
       "checks": {
         "/view/potato/capacity": 4,
         "/view/potato/host": "h1",
+        "/view/potato/ladder/1/size": 4,
+        "/view/potato/ladder/2": null,
         "/view/potato/next_round_at": 2000,
         "/view/potato/round": null,
         "/view/potato/size": 2
       },
-      "note": "a host with players: the ladder for its size, the first round a second later"
+      "note": "a host with players: the ladder of the sizes it runs, the first round a second later"
     },
     {
       "after": 4,
@@ -455,8 +457,10 @@
       "after": 13,
       "checks": {
         "/view/potato/ladder/0/broke/reason": "proof",
-        "/view/potato/ladder/0/record_hold_ms": 2000,
+        "/view/potato/ladder/0/record_pace": 0.5,
+        "/view/potato/ladder/0/record_prev_pace": null,
         "/view/potato/ladder/0/rounds": 1,
+        "/view/potato/last_drop/cause": "proof",
         "/view/potato/last_drop/player": 1,
         "/view/potato/last_drop/reason": "proof",
         "/view/potato/last_drop/seq": 3,
@@ -465,7 +469,7 @@
         "/view/potato/round": null,
         "/view/potato/size": 4
       },
-      "note": "a catch with the wrong colour drops the ball as a proof mismatch, keeps the size's record, and moves up the ladder"
+      "note": "a catch with the wrong colour drops the ball as a proof mismatch, keeps the size's record (the pace of its completed lap), and moves up the ladder"
     },
     {
       "after": 14,
@@ -511,7 +515,9 @@
       "after": 23,
       "checks": {
         "/view/potato/ladder/1/broke/reason": "not_listening",
-        "/view/potato/ladder/1/record_hold_ms": null,
+        "/view/potato/ladder/1/record_pace": null,
+        "/view/potato/last_drop/cause": "waking",
+        "/view/potato/last_drop/cause_ms": null,
         "/view/potato/last_drop/hold_ms": 533,
         "/view/potato/last_drop/player": 1,
         "/view/potato/last_drop/reason": "not_listening",
@@ -528,7 +534,9 @@
     {
       "after": 24,
       "checks": {
+        "/view/potato/ladder/1/broke/cause_ms": 84.0,
         "/view/potato/ladder/1/broke/listening_after_ms": 84.0,
+        "/view/potato/last_drop/cause_ms": 84.0,
         "/view/potato/last_drop/listening_after_ms": 84.0
       },
       "note": "when the catcher did start accepting"
@@ -539,7 +547,7 @@
         "/view/potato/round/id": 3,
         "/view/potato/round/size": 2
       },
-      "note": "after 96 the ladder starts again at 2; here the host runs 4, so after 4 comes 2"
+      "note": "after the largest size the ladder starts again at the smallest; the host runs 4, so after 4 comes 2"
     },
     {
       "after": 26,
@@ -556,7 +564,7 @@
       "checks": {
         "/view/potato/capacity": 0,
         "/view/potato/host": null,
-        "/view/potato/ladder/0/record_hold_ms": 2000,
+        "/view/potato/ladder/0/record_pace": 0.5,
         "/view/potato/players": []
       },
       "note": "the host goes: no players, the ladder stays"
@@ -709,10 +717,13 @@
         {
           "broke": {
             "at": 7901,
+            "cause": "proof",
+            "cause_ms": null,
             "detail": "caught with colour 10 where 9 was due",
             "hold_ms": 1800,
             "lap": 1,
             "listening_after_ms": null,
+            "pace": 0.5,
             "player": 1,
             "reason": "proof",
             "round": 1,
@@ -724,18 +735,22 @@
             "thrower": null,
             "wake_stages": {}
           },
-          "record_at": 4101,
-          "record_hold_ms": 2000,
+          "record_pace": 0.5,
+          "record_pace_at": 4101,
+          "record_prev_pace": null,
           "rounds": 1,
           "size": 2
         },
         {
           "broke": {
             "at": 14400,
+            "cause": "waking",
+            "cause_ms": 84.0,
             "detail": "player 1 was waking when player 0 threw (2 tries in 100 ms: connection timed out)",
             "hold_ms": 533,
             "lap": 0,
             "listening_after_ms": 84.0,
+            "pace": null,
             "player": 1,
             "reason": "not_listening",
             "round": 2,
@@ -749,53 +764,22 @@
             "thrower": 0,
             "wake_stages": {}
           },
-          "record_at": null,
-          "record_hold_ms": null,
+          "record_pace": null,
+          "record_pace_at": null,
+          "record_prev_pace": null,
           "rounds": 1,
           "size": 4
-        },
-        {
-          "broke": null,
-          "record_at": null,
-          "record_hold_ms": null,
-          "rounds": 0,
-          "size": 8
-        },
-        {
-          "broke": null,
-          "record_at": null,
-          "record_hold_ms": null,
-          "rounds": 0,
-          "size": 16
-        },
-        {
-          "broke": null,
-          "record_at": null,
-          "record_hold_ms": null,
-          "rounds": 0,
-          "size": 32
-        },
-        {
-          "broke": null,
-          "record_at": null,
-          "record_hold_ms": null,
-          "rounds": 0,
-          "size": 64
-        },
-        {
-          "broke": null,
-          "record_at": null,
-          "record_hold_ms": null,
-          "rounds": 0,
-          "size": 96
         }
       ],
       "last_drop": {
         "at": 14400,
+        "cause": "waking",
+        "cause_ms": 84.0,
         "detail": "player 1 was waking when player 0 threw (2 tries in 100 ms: connection timed out)",
         "hold_ms": 533,
         "lap": 0,
         "listening_after_ms": 84.0,
+        "pace": null,
         "player": 1,
         "reason": "not_listening",
         "round": 2,

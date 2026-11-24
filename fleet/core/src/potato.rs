@@ -226,19 +226,51 @@ impl PotatoConfig {
     }
 }
 
-/// One size of the ladder. `record_hold_ms` is the shortest hold of a lap a round of this
-/// size completed, ever; `broke` is what ended its latest round.
+/// One size of the ladder. `record_pace` is the fastest measured pace, in catches per second,
+/// a round of this size held for one full lap; `broke` is what ended its latest round.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rung {
     pub size: u32,
     #[serde(default)]
-    pub record_hold_ms: Option<u64>,
+    pub record_pace: Option<f64>,
     #[serde(default)]
-    pub record_at: Option<u64>,
+    pub record_pace_at: Option<u64>,
+    /// The record `record_pace` replaced; none until a record of this size has been beaten.
+    #[serde(default)]
+    pub record_prev_pace: Option<f64>,
     #[serde(default)]
     pub broke: Option<Drop>,
     #[serde(default)]
     pub rounds: u64,
+    /// The hold the ball carried when it last dropped for want of a catcher, for each of this
+    /// size's latest rounds that ended so, oldest first, at most [`DROPS_KEPT`]: where the
+    /// next round of the size starts from.
+    #[serde(default)]
+    pub drop_holds: Vec<u64>,
+}
+
+/// The drops of a size its next start is computed from.
+pub const DROPS_KEPT: usize = 5;
+
+impl Rung {
+    fn new(size: u32) -> Self {
+        Rung {
+            size,
+            ..Rung::default()
+        }
+    }
+
+    /// The median hold of the size's recent drops.
+    fn edge_hold_ms(&self) -> Option<u64> {
+        let mut holds = self.drop_holds.clone();
+        holds.sort_unstable();
+        let mid = holds.len().checked_sub(1)? / 2;
+        Some(if holds.len() % 2 == 1 {
+            holds[mid]
+        } else {
+            (holds[mid] + holds[mid + 1]).div_ceil(2)
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -282,6 +314,20 @@ pub struct Drop {
     /// When the catcher of a dropped ball did start accepting, ms after the drop.
     #[serde(default)]
     pub listening_after_ms: Option<f64>,
+    /// What was measured to be the cause: `waking` (the catcher's wake had started and not
+    /// finished), `cpu_wait` (its wake was waiting for a free CPU), `saving` (it was still
+    /// going to sleep from its last throw) or `proof`. None for anything else; `reason` says
+    /// what ended the round.
+    #[serde(default)]
+    pub cause: Option<String>,
+    /// The cause's measurement, ms: for `waking` how long after the drop the catcher accepted
+    /// (none until the agent reports it), for `cpu_wait` how long the wake had waited, for
+    /// `saving` how long the save had run.
+    #[serde(default)]
+    pub cause_ms: Option<f64>,
+    /// The pace of the last completed lap when the ball dropped.
+    #[serde(default)]
+    pub pace: Option<f64>,
     /// The catcher's last sleep and wake, split into stages, ms.
     #[serde(default)]
     pub sleep_stages: BTreeMap<String, f64>,
@@ -386,6 +432,9 @@ pub struct Round {
     /// behind a completed lap, and at the last catch of the latest completed lap.
     #[serde(default)]
     pub cpu_marks: BTreeMap<u64, (u64, u64)>,
+    /// A lap of this round has beaten its size's record.
+    #[serde(default)]
+    pub beat_record: bool,
 }
 
 /// The laps of a round the view keeps.
@@ -485,10 +534,29 @@ impl Round {
 /// the players and the host do not, because no agent connection survives one.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Potato {
+    /// The ladder being played: one rung for each of `sizes`, and any earlier size of the
+    /// same allotment, kept for its record.
     #[serde(default)]
     pub ladder: Vec<Rung>,
+    /// The sizes the ladder is played over, smallest first, derived from the potato host's
+    /// allotment and players when it says hello.
     #[serde(default)]
-    pub rung: usize,
+    pub sizes: Vec<u32>,
+    /// The size being played, or the next one.
+    #[serde(default)]
+    pub next_size: Option<u32>,
+    /// Where a coordinator before `next_size` kept its place: an index into its ladder. Read
+    /// once, by `resumed`, and never written.
+    #[serde(default, rename = "rung", skip_serializing)]
+    pub old_rung: usize,
+    /// The ladders played under other allotments, by allotment (0: an agent that reports
+    /// none). A record is a pace on K CPUs, so a host with another K gets its own ladder
+    /// and does not erase this one.
+    #[serde(default)]
+    pub shelved: BTreeMap<u32, Vec<Rung>>,
+    /// The sizes that have played a round since the potato host connected.
+    #[serde(default)]
+    pub played: std::collections::BTreeSet<u32>,
     #[serde(default)]
     pub records: Records,
     #[serde(default)]
@@ -526,37 +594,89 @@ pub enum PotatoIntent {
 }
 
 impl Potato {
-    /// The ladder for `cfg`, keeping every size's record.
-    fn ensure_ladder(&mut self, cfg: &PotatoConfig) {
-        for size in &cfg.sizes {
-            if !self.ladder.iter().any(|r| r.size == *size) {
-                self.ladder.push(Rung {
-                    size: *size,
-                    ..Rung::default()
-                });
+    /// The ladder's sizes for a host. With an allotment of K CPUs: 2K, doubling while below
+    /// the host's players, then the players themselves (K = 8 and 96 players: 16, 32, 64,
+    /// 96). A size of K or fewer can have nothing asleep, so the doubling starts above it;
+    /// the players are the top rung whatever their number. Without an allotment: the
+    /// configured sizes the host can run.
+    pub fn sizes_for(cpus: Option<u32>, players: u32, cfg: &PotatoConfig) -> Vec<u32> {
+        match cpus {
+            Some(k) => {
+                let mut sizes = Vec::new();
+                let mut size = 2 * u64::from(k);
+                while size < u64::from(players) {
+                    sizes.push(size as u32);
+                    size *= 2;
+                }
+                sizes.push(players);
+                sizes
             }
-        }
-        self.ladder.sort_by_key(|r| r.size);
-        if self.rung >= self.ladder.len() {
-            self.rung = 0;
+            None => cfg
+                .sizes
+                .iter()
+                .copied()
+                .filter(|s| *s <= players)
+                .collect(),
         }
     }
 
-    /// The first rung from `from` on (wrapping) whose size the host runs; `from` itself,
-    /// wrapped, when no host is connected.
-    fn next_rung(&self, from: usize) -> usize {
-        let n = self.ladder.len();
-        if n == 0 {
-            return 0;
+    /// The size after `size` on the ladder; after the last, the first.
+    fn size_after(&self, size: u32) -> Option<u32> {
+        self.sizes
+            .iter()
+            .find(|s| **s > size)
+            .or(self.sizes.first())
+            .copied()
+    }
+
+    /// The hold a round of `size` starts at: near where the size's recent rounds dropped the
+    /// ball. 1.5 times the median hold of those drops for its first round since the host
+    /// connected, 1.25 times for its later ones, and the configured start while the size has
+    /// dropped no ball.
+    fn start_hold_ms(&self, size: u32, cfg: &PotatoConfig) -> u64 {
+        let edge = self
+            .ladder
+            .iter()
+            .find(|r| r.size == size)
+            .and_then(Rung::edge_hold_ms);
+        let Some(edge) = edge else {
+            return cfg.start_hold_ms(size);
+        };
+        let (num, den) = if self.played.contains(&size) {
+            (5, 4)
+        } else {
+            (3, 2)
+        };
+        (edge * num).div_ceil(den).max(cfg.min_hold_ms)
+    }
+
+    /// Name the measured cause of the drop that just ended a round.
+    fn drop_cause(&mut self, cause: &str, cause_ms: Option<f64>) {
+        let Some(d) = self.last_drop.as_mut() else {
+            return;
+        };
+        d.cause = Some(cause.into());
+        d.cause_ms = cause_ms;
+        let round = d.round;
+        if let Some(b) = self
+            .ladder
+            .iter_mut()
+            .filter_map(|g| g.broke.as_mut())
+            .find(|b| b.round == round)
+        {
+            b.cause = Some(cause.into());
+            b.cause_ms = cause_ms;
         }
-        (0..n)
-            .map(|k| (from + k) % n)
-            .find(|i| self.capacity == 0 || self.ladder[*i].size <= self.capacity)
-            .unwrap_or(from % n)
     }
 
     /// A restarted coordinator: no agent is connected yet, so no round, players or host.
     pub fn resumed(&mut self) {
+        // a state file from before `next_size` names its place by index
+        if self.next_size.is_none() {
+            self.next_size = self.ladder.get(self.old_rung).map(|r| r.size);
+        }
+        self.old_rung = 0;
+        self.played.clear();
         self.round = None;
         self.players.clear();
         self.host = None;
@@ -588,11 +708,27 @@ impl Potato {
         if self.host.is_some() {
             self.end_quietly();
         }
-        self.ensure_ladder(cfg);
+        let cpus = (cpus > 0).then_some(cpus);
+        if cpus != self.cpus {
+            // another allotment: this ladder is put away, and that one's brought back
+            let ladder = std::mem::take(&mut self.ladder);
+            if !ladder.is_empty() {
+                self.shelved.insert(self.cpus.unwrap_or(0), ladder);
+            }
+            self.ladder = self.shelved.remove(&cpus.unwrap_or(0)).unwrap_or_default();
+        }
+        self.cpus = cpus;
+        self.confined = self.cpus.map(|_| confined);
+        self.sizes = Self::sizes_for(cpus, players, cfg);
+        for size in &self.sizes {
+            if !self.ladder.iter().any(|r| r.size == *size) {
+                self.ladder.push(Rung::new(*size));
+            }
+        }
+        self.ladder.sort_by_key(|r| r.size);
+        self.played.clear();
         self.host = Some(host.to_string());
         self.capacity = players;
-        self.cpus = (cpus > 0).then_some(cpus);
-        self.confined = self.cpus.map(|_| confined);
         self.players.clear();
         self.next_round_at = Some(at + 1000);
     }
@@ -606,7 +742,7 @@ impl Potato {
         }
         if let Some(r) = &self.round {
             let seq = r.seq.unwrap_or(0);
-            let rung = self.rung;
+            let size = r.size;
             self.drop_ball(
                 at,
                 "host_gone",
@@ -618,7 +754,7 @@ impl Potato {
                 "the host running the players disconnected".into(),
                 cfg,
             );
-            self.rung = rung;
+            self.next_size = Some(size);
         }
         self.round = None;
         self.players.clear();
@@ -691,24 +827,23 @@ impl Potato {
         if !due || !awake || self.host.is_none() || self.capacity < 2 {
             return;
         }
-        self.ensure_ladder(cfg);
-        // the next size this host can run
-        let n = self.ladder.len();
-        let Some(i) = (0..n)
-            .map(|k| (self.rung + k) % n)
-            .find(|i| self.ladder[*i].size <= self.capacity)
-        else {
+        // the size the ladder is at, or the next one this host runs
+        let at_or_after = self
+            .next_size
+            .and_then(|next| self.sizes.iter().find(|s| **s >= next));
+        let Some(size) = at_or_after.or(self.sizes.first()).copied() else {
             return;
         };
-        self.rung = i;
-        let size = self.ladder[i].size;
+        self.next_size = Some(size);
+        let start_hold_ms = self.start_hold_ms(size, cfg);
+        self.played.insert(size);
         self.round_count += 1;
         self.round = Some(Round {
             id: self.round_count,
             size,
             ring: (0..size).collect(),
             started_at: at,
-            start_hold_ms: cfg.start_hold_ms(size),
+            start_hold_ms,
             shrink_permille: cfg.shrink_permille,
             min_hold_ms: cfg.min_hold_ms,
             flight_ms: cfg.flight_ms,
@@ -729,6 +864,7 @@ impl Potato {
             ring_stats: None,
             lap_cpus_peak: BTreeMap::new(),
             cpu_marks: BTreeMap::new(),
+            beat_record: false,
         });
         self.next_round_at = None;
     }
@@ -764,19 +900,23 @@ impl Potato {
             stage: stage.into(),
             stage_ms,
             listening_after_ms: None,
+            cause: (reason == "proof").then(|| "proof".into()),
+            cause_ms: None,
+            pace: r.laps.last().map(|l| l.pace),
             sleep_stages,
             wake_stages,
             detail,
         };
         if let Some(rung) = self.ladder.iter_mut().find(|g| g.size == r.size) {
             rung.rounds += 1;
-            rung.broke = Some(d.clone());
-            if let Some(h) = r.best_lap_hold_ms {
-                if rung.record_hold_ms.is_none_or(|old| h < old) {
-                    rung.record_hold_ms = Some(h);
-                    rung.record_at = Some(at);
+            // where the pace outran the wakes: the next round of the size starts near it
+            if reason == "not_listening" {
+                rung.drop_holds.push(d.hold_ms);
+                while rung.drop_holds.len() > DROPS_KEPT {
+                    rung.drop_holds.remove(0);
                 }
             }
+            rung.broke = Some(d.clone());
         }
         let catches = r.verified_through.map_or(0, |s| s + 1);
         if catches > 0
@@ -794,8 +934,8 @@ impl Potato {
             });
         }
         self.last_drop = Some(d);
-        // up the ladder to the next size the host runs; after the last, back to the first
-        self.rung = self.next_rung(self.rung + 1);
+        // up the ladder to the next size; after the last, back to the first
+        self.next_size = self.size_after(r.size);
         self.next_round_at = Some(at + cfg.restart_after_ms);
     }
 
@@ -1004,10 +1144,17 @@ impl Potato {
                     // a size's record is acknowledged as soon as the lap is: it stays in the
                     // state file even if the coordinator restarts before the ball drops
                     let size = r.size;
-                    if let Some(rung) = self.ladder.iter_mut().find(|g| g.size == size) {
-                        if rung.record_hold_ms.is_none_or(|old| h < old) {
-                            rung.record_hold_ms = Some(h);
-                            rung.record_at = Some(at);
+                    let rung = self.ladder.iter_mut().find(|g| g.size == size);
+                    if let (Some(pace), Some(rung)) = (pace, rung) {
+                        if rung.record_pace.is_none_or(|old| pace > old) {
+                            // what this round beat is the record that stood when it began,
+                            // not its own earlier laps
+                            if !r.beat_record {
+                                rung.record_prev_pace = rung.record_pace;
+                                r.beat_record = true;
+                            }
+                            rung.record_pace = Some(pace);
+                            rung.record_pace_at = Some(at);
                         }
                     }
                 }
@@ -1045,7 +1192,7 @@ impl Potato {
                 catcher_phase_ms,
                 reason,
                 attempts,
-                ..
+                catcher_cpu_wait_ms,
             } => {
                 if self.round.as_ref().is_some_and(|r| r.id == *round) {
                     let detail = format!(
@@ -1064,6 +1211,14 @@ impl Potato {
                         detail,
                         cfg,
                     );
+                    // the cause, from what the agent measured of the catcher
+                    match (catcher_cpu_wait_ms, catcher_phase.as_str()) {
+                        (Some(waited), _) => self.drop_cause("cpu_wait", Some(*waited)),
+                        // how late it was arrives with the agent's `listening`
+                        (None, "waking") => self.drop_cause("waking", None),
+                        (None, "sleeping") => self.drop_cause("saving", Some(*catcher_phase_ms)),
+                        _ => {}
+                    }
                 }
             }
             PotatoKind::Listening {
@@ -1077,6 +1232,9 @@ impl Potato {
                     .filter(|d| d.round == *round && d.seq == *seq)
                 {
                     d.listening_after_ms = Some(*after_ms);
+                    if d.cause.as_deref() == Some("waking") {
+                        d.cause_ms = Some(*after_ms);
+                    }
                 }
                 if let Some(rung) = self
                     .ladder
@@ -1085,6 +1243,9 @@ impl Potato {
                 {
                     if let Some(d) = rung.broke.as_mut() {
                         d.listening_after_ms = Some(*after_ms);
+                        if d.cause.as_deref() == Some("waking") {
+                            d.cause_ms = Some(*after_ms);
+                        }
                     }
                 }
             }
@@ -1214,7 +1375,7 @@ impl Potato {
 /// players. No chain is in it; the page shows colours, phases and times.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PotatoView {
-    pub ladder: Vec<Rung>,
+    pub ladder: Vec<RungView>,
     /// The size being played, or the next one.
     pub size: Option<u32>,
     pub round: Option<RoundView>,
@@ -1234,6 +1395,21 @@ pub struct PotatoView {
     /// connected. The viewer-path smoke attributes its potato probe to it for the image
     /// release gate (fleet/coord/stage-smoke.py).
     pub host: Option<String>,
+}
+
+/// A size of the ladder as the page gets it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RungView {
+    pub size: u32,
+    /// The fastest measured pace, in catches per second, a round of this size held for one
+    /// full lap on the ladder's `cpus`; null until one completes a lap.
+    pub record_pace: Option<f64>,
+    pub record_pace_at: Option<u64>,
+    /// The record that stood before the round that set `record_pace`; null until a record
+    /// of this size has been beaten.
+    pub record_prev_pace: Option<f64>,
+    pub broke: Option<Drop>,
+    pub rounds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1330,12 +1506,27 @@ impl Potato {
             }
         });
         Some(PotatoView {
-            ladder: self.ladder.clone(),
+            // the sizes being played; every rung when no host has said which (a state file
+            // from before `sizes`)
+            ladder: self
+                .ladder
+                .iter()
+                .filter(|g| self.sizes.is_empty() || self.sizes.contains(&g.size))
+                .map(|g| RungView {
+                    size: g.size,
+                    record_pace: g.record_pace,
+                    record_pace_at: g.record_pace_at,
+                    record_prev_pace: g.record_prev_pace,
+                    broke: g.broke.clone(),
+                    rounds: g.rounds,
+                })
+                .collect(),
             size: self
                 .round
                 .as_ref()
                 .map(|r| r.size)
-                .or_else(|| self.ladder.get(self.rung).map(|g| g.size)),
+                .or(self.next_size)
+                .or_else(|| self.sizes.first().copied()),
             round,
             players: self
                 .players
@@ -1587,11 +1778,7 @@ mod tests {
             Some("proof")
         );
         assert_eq!(
-            g.ladder
-                .iter()
-                .find(|r| r.size == 4)
-                .unwrap()
-                .record_hold_ms,
+            g.ladder.iter().find(|r| r.size == 2).unwrap().record_pace,
             None
         );
         assert_eq!(
@@ -1652,10 +1839,13 @@ mod tests {
             let e = catch(&mut proofs, p, id, seq, 1100 + seq * 100, false);
             g.event("h", &e, e.at, &cfg);
         }
-        let start = cfg.start_hold_ms(2);
-        assert_eq!(g.ladder[0].record_hold_ms, Some(start));
+        assert_eq!(
+            g.ladder[0].record_pace,
+            Some(10.0),
+            "one catch 100 ms after the first"
+        );
         g.resumed();
-        assert_eq!(g.ladder[0].record_hold_ms, Some(start));
+        assert_eq!(g.ladder[0].record_pace, Some(10.0));
         assert!(g.round.is_none());
     }
 
@@ -1742,7 +1932,6 @@ mod tests {
         }
         let r = g.round.as_ref().unwrap();
         assert_eq!(r.best_lap_hold_ms, Some(9));
-        assert_eq!(g.ladder[0].record_hold_ms, Some(9));
         let v = g.view(&cfg).unwrap().round.unwrap();
         assert_eq!(
             (v.hold_ms, v.turnaround_ms),
@@ -1827,10 +2016,9 @@ mod tests {
             let e = catch(&mut proofs, p, id, seq, 1100 + seq * 100, false);
             g.event("h", &e, e.at, &cfg);
         }
-        let rung = g.rung;
         g.agent_gone("h", 2000, &cfg);
-        assert_eq!(g.rung, rung, "the same size next time");
-        let size2 = &g.ladder[rung];
+        assert_eq!(g.next_size, Some(2), "the same size next time");
+        let size2 = &g.ladder[0];
         assert_eq!(size2.rounds, 1);
         assert_eq!(
             size2.broke.as_ref().map(|d| d.reason.as_str()),
@@ -2134,5 +2322,386 @@ mod tests {
             &cfg,
         );
         assert_eq!(player(&g, 1).cpu_wait_ms, None);
+    }
+
+    #[test]
+    fn the_rungs_come_from_the_allotment_and_the_players() {
+        let cfg = PotatoConfig::default();
+        let sizes = |cpus, players| Potato::sizes_for(cpus, players, &cfg);
+        assert_eq!(sizes(Some(8), 96), vec![16, 32, 64, 96]);
+        assert_eq!(
+            sizes(Some(8), 64),
+            vec![16, 32, 64],
+            "the players are not a rung twice"
+        );
+        assert_eq!(sizes(Some(8), 80), vec![16, 32, 64, 80]);
+        assert_eq!(sizes(Some(3), 20), vec![6, 12, 20]);
+        assert_eq!(sizes(Some(8), 17), vec![16, 17]);
+        assert_eq!(
+            sizes(Some(8), 4),
+            vec![4],
+            "at or below K: the players alone"
+        );
+        // an agent that reports no allotment plays the configured sizes it can run
+        assert_eq!(sizes(None, 96), cfg.sizes);
+        assert_eq!(sizes(None, 5), vec![2, 4]);
+    }
+
+    /// A game on a host of `players` and `cpus`, its first round started.
+    fn ladder_game(players: u32, cpus: u32) -> (Potato, PotatoConfig, Vec<PotatoProof>) {
+        let cfg = PotatoConfig::default();
+        let mut g = Potato::default();
+        g.agent_hello("h", players, cpus, true, 0, &cfg);
+        let proofs = hellos(&mut g, players, &cfg);
+        g.tick(1000, true, &cfg);
+        (g, cfg, proofs)
+    }
+
+    /// Every player's first hello.
+    fn hellos(g: &mut Potato, players: u32, cfg: &PotatoConfig) -> Vec<PotatoProof> {
+        (0..players)
+            .map(|p| {
+                let proof = PotatoProof {
+                    colour: p % 12,
+                    counter: 0,
+                    chain: "00".repeat(32),
+                };
+                g.event(
+                    "h",
+                    &PotatoEvent {
+                        at: 10,
+                        player: p,
+                        kind: PotatoKind::Hello {
+                            proof: proof.clone(),
+                            colours: 12,
+                            connections: 1,
+                            last_round: None,
+                            last_seq: None,
+                        },
+                    },
+                    10,
+                    cfg,
+                );
+                proof
+            })
+            .collect()
+    }
+
+    /// One lap of the round being played, its catches `gap` ms apart, starting at `at`.
+    fn lap(
+        g: &mut Potato,
+        cfg: &PotatoConfig,
+        proofs: &mut [PotatoProof],
+        from: u64,
+        at: u64,
+        gap: u64,
+    ) {
+        let (id, n) = {
+            let r = g.round.as_ref().unwrap();
+            (r.id, r.ring.len() as u64)
+        };
+        for i in 0..n {
+            let seq = from + i;
+            let e = catch(proofs, (seq % n) as u32, id, seq, at + i * gap, false);
+            g.event("h", &e, e.at, cfg);
+        }
+    }
+
+    /// The ball dropped for want of a catcher, as the agent reports it.
+    fn dropped(g: &mut Potato, cfg: &PotatoConfig, at: u64, phase: &str, cpu_wait: Option<f64>) {
+        let (id, seq, n) = {
+            let r = g.round.as_ref().unwrap();
+            (r.id, r.seq.unwrap_or(0), r.ring.len() as u64)
+        };
+        let e = PotatoEvent {
+            at,
+            player: (seq % n) as u32,
+            kind: PotatoKind::Dropped {
+                round: id,
+                seq: seq + 1,
+                to: ((seq + 1) % n) as u32,
+                attempts: 2,
+                reason: "connection refused".into(),
+                catcher_phase: phase.into(),
+                catcher_phase_ms: 90.0,
+                catcher_cpu_wait_ms: cpu_wait,
+            },
+        };
+        g.event("h", &e, at, cfg);
+    }
+
+    /// A size's record is the fastest pace a round of it held for a full lap. The record it
+    /// replaced is kept beside it, and is none until a record has been beaten: a round's own
+    /// earlier laps are not a record it beat.
+    #[test]
+    fn a_record_is_the_fastest_pace_of_a_full_lap() {
+        let (mut g, cfg, mut proofs) = ladder_game(4, 8);
+        let rung = |g: &Potato| g.view(&cfg).unwrap().ladder[0].clone();
+        assert_eq!(
+            g.view(&cfg).unwrap().ladder.len(),
+            1,
+            "one rung: the 4 players"
+        );
+        assert_eq!(
+            (rung(&g).record_pace, rung(&g).record_prev_pace),
+            (None, None)
+        );
+        lap(&mut g, &cfg, &mut proofs, 0, 1100, 200);
+        assert_eq!(
+            rung(&g).record_pace,
+            Some(5.0),
+            "3 catches after the first in 600 ms"
+        );
+        assert_eq!(
+            rung(&g).record_prev_pace,
+            None,
+            "the first record beat nothing"
+        );
+        lap(&mut g, &cfg, &mut proofs, 4, 1800, 100);
+        assert_eq!(
+            rung(&g).record_pace,
+            Some(10.0),
+            "4 catches in the 400 ms after lap 0"
+        );
+        assert_eq!(
+            rung(&g).record_prev_pace,
+            None,
+            "the same round's earlier lap"
+        );
+        dropped(&mut g, &cfg, 2200, "waking", None);
+        // the next round of the size: slower, the record stands
+        g.tick(2200 + cfg.restart_after_ms, true, &cfg);
+        assert_eq!(
+            g.round.as_ref().unwrap().size,
+            4,
+            "one rung wraps to itself"
+        );
+        lap(&mut g, &cfg, &mut proofs, 0, 8000, 500);
+        assert_eq!(
+            (rung(&g).record_pace, rung(&g).record_prev_pace),
+            (Some(10.0), None)
+        );
+        // and faster: the record it beat is kept
+        lap(&mut g, &cfg, &mut proofs, 4, 9550, 50);
+        assert_eq!(
+            rung(&g).record_pace,
+            Some(20.0),
+            "4 catches in the 200 ms after 9500"
+        );
+        assert_eq!(rung(&g).record_prev_pace, Some(10.0));
+        lap(&mut g, &cfg, &mut proofs, 8, 9725, 25);
+        assert_eq!(rung(&g).record_pace, Some(40.0));
+        assert_eq!(
+            rung(&g).record_prev_pace,
+            Some(10.0),
+            "what the round beat, not its last lap"
+        );
+        // acknowledged state: it stays across a restart
+        g.resumed();
+        assert_eq!(g.ladder[0].record_pace, Some(40.0));
+        assert_eq!(g.ladder[0].record_prev_pace, Some(10.0));
+    }
+
+    /// A round starts near where its size dropped the ball: 1.5 times the median hold of the
+    /// size's recent drops for its first round since the host connected, 1.25 times after,
+    /// and the configured start while it has dropped none.
+    #[test]
+    fn a_round_starts_near_where_its_size_dropped_the_ball() {
+        let (mut g, cfg, _proofs) = ladder_game(4, 8);
+        let start = |g: &Potato| g.round.as_ref().unwrap().start_hold_ms;
+        assert_eq!(start(&g), cfg.start_hold_ms(4), "no drop yet");
+        // it drops at its starting hold, 666 ms
+        dropped(&mut g, &cfg, 1500, "waking", None);
+        assert_eq!(g.ladder[0].drop_holds, vec![666]);
+        g.tick(1500 + cfg.restart_after_ms, true, &cfg);
+        assert_eq!(
+            start(&g),
+            833,
+            "1.25 times 666: the size has played on this connection"
+        );
+        // a host that connects again starts each size further back, once
+        g.agent_gone("h", 9000, &cfg);
+        g.agent_hello("h", 4, 8, true, 9100, &cfg);
+        g.tick(10_200, true, &cfg);
+        assert_eq!(start(&g), 999, "1.5 times 666");
+        // the median of the last five, whatever ended the other rounds
+        g.ladder[0].drop_holds = vec![900, 100, 120, 110, 130, 140];
+        dropped(&mut g, &cfg, 10_300, "waking", None);
+        assert_eq!(g.ladder[0].drop_holds, vec![120, 110, 130, 140, 999]);
+        g.tick(10_300 + cfg.restart_after_ms, true, &cfg);
+        assert_eq!(start(&g), 163, "1.25 times the median, 130");
+        // a round that ends another way says nothing of the edge
+        g.agent_gone("h", 20_000, &cfg);
+        assert_eq!(g.ladder[0].drop_holds.len(), 5);
+    }
+
+    /// A drop names its cause from what the agent measured of the catcher.
+    #[test]
+    fn a_drop_names_its_measured_cause() {
+        let cause = |phase: &str, wait: Option<f64>| {
+            let (mut g, cfg, _proofs) = ladder_game(4, 8);
+            dropped(&mut g, &cfg, 1500, phase, wait);
+            let d = g.last_drop.clone().unwrap();
+            assert_eq!(
+                g.ladder[0].broke.as_ref(),
+                Some(&d),
+                "the rung's drop is the same"
+            );
+            (g, cfg, d.cause, d.cause_ms)
+        };
+        let (_, _, c, ms) = cause("asleep", Some(140.5));
+        assert_eq!((c.as_deref(), ms), (Some("cpu_wait"), Some(140.5)));
+        let (_, _, c, ms) = cause("sleeping", None);
+        assert_eq!((c.as_deref(), ms), (Some("saving"), Some(90.0)));
+        let (_, _, c, ms) = cause("asleep", None);
+        assert_eq!(
+            (c, ms),
+            (None, None),
+            "no wake was asked for: nothing measured to name"
+        );
+        // still waking: how late arrives when the catcher does accept
+        let (mut g, cfg, c, ms) = cause("waking", None);
+        assert_eq!((c.as_deref(), ms), (Some("waking"), None));
+        let d = g.last_drop.clone().unwrap();
+        let listening = PotatoEvent {
+            at: 1600,
+            player: d.player.unwrap(),
+            kind: PotatoKind::Listening {
+                round: d.round,
+                seq: d.seq,
+                after_ms: 84.0,
+            },
+        };
+        g.event("h", &listening, 1600, &cfg);
+        assert_eq!(g.last_drop.as_ref().unwrap().cause_ms, Some(84.0));
+        assert_eq!(g.ladder[0].broke.as_ref().unwrap().cause_ms, Some(84.0));
+        // a proof that does not verify
+        let (mut g, cfg, mut proofs) = ladder_game(4, 8);
+        let id = g.round.as_ref().unwrap().id;
+        let e = catch(&mut proofs, 0, id, 0, 1100, true);
+        g.event("h", &e, 1100, &cfg);
+        let d = g.last_drop.as_ref().unwrap();
+        assert_eq!(
+            (d.reason.as_str(), d.cause.as_deref(), d.cause_ms),
+            ("proof", Some("proof"), None)
+        );
+        // the pace it had reached
+        let (mut g, cfg, mut proofs) = ladder_game(4, 8);
+        lap(&mut g, &cfg, &mut proofs, 0, 1100, 200);
+        dropped(&mut g, &cfg, 2000, "waking", None);
+        assert_eq!(g.last_drop.as_ref().unwrap().pace, Some(5.0));
+    }
+
+    /// A state file written before the ladder was by pace: it loads, keeps its place (by
+    /// size), its round count and its drops, and shows no hold as a record.
+    #[test]
+    fn an_older_state_file_keeps_its_place_and_shows_no_hold_records() {
+        let old = serde_json::json!({
+            "ladder": [
+                {"size": 2, "record_hold_ms": 1458, "record_at": 1762317000000u64, "rounds": 3, "broke": null},
+                {"size": 4, "record_hold_ms": 599, "record_at": 1762317000000u64, "rounds": 3,
+                 "broke": {"at": 7, "round": 40, "size": 4, "reason": "not_listening", "player": 1,
+                           "thrower": 0, "seq": 11, "lap": 2, "hold_ms": 485, "stage": "waking",
+                           "stage_ms": 90.0, "listening_after_ms": 84.0, "detail": "x"}},
+                {"size": 8, "record_hold_ms": null, "record_at": null, "rounds": 2, "broke": null},
+                {"size": 16, "record_hold_ms": 250, "record_at": 5, "rounds": 2, "broke": null},
+                {"size": 32, "rounds": 0}, {"size": 64, "rounds": 0}, {"size": 96, "rounds": 0}
+            ],
+            "rung": 3,
+            "records": {"fastest_cycle_ms": {"value": 650.0, "size": 2, "player": 0, "at": 9},
+                        "longest_round": {"value": 151.0, "size": 64, "player": null, "at": 9}},
+            "round_count": 41,
+            "last_drop": null
+        });
+        let cfg = PotatoConfig::default();
+        let mut g: Potato = serde_json::from_value(old).unwrap();
+        g.resumed();
+        assert_eq!(g.next_size, Some(16), "its place, by size");
+        assert_eq!(g.round_count, 41);
+        assert_eq!(
+            g.records.longest_round.as_ref().map(|r| r.value),
+            Some(151.0)
+        );
+        let v = serde_json::to_value(g.view(&cfg).unwrap()).unwrap();
+        assert_eq!(v.pointer("/size"), Some(&serde_json::json!(16)));
+        assert_eq!(v.pointer("/ladder/1/rounds"), Some(&serde_json::json!(3)));
+        assert_eq!(
+            v.pointer("/ladder/1/broke/hold_ms"),
+            Some(&serde_json::json!(485))
+        );
+        assert_eq!(
+            v.pointer("/ladder/1/broke/cause"),
+            Some(&serde_json::Value::Null)
+        );
+        for rung in v["ladder"].as_array().unwrap() {
+            assert_eq!(rung["record_pace"], serde_json::Value::Null);
+            assert!(
+                rung.get("record_hold_ms").is_none(),
+                "a hold is not shown as a record"
+            );
+        }
+        // what is written from now on has neither the index nor the holds
+        let written = serde_json::to_string(&g).unwrap();
+        assert!(
+            !written.contains("record_hold_ms") && !written.contains("\"rung\""),
+            "{written}"
+        );
+        let again: Potato = serde_json::from_str(&written).unwrap();
+        assert_eq!(again, g);
+
+        // an agent without an allotment plays that ladder on, from its size
+        let mut uncapped = g.clone();
+        uncapped.agent_hello("old", 96, 0, false, 100, &cfg);
+        uncapped.tick(2000, true, &cfg);
+        let r = uncapped.round.as_ref().unwrap();
+        assert_eq!((r.size, r.id), (16, 42));
+        assert_eq!(uncapped.ladder[1].rounds, 3);
+
+        // an agent with one gets the ladder of its K: the rung of the same size, new records
+        g.agent_hello("h", 96, 8, true, 100, &cfg);
+        assert_eq!(g.sizes, vec![16, 32, 64, 96]);
+        assert_eq!(
+            g.view(&cfg)
+                .unwrap()
+                .ladder
+                .iter()
+                .map(|r| r.rounds)
+                .sum::<u64>(),
+            0
+        );
+        g.tick(2000, true, &cfg);
+        let r = g.round.as_ref().unwrap();
+        assert_eq!(
+            (r.size, r.id),
+            (16, 42),
+            "the same size, and round numbers go on"
+        );
+        // the other ladder is kept, with what it played, for a host without an allotment
+        assert_eq!(g.shelved[&0].iter().map(|r| r.rounds).sum::<u64>(), 10);
+        g.agent_gone("h", 3000, &cfg);
+        g.agent_hello("old", 96, 0, false, 4000, &cfg);
+        assert_eq!(g.ladder.iter().map(|r| r.rounds).sum::<u64>(), 10);
+        assert_eq!(
+            g.shelved[&8].len(),
+            4,
+            "and the allotment's ladder is put away in turn"
+        );
+    }
+
+    /// The ladder moves up on every drop and wraps, whatever the allotment.
+    #[test]
+    fn the_ladder_moves_up_on_each_drop() {
+        let (mut g, cfg, _proofs) = ladder_game(40, 8);
+        let mut played = Vec::new();
+        let mut at = 1000;
+        for _ in 0..4 {
+            played.push(g.round.as_ref().unwrap().size);
+            at += 500;
+            dropped(&mut g, &cfg, at, "waking", None);
+            at += cfg.restart_after_ms;
+            g.tick(at, true, &cfg);
+        }
+        assert_eq!(played, vec![16, 32, 40, 16]);
+        assert_eq!(g.view(&cfg).unwrap().size, Some(32));
     }
 }

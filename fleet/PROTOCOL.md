@@ -1233,13 +1233,16 @@ The snapshot's `state.potato` is absent until a host has run players, else:
 ```json
 {"size": 4, "colours": 12, "capacity": 96, "cpus": 8, "confined": true, "host": "<host name>",
  "next_round_at": null,
- "ladder": [{"size": 2, "record_hold_ms": 1458, "record_at": 1762317000000, "rounds": 3,
+ "ladder": [{"size": 2, "record_pace": 0.84, "record_pace_at": 1762317000000, "record_prev_pace": null,
+             "rounds": 3,
              "broke": {"reason": "not_listening", "player": 1, "thrower": 0, "seq": 11, "lap": 5,
                        "hold_ms": 1182, "stage": "waking", "stage_ms": 90.0, "listening_after_ms": 84.0,
+                       "cause": "waking", "cause_ms": 84.0, "pace": 0.84,
                        "sleep_stages": {"prepare_ms": 17.6, "pause_ms": 0.5, "save_ms": 74.5, "disk_ms": 114.7, "stop_ms": 106.7},
                        "wake_stages": {"restore_ms": 352.0, "ack_ms": 201.0, "listen_ms": 355.3},
                        "at": 1762317000000, "round": 7, "size": 2, "detail": "player 1 was waking when player 0 threw (1 tries in 100 ms: connection timed out)"}},
-            {"size": 4, "record_hold_ms": null, "record_at": null, "broke": null, "rounds": 0}],
+            {"size": 4, "record_pace": null, "record_pace_at": null, "record_prev_pace": null,
+             "broke": null, "rounds": 0}],
  "round": {"id": 8, "size": 4, "ring": [0, 1, 2, 3], "started_at": 1762317005000, "seq": 6, "lap": 1,
            "hold_ms": 599, "start_hold_ms": 666, "min_hold_ms": 2, "flight_ms": 100, "pace_ms": null,
            "turnaround_ms": 1797, "holder": 2, "last_catch_at": 1762317009100,
@@ -1258,10 +1261,22 @@ The snapshot's `state.potato` is absent until a host has run players, else:
  "last_drop": {...}}
 ```
 
-- `ladder`: every size of the game, smallest first, each with its record (`record_hold_ms`:
-  the shortest hold of a lap a round of that size completed) and what ended its latest
-  round (`broke`). Kept in the state file across a coordinator restart, with `records`,
-  `last_drop` and the size being played (`size`).
+- `ladder`: the sizes being played, smallest first, each with its record and what ended its
+  latest round (`broke`). The sizes come from the potato host's hello: 2 x `cpus`, doubling
+  while below its players, then its players (8 CPUs and 96 players: 16, 32, 64, 96); from an
+  agent that reports no allotment, the configured sizes it can run. `record_pace` is the
+  fastest measured pace, in catches per second, a round of that size held for one full lap
+  on `cpus` CPUs, `record_pace_at` when, and `record_prev_pace` the record that stood when
+  the round that set it began (null until a record of that size has been beaten: a size's
+  first record replaces nothing). Kept in the state file across a coordinator restart, with
+  `records`, `last_drop` and the size being played (`size`). A ladder belongs to its
+  allotment: a host that connects with another `cpus` gets its own, and the earlier one is
+  kept for a host with that allotment. `record_hold_ms` and `record_at`, which older
+  coordinators sent, are gone: a hold is not a pace, and none is shown as one.
+- A round starts near where its size last dropped the ball: `round.start_hold_ms` is 1.5
+  times the median hold of the size's last five `not_listening` drops for the size's first
+  round since the host connected, 1.25 times for its later ones, and the configured start
+  for a size that has dropped none.
 - `round`: the round being played, or null between rounds (`next_round_at` says when the
   next starts). `hold_ms` is the hold the ball carries now; `turnaround_ms` is (size - 1)
   holds, the time a player has between its throw and its next catch to sleep and wake.
@@ -1312,6 +1327,13 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   verified ones), `<stage>_failed` for an agent's `failed` report (`boot_failed`,
   `sleep_failed`, `wake_failed`, `kickoff_failed` today; a page shows any such value),
   `deadline` (no catch reported by the hold plus the flight plus 3 s) or `host_gone`.
+- A drop's `cause` is what was measured, or null: `waking` (the catcher's wake had started
+  and not finished; `cause_ms` is how long after the drop it accepted, null until the agent
+  reports it a moment later), `cpu_wait` (its wake was waiting for a free CPU; `cause_ms` is
+  how long it had waited), `saving` (it was still going to sleep from its last throw;
+  `cause_ms` is how long that had run) or `proof` (no `cause_ms`). Every other drop has a
+  null `cause`, and a page shows its `reason`. `pace` is the pace of the last completed lap
+  when the ball dropped, null if none had completed.
 
 ### Windows mode
 

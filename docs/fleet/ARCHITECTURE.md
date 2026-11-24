@@ -1796,9 +1796,10 @@ a conductor that pings each VM and VMs that throw to each other, "thrower is bet
   coordinator read the catches, never computed from the hold. Beside it the hold (how long a
   player keeps the ball before it throws), the lap and the ring's size, and a meter of the
   hold against the sleep-and-wake time it leaves a player.
-- **The ladder.** Rings of 2, 4, 8, 16, 32, 64 and 96 players. Each size reached shows its
-  record (the shortest hold that completed a lap) and what broke it. The current size and
-  pace are live. After 96 breaks, the ladder starts again at 2.
+- **The ladder.** Rings at a fixed K CPUs: with K = 8 and 96 players, 16, 32, 64 and 96
+  players, which is 2, 4, 8 and 12 machines per CPU. Each size reached shows its record (the
+  fastest pace held for a full lap) and what broke it. The current size and pace are live.
+  After the largest breaks, the ladder starts again at the smallest.
 - **The drop.** When the ball drops, a card names the player and the stage that was late,
   with its milliseconds ("player 7 was still waking: restore 412 ms, listening 84 ms after the
   ball's flight ended"), and the next round starts 5 s later.
@@ -1876,8 +1877,8 @@ player then draws its first colour from the guest's random pool.
 
 The ball drops when the thrower's flight window runs out (the catcher was asleep, waking,
 or not yet accepting), when a proof does not match, when a wake fails, or when no catch is
-reported by the round's deadline (the report path is gone). A size's record is the shortest
-hold of a lap that completed; then the ring grows to the next size.
+reported by the round's deadline (the report path is gone). A size's record is the fastest
+measured pace it held for one full lap; when the ball drops the ring grows to the next size.
 
 **What sets the limit.** A player throws one hold after it caught and catches again N holds
 after that catch, so between its throw and its next catch it has (N - 1) holds to sleep, be
@@ -2020,6 +2021,34 @@ kept: reflinking a diff's memory file into an ordinary directory (a sleep's p99 
 from btrfs into the agent). These runs predate the guest image without maintenance timers,
 whose fwupd OOMs stalled a few sleeps further.
 
+### The ladder and where a round starts
+
+- **The rungs** are derived from the potato host's hello, not configured: 2K, doubling while
+  below the host's players, then the players themselves (`Potato::sizes_for`; K = 8 and 96
+  players: 16, 32, 64, 96). A ring of K or fewer can have nothing asleep, so the doubling
+  starts above K. The players are the top rung whatever their number, so a host with
+  `--potato-players 4` and K = 8 plays one ring of 4, at under one machine per CPU. An agent
+  that reports no allotment plays the configured sizes, as before.
+- **A record** is the fastest measured pace (catches per second over a lap, "Pace" above) a
+  round of that size held for one full lap, on the ladder's K CPUs. It is acknowledged when
+  the lap is, and kept in the state file with the record it replaced (`record_prev_pace`:
+  what stood when the round that beat it began; none until a record has been beaten).
+- **A ladder belongs to its K.** A record is a pace on K CPUs, so a host that connects with
+  another allotment gets its own ladder, and the earlier one is kept for a host with that
+  allotment (`Potato::shelved`).
+- **A round starts near its edge.** Each rung keeps the hold the ball carried at its last
+  five drops for want of a catcher (`not_listening`). A rung's first round after the host
+  connects starts at 1.5 times the median of those, its later rounds on that connection at
+  1.25 times, and a rung that has dropped no ball at the configured start below. The ladder
+  still moves up one rung on every drop. A round that starts at 400 ms where the edge is
+  150 ms spends nine laps, about 4 minutes at 96 players, above the edge.
+- **A drop names its cause from what was measured**: `waking` (the catcher's wake had
+  started and not finished, with how long after the drop it did accept), `cpu_wait` (its
+  wake was waiting for a free CPU, with how long), `saving` (it was still going to sleep
+  from its last throw, with how long) or `proof`. Anything else (a missed deadline, a host
+  that left, a failed step, a catcher asleep with no wake asked for) has no cause, and the
+  page shows the reason as before.
+
 ### The starting pace
 
 Each size starts at `max(2000 / (size - 1), 400)` ms of hold and shrinks a tenth per lap
@@ -2106,8 +2135,9 @@ machines those K serve: N / K machines per CPU.
 - **The coordinator.** The game is part of `fleet_core::apply`: the agent's reports and a
   `tick` carrying the time are events, so drops, deadlines and records replay. It sends the
   agent a desired round (number, ring, starting hold, shrink, floor, flight window), which
-  the agent reconciles like a slot assignment. The ladder, each size's record and the
-  overall records are in the state file; a round in progress is not, and a restarted
+  the agent reconciles like a slot assignment. The ladder (each size's record, rounds, last
+  drop and recent drop holds), the size being played and the overall records are in the
+  state file; a round in progress is not, and a restarted
   coordinator starts a new round at the size it was on. Its log (target
   `fcvm::fleet::potato`) holds a line for each round's start and end, with what ended it,
   for each ball nobody caught, and for each sleep and wake when it ends (`potato player
@@ -2130,7 +2160,9 @@ machines those K serve: N / K machines per CPU.
 5. The ball passes only from player to player, apart from a round's first throw by the agent.
 6. A sleeping player has no process on the host.
 7. The game is replayable: the same events give the same drops, records and state.
-8. Each size's record and the overall records survive a coordinator restart.
+8. Each size's record and the overall records survive a coordinator restart, and a state
+   file from before records were paces loads with its place and shows no hold as a record
+   (`an_older_state_file_keeps_its_place_and_shows_no_hold_records`).
 9. The ball drops on each of: the flight window running out, a proof mismatch, a failed wake
    and a missed deadline.
 10. "Faster" never shortens the hold below the floor, and both buttons are rate limited.
