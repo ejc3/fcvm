@@ -1,0 +1,7 @@
+kernel 7.0.0-1018-aws
+cpus 192
+MemTotal:       395386980 kB
+store /dev/loop3 btrfs   96G /mnt/ram/store.img on tmpfs  tmpfs
+tree 2f89b1c976751e116c4274e1c3c36801452c1a0c
+net.ipv6.neigh.default.gc_thresh3 = 16384
+2026-11-24T12:41:37Z

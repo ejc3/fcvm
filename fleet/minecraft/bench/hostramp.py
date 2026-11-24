@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Minecraft servers on one host in the fleet's shape: each server an fcvm VM of 1 vCPU and MC_MEM MiB (1024) running the tile image with its own
+"""Minecraft servers on one host in the fleet's shape (docs/fleet/minecraft.md, "Servers on one
+host"): each server an fcvm VM of 1 vCPU and MC_MEM MiB (1024) running the tile image with its own
 bots inside (MCTILE_BOTS), bridged, restored from one gold snapshot. Run as root on a bare-metal
 box with fcvm set up and the tile image built (never on the shared dev host). mcbench.py beside
 this file is the other shape: bots outside the VMs, and the VMs held to a few cores.
