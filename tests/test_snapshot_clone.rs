@@ -8027,22 +8027,18 @@ fn assert_restore_hook_views(
     ),
 ) {
     // The container was running when the snapshot was taken, and podman had said
-    // so: the hook's exec is not preceded by a read of the runtime's state. The
-    // hook that failed is followed by one, which found the container running and
-    // left the failure the hook's.
+    // so: the hook's command is run without a read of the runtime's state, and a
+    // hook that fails is not followed by one either (its failure is its own).
     assert!(
         clone_log.contains("restore hook") && clone_log.contains("exited 0 in"),
         "the first clone's log does not show its hook"
     );
-    assert!(
-        !clone_log.contains("the restore hook returned"),
-        "the hook of a container podman reported running was preceded by a state read"
-    );
-    assert!(
-        log.contains("crun state after the restore hook returned code=0"),
-        "the failed hook was not followed by a read of the container's state"
-    );
-
+    for (which, log) in [("ran", &clone_log), ("failed", &log)] {
+        assert!(
+            !log.contains("the restore hook returned"),
+            "the hook that {which}, in a container podman reported running, came with a state read"
+        );
+    }
     // The hook is the process a `podman exec` session is: every line it reports of
     // itself is the line a session reports.
     assert_eq!(

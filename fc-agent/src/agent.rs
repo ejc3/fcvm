@@ -979,6 +979,15 @@ pub(crate) struct RetiredChronyd {
     restore: u64,
 }
 
+/// A retired chronyd of a lifecycle of its own, for tests of what holds one.
+#[cfg(test)]
+pub(crate) async fn retired_chronyd_for_test() -> RetiredChronyd {
+    RetiredChronyd {
+        state: ChronydLifecycle::new().state.lock_owned().await,
+        restore: 1,
+    }
+}
+
 impl ChronydLifecycle {
     fn new() -> Self {
         Self {
