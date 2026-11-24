@@ -94,8 +94,11 @@ pub enum PotatoKind {
     },
     /// Nothing accepted the ball within its flight window. `catcher_phase` is what the agent
     /// was doing with the catcher then (`asleep`, `sleeping`, `waking`, `awake`), and
-    /// `catcher_phase_ms` how long it had been doing it. `catcher_cpu_wait_ms`: the catcher
-    /// was asleep with its wake waiting for a free CPU, for this long.
+    /// `catcher_phase_ms` how long it had been doing it. `catcher_cpu_wait_ms`: how long the
+    /// catcher's wake has waited for a free CPU (it is still asleep), or waited before it
+    /// started (it is waking or awake). `catcher_late_ms`: the catcher is awake by now, and
+    /// was ready this long after the thrower's flight window ended (0: between the thrower's
+    /// last try and that end).
     Dropped {
         round: u64,
         seq: u64,
@@ -106,6 +109,8 @@ pub enum PotatoKind {
         catcher_phase_ms: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         catcher_cpu_wait_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catcher_late_ms: Option<f64>,
     },
     /// The player is asleep: its snapshot is written and its fcvm has exited. `stages`
     /// splits `sleep_ms` (prepare, pause, save, disk, stop, in ms, as fcvm logs them).
@@ -242,9 +247,11 @@ pub struct Rung {
     pub broke: Option<Drop>,
     #[serde(default)]
     pub rounds: u64,
-    /// The hold the ball carried when it last dropped for want of a catcher, for each of this
-    /// size's latest rounds that ended so, oldest first, at most [`DROPS_KEPT`]: where the
-    /// next round of the size starts from.
+    /// The hold the ball carried when the pace outran a catcher (it was still waking, waiting
+    /// for a CPU or saving), for each of this size's latest rounds that ended so, oldest
+    /// first, at most [`DROPS_KEPT`]: where the next round of the size starts from. A drop
+    /// with another cause (a failed wake, a proof, a host that left) says nothing of the pace
+    /// and is not here.
     #[serde(default)]
     pub drop_holds: Vec<u64>,
 }
@@ -314,17 +321,22 @@ pub struct Drop {
     /// When the catcher of a dropped ball did start accepting, ms after the drop.
     #[serde(default)]
     pub listening_after_ms: Option<f64>,
-    /// What was measured to be the cause: `waking` (the catcher's wake had started and not
-    /// finished), `cpu_wait` (its wake was waiting for a free CPU), `saving` (it was still
-    /// going to sleep from its last throw) or `proof`. None for anything else; `reason` says
-    /// what ended the round.
+    /// What was measured to be the cause: `waking` (the catcher's wake was not finished in
+    /// time), `cpu_wait` (its wake waited for a free CPU, and that wait is more than half of
+    /// how late it was, or the wake had not started at all), `saving` (it was still going to
+    /// sleep from its last throw) or `proof`. None for anything else; `reason` says what
+    /// ended the round.
     #[serde(default)]
     pub cause: Option<String>,
-    /// The cause's measurement, ms: for `waking` how long after the drop the catcher accepted
-    /// (none until the agent reports it), for `cpu_wait` how long the wake had waited, for
-    /// `saving` how long the save had run.
+    /// The cause's measurement, ms: for `waking` how late the catcher was (none until the
+    /// agent reports it), for `cpu_wait` how long the wake waited, for `saving` how long the
+    /// save had run.
     #[serde(default)]
     pub cause_ms: Option<f64>,
+    /// How long the catcher's wake waited for a free CPU, whatever the cause; none when it
+    /// did not wait.
+    #[serde(default)]
+    pub cpu_wait_ms: Option<f64>,
     /// The pace of the last completed lap when the ball dropped.
     #[serde(default)]
     pub pace: Option<f64>,
@@ -412,10 +424,12 @@ pub struct Round {
     /// built before they reported it.
     #[serde(default)]
     pub kept_us: Option<u64>,
-    /// When the coordinator read each catch not yet behind a completed lap, by seq, and the
-    /// last catch of the latest completed lap: what a lap's pace is measured from.
+    /// Each catch not yet behind a completed lap, by seq, and the last catch of the latest
+    /// completed lap: when the host's agent read it (the event's own `at`, ms on the host's
+    /// clock) and the hold its catcher kept (microseconds). What a lap's pace is measured
+    /// from, and bounded by.
     #[serde(default)]
-    pub catch_at: BTreeMap<u64, u64>,
+    pub catch_marks: BTreeMap<u64, (u64, u64)>,
     /// The completed laps, oldest first, at most the last [`LAPS_KEPT`].
     #[serde(default)]
     pub laps: Vec<Lap>,
@@ -440,12 +454,21 @@ pub struct Round {
 /// The laps of a round the view keeps.
 pub const LAPS_KEPT: usize = 60;
 
+/// A lap's catches are stamped when the host's agent reads their reports, and a report read
+/// late shortens the interval after it. A lap is timed only if its stamps span at least this
+/// share of the holds its catchers kept, in tenths; flight between the holds only adds time.
+const PACE_HOLD_TENTHS: u64 = 9;
+/// The stamps are whole milliseconds.
+const PACE_STAMP_SLACK_MS: u64 = 1;
+
 /// A completed lap: its measured pace, in catches per second, and the longest hold a catch
 /// of it carried.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Lap {
     pub lap: u64,
-    pub pace: f64,
+    /// None: the lap's stamps put it faster than the holds its catchers kept allow (reports
+    /// read in a burst), so it has no pace, sets no record and is not to be drawn.
+    pub pace: Option<f64>,
     pub hold_ms: u64,
     /// The most CPUs in use at any instant of the lap; none without an allotment.
     #[serde(default)]
@@ -492,19 +515,37 @@ impl Round {
         }
     }
 
-    /// The pace of completed lap `lap`, in catches per second, from the times the coordinator
+    /// The pace of completed lap `lap`, in catches per second, from the times the host's agent
     /// read its catches: the lap's catches over the time from the catch before its first to
     /// its last. Lap 0 has no catch before it: its last minus its first, over one catch fewer.
+    ///
+    /// The host's clock, not the coordinator's: the coordinator stamps a message when it
+    /// applies it, and a connection that stalls delivers a lap's catches in one burst. Every
+    /// agent has stamped its events since the first, so no agent lacks the stamp.
+    ///
+    /// Bounded by the game itself: each catcher keeps the ball for its hold before the next
+    /// can catch, so the lap cannot have taken less than the holds its catchers kept. A lap
+    /// whose stamps say it did (the agent read its reports late, in a burst) has no pace.
     fn lap_pace(&self, lap: u64) -> Option<f64> {
         let n = self.ring.len() as u64;
-        let last = *self.catch_at.get(&((lap + 1) * n - 1))?;
-        let before = (lap * n).checked_sub(1).and_then(|s| self.catch_at.get(&s));
-        let (from, catches) = match before {
-            Some(t) => (*t, n),
-            None => (*self.catch_at.get(&(lap * n))?, n - 1),
-        };
-        let wall = last.checked_sub(from).filter(|w| *w > 0)?;
-        (catches > 0).then(|| (catches as f64 * 100_000.0 / wall as f64).round() / 100.0)
+        let last = (lap + 1) * n - 1;
+        let first = lap * n;
+        let from = first
+            .checked_sub(1)
+            .filter(|s| self.catch_marks.contains_key(s))
+            .unwrap_or(first);
+        let (from_at, _) = *self.catch_marks.get(&from)?;
+        let (to_at, _) = *self.catch_marks.get(&last)?;
+        let catches = last - from;
+        let wall_ms = to_at.checked_sub(from_at).filter(|w| *w > 0)?;
+        // every catcher from `from` to the last but one held the ball before the next caught
+        let held_us = (from..last)
+            .map(|s| self.catch_marks.get(&s).map(|m| m.1))
+            .sum::<Option<u64>>()?;
+        if (wall_ms + PACE_STAMP_SLACK_MS) * 10_000 < held_us * PACE_HOLD_TENTHS {
+            return None;
+        }
+        (catches > 0).then(|| (catches as f64 * 100_000.0 / wall_ms as f64).round() / 100.0)
     }
 
     /// Host CPUs the ring used over completed lap `lap`: the cpuset's CPU time between the
@@ -647,16 +688,36 @@ impl Potato {
         } else {
             (3, 2)
         };
-        (edge * num).div_ceil(den).max(cfg.min_hold_ms)
+        // Never above the configured start. A ring with one player that cannot keep up drops
+        // every ball at whatever hold it started with, and each such drop would otherwise
+        // raise the next start by a quarter, without end. The cap also bounds whatever a
+        // state file holds.
+        edge.saturating_mul(num)
+            .div_ceil(den)
+            .max(cfg.min_hold_ms)
+            .min(cfg.start_hold_ms(size))
     }
 
-    /// Name the measured cause of the drop that just ended a round.
-    fn drop_cause(&mut self, cause: &str, cause_ms: Option<f64>) {
+    /// The latest drop was the pace outrunning a catcher: the next round of its size starts
+    /// near the hold it dropped at.
+    fn edge_found(&mut self, cfg: &PotatoConfig) {
+        let Some((size, hold)) = self.last_drop.as_ref().map(|d| (d.size, d.hold_ms)) else {
+            return;
+        };
+        if let Some(rung) = self.ladder.iter_mut().find(|g| g.size == size) {
+            rung.drop_holds.push(hold.min(cfg.start_hold_ms(size)));
+            while rung.drop_holds.len() > DROPS_KEPT {
+                rung.drop_holds.remove(0);
+            }
+        }
+    }
+
+    /// Record what was measured of the latest drop, in the drop and in its rung's copy of it.
+    fn drop_measured(&mut self, set: impl Fn(&mut Drop)) {
         let Some(d) = self.last_drop.as_mut() else {
             return;
         };
-        d.cause = Some(cause.into());
-        d.cause_ms = cause_ms;
+        set(d);
         let round = d.round;
         if let Some(b) = self
             .ladder
@@ -664,8 +725,19 @@ impl Potato {
             .filter_map(|g| g.broke.as_mut())
             .find(|b| b.round == round)
         {
-            b.cause = Some(cause.into());
-            b.cause_ms = cause_ms;
+            set(b);
+        }
+    }
+
+    /// The cause of a drop on a catcher whose wake had started: it was ready `late_ms` after
+    /// the ball needed it, and its wake had waited `wait_ms` for a free CPU first. The wait is
+    /// the cause when it is the larger part of the lateness (more than half of it): without
+    /// it the catcher would have been less than half as late, or on time. Otherwise the wake
+    /// itself is. With the lateness not yet reported it is the wake, for now.
+    fn late_cause(wait_ms: Option<f64>, late_ms: Option<f64>) -> (&'static str, Option<f64>) {
+        match (wait_ms, late_ms) {
+            (Some(wait), Some(late)) if 2.0 * wait > late => ("cpu_wait", Some(wait)),
+            (_, late) => ("waking", late),
         }
     }
 
@@ -858,7 +930,7 @@ impl Potato {
             verified_ahead: Default::default(),
             lap_holds: BTreeMap::new(),
             kept_us: None,
-            catch_at: BTreeMap::new(),
+            catch_marks: BTreeMap::new(),
             laps: Vec::new(),
             best_pace: None,
             ring_stats: None,
@@ -902,20 +974,14 @@ impl Potato {
             listening_after_ms: None,
             cause: (reason == "proof").then(|| "proof".into()),
             cause_ms: None,
-            pace: r.laps.last().map(|l| l.pace),
+            cpu_wait_ms: None,
+            pace: r.laps.last().and_then(|l| l.pace),
             sleep_stages,
             wake_stages,
             detail,
         };
         if let Some(rung) = self.ladder.iter_mut().find(|g| g.size == r.size) {
             rung.rounds += 1;
-            // where the pace outran the wakes: the next round of the size starts near it
-            if reason == "not_listening" {
-                rung.drop_holds.push(d.hold_ms);
-                while rung.drop_holds.len() > DROPS_KEPT {
-                    rung.drop_holds.remove(0);
-                }
-            }
             rung.broke = Some(d.clone());
         }
         let catches = r.verified_through.map_or(0, |s| s + 1);
@@ -1090,7 +1156,9 @@ impl Potato {
                 };
                 let longest = r.lap_holds.entry(lap).or_insert(hold);
                 *longest = (*longest).max(hold);
-                r.catch_at.insert(*seq, at);
+                // the host's stamp: both ends of every interval are its own clock's
+                r.catch_marks
+                    .insert(*seq, (e.at, hold_us.unwrap_or(hold * 1000)));
                 if let Some(stats) = ring {
                     let peak = r.lap_cpus_peak.entry(lap).or_insert(0);
                     *peak = (*peak).max(stats.cpus_peak).max(stats.cpus_in_use);
@@ -1120,26 +1188,27 @@ impl Potato {
                         r.best_lap_hold_ms = Some(h);
                     }
                     let pace = r.lap_pace(l);
-                    let cpus_busy = r.lap_busy(l);
+                    // a lap without a pace has no time to average its CPU use over either
+                    let cpus_busy = pace.and_then(|_| r.lap_busy(l));
                     let cpus_peak = r.lap_cpus_peak.remove(&l);
                     // the lap's last catch stays: the next lap is measured from it
-                    r.catch_at.retain(|s, _| *s + 1 >= (l + 1) * n);
+                    r.catch_marks.retain(|s, _| *s + 1 >= (l + 1) * n);
                     r.cpu_marks.retain(|s, _| *s + 1 >= (l + 1) * n);
                     if let Some(pace) = pace {
                         if r.best_pace.is_none_or(|b| pace > b) {
                             r.best_pace = Some(pace);
                         }
-                        r.laps.push(Lap {
-                            lap: l,
-                            pace,
-                            hold_ms: h,
-                            cpus_peak,
-                            cpus_busy,
-                        });
-                        if r.laps.len() > LAPS_KEPT {
-                            let cut = r.laps.len() - LAPS_KEPT;
-                            r.laps.drain(..cut);
-                        }
+                    }
+                    r.laps.push(Lap {
+                        lap: l,
+                        pace,
+                        hold_ms: h,
+                        cpus_peak,
+                        cpus_busy,
+                    });
+                    if r.laps.len() > LAPS_KEPT {
+                        let cut = r.laps.len() - LAPS_KEPT;
+                        r.laps.drain(..cut);
                     }
                     // a size's record is acknowledged as soon as the lap is: it stays in the
                     // state file even if the coordinator restarts before the ball drops
@@ -1193,8 +1262,10 @@ impl Potato {
                 reason,
                 attempts,
                 catcher_cpu_wait_ms,
+                catcher_late_ms,
             } => {
                 if self.round.as_ref().is_some_and(|r| r.id == *round) {
+                    let window = self.round.as_ref().map_or(0, |r| r.flight_window_ms());
                     let detail = format!(
                         "player {to} was {catcher_phase} when player {} threw ({attempts} tries in {} ms: {reason})",
                         e.player,
@@ -1212,12 +1283,34 @@ impl Potato {
                         cfg,
                     );
                     // the cause, from what the agent measured of the catcher
-                    match (catcher_cpu_wait_ms, catcher_phase.as_str()) {
-                        (Some(waited), _) => self.drop_cause("cpu_wait", Some(*waited)),
-                        // how late it was arrives with the agent's `listening`
-                        (None, "waking") => self.drop_cause("waking", None),
-                        (None, "sleeping") => self.drop_cause("saving", Some(*catcher_phase_ms)),
-                        _ => {}
+                    let wait = *catcher_cpu_wait_ms;
+                    let cause = match catcher_phase.as_str() {
+                        // its wake had not started: it was still waiting for a CPU
+                        "asleep" => wait.map(|w| ("cpu_wait", Some(w))),
+                        // How late it was arrives with the agent's `listening`. Until then: a
+                        // wake that waited for a CPU longer than it has run so far was held
+                        // up by the wait.
+                        "waking" => Some(match wait {
+                            Some(w) if w > *catcher_phase_ms => ("cpu_wait", Some(w)),
+                            _ => Self::late_cause(wait, None),
+                        }),
+                        // It woke while the thrower was still trying, or just after: the drop
+                        // was read with its wake already reported. It was late all the same.
+                        "awake" if *catcher_phase_ms < window as f64 => {
+                            Some(Self::late_cause(wait, *catcher_late_ms))
+                        }
+                        "sleeping" => Some(("saving", Some(*catcher_phase_ms))),
+                        _ => None,
+                    };
+                    self.drop_measured(|d| {
+                        d.cpu_wait_ms = wait;
+                        if let Some((cause, cause_ms)) = cause {
+                            d.cause = Some(cause.into());
+                            d.cause_ms = cause_ms;
+                        }
+                    });
+                    if cause.is_some() {
+                        self.edge_found(cfg);
                     }
                 }
             }
@@ -1232,8 +1325,13 @@ impl Potato {
                     .filter(|d| d.round == *round && d.seq == *seq)
                 {
                     d.listening_after_ms = Some(*after_ms);
-                    if d.cause.as_deref() == Some("waking") {
-                        d.cause_ms = Some(*after_ms);
+                    // its lateness is known now: the wake's wait for a CPU, or the wake itself
+                    if d.stage == "waking" {
+                        let (cause, cause_ms) = Self::late_cause(d.cpu_wait_ms, Some(*after_ms));
+                        self.drop_measured(|d| {
+                            d.cause = Some(cause.into());
+                            d.cause_ms = cause_ms;
+                        });
                     }
                 }
                 if let Some(rung) = self
@@ -1243,9 +1341,6 @@ impl Potato {
                 {
                     if let Some(d) = rung.broke.as_mut() {
                         d.listening_after_ms = Some(*after_ms);
-                        if d.cause.as_deref() == Some("waking") {
-                            d.cause_ms = Some(*after_ms);
-                        }
                     }
                 }
             }
@@ -1433,8 +1528,9 @@ pub struct RoundView {
     pub last_catch_at: Option<u64>,
     pub flight: Option<Flight>,
     pub best_lap_hold_ms: Option<u64>,
-    /// Catches per second over the last completed lap, measured from the times the
-    /// coordinator read the catches; null before a lap completes.
+    /// Catches per second over the last completed lap, measured from the times the host's
+    /// agent read the catches; null before a lap completes, and for a lap its catchers'
+    /// holds do not allow.
     pub pace: Option<f64>,
     /// The fastest pace of a completed lap of this round.
     pub best_pace: Option<f64>,
@@ -1493,7 +1589,7 @@ impl Potato {
                 last_catch_at: r.last_catch_at,
                 flight: r.flight.clone(),
                 best_lap_hold_ms: r.best_lap_hold_ms,
-                pace: r.laps.last().map(|l| l.pace),
+                pace: r.laps.last().and_then(|l| l.pace),
                 best_pace: r.best_pace,
                 laps: r.laps.clone(),
                 cpus_in_use: r.ring_stats.as_ref().map(|s| s.cpus_in_use),
@@ -1829,20 +1925,18 @@ mod tests {
         );
     }
 
-    /// A completed lap's record is acknowledged state at once: a coordinator that restarts
-    /// before the ball drops keeps it.
     #[test]
     fn a_completed_lap_is_a_record_before_the_ball_drops() {
         let (mut g, cfg, mut proofs) = game(2);
         let id = g.round.as_ref().unwrap().id;
         for (seq, p) in [(0, 0), (1, 1), (2, 0)] {
-            let e = catch(&mut proofs, p, id, seq, 1100 + seq * 100, false);
+            let e = held(catch(&mut proofs, p, id, seq, 1100 + seq * 100, false), 100);
             g.event("h", &e, e.at, &cfg);
         }
         assert_eq!(
             g.ladder[0].record_pace,
             Some(10.0),
-            "one catch 100 ms after the first"
+            "one catch 100 ms after the first, at a 100 ms hold"
         );
         g.resumed();
         assert_eq!(g.ladder[0].record_pace, Some(10.0));
@@ -1868,27 +1962,35 @@ mod tests {
         assert_eq!(g.round.as_ref().unwrap().best_lap_hold_ms, Some(start));
     }
 
-    /// The pace is what the catch times say, not 1000 / hold: a ring of 2 at a 2000 ms hold
-    /// whose catches were read 200 ms apart ran at 5 catches a second.
+    /// The pace is what the host's stamps of the catches say, not 1000 / hold and not the
+    /// times the coordinator applied them: a connection that stalls delivers a lap in a burst.
     #[test]
     fn pace_is_measured_from_the_catch_times() {
         let (mut g, cfg, mut proofs) = game(2);
         let id = g.round.as_ref().unwrap().id;
         let view = |g: &Potato| g.view(&cfg).unwrap().round.unwrap();
-        let mut play = |g: &mut Potato, seq: u64, at: u64| {
-            let e = catch(&mut proofs, (seq % 2) as u32, id, seq, at, false);
-            g.event("h", &e, e.at, &cfg);
+        // every catch reaches the coordinator in one burst, a millisecond apart
+        let mut applied = 5000;
+        let mut play = |g: &mut Potato, seq: u64, host_at: u64, hold_ms: u64| {
+            let e = held(
+                catch(&mut proofs, (seq % 2) as u32, id, seq, host_at, false),
+                hold_ms,
+            );
+            applied += 1;
+            g.event("h", &e, applied, &cfg);
         };
-        play(&mut g, 0, 1100);
+        play(&mut g, 0, 1100, 200);
         assert_eq!(view(&g).pace, None, "no lap is complete");
         assert!(view(&g).laps.is_empty());
-        play(&mut g, 1, 1300);
-        let v = view(&g);
-        assert_eq!(v.hold_ms, 2000);
-        assert_eq!(v.pace, Some(5.0), "one catch after the first, 200 ms later");
+        play(&mut g, 1, 1300, 100);
+        assert_eq!(
+            view(&g).pace,
+            Some(5.0),
+            "one catch after the first, 200 ms later"
+        );
         // lap 1 at twice the speed: 2 catches in the 200 ms after lap 0's last
-        play(&mut g, 2, 1400);
-        play(&mut g, 3, 1500);
+        play(&mut g, 2, 1400, 100);
+        play(&mut g, 3, 1500, 500);
         let v = view(&g);
         assert_eq!((v.pace, v.best_pace), (Some(10.0), Some(10.0)));
         assert_eq!(
@@ -1896,17 +1998,88 @@ mod tests {
                 .iter()
                 .map(|l| (l.lap, l.pace, l.hold_ms))
                 .collect::<Vec<_>>(),
-            vec![(0, 5.0, 2000), (1, 10.0, 1800)]
+            vec![(0, Some(5.0), 200), (1, Some(10.0), 500)],
+            "with the longest hold a catch of the lap carried"
         );
         // a slower lap is the pace now, and not the round's best
-        play(&mut g, 4, 2000);
-        play(&mut g, 5, 2500);
+        play(&mut g, 4, 2000, 500);
+        play(&mut g, 5, 2500, 500);
         let v = view(&g);
         assert_eq!((v.pace, v.best_pace), (Some(2.0), Some(10.0)));
+        assert_eq!(g.ladder[0].record_pace, Some(10.0));
         assert_eq!(
-            g.round.as_ref().unwrap().catch_at.len(),
+            g.round.as_ref().unwrap().catch_marks.len(),
             1,
             "only the last lap's last catch is kept to measure the next from"
+        );
+    }
+
+    /// A lap cannot be faster than the holds its catchers kept. One whose stamps say it was
+    /// (the agent read the reports late, in a burst) has no pace: it sets no record, is not
+    /// the round's best, and is listed without a pace so the page does not draw it.
+    #[test]
+    fn a_lap_the_holds_do_not_allow_has_no_pace_and_sets_no_record() {
+        let (mut g, cfg, mut proofs) = ladder_game(4, 8);
+        let id = g.round.as_ref().unwrap().id;
+        let mut play = |g: &mut Potato, seq: u64, host_at: u64| {
+            let e = held(
+                catch(&mut proofs, (seq % 4) as u32, id, seq, host_at, false),
+                100,
+            );
+            g.event("h", &e, host_at, &cfg);
+        };
+        // lap 0, read in a burst: four catches at 100 ms holds stamped within 2 ms
+        for (seq, at) in [(0, 1100), (1, 1101), (2, 1101), (3, 1102)] {
+            play(&mut g, seq, at);
+        }
+        let v = g.view(&cfg).unwrap();
+        let r = v.round.as_ref().unwrap();
+        assert_eq!(
+            (r.pace, r.best_pace),
+            (None, None),
+            "not 1500 catches a second"
+        );
+        assert_eq!(r.laps.len(), 1);
+        assert_eq!((r.laps[0].pace, r.laps[0].hold_ms), (None, 100));
+        assert_eq!(v.ladder[0].record_pace, None);
+        // lap 1 as it was played: a catch every 100 ms after the hold of the one before
+        for (seq, at) in [(4, 1500), (5, 1600), (6, 1700)] {
+            play(&mut g, seq, at);
+        }
+        // its last catch is read late, 350 ms after it happened: a slower lap, and plausible
+        play(&mut g, 7, 2150);
+        let v = g.view(&cfg).unwrap();
+        assert_eq!(
+            v.round.as_ref().unwrap().pace,
+            Some(3.82),
+            "4 catches in 1048 ms"
+        );
+        assert_eq!(v.ladder[0].record_pace, Some(3.82));
+        // lap 2 is measured from that late stamp: its catches, played at 1900 to 2200, were
+        // read at 2151 to 2200. Four catches in 50 ms at 100 ms holds did not happen.
+        for (seq, at) in [(8, 2151), (9, 2152), (10, 2153), (11, 2200)] {
+            play(&mut g, seq, at);
+        }
+        let v = g.view(&cfg).unwrap();
+        let r = v.round.as_ref().unwrap();
+        assert_eq!((r.pace, r.best_pace), (None, Some(3.82)));
+        assert_eq!(
+            r.laps.iter().map(|l| l.pace).collect::<Vec<_>>(),
+            vec![None, Some(3.82), None]
+        );
+        assert_eq!(
+            v.ladder[0].record_pace,
+            Some(3.82),
+            "80 catches a second is no record"
+        );
+        // a lap a little under its holds is the stamps' jitter, and is timed
+        for (seq, at) in [(12, 2300), (13, 2400), (14, 2500), (15, 2580)] {
+            play(&mut g, seq, at);
+        }
+        assert_eq!(
+            g.view(&cfg).unwrap().round.unwrap().pace,
+            Some(10.53),
+            "4 catches in 380 ms, at least nine tenths of the 400 ms held"
         );
     }
 
@@ -2106,7 +2279,7 @@ mod tests {
         host_at: u64,
         ring: RingStats,
     ) -> PotatoEvent {
-        let mut e = catch(proofs, (seq % 2) as u32, id, seq, at, false);
+        let mut e = held(catch(proofs, (seq % 2) as u32, id, seq, at, false), 100);
         e.at = host_at;
         if let PotatoKind::Caught { ring: r, .. } = &mut e.kind {
             *r = Some(ring);
@@ -2225,7 +2398,10 @@ mod tests {
         let (mut g, cfg, mut proofs) = game(2);
         let id = g.round.as_ref().unwrap().id;
         for seq in 0..2 {
-            let e = catch(&mut proofs, seq as u32, id, seq, 1100 + seq * 100, false);
+            let e = held(
+                catch(&mut proofs, seq as u32, id, seq, 1100 + seq * 100, false),
+                100,
+            );
             g.event("h", &e, e.at, &cfg);
         }
         let v = serde_json::to_value(g.view(&cfg).unwrap()).unwrap();
@@ -2387,7 +2563,16 @@ mod tests {
             .collect()
     }
 
-    /// One lap of the round being played, its catches `gap` ms apart, starting at `at`.
+    /// The catch `e`, its catcher reporting that it keeps the ball `hold_ms`.
+    fn held(mut e: PotatoEvent, hold_ms: u64) -> PotatoEvent {
+        if let PotatoKind::Caught { hold_us, .. } = &mut e.kind {
+            *hold_us = Some(hold_ms * 1000);
+        }
+        e
+    }
+
+    /// One lap of the round being played, its catches `gap` ms apart and each held for `gap`,
+    /// starting at `at`.
     fn lap(
         g: &mut Potato,
         cfg: &PotatoConfig,
@@ -2402,13 +2587,30 @@ mod tests {
         };
         for i in 0..n {
             let seq = from + i;
-            let e = catch(proofs, (seq % n) as u32, id, seq, at + i * gap, false);
+            let e = held(
+                catch(proofs, (seq % n) as u32, id, seq, at + i * gap, false),
+                gap,
+            );
             g.event("h", &e, e.at, cfg);
         }
     }
 
     /// The ball dropped for want of a catcher, as the agent reports it.
     fn dropped(g: &mut Potato, cfg: &PotatoConfig, at: u64, phase: &str, cpu_wait: Option<f64>) {
+        dropped_with(g, cfg, at, phase, 90.0, cpu_wait, None)
+    }
+
+    /// As [`dropped`], with how long the catcher had been in its phase and, for a catcher
+    /// that is awake by now, how late it woke.
+    fn dropped_with(
+        g: &mut Potato,
+        cfg: &PotatoConfig,
+        at: u64,
+        phase: &str,
+        phase_ms: f64,
+        cpu_wait: Option<f64>,
+        late: Option<f64>,
+    ) {
         let (id, seq, n) = {
             let r = g.round.as_ref().unwrap();
             (r.id, r.seq.unwrap_or(0), r.ring.len() as u64)
@@ -2423,8 +2625,9 @@ mod tests {
                 attempts: 2,
                 reason: "connection refused".into(),
                 catcher_phase: phase.into(),
-                catcher_phase_ms: 90.0,
+                catcher_phase_ms: phase_ms,
                 catcher_cpu_wait_ms: cpu_wait,
+                catcher_late_ms: late,
             },
         };
         g.event("h", &e, at, cfg);
@@ -2457,82 +2660,153 @@ mod tests {
             None,
             "the first record beat nothing"
         );
-        lap(&mut g, &cfg, &mut proofs, 4, 1800, 100);
+        // the last catcher of lap 0 holds 200 ms, then a catch every 100 ms
+        lap(&mut g, &cfg, &mut proofs, 4, 1900, 100);
         assert_eq!(
             rung(&g).record_pace,
-            Some(10.0),
-            "4 catches in the 400 ms after lap 0"
+            Some(8.0),
+            "4 catches in the 500 ms after lap 0"
         );
         assert_eq!(
             rung(&g).record_prev_pace,
             None,
             "the same round's earlier lap"
         );
-        dropped(&mut g, &cfg, 2200, "waking", None);
+        dropped(&mut g, &cfg, 2300, "waking", None);
         // the next round of the size: slower, the record stands
-        g.tick(2200 + cfg.restart_after_ms, true, &cfg);
+        g.tick(2300 + cfg.restart_after_ms, true, &cfg);
         assert_eq!(
             g.round.as_ref().unwrap().size,
             4,
             "one rung wraps to itself"
         );
         lap(&mut g, &cfg, &mut proofs, 0, 8000, 500);
+        lap(&mut g, &cfg, &mut proofs, 4, 10_000, 50);
         assert_eq!(
             (rung(&g).record_pace, rung(&g).record_prev_pace),
-            (Some(10.0), None)
+            (Some(8.0), None)
         );
         // and faster: the record it beat is kept
-        lap(&mut g, &cfg, &mut proofs, 4, 9550, 50);
-        assert_eq!(
-            rung(&g).record_pace,
-            Some(20.0),
-            "4 catches in the 200 ms after 9500"
-        );
-        assert_eq!(rung(&g).record_prev_pace, Some(10.0));
-        lap(&mut g, &cfg, &mut proofs, 8, 9725, 25);
-        assert_eq!(rung(&g).record_pace, Some(40.0));
+        lap(&mut g, &cfg, &mut proofs, 8, 10_200, 50);
+        assert_eq!(rung(&g).record_pace, Some(20.0), "4 catches in 200 ms");
+        assert_eq!(rung(&g).record_prev_pace, Some(8.0));
+        lap(&mut g, &cfg, &mut proofs, 12, 10_400, 25);
+        assert_eq!(rung(&g).record_pace, Some(32.0), "4 catches in 125 ms");
         assert_eq!(
             rung(&g).record_prev_pace,
-            Some(10.0),
+            Some(8.0),
             "what the round beat, not its last lap"
         );
         // acknowledged state: it stays across a restart
         g.resumed();
-        assert_eq!(g.ladder[0].record_pace, Some(40.0));
-        assert_eq!(g.ladder[0].record_prev_pace, Some(10.0));
+        assert_eq!(g.ladder[0].record_pace, Some(32.0));
+        assert_eq!(g.ladder[0].record_prev_pace, Some(8.0));
     }
 
-    /// A round starts near where its size dropped the ball: 1.5 times the median hold of the
-    /// size's recent drops for its first round since the host connected, 1.25 times after,
-    /// and the configured start while it has dropped none.
+    /// A round starts near where the pace last outran its size: 1.5 times the median hold of
+    /// the size's recent such drops for its first round since the host connected, 1.25 times
+    /// after, the configured start while it has none, and never above the configured start.
     #[test]
     fn a_round_starts_near_where_its_size_dropped_the_ball() {
         let (mut g, cfg, _proofs) = ladder_game(4, 8);
         let start = |g: &Potato| g.round.as_ref().unwrap().start_hold_ms;
-        assert_eq!(start(&g), cfg.start_hold_ms(4), "no drop yet");
-        // it drops at its starting hold, 666 ms
-        dropped(&mut g, &cfg, 1500, "waking", None);
-        assert_eq!(g.ladder[0].drop_holds, vec![666]);
-        g.tick(1500 + cfg.restart_after_ms, true, &cfg);
+        let configured = cfg.start_hold_ms(4);
+        assert_eq!((start(&g), configured), (666, 666), "no drop yet");
+        let mut at = 1500;
+        let mut next_round = |g: &mut Potato| {
+            dropped(g, &cfg, at, "waking", None);
+            at += cfg.restart_after_ms;
+            g.tick(at, true, &cfg);
+            at += 500;
+        };
+        next_round(&mut g);
+        assert_eq!(
+            g.ladder[0].drop_holds,
+            vec![666],
+            "it dropped at its starting hold"
+        );
         assert_eq!(
             start(&g),
-            833,
-            "1.25 times 666: the size has played on this connection"
+            666,
+            "1.25 times 666 is above the configured start"
         );
+        // the size has played on this connection: 1.25 times the median
+        g.ladder[0].drop_holds = vec![120];
+        next_round(&mut g);
+        assert_eq!(g.ladder[0].drop_holds, vec![120, 666]);
+        assert_eq!(start(&g), 492, "1.25 times the median of 120 and 666");
+        g.ladder[0].drop_holds = vec![120];
         // a host that connects again starts each size further back, once
-        g.agent_gone("h", 9000, &cfg);
-        g.agent_hello("h", 4, 8, true, 9100, &cfg);
-        g.tick(10_200, true, &cfg);
-        assert_eq!(start(&g), 999, "1.5 times 666");
-        // the median of the last five, whatever ended the other rounds
+        g.agent_gone("h", at, &cfg);
+        g.agent_hello("h", 4, 8, true, at + 100, &cfg);
+        g.tick(at + 1200, true, &cfg);
+        assert_eq!(start(&g), 180, "1.5 times 120");
+        // the median of the last five
+        at += 2000;
         g.ladder[0].drop_holds = vec![900, 100, 120, 110, 130, 140];
-        dropped(&mut g, &cfg, 10_300, "waking", None);
-        assert_eq!(g.ladder[0].drop_holds, vec![120, 110, 130, 140, 999]);
-        g.tick(10_300 + cfg.restart_after_ms, true, &cfg);
+        dropped(&mut g, &cfg, at, "waking", None);
+        assert_eq!(g.ladder[0].drop_holds, vec![120, 110, 130, 140, 180]);
+        g.tick(at + cfg.restart_after_ms, true, &cfg);
         assert_eq!(start(&g), 163, "1.25 times the median, 130");
         // a round that ends another way says nothing of the edge
-        g.agent_gone("h", 20_000, &cfg);
-        assert_eq!(g.ladder[0].drop_holds.len(), 5);
+        g.agent_gone("h", at + 20_000, &cfg);
+        assert_eq!(g.ladder[0].drop_holds, vec![120, 110, 130, 140, 180]);
+    }
+
+    /// One player whose wake never finishes in time drops every ball at whatever hold the
+    /// round started with. Each such drop used to raise the next start by a quarter, without
+    /// end, and the holds are kept in the state file: after an hour a ring started at minutes
+    /// of hold. The start never passes the configured one, whatever a state file holds, and a
+    /// drop the pace did not cause does not move it at all.
+    #[test]
+    fn a_ring_that_keeps_dropping_at_once_starts_no_slower_than_the_configured_start() {
+        let (mut g, cfg, _proofs) = ladder_game(4, 8);
+        let configured = cfg.start_hold_ms(4);
+        let mut at = 1500;
+        for _ in 0..50 {
+            // the catcher of the first throw is still waking, at any hold
+            dropped(&mut g, &cfg, at, "waking", None);
+            at += cfg.restart_after_ms;
+            g.tick(at, true, &cfg);
+            at += 500;
+            let r = g.round.as_ref().expect("the next round starts");
+            assert!(
+                r.start_hold_ms <= configured,
+                "started at {} ms, the configured start is {configured}",
+                r.start_hold_ms
+            );
+        }
+        assert!(g.ladder[0].drop_holds.iter().all(|h| *h <= configured));
+        // what an earlier coordinator wrote is bounded when it is used
+        g.ladder[0].drop_holds = vec![3_600_000; 5];
+        dropped(&mut g, &cfg, at, "waking", None);
+        g.tick(at + cfg.restart_after_ms, true, &cfg);
+        assert_eq!(g.round.as_ref().unwrap().start_hold_ms, configured);
+        // drops the pace did not cause leave the history alone: a catcher awake all along
+        // that refused, one asleep that nothing was waking, and a wake that failed
+        g.ladder[0].drop_holds = vec![100];
+        at += 10 * cfg.restart_after_ms;
+        dropped_with(&mut g, &cfg, at, "awake", 5000.0, None, None);
+        g.tick(at + cfg.restart_after_ms, true, &cfg);
+        dropped(
+            &mut g,
+            &cfg,
+            at + cfg.restart_after_ms + 100,
+            "asleep",
+            None,
+        );
+        g.tick(at + 2 * cfg.restart_after_ms + 100, true, &cfg);
+        let failed = PotatoEvent {
+            at: 1,
+            player: 1,
+            kind: PotatoKind::Failed {
+                stage: "wake".into(),
+                error: "gone".into(),
+            },
+        };
+        g.event("h", &failed, at + 2 * cfg.restart_after_ms + 200, &cfg);
+        assert_eq!(g.last_drop.as_ref().unwrap().reason, "wake_failed");
+        assert_eq!(g.ladder[0].drop_holds, vec![100]);
     }
 
     /// A drop names its cause from what the agent measured of the catcher.
@@ -2590,6 +2864,115 @@ mod tests {
         lap(&mut g, &cfg, &mut proofs, 0, 1100, 200);
         dropped(&mut g, &cfg, 2000, "waking", None);
         assert_eq!(g.last_drop.as_ref().unwrap().pace, Some(5.0));
+    }
+
+    /// A catcher's wake that waited for a CPU and then ran: the drop carries the wait, and the
+    /// cause is the wait when it is more than half of how late the catcher was, else the wake.
+    #[test]
+    fn a_late_wake_is_the_waits_fault_when_the_wait_is_the_larger_part() {
+        let late = |wait: Option<f64>, after_ms: f64| {
+            let (mut g, cfg, _proofs) = ladder_game(4, 8);
+            // 90 ms into its wake when the ball dropped
+            dropped(&mut g, &cfg, 1500, "waking", wait);
+            let d = g.last_drop.clone().unwrap();
+            // how late it was is not reported yet: a wait longer than the wake has run
+            let so_far = match wait {
+                Some(w) if w > 90.0 => (Some("cpu_wait"), Some(w)),
+                _ => (Some("waking"), None),
+            };
+            assert_eq!((d.cause.as_deref(), d.cause_ms), so_far);
+            assert_eq!(d.cpu_wait_ms, wait);
+            let listening = PotatoEvent {
+                at: 1600,
+                player: d.player.unwrap(),
+                kind: PotatoKind::Listening {
+                    round: d.round,
+                    seq: d.seq,
+                    after_ms,
+                },
+            };
+            g.event("h", &listening, 1600, &cfg);
+            let d = g.last_drop.clone().unwrap();
+            assert_eq!(
+                g.ladder[0].broke.as_ref(),
+                Some(&d),
+                "the rung's drop is the same"
+            );
+            assert_eq!(d.cpu_wait_ms, wait);
+            (d.cause.unwrap(), d.cause_ms)
+        };
+        // it waited 100 ms and was 84 ms late: without the wait it would have been on time
+        assert_eq!(late(Some(100.0), 84.0), ("cpu_wait".into(), Some(100.0)));
+        // it waited 50 ms and was 84 ms late: more than half of it
+        assert_eq!(late(Some(50.0), 84.0), ("cpu_wait".into(), Some(50.0)));
+        // it waited 20 ms and was 84 ms late: the wake itself was the larger part
+        assert_eq!(late(Some(20.0), 84.0), ("waking".into(), Some(84.0)));
+        // exactly half is not the larger part
+        assert_eq!(late(Some(42.0), 84.0), ("waking".into(), Some(84.0)));
+        assert_eq!(late(None, 84.0), ("waking".into(), Some(84.0)));
+        // a wake that waited 400 ms for a CPU and had run 30 ms when the ball dropped: the
+        // drop says so at once, with the wait, and still does when the lateness arrives
+        let (mut g, cfg, _proofs) = ladder_game(4, 8);
+        dropped_with(&mut g, &cfg, 1500, "waking", 30.0, Some(400.0), None);
+        let d = g.last_drop.clone().unwrap();
+        assert_eq!(
+            (d.cause.as_deref(), d.cause_ms, d.cpu_wait_ms),
+            (Some("cpu_wait"), Some(400.0), Some(400.0))
+        );
+        let listening = PotatoEvent {
+            at: 1600,
+            player: d.player.unwrap(),
+            kind: PotatoKind::Listening {
+                round: d.round,
+                seq: d.seq,
+                after_ms: 60.0,
+            },
+        };
+        g.event("h", &listening, 1600, &cfg);
+        let d = g.last_drop.clone().unwrap();
+        assert_eq!(
+            (d.cause.as_deref(), d.cause_ms),
+            (Some("cpu_wait"), Some(400.0))
+        );
+    }
+
+    /// A drop read just after the catcher's wake was reported: the catcher is `awake`, for
+    /// less than the thrower's flight window. It was late, by what the agent measured, and
+    /// the drop says so instead of naming no cause.
+    #[test]
+    fn a_catcher_that_woke_within_the_flight_window_was_late() {
+        let cause = |phase_ms: f64, wait: Option<f64>, late: Option<f64>| {
+            let (mut g, cfg, _proofs) = ladder_game(4, 8);
+            assert_eq!(g.round.as_ref().unwrap().flight_window_ms(), 100);
+            dropped_with(&mut g, &cfg, 1500, "awake", phase_ms, wait, late);
+            let d = g.last_drop.clone().unwrap();
+            assert_eq!(g.ladder[0].broke.as_ref(), Some(&d));
+            assert_eq!(d.stage, "awake", "the phase is reported as it was");
+            (d.cause, d.cause_ms, d.cpu_wait_ms)
+        };
+        assert_eq!(
+            cause(17.3, None, Some(3.5)),
+            (Some("waking".into()), Some(3.5), None)
+        );
+        assert_eq!(
+            cause(0.1, None, Some(0.0)),
+            (Some("waking".into()), Some(0.0), None),
+            "ready between the thrower's last try and the end of its window"
+        );
+        // its wake had waited for a CPU, for more than half of its lateness
+        assert_eq!(
+            cause(0.1, Some(150.0), Some(12.0)),
+            (Some("cpu_wait".into()), Some(150.0), Some(150.0))
+        );
+        assert_eq!(
+            cause(40.0, Some(5.0), Some(12.0)),
+            (Some("waking".into()), Some(12.0), Some(5.0))
+        );
+        // an agent that does not report the lateness: late, by an amount not measured
+        assert_eq!(cause(17.3, None, None), (Some("waking".into()), None, None));
+        // awake for longer than a thrower tries: its wake is not why the ball dropped
+        assert_eq!(cause(100.0, None, None), (None, None, None));
+        assert_eq!(cause(5000.0, Some(150.0), None), (None, None, Some(150.0)));
     }
 
     /// A state file written before the ladder was by pace: it loads, keeps its place (by

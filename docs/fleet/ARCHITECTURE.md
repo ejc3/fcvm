@@ -1793,7 +1793,7 @@ a conductor that pings each VM and VMs that throw to each other, "thrower is bet
   filling while it wakes, labelled with the restore's milliseconds. The ball arcs from the
   thrower's tile to the catcher's. Nothing on the page stands for the coordinator.
 - **The pace.** Catches per second over the last completed lap, measured from the times the
-  coordinator read the catches, never computed from the hold. Beside it the hold (how long a
+  host's agent read the catches, never computed from the hold. Beside it the hold (how long a
   player keeps the ball before it throws), the lap and the ring's size, and a meter of the
   hold against the sleep-and-wake time it leaves a player.
 - **The ladder.** Rings at a fixed K CPUs: with K = 8 and 96 players, 16, 32, 64 and 96
@@ -1872,8 +1872,14 @@ player then draws its first colour from the guest's random pool.
    0, so the hold stopped at 9 ms and never reached the 2 ms floor. `hold_ms` stays on the
    ball, rounded, for a player built before `hold_us`. The pace the page shows is measured:
    the catches of the last completed lap divided by the time from the catch before the
-   lap's first to the lap's last, on the coordinator's clock (lap 0 has no catch before it:
-   its last catch minus its first, over one catch fewer).
+   lap's first to the lap's last (lap 0 has no catch before it: its last catch minus its
+   first, over one catch fewer). The times are the host agent's stamps of the catch reports
+   (`at`, which every agent has sent since the first), not the coordinator's: the
+   coordinator stamps a message when it applies it, and a connection that stalls delivers a
+   lap's catches in one burst. The pace is also bounded by the game: every catcher keeps
+   the ball for its hold before the next can catch, so a lap whose stamps span less than
+   nine tenths of the holds its catchers kept (the agent read its reports late, in a burst)
+   has no pace, sets no record and is published with a null pace.
 
 The ball drops when the thrower's flight window runs out (the catcher was asleep, waking,
 or not yet accepting), when a proof does not match, when a wake fails, or when no catch is
@@ -2021,6 +2027,53 @@ kept: reflinking a diff's memory file into an ordinary directory (a sleep's p99 
 from btrfs into the agent). These runs predate the guest image without maintenance timers,
 whose fwupd OOMs stalled a few sleeps further.
 
+### Measured: the ladder on 8 CPUs (2026-11-24)
+
+96 players with `--potato-cpus 8` on a c8g.metal-24xl (96 vCPU, Linux 7.0), the stack at
+29789bae, a coordinator on loopback with the host's agent as its agent, 30 minutes an arm:
+`confined` in a delegated unit (the ring's cpuset on 8 CPUs) and `counted` without. The store
+was a btrfs image in RAM (the box has no instance NVMe), so the sleep and wake times are for
+that store, not for a fleet host. Each arm played 69 rounds.
+
+| ring | machines per CPU | best lap pace, catches/s | median pace at the drop | median hold at the drop, ms | asleep, % | CPU wait p50 / max, ms |
+|---|---|---|---|---|---|---|
+| 16 | 2 | 16.5 / 13.7 | 13.9 / 12.6 | 62.5 / 70 | 50 | 187 / 318, 187 / 362 |
+| 32 | 4 | 13.6 / 13.5 | 12.7 / 11.9 | 68 / 75 | 75 | 182 / 312, 181 / 309 |
+| 64 | 8 | 13.2 / 13.1 | 12.3 / 11.8 | 73 / 74 | 87.5 | 178 / 301, 178 / 336 |
+| 96 | 12 | 13.3 / 13.0 | 12.3 / 11.4 | 73 / 79 | 91.7 | 176 / 302, 173 / 358 |
+
+Each cell is confined / counted.
+
+- **The cap held.** The agent's count of machines not asleep peaked at 8 on every rung of
+  both arms and never passed it; 61% of the sampled catches found all 8 held, and the
+  share asleep was (N - 8) / N throughout. The count is the agent's ledger; no process
+  count was taken beside it.
+- **CPUs busy** (the cpuset's `cpu.stat`, confined arm): a median of 3.2 to 3.3 of the 8,
+  and 4.0 to 5.0 on each rung's best lap.
+- **Wake** p50 91 to 98 ms and p95 278 to 287 ms; **sleep** p50 255 to 264 ms, p95 303 to
+  317 ms confined and 327 to 336 ms counted.
+- **Drops:** 135 of the 138 were a catcher still waking, late by a median of 22 to 58 ms;
+  two were wakes that failed, and one had no cause (the catcher's wake was reported 0.1 ms
+  before the drop was read, which the cause rules above now name).
+- **Confinement cost nothing measurable:** the confined arm's median pace at the drop was
+  3 to 10% above the counted arm's, which started with the load average still at 3.6 from
+  the arm before it.
+- **The edge.** A catcher holds a CPU from the start of its wake to the end of its save, so
+  at a pace p the ring holds about p x (wake + sleep) + 1 CPUs, and the pace K CPUs carry
+  is about (K - 1) / (wake + sleep). An earlier estimate of 9 catches a second for 8 CPUs
+  at a 250 ms wake and a 250 ms sleep was low: the same figures give 14. Here the median
+  wake and sleep (92 and 255 ms) give 20, and the measured 12 to 14 is what the slower
+  cluster of wakes gives (282 and 255 ms: 13).
+- **Why the wakes are in two clusters.** 10,921 of the confined arm's 12,217 wakes took
+  under 200 ms, 1,271 took 250 to 350 ms, and 23 fell between. The slow ones spend the
+  same 84 ms restoring and about 200 ms more waiting for the ball port: the agent's probe
+  of the port (`until_listening`) gives each try 250 ms, and a try sent before the port
+  answers waits all of it. Every drop's catcher had been waking 180 to 375 ms. A third,
+  10 minute arm with that timeout at 25 ms had 1 wake of 200 ms or more in 2,895 and
+  dropped at holds of 39, 49 and 49 ms on rings of 16, 32 and 64 (17 to 18.5 catches a
+  second; one round a rung). The probe is being changed for every mode of the agent at
+  once, outside this section's commit; until then the edge sits at 12 to 14.
+
 ### The ladder and where a round starts
 
 - **The rungs** are derived from the potato host's hello, not configured: 2K, doubling while
@@ -2037,17 +2090,34 @@ whose fwupd OOMs stalled a few sleeps further.
   another allotment gets its own ladder, and the earlier one is kept for a host with that
   allotment (`Potato::shelved`).
 - **A round starts near its edge.** Each rung keeps the hold the ball carried at its last
-  five drops for want of a catcher (`not_listening`). A rung's first round after the host
-  connects starts at 1.5 times the median of those, its later rounds on that connection at
-  1.25 times, and a rung that has dropped no ball at the configured start below. The ladder
-  still moves up one rung on every drop. A round that starts at 400 ms where the edge is
-  150 ms spends nine laps, about 4 minutes at 96 players, above the edge.
-- **A drop names its cause from what was measured**: `waking` (the catcher's wake had
-  started and not finished, with how long after the drop it did accept), `cpu_wait` (its
-  wake was waiting for a free CPU, with how long), `saving` (it was still going to sleep
-  from its last throw, with how long) or `proof`. Anything else (a missed deadline, a host
-  that left, a failed step, a catcher asleep with no wake asked for) has no cause, and the
-  page shows the reason as before.
+  five drops the pace caused (the catcher was still waking, waiting for a CPU or saving). A
+  rung's first round after the host connects starts at 1.5 times the median of those, its
+  later rounds on that connection at 1.25 times, and a rung with no such drop at the
+  configured start below. The ladder still moves up one rung on every drop. A round that
+  starts at 400 ms where the edge is 150 ms spends nine laps, about 4 minutes at 96
+  players, above the edge.
+- **The start never passes the configured one.** A ring with one player that cannot keep up
+  drops every ball in its first lap at whatever hold the round started with, and each such
+  drop would raise the next start by a quarter without end (two laps shrink the hold to
+  0.81 of the start, and 0.81 times 1.25 is above 1). The start is capped at the
+  configured start, which also bounds whatever a state file holds, and a drop the pace did
+  not cause (a failed wake, a proof, a host that left, a catcher that was awake and
+  refused) is not kept. A drop in a round's first lap is kept: without it a start that is
+  below the edge, on a host that got slower, would never move back up.
+- **A drop names its cause from what was measured**:
+  - `waking`: the catcher's wake was not finished in time, with how late it was (how long
+    after the drop it accepted, or, when the drop was read with the wake already reported,
+    how long after the end of the thrower's flight window it was ready).
+  - `cpu_wait`: its wake waited for a free CPU, with how long. The drop carries that wait
+    (`cpu_wait_ms`) whatever the cause, and the wait is the cause when it is the larger
+    part of the lateness: more than half of it, so that without the wait the catcher would
+    have been less than half as late, or on time. A wake that had not started at all is
+    `cpu_wait`. Until the lateness is reported, a wake that waited longer than it has run
+    is `cpu_wait`.
+  - `saving`: it was still going to sleep from its last throw, with how long.
+  - `proof`.
+  Anything else (a missed deadline, a host that left, a failed step, a catcher awake for
+  longer than a thrower tries) has no cause, and the page shows the reason as before.
 
 ### The starting pace
 
@@ -2085,6 +2155,13 @@ machines those K serve: N / K machines per CPU.
   before it reports, and a sleep whose fcvm has not exited 40 s after `snapshot create
   --stop` stops it and waits. Before this a failed wake dropped its VM with SIGTERM and
   reported at once.
+- **An fcvm that exits is noticed at once.** While the agent waits for a machine's port
+  (the gold's, a new player's, a waking player's) it also watches the machine's fcvm. If
+  that exits first (a refused preflight, a snapshot whose memory is gone), the operation
+  fails then, with the exit status and fcvm's last lines, logged at warn, and its CPU is
+  free. The agent used to wait out the port's deadline, 600 s for the gold and a new
+  player, with nothing in its log; on a host without IPv6 forwarding every round ended at
+  the coordinator's 120 s deadline for that reason.
 - **K is physical where the host allows it.** Under a delegated systemd unit
   (`Delegate=yes`, `DelegateSubgroup=agent`, in `fcvm-fleet-agent.service`) the agent makes
   a cgroup beside its own, `<unit>/potato`, sets its `cpuset.cpus` to the K highest-numbered
@@ -2114,9 +2191,18 @@ machines those K serve: N / K machines per CPU.
 - **New players.** A round boots its missing players K at a time, those the ball reaches
   last first: each sleeps once booted and its CPU goes to the next. Those within the lead
   boot last and stay awake, and the first ball is thrown when every player exists.
-- **When the agent stops** it waits up to 30 s for the ring's cgroup to empty. That cgroup
-  is inside the agent's unit, so systemd kills what is left with SIGKILL, and an fcvm
-  killed that way leaves its VM's network behind.
+- **Boots yield to wakes once the ball is in play.** A player whose sleep failed has no
+  snapshot and is booted again in the middle of a round, and a boot can hold its CPU for as
+  long as a restore is given. After the first throw a boot takes a CPU only if another
+  stays free for the next wake. Before the first throw the boots take every CPU.
+- **When the agent stops** it tells the ring to stop first and waits for it last, after the
+  slots have been told too, so the ring's wait does not come out of the time the wall's and
+  the phones' VMs have to stop in. The ring stops within its own time: SIGTERM to every
+  player's VM at once, SIGKILL after 20 s to one that has not exited, and after that
+  `cgroup.kill` on the ring's cgroup for what no handle reaches (a VM inside an operation
+  that was aborted), with 5 s for it to be gone. That is inside the unit's 60 s. A ring
+  without a cgroup has no hold on those last. The ring's cgroup is inside the agent's
+  unit, so systemd kills whatever is still there with the unit.
 
 ### Components
 
@@ -2173,8 +2259,12 @@ machines those K serve: N / K machines per CPU.
 11. No oversubscription: at every instant the machines not asleep are at most K, the ledger
     agrees with the operations the driver started, no CPU idles while a wake waits for one,
     and a CPU is freed only by an operation whose fcvm has exited
-    (`machines_not_asleep_never_exceed_the_cpus_in_any_interleaving`, which drives the
-    driver through every order of its events, and
+    (`machines_not_asleep_never_exceed_the_cpus_in_any_interleaving` and the four
+    `the_cap_holds_...` tests beside it, which drive the driver through every order of its
+    events within their bounds: the gold made, failing and made again; boots, wakes and
+    sleeps ending either way; catches, throws read late and drops; a round replaced or
+    ended at any point, by one of another ring; 3, 4 and 5 CPUs, the lead at its cap and
+    below it; and a boot started while the ball is in play leaving a CPU free. Also
     `a_failed_operation_reports_after_its_fcvm_has_exited`).
 12. A player that has thrown refuses the ball until the agent wakes it; a repeated ball counts
     once; a stopped round's throw is abandoned; a connection that sends nothing never holds

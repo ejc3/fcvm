@@ -324,6 +324,11 @@ impl RingCgroup {
             .unwrap_or(false)
     }
 
+    /// SIGKILL every process left in the ring's cgroup (`cgroup.kill`).
+    pub fn kill(&self) -> std::io::Result<()> {
+        std::fs::write(self.dir.join("cgroup.kill"), "1")
+    }
+
     /// Wait until no process of the ring is left, for at most `deadline`. The ring's cgroup
     /// is inside the agent's unit, so whatever is left when the agent exits is killed by
     /// systemd with SIGKILL, and an fcvm killed that way leaves its VM's network behind.

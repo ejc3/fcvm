@@ -51,8 +51,13 @@ const FIRST_WAKE_MS: f64 = 1500.0;
 const WAKE_WINDOW: Duration = Duration::from_secs(30);
 /// How long an fcvm the agent stops has to exit after SIGTERM before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(30);
-/// How long the agent waits, when it stops, for the ring's cgroup to empty.
-const EMPTY_DEADLINE: Duration = Duration::from_secs(30);
+/// How long an fcvm that exited is given for its last lines to be read into its failure.
+const TAIL_WAIT: Duration = Duration::from_millis(100);
+/// How long the ring's VMs have to exit after SIGTERM when the agent stops; what is left is
+/// killed. With [`RING_KILL_WAIT`] it stays well inside the agent unit's 60 s to stop.
+const RING_STOP_GRACE: Duration = Duration::from_secs(20);
+/// How long a killed ring is given to be gone.
+const RING_KILL_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct PotatoCfg {
@@ -192,6 +197,8 @@ struct Player {
     margin_due: Option<Instant>,
     /// The round its wake was started for.
     woken_for: Option<u64>,
+    /// How long its latest wake waited for a free CPU before it started, ms.
+    cpu_waited_ms: Option<f64>,
 }
 
 impl Player {
@@ -205,6 +212,7 @@ impl Player {
             ready_at: None,
             margin_due: None,
             woken_for: None,
+            cpu_waited_ms: None,
         }
     }
 }
@@ -269,9 +277,10 @@ struct Playing {
     kicked: bool,
     /// The ball dropped (or the round was replaced): no more wakes.
     over: bool,
-    /// When the holder of the latest catch starts its throw, and the seq that throw carries:
-    /// the catch's read time plus the hold the catcher keeps.
-    throw_due: Option<(u64, Instant)>,
+    /// The throw of the latest catch's holder: the seq it carries, when it starts (the catch's
+    /// read time plus the hold the catcher keeps) and how long the thrower then tries (its
+    /// flight window).
+    throw_due: Option<(u64, Instant, Duration)>,
 }
 
 impl Playing {
@@ -533,20 +542,54 @@ pub async fn run(
         }
     }
     tracing::info!("potato mode stopping: every player's VM goes with the agent");
-    // in-flight work first (a boot waiting for a slot would start a VM after this), then the
-    // players' VMs, which stop when the driver drops them
+    // in-flight work first (a boot waiting for a slot would start a VM after this): an aborted
+    // operation drops the VM it holds, which sends its fcvm SIGTERM
     d.ops.shutdown();
+    let vms: Vec<Vm> = d.players.iter_mut().filter_map(|p| p.vm.take()).collect();
     drop(d);
-    // The ring's cgroup is inside the agent's unit: what is left in it when the agent exits,
-    // systemd kills with SIGKILL, and an fcvm killed that way leaves its VM's network behind.
-    if let Some(cgroup) = &cfg.cgroup {
-        if !cgroup.emptied(EMPTY_DEADLINE).await {
-            tracing::warn!(
-                "potato: processes are left in the ring's cgroup {EMPTY_DEADLINE:?} after its VMs were stopped"
-            );
-        }
-    }
+    stop_ring(vms, cfg.cgroup.as_deref(), RING_STOP_GRACE, RING_KILL_WAIT).await;
     Ok(())
+}
+
+/// Stop the ring's VMs within the ring's own time: SIGTERM to each at once, SIGKILL to one
+/// that has not exited after `grace`. One stuck player VM must not hold the agent past the
+/// time systemd gives its unit, or systemd kills every VM of the host, the wall's and the
+/// phones' included, without their teardown.
+///
+/// `vms` are the VMs the players held. A VM inside an operation that was aborted (a wake, a
+/// boot, a sleep) got SIGTERM when the operation dropped it and has no handle left; where
+/// the ring has a cgroup, whatever is still in it after `grace` is killed through it. A ring
+/// without a cgroup has no hold on those.
+async fn stop_ring(
+    vms: Vec<Vm>,
+    cgroup: Option<&RingCgroup>,
+    grace: Duration,
+    kill_wait: Duration,
+) {
+    let end = tokio::time::Instant::now() + grace;
+    let mut stops = tokio::task::JoinSet::new();
+    for mut vm in vms {
+        stops.spawn(async move {
+            vm.stop(grace).await;
+        });
+    }
+    while stops.join_next().await.is_some() {}
+    let Some(cgroup) = cgroup else { return };
+    let left = end.saturating_duration_since(tokio::time::Instant::now());
+    if cgroup.emptied(left).await {
+        return;
+    }
+    tracing::warn!(
+        "potato: processes are left in the ring's cgroup {grace:?} after SIGTERM; killing them"
+    );
+    if let Err(e) = cgroup.kill() {
+        tracing::warn!(error = %e, "potato: the ring's cgroup could not be killed");
+    }
+    if !cgroup.emptied(kill_wait).await {
+        tracing::warn!(
+            "potato: the ring's cgroup is still populated {kill_wait:?} after it was killed"
+        );
+    }
 }
 
 async fn serve_reports(listener: tokio::net::TcpListener, tx: mpsc::UnboundedSender<Heard>) {
@@ -731,6 +774,31 @@ fn start_vm(cfg: &PotatoCfg, args: &[String], slot: &str) -> Result<Vm> {
     })
 }
 
+/// Wait for `port`, which only a running `vm` can answer. If the VM's fcvm exits first (a
+/// refused preflight, a snapshot that is gone), fail at once with its exit status and last
+/// lines instead of waiting out the port's deadline, and say so at warn: nothing else logs
+/// why a machine never came up.
+async fn while_running<T>(
+    vm: &mut Vm,
+    what: &str,
+    port: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let status = tokio::select! {
+        answered = port => return answered,
+        status = vm.exited() => status,
+    };
+    // its output is read by other tasks: give its last lines a moment to arrive
+    let waited = Instant::now();
+    while !vm.has_tail() && waited.elapsed() < TAIL_WAIT {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let tail = vm.tail();
+    let last: Vec<&str> = tail.lines().rev().take(4).collect();
+    let tail = last.into_iter().rev().collect::<Vec<_>>().join(" | ");
+    tracing::warn!(machine = what, %status, %tail, "potato: fcvm exited while its machine's port was awaited");
+    bail!("{what}'s fcvm exited ({status}) before its port answered: {tail}")
+}
+
 /// A failure before any fcvm was started.
 fn unstarted(error: anyhow::Error) -> Failed {
     Failed {
@@ -753,15 +821,17 @@ impl Ops for FcvmOps {
                     args[args.iter().position(|a| a == "--ipv6-address").unwrap() + 1].parse()?;
                 Ok((start_vm(&cfg, &args, GOLD)?, addr))
             });
-            let (gold, addr) = match started {
+            let (mut gold, addr) = match started {
                 Ok(x) => x,
                 Err(e) => {
                     let _ = done.send(Done::Gold(Err(e), Exited::none()));
                     return;
                 }
             };
+            let listening =
+                while_running(&mut gold, GOLD, until_listening(addr, BOOT_DEADLINE)).await;
             let created = async {
-                until_listening(addr, BOOT_DEADLINE).await?;
+                listening?;
                 run_fcvm(
                     &cfg.fcvm,
                     &[
@@ -792,8 +862,8 @@ impl Ops for FcvmOps {
                 let _slot = slots.acquire().await.map_err(|e| unstarted(e.into()))?;
                 let addr = cfg.prefix.player_address(n).map_err(unstarted)?;
                 let args = cfg.restore_args(GOLD, n).map_err(unstarted)?;
-                let vm = start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?;
-                let assigned = async {
+                let mut vm = start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?;
+                let assigned = while_running(&mut vm, &PotatoCfg::tag(n), async {
                     until_listening(addr, BOOT_DEADLINE).await?;
                     let answer = ask(
                         addr,
@@ -808,7 +878,7 @@ impl Ops for FcvmOps {
                         bail!("player {n} refused its number: {e}");
                     }
                     Ok(Instant::now())
-                }
+                })
                 .await;
                 match assigned {
                     Ok(at) => Ok(Ready {
@@ -899,18 +969,24 @@ impl Ops for FcvmOps {
             let r = async {
                 let args = cfg.restore_args(&PotatoCfg::tag(n), n).map_err(unstarted)?;
                 let addr = cfg.prefix.player_address(n).map_err(unstarted)?;
-                let vm = start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?;
-                let listening = async {
-                    until_listening(addr, WAKE_DEADLINE).await?;
+                let mut vm = start_vm(&cfg, &args, &PotatoCfg::tag(n)).map_err(unstarted)?;
+                let listening = while_running(&mut vm, &PotatoCfg::tag(n), async {
+                    let probed = until_listening(addr, WAKE_DEADLINE).await?;
                     // it catches only once told it woke: a report connection can fail for other
                     // reasons, and a probe answers before the gate's last half opens
-                    let answer =
-                        ask(addr, &Inbound::Wake { round }, Duration::from_secs(5)).await?;
+                    let answer = ask(addr, &Inbound::Wake { round }, Duration::from_secs(5))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "the wake message, {:.1} ms after the ball port answered a probe",
+                                ms(probed.elapsed())
+                            )
+                        })?;
                     if let Err(e) = fleet_potato::Reply::ok(&answer) {
                         bail!("player {n} refused its wake: {e}");
                     }
                     Ok(Instant::now())
-                }
+                })
                 .await;
                 match listening {
                     Ok(at) => {
@@ -1126,6 +1202,7 @@ impl Driver {
             return;
         }
         let ring = p.order.ring.clone();
+        let in_play = p.kicked;
         // wakes first: the ball is on its way to them
         self.schedule_wakes();
         // Then new players, those the ball reaches last first: they sleep once booted and
@@ -1140,7 +1217,14 @@ impl Driver {
                 )
             })
             .partition(|n| lead.contains(n));
+        // While the ball is in play a boot takes a CPU only if another stays free: the next
+        // catch needs one for a wake, and a boot can hold its CPU for as long as a restore is
+        // given (a player whose sleep failed is booted again in the middle of a round).
+        // Before the first throw the boots take every CPU: nothing is waiting to wake.
         for n in far.into_iter().chain(near) {
+            if in_play && self.cpus.in_use() + 1 >= self.cpus.cap() {
+                break;
+            }
             if !self.boot(n) {
                 break;
             }
@@ -1278,6 +1362,7 @@ impl Driver {
             .wanted_since
             .take()
             .map(|since| ms(since.elapsed()));
+        self.players[n as usize].cpu_waited_ms = cpu_wait_ms;
         self.set(n, Phase::Waking);
         self.emit(n, PotatoKind::Waking { cpu_wait_ms });
         let round = self.playing.as_ref().map(|p| p.order.round);
@@ -1410,7 +1495,10 @@ impl Driver {
                 if let Some(pl) = self.playing.as_mut().filter(|pl| pl.order.round == round) {
                     let newest = !pl.caught || seq >= pl.seq;
                     // when the throw that this catch ended began
-                    let due = pl.throw_due.filter(|(s, _)| *s == seq).map(|(_, at)| at);
+                    let due = pl
+                        .throw_due
+                        .filter(|(s, ..)| *s == seq)
+                        .map(|(_, at, _)| at);
                     pl.seq = if pl.caught { pl.seq.max(seq) } else { seq };
                     pl.caught = true;
                     if newest {
@@ -1419,7 +1507,8 @@ impl Driver {
                             || Duration::from_millis(pl.hold_ms()),
                             Duration::from_micros,
                         );
-                        pl.throw_due = Some((seq + 1, read + hold));
+                        let flight = hold.min(Duration::from_millis(pl.order.flight_ms));
+                        pl.throw_due = Some((seq + 1, read + hold, flight));
                     }
                     if let (Some(due), Some(catcher)) = (due, self.players.get_mut(player as usize))
                     {
@@ -1491,11 +1580,26 @@ impl Driver {
                     .get(to as usize)
                     .map(|p| (p.phase.name(), ms(p.since.elapsed())))
                     .unwrap_or(("unknown", 0.0));
-                let catcher_cpu_wait_ms = self
-                    .players
-                    .get(to as usize)
-                    .and_then(|p| p.wanted_since)
-                    .map(|since| ms(since.elapsed()));
+                let catcher = self.players.get(to as usize);
+                // how long the catcher's wake has waited for a CPU (it is still asleep), or
+                // waited before it started (it is waking, or has just woken)
+                let catcher_cpu_wait_ms = catcher.and_then(|p| match p.phase {
+                    Phase::Asleep => p.wanted_since.map(|since| ms(since.elapsed())),
+                    Phase::Waking | Phase::Awake => p.cpu_waited_ms,
+                    _ => None,
+                });
+                // A catcher that is awake by now was ready this long after the thrower's flight
+                // window ended; 0 when it was ready between the thrower's last try and that end.
+                let flight_end = self
+                    .playing
+                    .as_ref()
+                    .filter(|pl| pl.order.round == round)
+                    .and_then(|pl| pl.throw_due)
+                    .filter(|(s, ..)| *s == seq)
+                    .map(|(_, start, flight)| start + flight);
+                let catcher_late_ms = catcher
+                    .filter(|p| p.phase == Phase::Awake)
+                    .and_then(|p| Some(signed_ms(p.ready_at?, flight_end?).max(0.0)));
                 send(
                     self,
                     player,
@@ -1508,6 +1612,7 @@ impl Driver {
                         catcher_phase: phase.to_string(),
                         catcher_phase_ms: since,
                         catcher_cpu_wait_ms,
+                        catcher_late_ms,
                     },
                 );
                 let current = self
@@ -2518,6 +2623,211 @@ mod tests {
         assert_eq!(waits[0].0, 3);
         assert!(waits[0].1.is_some_and(|w| w >= 15.0), "{waits:?}");
         assert!(d.players[3].wanted_since.is_none());
+        // the ball drops on player 3 while its wake runs: the drop carries the wait of that
+        // wake, though the wait is over
+        d.heard(heard(Report::Dropped {
+            player: 2,
+            round: 1,
+            seq: 3,
+            to: addr(3),
+            attempts: 2,
+            reason: "connection refused".into(),
+        }));
+        let dropped = sent(&mut out)
+            .into_iter()
+            .find_map(|e| match e.kind {
+                PotatoKind::Dropped {
+                    catcher_phase,
+                    catcher_cpu_wait_ms,
+                    catcher_late_ms,
+                    ..
+                } => Some((catcher_phase, catcher_cpu_wait_ms, catcher_late_ms)),
+                _ => None,
+            })
+            .expect("the drop is reported");
+        assert_eq!((dropped.0.as_str(), dropped.2), ("waking", None));
+        assert_eq!(dropped.1, waits[0].1, "the wait its wake reported");
+    }
+
+    /// A drop read after the catcher's wake was reported finds it awake: the drop says how
+    /// long after the end of the thrower's flight window the catcher was ready.
+    #[test]
+    fn a_drop_on_a_catcher_that_has_just_woken_says_how_late_it_was() {
+        let late = |ready_after_ms: u64| {
+            let (mut d, _rec, mut out) = asleep(2, 300.0);
+            d.order(Some(round(1, vec![0, 1], 1000)));
+            d.done(Done::Woke(0, Ok(ready()), 300.0));
+            let base = Instant::now();
+            // player 0 catches at `base`, keeps the ball 50 ms and then tries for 50 ms (its
+            // hold, shorter than the round's 100 ms flight): its window ends 100 ms after
+            d.heard(Heard {
+                report: Report::Caught {
+                    player: 0,
+                    round: 1,
+                    seq: 0,
+                    proof: proof(),
+                    hold_us: Some(50_000),
+                },
+                at: 1,
+                read: base,
+            });
+            d.done(Done::Woke(
+                1,
+                Ok(Ready {
+                    vm: None,
+                    stages: BTreeMap::new(),
+                    at: base + Duration::from_millis(ready_after_ms),
+                }),
+                300.0,
+            ));
+            sent(&mut out);
+            d.heard(heard(Report::Dropped {
+                player: 0,
+                round: 1,
+                seq: 1,
+                to: addr(1),
+                attempts: 20,
+                reason: "refused".into(),
+            }));
+            sent(&mut out)
+                .into_iter()
+                .find_map(|e| match e.kind {
+                    PotatoKind::Dropped {
+                        catcher_phase,
+                        catcher_cpu_wait_ms,
+                        catcher_late_ms,
+                        ..
+                    } => Some((catcher_phase, catcher_cpu_wait_ms, catcher_late_ms)),
+                    _ => None,
+                })
+                .expect("the drop is reported")
+        };
+        assert_eq!(late(130), ("awake".into(), None, Some(30.0)));
+        assert_eq!(
+            late(90),
+            ("awake".into(), None, Some(0.0)),
+            "ready inside the window, after the thrower's last try"
+        );
+    }
+
+    /// While the ball is in play a boot leaves a CPU for the next wake. A player whose sleep
+    /// failed is booted again in the middle of a round, and a boot can hold its CPU for as
+    /// long as a restore is given.
+    #[test]
+    fn a_boot_during_a_round_leaves_a_cpu_for_the_next_wake() {
+        let (mut d, rec, _out) = driver_on(6, 3);
+        d.gold_ready = true;
+        for p in &mut d.players {
+            p.phase = Phase::Asleep;
+        }
+        d.wakes.push_back((Instant::now(), 300.0));
+        d.order(Some(round(1, (0..6).collect(), 200)));
+        d.done(Done::Woke(0, Ok(ready()), 300.0));
+        d.heard(caught(0, 1, 0));
+        assert_eq!(rec.take(), vec!["wake 0", "kick 1", "wake 1"]);
+        // player 5's snapshot is gone (its sleep failed): it has to be restored from the gold
+        d.set(5, Phase::Missing);
+        d.advance();
+        assert_eq!(
+            (rec.take(), d.cpus.in_use()),
+            (Vec::<String>::new(), 2),
+            "the one free CPU is the next wake's"
+        );
+        d.heard(threw(0, 1, 1, 1));
+        d.done(Done::Slept(0, Ok(BTreeMap::new()), 300.0, Exited::none()));
+        assert_eq!(
+            rec.take(),
+            vec!["sleep 0", "boot 5"],
+            "with two free, one goes to the boot"
+        );
+        assert!(d.cpus.has_free());
+    }
+
+    /// A ring VM that ignores SIGTERM is killed within the ring's own wait when the agent
+    /// stops, so it cannot hold the agent until systemd kills the whole unit.
+    #[tokio::test]
+    async fn a_ring_vm_that_ignores_sigterm_is_killed_within_the_rings_own_wait() {
+        // one process, which ends by itself if this test does not end it
+        let vm = Vm::spawn_args(
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), "trap '' TERM; exec sleep 20".to_string()],
+            "test",
+        )
+        .unwrap();
+        let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
+        // let the shell ignore the signal and become the sleep
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        stop_ring(
+            vec![vm],
+            None,
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH),
+            "the VM is gone when the ring's stop returns"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// What the players' handles do not reach (a VM inside an operation that was aborted) is
+    /// killed through the ring's cgroup when it is still there after the grace.
+    #[tokio::test]
+    async fn a_ring_cgroup_still_populated_after_the_grace_is_killed() {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("system.slice/agent.service");
+        std::fs::create_dir_all(unit.join("agent")).unwrap();
+        std::fs::create_dir_all(unit.join("potato")).unwrap();
+        std::fs::write(unit.join("cgroup.controllers"), "cpuset\n").unwrap();
+        std::fs::write(unit.join("cpuset.cpus.effective"), "0-7\n").unwrap();
+        std::fs::write(unit.join("potato/cpuset.cpus.effective"), "4-7\n").unwrap();
+        let ring = RingCgroup::create(
+            root.path(),
+            std::path::Path::new("system.slice/agent.service/agent"),
+            &|_| true,
+            4,
+        )
+        .unwrap();
+        let events = unit.join("potato/cgroup.events");
+        let killed = unit.join("potato/cgroup.kill");
+        // empty within the grace: nothing is killed
+        std::fs::write(&events, "populated 0\nfrozen 0\n").unwrap();
+        let wait = Duration::from_millis(100);
+        stop_ring(Vec::new(), Some(&ring), wait, wait).await;
+        assert!(!killed.exists());
+        // a process that outlives the grace
+        std::fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
+        stop_ring(Vec::new(), Some(&ring), wait, wait).await;
+        assert_eq!(std::fs::read_to_string(&killed).unwrap(), "1");
+    }
+
+    /// The agent tells the ring to stop before the slots and waits for it after them, so the
+    /// ring's wait does not come out of the time the slots' VMs have to stop in.
+    #[test]
+    fn the_ring_is_waited_for_after_the_slots_are_told_to_stop() {
+        let agent = include_str!("mod.rs");
+        let at = |what: &str| {
+            agent
+                .find(what)
+                .unwrap_or_else(|| panic!("{what:?} is not in mod.rs"))
+        };
+        let told = at("drop(potato_tx);");
+        let slots_told = at("\"coordinator closed the connection; stopping every VM\"");
+        let slots_waited = at("for t in retired {");
+        let ring_waited = at("if let Some(t) = potato_task {");
+        assert!(told < slots_told, "the ring is told first");
+        assert!(
+            slots_told < ring_waited,
+            "and waited for once the slots are told"
+        );
+        assert!(slots_waited < ring_waited);
     }
 
     /// A wake that did not wait says nothing of a wait, and a dropped ball names how long the
@@ -2815,11 +3125,91 @@ mod tests {
         assert_eq!(rec.take(), vec!["kick 2"]);
     }
 
+    /// An fcvm that exits while the agent waits for its machine's port (a refused preflight, a
+    /// snapshot that is gone) ends the operation at once, with its exit status and last
+    /// lines, not when the 60 s or 600 s the port is given runs out.
+    #[tokio::test]
+    async fn an_fcvm_that_exits_fails_its_operation_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fcvm = dir.path().join("fcvm");
+        std::fs::write(
+            &fcvm,
+            "#!/bin/sh\necho 'Error: routed mode preflight check failed' >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fcvm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ops = FcvmOps {
+            cfg: Arc::new(PotatoCfg {
+                fcvm,
+                image: "img".into(),
+                players: 2,
+                prefix: Prefix::parse("2001:db8::/80").unwrap(),
+                mem_mib: 256,
+                sleep_memory_dir: None,
+                sleep_memory_cap_mib: 0,
+                cpus: 8,
+                cgroup: None,
+            }),
+            sleep_memory: None,
+            boot_slots: Arc::new(Semaphore::new(BOOT_PARALLEL)),
+            tasks: Default::default(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ops.make_gold(tx.clone());
+        ops.boot(0, 12, tx.clone());
+        ops.wake(1, None, tx.clone());
+        let mut failed = Vec::new();
+        for _ in 0..3 {
+            let done = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("an operation ends when its fcvm does")
+                .unwrap();
+            failed.push(match done {
+                Done::Gold(Err(e), _) => format!("gold: {e:#}"),
+                Done::Booted(0, Err(f)) => format!("boot: {:#}", f.error),
+                Done::Woke(1, Err(f), _) => format!("wake: {:#}", f.error),
+                _ => panic!("an operation whose fcvm exited did not fail"),
+            });
+        }
+        ops.shutdown();
+        failed.sort();
+        assert_eq!(failed.len(), 3);
+        for (e, op) in failed.iter().zip(["boot", "gold", "wake"]) {
+            assert!(e.starts_with(op), "{e}");
+            assert!(
+                e.contains("exit status: 3") && e.contains("preflight check failed"),
+                "the failure names fcvm's exit and its last lines: {e}"
+            );
+        }
+    }
+
     // ---- every interleaving ---------------------------------------------------------------
+
+    /// What a search covers.
+    #[derive(Debug, Clone, Copy)]
+    struct Bound {
+        players: u32,
+        cpus: u32,
+        /// Rounds after the first: at any point the coordinator may replace the round or end it.
+        rounds: u32,
+        /// Catches per round.
+        catches: u64,
+        /// The hold of every round, ms. With no wake seen the lead is 1650 / hold catches and
+        /// one more, capped at `cpus - 2`: 200 puts it at the cap, 2000 at 2.
+        hold_ms: u64,
+        /// Start with the gold still to make, and let its making fail once.
+        gold: bool,
+        /// A new round may leave player 0 out of its ring.
+        rings: bool,
+    }
 
     /// One thing that can happen to the driver.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Ev {
+        Gold(bool),
+        /// The 10 s after a gold that failed are over.
+        RetryGold,
         Booted(u32, bool),
         Woke(u32, bool),
         Slept(u32, bool),
@@ -2831,18 +3221,23 @@ mod tests {
         Drop,
         /// The holder of an ended round's ball abandons its throw.
         StaleDrop(u32, u64, u64),
-        NextRound,
+        /// A new round: of every player, or (true) without player 0.
+        NextRound(bool),
         NoRound,
     }
 
     /// The driver and the world around it: the operations it started and has not been told
     /// the end of, and where the ball is.
     struct World {
+        bound: Bound,
         d: Driver,
         rec: Arc<Recorder>,
         ring: Vec<u32>,
         /// player -> `boot`, `wake` or `sleep`.
         ops: BTreeMap<u32, &'static str>,
+        /// The gold: `making`, or `retry` while the driver waits to make it again.
+        gold: Option<&'static str>,
+        gold_failures_left: u32,
         round: u64,
         /// The latest catch of the round being played: (seq, catcher).
         held: Option<(u64, u32)>,
@@ -2854,27 +3249,40 @@ mod tests {
         spent: std::collections::BTreeSet<u32>,
         stale: Option<(u32, u64, u64)>,
         rounds_left: u32,
+        /// An invariant an event broke as it was applied.
+        broken: Option<String>,
     }
 
     impl World {
-        fn new(players: u32, cpus: u32, rounds: u32) -> World {
-            let (mut d, rec, out) = driver_on(players, cpus);
+        fn new(bound: Bound) -> World {
+            let (mut d, rec, out) = driver_on(bound.players, bound.cpus);
             std::mem::forget(out);
-            d.gold_ready = true;
             let mut w = World {
-                d,
+                bound,
                 rec,
-                ring: (0..players).collect(),
+                ring: Vec::new(),
                 ops: BTreeMap::new(),
+                gold: None,
+                gold_failures_left: u32::from(bound.gold),
                 round: 0,
                 held: None,
                 kicked: false,
                 threw: Vec::new(),
                 spent: Default::default(),
                 stale: None,
-                rounds_left: rounds,
+                rounds_left: bound.rounds + 1,
+                broken: None,
+                d: {
+                    if bound.gold {
+                        d.make_gold();
+                    } else {
+                        d.gold_ready = true;
+                    }
+                    d
+                },
             };
-            w.apply(Ev::NextRound);
+            w.started();
+            w.apply(Ev::NextRound(false));
             w
         }
 
@@ -2884,7 +3292,7 @@ mod tests {
 
         /// A copy that goes its own way: a new driver with this one's state.
         fn fork(&self) -> World {
-            let (mut d, rec, out) = driver_on(self.d.cfg.players, self.d.cpus.cap());
+            let (mut d, rec, out) = driver_on(self.bound.players, self.bound.cpus);
             std::mem::forget(out);
             for (to, from) in d.players.iter_mut().zip(&self.d.players) {
                 *to = Player { vm: None, ..*from };
@@ -2896,10 +3304,13 @@ mod tests {
             d.late = self.d.late;
             d.ended = self.d.ended;
             World {
+                bound: self.bound,
                 d,
                 rec,
                 ring: self.ring.clone(),
                 ops: self.ops.clone(),
+                gold: self.gold,
+                gold_failures_left: self.gold_failures_left,
                 round: self.round,
                 held: self.held,
                 kicked: self.kicked,
@@ -2907,6 +3318,7 @@ mod tests {
                 spent: self.spent.clone(),
                 stale: self.stale,
                 rounds_left: self.rounds_left,
+                broken: None,
             }
         }
 
@@ -2926,8 +3338,18 @@ mod tests {
             }
         }
 
-        fn enabled(&self, max_seq: u64) -> Vec<Ev> {
+        fn enabled(&self) -> Vec<Ev> {
             let mut evs = Vec::new();
+            match self.gold {
+                Some("making") => {
+                    evs.push(Ev::Gold(true));
+                    if self.gold_failures_left > 0 {
+                        evs.push(Ev::Gold(false));
+                    }
+                }
+                Some(_) => evs.push(Ev::RetryGold),
+                None => {}
+            }
             for (n, op) in &self.ops {
                 for ok in [true, false] {
                     evs.push(match *op {
@@ -2938,7 +3360,7 @@ mod tests {
                 }
             }
             if let Some((seq, to)) = self.next_catcher() {
-                if seq <= max_seq && self.may_accept(to) {
+                if seq < self.bound.catches && self.may_accept(to) {
                     evs.push(Ev::Catch);
                 }
                 // a throw finds nobody unless the catcher is plainly awake and accepting
@@ -2951,7 +3373,10 @@ mod tests {
                 evs.push(Ev::StaleDrop(n, round, seq));
             }
             if self.rounds_left > 0 {
-                evs.push(Ev::NextRound);
+                evs.push(Ev::NextRound(false));
+                if self.bound.rings {
+                    evs.push(Ev::NextRound(true));
+                }
                 evs.push(Ev::NoRound);
             }
             evs
@@ -2962,11 +3387,28 @@ mod tests {
                 self.stale = Some((by, self.round, seq + 1));
             }
             self.kicked = false;
+            self.rounds_left = self.rounds_left.saturating_sub(1);
+            self.threw.clear();
         }
 
         fn apply(&mut self, ev: Ev) {
             let fail = || unstarted(anyhow::anyhow!("failed"));
             match ev {
+                Ev::Gold(ok) => {
+                    let made = if ok {
+                        self.gold = None;
+                        Ok(())
+                    } else {
+                        self.gold = Some("retry");
+                        self.gold_failures_left -= 1;
+                        Err(anyhow::anyhow!("failed"))
+                    };
+                    self.d.done(Done::Gold(made, Exited::none()));
+                }
+                Ev::RetryGold => {
+                    self.gold = None;
+                    self.d.done(Done::RetryGold);
+                }
                 Ev::Booted(n, ok) => {
                     self.ops.remove(&n);
                     let r = if ok { Ok(ready()) } else { Err(fail()) };
@@ -3023,26 +3465,41 @@ mod tests {
                         reason: "the round is over".into(),
                     }));
                 }
-                Ev::NextRound => {
+                Ev::NextRound(without_first) => {
                     self.end_round();
-                    self.rounds_left = self.rounds_left.saturating_sub(1);
                     self.round += 1;
-                    self.threw.clear();
-                    self.d
-                        .order(Some(round(self.round, self.ring.clone(), 200)));
+                    self.ring = (u32::from(without_first)..self.bound.players).collect();
+                    self.d.order(Some(round(
+                        self.round,
+                        self.ring.clone(),
+                        self.bound.hold_ms,
+                    )));
                 }
                 Ev::NoRound => {
                     self.end_round();
-                    self.rounds_left = self.rounds_left.saturating_sub(1);
-                    self.threw.clear();
                     self.d.order(None);
                 }
             }
-            // what the driver started
+            let booted = self.started();
+            // a boot started while the ball of the round now played is in the air must leave
+            // a CPU free
+            let in_play = self.d.playing.as_ref().is_some_and(|p| p.kicked && !p.over);
+            if booted && in_play && !self.d.cpus.has_free() {
+                self.broken = Some("a boot took the last CPU while the ball was in play".into());
+            }
+        }
+
+        /// Take what the driver has started into the world. True when it started a boot.
+        fn started(&mut self) -> bool {
+            let mut booted = false;
             for cmd in self.rec.take() {
-                let mut words = cmd.split(' ').rev();
-                let last = words.next().unwrap();
+                let last = cmd.rsplit(' ').next().unwrap();
                 let op = match cmd.split(' ').next().unwrap() {
+                    "gold" => {
+                        assert!(self.gold.is_none(), "the gold is made twice at once");
+                        self.gold = Some("making");
+                        continue;
+                    }
                     "boot" => "boot",
                     "wake" => "wake",
                     "sleep" | "stop" => "sleep",
@@ -3058,19 +3515,34 @@ mod tests {
                 if op != "sleep" {
                     self.spent.remove(&n);
                 }
+                booted |= op == "boot";
                 assert!(
                     self.ops.insert(n, op).is_none(),
                     "{cmd}: player {n} already has an operation running"
                 );
             }
+            booted
         }
 
         /// What must hold after every event.
-        fn check(&self, cpus: u32) -> Result<(), String> {
+        fn check(&self) -> Result<(), String> {
             let d = &self.d;
+            let cpus = self.bound.cpus;
             let ensure = |ok: bool, what: String| if ok { Ok(()) } else { Err(what) };
+            if let Some(broken) = &self.broken {
+                return Err(broken.clone());
+            }
             ensure(d.cpus.in_use() <= cpus, "more machines than CPUs".into())?;
-            let mut not_asleep = 0;
+            let making = self.gold == Some("making");
+            ensure(
+                d.cpus.holds(Holder::Gold) == making,
+                format!("the ledger and the gold ({:?}) disagree", self.gold),
+            )?;
+            ensure(
+                d.gold_ready || self.ops.is_empty(),
+                "a player was started before the gold was made".into(),
+            )?;
+            let mut not_asleep = u32::from(making);
             for (n, p) in d.players.iter().enumerate() {
                 let n = n as u32;
                 ensure(
@@ -3116,11 +3588,11 @@ mod tests {
                     ),
                 )?;
             }
-            // and a CPU will come free for the next catcher: an operation is on its way out,
-            // or the ball is held by a machine that sleeps once it has thrown
+            // and a CPU will come free for the next catcher: an operation or the gold is on
+            // its way out, or the ball is held by a machine that sleeps once it has thrown
             if let Some(next) = lead.first().filter(|n| self.phase(**n) == Phase::Asleep) {
                 ensure(
-                    !self.ops.is_empty() || self.held.is_some(),
+                    !self.ops.is_empty() || self.held.is_some() || making,
                     format!("player {next}, the next catcher, waits for a CPU that nothing frees"),
                 )?;
             }
@@ -3132,14 +3604,21 @@ mod tests {
             let players: Vec<_> = d
                 .players
                 .iter()
-                .map(|p| (p.phase.name(), p.sleep_after_wake, p.wanted_since.is_some()))
+                .map(|p| {
+                    (
+                        p.phase.name(),
+                        p.sleep_after_wake,
+                        p.wanted_since.is_some(),
+                        p.woken_for,
+                    )
+                })
                 .collect();
             let playing = d
                 .playing
                 .as_ref()
                 .map(|p| (p.order.round, p.seq, p.caught, p.kicked, p.over));
             format!(
-                "{players:?} {playing:?} {:?} {:?} {:?} {} {:?} {:?} {:?} {:?} {} {}",
+                "{players:?} {playing:?} {:?} {:?} {:?} {} {:?} {:?} {:?} {:?} {} {} {:?} {} {} {}",
                 d.ended,
                 d.late.map(|l| (l.0, l.1, l.2)),
                 self.ops,
@@ -3150,63 +3629,154 @@ mod tests {
                 self.stale,
                 self.kicked,
                 self.rounds_left,
+                self.gold,
+                self.gold_failures_left,
+                d.gold_ready,
+                self.ring.len(),
             )
         }
     }
 
-    /// Drive the driver through every order of events its state allows (ends of boots, wakes
-    /// and sleeps, each succeeding or failing; catches, throws read late, drops, a round ended
-    /// or replaced at any point), and check the invariants after each. Returns the states
-    /// seen.
-    fn explore(players: u32, cpus: u32, rounds: u32, max_seq: u64) -> usize {
+    /// Drive the driver through every order of events its state allows within `bound` (the
+    /// gold made, failing and made again; ends of boots, wakes and sleeps, each succeeding or
+    /// failing; catches, throws read late, drops; a round ended or replaced at any point, by
+    /// one of another ring), and check the invariants after each. Returns the states seen.
+    fn explore(bound: Bound) -> usize {
         let mut seen = std::collections::HashSet::new();
         // each state with the events that led to it, for the report of a broken invariant
         let mut queue = VecDeque::new();
-        let start = World::new(players, cpus, rounds);
-        start.check(cpus).unwrap();
+        let start = World::new(bound);
+        start.check().unwrap();
         seen.insert(start.key());
         queue.push_back((start, Vec::<Ev>::new()));
         while let Some((at, path)) = queue.pop_front() {
-            for ev in at.enabled(max_seq) {
+            for ev in at.enabled() {
                 let mut next = at.fork();
                 next.apply(ev);
                 let mut longer = path.clone();
                 longer.push(ev);
-                if let Err(broken) = next.check(cpus) {
-                    panic!("{broken}, after {longer:?}");
+                if let Err(broken) = next.check() {
+                    panic!("{bound:?}: {broken}, after {longer:?}");
                 }
                 if seen.insert(next.key()) {
                     queue.push_back((next, longer));
                 }
             }
+            assert!(
+                seen.len() < 4_000_000,
+                "{bound:?}: more than 4,000,000 states; the bound is too wide for a test"
+            );
         }
         seen.len()
     }
 
+    /// Search `bound` and require at least `at_least` states: a search that finds few has
+    /// stopped searching.
+    fn searched(bound: Bound, at_least: usize) {
+        let states = explore(bound);
+        assert!(states >= at_least, "{bound:?}: only {states} states");
+    }
+
     /// No oversubscription, in every interleaving: machines not asleep never exceed the CPUs,
-    /// the ledger agrees with what the driver started, no CPU idles while a wake waits, and
-    /// nothing waits for a CPU that will not come free.
-    #[test]
-    fn machines_not_asleep_never_exceed_the_cpus_in_any_interleaving() {
-        // (players, CPUs, rounds, catches per round). 3 CPUs are the fewest allowed, with more
-        // players than CPUs so the ring always wants more than it has; two rounds let the
-        // coordinator replace or end a round at any point of the first. A search that finds
-        // few states has stopped searching.
-        for (bound, at_least) in [
-            ((4, 3, 2, 2), 150_000),
-            ((4, 3, 1, 3), 80_000),
-            ((4, 4, 1, 3), 40_000),
-        ] {
-            let (players, cpus, rounds, catches) = bound;
-            let states = explore(players, cpus, rounds, catches);
-            assert!(states >= at_least, "{bound:?}: only {states} states");
+    /// the ledger agrees with what the driver started (the gold included), no CPU idles
+    /// while a wake waits, nothing waits for a CPU that will not come free, and a boot
+    /// started while the ball is in play leaves a CPU for the next wake.
+    ///
+    /// Here on 3 CPUs, the fewest allowed, with 4 players: the gold made, failing and made
+    /// again, and a round that the coordinator replaces or ends at any point, by one whose
+    /// ring leaves player 0 out. 339,876 states. The four tests below search other bounds;
+    /// they are separate tests so that they run side by side.
+    ///
+    /// A runtime, because a gold that fails starts the driver's 10 s timer; nothing here
+    /// waits for it.
+    #[tokio::test]
+    async fn machines_not_asleep_never_exceed_the_cpus_in_any_interleaving() {
+        // POTATO_SEARCH=players,cpus,rounds,catches,hold,gold,rings[;...] searches other
+        // bounds instead, for a deeper run than the suite has time for, and prints what it
+        // found (run it with --no-capture). 4,3,1,3,200,1,1 is 2,660,624 states.
+        if let Ok(spec) = std::env::var("POTATO_SEARCH") {
+            for one in spec.split(';') {
+                let b: Vec<u64> = one.split(',').map(|x| x.parse().unwrap()).collect();
+                let started = Instant::now();
+                let states = explore(Bound {
+                    players: b[0] as u32,
+                    cpus: b[1] as u32,
+                    rounds: b[2] as u32,
+                    catches: b[3],
+                    hold_ms: b[4],
+                    gold: b[5] != 0,
+                    rings: b[6] != 0,
+                });
+                eprintln!(
+                    "POTATO_SEARCH {one}: {states} states in {:?}",
+                    started.elapsed()
+                );
+            }
+            return;
         }
-        // POTATO_SEARCH=players,cpus,rounds,catches searches one more bound, for a deeper run
-        // than the suite has time for (4,3,1,5 is 881,212 states).
-        if let Ok(bound) = std::env::var("POTATO_SEARCH") {
-            let b: Vec<u64> = bound.split(',').map(|x| x.parse().unwrap()).collect();
-            let states = explore(b[0] as u32, b[1] as u32, b[2] as u32, b[3]);
-            eprintln!("{bound}: {states} states");
+        searched(
+            Bound {
+                players: 4,
+                cpus: 3,
+                rounds: 1,
+                catches: 2,
+                hold_ms: 200,
+                gold: true,
+                rings: true,
+            },
+            300_000,
+        );
+    }
+
+    /// One round, with every player there already and the gold made.
+    fn one_round(players: u32, cpus: u32, catches: u64, hold_ms: u64) -> Bound {
+        Bound {
+            players,
+            cpus,
+            rounds: 0,
+            catches,
+            hold_ms,
+            gold: false,
+            rings: false,
         }
+    }
+
+    /// Deeper into a round on 3 CPUs: four catches. 109,807 states.
+    #[tokio::test]
+    async fn the_cap_holds_four_catches_into_a_round_on_3_cpus() {
+        searched(one_round(4, 3, 4, 200), 100_000);
+    }
+
+    /// 4 CPUs, a lead of 2. 164,384 states.
+    #[tokio::test]
+    async fn the_cap_holds_on_4_cpus() {
+        searched(one_round(4, 4, 4, 200), 150_000);
+    }
+
+    /// 5 CPUs for 6 players, the lead at its cap of 3. 156,766 states.
+    #[tokio::test]
+    async fn the_cap_holds_on_5_cpus_with_the_lead_at_its_cap() {
+        let bound = one_round(6, 5, 3, 200);
+        let w = World::new(bound);
+        assert_eq!(
+            w.d.lead_now(),
+            3,
+            "1650 ms of wake in 200 ms holds, capped at 5 - 2"
+        );
+        searched(bound, 140_000);
+    }
+
+    /// 5 CPUs for 6 players at a hold so long that the lead, 2, is below its cap of 3: the
+    /// agent leaves a CPU it could use. 51,350 states.
+    #[tokio::test]
+    async fn the_cap_holds_on_5_cpus_with_the_lead_below_its_cap() {
+        let bound = one_round(6, 5, 2, 2000);
+        let w = World::new(bound);
+        assert_eq!(
+            w.d.lead_now(),
+            2,
+            "1650 ms of wake in 2000 ms holds, and one"
+        );
+        searched(bound, 45_000);
     }
 }

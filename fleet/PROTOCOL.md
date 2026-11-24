@@ -1273,10 +1273,11 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   allotment: a host that connects with another `cpus` gets its own, and the earlier one is
   kept for a host with that allotment. `record_hold_ms` and `record_at`, which older
   coordinators sent, are gone: a hold is not a pace, and none is shown as one.
-- A round starts near where its size last dropped the ball: `round.start_hold_ms` is 1.5
-  times the median hold of the size's last five `not_listening` drops for the size's first
-  round since the host connected, 1.25 times for its later ones, and the configured start
-  for a size that has dropped none.
+- A round starts near where the pace last outran its size: `round.start_hold_ms` is 1.5
+  times the median hold of the size's last five drops with a `cause` of `waking`, `cpu_wait`
+  or `saving` for the size's first round since the host connected, 1.25 times for its later
+  ones, and the configured start for a size with no such drop. It is never above the
+  configured start.
 - `round`: the round being played, or null between rounds (`next_round_at` says when the
   next starts). `hold_ms` is the hold the ball carries now; `turnaround_ms` is (size - 1)
   holds, the time a player has between its throw and its next catch to sleep and wake.
@@ -1284,10 +1285,13 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   `flight_ms` is the most a thrower retries for; a thrower that reports its hold (`hold_us`,
   below) retries for that hold when it is shorter. `pace` is catches per second over the last
   completed lap, measured: the lap's catches divided by the time from the catch before its
-  first to its last, by the times the coordinator read them (lap 0: its last catch minus its
-  first, over size - 1 catches); null before a lap completes, and never computed from the
-  hold. `best_pace` is the fastest of the round's laps, and `laps` the completed laps, oldest
-  first, at most the last 60, each with its pace and the longest hold a catch of it carried.
+  first to its last, by the host agent's stamps of the catch reports (lap 0: its last catch
+  minus its first, over size - 1 catches); null before a lap completes, and never computed
+  from the hold. A lap whose stamps span less than nine tenths of the holds its catchers
+  kept was read in a burst and did not happen at that speed: its `pace` is null, it sets no
+  record and is not the round's best, and a page does not draw it. `best_pace` is the
+  fastest of the round's laps, and `laps` the completed laps, oldest first, at most the last
+  60, each with its pace (null as above) and the longest hold a catch of it carried.
   A page that does not know `pace`, `best_pace` or `laps` ignores them, and one that does
   shows nothing for a field that is null or absent (an older coordinator sends none).
 - `cpus` is K, the CPU allotment of the host that played the ladder last: its agent never has
@@ -1327,13 +1331,19 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   verified ones), `<stage>_failed` for an agent's `failed` report (`boot_failed`,
   `sleep_failed`, `wake_failed`, `kickoff_failed` today; a page shows any such value),
   `deadline` (no catch reported by the hold plus the flight plus 3 s) or `host_gone`.
-- A drop's `cause` is what was measured, or null: `waking` (the catcher's wake had started
-  and not finished; `cause_ms` is how long after the drop it accepted, null until the agent
-  reports it a moment later), `cpu_wait` (its wake was waiting for a free CPU; `cause_ms` is
-  how long it had waited), `saving` (it was still going to sleep from its last throw;
-  `cause_ms` is how long that had run) or `proof` (no `cause_ms`). Every other drop has a
-  null `cause`, and a page shows its `reason`. `pace` is the pace of the last completed lap
-  when the ball dropped, null if none had completed.
+- A drop's `cause` is what was measured, or null: `waking` (the catcher's wake was not
+  finished in time; `cause_ms` is how late it was, null until the agent reports it a moment
+  later), `cpu_wait` (its wake waited for a free CPU; `cause_ms` is how long), `saving` (it
+  was still going to sleep from its last throw; `cause_ms` is how long that had run) or
+  `proof` (no `cause_ms`). `cpu_wait_ms` is how long the catcher's wake waited for a free
+  CPU, whatever the cause, null when it did not wait. Between `waking` and `cpu_wait` the
+  wait decides when it is more than half of the lateness; a wake that had not started is
+  `cpu_wait`; and until the lateness is known, a wake that waited longer than it has run
+  is `cpu_wait`. So a `cause` can change once, from `waking` to `cpu_wait` or back, when
+  the lateness arrives. A catcher whose wake was reported less than a flight window before
+  the drop was read (`stage` is then `awake`) is `waking` or `cpu_wait` by the same rule.
+  Every other drop has a null `cause`, and a page shows its `reason`. `pace` is the pace of
+  the last completed lap when the ball dropped, null if none had completed.
 
 ### Windows mode
 
@@ -1751,7 +1761,7 @@ cpuset of that many host CPUs; absent means false). `kind` is one of:
 | `hello` | `colour`, `counter`, `chain`, `colours`, `connections`, `last_round`, `last_seq` | the player opened a report connection: once when new (`connections` 1, `counter` 0), and once after each wake. `last_round`/`last_seq` name its last catch |
 | `caught` | `round`, `seq`, `colour`, `counter`, `chain`, `hold_us`, `ring`, `ready_margin_ms` | it caught the ball. `ring` is the agent's count when it read the catch, `{"cpus_in_use", "cpus_peak" (the most since the catch before), "asleep", "lead", "slowest_wake_ms", "slots": [{"player", "phase"}], "cpu_usec" (the cpuset's `usage_usec`, absent when not confined)}`; `ready_margin_ms` is how long before the throw to it began the catcher was ready, absent for a round's first catch and when the catch was read before the end of the catcher's wake. Both are absent from an agent without an allotment. `hold_us` is the hold it will keep, in microseconds, after any pace cap; absent from a player built before it, and the coordinator then computes the hold as those players do (a tenth off per lap in whole milliseconds) |
 | `threw` | `round`, `seq` (the ball's new seq), `to`, `attempts`, `wait_ms`, `send_ms` | the next player accepted the ball |
-| `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms`, `catcher_cpu_wait_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to`, and `catcher_cpu_wait_ms`, when present, how long `to`'s wake had waited for a free CPU |
+| `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms`, `catcher_cpu_wait_ms`, `catcher_late_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to`. `catcher_cpu_wait_ms`, when present, is how long `to`'s wake has waited for a free CPU (it is still `asleep`) or waited before it started (`waking`, `awake`). `catcher_late_ms`, present when `to` is `awake` by the time the drop is read, is how long after the end of the thrower's flight window it was ready (0: between the thrower's last try and that end) |
 | `slept` | `sleep_ms`, `stages`, `written_mib` | its snapshot is written and its fcvm has exited. `stages` splits `sleep_ms` into the agent's steps, `ask_ms` (telling the player its round is over), `create_ms` (`fcvm snapshot create --stop`) and `reap_ms` (waiting for the player's fcvm to exit), and splits `create_ms` with fcvm's own: `stage_ms` (the new generation's directory and memory file), `prepare_ms`, `pause_ms`, `save_ms`, `disk_ms`, `publish_ms` (installing it and removing the old one) and `stop_ms` |
 | `waking` | `cpu_wait_ms` | its restore started; `cpu_wait_ms`, when present, is how long it waited for a free CPU first |
 | `woke` | `wake_ms`, `stages` (`restore_ms`, `ack_ms`, `listen_ms`), `ready_margin_ms` | its ball port accepts again; `ready_margin_ms` as a catch's, when the player's catch was read before this |

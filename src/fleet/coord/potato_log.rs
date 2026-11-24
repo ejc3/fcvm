@@ -420,6 +420,7 @@ mod tests {
             listening_after_ms: None,
             cause: Some("saving".into()),
             cause_ms: Some(99_400.0),
+            cpu_wait_ms: None,
             pace: None,
             sleep_stages: BTreeMap::from([("create_ms".to_string(), 1_500.0)]),
             wake_stages: BTreeMap::new(),
