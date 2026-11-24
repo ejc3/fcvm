@@ -182,6 +182,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
+      # No benchmark numbers from a runner whose kernel lacks the bridge teardown fix (#1563).
+      - name: Runner kernel check
+        working-directory: fcvm
+        run: ./scripts/check-bridge-teardown-kernel.sh
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
