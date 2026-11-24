@@ -3,7 +3,8 @@
 // The line under a page's title and its "What is this?" control. One component for all five
 // pages; the words come from core/landing.ts.
 
-import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { landingPanelText, type LandingView, type LegendEntry } from "../../core/index.ts";
 import "./landing.css";
 
@@ -100,24 +101,12 @@ export function PotatoLegend({ legend, form, colour, id }: { legend: NonNullable
 }
 
 /** The page's line, and the "What is this?" button with its panel (a popover on a wide screen, a bottom sheet on a phone). */
-export function Landing({ landing, legendInPanel, colour, children }: { landing: LandingView; legendInPanel?: boolean; colour: string; children?: ReactNode }) {
+export function Landing({ landing, legendInPanel, colour, sheet = "bottom", children }: { landing: LandingView; legendInPanel?: boolean; colour: string; sheet?: "top" | "bottom"; children?: ReactNode }) {
   const [open, setOpen] = useState(false);
-  const [clamped, setClamped] = useState(false);
-  const lineRef = useRef<HTMLParagraphElement | null>(null);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
   const panelId = useId();
-
-  // The line is clamped to two lines; when it is cut, the panel carries it whole.
-  useLayoutEffect(() => {
-    const el = lineRef.current;
-    if (!el) return;
-    const measure = () => setClamped(el.scrollHeight > el.clientHeight + 1);
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [landing.line]);
+  const [anchor, setAnchor] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -126,38 +115,57 @@ export function Landing({ landing, legendInPanel, colour, children }: { landing:
       setOpen(false);
       if (back) btnRef.current?.focus();
     };
+    // The topmost layer takes Escape: the panel closes and nothing under it (a taken-over server, an opened phone) sees the key.
     const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close(true);
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      e.preventDefault();
+      close(true);
     };
+    // A tap outside only closes: the click that follows it is swallowed.
     const down = (e: PointerEvent) => {
       const t = e.target as Node;
-      if (!panelRef.current?.contains(t) && !btnRef.current?.contains(t)) close(false);
+      if (panelRef.current?.contains(t) || btnRef.current?.contains(t)) return;
+      const swallow = (c: Event) => c.stopPropagation();
+      window.addEventListener("click", swallow, { capture: true, once: true });
+      window.setTimeout(() => window.removeEventListener("click", swallow, true), 400);
+      close(false);
     };
-    document.addEventListener("keydown", key);
-    document.addEventListener("pointerdown", down);
+    window.addEventListener("keydown", key, true);
+    window.addEventListener("pointerdown", down, true);
     return () => {
-      document.removeEventListener("keydown", key);
-      document.removeEventListener("pointerdown", down);
+      window.removeEventListener("keydown", key, true);
+      window.removeEventListener("pointerdown", down, true);
     };
   }, [open]);
 
-  const text = landingPanelText(landing, clamped);
+  const text = landingPanelText(landing);
   return (
     <div className="landing" data-testid="landing">
-      <p ref={lineRef} className="landing-line" data-testid="landing-line">
-        {landing.line}
+      <p className="landing-line" data-testid="landing-line">
+        <span data-testid="landing-text">{landing.line}</span>{" "}
+        <button ref={btnRef} type="button" className="landing-btn" aria-expanded={open} aria-controls={open ? panelId : undefined} data-testid="landing-button" onClick={() => {
+          const r = btnRef.current?.getBoundingClientRect();
+          if (r) setAnchor({ x: r.left, y: r.bottom + 4 });
+          setOpen((o) => !o);
+        }}>
+          {landing.button}
+        </button>
       </p>
-      <button ref={btnRef} type="button" className="landing-btn" aria-expanded={open} aria-controls={open ? panelId : undefined} data-testid="landing-button" onClick={() => setOpen((o) => !o)}>
-        {landing.button}
-      </button>
-      {open ? (
-        <div ref={panelRef} id={panelId} className="landing-panel" role="dialog" aria-label={landing.button} tabIndex={-1} data-testid="landing-panel">
+      {open && typeof document !== "undefined"
+        ? createPortal(
+        <div ref={panelRef} id={panelId} className="landing-panel" data-sheet={sheet} role="dialog" aria-label="About this page" tabIndex={-1} data-testid="landing-panel" style={{ ["--lx" as string]: `${Math.min(anchor?.x ?? 0, Math.max(0, window.innerWidth - 436))}px`, ["--ly" as string]: `${anchor?.y ?? 0}px` }}>
+          <button type="button" className="landing-close" aria-label="Close" data-testid="landing-close" onClick={() => { setOpen(false); btnRef.current?.focus(); }}>
+            Close
+          </button>
           {text.map((t) => (
             <p key={t}>{t}</p>
           ))}
           {legendInPanel && landing.legend ? <PotatoLegend legend={landing.legend} form="list" colour={colour} /> : null}
-        </div>
-      ) : null}
+        </div>,
+        document.body,
+      )
+        : null}
       {children}
     </div>
   );

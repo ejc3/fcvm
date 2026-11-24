@@ -366,7 +366,7 @@ for (const screen of SCREENS)
   await page.mouse.click(t.box.x + 0.75 * t.box.w, t.box.y + 0.95 * t.box.h);
   await expect.poll(async () => (await taps()).length).toBe(2);
   const info = (await taps())[1]!;
-  expect(info.x).toBeCloseTo(0.75, 2);
+  expect(Math.abs((info.x ?? 0) - 0.75) * t.box.w, "within a pixel of the click").toBeLessThanOrEqual(1);
   expect(info.y).toBeCloseTo(0.95 * t.yScale, 2);
   // the page drops a click sooner than 210 ms after the last tap it sent
   await page.waitForTimeout(300);
@@ -378,7 +378,7 @@ for (const screen of SCREENS)
   await page.mouse.click(m.box.x + 0.75 * m.box.w, m.box.y + 0.1 * m.box.h);
   await expect.poll(async () => (await taps()).length).toBe(3);
   const second = (await taps())[2]!;
-  expect(second.x).toBeCloseTo(0.75, 2);
+  expect(Math.abs((second.x ?? 0) - 0.75) * t.box.w, "within a pixel of the click").toBeLessThanOrEqual(1);
   expect(second.y).toBeCloseTo(0.1 * m.yScale, 2);
   await expect(page.getByTestId("phone-notice")).toHaveCount(0);
   await page.getByTestId("phone-give-back").click();
@@ -591,6 +591,22 @@ test("pictures: seamless, zoomed out, and a phone taken over", async ({ page }) 
 test("phones: the line under the title and the What is this? control", async ({ page }) => {
   await openPhones(page);
   await expectLanding(page, { stage: "phones-stage", phone: false });
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 360, height: 800 });
   await expectLanding(page, { stage: "phones-stage", phone: true });
 });
+
+test("phones: Escape closes the About panel and nothing under it", async ({ page }) => {
+  await openPhones(page);
+  await page.getByTestId("phone-hit-phone:2").click();
+  const under = page.getByTestId("phone-panel");
+  await expect(under).toBeVisible();
+  const btn = page.getByTestId("landing-button");
+  await btn.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await page.waitForTimeout(300);
+  await expect(under, "the layer under it stays").toBeVisible();
+});
+

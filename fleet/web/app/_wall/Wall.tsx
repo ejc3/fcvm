@@ -849,7 +849,7 @@ export function Wall({ coordUrl, directUrl, mediaUrl }: { coordUrl: string; dire
           </span>
         ) : null}
       </div>
-      <Landing landing={view.landing} colour="" />
+      {phone ? null : <Landing landing={view.landing} colour="" sheet="top" />}
       {phone ? null : <ModeSwitch current="wall" stream={view.streamMode} onStream={view.play ? (el) => openDrawer("play", el) : undefined} />}
     </div>
   );
@@ -930,6 +930,7 @@ export function Wall({ coordUrl, directUrl, mediaUrl }: { coordUrl: string; dire
             </p>
           ) : null}
           {info}
+          <Landing landing={view.landing} colour="" sheet="top" />
           {/* The title's line has no room on a phone and the image stays at the top, so the switch sits under the image. */}
           <ModeSwitch current="wall" stream={view.streamMode} onStream={view.play ? (el) => openDrawer("play", el) : undefined} />
           <p className="rotate-hint" data-testid="rotate-hint">

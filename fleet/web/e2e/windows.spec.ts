@@ -376,6 +376,22 @@ test.describe("on a 390 px phone", () => {
 test("windows: the line under the title and the What is this? control", async ({ page }) => {
   await openWindows(page);
   await expectLanding(page, { stage: "win-stage", phone: false });
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 360, height: 800 });
   await expectLanding(page, { stage: "win-stage", phone: true });
 });
+
+test("windows: Escape closes the About panel and nothing under it", async ({ page }) => {
+  await openWindows(page);
+  await page.getByTestId("sandbox-take-win-3").click();
+  const under = page.getByTestId("win-panel");
+  await expect(under).toBeVisible();
+  const btn = page.getByTestId("landing-button");
+  await btn.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await page.waitForTimeout(300);
+  await expect(under, "the layer under it stays").toBeVisible();
+});
+

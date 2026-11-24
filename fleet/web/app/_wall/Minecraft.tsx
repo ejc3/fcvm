@@ -469,8 +469,10 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
                 <span className="site">{SITE}</span>
                 <h1>{view.title}</h1>
               </div>
-              <Landing landing={view.landing} colour="" />
-              <ModeSwitch current="minecraft" />
+              <div className="landing-row">
+                <ModeSwitch current="minecraft" />
+                <Landing landing={view.landing} colour="" />
+              </div>
             </div>
             <button type="button" className="btn" disabled={view.resetAll.disabled || resetAllPending} onClick={() => void client.act("minecraft_reset", { all: true })} data-testid="mc-reset-all">
               {view.resetAll.label}
