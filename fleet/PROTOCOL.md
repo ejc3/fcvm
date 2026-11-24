@@ -1622,9 +1622,10 @@ a snapshot of 271,732 bytes (525 a server). So:
   sent to no page, and a page that holds them shows their servers as not reported, never as
   they last were. A host whose last server is unassigned sends one report with every row not
   reported and then none. The coordinator takes a report only from the host's current
-  connection, no more often than every 500 ms (an agent sends one a second), and only when
-  `rows` is base64 of whole rows for no more servers than the host's hello said it runs;
-  anything else is dropped.
+  connection and only when `rows` is base64 of whole rows for no more servers than the host's
+  hello said it runs; anything else is dropped. It takes them no closer together than 500 ms
+  (an agent sends one a second): of those that come sooner it keeps the latest and takes it
+  when the 500 ms end, so a host's last report is not lost.
 
 #### Agent messages (Minecraft mode)
 
