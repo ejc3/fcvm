@@ -8,7 +8,12 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import {
+  cellAt,
+  cellText,
   driveInputOf,
+  FIELD_READOUT_H,
+  FIELD_TEXT_H,
+  FIELD_TEXT_H_NARROW,
   Driver,
   minecraftView,
   SITE,
@@ -22,6 +27,7 @@ import {
 import { WallClient } from "./wall-client.ts";
 import { McTiles } from "./minecraft-tiles.ts";
 import { McStage, type StageDebug } from "./minecraft-stage.ts";
+import { McField } from "./minecraft-field.ts";
 import { VerifyCard } from "./Turnstile.tsx";
 import { ModeSwitch } from "./ModeSwitch.tsx";
 import { WakeCard } from "./Overlays.tsx";
@@ -43,6 +49,8 @@ declare global {
       stage: () => StageDebug | null;
       /** Turn the frame-time guard off or on (a test that looks at motion on a software renderer). */
       setBudget: (on: boolean) => void;
+      /** The field's painter: how often it painted and how long its last paint took (ms). */
+      field: () => { paints: number; lastMs: number };
     };
   }
 }
@@ -229,7 +237,15 @@ function Sheet({
 
 export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl: string | null }) {
   // No frame streams: each tile is drawn from its own view socket.
-  const client = useMemo(() => new WallClient(coordUrl, (st) => st.minecraft?.tiles ?? [], directUrl), [coordUrl, directUrl]);
+  // This page shows Minecraft mode: it asks for the servers' status rows with its visibility.
+  const client = useMemo(() => new WallClient(coordUrl, (st) => st.minecraft?.tiles ?? [], directUrl, true), [coordUrl, directUrl]);
+  const fieldPainter = useMemo(() => new McField(), []);
+  const fieldCanvas = useRef<HTMLCanvasElement | null>(null);
+  // Servers picked from the field (each keeps a 3D tile for a while), the cell pointed at, and
+  // when the last reset of every server was first seen whole.
+  const [pins, setPins] = useState<{ n: number; at: number }[]>([]);
+  const [cursor, setCursor] = useState<number | null>(null);
+  const wave = useRef<{ clicked: number | null; doneAt: number | null }>({ clicked: null, doneAt: null });
   const tiles = useMemo(() => new McTiles(), []);
   const state = useSyncExternalStore(client.subscribe, client.getState, client.getState);
   const live = useSyncExternalStore(tiles.subscribe, tiles.getLive, tiles.getLive);
@@ -343,10 +359,35 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   }, [narrow]);
 
   const view = useMemo(
-    () => minecraftView({ state, now: now || 0, dpr, stage, narrow, touch, live, drive: { samples, refused }, released, renderer, opened, lost, reduced, reducedMotion }),
-    [state, now, dpr, stage, narrow, touch, live, samples, refused, released, renderer, opened, lost, reduced, reducedMotion],
+    () =>
+      minecraftView({
+        state,
+        now: now || 0,
+        dpr,
+        stage,
+        narrow,
+        touch,
+        live,
+        drive: { samples, refused },
+        released,
+        renderer,
+        opened,
+        lost,
+        reduced,
+        reducedMotion,
+        statuses: state.minecraftStatus,
+        pins,
+        waveDoneAt: wave.current.clicked === (state.accepted?.minecraft?.last_reset_all?.clicked_at ?? null) ? wave.current.doneAt : null,
+      }),
+    [state, now, dpr, stage, narrow, touch, live, samples, refused, released, renderer, opened, lost, reduced, reducedMotion, pins],
   );
   viewRef.current = view;
+  // The moment the last server of a reset of all is back is noted once, so its time stands still after.
+  const clickedAt = state.accepted?.minecraft?.last_reset_all?.clicked_at ?? null;
+  if (wave.current.clicked !== clickedAt) wave.current = { clicked: clickedAt, doneAt: null };
+  if (view.field?.wave?.done === true && wave.current.doneAt === null) wave.current.doneAt = view.field.srvNow;
+  const cursorRef = useRef<number | null>(null);
+  cursorRef.current = cursor;
   // The boxes in `view` were laid out in this stage: the 3D view draws into the same one.
   stageBox.current = stage;
   const panel = view.panel;
@@ -528,7 +569,13 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
             flights: flightsRef.current,
           });
         }
-      } else if (v && renderer === "flat") {
+      }
+      // The field: every server a cell, on its one canvas.
+      const f = v?.field;
+      if (f && f.layout && fieldCanvas.current) {
+        fieldPainter.paint(fieldCanvas.current, { layout: f.layout, cells: f.cells, shown: f.shown, cursor: cursorRef.current, dpr, reducedMotion }, localNow());
+      }
+      if (v && renderer === "flat") {
         for (const c of v.cards) {
           const canvas = canvases.current.get(c.id);
           if (!canvas || !c.box) continue;
@@ -541,7 +588,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
     };
     id = requestAnimationFrame(frame);
     return () => cancelAnimationFrame(id);
-  }, [tiles, dpr, renderer, reducedMotion]);
+  }, [tiles, dpr, renderer, reducedMotion, fieldPainter]);
 
   // Test hook, only with ?debug=1.
   useEffect(() => {
@@ -558,9 +605,35 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
         setBudget: (on) => {
           if (stage3d.current) stage3d.current.budgetOn = on;
         },
+        field: () => ({ paints: fieldPainter.paints, lastMs: fieldPainter.lastMs }),
       };
     }
-  }, [client, tiles]);
+  }, [client, tiles, fieldPainter]);
+
+  // A cell picked from the field: its server takes a 3D tile.
+  const fieldView = view.field;
+  const pick = (i: number | null) => {
+    const c = i === null ? undefined : fieldView?.cells[i];
+    if (c) setPins((p) => [...p.filter((x) => x.n !== c.n), { n: c.n, at: localNow() }].slice(-6));
+  };
+  const cellUnder = (e: React.PointerEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>): number | null => {
+    if (!fieldView?.layout) return null;
+    const r = e.currentTarget.getBoundingClientRect();
+    return cellAt(fieldView.layout, fieldView.cells.length, e.clientX - r.left, e.clientY - r.top);
+  };
+  const onFieldKey = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
+    if (!fieldView?.layout) return;
+    const n = fieldView.cells.length;
+    const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -fieldView.layout.cols, ArrowDown: fieldView.layout.cols }[e.key];
+    if (step !== undefined) {
+      e.preventDefault();
+      setCursor((c) => Math.max(0, Math.min(n - 1, (c ?? 0) + (c === null ? 0 : step))));
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      pick(cursor);
+    }
+  };
+  const pointed = cursor === null ? undefined : fieldView?.cells[cursor];
 
   const resetAllPending = state.pending.some((p) => p.intent.name === "minecraft_reset" && p.intent.args["all"] === true);
   const needsVerifyPrompt = view.verify.prompt;
@@ -620,6 +693,63 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
       <div className="win-layer mc-layer" data-renderer={renderer ?? undefined} data-testid="mc-layer">
         {/* one WebGL canvas under every tile: each world is drawn into its tile's rectangle */}
         {renderer !== "flat" || lost ? <canvas ref={glRef} className="mc-gl" aria-hidden="true" style={stage && renderer !== "flat" ? at(stage) : { display: "none" }} data-testid="mc-gl" /> : null}
+        {fieldView && fieldView.box && fieldView.grid && fieldView.layout ? (
+          <section className="mc-field" style={at(fieldView.box)} aria-label="Every server" data-testid="mc-field">
+            <div className="mc-field-text" style={{ height: narrow ? FIELD_TEXT_H_NARROW : FIELD_TEXT_H }}>
+              <p className="servers" data-testid="mc-field-servers">
+                {fieldView.headline.servers}
+              </p>
+              <p data-testid="mc-field-states">{fieldView.headline.states}</p>
+              {/* a phone has room for three lines: the two readings share one, without their workings, and a reset's count takes its place while it runs */}
+              {narrow ? (
+                (fieldView.headline.perCpu || fieldView.headline.perGib) && !fieldView.wave ? (
+                  <p data-testid="mc-field-density">
+                    {[fieldView.headline.perCpu, fieldView.headline.perGib]
+                      .filter((x) => x !== null)
+                      .map((x) => x.replace(/ \(.*\)$/, ""))
+                      .join(" · ")}
+                  </p>
+                ) : null
+              ) : (
+                <>
+                  {fieldView.headline.perCpu ? <p data-testid="mc-field-density">{fieldView.headline.perCpu}</p> : null}
+                  {fieldView.headline.perGib ? <p data-testid="mc-field-density-mem">{fieldView.headline.perGib}</p> : null}
+                </>
+              )}
+              {fieldView.wave ? (
+                <p className="wave" data-testid="mc-wave">
+                  {fieldView.wave.text}
+                </p>
+              ) : fieldView.headline.tps && !narrow ? (
+                <p data-testid="mc-field-tps">{fieldView.headline.tps}</p>
+              ) : null}
+            </div>
+            {/* one canvas for every cell; it scrolls when the cells do not fit */}
+            <div className="mc-field-scroll" style={{ maxHeight: fieldView.grid.h }} data-scrolls={fieldView.layout.scrolls ? "true" : undefined}>
+              <canvas
+                ref={fieldCanvas}
+                className="mc-field-canvas"
+                role="application"
+                tabIndex={0}
+                aria-label={fieldView.ariaLabel}
+                aria-describedby="mc-cell-readout"
+                style={{ width: fieldView.layout.w, height: fieldView.layout.h }}
+                data-testid="mc-field-canvas"
+                onPointerDown={(e) => setCursor(cellUnder(e))}
+                onPointerMove={(e) => setCursor(cellUnder(e))}
+                // a finger leaves as it lifts: the cell it tapped stays the one described
+                onPointerLeave={(e) => {
+                  if (e.pointerType === "mouse") setCursor(null);
+                }}
+                onClick={(e) => pick(cellUnder(e))}
+                onKeyDown={onFieldKey}
+              />
+            </div>
+            <p id="mc-cell-readout" className="mc-field-readout" style={{ height: FIELD_READOUT_H }} data-testid="mc-cell-readout" aria-live="polite">
+              {pointed ? cellText(pointed) : "Pick a server to see it in 3D."}
+            </p>
+          </section>
+        ) : null}
         {view.cards.map((c) =>
           c.box ? (
             <div

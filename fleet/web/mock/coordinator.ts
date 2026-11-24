@@ -124,6 +124,8 @@ interface Client {
   claim: ClaimRuntime | null;
   /** Connected while the broadcast took late viewers only: admitted to the broadcast alone. */
   late: boolean;
+  /** Its visibility said `minecraft`: it is sent the servers' status rows. */
+  minecraft?: boolean;
 }
 
 interface Act {
@@ -604,6 +606,7 @@ export class MockCoordinator {
         this.sendTo(client, { type: "clock", server_unix_ms: this.now(), client_unix_ms: m["client_unix_ms"] });
       } else if (m["type"] === "visibility") {
         client.visible = m["visible"] === true;
+        client.minecraft = m["minecraft"] === true;
         this.markDirty();
       } else if (m["type"] === "seat") {
         // The mock seats every verified page; the ticket is not checked. A page with neither a
@@ -1049,8 +1052,15 @@ export class MockCoordinator {
 
   // ---- the clock: the owner's cadence, the directed camera, retries ----------------
 
+  private statusTicks = 0;
+
   private tick(): void {
     const now = this.now();
+    // Once a second: every host's Minecraft status rows, to the pages that asked for them.
+    if (this.minecraft && ++this.statusTicks % 4 === 0) {
+      const asked = [...this.clients].filter((c) => c.minecraft === true);
+      if (asked.length > 0) for (const m of this.minecraft.statusMessages()) for (const c of asked) this.sendTo(c, m);
+    }
     this.powerTick(now);
     if (this.nextRaceAt !== null && now >= this.nextRaceAt) {
       // Skip a beat that falls inside a running race.
@@ -1662,6 +1672,9 @@ export class MockCoordinator {
         body((b) => {
           if (!this.minecraft) throw new Error("the mock runs no Minecraft servers (FLEET_MOCK_MINECRAFT)");
           this.minecraft.reset({ ...(b["release_all"] === true ? { release_all: true } : {}) });
+          // `servers` (and `per_host`): run that many servers in place of the ones there.
+          if (typeof b["servers"] === "number") this.minecraft.resize(b["servers"], typeof b["per_host"] === "number" ? b["per_host"] : undefined);
+          if (typeof b["status_off"] === "boolean") this.minecraft.statusOff = b["status_off"];
           return { ok: true };
         });
         return;

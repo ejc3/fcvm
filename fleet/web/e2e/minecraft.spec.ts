@@ -652,3 +652,172 @@ test("a lost WebGL context gives the flat map and says the 3D view was lost; a r
   await expect(page.getByText("3D view lost; showing the flat map.")).toHaveCount(0);
   await expect.poll(async () => (await drawnShare(page, "mc-1")).share).toBeGreaterThan(0.9);
 });
+
+// ---- a fleet of hundreds: the field ----------------------------------------------------------
+
+test.describe("a fleet of hundreds of servers on one host", () => {
+  const fieldNow = (page: Page) => page.evaluate(() => window.__minecraft!.view().field);
+  const resize = async (servers: number, perHost: number) => {
+    await admin("/mock/minecraft", { servers, per_host: perHost, status_off: false });
+    await expect.poll(async () => (await mockMc()).tiles.every((t) => t.phase === "running"), { timeout: 15_000 }).toBe(true);
+  };
+  const openField = async (page: Page, servers: number) => {
+    await page.goto("/?mode=minecraft&debug=1");
+    await page.waitForFunction(() => window.__minecraft !== undefined);
+    await expect(page.getByTestId("mc-field-servers")).toHaveText(`${servers} servers on one host`, { timeout: 20_000 });
+    await expect(page.getByTestId("mc-field-states")).toHaveText(`${servers} running`, { timeout: 20_000 });
+  };
+
+  test.beforeAll(() => resize(512, 512));
+  test.afterAll(() => resize(4, 8));
+
+  test("512 servers are 512 cells with real state, six of them drawn in 3D, and only those six open a view socket", async ({ page }, info) => {
+    await openField(page, 512);
+    // the headline: the count, and the density from the host's own readings
+    await expect(page.getByTestId("mc-field-density")).toHaveText(
+      isPhone(info) ? /^\d+\.\d per busy CPU · \d+\.\d per GiB in use$/ : /^\d+\.\d per busy CPU \(\d+\.\d of 192 busy\)$/,
+    );
+    if (!isPhone(info)) await expect(page.getByTestId("mc-field-density-mem")).toHaveText(/^\d+\.\d per GiB in use \(\d+ GiB\)$/);
+    // the field's words fit their room: no line is cut off or laid over another
+    const text = await page.locator(".mc-field-text").evaluate((el) => ({ room: el.clientHeight, need: el.scrollHeight, cut: [...el.querySelectorAll("p")].filter((p) => p.scrollWidth > p.clientWidth + 1).length }));
+    expect(text.need).toBeLessThanOrEqual(text.room);
+    expect(text.cut).toBe(0);
+    await expect(page.getByTestId("mc-up")).toHaveText("512 of 512 servers up");
+    const f = (await fieldNow(page))!;
+    expect(f.cells).toHaveLength(512);
+    expect(f.cells.every((c) => c.phase === "running" && c.tps !== null && c.tps >= 19.9 && c.players === 3 && c.ageS !== null)).toBe(true);
+    // six 3D tiles, each a different server, ringed in the field; six sockets and six worlds on the GPU, not 512
+    expect(f.shown).toHaveLength(6);
+    await expect(page.locator(".mc-tile")).toHaveCount(6);
+    await expect.poll(async () => Object.values(await tilesNow(page)).filter((t) => t.open).length, { timeout: 20_000 }).toBe(6);
+    expect(Object.keys(await tilesNow(page))).toHaveLength(6);
+    await expect.poll(async () => (await stageNow(page))?.held ?? 0, { timeout: 20_000 }).toBe(6);
+    // the field and the tiles share the stage without overlapping, inside the viewport, and the page does not scroll sideways
+    // (read in one go: the tiles cut to other servers every few seconds)
+    const boxes = await page.evaluate(() => {
+      const box = (el: Element) => {
+        const r = el.getBoundingClientRect();
+        return { x: r.x, y: r.y, w: r.width, h: r.height };
+      };
+      return { field: box(document.querySelector('[data-testid="mc-field"]')!), tiles: [...document.querySelectorAll(".mc-tile")].map(box) };
+    });
+    const vp = page.viewportSize()!;
+    expect(boxes.tiles).toHaveLength(6);
+    expect(boxes.field.x).toBeGreaterThanOrEqual(0);
+    expect(boxes.field.x + boxes.field.w).toBeLessThanOrEqual(vp.width + 0.5);
+    for (const t of boxes.tiles) {
+      expect(t.x >= boxes.field.x + boxes.field.w || t.y >= boxes.field.y + boxes.field.h, JSON.stringify(t)).toBe(true);
+      expect(t.x + t.w).toBeLessThanOrEqual(vp.width + 0.5);
+      expect(t.w).toBeGreaterThan(60);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    // on a laptop every cell is on screen at once; on a phone a cell is never smaller than a finger can pick, and the field scrolls when they do not all fit
+    const scroller = page.locator(".mc-field-scroll");
+    expect(f.layout!.cell).toBeGreaterThanOrEqual(9);
+    if (!isPhone(info)) expect(f.layout!.scrolls).toBe(false);
+    expect(await scroller.evaluate((el) => el.scrollHeight > el.clientHeight + 1)).toBe(f.layout!.scrolls);
+    // one canvas for every cell, painted in a few milliseconds and only when something changed
+    await expect(page.locator(".mc-field canvas")).toHaveCount(1);
+    const a = await page.evaluate(() => window.__minecraft!.field());
+    expect(a.lastMs).toBeLessThan(5);
+    await expect.poll(async () => (await page.evaluate(() => window.__minecraft!.field())).paints).toBeGreaterThan(a.paints);
+    const frames = await page.evaluate(
+      () =>
+        new Promise<{ paints: number; frames: number }>((done) => {
+          const from = window.__minecraft!.field().paints;
+          let n = 0;
+          const tick = () => (++n < 120 ? requestAnimationFrame(tick) : done({ paints: window.__minecraft!.field().paints - from, frames: n }));
+          requestAnimationFrame(tick);
+        }),
+    );
+    // 120 animation frames, a handful of paints (the rows come once a second)
+    expect(frames.paints).toBeLessThan(30);
+    const dir = process.env.FLEET_SCREENSHOT_DIR;
+    if (dir) await page.screenshot({ path: `${dir}/minecraft-field-512-${info.project.name}.png` });
+  });
+
+  test("a cell says what its server is, and picking it brings that server into the first 3D tile", async ({ page }, info) => {
+    await openField(page, 512);
+    const f = (await fieldNow(page))!;
+    // a server in the first rows that is not in a tile now
+    const i = Array.from({ length: 40 }, (_, k) => k).find((k) => !f.shown.includes(k + 1))!;
+    const canvas = (await page.getByTestId("mc-field-canvas").boundingBox())!;
+    const at = { x: canvas.x + (i % f.layout!.cols) * f.layout!.cell + f.layout!.cell / 2, y: canvas.y + Math.floor(i / f.layout!.cols) * f.layout!.cell + f.layout!.cell / 2 };
+    await expect(page.getByTestId("mc-cell-readout")).toHaveText("Pick a server to see it in 3D.");
+    await page.mouse.move(at.x, at.y);
+    await expect(page.getByTestId("mc-cell-readout")).toHaveText(new RegExp(`^mc-${i + 1} · running · \\d+\\.\\d TPS · 3 players · up .+ · restored in \\d+\\.\\d\\d s$`));
+    await expect(page.getByTestId(`mc-tile-mc-${i + 1}`)).toHaveCount(0);
+    await page.mouse.click(at.x, at.y);
+    await expect(page.getByTestId(`mc-tile-mc-${i + 1}`)).toHaveCount(1);
+    expect((await fieldNow(page))!.shown[0]).toBe(i + 1);
+    await expect(page.locator(".mc-tile")).toHaveCount(6);
+    // its own view socket opens and its world is drawn; its tile has what every tile has
+    await expect.poll(async () => (await drawnShare(page, `mc-${i + 1}`)).share, { timeout: 20_000 }).toBeGreaterThan(0.9);
+    await expect(page.getByTestId(`mc-tps-mc-${i + 1}`)).toHaveText(/^\d+\.\d TPS$/);
+    await expect(page.getByTestId(`mc-up-in-mc-${i + 1}`)).toHaveText(/^Up in \d+\.\d\d s$/);
+    for (const b of ["reset", "fork"]) await expect(page.getByTestId(`mc-${b}-mc-${i + 1}`)).toBeEnabled();
+    // a finger: the tapped cell is picked, and stays the one described after the finger lifts
+    if (isPhone(info)) {
+      const j = Array.from({ length: 40 }, (_, k) => k).find((k) => k !== i && !f.shown.includes(k + 1))!;
+      // the page has scrolled to the tiles by now: find the field again
+      await page.getByTestId("mc-field-canvas").scrollIntoViewIfNeeded();
+      const c2 = (await page.getByTestId("mc-field-canvas").boundingBox())!;
+      await page.touchscreen.tap(c2.x + (j % f.layout!.cols) * f.layout!.cell + f.layout!.cell / 2, c2.y + Math.floor(j / f.layout!.cols) * f.layout!.cell + f.layout!.cell / 2);
+      await expect(page.getByTestId(`mc-tile-mc-${j + 1}`)).toHaveCount(1);
+      await page.waitForTimeout(300);
+      await expect(page.getByTestId("mc-cell-readout")).toHaveText(new RegExp(`^mc-${j + 1} · running`));
+    }
+    // the keyboard picks too: the field takes focus, arrows move, Enter picks
+    await page.getByTestId("mc-field-canvas").focus();
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowDown");
+    await expect(page.getByTestId("mc-cell-readout")).toHaveText(/^mc-\d+ · running/);
+  });
+
+  test("Reset all comes back as a wave: the cells flash back, counted with the rate, then the whole time", async ({ page }) => {
+    await openField(page, 512);
+    await page.getByTestId("mc-reset-all").click();
+    await expect(page.getByTestId("mc-wave")).toHaveText(/^Reset all: \d+ of 512 back · \d+\.\d a second · \d+\.\d s$/, { timeout: 10_000 });
+    await expect(page.getByTestId("mc-field-states")).toHaveText(/^\d+ running · \d+ restoring$/);
+    // the count rises
+    const back = async () => Number(/^Reset all: (\d+) of/.exec((await page.getByTestId("mc-wave").textContent()) ?? "")?.[1] ?? "512");
+    const early = await back();
+    await expect.poll(back, { timeout: 20_000 }).toBeGreaterThan(early);
+    await expect(page.getByTestId("mc-wave")).toHaveText(/^Reset all: 512 servers back in \d+\.\d s \(\d+\.\d a second\)$/, { timeout: 60_000 });
+    await expect(page.getByTestId("mc-field-states")).toHaveText("512 running");
+    // the time stands still once it is whole
+    const said = await page.getByTestId("mc-wave").textContent();
+    await page.waitForTimeout(1500);
+    await expect(page.getByTestId("mc-wave")).toHaveText(said!);
+  });
+
+  test("servers whose host stops reporting are shown as not reported, never as zero or as running", async ({ page }) => {
+    await openField(page, 512);
+    await admin("/mock/minecraft", { status_off: true });
+    try {
+      await expect(page.getByTestId("mc-field-states")).toHaveText("0 running · 512 not reported", { timeout: 15_000 });
+      await expect(page.getByTestId("mc-up")).toHaveText("0 of 512 servers up");
+      await expect(page.getByTestId("mc-field-density")).toHaveCount(0);
+      await expect(page.getByTestId("mc-field-density-mem")).toHaveCount(0);
+      expect((await fieldNow(page))!.cells.every((c) => c.phase === "none" && c.tps === null)).toBe(true);
+    } finally {
+      await admin("/mock/minecraft", { status_off: false });
+    }
+    await expect(page.getByTestId("mc-field-states")).toHaveText("512 running", { timeout: 15_000 });
+  });
+
+  test("256 servers fit the same way, in larger cells", async ({ page }, info) => {
+    await resize(256, 256);
+    try {
+      await openField(page, 256);
+      const f = (await fieldNow(page))!;
+      expect(f.cells).toHaveLength(256);
+      await expect(page.locator(".mc-tile")).toHaveCount(6);
+      if (!isPhone(info)) expect(f.layout!.scrolls).toBe(false);
+      const dir = process.env.FLEET_SCREENSHOT_DIR;
+      if (dir) await page.screenshot({ path: `${dir}/minecraft-field-256-${info.project.name}.png` });
+    } finally {
+      await resize(512, 512);
+    }
+  });
+});

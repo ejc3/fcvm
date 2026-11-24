@@ -14,6 +14,7 @@ import { streamUrl } from "./net.ts";
 import { openedArea, tenths } from "./phones.ts";
 import { noneListedText, sleepView, verifyView, type SleepView } from "./view.ts";
 import { hundredthsText, layoutCaptioned, medianMs, type CaptionSizes } from "./windows.ts";
+import { FIELD_TILES, fieldCells, fieldHeadline, fieldLayout, resetWave, sampleOf, type FieldCell, type FieldHeadline, type FieldLayout, type FieldStatus, type ResetWave } from "./minecraft-field.ts";
 
 export const MINECRAFT_TITLE = "Minecraft";
 export const MINECRAFT_SENTENCE =
@@ -876,6 +877,33 @@ export interface MinecraftCard {
   about: string | null;
 }
 
+/** A fleet too large to draw whole: every server a cell of the field, a few of them 3D tiles. */
+export interface MinecraftFieldView {
+  /** The field's share of the stage, in the viewport: its words, its cells and the line that says what one cell is. Null while one server has the stage. */
+  box: Box | null;
+  /** Where the cells go inside it, and how they are laid out there (they scroll when they do not fit). */
+  grid: Box | null;
+  layout: FieldLayout | null;
+  /** The coordinator's clock now: the page notes it when it first sees a reset's last server back. */
+  srvNow: number;
+  cells: FieldCell[];
+  /** The servers (by number) in the 3D tiles now. */
+  shown: number[];
+  headline: FieldHeadline;
+  /** The last reset of every server, while it runs and for a minute after. */
+  wave: ResetWave | null;
+  ariaLabel: string;
+}
+
+/** The share of the stage the field takes: its width beside the tiles, or on a phone its height above them. */
+export const FIELD_SHARE = 0.4;
+export const FIELD_SHARE_NARROW = 0.3;
+/** Room in the field for its words (above the cells) and for the line that says what one cell is (below them). */
+export const FIELD_TEXT_H = 92;
+export const FIELD_TEXT_H_NARROW = 58;
+export const FIELD_READOUT_H = 18;
+const FIELD_GAP = 12;
+
 /** How the page draws the worlds: "flat" is the map from above, for a browser with no WebGL2. */
 export type McRenderer = "3d" | "flat";
 export const MC_FLAT_NOTE = "Flat map: no WebGL2 in this browser.";
@@ -960,6 +988,12 @@ export interface MinecraftInput {
   reduced?: boolean;
   /** The viewer asked for reduced motion: nothing flies. */
   reducedMotion?: boolean;
+  /** Each host's last status rows (the store's `minecraftStatus`): the field's state. */
+  statuses?: Readonly<Record<string, FieldStatus>>;
+  /** Servers the viewer picked from the field, with when (local ms): each keeps a 3D tile for a while. */
+  pins?: readonly { n: number; at: number }[];
+  /** When the page first saw every server back from the last reset of all (the coordinator's clock); null until then. */
+  waveDoneAt?: number | null;
   /** The tile (by id) opened to the whole stage. */
   opened?: string | null;
 }
@@ -977,6 +1011,8 @@ export interface MinecraftView {
   renderer: McRenderer | null;
   /** The slot opened to the whole stage; null: the wall. */
   opened: string | null;
+  /** With more servers than are listed as tiles: every server as a cell, six of them in the 3D tiles. */
+  field: MinecraftFieldView | null;
   verify: ReturnType<typeof verifyView>;
   notice: string | null;
   sleep: SleepView | null;
@@ -1008,11 +1044,46 @@ export function heldLayout(area: Box, id: string, narrow: boolean, dpr: number):
   return { id, box: { x, y: area.y, w: side, h: side }, caption: { x, y: area.y + side, w: side, h: capH }, compact: narrow };
 }
 
-function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: McRenderer | null): MinecraftHeader {
-  const times = upTimes(m.tiles);
+/** A server that is not a listed tile, as a tile: what its cell and its host's rows say, and nothing they do not. */
+function tileOfCell(c: FieldCell): MinecraftTile {
+  return {
+    id: c.id,
+    half: "fcvm",
+    side: "fcvm",
+    rect: { x: 0, y: 0, w: 1, h: 1 },
+    // not reported is not running: the tile is dark until its host says what it is
+    phase: c.phase === "none" ? "pending" : c.phase,
+    slot: c.slot,
+    vm: null,
+    generation: null,
+    fps: null,
+    error: null,
+    failure: null,
+    frame_url: c.frame,
+    frame_url_v4: c.frameV4,
+    gpu: null,
+    host: null,
+    place: null,
+    // its launch's time to the first chunk, as its row says it ("Up in 0.41 s")
+    last_relaunch: c.launchMs === null || c.phase !== "running" ? null : { clicked_at: 0, first_frame_at: c.launchMs, phases: { total_ms: c.launchMs } },
+    borrowed: null,
+    join: null,
+    forked_from: null,
+  };
+}
+
+function fieldAria(field: NonNullable<Minecraft["field"]>, cells: readonly FieldCell[], statuses: Readonly<Record<string, FieldStatus>>, now: number): string {
+  const h = fieldHeadline(field, cells, statuses, now);
+  return `${h.servers}: ${h.states.replaceAll(" · ", ", ")}`;
+}
+
+function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: McRenderer | null, cells: readonly FieldCell[] | null = null): MinecraftHeader {
+  // With a field the figures are every server's, from the hosts' rows; else the listed tiles'.
+  const times = cells === null ? upTimes(m.tiles) : cells.filter((c) => c.launchMs !== null).map((c) => c.launchMs!);
   const median = medianMs(times);
-  const up = m.tiles.filter((t) => t.phase === "running").length;
-  const servers = m.tiles.length === 1 ? "server" : "servers";
+  const up = cells === null ? m.tiles.filter((t) => t.phase === "running").length : cells.filter((c) => c.phase === "running").length;
+  const total = cells === null ? m.tiles.length : cells.length;
+  const servers = total === 1 ? "server" : "servers";
   const recent = (at: number) => srvNow - at <= HEADER_RECENT_MS;
   const f = m.last_fork;
   let lastFork: string | null = null;
@@ -1027,7 +1098,7 @@ function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: Mc
   const joinable = m.tiles.find((t) => t.join !== null && t.phase === "running") ?? m.tiles.find((t) => t.join !== null);
   const version = javaVersion(m.server);
   return {
-    up: `${up} of ${m.tiles.length} ${servers} up`,
+    up: `${up} of ${total} ${servers} up`,
     server: m.server,
     median: `Median restore to first chunk ${median === null ? "--" : hundredthsText(median)}`,
     slowest: `Slowest ${times.length === 0 ? "--" : hundredthsText(Math.max(...times))}`,
@@ -1047,7 +1118,7 @@ function seatsFull(reason: string | null, seatFree: boolean): string {
 
 export function minecraftView(inp: MinecraftInput): MinecraftView {
   const s = inp.state;
-  const m = s.accepted?.minecraft ?? null;
+  let m = s.accepted?.minecraft ?? null;
   const online = s.connection === "open";
   const srvNow = serverNow(s.clock, inp.now);
   const common = {
@@ -1075,10 +1146,26 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
       cards: [],
       panel: null,
       opened: null,
+      field: null,
     };
   }
   const mine = (t: MinecraftTile) => t.borrowed !== null && sameViewer(t.borrowed.viewer ?? null, s.you);
   const held = m.tiles.find((t) => mine(t) && t.borrowed?.session !== undefined && t.borrowed.session !== (inp.released ?? null)) ?? null;
+  // A fleet with a field: its cells, and the servers drawn in 3D. The cards below are those
+  // servers' (a listed tile as the coordinator sent it, any other made from its cell), plus
+  // every lent tile, which is how this viewer's own server is found.
+  const cells = m.field === null ? null : fieldCells(m.field, inp.statuses ?? {}, inp.now);
+  const sample = cells === null ? null : sampleOf(cells, FIELD_TILES, inp.reducedMotion === true ? 0 : inp.now, inp.pins ?? []);
+  const all = m.tiles;
+  if (cells !== null && sample !== null) {
+    const listed = new Map(m.tiles.map((t) => [serverName(t), t]));
+    const drawn = sample.map((n, j) => {
+      const c = cells.find((x) => x.n === n)!;
+      const rect = { x: (j % 3) / 3, y: Math.floor(j / 3) / 2, w: 1 / 3, h: 1 / 2 };
+      return { ...(listed.get(c.slot) ?? tileOfCell(c)), rect };
+    });
+    m = { ...m, image_aspect: 1.5, tiles: [...drawn, ...all.filter((t) => t.borrowed !== null && !drawn.some((d) => d.id === t.id))] };
+  }
   const panelOpen = held !== null;
   const area = inp.stage === null ? null : panelOpen ? openedArea(inp.stage, inp.narrow) : inp.stage;
   // While this viewer holds a server, it is the one view, as large as the room beside (or above)
@@ -1086,11 +1173,28 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
   // opened from the wall takes the stage the same way.
   const opened = held === null ? (m.tiles.find((t) => t.id === (inp.opened ?? null)) ?? null) : null;
   const alone = held ?? opened;
+  // With a field the stage is shared: the field beside the 3D tiles (above them on a phone).
+  let fieldBox: Box | null = null;
+  let tilesArea = area;
+  if (cells !== null && area !== null && alone === null) {
+    if (inp.narrow) {
+      const h = Math.round(area.h * FIELD_SHARE_NARROW);
+      fieldBox = { x: area.x, y: area.y, w: area.w, h };
+      tilesArea = { x: area.x, y: area.y + h + FIELD_GAP, w: area.w, h: Math.max(0, area.h - h - FIELD_GAP) };
+    } else {
+      const w = Math.round(area.w * FIELD_SHARE);
+      fieldBox = { x: area.x, y: area.y, w, h: area.h };
+      tilesArea = { x: area.x + w + FIELD_GAP, y: area.y, w: Math.max(0, area.w - w - FIELD_GAP), h: area.h };
+    }
+  }
+  const walled = cells === null ? m.tiles : m.tiles.slice(0, sample!.length);
   const placed = new Map(
     area === null
       ? []
       : alone !== null
         ? [[alone.id, heldLayout(area, alone.id, inp.narrow, inp.dpr)]]
+        : cells !== null
+          ? layoutCaptioned({ area: tilesArea!, tiles: walled, imageAspect: m.image_aspect, narrow: inp.narrow, panel: false, dpr: inp.dpr, fill: true }, MINECRAFT_CAPTIONS).map((b) => [b.id, b] as const)
         : layoutCaptioned({ area, tiles: m.tiles, imageAspect: m.image_aspect, narrow: inp.narrow, panel: panelOpen, dpr: inp.dpr }, MINECRAFT_CAPTIONS).map((b) => [b.id, b]),
   );
   const first = viewFirstMessage(s);
@@ -1122,8 +1226,9 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     else if (lentToOther) takeTitle = "Lent to another viewer.";
     else if (!running) takeTitle = "It can be borrowed once it is running.";
     else if (live?.open !== true) takeTitle = `This page is not connected to ${slot} yet: its turn would run with nothing to drive.`;
-    const target = running ? forkTarget(m.tiles, t) : null;
-    const forkTitle = !running ? "It can be copied once it is running." : target === null ? "No other server on its host can take a copy now." : `Copies its world into ${serverName(target)}.`;
+    // Which server takes the copy is the coordinator's to say; the page names it only when it lists every server.
+    const target = running ? (cells === null ? forkTarget(all, t) : t) : null;
+    const forkTitle = !running ? "It can be copied once it is running." : target === null ? "No other server on its host can take a copy now." : cells !== null ? "Copies its world into the next server on its host." : `Copies its world into ${serverName(target)}.`;
     const resetTitle = mine(t) ? "Yours: give it back and it is reset." : lentToOther ? "Lent to another viewer." : null;
     const lastFork = m.last_fork !== null && m.last_fork.to === slot ? m.last_fork : null;
     const phases = t.last_relaunch?.phases ?? {};
@@ -1131,7 +1236,8 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     // The view socket over the family the page's probe chose (core/net.ts), as every stream is:
     // a viewer with no IPv6 reaches the tile over its IPv4 name.
     const url = running ? streamUrl(t, s.net.family) : null;
-    const socket = url !== null && first !== null ? { url, first, key: `${url}#${t.generation ?? 0}` } : null;
+    // Of a field's servers only the ones on the stage open a view socket.
+    const socket = url !== null && first !== null && (cells === null || p !== undefined) ? { url, first, key: `${url}#${t.generation ?? 0}` } : null;
     const stream = streamOf(t, socket !== null);
     const state = running ? "running" : t.phase === "failed" ? "failed" : t.phase === "forking" ? "forking" : "restoring";
     // The world this one is a copy of, while that server still runs the launch it was copied from.
@@ -1216,14 +1322,30 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
       giveBack: "Give back",
     };
   }
+  const textH = inp.narrow ? FIELD_TEXT_H_NARROW : FIELD_TEXT_H;
+  const grid = fieldBox === null ? null : { x: fieldBox.x, y: fieldBox.y + textH, w: fieldBox.w, h: Math.max(0, fieldBox.h - textH - FIELD_READOUT_H) };
   return {
     ...common,
     empty: null,
     banner,
-    header: headerOf(m, s.you, srvNow, inp.renderer ?? null),
+    header: headerOf(m, s.you, srvNow, inp.renderer ?? null, cells),
     resetAll: { label: "Reset all", disabled: !online || m.tiles.length === 0 },
     cards,
     panel,
     opened: opened === null ? null : serverName(opened),
+    field:
+      cells === null || m.field === null
+        ? null
+        : {
+            box: fieldBox,
+            grid,
+            layout: grid === null ? null : fieldLayout(grid, cells.length),
+            srvNow,
+            cells,
+            shown: sample!,
+            headline: fieldHeadline(m.field, cells, inp.statuses ?? {}, inp.now),
+            wave: m.last_reset_all === null ? null : resetWave(cells, m.last_reset_all.clicked_at, srvNow, inp.waveDoneAt ?? null),
+            ariaLabel: fieldAria(m.field, cells, inp.statuses ?? {}, inp.now),
+          },
   };
 }
