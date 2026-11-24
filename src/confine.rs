@@ -870,7 +870,7 @@ mod tests {
             .find("libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL)")
             .unwrap();
         let check = utils[arm..].find("libc::getppid() != parent").unwrap();
-        assert!(utils[arm + check..].find("libc::_exit(1)").is_some());
+        assert!(utils[arm + check..].contains("libc::_exit(1)"));
     }
 
     /// A mode nothing recorded is read from the config, never taken as off: a library
