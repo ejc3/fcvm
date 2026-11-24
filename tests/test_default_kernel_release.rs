@@ -281,7 +281,11 @@ fn apt_packages(script: &str) -> std::collections::BTreeSet<String> {
         let Some(install) = words.iter().position(|word| *word == "install") else {
             continue;
         };
-        if !words[..install].iter().any(|word| word.contains("apt-get")) {
+        // `apt_get` is the retrying wrapper in the runner image's user data (scripts/build-ami.sh).
+        if !words[..install]
+            .iter()
+            .any(|word| word.contains("apt-get") || *word == "apt_get")
+        {
             continue;
         }
         packages.extend(
@@ -299,9 +303,10 @@ fn apt_packages_reads_continuations_and_ignores_comments() {
     let script = "./scripts/ci-apt-get.sh update\n\
                   ./scripts/ci-apt-get.sh install -y flex bison \\\n    libseccomp-dev  # linked by firecracker\n\
                   ./scripts/ci-apt-get.sh install -y gh  # libelf-dev comes from the image\n\
+                  apt_get install -y unzip\n\
                   echo install nothing\n";
     let packages = apt_packages(script);
-    let expected = ["bison", "flex", "gh", "libseccomp-dev"];
+    let expected = ["bison", "flex", "gh", "libseccomp-dev", "unzip"];
     assert_eq!(
         packages.iter().map(String::as_str).collect::<Vec<_>>(),
         expected
