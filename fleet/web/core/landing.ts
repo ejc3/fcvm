@@ -19,11 +19,11 @@ const LINES: Record<Exclude<LandingPage, "wall">, string> = {
 
 /** The panel's sentences after the shared line. Only what the line and the labelled controls on the page do not say. */
 const ADDED: Record<LandingPage, string[]> = {
-  wall: ["After a restart, compare how long each side takes to come back."],
-  phones: ["Together they draw one scene. Open a phone to see how long its restore took."],
+  wall: ["Press Restart all and compare how long each side takes to come back."],
+  phones: ["Together they draw one scene. Open a phone to see how long its restore took, or take it over for a short time."],
   potato: ["The hold gets a tenth shorter each lap, until a player is still waking when the ball arrives."],
-  windows: ["Taking a tile over allows a fixed set of actions."],
-  minecraft: ["Fork copies a running server's world into the next server on its host."],
+  windows: ["Click a tile to reset it, or take one over for a fixed set of actions."],
+  minecraft: ["Fork copies a running server's world into the next server on its host. A Java Edition client can join at the address shown."],
 };
 
 /** What a legend entry draws: a tile in a phase (with the ball when it holds it), or one of the Hold card's marks. */
@@ -77,7 +77,7 @@ export function landingView(page: LandingPage, opts: { lambda?: boolean } = {}):
   };
 }
 
-/** The panel's paragraphs in order. The page's line is added only when the page clamps it. */
-export function landingPanelText(v: LandingView, lineClamped: boolean): string[] {
-  return [v.shared, ...(lineClamped ? [v.line] : []), ...v.added];
+/** The panel's paragraphs in order: the shared line, the page's line, the added sentences. */
+export function landingPanelText(v: LandingView): string[] {
+  return [v.shared, v.line, ...v.added];
 }

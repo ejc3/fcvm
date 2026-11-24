@@ -29,6 +29,7 @@ import {
   potatoView,
   ringGeometry,
   type PotatoInput,
+  placeReadout,
   tileReadout,
 } from "../potato.ts";
 import { parseServerMsg, ProtocolError, type Potato, type PotatoDrop, type PotatoRound } from "../protocol.ts";
@@ -233,8 +234,11 @@ describe("the ring", () => {
     expect(v.ring!.caption).toBe("Ring of 4: player 2 has the ball, catch 7");
   });
 
-  it("reads a player that has not started without a detail line", () => {
+  it("reads a player that has not started without a detail line or a trailing separator", () => {
     expect(tileReadout(5, "not started", false, null)).toEqual({ head: "Player 5 · not started", detail: "" });
+    const p = potato({ players: [] });
+    const t = potatoView(input(stateWith({ ...p, round: round({ ring: [0, 1], size: 2, holder: 0 }) }))).ring!.tiles[1]!;
+    expect(t.ariaLabel).toBe("Player 1 · not started");
   });
 
   it("shows a player that threw as going to sleep until its sleep is done", () => {
@@ -747,4 +751,25 @@ describe("the view", () => {
     const tiles = potatoView(input(s, { now: T - 5000 })).ring!.tiles;
     expect(tiles[1]!.wake!.text).toBe("200 ms");
   });
+});
+
+describe("the readout card stays inside the stage", () => {
+  const card = { w: 260, h: 64 };
+  for (const [name, stage] of [["a 360 px phone", { w: 328, h: 328 }], ["a desktop", { w: 880, h: 710 }]] as const) {
+    it(`on ${name}, for a tile on each of the four sides and the corners, the card is wholly inside the stage and off its tile`, () => {
+      const g = ringGeometry({ x: 0, y: 0, ...stage }, 32);
+      for (let i = 0; i < 32; i++) {
+        const c = g.places[i]!;
+        const tile = { x: c.x - g.tile / 2, y: c.y - g.tile / 2, w: g.tile, h: g.tile };
+        const p = placeReadout(tile, g.centre, card, stage);
+        const w = Math.min(card.w, stage.w - 8);
+        expect(p.x, `tile ${i} left`).toBeGreaterThanOrEqual(0);
+        expect(p.y, `tile ${i} top`).toBeGreaterThanOrEqual(0);
+        expect(p.x + w, `tile ${i} right`).toBeLessThanOrEqual(stage.w);
+        expect(p.y + card.h, `tile ${i} bottom`).toBeLessThanOrEqual(stage.h);
+        const off = p.x + w <= tile.x || p.x >= tile.x + tile.w || p.y + card.h <= tile.y || p.y >= tile.y + tile.h;
+        expect(off, `tile ${i} clear of its card`).toBe(true);
+      }
+    });
+  }
 });

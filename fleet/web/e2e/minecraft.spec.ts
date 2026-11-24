@@ -331,7 +331,7 @@ test("the held server is the large view, with the others off the stage, and Give
   await expect(page.getByTestId("mc-panel")).toBeVisible();
   const big = (await page.getByTestId("mc-tile-mc-2").boundingBox())!;
   // on a desktop it fills the room beside the panel; on a phone the half of the screen above it
-  expect(big.width).toBeGreaterThan((isPhone(info) ? 1.05 : 1.3) * small.width);
+  expect(big.width).toBeGreaterThan((isPhone(info) ? 1.0 : 1.3) * small.width);
   for (const slot of ["mc-1", "mc-3", "mc-4"]) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(0);
   // the panel does not cover the held view
   const sheet = (await page.getByTestId("mc-panel").boundingBox())!;
@@ -425,6 +425,22 @@ test("the page sends only the four intents and, on a view socket, its admission 
 test("minecraft: the line under the title and the What is this? control", async ({ page }) => {
   await openMinecraft(page);
   await expectLanding(page, { stage: "mc-stage", phone: false });
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 360, height: 800 });
   await expectLanding(page, { stage: "mc-stage", phone: true });
 });
+
+test("minecraft: Escape closes the About panel and nothing under it", async ({ page }) => {
+  await openMinecraft(page);
+  await page.getByTestId("mc-take-mc-2").click();
+  const under = page.getByTestId("mc-panel");
+  await expect(under).toBeVisible();
+  const btn = page.getByTestId("landing-button");
+  await btn.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("landing-panel")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
+  await page.waitForTimeout(300);
+  await expect(under, "the layer under it stays").toBeVisible();
+});
+

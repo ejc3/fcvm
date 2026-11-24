@@ -2183,6 +2183,6 @@ test("a probe that lands while the renderers are not accepting yet tries again: 
 test("the line under the title and the What is this? control", async ({ page }) => {
   await openWall(page, 1);
   await expectLanding(page, { phone: false });
-  await page.setViewportSize({ width: 390, height: 844 });
+  await page.setViewportSize({ width: 360, height: 800 });
   await expectLanding(page, { phone: true });
 });

@@ -601,8 +601,10 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
               <span className="site">{SITE}</span>
               <h1>{view.title}</h1>
             </div>
-            <Landing landing={view.landing} colour="" />
-            <ModeSwitch current="phones" />
+            <div className="landing-row">
+              <ModeSwitch current="phones" />
+              <Landing landing={view.landing} colour="" />
+            </div>
           </div>
           {!panelOpen ? (
             <button
