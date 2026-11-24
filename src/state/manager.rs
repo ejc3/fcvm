@@ -15,14 +15,14 @@ const LAYOUT_FILE: &str = "layout";
 ///
 /// ```text
 /// layout                                      this number
-/// vms/<bb>/<vm_id>.json  .json.tmp  .json.lock
-/// names/<bb>/<sha256(name)>/<pid>.<start>.<vm_id>     a name slot and its one token
-/// names/<bb>/.claim.<pid>.<start>.<vm_id>/            a claim being built
-/// pids/<bb>/<pid>.<vm_id>
+/// vms/<b>/<vm_id>.json  .json.tmp  .json.lock
+/// names/<b>/<sha256(name)>/<pid>.<start>.<vm_id>     a name slot and its one token
+/// names/<b>/.claim.<pid>.<start>.<vm_id>/            a claim being built
+/// pids/<b>/<pid>.<vm_id>
 /// sweep.lock  sweep.stamp
 /// ```
 ///
-/// `<bb>` is a bucket (`bucket_of`), so no directory takes every VM's writes: a create or a
+/// `<b>` is a bucket (`bucket_of`), so no directory takes every VM's writes: a create or a
 /// rename holds its directory's lock exclusively, and with every VM's state in one directory
 /// that lock was what a thousand clones starting together waited on. Layout 1 kept
 /// `<vm_id>.json` in the state directory itself, with `name/`, `pid/` and a host-wide
@@ -48,17 +48,26 @@ const CLAIM_PREFIX: &str = ".claim.";
 /// retry means another claimer took the slot in between, and that one is live.
 const CLAIM_ATTEMPTS: usize = 16;
 
-/// The bucket of `key`: two hex digits, the first byte of its SHA-256. The same in every
-/// process and every build, which a hasher keyed per process would not be: two fcvm
-/// processes must look for one VM in one directory.
+/// The bucket of `key`: one hex digit, the first of its SHA-256. The same in every process
+/// and every build, which a hasher keyed per process would not be: two fcvm processes must
+/// look for one VM in one directory.
+///
+/// Sixteen buckets, by measurement (1000 clones of one snapshot, 128 and 512 starting at
+/// once): a start waited 0.5 and 13.6 ms for its state bucket's lock with 16 buckets, 0.1
+/// and 11.3 ms with 64, 0.1 and 0.0 ms with 256, against 58 and 11 ms plus 34 and 221 ms
+/// for the host-wide name lock with every state in one directory. A listing opens every
+/// bucket, at about 0.13 ms each: `fcvm ls` on an empty store took 4.9 ms with 16 buckets,
+/// 12.9 ms with 64 and 40 ms with 256, and 4.5 ms with one directory. At 70 starts a second
+/// the busiest of 16 buckets was locked 2.9% of the time, so the count is due for another
+/// look near ten times that rate.
 pub fn bucket_of(key: &str) -> String {
     use sha2::Digest;
-    format!("{:02x}", sha2::Sha256::digest(key.as_bytes())[0])
+    format!("{:x}", sha2::Sha256::digest(key.as_bytes())[0] >> 4)
 }
 
 /// Whether `name` is a bucket directory's name.
 fn is_bucket(name: &str) -> bool {
-    name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
+    name.len() == 1 && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// How often a claim sweeps the state directory for what SIGKILLed VMs left
@@ -100,8 +109,57 @@ fn hand_to_state_dir_owner(state_dir: &Path, dir: &Path) {
     }
 }
 
+/// Publish the state written at `temp` as `state`, atomically: a reader of `state` gets the
+/// state before this write or the one after it, whole.
+///
+/// When `state` exists the two files are exchanged and the old state, now at `temp`, is
+/// unlinked. A plain rename over an existing file would publish the same way, but btrfs
+/// answers it by starting the write-out of the new file's data inside the rename ("we're
+/// using rename to replace one file with another, start IO on it now"), with the directory
+/// locked. A state is rewritten four times in a start, and with 128 clones starting
+/// together each of those renames took 55 to 108 ms, the block layer holding back the
+/// writes behind the VMs' own disk reads (bench/start-rate). An exchange starts no I/O:
+/// the data goes out with the filesystem's periodic writeback, or never, when the state is
+/// replaced or its VM exits first.
+///
+/// A kill between the exchange and the unlink leaves the new state published and the old
+/// one at `temp`, which the next write replaces and `delete_state` removes. A filesystem
+/// without `RENAME_EXCHANGE` gets the plain rename.
+fn publish_state(temp: &Path, state: &Path) -> std::io::Result<()> {
+    match rename_with_flags(temp, state, libc::RENAME_EXCHANGE) {
+        Ok(()) => {
+            if let Err(error) = remove_if_exists(temp) {
+                tracing::warn!(
+                    path = %temp.display(),
+                    %error,
+                    "cannot remove the state a write replaced; the next write overwrites it"
+                );
+            }
+            Ok(())
+        }
+        // No state yet (a VM's first write), or no exchange on this filesystem.
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT)
+                    | Some(libc::EINVAL)
+                    | Some(libc::ENOSYS)
+                    | Some(libc::EOPNOTSUPP)
+            ) =>
+        {
+            std::fs::rename(temp, state)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// `rename(from, to)` that fails with EEXIST instead of replacing what is at `to`.
 fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    rename_with_flags(from, to, libc::RENAME_NOREPLACE)
+}
+
+/// `renameat2(from, to, flags)`.
+fn rename_with_flags(from: &Path, to: &Path, flags: libc::c_uint) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
     let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
@@ -112,7 +170,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
             from.as_ptr(),
             libc::AT_FDCWD,
             to.as_ptr(),
-            libc::RENAME_NOREPLACE,
+            flags,
         )
     };
     if result == 0 {
@@ -387,8 +445,46 @@ pub struct StateManager {
     layout_checked: std::sync::OnceLock<()>,
 }
 
+/// The most threads a listing reads on.
+const LIST_THREADS: usize = 8;
+
+/// The fewest items a listing thread is started for.
+const LIST_CHUNK: usize = 32;
+
+/// `work` over `items`, on up to `LIST_THREADS` threads when there are enough of them,
+/// with the results in the items' order. A listing opens and reads every bucket and then
+/// every state file. Read one after another, 1000 states took 67 ms; on threads, 54 ms.
+fn on_listing_threads<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+    let threads = LIST_THREADS.min(cores).min(items.len() / LIST_CHUNK).max(1);
+    if threads == 1 {
+        return items.into_iter().map(work).collect();
+    }
+    let per_thread = items.len().div_ceil(threads);
+    let mut items = items.into_iter();
+    let mut chunks = Vec::with_capacity(threads);
+    loop {
+        let chunk: Vec<T> = items.by_ref().take(per_thread).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        chunks.push(chunk);
+    }
+    let work = &work;
+    std::thread::scope(|scope| {
+        let running: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| scope.spawn(move || chunk.into_iter().map(work).collect::<Vec<R>>()))
+            .collect();
+        running
+            .into_iter()
+            .flat_map(|thread| thread.join().expect("a listing thread panicked"))
+            .collect()
+    })
+}
+
 /// The entries of every bucket of `vms_dir`, as paths. The buckets are opened and read on
-/// one blocking thread, with `after_open` between the two: a test seam for the window a
+/// blocking threads, with `after_open` between the two: a test seam for the window a
 /// rename has to land in to be missed by a btrfs scan (`list_vms_after_open`). Every bucket
 /// is open before the first is read, so a state that existed when the scan began is in a
 /// directory this scan already holds.
@@ -398,18 +494,13 @@ async fn scan_vm_buckets(
 ) -> Result<Vec<PathBuf>> {
     let vms_dir = vms_dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> std::io::Result<Vec<PathBuf>> {
-        let mut open = Vec::new();
+        let mut buckets = Vec::new();
         match std::fs::read_dir(&vms_dir) {
-            Ok(buckets) => {
-                for bucket in buckets {
+            Ok(entries) => {
+                for bucket in entries {
                     let bucket = bucket?;
-                    if !bucket.file_name().to_str().is_some_and(is_bucket) {
-                        continue;
-                    }
-                    match std::fs::read_dir(bucket.path()) {
-                        Ok(entries) => open.push(entries),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
+                    if bucket.file_name().to_str().is_some_and(is_bucket) {
+                        buckets.push(bucket.path());
                     }
                 }
             }
@@ -417,12 +508,22 @@ async fn scan_vm_buckets(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        let open = on_listing_threads(buckets, |bucket| match std::fs::read_dir(bucket) {
+            Ok(entries) => Ok(Some(entries)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        })
+        .into_iter()
+        .collect::<std::io::Result<Vec<_>>>()?;
         after_open();
+        let read = on_listing_threads(open.into_iter().flatten().collect(), |entries| {
+            entries
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect::<std::io::Result<Vec<PathBuf>>>()
+        });
         let mut paths = Vec::new();
-        for entries in open {
-            for entry in entries {
-                paths.push(entry?.path());
-            }
+        for bucket in read {
+            paths.extend(bucket?);
         }
         Ok(paths)
     })
@@ -652,10 +753,9 @@ impl StateManager {
                     .context("setting file permissions on state file")?;
             }
 
-            // Atomic rename (this is an atomic operation on Unix)
-            fs::rename(&temp_file, &state_file)
-                .await
-                .context("renaming temp state file")?;
+            // Published whole: by exchange with the state it replaces, or by rename when
+            // this is the VM's first (`publish_state`).
+            publish_state(&temp_file, &state_file).context("renaming temp state file")?;
 
             // The state is published; the index only speeds up `load_state_by_pid`, which
             // scans when it finds nothing, so a failure to index is logged and the save
@@ -694,7 +794,7 @@ impl StateManager {
 
     /// Write a new VM's first state, under its name, while no other live VM has that name.
     ///
-    /// A name in use is a directory, its slot (`names/<bb>/<sha256(name)>`), holding one
+    /// A name in use is a directory, its slot (`names/<b>/<sha256(name)>`), holding one
     /// file, the token of the VM that has it. A claim builds a directory of its own with its
     /// token inside and renames it onto the slot. The kernel lets a directory replace
     /// another only when the other is absent or empty, so of any number of launches with one
@@ -1609,50 +1709,50 @@ impl StateManager {
             }
         }
 
-        for vm_id in vm_ids {
-            let path = self.state_file(&vm_id);
-            {
-                tracing::trace!(
-                    path = %path.display(),
-                    "list_vms: reading state file"
-                );
-
-                match fs::read_to_string(&path).await {
-                    Ok(state_json) => match serde_json::from_str::<VmState>(&state_json) {
-                        Ok(state) => {
-                            tracing::trace!(
-                                path = %path.display(),
-                                vm_id = %state.vm_id,
-                                pid = ?state.pid,
-                                "list_vms: parsed state file"
-                            );
-                            vms.push(state);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %e,
-                                "list_vms: failed to parse state file"
-                            );
-                        }
-                    },
-                    // A VM that exits deletes its state file before its lock file,
-                    // and a new VM makes its lock file before its state file, so a
-                    // name from the scan can have no state file by the time it is
-                    // read. Not an error.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        tracing::debug!(
-                            path = %path.display(),
-                            "list_vms: no state file for this name (VM starting or gone)"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "list_vms: failed to read state file"
-                        );
-                    }
+        // Read and parsed on blocking threads; reported here, on the caller's own.
+        let paths: Vec<PathBuf> = vm_ids.iter().map(|vm_id| self.state_file(vm_id)).collect();
+        let read = tokio::task::spawn_blocking(move || {
+            on_listing_threads(paths, |path| {
+                let state = std::fs::read_to_string(&path)
+                    .map(|json| serde_json::from_str::<VmState>(&json));
+                (path, state)
+            })
+        })
+        .await
+        .context("reading state files")?;
+        for (path, state) in read {
+            match state {
+                Ok(Ok(state)) => {
+                    tracing::trace!(
+                        path = %path.display(),
+                        vm_id = %state.vm_id,
+                        pid = ?state.pid,
+                        "list_vms: parsed state file"
+                    );
+                    vms.push(state);
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "list_vms: failed to parse state file"
+                    );
+                }
+                // A VM that exits deletes its state file before its lock file, and a new
+                // VM makes its lock file before its state file, so a name from the scan
+                // can have no state file by the time it is read. Not an error.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        "list_vms: no state file for this name (VM starting or gone)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "list_vms: failed to read state file"
+                    );
                 }
             }
         }
@@ -1741,9 +1841,8 @@ impl StateManager {
                     .context("setting file permissions on state file")?;
             }
 
-            // Atomic rename
-            fs::rename(&temp_file, &state_file)
-                .await
+            // Published whole, by exchange with the state it replaces (`publish_state`).
+            publish_state(&temp_file, &state_file)
                 .context("renaming temp state file for update")?;
 
             Ok(Some(state))
@@ -2077,37 +2176,37 @@ mod tests {
         }
     }
 
-    /// The bucket of a key is the first byte of its SHA-256, in every process and every
+    /// The bucket of a key is the first hex digit of its SHA-256, in every process and every
     /// build. A hasher keyed per process would send two fcvm processes to two directories
     /// for one VM.
     #[test]
     fn a_key_has_one_bucket_in_every_process() {
         for (key, bucket) in [
-            ("vm-1", "2d"),
-            ("vm-0123456789abcdef0123456789abcdef", "ae"),
-            ("web", "4b"),
-            ("4242", "03"),
-            ("", "e3"),
+            ("vm-1", "2"),
+            ("vm-0123456789abcdef0123456789abcdef", "a"),
+            ("web", "4"),
+            ("4242", "0"),
+            ("", "e"),
         ] {
             assert_eq!(bucket_of(key), bucket, "bucket of {key:?}");
         }
         let manager = StateManager::new(PathBuf::from("/s"));
         assert_eq!(
             manager.state_file("vm-1"),
-            PathBuf::from("/s/vms/2d/vm-1.json")
+            PathBuf::from("/s/vms/2/vm-1.json")
         );
         assert_eq!(
             manager.lock_file("vm-1"),
-            PathBuf::from("/s/vms/2d/vm-1.json.lock")
+            PathBuf::from("/s/vms/2/vm-1.json.lock")
         );
         assert_eq!(
             manager.pid_entry(4242, "vm-1"),
-            PathBuf::from("/s/pids/03/4242.vm-1")
+            PathBuf::from("/s/pids/0/4242.vm-1")
         );
         assert_eq!(
             manager.name_slot("web"),
             PathBuf::from(
-                "/s/names/4b/4b5e57f6eb2f42b9039b3d1e13929295f231749c510cbe341cd68036d9af97e2"
+                "/s/names/4/4b5e57f6eb2f42b9039b3d1e13929295f231749c510cbe341cd68036d9af97e2"
             )
         );
     }
