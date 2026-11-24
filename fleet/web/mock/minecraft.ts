@@ -478,7 +478,7 @@ export class MockMinecraft {
         rows.writeUInt16LE(running && launch !== undefined ? Math.min(65534, launch) : 65535, i * 8 + 6);
       });
       const running = servers.filter((s) => s.phase === "running").length;
-      return { type: "minecraft_status", host: hostKey(host), t: now, rows: rows.toString("base64"), cpus: 192, busy: Math.round(running * 1.9) / 10, mem_total_mib: 385_024, mem_used_mib: 20_480 + servers.length * 400 };
+      return { type: "minecraft_status", host: hostKey(host), received_at: now, t: now, rows: rows.toString("base64"), cpus: 192, busy: Math.round(running * 1.9) / 10, mem_total_mib: 385_024, mem_used_mib: 20_480 + servers.length * 400 };
     });
   }
 

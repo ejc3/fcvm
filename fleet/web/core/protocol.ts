@@ -546,6 +546,8 @@ export interface MinecraftField {
 export interface MinecraftStatusMsg {
   type: "minecraft_status";
   host: string;
+  /** The coordinator's clock when the report reached it; null from a coordinator that does not say. */
+  received_at: number | null;
   t: number;
   rows: string;
   cpus: number | null;
@@ -1597,6 +1599,7 @@ export function parseServerMsg(text: string): ServerMsg {
       return {
         type: "minecraft_status",
         host: str(v, "host", "minecraft_status"),
+        received_at: numOrNull(v, "received_at", "minecraft_status"),
         t: num(v, "t", "minecraft_status"),
         rows: str(v, "rows", "minecraft_status"),
         cpus: numOrNull(v, "cpus", "minecraft_status"),

@@ -964,7 +964,7 @@ describe("a fleet with a field", () => {
     hosts: [{ key: "aaaaaaaaaaaa", servers: Array.from({ length: N }, (_, i) => i + 1), frames: { prefix: "wss://mc-", suffix: "-aaaaaaaa.example.test/view", names: Array.from({ length: N }, (_, i) => String(i + 1)) } }],
   } as unknown as Minecraft["field"];
   const statuses = (rows: number[][] = Array.from({ length: N }, () => row(3, 200, 3, 100, 410))) => ({
-    aaaaaaaaaaaa: { type: "minecraft_status" as const, host: "aaaaaaaaaaaa", t: NOW, rows: Buffer.from(rows.flat()).toString("base64"), cpus: 192, busy: 100, mem_total_mib: 385_024, mem_used_mib: 204_800, at: NOW },
+    aaaaaaaaaaaa: { type: "minecraft_status" as const, host: "aaaaaaaaaaaa", received_at: NOW, t: NOW, rows: Buffer.from(rows.flat()).toString("base64"), cpus: 192, busy: 100, mem_total_mib: 385_024, mem_used_mib: 204_800, at: NOW },
   });
   const big = (over: Partial<Minecraft> = {}) => minecraftOf(16, { field, ...over });
 
@@ -976,13 +976,13 @@ describe("a fleet with a field", () => {
     expect(new Set(f.shown).size).toBe(6);
     // the field takes its share of the stage and the tiles the rest, and they do not overlap
     expect(f.box).toEqual({ x: STAGE.x, y: STAGE.y, w: STAGE.w * FIELD_SHARE, h: STAGE.h });
-    // its cells have the room between its words and its one-cell line, and all 512 fit there
-    expect(f.grid).toEqual({ x: STAGE.x, y: STAGE.y + 92, w: STAGE.w * FIELD_SHARE, h: STAGE.h - 92 - 18 });
+    // its cells have the room between its words and the rows under them (what one cell is, and what the marks mean), and all 512 fit there
+    expect(f.grid).toEqual({ x: STAGE.x, y: STAGE.y + 92, w: STAGE.w * FIELD_SHARE, h: STAGE.h - 92 - 30 - 18 });
     expect(f.layout!.scrolls).toBe(false);
-    expect(f.layout!.cell).toBe(17);
+    expect(f.layout!.cell).toBe(16);
     // on a phone the cells keep a size a finger can pick, and scroll
     const phone = viewOf(big(), { statuses: statuses(), renderer: "3d", narrow: true, stage: { x: 0, y: 200, w: 390, h: 520 } }).field!;
-    expect(phone.box).toEqual({ x: 0, y: 200, w: 390, h: 156 });
+    expect(phone.box).toEqual({ x: 0, y: 200, w: 390, h: 198 });
     expect([phone.layout!.cell, phone.layout!.scrolls]).toEqual([9, true]);
     const placed = v.cards.filter((c) => c.box !== null);
     expect(placed.map((c) => c.slot)).toEqual(f.shown.map((n) => `mc-${n}`));
@@ -1014,23 +1014,67 @@ describe("a fleet with a field", () => {
   it("draws nothing for servers whose host has not reported: no rows is not zero servers up", () => {
     const v = viewOf(big(), { renderer: "3d" });
     expect(v.field!.cells.every((c) => c.phase === "none")).toBe(true);
-    expect(v.field!.headline.states).toBe("0 running · 512 not reported");
-    expect(v.header!.up).toBe("0 of 512 servers up");
+    // no count at all: "0 of 512 servers up" would be a reading nobody took
+    expect(v.field!.headline.states).toBe("not reported yet");
+    expect(v.header!.up).toBe("512 servers, not reported yet");
+    expect(v.field!.ariaLabel).toBe("512 servers on one host: not reported yet");
     expect(v.header!.median).toBe("Median restore to first chunk --");
-    // the tiles are the first servers, dark until their host says what they are
+    // the tiles are the first servers, which the snapshot lists whole
     const shown = v.cards.filter((c) => c.box !== null);
     expect(shown.map((c) => c.slot)).toEqual(["mc-1", "mc-2", "mc-3", "mc-4", "mc-5", "mc-6"]);
+    // a server the snapshot does not list, picked while its host is silent: dark, and it says
+    // "Not reported", not "Restoring" (nobody said it is being restored)
+    const picked = viewOf(big(), { renderer: "3d", pins: [{ n: 300, at: NOW - 1000 }] }).cards.find((c) => c.slot === "mc-300")!;
+    expect([picked.box !== null, picked.dark, picked.timer, picked.ariaLabel]).toEqual([true, true, "Not reported", "mc-300, not reported"]);
+    // rows that stopped coming: the same, with how long ago
+    const gone = minecraftView(input(stateWith(big()), { statuses: statuses(), renderer: "3d", now: NOW + 9000 }));
+    expect(gone.header!.up).toBe("512 servers, no report for 9 s");
+    // some servers reported: a count of those, as before
+    const some = viewOf(big(), { statuses: statuses(Array.from({ length: N }, (_, i) => (i < 500 ? row(3, 200, 3, 100, 410) : row(0)))), renderer: "3d" });
+    expect([some.header!.up, some.field!.headline.states]).toEqual(["500 of 512 servers up", "500 running · 12 not reported"]);
   });
 
-  it("puts a server the viewer picked into the first tile, and keeps it there", () => {
+  it("puts a server the viewer picked into one tile, marks it, and moves no other", () => {
     const st = statuses();
-    const v = viewOf(big(), { statuses: st, renderer: "3d", pins: [{ n: 300, at: NOW - 1000 }] });
-    expect(v.field!.shown[0]).toBe(300);
-    expect(v.cards.filter((c) => c.box !== null)[0]!.slot).toBe("mc-300");
+    const before = viewOf(big(), { statuses: st, renderer: "3d" }).field!;
+    const v = viewOf(big(), { statuses: st, renderer: "3d", sample: before.slots, pins: [{ n: 300, at: NOW - 1000 }] });
+    // the tile whose turn was nearest its end takes it; the other five keep their servers
+    expect(v.field!.shown.map((n, j) => (n === before.shown[j] ? "same" : n))).toEqual(["same", "same", "same", "same", "same", 300]);
+    expect(v.field!.pinned).toEqual([300]);
+    const card = v.cards.find((c) => c.slot === "mc-300")!;
+    expect([card.box !== null, card.pinned]).toEqual([true, true]);
+    expect(v.cards.filter((c) => c.pinned)).toHaveLength(1);
     // with reduced motion the tiles do not rotate: the same six whenever
-    const a = viewOf(big(), { statuses: st, renderer: "3d", reducedMotion: true }).field!.shown;
-    const later = minecraftView(input(stateWith(big()), { statuses: Object.fromEntries(Object.entries(st).map(([k, x]) => [k, { ...x, at: NOW + 60_000 }])), renderer: "3d", reducedMotion: true, now: NOW + 60_000 })).field!.shown;
-    expect(later).toEqual(a);
+    const at = (now: number, sample: typeof before.slots) =>
+      minecraftView(input(stateWith(big()), { statuses: Object.fromEntries(Object.entries(st).map(([k, x]) => [k, { ...x, at: now }])), renderer: "3d", reducedMotion: true, now, sample })).field!;
+    const a = at(NOW, []);
+    expect(at(NOW + 60_000, a.slots).shown).toEqual(a.shown);
+    // with motion they do, one tile at a time, from the state the page hands back
+    let f = before;
+    const seen = new Set(f.shown);
+    for (let t = NOW; t <= NOW + 30_000; t += 500) {
+      const next = minecraftView(input(stateWith(big()), { statuses: Object.fromEntries(Object.entries(st).map(([k, x]) => [k, { ...x, at: t }])), renderer: "3d", now: t, sample: f.slots })).field!;
+      expect(next.shown.filter((n, j) => n !== f.shown[j]).length).toBeLessThanOrEqual(1);
+      f = next;
+      for (const n of f.shown) seen.add(n);
+    }
+    expect(seen.size).toBeGreaterThan(12);
+  });
+
+  it("keeps an opened server open until the viewer closes it, whatever its tile's turn", () => {
+    const st = statuses();
+    let f = viewOf(big(), { statuses: st, renderer: "3d" });
+    // the tile whose turn ends first
+    const opened = f.cards.filter((c) => c.box !== null)[5]!;
+    for (let t = NOW; t <= NOW + 40_000; t += 500) {
+      f = minecraftView(input(stateWith(big()), { statuses: Object.fromEntries(Object.entries(st).map(([k, x]) => [k, { ...x, at: t }])), renderer: "3d", now: t, sample: f.field!.slots, opened: opened.id }));
+      expect(f.opened, String(t - NOW)).toBe(opened.slot);
+    }
+    expect(f.cards.filter((c) => c.box !== null).map((c) => c.slot)).toEqual([opened.slot]);
+    // closed: the wall returns with it still on its tile
+    const closed = minecraftView(input(stateWith(big()), { statuses: Object.fromEntries(Object.entries(st).map(([k, x]) => [k, { ...x, at: NOW + 40_500 }])), renderer: "3d", now: NOW + 40_500, sample: f.field!.slots }));
+    expect(closed.opened).toBeNull();
+    expect(closed.field!.shown[5]).toBe(Number(opened.slot.slice(3)));
   });
 
   it("gives the whole stage to a server this viewer holds or opened, and the field comes back after", () => {
@@ -1046,6 +1090,25 @@ describe("a fleet with a field", () => {
     expect(o.opened).toBe(first.cards.find((c) => c.box !== null)!.slot);
     expect(o.field!.box).toBeNull();
     expect(o.cards.filter((c) => c.box !== null)).toHaveLength(1);
+  });
+
+  it("names a server to the coordinator by its own name, never by the page's key for its tile", () => {
+    // A field server's tile id is worked out by the page (or made up when it cannot be): an
+    // action sent with it could reach another server. Every action sends the server's name.
+    const page = readFileSync(new URL("../../app/_wall/Minecraft.tsx", import.meta.url), "utf8");
+    const acts = [...page.matchAll(/client\.act\("(minecraft_reset|minecraft_fork|claim_minecraft)", (\{[^}]*\})\)/g)].map((m) => [m[1], m[2]]);
+    expect(acts).toEqual([
+      ["minecraft_reset", "{ all: true }"],
+      ["minecraft_reset", "{ slot: c.slot }"],
+      ["minecraft_fork", "{ slot: c.slot }"],
+      ["claim_minecraft", "{ slot: c.slot }"],
+    ]);
+    // and a card's slot is its server's name whatever its id: a field with a made-up key
+    const odd = { ...field!, servers: N + 1 };
+    const v = viewOf(big({ field: odd }), { statuses: statuses(), renderer: "3d", pins: [{ n: 300, at: NOW - 1000 }] });
+    const card = v.cards.find((c) => c.slot === "mc-300")!;
+    expect([card.id, card.slot, card.reset.disabled]).toEqual(["field:300", "mc-300", false]);
+    expect(new Set(v.cards.map((c) => c.id)).size).toBe(v.cards.length);
   });
 
   it("counts a reset of every server as its servers come back", () => {

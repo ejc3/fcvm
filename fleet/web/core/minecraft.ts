@@ -14,7 +14,22 @@ import { streamUrl } from "./net.ts";
 import { openedArea, tenths } from "./phones.ts";
 import { noneListedText, sleepView, verifyView, type SleepView } from "./view.ts";
 import { hundredthsText, layoutCaptioned, medianMs, type CaptionSizes } from "./windows.ts";
-import { FIELD_TILES, fieldCells, fieldHeadline, fieldLayout, resetWave, sampleOf, type FieldCell, type FieldHeadline, type FieldLayout, type FieldStatus, type ResetWave } from "./minecraft-field.ts";
+import {
+  FIELD_TILES,
+  fieldCells,
+  fieldHeadline,
+  fieldLayout,
+  PIN_MS,
+  resetWave,
+  stepSample,
+  unreported,
+  type FieldCell,
+  type FieldHeadline,
+  type FieldLayout,
+  type FieldStatus,
+  type ResetWave,
+  type SampleSlot,
+} from "./minecraft-field.ts";
 
 export const MINECRAFT_TITLE = "Minecraft";
 export const MINECRAFT_SENTENCE =
@@ -752,7 +767,7 @@ export function serverName(t: { id: string; slot: string | null }): string {
   return t.slot ?? t.id;
 }
 
-const TRANSIENT = new Set(["restoring", "forking", "relaunching", "pending", "requested", "starting", "stopping"]);
+const TRANSIENT = new Set(["restoring", "forking", "relaunching", "pending", "requested", "starting", "stopping", "not_reported"]);
 
 export function isMcRestoring(t: { phase: string }): boolean {
   return TRANSIENT.has(t.phase);
@@ -790,6 +805,7 @@ export function forkSplitText(snapshotMs: number | null | undefined, restoreMs: 
 
 /** The dark tile's running timer from the click: "Restoring 1.4 s", "Forking 0.6 s". */
 export function mcTimerText(t: MinecraftTile, srvNow: number): string {
+  if (t.phase === MC_NOT_REPORTED) return "Not reported";
   const word = t.phase === "forking" ? "Forking" : "Restoring";
   const lr = t.last_relaunch;
   return lr === null ? word : `${word} ${tenths(srvNow - lr.clicked_at)}`;
@@ -861,6 +877,8 @@ export interface MinecraftCard {
   /** "mc-3.<zone>:25565", for Java Edition players. */
   join: string | null;
   timer: string | null;
+  /** A viewer's pick holds it on its tile (a field's server). */
+  pinned: boolean;
   error: string | null;
   box: Box | null;
   caption: Box | null;
@@ -902,11 +920,13 @@ export interface MinecraftFieldView {
   /** Where the cells go inside it, and how they are laid out there (they scroll when they do not fit). */
   grid: Box | null;
   layout: FieldLayout | null;
-  /** The coordinator's clock now: the page notes it when it first sees a reset's last server back. */
-  srvNow: number;
   cells: FieldCell[];
   /** The servers (by number) in the 3D tiles now. */
   shown: number[];
+  /** The 3D tiles' servers with since when: the page hands this back as `sample` the next time. */
+  slots: SampleSlot[];
+  /** The servers (by number) a viewer's pick holds on a tile now. */
+  pinned: number[];
   headline: FieldHeadline;
   /** The last reset of every server, while it runs and for a minute after. */
   wave: ResetWave | null;
@@ -915,11 +935,17 @@ export interface MinecraftFieldView {
 
 /** The share of the stage the field takes: its width beside the tiles, or on a phone its height above them. */
 export const FIELD_SHARE = 0.4;
-export const FIELD_SHARE_NARROW = 0.3;
-/** Room in the field for its words (above the cells) and for the line that says what one cell is (below them). */
+export const FIELD_SHARE_NARROW = 0.38;
+/**
+ * Room in the field for its words (above the cells), and below them for the row that says what
+ * one cell is and steps to the next (a finger's height on a phone) and the line that says what
+ * the marks mean.
+ */
 export const FIELD_TEXT_H = 92;
 export const FIELD_TEXT_H_NARROW = 58;
-export const FIELD_READOUT_H = 18;
+export const FIELD_READOUT_H = 30;
+export const FIELD_READOUT_H_NARROW = 44;
+export const FIELD_LEGEND_H = 18;
 const FIELD_GAP = 12;
 
 /** How the page draws the worlds: "flat" is the map from above, for a browser with no WebGL2. */
@@ -1010,8 +1036,10 @@ export interface MinecraftInput {
   statuses?: Readonly<Record<string, FieldStatus>>;
   /** Servers the viewer picked from the field, with when (local ms): each keeps a 3D tile for a while. */
   pins?: readonly { n: number; at: number }[];
-  /** When the page first saw every server back from the last reset of all (the coordinator's clock); null until then. */
-  waveDoneAt?: number | null;
+  /** The view's last `field.slots`: which server each 3D tile showed, and since when. */
+  sample?: readonly SampleSlot[];
+  /** The time the page showed for the last reset of all once it was over (`field.wave.tookS`), for the reset clicked at `clicked_at`: it stands. */
+  waveStood?: { clicked_at: number; s: number } | null;
   /** The tile (by id) opened to the whole stage. */
   opened?: string | null;
 }
@@ -1062,6 +1090,9 @@ export function heldLayout(area: Box, id: string, narrow: boolean, dpr: number):
   return { id, box: { x, y: area.y, w: side, h: side }, caption: { x, y: area.y + side, w: side, h: capH }, compact: narrow };
 }
 
+/** The phase the page gives a field server its host has not reported: no coordinator sends it. */
+export const MC_NOT_REPORTED = "not_reported";
+
 /** A server that is not a listed tile, as a tile: what its cell and its host's rows say, and nothing they do not. */
 function tileOfCell(c: FieldCell): MinecraftTile {
   return {
@@ -1069,8 +1100,8 @@ function tileOfCell(c: FieldCell): MinecraftTile {
     half: "fcvm",
     side: "fcvm",
     rect: { x: 0, y: 0, w: 1, h: 1 },
-    // not reported is not running: the tile is dark until its host says what it is
-    phase: c.phase === "none" ? "pending" : c.phase,
+    // not reported is not running: the tile is dark, and says so, until its host says what it is
+    phase: c.phase === "none" ? MC_NOT_REPORTED : c.phase,
     slot: c.slot,
     vm: null,
     generation: null,
@@ -1095,7 +1126,7 @@ function fieldAria(field: NonNullable<Minecraft["field"]>, cells: readonly Field
   return `${h.servers}: ${h.states.replaceAll(" · ", ", ")}`;
 }
 
-function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: McRenderer | null, cells: readonly FieldCell[] | null = null): MinecraftHeader {
+function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: McRenderer | null, cells: readonly FieldCell[] | null = null, silent: string | null = null): MinecraftHeader {
   // With a field the figures are every server's, from the hosts' rows; else the listed tiles'.
   const times = cells === null ? upTimes(m.tiles) : cells.filter((c) => c.launchMs !== null).map((c) => c.launchMs!);
   const median = medianMs(times);
@@ -1116,7 +1147,8 @@ function headerOf(m: Minecraft, you: string | null, srvNow: number, renderer: Mc
   const joinable = m.tiles.find((t) => t.join !== null && t.phase === "running") ?? m.tiles.find((t) => t.join !== null);
   const version = javaVersion(m.server);
   return {
-    up: `${up} of ${total} ${servers} up`,
+    // with no server of a field reported there is no count to give: never a zero nobody read
+    up: silent !== null ? `${total} ${servers}, ${silent}` : `${up} of ${total} ${servers} up`,
     server: m.server,
     median: `Median restore to first chunk ${median === null ? "--" : hundredthsText(median)}`,
     slowest: `Slowest ${times.length === 0 ? "--" : hundredthsText(Math.max(...times))}`,
@@ -1172,8 +1204,11 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
   // A fleet with a field: its cells, and the servers drawn in 3D. The cards below are those
   // servers' (a listed tile as the coordinator sent it, any other made from its cell), plus
   // every lent tile, which is how this viewer's own server is found.
-  const cells = m.field === null ? null : fieldCells(m.field, inp.statuses ?? {}, inp.now);
-  const sample = cells === null ? null : sampleOf(cells, FIELD_TILES, inp.reducedMotion === true ? 0 : inp.now, inp.pins ?? []);
+  const cells = m.field === null ? null : fieldCells(m.field, inp.statuses ?? {}, inp.now, m.tiles);
+  // The opened server keeps its tile until the viewer closes it.
+  const openedCell = cells?.find((c) => c.id === (inp.opened ?? null)) ?? null;
+  const slots = cells === null ? null : stepSample(inp.sample ?? [], cells, FIELD_TILES, inp.now, { pins: inp.pins ?? [], held: held === null ? (openedCell?.n ?? null) : null, still: inp.reducedMotion === true });
+  const sample = slots?.map((x) => x.n) ?? null;
   const all = m.tiles;
   if (cells !== null && sample !== null) {
     const listed = new Map(m.tiles.map((t) => [serverName(t), t]));
@@ -1233,6 +1268,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     if ((live?.failures ?? 0) > 0 || late) return { text: `Cannot reach ${slot}'s view. Trying again.`, failed: true };
     return { text: `Connecting to ${slot}.`, failed: false };
   };
+  const pinnedNow = new Set((inp.pins ?? []).filter((x) => inp.now - x.at < PIN_MS).map((x) => `mc-${x.n}`));
   const cards: MinecraftCard[] = m.tiles.map((t) => {
     const p = placed.get(t.id);
     const slot = serverName(t);
@@ -1257,7 +1293,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     // Of a field's servers only the ones on the stage open a view socket.
     const socket = url !== null && first !== null && (cells === null || p !== undefined) ? { url, first, key: `${url}#${t.generation ?? 0}` } : null;
     const stream = streamOf(t, socket !== null);
-    const state = running ? "running" : t.phase === "failed" ? "failed" : t.phase === "forking" ? "forking" : "restoring";
+    const state = running ? "running" : t.phase === "failed" ? "failed" : t.phase === "forking" ? "forking" : t.phase === MC_NOT_REPORTED ? "not reported" : "restoring";
     // The world this one is a copy of, while that server still runs the launch it was copied from.
     const from = t.forked_from === null ? null : (m.tiles.find((x) => x.id !== t.id && serverName(x) === t.forked_from) ?? null);
     const source = from !== null && (from.last_relaunch?.clicked_at ?? 0) <= (t.last_relaunch?.clicked_at ?? 0) ? from : null;
@@ -1296,6 +1332,7 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
       reset: { label: "Reset", disabled: !online || t.borrowed !== null, title: resetTitle },
       fork: { label: "Fork", disabled: !online || !running || target === null, title: forkTitle },
       take: { label: "Take over", disabled: !online || !running || t.borrowed !== null || held !== null || live?.open !== true, title: takeTitle },
+      pinned: pinnedNow.has(slot),
       lentText: mine(t) ? "Yours" : lentToOther ? `Lent to another viewer until ${fmt.utcClock(t.borrowed!.until)} UTC` : null,
       mine: mine(t),
       lent: lentToOther,
@@ -1341,12 +1378,13 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
     };
   }
   const textH = inp.narrow ? FIELD_TEXT_H_NARROW : FIELD_TEXT_H;
-  const grid = fieldBox === null ? null : { x: fieldBox.x, y: fieldBox.y + textH, w: fieldBox.w, h: Math.max(0, fieldBox.h - textH - FIELD_READOUT_H) };
+  const belowH = (inp.narrow || inp.touch ? FIELD_READOUT_H_NARROW : FIELD_READOUT_H) + FIELD_LEGEND_H;
+  const grid = fieldBox === null ? null : { x: fieldBox.x, y: fieldBox.y + textH, w: fieldBox.w, h: Math.max(0, fieldBox.h - textH - belowH) };
   return {
     ...common,
     empty: null,
     banner,
-    header: headerOf(m, s.you, srvNow, inp.renderer ?? null, cells),
+    header: headerOf(m, s.you, srvNow, inp.renderer ?? null, cells, cells === null || m.field === null ? null : unreported(m.field, cells, inp.statuses ?? {}, inp.now)),
     resetAll: { label: "Reset all", disabled: !online || m.tiles.length === 0 },
     cards,
     panel,
@@ -1358,11 +1396,12 @@ export function minecraftView(inp: MinecraftInput): MinecraftView {
             box: fieldBox,
             grid,
             layout: grid === null ? null : fieldLayout(grid, cells.length),
-            srvNow,
             cells,
             shown: sample!,
+            slots: slots!,
+            pinned: (inp.pins ?? []).filter((p) => inp.now - p.at < PIN_MS && sample!.includes(p.n)).map((p) => p.n),
             headline: fieldHeadline(m.field, cells, inp.statuses ?? {}, inp.now),
-            wave: m.last_reset_all === null ? null : resetWave(cells, m.last_reset_all.clicked_at, srvNow, inp.waveDoneAt ?? null),
+            wave: m.last_reset_all === null ? null : resetWave(cells, m.last_reset_all, srvNow, inp.waveStood?.clicked_at === m.last_reset_all.clicked_at ? inp.waveStood.s : null),
             ariaLabel: fieldAria(m.field, cells, inp.statuses ?? {}, inp.now),
           },
   };

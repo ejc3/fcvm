@@ -1651,13 +1651,13 @@ describe("mock minecraft", () => {
       expect(mc.field.hosts.map((h) => Object.keys(h).sort())).toEqual([["frames", "frames_v4", "key", "servers"], ["frames", "frames_v4", "key", "servers"]]);
       expect(Object.keys(mc.field.hosts[0]!["frames"] as object).sort()).toEqual(["names", "prefix", "suffix"]);
       const msgs = (big as unknown as { minecraft: { statusMessages(): Record<string, unknown>[] } }).minecraft.statusMessages();
-      expect(msgs.map((m) => Object.keys(m).sort())).toEqual(Array(2).fill(["busy", "cpus", "host", "mem_total_mib", "mem_used_mib", "rows", "t", "type"]));
+      expect(msgs.map((m) => Object.keys(m).sort())).toEqual(Array(2).fill(["busy", "cpus", "host", "mem_total_mib", "mem_used_mib", "received_at", "rows", "t", "type"]));
       // the page's own parser and field read them: 40 cells, each running with its numbers
       const field = parseMinecraftField(mc.field);
       const statuses = Object.fromEntries(msgs.map((m) => [m["host"] as string, { ...(parseServerMsg(JSON.stringify(m)) as MinecraftStatusMsg), at: 0 }]));
       const cells = fieldCells(field!, statuses, 0);
       expect(cells.map((c) => c.n)).toEqual(Array.from({ length: 40 }, (_, k) => k + 1));
-      expect(cells.every((c) => c.phase === "running" && c.tps !== null && c.players === 3 && c.ageS !== null && c.launchMs !== null && c.frame !== null)).toBe(true);
+      expect(cells.every((c) => c.phase === "running" && c.tps !== null && c.players === 3 && c.ageS !== null && c.launchMs !== null && c.frame !== null && c.seenAt !== null)).toBe(true);
       expect(cells[20]!.frame).toMatch(/^ws:\/\/localhost:\d+\/mc-21\/view$/);
     } finally {
       await big.close();

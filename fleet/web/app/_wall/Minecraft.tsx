@@ -11,9 +11,17 @@ import {
   cellAt,
   cellText,
   driveInputOf,
+  FIELD_LEGEND,
+  FIELD_LEGEND_H,
+  FIELD_LEGEND_RING,
+  FIELD_LEGEND_YOUNG,
   FIELD_READOUT_H,
+  FIELD_READOUT_H_NARROW,
   FIELD_TEXT_H,
   FIELD_TEXT_H_NARROW,
+  moveCursor,
+  scrollTo,
+  type SampleSlot,
   Driver,
   minecraftView,
   SITE,
@@ -49,8 +57,8 @@ declare global {
       stage: () => StageDebug | null;
       /** Turn the frame-time guard off or on (a test that looks at motion on a software renderer). */
       setBudget: (on: boolean) => void;
-      /** The field's painter: how often it painted and how long its last paint took (ms). */
-      field: () => { paints: number; lastMs: number };
+      /** The field's painter: how often it painted, and how many cells its last paint drew. */
+      field: () => { paints: number; cells: number };
     };
   }
 }
@@ -67,7 +75,7 @@ function capture(el: Element, pointerId: number): void {
   }
 }
 
-function Caption({ c, onReset, onFork, onTake, onClose }: { c: MinecraftCard; onReset: () => void; onFork: () => void; onTake: () => void; onClose: () => void }) {
+function Caption({ c, onReset, onFork, onTake, onClose, onUnpin }: { c: MinecraftCard; onReset: () => void; onFork: () => void; onTake: () => void; onClose: () => void; onUnpin: () => void }) {
   if (!c.caption) return null;
   return (
     <div className={`mc-caption${c.compact ? " compact" : ""}`} style={at(c.caption)} data-testid={`mc-caption-${c.slot}`} data-mine={c.mine ? "true" : undefined} data-lent={c.lent ? "true" : undefined}>
@@ -82,6 +90,12 @@ function Caption({ c, onReset, onFork, onTake, onClose }: { c: MinecraftCard; on
           <span className="in" data-testid={`mc-up-in-${c.slot}`}>
             {c.upIn}
           </span>
+        ) : null}
+        {/* a server a viewer picked from the field: marked, and given back to the rotation here */}
+        {c.pinned && !c.opened ? (
+          <button type="button" className="btn mini pin" title="Picked from the field: it keeps this tile for a minute." onClick={onUnpin} data-testid={`mc-unpin-${c.slot}`}>
+            Unpin
+          </button>
         ) : null}
       </div>
       {c.forkedFrom ? (
@@ -242,10 +256,15 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
   const fieldPainter = useMemo(() => new McField(), []);
   const fieldCanvas = useRef<HTMLCanvasElement | null>(null);
   // Servers picked from the field (each keeps a 3D tile for a while), the cell pointed at, and
-  // when the last reset of every server was first seen whole.
+  // which server each 3D tile showed last (the view steps from it, so a tile keeps its server).
   const [pins, setPins] = useState<{ n: number; at: number }[]>([]);
   const [cursor, setCursor] = useState<number | null>(null);
-  const wave = useRef<{ clicked: number | null; doneAt: number | null }>({ clicked: null, doneAt: null });
+  const sample = useRef<SampleSlot[]>([]);
+  // The time shown for a reset of all once it is over: it stands, though the rows' whole seconds would move it.
+  const waveStood = useRef<{ clicked_at: number; s: number } | null>(null);
+  const fieldScroll = useRef<HTMLDivElement | null>(null);
+  // A mouse picks with its click; a finger's tap only points (the cells are smaller than a finger), and Show picks.
+  const lastPointer = useRef("mouse");
   const tiles = useMemo(() => new McTiles(), []);
   const state = useSyncExternalStore(client.subscribe, client.getState, client.getState);
   const live = useSyncExternalStore(tiles.subscribe, tiles.getLive, tiles.getLive);
@@ -377,15 +396,19 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
         reducedMotion,
         statuses: state.minecraftStatus,
         pins,
-        waveDoneAt: wave.current.clicked === (state.accepted?.minecraft?.last_reset_all?.clicked_at ?? null) ? wave.current.doneAt : null,
+        sample: sample.current,
+        waveStood: waveStood.current,
       }),
     [state, now, dpr, stage, narrow, touch, live, samples, refused, released, renderer, opened, lost, reduced, reducedMotion, pins],
   );
   viewRef.current = view;
-  // The moment the last server of a reset of all is back is noted once, so its time stands still after.
-  const clickedAt = state.accepted?.minecraft?.last_reset_all?.clicked_at ?? null;
-  if (wave.current.clicked !== clickedAt) wave.current = { clicked: clickedAt, doneAt: null };
-  if (view.field?.wave?.done === true && wave.current.doneAt === null) wave.current.doneAt = view.field.srvNow;
+  sample.current = view.field?.slots ?? [];
+  const resetAt = state.accepted?.minecraft?.last_reset_all?.clicked_at ?? null;
+  const over = view.field?.wave?.settled === true ? view.field.wave.tookS : null;
+  if (resetAt === null || over === null) {
+    // not over (or over with no time to give): nothing stands, and a reset that goes on again is read afresh
+    if (view.field?.wave?.settled !== true) waveStood.current = null;
+  } else if (waveStood.current?.clicked_at !== resetAt) waveStood.current = { clicked_at: resetAt, s: over };
   const cursorRef = useRef<number | null>(null);
   cursorRef.current = cursor;
   // The boxes in `view` were laid out in this stage: the 3D view draws into the same one.
@@ -583,7 +606,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
       // The field: every server a cell, on its one canvas.
       const f = v?.field;
       if (f && f.layout && fieldCanvas.current) {
-        fieldPainter.paint(fieldCanvas.current, { layout: f.layout, cells: f.cells, shown: f.shown, cursor: cursorRef.current, dpr, reducedMotion }, localNow());
+        fieldPainter.paint(fieldCanvas.current, { layout: f.layout, cells: f.cells, shown: f.shown, pinned: f.pinned, cursor: cursorRef.current, dpr, reducedMotion }, localNow());
       }
       if (v && renderer === "flat") {
         for (const c of v.cards) {
@@ -615,35 +638,43 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
         setBudget: (on) => {
           if (stage3d.current) stage3d.current.budgetOn = on;
         },
-        field: () => ({ paints: fieldPainter.paints, lastMs: fieldPainter.lastMs }),
+        field: () => ({ paints: fieldPainter.paints, cells: fieldPainter.lastCells }),
       };
     }
   }, [client, tiles, fieldPainter]);
 
-  // A cell picked from the field: its server takes a 3D tile.
+  // A cell picked from the field: its server takes a 3D tile, until it is unpinned or its minute is up.
   const fieldView = view.field;
   const pick = (i: number | null) => {
     const c = i === null ? undefined : fieldView?.cells[i];
     if (c) setPins((p) => [...p.filter((x) => x.n !== c.n), { n: c.n, at: localNow() }].slice(-6));
   };
+  const unpin = (n: number) => setPins((p) => p.filter((x) => x.n !== n));
   const cellUnder = (e: React.PointerEvent<HTMLCanvasElement> | React.MouseEvent<HTMLCanvasElement>): number | null => {
     if (!fieldView?.layout) return null;
     const r = e.currentTarget.getBoundingClientRect();
     return cellAt(fieldView.layout, fieldView.cells.length, e.clientX - r.left, e.clientY - r.top);
   };
-  const onFieldKey = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
+  /** Move the cursor by an arrow key or a step button, and keep its cell in view when the field scrolls. */
+  const step = (key: "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown") => {
     if (!fieldView?.layout) return;
-    const n = fieldView.cells.length;
-    const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -fieldView.layout.cols, ArrowDown: fieldView.layout.cols }[e.key];
-    if (step !== undefined) {
+    const to = moveCursor(fieldView.layout, fieldView.cells.length, cursor, key);
+    setCursor(to);
+    const el = fieldScroll.current;
+    if (to !== null && el) el.scrollTop = scrollTo(fieldView.layout, to, el.scrollTop, el.clientHeight);
+  };
+  const onFieldKey = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "ArrowUp" || e.key === "ArrowDown") {
       e.preventDefault();
-      setCursor((c) => Math.max(0, Math.min(n - 1, (c ?? 0) + (c === null ? 0 : step))));
+      step(e.key);
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       pick(cursor);
     }
   };
   const pointed = cursor === null ? undefined : fieldView?.cells[cursor];
+  const pointedPinned = pointed !== undefined && fieldView?.pinned.includes(pointed.n) === true;
+  const fieldTouch = narrow || touch;
 
   const resetAllPending = state.pending.some((p) => p.intent.name === "minecraft_reset" && p.intent.args["all"] === true);
   const needsVerifyPrompt = view.verify.prompt;
@@ -735,7 +766,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
               ) : null}
             </div>
             {/* one canvas for every cell; it scrolls when the cells do not fit */}
-            <div className="mc-field-scroll" style={{ maxHeight: fieldView.grid.h }} data-scrolls={fieldView.layout.scrolls ? "true" : undefined}>
+            <div ref={fieldScroll} className="mc-field-scroll" style={{ maxHeight: fieldView.grid.h }} data-scrolls={fieldView.layout.scrolls ? "true" : undefined}>
               <canvas
                 ref={fieldCanvas}
                 className="mc-field-canvas"
@@ -745,18 +776,54 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
                 aria-describedby="mc-cell-readout"
                 style={{ width: fieldView.layout.w, height: fieldView.layout.h }}
                 data-testid="mc-field-canvas"
-                onPointerDown={(e) => setCursor(cellUnder(e))}
+                onPointerDown={(e) => {
+                  lastPointer.current = e.pointerType;
+                  setCursor(cellUnder(e));
+                }}
                 onPointerMove={(e) => setCursor(cellUnder(e))}
                 // a finger leaves as it lifts: the cell it tapped stays the one described
                 onPointerLeave={(e) => {
                   if (e.pointerType === "mouse") setCursor(null);
                 }}
-                onClick={(e) => pick(cellUnder(e))}
+                onClick={(e) => {
+                  if (lastPointer.current === "mouse") pick(cellUnder(e));
+                }}
                 onKeyDown={onFieldKey}
               />
             </div>
-            <p id="mc-cell-readout" className="mc-field-readout" style={{ height: FIELD_READOUT_H }} data-testid="mc-cell-readout" aria-live="polite">
-              {pointed ? cellText(pointed) : "Pick a server to see it in 3D."}
+            {/* what the pointed cell is, a step to the next server either way, and the pick: the way in for a finger, which a 9 px cell is too small for */}
+            <div className={`mc-field-readout${fieldTouch ? " touch" : ""}`} style={{ height: fieldTouch ? FIELD_READOUT_H_NARROW : FIELD_READOUT_H }}>
+              <button type="button" className="btn mini" aria-label="Previous server" onClick={() => step("ArrowLeft")} data-testid="mc-cell-prev">
+                ‹
+              </button>
+              <button type="button" className="btn mini" aria-label="Next server" onClick={() => step("ArrowRight")} data-testid="mc-cell-next">
+                ›
+              </button>
+              <p id="mc-cell-readout" data-testid="mc-cell-readout" aria-live="polite">
+                {pointed ? cellText(pointed, fieldTouch) : fieldTouch ? "Tap a server, or step to one." : "Pick a server to see it in 3D."}
+              </p>
+              {pointed && pointedPinned ? (
+                <button type="button" className="btn mini" onClick={() => unpin(pointed.n)} data-testid="mc-cell-unpin">
+                  Unpin
+                </button>
+              ) : (
+                <button type="button" className="btn mini" disabled={!pointed} onClick={() => pick(cursor)} data-testid="mc-cell-show">
+                  Show
+                </button>
+              )}
+            </div>
+            <p className="mc-field-legend" style={{ height: FIELD_LEGEND_H }} data-testid="mc-field-legend">
+              {FIELD_LEGEND.map((l) => (
+                <span key={l.key}>
+                  <i style={l.rgb ? { background: `rgb(${l.rgb.join()})` } : undefined} className={l.rgb ? undefined : "none"} />
+                  {l.text}
+                </span>
+              ))}
+              <span>
+                <i className="ring" />
+                {FIELD_LEGEND_RING}
+              </span>
+              <span>{FIELD_LEGEND_YOUNG}</span>
             </p>
           </section>
         ) : null}
@@ -844,6 +911,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
             onFork={() => void client.act("minecraft_fork", { slot: c.slot })}
             onTake={() => void client.act("claim_minecraft", { slot: c.slot })}
             onClose={() => setOpened(null)}
+            onUnpin={() => unpin(Number(c.slot.slice(3)))}
           />
         ))}
         {/* the frames of forks in flight (minecraft-stage.ts adds and moves them) */}

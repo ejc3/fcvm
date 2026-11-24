@@ -72,4 +72,13 @@
 .mc-field-scroll { flex: none; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; }
 .mc-field-canvas { display: block; cursor: pointer; }
 .mc-field-canvas:focus-visible { outline: 2px solid var(--fcvm); outline-offset: 1px; }
-.mc-field-readout { margin: 0; flex: none; font: 500 11px/18px var(--mono); font-variant-numeric: tabular-nums; color: var(--fcvm-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mc-field-readout { flex: none; display: flex; align-items: center; gap: 4px; min-width: 0; }
+.mc-field-readout p { margin: 0; flex: 1 1 0; min-width: 0; font: 500 11px/18px var(--mono); font-variant-numeric: tabular-nums; color: var(--fcvm-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mc-field-readout .btn.mini { flex: none; min-width: 26px; min-height: 24px; height: 24px; padding: 0 8px; justify-content: center; font-size: 12px; }
+.mc-field-readout.touch .btn.mini { min-width: 44px; height: 40px; }
+.mc-field-legend { margin: 0; flex: none; display: flex; align-items: center; gap: 10px; font: 500 10px/18px var(--mono); color: var(--muted); white-space: nowrap; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+.mc-field-legend span { display: inline-flex; align-items: center; gap: 4px; flex: none; }
+.mc-field-legend i { display: inline-block; width: 8px; height: 8px; flex: none; }
+.mc-field-legend i.none { outline: 1px solid rgb(52, 58, 66); outline-offset: -1px; }
+.mc-field-legend i.ring { outline: 2px solid #fff; outline-offset: -2px; background: rgb(84, 176, 96); }
+.mc-caption .btn.mini.pin { margin-left: auto; min-height: 22px; padding: 0 8px; font-size: 11px; pointer-events: auto; background: rgba(11, 13, 16, 0.55); }

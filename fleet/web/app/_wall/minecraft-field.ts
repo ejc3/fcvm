@@ -8,8 +8,9 @@ import { cellBox, cellColor, FLASH_MS, youngLift, type FieldCell, type FieldLayo
 export interface FieldPaint {
   layout: FieldLayout;
   cells: readonly FieldCell[];
-  /** The servers (by number) in the 3D tiles. */
+  /** The servers (by number) in the 3D tiles, and those of them a viewer's pick holds there. */
   shown: readonly number[];
+  pinned: readonly number[];
   /** The cell under the pointer or the keyboard's cursor (its index), if any. */
   cursor: number | null;
   dpr: number;
@@ -21,9 +22,11 @@ export class McField {
   private flashes = new Map<number, number>();
   private before = new Map<number, string>();
   private sig = "";
-  /** Paints so far, and the last one's time in ms, for the test hook. */
+  /** The canvas last painted: another one (the field came back to the page) is blank until painted. */
+  private canvas: HTMLCanvasElement | null = null;
+  /** Paints so far, and how many cells the last one drew, for the test hook. */
   paints = 0;
-  lastMs = 0;
+  lastCells = 0;
 
   /** Note which servers just came back (restoring or forking, then running), so they flash. */
   private track(cells: readonly FieldCell[], now: number): void {
@@ -40,10 +43,13 @@ export class McField {
     this.track(p.cells, now);
     const flashing = !p.reducedMotion && this.flashes.size > 0;
     // a young server's lift changes with its age: every 3 s is fine enough to see it fade
-    const sig = `${p.layout.cell},${p.layout.cols},${p.dpr},${p.cursor}|${p.shown.join()}|${p.cells.map((c) => `${c.phase[0]}${c.tps ?? ""}${youngLift(c) > 0 ? `y${Math.floor(c.ageS! / 3)}` : ""}`).join()}`;
-    if (sig === this.sig && !flashing) return false;
+    const sig = `${p.layout.cell},${p.layout.cols},${p.dpr},${p.cursor}|${p.shown.join()}|${p.pinned.join()}|${p.cells.map((c) => `${c.phase[0]}${c.tps ?? ""}${youngLift(c) > 0 ? `y${Math.floor(c.ageS! / 3)}` : ""}`).join()}`;
+    // A canvas this painter has not painted holds nothing: the same field is painted again on
+    // it, with motion or without.
+    const fresh = canvas !== this.canvas;
+    if (sig === this.sig && !flashing && !fresh) return false;
     this.sig = sig;
-    const t0 = performance.now();
+    this.canvas = canvas;
     const W = Math.max(1, Math.round(p.layout.w * p.dpr));
     const H = Math.max(1, Math.round(p.layout.h * p.dpr));
     if (canvas.width !== W || canvas.height !== H) {
@@ -55,6 +61,7 @@ export class McField {
     ctx.setTransform(p.dpr, 0, 0, p.dpr, 0, 0);
     ctx.clearRect(0, 0, p.layout.w, p.layout.h);
     const shown = new Set(p.shown);
+    const pinned = new Set(p.pinned);
     p.cells.forEach((c, i) => {
       const b = cellBox(p.layout, i);
       const [r, g, bl] = cellColor(c);
@@ -70,13 +77,14 @@ export class McField {
         ctx.fillRect(b.x, b.y, b.w, b.h);
       }
       if (shown.has(c.n) || i === p.cursor) {
-        ctx.strokeStyle = i === p.cursor ? "#7cc4ff" : "#ffffff";
+        // in a 3D tile: ringed white, or amber when a viewer's pick holds it there; the cursor's cell blue
+        ctx.strokeStyle = i === p.cursor ? "#7cc4ff" : pinned.has(c.n) ? "#ffd27c" : "#ffffff";
         ctx.lineWidth = 2;
         ctx.strokeRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2);
       }
     });
     this.paints++;
-    this.lastMs = performance.now() - t0;
+    this.lastCells = p.cells.length;
     return true;
   }
 }

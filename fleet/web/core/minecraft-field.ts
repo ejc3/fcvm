@@ -17,6 +17,8 @@ export const FIELD_TILES = 6;
 export const SAMPLE_MS = 12_000;
 /** A server a viewer picked from the field keeps its 3D tile this long. */
 export const PIN_MS = 60_000;
+/** A server that came back from a restore stays on its tile at least this long after, seconds. */
+export const BACK_HOLD_S = 4;
 /** A cell flashes this long when its server comes back from a restore. */
 export const FLASH_MS = 1500;
 
@@ -28,7 +30,11 @@ export interface FieldCell {
   /** `mc-<n>`. */
   n: number;
   slot: string;
-  /** The tile id the coordinator gives it: `mc:<k>`, k its place among all servers. */
+  /**
+   * The page's key for its tile, sockets and world: the id the coordinator gives it (`mc:<k>`, k
+   * its place among all servers) when the page can tell, else `field:<n>`, which is no
+   * coordinator's id. Never sent: an action names its server by `slot`.
+   */
   id: string;
   frame: string | null;
   frameV4: string | null;
@@ -40,6 +46,8 @@ export interface FieldCell {
   ageS: number | null;
   /** The launch's milliseconds to its first chunk. */
   launchMs: number | null;
+  /** When the coordinator received the row this was read from (its clock, ms); null from a coordinator that does not say. */
+  seenAt: number | null;
 }
 
 export type FieldStatus = MinecraftStatusMsg & { at: number };
@@ -61,8 +69,15 @@ export function statusRows(status: { rows: string }, servers: number): Uint8Arra
   return bytes.length === servers * STATUS_ROW_BYTES ? bytes : null;
 }
 
-/** Every server of the field, by number, with what its host last read of it. */
-export function fieldCells(field: MinecraftField, statuses: Readonly<Record<string, FieldStatus>>, now: number): FieldCell[] {
+/**
+ * Every server of the field, by number, with what its host last read of it. `listed` is the
+ * snapshot's tiles (id and server name). The coordinator's id of a server is its place among
+ * all servers, which the page can work out only when the field names every server and the
+ * listed tiles agree with that count. When it cannot (a server with no host yet is in the count
+ * and in no host's list), a server that is not a listed tile gets a key of the page's own, so
+ * it never shares one with another server's listed tile.
+ */
+export function fieldCells(field: MinecraftField, statuses: Readonly<Record<string, FieldStatus>>, now: number, listed: readonly { id: string; slot: string | null }[] = []): FieldCell[] {
   const out: FieldCell[] = [];
   for (const h of field.hosts) {
     const st = statuses[h.key];
@@ -82,11 +97,14 @@ export function fieldCells(field: MinecraftField, statuses: Readonly<Record<stri
         players: known && rows[o + 2] !== 255 ? rows[o + 2]! : null,
         ageS: known ? u16(rows, o + 4) : null,
         launchMs: known ? u16(rows, o + 6) : null,
+        seenAt: known ? (st!.received_at ?? null) : null,
       });
     });
   }
   out.sort((a, b) => a.n - b.n);
-  out.forEach((c, k) => (c.id = `mc:${k + 1}`));
+  const ids = new Map(listed.filter((t) => t.slot !== null).map((t) => [t.slot!, t.id]));
+  const ranked = field.servers === out.length && out.every((c, k) => (ids.get(c.slot) ?? `mc:${k + 1}`) === `mc:${k + 1}`);
+  out.forEach((c, k) => (c.id = ids.get(c.slot) ?? (ranked ? `mc:${k + 1}` : `field:${c.n}`)));
   return out;
 }
 
@@ -133,6 +151,26 @@ export function cellBox(l: FieldLayout, i: number): Box {
   return { x: (i % l.cols) * l.cell, y: Math.floor(i / l.cols) * l.cell, w: l.cell - 1, h: l.cell - 1 };
 }
 
+/**
+ * The cursor after an arrow key: one cell over, or one row up or down in the same column. A
+ * move off the field (up from the first row, down past the last cell, left of the first cell,
+ * right of the last) stays where it is. With no cursor yet, any arrow starts at the first cell.
+ */
+export function moveCursor(l: FieldLayout, count: number, cursor: number | null, key: "ArrowLeft" | "ArrowRight" | "ArrowUp" | "ArrowDown"): number | null {
+  if (count <= 0) return null;
+  if (cursor === null) return 0;
+  const to = cursor + { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -l.cols, ArrowDown: l.cols }[key];
+  return to >= 0 && to < count ? to : cursor;
+}
+
+/** How far a scrolling field must be scrolled (from `top`, showing `view` pixels) for cell `i` to be whole in view. */
+export function scrollTo(l: FieldLayout, i: number, top: number, view: number): number {
+  const b = cellBox(l, i);
+  if (b.y < top) return b.y;
+  if (b.y + l.cell > top + view) return b.y + l.cell - view;
+  return top;
+}
+
 // ---- colour ---------------------------------------------------------------------------------
 
 export type Rgb = readonly [number, number, number];
@@ -149,6 +187,19 @@ export const CELL_SILENT: Rgb = [58, 96, 66];
 
 /** A running server keeps up at this tick rate or above. */
 export const HOLD_TPS = 19.5;
+
+/** What the field's marks mean, in the order they are explained: a colour (null: an outline only) and its word. */
+export const FIELD_LEGEND: readonly { key: string; rgb: Rgb | null; text: string }[] = [
+  { key: "running", rgb: CELL_RUNNING, text: "20 TPS" },
+  { key: "slow", rgb: CELL_SLOW, text: "slower" },
+  { key: "restoring", rgb: CELL_RESTORING, text: "restoring" },
+  { key: "forking", rgb: CELL_FORKING, text: "forking" },
+  { key: "failed", rgb: CELL_FAILED, text: "failed" },
+  { key: "none", rgb: null, text: "not reported" },
+];
+/** The two marks that are not a state. */
+export const FIELD_LEGEND_RING = "ringed: in 3D";
+export const FIELD_LEGEND_YOUNG = "lighter: up under a minute";
 
 /** A cell's colour: its state, and for a running server how its tick rate stands. */
 export function cellColor(c: FieldCell): Rgb {
@@ -180,9 +231,13 @@ export function youngLift(c: FieldCell): number {
   return YOUNG_LIFT * (1 - c.ageS / YOUNG_S);
 }
 
-/** What a cell says when it is pointed at: "mc-217 · running · 20.0 TPS · 3 players · up 4 min 12 s · restored in 0.41 s". */
-export function cellText(c: FieldCell): string {
+/**
+ * What a cell says when it is pointed at: "mc-217 · running · 20.0 TPS · 3 players · up 4 min 12 s
+ * · restored in 0.41 s"; `short` (a phone's row, between its buttons): "mc-217 · running · 20.0 TPS".
+ */
+export function cellText(c: FieldCell, short = false): string {
   if (c.phase === "none") return `${c.slot} · not reported`;
+  if (short) return [c.slot, c.phase, c.tps === null ? null : `${c.tps.toFixed(1)} TPS`].filter((x) => x !== null).join(" · ");
   const age = c.ageS === null ? null : c.ageS < 60 ? `up ${c.ageS} s` : `up ${Math.floor(c.ageS / 60)} min ${c.ageS % 60} s`;
   return [
     c.slot,
@@ -205,33 +260,115 @@ function mix(a: number, b: number): number {
   return (h ^ (h >>> 13)) >>> 0;
 }
 
+/** One 3D tile's server, and since when (the page's clock, ms). `pin`: a viewer's pick put it there. */
+export interface SampleSlot {
+  n: number;
+  since: number;
+  pin?: boolean;
+}
+
+export interface SampleOpts {
+  /** Servers the viewer picked from the field, with when: each keeps a tile for PIN_MS. */
+  pins?: readonly { n: number; at: number }[];
+  /** The server opened to the whole stage: it keeps its tile until the viewer closes it. */
+  held?: number | null;
+  /** Reduced motion: no tile cuts by itself. */
+  still?: boolean;
+}
+
+/** A server whose restore is on its tile stays there until it is back and has been seen back. */
+function staying(c: FieldCell | undefined): boolean {
+  return c !== undefined && (c.phase === "restoring" || c.phase === "forking" || (c.phase === "running" && c.ageS !== null && c.ageS < BACK_HOLD_S));
+}
+
 /**
- * The servers (by number) the `k` 3D tiles show at `timeMs`, in tile order. A server a viewer
- * picked keeps a tile for PIN_MS, the newest pick first. Each other tile holds a running server
- * for SAMPLE_MS and then cuts to another, the tiles cutting one after another, never two tiles
- * on one server. Fewer running servers than tiles: the rest show the first servers that are not.
+ * The servers the `k` 3D tiles show at `timeMs`, tile by tile, from what they showed before
+ * (`prev`; empty at first). A tile keeps its server for SAMPLE_MS whatever any other server
+ * does, and past that while its server is being restored and until it has been back for
+ * BACK_HOLD_S; then it cuts to a running server no tile shows, chosen by a hash of the tile, the
+ * time and the server's number (never by a place in a list, which every reset would shift). One
+ * tile cuts at a time. A server a viewer picked takes the tile whose turn is nearest and keeps
+ * it for PIN_MS or until it is unpinned; the opened server keeps its tile until it is closed.
+ * A tile whose server left the field takes another at once. Fewer running servers than tiles:
+ * the rest show servers that are not.
  */
-export function sampleOf(cells: readonly FieldCell[], k: number, timeMs: number, pins: readonly { n: number; at: number }[] = []): number[] {
-  const known = new Set(cells.map((c) => c.n));
-  const out: number[] = [];
-  for (const p of [...pins].sort((a, b) => b.at - a.at)) {
-    if (out.length < k && timeMs - p.at < PIN_MS && known.has(p.n) && !out.includes(p.n)) out.push(p.n);
+export function stepSample(prev: readonly SampleSlot[], cells: readonly FieldCell[], k: number, timeMs: number, opts: SampleOpts = {}): SampleSlot[] {
+  const byN = new Map(cells.map((c) => [c.n, c]));
+  const size = Math.min(k, cells.length);
+  const held = opts.held !== null && opts.held !== undefined && byN.has(opts.held) ? opts.held : null;
+  const pins: number[] = [];
+  for (const p of [...(opts.pins ?? [])].sort((a, b) => b.at - a.at)) {
+    if (pins.length < size && timeMs - p.at < PIN_MS && byN.has(p.n) && !pins.includes(p.n)) pins.push(p.n);
   }
-  const pinned = out.length;
-  const running = cells.filter((c) => c.phase === "running").map((c) => c.n);
-  for (let j = pinned; j < k && running.length > 0; j++) {
-    // each tile cuts at its own moment
-    const epoch = Math.floor((timeMs + (j * SAMPLE_MS) / k) / SAMPLE_MS);
-    let at = mix(epoch, j) % running.length;
-    let tries = 0;
-    while (out.includes(running[at]!) && tries++ < running.length) at = (at + 1) % running.length;
-    if (!out.includes(running[at]!)) out.push(running[at]!);
+  const first = prev.length === 0;
+  const slots: (SampleSlot | null)[] = [];
+  for (let j = 0; j < size; j++) {
+    const s = prev[j];
+    slots.push(s !== undefined && byN.has(s.n) && !slots.some((x) => x?.n === s.n) ? { ...s } : null);
   }
-  for (const c of cells) {
-    if (out.length >= k) break;
-    if (!out.includes(c.n)) out.push(c.n);
+  // Whose turn is over. A pick that ran out or was taken back gives its tile up whatever the motion.
+  const due: boolean[] = slots.map((s) => {
+    if (s === null || s.n === held || pins.includes(s.n) || staying(byN.get(s.n))) return false;
+    if (s.pin === true) return true;
+    return opts.still !== true && timeMs - s.since >= SAMPLE_MS;
+  });
+  for (const s of slots) {
+    if (s === null) continue;
+    if (s.n === held) {
+      // opened: its turn starts over for as long as it is open, and it is no pick's any more
+      s.since = timeMs;
+      delete s.pin;
+    }
+    if (pins.includes(s.n)) s.pin = true;
   }
-  return out;
+  // A picked or opened server that no tile shows takes one: an empty tile, else one whose turn is
+  // over, else the one that has had the longest turn.
+  const fixed = (s: SampleSlot | null) => s !== null && (s.n === held || pins.includes(s.n));
+  for (const n of [...(held === null ? [] : [held]), ...pins]) {
+    if (slots.some((s) => s?.n === n)) continue;
+    let j = slots.findIndex((s) => s === null);
+    if (j < 0) j = due.indexOf(true);
+    if (j < 0) {
+      const free = slots.map((s, i) => ({ s, i })).filter((x) => !fixed(x.s));
+      if (free.length === 0) continue;
+      j = free.reduce((a, b) => (b.s!.since < a.s!.since ? b : a)).i;
+    }
+    slots[j] = { n, since: timeMs, ...(n === held ? {} : { pin: true }) };
+    due[j] = false;
+  }
+  const shown = () => new Set(slots.filter((s) => s !== null).map((s) => s.n));
+  const pick = (j: number, not: number | null): number | null => {
+    const taken = shown();
+    let best: number | null = null;
+    let score = -1;
+    for (const c of cells) {
+      if (c.phase !== "running" || taken.has(c.n) || c.n === not) continue;
+      const h = mix(mix(Math.floor(timeMs), j + 1), c.n);
+      if (h > score) [best, score] = [c.n, h];
+    }
+    return best;
+  };
+  // Empty tiles: a running server, else one being restored, else whatever is left, in order.
+  for (let j = 0; j < size; j++) {
+    if (slots[j] !== null) continue;
+    const taken = shown();
+    const n = pick(j, null) ?? cells.find((c) => !taken.has(c.n) && (c.phase === "restoring" || c.phase === "forking"))?.n ?? cells.find((c) => !taken.has(c.n))?.n;
+    if (n === undefined) continue;
+    // at first the tiles' turns are spread, so they cut one after another
+    slots[j] = { n, since: first ? timeMs - (j * SAMPLE_MS) / size : timeMs };
+  }
+  // One tile whose turn is over cuts, the longest-shown first, and never two within a moment.
+  const last = Math.max(...slots.map((s) => (s === null ? Number.NEGATIVE_INFINITY : s.since)));
+  if (first || timeMs - last >= SAMPLE_MS / size / 2) {
+    const order = due.map((d, j) => ({ d, j })).filter((x) => x.d).sort((a, b) => slots[a.j]!.since - slots[b.j]!.since);
+    for (const { j } of order) {
+      const n = pick(j, slots[j]!.n);
+      if (n === null) continue;
+      slots[j] = { n, since: timeMs };
+      break;
+    }
+  }
+  return slots.filter((s) => s !== null);
 }
 
 // ---- the headline ---------------------------------------------------------------------------
@@ -239,7 +376,7 @@ export function sampleOf(cells: readonly FieldCell[], k: number, timeMs: number,
 export interface FieldHeadline {
   /** "512 servers on one host" / "512 servers on 2 hosts". */
   servers: string;
-  /** "510 running", with what is not: "498 running · 12 restoring · 2 not reported". */
+  /** "510 running", with what is not: "498 running · 12 restoring · 2 not reported"; with no server reported, "not reported yet" or "no report for 8 s". */
   states: string;
   /** "5.2 per busy CPU (98.7 of 192 busy)"; null until every host has said its CPUs. */
   perCpu: string | null;
@@ -249,12 +386,27 @@ export interface FieldHeadline {
   tps: string | null;
 }
 
+/**
+ * What to say in place of counts when no server of the field is reported: "not reported yet"
+ * before any host's rows came, "no report for 8 s" once they stopped. Null when any server is
+ * reported.
+ */
+export function unreported(field: MinecraftField, cells: readonly FieldCell[], statuses: Readonly<Record<string, FieldStatus>>, now: number): string | null {
+  if (cells.some((c) => c.phase !== "none")) return null;
+  const last = Math.max(...field.hosts.map((h) => statuses[h.key]?.at ?? Number.NEGATIVE_INFINITY));
+  return Number.isFinite(last) && now - last > STATUS_STALE_MS ? `no report for ${Math.floor((now - last) / 1000)} s` : "not reported yet";
+}
+
 export function fieldHeadline(field: MinecraftField, cells: readonly FieldCell[], statuses: Readonly<Record<string, FieldStatus>>, now: number): FieldHeadline {
   const count = (p: CellPhase) => cells.filter((c) => c.phase === p).length;
   const running = count("running");
-  const states = [`${running} running`, ...(["restoring", "forking", "failed"] as const).map((p) => (count(p) > 0 ? `${count(p)} ${p}` : null)), count("none") > 0 ? `${count("none")} not reported` : null]
-    .filter((x) => x !== null)
-    .join(" · ");
+  // With no server reported there is no count to give: a zero would be a reading nobody took.
+  const silent = unreported(field, cells, statuses, now);
+  const states =
+    silent ??
+    [`${running} running`, ...(["restoring", "forking", "failed"] as const).map((p) => (count(p) > 0 ? `${count(p)} ${p}` : null)), count("none") > 0 ? `${count("none")} not reported` : null]
+      .filter((x) => x !== null)
+      .join(" · ");
   const fresh = field.hosts.map((h) => statuses[h.key]).filter((s): s is FieldStatus => s !== undefined && now - s.at <= STATUS_STALE_MS);
   const all = fresh.length === field.hosts.length && fresh.length > 0;
   const sum = (k: "busy" | "cpus" | "mem_used_mib") => (all && fresh.every((s) => s[k] !== null) ? fresh.reduce((a, s) => a + s[k]!, 0) : null);
@@ -274,31 +426,60 @@ export function fieldHeadline(field: MinecraftField, cells: readonly FieldCell[]
 // ---- a reset of every server ----------------------------------------------------------------
 
 export interface ResetWave {
-  /** Servers back from this reset: running, with a launch younger than the click. */
+  /** Servers back from this reset: running, on a launch whose first chunk came after the click. */
   back: number;
+  /** The servers the reset was sent to, as the coordinator published it. */
   total: number;
-  /** "Reset all: 312 of 512 back · 14.2 a second · 22.0 s" while it runs; "Reset all: 512 servers back in 36.2 s (14.1 a second)" once done. */
+  /**
+   * "Reset all: 312 of 512 back · 14.2 a second · 22.0 s" while it runs; "Reset all: 512 servers
+   * back in 36 s (14.2 a second)" once done; "Reset all: 510 of 512 back after 36 s" when the
+   * rest are not coming.
+   */
   text: string;
   done: boolean;
+  /** Over: done, or the rest are not coming. Its time then stands (`tookS`), and the page hands it back. */
+  settled: boolean;
+  /** Seconds from the click to the last server back, once settled; null when the rows cannot say. */
+  tookS: number | null;
 }
 
+/** With no server being restored and none back for this long, the rest of a reset are not coming, seconds. */
+export const WAVE_STALL_S = 10;
+/** A reset's line stays this long after its last server came back, seconds. */
+export const WAVE_SHOWN_S = 60;
+
 /**
- * A reset of every server, from the click (`clickedAt`, the coordinator's clock, as `srvNow` is)
- * while it runs and for a minute after its last server is back. `doneAt` is when the page first
- * saw every server back (it keeps that between calls); null until then.
+ * A reset of every server (`reset`: the snapshot's `last_reset_all`; `srvNow` on the
+ * coordinator's clock, as its `clicked_at` is), while it runs and for a minute after its last
+ * server is back. Everything is read from the rows, so a page opened late says the same as one
+ * that watched: a server is back when its launch's first chunk came after the click (the time
+ * its row came, less its age), and the reset took until the last of those. The rows give whole
+ * seconds, so the finished time is in whole seconds; from a coordinator that does not say when a
+ * row came, no time is given. A row's age is cut to a whole second at a moment that moves a
+ * little from report to report, so the same reset can read 21 s in one report and 22 s in the
+ * next: `stood` is the time this page already showed for this reset once it was over, and it
+ * stands.
  */
-export function resetWave(cells: readonly FieldCell[], clickedAt: number, srvNow: number, doneAt: number | null): ResetWave | null {
-  const elapsed = srvNow - clickedAt;
-  if (elapsed < 0 || cells.length === 0) return null;
-  // back: its launch's first chunk came after the click (a second's slack for the row's whole seconds)
-  const back = cells.filter((c) => c.phase === "running" && c.ageS !== null && c.ageS * 1000 <= elapsed + 1000).length;
-  const total = cells.length;
-  const done = doneAt !== null || back >= total;
-  const took = ((doneAt ?? srvNow) - clickedAt) / 1000;
-  if (done && srvNow - (doneAt ?? srvNow) > 60_000) return null;
-  const rate = took > 0 ? (done ? total : back) / took : 0;
-  const text = done
-    ? `Reset all: ${total} servers back in ${took.toFixed(1)} s (${rate.toFixed(1)} a second)`
-    : `Reset all: ${back} of ${total} back · ${rate.toFixed(1)} a second · ${took.toFixed(1)} s`;
-  return { back, total, text, done };
+export function resetWave(cells: readonly FieldCell[], reset: { clicked_at: number; servers: number }, srvNow: number, stood: number | null = null): ResetWave | null {
+  const elapsed = srvNow - reset.clicked_at;
+  const total = reset.servers;
+  if (elapsed < 0 || total <= 0) return null;
+  const firstChunkAt = (c: FieldCell) => (c.seenAt ?? srvNow) - c.ageS! * 1000;
+  const fresh = cells.filter((c) => c.phase === "running" && c.ageS !== null && firstChunkAt(c) >= reset.clicked_at);
+  const back = Math.min(total, fresh.length);
+  const done = back >= total;
+  const timed = fresh.length > 0 && fresh.every((c) => c.seenAt !== null);
+  // the last one back: when, and how long ago by its own age
+  const read = timed ? Math.max(1, Math.round((Math.max(...fresh.map(firstChunkAt)) - reset.clicked_at) / 1000)) : null;
+  const sinceLastS = fresh.length === 0 ? null : Math.min(...fresh.map((c) => c.ageS!));
+  const inFlight = cells.some((c) => c.phase === "restoring" || c.phase === "forking");
+  const stalled = !done && !inFlight && (sinceLastS === null ? elapsed >= WAVE_SHOWN_S * 1000 : sinceLastS >= WAVE_STALL_S);
+  if ((done || stalled) && (sinceLastS === null || sinceLastS > WAVE_SHOWN_S)) return null;
+  const settled = done || stalled;
+  const tookS = settled ? (stood ?? read) : read;
+  let text: string;
+  if (done) text = tookS === null ? `Reset all: ${total} servers back` : `Reset all: ${total} servers back in ${tookS} s (${(total / tookS).toFixed(1)} a second)`;
+  else if (stalled) text = `Reset all: ${back} of ${total} back${tookS === null ? "" : ` after ${tookS} s`}`;
+  else text = `Reset all: ${back} of ${total} back · ${(elapsed > 0 ? back / (elapsed / 1000) : 0).toFixed(1)} a second · ${(elapsed / 1000).toFixed(1)} s`;
+  return { back, total, text, done, settled, tookS: settled ? tookS : null };
 }
