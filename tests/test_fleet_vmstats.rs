@@ -61,11 +61,7 @@ async fn sample_idle_then_busy(fcvm_pid: u32) -> Result<()> {
     let busy = tokio::spawn(async move {
         common::exec_in_vm(
             fcvm_pid,
-            &[
-                "sh",
-                "-c",
-                "for i in $(seq 1 2); do timeout 10 sh -c 'while :; do :; done' & done; wait",
-            ],
+            &["for i in 1 2; do timeout 10 sh -c 'while :; do :; done' & done; wait"],
         )
         .await
     });
@@ -84,7 +80,8 @@ async fn sample_idle_then_busy(fcvm_pid: u32) -> Result<()> {
     let loaded_max = loaded.iter().cloned().fold(0.0, f64::max);
     assert!(
         loaded_max > 50.0 && loaded_max > idle_max + 25.0,
-        "a VM running {VCPUS} busy loops read {loaded:?} against idle {idle:?}"
+        "a VM running {VCPUS} busy loops read {loaded:?} against idle {idle:?} (busy loops: {:?})",
+        busy.is_finished()
     );
     let _ = busy.await;
     Ok(())
