@@ -14,6 +14,10 @@ type MockPhones = { zoomed_out: boolean; tiles: { id: string; phase: string; bor
 const mockPhones = async () => ((await mockState()).state as unknown as { phones: MockPhones }).phones;
 const phoneActions = async () =>
   ((await (await fetch(`${COORD}/mock/phone-actions`)).json()) as { actions: { action: string; phone: string; session: string; x?: number; y?: number }[] }).actions;
+/** A tap's fraction lands within rounding of where the click was: within one CSS pixel: the page rounds the screen's box, which moved y by up to 0.97 px before this change too, so a one-pixel offset fails. */
+function withinPixel(got: number | undefined, want: number, size: number, what: string): void {
+  expect(Math.abs((got ?? 99) - want) * size, what).toBeLessThanOrEqual(1);
+}
 const taps = async () => (await phoneActions()).filter((a) => a.action === "tap");
 
 /** Open the phones page and wait until every phone draws at the common t. */
@@ -356,8 +360,8 @@ for (const screen of SCREENS)
   await expect.poll(async () => (await taps()).length).toBe(1);
   const [first] = await taps();
   expect([first!.phone, first!.session]).toEqual(["phone-3", session]);
-  expect(first!.x).toBeCloseTo(0.25, 2);
-  expect(first!.y).toBeCloseTo(0.6 * t.yScale, 2);
+  withinPixel(first!.x, 0.25, t.box.w, "first tap x");
+  withinPixel(first!.y, 0.6 * t.yScale, t.box.h / t.yScale, "first tap y");
   // the bezel: inside the body, outside the screen
   const b = card.bezel!;
   await page.mouse.click(b.x + card.pad.left / 2, b.y + b.h / 2);
@@ -369,8 +373,8 @@ for (const screen of SCREENS)
   await page.mouse.click(t.box.x + 0.75 * t.box.w, t.box.y + 0.95 * t.box.h);
   await expect.poll(async () => (await taps()).length).toBe(2);
   const info = (await taps())[1]!;
-  expect(Math.abs((info.x ?? 0) - 0.75) * t.box.w, "within a pixel of the click").toBeLessThanOrEqual(1);
-  expect(info.y).toBeCloseTo(0.95 * t.yScale, 2);
+  withinPixel(info.x, 0.75, t.box.w, "info tap x");
+  withinPixel(info.y, 0.95 * t.yScale, t.box.h / t.yScale, "info tap y");
   // the page drops a click sooner than 210 ms after the last tap it sent
   await page.waitForTimeout(300);
   // the GPU mirror beside the video takes taps the same way
@@ -381,8 +385,8 @@ for (const screen of SCREENS)
   await page.mouse.click(m.box.x + 0.75 * m.box.w, m.box.y + 0.1 * m.box.h);
   await expect.poll(async () => (await taps()).length).toBe(3);
   const second = (await taps())[2]!;
-  expect(Math.abs((second.x ?? 0) - 0.75) * t.box.w, "within a pixel of the click").toBeLessThanOrEqual(1);
-  expect(second.y).toBeCloseTo(0.1 * m.yScale, 2);
+  withinPixel(second.x, 0.75, m.box.w, "mirror tap x");
+  withinPixel(second.y, 0.1 * m.yScale, m.box.h / m.yScale, "mirror tap y");
   await expect(page.getByTestId("phone-notice")).toHaveCount(0);
   await page.getByTestId("phone-give-back").click();
   await expect(page.getByTestId("phone-tap-video")).toHaveCount(0);
@@ -598,18 +602,30 @@ test("phones: the line under the title and the What is this? control", async ({ 
   await expectLanding(page, { stage: "phones-stage", phone: true });
 });
 
-test("phones: Escape closes the About panel and nothing under it", async ({ page }) => {
+test("phones: Escape closes the About panel and releases nothing under it", async ({ page }, info) => {
+  // On a phone the line and its control step aside while something is held (the held view takes the room), so there is no panel to close then.
+  test.skip(info.project.name === "phone", "the control is hidden while something is held on a phone");
+  const sent: string[] = [];
+  page.on("websocket", (ws) => ws.on("framesent", (e) => sent.push(String(e.payload))));
   await openPhones(page);
   await page.getByTestId("phone-hit-phone:2").click();
-  const under = page.getByTestId("phone-panel");
-  await expect(under).toBeVisible();
-  const btn = page.getByTestId("landing-button");
-  await btn.focus();
+  await expect(page.getByTestId("phone-panel")).toBeVisible();
+  await page.getByTestId("landing-button").focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("landing-panel")).toBeVisible();
+  const before = sent.length;
   await page.keyboard.press("Escape");
   await expect(page.getByTestId("landing-panel")).toHaveCount(0);
-  await page.waitForTimeout(300);
-  await expect(under, "the layer under it stays").toBeVisible();
+  await expect(page.getByTestId("phone-panel"), "the layer under it stays").toBeVisible();
+  await page.waitForTimeout(500);
+  expect(sent.slice(before).filter((t) => /release_|"close"/.test(t)), "no release or close intent was sent").toEqual([]);
+});
+
+test("phones: at 360 by 640 with the line at four lines, the page's main control is on screen", async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 640 });
+  await openPhones(page);
+  const b = (await page.getByTestId("phones-zoom").boundingBox())!;
+  expect(b.y + b.height).toBeLessThanOrEqual(640);
+  expect(b.x + b.width).toBeLessThanOrEqual(360);
 });
 

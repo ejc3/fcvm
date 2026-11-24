@@ -44,3 +44,13 @@
 .landing-row .landing-line { line-height: 1.25; }
 .masthead:has(.landing-row) { flex: 1 1 340px; min-width: 0; }
 @media (max-width: 700px) { .landing-row .landing-line { line-height: 1.15; } }
+.landing-backdrop { position: fixed; inset: 0; z-index: 59; background: transparent; }
+/* On a phone the header gives the stage back what the line takes. */
+@media (max-width: 700px) {
+  .win-top { gap: 2px; padding-top: 8px; padding-bottom: 4px; }
+  .win-top .masthead, .phones-top .masthead { gap: 4px; }
+  .phones-top { padding-top: 8px; padding-bottom: 8px; min-height: 0; }
+}
+@media (max-width: 700px) { .win-page .win-top .brand h1 { line-height: 1.05; } .landing-row .landing-line { line-height: 1.1; } }
+/* While a server, a desktop or a phone is held on a phone, its view takes the room the line used. */
+@media (max-width: 700px) { body:has(.win-sheet, .phone-sheet) .landing-row .landing { display: none; } }

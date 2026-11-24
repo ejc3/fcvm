@@ -326,7 +326,7 @@ export async function expectLanding(page: Page, o: { stage?: string | null; phon
     const apart = l.y + l.height <= s!.y + 1 || s!.y + s!.height <= l.y + 1 || l.x + l.width <= s!.x + 1 || s!.x + s!.width <= l.x + 1;
     expect(apart, "the line does not overlap the stage").toBe(true);
   }
-  // The words are never cut: no clamp, so all of it is visible; two lines on a desktop, three on a narrow phone.
+  // The words are never cut: no clamp, so all of it is visible; two lines on a desktop, up to four at 360 px.
   const m = await line.evaluate((el) => ({ lines: (el.getBoundingClientRect().height - parseFloat(getComputedStyle(el).paddingTop) - parseFloat(getComputedStyle(el).paddingBottom)) / parseFloat(getComputedStyle(el).lineHeight), clamp: getComputedStyle(el).webkitLineClamp, overflow: getComputedStyle(el).overflow }));
   expect(m.clamp, "no line clamp").toBe("none");
   expect(m.overflow).toBe("visible");
@@ -339,7 +339,7 @@ export async function expectLanding(page: Page, o: { stage?: string | null; phon
   await expect(btn).toHaveAttribute("aria-expanded", "true");
   const panel = page.getByTestId("landing-panel");
   await expect(panel).toContainText("fcvm starts virtual machines from saved snapshots instead of booting them.");
-  await expect(panel).toHaveAttribute("aria-label", "About this page");
+  await expect(panel).toHaveAttribute("aria-label", "What this page shows");
   await expect(panel.getByTestId("landing-close")).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(panel).toHaveCount(0);
