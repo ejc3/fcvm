@@ -35,6 +35,7 @@ async fn test_state_persistence() {
             memory_mib: 512,
             network: NetworkConfig {
                 tap_device: "tap0".to_string(),
+                tap_fd: None,
                 guest_mac: "02:00:00:00:00:01".to_string(),
                 guest_ip: Some("172.16.0.2".to_string()),
                 host_ip: Some("172.16.0.1".to_string()),
