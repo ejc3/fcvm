@@ -170,8 +170,9 @@ IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
 - **All N up** is from the coordinator's own log (`all_up_s` in a run's summary): from the gold
   snapshot being made (the 512 RAM run made it) or, where it was already there, from the agent's
   hello, to the last server's first "server up". The client's own figure (`restore_all_s`)
-  starts when it first sees a restoring server, and in the 512 RAM run its first rows came
-  21.7 s after the gold was made: it read 12.2 s there.
+  starts at its first sample that shows a restoring server (it samples every 5 s once rows
+  come), and in the 512 RAM run that sample came about 20 s after the gold was made: it read
+  12.2 s there.
 - **A reading** is one server's tick rate in its status row, read every 5 s from when every
   server ran until the run's reset of all; a running server whose row has no rate is
   unanswered. Busy CPUs are the host's (`/proc/stat`), and memory is the VMMs' proportional
