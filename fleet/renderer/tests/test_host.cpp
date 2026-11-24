@@ -408,12 +408,22 @@ struct ServerTest {
     for (int i = 0; i < 4; i++) idle.push_back(connect_lo(r.port));
     CHECK(within(2000, [&] { return r.server.pending_.size() == 4; }), "4 idle connections are pending (%zu)",
           r.server.pending_.size());
+    // The server thread stalls between a refusal's close and its count, so a client that sees the
+    // close reads the counter at the worst moment. The count must already be in by then.
+    r.server.refuse_hook_ = [] { usleep(100 * 1000); };
     int refused = 0;
+    unsigned long long lagged = 0;
     for (int i = 0; i < 6; i++) {
       int fd = connect_lo(r.port);
-      if (fd >= 0 && closed_within(fd, 1000)) refused++;
+      if (fd >= 0 && closed_within(fd, 1000)) {
+        refused++;
+        if (r.server.refused_pending_ < (unsigned long long)refused) lagged++;
+      }
       if (fd >= 0) close(fd);
     }
+    CHECK(lagged == 0, "a refusal is counted before its close is visible (%llu closes seen before their count)", lagged);
+    within(2000, [&] { return r.server.refused_pending_ == 6; });
+    r.server.refuse_hook_ = nullptr;
     CHECK(refused == 6 && r.server.refused_pending_ == 6 && r.server.pending_.size() == 4,
           "6 more past the cap are closed at once (%d closed, %llu counted, %zu pending)", refused,
           (unsigned long long)r.server.refused_pending_, r.server.pending_.size());

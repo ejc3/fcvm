@@ -4,6 +4,7 @@
 #pragma once
 #include "access.h"
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -85,6 +86,8 @@ class Server {
   // Connections that have reached no stream, on both listeners, and those refused past its caps.
   PendingTable pending_{MAX_PENDING_CONNECTIONS, MAX_PENDING_PER_SOURCE};
   std::atomic<unsigned long long> refused_pending_{0};
+  // Tests: run between a refusal's close and its count, whichever comes first.
+  std::function<void()> refuse_hook_;
   // Tests: shorter waits.
   int request_wait_ms_ = REQUEST_WAIT_MS;
   int admit_wait_ms_ = ADMIT_WAIT_MS;
