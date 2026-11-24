@@ -877,7 +877,10 @@ mod tests {
     /// still the parent: one that exited before the signal was armed sends none.
     #[test]
     fn the_vmm_exits_if_its_parent_died_before_the_death_signal_was_armed() {
-        let utils = include_str!("utils.rs");
+        // Within install_namespace_pre_exec: other helpers in utils.rs have checks of their own.
+        let source = include_str!("utils.rs");
+        let start = source.find("pub fn install_namespace_pre_exec(").unwrap();
+        let utils = &source[start..start + source[start..].find("\n}\n").unwrap()];
         let arm = utils
             .find("libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL)")
             .unwrap();
