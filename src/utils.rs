@@ -1462,8 +1462,8 @@ mod tests {
 
     #[test]
     fn forwarded_lines_and_records_are_written_whole() {
+        // The whole file: it has production code after its first test module.
         let listeners = include_str!("commands/podman/listeners.rs");
-        let listeners = listeners.split("#[cfg(test)]").next().unwrap();
         for split in ["writeln!(std::io::stdout()", "writeln!(std::io::stderr()"] {
             assert!(
                 !listeners.contains(split),
@@ -1480,10 +1480,19 @@ mod tests {
                 .collect();
             assert!(!calls.is_empty(), "no call to {record}");
             for i in calls {
-                let before = &snapshot[i.saturating_sub(80)..i];
+                let mut start = i.saturating_sub(120);
+                while !snapshot.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let before = &snapshot[start..i];
                 assert!(
                     before.contains("write_whole_line("),
                     "{record} is printed some other way"
+                );
+                // A record a caller waits for: a failed write is reported, not dropped.
+                assert!(
+                    !before.contains("let _ ="),
+                    "the result of writing {record} is discarded"
                 );
             }
         }

@@ -2530,7 +2530,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // queue in the backlog until the accept loop below runs) and the state
     // file exists, so a consumer can clone by pid or find the serve in
     // `fcvm ls --json` the moment it reads this.
-    let _ = crate::utils::write_whole_line(
+    let written = crate::utils::write_whole_line(
         &mut std::io::stdout(),
         &serve_ready_record(
             &args.snapshot_name,
@@ -2542,6 +2542,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         )
         .to_string(),
     );
+    if let Err(error) = written {
+        // A caller that waits for this line would otherwise wait with nothing saying why.
+        warn!(%error, "could not write the serve ready record to stdout");
+    }
 
     // Setup signal handlers
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -4570,7 +4574,7 @@ async fn cmd_snapshot_run_inner(
         } else {
             "file"
         };
-        let _ = crate::utils::write_whole_line(
+        let written = crate::utils::write_whole_line(
             &mut std::io::stdout(),
             &restored_record(
                 &vm_name,
@@ -4587,6 +4591,9 @@ async fn cmd_snapshot_run_inner(
             )
             .to_string(),
         );
+        if let Err(error) = written {
+            warn!(%error, "could not write the restored record to stdout");
+        }
     }
     // The clone is acknowledged; replace the spare it used (once: a later failure finds
     // nothing to give back).
