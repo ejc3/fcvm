@@ -625,3 +625,60 @@ fn a_held_wall_loan_counts_against_the_borrow_cap() {
         s.receipts["c2"].reason
     );
 }
+
+// What a restart does to the power rules: nothing. The stored arrival stays, the pages
+// that reconnect are not arrivals, and the fleet is up until the stored limit.
+
+fn power_config() -> Config {
+    let mut base = serde_json::to_value(Config::default()).unwrap();
+    base["max_tiles"] = json!(2);
+    base["power_managed"] = json!(true);
+    base["idle_scale_down_secs"] = json!(60);
+    base["sleep_without_new_viewer_secs"] = json!(1000);
+    serde_json::from_value(base).unwrap()
+}
+
+#[test]
+fn a_restart_keeps_an_awake_fleet_awake_until_the_stored_limit() {
+    // Awake with one viewer that arrived at 5 s: the limit ends at 1005 s. Stored at 900 s.
+    let stored = run(
+        State::new(power_config(), 0),
+        vec![
+            hello(1000),
+            running(2000, "slot-1", 1),
+            running(2000, "slot-2", 1),
+            running(2000, "slot-3", 1),
+            joined(5000, "v1"),
+            tick(900_000),
+        ],
+    );
+    assert_eq!(stored.fleet.power.state, "awake");
+    // The coordinator is killed and the next one starts at 950 s from what was stored.
+    let read: State = serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+    let mut s = read.resumed(power_config(), 950_000);
+    assert_eq!(s.fleet.power.state, "awake");
+    assert_eq!(s.fleet.power.last_arrival_at, Some(5000));
+    // Its first ticks, before any page is back, sleep nothing.
+    s = run(s, vec![tick(950_500), tick(951_500)]);
+    assert_eq!(s.fleet.power.state, "awake", "{:?}", s.fleet.power);
+    // The host's agent and the page reconnect; the page says it connected before.
+    s = run(
+        s,
+        vec![
+            hello(952_000),
+            running(952_001, "slot-1", 1),
+            running(952_001, "slot-2", 1),
+            running(952_001, "slot-3", 1),
+            ev(
+                json!({"at": 953_000, "type": "viewer_joined", "viewer": "v1",
+                "client": "198.51.100.20", "returning": true}),
+            ),
+            tick(1_004_999),
+        ],
+    );
+    assert_eq!(s.fleet.power.state, "awake");
+    assert_eq!(s.fleet.power.last_arrival_at, Some(5000));
+    // The stored limit, neither earlier nor later.
+    s = run(s, vec![tick(1_005_000)]);
+    assert_eq!(s.fleet.power.state, "asleep");
+}

@@ -84,6 +84,13 @@ pub struct Config {
     /// long (`Power::last_arrival_at`), even while viewers stay connected. 0: never.
     #[serde(default = "one_hour")]
     pub sleep_without_new_viewer_secs: u64,
+    /// Asleep, a connected page that becomes active (shown again, or reconnecting) wakes
+    /// the fleet only while at least this much of `sleep_without_new_viewer_secs` remains,
+    /// so a wake is never for less; with less left the page's Wake button wakes it. Such a
+    /// wake is no arrival. An arrival has the whole limit ahead and always wakes; a limit
+    /// shorter than this leaves only arrivals (`crate::view::page_wakes`).
+    #[serde(default = "ten_minutes")]
+    pub min_wake_remaining_secs: u64,
     /// The most the fleet may spend in one UTC day, in USD: at it the fleet sleeps until
     /// 00:00 UTC (`crate::spend`). `None`: no ceiling.
     #[serde(default)]
@@ -272,6 +279,7 @@ impl Default for Config {
             power_managed: false,
             idle_scale_down_secs: 600,
             sleep_without_new_viewer_secs: 3600,
+            min_wake_remaining_secs: 600,
             daily_spend_usd: None,
             warm_hours: Vec::new(),
             names_published: false,

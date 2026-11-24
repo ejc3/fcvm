@@ -1198,6 +1198,22 @@ pub fn no_arrival_deadline(p: &Power, c: &crate::state::Config) -> Option<u64> {
         .map(|t| t + c.sleep_without_new_viewer_secs * 1000)
 }
 
+/// Whether an active page wakes a sleeping fleet at `at`: the limit without a new viewer
+/// has at least `min_wake_remaining_secs` left (the whole limit, when the limit is shorter
+/// than that), or there is no limit. A wake with less left would launch hosts that the limit
+/// terminates minutes later, under the viewer they were launched for. An arrival sets the
+/// limit's start to `at` first, so it always wakes.
+pub fn page_wakes(p: &Power, c: &crate::state::Config, at: u64) -> bool {
+    let Some(deadline) = no_arrival_deadline(p, c) else {
+        return true;
+    };
+    let min = c
+        .min_wake_remaining_secs
+        .min(c.sleep_without_new_viewer_secs)
+        * 1000;
+    at < deadline && deadline - at >= min
+}
+
 fn relaunch_all(r: &Race) -> RelaunchAllView {
     let pending = |h: &HalfRace| {
         h.tiles

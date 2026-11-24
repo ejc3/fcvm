@@ -578,7 +578,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
   fixed host, a test box); without either it stays `awake`. After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), or
-  after `--sleep-without-new-viewer` seconds (default 3600, 0 never) with no arrival, even
+  after `--sleep-without-new-viewer` seconds (default 3600, 0 never; also
+  `FLEET_SLEEP_WITHOUT_NEW_VIEWER`) with no arrival, even
   while viewers stay connected and visible, and never while a claim (a wall GPU or a phone)
   is active or a race is running, the fleet goes `asleep` (`asleep_since`). A claim or race
   that outlasts either limit holds the fleet awake until it ends, and it sleeps then. An
@@ -597,12 +598,19 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now`, `claim_gpu` and `claim_phone` are refused. Hosts that leave then are not reclaimed. When an active viewer
-  is there and the last arrival is within the limit (a new viewer arrived, a page sent
-  `wake`, or a hidden page turned visible again before the limit ran out) it is `waking`
+  is there and at least `--min-wake-remaining` seconds (default 600; also
+  `FLEET_MIN_WAKE_REMAINING`) of the limit remain
+  (a new viewer arrived or a page sent `wake`, each of which has the whole limit ahead, or
+  a hidden page turned visible again, or a page reconnected, that long before the limit
+  runs out) it is `waking`
   from `woke_at`, the moment the wake began: every host region gets `--awake-hosts` hosts
-  again (default 1) and the EC2 half launches its `--ec2-tiles` tiles. Connected pages alone
-  never wake a fleet whose limit has run out: the page shows the sleep card with a Wake
-  button, which sends `wake`. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
+  again (default 1) and the EC2 half launches its `--ec2-tiles` tiles. A wake for a page
+  shown again or reconnecting is not an arrival and moves no limit, so with less than the
+  minimum left the fleet stays asleep: the wake would launch hosts that the limit
+  terminates minutes later. Nor do connected pages wake a fleet whose limit has run out.
+  In both cases the page shows the sleep card with a Wake
+  button, which sends `wake`. A limit shorter than the minimum leaves only arrivals to wake
+  the fleet. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
   order: `instance_pending` and `booted` from EC2 (pending, then running),
   `store_ready` when the host marked its store mounted (the agent's hello reports it; the
   phase is absent when the host does not mark it), `agent_connected` when its agent says
@@ -726,7 +734,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
                  [--awake-hosts 1] [--host-spread none|az] [--host-on-demand-max 8] [--idle-scale-down 600]
-                 [--sleep-without-new-viewer 3600] [--history-idle 60]
+                 [--sleep-without-new-viewer 3600] [--min-wake-remaining 600]
+                 [--history-idle 60]
                  [--daily-spend-usd <usd> [--spend-rates <instance type>=<usd per hour>,...]]
                  [--warm-hours <Mon..Sun> HH:MM-HH:MM,...]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
