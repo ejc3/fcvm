@@ -833,6 +833,7 @@ async fn boot_firmware(backend: &mut dyn Hypervisor, boot: &RawBoot) -> Result<(
         .add_network_interface(&NetIfaceSpec {
             iface_id: "eth0".to_string(),
             host_dev_name: boot.tap_device.clone(),
+            host_dev_fd: None,
             guest_mac: Some(boot.guest_mac.clone()),
         })
         .await?;

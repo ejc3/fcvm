@@ -115,6 +115,7 @@ async fn test_health_monitor_behaviors() {
         4194305,
         NetworkConfig {
             tap_device: "tap-test".to_string(),
+            tap_fd: None,
             guest_mac: "02:00:00:00:00:01".to_string(),
             guest_ip: Some("192.168.1.100".to_string()),
             host_ip: Some("192.168.1.1".to_string()),

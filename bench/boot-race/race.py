@@ -657,6 +657,9 @@ def imds(path):
         return None
 
 
+COMMIT_PREFIX = 10
+
+
 def run_out(args):
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout.strip()
 
@@ -669,7 +672,9 @@ def setup_rows(cfg, s):
                  f"{imds('instance-life-cycle')}, kernel {os.uname().release}"])
     # The checkout this driver runs from is the one fcvm was built from (box-setup.sh).
     commit = run_out(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"])
-    rows.append(["fcvm", f"commit {commit[:12]}, {run_out([cfg['fcvm_bin'], '--version'])}"])
+    # Ten characters, not twelve: a prefix that happens to be all digits would read as a 12-digit
+    # account id to the page's public checks (render.FORBIDDEN), which refuse to write it.
+    rows.append(["fcvm", f"commit {commit[:COMMIT_PREFIX]}, {run_out([cfg['fcvm_bin'], '--version'])}"])
     rows.append(["fcvm VM", "1 vCPU, 2048 MiB, rootless networking, port published on the host's loopback; one "
                  "snapshot, restored by both fcvm lanes"])
     lt = ec2.describe_launch_template_versions(LaunchTemplateName="boot-race-ec2", Versions=["$Default"])

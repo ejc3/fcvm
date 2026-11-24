@@ -4,8 +4,8 @@
 //!
 //! Each test runs its own pool in a data directory of its own, so no other test's clones
 //! claim from it. A tenant is played by this test binary started again inside the leased
-//! namespace ([`helper_in_the_namespace`]): it attaches to the VMM's TAP as a VMM does and
-//! sends and records Ethernet frames as a guest would.
+//! namespace ([`helper_in_the_namespace`]): it inherits the queue of the namespace's TAP as a
+//! VMM does and sends and records Ethernet frames as a guest would.
 
 #![cfg(feature = "integration-fast")]
 
@@ -31,8 +31,9 @@ const POISON_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xaa];
 // The helper: this binary, started inside a leased namespace.
 // ---------------------------------------------------------------------------------------
 
-/// Not a test of its own. With `NETPOOL_TEST_TAP` set this is the body of the process a test
-/// starts inside a leased namespace: it attaches to the TAP and serves the commands on its
+/// Not a test of its own. With `NETPOOL_TEST_TAP_FD` set this is the body of the process a
+/// test starts inside a leased namespace: it takes the TAP's queue, which it inherited as
+/// that descriptor, and serves the commands on its
 /// standard input, one line each, answering each with one line `@@=ANSWER`.
 ///
 /// - `capture MS`: record every frame for MS milliseconds, print `@@frame HEX` for each.
@@ -41,15 +42,18 @@ const POISON_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xaa];
 ///   with an ICMP "fragmentation needed" for 576 bytes, never acknowledging the data.
 /// - `udp PORT`: send one UDP datagram to the gateway's PORT, as a guest that starts a flow
 ///   through pasta.
+/// - `tcp PORT`: open a TCP connection to the gateway's PORT, as a guest that connects out
+///   through pasta, and leave it open.
 /// - `detach`: close the TAP.
 /// - `fingerprint`: the namespace's fingerprint as the holder would take it, its lines
 ///   joined by " | ".
 #[test]
 fn helper_in_the_namespace() {
-    let Ok(tap_name) = std::env::var("NETPOOL_TEST_TAP") else {
+    let Ok(fd) = std::env::var("NETPOOL_TEST_TAP_FD") else {
         return;
     };
-    let mut tap = Some(attach(&tap_name));
+    let tap_name = std::env::var("NETPOOL_TEST_TAP").expect("the TAP's name");
+    let mut tap = Some(inherited_queue(fd.parse().expect("a descriptor number")));
     println!("@@=attached");
     for line in std::io::stdin().lock().lines() {
         let line = line.expect("reading a command");
@@ -70,6 +74,10 @@ fn helper_in_the_namespace() {
                 let port = port.parse().expect("a port");
                 println!("@@={}", udp_to_gateway(tap.as_mut().unwrap(), port));
             }
+            (Some("tcp"), Some(port)) => {
+                let port = port.parse().expect("a port");
+                println!("@@={}", tcp_to_gateway(tap.as_mut().unwrap(), port));
+            }
             (Some("detach"), _) => {
                 tap = None;
                 println!("@@=detached");
@@ -88,34 +96,23 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Attach to the TAP `name` the way a VMM does: `TUNSETIFF` on a new descriptor.
-fn attach(name: &str) -> std::fs::File {
-    #[repr(C)]
-    struct IfReq {
-        name: [u8; libc::IFNAMSIZ],
-        flags: libc::c_short,
-        pad: [u8; 22],
-    }
-    const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
-    const IFF_TAP: libc::c_short = 0x0002;
-    const IFF_NO_PI: libc::c_short = 0x1000;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/net/tun")
-        .expect("opening /dev/net/tun");
-    let mut request = IfReq {
-        name: [0; libc::IFNAMSIZ],
-        flags: IFF_TAP | IFF_NO_PI,
-        pad: [0; 22],
-    };
-    request.name[..name.len()].copy_from_slice(name.as_bytes());
-    // SAFETY: `request` is a `struct ifreq` that outlives the call.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF as _, &request) };
+/// Every frame on the queue is preceded by a virtio-net header of this size, which the
+/// helper sets as Firecracker does (`TUNSETVNETHDRSZ`).
+const VNET_HEADER: usize = 12;
+
+/// The TAP queue this process inherited as `fd`, set up the way a VMM sets its own up.
+fn inherited_queue(fd: i32) -> std::fs::File {
+    use std::os::fd::FromRawFd;
+    const TUNSETVNETHDRSZ: libc::c_ulong = 0x4004_54d8;
+    // SAFETY: the test that started this process left the descriptor open for it alone.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let size = VNET_HEADER as libc::c_int;
+    // SAFETY: the argument is one int that outlives the call.
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETVNETHDRSZ as _, &size) };
     assert_eq!(
         rc,
         0,
-        "TUNSETIFF {name}: {}",
+        "TUNSETVNETHDRSZ: {}",
         std::io::Error::last_os_error()
     );
     file
@@ -133,10 +130,10 @@ fn read_frame(tap: &mut std::fs::File, deadline: Instant) -> Option<Vec<u8>> {
     if unsafe { libc::poll(&mut poll, 1, left.as_millis() as libc::c_int) } <= 0 {
         return None;
     }
-    let mut frame = vec![0u8; 65536];
+    let mut frame = vec![0u8; 65536 + VNET_HEADER];
     let len = tap.read(&mut frame).expect("reading a frame");
     frame.truncate(len);
-    Some(frame)
+    Some(frame.split_off(VNET_HEADER.min(len)))
 }
 
 fn checksum(parts: &[&[u8]]) -> [u8; 2] {
@@ -163,8 +160,11 @@ fn ipv4_header(to: [u8; 4], protocol: u8, payload_len: usize) -> Vec<u8> {
     header
 }
 
+/// A frame from the tenant's MAC, as it is written to the queue: behind an empty virtio-net
+/// header.
 fn ethernet(to: &[u8], ethertype: u16, payload: &[u8]) -> Vec<u8> {
-    let mut frame = to.to_vec();
+    let mut frame = vec![0u8; VNET_HEADER];
+    frame.extend_from_slice(to);
     frame.extend_from_slice(&POISON_MAC);
     frame.extend_from_slice(&ethertype.to_be_bytes());
     frame.extend_from_slice(payload);
@@ -227,8 +227,8 @@ fn poison(tap: &mut std::fs::File) -> String {
     format!("no data segment arrived (connected: {connected})")
 }
 
-/// Ask who has the gateway's address, then send one UDP datagram to `port` there.
-fn udp_to_gateway(tap: &mut std::fs::File, port: u16) -> String {
+/// The gateway's MAC, by asking who has its address.
+fn gateway_mac(tap: &mut std::fs::File) -> Option<Vec<u8>> {
     let mut request = vec![0, 1, 8, 0, 6, 4, 0, 1];
     request.extend_from_slice(&POISON_MAC);
     request.extend_from_slice(&GUEST_IP);
@@ -237,18 +237,75 @@ fn udp_to_gateway(tap: &mut std::fs::File, port: u16) -> String {
     tap.write_all(&ethernet(&[0xff; 6], 0x0806, &request))
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let gateway = loop {
-        let Some(frame) = read_frame(tap, deadline) else {
-            return "no ARP reply for the gateway".to_string();
-        };
+    loop {
+        let frame = read_frame(tap, deadline)?;
         let body = &frame[14.min(frame.len())..];
         if frame.len() >= 42
             && frame[12..14] == [0x08, 0x06]
             && body[7] == 2
             && body[14..18] == GATEWAY_IP
         {
-            break body[8..14].to_vec();
+            return Some(body[8..14].to_vec());
         }
+    }
+}
+
+/// One TCP segment without data from the guest's port 40001 to the gateway's `port`.
+fn tcp_segment(gateway: &[u8], port: u16, seq: u32, ack: u32, flags: u8) -> Vec<u8> {
+    let mut tcp = Vec::new();
+    tcp.extend_from_slice(&40001u16.to_be_bytes());
+    tcp.extend_from_slice(&port.to_be_bytes());
+    tcp.extend_from_slice(&seq.to_be_bytes());
+    tcp.extend_from_slice(&ack.to_be_bytes());
+    tcp.extend_from_slice(&[0x50, flags, 0xff, 0xff, 0, 0, 0, 0]);
+    let pseudo = [&GUEST_IP[..], &GATEWAY_IP[..], &[0, 6, 0, 20][..]].concat();
+    let sum = checksum(&[&pseudo, &tcp]);
+    tcp[16..18].copy_from_slice(&sum);
+    let packet = [ipv4_header(GATEWAY_IP, 6, tcp.len()), tcp].concat();
+    ethernet(gateway, 0x0800, &packet)
+}
+
+/// Connect to the gateway's `port` as a guest does: SYN, the gateway's SYN and ACK, ACK.
+/// pasta makes the connection to the host on the guest's behalf, and keeps it as a flow.
+fn tcp_to_gateway(tap: &mut std::fs::File, port: u16) -> String {
+    let Some(gateway) = gateway_mac(tap) else {
+        return "no ARP reply for the gateway".to_string();
+    };
+    tap.write_all(&tcp_segment(&gateway, port, 5000, 0, 0x02))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while let Some(frame) = read_frame(tap, deadline) {
+        if frame.len() < 14 + 20 + 20 || frame[12..14] != [0x08, 0x00] {
+            continue;
+        }
+        let body = &frame[14..];
+        let ip_len = usize::from(body[0] & 0xf) * 4;
+        if body[9] != 6 || body[12..16] != GATEWAY_IP || body.len() < ip_len + 20 {
+            continue;
+        }
+        let tcp = &body[ip_len..];
+        let to_us = u16::from_be_bytes([tcp[2], tcp[3]]) == 40001;
+        // SYN and ACK, acknowledging our sequence number plus one.
+        if to_us && tcp[13] & 0x12 == 0x12 {
+            let theirs = u32::from_be_bytes(tcp[4..8].try_into().unwrap());
+            tap.write_all(&tcp_segment(
+                &gateway,
+                port,
+                5001,
+                theirs.wrapping_add(1),
+                0x10,
+            ))
+            .unwrap();
+            return "connected".to_string();
+        }
+    }
+    "the gateway did not accept the connection".to_string()
+}
+
+/// Ask who has the gateway's address, then send one UDP datagram to `port` there.
+fn udp_to_gateway(tap: &mut std::fs::File, port: u16) -> String {
+    let Some(gateway) = gateway_mac(tap) else {
+        return "no ARP reply for the gateway".to_string();
     };
     let payload = b"from the first tenant";
     let mut udp = Vec::new();
@@ -312,12 +369,13 @@ struct Helper {
 }
 
 impl Helper {
-    /// Start the helper in the namespace of `lease`, attached to its TAP. With `keep_lease`
-    /// it inherits the lease as a VMM does; without, it holds the TAP and no lease.
-    async fn start(lease: &Lease, keep_lease: bool) -> Self {
+    /// Start the helper in the namespace of `lease` with the queue of its TAP, and with the
+    /// lease itself: everything a VMM inherits.
+    async fn start(lease: &Lease) -> Self {
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", "helper_in_the_namespace", "--nocapture"])
+            .env("NETPOOL_TEST_TAP_FD", lease.tap_fd().to_string())
             .env("NETPOOL_TEST_TAP", &lease.grant.tap)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -328,11 +386,7 @@ impl Helper {
                 vm_id: "netpool-test".to_string(),
                 user_namespace_path: Some(lease.user_namespace_path()),
                 net_namespace_path: Some(lease.net_namespace_path()),
-                keep_fds: if keep_lease {
-                    vec![lease.fd()]
-                } else {
-                    Vec::new()
-                },
+                keep_fds: vec![lease.fd(), lease.tap_fd()],
                 ..Default::default()
             },
         )
@@ -606,7 +660,7 @@ async fn a_namespace_is_not_lent_while_a_process_of_its_last_lease_runs() {
     let pool = Pool::start(1).await;
     let lease = pool.claim().await.expect("a free namespace");
     let holder = lease.grant.holder_pid;
-    let vmm = Helper::start(&lease, true).await;
+    let vmm = Helper::start(&lease).await;
     drop(lease);
 
     for _ in 0..25 {
@@ -632,81 +686,50 @@ async fn a_namespace_is_not_lent_while_a_process_of_its_last_lease_runs() {
     pool.stop().await;
 }
 
-/// The other half of invariant 2: a process that is still attached to the TAP when the
-/// lease ends (it never had the lease, or gave it up) keeps the namespace from being lent.
-/// The reset finds the TAP with a carrier, and the namespace is destroyed and replaced.
+/// The TAP's queue stays open from one tenant to the next, so the kernel never purges it:
+/// frames the namespace sent towards a tenant that did not read them are still in it when
+/// the tenant is gone. The next tenant must not get them. Here the namespace asks who has
+/// the guest's address, for a connection the first tenant never answers.
 #[tokio::test(flavor = "current_thread")]
-async fn a_namespace_with_a_process_still_on_its_tap_is_destroyed() {
+async fn frames_left_in_the_queue_do_not_reach_the_next_tenant() {
     let pool = Pool::start(1).await;
     let lease = pool.claim().await.expect("a free namespace");
     let holder = lease.grant.holder_pid;
-    let stray = Helper::start(&lease, false).await;
+    let first = Helper::start(&lease).await;
+    let socket = lease
+        .agent
+        .tcp_socket(&"10.0.2.100".parse().unwrap())
+        .await
+        .expect("a socket in the namespace");
+    // The first ARP request leaves at once and the next a second later; none is read.
+    let unanswered = tokio::time::timeout(
+        Duration::from_millis(1500),
+        socket.connect("10.0.2.100:80".parse().unwrap()),
+    )
+    .await;
+    assert!(unanswered.is_err(), "something answered for the guest");
+    first.kill().await;
     drop(lease);
-
-    let stats = pool
-        .wait_for("a replacement namespace", |s| s.ready == 1 && s.builds == 2)
-        .await;
-    assert_eq!((stats.destroys, stats.resets), (1, 0));
-    let next = pool.claim().await.expect("the replacement");
-    assert_ne!(next.grant.holder_pid, holder);
-    assert_eq!(next.grant.generation, 1);
-    stray.kill().await;
-    drop(next);
-    pool.stop().await;
-}
-
-/// A process still on the TAP after its lease has ended can send frames, and what a frame
-/// leaves in pasta (a flow, the MAC and address pasta learns) is in no fingerprint. Here it
-/// starts a UDP flow through pasta half a second after the lease's end and detaches, well
-/// inside the reset's budget; everything it left in the kernel is gone by then. The pasta
-/// that serves the next tenant must not be the one that saw that datagram: the reset waits
-/// for the TAP to be free before it restarts pasta, where it used to restart pasta at once
-/// and then wait, and the host service's late answer reached the next tenant.
-#[tokio::test(flavor = "current_thread")]
-async fn a_process_that_writes_after_its_lease_and_detaches_leaves_the_next_tenant_nothing() {
-    let pool = Pool::start(1).await;
-    let lease = pool.claim().await.expect("a free namespace");
-    let holder = lease.grant.holder_pid;
-    let mut stray = Helper::start(&lease, false).await;
-    let service = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let port = service.local_addr().unwrap().port();
-    drop(lease);
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(stray.command(&format!("udp {port}")).await.0, "sent");
-    let mut datagram = [0u8; 64];
-    let (_, pasta_flow) =
-        tokio::time::timeout(Duration::from_secs(10), service.recv_from(&mut datagram))
-            .await
-            .expect("the stray's datagram never reached the host")
-            .unwrap();
-    assert_eq!(stray.command("detach").await.0, "detached");
-
     let stats = pool
         .wait_for("the namespace back", |s| {
             s.ready == 1 && (s.resets == 1 || s.destroys == 1)
         })
         .await;
-    assert_eq!(
-        (stats.resets, stats.destroys),
-        (1, 0),
-        "a TAP that was freed inside the budget got its namespace destroyed"
-    );
+    assert_eq!((stats.resets, stats.destroys), (1, 0));
+
     let lease = pool.claim().await.expect("the recycled namespace");
     assert_eq!(
         (lease.grant.holder_pid, lease.grant.generation),
         (holder, 2)
     );
-    let mut second = Helper::start(&lease, true).await;
-    let _ = service.send_to(b"a late answer", pasta_flow).await;
+    let mut second = Helper::start(&lease).await;
     let (_, frames) = second.command("capture 1500").await;
     assert_eq!(
         not_membership_reports(&frames),
         Vec::<String>::new(),
-        "the next tenant received the answer to a datagram sent after the last lease ended"
+        "the second tenant read frames queued for the first"
     );
     second.kill().await;
-    stray.kill().await;
     drop(lease);
     pool.stop().await;
 }
@@ -831,7 +854,7 @@ async fn the_next_tenant_gets_no_frame_from_the_last() {
     // What a tenant that sends nothing receives in a namespace no one has used.
     let lease = pool.claim().await.expect("a free namespace");
     let holder = lease.grant.holder_pid;
-    let mut first = Helper::start(&lease, true).await;
+    let mut first = Helper::start(&lease).await;
     let (_, unused) = first.command("capture 1500").await;
     assert_eq!(
         not_membership_reports(&unused),
@@ -886,6 +909,19 @@ async fn the_next_tenant_gets_no_frame_from_the_last() {
             .unwrap();
     assert_eq!(&datagram[..len], b"from the first tenant");
 
+    // A TCP connection through pasta: the tenant connects out to a service on the host's
+    // loopback, which accepts and will write to it after the tenant has left.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_port = listener.local_addr().unwrap().port();
+    assert_eq!(
+        first.command(&format!("tcp {tcp_port}")).await.0,
+        "connected"
+    );
+    let (mut from_tenant, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("the tenant's connection never reached the host")
+        .unwrap();
+
     // The tenant leaves: its VMM exits and its clone's descriptors close.
     first.kill().await;
     drop(stream);
@@ -906,10 +942,14 @@ async fn the_next_tenant_gets_no_frame_from_the_last() {
         (lease.grant.holder_pid, lease.grant.generation),
         (holder, 2)
     );
-    let mut second = Helper::start(&lease, true).await;
-    // The host service answers the first tenant now. The pasta that had the flow is gone,
-    // so the answer goes nowhere; the send itself may be refused.
+    let mut second = Helper::start(&lease).await;
+    // The host services answer the first tenant now. pasta is the same process, and its
+    // reset closed both flows without a word to the TAP, so the answers go nowhere; the
+    // sends themselves may be refused.
     let _ = service.send_to(b"a late answer", pasta_flow).await;
+    let _ = from_tenant
+        .write_all(b"late data on the first tenant's connection")
+        .await;
     // Long enough for a retransmission of the first tenant's data, were its socket alive.
     let (_, frames) = second.command("capture 3500").await;
     assert_eq!(
@@ -1002,6 +1042,54 @@ fn sockets_of(pid: u32) -> Vec<String> {
         .map(|target| target.to_string_lossy().into_owned())
         .filter(|target| target.starts_with("socket:"))
         .collect()
+}
+
+/// `pid` and every process below it.
+fn tree_of(pid: u32) -> Vec<u32> {
+    let mut tree = vec![pid];
+    let mut next = 0;
+    while next < tree.len() {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{}/task", tree[next])) else {
+            next += 1;
+            continue;
+        };
+        for task in tasks.flatten() {
+            let list = std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+            tree.extend(
+                list.split_whitespace()
+                    .map(|child| child.parse::<u32>().unwrap()),
+            );
+        }
+        next += 1;
+    }
+    tree
+}
+
+/// For each descriptor `pid` has open on the TUN device node, whether it is close-on-exec.
+fn tun_fds_of(pid: u32) -> Vec<bool> {
+    let mut found = Vec::new();
+    for fd in std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if std::fs::read_link(fd.path())
+            .is_ok_and(|target| target == std::path::Path::new("/dev/net/tun"))
+        {
+            let info = std::fs::read_to_string(format!(
+                "/proc/{pid}/fdinfo/{}",
+                fd.file_name().to_string_lossy()
+            ))
+            .unwrap_or_default();
+            let flags = info
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:"))
+                .map(|octal| i32::from_str_radix(octal.trim(), 8).unwrap())
+                .expect("fdinfo has no flags line");
+            found.push(flags & libc::O_CLOEXEC != 0);
+        }
+    }
+    found
 }
 
 /// The Firecracker process that is a child of the fcvm process `pid`.
@@ -1099,6 +1187,25 @@ impl Fixture {
             .expect("starting fcvm")
     }
 
+    /// `fcvm exec --vm` in the VM of the fcvm process `pid`, in this fixture's data
+    /// directory: the command's output, or what went wrong.
+    async fn exec(&self, pid: u32, command: &[&str]) -> Result<String, String> {
+        let pid = pid.to_string();
+        let mut args = vec!["exec", "--pid", &pid, "--vm", "--"];
+        args.extend_from_slice(command);
+        let output = tokio::process::Command::new(common::find_fcvm_binary().unwrap())
+            .args(&args)
+            .envs(self.env.iter().cloned())
+            .output()
+            .await
+            .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    }
+
     async fn clone(
         &self,
         name: &str,
@@ -1149,6 +1256,73 @@ async fn a_clone_comes_up_in_its_own_namespace_when_the_pool_does_not_answer() {
     fixture.pool.stop().await;
 }
 
+/// A guest reboot relaunches the clone's VMM in the namespace the clone holds. The new VMM
+/// inherits the lease and the TAP's queue as the first did and takes the queue by its
+/// descriptor (`PUT /network-interfaces` with `host_dev_fd`): nothing can attach to a
+/// pooled TAP by name. The namespace is not given back in between, and the rebooted
+/// guest's frames go through the queue.
+#[tokio::test]
+async fn a_pooled_clone_reboots_in_its_namespace() {
+    let fixture = Fixture::new(1).await;
+    let data_dir = fixture.pool.data_dir.clone();
+    let (mut clone, pid) = fixture.clone("reboots", &NO_PORTS, &[]).await;
+    let state = healthy(&data_dir, "reboots", &mut clone).await;
+    assert_eq!(state["netpool"]["generation"], 1, "{state}");
+    let first_vmm = vmm_of(pid);
+    let before = fixture
+        .exec(pid, &["cat", "/etc/machine-id"])
+        .await
+        .expect("reading the machine-id before the reboot");
+    assert!(!before.trim().is_empty());
+
+    // The exec dies with the guest. A guest that booted again has a new machine-id.
+    let _ = fixture.exec(pid, &["reboot"]).await;
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        match fixture.exec(pid, &["cat", "/etc/machine-id"]).await {
+            Ok(now) if !now.trim().is_empty() && now.trim() != before.trim() => break,
+            other => assert!(
+                Instant::now() < deadline,
+                "the guest did not come back from its reboot; last: {other:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    assert_ne!(vmm_of(pid), first_vmm, "the VMM was not relaunched");
+
+    // The namespace answers the rebooted guest over the inherited queue: nothing listens
+    // on the bridge's address, so a connection there is refused, which takes the guest's
+    // ARP and SYN out through the queue and the replies back.
+    let probe = "timeout 3 /usr/bin/bash -c 'exec 3<>/dev/tcp/10.0.2.1/9' 2>&1; true";
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let said = fixture.exec(pid, &["/usr/bin/bash", "-c", probe]).await;
+        if matches!(&said, Ok(out) if out.contains("Connection refused")) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rebooted guest does not reach its namespace: {said:?}"
+        );
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let stats = fixture.pool.stats().await;
+    assert_eq!(
+        (stats.leased, stats.resets, stats.grants),
+        (1, 0, 1),
+        "the namespace changed hands during the reboot"
+    );
+
+    common::kill_process(pid).await;
+    let _ = clone.wait().await;
+    let stats = fixture
+        .pool
+        .wait_for("the namespace back", |s| s.ready == 1 && s.resets == 1)
+        .await;
+    assert_eq!(stats.destroys, 0);
+    fixture.pool.stop().await;
+}
+
 /// A restored clone runs in a pooled namespace and gives it back; the next clone runs in
 /// the recycled one. The clone's VMM holds the lease. A clone finds the pool's one namespace
 /// lent and builds its own. A clone with a published port builds its own namespace without
@@ -1178,6 +1352,23 @@ async fn clones_run_in_recycled_namespaces() {
         1,
         "the VMM does not hold the lease: {shared:?}"
     );
+    // The TAP's queue goes where the lease goes and nowhere else: of the clone's whole
+    // process tree, fcvm has it, close-on-exec, and the VMM has it. The pool lends the
+    // namespace again when the lease reads end-of-file, so a process with the queue and
+    // without the lease would still be on the TAP when the next VM runs.
+    let mut holders: Vec<(u32, Vec<bool>)> = tree_of(first_pid)
+        .into_iter()
+        .map(|pid| (pid, tun_fds_of(pid)))
+        .filter(|(_, fds)| !fds.is_empty())
+        .collect();
+    holders.sort();
+    let mut expected = vec![(first_pid, vec![true]), (vmm, tun_fds_of(vmm))];
+    expected.sort();
+    assert_eq!(
+        holders, expected,
+        "who has a TAP queue open in the clone's tree"
+    );
+    assert_eq!(tun_fds_of(vmm).len(), 1, "the VMM has one queue");
 
     // With the one namespace lent, a second clone builds its own.
     let (mut second_own, second_own_pid) = fixture.clone("own", &NO_PORTS, &[]).await;

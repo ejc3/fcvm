@@ -1402,6 +1402,7 @@ impl NetworkManager for RoutedNetwork {
 
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
+            tap_fd: None,
             guest_mac,
             guest_ip: Some(guest_ip),
             host_ip: Some(GUEST_GATEWAY.to_string()),

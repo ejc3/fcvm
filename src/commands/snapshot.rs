@@ -3790,14 +3790,22 @@ async fn cmd_snapshot_run_inner(
             // --dns 10.0.2.2 restores with pasta's DNS special case off, so its
             // guests keep reaching the host loopback service the golden was
             // recorded against.
-            // A Firecracker clone may run in a pooled namespace (`crate::netpool`). The
-            // Cloud Hypervisor restore has not been run in one.
+            // A clone may run in a pooled namespace (`crate::netpool`) when its VMM takes the
+            // namespace's TAP as an inherited queue: a pooled TAP is attached once, by its
+            // holder, and cannot be attached by name. That is Firecracker built from
+            // ejc3/firecracker with `tap-fd` in its version.
+            let vmm_takes_a_tap_queue = super::common::vmm_takes_a_tap_queue(
+                snapshot_config.metadata.hypervisor,
+                super::common::find_firecracker_with_version(&runtime_config)
+                    .ok()
+                    .map(|(_, version)| version),
+            );
             let net = PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
                 .with_loopback_ip(loopback_ip)
                 .with_dns_server(resolvers.mode_server.clone())
                 .with_restore_mode()
                 .with_pooling(clone_may_pool(
-                    snapshot_config.metadata.hypervisor,
+                    vmm_takes_a_tap_queue,
                     vm_state.confinement.is_some(),
                 ));
             Box::new(net)
@@ -6597,23 +6605,22 @@ async fn record_diff_parent(
         .map(|opt| opt.map(|_| ()))
 }
 
-/// Whether a clone may take its namespace from the pool (`crate::netpool`). A Cloud
-/// Hypervisor restore has not been run in one. A confined clone builds its own: a pooled
-/// TAP is unowned and shared across leases, and a confined VMM, without CAP_NET_ADMIN, can
-/// attach only to a TAP owned by its uid (Linux 7.3), which only an unpooled namespace may
-/// be given. A pooled confined clone needs the inherited TAP queue of #2051.
-fn clone_may_pool(hypervisor: crate::hypervisor::Backend, confined: bool) -> bool {
-    hypervisor == crate::hypervisor::Backend::Firecracker && !confined
+/// Whether a clone may take its namespace from the pool (`crate::netpool`): its VMM must
+/// take the slot's TAP queue (`vmm_takes_a_tap_queue`), and it must not be confined. A
+/// confined VMM on a pooled slot would use that inherited queue too, which needs no attach
+/// and so no CAP_NET_ADMIN, but no test runs a confined clone on a pool yet, so a confined
+/// clone builds its own namespace until one does.
+fn clone_may_pool(vmm_takes_a_tap_queue: bool, confined: bool) -> bool {
+    vmm_takes_a_tap_queue && !confined
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn a_confined_clone_builds_its_own_namespace() {
-        use crate::hypervisor::Backend;
-        assert!(super::clone_may_pool(Backend::Firecracker, false));
-        assert!(!super::clone_may_pool(Backend::Firecracker, true));
-        assert!(!super::clone_may_pool(Backend::CloudHypervisor, false));
+        assert!(super::clone_may_pool(true, false));
+        assert!(!super::clone_may_pool(true, true));
+        assert!(!super::clone_may_pool(false, false));
     }
 
     /// Only the File backend carries a write set: its sidecar is named in the branch that

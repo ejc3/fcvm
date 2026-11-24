@@ -31,9 +31,10 @@ mode = "off"
 # address, and took the packets the VM's namespace sent to the guest.
 # It also contains 3f57f0382f6a, the addr_seen fix for issue #661: overheard
 # bridge traffic must not retarget inbound port forwarding away from the guest.
-# `fcvm setup` builds it, plus the carried patch that guards udp_sock_errs()
-# against a NULL flow (scripts/passt-udp-sock-errs-null-flow.patch), into a
-# content-addressed binary. Rootless VMs require that binary while this section
+# `fcvm setup` builds it, plus the carried patches (scripts/passt-*.patch: a
+# guard of udp_sock_errs() against a NULL flow, and for the pastas of a
+# namespace pool `--no-neigh-notify` and a reset with a status reply on the
+# control socket), into a content-addressed binary. Rootless VMs require that binary while this section
 # is present.
 #
 # The source comes from the commit's snapshot archive, verified by
@@ -68,6 +69,8 @@ archives = [
 # architecture allowed, the same program for the API, vCPU and VMM threads. This build
 # installs that program once per process and its threads inherit it, where each thread
 # installed a copy (one kernel BPF program per thread to compile and to free).
+# A net device takes host_dev_fd, a TAP queue the process inherited, which is how a clone
+# in a pooled namespace gets its TAP (`tap-fd` in the same build metadata).
 # v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
 # build cannot restore format 12. A restore uses the binary the snapshot
 # recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
@@ -84,8 +87,8 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-write-set"
-commit = "0cc0408b9565f5c9fd9f55fd477bc208887a8d63"
+branch = "agent/uffd-minor-v1.17.0-write-set-tap-fd"
+commit = "6cb6e98817bed4ee8b6779d88bf25f674863ba8a"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).

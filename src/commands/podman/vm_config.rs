@@ -1712,6 +1712,7 @@ pub(crate) async fn configure_and_boot_vm(
     hv.add_network_interface(&crate::hypervisor::NetIfaceSpec {
         iface_id: "eth0".to_string(),
         host_dev_name: network_config.tap_device.clone(),
+        host_dev_fd: network_config.tap_fd,
         guest_mac: Some(network_config.guest_mac.clone()),
     })
     .await?;

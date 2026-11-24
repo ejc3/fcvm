@@ -17,7 +17,11 @@ import {
   restoreText,
   screenYScale,
   tapPoint,
+  askTap,
+  RECONNECTING_NOTE,
+  tapAsked,
   TAP_BROWSER_NOTE,
+  TAP_TAKE_OVER_NOTE,
   zoomProgressAt,
   type PhoneLayout,
   type PhonesInput,
@@ -346,6 +350,21 @@ describe("the page's view", () => {
     expect(phonesView(input(initialState())).empty).toBe("Connecting to the fleet.");
   });
 
+  it("does not say the fleet runs no phones before a GPU host is up", () => {
+    // The coordinator lists phones only once the host that runs them has connected: a viewer
+    // who woke the fleet read "This fleet runs no phones." for about a minute (2026-11-24).
+    const base = stateWith(null);
+    const st = base.accepted!;
+    const withFleet = (fleet: typeof st.fleet) =>
+      phonesView(input(reduce(base, { type: "message", text: snapshotText(2, { ...st, fleet }), at: EPOCH }))).empty;
+    const power = (state: "asleep" | "waking" | "awake") => ({ ...st.fleet.power, state, asleep_since: state === "asleep" ? EPOCH - 1000 : null, woke_at: state === "waking" ? EPOCH - 1000 : null });
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("asleep") })).toBe("The phones start when the fleet wakes.");
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("waking") })).toBe("The fleet is waking. The phones start when a GPU host is up.");
+    // awake by its EC2 half, or a GPU host refused for capacity: still no host
+    expect(withFleet({ ...st.fleet, hosts: [], power: power("awake") })).toBe("No GPU host is up yet. The phones start when one is.");
+    expect(withFleet({ ...st.fleet, power: power("awake") })).toBe("This fleet runs no phones.");
+  });
+
   it("follows the shared zoom in the button, not a local choice", () => {
     expect(phonesView(input(stateWith(phonesOf(2)))).zoom).toEqual({ label: "Zoom out", out: false, disabled: false });
     expect(phonesView(input(stateWith(phonesOf(2, { zoomed_out: true })))).zoom).toEqual({ label: "Zoom in", out: true, disabled: false });
@@ -354,7 +373,9 @@ describe("the page's view", () => {
   it("gives each phone a card with its label", () => {
     const v = phonesView(input(stateWith(phonesOf(2)), { progress: 1 }));
     expect(v.cards.map((c) => c.label)).toEqual(["Phone 1 · restored in 22.3 s", "Phone 2 · restored in 22.3 s"]);
-    expect(v.cards[0]!.ariaLabel).toBe("Phone 1, streaming. Open its details.");
+    // in the overview a phone is one button that opens it, whatever part of its picture is clicked
+    expect(v.cards[0]!.ariaLabel).toBe("Open Phone 1: streaming.");
+    expect(v.cards.map((c) => c.title)).toEqual(["Open Phone 1", "Open Phone 2"]);
   });
 
   it("opens no panel for a phone that is not there", () => {
@@ -583,7 +604,7 @@ describe("taps on the held phone's screen", () => {
     const s = held();
     const v = viewOf(s, { takeover: "video" });
     const box = v.layout!.phones.find((p) => p.id === "phone:1")!.box!;
-    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [{ name: "video", box, yScale: 1 }], note: null });
+    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [{ name: "video", box, yScale: 1 }], note: null, locked: null });
     const both = viewOf(s, { takeover: "both", mirrorPicture: { id: "phone:1", w: 720, h: 1280, banded: true } });
     expect(both.taps!.targets.map((t) => t.name)).toEqual(["video", "mirror"]);
     expect(both.taps!.targets[1]!.box).toEqual(both.mirror!.box);
@@ -601,7 +622,7 @@ describe("taps on the held phone's screen", () => {
 
   it("takes no tap with the browser in front, and says so under the screen", () => {
     const v = viewOf(held({ front: "browser" }));
-    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [], note: TAP_BROWSER_NOTE });
+    expect(v.taps).toEqual({ tileId: "phone:1", session: "s", targets: [], note: TAP_BROWSER_NOTE, locked: null });
     expect(TAP_BROWSER_NOTE).toBe("Taps reach the phone only in Robot Park.");
   });
 
@@ -615,8 +636,92 @@ describe("taps on the held phone's screen", () => {
   it("takes no tap on a phone that is restoring, another viewer's, or not opened", () => {
     expect(viewOf(held({ phase: "relaunching" })).taps!.targets).toEqual([]);
     expect(viewOf(held({ phase: "relaunching" })).taps!.note).toBeNull();
-    expect(viewOf(held({ borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-9" } })).taps).toBeNull();
+    expect(viewOf(held({ borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-9" } })).taps!.targets).toEqual([]);
     expect(phonesView(input(held(), { openId: null })).taps).toBeNull();
+  });
+
+  describe("on an opened phone the viewer does not hold", () => {
+    const free = (over: Partial<PhoneTile> = {}, phones: Partial<Phones> = {}) => {
+      const ph = phonesOf(2, phones);
+      ph.tiles[0] = { ...ph.tiles[0]!, actions: WITH_TAP, ...over };
+      return stateWith(ph);
+    };
+    const boxOf = (v: ReturnType<typeof phonesView>) => v.layout!.phones.find((p) => p.id === "phone:1")!.box!;
+
+    it("says under the screen that taps need a take-over, and sends none", () => {
+      const v = viewOf(free());
+      expect(TAP_TAKE_OVER_NOTE).toBe("Take over this phone to tap its screen.");
+      expect(v.taps).toEqual({ tileId: "phone:1", session: null, targets: [], note: TAP_TAKE_OVER_NOTE, locked: { box: boxOf(v), takeable: true } });
+    });
+
+    it("says why it cannot be taken over now, in the panel's own words", () => {
+      // another viewer holds it
+      const lent = viewOf(free({ borrowed: { until: EPOCH + 60_000, viewer: "v-9" } }));
+      if (lent.panel!.borrow.kind !== "lent") throw new Error(lent.panel!.borrow.kind);
+      expect(lent.taps).toMatchObject({ session: null, targets: [], note: lent.panel!.borrow.text, locked: { takeable: false } });
+      expect(lent.taps!.note).toMatch(/^Borrowed by another viewer until /);
+      // it is still restoring
+      const restoring = viewOf(free({ phase: "relaunching" }));
+      expect(restoring.taps).toMatchObject({ note: "It can be borrowed once it has restored.", locked: { takeable: false } });
+      expect(restoring.panel!.borrow).toMatchObject({ kind: "free", note: "It can be borrowed once it has restored." });
+      // every phone that may be lent is lent
+      const full = viewOf(free({}, { borrow: { cap: 2, lent: 2, next_return_at: null } }));
+      expect(full.taps).toMatchObject({ note: "2 of 2 lent now.", locked: { takeable: false } });
+      expect(full.panel!.borrow).toMatchObject({ kind: "free", note: expect.stringMatching(/ 2 of 2 lent now\.$/) });
+      // the viewer holds another phone
+      const ph = phonesOf(2);
+      ph.tiles[0] = { ...ph.tiles[0]!, actions: WITH_TAP };
+      ph.tiles[1] = { ...ph.tiles[1]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
+      expect(viewOf(stateWith(ph)).taps).toMatchObject({ note: "You are using Phone 2. Give it back to take another.", locked: { takeable: false } });
+    });
+
+    it("says the page is reconnecting while the coordinator's connection is down, as the banner does", () => {
+      const v = viewOf(reduce(free(), { type: "socket", status: "closed", at: EPOCH }));
+      expect(v.panel!.borrow).toMatchObject({ kind: "free", button: { disabled: true } });
+      expect(RECONNECTING_NOTE).toBe("Reconnecting to the coordinator.");
+      expect(v.banner).toBe(`${RECONNECTING_NOTE} The picture still streams straight from the phones; the controls are paused until it is back.`);
+      expect(v.taps).toMatchObject({ session: null, targets: [], note: RECONNECTING_NOTE, locked: { takeable: false } });
+    });
+
+    it("promises no taps with the browser in front: it says what a holder is told", () => {
+      const v = viewOf(free({ front: "browser" }));
+      expect(v.taps).toMatchObject({ session: null, targets: [], note: TAP_BROWSER_NOTE, locked: { takeable: true } });
+      // a reason the phone cannot be taken over comes first
+      const lent = viewOf(free({ front: "browser", borrowed: { until: EPOCH + 60_000, viewer: "v-9" } }));
+      expect(lent.taps!.note).toMatch(/^Borrowed by another viewer until /);
+    });
+
+    it("marks the line a click pointed at only while that line and its button stand", () => {
+      const open = viewOf(free()).taps;
+      const ask = askTap(null, open)!;
+      expect(ask).toEqual({ tileId: "phone:1", note: TAP_TAKE_OVER_NOTE, takeable: true, n: 1 });
+      expect(tapAsked(ask, open)).toBe(1);
+      // each further click on the same line counts, so the page restarts its mark
+      expect(askTap(ask, open)!.n).toBe(2);
+      expect(tapAsked(null, open)).toBe(0);
+      // the line says something else, or the phone stopped being takeable: the mark is over
+      const over: [string, ClientState][] = [
+        ["another viewer took it", free({ borrowed: { until: EPOCH + 60_000, viewer: "v-9" } })],
+        ["it restarted", free({ phase: "relaunching" })],
+        ["the last phone was lent", free({}, { borrow: { cap: 2, lent: 2, next_return_at: null } })],
+        ["the connection dropped", reduce(free(), { type: "socket", status: "closed", at: EPOCH })],
+        ["the browser came to the front", free({ front: "browser" })],
+        ["the viewer took it over", free({ borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } })],
+      ];
+      for (const [why, s] of over) expect(tapAsked(ask, viewOf(s).taps), why).toBe(0);
+      expect(tapAsked(ask, phonesView(input(free(), { openId: null })).taps), "closed").toBe(0);
+      expect(tapAsked({ ...ask, tileId: "phone:2" }, open), "another phone").toBe(0);
+      // a click after the change marks the new line, counted from one
+      const lent = viewOf(over[0]![1]).taps;
+      expect(askTap(ask, lent)).toMatchObject({ takeable: false, n: 1 });
+      // a held phone's screen is not locked: nothing to mark
+      expect(askTap(ask, viewOf(over[5]![1]).taps)).toBeNull();
+    });
+
+    it("says nothing about taps on a host that does not list them, or with no phone opened", () => {
+      expect(viewOf(free({ actions: ACTIONS })).taps).toBeNull();
+      expect(phonesView(input(free(), { openId: null })).taps).toBeNull();
+    });
   });
 
   it("tells a viewer about to borrow that taps reach Robot Park", () => {

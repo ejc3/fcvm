@@ -161,6 +161,8 @@ pub struct PmemSpec {
 pub struct NetIfaceSpec {
     pub iface_id: String,
     pub host_dev_name: String,
+    /// A queue of `host_dev_name` the VMM inherited ([`crate::network::NetworkConfig::tap_fd`]).
+    pub host_dev_fd: Option<std::os::fd::RawFd>,
     pub guest_mac: Option<String>,
 }
 

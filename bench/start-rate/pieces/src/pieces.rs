@@ -407,6 +407,12 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
                 .await?
                 .context("the pool had no free namespace")?;
             stages.push(("generation", lease.grant.generation as f64));
+            // What the clone's VMM then does with the namespace's TAP: three ioctls on
+            // the queue it inherits, where a VMM in a namespace of its own attaches by
+            // name (the tap-attach piece).
+            let t = Instant::now();
+            crate::tap::use_inherited(lease.tap_fd())?;
+            stages.push(("vmm-tap", ms(t)));
             held.lease = Some(lease);
         }
         Piece::FcSpawn => {
@@ -508,6 +514,7 @@ async fn restore(args: &PieceArgs, held: &mut Held, stages: &mut Stages) -> Resu
             network_overrides: Some(vec![NetworkOverride {
                 iface_id: "eth0".into(),
                 host_dev_name: tap_device(&held.vm_id),
+                host_dev_fd: None,
             }]),
             vsock_override: Some(VsockOverride {
                 uds_path: dir.join("vsock.sock").display().to_string(),
