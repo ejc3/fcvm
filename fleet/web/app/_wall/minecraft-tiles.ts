@@ -5,6 +5,8 @@
 
 import {
   applyDelta,
+  botCount,
+  sameColumns,
   countDiff,
   RECENT_GLOW_MS,
   sameGrid,
@@ -214,22 +216,28 @@ class TileSocket {
         this.owner.changed();
         return;
       case "map": {
+        const old = this.world;
         this.world = worldFromMap(m);
+        // Column indices remembered from another grid would name other columns in this one.
+        if (!sameColumns(old, this.world)) {
+          this.recent.clear();
+          this.lastChange = null;
+        }
         this.dirty = true;
         this.rev++;
         this.owner.changed();
         return;
       }
-      case "delta":
-        if (applyDelta(this.world, m) > 0) {
+      case "delta": {
+        // every column whose top block or ground changed, once each
+        const changed = new Set<number>();
+        if (applyDelta(this.world, m, changed) > 0) {
           this.dirty = true;
           this.rev++;
           // Only columns of this grid are remembered, and only for as long as they glow: a tile
           // nobody draws (the flat map, off the screen) must not collect them for ever.
-          const inGrid = this.world!.region.w * this.world!.region.h;
           for (const [i, seen] of this.recent) if (at - seen > RECENT_GLOW_MS) this.recent.delete(i);
-          for (const [i] of m.cells) {
-            if (i >= inGrid) continue;
+          for (const i of changed) {
             this.recent.set(i, at);
             this.lastChange = { i, at };
           }
@@ -240,15 +248,17 @@ class TileSocket {
           this.owner.events?.delta(this.id, at, columns);
         }
         return;
+      }
       case "status": {
         this.players = m.players;
         this.dayTime = m.day_time;
         this.dirty = true;
         this.rev++;
         const tps = m.tps === null ? null : Math.round(m.tps * 10) / 10;
-        if (tps !== this.tps || m.players.length !== this.bots) {
+        const bots = botCount(m.players);
+        if (tps !== this.tps || bots !== this.bots) {
           this.tps = tps;
-          this.bots = m.players.length;
+          this.bots = bots;
           this.owner.changed();
         }
         this.owner.events?.status(this.id, m.players, at);

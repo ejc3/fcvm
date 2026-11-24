@@ -343,14 +343,17 @@ export function worldFromMap(m: Extract<ViewMsg, { type: "map" }>): McWorld {
  * world that holds one). A delta before any map, or older than what the world holds, changes
  * nothing; an index outside the grid is skipped.
  */
-export function applyDelta(world: McWorld | null, d: Extract<ViewMsg, { type: "delta" }>): number {
+export function applyDelta(world: McWorld | null, d: Extract<ViewMsg, { type: "delta" }>, columns?: Set<number>): number {
   if (world === null || d.seq <= world.seq) return 0;
   world.seq = d.seq;
   const len = world.region.w * world.region.h;
   let changed = 0;
   for (const [i, m, h] of d.cells) {
     if (i >= len) continue;
-    if (world.cells[i * 2] !== (m & 255) || world.cells[i * 2 + 1] !== (h & 255)) changed++;
+    if (world.cells[i * 2] !== (m & 255) || world.cells[i * 2 + 1] !== (h & 255)) {
+      changed++;
+      columns?.add(i);
+    }
     world.cells[i * 2] = m & 255;
     world.cells[i * 2 + 1] = h & 255;
   }
@@ -358,12 +361,25 @@ export function applyDelta(world: McWorld | null, d: Extract<ViewMsg, { type: "d
   if (g !== null) {
     for (const [i, m, h] of d.ground ?? []) {
       if (i >= len) continue;
-      if (g[i * 2] !== (m & 255) || g[i * 2 + 1] !== (h & 255)) changed++;
+      if (g[i * 2] !== (m & 255) || g[i * 2 + 1] !== (h & 255)) {
+        changed++;
+        columns?.add(i);
+      }
       g[i * 2] = m & 255;
       g[i * 2 + 1] = h & 255;
     }
   }
   return changed;
+}
+
+/** Whether what a tile remembers by column index (the columns that just changed) still means the same columns after `next` replaces `old`: only on the same grid. */
+export function sameColumns(old: McWorld | null, next: McWorld): boolean {
+  return old !== null && sameGrid(old, null, next, null);
+}
+
+/** The bots among a status's players: a person who joined is a player and not one of the tile's bots. */
+export function botCount(players: readonly { bot: boolean }[]): number {
+  return players.filter((p) => p.bot).length;
 }
 
 /**
@@ -884,7 +900,7 @@ export const MC_LOST_NOTE = "3D view lost; showing the flat map.";
 /** The page draws fewer columns, or frames, to keep up (FrameBudget). */
 export const MC_REDUCED_NOTE = "Reduced detail";
 /** What is drawn from the servers' data and what the page fills in, said once. */
-export const MC_DRAWN_NOTE = "Drawn from each column's top block; trunks, the forest floor and lake beds are filled in.";
+export const MC_DRAWN_NOTE = "Drawn from each column's top block; trunks are filled in, and so are the forest floor and lake beds of a server that does not send them.";
 
 function diffText(k: number): string {
   return k === 0 ? "same so far" : `${k} column${k === 1 ? " differs" : "s differ"}`;

@@ -522,7 +522,7 @@ export function Minecraft({ coordUrl, directUrl }: { coordUrl: string; directUrl
           st.frame(localNow(), {
             stage: area,
             dpr,
-            tiles: v.cards.map((c, index) => ({ id: c.id, slot: c.slot, index, box: c.box, forkOf: c.forkOf, flight: c.flight, timer: c.timer, dark: c.dark })),
+            tiles: v.cards.map((c, index) => ({ id: c.id, slot: c.slot, index, box: c.box, forkOf: c.forkOf, flight: c.flight, timer: c.timer, dark: c.dark, mine: c.mine })),
             reducedMotion,
             labels: (tid) => canvases.current.get(tid),
             flights: flightsRef.current,

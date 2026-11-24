@@ -33,6 +33,8 @@ const M = {
   water: mat("water"), grass: mat("grass"), sand: mat("sand"), stone: mat("stone"), snow: mat("snow"),
   leaves: mat("leaves"), flower: mat("flower"), dirt: mat("dirt"), gravel: mat("gravel"), plant: mat("plant"),
 };
+/** What stands over a column's ground without being it (the tile's `palette::is_cover`). */
+const COVER = new Set([M.leaves, M.water, M.plant, M.flower]);
 
 export interface MockMinecraftOptions {
   count: number;
@@ -110,6 +112,8 @@ interface Server {
   borrow: Borrow | null;
   timers: NodeJS.Timeout[];
   world: Uint8Array;
+  /** Each column's highest block that is not leaves, a plant or water: what `map.ground` carries. It moves with the world. */
+  ground: Uint8Array;
   /** When the current launch's world came up (the mock's clock): its day runs on from the snapshot's. */
   dayFrom: { at: number; tick: number };
   bots: Bot[];
@@ -279,6 +283,7 @@ export class MockMinecraft {
         borrow: null,
         timers: [],
         world: GOLD.slice(),
+        ground: GOLD_GROUND.slice(),
         dayFrom: { at: this.host.now(), tick: GOLD_DAY_TIME },
         bots: [],
         rng: mulberry32(n),
@@ -583,6 +588,7 @@ export class MockMinecraft {
         if (s.generation !== gen) return;
         const done = h.now();
         s.world = GOLD.slice();
+        s.ground = GOLD_GROUND.slice();
         s.dayFrom = { at: this.host.now(), tick: GOLD_DAY_TIME };
         s.changed.clear();
         s.seq += 1;
@@ -616,11 +622,11 @@ export class MockMinecraft {
     dst.lastRelaunch = { clicked_at: clicked, by: `fork:${src.slot}`, first_frame_at: null, phases: {} };
     this.dropSockets(dst);
     h.markDirty();
-    let copy: { world: Uint8Array; bots: Bot[]; tick: number } | null = null;
+    let copy: { world: Uint8Array; ground: Uint8Array; bots: Bot[]; tick: number } | null = null;
     dst.timers.push(
       h.later(snapMs, () => {
         if (dst.generation !== gen) return;
-        copy = { world: src.world.slice(), bots: src.bots.map((b) => ({ ...b, target: null, tower: null })), tick: this.dayTime(src) };
+        copy = { world: src.world.slice(), ground: src.ground.slice(), bots: src.bots.map((b) => ({ ...b, target: null, tower: null })), tick: this.dayTime(src) };
       }),
     );
     dst.timers.push(
@@ -628,6 +634,7 @@ export class MockMinecraft {
         if (dst.generation !== gen || copy === null) return;
         const done = h.now();
         dst.world = copy.world;
+        dst.ground = copy.ground;
         dst.dayFrom = { at: this.host.now(), tick: copy.tick };
         dst.changed.clear();
         dst.seq += 1;
@@ -657,6 +664,12 @@ export class MockMinecraft {
   private setColumn(s: Server, i: number, m: number, y: number): void {
     s.world[i * 2] = m;
     s.world[i * 2 + 1] = Math.max(0, Math.min(255, y + 64));
+    // A top block that is not leaves, a plant or water is the column's ground too. (The mock's
+    // bots build on and dig what they placed; under a canopy or a lake the ground stays.)
+    if (!COVER.has(m)) {
+      s.ground[i * 2] = s.world[i * 2]!;
+      s.ground[i * 2 + 1] = s.world[i * 2 + 1]!;
+    }
     s.changed.add(i);
   }
 
@@ -788,7 +801,7 @@ export class MockMinecraft {
   private standY(s: Server, x: number, z: number): number {
     const c = this.column(s, x, z);
     if (c === null) return 65;
-    if (c.m === M.leaves || c.m === M.water || c.m === M.plant || c.m === M.flower) return GOLD_GROUND[c.i * 2 + 1]! - 64 + 1;
+    if (COVER.has(c.m)) return s.ground[c.i * 2 + 1]! - 64 + 1;
     return c.y + 1;
   }
 
@@ -797,8 +810,10 @@ export class MockMinecraft {
       if (s.changed.size === 0) continue;
       s.seq += 1;
       const cells = [...s.changed].map((i) => [i, s.world[i * 2]!, s.world[i * 2 + 1]!]);
+      // a tile that sends its ground sends the ground of the columns that changed
+      const ground = this.sendsExtras(s) ? { ground: [...s.changed].map((i) => [i, s.ground[i * 2]!, s.ground[i * 2 + 1]!]) } : {};
       s.changed.clear();
-      if (s.phase === "running") this.broadcast(s, JSON.stringify({ type: "delta", seq: s.seq, cells }));
+      if (s.phase === "running") this.broadcast(s, JSON.stringify({ type: "delta", seq: s.seq, cells, ...ground }));
     }
   }
 
@@ -807,7 +822,7 @@ export class MockMinecraft {
   }
 
   private mapOf(s: Server): string {
-    return JSON.stringify({ type: "map", seq: s.seq, region: MC_REGION, cells: Buffer.from(s.world).toString("base64"), ...(this.sendsExtras(s) ? { ground: Buffer.from(GOLD_GROUND).toString("base64") } : {}) });
+    return JSON.stringify({ type: "map", seq: s.seq, region: MC_REGION, cells: Buffer.from(s.world).toString("base64"), ...(this.sendsExtras(s) ? { ground: Buffer.from(s.ground).toString("base64") } : {}) });
   }
 
   /** The direct token the mock coordinator makes (`v1.<expiry s>.<viewer>.mock`): its viewer, or null when it is not one or has expired. */
@@ -915,9 +930,9 @@ export class MockMinecraft {
   }
 
   /** Tests: the world a server's view socket would send now, and its bots. */
-  peek(slot: string): { world: Uint8Array; bots: { name: string; x: number; z: number; yaw: number }[] } | null {
+  peek(slot: string): { world: Uint8Array; ground: Uint8Array; bots: { name: string; x: number; z: number; yaw: number }[] } | null {
     const s = this.servers.find((x) => x.slot === slot);
-    return s ? { world: s.world.slice(), bots: s.bots.map((b) => ({ name: b.name, x: b.x, z: b.z, yaw: b.yaw })) } : null;
+    return s ? { world: s.world.slice(), ground: s.ground.slice(), bots: s.bots.map((b) => ({ name: b.name, x: b.x, z: b.z, yaw: b.yaw })) } : null;
   }
 
   async close(): Promise<void> {

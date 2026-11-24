@@ -3695,9 +3695,9 @@ rules (`SCENE_TOKEN_FILE` is not used; `TLS_CERT_FILE` and its `scene_token`, re
     (0 sunrise, 6000 noon, 12000 sunset, 18000 midnight), for the world's sky; without it the
     page lights every world at mid-morning.
 
-  `ground` and `day_time` are additions an older page ignores and a newer page does without. No
-  tile sends them yet; the page and its mock have them (the mock sends both from every other
-  server).
+  `ground` and `day_time` are optional: without them the page guesses the forest floor and the
+  lake's bed and lights every world at mid-morning. No tile sends them yet; the page's mock
+  sends both from every other server.
   - `{"type": "drive_ack", "seq": 12, "ok": true, "at": <unix ms>}` or `{"ok": false,
     "reason": "..."}`, for each drive message.
 

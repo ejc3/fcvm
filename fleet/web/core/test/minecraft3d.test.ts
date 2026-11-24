@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { MATERIALS, type McPlayer, type McWorld } from "../minecraft.ts";
 import {
@@ -25,6 +26,9 @@ import {
   sceneOf,
   scenePlayer,
   shotOf,
+  shotCue,
+  cutOf,
+  RECENT_CUT_MS,
   SHOT_MS,
   showsAbove,
   skyOf,
@@ -288,10 +292,14 @@ describe("the camera", () => {
     expect(at(0, true, 2)).not.toBe(at(0, true, 3));
   });
 
-  it("follows a driven bot from behind, whatever the time and even standing still", () => {
+  it("follows a driven bot from behind, whatever the time, and standing still only for the viewer who drives it", () => {
     const driven = [players[0]!, { ...players[1]!, driven: true }];
-    for (const still of [false, true]) {
-      const shot = shotOf({ scene: s, players: driven, seed: 1, timeMs: 5 * SHOT_MS + 10, still });
+    // with reduced motion another viewer's driving must not move this page's tile: the still wide view
+    const watching = shotOf({ scene: s, players: driven, seed: 1, timeMs: 5 * SHOT_MS + 10, still: true });
+    expect([watching.kind, watching.follows]).toEqual(["wide", null]);
+    expect(watching).toEqual(shotOf({ scene: s, players, seed: 1, timeMs: 99, still: true }));
+    for (const [still, mine] of [[false, false], [false, true], [true, true]] as const) {
+      const shot = shotOf({ scene: s, players: driven, seed: 1, timeMs: 5 * SHOT_MS + 10, still, mine });
       expect(shot.follows).toBe("fcvm_bot2");
       const fwd = [-Math.sin(2), Math.cos(2)];
       const back = [shot.cam.eye[0] - 44.5, shot.cam.eye[2] - 20.5];
@@ -311,13 +319,63 @@ describe("the camera", () => {
 
   it("cuts to a column that just changed, to the bot beside it when one shows", () => {
     const i = 21 * 64 + 45;
-    const shot = shotOf({ scene: s, players, seed: 0, timeMs: 30_000, still: false, recent: { i, at: 29_000 } });
+    const shot = shotOf({ scene: s, players, seed: 0, timeMs: 30_000, still: false, cue: i });
     expect(shot.follows).toBe("fcvm_bot2");
-    const far = shotOf({ scene: s, players, seed: 0, timeMs: 30_000, still: false, recent: { i: 60 * 64 + 60, at: 29_000 } });
+    const far = shotOf({ scene: s, players, seed: 0, timeMs: 30_000, still: false, cue: 60 * 64 + 60 });
     expect(far.follows).toBeNull();
     expect(far.cam.subject[0]).toBe(60.5);
-    // an old change draws nothing
-    expect(shotOf({ scene: s, players, seed: 0, timeMs: 60_000, still: false, recent: { i, at: 29_000 } })).toEqual(shotOf({ scene: s, players, seed: 0, timeMs: 60_000, still: false }));
+    // no cue, or one outside the grid: the tile's own shot
+    const own = shotOf({ scene: s, players, seed: 0, timeMs: 30_000, still: false });
+    expect(shotOf({ scene: s, players, seed: 0, timeMs: 30_000, still: false, cue: null })).toEqual(own);
+    expect(shotOf({ scene: s, players, seed: 0, timeMs: 30_000, still: false, cue: 64 * 64 + 7 })).toEqual(own);
+  });
+
+  it("chooses the changed column a cut features when the cut begins, and never for two cuts in a row", () => {
+    const seed = 0;
+    // a column changed 1 s before cut 3 began: cut 3 features it
+    const c3 = shotCue(null, { seed, timeMs: 3 * SHOT_MS + 5, last: { i: 77, at: 3 * SHOT_MS - 1000 } });
+    expect(c3).toEqual({ cut: 3, site: 77 });
+    // bots go on building: other columns change during the cut, and its subject stays
+    const mid = shotCue(c3, { seed, timeMs: 3 * SHOT_MS + 6000, last: { i: 900, at: 3 * SHOT_MS + 5990 } });
+    expect(mid).toBe(c3);
+    // the next cut is the tile's own shot again, however fresh the last change
+    const c4 = shotCue(mid, { seed, timeMs: 4 * SHOT_MS + 5, last: { i: 900, at: 4 * SHOT_MS - 10 } });
+    expect(c4).toEqual({ cut: 4, site: null });
+    // and the one after may feature a change again
+    expect(shotCue(c4, { seed, timeMs: 5 * SHOT_MS + 5, last: { i: 901, at: 5 * SHOT_MS - 10 } })).toEqual({ cut: 5, site: 901 });
+    // a change older than RECENT_CUT_MS when the cut begins, or none, is no cue
+    expect(shotCue(null, { seed, timeMs: 9 * SHOT_MS, last: { i: 5, at: 9 * SHOT_MS - RECENT_CUT_MS } }).site).toBeNull();
+    expect(shotCue(null, { seed, timeMs: 9 * SHOT_MS, last: null }).site).toBeNull();
+    // a tile that was not drawn for a while starts over: the cut before its last cue is long past
+    expect(shotCue(c3, { seed, timeMs: 8 * SHOT_MS + 5, last: { i: 12, at: 8 * SHOT_MS - 10 } })).toEqual({ cut: 8, site: 12 });
+    // the cut is shotOf's own: tiles with different seeds cut at different times
+    expect([cutOf(3 * SHOT_MS - 1, 0), cutOf(3 * SHOT_MS, 0), cutOf(3 * SHOT_MS - 3700, 1)]).toEqual([2, 3, 3]);
+  });
+
+  it("the stage ends flights before it waits for the GPU, and draws a still view again while a rebuild is owed", () => {
+    // Pinned in the stage's source: both need a GPU that is busy at the right moment.
+    const stage = readFileSync(new URL("../../app/_wall/minecraft-stage.ts", import.meta.url), "utf8");
+    const frame = stage.slice(stage.indexOf("  frame(now: number, f: StageFrame): boolean {"));
+    // a fork's frame must leave a tile that left the stage even while the last drawn frame is not done
+    expect(frame.indexOf("this.trackFlights(now, f);")).toBeGreaterThan(0);
+    expect(frame.indexOf("this.trackFlights(now, f);")).toBeLessThan(frame.indexOf("if (this.gl.busy(now)) return false;"));
+    // a still view whose scene put a rebuild off (REBUILD_MIN_MS) is not yet the picture of its world
+    expect(frame).toContain("if (sig === this.lastSig && this.flights.size === 0 && !this.owed) return false;");
+    expect(stage).toMatch(/if \(same\) return cur\.scene;\s+if \(now - cur\.builtAt < REBUILD_MIN_MS\) \{\s+this\.owed = true;\s+return cur\.scene;/);
+  });
+
+  it("a tile's socket remembers changed columns by what changed, forgets them with their grid, and counts bots only", () => {
+    // The rules are core's (applyDelta's columns, sameColumns, botCount: core/test/minecraft.test.ts);
+    // pinned here is that the socket uses them.
+    const tiles = readFileSync(new URL("../../app/_wall/minecraft-tiles.ts", import.meta.url), "utf8");
+    // every column whose top block or ground changed, not the delta's `cells` alone
+    expect(tiles).toContain("applyDelta(this.world, m, changed)");
+    expect(tiles).toContain("for (const i of changed) {");
+    // a map of another grid: the remembered indices would name other columns
+    expect(tiles).toMatch(/if \(!sameColumns\(old, this\.world\)\) \{\s+this\.recent\.clear\(\);\s+this\.lastChange = null;/);
+    // a person who joined is not one of the tile's bots
+    expect(tiles).toContain("const bots = botCount(m.players);");
+    expect(tiles).not.toContain("m.players.length");
   });
 
   it("puts a name over its bot's head, and none behind a hill, under the lake or outside the frame", () => {
@@ -408,6 +466,32 @@ describe("drawing within a device's means", () => {
     // nor do short frames before them (a page that starts with nothing to draw) hide them
     for (const cost of [FRAME_BUDGET_MS * 5, FRAME_BUDGET_MS * 5]) e.sample(cost, 2);
     expect(e.level).toBe(1);
+  });
+
+  it("steps down on three frames far over the budget even after a run of short ones", () => {
+    // ten quick frames, then three that each took five times the budget: the quick ones
+    // outvote them in the window's median, and the window is then thrown away
+    const b = new FrameBudget();
+    for (let k = 0; k < 10; k++) b.sample(5, k);
+    for (let k = 0; k < 3; k++) b.sample(FRAME_BUDGET_MS * 5, 10 + k);
+    expect(b.level).toBe(1);
+  });
+
+  it("counts the 20 s before a step up from the last window that did not keep up", () => {
+    const b = new FrameBudget();
+    run(b, 90, 1000);
+    expect(b.level).toBe(1);
+    // 19 s of keeping up, then a window that misses the display without breaking the budget
+    for (let t = 2000; t <= 20_000; t += 1000) run(b, 5, t);
+    run(b, 30, 20_500);
+    expect(b.level).toBe(1);
+    // one quick window at 21 s is not 20 s of keeping up
+    run(b, 5, 21_500);
+    expect(b.level).toBe(1);
+    for (let t = 22_000; t <= 41_000; t += 1000) run(b, 5, t);
+    expect(b.level).toBe(1);
+    run(b, 5, 41_600);
+    expect(b.level).toBe(0);
   });
 
   /** Twenty frames of `cost` ending at `at` ms. */
