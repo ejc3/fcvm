@@ -124,6 +124,11 @@ pub struct Confinement {
     /// The kernel's Landlock ABI when the VM started.
     pub landlock_abi: u32,
     pub layers: Vec<Layer>,
+    /// The RLIMIT_CORE the process layer installs, decided at the preflight from the
+    /// inherited hard limit and the core_pattern ([`core_limit_for`]). The spawn installs
+    /// exactly this, and fails if it cannot, rather than read the limit again.
+    #[serde(default)]
+    pub core_limit: u64,
 }
 
 /// What a missing piece belongs to.
@@ -430,6 +435,7 @@ pub fn decide(request: &Request<'_>, host: &Host) -> anyhow::Result<Option<Confi
     if missing.is_empty() {
         return Ok(Some(Confinement {
             landlock_abi: host.landlock_abi.unwrap_or_default(),
+            core_limit: core_limit_for(host.core_hard_limit),
             layers: vec![Layer::Process],
         }));
     }
@@ -683,6 +689,7 @@ mod tests {
             Some(Confinement {
                 landlock_abi: 11,
                 layers: vec![Layer::Process],
+                core_limit: 1,
             })
         );
     }
@@ -875,6 +882,49 @@ mod tests {
         assert_eq!(core_limit_for(0), 0);
         assert_eq!(core_limit_for(1), 1);
         assert_eq!(core_limit_for(u64::MAX), 1);
+    }
+
+    /// The spawn installs the core limit the preflight validated and fails if it cannot. If
+    /// fcvm's hard limit drops to 0 after the preflight (another process's prlimit), reading
+    /// it again would hand the VMM 0, which a pipe core_pattern ignores.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_core_limit_that_can_no_longer_be_installed_fails_the_spawn() {
+        let (mut holder, holder_pid) = crate::commands::common::spawn_namespace_holder()
+            .await
+            .expect("spawning the namespace holder");
+        // Decided while the hard limit allowed 1, as under a pipe core_pattern.
+        let decision = Decision::for_test(Some(Confinement {
+            landlock_abi: LANDLOCK_ABI_FLOOR,
+            layers: vec![Layer::Process],
+            core_limit: 1,
+        }));
+        // Then this process's hard limit drops to 0, which it cannot raise again. (Each
+        // test runs in a process of its own.)
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: setrlimit reads the struct, which outlives the call.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) }, 0);
+        let mut cmd = tokio::process::Command::new("true");
+        crate::utils::install_namespace_pre_exec(
+            &mut cmd,
+            &crate::utils::NamespaceParams {
+                user_namespace_path: Some(format!("/proc/{holder_pid}/ns/user").into()),
+                net_namespace_path: Some(format!("/proc/{holder_pid}/ns/net").into()),
+                ..crate::utils::NamespaceParams::new("core-limit-dropped", decision)
+            },
+        )
+        .unwrap();
+        let spawned = cmd.spawn();
+        let _ = holder.start_kill();
+        let _ = holder.wait().await;
+        crate::companion::forget(holder_pid);
+        crate::network::netns_agent::forget(holder_pid);
+        let error = spawned
+            .map(|_| ())
+            .expect_err("the VMM started with a core limit below the one the preflight checked");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error}");
     }
 
     /// The TUNSETIFF calls pass a mutable ifreq: the kernel writes it back.
@@ -1327,6 +1377,7 @@ mod tests {
                     Decision::for_test(confine.then(|| Confinement {
                         landlock_abi: LANDLOCK_ABI_FLOOR,
                         layers: vec![Layer::Process],
+                        core_limit: core_limit_for(core_hard_limit()),
                     })),
                 )
             },

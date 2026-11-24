@@ -1024,7 +1024,7 @@ pub fn install_namespace_pre_exec(
 
     // Confinement is checked before anything is created or registered: a confined spawn
     // that cannot be set up fails before its mount targets exist.
-    let confined_tap = if ns.decision.confinement().is_some() {
+    let confined_tap = if let Some(confinement) = ns.decision.confinement() {
         anyhow::ensure!(
             ns.user_namespace_path.is_some(),
             "confining the VMM of {} needs it to enter a user namespace (rootless mode)",
@@ -1035,8 +1035,9 @@ pub fn install_namespace_pre_exec(
                 .as_deref()
                 .map(crate::confine::TapName::new)
                 .transpose()?,
-            // Read before the fork: the child cannot raise the hard limit it inherits.
-            crate::confine::core_limit_for(crate::confine::core_hard_limit()),
+            // The limit the preflight validated; installing it fails the spawn if the hard
+            // limit has since dropped below it.
+            confinement.core_limit,
         ))
     } else {
         None
@@ -1451,6 +1452,7 @@ mod tests {
                     crate::confine::Decision::for_test(Some(crate::confine::Confinement {
                         landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
                         layers: vec![crate::confine::Layer::Process],
+                        core_limit: 1,
                     })),
                 )
             },

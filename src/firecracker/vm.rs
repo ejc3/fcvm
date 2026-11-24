@@ -1066,6 +1066,7 @@ mod tests {
             crate::confine::Decision::for_test(Some(crate::confine::Confinement {
                 landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
                 layers: vec![crate::confine::Layer::Process],
+                core_limit: 1,
             })),
         );
         for args in ["--no-seccomp", "--enable-nv2 --seccomp-filter /x.bpf"] {
