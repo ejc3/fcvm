@@ -531,6 +531,71 @@ fn warn_unparsable_state(path: &Path, error: &dyn std::fmt::Display, context: &s
     }
 }
 
+/// How long a launch waits for layout 1's `names.lock` before it fails
+/// (`StateManager::lock_old_names`).
+const OLD_NAMES_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(test)]
+thread_local! {
+    /// `OLD_NAMES_LOCK_WAIT` for launches made from this thread, for tests.
+    static OLD_NAMES_LOCK_WAIT_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn old_names_lock_wait() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(wait) = OLD_NAMES_LOCK_WAIT_FOR_TEST.with(|wait| wait.get()) {
+        return wait;
+    }
+    OLD_NAMES_LOCK_WAIT
+}
+
+/// The PID /proc/locks names as the holder of a flock on the file at `path`, for a
+/// message. `None` when it names none (or the holder is outside this PID namespace).
+fn flock_holder(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let inode = std::fs::metadata(path).ok()?.ino().to_string();
+    // "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF"
+    std::fs::read_to_string("/proc/locks")
+        .ok()?
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let held = fields.get(1) == Some(&"FLOCK")
+                && fields.get(5)?.rsplit(':').next() == Some(inode.as_str());
+            held.then(|| fields.get(4)?.parse::<u32>().ok()).flatten()
+        })
+        .find(|pid| *pid > 0)
+}
+
+/// Write the `layout` marker of `state_dir`: under a name of its own, world-readable
+/// whatever the umask, synced, and renamed, with the directory synced after.
+///
+/// Every command reads the marker, root's and the store owner's alike, so its mode is set
+/// and not left to the umask of whichever user wrote it first. It is the one file on the
+/// state path that is synced: it is written once per store, and an empty marker after a
+/// host crash would have every command refuse the store until someone removed it.
+fn write_layout_marker(state_dir: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let temp = state_dir.join(format!(
+        "{INDEX_STAGING_PREFIX}{LAYOUT_FILE}.{}",
+        uuid::Uuid::new_v4()
+    ));
+    let written = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(format!("{LAYOUT}\n").as_bytes())?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        file.sync_all()?;
+        std::fs::rename(&temp, state_dir.join(LAYOUT_FILE))?;
+        std::fs::File::open(state_dir)?.sync_all()
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
 /// What the state directory's own entries say about its layout (`StateManager::scan_layout`).
 #[derive(Default)]
 struct LayoutScan {
@@ -667,7 +732,7 @@ impl StateManager {
         fs::create_dir_all(&self.state_dir)
             .await
             .context("creating state directory")?;
-        self.check_layout_for_write()
+        self.check_layout_for_write().await
     }
 
     /// The bucket directory of VM `vm_id`'s state, lock and temporary file.
@@ -747,12 +812,25 @@ impl StateManager {
     /// sees no VMs and cannot tell.
     fn refuse_other_layouts(&self, scan: &LayoutScan) -> Result<()> {
         if let Some(marker) = &scan.marker {
-            if marker.trim_end_matches('\n') != LAYOUT {
+            let marked = marker.trim_end_matches('\n');
+            if marked != LAYOUT && marked.parse::<u32>().is_ok() {
                 bail!(
                     "the state directory {} is marked as layout {:?}, and this fcvm reads and \
                      writes layout {LAYOUT:?} only; use the fcvm that wrote it",
                     self.state_dir.display(),
-                    marker.trim_end_matches('\n')
+                    marked
+                );
+            }
+            if marked != LAYOUT {
+                // Not a layout number at all. The marker is synced when it is first
+                // written, so this is not what a host crash leaves, but a store must
+                // not be refused for ever with advice to use another fcvm.
+                bail!(
+                    "the layout marker {} is empty or damaged (it holds {:?}, not a layout \
+                     number). When no fcvm VM is running on this store, remove that file and \
+                     run this command again: fcvm writes it anew",
+                    self.state_dir.join(LAYOUT_FILE).display(),
+                    marker
                 );
             }
         }
@@ -822,7 +900,7 @@ impl StateManager {
     /// then writes into a store this build refuses from then on. Nothing of a launch in
     /// progress is removed. The lock file itself stays: unlinking it would give the next
     /// conversion a lock that excludes nobody.
-    fn check_layout_for_write(&self) -> Result<()> {
+    async fn check_layout_for_write(&self) -> Result<()> {
         if self.layout_written.get().is_some() {
             return Ok(());
         }
@@ -832,13 +910,7 @@ impl StateManager {
         self.refuse_other_layouts(&scan)?;
         let mut _names = None;
         if scan.has_old_entries() {
-            let file = open_lock_file(&self.state_dir.join("names.lock"))
-                .context("opening the older layout's name lock")?;
-            _names = Some(
-                Flock::lock(file, FlockArg::LockExclusive)
-                    .map_err(|(_, error)| error)
-                    .context("acquiring the older layout's name lock")?,
-            );
+            _names = Some(self.lock_old_names().await?);
             // What an older launch that held the lock wrote meanwhile.
             scan = self
                 .scan_layout()?
@@ -860,21 +932,67 @@ impl StateManager {
             }
         }
         if scan.marker.is_none() {
-            // Under a name of its own and renamed, so no reader finds it half written.
-            let temp = self.state_dir.join(format!(
-                "{INDEX_STAGING_PREFIX}{LAYOUT_FILE}.{}",
-                uuid::Uuid::new_v4()
-            ));
-            std::fs::write(&temp, format!("{LAYOUT}\n"))
-                .and_then(|()| std::fs::rename(&temp, self.state_dir.join(LAYOUT_FILE)))
-                .with_context(|| {
-                    let _ = std::fs::remove_file(&temp);
-                    format!("marking the layout of {}", self.state_dir.display())
-                })?;
+            write_layout_marker(&self.state_dir)
+                .with_context(|| format!("marking the layout of {}", self.state_dir.display()))?;
         }
         let _ = self.layout_written.set(());
         let _ = self.layout_readable.set(());
         Ok(())
+    }
+
+    /// Layout 1's `names.lock`, exclusively, for the conversion. An older build's launch
+    /// holds it for milliseconds; an older fcvm that is stopped or hung holds it for good,
+    /// and a launch of this build must then fail with a reason, not hang. So: one try
+    /// without waiting, then a warning that names the lock and its holder, then further
+    /// tries for `OLD_NAMES_LOCK_WAIT` on a blocking thread, then an error.
+    async fn lock_old_names(&self) -> Result<Flock<std::fs::File>> {
+        let path = self.state_dir.join("names.lock");
+        let try_lock = |path: &Path| -> Result<Option<Flock<std::fs::File>>> {
+            let file = open_lock_file(path).context("opening the older layout's name lock")?;
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => Ok(Some(lock)),
+                Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+                Err((_, error)) => Err(error).context("acquiring the older layout's name lock"),
+            }
+        };
+        if let Some(lock) = try_lock(&path)? {
+            return Ok(lock);
+        }
+        let wait = old_names_lock_wait();
+        let holder = || {
+            flock_holder(&path)
+                .map_or_else(|| "another process".to_string(), |pid| format!("pid {pid}"))
+        };
+        tracing::warn!(
+            lock = %path.display(),
+            holder = %holder(),
+            wait_s = wait.as_secs_f64(),
+            "waiting for an older fcvm's name lock before removing what its layout left"
+        );
+        let deadline = std::time::Instant::now() + wait;
+        let polled = path.clone();
+        let locked = tokio::task::spawn_blocking(move || loop {
+            match try_lock(&polled) {
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50))
+                }
+                other => return other,
+            }
+        })
+        .await
+        .context("waiting for the older layout's name lock")??;
+        locked.with_context(|| {
+            format!(
+                "the state directory {} holds files of an older fcvm's layout, and {} has held \
+                 that layout's name lock {} for {:.0?}. An older fcvm holds it while it starts \
+                 a VM; one that is stopped or hung holds it for good. End that process, then \
+                 run this command again",
+                self.state_dir.display(),
+                holder(),
+                path.display(),
+                wait
+            )
+        })
     }
 
     /// Save VM state atomically (write to temp file, then rename)
@@ -901,7 +1019,7 @@ impl StateManager {
             "save_state: starting save"
         );
 
-        self.check_layout_for_write()?;
+        self.check_layout_for_write().await?;
         self.bucket_dir(VMS_DIR, &bucket_of(&state.vm_id))
             .context("making the VM's state bucket")?;
         let state_file = self.state_file(&state.vm_id);
@@ -1033,7 +1151,7 @@ impl StateManager {
         before_rename: impl FnOnce(),
         after_rename: impl FnOnce(),
     ) -> Result<()> {
-        self.check_layout_for_write()?;
+        self.check_layout_for_write().await?;
         let name = vm_state
             .name
             .clone()
@@ -3351,10 +3469,18 @@ mod tests {
                         .unwrap_err()
                 ),
             ];
+            // Another layout's number: use the fcvm that wrote it. Anything else is a
+            // damaged marker, and the refusal says how to get the store back.
+            let expected = if other.trim_end_matches('\n').parse::<u32>().is_ok() {
+                "writes layout \"2\" only; use the fcvm that wrote it"
+            } else {
+                "is empty or damaged"
+            };
             for refusal in refusals {
-                assert!(
-                    refusal.contains("is marked as layout")
-                        && refusal.contains("layout \"2\" only"),
+                assert!(refusal.contains(expected), "marker {other:?}: {refusal}");
+                assert_eq!(
+                    refusal.contains("remove that file"),
+                    expected == "is empty or damaged",
                     "marker {other:?}: {refusal}"
                 );
             }
@@ -3376,6 +3502,82 @@ mod tests {
                 this
             );
         }
+    }
+
+    /// The marker is readable by every user whatever umask its first writer had: every
+    /// command reads it, and root with umask 077 writing it first on a store shared with
+    /// its unprivileged owner would otherwise lock that owner out of `fcvm ls`.
+    /// The umask is the process's; nextest runs each test in a process of its own.
+    #[tokio::test]
+    async fn the_marker_is_world_readable_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let old = nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+        let made = StateManager::new(state_dir.clone()).init().await;
+        nix::sys::stat::umask(old);
+        made.unwrap();
+        let mode = std::fs::metadata(state_dir.join(LAYOUT_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o644, "the marker's mode follows the umask");
+    }
+
+    /// The marker's temporary is synced before the rename that publishes it and the
+    /// directory after, in that order: a host crash must not leave an empty marker.
+    #[test]
+    fn the_marker_is_synced_before_and_after_its_rename() {
+        let source = include_str!("manager.rs");
+        let start = source.find("\nfn write_layout_marker(").unwrap();
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        let file_sync = body
+            .find("file.sync_all()?;")
+            .expect("the temporary is not synced");
+        let rename = body.find("std::fs::rename(&temp").expect("no rename");
+        let dir_sync = body
+            .find("std::fs::File::open(state_dir)?.sync_all()")
+            .expect("the directory is not synced");
+        assert!(file_sync < rename && rename < dir_sync, "{body}");
+    }
+
+    /// An older fcvm that is stopped or hung while holding `names.lock` does not hang a
+    /// launch of this build: after a bounded wait the launch fails, names the lock and its
+    /// holder, and has removed nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launch_does_not_wait_for_ever_for_an_older_builds_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = old_launch_in_progress(dir.path());
+        let in_progress = tree(dir.path());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let state_dir = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            OLD_NAMES_LOCK_WAIT_FOR_TEST
+                .with(|wait| wait.set(Some(std::time::Duration::from_millis(300))));
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(StateManager::new(state_dir).init());
+            let _ = done_tx.send(result);
+        });
+        let refusal = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the launch is still waiting for names.lock")
+            .unwrap_err();
+        let refusal = format!("{refusal:#}");
+        assert!(
+            refusal.contains("names.lock")
+                && refusal.contains(&format!("pid {}", std::process::id()))
+                && refusal.contains("End that process"),
+            "{refusal}"
+        );
+        assert_eq!(
+            tree(dir.path()),
+            in_progress,
+            "the refused launch changed the store"
+        );
+        drop(names);
     }
 
     /// A holder whose /proc entry cannot be read (out of descriptors, no permission) is not
