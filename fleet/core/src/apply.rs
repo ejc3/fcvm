@@ -277,7 +277,9 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         } => {
             let key = client_key(viewer, client.as_deref()).to_string();
             state.fleet.viewers.insert(viewer.clone(), key);
-            if !returning {
+            // A page reconnecting to a coordinator that has just resumed the fleet may be
+            // one whose arrival the stored state does not hold, so it arrives again.
+            if !returning || state.fleet.power.resuming(at) {
                 state.fleet.power.last_arrival_at = Some(at);
             }
             None
@@ -690,9 +692,10 @@ fn image_complete(f: &Fleet) -> bool {
 }
 
 /// Sleep after `idle_scale_down_secs` with no active viewer, or once no viewer has arrived
-/// for `sleep_without_new_viewer_secs` (never during a claim, a race or a warm window); wake
-/// on an active viewer while a viewer has arrived within that limit, and at once inside a
-/// warm window (`crate::warm`); be awake once the image is complete.
+/// for `sleep_without_new_viewer_secs` (never during a claim, a race or a warm window, nor
+/// in the first `RESUME_GRACE_MS` after a restart resumed the fleet up); wake on an active
+/// viewer while a viewer has arrived within that limit, which counts as an arrival, and at
+/// once inside a warm window (`crate::warm`); be awake once the image is complete.
 fn power_step(state: &mut State, at: u64) {
     // Read from the clock and the configured windows, and false while the day's budget is
     // spent, so the warm rule stands down for the budget.
@@ -727,6 +730,12 @@ fn power_step(state: &mut State, at: u64) {
     if f.power.state == "asleep" {
         // Connected pages do not wake it once the limit has run out: an arrival does.
         if (active > 0 && !no_arrival) || warm {
+            if active > 0 && !no_arrival {
+                // A wake for a viewer starts the limit again. Counted from the arrival
+                // before it, the limit could end minutes into the wake and terminate the
+                // hosts it had just launched, under the viewer it woke for.
+                f.power.last_arrival_at = Some(at);
+            }
             f.power.state = "waking".into();
             f.power.woke_at = Some(at);
             f.power.asleep_since = None;
@@ -735,7 +744,10 @@ fn power_step(state: &mut State, at: u64) {
         return;
     }
     let idle = active == 0 && f.power.idle_since.is_some_and(|t| at >= t + idle_ms);
-    if (idle || no_arrival) && !claims && !racing && !warm {
+    // Just resumed: what the stored state says is no ground for terminating hosts until
+    // the pages of the process before this one have had time to reconnect.
+    let resuming = f.power.resuming(at);
+    if (idle || no_arrival) && !claims && !racing && !warm && !resuming {
         f.power.state = "asleep".into();
         f.power.asleep_since = Some(at);
         f.power.woke_at = None;

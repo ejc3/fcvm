@@ -4884,6 +4884,139 @@ async fn a_restart_keeps_the_hosts_it_finds() {
     assert_eq!(fake.present("us-east-1").len(), 1);
 }
 
+/// A fleet that is awake for a viewer stays awake through a coordinator restart
+/// (fleet/PROTOCOL.md, `fleet.power`). Killed: the new coordinator reads the state stored
+/// before that viewer arrived, as when the process dies between seating a viewer and its
+/// next write, and the limit that state holds runs out soon after the restart. Shut down:
+/// the last write holds the arrival. Either way the new coordinator terminates no host, and
+/// the page that reconnects finds the fleet awake after the stored limit.
+#[tokio::test]
+async fn a_restart_keeps_the_fleet_awake_for_the_viewer_it_was_awake_for() {
+    tokio::join!(restart_with_a_viewer(true), restart_with_a_viewer(false));
+}
+
+async fn restart_with_a_viewer(killed: bool) {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Host, Market};
+    // The coordinator applies its rules once a second, so the limits are seconds apart.
+    const LIMIT_MS: u64 = 6000;
+    let power_of = |handle: &Handle| {
+        serde_json::from_str::<Value>(&handle.snapshot.borrow().text).unwrap()["state"]["fleet"]
+            ["power"]
+            .clone()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fleet.json");
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 600,
+        sleep_without_new_viewer_secs: LIMIT_MS / 1000,
+        ..Config::default()
+    };
+    let (handle, actor) = start(
+        State::new(config.clone(), now_ms()),
+        Some(store::spawn_writer(path.clone())),
+        None,
+        None,
+        None,
+        None,
+    );
+    let url = page_url(&handle).await;
+    let mut first = Viewer::connect(&url).await;
+    let s = first.until(|s| s["viewers"]["active"] == 1).await;
+    let stale_arrival = s["fleet"]["power"]["last_arrival_at"].as_u64().unwrap();
+    // The state file once it holds the first viewer, copied: what a coordinator killed
+    // before its next write leaves behind.
+    let stale = dir.path().join("stale.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let held = store::load(&path)
+            .unwrap()
+            .is_some_and(|s| s.fleet.power.last_arrival_at == Some(stale_arrival));
+        if held {
+            std::fs::copy(&path, &stale).unwrap();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first arrival was not stored"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A second viewer arrives half way through the limit and is shown the fleet awake
+    // for it until its own limit.
+    tokio::time::sleep(Duration::from_millis(LIMIT_MS / 2)).await;
+    let mut second = Viewer::connect(&url).await;
+    let s = second.until(|s| s["viewers"]["active"] == 2).await;
+    let shown = s["fleet"]["power"]["sleep_without_arrival_at"]
+        .as_u64()
+        .unwrap();
+    assert!(shown >= stale_arrival + LIMIT_MS + LIMIT_MS / 2, "{s}");
+    let stored = if killed {
+        actor.abort();
+        let _ = actor.await;
+        stale
+    } else {
+        assert!(handle.shutdown().await, "the last state was not stored");
+        tokio::time::timeout(Duration::from_secs(5), actor)
+            .await
+            .unwrap()
+            .unwrap();
+        path
+    };
+    drop((first, second));
+
+    // The new coordinator, with the host the old one left running.
+    let fake = Arc::new(FakeHosts::default());
+    fake.hosts.lock().unwrap().insert(
+        "us-east-1".into(),
+        vec![Host {
+            id: "i-0123456789abcdef0".into(),
+            state: "running".into(),
+            market: Market::OnDemand,
+            sources: Vec::new(),
+            zone: None,
+        }],
+    );
+    let state = store::load(&stored)
+        .unwrap()
+        .expect("a stored state")
+        .resumed(config, now_ms());
+    assert_eq!(state.fleet.power.state, "awake");
+    let (handle, _actor) = start(
+        state,
+        Some(store::spawn_writer(stored)),
+        None,
+        None,
+        Some(host_config(&fake, &["us-east-1"], 1, 8)),
+        None,
+    );
+    // The second viewer's page reconnects and says it connected before.
+    let url = page_url(&handle).await;
+    let mut back = Viewer::connect_raw(&url, None).await;
+    back.send(json!({"type": "seat", "ticket": null, "returning": true}))
+        .await;
+    back.until(|s| s["viewers"]["active"] == 1).await;
+    // Past the limit of the state from before the second viewer, by more than the
+    // second between two ticks, and short of the one that viewer was shown.
+    let past_stale = stale_arrival + LIMIT_MS + 1500;
+    assert!(
+        past_stale + 1000 < shown,
+        "the two limits are too close to tell apart"
+    );
+    tokio::time::sleep(Duration::from_millis(past_stale.saturating_sub(now_ms()))).await;
+    let power = power_of(&handle);
+    assert_eq!(
+        power["state"], "awake",
+        "killed={killed}: asleep under the viewer it was awake for: {power}"
+    );
+    assert!(
+        !fake.calls().iter().any(|c| c.starts_with("terminate")),
+        "killed={killed}: {:?}",
+        fake.calls()
+    );
+    assert_eq!(fake.present("us-east-1").len(), 1);
+}
+
 /// Two awake hosts in `us-east-1`, spread over three zones and running, with an agent of
 /// two GPUs on each whose slots render: the fake, the coordinator, the agents and a viewer.
 async fn two_spread_hosts(

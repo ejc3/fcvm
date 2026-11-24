@@ -418,7 +418,8 @@ pub struct PowerView {
     /// The last completed wake, and the last 20.
     pub last_wake: Option<Wake>,
     pub wakes: Vec<Wake>,
-    /// The last arrival: a new viewer connection or a connected page's `wake`.
+    /// The last arrival: a new viewer connection, a connected page's `wake`, or a wake an
+    /// active page caused.
     pub last_arrival_at: Option<u64>,
     /// When the fleet sleeps if no viewer arrives before then (past while asleep); null
     /// when the fleet does not sleep or `--sleep-without-new-viewer` is 0.

@@ -582,8 +582,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   is active or a race is running, the fleet goes `asleep` (`asleep_since`). A claim or race
   that outlasts either limit holds the fleet awake until it ends, and it sleeps then. An
   arrival is a new viewer connection (one whose first message carries no seat ticket and
-  not `returning`, see `admission`; with Turnstile on, at the moment it is verified) or a
-  connected page's `wake` intent. A page that
+  not `returning`, see `admission`; with Turnstile on, at the moment it is verified), a
+  connected page's `wake` intent, or a wake that an active page causes (below). A page that
   reconnects after a network blip or reloads in the same tab sends its ticket and is not an
   arrival; neither is a page turning visible again. A reconnect after the ticket's 60 s
   grace still carries the ticket, so it is not an arrival either. A tab whose storage is
@@ -591,14 +591,20 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   cannot be told from a new viewer and counts as one. `last_arrival_at` is the last arrival
   and `sleep_without_arrival_at` when the limit runs out (null without power management or
   with the limit off). A coordinator that starts with no arrival on record counts from its
-  start, and a restart keeps the stored one, since the pages that reconnect to it are not
-  arrivals. Asleep: every GPU host is terminated, nothing is placed (every fcvm
+  start, and a restart keeps the stored one. A coordinator that restarts with the fleet up
+  (`awake` or `waking` in the stored state) does not put it to sleep in its first 60 s,
+  under either rule: the stored state names no viewer, and a process that was killed may
+  have seated one after its last write. A page that reconnects in those 60 s counts as an
+  arrival, `returning` or not; after them, and for a fleet stored asleep, a reconnecting
+  page is not one. Asleep: every GPU host is terminated, nothing is placed (every fcvm
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now`, `claim_gpu` and `claim_phone` are refused. Hosts that leave then are not reclaimed. When an active viewer
   is there and the last arrival is within the limit (a new viewer arrived, a page sent
   `wake`, or a hidden page turned visible again before the limit ran out) it is `waking`
-  from `woke_at`, the moment the wake began: every host region gets `--awake-hosts` hosts
+  from `woke_at`, the moment the wake began. A wake for an active page is an arrival
+  (`last_arrival_at` is `woke_at`), so the limit runs in full from it and does not end
+  minutes into the wake. While `waking`: every host region gets `--awake-hosts` hosts
   again (default 1) and the EC2 half launches its `--ec2-tiles` tiles. Connected pages alone
   never wake a fleet whose limit has run out: the page shows the sleep card with a Wake
   button, which sends `wake`. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in

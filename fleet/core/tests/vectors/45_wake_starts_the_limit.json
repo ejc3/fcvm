@@ -1,0 +1,922 @@
+{
+  "config": {
+    "claim_secs": 120,
+    "idle_scale_down_secs": 60,
+    "max_tiles": 2,
+    "power_managed": true,
+    "restart_cooldown_secs": 1,
+    "sleep_without_new_viewer_secs": 1000
+  },
+  "description": "A wake that an active page causes is an arrival. A fleet that slept idle wakes when a connected page turns visible again (or a page rejoins as returning) while the last arrival is within sleep_without_new_viewer_secs, and that wake starts the limit again, so the fleet is not put to sleep minutes into a wake by the limit counted from an older arrival. Once the limit has run out, connected pages still do not wake it.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 1,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 1,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 5000,
+      "client": "198.51.100.41",
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 6000,
+      "type": "visibility",
+      "viewer": "v1",
+      "visible": false
+    },
+    {
+      "at": 66000,
+      "type": "tick"
+    },
+    {
+      "at": 900000,
+      "type": "visibility",
+      "viewer": "v1",
+      "visible": true
+    },
+    {
+      "at": 901000,
+      "type": "tick"
+    },
+    {
+      "at": 1005000,
+      "type": "tick"
+    },
+    {
+      "at": 1899999,
+      "type": "tick"
+    },
+    {
+      "at": 1900000,
+      "type": "tick"
+    },
+    {
+      "at": 1910000,
+      "type": "visibility",
+      "viewer": "v1",
+      "visible": false
+    },
+    {
+      "at": 1920000,
+      "type": "visibility",
+      "viewer": "v1",
+      "visible": true
+    },
+    {
+      "at": 1930000,
+      "client": "198.51.100.41",
+      "returning": true,
+      "type": "viewer_joined",
+      "viewer": "v2"
+    }
+  ],
+  "expect": [
+    {
+      "after": 4,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/fleet/power/sleep_without_arrival_at": 1005000,
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/fleet/power/asleep_since": 66000,
+        "/view/fleet/power/last_arrival_at": 5000,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "idle: its one page is hidden"
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 900000,
+        "/view/fleet/power/sleep_without_arrival_at": 1900000,
+        "/view/fleet/power/state": "waking",
+        "/view/fleet/power/woke_at": 900000
+      },
+      "note": "the page is shown again inside the limit: the fleet wakes for it, and the wake starts the limit again"
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/view/fleet/power/state": "awake",
+        "/view/viewers/active": 1
+      },
+      "note": "the limit counted from the first arrival ends here; the wake is not cut short (production, 2026-11-24: asleep 2 min 47 s after a wake)"
+    },
+    {
+      "after": 10,
+      "checks": {
+        "/view/fleet/power/state": "awake"
+      }
+    },
+    {
+      "after": 11,
+      "checks": {
+        "/view/fleet/power/asleep_since": 1900000,
+        "/view/fleet/power/state": "asleep",
+        "/view/viewers/active": 1
+      },
+      "note": "the limit from the wake ran out: asleep with the page connected, as before"
+    },
+    {
+      "after": 13,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 900000,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "past the limit a page turning visible again does not wake it"
+    },
+    {
+      "after": 14,
+      "checks": {
+        "/view/fleet/power/last_arrival_at": 900000,
+        "/view/fleet/power/state": "asleep"
+      },
+      "note": "nor does a returning page"
+    }
+  ],
+  "final_view": {
+    "actions": [],
+    "aggregates": [],
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "budget": null,
+    "budget_from_t": null,
+    "claims": [],
+    "cooldown_until": null,
+    "counters": {
+      "restores": 3,
+      "restores_last_hour": 3,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
+    "failures": [],
+    "fleet": {
+      "agents": {
+        "hosts": [
+          {
+            "first_at": 1000,
+            "last_at": 1000,
+            "name": "h1"
+          }
+        ],
+        "since": 0
+      },
+      "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
+      "fcvm_gpus": 3,
+      "gpus": 3,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 2,
+      "n": 0,
+      "power": {
+        "asleep_since": 1900000,
+        "hosts": [],
+        "idle_since": null,
+        "last_arrival_at": 900000,
+        "last_wake": {
+          "awake_at": 901000,
+          "gpus": 2,
+          "ms": 1000,
+          "started_at": 900000
+        },
+        "sleep_without_arrival_at": 1900000,
+        "state": "asleep",
+        "wakes": [
+          {
+            "awake_at": 901000,
+            "gpus": 2,
+            "ms": 1000,
+            "started_at": 900000
+          }
+        ],
+        "woke_at": null
+      },
+      "standby": [
+        "slot-1",
+        "slot-2",
+        "slot-3"
+      ],
+      "standby_ready": 0,
+      "warming": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 57045,
+      "from_t": 1901.5,
+      "generation": 4
+    },
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": 1916000,
+      "closes_at": 1924000,
+      "holding": null,
+      "holding_label": null,
+      "leading": "cloud-climb",
+      "next": "high-lakes",
+      "next_hold_at": null,
+      "next_label": "The high lakes",
+      "opened_at": 1900000,
+      "targets": [
+        {
+          "arrive_at": 1938000,
+          "id": "cloud-climb",
+          "label": "Up through the clouds",
+          "votes": 0
+        },
+        {
+          "arrive_at": 1948000,
+          "id": "lake-skim",
+          "label": "Low over the western lakes",
+          "votes": 0
+        },
+        {
+          "arrive_at": 1948000,
+          "id": "western-sea",
+          "label": "Over the western sea",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -48.581291,
+            2.591,
+            -98.989132
+          ],
+          "t": 1889.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -48.233048,
+            2.5928,
+            -99.378429
+          ],
+          "t": 1890.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -47.900691,
+            2.5946,
+            -99.774747
+          ],
+          "t": 1891.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -47.584337,
+            2.5964,
+            -100.177503
+          ],
+          "t": 1892.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -47.284081,
+            2.5982,
+            -100.586115
+          ],
+          "t": 1893.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -47.0,
+            2.6,
+            -101.0
+          ],
+          "t": 1894.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -46.732151,
+            2.6018,
+            -101.418576
+          ],
+          "t": 1895.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -46.480572,
+            2.6036,
+            -101.841261
+          ],
+          "t": 1896.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -46.245278,
+            2.6054,
+            -102.267476
+          ],
+          "t": 1897.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -46.026268,
+            2.6072,
+            -102.696644
+          ],
+          "t": 1898.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -45.82352,
+            2.609,
+            -103.12819
+          ],
+          "t": 1899.0
+        },
+        {
+          "fov_deg": 55.0,
+          "look": [
+            -56.0,
+            2.75,
+            -114.75
+          ],
+          "pos": [
+            -45.62889,
+            2.6108,
+            -103.560734
+          ],
+          "t": 1900.0
+        },
+        {
+          "fov_deg": 55.551758,
+          "look": [
+            -54.011763,
+            3.178808,
+            -116.556242
+          ],
+          "pos": [
+            -45.061912,
+            2.944146,
+            -104.265662
+          ],
+          "t": 1901.0
+        },
+        {
+          "fov_deg": 56.960938,
+          "look": [
+            -48.945931,
+            4.24764,
+            -119.65919
+          ],
+          "pos": [
+            -43.858682,
+            3.786895,
+            -105.49146
+          ],
+          "t": 1902.0
+        },
+        {
+          "fov_deg": 58.893555,
+          "look": [
+            -42.569194,
+            5.614102,
+            -122.009011
+          ],
+          "pos": [
+            -42.172397,
+            4.909596,
+            -107.196321
+          ],
+          "t": 1903.0
+        },
+        {
+          "fov_deg": 61.0625,
+          "look": [
+            -37.158461,
+            6.948115,
+            -123.536436
+          ],
+          "pos": [
+            -40.143634,
+            6.08231,
+            -109.330492
+          ],
+          "t": 1904.0
+        },
+        {
+          "fov_deg": 63.227539,
+          "look": [
+            -34.050697,
+            7.944497,
+            -125.472103
+          ],
+          "pos": [
+            -37.900343,
+            7.072679,
+            -111.836272
+          ],
+          "t": 1905.0
+        },
+        {
+          "fov_deg": 65.195313,
+          "look": [
+            -31.768917,
+            7.873972,
+            -127.925079
+          ],
+          "pos": [
+            -35.557852,
+            7.64461,
+            -114.648012
+          ],
+          "t": 1906.0
+        },
+        {
+          "fov_deg": 66.819336,
+          "look": [
+            -29.513465,
+            7.253183,
+            -130.557204
+          ],
+          "pos": [
+            -33.218864,
+            7.702494,
+            -117.692117
+          ],
+          "t": 1907.0
+        },
+        {
+          "fov_deg": 68.0,
+          "look": [
+            -27.368597,
+            7.19691,
+            -133.334481
+          ],
+          "pos": [
+            -30.97346,
+            7.702494,
+            -120.887043
+          ],
+          "t": 1908.0
+        },
+        {
+          "fov_deg": 68.68457,
+          "look": [
+            -25.418718,
+            7.142967,
+            -136.179689
+          ],
+          "pos": [
+            -28.899095,
+            7.702494,
+            -124.1433
+          ],
+          "t": 1909.0
+        },
+        {
+          "fov_deg": 68.867188,
+          "look": [
+            -23.748596,
+            6.454843,
+            -138.97029
+          ],
+          "pos": [
+            -27.060603,
+            7.643722,
+            -127.363449
+          ],
+          "t": 1910.0
+        },
+        {
+          "fov_deg": 68.588867,
+          "look": [
+            -22.442266,
+            4.769414,
+            -141.542602
+          ],
+          "pos": [
+            -25.510193,
+            7.058536,
+            -130.442105
+          ],
+          "t": 1911.0
+        },
+        {
+          "fov_deg": 67.9375,
+          "look": [
+            -21.705675,
+            3.081769,
+            -143.964925
+          ],
+          "pos": [
+            -24.287449,
+            6.035601,
+            -133.265936
+          ],
+          "t": 1912.0
+        },
+        {
+          "fov_deg": 67.047852,
+          "look": [
+            -21.47875,
+            2.424666,
+            -146.381253
+          ],
+          "pos": [
+            -23.419333,
+            4.814104,
+            -135.713662
+          ],
+          "t": 1913.0
+        },
+        {
+          "fov_deg": 66.101563,
+          "look": [
+            -21.381909,
+            2.24867,
+            -148.333969
+          ],
+          "pos": [
+            -22.920183,
+            3.637086,
+            -137.656055
+          ],
+          "t": 1914.0
+        },
+        {
+          "fov_deg": 65.327148,
+          "look": [
+            -21.285312,
+            2.262006,
+            -149.570338
+          ],
+          "pos": [
+            -22.791712,
+            2.750222,
+            -138.95594
+          ],
+          "t": 1915.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -23.023012,
+            2.4,
+            -139.468194
+          ],
+          "t": 1916.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -23.425998,
+            2.4,
+            -139.544019
+          ],
+          "t": 1917.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -23.825776,
+            2.4,
+            -139.635258
+          ],
+          "t": 1918.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -24.221758,
+            2.4,
+            -139.741776
+          ],
+          "t": 1919.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -24.613358,
+            2.4,
+            -139.863417
+          ],
+          "t": 1920.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -25.0,
+            2.4,
+            -140.0
+          ],
+          "t": 1921.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -25.381114,
+            2.4,
+            -140.151325
+          ],
+          "t": 1922.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -25.756138,
+            2.4,
+            -140.317169
+          ],
+          "t": 1923.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -26.124519,
+            2.4,
+            -140.497287
+          ],
+          "t": 1924.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -26.485715,
+            2.4,
+            -140.691413
+          ],
+          "t": 1925.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -26.839192,
+            2.4,
+            -140.899262
+          ],
+          "t": 1926.0
+        },
+        {
+          "fov_deg": 65.0,
+          "look": [
+            -21.25,
+            2.3,
+            -150.0
+          ],
+          "pos": [
+            -27.188635,
+            2.4,
+            -141.113871
+          ],
+          "t": 1927.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.229,
+      "weather": [
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 1.5,
+          "t": 1899.0,
+          "towers": 0.0
+        },
+        {
+          "cover": 0.5,
+          "rays": 1.0,
+          "snow_line_km": 1.6389,
+          "t": 1916.0,
+          "towers": 0.0
+        }
+      ],
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [],
+    "viewers": {
+      "active": 2,
+      "count": 2
+    }
+  }
+}

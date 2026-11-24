@@ -194,10 +194,16 @@ pub struct Power {
     pub woke_at: Option<u64>,
     pub hosts: BTreeMap<String, HostWake>,
     pub wakes: VecDeque<Wake>,
-    /// The last arrival: a new viewer connection (not a page reconnecting) or a connected
-    /// page's `wake`. A state that records none counts from the coordinator's start.
+    /// The last arrival: a new viewer connection (not a page reconnecting), a connected
+    /// page's `wake`, or a wake an active page caused. A state that records none counts
+    /// from the coordinator's start.
     #[serde(default)]
     pub last_arrival_at: Option<u64>,
+    /// When this coordinator resumed the fleet from a stored state that had it up (absent
+    /// in a new state and when it resumed asleep). For [`RESUME_GRACE_MS`] after it the
+    /// sleep rules wait, and a page that says it is returning counts as an arrival.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_at: Option<u64>,
     /// Why the power state is not the viewer rules' alone: `budget` while the day's spend
     /// ceiling holds it asleep (`crate::spend`), `warm` while a warm window holds it awake
     /// (`crate::warm`). Each is set again from the clock at every event.
@@ -215,8 +221,17 @@ impl Default for Power {
             hosts: BTreeMap::new(),
             wakes: VecDeque::new(),
             last_arrival_at: None,
+            resumed_at: None,
             reason: None,
         }
+    }
+}
+
+impl Power {
+    /// Whether the coordinator resumed this fleet, up, less than [`RESUME_GRACE_MS`] ago:
+    /// the pages of the process before it may not have reconnected yet.
+    pub fn resuming(&self, at: u64) -> bool {
+        self.resumed_at.is_some_and(|t| at < t + RESUME_GRACE_MS)
     }
 }
 
@@ -492,6 +507,13 @@ pub struct Claim {
 /// How long after a restart a claim waits for its viewer's page to reconnect and present its
 /// token. A page reconnects within 0.5 to 10 s (`fleet/web/core/net.ts`).
 pub const CLAIM_RESUME_MS: u64 = 30_000;
+
+/// How long after a coordinator resumes a fleet that is up the sleep rules wait for the
+/// pages of the process before it. The resumed state knows no viewer (their ids went with
+/// the old process), and it can be older than an arrival that process seated in its last
+/// moments, so until pages have had time to reconnect it is no ground for terminating
+/// hosts. A page retries every 10 s at most and verifies again on the new connection.
+pub const RESUME_GRACE_MS: u64 = 60_000;
 
 /// A GPU claim a restart carried over whose host's agent has not said hello again yet: it goes
 /// back on the slot of that GPU when the agent does (`apply::hello`).
@@ -1074,9 +1096,14 @@ impl State {
         f.viewers.clear();
         f.hidden.clear();
         f.degraded.clear();
-        // The hour without a new viewer runs on across a restart: the pages that reconnect
-        // to the new process are not arrivals.
+        // The hour without a new viewer runs on across a restart: the stored arrival stays.
         f.power.last_arrival_at.get_or_insert(now_ms);
+        // A fleet that was up is not taken down on this state alone. The viewers went with
+        // the old process, and a process that was killed may have seated one after its last
+        // write, so for `RESUME_GRACE_MS` neither sleep rule fires and a page that
+        // reconnects counts as arriving (`Power::resuming`). A fleet stored asleep stays
+        // under the rules as they were: reconnecting pages do not wake it.
+        f.power.resumed_at = (f.power.state != "asleep").then_some(now_ms);
         // The EC2 aggregator's names were for the previous coordinator's addresses.
         f.ec2_aggregate_published = None;
         // Released: a race the restart interrupted. Its times are the coordinator's sightings
@@ -1444,6 +1471,15 @@ mod tests {
         s.fleet.power.last_arrival_at = Some(1500);
         let resumed = s.clone().resumed(Config::default(), 9000);
         assert_eq!(resumed.fleet.power.last_arrival_at, Some(1500));
+        // Resumed up: the reconnect window opens at the start. Resumed asleep: none.
+        assert_eq!(resumed.fleet.power.resumed_at, Some(9000));
+        assert!(resumed.fleet.power.resuming(9000 + RESUME_GRACE_MS - 1));
+        assert!(!resumed.fleet.power.resuming(9000 + RESUME_GRACE_MS));
+        let mut asleep = s.clone();
+        asleep.fleet.power.state = "asleep".into();
+        asleep.fleet.power.resumed_at = Some(1);
+        let asleep = asleep.resumed(Config::default(), 9000);
+        assert_eq!(asleep.fleet.power.resumed_at, None);
         s.fleet.power.last_arrival_at = None;
         assert_eq!(
             s.resumed(Config::default(), 9000)

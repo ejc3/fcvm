@@ -1254,7 +1254,11 @@ export class MockCoordinator {
         if (now - this.idleSince >= after) this.sleep();
       }
     }
-    if (this.power.state === "asleep" && visible > 0 && !this.holdAsleep) this.wake();
+    if (this.power.state === "asleep" && visible > 0 && !this.holdAsleep) {
+      // A wake for an active page is an arrival, as in the coordinator.
+      this.lastArrivalAt = now;
+      this.wake();
+    }
   }
 
   /**
