@@ -9,10 +9,18 @@
 //! which the recorded working set then replays.
 //!
 //! This only reads, and it reads a bounded amount: at most [`WARMUP_MAX_BYTES`], within
-//! [`WARMUP_DEADLINE`], and nothing at all when the guest's `MemAvailable` is less than
-//! [`WARMUP_MEMORY_MARGIN`] over what it would read. It starts, stops, flushes and writes
-//! nothing. A page-cache read is what any process in the guest does, the kernel can drop the
-//! pages again, and a file that cannot be read is skipped.
+//! [`WARMUP_DEADLINE`], which planning and reading both check. It reads only into free memory:
+//! its headroom is the guest's free memory above the kernel's high watermarks (`MemFree` less
+//! the zones' `high` in `/proc/zoneinfo`), below which page reclaim, and so eviction of the
+//! workload's own cache, begins. Under [`PLANNING_MAX_BYTES`] of headroom it reads nothing at
+//! all, not even to plan; planning reads ELF headers, unit and chrony files and journal
+//! headers (at most about 80 KiB per executable or library, 160 bytes per journal); and the
+//! reads proper happen only when the headroom holds the planned total, so they never push the
+//! guest into reclaim. The rule scales with the guest rather than being a fixed margin, which
+//! a small guest could never pass. An overlay root, or any
+//! root whose filesystem is not in [`LOCAL_FS_TYPES`], reads nothing either. It starts,
+//! stops, flushes and writes nothing. A page-cache read is what any process in the guest
+//! does, the kernel can drop the pages again, and a file that cannot be read is skipped.
 //!
 //! What it reads, in this order, until a bound stops it:
 //! 1. each program in [`RESTORE_PROGRAMS`], resolved the way the spawn resolves it (an
@@ -29,12 +37,14 @@
 //! FUSE mount sleeps uninterruptibly, and this runs before the snapshot's pause.
 //!
 //! [`RESTORE_PROGRAMS`] is kept by hand. What checks it is a scan of every `Command::new` in
-//! the non-test code of the modules a restore runs (`restore.rs`, `snapshot_network.rs`,
-//! `mounts.rs`, `network.rs`, `proxy.rs`, `retired_address.rs`, and `agent.rs`'s chronyd
-//! functions): one test per module pins that module's exact set of spawn expressions, a
-//! literal program must be in the registry, and a spawn whose program is a variable lists the
-//! programs fed to it, each of which must appear in that module. A new spawn site fails its
-//! module's test until it is registered.
+//! the non-test code of fc-agent: every source file that spawns is either pinned by a test of
+//! its own (`restore.rs`, `snapshot_network.rs`, `mounts.rs`, `network.rs`, `proxy.rs`,
+//! `retired_address.rs`, `agent.rs`, `gpu.rs`, `gpu_park.rs`), which fixes that module's exact
+//! set of spawn expressions, or named, with its reason, as off the restore path
+//! (`container.rs`, `tty.rs`, `system.rs`). A literal program must be in the registry, and a
+//! spawn whose program is a variable lists the programs fed to it, each of which must appear
+//! in that module. A new spawn site, in any file, fails a test until it is registered or
+//! excluded. A program started inside a `sh -c` script is not seen by the scan.
 
 use std::ffi::OsString;
 use std::os::unix::fs::FileExt;
@@ -56,6 +66,9 @@ pub enum Warm {
     /// Only when the guest has an NFS mount when the snapshot is taken: the restore remounts
     /// only the shares the guest had.
     IfNfs,
+    /// Only when the guest has the GPU driver image mounted at `gpu::DRIVER_ROOT`: only such
+    /// a guest's clones attach GPUs.
+    IfGpu,
     /// Never: see the entry.
     Never,
 }
@@ -157,6 +170,41 @@ pub const RESTORE_PROGRAMS: &[Program] = &[
         name: "crun",
         spawned_by: "`podman exec`",
         warm: Warm::Always,
+    }, // GPU attach (gpu.rs, and gpu_park.rs, which it calls to unpark), on a clone given GPUs.
+    Program {
+        name: "dmesg",
+        spawned_by: "gpu::attach",
+        warm: Warm::IfGpu,
+    },
+    Program {
+        name: "insmod",
+        spawned_by: "gpu::attach",
+        warm: Warm::IfGpu,
+    },
+    Program {
+        name: "/run/fcvm-gpu/driver/usr/bin/nvidia-smi",
+        spawned_by: "gpu::attach, gpu_park",
+        warm: Warm::IfGpu,
+    },
+    Program {
+        name: "/run/fcvm-gpu/driver/usr/bin/nvidia-ctk",
+        spawned_by: "gpu::attach",
+        warm: Warm::IfGpu,
+    },
+    Program {
+        name: "/run/fcvm-gpu/driver/usr/bin/fcvm-gpu-scrub",
+        spawned_by: "gpu::attach (gpu::SCRUB_TOOL)",
+        warm: Warm::IfGpu,
+    },
+    Program {
+        name: "/run/fcvm-gpu/driver/usr/bin/nvidia-persistenced",
+        spawned_by: "gpu::attach",
+        warm: Warm::IfGpu,
+    },
+    Program {
+        name: "/run/fcvm-gpu/driver/usr/bin/cuda-checkpoint",
+        spawned_by: "gpu_park::unpark",
+        warm: Warm::IfGpu,
     },
 ];
 
@@ -172,9 +220,9 @@ pub const WARMUP_MAX_BYTES: u64 = 64 << 20;
 /// from a cold guest page cache. The host's exec of the prepare one-shot has no timeout of
 /// its own, so this is what bounds the time the warm-up adds to `snapshot create`.
 pub const WARMUP_DEADLINE: Duration = Duration::from_secs(2);
-/// The warm-up reads nothing unless `MemAvailable` exceeds what it would read by this, so a
-/// guest short of memory keeps its own page cache: the warm-up is only a hint.
-pub const WARMUP_MEMORY_MARGIN: u64 = 256 << 20;
+/// The warm-up plans nothing unless the guest's headroom ([`headroom`]) is at least this, a
+/// bound on what planning itself reads.
+pub const PLANNING_MAX_BYTES: u64 = 8 << 20;
 
 /// A live journal whose used part is at most this size is read whole: journald allocates its
 /// files 8 MiB at a time, and a fresh guest's `system.journal` is one such file.
@@ -188,6 +236,11 @@ pub const JOURNAL_TAIL_BYTES: u64 = 1 << 20;
 pub const JOURNAL_ARCHIVE_HEAD_BYTES: u64 = 16 << 10;
 /// At most this many archives are read: journald's default `SystemMaxFiles`.
 pub const JOURNAL_MAX_ARCHIVES: usize = 100;
+/// At most this many live journals are read, the most recently modified first. The traced
+/// guest had one (`system.journal`); a guest has one more per user who has logged.
+pub const JOURNAL_MAX_LIVE: usize = 16;
+/// At most this many directory entries under the journal directory are looked at.
+pub const JOURNAL_MAX_ENTRIES: usize = 4096;
 
 /// Filesystems a read cannot park on: local block filesystems and memory.
 pub const LOCAL_FS_TYPES: &[&str] = &["ext4", "btrfs", "xfs", "tmpfs", "ramfs", "rootfs"];
@@ -225,10 +278,13 @@ const ELF_MAX_PHNUM: usize = 64;
 const READ_CHUNK: usize = 1 << 20;
 
 /// The registered programs the warm-up reads, given whether the guest has an NFS mount.
-fn programs_to_warm(nfs: bool) -> impl Iterator<Item = &'static Program> {
-    RESTORE_PROGRAMS
-        .iter()
-        .filter(move |p| p.warm == Warm::Always || (p.warm == Warm::IfNfs && nfs))
+fn programs_to_warm(nfs: bool, gpu: bool) -> impl Iterator<Item = &'static Program> {
+    RESTORE_PROGRAMS.iter().filter(move |p| match p.warm {
+        Warm::Always => true,
+        Warm::IfNfs => nfs,
+        Warm::IfGpu => gpu,
+        Warm::Never => false,
+    })
 }
 
 /// Add all of `path` to `plan` unless it is there already or is not a regular file.
@@ -258,6 +314,8 @@ pub struct Report {
     pub not_local: Vec<PathBuf>,
     /// Set when nothing was read because memory was short, or when a bound stopped the reads.
     pub stopped: Option<String>,
+    /// `MemFree` and the zones' summed high watermarks when it started, in bytes.
+    pub memory: Option<(u64, u64)>,
 }
 
 impl std::fmt::Display for Report {
@@ -283,6 +341,14 @@ impl std::fmt::Display for Report {
         if let Some(why) = &self.stopped {
             write!(f, "; {why}")?;
         }
+        if let Some((free, high)) = self.memory {
+            write!(
+                f,
+                "; MemFree {} KiB, high watermarks {} KiB",
+                free / 1024,
+                high / 1024
+            )?;
+        }
         Ok(())
     }
 }
@@ -306,16 +372,40 @@ pub fn warm() -> Report {
         chrony_conf: Path::new(CHRONY_CONF),
         deadline: started + WARMUP_DEADLINE,
     };
+    let memory = memory();
+    let mut report = warm_in(
+        &env,
+        memory.map(|(free, high)| free.saturating_sub(high)),
+        started,
+    );
+    report.memory = memory;
+    report
+}
+
+/// [`warm`] in `env`, given the guest's memory headroom. It is checked before anything is
+/// planned, so a guest without room for planning reads nothing at all, and again on the
+/// planned total.
+fn warm_in(env: &Env, headroom: Option<u64>, started: Instant) -> Report {
+    if headroom.is_none_or(|room| room < PLANNING_MAX_BYTES) {
+        return Report {
+            stopped: Some(format!(
+                "skipped before planning: {} KiB free above the high watermarks, under {} KiB",
+                headroom.map_or("unknown".into(), |a| (a / 1024).to_string()),
+                PLANNING_MAX_BYTES / 1024
+            )),
+            elapsed: started.elapsed(),
+            ..Default::default()
+        };
+    }
     let mut report = Report::default();
-    let plan = plan(&env, &mut report);
-    let mem_available = mem_available();
+    let plan = plan(env, &mut report);
     let mut report = execute(
         &plan,
         report,
         Bounds {
             max_bytes: WARMUP_MAX_BYTES,
-            deadline: started + WARMUP_DEADLINE,
-            mem_available,
+            deadline: env.deadline,
+            headroom,
         },
     );
     report.elapsed = started.elapsed();
@@ -348,7 +438,8 @@ impl FileRead {
 fn plan(env: &Env, report: &mut Report) -> Vec<FileRead> {
     let mut plan: Vec<FileRead> = Vec::new();
     let mut executables = Vec::new();
-    for program in programs_to_warm(env.mounts.has_nfs()) {
+    let gpu = env.mounts.has_mount_at(Path::new(crate::gpu::DRIVER_ROOT));
+    for program in programs_to_warm(env.mounts.has_nfs(), gpu) {
         match find_program(program.name, &env.path, env.mounts, &mut report.not_local) {
             Some(path) => executables.push(path),
             None => report
@@ -369,26 +460,25 @@ fn plan(env: &Env, report: &mut Report) -> Vec<FileRead> {
         }
     }
     for exe in executables {
-        if Instant::now() >= env.deadline {
-            report.stopped = Some("planning reached the deadline".into());
-            return plan;
-        }
         add_whole(&mut plan, exe.clone());
-        for lib in library_closure(&exe, env.mounts) {
+        for lib in library_closure(&exe, env.mounts, env.deadline) {
             add_whole(&mut plan, lib);
         }
     }
     for path in chrony_files(env.chrony_conf, env.mounts) {
         add_whole(&mut plan, path);
     }
-    plan.extend(journal_reads(env.journal_dir, env.mounts));
+    plan.extend(journal_reads(env.journal_dir, env.mounts, env.deadline));
+    if Instant::now() >= env.deadline {
+        report.stopped = Some("planning reached the deadline".into());
+    }
     plan
 }
 
 struct Bounds {
     max_bytes: u64,
     deadline: Instant,
-    mem_available: Option<u64>,
+    headroom: Option<u64>,
 }
 
 fn execute(plan: &[FileRead], mut report: Report, bounds: Bounds) -> Report {
@@ -397,14 +487,13 @@ fn execute(plan: &[FileRead], mut report: Report, bounds: Bounds) -> Report {
         .map(FileRead::bytes)
         .sum::<u64>()
         .min(bounds.max_bytes);
-    match bounds.mem_available {
-        Some(available) if available >= planned.saturating_add(WARMUP_MEMORY_MARGIN) => {}
-        available => {
+    match bounds.headroom {
+        Some(room) if room >= planned => {}
+        room => {
             report.stopped = Some(format!(
-                "skipped: MemAvailable {} KiB is under {} KiB to read plus a {} KiB margin",
-                available.map_or("unknown".into(), |a| (a / 1024).to_string()),
-                planned / 1024,
-                WARMUP_MEMORY_MARGIN / 1024
+                "skipped: {} KiB free above the high watermarks, under the {} KiB to read",
+                room.map_or("unknown".into(), |a| (a / 1024).to_string()),
+                planned / 1024
             ));
             return report;
         }
@@ -445,11 +534,28 @@ fn execute(plan: &[FileRead], mut report: Report, bounds: Bounds) -> Report {
     report
 }
 
-fn mem_available() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib * 1024)
+/// The guest's free memory and the sum of its zones' high watermarks, in bytes. The free
+/// memory above the watermarks is the headroom: what can be filled without waking reclaim.
+/// None when either file cannot be read.
+fn memory() -> Option<(u64, u64)> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let zoneinfo = std::fs::read_to_string("/proc/zoneinfo").ok()?;
+    // SAFETY: sysconf takes a constant and reads no memory of ours.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    memory_from(&meminfo, &zoneinfo, page)
+}
+
+fn memory_from(meminfo: &str, zoneinfo: &str, page: u64) -> Option<(u64, u64)> {
+    let line = meminfo.lines().find(|l| l.starts_with("MemFree:"))?;
+    let free = line.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024;
+    let mut high_pages = 0u64;
+    for line in zoneinfo.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("high") {
+            high_pages += words.next()?.parse::<u64>().ok()?;
+        }
+    }
+    Some((free, high_pages * page))
 }
 
 /// The mounts of `/proc/self/mountinfo`: mount point and filesystem type, in mount order.
@@ -467,6 +573,11 @@ impl Mounts {
             })
             .collect();
         Mounts(mounts)
+    }
+
+    /// Whether something is mounted at `point`.
+    fn has_mount_at(&self, point: &Path) -> bool {
+        self.0.iter().any(|(mounted, _)| mounted == point)
     }
 
     /// Whether any mount is NFS.
@@ -657,45 +768,61 @@ fn chrony_files(conf: &Path, mounts: &Mounts) -> Vec<PathBuf> {
 /// The journal files under `dir` and its machine-id subdirectories: of each live file the
 /// parts [`journal_ranges`] gives, of each archive (`system@….journal`, `….journal~`) its
 /// first [`JOURNAL_ARCHIVE_HEAD_BYTES`], for at most [`JOURNAL_MAX_ARCHIVES`] archives.
-fn journal_reads(dir: &Path, mounts: &Mounts) -> Vec<FileRead> {
+fn journal_reads(dir: &Path, mounts: &Mounts, deadline: Instant) -> Vec<FileRead> {
     let mut out = Vec::new();
     let Ok(dir) = resolve(dir, mounts) else {
         return out;
     };
+    // (modified time, live, path) of the journal files, newest first once sorted.
+    let mut found: Vec<(std::time::SystemTime, bool, PathBuf)> = Vec::new();
     let mut dirs = vec![dir];
-    let mut archives = 0;
-    while let Some(dir) = dirs.pop() {
+    let mut seen = 0;
+    'scan: while let Some(dir) = dirs.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else {
+            seen += 1;
+            if seen > JOURNAL_MAX_ENTRIES || Instant::now() >= deadline {
+                break 'scan;
+            }
+            let Ok(meta) = entry.metadata() else {
                 continue;
             };
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if kind.is_dir() && dirs.len() < 64 {
+            if meta.is_dir() && dirs.len() < 64 {
                 if let Ok(sub) = resolve(&entry.path(), mounts) {
                     dirs.push(sub);
                 }
-            } else if kind.is_file() && name.contains(".journal") {
-                let path = entry.path();
-                let Ok(file) = std::fs::File::open(&path) else {
-                    continue;
-                };
-                if name.ends_with(".journal") && !name.contains('@') {
-                    if let Some(ranges) = journal_ranges(&file) {
-                        out.push(FileRead { path, ranges });
-                    }
-                } else if archives < JOURNAL_MAX_ARCHIVES {
-                    archives += 1;
-                    let len = file.metadata().map_or(0, |m| m.len());
-                    out.push(FileRead {
-                        path,
-                        ranges: vec![(0, len.min(JOURNAL_ARCHIVE_HEAD_BYTES))],
-                    });
-                }
+            } else if meta.is_file() && name.contains(".journal") {
+                let live = name.ends_with(".journal") && !name.contains('@');
+                let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                found.push((modified, live, entry.path()));
             }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    let (mut live, mut archives) = (0, 0);
+    for (_, is_live, path) in found {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if is_live && live < JOURNAL_MAX_LIVE {
+            live += 1;
+            if let Some(ranges) = journal_ranges(&file) {
+                out.push(FileRead { path, ranges });
+            }
+        } else if !is_live && archives < JOURNAL_MAX_ARCHIVES {
+            archives += 1;
+            let len = file.metadata().map_or(0, |m| m.len());
+            out.push(FileRead {
+                path,
+                ranges: vec![(0, len.min(JOURNAL_ARCHIVE_HEAD_BYTES))],
+            });
         }
     }
     out
@@ -748,10 +875,13 @@ fn journal_ranges(file: &std::fs::File) -> Option<Vec<(u64, u64)>> {
 }
 
 /// The shared libraries `exe` needs, its interpreter included, followed transitively.
-fn library_closure(exe: &Path, mounts: &Mounts) -> Vec<PathBuf> {
+fn library_closure(exe: &Path, mounts: &Mounts, deadline: Instant) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut queue = vec![exe.to_path_buf()];
     while let Some(next) = queue.pop() {
+        if Instant::now() >= deadline {
+            break;
+        }
         let Ok(file) = std::fs::File::open(&next) else {
             continue;
         };
@@ -1139,6 +1269,194 @@ mod tests {
         );
     }
 
+    /// The whole of agent.rs: the chronyd functions run on every restore, and `hostname` sets
+    /// the hostname at boot only, so it is not registered.
+    #[test]
+    fn agent_spawns_are_registered_or_boot_only() {
+        let source = shipped(include_str!("agent.rs"));
+        let mut expected = vec![
+            "\"/usr/sbin/chronyd\"",
+            "\"/usr/bin/chronyc\"",
+            "\"systemctl\"",
+            "\"sysctl\"",
+            "\"hostname\"",
+        ];
+        expected.sort();
+        assert_eq!(spawns(&source), expected);
+        assert!(registered("sysctl") && !registered("hostname"));
+    }
+
+    #[test]
+    fn gpu_spawns_are_registered() {
+        let source = shipped(include_str!("gpu.rs"));
+        check_module(
+            "gpu.rs",
+            &source,
+            &[
+                "\"dmesg\"",
+                "\"insmod\"",
+                "driver_root.join(\"usr/bin/nvidia-smi\")",
+                "driver_root.join(\"usr/bin/nvidia-smi\")",
+                "driver_root.join(\"usr/bin/nvidia-ctk\")",
+                "driver_root.join(SCRUB_TOOL)",
+                "driver_root.join(\"usr/bin/nvidia-persistenced\")",
+            ],
+            &[],
+        );
+        let tools = [
+            "usr/bin/nvidia-smi",
+            "usr/bin/nvidia-ctk",
+            crate::gpu::SCRUB_TOOL,
+            "usr/bin/nvidia-persistenced",
+        ];
+        for tool in tools {
+            let path = format!("{}/{tool}", crate::gpu::DRIVER_ROOT);
+            assert!(registered(&path), "{path}");
+        }
+    }
+
+    #[test]
+    fn gpu_park_spawns_are_registered() {
+        let source = shipped(include_str!("gpu_park.rs"));
+        check_module(
+            "gpu_park.rs",
+            &source,
+            &[
+                "&argv[0]",
+                "root.join(\"usr/bin/cuda-checkpoint\")",
+                "root.join(\"usr/bin/nvidia-smi\")",
+            ],
+            &["podman"],
+        );
+        for tool in ["usr/bin/cuda-checkpoint", "usr/bin/nvidia-smi"] {
+            let path = format!("{}/{tool}", crate::gpu::DRIVER_ROOT);
+            assert!(registered(&path), "{path}");
+        }
+    }
+
+    /// Modules that spawn but are not on the restore path, and why.
+    const OFF_RESTORE_PATH: &[(&str, &str)] = &[
+        (
+            "container.rs",
+            "boot: starts the container and prepares its storage and user; the restore \
+             hook's prefix comes from it but snapshot_network spawns the hook",
+        ),
+        (
+            "tty.rs",
+            "the exec server: spawns the argv an exec request names, not a restore step",
+        ),
+        (
+            "system.rs",
+            "shutdown (sync, poweroff, reboot), which ends a clone rather than restoring it",
+        ),
+    ];
+
+    /// Modules a test above pins.
+    const PINNED: &[&str] = &[
+        "restore.rs",
+        "snapshot_network.rs",
+        "mounts.rs",
+        "network.rs",
+        "proxy.rs",
+        "retired_address.rs",
+        "agent.rs",
+        "gpu.rs",
+        "gpu_park.rs",
+    ];
+
+    /// Every fc-agent source file whose shipped code spawns a process is pinned by a test
+    /// above or named as off the restore path, so a spawn in a new module fails here.
+    #[test]
+    fn every_spawning_module_is_pinned_or_excluded() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut dirs = vec![src.clone()];
+        let mut spawning = Vec::new();
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    if !spawns(&shipped(&source)).is_empty() {
+                        let name = path.strip_prefix(&src).unwrap();
+                        spawning.push(name.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        spawning.sort();
+        let mut known: Vec<String> = PINNED
+            .iter()
+            .chain(OFF_RESTORE_PATH.iter().map(|(module, _)| module))
+            .map(|module| module.to_string())
+            .collect();
+        known.sort();
+        assert_eq!(
+            spawning, known,
+            "a module that spawns is neither pinned nor named off the restore path"
+        );
+    }
+
+    /// The memory figures are `MemFree` and every zone's high watermark, in pages.
+    #[test]
+    fn memory_is_free_memory_and_the_high_watermarks() {
+        let meminfo = "MemTotal:  262144 kB\nMemFree:   102400 kB\nMemAvailable: 150000 kB\n";
+        let zoneinfo = "Node 0, zone      DMA\n  pages free     25600\n        min      512\n        low      640\n        high     768\n        spanned  65536\nNode 0, zone   Normal\n  pages free     0\n        min      0\n        low      0\n        high     256\n";
+        assert_eq!(
+            memory_from(meminfo, zoneinfo, 4096),
+            Some((100 << 20, 1024 * 4096))
+        );
+        assert_eq!(memory_from("", zoneinfo, 4096), None);
+    }
+
+    /// Under the planning bound nothing is planned: planning would have looked every program up
+    /// and reported the ones an empty `PATH` cannot find.
+    #[test]
+    fn short_memory_skips_planning_too() {
+        let dir = scratch("short-memory");
+        let mounts = local_root();
+        let conf = dir.join("chrony.conf");
+        let env = Env {
+            mounts: &mounts,
+            path: dir.clone().into_os_string(),
+            journal_dir: &dir,
+            chrony_conf: &conf,
+            deadline: far(),
+        };
+        let short = warm_in(&env, Some(PLANNING_MAX_BYTES - 1), Instant::now());
+        assert!(short.not_found.is_empty(), "{short}");
+        assert!(short
+            .stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("skipped before planning"));
+        assert!(warm_in(&env, None, Instant::now()).not_found.is_empty());
+        let enough = warm_in(&env, Some(u64::MAX), Instant::now());
+        assert!(enough.not_found.iter().any(|n| n.starts_with("systemctl")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A deadline already past stops library and journal planning, and journal planning
+    /// considers at most the newest live journals and directory entries its caps allow.
+    #[test]
+    fn planning_stops_at_the_deadline_and_the_journal_caps() {
+        let me = std::env::current_exe().unwrap();
+        assert!(library_closure(&me, &local_root(), Instant::now()).is_empty());
+        let dir = scratch("many-journals");
+        for i in 0..(JOURNAL_MAX_LIVE + 4) {
+            fake_journal(&dir.join(format!("user-{i}.journal")), 1 << 20, 1 << 20);
+        }
+        assert!(journal_reads(&dir, &local_root(), Instant::now()).is_empty());
+        let reads = journal_reads(&dir, &local_root(), far());
+        assert_eq!(reads.len(), JOURNAL_MAX_LIVE);
+        for i in 0..JOURNAL_MAX_ENTRIES {
+            std::fs::write(dir.join(format!("other-{i}")), b"").unwrap();
+        }
+        assert!(journal_reads(&dir, &local_root(), far()).len() <= JOURNAL_MAX_LIVE);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn agent_chronyd_spawns_are_registered() {
         let agent = include_str!("agent.rs");
@@ -1166,6 +1484,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(600)
     }
 
     fn local_root() -> Mounts {
@@ -1213,7 +1535,7 @@ mod tests {
             );
         }
         fake_journal(&machine.join("user-1000.journal"), 2 << 20, 8 << 20);
-        let reads = journal_reads(&dir, &local_root());
+        let reads = journal_reads(&dir, &local_root(), far());
         let live: Vec<_> = reads
             .iter()
             .filter(|r| {
@@ -1258,10 +1580,10 @@ mod tests {
         );
 
         // The whole warm-up stops at its byte cap.
-        let bounds = |max_bytes, deadline, mem_available| Bounds {
+        let bounds = |max_bytes, deadline, headroom| Bounds {
             max_bytes,
             deadline,
-            mem_available,
+            headroom,
         };
         let far = Instant::now() + Duration::from_secs(60);
         let report = execute(
@@ -1287,21 +1609,17 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("stopped at the deadline"));
-        // And reads nothing when memory is short of what it would read plus the margin.
-        let short = total + WARMUP_MEMORY_MARGIN - 1;
+        // And reads nothing when the free memory above the watermarks cannot hold it.
+        let short = total - 1;
         let report = execute(
             &reads,
             Report::default(),
             bounds(u64::MAX, far, Some(short)),
         );
         assert_eq!((report.files, report.bytes), (0, 0));
-        assert!(report
-            .stopped
-            .as_deref()
-            .unwrap()
-            .starts_with("skipped: MemAvailable"));
+        assert!(report.stopped.as_deref().unwrap().starts_with("skipped: "));
         let report = execute(&reads, Report::default(), bounds(u64::MAX, far, None));
-        assert_eq!(report.bytes, 0, "an unreadable MemAvailable reads nothing");
+        assert_eq!(report.bytes, 0, "unreadable memory figures read nothing");
         let report = execute(
             &reads,
             Report::default(),
@@ -1314,15 +1632,34 @@ mod tests {
     /// The NFS programs are read only when the guest has an NFS mount, and podman never.
     #[test]
     fn the_nfs_programs_are_read_only_with_nfs_and_podman_never() {
-        let names = |nfs| programs_to_warm(nfs).map(|p| p.name).collect::<Vec<_>>();
+        let names = |nfs, gpu| {
+            programs_to_warm(nfs, gpu)
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+        };
         let nfs_only = ["umount", "mount", "/sbin/mount.nfs"];
-        let without = names(false);
-        let with = names(true);
+        let without = names(false, false);
+        let with = names(true, false);
         assert!(nfs_only
             .iter()
             .all(|n| !without.contains(n) && with.contains(n)));
         assert!(!with.contains(&"podman"));
-        assert_eq!(with.len(), RESTORE_PROGRAMS.len() - 1);
+        let gpu_only: Vec<_> = RESTORE_PROGRAMS
+            .iter()
+            .filter(|p| p.warm == Warm::IfGpu)
+            .map(|p| p.name)
+            .collect();
+        assert!(gpu_only.contains(&"insmod"));
+        assert!(gpu_only
+            .iter()
+            .all(|n| !with.contains(n) && names(false, true).contains(n)));
+        assert_eq!(names(true, true).len(), RESTORE_PROGRAMS.len() - 1);
+        let driver = Mounts::parse(&format!(
+            "40 22 254:16 / {} ro - ext4 /dev/vdb ro\n",
+            crate::gpu::DRIVER_ROOT
+        ));
+        assert!(driver.has_mount_at(Path::new(crate::gpu::DRIVER_ROOT)));
+        assert!(!local_root().has_mount_at(Path::new(crate::gpu::DRIVER_ROOT)));
         assert!(Mounts::parse("30 22 0:5 / /mnt rw - nfs4 host:/ rw\n").has_nfs());
         assert!(!local_root().has_nfs());
     }
@@ -1473,14 +1810,14 @@ mod tests {
         assert!((asked.iter().sum::<usize>() as u64) < file.metadata().unwrap().len());
         if dynamic.needed.is_empty() {
             // A static build (musl) needs nothing: its closure is empty.
-            assert!(library_closure(&me, &local_root()).is_empty());
+            assert!(library_closure(&me, &local_root(), far()).is_empty());
             return;
         }
         assert!(
             dynamic.needed.iter().any(|n| n.starts_with("libc.so")),
             "{dynamic:?}"
         );
-        let closure = library_closure(&me, &local_root());
+        let closure = library_closure(&me, &local_root(), far());
         assert!(
             closure.iter().any(|p| p
                 .file_name()
@@ -1505,11 +1842,12 @@ mod tests {
             not_found: vec!["conntrack (the gate)".into()],
             not_local: vec![PathBuf::from("/mnt/nfs")],
             stopped: None,
+            memory: Some((100 << 20, 4 << 20)),
         };
         assert_eq!(
             report.to_string(),
             "read 3 files (4 KiB) a restore runs into the page cache in 7 ms; not found: conntrack (the gate); \
-             not on a local filesystem: /mnt/nfs"
+             not on a local filesystem: /mnt/nfs; MemFree 102400 KiB, high watermarks 4096 KiB"
         );
     }
 }
