@@ -536,30 +536,58 @@ export interface ShotInput {
   timeMs: number;
   /** No flight (reduced motion, or a device that draws too slowly): one wide view from the tile's own side. */
   still: boolean;
-  /** The column that last changed, and when (`timeMs`'s clock). */
-  recent?: { i: number; at: number } | null;
+  /** This page's viewer drives the tile's bot: the view from behind it is theirs also when the tile stands still. */
+  mine?: boolean;
+  /** The changed column this cut features, chosen when the cut began (`shotCue`). */
+  cue?: number | null;
+}
+
+/** The cut a tile is in at `timeMs`: tiles cut at different times by their seed. */
+export function cutOf(timeMs: number, seed: number): number {
+  return Math.floor((timeMs + seed * 3700) / SHOT_MS);
+}
+
+/** The cut a tile's cue was chosen for, and the changed column it features (none: the tile's own shot). */
+export interface ShotCue {
+  cut: number;
+  site: number | null;
 }
 
 /**
- * Where a tile's camera is at `timeMs`. A driven bot is followed from behind. Otherwise every
- * SHOT_MS the tile cuts to its next shot: behind a bot that shows above ground, a circle round a
- * bot or round something the bots built, or the whole region; a column that just changed takes
- * the next cut.
+ * Which changed column, if any, a tile's present cut features. Chosen once, when the cut begins,
+ * and kept for the whole cut: bots that go on building do not move the camera's subject in the
+ * middle of a shot. A column that changed within RECENT_CUT_MS takes the next cut, but never two
+ * cuts in a row, so the tile's own sequence of shots goes on however long the bots build.
+ */
+export function shotCue(prev: ShotCue | null, inp: { seed: number; timeMs: number; last: { i: number; at: number } | null }): ShotCue {
+  const cut = cutOf(inp.timeMs, inp.seed);
+  if (prev !== null && prev.cut === cut) return prev;
+  const fresh = inp.last !== null && inp.timeMs - inp.last.at < RECENT_CUT_MS;
+  const afterCue = prev !== null && prev.cut === cut - 1 && prev.site !== null;
+  return { cut, site: fresh && !afterCue ? inp.last!.i : null };
+}
+
+/**
+ * Where a tile's camera is at `timeMs`. A driven bot is followed from behind (on a tile that
+ * stands still, only for the viewer who drives it). Otherwise every SHOT_MS the tile cuts to its
+ * next shot: behind a bot that shows above ground, a circle round a bot or round something the
+ * bots built, or the whole region; a cut with a cue (`shotCue`) circles the column that changed.
  */
 export function shotOf(inp: ShotInput): McShot {
   const s = inp.scene;
   const driven = inp.players.find((p) => p.driven) ?? null;
-  if (driven !== null) return { kind: "chase", cam: chaseCam(s, driven, { back: 7, up: 5, side: 0 }), figScale: 1, follows: driven.name };
+  // Standing still (reduced motion), another viewer's driving does not move this page's tile.
+  if (driven !== null && (!inp.still || inp.mine === true)) return { kind: "chase", cam: chaseCam(s, driven, { back: 7, up: 5, side: 0 }), figScale: 1, follows: driven.name };
   if (inp.still) return { kind: "wide", cam: wideCam(s, 0.7 + inp.seed * 1.9), figScale: 3.2, follows: null };
-  const t = inp.timeMs + inp.seed * 3700;
-  const cut = Math.floor(t / SHOT_MS);
-  const u = t / SHOT_MS - cut;
+  const cut = cutOf(inp.timeMs, inp.seed);
+  const u = (inp.timeMs + inp.seed * 3700) / SHOT_MS - cut;
   const pick = cut + inp.seed;
   const turn = hash2(cut, inp.seed) * Math.PI * 2;
   const shown = inp.players.filter((p) => showsAbove(s, p));
   const siteOf = (i: number) => ({ x: (i % s.w) + 0.5, z: Math.floor(i / s.w) + 0.5 });
   const orbit = (p: { x: number; z: number }, name: string | null, r: number): McShot => ({ kind: "orbit", cam: orbitCam(s, p, { az: turn + u * 1.0, r, up: r * 0.6 }), figScale: r > 16 ? 1.4 : 1.15, follows: name });
-  const recent = inp.recent && inp.timeMs - inp.recent.at < RECENT_CUT_MS ? siteOf(inp.recent.i) : null;
+  const cue = inp.cue ?? null;
+  const recent = cue !== null && cue >= 0 && cue < s.w * s.h ? siteOf(cue) : null;
   if (recent !== null) {
     const by = shown.find((p) => Math.hypot(p.x - recent.x, p.z - recent.z) < 12) ?? null;
     return orbit(by ?? recent, by?.name ?? null, 13);
@@ -744,7 +772,10 @@ export const REBUILD_MIN_MS = 200;
 export class FrameBudget {
   level: number;
   private costs: number[] = [];
-  private changedAt: number | null = null;
+  /** When the window being filled began. */
+  private windowAt = 0;
+  /** Since when every window has kept up with the display: from the last level change, or from the first window after one that did not. */
+  private keptUpSince: number | null = null;
   private wait = BUDGET_RECOVER_MS;
   /** When the last step up was made, until a step down judges it. */
   private triedUpAt: number | null = null;
@@ -770,22 +801,31 @@ export class FrameBudget {
 
   /** `displayMs`: the time between the display's ticks (16.7 at 60 Hz), as the page measured it. */
   sample(costMs: number, nowMs: number, displayMs = 16.7): void {
-    this.changedAt ??= nowMs;
+    if (this.costs.length === 0) this.windowAt = nowMs;
     this.costs.push(costMs);
     const far = this.costs.length >= 3 && this.costs.slice(-3).every((x) => x > FRAME_BUDGET_MS * 4);
     if (this.costs.length < BUDGET_WINDOW && !far) return;
     const sorted = [...this.costs].sort((a, b) => a - b);
     const median = sorted[sorted.length >> 1]!;
     this.costs = [];
-    const keepsUp = median <= FRAME_BUDGET_MS && median <= Math.max(FRAME_BUDGET_MS / 2, displayMs * 1.25);
-    if (median > FRAME_BUDGET_MS && this.level < FRAME_LEVELS.length - 1) {
+    const keepsUp = !far && median <= FRAME_BUDGET_MS && median <= Math.max(FRAME_BUDGET_MS / 2, displayMs * 1.25);
+    // Three frames far over the budget step down whatever came before them in the window.
+    if ((median > FRAME_BUDGET_MS || far) && this.level < FRAME_LEVELS.length - 1) {
       if (this.triedUpAt !== null) this.wait = nowMs - this.triedUpAt < this.wait ? Math.min(this.wait * 2, BUDGET_RECOVER_MAX_MS) : BUDGET_RECOVER_MS;
       this.triedUpAt = null;
       this.level++;
-      this.changedAt = nowMs;
-    } else if (keepsUp && this.level > 0 && nowMs - this.changedAt >= this.wait) {
+      this.keptUpSince = nowMs;
+      return;
+    }
+    if (!keepsUp) {
+      // A window that missed the display starts the wait again, even when it broke no budget.
+      this.keptUpSince = null;
+      return;
+    }
+    this.keptUpSince ??= this.windowAt;
+    if (this.level > 0 && nowMs - this.keptUpSince >= this.wait) {
       this.level--;
-      this.changedAt = nowMs;
+      this.keptUpSince = nowMs;
       this.triedUpAt = nowMs;
     }
   }

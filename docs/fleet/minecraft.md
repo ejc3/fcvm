@@ -183,10 +183,14 @@ guard; pure and unit-tested) and `fleet/web/app/_wall/minecraft-gl.ts` and `mine
   browser." on each tile; a lost context is the flat map with "3D view lost; showing the flat
   map.", and the 3D view returns when the browser restores the context.
 - **What is drawn from data and what is filled in** is said once under the header: "Drawn from
-  each column's top block; trunks, the forest floor and lake beds are filled in." The sky does not
-  move until a server sends its clock.
+  each column's top block; trunks are filled in, and so are the forest floor and lake beds of a
+  server that does not send them." The sky does not move until a server sends its clock.
 - **Reduced motion:** one still wide view per tile, each from its own side, drawn again (at most
-  four times a second) only when its world or its players change; no flight for a fork.
+  four times a second) only when its world or its players change; no flight for a fork. A bot
+  another viewer drives does not move the tile; the viewer who drives it keeps the view from
+  behind it.
+- **A column that just changed** takes a tile's next cut, chosen when the cut begins and kept
+  for it, and never two cuts in a row: bots that build without pause do not hold the camera.
 - **Opening a tile** (a click, or Enter on it) gives one server the whole stage; Escape or "All
   servers" brings the wall back, and focus goes to "All servers" and back to the tile. The other
   servers keep their sockets.

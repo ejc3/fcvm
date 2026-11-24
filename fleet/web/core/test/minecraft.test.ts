@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   applyDelta,
+  botCount,
+  sameColumns,
   BOT_DYES,
   decodeBase64,
   DRIVE_HEARTBEAT_MS,
@@ -801,6 +803,27 @@ describe("the 3D view's words", () => {
     // a world with no ground ignores a delta's
     const bare = worldFromMap(plain as Extract<typeof plain, { type: "map" }>);
     expect(applyDelta(bare, { type: "delta", seq: 6, cells: [], ground: [[1, 5, 119]] })).toBe(0);
+    // the columns that changed, in either layer, once each; a triple that changes nothing is not one
+    const b64 = (bytes: number[]) => Buffer.from(bytes).toString("base64");
+    const mapOf = (w: number, h: number, bytes: number[], ground = false) => {
+      const m = parseViewMsg(JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: b64(bytes), ...(ground ? { ground: b64(bytes) } : {}) }))!;
+      if (m.type !== "map") throw new Error("not a map");
+      return worldFromMap(m);
+    };
+    const wb = mapOf(2, 2, [2, 130, 2, 130, 2, 130, 2, 130], true);
+    const cols = new Set<number>();
+    expect(applyDelta(wb, { type: "delta", seq: 2, cells: [[0, 46, 131], [1, 2, 130]], ground: [[0, 46, 131], [3, 5, 120]] }, cols)).toBe(3);
+    expect([...cols].sort()).toEqual([0, 3]);
+    // a delta of the ground alone names its column too
+    cols.clear();
+    expect(applyDelta(wb, { type: "delta", seq: 3, cells: [], ground: [[2, 5, 121]] }, cols)).toBe(1);
+    expect([...cols]).toEqual([2]);
+    // column indices mean the same columns only on the same grid
+    const again = mapOf(2, 2, [1, 126, 1, 126, 1, 126, 1, 126]);
+    const small = mapOf(1, 1, [2, 130]);
+    expect([sameColumns(wb, again), sameColumns(wb, small), sameColumns(null, small)]).toEqual([true, false, false]);
+    // a person who joined is a player, not one of the tile's bots
+    expect(botCount([{ bot: true }, { bot: true }, { bot: true }, { bot: false }])).toBe(3);
     expect(bare.ground).toBeNull();
     const status = (extra: Record<string, unknown>) => parseViewMsg(JSON.stringify({ type: "status", t: 1, tps: 20, players: [], drive: null, ...extra }))!;
     expect(status({ day_time: 13000 })).toMatchObject({ day_time: 13000 });
@@ -813,8 +836,11 @@ describe("the 3D view's words", () => {
     expect(() => parseViewMsg(grid(MC_MAX_SIDE + 1, 1))).toThrow(/not a grid/);
     expect(() => parseViewMsg(grid(1, MC_MAX_SIDE + 1))).toThrow(/not a grid/);
     expect(() => parseViewMsg(grid(1024, 128))).toThrow(/not a grid/);
-    expect(() => parseViewMsg(grid(1024, 64))).not.toThrow(/not a grid/);
-    expect(() => parseViewMsg(grid(2, 4))).not.toThrow(/not a grid/);
+    // a whole map at the cap parses, and so does a small one
+    const whole = (w: number, h: number) => JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: Buffer.alloc(w * h * 2).toString("base64") });
+    expect(parseViewMsg(whole(1024, 64))).toMatchObject({ type: "map", region: { w: 1024, h: 64 } });
+    expect(parseViewMsg(whole(256, 256))).toMatchObject({ type: "map", region: { w: 256, h: 256 } });
+    expect(parseViewMsg(whole(2, 4))).toMatchObject({ type: "map" });
     const delta = (cells: unknown) => JSON.stringify({ type: "delta", seq: 2, cells });
     expect(() => parseViewMsg(delta([[MC_MAX_COLUMNS, 1, 1]]))).toThrow(ProtocolError);
     expect(parseViewMsg(delta([[MC_MAX_COLUMNS - 1, 1, 1]]))).toMatchObject({ type: "delta" });
@@ -853,7 +879,7 @@ describe("the 3D view's words", () => {
     expect(reduced.ariaLabel).toBe("mc-1, running, reduced detail");
     // what is drawn from data and what is filled in, said once, with the 3D view only
     expect(gl.header!.drawn).toBe(MC_DRAWN_NOTE);
-    expect(MC_DRAWN_NOTE).toBe("Drawn from each column's top block; trunks, the forest floor and lake beds are filled in.");
+    expect(MC_DRAWN_NOTE).toBe("Drawn from each column's top block; trunks are filled in, and so are the forest floor and lake beds of a server that does not send them.");
     expect(flat.header!.drawn).toBeNull();
   });
 

@@ -21,6 +21,8 @@ import {
   sceneOf,
   scenePlayer,
   shotOf,
+  shotCue,
+  type ShotCue,
   skyOf,
   type Box,
   type McScene,
@@ -49,6 +51,8 @@ export interface StageTile {
   timer: string | null;
   /** Not running: restoring, taking a copy, or failed. */
   dark: boolean;
+  /** This page's viewer holds the server: its bot is theirs to drive. */
+  mine?: boolean;
 }
 
 /** A flight waits this long for the copy's world after the copy runs, then gives the tile back. */
@@ -131,6 +135,10 @@ export class McStage {
   /** Per tile: when a copy landed there and whose camera it keeps for a moment. */
   private landed = new Map<string, { at: number; seed: number }>();
   private shots = new Map<string, McShot>();
+  /** Each tile's cue: the changed column its present cut features. */
+  private cues = new Map<string, ShotCue>();
+  /** A scene put its rebuild off (REBUILD_MIN_MS): a still view is not yet the picture of its world. */
+  private owed = false;
   private lastDrawAt = Number.NEGATIVE_INFINITY;
   private lastDrew = false;
   private lastSig = "";
@@ -189,7 +197,11 @@ export class McStage {
     const cur = this.scenes.get(t.id);
     if (cur && cur.key === s.key && cur.scene.step === step && cur.scene.w === w.region.w && cur.scene.h === w.region.h) {
       const same = cur.seq === w.seq && cur.recentSig === recentSig && cur.from === (from?.cells ?? null) && cur.fromSeq === fromSeq;
-      if (same || now - cur.builtAt < REBUILD_MIN_MS) return cur.scene;
+      if (same) return cur.scene;
+      if (now - cur.builtAt < REBUILD_MIN_MS) {
+        this.owed = true;
+        return cur.scene;
+      }
     }
     const scene = sceneOf(w, s.remap, { ground: w.ground ?? null, diffFrom: from?.cells ?? null, recent: glow && s.recent.size > 0 ? new Set(s.recent.keys()) : null, step });
     this.scenes.set(t.id, { seq: w.seq, key: s.key, recentSig, from: from?.cells ?? null, fromSeq, scene, builtAt: now });
@@ -201,6 +213,7 @@ export class McStage {
     this.gl.release(id);
     this.scenes.delete(id);
     this.shots.delete(id);
+    this.cues.delete(id);
   }
 
   /** One animation frame at `now` (local ms). Draws when its turn has come; returns whether it drew. */
@@ -212,6 +225,9 @@ export class McStage {
       if (this.ticks.length > 30) this.ticks.shift();
     }
     this.lastTick = now;
+    // Before waiting for the GPU: a flight whose tiles left the stage ends now, not when the
+    // last drawn frame is done.
+    this.trackFlights(now, f);
     if (this.gl.busy(now)) return false;
     if (this.lastDrew) {
       // What the last drawn frame cost: the time until the GPU had drawn it, to the animation
@@ -223,7 +239,6 @@ export class McStage {
       this.lastDrew = false;
     }
     const still = f.reducedMotion || (this.budgetOn && this.budget.still);
-    this.trackFlights(now, f);
     // A fork in flight is drawn at least ten times a second, whatever the pace.
     const paced = Math.min(this.budgetOn ? this.budget.everyMs : 33, this.flights.size > 0 ? 100 : Number.POSITIVE_INFINITY);
     const every = f.reducedMotion ? Math.max(STILL_REDRAW_MS, paced) : paced;
@@ -236,9 +251,10 @@ export class McStage {
     if (still) {
       // A still view is drawn again only when something in it changed.
       const sig = `${layout}|${f.tiles.map((t) => `${this.tiles.peek(t.id)?.rev ?? -1}:${this.tiles.source(t.id)?.seq ?? -1}`).join()}|${this.flights.size}`;
-      if (sig === this.lastSig && this.flights.size === 0) return false;
+      if (sig === this.lastSig && this.flights.size === 0 && !this.owed) return false;
       this.lastSig = sig;
     }
+    this.owed = false;
     const gl = this.gl;
     gl.resize(f.stage.w, f.stage.h, pixelScale(f.stage.w, f.stage.h, f.dpr));
     gl.begin();
@@ -274,7 +290,10 @@ export class McStage {
   private draw(t: StageTile, s: TileState, now: number, box: Box, f: StageFrame, still: boolean, seed: number, step: number): McShot {
     const scene = this.scene(t, s, now, !f.reducedMotion, step);
     const players = s.players.map((p) => scenePlayer(s.world!.region, p));
-    const shot = shotOf({ scene, players, seed, timeMs: now, still, recent: f.reducedMotion ? null : s.lastChange });
+    // The changed column this cut features is chosen when the cut begins and kept for it.
+    const cue = still ? null : shotCue(this.cues.get(t.id) ?? null, { seed, timeMs: now, last: s.lastChange });
+    if (cue !== null) this.cues.set(t.id, cue);
+    const shot = shotOf({ scene, players, seed, timeMs: now, still, mine: t.mine === true, cue: cue?.site ?? null });
     const sky = skyOf(s.dayTime);
     const figures: number[] = [];
     for (const p of players) figureBoxes(figures, p, botColor(p, s.botNames), shot.figScale, { glow: sky.night, beacon: shot.figScale >= 1.25 });

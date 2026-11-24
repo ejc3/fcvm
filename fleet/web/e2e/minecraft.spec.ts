@@ -446,7 +446,7 @@ test("the worlds are drawn in 3D on one WebGL canvas, each tile from its own mov
   expect(await renderer(page)).toBe("3d");
   await expect(page.getByTestId("mc-gl")).toHaveCount(1);
   // what is drawn from data and what is filled in: under the header where there is a line for it, else under an opened server
-  await expect(page.getByTestId("mc-drawn")).toHaveText("Drawn from each column's top block; trunks, the forest floor and lake beds are filled in.");
+  await expect(page.getByTestId("mc-drawn")).toHaveText("Drawn from each column's top block; trunks are filled in, and so are the forest floor and lake beds of a server that does not send them.");
   if (isPhone(test.info())) await expect(page.getByTestId("mc-drawn")).toBeHidden();
   else await expect(page.getByTestId("mc-drawn")).toBeVisible();
   await expect.poll(async () => (await stageNow(page))!.held).toBe(SLOTS.length);
@@ -596,7 +596,7 @@ test("a click or Enter opens one server to the whole stage, and Escape or All se
   await expect(page.getByTestId("mc-close")).toBeVisible();
   // focus goes with the view: to All servers, and back to the tile when the wall returns
   await expect(page.getByTestId("mc-close")).toBeFocused();
-  await expect(page.getByTestId("mc-about-mc-3")).toHaveText("Drawn from each column's top block; trunks, the forest floor and lake beds are filled in.");
+  await expect(page.getByTestId("mc-about-mc-3")).toHaveText("Drawn from each column's top block; trunks are filled in, and so are the forest floor and lake beds of a server that does not send them.");
   for (const slot of ["mc-1", "mc-2", "mc-4"]) await expect(page.getByTestId(`mc-tile-${slot}`)).toHaveCount(0);
   const big = (await page.getByTestId("mc-tile-mc-3").boundingBox())!;
   expect(big.width).toBeGreaterThan(1.05 * small.width);
