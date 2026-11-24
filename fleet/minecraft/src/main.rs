@@ -10,6 +10,7 @@ mod bots;
 mod drive;
 mod map;
 mod palette;
+mod plan;
 mod pumpkin;
 mod server;
 mod tile;
@@ -26,12 +27,16 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// The largest map side a tile sends: the page draws no map of more than 65,536 columns
+/// (fleet/web/core/minecraft.ts, `MC_MAX_COLUMNS`), which is this squared.
+const MAX_REGION: u32 = 256;
+
 #[derive(clap::Args, Clone)]
 struct Common {
     /// Bots to run
     #[arg(long, env = "MCTILE_BOTS", default_value_t = 3)]
     bots: usize,
-    /// The map's side in blocks, around the spawn
+    /// The map's side in blocks, around the spawn (32 to 256, in whole chunks)
     #[arg(long, env = "MCTILE_REGION", default_value_t = 128)]
     region: u32,
     /// Bot names start with this
@@ -82,7 +87,7 @@ fn tile_cfg(c: &Common, server: String) -> tile::Cfg {
     tile::Cfg {
         bots: c.bots,
         server,
-        region_side: c.region.clamp(32, 512) / 16 * 16,
+        region_side: c.region.clamp(32, MAX_REGION) / 16 * 16,
         bot_prefix: c.bot_prefix.clone(),
     }
 }

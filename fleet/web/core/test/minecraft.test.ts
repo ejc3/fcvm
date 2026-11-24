@@ -830,6 +830,12 @@ describe("the 3D view's words", () => {
   it("takes only a grid it can build: each side within 16 bits' reach and the whole within the cap, and a delta's indices inside it", () => {
     const grid = (w: number, h: number) => JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: Buffer.alloc(Math.min(w * h * 2, 16)).toString("base64") });
     expect([MC_MAX_SIDE, MC_MAX_COLUMNS]).toEqual([1024, 65_536]);
+    // the largest map a tile sends is one the page draws: mctile holds its region to this side
+    const tile = readFileSync(new URL("../../../minecraft/src/main.rs", import.meta.url), "utf8");
+    const side = Number(/const MAX_REGION: u32 = (\d+);/.exec(tile)![1]);
+    expect(tile).toContain("c.region.clamp(32, MAX_REGION)");
+    expect(side * side).toBeLessThanOrEqual(MC_MAX_COLUMNS);
+    expect(side).toBeLessThanOrEqual(MC_MAX_SIDE);
     expect(() => parseViewMsg(grid(MC_MAX_SIDE + 1, 1))).toThrow(/not a grid/);
     expect(() => parseViewMsg(grid(1, MC_MAX_SIDE + 1))).toThrow(/not a grid/);
     expect(() => parseViewMsg(grid(1024, 128))).toThrow(/not a grid/);
