@@ -301,8 +301,14 @@ test("a server whose view cannot be reached says so on its tile with a Retry, ca
   } finally {
     await admin("/mock/fault", { minecraft_down: false });
   }
-  await page.getByTestId("mc-stream-retry-mc-1").click();
-  await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 10_000 });
+  // The view is back by Retry or by the page's own next try, whichever comes first. The page's
+  // try takes the Retry button away, and a click that had found the button then waited for it
+  // until the test's own deadline: so Retry is clicked only while it is there, in short tries.
+  await expect(async () => {
+    const retry = page.getByTestId("mc-stream-retry-mc-1");
+    if ((await retry.count()) > 0) await retry.click({ timeout: 1000 });
+    await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 1000 });
+  }).toPass({ timeout: 15_000 });
   await expect.poll(async () => (await drawnShare(page, "mc-1")).share, { timeout: 10_000 }).toBeGreaterThan(0.9);
   await expect(page.getByTestId("mc-take-mc-1")).toBeEnabled();
 });
