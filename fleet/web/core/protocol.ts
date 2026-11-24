@@ -39,6 +39,18 @@ export interface GpuInfo {
   temp_c: number | null;
   power_w: number | null;
   util_pct: number | null;
+  /** GPU memory in use and its size, in MB, when the renderer reports them. */
+  mem_used_mb: number | null;
+  mem_total_mb: number | null;
+  /** Unix ms the readings were taken, when the coordinator says; null from one that does not. */
+  at: number | null;
+}
+
+/** A phone VM's CPU use (percent of its vCPUs), read on its host; `at` is the coordinator's receipt time. */
+export interface VmStats {
+  cpu_pct: number;
+  vcpus: number;
+  at: number | null;
 }
 
 /** Why a tile is not running when that is a fault: `relaunch_failed` (the VM did not come back; the agent retries at `retry_at`). */
@@ -75,6 +87,8 @@ export interface Tile {
   /** The same renderer over IPv4 (`wss://<label>-v4.<zone>[:port]/frames`), null alike. */
   frame_url_v4: string | null;
   gpu: GpuInfo | null;
+  /** The phone VM's CPU use; null from a coordinator or agent that does not report them. */
+  vm_stats: VmStats | null;
   host: string | null;
   /** Where the tile runs, worded for a viewer (`EC2 in us-east-1`); null until the slot reports it. */
   place: string | null;
@@ -954,14 +968,35 @@ function reading(o: Obj | null, k: string): number | null {
 function parseGpu(v: unknown, stats: unknown, where: string): GpuInfo | null {
   if (v === null || v === undefined) return null;
   const st = isObj(stats) ? stats : null;
-  if (typeof v === "string") return { name: v, temp_c: reading(st, "temp_c"), power_w: reading(st, "power_w"), util_pct: reading(st, "util_pct") };
+  if (typeof v === "string") {
+    return {
+      name: v,
+      temp_c: reading(st, "temp_c"),
+      power_w: reading(st, "power_w"),
+      util_pct: reading(st, "util_pct"),
+      mem_used_mb: reading(st, "mem_used_mb"),
+      mem_total_mb: reading(st, "mem_total_mb"),
+      at: reading(st, "at"),
+    };
+  }
   if (!isObj(v)) throw new ProtocolError(`${where} is neither a name nor an object`);
   return {
     name: str(v, "name", where),
     temp_c: reading(st, "temp_c") ?? reading(v, "temp_c"),
     power_w: reading(st, "power_w") ?? reading(v, "power_w"),
     util_pct: reading(st, "util_pct") ?? reading(v, "util_pct"),
+    mem_used_mb: reading(st, "mem_used_mb") ?? reading(v, "mem_used_mb"),
+    mem_total_mb: reading(st, "mem_total_mb") ?? reading(v, "mem_total_mb"),
+    at: reading(st, "at") ?? reading(v, "at"),
   };
+}
+
+function parseVmStats(v: unknown): VmStats | null {
+  if (!isObj(v)) return null;
+  const cpu = reading(v, "cpu_pct");
+  const vcpus = reading(v, "vcpus");
+  if (cpu === null || vcpus === null || vcpus < 1) return null;
+  return { cpu_pct: cpu, vcpus: Math.round(vcpus), at: reading(v, "at") };
 }
 
 function parseLastRelaunch(v: unknown, where: string): LastRelaunch | null {
@@ -997,6 +1032,7 @@ function parseTile(v: unknown, i: number): Tile {
     frame_url: strOrNull(v, "frame_url", where),
     frame_url_v4: strOrNull(v, "frame_url_v4", where),
     gpu: parseGpu(v["gpu"], v["gpu_stats"], `${where}.gpu`),
+    vm_stats: parseVmStats(v["vm_stats"]),
     host: strOrNull(v, "host", where),
     place: strOrNull(v, "place", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),

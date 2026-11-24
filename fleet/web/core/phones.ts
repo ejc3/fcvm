@@ -17,7 +17,7 @@ import { streamBitrate } from "./bandwidth.ts";
 import * as fmt from "./format.ts";
 import { frameSocketUrl, mirrorSocketUrl, streamUrl } from "./net.ts";
 import { megabytes, mbits } from "./meter.ts";
-import { sameViewer, type Admission, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
+import { sameViewer, type Admission, type GpuInfo, type VmStats, type PhoneTile, type Phones, type Tile } from "./protocol.ts";
 import { serverNow } from "./clock.ts";
 import type { ClientState, Notice } from "./store.ts";
 import {
@@ -622,11 +622,68 @@ export function readoutRows(view: TakeoverView, video: StreamReadout | null, mir
   return rows;
 }
 
+/**
+ * One live reading: `text` has fixed-width digits and `fraction` (0..1) drives a bar. A reading
+ * with a bar is a meter, named `meter.name` with `meter.valuetext` as its value; one without
+ * is plain text under its `term`.
+ */
+export interface PhoneStat {
+  key: string;
+  term: string;
+  text: string;
+  fraction: number | null;
+  meter: { name: string; valuetext: string } | null;
+}
+
+/** A reading older than this is dropped (the renderer is sampled about once a second). */
+export const STATS_STALE_MS = 5000;
+
+const pad = (n: number, w: number) => String(Math.round(n)).padStart(w, "\u2007");
+const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
+const gb = (mb: number) => (Math.round((mb / 1024) * 10) / 10).toString();
+
+/**
+ * The readings of a phone, GPU first. `at` is the coordinator's receipt time, so a reading is
+ * dropped as stale only against the coordinator's clock: with `clocked` false (the page has
+ * no clock sample yet) its local clock is not trusted and every reading is shown.
+ */
+export function statsOf(g: GpuInfo | null, vm: VmStats | null, srvNow: number, clocked = true): PhoneStat[] {
+  const fresh = (at: number | null) => at === null || !clocked || srvNow - at <= STATS_STALE_MS;
+  return [...(g !== null && fresh(g.at) ? gpuStats(g) : []), ...(vm !== null && fresh(vm.at) ? vmStatsOf(vm) : [])];
+}
+
+function vmStatsOf(vm: VmStats): PhoneStat[] {
+  const n = `${vm.vcpus} vCPU${vm.vcpus === 1 ? "" : "s"}`;
+  return [
+    { key: "vm-cpu", term: "CPU", text: `${pad(vm.cpu_pct, 3)} %  ${n}`, fraction: clamp01(vm.cpu_pct / 100), meter: { name: "CPU", valuetext: `${Math.round(vm.cpu_pct)} percent of ${n}` } },
+  ];
+}
+
+function gpuStats(g: GpuInfo): PhoneStat[] {
+  const out: PhoneStat[] = [];
+  if (g.util_pct !== null) out.push({ key: "gpu-util", term: "GPU", text: `${pad(g.util_pct, 3)} %`, fraction: clamp01(g.util_pct / 100), meter: { name: "GPU utilisation", valuetext: `${Math.round(g.util_pct)} percent` } });
+  if (g.temp_c !== null) out.push({ key: "gpu-temp", term: "Temperature", text: `${pad(g.temp_c, 3)} \u00b0C`, fraction: null, meter: null });
+  if (g.power_w !== null) out.push({ key: "gpu-power", term: "Power", text: `${pad(g.power_w, 3)} W`, fraction: null, meter: null });
+  if (g.mem_used_mb !== null) {
+    const total = g.mem_total_mb !== null && g.mem_total_mb > 0 ? g.mem_total_mb : null;
+    out.push({
+      key: "gpu-mem",
+      term: "GPU memory",
+      text: total === null ? `${pad(g.mem_used_mb, 5)} MB` : `${pad(g.mem_used_mb, 5)} of ${pad(total, 5)} MB`,
+      fraction: total === null ? null : clamp01(g.mem_used_mb / total),
+      meter: total === null ? null : { name: "GPU memory", valuetext: `${gb(g.mem_used_mb)} of ${gb(total)} GB` },
+    });
+  }
+  return out;
+}
+
 export interface PhonePanel {
   id: string;
   title: string;
   state: string;
   rows: { term: string; value: string }[];
+  /** Live readings, one row each; a reading the phone does not report has no row. */
+  stats: PhoneStat[];
   restoreTitle: string;
   restoreTotal: string;
   restoreNote: string;
@@ -995,6 +1052,7 @@ function panelOf(
   return {
     id: t.id,
     title: phoneName(t),
+    stats: running ? statsOf(g, t.vm_stats, srvNow, s.clock.offsetMs !== null) : [],
     state: running ? (restored && !restored.restoring ? restored.text : "streaming") : restored?.text ?? phaseText(t.phase),
     rows: [
       { term: "GPU", value: g?.name ?? "none yet" },

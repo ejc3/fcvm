@@ -805,6 +805,7 @@ impl NetworkManager for BridgedNetwork {
         // siblings. It derives this VM's own address from `host_ip` (`host_reachable_ip`).
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
+            tap_fd: None,
             guest_mac,
             guest_ip: Some(guest_ip.clone()),
             host_ip: Some(host_ip.clone()),

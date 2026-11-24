@@ -188,6 +188,17 @@ class MatrixTest(unittest.TestCase):
             self.assertNotEqual(self.sh(f"ARGS='--tap-warm-cycles 0 --tap-hold-ms 20' cell_done {cell}").returncode, 0)
             self.assertNotEqual(self.sh(f"cell_done {cell}").returncode, 0)
 
+    def test_a_traced_netpool_cell_is_done_by_the_plain_cells_test(self):
+        # A summary alone does not make a cell done (it may hold failures, or be from other
+        # arguments). The traced cell is decided by the test its `cell` function uses, or
+        # the tracer would run over a cell that `cell` then skips, or be skipped for a cell
+        # that failed.
+        script = (HERE / "netpool.sh").read_text()
+        self.assertNotIn('-f "$traced/summary.json"', script)
+        done = 'ARGS="--netpool-socket $socket --steady-secs 5" cell_done'
+        self.assertEqual(script.count(done), 2)
+        self.assertIn(done + ' "$traced"', script)
+
 
 class RtnlSummaryTest(unittest.TestCase):
     DUMP = """

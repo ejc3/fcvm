@@ -1022,7 +1022,7 @@ describe("seams and hover", () => {
 
     it("names a live tile's GPU, place and last launch from what the coordinator reported", () => {
       const l = label("ec2:2", (t) => {
-        t.gpu = { name: "Tesla T4", temp_c: 40, power_w: 50, util_pct: 90 };
+        t.gpu = { name: "Tesla T4", temp_c: 40, power_w: 50, util_pct: 90, mem_used_mb: null, mem_total_mb: null, at: null };
         t.place = "EC2 in us-east-1";
         t.host = "i-example-host";
         t.last_relaunch = { clicked_at: EPOCH, first_frame_at: EPOCH + 58_000, phases: {} };
@@ -1372,6 +1372,14 @@ describe("asleep and waking", () => {
     // Waking: no button, the phases instead.
     const waking = sleeping({ state: "waking", woke_at: EPOCH - 5000 });
     expect(view(stateWith(waking), EPOCH).sleep!.wake).toBeNull();
+  });
+
+  it("asleep under this page with part of the hour left: the same card, and Wake is offered", () => {
+    // The coordinator does not wake for a page shown again with less than its minimum of
+    // the hour left (fleet/PROTOCOL.md, `fleet.power`; here 167 s), so the card cannot wait
+    // for a wake that will not come: it says to press Wake, and the button works.
+    const st = sleeping({ state: "asleep", asleep_since: EPOCH - 600_000, last_arrival_at: EPOCH - 3_433_000, sleep_without_arrival_at: EPOCH + 167_000 });
+    expect(view(stateWith(st), EPOCH).sleep).toEqual({ state: "asleep", title: "Asleep.", line: "The GPUs start when you press Wake.", clock: "", steps: [], wake: { label: "Wake", disabled: false } });
   });
 
   it("asleep for the day's GPU budget: rests until 00:00 UTC, says why, and offers no Wake button", () => {
