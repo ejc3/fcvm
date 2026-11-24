@@ -5546,6 +5546,12 @@ mod tests {
             waits < publish,
             "the hook runs before the egress proxy and exec server are back"
         );
+        // And nothing the restore runs in the background starts beside the hook:
+        // the fresh chronyd and the journald restart start after the publication.
+        assert!(
+            publish < at("side_jobs.start();"),
+            "the restore's side jobs start before the hook has run"
+        );
     }
 
     /// The inherited neighbours are flushed before the clone takes its new IPv6
