@@ -552,6 +552,12 @@ pub struct FleetCoordArgs {
     #[arg(long, env = "FLEET_SLEEP_WITHOUT_NEW_VIEWER", default_value_t = 3600)]
     pub sleep_without_new_viewer: u64,
 
+    /// Seconds of --sleep-without-new-viewer that must remain for a connected page that
+    /// becomes active (shown again, or reconnecting) to wake a sleeping fleet. With less
+    /// left the page's Wake button wakes it.
+    #[arg(long, default_value_t = 600)]
+    pub min_wake_remaining: u64,
+
     /// The most the fleet may spend in one UTC day, in USD. The coordinator meters what the
     /// fleet's GPU hosts and EC2 tiles cost (spot at the spot price, on demand at the
     /// on-demand rate) and, at this less 15 minutes of the current burn, sleeps the fleet

@@ -626,9 +626,8 @@ fn a_held_wall_loan_counts_against_the_borrow_cap() {
     );
 }
 
-// What a restart does to the power rules: a coordinator that resumes a fleet that is up
-// does not take it down before the pages of the old process can reconnect, and a page that
-// reconnects inside that window holds the fleet as its arrival did.
+// What a restart does to the power rules: nothing. The stored arrival stays, the pages
+// that reconnect are not arrivals, and the fleet is up until the stored limit.
 
 fn power_config() -> Config {
     let mut base = serde_json::to_value(Config::default()).unwrap();
@@ -639,20 +638,10 @@ fn power_config() -> Config {
     serde_json::from_value(base).unwrap()
 }
 
-fn returning(at: u64, viewer: &str) -> Event {
-    ev(json!({"at": at, "type": "viewer_joined", "viewer": viewer,
-        "client": "198.51.100.20", "returning": true}))
-}
-
-/// The state as a coordinator that starts at `at` reads it back from the store.
-fn restarted(stored: &State, at: u64) -> State {
-    let read: State = serde_json::from_slice(&serde_json::to_vec(stored).unwrap()).unwrap();
-    read.resumed(power_config(), at)
-}
-
-/// Awake with one viewer that arrived at 5 s: the limit without a new viewer ends at 1005 s.
-fn awake_with_one_arrival() -> State {
-    run(
+#[test]
+fn a_restart_keeps_an_awake_fleet_awake_until_the_stored_limit() {
+    // Awake with one viewer that arrived at 5 s: the limit ends at 1005 s. Stored at 900 s.
+    let stored = run(
         State::new(power_config(), 0),
         vec![
             hello(1000),
@@ -662,104 +651,34 @@ fn awake_with_one_arrival() -> State {
             joined(5000, "v1"),
             tick(900_000),
         ],
-    )
-}
-
-fn host_back(at: u64) -> Vec<Event> {
-    vec![
-        hello(at),
-        running(at + 1, "slot-1", 1),
-        running(at + 1, "slot-2", 1),
-        running(at + 1, "slot-3", 1),
-    ]
-}
-
-#[test]
-fn a_restart_keeps_the_fleet_awake_for_a_viewer_whose_arrival_was_not_stored() {
-    // The state as last stored: awake, the last arrival at 5 s.
-    let stored = awake_with_one_arrival();
+    );
     assert_eq!(stored.fleet.power.state, "awake");
-    // The old process then seats a new viewer at 990 s (the limit now ends at 1990 s) and
-    // is killed before it stores that.
-    let lost = run(stored.clone(), vec![joined(990_000, "v2")]);
-    assert_eq!(lost.fleet.power.last_arrival_at, Some(990_000));
-    // The new process starts at 1000 s from the stored state. The host's agent and that
-    // viewer's page reconnect; the page says it connected before.
-    let mut s = restarted(&stored, 1_000_000);
-    s = run(s, host_back(1_001_000));
-    s = run(s, vec![returning(1_003_000, "v1"), tick(1_003_500)]);
-    // 1005 s is where the stored state's limit ends.
-    s = run(s, vec![tick(1_005_000), tick(1_100_000)]);
-    assert_eq!(
-        s.fleet.power.state, "awake",
-        "asleep with its viewer connected: {:?}",
-        s.fleet.power
-    );
-    assert_eq!(s.fleet.power.last_arrival_at, Some(1_003_000));
-    // The limit itself is unchanged: with nobody new, asleep 1000 s after that.
-    s = run(s, vec![tick(2_002_999)]);
+    // The coordinator is killed and the next one starts at 950 s from what was stored.
+    let read: State = serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+    let mut s = read.resumed(power_config(), 950_000);
     assert_eq!(s.fleet.power.state, "awake");
-    s = run(s, vec![tick(2_003_000)]);
-    assert_eq!(s.fleet.power.state, "asleep");
-}
-
-#[test]
-fn a_restarted_coordinator_sleeps_nothing_before_its_pages_can_reconnect() {
-    use fleet_core::state::RESUME_GRACE_MS;
-    // The limit without a new viewer ran out (1005 s) while no coordinator was running.
-    let stored = awake_with_one_arrival();
-    let mut s = restarted(&stored, 1_010_000);
-    s = run(s, vec![tick(1_010_500)]);
-    assert_eq!(
-        s.fleet.power.state, "awake",
-        "asleep on the first tick, from a state older than the process: {:?}",
-        s.fleet.power
-    );
-    s = run(s, vec![tick(1_010_000 + RESUME_GRACE_MS - 1)]);
-    assert_eq!(s.fleet.power.state, "awake");
-    // Nobody reconnected: the stored state's rule applies as soon as the window closes.
-    s = run(s, vec![tick(1_010_000 + RESUME_GRACE_MS)]);
-    assert_eq!(s.fleet.power.state, "asleep");
-
-    // The same for the idle rule: hidden since 6 s, idle limit 60 s, killed before it slept.
-    let mut hidden = run(
-        State::new(power_config(), 0),
+    assert_eq!(s.fleet.power.last_arrival_at, Some(5000));
+    // Its first ticks, before any page is back, sleep nothing.
+    s = run(s, vec![tick(950_500), tick(951_500)]);
+    assert_eq!(s.fleet.power.state, "awake", "{:?}", s.fleet.power);
+    // The host's agent and the page reconnect; the page says it connected before.
+    s = run(
+        s,
         vec![
-            joined(5000, "v1"),
-            ev(json!({"at": 6000, "type": "visibility", "viewer": "v1", "visible": false})),
-            tick(60_000),
+            hello(952_000),
+            running(952_001, "slot-1", 1),
+            running(952_001, "slot-2", 1),
+            running(952_001, "slot-3", 1),
+            ev(
+                json!({"at": 953_000, "type": "viewer_joined", "viewer": "v1",
+                "client": "198.51.100.20", "returning": true}),
+            ),
+            tick(1_004_999),
         ],
     );
-    assert_eq!(hidden.fleet.power.state, "awake");
-    hidden = restarted(&hidden, 100_000);
-    hidden = run(hidden, vec![tick(100_500)]);
-    assert_eq!(
-        hidden.fleet.power.state, "awake",
-        "{:?}",
-        hidden.fleet.power
-    );
-    hidden = run(hidden, vec![tick(100_000 + RESUME_GRACE_MS)]);
-    assert_eq!(hidden.fleet.power.state, "asleep");
-}
-
-#[test]
-fn a_restart_gives_reconnecting_pages_no_arrival_outside_its_window_or_asleep() {
-    use fleet_core::state::RESUME_GRACE_MS;
-    // After the window a page that says it connected before is no arrival, as ever.
-    let stored = awake_with_one_arrival();
-    let mut s = restarted(&stored, 901_000);
-    s = run(s, host_back(902_000));
-    s = run(s, vec![returning(901_000 + RESUME_GRACE_MS, "v1")]);
+    assert_eq!(s.fleet.power.state, "awake");
     assert_eq!(s.fleet.power.last_arrival_at, Some(5000));
+    // The stored limit, neither earlier nor later.
     s = run(s, vec![tick(1_005_000)]);
     assert_eq!(s.fleet.power.state, "asleep");
-
-    // A fleet stored asleep stays asleep through a restart: its limit ran out with a page
-    // connected, and that page reconnecting does not wake it or count as an arrival.
-    let asleep = run(awake_with_one_arrival(), vec![tick(1_005_000)]);
-    assert_eq!(asleep.fleet.power.state, "asleep");
-    let mut s = restarted(&asleep, 1_010_000);
-    s = run(s, vec![returning(1_011_000, "v1"), tick(1_012_000)]);
-    assert_eq!(s.fleet.power.state, "asleep");
-    assert_eq!(s.fleet.power.last_arrival_at, Some(5000));
 }

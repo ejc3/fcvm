@@ -2262,7 +2262,12 @@ after an hour (`--sleep-without-new-viewer`, default 3600 s) with no arrival, ev
 viewers stay connected. An arrival is a new viewer connection or a connected page's Wake
 button (the `wake` intent); a page that reconnects or reloads presents its seat ticket and
 is not one (fleet/PROTOCOL.md, `fleet.power`). A page connected while the fleet sleeps shows
-the sleep card with a Wake button, on the wall and in phones mode. A claim or race in progress
+the sleep card with a Wake button, on the wall and in phones mode. A connected page that is
+shown again, or reconnects, wakes a fleet that slept idle only while at least ten minutes of
+the hour remain (`--min-wake-remaining`, default 600 s), and that wake does not start the
+hour again. With less left the fleet stays asleep and the card's Wake button wakes it. On
+2026-11-24 production woke for a page shown again with 2 min 47 s of the hour left, and
+terminated the GPU hosts it had just launched when the hour ended, under that viewer. A claim or race in progress
 holds the fleet awake past the hour, and it sleeps when that ends.
 
 **The wake reel. DECIDED (2026-10-23).** While the fleet is asleep or waking, the stage plays a

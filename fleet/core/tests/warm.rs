@@ -45,16 +45,9 @@ fn a_restart_inside_a_window_decides_from_the_flag_it_starts_with() {
     assert_eq!(kept.fleet.power.state, "waking");
     assert_eq!(kept.fleet.power.reason.as_deref(), Some("warm"));
 
-    // Restarted without them, nothing stored keeps it up: the viewer rules decide, once
-    // the pages of the old process have had their time to reconnect.
+    // Restarted without them, nothing stored keeps it up: the viewer rules decide.
     let mut cold = restart(&s, config(&[]), SAT + 18 * HOUR);
     cold = apply(cold, &tick(SAT + 18 * HOUR));
-    assert_eq!(cold.fleet.power.state, "waking");
-    assert_eq!(cold.fleet.power.reason, None);
-    let grace = fleet_core::state::RESUME_GRACE_MS;
-    cold = apply(cold, &tick(SAT + 18 * HOUR + grace - 1));
-    assert_eq!(cold.fleet.power.state, "waking");
-    cold = apply(cold, &tick(SAT + 18 * HOUR + grace));
     assert_eq!(cold.fleet.power.state, "asleep");
     assert_eq!(cold.fleet.power.reason, None);
 }

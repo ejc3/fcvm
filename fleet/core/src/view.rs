@@ -418,8 +418,7 @@ pub struct PowerView {
     /// The last completed wake, and the last 20.
     pub last_wake: Option<Wake>,
     pub wakes: Vec<Wake>,
-    /// The last arrival: a new viewer connection, a connected page's `wake`, or a wake an
-    /// active page caused.
+    /// The last arrival: a new viewer connection or a connected page's `wake`.
     pub last_arrival_at: Option<u64>,
     /// When the fleet sleeps if no viewer arrives before then (past while asleep); null
     /// when the fleet does not sleep or `--sleep-without-new-viewer` is 0.
@@ -1193,6 +1192,22 @@ pub fn no_arrival_deadline(p: &Power, c: &crate::state::Config) -> Option<u64> {
     }
     p.last_arrival_at
         .map(|t| t + c.sleep_without_new_viewer_secs * 1000)
+}
+
+/// Whether an active page wakes a sleeping fleet at `at`: the limit without a new viewer
+/// has at least `min_wake_remaining_secs` left (the whole limit, when the limit is shorter
+/// than that), or there is no limit. A wake with less left would launch hosts that the limit
+/// terminates minutes later, under the viewer they were launched for. An arrival sets the
+/// limit's start to `at` first, so it always wakes.
+pub fn page_wakes(p: &Power, c: &crate::state::Config, at: u64) -> bool {
+    let Some(deadline) = no_arrival_deadline(p, c) else {
+        return true;
+    };
+    let min = c
+        .min_wake_remaining_secs
+        .min(c.sleep_without_new_viewer_secs)
+        * 1000;
+    at < deadline && deadline - at >= min
 }
 
 fn relaunch_all(r: &Race) -> RelaunchAllView {

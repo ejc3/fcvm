@@ -7,7 +7,7 @@
     "restart_cooldown_secs": 1,
     "sleep_without_new_viewer_secs": 1000
   },
-  "description": "With power management, the fleet also sleeps once no viewer has arrived for sleep_without_new_viewer_secs, even while viewers stay connected and visible. An arrival is a new viewer connection or a connected page's wake intent; a page that rejoins as returning (it kept a seat ticket, or said it connected before) is not one, and neither is a page turning visible again (unless it wakes the fleet, 45_wake_starts_the_limit). Asleep with the limit run out, connected pages do not wake the fleet; a wake intent does, and so does a new viewer, each starting the limit again. A claim or a race in progress holds the fleet awake past the limit; it sleeps as soon as the hold ends. Asleep, claim_gpu and claim_phone are refused.",
+  "description": "With power management, the fleet also sleeps once no viewer has arrived for sleep_without_new_viewer_secs, even while viewers stay connected and visible. An arrival is a new viewer connection or a connected page's wake intent; a page that rejoins as returning (it kept a seat ticket, or said it connected before) is not one, and neither is a page turning visible again. Asleep with the limit run out, connected pages do not wake the fleet; a wake intent does, and so does a new viewer, each starting the limit again. A claim or a race in progress holds the fleet awake past the limit; it sleeps as soon as the hold ends. Asleep, claim_gpu and claim_phone are refused.",
   "events": [
     {
       "at": 1000,

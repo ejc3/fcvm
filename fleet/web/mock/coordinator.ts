@@ -311,7 +311,8 @@ export class MockCoordinator {
   private slept: { fcvm: number[]; ec2: number } | null = null;
   /**
    * Tests: stay asleep whoever watches, as the coordinator does once nobody new has arrived
-   * for an hour. A `wake` lifts it.
+   * for an hour, or while less than its minimum of that hour remains (`--min-wake-remaining`).
+   * A `wake` lifts it.
    */
   private holdAsleep = false;
   /** The last arrival: a page connecting for the first time (no ticket, not returning) or a `wake`. */
@@ -1254,11 +1255,7 @@ export class MockCoordinator {
         if (now - this.idleSince >= after) this.sleep();
       }
     }
-    if (this.power.state === "asleep" && visible > 0 && !this.holdAsleep) {
-      // A wake for an active page is an arrival, as in the coordinator.
-      this.lastArrivalAt = now;
-      this.wake();
-    }
+    if (this.power.state === "asleep" && visible > 0 && !this.holdAsleep) this.wake();
   }
 
   /**

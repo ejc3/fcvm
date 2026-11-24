@@ -1462,6 +1462,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         power_managed: power_managed(&args),
         idle_scale_down_secs: args.idle_scale_down,
         sleep_without_new_viewer_secs: args.sleep_without_new_viewer,
+        min_wake_remaining_secs: args.min_wake_remaining,
         daily_spend_usd: args.daily_spend_usd,
         warm_hours: args.warm_hours.clone(),
         history_idle_secs: args.history_idle,
