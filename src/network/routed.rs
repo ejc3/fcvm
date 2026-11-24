@@ -2559,8 +2559,10 @@ fe80000000000000742b74fffe8683d8 02 40 20 80      up0
             };
             for setup in [
                 &["link", "set", "lo", "up"][..],
-                &["link", "add", "up0", "type", "dummy"],
+                // a veth pair, which every host that runs routed VMs can make
+                &["link", "add", "up0", "type", "veth", "peer", "name", "up1"],
                 &["link", "set", "up0", "up"],
+                &["link", "set", "up1", "up"],
                 &[
                     "-6",
                     "addr",
