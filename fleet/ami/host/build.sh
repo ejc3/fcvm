@@ -128,8 +128,9 @@ net.ipv6.conf.all.forwarding=1
 # host, and every routed VM adds to both: 512 Minecraft servers held 8,513 IPv6 entries and
 # 1,026 IPv4 ones (docs/fleet/minecraft.md, "What the host needs for hundreds of servers"). At
 # gc_thresh3 the kernel drops packets ("neighbor table overflow"); its defaults are 128, 512
-# and 1024. The agent refuses a fleet these limits have no room for, at 24 IPv6 and 4 IPv4
-# entries a VM (src/fleet/agent/minecraft.rs): 32768 holds about 1,300 VMs.
+# and 1024. The agent refuses a Minecraft fleet these limits have no room for, at 24 IPv6 and
+# 4 IPv4 entries a server (src/fleet/agent/minecraft.rs): 32768 holds about 1,300 of them.
+# This image carries that agent too (the fcvm installed below), so a host gets both at once.
 net.ipv6.neigh.default.gc_thresh1=8192
 net.ipv6.neigh.default.gc_thresh2=28672
 net.ipv6.neigh.default.gc_thresh3=32768

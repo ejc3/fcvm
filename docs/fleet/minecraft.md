@@ -197,7 +197,6 @@ IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
 - **What bounds N**, in the order the runs met them:
   1. The IPv6 neighbour table (`net.ipv6.neigh.default.gc_thresh3`, 1024 on Ubuntu): 512 routed
      servers overflowed it and did not all start. A server costs about 16.5 entries ("What the
-     host needs for hundreds of servers", below). A server costs about 16.5 entries ("What the
      host needs for hundreds of servers", below).
   2. The store's size and speed, as above.
   3. Memory: 543 MiB a server at 30 minutes, when the coordinator resets it. This host's
@@ -244,14 +243,24 @@ namespace's):
 - 512 servers hold more IPv4 entries (1,026) than the kernel's default limit (1024). Ubuntu's
   image hides that; a host that leaves the default would overflow the IPv4 table too.
 - **The agent's check.** `fcvm fleet agent --minecraft N` stops at start-up unless both limits
-  leave room for 24 IPv6 and 4 IPv4 entries for every VM it may run: the N servers, their gold
-  VM, and the host's wall tiles, phones, potato players and Windows sandboxes
-  (`check_neighbour_room`, `src/fleet/agent/minecraft.rs`). The other VMs' entries were not
-  measured and are given a server's figures. The error names the value the limit needs.
+  leave room for the Minecraft fleet's own need: 24 IPv6 and 4 IPv4 entries for each of the N
+  servers and their gold VM, and 64 for the host itself (an idle host held 25 and 4)
+  (`check_neighbour_room`, `src/fleet/agent/minecraft.rs`). The error names the value the limit
+  needs. On the kernel's limits that is 39 servers.
+- **A host's other VMs refuse nothing.** Wall tiles, phones, potato players and Windows
+  sandboxes use other network modes and their entries were not measured. If each of them held
+  what a Minecraft server does and a table would then be over its limit, the agent logs a
+  warning and starts: a host that ran 4 servers beside 64 potato players on the kernel's limits
+  still does.
 - **The host image** sets `gc_thresh1`, `gc_thresh2` and `gc_thresh3` to 8192, 28672 and 32768
-  for both families (`fleet/ami/host/build.sh`): room for about 1,300 VMs by that allowance.
-  The agent's unit keeps systemd's default dependencies, so it starts after `systemd-sysctl`
-  has applied them (`fleet/ami/test_pipeline.py` pins both).
+  for both families (`fleet/ami/host/build.sh`): room for about 1,300 Minecraft servers by that
+  allowance. The agent's unit keeps systemd's default dependencies, so it starts after
+  `systemd-sysctl` has applied them (`fleet/ami/test_pipeline.py` pins both).
+- **Order of arrival.** A fleet host gets the agent and the limits together: the same image
+  build installs `fcvm` and writes `/etc/sysctl.d/99-fcvm.conf`, and a host is launched from
+  the image by its launch template (docs/fleet/ARCHITECTURE.md, "AMI" and "Hosts"), never
+  given a new agent in place. Were an agent with this check to reach a host with the old
+  limits all the same, today's 4 servers need 184 of the 1024 and it starts.
 - **Outside the host's first network namespace** the limits cannot be read: the kernel shows
   no `neigh/default/gc_thresh3` and no `/proc/net/stat/ndisc_cache` in any other (checked on
   that host in a namespace made by `ip netns add` and in one made by `unshare -Urn`). An
