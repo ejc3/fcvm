@@ -2530,9 +2530,9 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // queue in the backlog until the accept loop below runs) and the state
     // file exists, so a consumer can clone by pid or find the serve in
     // `fcvm ls --json` the moment it reads this.
-    println!(
-        "{}",
-        serve_ready_record(
+    let _ = crate::utils::write_whole_line(
+        &mut std::io::stdout(),
+        &serve_ready_record(
             &args.snapshot_name,
             my_pid,
             &socket_path,
@@ -2540,6 +2540,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             matches!(prefetch, Prefetch::On),
             server.recorded_working_set(),
         )
+        .to_string(),
     );
 
     // Setup signal handlers
@@ -4547,9 +4548,9 @@ async fn cmd_snapshot_run_inner(
         } else {
             "file"
         };
-        println!(
-            "{}",
-            restored_record(
+        let _ = crate::utils::write_whole_line(
+            &mut std::io::stdout(),
+            &restored_record(
                 &vm_name,
                 &snapshot_name,
                 &vm_id,
@@ -4562,6 +4563,7 @@ async fn cmd_snapshot_run_inner(
                 restore_started.elapsed().as_millis() as u64,
                 guest_phases.as_deref(),
             )
+            .to_string(),
         );
     }
     // The clone is acknowledged; replace the spare it used (once: a later failure finds
