@@ -3134,15 +3134,8 @@ mod tests {
     #[tokio::test]
     async fn a_ring_vm_that_ignores_sigterm_is_killed_within_the_rings_own_wait() {
         // one process, which ends by itself if this test does not end it
-        let vm = Vm::spawn_args(
-            std::path::Path::new("/bin/sh"),
-            &["-c".to_string(), "trap '' TERM; exec sleep 20".to_string()],
-            "test",
-        )
-        .unwrap();
-        let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
-        // let the shell ignore the signal and become the sleep
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (vm, pid) = stand_in(dir.path(), "trap '' TERM; : > \"$READY\"; exec sleep 20").await;
         let started = Instant::now();
         stop_ring(
             None,
@@ -3164,8 +3157,39 @@ mod tests {
         );
     }
 
-    /// A stand-in for fcvm in `dir`. `snapshot create` and `snapshot run` each write their pid
-    /// to `create.pid` or `run.pid` and then behave as `create` and `run` say (shell). Every
+    /// A stand-in for a VM's fcvm: `/bin/sh -c script`, returned once the script has made the
+    /// file `$READY`, which it does after installing its trap. No test waits a fixed time for
+    /// a shell to get that far: a SIGTERM sent before the trap ends the shell at once.
+    async fn stand_in(dir: &std::path::Path, script: &str) -> (Vm, nix::unistd::Pid) {
+        let ready = dir.join("vm.ready");
+        let vm = Vm::spawn_args_in(
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_string(), script.to_string()],
+            "test",
+            |cmd| {
+                cmd.env("READY", &ready);
+            },
+        )
+        .unwrap();
+        written(&ready).await;
+        let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
+        (vm, pid)
+    }
+
+    /// Wait until a stand-in has made `file`, and return what it holds.
+    async fn written(file: &std::path::Path) -> String {
+        for _ in 0..3000 {
+            if let Ok(s) = std::fs::read_to_string(file) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} was not written", file.display());
+    }
+
+    /// A stand-in for fcvm in `dir`. `snapshot create` and `snapshot run` behave as `create`
+    /// and `run` say (shell). A script calls `ready` once its trap is installed, which
+    /// publishes its pid as `create.pid` or `run.pid` (written whole, by a rename). Every
     /// process it leaves ends by itself within 30 s.
     fn fake_fcvm(dir: &std::path::Path, create: &str, run: &str) -> Arc<FcvmOps> {
         use std::os::unix::fs::PermissionsExt;
@@ -3173,9 +3197,11 @@ mod tests {
         std::fs::write(
             &fcvm,
             format!(
-                "#!/bin/sh\nd=$(dirname \"$0\")\ncase \"$1 $2\" in\n\
-                 'snapshot create') echo $$ > \"$d/create.pid\"; {create} ;;\n\
-                 'snapshot run') echo $$ > \"$d/run.pid\"; {run} ;;\nesac\n"
+                "#!/bin/sh\nd=$(dirname \"$0\")\n\
+                 ready() {{ echo $$ > \"$d/$op.tmp\" && mv \"$d/$op.tmp\" \"$d/$op.pid\"; }}\n\
+                 case \"$1 $2\" in\n\
+                 'snapshot create') op=create; {create} ;;\n\
+                 'snapshot run') op=run; {run} ;;\nesac\n"
             ),
         )
         .unwrap();
@@ -3200,20 +3226,15 @@ mod tests {
         })
     }
 
-    /// The pid a stand-in wrote to `file`, once it has.
+    /// A VM that is slow to stop: it exits 0.3 s after SIGTERM, taking its own child with it.
+    /// Its trap is installed and its child started before it says it is ready.
+    const SLOW_TO_STOP: &str =
+        "trap 'sleep 0.3; kill $!; exit 0' TERM; sleep 30 & : > \"$READY\"; wait";
+
+    /// The pid the fcvm stand-in published in `file` when its script called `ready`.
     async fn pid_in(file: &std::path::Path) -> nix::unistd::Pid {
-        for _ in 0..500 {
-            if let Some(pid) = std::fs::read_to_string(file)
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-            {
-                // and it has had time to ignore the signal and become its sleep
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                return nix::unistd::Pid::from_raw(pid);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("{} was not written", file.display());
+        let pid = written(file).await;
+        nix::unistd::Pid::from_raw(pid.trim().parse().unwrap())
     }
 
     fn gone(pid: nix::unistd::Pid) -> bool {
@@ -3226,15 +3247,9 @@ mod tests {
     #[tokio::test]
     async fn a_save_that_outlives_the_rings_stop_is_killed_with_its_vm() {
         let dir = tempfile::tempdir().unwrap();
-        let stuck = "trap '' TERM; exec sleep 30";
-        let ops = fake_fcvm(dir.path(), stuck, "exit 0");
-        let vm = Vm::spawn_args(
-            std::path::Path::new("/bin/sh"),
-            &["-c".to_string(), stuck.to_string()],
-            "test",
-        )
-        .unwrap();
-        let vm_pid = nix::unistd::Pid::from_raw(vm.pid as i32);
+        let ops = fake_fcvm(dir.path(), "trap '' TERM; ready; exec sleep 30", "exit 0");
+        let (vm, vm_pid) =
+            stand_in(dir.path(), "trap '' TERM; : > \"$READY\"; exec sleep 30").await;
         let (tx, _rx) = mpsc::unbounded_channel();
         ops.sleep(0, Some(vm), None, tx);
         let create = pid_in(&dir.path().join("create.pid")).await;
@@ -3281,7 +3296,11 @@ mod tests {
     #[tokio::test]
     async fn a_save_in_flight_finishes_within_the_rings_stop() {
         let dir = tempfile::tempdir().unwrap();
-        let ops = fake_fcvm(dir.path(), "sleep 0.3; echo saved > \"$d/saved\"", "exit 0");
+        let ops = fake_fcvm(
+            dir.path(),
+            "ready; sleep 0.3; echo saved > \"$d/saved\"",
+            "exit 0",
+        );
         // the VM stops by itself, as one saved with --stop does
         let vm = Vm::spawn_args(
             std::path::Path::new("/bin/sh"),
@@ -3317,7 +3336,7 @@ mod tests {
     #[tokio::test]
     async fn a_wake_in_flight_is_ended_by_its_handle_when_the_agent_stops() {
         let dir = tempfile::tempdir().unwrap();
-        let ops = fake_fcvm(dir.path(), "exit 0", "trap '' TERM; exec sleep 30");
+        let ops = fake_fcvm(dir.path(), "exit 0", "trap '' TERM; ready; exec sleep 30");
         let (tx, _rx) = mpsc::unbounded_channel();
         ops.wake(1, None, tx);
         let run = pid_in(&dir.path().join("run.pid")).await;
@@ -3417,17 +3436,7 @@ mod tests {
     async fn an_operation_that_panics_is_failed_once_its_vm_is_gone() {
         let dir = tempfile::tempdir().unwrap();
         let ops = fake_fcvm(dir.path(), "exit 0", "exit 0");
-        // slow to stop: 0.3 s after SIGTERM, taking its own child with it
-        let slow = "trap 'sleep 0.3; kill $!; exit 0' TERM; sleep 30 & wait";
-        let vm = Vm::spawn_args(
-            std::path::Path::new("/bin/sh"),
-            &["-c".to_string(), slow.to_string()],
-            "test",
-        )
-        .unwrap();
-        let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
-        // let the shell install its trap
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (vm, pid) = stand_in(dir.path(), SLOW_TO_STOP).await;
         let holder = ops.holder();
         let held = holder.hold(vm);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -3483,20 +3492,19 @@ mod tests {
     async fn an_operation_aborted_while_it_ends_its_vm_hands_the_vm_over() {
         let dir = tempfile::tempdir().unwrap();
         let ops = fake_fcvm(dir.path(), "exit 0", "exit 0");
-        let vm = Vm::spawn_args(
-            std::path::Path::new("/bin/sh"),
-            &["-c".to_string(), "trap '' TERM; exec sleep 30".to_string()],
-            "test",
+        // it outlives SIGTERM and says when one has reached it; it ends by itself in 30 s
+        let (vm, pid) = stand_in(
+            dir.path(),
+            "trap ': > \"$READY.term\"' TERM; : > \"$READY\"; \
+             i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done",
         )
-        .unwrap();
-        let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
-        // let the shell ignore the signal and become the sleep
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        .await;
         let held = ops.holder().hold(vm);
         let ending = tokio::spawn(async move {
             held.ended(Duration::from_secs(60)).await;
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // the operation has sent its SIGTERM and now waits out its 60 s
+        written(&dir.path().join("vm.ready.term")).await;
         ending.abort();
         let _ = ending.await;
         assert!(!gone(pid));
@@ -3525,17 +3533,19 @@ mod tests {
         let ops = fake_fcvm(dir.path(), "exit 0", "exit 0");
         let (tx, _rx) = mpsc::unbounded_channel();
         let failed = |error, exited| Done::Slept(0, Err(error), 0.0, exited);
+        let (running_tx, running) = tokio::sync::oneshot::channel();
         ops.spawn_op(
             true,
             "save of player 0".into(),
             ops.holder(),
             tx,
             failed,
-            async {
+            async move {
+                let _ = running_tx.send(());
                 std::thread::sleep(Duration::from_secs(3));
             },
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        running.await.unwrap();
         let started = Instant::now();
         stop_ring(
             Some(&ops),
@@ -3776,18 +3786,9 @@ mod tests {
     /// frees the player's CPU on that message.
     #[tokio::test]
     async fn a_failed_operation_reports_after_its_fcvm_has_exited() {
-        // slow to stop: 0.3 s after SIGTERM, taking its own child with it
-        let slow = "trap 'sleep 0.3; kill $!; exit 0' TERM; sleep 30 & wait";
-        let vm = Vm::spawn_args(
-            std::path::Path::new("/bin/sh"),
-            &["-c".to_string(), slow.to_string()],
-            "test",
-        )
-        .unwrap();
-        let pid = nix::unistd::Pid::from_raw(vm.pid as i32);
-        // let the shell install its trap
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let ops = fake_fcvm(tempfile::tempdir().unwrap().path(), "exit 0", "exit 0");
+        let dir = tempfile::tempdir().unwrap();
+        let (vm, pid) = stand_in(dir.path(), SLOW_TO_STOP).await;
+        let ops = fake_fcvm(dir.path(), "exit 0", "exit 0");
         let _exited: Exited = ops.holder().hold(vm).ended(Duration::from_secs(10)).await;
         assert_eq!(
             nix::sys::signal::kill(pid, None),
