@@ -88,10 +88,12 @@ interface Drop {
   detail: string;
   cause?: string | null;
   cause_ms?: number | null;
+  cpu_wait_ms?: number | null;
   pace?: number | null;
 }
 
 interface Lap {
+  cpus_busy?: number | null;
   lap: number;
   pace: number;
   hold_ms: number;
@@ -223,7 +225,8 @@ export class MockPotato {
     const seq = r?.seq ?? 0;
     const hold = r ? this.holdAt(r, seq) : 0;
     return {
-      ladder: this.ladder.map((g) => ({ ...g, broke: g.broke && { ...g.broke } })),
+      // the coordinator no longer sends the old hold records (PROTOCOL.md): only the pace record
+      ladder: this.ladder.map(({ record_hold_ms: _h, record_at: _a, ...g }) => ({ ...g, broke: g.broke && { ...g.broke } })),
       size: r?.size ?? this.ladder[this.rung]?.size ?? null,
       round: r && {
         id: r.id,
@@ -244,8 +247,9 @@ export class MockPotato {
         best_lap_hold_ms: r.best_lap_hold_ms,
         pace: r.pace,
         best_pace: r.bestPace,
-        laps: r.laps.slice(-60).map((l) => ({ ...l, cpus_peak: this.cpus === null ? null : l.cpus_peak })),
-        ...(this.cpus === null ? {} : this.cpuFields(r)),
+        laps: r.laps.slice(-60).map((l) => ({ ...l, cpus_peak: this.cpus === null ? null : l.cpus_peak, cpus_busy: this.cpus === null ? null : (l.cpus_busy ?? null) })),
+        // an agent that reports no allotment: the counts are null, never zero
+        ...(this.cpus === null ? { cpus_in_use: null, cpus_peak: null, asleep: null, lead: null, slowest_wake_ms: null, cpus_busy: null, cpu_slots: null } : this.cpuFields(r)),
       },
       players: [...this.players.entries()]
         .sort(([a], [b]) => a - b)
@@ -258,7 +262,8 @@ export class MockPotato {
           since: p.sleepingSince ?? p.since,
           last_sleep_ms: p.last_sleep_ms,
           last_wake_ms: p.last_wake_ms,
-          ...(this.cpus === null ? {} : { cpu_wait_ms: p.cpuWaitMs, ready_margin_ms: null }),
+          cpu_wait_ms: this.cpus === null ? null : p.cpuWaitMs,
+          ready_margin_ms: null,
         })),
       records: { fastest_cycle_ms: this.records.fastest_cycle_ms && { ...this.records.fastest_cycle_ms }, longest_round: this.records.longest_round && { ...this.records.longest_round } },
       last_drop: this.lastDrop && { ...this.lastDrop },
@@ -497,7 +502,7 @@ export class MockPotato {
       sleep_stages: { ...(q?.sleep_stages ?? {}) },
       wake_stages: { ...(q?.wake_stages ?? {}) },
       detail: d.detail,
-      ...(this.cpus === null ? {} : this.causeOf(d, q, now, r)),
+      ...(this.cpus === null ? { cause: null, cause_ms: null, cpu_wait_ms: null, pace: r.pace } : this.causeOf(d, q, now, r)),
     };
     this.endRound(r);
     const rung = this.ladder.find((g) => g.size === r.size);
@@ -522,7 +527,7 @@ export class MockPotato {
   private causeOf(d: { stage: string; stage_ms: number }, q: Player | null, now: number, r: Round) {
     const cause = q === null ? null : q.waitSince !== null ? "cpu_wait" : d.stage === "sleeping" ? "saving" : d.stage === "waking" ? "waking" : null;
     const cause_ms = cause === "cpu_wait" ? Math.round(now - q!.waitSince!) : cause === "saving" ? d.stage_ms : null;
-    return { cause, cause_ms, pace: r.pace };
+    return { cause, cause_ms, cpu_wait_ms: cause === "cpu_wait" ? cause_ms : null, pace: r.pace };
   }
 
   private endRound(r: Round): void {

@@ -54,11 +54,9 @@ describe("mock potato", () => {
     const rung2 = dropped.ladder.find((g) => g.size === 2)!;
     expect(rung2.rounds).toBe(1);
     expect(rung2.broke).toEqual(d);
-    // the record is the hold of the last lap completed: the one before the lap that dropped
     expect(d.lap).toBeGreaterThanOrEqual(1);
-    let h = 700;
-    for (let k = 0; k < d.lap - 1; k++) h -= Math.floor(h / 10);
-    expect(rung2.record_hold_ms).toBe(h);
+    // the coordinator no longer sends the old hold record
+    expect("record_hold_ms" in rung2).toBe(false);
     expect(dropped.size).toBe(4);
     expect(dropped.next_round_at).toBe(d.at + 2000);
     expect(dropped.records.longest_round).toMatchObject({ size: 2, value: d.seq });
@@ -126,15 +124,8 @@ describe("mock potato", () => {
     const coordinator = shapes(fixture.views["33_potato"]!.potato);
     shapes(JSON.parse(example), "", coordinator);
     // The stage maps' keys are whatever the agent measured: the coordinator passes them on.
-    const free = (p: string) => /\.(sleep|wake)_stages\./.test(p);
-    // The density page's fields (fleet POTATO-FIELDS.md, which the host-side PRs add to the coordinator's view and PROTOCOL.md).
-    const pending = (p: string) =>
-      /^(confined|cpus)$/.test(p) ||
-      /^round\.(pace|best_pace|laps|cpus_in_use|cpus_peak|asleep|lead|slowest_wake_ms|cpus_busy|cpu_slots)$/.test(p) ||
-      /^round\.(laps|cpu_slots)\[\]/.test(p) ||
-      /^players\[\]\.(cpu_wait_ms|ready_margin_ms)$/.test(p) ||
-      /^ladder\[\]\.(record_pace|record_pace_at|record_prev_pace)$/.test(p) ||
-      /(last_drop|broke)\.(cause|cause_ms|pace)$/.test(p);
+    const free = (p: string) => /\.(sleep|wake)_stages\./.test(p) || /^round\.cpu_slots/.test(p); // null with no allotment, a list of slots otherwise
+    // The pace record and its time come with the density page's fields; the coordinator's vector holds them too.
     start({ slowWakeChance: 0.2 });
     const mock = new Set<string>();
     for (let i = 0; i < 3000; i++) {
@@ -143,7 +134,7 @@ describe("mock potato", () => {
     }
     expect(mock.has("round.flight.from")).toBe(true);
     expect(mock.has("last_drop.listening_after_ms")).toBe(true);
-    expect([...mock].filter((p) => p !== "" && !coordinator.has(p) && !free(p) && !pending(p)).sort()).toEqual([]);
+    expect([...mock].filter((p) => p !== "" && !coordinator.has(p) && !free(p)).sort()).toEqual([]);
     expect([...coordinator].filter((p) => p !== "" && !mock.has(p) && !free(p)).sort()).toEqual([]);
   });
 
