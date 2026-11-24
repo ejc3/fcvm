@@ -176,6 +176,7 @@ fn the_ball_goes_round_and_drops_when_nobody_catches() {
         seq: 0,
         ring: vec![format!("127.0.0.1:{pa}"), format!("127.0.0.1:{pb}")],
         hold_ms: 300,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 300,
         flight_ms: 300,
@@ -192,8 +193,10 @@ fn the_ball_goes_round_and_drops_when_nobody_catches() {
                 round,
                 seq,
                 proof,
+                hold_us,
             } => {
                 assert_eq!((round, seq), (7, caught));
+                assert_eq!(hold_us, Some(300_000), "the hold it keeps, reported");
                 assert_eq!(player as u64, seq % 2, "the ring's order");
                 let (colour, chain) = state[&player];
                 let colour = (colour + 1) % DEFAULT_COLOURS;
@@ -252,6 +255,7 @@ fn a_retired_report_connection_comes_back_with_the_state() {
         seq: 5,
         ring: vec!["127.0.0.1:1".into(), format!("127.0.0.1:{pa}")],
         hold_ms: 0,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 0,
         flight_ms: 50,
@@ -313,6 +317,7 @@ fn an_unassigned_player_waits_for_its_number() {
         seq: 0,
         ring: vec![format!("127.0.0.1:{pa}")],
         hold_ms: 0,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 0,
         flight_ms: 10,
@@ -394,6 +399,7 @@ fn a_pace_shortens_the_hold_of_its_round_only() {
         seq: 0,
         ring: vec![format!("127.0.0.1:{pa}"), format!("127.0.0.1:{sink_port}")],
         hold_ms: 3000,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 10,
         flight_ms: 500,
@@ -441,6 +447,7 @@ fn a_silent_connection_does_not_hold_up_the_ball() {
         seq: 0,
         ring: vec![format!("127.0.0.1:{pa}"), "127.0.0.1:1".into()],
         hold_ms: 0,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 0,
         flight_ms: 10,
@@ -469,6 +476,7 @@ fn a_player_that_has_thrown_refuses_the_ball_until_it_is_woken() {
         seq,
         ring: vec![format!("127.0.0.1:{pa}"), "127.0.0.1:1".into()],
         hold_ms: 0,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 0,
         flight_ms: 20,
@@ -511,6 +519,7 @@ fn a_stopped_player_refuses_every_ball_until_it_is_woken() {
         seq: 1,
         ring: vec!["127.0.0.1:1".into(), format!("127.0.0.1:{pa}")],
         hold_ms: 0,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 0,
         flight_ms: 20,
@@ -544,6 +553,7 @@ fn a_ball_sent_twice_is_caught_once() {
             format!("127.0.0.1:{pa}"),
         ],
         hold_ms: 300,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 0,
         flight_ms: 20,
@@ -583,6 +593,7 @@ fn a_stopped_round_abandons_the_throw_and_refuses_its_balls() {
         seq: 0,
         ring: vec![format!("127.0.0.1:{pa}"), format!("127.0.0.1:{pb}")],
         hold_ms: 400,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 0,
         flight_ms: 100,
@@ -641,6 +652,7 @@ fn the_first_hello_comes_before_the_first_catch() {
         seq: 0,
         ring: vec![format!("127.0.0.1:{pa}"), "127.0.0.1:1".into()],
         hold_ms: 0,
+        hold_us: None,
         shrink_permille: 0,
         min_hold_ms: 0,
         flight_ms: 10,
@@ -680,9 +692,10 @@ fn a_refusal_that_says_ok_is_not_a_catch() {
         round: 1,
         seq: 0,
         ring: vec![format!("127.0.0.1:{pa}"), format!("127.0.0.1:{cp}")],
-        hold_ms: 0,
+        hold_ms: 50,
+        hold_us: None,
         shrink_permille: 0,
-        min_hold_ms: 0,
+        min_hold_ms: 50,
         flight_ms: 50,
         trail: vec![],
     };
@@ -697,4 +710,70 @@ fn a_refusal_that_says_ok_is_not_a_catch() {
         }
         other => panic!("a refusal was taken for a catch: {other:?}"),
     }
+    // a hold of nothing leaves no flight window: the throw is still tried, once
+    wake(pa);
+    send_ball(
+        pa,
+        &Ball {
+            round: 2,
+            hold_ms: 0,
+            ..ball
+        },
+    );
+    assert!(matches!(next(&reports), Report::Caught { round: 2, .. }));
+    match next(&reports) {
+        Report::Dropped {
+            reason, attempts, ..
+        } => {
+            assert_eq!(attempts, 1);
+            assert!(reason.contains("refused"), "{reason}");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// A thrower tries for no longer than it held the ball: a lap must not complete at a hold
+/// the throws did not keep. The catcher here never listens, so the drop comes when the
+/// flight window ends.
+#[test]
+fn a_throw_does_not_retry_past_the_hold() {
+    let (report, reports, _conns, _latest) = report_server();
+    let (_a, pa) = player(0, report);
+    hello_of(next(&reports));
+    let nobody = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let ball = Ball {
+        round: 1,
+        seq: 0,
+        ring: vec![format!("127.0.0.1:{pa}"), format!("127.0.0.1:{nobody}")],
+        hold_ms: 50,
+        hold_us: None,
+        shrink_permille: 0,
+        min_hold_ms: 50,
+        flight_ms: 3000,
+        trail: vec![],
+    };
+    send_ball(pa, &ball);
+    let caught = loop {
+        match next(&reports) {
+            Report::Caught { .. } => break std::time::Instant::now(),
+            Report::Hello { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    loop {
+        match next(&reports) {
+            Report::Dropped { .. } => break,
+            Report::Hello { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    let took = caught.elapsed();
+    assert!(
+        took < Duration::from_millis(1500),
+        "a 50 ms hold and a flight of at most 50 ms, not the ball's 3 s: {took:?}"
+    );
 }

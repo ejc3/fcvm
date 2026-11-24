@@ -81,8 +81,8 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-write-set-tap-fd"
-commit = "6cb6e98817bed4ee8b6779d88bf25f674863ba8a"
+branch = "agent/uffd-minor-v1.17.0-tap-fd-drive-random"
+commit = "3e203733cb9115d1cbdd6857d59703541b85ddf6"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).

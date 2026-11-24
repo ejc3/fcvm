@@ -702,6 +702,35 @@ describe("mock race, second design review", () => {
     expect(st.counters.restores).toBe(restored + st.tiles.filter((t) => t.slot && t.half === "fcvm").length);
   });
 
+  it("asleep, a visible page wakes it only with the minimum of the limit left, and a page's wake always does", async () => {
+    const power = () => coord.fleetState().fleet.power;
+    const c = await live();
+    await c.next((m) => m["type"] === "snapshot");
+    try {
+      // 167 s of an hour left, under the 600 s minimum: asleep under the visible page.
+      await admin("/mock/power", { limit_secs: 3600, min_wake_secs: 600, arrived_ms_ago: 3_433_000, sleep: true });
+      const arrived = power().last_arrival_at!;
+      expect(power().sleep_without_arrival_at).toBe(arrived + 3_600_000);
+      await sleep(700);
+      expect(power().state).toBe("asleep");
+      // Its Wake button: an arrival, with the whole limit ahead.
+      c.ws.send(JSON.stringify({ type: "intent", id: "wake-min", name: "wake", args: {} }));
+      await c.next((m) => m["type"] === "receipt" && m["id"] === "wake-min");
+      expect(power().state).toBe("waking");
+      expect(power().last_arrival_at!).toBeGreaterThan(arrived);
+      await until(() => power().state === "awake", 5000);
+      // 2600 s left: the visible page wakes it, and that is no arrival.
+      await admin("/mock/power", { arrived_ms_ago: 1_000_000, sleep: true });
+      const before = power().last_arrival_at;
+      await until(() => power().state !== "asleep", 2000);
+      expect(power().last_arrival_at).toBe(before);
+      await until(() => power().state === "awake", 5000);
+    } finally {
+      await admin("/mock/power", { limit_secs: 0 });
+      c.ws.close();
+    }
+  });
+
   it("held asleep with pages connected, a returning page does not wake it and a page's wake does", async () => {
     await admin("/mock/power", { sleep: true, hold: true });
     const power = () => coord.fleetState().fleet.power;
@@ -1627,6 +1656,38 @@ describe("mock minecraft", () => {
     const acks = await Promise.all(Array.from({ length: 34 }, () => drive(va)));
     expect(acks.filter((x) => !x.ok).map((x) => x.reason)).toContain("at most 30 drive messages a second");
     for (const x of [va.ws, vb.ws, a.ws, b.ws]) x.close();
+  });
+
+  it("the hang fault leaves a handshake unanswered while it is on, and lifting it resets the ones it held", async () => {
+    const url = new URL(tile("mc-2").frame_url);
+    // A handshake as a browser sends it, over a plain socket: what comes back, and whether the server ended it.
+    const handshake = () => {
+      const sock = net.connect(Number(url.port), "127.0.0.1");
+      const got = { data: "", closed: false };
+      sock.on("data", (d) => (got.data += d.toString()));
+      sock.on("close", () => (got.closed = true));
+      sock.on("error", () => {});
+      sock.on("connect", () =>
+        sock.write(`GET ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`),
+      );
+      return { sock, got };
+    };
+    await admin("/mock/fault", { minecraft_hang: true });
+    const held = handshake();
+    try {
+      // held: connected, never answered, not ended
+      await new Promise((r) => setTimeout(r, 300));
+      expect(held.got).toEqual({ data: "", closed: false });
+    } finally {
+      await admin("/mock/fault", { minecraft_hang: false });
+    }
+    // Lifted: the held one is ended at once, so it cannot keep a browser's next handshake to this
+    // address and port unsent (Chromium sends them one at a time), and a new one is answered.
+    await until(() => held.got.closed, 1000);
+    expect(held.got.data).toBe("");
+    const fresh = handshake();
+    await until(() => fresh.got.data.startsWith("HTTP/1.1 101 "), 1000);
+    fresh.sock.destroy();
   });
 });
 

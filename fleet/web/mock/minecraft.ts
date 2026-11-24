@@ -309,6 +309,7 @@ export class MockMinecraft {
       }
       // Tests: a handshake that is never answered (the connection stays open, silent).
       if (this.hang) {
+        this.held.push(s.slot);
         this.hung.add(socket);
         socket.on("close", () => this.hung.delete(socket));
         return;
@@ -367,12 +368,20 @@ export class MockMinecraft {
 
   private hang = false;
   private hung = new Set<import("node:stream").Duplex>();
+  /** Tests: the server of every handshake the hang fault has held, in the order they came. */
+  readonly held: string[] = [];
   /**
-   * Tests: leave every new view socket's handshake unanswered. Turning it off answers new ones
-   * again and leaves the held ones hanging, as a lost packet would: only the page can end them.
+   * Tests: leave every new view socket's handshake unanswered; only the page can end one. Turning
+   * it off answers new ones again and resets the held ones. Every server here is at one address
+   * and port, and Chromium sends one WebSocket handshake at a time to an address and port, so a
+   * handshake left held would keep every other server's next one unsent until its page gave it
+   * up. A fleet's servers each have an address or a port of their own.
    */
   setHang(hang: boolean): void {
     this.hang = hang;
+    if (hang) return;
+    for (const s of this.hung) s.destroy();
+    this.hung.clear();
   }
 
   private down = false;
