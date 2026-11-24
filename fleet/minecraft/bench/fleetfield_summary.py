@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""One run of fleetfield.sh as a few lines: fleetfield_summary.py OUT"""
+"""One run of fleetfield.sh as a few lines: fleetfield_summary.py OUT
+
+fleetfield_summary.py --all-up OUT N prints only the time the N servers took to come up, from the
+run's coordinator log or the excerpt of it a record keeps (coord-up.log)."""
 import datetime, json, os, re, sys
 out = sys.argv[1]
 
@@ -31,6 +34,17 @@ def all_up_from_log(path, n):
     return {"from": "gold snapshot made" if gold is not None else "agent hello", "s": round(last - start, 1)}
 
 
+def up_log(out):
+    """The run's coordinator log, or the excerpt of it kept with a record: its hello, gold and "server up" lines."""
+    for name in ("coord.log", "coord-up.log"):
+        if os.path.exists(f"{out}/{name}"):
+            return f"{out}/{name}"
+    return None
+
+
+if out == "--all-up":
+    print(json.dumps(all_up_from_log(up_log(sys.argv[2]), int(sys.argv[3]))))
+    sys.exit(0)
 ev = [json.loads(l) for l in open(f"{out}/run.jsonl")]
 samples = [json.loads(l) for l in open(f"{out}/samples.jsonl")]
 disk, neigh = [], {"ndisc": [], "arp": []}
@@ -43,8 +57,8 @@ for l in open(f"{out}/disk.log"):
             neigh[k].append(int(kv[k]))
 n = next(e["n"] for e in ev if e["event"] == "start")
 res = {"servers": n, "host": open(f"{out}/host.txt").read().strip().splitlines()}
-if os.path.exists(f"{out}/coord.log"):
-    res["all_up_s"] = all_up_from_log(f"{out}/coord.log", n)
+if up_log(out):
+    res["all_up_s"] = all_up_from_log(up_log(out), n)
 for e in ev:
     if e["event"] == "all_running":
         res["restore_all_s"] = round(e["restore_all_s"], 1)

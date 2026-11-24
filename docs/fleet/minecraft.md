@@ -167,7 +167,8 @@ IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
 | 512, RAM | 29.9 s | 0.262 / 0.245 / 0.199 | 492 / 543 | 43 of 179,200, all in the first 18 s |
 | 256, RAM (100 s) | 6.9 s | 0.201 | | 0 of 5,120 |
 
-- **All N up** is from the coordinator's own log (`all_up_s` in a run's summary): from the gold
+- **All N up** is from the coordinator's own log (`all_up_s` in a run's summary; a run keeps
+  the lines it is read from as `coord-up.log`, and a test derives it from them again): from the gold
   snapshot being made (the 512 RAM run made it) or, where it was already there, from the agent's
   hello, to the last server's first "server up". The client's own figure (`restore_all_s`)
   starts at its first sample that shows a restoring server (it samples every 5 s once rows

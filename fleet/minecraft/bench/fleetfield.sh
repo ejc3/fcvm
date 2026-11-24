@@ -8,8 +8,8 @@
 #
 # OUT gets host.txt (kernel, CPUs, memory, the store's device), disk.log (every 5 s: the store's
 # use, the host's I/O stall time, and the kernel's IPv6 and IPv4 neighbour entries, which are
-# counted over every network namespace), the coordinator's log and state file, and
-# fleetfield.py's records.
+# counted over every network namespace), the coordinator's log (and coord-up.log, the lines of
+# it a record keeps) and state file, and fleetfield.py's records.
 #
 # It refuses a host that already runs a fleet agent or any fcvm VM: the agent it starts sweeps
 # fork snapshots and installs its FORWARD rules, and the readings are the whole host's. The
@@ -48,6 +48,9 @@ python3 "$HERE/fleetfield.py" "ws://127.0.0.1:$PORT/live" "$OUT" "$N" "$@" > "$O
 echo "fleetfield.py exit=$?" >> "$OUT/fleetfield.log"
 kill -TERM $CP; wait $CP
 echo "coordinator exit=$?" >> "$OUT/fleetfield.log"
+# What a record keeps of the coordinator's log (the whole log names the host's addresses): the
+# lines the time to all servers up is read from (fleetfield_summary.py, `all_up_s`).
+grep -E 'agent hello|making the gold snapshot|gold snapshot made|server up .* generation=1 ' "$OUT/coord.log" > "$OUT/coord-up.log" || true
 kill $DL 2>/dev/null
 for i in $(seq 1 120); do [ "$(pgrep -c firecracker)" = 0 ] && break; sleep 1; done
 echo "left: firecracker=$(pgrep -c firecracker)" >> "$OUT/fleetfield.log"

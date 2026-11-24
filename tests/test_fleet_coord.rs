@@ -2050,10 +2050,9 @@ async fn minecraft_status_rows_reach_the_pages_that_asked_and_move_no_version() 
     );
     // and nothing in the state moved
     assert_eq!(handle.snapshot.borrow().version, before);
-    // a later report replaces it (a host is heard no more than twice a period: an agent sends
-    // one a second)
-    let gap = fcvm::fleet::coord::minecraft_status::MIN_GAP + Duration::from_millis(100);
-    tokio::time::sleep(gap).await;
+    // A later report replaces it. It comes at once, inside the gap the coordinator keeps between
+    // a host's reports, so it is kept and reaches the page when the gap ends: the test waits
+    // for the message, not for a time.
     agent.to_coord.send(rows(2000)).unwrap();
     asked
         .message_where("minecraft_status", |m| m["t"] == 2000)
@@ -2068,7 +2067,6 @@ async fn minecraft_status_rows_reach_the_pages_that_asked_and_move_no_version() 
     other
         .message_where("clock", |m| m["client_unix_ms"] == 3.0)
         .await;
-    tokio::time::sleep(gap).await;
     agent.to_coord.send(rows(3000)).unwrap();
     let late = other.message("minecraft_status").await;
     assert_eq!(late["t"], 3000);
