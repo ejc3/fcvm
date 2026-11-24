@@ -1409,6 +1409,17 @@ async fn a_write_killed_before_its_rename_leaves_the_last_published_state() {
     }
     assert_eq!(manager.list_vms().await.unwrap().len(), 1);
 
+    // A writer killed after publishing and before unlinking the state it replaced leaves
+    // that older state at the temporary name; the published one is still what is read.
+    let mut older: serde_json::Value = serde_json::from_slice(&published).unwrap();
+    older["health_status"] = "unknown".into();
+    std::fs::write(&temp, serde_json::to_vec(&older).unwrap()).unwrap();
+    assert!(matches!(
+        manager.load_state("vm-ack").await.unwrap().health_status,
+        HealthStatus::Healthy
+    ));
+    assert_eq!(manager.list_vms().await.unwrap().len(), 1);
+
     // The next write is published whole, over what the killed one left.
     manager
         .update_health_status("vm-ack", HealthStatus::Stopped, Some(3))

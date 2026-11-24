@@ -127,3 +127,92 @@ async fn a_start_and_stop_waits_on_no_lock_every_vm_shares() {
     });
     drop(held);
 }
+
+/// Every `.json` and `.json.tmp` path under `root`.
+fn state_and_temp_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                dirs.push(path);
+            } else if path.to_string_lossy().ends_with(".json")
+                || path.to_string_lossy().ends_with(".json.tmp")
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A write that replaces a state swaps the old state out of its name and unlinks it; it does
+/// not rename the new file over the old one. btrfs starts writing a file's data out inside
+/// a rename that replaces another file, with the directory locked, and with 128 clones
+/// starting together each such rename took 55 to 108 ms behind the VMs' disk reads
+/// (bench/start-rate). The exchange is seen from outside as the old state arriving at the
+/// temporary name.
+#[tokio::test]
+async fn a_write_that_replaces_a_state_starts_no_write_out_in_its_rename() {
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    let mut vm = VmState::new("vm-swap".to_string(), "alpine:latest".to_string(), 1, 512);
+    vm.name = Some("swap".to_string());
+    manager.claim_name(&mut vm).await.unwrap();
+    let state_file = state_and_temp_files(temp_dir.path())
+        .into_iter()
+        .find(|path| path.file_name().is_some_and(|name| name == "vm-swap.json"))
+        .expect("the claim wrote the VM's state");
+
+    let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
+    inotify
+        .add_watch(
+            state_file.parent().unwrap(),
+            AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_DELETE,
+        )
+        .unwrap();
+    manager
+        .update_health_status("vm-swap", HealthStatus::Healthy, None)
+        .await
+        .unwrap();
+
+    let mut seen = Vec::new();
+    loop {
+        match inotify.read_events() {
+            Ok(events) if !events.is_empty() => {
+                for event in events {
+                    let name = event.name.unwrap().to_string_lossy().into_owned();
+                    let kind = if event.mask.contains(AddWatchFlags::IN_DELETE) {
+                        "deleted"
+                    } else {
+                        "moved to"
+                    };
+                    seen.push(format!("{kind} {name}"));
+                }
+            }
+            Ok(_) | Err(nix::errno::Errno::EAGAIN) => break,
+            Err(error) => panic!("reading inotify events: {error}"),
+        }
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            "deleted vm-swap.json.tmp",
+            "moved to vm-swap.json",
+            "moved to vm-swap.json.tmp"
+        ],
+        "the write did not exchange the new state with the old one and unlink the old"
+    );
+    let published: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
+    assert_eq!(published["health_status"], "healthy");
+    assert_eq!(
+        state_and_temp_files(temp_dir.path()),
+        vec![state_file],
+        "a write left a temporary file"
+    );
+    manager.delete_state("vm-swap").await.unwrap();
+}

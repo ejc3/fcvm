@@ -2559,6 +2559,12 @@ waited 0.3 to 0.5 s for that lock and 0.5 to 0.8 s for the directory (bench/star
   `load_state_by_pid()` reads the states its bucket names and scans everything only on a
   miss.
 - The only flock on the start path is the VM's own `<vm_id>.json.lock`.
+- **A state is published by exchange, not by a rename over the old one** (`publish_state`):
+  `RENAME_EXCHANGE` of `<vm_id>.json.tmp` with `<vm_id>.json`, then the old state is
+  unlinked. btrfs starts writing a file's data out inside a rename that replaces another
+  file, with the directory locked; with 128 clones starting together each such rename
+  took 55 to 108 ms. An exchange starts no I/O.
+- `list_vms()` opens and reads the buckets and the state files on up to 8 threads.
 - Root and the state directory's owner share one state directory (privileged tests run as
   root beside unprivileged ones), so a directory root makes (`shared_dir`, a claim
   directory) is handed to the state directory's owner before it appears, and `sweep.stamp`
