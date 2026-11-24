@@ -2520,7 +2520,7 @@ On serve process exit (SIGTERM/SIGINT):
 
 2. **A periodic sweep, not one per start.** The fast path of a start reads no other VM's
    state, so its cost does not grow with the number of VMs (with every state read on every
-   start, a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). Once a
+   start, a start's wait on the name lock grew with the number of VMs up, bench/start-rate). Once a
    minute per state directory (`maybe_sweep`: `sweep.stamp` missing or expired, and
    `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim has released
    `names.lock`; that launch pays for the scan, and no other start waits for it. The sweep
@@ -2745,13 +2745,12 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   snapshot's commit, and the parent directory lock it holds through the commit, took 193 ms p50 and 1.8 s p99 with
   four restores and four snapshots at once on a fleet host, against 17 ms and 192 ms for a reflink of a 684-extent
   disk; but every clone of a snapshot reflinks the same source file and btrfs holds that inode's lock for the whole
-  reflink, so reflinks of one snapshot run one at a time, 4.6 ms each for an 871-extent disk, about 240 per second
-  at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
+  reflink, so reflinks of one snapshot run one at a time. With 8 queued the last waits for 8 reflinks, under the
+  subvolume median, and the fleet
   relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
-  share no lock. On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
-  none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
-  against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
-  subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes
+  share no lock. On the disk piece (bench/start-rate/pieces RESULTS.md; m8gd.metal-24xl,
+  Ubuntu's 7.0.0-1018-aws, btrfs on the instance-store NVMe, none held, 2026-11-24), clones per second at C=1, 8,
+  128 and 512 were 293, 245, 1003 and 870 with the slots, and the C=8 p50 was 47 ms. `rm -rf` removes
   subvolumes, so teardown is unchanged, but btrfs reclaims a removed subvolume's space on its cleaner thread after the rmdir returns, where an unlinked reflink
   freed its space at once; `df` right after many clone teardowns can read high for a while.
 - Each snapshot directory is a btrfs subvolume too, and a diff snapshot is staged as a subvolume snapshot of its

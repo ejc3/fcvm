@@ -87,12 +87,9 @@ it traces `rtnl_mutex` as a mutex: a probe on `rtnl_lock()` misses every hold ta
 rtnetlink.c, where that function is inlined. `rtnl.py CELL.bt OPS` prints the hold per op by
 holder, with the `rcu_barrier()` time under it apart.
 `perftop.sh` writes each cell's top frames, and `table.py` prints the table in `RESULTS.md`.
-The `kernel.bt` output of the first table's attribution pass (C=128, 1000 held, one file per
-piece; start, steady and teardown in one window) is in `traces/`.
-Those dumps were taken with the tracer stopped at the driver's exit and with probes on
-`rtnl_lock()`. For the pieces that make namespaces, `traces/rtnl/` holds what `rtnl.py` reads
-from complete dumps instead: `rootless-net` before and after changelog step 5 (three runs
-each), `holder` and `health`.
+The `kernel.bt` dumps of the earlier attribution passes were taken on Ubuntu's 7.0.0-1013-aws,
+whose namespace cleanup holds RTNL through one `rcu_barrier()` per dying bridge, and are not
+kept; `kernel.bt` and `rtnl.py` take new ones the same way.
 
 `PERF_FREQ=99` adds `perf record -a -g` over the timed phase (`perf.data`), and
 `PERF_EVENTS=...` adds `perf stat -a` over the timed and steady phases. Host-wide numbers mean

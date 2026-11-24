@@ -3,9 +3,8 @@
 //!
 //! A File-backend restore maps `memory.bin` privately. The guest's first write to a page it has
 //! read then takes a stage-2 fault whose copy-on-write runs the MMU notifier's stage-2 unmap and
-//! a PTE clear-and-flush: two broadcast TLB invalidations per page while the vCPU waits. Under
-//! load that copy-on-write was 66% of `user_mem_abort`'s time, about 6,700 such pages a clone
-//! (bench/start-rate/RESTORE.md). Firecracker (`mem_backend.write_set_path`, in builds whose
+//! a PTE clear-and-flush: two broadcast TLB invalidations per page while the vCPU waits.
+//! Firecracker (`mem_backend.write_set_path`, in builds whose
 //! `--version` says `write-set`) instead copies those pages into the clone with
 //! `MADV_POPULATE_WRITE` before the VM runs.
 //!
