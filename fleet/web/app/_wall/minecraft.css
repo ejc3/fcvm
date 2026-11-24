@@ -8,7 +8,8 @@
 .mc-join .label { flex: none; }
 .mc-join code { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; padding: 2px 6px; border-radius: 4px; background: rgba(255, 255, 255, 0.06); font: 500 13px var(--mono); color: var(--text); user-select: all; }
 .mc-join .btn.mini { flex: none; min-height: 28px; padding: 0 10px; font-size: 12px; }
-.mc-join .hint { flex: 0 1000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+/* not .hint: that is the wall's centred notice (wall.css), position: fixed */
+.mc-join .mc-hint { flex: 0 1000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
 
 .mc-tile { position: absolute; border-radius: 4px; overflow: hidden; background: #06080b; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06); }
 .mc-tile.mine { box-shadow: 0 0 0 2px var(--fcvm); }

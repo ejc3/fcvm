@@ -112,9 +112,12 @@ anything only on a quiet box.
 `netpool` is the claim a restored clone makes when a pool runs (`fcvm netpool serve`,
 `src/netpool/`): one connection to the pool's socket, one request, one reply that carries the
 namespace's descriptors. It runs in the instance's own process, as it does in a clone's,
-because the connection is the lease and has to be held. The op is the claim; the instance holds
-the lease through the steady phase and drops it at teardown. The stage `generation` is the
-namespace's generation, not a time: 1 for a namespace no lease has used.
+because the connection is the lease and has to be held. The op is the claim and what the
+clone's VMM then does with the namespace's TAP: the three ioctls Firecracker makes on the
+queue it inherits (`TUNGETIFF`, `TUNSETVNETHDRSZ`, `TUNSETOFFLOAD`; stage `vmm-tap`), where
+a VMM in a namespace of its own attaches by name and detaches at its exit (`tap-attach`).
+The instance holds the lease through the steady phase and drops it at teardown. The stage
+`generation` is the namespace's generation, not a time: 1 for a namespace no lease has used.
 
 The pool resets a namespace after its lease has ended, so the reset is not in the teardown's
 latency. The driver reads the pool's counters before the teardown and waits until every

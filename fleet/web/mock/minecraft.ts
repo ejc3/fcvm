@@ -264,6 +264,9 @@ export class MockMinecraft {
     this.http = http.createServer((_req, res) => res.writeHead(404).end());
     this.wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
     this.http.on("upgrade", (req, socket, head) => {
+      // Node hands an upgraded socket over with no error listener, and a page that goes away
+      // resets its pending connects: unheard, that reset ends the whole mock.
+      socket.on("error", () => {});
       const m = /^\/(mc-\d+)\/view$/.exec(new URL(req.url ?? "/", "http://mock").pathname);
       const s = m ? this.servers.find((x) => x.slot === m[1]) : undefined;
       if (!s) {
@@ -273,8 +276,6 @@ export class MockMinecraft {
       // Tests: a handshake that is never answered (the connection stays open, silent).
       if (this.hang) {
         this.hung.add(socket);
-        // the page drops a pending connect with a reset: no handler would make that fatal here
-        socket.on("error", () => {});
         socket.on("close", () => this.hung.delete(socket));
         return;
       }

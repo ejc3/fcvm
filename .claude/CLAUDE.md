@@ -1591,7 +1591,11 @@ How it works:
   to `/tmp/fcvm-firecracker-<vm_id>.log` at teardown) is written at `Info`.
   `FCVM_FIRECRACKER_LOG_LEVEL=Debug` raises it, and then the vsock muxer logs one line per
   packet: 311 MiB for a 75 s FUSE workload in a small VM, and 9.99 GiB in the first 84 minutes
-  of a 128 GiB guest whose volumes are FUSE over vsock
+  of a 128 GiB guest whose volumes are FUSE over vsock.
+  While the VMM runs, fcvm repeats each ERROR line Firecracker writes there as a WARN in its own log (the
+  first 20 per process; the rest are counted when it stops). fcvm empties the file before each launch, because
+  Firecracker writes it from its start without truncating it. A guest disk write the host refused (ENOSPC) is
+  recorded nowhere else, and the guest sees it only as an I/O error that remounts its filesystem read-only.
 
 ### Common Commands
 ```bash
@@ -2695,7 +2699,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Port forwarding via pasta CLI flags (-t/-u)
 - The holder builds every link over netlink in one `build` request from fcvm (`netns_agent::build`, `src/network/rtnl.rs`); both TAPs are persistent, so the VMM and pasta attach to devices that exist. The bridge takes four netlink requests (create, MTU and `addrgenmode none` while it is down, up after its ports have joined, address) and each TAP one
 - IPv6 supported with `--enable-ipv6` and native DNS proxying
-- `fcvm netpool serve --slots N` (`src/netpool/`) keeps N such namespaces and lends each to one restored clone at a time. The lease is the clone's connection to the pool, which the VMM inherits; the pool resets a returned namespace, checks it against the fingerprint taken at build (`src/network/fingerprint.rs`) and destroys one that differs. A clone with a published port, a cold boot and a clone with no pool build their own. A pooled clone's `holder_pid` is the pool's process: never signal it from a clone
+- `fcvm netpool serve --slots N` (`src/netpool/`) keeps N such namespaces and lends each to one restored clone at a time. The lease is the clone's connection to the pool, which the VMM inherits; the pool resets a returned namespace, checks it against the fingerprint taken at build (`src/network/fingerprint.rs`) and destroys one that differs. A pooled namespace's TAP is attached once, by its holder, and the VMM uses it through the queue it inherits (`NetworkConfig::tap_fd`, Firecracker's `host_dev_fd`): nothing may attach to a pooled TAP by name, and a VMM that takes no queue (Cloud Hypervisor, a Firecracker without `tap-fd` in its version) is never pooled. A clone with a published port, a cold boot and a clone with no pool build their own. A pooled clone's `holder_pid` is the pool's process: never signal it from a clone
 
 **Routed Architecture** (`src/network/routed.rs`):
 - veth pair connects VM namespace to host with native IPv6 kernel routing (no userspace proxy)

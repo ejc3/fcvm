@@ -382,16 +382,29 @@ impl Rtnl {
         self.change(RTM_DELNEIGH, 0, &payload)
     }
 
-    /// Delete the address `mac` that the bridge learned on its port `index`:
-    /// `bridge fdb del MAC dev INDEX master`.
-    pub fn del_learned_address(&mut self, index: u32, mac: &[u8]) -> io::Result<()> {
-        const NDA_LLADDR: u16 = 2;
-        const NTF_MASTER: u8 = 0x04;
-        let mut payload = vec![libc::AF_BRIDGE as u8, 0, 0, 0];
-        payload.extend_from_slice(&(index as i32).to_ne_bytes());
-        payload.extend_from_slice(&[0, 0, NTF_MASTER, 0]);
-        attr(&mut payload, NDA_LLADDR, mac);
-        self.change(RTM_DELNEIGH, 0, &payload)
+    /// Have the bridge `index` forget every address it learned:
+    /// `ip link set dev BRIDGE type bridge fdb_flush`. The kernel removes the entries that
+    /// are not static, on every port; a port's own address and an entry added to stay are
+    /// static and remain.
+    ///
+    /// Not one `RTM_DELNEIGH` per entry (`bridge fdb del`): Linux 6.14 refuses that
+    /// request with EPERM to the root of an unprivileged user's namespace (seen on the
+    /// x86_64 CI runners, 6.14.0-1018-aws; 7.0 and later allow it), which failed every
+    /// reset there. That 6.14 refuses it is known from those runs' error, not from reading
+    /// its source. A link change needs CAP_NET_ADMIN in the namespace's own user
+    /// namespace only, and it is the request this module already makes to build the
+    /// bridge.
+    pub fn flush_learned_addresses(&mut self, index: u32) -> io::Result<()> {
+        const IFLA_INFO_DATA: u16 = 2;
+        const IFLA_BR_FDB_FLUSH: u16 = 21;
+        let mut data = Vec::new();
+        attr(&mut data, IFLA_BR_FDB_FLUSH, &[]);
+        let mut info = Vec::new();
+        attr(&mut info, IFLA_INFO_KIND, b"bridge\0");
+        attr(&mut info, IFLA_INFO_DATA, &data);
+        let mut payload = ifinfomsg(index, 0, 0);
+        attr(&mut payload, IFLA_LINKINFO, &info);
+        self.change(RTM_NEWLINK, 0, &payload)
     }
 
     /// Remove every IPv4 address of this namespace that is not loopback's and add it
@@ -449,9 +462,11 @@ const TUNSETPERSIST: libc::c_ulong = 0x4004_54cb;
 const IFF_TAP: libc::c_short = 0x0002;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
-/// `ip tuntap add NAME mode tap`: a TAP device that stays when the descriptor that made it
-/// closes. Whoever opens it later attaches to this device instead of making one.
-pub fn add_tap(name: &str) -> io::Result<()> {
+const IFF_VNET_HDR: libc::c_short = 0x4000;
+
+/// Open `/dev/net/tun` and attach the descriptor to the TAP device `name` with `flags`,
+/// making the device if it does not exist.
+fn attach_tap(name: &str, flags: libc::c_short, open_flags: libc::c_int) -> io::Result<OwnedFd> {
     #[repr(C)]
     struct IfReq {
         name: [u8; libc::IFNAMSIZ],
@@ -466,12 +481,12 @@ pub fn add_tap(name: &str) -> io::Result<()> {
     }
     let mut request = IfReq {
         name: [0; libc::IFNAMSIZ],
-        flags: IFF_TAP | IFF_NO_PI,
+        flags,
         pad: [0; 22],
     };
     request.name[..name.len()].copy_from_slice(name.as_bytes());
     // SAFETY: the path is a NUL-terminated literal.
-    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | open_flags) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -482,6 +497,13 @@ pub fn add_tap(name: &str) -> io::Result<()> {
     if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETIFF as _, &request) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(tun)
+}
+
+/// `ip tuntap add NAME mode tap`: a TAP device that stays when the descriptor that made it
+/// closes. Whoever opens it later attaches to this device instead of making one.
+pub fn add_tap(name: &str) -> io::Result<()> {
+    let tun = attach_tap(name, IFF_TAP | IFF_NO_PI, libc::O_CLOEXEC)?;
     // SAFETY: TUNSETPERSIST takes its argument by value.
     if unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETPERSIST as _, 1 as libc::c_ulong) } != 0 {
         return Err(io::Error::last_os_error());
@@ -489,9 +511,133 @@ pub fn add_tap(name: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// A TAP device made attached, and the queue it is attached by: the device has a carrier
+/// from here on and keeps it for as long as the descriptor, or a copy of it, is open.
+///
+/// A VMM uses the device through a copy of this descriptor. It attaches nothing and, when
+/// it exits, detaches nothing, so neither its start nor its stop takes `rtnl_mutex` for the
+/// TAP or flips its carrier: on a host with 2000 namespaces an attach and detach by name
+/// hold that mutex 1.5 ms or more (`bench/start-rate/pieces/RESULTS.md`, tap-attach). The
+/// queue has the flags Firecracker opens a TAP with, virtio-net header included, and is
+/// non-blocking, which is a property of the open file and so of every copy.
+pub fn add_attached_tap(name: &str) -> io::Result<OwnedFd> {
+    attach_tap(
+        name,
+        IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
+        libc::O_CLOEXEC | libc::O_NONBLOCK,
+    )
+}
+
+/// Read and discard every frame waiting in the TAP queue `queue`, and say how many there
+/// were. The queue holds frames the namespace sent towards the VMM that the VMM had not
+/// read; with the queue kept open across VMMs the kernel never purges them (it does at the
+/// close of a queue), so they would be the next VMM's first frames.
+///
+/// This never waits. Non-blocking mode is a flag of the open file description, which
+/// every VMM that inherited the queue shares with the holder: one that cleared it would
+/// leave a plain read here waiting on an empty queue for ever, with the holder's one
+/// thread in it. So the flag is set again first, and each read follows a poll that says a
+/// frame is there.
+pub fn drain_tap(queue: &OwnedFd) -> io::Result<usize> {
+    let mut on: libc::c_int = 1;
+    // SAFETY: FIONBIO reads one int through the pointer, which outlives the call.
+    if unsafe { libc::ioctl(queue.as_raw_fd(), libc::FIONBIO as _, &mut on) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut frame = [0u8; 65536 + 64];
+    let mut drained = 0;
+    loop {
+        let mut ready = libc::pollfd {
+            fd: queue.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd, and a timeout of zero: the call returns at once.
+        match unsafe { libc::poll(&mut ready, 1, 0) } {
+            0 => return Ok(drained),
+            n if n < 0 => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            _ => {}
+        }
+        if ready.revents & libc::POLLIN == 0 {
+            return Err(io::Error::other(format!(
+                "the TAP queue polls as {:#x}",
+                ready.revents
+            )));
+        }
+        // SAFETY: `frame` is writable for its whole length.
+        let got = unsafe { libc::read(queue.as_raw_fd(), frame.as_mut_ptr().cast(), frame.len()) };
+        if got >= 0 {
+            drained += 1;
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::WouldBlock => return Ok(drained),
+            io::ErrorKind::Interrupted => continue,
+            _ => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The queue is emptied without waiting even when a tenant cleared non-blocking mode
+    /// on it, and is left non-blocking for the next one. A socket pair stands in for the
+    /// queue: the drain makes no TAP call. Before, the read after the last frame waited
+    /// for ever, and so did the holder, which makes this call on its one thread.
+    #[test]
+    fn a_queue_a_tenant_made_blocking_is_emptied_without_waiting() {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is two descriptors long, which is what socketpair writes.
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: socketpair returned two new descriptors nothing else owns.
+        let (queue, sender) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        for frame in [&b"one"[..], b"two", b"three"] {
+            // SAFETY: `frame` is readable for its length.
+            let sent =
+                unsafe { libc::write(sender.as_raw_fd(), frame.as_ptr().cast(), frame.len()) };
+            assert_eq!(sent, frame.len() as isize);
+        }
+        let flags = |fd: &OwnedFd| {
+            // SAFETY: F_GETFL takes no pointer.
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            flags
+        };
+        assert_eq!(
+            flags(&queue) & libc::O_NONBLOCK,
+            0,
+            "the stand-in starts blocking"
+        );
+
+        let (done, result) = std::sync::mpsc::channel();
+        let drained = queue.try_clone().unwrap();
+        std::thread::spawn(move || done.send(drain_tap(&drained)));
+        let count = result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the drain waited on an empty queue")
+            .expect("draining");
+        assert_eq!(count, 3);
+        assert_ne!(
+            flags(&queue) & libc::O_NONBLOCK,
+            0,
+            "the queue is left non-blocking"
+        );
+        assert_eq!(drain_tap(&queue).unwrap(), 0);
+    }
 
     /// One netlink message: header and payload, padded.
     fn message(kind: u16, flags: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
