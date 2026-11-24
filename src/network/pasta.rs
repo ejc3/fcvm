@@ -810,6 +810,10 @@ fn pid_file_is_written(pid_file: &Path) -> bool {
         .is_ok_and(|text| text.ends_with('\n') && text.trim().parse::<u32>().is_ok())
 }
 
+/// The host's global IPv6 address as this process first found it
+/// ([`PastaNetwork::detect_host_ipv6`]).
+static HOST_IPV6: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 /// What a pool key holds of the host and of the user, beside the network's own shape.
 struct PoolHost {
     /// The host's global IPv6 address, which pasta is started with.
@@ -903,6 +907,9 @@ pub struct PastaNetwork {
     // Where pasta's PID file goes when not in the VM's runtime directory: a pooled
     // namespace is no VM's.
     pid_dir: Option<PathBuf>,
+    // The VMM's TAP is made attached and its queue kept by the holder (`with_attached_tap`):
+    // the namespaces a pool builds.
+    attached_tap: bool,
     // Whether this VM may ask a namespace pool for its namespace (`with_pooling`).
     pooling: bool,
     // The pooled namespace this VM runs in, when it claimed one (`crate::netpool`). The pool
@@ -1022,9 +1029,18 @@ impl PastaNetwork {
             isolated: false,
             dns_server: None,
             pid_dir: None,
+            attached_tap: false,
             pooling: false,
             lease: None,
         }
+    }
+
+    /// Build the namespace with the VMM's TAP attached, its queue held by the holder
+    /// ([`super::netns_agent::Shape::tap_attached`]): what a pool builds, for VMMs that take
+    /// the queue as a descriptor.
+    pub fn with_attached_tap(mut self) -> Self {
+        self.attached_tap = true;
+        self
     }
 
     /// Let this VM run in a pooled namespace when one is to be had ([`Self::poolable`]).
@@ -1057,14 +1073,25 @@ impl PastaNetwork {
     /// [`Self::pool_key`] with the host probed now. A pool lives for days: what it found
     /// when it started (the host's IPv6 address, its resolver file) may no longer be what a
     /// clone that starts now finds.
-    pub fn pool_key_now(&self) -> String {
-        self.pool_key_of(&PoolHost::of(Self::probe_host_ipv6()))
+    ///
+    /// `None` when the host's address could not be probed: a key made from a failed probe
+    /// would say the host has no IPv6 address.
+    pub fn pool_key_now(&self) -> Option<String> {
+        match Self::probe_host_ipv6() {
+            Ok(ipv6) => Some(self.pool_key_of(&PoolHost::of(ipv6))),
+            Err(error) => {
+                warn!(%error, "probing the host's IPv6 address failed");
+                None
+            }
+        }
     }
 
     fn pool_key_of(&self, host: &PoolHost) -> String {
         use sha2::Digest;
         let mut shape = self.shape();
         shape.tap = String::new();
+        // A pooled namespace's TAP is attached, whatever this VM would build for itself.
+        shape.tap_attached = true;
         let args = self.build_pasta_args(
             Path::new("/"),
             0,
@@ -1174,6 +1201,7 @@ impl PastaNetwork {
                 .expect("NAMESPACE_IP is an IPv4 address"),
             bridge_prefix: 24,
             mtu: self.links_mtu(),
+            tap_attached: self.attached_tap,
         }
     }
 
@@ -1250,30 +1278,71 @@ impl PastaNetwork {
     /// Detect host's global IPv6 address for pasta outbound traffic.
     ///
     /// Memoised for the process lifetime: `setup()` and `start_pasta()` both need
-    /// it, and the answer cannot change during one launch.
+    /// it, and the answer cannot change during one launch. Only an answer is kept: a
+    /// probe that failed is "no address" for this call and is made again at the next
+    /// ([`Self::remembered`]).
     fn detect_host_ipv6() -> Option<String> {
-        static HOST_IPV6: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        HOST_IPV6.get_or_init(Self::probe_host_ipv6).clone()
+        Self::remembered(&HOST_IPV6, Self::probe_host_ipv6)
+    }
+
+    /// Probe the host's IPv6 address now unless this process already has its answer, and
+    /// fail when the probe does. For a process whose key and namespaces last for days (the
+    /// namespace pool): it must not start on "no address" because one probe failed.
+    pub fn host_ipv6_known() -> std::io::Result<()> {
+        Self::remembered_or_error(&HOST_IPV6, Self::probe_host_ipv6).map(drop)
+    }
+
+    /// `probe`'s answer, kept in `kept` once there is one. A probe that fails is logged
+    /// and answered as `None` without being kept, so a failure that passes (the address
+    /// dump interrupted four times in a row on a host that is changing its addresses) does
+    /// not become "this host has no IPv6 address" for the rest of a long-lived process.
+    fn remembered(
+        kept: &std::sync::OnceLock<Option<String>>,
+        probe: impl FnOnce() -> std::io::Result<Option<String>>,
+    ) -> Option<String> {
+        match Self::remembered_or_error(kept, probe) {
+            Ok(answer) => answer,
+            Err(error) => {
+                warn!(%error, "probing the host's IPv6 address failed; none is assumed for now");
+                None
+            }
+        }
+    }
+
+    /// [`Self::remembered`] for a caller that must have an answer: the probe's failure is
+    /// its error, and nothing is kept.
+    fn remembered_or_error(
+        kept: &std::sync::OnceLock<Option<String>>,
+        probe: impl FnOnce() -> std::io::Result<Option<String>>,
+    ) -> std::io::Result<Option<String>> {
+        if let Some(answer) = kept.get() {
+            return Ok(answer.clone());
+        }
+        let answer = probe()?;
+        Ok(kept.get_or_init(|| answer).clone())
     }
 
     /// The first global-scope IPv6 address of this network namespace's interfaces that is
     /// not a unique local one (fd00::/8), from one netlink dump of the IPv6 addresses: no
     /// process is started. Only addresses are asked for. A dump of the links as well, which
     /// getifaddrs makes, waits for `rtnl_mutex` on a host that is starting many VMs.
-    fn probe_host_ipv6() -> Option<String> {
-        let mut rtnl = super::rtnl::Rtnl::open().ok()?;
+    ///
+    /// An error is the probe failing (no netlink socket, a dump the kernel kept
+    /// interrupting), which is not the same as a host without such an address.
+    fn probe_host_ipv6() -> std::io::Result<Option<String>> {
+        let mut rtnl = super::rtnl::Rtnl::open()?;
         // struct ifaddrmsg: family, prefix length, flags, scope, index.
         let mut header = [0u8; 8];
         header[0] = libc::AF_INET6 as u8;
-        let entries = rtnl.dump(super::rtnl::RTM_GETADDR, &header).ok()?;
+        let entries = rtnl.dump(super::rtnl::RTM_GETADDR, &header)?;
         const RT_SCOPE_UNIVERSE: u8 = 0;
-        Self::first_global_ipv6(
+        Ok(Self::first_global_ipv6(
             entries
                 .iter()
                 .filter(|entry| entry.payload.get(3) == Some(&RT_SCOPE_UNIVERSE))
                 .filter_map(|entry| Self::own_ipv6_address(&entry.attrs(8))),
         )
-        .map(|address| address.to_string())
+        .map(|address| address.to_string()))
     }
 
     /// This host's own address in one dumped IPv6 address entry: `IFA_LOCAL` when the entry
@@ -2047,6 +2116,7 @@ impl NetworkManager for PastaNetwork {
         }
         info!(vm_id = %self.vm_id, "setting up rootless networking with pasta (bridge mode)");
 
+        let mut tap_fd = None;
         // A namespace from the pool, when one serves this data directory and has a free
         // namespace built the way this VM's would be. Here, before anything names the TAP:
         // a pooled namespace's TAP has the pool's name, not this VM's.
@@ -2074,6 +2144,7 @@ impl NetworkManager for PastaNetwork {
                     "running in a pooled namespace"
                 );
                 self.tap_device = lease.grant.tap.clone();
+                tap_fd = Some(lease.tap_fd());
                 self.lease = Some(lease);
                 failpoint::hit_async("pool.post_claim").await;
             }
@@ -2115,6 +2186,7 @@ impl NetworkManager for PastaNetwork {
 
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
+            tap_fd,
             guest_mac,
             guest_ip: Some(format!("{}/24", self.guest_ip)),
             host_ip: Some(GUEST_GATEWAY.to_string()),
@@ -3472,7 +3544,7 @@ mod tests {
             ))
         );
         // In one process the two public forms agree while the host does not change.
-        assert_eq!(network.pool_key(), network.pool_key_now());
+        assert_eq!(Some(network.pool_key()), network.pool_key_now());
     }
 
     /// A clone whose pasta would be started differently does not match: here one that
@@ -4246,6 +4318,7 @@ mod tests {
                 bridge_address: "10.0.2.1".parse().unwrap(),
                 bridge_prefix: 24,
                 mtu: Some(GUEST_MTU),
+                tap_attached: false,
             }
         );
     }
@@ -4340,8 +4413,43 @@ mod tests {
             .unwrap()
             .filter_map(|interface| Some(interface.address?.as_sockaddr_in6()?.ip()));
         assert_eq!(
-            PastaNetwork::probe_host_ipv6(),
+            PastaNetwork::probe_host_ipv6().unwrap(),
             PastaNetwork::first_global_ipv6(listed).map(|address| address.to_string())
+        );
+    }
+
+    /// A probe that fails is not remembered as "no address": the next call probes again,
+    /// and the first answer is the one kept.
+    #[test]
+    fn a_failed_probe_of_the_host_address_is_not_remembered() {
+        let kept = std::sync::OnceLock::new();
+        let interrupted = || Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        assert_eq!(PastaNetwork::remembered(&kept, interrupted), None);
+        assert!(kept.get().is_none(), "a failed probe was kept");
+        let found = || Ok(Some("2001:db8::1".to_string()));
+        assert_eq!(
+            PastaNetwork::remembered(&kept, found).as_deref(),
+            Some("2001:db8::1")
+        );
+        let never = || -> std::io::Result<Option<String>> { panic!("probed again") };
+        assert_eq!(
+            PastaNetwork::remembered(&kept, never).as_deref(),
+            Some("2001:db8::1")
+        );
+        // A host without an address is an answer, and is kept.
+        let none = std::sync::OnceLock::new();
+        assert_eq!(PastaNetwork::remembered(&none, || Ok(None)), None);
+        assert_eq!(none.get(), Some(&None));
+        // A caller that must have an answer gets the failure itself, and nothing is kept.
+        let asked = std::sync::OnceLock::new();
+        let failed = PastaNetwork::remembered_or_error(&asked, interrupted).unwrap_err();
+        assert_eq!(failed.kind(), std::io::ErrorKind::Interrupted);
+        assert!(asked.get().is_none());
+        assert_eq!(
+            PastaNetwork::remembered_or_error(&asked, found)
+                .unwrap()
+                .as_deref(),
+            Some("2001:db8::1")
         );
     }
 

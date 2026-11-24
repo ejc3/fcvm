@@ -62,7 +62,7 @@ for rung in $RUNGS; do
   if [ -n "${TRACE:-}" ]; then
     traced=$out_root/traced/netpool-c$c-n$n-a$ALIVE
     mkdir -p "$out_root/traced"
-    if [ ! -f "$traced/summary.json" ]; then
+    if ! ARGS="--netpool-socket $socket --steady-secs 5" cell_done "$traced"; then
       quiet "traced netpool C=$c" || continue
       rm -f "$traced.bt" "$traced.bt.err"
       sudo bpftrace "$here/kernel.bt" > "$traced.bt" 2> "$traced.bt.err" &
