@@ -4070,7 +4070,12 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     spawn_lifecycle_signal_handler("cancelling podman prepare")?;
 
     let record = !args.no_record_working_set;
+    // The recording clone is another VMM start: it asks for the prepare's confinement.
     let ready_timeout = std::time::Duration::from_secs(args.ready_timeout);
+    let recording = Recording {
+        timeout: ready_timeout,
+        confine: args.run.confine,
+    };
     let lifecycle = PodmanLifecycle::Prepare(PrepareOptions {
         tag: args.tag,
         force: args.force,
@@ -4079,7 +4084,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     match prepare_vm_for_lifecycle(args.run, lifecycle.clone()).await? {
         VmPreparation::Prepared(prepared) => {
             if record {
-                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
+                record_working_set(&prepared.output.snapshot_key, &recording, &cancel).await;
             }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -4115,7 +4120,7 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
             };
             let prepared = finish_prepare(operation, cleanup)?;
             if record {
-                record_working_set(&prepared.output.snapshot_key, ready_timeout, &cancel).await;
+                record_working_set(&prepared.output.snapshot_key, &recording, &cancel).await;
             }
             publish_prepared_snapshot_gated(&lifecycle_gate, &prepared)
         }
@@ -4131,11 +4136,17 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
 /// `snapshot run --exec true` through a memory server (`FCVM_FORCE_UFFD`), whose server
 /// writes the clone's faults beside the snapshot when it stops, and the clone is torn down.
 /// A recording that fails is logged and the prepare still succeeds: the set is a hint.
-async fn record_working_set(
-    snapshot_key: &str,
+/// How a prepare's working-set recording clone runs.
+#[derive(Clone, Copy)]
+struct Recording {
+    /// How long the clone has to become ready.
     timeout: std::time::Duration,
-    cancel: &CancellationToken,
-) {
+    /// The prepare's --confine, which the clone, another VMM start, asks for too.
+    confine: bool,
+}
+
+async fn record_working_set(snapshot_key: &str, recording: &Recording, cancel: &CancellationToken) {
+    let Recording { timeout, confine } = *recording;
     let snapshot_dir = paths::snapshot_dir().join(snapshot_key);
     if recorded_pages(&snapshot_dir) > 0 {
         info!(
@@ -4145,7 +4156,7 @@ async fn record_working_set(
         return;
     }
     let started = std::time::Instant::now();
-    match recording_restore(snapshot_key, timeout, cancel).await {
+    match recording_restore(snapshot_key, timeout, confine, cancel).await {
         Ok(()) if recorded_pages(&snapshot_dir) > 0 => info!(
             snapshot_key,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -4171,10 +4182,11 @@ async fn record_working_set(
 async fn recording_restore(
     snapshot_key: &str,
     timeout: std::time::Duration,
+    confine: bool,
     cancel: &CancellationToken,
 ) -> Result<()> {
     let exe = std::env::current_exe().context("locating the fcvm binary")?;
-    let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name());
+    let mut command = recording_restore_command(&exe, snapshot_key, &recording_vm_name(), confine);
     run_recording(&mut command, timeout, cancel).await
 }
 
@@ -4229,6 +4241,7 @@ fn recording_restore_command(
     exe: &std::path::Path,
     snapshot_key: &str,
     name: &str,
+    confine: bool,
 ) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(exe);
     command
@@ -4241,6 +4254,7 @@ fn recording_restore_command(
             name,
         ])
         .args(["--exec", "true"])
+        .args(confine.then_some("--confine"))
         .env("FCVM_FORCE_UFFD", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -4314,13 +4328,37 @@ mod tests {
         );
     }
 
+    /// A confined prepare's working-set recording clone is another VMM start: it asks for
+    /// the same confinement.
+    #[test]
+    fn a_confined_prepare_records_with_a_confined_clone() {
+        let args = |confine| -> Vec<String> {
+            recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap", confine)
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(args(true).last().map(String::as_str), Some("--confine"));
+        assert!(!args(false).iter().any(|a| a == "--confine"));
+        let source = include_str!("mod.rs");
+        let prepare = &source[source.find("pub async fn cmd_podman_prepare(").unwrap()..];
+        let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
+        assert!(prepare.contains("let confine = args.run.confine;"));
+        assert_eq!(
+            prepare.matches("ready_timeout, confine, &cancel").count(),
+            2
+        );
+    }
+
     /// The recording restore is `snapshot run --snapshot <key> --exec true` of this binary
     /// through a memory server, with its stdout discarded, and a prepare runs it before it
     /// publishes, on a cache hit and after a cold or restored boot alike, unless told not
     /// to (#955).
     #[test]
     fn a_prepare_records_its_snapshots_working_set_before_it_publishes() {
-        let command = recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap");
+        let command =
+            recording_restore_command(Path::new("/bin/fcvm"), "snap", "record-1-snap", false);
         let std = command.as_std();
         let args: Vec<_> = std
             .get_args()
