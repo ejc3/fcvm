@@ -275,6 +275,7 @@ export class MockMinecraft {
       }
       // Tests: a handshake that is never answered (the connection stays open, silent).
       if (this.hang) {
+        this.held.push(s.slot);
         this.hung.add(socket);
         socket.on("close", () => this.hung.delete(socket));
         return;
@@ -333,6 +334,8 @@ export class MockMinecraft {
 
   private hang = false;
   private hung = new Set<import("node:stream").Duplex>();
+  /** Tests: the server of every handshake the hang fault has held, in the order they came. */
+  readonly held: string[] = [];
   /**
    * Tests: leave every new view socket's handshake unanswered; only the page can end one. Turning
    * it off answers new ones again and resets the held ones. Every server here is at one address

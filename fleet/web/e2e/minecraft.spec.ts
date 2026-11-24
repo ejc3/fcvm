@@ -17,6 +17,8 @@ const record = async () =>
   (await (await fetch(`${COORD}/mock/minecraft-record`)).json()) as {
     intents: { name: string; outcome: string; args: Record<string, unknown> }[];
     drives: { slot: string; viewer: string; msg: Record<string, unknown>; ok: boolean; reason: string | null }[];
+    /** The server of every handshake the hang fault has held, in the order they came. */
+    held: string[];
   };
 const seconds = (text: string | null) => Number(/(\d+\.\d+) s/.exec(text ?? "")![1]);
 const view = (page: Page) => page.evaluate(() => window.__minecraft!.view());
@@ -306,26 +308,56 @@ test("a server whose view cannot be reached says so on its tile with a Retry, ca
 });
 
 test("a handshake that never answers is given up after the deadline, and Retry starts a fresh one at once", async ({ page }) => {
+  // Every view socket the page constructs, by server: what the page controls. When the browser
+  // sends a socket's handshake is its own business. Chromium sends one at a time to an address
+  // and port, and after failed connects holds a new one back: 21 ms after 8 failures, 313 ms
+  // after 12, and 1 to 5 s past 16 (measured), which is as long as the page's own deadline.
+  await page.addInitScript(() => {
+    const made: string[] = [];
+    (window as unknown as { __viewSockets: string[] }).__viewSockets = made;
+    const Real = window.WebSocket;
+    window.WebSocket = class extends Real {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols);
+        const m = /\/(mc-\d+)\/view/.exec(String(url));
+        if (m) made.push(m[1]!);
+      }
+    };
+  });
+  const made = (slot?: string) => page.evaluate((s) => (window as unknown as { __viewSockets: string[] }).__viewSockets.filter((w) => s === undefined || w === s).length, slot);
+  // The page comes up with every view connected, so the fault's failures are the tiles' own
+  // and few. (Loaded under the fault, the page's address-family probe alone fails 18 connects
+  // before the first tile tries, and Chromium's hold-back then decides the test.)
+  await openMinecraft(page);
+  const healthy = await made();
   await admin("/mock/fault", { minecraft_hang: true });
   try {
-    await page.goto("/?mode=minecraft&debug=1");
-    await page.waitForFunction(() => window.__minecraft !== undefined);
+    // the open sockets are dropped, and every handshake after that is left unanswered
+    await admin("/mock/fault", { minecraft_down: true });
+    await admin("/mock/fault", { minecraft_down: false });
+    // given up at the connect deadline, not left connecting for ever
     await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Cannot reach mc-1's view. Trying again.", { timeout: 15_000 });
-    // Retry under the same fault starts over: the tile says it is connecting again, without Retry
+    // Retry starts a fresh attempt at once: a new socket is constructed there and then, and the
+    // tile says it is connecting again, without Retry
+    const before = await made("mc-1");
+    const heldBefore = (await record()).held.filter((s) => s === "mc-1").length;
     await page.getByTestId("mc-stream-retry-mc-1").click();
+    await expect.poll(() => made("mc-1"), { timeout: 1000, intervals: [20] }).toBe(before + 1);
     await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Connecting to mc-1.", { timeout: 1000 });
     await expect(page.getByTestId("mc-stream-retry-mc-1")).toHaveCount(0);
-    await expect(page.getByTestId("mc-stream-mc-1")).toContainText("Cannot reach mc-1's view. Trying again.", { timeout: 15_000 });
+    // The fault is lifted only once the server holds that fresh handshake, so every run lifts it
+    // in the same state: one attempt of mc-1 in flight and unanswered.
+    await expect.poll(async () => (await record()).held.filter((s) => s === "mc-1").length).toBe(heldBefore + 1);
+    // Each tile has failed once and is on its second try: at most nine failed connects, the
+    // test's shape and not its speed, where the browser's hold-back is tens of milliseconds.
+    expect((await made()) - healthy).toBeLessThanOrEqual(9);
   } finally {
     await admin("/mock/fault", { minecraft_hang: false });
   }
-  await page.getByTestId("mc-stream-retry-mc-1").click();
-  // The page opens the fresh socket at once, but Chromium decides when its handshake is sent:
-  // after connects that failed with none succeeding it holds a new one back, measured at 21 ms
-  // after 8 failures, 313 ms after 12 and between 1.0 and 5.0 s after 20 (ten trials). How many
-  // the four tiles left behind under the fault depends on how fast the test ran, so the view
-  // is given that delay's 5 s and the 2 s a connect had before.
-  await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 7000 });
+  // Lifting the fault ends the handshake it held, so the page tries again (0.5 s later) and is
+  // answered: the view is back well inside 2 s. A handshake left held would keep it away until
+  // the page's 5 s deadline.
+  await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 2000 });
   await expect.poll(async () => (await drawnShare(page, "mc-1")).share, { timeout: 5000 }).toBeGreaterThan(0.9);
 });
 

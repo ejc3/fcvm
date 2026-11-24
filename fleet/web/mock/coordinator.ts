@@ -1626,7 +1626,7 @@ export class MockCoordinator {
       return;
     }
     if (req.method === "GET" && url.pathname === "/mock/minecraft-record") {
-      json(200, { intents: this.minecraft?.intents ?? [], drives: this.minecraft?.drives ?? [] });
+      json(200, { intents: this.minecraft?.intents ?? [], drives: this.minecraft?.drives ?? [], held: this.minecraft?.held ?? [] });
       return;
     }
     if (req.method === "GET" && url.pathname === "/mock/windows-actions") {
