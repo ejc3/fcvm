@@ -1598,6 +1598,38 @@ describe("mock minecraft", () => {
     expect(acks.filter((x) => !x.ok).map((x) => x.reason)).toContain("at most 30 drive messages a second");
     for (const x of [va.ws, vb.ws, a.ws, b.ws]) x.close();
   });
+
+  it("the hang fault leaves a handshake unanswered while it is on, and lifting it resets the ones it held", async () => {
+    const url = new URL(tile("mc-2").frame_url);
+    // A handshake as a browser sends it, over a plain socket: what comes back, and whether the server ended it.
+    const handshake = () => {
+      const sock = net.connect(Number(url.port), "127.0.0.1");
+      const got = { data: "", closed: false };
+      sock.on("data", (d) => (got.data += d.toString()));
+      sock.on("close", () => (got.closed = true));
+      sock.on("error", () => {});
+      sock.on("connect", () =>
+        sock.write(`GET ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`),
+      );
+      return { sock, got };
+    };
+    await admin("/mock/fault", { minecraft_hang: true });
+    const held = handshake();
+    try {
+      // held: connected, never answered, not ended
+      await new Promise((r) => setTimeout(r, 300));
+      expect(held.got).toEqual({ data: "", closed: false });
+    } finally {
+      await admin("/mock/fault", { minecraft_hang: false });
+    }
+    // Lifted: the held one is ended at once, so it cannot keep a browser's next handshake to this
+    // address and port unsent (Chromium sends them one at a time), and a new one is answered.
+    await until(() => held.got.closed, 1000);
+    expect(held.got.data).toBe("");
+    const fresh = handshake();
+    await until(() => fresh.got.data.startsWith("HTTP/1.1 101 "), 1000);
+    fresh.sock.destroy();
+  });
 });
 
 describe("the mock speaks the coordinator's snapshot shapes", () => {

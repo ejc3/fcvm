@@ -320,7 +320,12 @@ test("a handshake that never answers is given up after the deadline, and Retry s
     await admin("/mock/fault", { minecraft_hang: false });
   }
   await page.getByTestId("mc-stream-retry-mc-1").click();
-  await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 2000 });
+  // The page opens the fresh socket at once, but Chromium decides when its handshake is sent:
+  // after connects that failed with none succeeding it holds a new one back, measured at 21 ms
+  // after 8 failures, 313 ms after 12 and between 1.0 and 5.0 s after 20 (ten trials). How many
+  // the four tiles left behind under the fault depends on how fast the test ran, so the view
+  // is given that delay's 5 s and the 2 s a connect had before.
+  await expect(page.getByTestId("mc-stream-mc-1")).toHaveCount(0, { timeout: 7000 });
   await expect.poll(async () => (await drawnShare(page, "mc-1")).share, { timeout: 5000 }).toBeGreaterThan(0.9);
 });
 
