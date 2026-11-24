@@ -170,6 +170,69 @@ class ConnectionClose(unittest.TestCase):
         self.assertNotIn("\r\nconnection:", self.reply_headers())
 
 
+class ReplayKeepAlive(unittest.TestCase):
+    """--http11: one connection answers request after request. Without the flag
+    the replay answers HTTP/1.0 and closes after the first reply."""
+
+    @staticmethod
+    def read_reply(conn):
+        """One reply off the connection: its status line and its body."""
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return None, b""
+            data += chunk
+        head, body = data.split(b"\r\n\r\n", 1)
+        length = 0
+        for line in head.split(b"\r\n")[1:]:
+            name, _, value = line.partition(b":")
+            if name.strip().lower() == b"content-length":
+                length = int(value)
+        while len(body) < length:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+        return head.split(b"\r\n", 1)[0].decode(), body
+
+    def replies_on_one_connection(self, requests, *extra):
+        out = []
+        with ReplayServer(*extra) as s:
+            with socket.create_connection(("127.0.0.1", s.http), timeout=10) as conn:
+                for request in requests:
+                    try:
+                        conn.sendall(request)
+                    except OSError:
+                        out.append((None, b""))
+                        continue
+                    try:
+                        out.append(self.read_reply(conn))
+                    except OSError:
+                        out.append((None, b""))
+        return out
+
+    GET = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    POST = (b"POST /beacon HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello")
+
+    def test_a_connection_answers_every_request(self):
+        replies = self.replies_on_one_connection([self.GET, self.POST, self.GET], "--http11")
+        self.assertEqual([status for status, _ in replies],
+                         ["HTTP/1.1 200 OK", "HTTP/1.1 404 Not Found", "HTTP/1.1 200 OK"])
+        self.assertEqual(replies[0][1], replies[2][1])
+        self.assertIn(b"Example Domain", replies[0][1])
+
+    def test_default_closes_after_one_reply(self):
+        replies = self.replies_on_one_connection([self.GET, self.GET])
+        self.assertEqual(replies[0][0], "HTTP/1.0 200 OK")
+        self.assertIsNone(replies[1][0])
+
+    def test_keep_alive_and_connection_close_are_refused_together(self):
+        with self.assertRaises(RuntimeError):
+            with ReplayServer("--http11", "--connection-close"):
+                pass
+
+
 class BlankScreenshots(unittest.TestCase):
     """A page that comes back as one colour is a failure, not a fast render."""
 
