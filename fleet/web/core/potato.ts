@@ -57,12 +57,42 @@ export interface Point {
   y: number;
 }
 
+/** Rings up to this size are laid out in ring order round the circle; their neighbours are already far apart. */
+const NEIGHBOUR_RING_MAX = 8;
+/** A larger ring steps this share of the circle between consecutive players, so a throw is a long chord. */
+const STEP_SHARE = 0.382;
+
+const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+
+/** Circle slots between consecutive ring positions: 1 for a small ring, else the number coprime with n nearest 0.382 n. */
+export function ringStep(n: number): number {
+  if (n <= NEIGHBOUR_RING_MAX) return 1;
+  const want = STEP_SHARE * n;
+  let best = 1;
+  for (let k = 1; k < n; k++) if (gcd(k, n) === 1 && Math.abs(k - want) < Math.abs(best - want)) best = k;
+  return best;
+}
+
+/** The circle slot a ring position is drawn at: slot 0 is the top, then clockwise. */
+export function ringSlot(i: number, n: number): number {
+  return (i * ringStep(n)) % n;
+}
+
+/** The ring position drawn at a circle slot: the inverse of ringSlot. */
+export function ringPosition(slot: number, n: number): number {
+  const step = ringStep(n);
+  for (let i = 0; i < n; i++) if ((i * step) % n === slot) return i;
+  return -1;
+}
+
 export interface RingGeometry {
   centre: Point;
   radius: number;
   /** Each tile's width and height, CSS px. */
   tile: number;
-  /** Every place's centre, in ring order, the first at the top and the rest clockwise. */
+  /** Circle slots between consecutive ring positions (ringStep): 1 draws neighbours side by side. */
+  step: number;
+  /** Every place's centre, by ring position: position i stands at circle slot ringSlot(i, n), slot 0 at the top, then clockwise. */
   places: Point[];
 }
 
@@ -77,10 +107,10 @@ export function ringGeometry(area: Box, n: number): RingGeometry {
   const radius = n > 1 ? Math.max(0, outer - tile / 2) : 0;
   const places: Point[] = [];
   for (let i = 0; i < n; i++) {
-    const a = -Math.PI / 2 + (2 * Math.PI * i) / n;
+    const a = -Math.PI / 2 + (2 * Math.PI * ringSlot(i, n)) / n;
     places.push({ x: centre.x + radius * Math.cos(a), y: centre.y + radius * Math.sin(a) });
   }
-  return { centre, radius, tile, places };
+  return { centre, radius, tile, step: ringStep(n), places };
 }
 
 export type TilePhase = "awake" | "sleeping" | "asleep" | "waking" | "failed" | "absent";
@@ -114,6 +144,8 @@ export interface RingView {
   geometry: RingGeometry;
   tiles: RingTile[];
   ball: BallView | null;
+  /** The next throw's chord, drawn faintly, when the ring is laid out with a step; null otherwise. */
+  cue: { from: Point; to: Point } | null;
   /** One line over the ring. */
   caption: string;
   ariaLabel: string;
@@ -193,8 +225,12 @@ export function arcMs(holdMs: number): number {
   return Math.min(ARC_MAX_MS, Math.max(ARC_MIN_MS, holdMs / 2));
 }
 
-/** A point on the throw from `a` to `b` at `t` (0 to 1): a curve bowed away from the ring's centre. */
-export function arcPoint(a: Point, b: Point, centre: Point, t: number): Point {
+/** How far a short hop bows, and a chord throw across the ring, as a share of the throw's length. */
+const HOP_LIFT = 0.35;
+const CHORD_LIFT = 0.12;
+
+/** A point on the throw from `a` to `b` at `t` (0 to 1): a curve bowed away from the ring's centre by `lift` of its length. */
+export function arcPoint(a: Point, b: Point, centre: Point, t: number, lift = HOP_LIFT): Point {
   const k = Math.min(1, Math.max(0, t));
   const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
   const dx = b.x - a.x;
@@ -210,8 +246,8 @@ export function arcPoint(a: Point, b: Point, centre: Point, t: number): Point {
     nx = -nx;
     ny = -ny;
   }
-  const lift = 0.35 * len;
-  const c = { x: mid.x + nx * lift, y: mid.y + ny * lift };
+  const bow = lift * len;
+  const c = { x: mid.x + nx * bow, y: mid.y + ny * bow };
   const u = 1 - k;
   return { x: u * u * a.x + 2 * u * k * c.x + k * k * b.x, y: u * u * a.y + 2 * u * k * c.y + k * k * b.y };
 }
@@ -234,7 +270,7 @@ export function ballOf(r: PotatoRound, g: RingGeometry, now: number, reducedMoti
     const b = place(to);
     if (a === null || b === null) return null;
     const t = reducedMotion ? 1 : (now - at) / arc;
-    return { at: arcPoint(a, b, g.centre, t), size, flying: t < 1, dropped: false };
+    return { at: arcPoint(a, b, g.centre, t, g.step > 1 ? CHORD_LIFT : HOP_LIFT), size, flying: t < 1, dropped: false };
   };
   if (r.flight) {
     const b = throwOf(r.flight.from, r.flight.to, r.flight.at);
@@ -280,7 +316,8 @@ function ringOf(p: Potato, area: Box | null, now: number, reducedMotion: boolean
     : drop
       ? `Ring of ${drop.size}: the ball dropped`
       : `Next: a ring of ${players.length}`;
-  return { geometry: g, tiles, ball, caption, ariaLabel: `${caption}. ${plural(players.length, "player", "players")} on a circle.` };
+  const cue = r && g.step > 1 && r.holder !== null && r.ring.indexOf(r.holder) >= 0 ? { from: g.places[r.ring.indexOf(r.holder)]!, to: g.places[(r.ring.indexOf(r.holder) + 1) % players.length]! } : null;
+  return { geometry: g, tiles, ball, cue, caption, ariaLabel: `${caption}. ${plural(players.length, "player", "players")} on a circle.` };
 }
 
 // ---- the pace --------------------------------------------------------------------

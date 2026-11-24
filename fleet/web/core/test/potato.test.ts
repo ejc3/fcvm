@@ -22,6 +22,9 @@ import {
   potatoView,
   recordsOf,
   ringGeometry,
+  ringPosition,
+  ringSlot,
+  ringStep,
   type PotatoInput,
 } from "../potato.ts";
 import { parseServerMsg, ProtocolError, type Potato, type PotatoDrop, type PotatoRound } from "../protocol.ts";
@@ -240,6 +243,57 @@ describe("colours", () => {
     const at = (c: number) => potatoView(input(stateWith(potato({ players: [{ player: 0, colour: c, counter: 1, phase: "awake", since: T, last_sleep_ms: null, last_wake_ms: null }] })))).ring!.tiles[0]!.colour;
     expect(new Set([0, 1, 2, 3].map(at)).size).toBe(4);
     expect(at(12)).toBe(at(0));
+  });
+});
+
+describe("the ring's slots", () => {
+  const SIZES = [2, 4, 8, 16, 32, 64, 96];
+  for (const n of SIZES) {
+    it(`maps the ${n} ring positions onto the ${n} circle slots one to one, and back`, () => {
+      const slots = Array.from({ length: n }, (_, i) => ringSlot(i, n));
+      expect([...slots].sort((a, b) => a - b)).toEqual(Array.from({ length: n }, (_, i) => i));
+      for (let i = 0; i < n; i++) expect(ringPosition(ringSlot(i, n), n)).toBe(i);
+      expect(ringSlot(0, n)).toBe(0);
+    });
+  }
+
+  it("keeps step 1 for small rings and about 0.382 of the ring for larger ones", () => {
+    expect([2, 4, 8].map((n) => ringStep(n))).toEqual([1, 1, 1]);
+    expect([16, 32, 64, 96].map((n) => ringStep(n))).toEqual([7, 13, 25, 37]);
+  });
+
+  for (const n of [16, 24, 32, 48, 64, 96]) {
+    it(`puts consecutive players of a ring of ${n} at least a third of the circle apart`, () => {
+      for (let i = 0; i < n; i++) {
+        const d = Math.abs(ringSlot((i + 1) % n, n) - ringSlot(i, n));
+        expect(Math.min(d, n - d)).toBeGreaterThanOrEqual(n / 3);
+      }
+    });
+  }
+
+  it("draws a thrower and its catcher far apart, and a chord throw stays inside the ring's box", () => {
+    const g = ringGeometry(STAGE, 96);
+    const half = g.radius + g.tile / 2;
+    for (const [from, to] of [[0, 1], [40, 41], [95, 0]] as const) {
+      expect(dist(g.places[from]!, g.places[to]!)).toBeGreaterThan(g.radius);
+      const r = round({ ring: Array.from({ length: 96 }, (_, i) => i), size: 96, flight: { from, to, at: T }, hold_ms: 400 });
+      for (let k = 0; k <= 20; k++) {
+        const b = ballOf(r, g, T + (k / 20) * arcMs(400), false)!;
+        expect(Math.abs(b.at.x - g.centre.x), `t ${k / 20}`).toBeLessThanOrEqual(half);
+        expect(Math.abs(b.at.y - g.centre.y), `t ${k / 20}`).toBeLessThanOrEqual(half);
+        expect(dist(b.at, g.centre), `t ${k / 20}`).toBeLessThanOrEqual(g.radius + g.tile / 2);
+      }
+    }
+  });
+
+  it("draws the next throw's chord faintly when the ring is laid out with a step, and not for a small ring", () => {
+    const ids = (n: number) => Array.from({ length: n }, (_, i) => i);
+    const big = potato({ round: round({ ring: ids(16), size: 16, holder: 3, seq: 2, flight: null }) });
+    const cue = potatoView(input(stateWith(big))).ring!.cue!;
+    const g = ringGeometry(STAGE, 16);
+    expect(cue.from).toEqual(g.places[3]);
+    expect(cue.to).toEqual(g.places[4]);
+    expect(potatoView(input(stateWith(potato()))).ring!.cue).toBeNull();
   });
 });
 

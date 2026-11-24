@@ -146,6 +146,11 @@ export function Potato({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
                 style={{ left: ring.geometry.centre.x - ring.geometry.radius, top: ring.geometry.centre.y - ring.geometry.radius, width: 2 * ring.geometry.radius, height: 2 * ring.geometry.radius }}
               />
             ) : null}
+            {ring?.cue ? (
+              <svg className="potato-cue" data-testid="potato-cue" aria-hidden="true">
+                <line x1={ring.cue.from.x} y1={ring.cue.from.y} x2={ring.cue.to.x} y2={ring.cue.to.y} />
+              </svg>
+            ) : null}
             {ring
               ? ring.tiles.map((t) => (
                   <div
