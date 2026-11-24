@@ -823,7 +823,9 @@ mod tests {
             1
         );
         assert_eq!(
-            tests.matches("as _, &mut request as *mut IfReq) }").count(),
+            tests
+                .matches(concat!("as _, &mut request as *mut ", "IfReq) }"))
+                .count(),
             1
         );
         assert!(!code.contains(concat!("TUNSETIFF as _, &", "request)")));
