@@ -418,11 +418,11 @@ mod status_tests {
 
     #[test]
     fn a_host_key_is_stable_and_is_not_the_name() {
-        let k = host_key("i-0123456789abcdef0");
+        let k = host_key("example-host-a");
         assert_eq!(k.len(), 12);
-        assert_eq!(k, host_key("i-0123456789abcdef0"));
-        assert_ne!(k, host_key("i-0123456789abcdef1"));
-        assert!(!k.contains("i-0"));
+        assert_eq!(k, host_key("example-host-a"));
+        assert_ne!(k, host_key("example-host-b"));
+        assert!(!k.contains("example"));
     }
 
     #[test]
