@@ -44,6 +44,30 @@ wait
 for i in 1 2 3 4; do cmp -s "$dir/src/b.tgz" "$dir/par$i" || fail "concurrent run $i wrote the wrong bytes: $(cat "$dir/par$i.log")"; done
 [ "$(ls -A "$dir/cache3")" = "$shb-b.tgz" ] || fail "concurrent runs left: $(ls -A "$dir/cache3")"
 
+# An entry the caller cannot hard-link (fs.protected_hardlinks on a root-cached file, or no hard
+# links): a wrapper ln that always fails. A warm cache still makes no request, and a cold one
+# still publishes and exits 0.
+mkdir -p "$dir/noln"
+printf '#!/bin/sh\nexit 1\n' > "$dir/noln/ln"; chmod +x "$dir/noln/ln"
+PATH="$dir/noln:$PATH" "$dl" "$url" "$sha" "$dir/noln1" "$dir/cache-noln" >"$dir/noln1.log" 2>&1 \
+  || fail "a cold run with ln failing exited non-zero: $(cat "$dir/noln1.log")"
+cmp -s "$dir/src/a.tgz" "$dir/noln1" || fail "a cold run with ln failing wrote the wrong bytes"
+[ "$(ls -A "$dir/cache-noln")" = "$sha-a.tgz" ] || fail "a cold run with ln failing left: $(ls -A "$dir/cache-noln")"
+mv "$dir/src/a.tgz" "$dir/src/gone.tgz"
+PATH="$dir/noln:$PATH" "$dl" "$url" "$sha" "$dir/noln2" "$dir/cache-noln" >"$dir/noln2.log" 2>&1 \
+  || fail "a warm run with ln failing needed the source: $(cat "$dir/noln2.log")"
+grep -q 'no download' "$dir/noln2.log" || fail "a warm run with ln failing downloaded: $(cat "$dir/noln2.log")"
+cmp -s "$dir/src/gone.tgz" "$dir/noln2" || fail "a warm run with ln failing wrote the wrong bytes"
+mv "$dir/src/gone.tgz" "$dir/src/a.tgz"
+
+# Private names a killed run left an hour ago are swept; a fresh one is kept.
+mkdir -p "$dir/cache-sweep"
+: > "$dir/cache-sweep/.a.tgz.OLD123"; touch -d '2 hours ago' "$dir/cache-sweep/.a.tgz.OLD123"
+: > "$dir/cache-sweep/.a.tgz.NEW123"
+"$dl" "$url" "$sha" "$dir/sweep1" "$dir/cache-sweep" >/dev/null 2>&1 || fail "sweep run failed"
+[ ! -e "$dir/cache-sweep/.a.tgz.OLD123" ] || fail "a private name two hours old was not swept"
+[ -e "$dir/cache-sweep/.a.tgz.NEW123" ] || fail "a fresh private name was swept"
+
 # A run that replaces the cache entry while another copies it: cp stats its source and then opens
 # it, and coreutils skips a source that changed in between. The shim renames a fresh copy of the
 # entry over it at the moment cp opens it, which is the interleaving a concurrent run's publish
@@ -63,8 +87,10 @@ if command -v cc >/dev/null; then
 int openat(int dirfd, const char *path, int flags, ...) {
   static int (*real)(int, const char *, int, ...);
   if (!real) real = dlsym(RTLD_NEXT, "openat");
-  const char *entry = getenv("SHIM_ENTRY"), *fresh = getenv("SHIM_FRESH");
-  if (entry && fresh && strcmp(path, entry) == 0 && access(fresh, F_OK) == 0) rename(fresh, entry);
+  const char *entry = getenv("SHIM_ENTRY"), *fresh = getenv("SHIM_FRESH"), *priv = getenv("SHIM_PRIVATE");
+  if (entry && fresh && (strcmp(path, entry) == 0 || (priv && strncmp(path, priv, strlen(priv)) == 0)) &&
+      access(fresh, F_OK) == 0)
+    rename(fresh, entry);
   mode_t mode = 0;
   if (flags & O_CREAT) { va_list ap; va_start(ap, flags); mode = va_arg(ap, mode_t); va_end(ap); }
   return real(dirfd, path, flags, mode);
@@ -98,10 +124,13 @@ C
       fail "the replace shim did not interrupt a plain cp of the entry"
     fi
     cp "$entry" "$dir/race-cache/.fresh"
-    SHIM_ENTRY=$entry SHIM_FRESH=$dir/race-cache/.fresh PATH="$dir/shim:$PATH" \
+    # SHIM_PRIVATE also fires on the private link the fixed script copies from, so the entry is
+    # replaced after the link exists and before the copy out.
+    SHIM_ENTRY=$entry SHIM_FRESH=$dir/race-cache/.fresh SHIM_PRIVATE="$dir/race-cache/.c.tgz." PATH="$dir/shim:$PATH" \
       "$dl" "file://$shr" "$shc" "$dir/race1" "$dir/race-cache" > "$dir/race1.log" 2>&1 \
       || fail "a run whose entry was replaced mid-copy failed: $(cat "$dir/race1.log")"
     cmp -s "$shr" "$dir/race1" || fail "a run whose entry was replaced mid-copy wrote the wrong bytes: $(cat "$dir/race1.log")"
+    [ ! -e "$dir/race-cache/.fresh" ] || fail "the replace shim never fired during the script's copy"
   else
     fail "cc cannot build the replace shim"
   fi
