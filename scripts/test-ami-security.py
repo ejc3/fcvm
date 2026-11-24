@@ -34,11 +34,11 @@ elif operation == "run-instances":
         raise SystemExit("Error: no Spot capacity")
     # the builder, or the boot test launched from the image the build created
     boot_test = args[args.index("--image-id") + 1] == "ami-1234567890abcdef0"
-    print("i-2234567890abcdef0" if boot_test else "i-1234567890abcdef0")
+    print("i-2234567890abcdef" if boot_test else "i-1234567890abcdef")
 elif operation == "describe-tags":
     if "Name=key,Values=KernelVersion" not in args:
         print(os.environ.get("AMI_TEST_BUILD_STATUS", "boot-ok"))
-    elif "Name=resource-id,Values=i-2234567890abcdef0" in args:
+    elif "Name=resource-id,Values=i-2234567890abcdef" in args:
         print(os.environ.get("AMI_TEST_KERNEL", "7.3.3-fcvm-0123456789ab"))
     else:
         print(os.environ.get("AMI_TEST_BUILDER_KERNEL", "7.3.3-fcvm-0123456789ab"))
@@ -69,7 +69,7 @@ class AmiSecurityTest(unittest.TestCase):
                 calls = directory / 'calls.jsonl'
                 harness = 'set -euo pipefail\nREGION=us-west-1\nsleep() { :; }\n' + function
                 result = subprocess.run(
-                    ['bash', '-c', harness + '\nwait_for_build i-1234567890abcdef0 2'],
+                    ['bash', '-c', harness + '\nwait_for_build i-1234567890abcdef 2'],
                     text=True, capture_output=True, timeout=10,
                     env={**os.environ, 'PATH': f"{directory}:{os.environ['PATH']}",
                          'AMI_TEST_CALLS': str(calls), 'AMI_TEST_BUILD_STATUS': status},
