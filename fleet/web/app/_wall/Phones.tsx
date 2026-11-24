@@ -16,6 +16,8 @@ import {
   zoomProgressAt,
   phonesView,
   sameViewer,
+  askTap,
+  tapAsked,
   tapPoint,
   TAP,
   TAP_INTERVAL_MS,
@@ -27,6 +29,7 @@ import {
   type SceneClock,
   type StreamReadout,
   type TakeoverView,
+  type TapAsk,
   type TapTarget,
 } from "../../core/index.ts";
 import { RateMeter } from "../../core/meter.ts";
@@ -83,6 +86,7 @@ function PanelView({
   onAction,
   takeRef,
   takeAsked,
+  onTakeBlur,
 }: {
   panel: PhonePanel;
   narrow: boolean;
@@ -95,8 +99,9 @@ function PanelView({
   onAction: (action: string, claim: string) => void;
   /** The take-over button, which a click on a screen that is not held moves focus to. */
   takeRef: React.RefObject<HTMLButtonElement | null>;
-  /** That click happened on this phone: the button is outlined. */
+  /** That click moved focus here: the button is outlined until focus leaves it. */
   takeAsked: boolean;
+  onTakeBlur: () => void;
 }) {
   const b = panel.borrow;
   return (
@@ -131,7 +136,7 @@ function PanelView({
             <>
               <h2 id="borrow-h">Take over</h2>
               <p className="note">{b.note}</p>
-              <button ref={takeRef} type="button" className="btn primary" style={{ justifyContent: "center" }} disabled={b.button.disabled} onClick={() => client.act("claim_phone", slot === null ? {} : { phone: slot })} data-asked={takeAsked ? "true" : undefined} data-testid="phone-take">
+              <button ref={takeRef} type="button" className="btn primary" style={{ justifyContent: "center" }} disabled={b.button.disabled} onClick={() => client.act("claim_phone", slot === null ? {} : { phone: slot })} onBlur={onTakeBlur} data-asked={takeAsked ? "true" : undefined} data-testid="phone-take">
                 {b.button.label}
               </button>
             </>
@@ -528,21 +533,27 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
 
   // A click on the screen of an opened phone this viewer does not hold sends nothing: the
   // line under the screen says why, and the click points at it and at the take-over button.
-  // `asked` counts those clicks on the phone it names, so each one restarts the line's pulse.
+  // The mark belongs to the line it was made on (core/phones.ts, `tapAsked`): it is gone as
+  // soon as the line says something else or the phone stops being takeable, and the button's
+  // outline goes when focus leaves the button.
   const takeRef = useRef<HTMLButtonElement | null>(null);
-  const [asked, setAsked] = useState<{ id: string; n: number } | null>(null);
+  const [asked, setAsked] = useState<TapAsk | null>(null);
+  const [takeMarked, setTakeMarked] = useState(false);
   const onLockedTap = () => {
     const taps = viewRef.current?.taps;
     if (!taps?.locked) return;
-    setAsked((a) => ({ id: taps.tileId, n: a?.id === taps.tileId ? a.n + 1 : 1 }));
+    setAsked((a) => askTap(a, taps));
+    setTakeMarked(taps.locked.takeable);
     if (taps.locked.takeable) takeRef.current?.focus();
   };
-  const lockedId = view.taps?.locked ? view.taps.tileId : null;
-  const askedHere = asked !== null && asked.id === lockedId ? asked.n : 0;
-  // the mark ends with the state it was made in: the phone closed, taken over or lent
+  const askedHere = tapAsked(asked, view.taps);
+  // a mark whose state is over does not come back when that state does
   useEffect(() => {
-    if (lockedId === null) setAsked(null);
-  }, [lockedId]);
+    if (asked !== null && askedHere === 0) {
+      setAsked(null);
+      setTakeMarked(false);
+    }
+  }, [asked, askedHere]);
 
   // ---- opening a phone -------------------------------------------------------------
 
@@ -667,7 +678,7 @@ export function Phones({ coordUrl, directUrl }: { coordUrl: string; directUrl: s
         {view.taps?.locked ? <div className="phone-tap locked" style={at(view.taps.locked.box)} aria-hidden="true" data-testid="phone-tap-locked" onClick={onLockedTap} /> : null}
       </div>
       {view.panel ? (
-        <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} onAction={actPhone} takeRef={takeRef} takeAsked={askedHere > 0} />
+        <PanelView panel={view.panel} narrow={narrow} top={sheetTop} client={client} slot={openedSlot} onBack={close} backRef={backRef} onView={setTakeover} onAction={actPhone} takeRef={takeRef} takeAsked={askedHere > 0 && takeMarked} onTakeBlur={() => setTakeMarked(false)} />
       ) : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.verify.title}>

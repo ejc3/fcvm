@@ -297,6 +297,38 @@ export const TAP_INTERVAL_MS = 200;
 export const TAP_BROWSER_NOTE = "Taps reach the phone only in Robot Park.";
 /** Under an opened phone the viewer does not hold, whose host takes taps: its screen takes them only from its holder. */
 export const TAP_TAKE_OVER_NOTE = "Take over this phone to tap its screen.";
+/** While the coordinator's connection is down: the banner opens with it, and it is the line under a phone that cannot be taken over for that reason. */
+export const RECONNECTING_NOTE = "Reconnecting to the coordinator.";
+
+/**
+ * A click on a screen that takes no taps from this viewer (`TapView.locked`): the phone, the
+ * line under it that the click marked, whether it pointed at the take-over button, and how many
+ * such clicks that line has had (each restarts its mark).
+ */
+export interface TapAsk {
+  tileId: string;
+  note: string | null;
+  takeable: boolean;
+  n: number;
+}
+
+/**
+ * How many clicks mark the line under the opened phone now. 0 once the mark's state is over:
+ * another phone, a phone that is held or closed, a line that says something else (another
+ * viewer took the phone, it restarted, the last phone was lent), or a phone that stopped or
+ * started being takeable.
+ */
+export function tapAsked(ask: TapAsk | null, taps: TapView | null): number {
+  if (ask === null || !taps?.locked) return 0;
+  if (taps.tileId !== ask.tileId || taps.note !== ask.note || taps.locked.takeable !== ask.takeable) return 0;
+  return ask.n;
+}
+
+/** The ask after one more click on the locked screen of `taps`; null when its screen is not locked. */
+export function askTap(prev: TapAsk | null, taps: TapView | null): TapAsk | null {
+  if (!taps?.locked) return null;
+  return { tileId: taps.tileId, note: taps.note, takeable: taps.locked.takeable, n: tapAsked(prev, taps) + 1 };
+}
 
 const PHONE_INTENTS = new Set(["claim_phone", "release_phone", "phone_action", "phones_zoom"]);
 
@@ -764,7 +796,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
     : s.admission?.locked === true
       ? seatsFull(s.admission)
     : s.accepted !== null && !online
-      ? "Reconnecting to the coordinator. The picture still streams straight from the phones; the controls are paused until it is back."
+      ? `${RECONNECTING_NOTE} The picture still streams straight from the phones; the controls are paused until it is back.`
       : null;
   if (phones === null || s.accepted === null) {
     return {
@@ -869,16 +901,18 @@ export function phonesView(inp: PhonesInput): PhonesView {
       ? null
       : panelOf(s, phones, openTile, srvNow, online, takeover, inp.readouts ?? { video: null, mirror: null }, inp.mirrorUnavailable ?? null);
   // Not held: the screen takes no tap, and the line under it says what would let it, or why
-  // the phone cannot be taken over now (the panel's own words).
+  // the phone cannot be taken over now (the panel's own words, or the banner's while the
+  // coordinator's connection is down). With the browser in front a holder's taps reach nothing
+  // either, so the line says that, as it does for a holder, and promises none.
   const openBox = openTile === null ? undefined : placed.get(openTile.id)?.box;
   if (taps === null && openTile !== null && panel !== null && panel.borrow.kind !== "yours" && openTile.actions.includes(TAP) && openBox) {
     const b = panel.borrow;
-    const blocked = b.kind === "lent" ? b.text : b.blocked;
+    const blocked = b.kind === "lent" ? b.text : (b.blocked ?? (online ? null : RECONNECTING_NOTE));
     taps = {
       tileId: openTile.id,
       session: null,
       targets: [],
-      note: blocked ?? TAP_TAKE_OVER_NOTE,
+      note: blocked ?? (openTile.front === "browser" ? TAP_BROWSER_NOTE : TAP_TAKE_OVER_NOTE),
       locked: { box: openBox, takeable: blocked === null && b.kind === "free" && !b.button.disabled },
     };
   }

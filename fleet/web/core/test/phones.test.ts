@@ -17,6 +17,9 @@ import {
   restoreText,
   screenYScale,
   tapPoint,
+  askTap,
+  RECONNECTING_NOTE,
+  tapAsked,
   TAP_BROWSER_NOTE,
   TAP_TAKE_OVER_NOTE,
   zoomProgressAt,
@@ -655,6 +658,49 @@ describe("taps on the held phone's screen", () => {
       ph.tiles[0] = { ...ph.tiles[0]!, actions: WITH_TAP };
       ph.tiles[1] = { ...ph.tiles[1]!, borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } };
       expect(viewOf(stateWith(ph)).taps).toMatchObject({ note: "You are using Phone 2. Give it back to take another.", locked: { takeable: false } });
+    });
+
+    it("says the page is reconnecting while the coordinator's connection is down, as the banner does", () => {
+      const v = viewOf(reduce(free(), { type: "socket", status: "closed", at: EPOCH }));
+      expect(v.panel!.borrow).toMatchObject({ kind: "free", button: { disabled: true } });
+      expect(RECONNECTING_NOTE).toBe("Reconnecting to the coordinator.");
+      expect(v.banner).toBe(`${RECONNECTING_NOTE} The picture still streams straight from the phones; the controls are paused until it is back.`);
+      expect(v.taps).toMatchObject({ session: null, targets: [], note: RECONNECTING_NOTE, locked: { takeable: false } });
+    });
+
+    it("promises no taps with the browser in front: it says what a holder is told", () => {
+      const v = viewOf(free({ front: "browser" }));
+      expect(v.taps).toMatchObject({ session: null, targets: [], note: TAP_BROWSER_NOTE, locked: { takeable: true } });
+      // a reason the phone cannot be taken over comes first
+      const lent = viewOf(free({ front: "browser", borrowed: { until: EPOCH + 60_000, viewer: "v-9" } }));
+      expect(lent.taps!.note).toMatch(/^Borrowed by another viewer until /);
+    });
+
+    it("marks the line a click pointed at only while that line and its button stand", () => {
+      const open = viewOf(free()).taps;
+      const ask = askTap(null, open)!;
+      expect(ask).toEqual({ tileId: "phone:1", note: TAP_TAKE_OVER_NOTE, takeable: true, n: 1 });
+      expect(tapAsked(ask, open)).toBe(1);
+      // each further click on the same line counts, so the page restarts its mark
+      expect(askTap(ask, open)!.n).toBe(2);
+      expect(tapAsked(null, open)).toBe(0);
+      // the line says something else, or the phone stopped being takeable: the mark is over
+      const over: [string, ClientState][] = [
+        ["another viewer took it", free({ borrowed: { until: EPOCH + 60_000, viewer: "v-9" } })],
+        ["it restarted", free({ phase: "relaunching" })],
+        ["the last phone was lent", free({}, { borrow: { cap: 2, lent: 2, next_return_at: null } })],
+        ["the connection dropped", reduce(free(), { type: "socket", status: "closed", at: EPOCH })],
+        ["the browser came to the front", free({ front: "browser" })],
+        ["the viewer took it over", free({ borrowed: { until: EPOCH + 60_000, session: "s", viewer: "v-1" } })],
+      ];
+      for (const [why, s] of over) expect(tapAsked(ask, viewOf(s).taps), why).toBe(0);
+      expect(tapAsked(ask, phonesView(input(free(), { openId: null })).taps), "closed").toBe(0);
+      expect(tapAsked({ ...ask, tileId: "phone:2" }, open), "another phone").toBe(0);
+      // a click after the change marks the new line, counted from one
+      const lent = viewOf(over[0]![1]).taps;
+      expect(askTap(ask, lent)).toMatchObject({ takeable: false, n: 1 });
+      // a held phone's screen is not locked: nothing to mark
+      expect(askTap(ask, viewOf(over[5]![1]).taps)).toBeNull();
     });
 
     it("says nothing about taps on a host that does not list them, or with no phone opened", () => {

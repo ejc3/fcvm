@@ -1245,8 +1245,12 @@ assignment for 3 s.
 A phone the viewer has opened but does not hold takes no taps, and the page says so: the line
 under its screen reads "Take over this phone to tap its screen.", or the panel's own reason
 when the phone cannot be taken over now (another viewer holds it, it is restoring, every phone
-that may be lent is lent, or the viewer holds another). A click on that screen sends nothing; it
-marks the line and moves focus to the "Take over this phone" button when the phone can be taken.
+that may be lent is lent, the viewer holds another, or the page is reconnecting to the
+coordinator). With the browser in front it reads "Taps reach the phone only in Robot Park.", as
+it does for a holder. A click on that screen sends nothing; it marks the line and moves focus to
+the "Take over this phone" button when the phone can be taken. The mark lasts while the line
+says the same thing and the phone is as takeable as it was, and the button's outline until focus
+leaves the button.
 In the zoomed-out overview a phone is one button that opens it ("Open Phone N"), wherever on its
 picture the click lands, the app's tabs included. The owner, 2026-11-24, after clicking the
 tabs of a phone that was not held: "Scene and Info do the same thing."

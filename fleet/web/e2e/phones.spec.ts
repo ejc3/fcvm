@@ -329,7 +329,7 @@ const SCREENS = [
   { name: "", narrow: false },
   { name: " (phone-sized screen)", narrow: true },
 ];
-/** The test's page, or one in a 390 x 780 viewport: the phones page, open. */
+/** The test's page, or one in a 390 x 780 viewport of its own context (the test closes it): the phones page, open. */
 async function onScreen(narrow: boolean, page: Page, browser: Browser): Promise<Page> {
   if (narrow) return viewer(browser, 390, 780);
   await openPhones(page);
@@ -383,6 +383,7 @@ for (const screen of SCREENS)
   await expect(page.getByTestId("phone-notice")).toHaveCount(0);
   await page.getByTestId("phone-give-back").click();
   await expect(page.getByTestId("phone-tap-video")).toHaveCount(0);
+  if (screen.narrow) await page.context().close();
 });
 
 for (const screen of SCREENS)
@@ -408,6 +409,10 @@ for (const screen of SCREENS)
   await page.waitForTimeout(400);
   expect(await phoneActions()).toEqual([]);
   await expect(page.getByTestId("phone-notice")).toHaveCount(0);
+  // the button's outline goes when focus leaves it; the line under the screen stays marked
+  await take.blur();
+  await expect(take).not.toHaveAttribute("data-asked");
+  await expect(note).toHaveClass(/asked/);
   // taken over, the same click is a tap on the phone
   await take.click();
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
@@ -417,6 +422,8 @@ for (const screen of SCREENS)
   await page.mouse.click(t.box.x + 0.75 * t.box.w, t.box.y + 0.95 * t.box.h);
   await expect.poll(async () => (await taps()).map((a) => a.phone)).toEqual(["phone-2"]);
   await page.getByTestId("phone-give-back").click();
+  await expect(page.getByTestId("phone-borrow")).not.toHaveAttribute("data-kind", "yours");
+  if (screen.narrow) await page.context().close();
 });
 
 test("on a host that does not list tap the screen takes no taps: a click sends nothing and shows no refusal", async ({ page }) => {
