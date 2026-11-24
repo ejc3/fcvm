@@ -367,6 +367,34 @@ fn fleet_web_changes_run_the_fleet_web_job() {
     }
 }
 
+/// What fleet/web's tests read outside fleet/web runs the fleet web suite too.
+///
+/// `mock/test/potato.test.ts` compares the mock with `fleet/core/tests/vectors/33_potato.json`
+/// (through the fixture generated from it) and `fleet/PROTOCOL.md`. The potato host stack
+/// changed both and landed with Fleet Web skipped, which left main's unit step red.
+#[test]
+fn fleet_web_runs_when_what_it_reads_changes() {
+    let text = changes_scripts();
+    let core_arm = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("fleet/core/*)"))
+        .expect("`changes` lost its fleet/core arm");
+    assert!(
+        core_arm.contains("web=true"),
+        "a change under fleet/core (the vectors, the coordinator's view) does not run fleet-web: {core_arm}"
+    );
+    let protocol_arm = text
+        .find("fleet/PROTOCOL.md) web=true")
+        .expect("a fleet/PROTOCOL.md change does not run fleet-web");
+    let catch_all = text
+        .find("fleet/*|.github/workflows/fleet-coordinator-deploy.yml)")
+        .expect("`changes` lost its fleet arm");
+    assert!(
+        protocol_arm < catch_all,
+        "the PROTOCOL.md arm must come before the fleet/* arm that would swallow it"
+    );
+}
+
 /// A failing browser test leaves its Playwright trace (`trace: "retain-on-failure"` in
 /// fleet/web/playwright.config.ts writes it under `test-results/`), and the job uploads it.
 /// Without the upload the trace dies with the runner: #1348's seam failure on tile ec2:7
