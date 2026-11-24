@@ -921,6 +921,9 @@ impl NetworkManager for RoutedNetwork {
             let (network, len) = Self::parse_ipv6_prefix(prefix)?;
             let host_addr = std::net::Ipv6Addr::from(network | 1).to_string();
             info!(prefix = %prefix, "using explicit --ipv6-prefix (routable, no MASQUERADE)");
+            // Before this VM's address is chosen: its /128 route comes many steps later,
+            // and whoever is already calling the address must not circle until then.
+            answer_for_the_prefix(network, len).await;
             (host_addr, network, len)
         } else {
             let (host_addr, prefix) = Self::detect_host_ipv6().context(
@@ -1761,6 +1764,135 @@ async fn detect_ipv6_dns(selected: Option<String>) -> Option<String> {
     None
 }
 
+/// The calling thread's IPv6 routes and addresses as the kernel prints them. `thread-self`
+/// and not `self`: every thread of fcvm is in one network namespace, and a test that
+/// moves one thread into a namespace of its own must read that one.
+const IPV6_ROUTE_TABLE: &str = "/proc/thread-self/net/ipv6_route";
+const IPV6_ADDRESS_TABLE: &str = "/proc/thread-self/net/if_inet6";
+
+/// `RTF_REJECT`: the route answers instead of forwarding (unreachable, prohibit, blackhole).
+const RTF_REJECT: u32 = 0x0200;
+
+/// The metric of the VM prefix's `unreachable` route. Worse than what the kernel gives a
+/// connected prefix (256) and than a route added by hand (1024), so it decides only when
+/// nothing else names the prefix.
+const PREFIX_UNREACHABLE_METRIC: &str = "2147483647";
+
+/// One line of `ipv6_route`: destination, its length, the flags and the device.
+fn route_table_line(line: &str) -> Option<(u128, u8, u32, &str)> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let [destination, length, _, _, _, _, _, _, flags, device] = fields.as_slice() else {
+        return None;
+    };
+    Some((
+        u128::from_str_radix(destination, 16).ok()?,
+        u8::from_str_radix(length, 16).ok()?,
+        u32::from_str_radix(flags, 16).ok()?,
+        device,
+    ))
+}
+
+/// Whether the route table holds a reject route for exactly `network/len`.
+fn has_reject_route(table: &str, network: u128, len: u8) -> bool {
+    table
+        .lines()
+        .filter_map(route_table_line)
+        .any(|(destination, length, flags, _)| {
+            destination == network && length == len && flags & RTF_REJECT != 0
+        })
+}
+
+/// The devices the host's default routes leave by.
+fn uplinks(table: &str) -> Vec<&str> {
+    let mut devices: Vec<&str> = table
+        .lines()
+        .filter_map(route_table_line)
+        .filter(|(_, length, flags, _)| *length == 0 && flags & RTF_REJECT == 0)
+        .map(|(_, _, _, device)| device)
+        .collect();
+    devices.sort_unstable();
+    devices.dedup();
+    devices
+}
+
+/// Whether one of `devices` holds a global address inside `network/len`, by the kernel's
+/// `if_inet6` listing (address, interface index, prefix length, scope, flags, device).
+/// The prefix's suffix 1 does not count: it is the host's own side of a VM prefix, which no
+/// VM is given, and a fleet host puts it on its uplink for the aggregator.
+fn a_device_holds_an_address_in(addresses: &str, devices: &[&str], network: u128, len: u8) -> bool {
+    // the top `len` bits
+    let mask = !u128::MAX.checked_shr(u32::from(len)).unwrap_or(0);
+    addresses.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [address, _, _, scope, _, device] = fields.as_slice() else {
+            return false;
+        };
+        *scope == "00"
+            && devices.contains(device)
+            && u128::from_str_radix(address, 16)
+                .is_ok_and(|address| address & mask == network && address != network | 1)
+    })
+}
+
+/// Make the host answer for the whole VM prefix: an `unreachable` route for it, which every
+/// VM's /128 route overrides.
+///
+/// A prefix given with `--ipv6-prefix` is routed to this host by the network. A packet for
+/// one of its addresses that no VM holds (a VM that is still starting, or stopped, or a
+/// client's stray connection) matched only the default route, left by the uplink, and came
+/// straight back, until its hop limit ran out: 9,560 of 10,291 packets captured for one
+/// address in 64 s were one SYN going out and in again (#2109). With this route the host
+/// drops such a packet and says so (ICMPv6 destination unreachable; a local sender gets
+/// `EHOSTUNREACH` at once).
+///
+/// A prefix that holds one of the uplink's own addresses (other than the prefix's suffix 1,
+/// the host's side of a VM prefix) is the uplink's subnet, shared with its neighbours:
+/// nothing routes it back here, so nothing loops, and an unreachable route would cut the
+/// host off from them. It is left alone.
+///
+/// Every routed launch calls this. The steady state is one read of the route table and no
+/// process. The route is added with `replace`, so launches that start together each add the
+/// same route and none can fail on another's. It is not removed when a VM stops: the
+/// network routes the prefix here whether or not a VM is running, and removing it would race
+/// the next launch's check. It goes with the host's routes at reboot, or with
+/// `ip -6 route del unreachable <prefix>`.
+async fn answer_for_the_prefix(network: u128, len: u8) {
+    let prefix = format!("{}/{len}", std::net::Ipv6Addr::from(network));
+    let table = match std::fs::read_to_string(IPV6_ROUTE_TABLE) {
+        Ok(table) => table,
+        Err(error) => {
+            warn!(%prefix, %error, "cannot read {IPV6_ROUTE_TABLE}; adding the prefix's unreachable route unseen");
+            String::new()
+        }
+    };
+    if has_reject_route(&table, network, len) {
+        return;
+    }
+    let uplinks = uplinks(&table);
+    let addresses = std::fs::read_to_string(IPV6_ADDRESS_TABLE).unwrap_or_default();
+    if a_device_holds_an_address_in(&addresses, &uplinks, network, len) {
+        info!(%prefix, ?uplinks, "the prefix is the uplink's own subnet; no unreachable route for it");
+        return;
+    }
+    if run_host_command(
+        "adding the VM prefix's unreachable route",
+        "ip",
+        &[
+            "-6",
+            "route",
+            "replace",
+            "unreachable",
+            &prefix,
+            "metric",
+            PREFIX_UNREACHABLE_METRIC,
+        ],
+    )
+    .await
+    {
+        info!(%prefix, "the host answers unreachable for prefix addresses no VM holds");
+    }
+}
+
 /// Detect the default IPv6 outgoing interface
 pub(crate) async fn detect_default_ipv6_interface() -> Option<String> {
     let output = tokio::process::Command::new("ip")
@@ -2317,6 +2449,227 @@ mod tests {
             "the host's own address was not found as a route"
         );
         assert!(host_route_for("2001:db8:ffff::77").await.unwrap().is_none());
+    }
+
+    /// The kernel's `ipv6_route` in a namespace with an uplink `up0` at 2001:db8:ffff::2/64,
+    /// a default route through it, and the unreachable route for 2001:db8:2109::/64
+    /// (captured on Linux 7.0). The last line is the kernel's own reject entry for `::/0`.
+    const ROUTE_TABLE: &str = "\
+20010db8210900000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 7fffffff 00000002 00000000 00200200       lo
+20010db8ffff00000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000002 00000000 00000001      up0
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001      up0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 20010db8ffff00000000000000000001 00000400 00000002 00000000 00000003      up0
+20010db8ffff00000000000000000002 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000002 00000000 80200001      up0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
+";
+
+    /// The same namespace's `if_inet6`: a link-local and a global address on `up0`.
+    const ADDRESS_TABLE: &str = "\
+fe80000000000000742b74fffe8683d8 02 40 20 80      up0
+00000000000000000000000000000001 01 80 10 80       lo
+20010db8ffff00000000000000000002 02 40 00 82      up0
+";
+
+    #[test]
+    fn the_route_table_names_the_prefixes_reject_route_and_the_uplinks() {
+        let (vms, len) = prefix("2001:db8:2109::/64");
+        assert!(has_reject_route(ROUTE_TABLE, vms, len));
+        // another length, another prefix, and a prefix with an ordinary route are not it
+        assert!(!has_reject_route(ROUTE_TABLE, vms, 80));
+        let (other, len) = prefix("2001:db8:2110::/64");
+        assert!(!has_reject_route(ROUTE_TABLE, other, len));
+        let (connected, len) = prefix("2001:db8:ffff::/64");
+        assert!(!has_reject_route(ROUTE_TABLE, connected, len));
+        // the kernel's reject entry for ::/0 is not an uplink
+        assert_eq!(uplinks(ROUTE_TABLE), ["up0"]);
+        assert!(uplinks("").is_empty() && !has_reject_route("not a table\n", vms, 64));
+    }
+
+    /// A prefix that holds one of the uplink's own global addresses is the uplink's subnet.
+    /// A link-local address, or an address on another device, does not make it one.
+    #[test]
+    fn a_prefix_holding_an_uplink_address_is_the_uplinks_subnet() {
+        let held = |cidr: &str, devices: &[&str]| {
+            let (network, len) = prefix(cidr);
+            a_device_holds_an_address_in(ADDRESS_TABLE, devices, network, len)
+        };
+        assert!(held("2001:db8:ffff::/64", &["up0"]));
+        assert!(held("2001:db8:ffff::/112", &["up0"]));
+        assert!(!held("2001:db8:2109::/64", &["up0"]));
+        assert!(!held("2001:db8:ffff:1::/80", &["up0"]));
+        assert!(!held("2001:db8:ffff::/64", &["eth9"]));
+        assert!(!held("fe80::/64", &["up0"]), "a link-local address");
+        // the host's side of a VM prefix on the uplink is not a neighbour's subnet
+        let own_side = "20010db8210900000000000000000001 02 80 00 80      up0\n";
+        let (vms, len) = prefix("2001:db8:2109::/64");
+        assert!(!a_device_holds_an_address_in(own_side, &["up0"], vms, len));
+        let (other, len) = prefix("2001:db8:2109::/112");
+        assert!(a_device_holds_an_address_in(
+            "20010db8210900000000000000000002 02 80 00 80      up0\n",
+            &["up0"],
+            other,
+            len
+        ));
+        assert!(!held("2001:db8:ffff::/64", &[]));
+    }
+
+    /// The prefix's route is there before this VM's address is chosen: whoever calls the
+    /// address while the VM starts gets an answer from the first moment.
+    #[test]
+    fn the_prefix_is_answered_for_before_an_address_is_leased() {
+        let source = include_str!("routed.rs");
+        let setup = &source[source.find("    async fn setup(&mut self)").unwrap()..];
+        let answered = setup
+            .find("answer_for_the_prefix(network, len).await")
+            .unwrap();
+        let leased = setup.find("lease_address(lease_dir").unwrap();
+        assert!(answered < leased);
+    }
+
+    /// #2109: a packet for an address of the VM prefix that no VM holds left by the
+    /// uplink, and on a host the prefix is routed to it came straight back, until its hop
+    /// limit ran out. In a network namespace with an uplink and a default route: before,
+    /// such an address routes out of the uplink; once the prefix is answered for, it has
+    /// no route out (a sender is told at once), a VM's own /128 still wins, a second call
+    /// changes nothing, and a prefix that is the uplink's own subnet is left alone.
+    ///
+    /// RED WITHOUT THE ROUTE: the address still routes `dev up0`.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn a_prefix_address_no_vm_holds_does_not_leave_by_the_uplink() {
+        std::thread::spawn(|| {
+            // SAFETY: unshare(2) takes plain flags and moves this thread alone.
+            assert_eq!(
+                unsafe { libc::unshare(libc::CLONE_NEWNET) },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            // children are forked from this thread and inherit its namespace
+            let ip = |args: &[&str]| {
+                let out = std::process::Command::new("ip")
+                    .args(args)
+                    .output()
+                    .unwrap();
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            };
+            for setup in [
+                &["link", "set", "lo", "up"][..],
+                &["link", "add", "up0", "type", "dummy"],
+                &["link", "set", "up0", "up"],
+                &[
+                    "-6",
+                    "addr",
+                    "add",
+                    "2001:db8:ffff::2/64",
+                    "dev",
+                    "up0",
+                    "nodad",
+                ],
+                &[
+                    "-6",
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    "2001:db8:ffff::1",
+                    "dev",
+                    "up0",
+                ],
+            ] {
+                assert_eq!(ip(setup), "", "ip {setup:?}");
+            }
+            let route_of = |address: &str| ip(&["-6", "route", "get", address]);
+            let send_to = |address: &str| {
+                std::net::UdpSocket::bind("[::]:0")
+                    .unwrap()
+                    .send_to(b"x", (address, 9))
+            };
+            // the host's own side of the VM prefix, where a fleet host's aggregator listens
+            assert_eq!(
+                ip(&[
+                    "-6",
+                    "addr",
+                    "add",
+                    "2001:db8:2109::1/128",
+                    "dev",
+                    "up0",
+                    "nodad"
+                ]),
+                ""
+            );
+            let nobody = "2001:db8:2109::5";
+            assert!(route_of(nobody).contains("dev up0"), "the test's premise");
+            send_to(nobody).expect("before: the datagram leaves by the uplink");
+
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (vms, len) = prefix("2001:db8:2109::/64");
+            runtime.block_on(answer_for_the_prefix(vms, len));
+            let route = route_of(nobody);
+            assert!(
+                !route.contains("dev up0") && route.contains("No route to host"),
+                "an address no VM holds still leaves by the uplink: {route}"
+            );
+            let refused = send_to(nobody).expect_err("the sender is told at once");
+            assert_eq!(
+                refused.raw_os_error(),
+                Some(libc::EHOSTUNREACH),
+                "{refused}"
+            );
+
+            // the host still answers on its own side of the prefix
+            assert!(
+                route_of("2001:db8:2109::1").contains("local"),
+                "{}",
+                route_of("2001:db8:2109::1")
+            );
+
+            // a VM's own route is more specific and wins
+            assert_eq!(
+                ip(&["-6", "route", "add", "2001:db8:2109::7/128", "dev", "up0"]),
+                ""
+            );
+            assert!(route_of("2001:db8:2109::7").contains("dev up0"));
+
+            // every launch calls it: nothing changes
+            runtime.block_on(answer_for_the_prefix(vms, len));
+            let unreachable = ip(&["-6", "route", "show", "type", "unreachable"]);
+            assert_eq!(
+                unreachable.matches("2001:db8:2109::/64").count(),
+                1,
+                "{unreachable}"
+            );
+
+            // the uplink's own subnet stays reachable through the uplink
+            let (subnet, len) = prefix("2001:db8:ffff::/64");
+            runtime.block_on(answer_for_the_prefix(subnet, len));
+            assert!(route_of("2001:db8:ffff::9").contains("dev up0"));
+            // and so does one with no connected route, which only the default route carried
+            assert_eq!(
+                ip(&[
+                    "-6",
+                    "addr",
+                    "add",
+                    "2001:db8:eeee::2/128",
+                    "dev",
+                    "up0",
+                    "nodad"
+                ]),
+                ""
+            );
+            let (bare, len) = prefix("2001:db8:eeee::/64");
+            runtime.block_on(answer_for_the_prefix(bare, len));
+            assert!(route_of("2001:db8:eeee::9").contains("dev up0"));
+        })
+        .join()
+        .unwrap();
     }
 
     // --- parse_ipv6_prefix tests ---
