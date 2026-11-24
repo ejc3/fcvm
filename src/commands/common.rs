@@ -5849,7 +5849,10 @@ pub(crate) fn recorded_vsock_socket_path(vm_state: &VmState) -> Result<&Path> {
 /// This is intentionally part of both snapshot APIs: deriving a conventional
 /// runtime path here would silently bypass `--vsock-dir`.
 async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &str) -> Result<()> {
-    run_fc_agent_one_shot(vsock_socket, vm_id, flag).await
+    let output = run_fc_agent_command(vsock_socket, vm_id, &[flag]).await?;
+    // The one-shot's report (the prepare's restore warm-up among it) reaches no console.
+    debug!(vm_id, flag, guest = %output.stderr.trim(), "guest snapshot network command ran");
+    Ok(())
 }
 
 /// Reopen the source's network once a pause has been invoked, and set the source's
