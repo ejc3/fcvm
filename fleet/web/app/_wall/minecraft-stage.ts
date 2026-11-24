@@ -5,6 +5,7 @@
 // screen and a hidden tab hold nothing on the GPU.
 
 import {
+  displayTick,
   figureBoxes,
   flightBox,
   flightProgress,
@@ -235,7 +236,7 @@ export class McStage {
       const cost = now - this.lastDrawAt;
       this.costs.push(cost);
       if (this.costs.length > 20) this.costs.shift();
-      if (this.budgetOn) this.budget.sample(cost, now, Math.max(4, Math.min(100, Math.min(...this.ticks, 100))));
+      if (this.budgetOn) this.budget.sample(cost, now, displayTick(this.ticks));
       this.lastDrew = false;
     }
     const still = f.reducedMotion || (this.budgetOn && this.budget.still);

@@ -17,6 +17,7 @@ import {
   flightBox,
   flightProgress,
   FRAME_BUDGET_MS,
+  displayTick,
   FrameBudget,
   groundAt,
   labelsOf,
@@ -516,6 +517,27 @@ describe("drawing within a device's means", () => {
     run(sixty, 34, 1000, 16.7);
     run(sixty, 34, 30_000, 16.7);
     expect(sixty.level).toBe(3);
+  });
+
+  it("reads the display's tick as the median spacing of its frames, so one late callback does not make a 30 Hz display a faster one", () => {
+    const steady = Array.from({ length: 30 }, () => 33.3);
+    expect(displayTick(steady)).toBe(33.3);
+    // one callback 25 ms late: its spacing is long and the next one short
+    const late = [...steady.slice(0, 28), 58.3, 8.3];
+    expect(Math.min(...late)).toBe(8.3);
+    expect(displayTick(late)).toBe(33.3);
+    // and with that tick a 30 Hz device's 34 ms frames keep up, as they do without the late one
+    const thirty = new FrameBudget(true);
+    run(thirty, 34, 1000, displayTick(late));
+    run(thirty, 34, 30_000, displayTick(late));
+    expect(thirty.level).toBe(2);
+    // read as 8.3 ms they never would
+    const misread = new FrameBudget(true);
+    run(misread, 34, 1000, 8.3);
+    run(misread, 34, 30_000, 8.3);
+    expect(misread.level).toBe(3);
+    // within 4 to 100 ms, and 100 before any frame
+    expect([displayTick([]), displayTick([1, 1, 1]), displayTick([500, 500]), displayTick([16.7])]).toEqual([100, 4, 100, 16.7]);
   });
 
   it("waits twice as long before each recovery that follows a failed one, and starts over once one holds", () => {

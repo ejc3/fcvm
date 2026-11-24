@@ -761,6 +761,18 @@ export const RECENT_GLOW_MS = 1200;
 export const REBUILD_MIN_MS = 200;
 
 /**
+ * The time between the display's ticks, from the spacings of the page's last animation frames:
+ * their median, within 4 to 100 ms. Not their least: one callback that came late makes the next
+ * spacing short, and a 30 Hz display read as a faster one never keeps up by [`FrameBudget`]'s
+ * rule, so it would never step back up. With no spacing yet, 100.
+ */
+export function displayTick(spacings: readonly number[]): number {
+  if (spacings.length === 0) return 100;
+  const sorted = [...spacings].sort((a, b) => a - b);
+  return Math.max(4, Math.min(100, sorted[sorted.length >> 1]!));
+}
+
+/**
  * Slows the drawing down when frames run long, rather than stutter: the page gives it the time
  * each drawn frame took until the GPU had drawn it. When the median of the last 20 is over
  * FRAME_BUDGET_MS, or the last three each took over four times that, it goes down a level
@@ -799,7 +811,7 @@ export class FrameBudget {
     return this.level === FRAME_LEVELS.length - 1;
   }
 
-  /** `displayMs`: the time between the display's ticks (16.7 at 60 Hz), as the page measured it. */
+  /** `displayMs`: the time between the display's ticks (16.7 at 60 Hz), as the page measured it ([`displayTick`]). */
   sample(costMs: number, nowMs: number, displayMs = 16.7): void {
     if (this.costs.length === 0) this.windowAt = nowMs;
     this.costs.push(costMs);
