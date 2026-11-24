@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   applyDelta,
+  botCount,
+  sameColumns,
   BOT_DYES,
   decodeBase64,
   DRIVE_HEARTBEAT_MS,
@@ -17,6 +19,11 @@ import {
   MATERIALS,
   MC_UNKNOWN,
   minecraftNotice,
+  MC_DRAWN_NOTE,
+  MC_FLAT_NOTE,
+  MC_MAX_COLUMNS,
+  MC_MAX_SIDE,
+  sameGrid,
   minecraftView,
   parseViewMsg,
   remapOf,
@@ -210,7 +217,7 @@ describe("the view socket's messages", () => {
     expect(map?.type === "map" && [...map.cells]).toEqual([2, 130, 1, 126]);
     expect(parseViewMsg(JSON.stringify({ type: "delta", seq: 42, cells: [[3, 46, 140]] }))).toEqual({ type: "delta", seq: 42, cells: [[3, 46, 140]] });
     const st = parseViewMsg(JSON.stringify({ type: "status", t: 5, tps: 19.98, players: [{ name: "fcvm_bot1", x: 1.5, y: 70, z: -2, yaw: 90, bot: true, driven: true }], drive: { seq: 12, moved_at: 6 } }));
-    expect(st).toEqual({ type: "status", t: 5, tps: 19.98, players: [{ name: "fcvm_bot1", x: 1.5, y: 70, z: -2, yaw: 90, bot: true, driven: true }], drive: { seq: 12, moved_at: 6 } });
+    expect(st).toEqual({ type: "status", t: 5, tps: 19.98, players: [{ name: "fcvm_bot1", x: 1.5, y: 70, z: -2, yaw: 90, bot: true, driven: true }], drive: { seq: 12, moved_at: 6 }, day_time: null });
     expect(parseViewMsg(JSON.stringify({ type: "status", t: 5, tps: null, players: [], drive: null }))).toMatchObject({ tps: null, drive: null });
     expect(parseViewMsg(JSON.stringify({ type: "drive_ack", seq: 12, ok: false, reason: "another viewer holds this tile" }))).toEqual({ type: "drive_ack", seq: 12, ok: false, at: null, reason: "another viewer holds this tile" });
     expect(parseViewMsg(JSON.stringify({ type: "later_addition" }))).toBeNull();
@@ -769,5 +776,178 @@ describe("the held server", () => {
     expect(p.driving).toBe(false);
     expect(p.failed).toBe(true);
     expect(p.waiting).toBe("Lost the connection to mc-2. Trying again; Retry tries now.");
+  });
+});
+
+describe("the 3D view's words", () => {
+  const map = (extra: Record<string, unknown> = {}) => JSON.stringify({ type: "map", seq: 5, region: { x0: 0, z0: 0, w: 2, h: 2 }, cells: Buffer.from([2, 130, 1, 126, 10, 140, 2, 131]).toString("base64"), ...extra });
+
+  it("takes the ground and the clock when a tile sends them, and does without when it does not", () => {
+    const plain = parseViewMsg(map())!;
+    expect(plain).toMatchObject({ type: "map", ground: null });
+    expect(worldFromMap(plain as Extract<typeof plain, { type: "map" }>).ground).toBeNull();
+    const m = parseViewMsg(map({ ground: Buffer.from([2, 130, 4, 121, 3, 133, 2, 131]).toString("base64") }))!;
+    if (m.type !== "map") throw new Error("not a map");
+    const w = worldFromMap(m);
+    expect([...w.ground!]).toEqual([2, 130, 4, 121, 3, 133, 2, 131]);
+    expect(() => parseViewMsg(map({ ground: Buffer.from([2, 130]).toString("base64") }))).toThrow(ProtocolError);
+    // a delta moves the ground with the columns
+    const d = parseViewMsg(JSON.stringify({ type: "delta", seq: 6, cells: [], ground: [[1, 5, 119], [9, 1, 1]] }))!;
+    if (d.type !== "delta") throw new Error("not a delta");
+    expect(applyDelta(w, d)).toBe(1);
+    expect([...w.ground!.slice(2, 4)]).toEqual([5, 119]);
+    expect(() => parseViewMsg(JSON.stringify({ type: "delta", seq: 7, cells: [], ground: [[1, 5]] }))).toThrow(ProtocolError);
+    // a world with no ground ignores a delta's
+    const bare = worldFromMap(plain as Extract<typeof plain, { type: "map" }>);
+    expect(applyDelta(bare, { type: "delta", seq: 6, cells: [], ground: [[1, 5, 119]] })).toBe(0);
+    // the columns that changed, in either layer, once each; a triple that changes nothing is not one
+    const b64 = (bytes: number[]) => Buffer.from(bytes).toString("base64");
+    const mapOf = (w: number, h: number, bytes: number[], ground = false) => {
+      const m = parseViewMsg(JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: b64(bytes), ...(ground ? { ground: b64(bytes) } : {}) }))!;
+      if (m.type !== "map") throw new Error("not a map");
+      return worldFromMap(m);
+    };
+    const wb = mapOf(2, 2, [2, 130, 2, 130, 2, 130, 2, 130], true);
+    const cols = new Set<number>();
+    expect(applyDelta(wb, { type: "delta", seq: 2, cells: [[0, 46, 131], [1, 2, 130]], ground: [[0, 46, 131], [3, 5, 120]] }, cols)).toBe(3);
+    expect([...cols].sort()).toEqual([0, 3]);
+    // a delta of the ground alone names its column too
+    cols.clear();
+    expect(applyDelta(wb, { type: "delta", seq: 3, cells: [], ground: [[2, 5, 121]] }, cols)).toBe(1);
+    expect([...cols]).toEqual([2]);
+    // column indices mean the same columns only on the same grid
+    const again = mapOf(2, 2, [1, 126, 1, 126, 1, 126, 1, 126]);
+    const small = mapOf(1, 1, [2, 130]);
+    expect([sameColumns(wb, again), sameColumns(wb, small), sameColumns(null, small)]).toEqual([true, false, false]);
+    // a person who joined is a player, not one of the tile's bots
+    expect(botCount([{ bot: true }, { bot: true }, { bot: true }, { bot: false }])).toBe(3);
+    expect(bare.ground).toBeNull();
+    const status = (extra: Record<string, unknown>) => parseViewMsg(JSON.stringify({ type: "status", t: 1, tps: 20, players: [], drive: null, ...extra }))!;
+    expect(status({ day_time: 13000 })).toMatchObject({ day_time: 13000 });
+    expect(status({})).toMatchObject({ day_time: null });
+  });
+
+  it("takes only a grid it can build: each side within 16 bits' reach and the whole within the cap, and a delta's indices inside it", () => {
+    const grid = (w: number, h: number) => JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: Buffer.alloc(Math.min(w * h * 2, 16)).toString("base64") });
+    // The cap is the tile server's own largest region: whatever side a server is started with,
+    // its map is one this page draws.
+    const serverSide = /region_side: c\.region\.clamp\((\d+), (\d+)\)/.exec(readFileSync(new URL("../../../minecraft/src/main.rs", import.meta.url), "utf8"))!;
+    const most = Number(serverSide[2]);
+    expect(most).toBe(512);
+    expect([MC_MAX_SIDE, MC_MAX_COLUMNS]).toEqual([1024, most * most]);
+    expect(() => parseViewMsg(grid(MC_MAX_SIDE + 1, 1))).toThrow(/not a grid/);
+    expect(() => parseViewMsg(grid(1, MC_MAX_SIDE + 1))).toThrow(/not a grid/);
+    // a whole map at the cap parses (the server's largest, and the same columns the long way),
+    // one column more does not, and a small one does
+    const whole = (w: number, h: number) => JSON.stringify({ type: "map", seq: 1, region: { x0: 0, z0: 0, w, h }, cells: Buffer.alloc(w * h * 2).toString("base64") });
+    expect(parseViewMsg(whole(most, most))).toMatchObject({ type: "map", region: { w: most, h: most } });
+    expect(parseViewMsg(whole(1024, 256))).toMatchObject({ type: "map", region: { w: 1024, h: 256 } });
+    expect(() => parseViewMsg(grid(most + 1, most))).toThrow(/not a grid/);
+    expect(() => parseViewMsg(grid(1024, 257))).toThrow(/not a grid/);
+    expect(parseViewMsg(whole(256, 256))).toMatchObject({ type: "map", region: { w: 256, h: 256 } });
+    expect(parseViewMsg(whole(2, 4))).toMatchObject({ type: "map" });
+    const delta = (cells: unknown) => JSON.stringify({ type: "delta", seq: 2, cells });
+    expect(() => parseViewMsg(delta([[MC_MAX_COLUMNS, 1, 1]]))).toThrow(ProtocolError);
+    expect(parseViewMsg(delta([[MC_MAX_COLUMNS - 1, 1, 1]]))).toMatchObject({ type: "delta" });
+  });
+
+  it("compares a copy with its source only when both are the same grid of the same materials", () => {
+    const w = (x0: number, side = 2): McWorld => ({ region: { x0, z0: 0, w: side, h: side }, cells: new Uint8Array(side * side * 2), seq: 1 });
+    const mats = remapOf([...MATERIALS]);
+    expect(sameGrid(w(0), mats, w(0), remapOf([...MATERIALS]))).toBe(true);
+    expect(sameGrid(w(0), mats, w(8), mats)).toBe(false);
+    expect(sameGrid(w(0), mats, w(0, 4), mats)).toBe(false);
+    expect(sameGrid(w(0), mats, w(0), remapOf(["unknown", "grass", "water"]))).toBe(false);
+    expect(sameGrid(w(0), mats, w(0), null)).toBe(false);
+    expect(sameGrid(w(0), null, w(0), null)).toBe(true);
+  });
+
+  it("says on the tile that it is a flat map when the browser has no WebGL2, and nothing when it is 3D", () => {
+    const flat = viewOf(minecraftOf(2), { renderer: "flat" });
+    expect(flat.renderer).toBe("flat");
+    expect(flat.cards[0]!.note).toBe(MC_FLAT_NOTE);
+    expect(MC_FLAT_NOTE).toBe("Flat map: no WebGL2 in this browser.");
+    expect(flat.cards[0]!.ariaLabel).toBe("mc-1, running, flat map");
+    const gl = viewOf(minecraftOf(2), { renderer: "3d" });
+    expect(gl.renderer).toBe("3d");
+    expect(gl.cards[0]!.note).toBeNull();
+    expect(gl.cards[0]!.ariaLabel).toBe("mc-1, running");
+    // unsaid, the page has not looked yet: nothing claims a flat map
+    expect(viewOf(minecraftOf(2)).cards[0]!.note).toBeNull();
+    // a 3D view that was lost says so, not that the browser has none
+    const lost = viewOf(minecraftOf(2), { renderer: "flat", lost: true }).cards[0]!;
+    expect(lost.note).toBe("3D view lost; showing the flat map.");
+    expect(lost.ariaLabel).toBe("mc-1, running, flat map");
+    // a view the page draws with less detail to keep up says so
+    const reduced = viewOf(minecraftOf(2), { renderer: "3d", reduced: true }).cards[0]!;
+    expect(reduced.note).toBe("Reduced detail");
+    expect(reduced.ariaLabel).toBe("mc-1, running, reduced detail");
+    // what is drawn from data and what is filled in, said once, with the 3D view only
+    expect(gl.header!.drawn).toBe(MC_DRAWN_NOTE);
+    expect(MC_DRAWN_NOTE).toBe("Drawn from each column's top block; trunks are filled in, and so are the forest floor and lake beds of a server that does not send them.");
+    expect(flat.header!.drawn).toBeNull();
+  });
+
+  it("names a copy's source, counts the columns that differ from its source's world now, and flies the copy while it is taken", () => {
+    const forked = with1(minecraftOf(4), 1, { forked_from: "mc-1" });
+    const live = { ...LIVE(4), "mc:2": { ...LIVE(4)["mc:2"]!, diff: 4, bots: 3 } };
+    const c = viewOf(forked, { live }).cards[1]!;
+    expect(c.forkOf).toBe("mc:1");
+    expect(c.diff).toBe("4 columns differ");
+    expect(c.flight).toBeNull();
+    expect(c.ariaLabel).toBe("mc-2, running, 3 bots, copy of mc-1, 4 columns differ");
+    expect(viewOf(forked, { live: { ...live, "mc:2": { ...live["mc:2"]!, diff: 1 } } }).cards[1]!.diff).toBe("1 column differs");
+    expect(viewOf(forked, { live: { ...live, "mc:2": { ...live["mc:2"]!, diff: 0 } } }).cards[1]!.diff).toBe("same so far");
+    // no count yet (the page holds only one of the two worlds), and none for a server that is no copy
+    expect(viewOf(forked).cards[1]!.diff).toBeNull();
+    expect(viewOf(minecraftOf(4), { live }).cards[1]!.diff).toBeNull();
+    expect(viewOf(minecraftOf(4), { live }).cards[1]!.forkOf).toBeNull();
+    // while the copy is taken, its picture flies from the source
+    const forking = with1(forked, 1, { phase: "forking", last_relaunch: { clicked_at: NOW - 1200, first_frame_at: null, phases: {} } });
+    const taking = viewOf(forking, { live, renderer: "3d" }).cards[1]!;
+    expect(taking.flight).toEqual({ from: "mc:1", elapsedMs: 1200 });
+    expect(taking.diff).toBeNull();
+    // the flight is the tile's picture only when it can be drawn: in 3D, with motion, the source on the stage with its world in
+    expect(viewOf(forking, { live }).cards[1]!.flight).toBeNull();
+    expect(viewOf(forking, { live, renderer: "flat" }).cards[1]!.flight).toBeNull();
+    expect(viewOf(forking, { live, renderer: "3d", reducedMotion: true }).cards[1]!.flight).toBeNull();
+    expect(viewOf(forking, { live: { ...live, "mc:1": { ...LIVE(4)["mc:1"]!, hasMap: false } }, renderer: "3d" }).cards[1]!.flight).toBeNull();
+    expect(viewOf(forking, { live, renderer: "3d", opened: "mc:2" }).cards[1]!.flight).toBeNull();
+    // and without it the tile keeps its own timer
+    expect(viewOf(forking, { live, renderer: "flat" }).cards[1]!.timer).toBe("Forking 1.2 s");
+    // a fork that failed flies nothing: the tile says why
+    const failed = viewOf(with1(forking, 1, { phase: "failed", error: "the copy's restore failed" }), { live, renderer: "3d" }).cards[1]!;
+    expect(failed.flight).toBeNull();
+    expect(failed.error).toContain("the copy's restore failed");
+    // a source relaunched since the fork is another world: nothing to compare with
+    const relaunched = with1(with1(forked, 1, { last_relaunch: { clicked_at: EPOCH + 1000, first_frame_at: EPOCH + 2000, phases: {} } }), 0, { last_relaunch: { clicked_at: EPOCH + 5000, first_frame_at: EPOCH + 6000, phases: {} } });
+    expect(viewOf(relaunched, { live }).cards[1]!.forkOf).toBeNull();
+    expect(viewOf(relaunched, { live }).cards[1]!.diff).toBeNull();
+    // a source that has left the fleet is no source
+    expect(viewOf(with1(minecraftOf(4), 1, { forked_from: "mc-9", phase: "forking" }), { renderer: "3d" }).cards[1]!.flight).toBeNull();
+  });
+
+  it("opens one server to the whole stage and puts the rest away, unless this viewer holds one", () => {
+    const v = viewOf(minecraftOf(4), { opened: "mc:3" });
+    expect(v.opened).toBe("mc-3");
+    expect(v.cards.map((c) => c.box !== null)).toEqual([false, false, true, false]);
+    const c = v.cards[2]!;
+    expect(c.box!.w).toBe(STAGE.h - 104);
+    expect(c.box!.w).toBe(c.box!.h);
+    expect(c.opened).toBe(true);
+    // the opened 3D view says what is drawn and what is filled in; the flat map draws only data
+    expect(c.about).toBeNull();
+    expect(viewOf(minecraftOf(4), { opened: "mc:3", renderer: "3d" }).cards.map((x) => x.about)).toEqual([null, null, MC_DRAWN_NOTE, null]);
+    expect(viewOf(minecraftOf(4), { opened: "mc:3", renderer: "flat" }).cards[2]!.about).toBeNull();
+    // every other server keeps its socket: the worlds are there when the wall comes back
+    expect(v.cards.every((x) => x.socket !== null)).toBe(true);
+    const wall = viewOf(minecraftOf(4));
+    expect(wall.opened).toBeNull();
+    expect(wall.cards.every((x) => x.box !== null && !x.opened)).toBe(true);
+    expect(viewOf(minecraftOf(4), { opened: "mc:9" }).opened).toBeNull();
+    const held = with1(minecraftOf(4), 0, { borrowed: { session: "minecraft-claim-1", viewer: "v-1", since: NOW, until: NOW + 60_000 } });
+    const h = viewOf(held, { opened: "mc:3" });
+    expect(h.opened).toBeNull();
+    expect(h.cards.map((x) => x.box !== null)).toEqual([true, false, false, false]);
   });
 });

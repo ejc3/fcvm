@@ -13,6 +13,24 @@
 
 .mc-tile { position: absolute; border-radius: 4px; overflow: hidden; background: #06080b; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06); }
 .mc-tile.mine { box-shadow: 0 0 0 2px var(--fcvm); }
+/* The 3D view: one WebGL canvas the size of the stage, under the tiles. A tile is then a window
+   onto its rectangle of it, and its own canvas holds only the bots' names. */
+.mc-gl { display: block; z-index: 0; }
+.mc-tile.gl { background: none; }
+.mc-tile.gl .mc-canvas { image-rendering: auto; }
+.mc-tile.gl:not(.mine) .mc-canvas[role="button"] { cursor: zoom-in; }
+.mc-canvas:focus-visible { outline: 2px solid var(--fcvm); outline-offset: -2px; }
+/* The tile a copy is flying to shows the flight, not a dimmed square. */
+.mc-tile.gl.taking .dark { background: none; }
+.mc-tile.gl.taking .dark .timer { visibility: hidden; }
+.mc-drawn { margin: 0; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* A phone's stage has no line to spare: there the same words are under an opened server. */
+@media (max-width: 700px) { .mc-drawn { display: none; } }
+.mc-tile .diff { position: absolute; left: 6px; top: 6px; max-width: calc(100% - 12px); padding: 2px 6px; border-radius: 4px; background: rgba(6, 8, 11, 0.78); font: 600 11px var(--mono); font-variant-numeric: tabular-nums; color: #ffed8c; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.mc-flights { inset: 0; pointer-events: none; }
+.mc-flight { position: absolute; left: 0; top: 0; display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; padding: 6px 8px; box-sizing: border-box; border-radius: 5px; box-shadow: 0 0 0 2px var(--fcvm), 0 0 24px rgba(124, 196, 255, 0.7); font: 600 12px var(--mono); color: var(--fcvm); text-shadow: 0 1px 4px rgba(0, 0, 0, 0.9); white-space: nowrap; overflow: hidden; }
+.mc-flight span { padding: 2px 6px; border-radius: 4px; background: rgba(6, 8, 11, 0.78); }
+.mc-flight span:last-child { color: var(--text); font-variant-numeric: tabular-nums; }
 .mc-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; image-rendering: pixelated; pointer-events: auto; }
 .mc-tile .dark { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: 6px; background: rgba(6, 8, 11, 0.72); pointer-events: none; }
 .mc-tile .stream { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 12px; text-align: center; font: 400 14px/1.35 var(--sans); color: var(--muted); }
@@ -30,6 +48,8 @@
 .mc-caption .forked .split { color: var(--muted); }
 .mc-caption .buttons { display: flex; flex-wrap: wrap; gap: 4px 6px; }
 .mc-caption .buttons .btn { min-height: 28px; padding: 0 10px; font-size: 13px; white-space: nowrap; pointer-events: auto; background: rgba(11, 13, 16, 0.55); }
+.mc-caption .note { margin: 0; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mc-caption .about { margin: 0; font-size: 11px; line-height: 1.3; color: var(--muted); }
 .mc-caption .lent, .mc-caption .join { margin: 0; font-size: 11px; color: var(--fcvm-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mc-caption .join { font-family: var(--mono); color: var(--muted); }
 .mc-caption.compact .row { gap: 0 6px; }

@@ -140,9 +140,12 @@ the top of `mock/main.ts`.
 
 `/?mode=minecraft` shows the Minecraft servers (PROTOCOL.md, "Minecraft mode"; design in
 docs/fleet/minecraft.md). Each tile opens its own WebSocket to the server's view socket, sends
-the page's direct token first, and draws the world from above on a canvas: one flat colour per
-material (`MATERIAL_COLORS` in core/minecraft.ts, no asset of the game), lighter the higher a
-column stands, with each player as a marker, a facing tick and its name. A tile is labelled with
+the page's direct token first, and draws the world in 3D (core/minecraft3d.ts, drawn by
+app/_wall/minecraft-stage.ts on one WebGL2 canvas under the tiles; docs/fleet/minecraft.md, "The
+page in 3D"): plain boxes, one flat colour per material (`MATERIAL_COLORS` in core/minecraft.ts,
+no asset of the game), each player a block figure with its name, from a camera that flies through
+the world. Without WebGL2 it draws the map from above on the tile's own canvas and says so. A
+tile is labelled with
 its slot, the ticks per second its server reports, "Up in X.XX s" (click to first chunk) and, for
 a copy, "Forked from mc-N in X.XX s", with Reset, Fork and Take over. The header gives the
 servers up, the server's name and version, the median and slowest restore, the last fork with

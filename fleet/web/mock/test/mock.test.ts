@@ -1487,6 +1487,36 @@ describe("mock minecraft", () => {
     a.ws.close();
   });
 
+  it("a server that sends its ground keeps it with its world: a block a bot placed is the ground of its column, in the delta and in a later map", async () => {
+    await settle();
+    const a = await live();
+    const first = { admit: await token(a) };
+    // mc-2 sends the optional fields (every other server does)
+    const v = await view(tile("mc-2").frame_url, first);
+    const map = await v.next((m) => m["type"] === "map");
+    expect(typeof map["ground"]).toBe("string");
+    const d = (await v.next((m) => m["type"] === "delta" && (m["cells"] as number[][]).some((c) => c[1]! >= 32), 8000)) as { cells: number[][]; ground: number[][] };
+    // the delta carries the ground of the columns that changed: under a block of wool, the wool
+    const built = d.cells.find((c) => c[1]! >= 32)!;
+    expect(d.ground.find((g) => g[0] === built[0])).toEqual(built);
+    v.ws.close();
+    // a page that connects afterwards gets that ground in its map, not the snapshot's
+    const again = await view(tile("mc-2").frame_url, first);
+    const later = await again.next((m) => m["type"] === "map");
+    const ground = Buffer.from(later["ground"] as string, "base64");
+    const cells = Buffer.from(later["cells"] as string, "base64");
+    const i = built[0]!;
+    expect([ground[i * 2], ground[i * 2 + 1]]).toEqual([cells[i * 2], cells[i * 2 + 1]]);
+    expect(cells[i * 2]).toBeGreaterThanOrEqual(32);
+    again.ws.close();
+    // a server that does not send its ground sends none in its deltas either
+    const plain = await view(tile("mc-1").frame_url, first);
+    const pd = await plain.next((m) => m["type"] === "delta", 8000);
+    expect("ground" in pd).toBe(false);
+    plain.ws.close();
+    a.ws.close();
+  });
+
   it("resets one server: restoring, then running with a new launch timed from the click, and its sockets close", async () => {
     await settle();
     const a = await live();
