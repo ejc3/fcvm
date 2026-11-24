@@ -214,7 +214,10 @@ pub struct Host {
     pub no_seccomp: bool,
     /// `FCVM_FIRECRACKER_ARGS`.
     pub firecracker_args: Option<String>,
-    /// `/proc/sys/kernel/core_pattern`, or `None` when it cannot be read.
+    /// `/proc/sys/kernel/core_pattern`, or `None` when it cannot be read. It is read once,
+    /// at the preflight: an administrator who later switches the pattern (to a socket, or to
+    /// a pipe while the inherited hard core limit is 0) changes what VMMs already running
+    /// can dump.
     pub core_pattern: Option<String>,
     /// This process's hard RLIMIT_CORE, which the VMM inherits: an unprivileged process
     /// cannot raise it.
@@ -384,7 +387,7 @@ pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
 }
 
 /// This process's hard RLIMIT_CORE.
-pub(crate) fn core_hard_limit() -> u64 {
+pub fn core_hard_limit() -> u64 {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -399,7 +402,7 @@ pub(crate) fn core_hard_limit() -> u64 {
 /// The core limit the process layer sets, given the inherited hard limit: 1, which the
 /// kernel takes as "no dump" for a pipe as well as a file, unless the hard limit is already
 /// 0, which cannot be raised and stops a file dump (a pipe one is refused in the preflight).
-pub(crate) fn core_limit_for(hard: u64) -> libc::rlim_t {
+pub fn core_limit_for(hard: u64) -> libc::rlim_t {
     if hard >= 1 {
         1
     } else {
@@ -577,9 +580,12 @@ pub(crate) fn apply_process_layer(core_limit: libc::rlim_t) -> std::io::Result<(
         }
     };
 
-    // 1, not 0: the kernel takes a limit of 1 as "no dump" for a pipe core_pattern too,
-    // where it ignores any other limit (fs/coredump.c, coredump_pipe); a file dump needs at
-    // least a page.
+    // 1, not 0, when the inherited hard limit allows it ([`core_limit_for`]). In Linux
+    // v7.3.3, fs/coredump.c: coredump_pipe() (line 976) aborts a pipe dump when the limit is
+    // exactly 1 ("RLIMIT_CORE is set to 1, aborting core") and otherwise ignores the limit;
+    // coredump_file() (line 886) writes nothing below binfmt->min_coredump, a page;
+    // coredump_socket() (line 858) does not read the limit, so a socket core_pattern is
+    // refused in the preflight.
     let no_core = libc::rlimit {
         rlim_cur: core_limit,
         rlim_max: core_limit,
@@ -1391,7 +1397,7 @@ mod tests {
                 no_new_privs: "1".to_string(),
                 net_sysctl_errno: libc::EACCES,
                 unshare_errno: libc::EPERM,
-                core_limit: 1,
+                core_limit: core_limit_for(core_hard_limit()),
                 tap_attach_errno: 0,
             }
         );

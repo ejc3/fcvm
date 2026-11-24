@@ -67,12 +67,33 @@ async fn test_confine_rootless_vm() -> Result<()> {
     let abi = fcvm::confine::landlock_abi();
     // Logged so a CI job says which branch ran and why.
     println!("landlock ABI on this host: {abi:?}; confinement needs {floor}");
+    // The core dump settings decide the VMM's core limit, or a refusal, as the preflight
+    // and the process layer do; logged so a CI job says what its runner has.
+    let core_pattern = std::fs::read_to_string("/proc/sys/kernel/core_pattern")
+        .map(|p| p.trim_end().to_string())
+        .ok();
+    let core_hard = fcvm::confine::core_hard_limit();
+    println!("core_pattern: {core_pattern:?}; hard core limit: {core_hard}");
     let (vm_name, _, _, _) = common::unique_names("confine");
 
-    match abi {
-        Ok(abi) if abi >= floor => {}
-        _ => {
-            // Below the floor the start fails closed, before anything is created.
+    let core_refusal = match core_pattern.as_deref() {
+        None => Some("process: the host's core_pattern cannot be read".to_string()),
+        Some(p) if p.starts_with('@') => Some(format!("process: the host's core_pattern ({p})")),
+        Some(p) if p.starts_with('|') && core_hard < 1 => Some(format!(
+            "process: the host's core_pattern ({p}) pipes core dumps"
+        )),
+        Some(_) => None,
+    };
+    let refusal = match abi {
+        Ok(abi) if abi >= floor => core_refusal,
+        Ok(abi) => Some(format!("landlock: the kernel's Landlock ABI is {abi};")),
+        Err(_) => Some("landlock: Landlock is unavailable".to_string()),
+    };
+
+    match refusal {
+        None => {}
+        Some(expected) => {
+            // A start that cannot be confined fails closed, before anything is created.
             let output = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 tokio::process::Command::new(common::find_fcvm_binary()?)
@@ -92,15 +113,11 @@ async fn test_confine_rootless_vm() -> Result<()> {
             .context("a refused --confine start did not exit")??;
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!output.status.success(), "stderr: {stderr}");
-            let expected = match abi {
-                Ok(abi) => format!("landlock: the kernel's Landlock ABI is {abi};"),
-                Err(_) => "landlock: Landlock is unavailable".to_string(),
-            };
             assert!(
                 stderr.contains(&expected) && stderr.contains("nothing was started"),
                 "expected {expected:?} in: {stderr}"
             );
-            println!("refused below the floor, as required: {expected}");
+            println!("refused, as required: {expected}");
             return Ok(());
         }
     }
@@ -149,9 +166,13 @@ async fn test_confine_rootless_vm() -> Result<()> {
             .lines()
             .find(|l| l.starts_with("Max core file size"))
             .context("no core limit in /proc/<pid>/limits")?;
+        let want = fcvm::confine::core_limit_for(core_hard).to_string();
         anyhow::ensure!(
-            core.split_whitespace().skip(4).take(2).eq(["1", "1"]),
-            "core limit: {core}"
+            core.split_whitespace()
+                .skip(4)
+                .take(2)
+                .eq([want.as_str(), want.as_str()]),
+            "core limit: {core}, expected {want} from a hard limit of {core_hard}"
         );
 
         let ls = tokio::process::Command::new(common::find_fcvm_binary()?)
