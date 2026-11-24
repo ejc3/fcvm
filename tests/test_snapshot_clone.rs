@@ -7931,6 +7931,199 @@ async fn the_restore_hook_runs_in_the_restored_clone() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What a process in the container reports of itself: its user and groups, its
+/// working directory and environment, its cgroup and namespaces, its capability
+/// sets, no-new-privileges bit and seccomp mode, its resource limits, OOM score
+/// adjustment, umask and security label.
+const HOOK_SELF_VIEW: &str = r#"echo "uid=$(id -u) gid=$(id -g)"; grep '^Groups:' /proc/self/status; echo "cwd=$(pwd)"; env | sort; echo "cgroup=$(cat /proc/self/cgroup)"; for n in cgroup ipc mnt net pid user uts; do echo "ns-$n=$(readlink /proc/self/ns/$n)"; done; grep -E '^(Cap|NoNewPrivs|Seccomp)' /proc/self/status; cat /proc/self/limits; echo "oom_score_adj=$(cat /proc/self/oom_score_adj)"; echo "umask=$(umask)"; echo "label=$(cat /proc/self/attr/current)""#;
+
+/// The same namespaces and cgroup, read of the container's first process.
+const CONTAINER_INIT_VIEW: &str = r#"echo "cgroup=$(cat /proc/1/cgroup)"; for n in cgroup ipc mnt net pid user uts; do echo "ns-$n=$(readlink /proc/1/ns/$n)"; done"#;
+
+/// Boot `image` with `run_args`, snapshot it, and restore two clones: one whose
+/// hook records [`HOOK_SELF_VIEW`], and one whose hook fails. Returns the hook's
+/// record, the same view taken through `podman exec` (`fcvm exec` in the
+/// container) in that clone, the view of the container's first process, and the
+/// failing clone's exit status and log.
+async fn restore_hook_views(
+    prefix: &str,
+    run_args: &[&str],
+) -> anyhow::Result<(String, String, String, std::process::ExitStatus, String)> {
+    let (vm_name, clone_name, snap_tag, _) = common::unique_names(prefix);
+    let failing_name = format!("{clone_name}-failing");
+    let mut args = vec!["podman", "run", "--name", &vm_name];
+    args.extend_from_slice(run_args);
+    let (mut child, pid) = common::spawn_fcvm_with_logs(&args, &vm_name).await?;
+    let record = format!("{{ {HOOK_SELF_VIEW}; }} > /tmp/fcvm-hook-self 2>&1");
+    let outcome = async {
+        common::poll_health(&mut child, 300).await?;
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+
+        let (mut clone, clone_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap_tag,
+                "--name",
+                &clone_name,
+                "--on-restore",
+                &record,
+            ],
+            &[],
+        )
+        .await?;
+        let views = async {
+            common::poll_health(&mut clone, 300).await?;
+            let by_hook =
+                common::exec_in_container(clone_pid, &["cat /tmp/fcvm-hook-self"]).await?;
+            let by_podman = common::exec_in_container(clone_pid, &[HOOK_SELF_VIEW]).await?;
+            let init = common::exec_in_container(clone_pid, &[CONTAINER_INIT_VIEW]).await?;
+            anyhow::Ok((by_hook, by_podman, init))
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone.wait().await;
+        let (by_hook, by_podman, init) = views?;
+
+        let (mut failing, failing_pid, failing_log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap_tag,
+                "--name",
+                &failing_name,
+                "--on-restore",
+                "echo hook-said-out; echo hook-said-err >&2; exit 7",
+            ],
+            &[],
+        )
+        .await?;
+        let status = tokio::time::timeout(Duration::from_secs(180), failing.wait()).await;
+        common::kill_process(failing_pid).await;
+        let status = match status {
+            Ok(status) => status?,
+            Err(_) => failing.wait().await?,
+        };
+        let log = std::fs::read_to_string(&failing_log)?;
+        anyhow::Ok((by_hook, by_podman, init, status, log))
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+    outcome
+}
+
+/// The lines of `view` that start with one of `prefixes`.
+fn view_lines<'a>(view: &'a str, prefixes: &[&str]) -> Vec<&'a str> {
+    view.lines()
+        .filter(|line| prefixes.iter().any(|p| line.starts_with(p)))
+        .collect()
+}
+
+fn assert_restore_hook_views(
+    (by_hook, by_podman, init, status, log): (
+        String,
+        String,
+        String,
+        std::process::ExitStatus,
+        String,
+    ),
+) {
+    // The hook is the process a `podman exec` session is: every line it reports of
+    // itself is the line a session reports.
+    assert_eq!(
+        by_hook, by_podman,
+        "the restore hook (left) does not see itself as a podman exec session does (right)"
+    );
+    assert!(
+        by_hook.contains("uid=")
+            && by_hook.contains("CapEff:")
+            && by_hook.contains("Max open files"),
+        "the hook's record is not a view of a process: {by_hook}"
+    );
+    // And it is inside the container: the namespaces and the cgroup of the
+    // container's first process.
+    let inside = ["cgroup=", "ns-"];
+    assert_eq!(
+        view_lines(&by_hook, &inside),
+        view_lines(&init, &inside),
+        "the restore hook is not in the namespaces and cgroup of the container's first process"
+    );
+    assert_eq!(view_lines(&init, &inside).len(), 8, "{init}");
+    // A hook that fails fails the restore, and what it printed is reported.
+    assert!(
+        !status.success(),
+        "a clone whose restore hook exited 7 ran to a clean exit"
+    );
+    for said in ["exited exit status: 7", "hook-said-out", "hook-said-err"] {
+        assert!(
+            log.lines()
+                .any(|line| line.contains("restore hook") && line.contains(said)),
+            "the failed hook's report does not carry {said:?}"
+        );
+    }
+}
+
+/// The restore hook runs as a `podman exec` session of the container would: the
+/// same user and groups, working directory, environment, cgroup, namespaces,
+/// capabilities, seccomp mode, limits and label, in the container's namespaces.
+/// The agent runs it through `crun exec` with a process it makes from the
+/// container's config, and the session it is compared with is podman's own, in
+/// the same clone. A hook that exits non-zero fails the restore with its status
+/// and output. Here podman runs as root and the container has no user set, so
+/// its first process holds the groups Alpine's /etc/group gives root and a
+/// HOSTNAME the start added, neither of which a session has.
+///
+/// RED BEFORE THE FIX: with the hook's process taken unchanged from the
+/// container's config, its Groups line listed root's groups and its environment
+/// held HOSTNAME.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn the_restore_hook_is_a_podman_exec_session_of_the_container() -> anyhow::Result<()> {
+    assert_restore_hook_views(
+        restore_hook_views(
+            "rhookself",
+            &[
+                "--network",
+                "rootless",
+                "--health-check",
+                "http://localhost/",
+                common::TEST_IMAGE,
+            ],
+        )
+        .await?,
+    );
+    Ok(())
+}
+
+/// The same with podman run as a user in the guest (`--user`): the container's
+/// processes are that user's in a user namespace podman keeps, and crun runs as
+/// that user too, under the prefix podman runs under, so the hook holds nothing
+/// that user's podman could not give it.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn the_restore_hook_is_a_podman_exec_session_of_a_users_container() -> anyhow::Result<()> {
+    assert_restore_hook_views(
+        restore_hook_views(
+            "rhookuser",
+            &[
+                "--kernel-profile",
+                "btrfs",
+                "--user",
+                "1000:1000",
+                common::ALPINE_IMAGE,
+                "sleep",
+                "600",
+            ],
+        )
+        .await?,
+    );
+    Ok(())
+}
+
 /// A VM that boots from its startup snapshot (the snapshot lifecycle's cache hit,
 /// taken when a previous boot of the same configuration became healthy) restores a
 /// running container, so the hook runs there too: the restored VM becomes healthy
