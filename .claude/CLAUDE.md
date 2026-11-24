@@ -3248,7 +3248,23 @@ separately.
   unioned and 66 MiB with the bound, and wave 3's private memory was 68.5 and 69.9 MB per
   clone. With the guest's 120 s boot burst gone (#2052) these clones' windows record the
   same pages, so on this workload the bound changes nothing; it bounds growth where windows
-  differ. In copy mode every replayed page is a private
+  differ. Where they differ it holds the set: seven clones in turn, each reading a different
+  128 MiB of an 896 MiB tmpfs file the snapshot of a 2 GiB guest holds, inside a 60 s window,
+  the seventh repeating the first's 128 MiB (same host, kernel and store; private memory is
+  the clone's Firecracker `Anonymous` after its read):
+
+  | clone | set after it, MiB (all windows / bound) | clone private memory, MiB (all windows / bound) |
+  |---|---|---|
+  | 1 | 316 / 321 | 182 / 174 |
+  | 2 | 455 / 456 | 393 / 381 |
+  | 3 | 586 / 587 | 530 / 512 |
+  | 4 | 721 / 718 | 662 / 643 |
+  | 5 | 851 / 718 | 792 / 774 |
+  | 6 | 982 / 718 | 923 / 776 |
+  | 7, as 1 | 982 / 718 | 923 / 645 |
+
+  The repeat clone was no slower with the bound: 877 and 1,216 demand faults, replay 59 and
+  43 ms, restore acknowledged in 52 and 44 ms. In copy mode every replayed page is a private
   copy, so a clone also holds pages it would never have touched, including a clone that is
   created and destroyed at once. On one 128 GiB guest the set grew from 3.7M pages after one
   clone to 9.4M after six (issue #955). PR #956 measured two clones on that guest at first
