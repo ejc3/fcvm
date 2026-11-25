@@ -819,9 +819,14 @@ Enforcement: `tests/test_ci_workflow_coverage.rs` fails if `ci.yml` reintroduces
 ### CI runs on the top of a stack, not on every layer
 
 A draft PR runs no tests, and neither does a PR that another open PR from this repository is
-stacked on (`scripts/ci-pr-scope.sh`). Their run ends in a check named **`Summary (deferred)`**,
-never `Summary`, so it can never be read as a pass. Push the stack as drafts, mark it ready, and
-the top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
+stacked on (`scripts/ci-pr-scope.sh`), when that other PR is not a draft and its head contains
+this one's. A draft tests nothing, so a ready PR under a draft runs the matrix itself, and so
+does one whose child's draft state cannot be read. Their run ends in a check named
+**`Summary (deferred)`**, never `Summary`, so it can never be read as a pass. Push the stack as
+drafts and mark every layer ready back to back. A layer whose run starts while the PR above it
+is still a draft runs the matrix itself and nothing cancels that run, so flips spaced apart
+from the bottom up can cost one run per layer on the self-hosted fleet; from the tip down they
+cannot. The top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
 `main`, not only the top PR's files, so a docs-only top cannot skip the matrix for code changed
 lower down.
 
