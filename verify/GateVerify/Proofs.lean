@@ -1,5 +1,6 @@
 import GateVerify.Lemmas
 import GateVerify.Socks
+import GateVerify.Gens
 
 /-!
 # The design keeps its properties, in every reachable state
@@ -10,14 +11,14 @@ snapshots asked early) and every state reachable from `init C` under `Design.rul
 any length.
 
 No `sorry`, and no axiom beyond Lean's own (`Axioms.lean` checks it on every build). The proofs
-are inductive invariants (`Scal` and `Flags` in `Lemmas.lean`, `Sk` in `Socks.lean`) over the
-same `step` the search runs, not the search.
+are inductive invariants (`Scal` and `Flags` in `Lemmas.lean`, `Sk` in `Socks.lean`, `Gn` in
+`Gens.lean`) over the same `step` the search runs, not the search.
 
-What is NOT proved here, and is only searched (`verify/GateVerify/README.md`): P2
-(`generationBroken`). It says a retirement destroys no socket a process of the clone opened and
-no end of a live connection inside the guest, and needs more about the sockets than `Sk` holds:
-which cookies the manifest and the list can name, and that connections inside the guest keep
-both ends.
+P6 has two more theorems in `Ends.lean`: a measure every step of the system makes smaller
+(`design_bounded`), and where a run ends (`design_settles`).
+
+P2 is proved for the connections `step` can make. One it cannot make is a connection inside the
+guest with one end freed and the other kept; `Limits.lean` has what follows from one.
 -/
 
 namespace Gate
@@ -38,6 +39,38 @@ theorem design_sourceUndisturbed (hr : Reachable Design.rules C s) : sourceDistu
   · have hi := hi hpw
     cases hrp : s.rp <;> cases hsp : s.sp <;>
       simp_all [SrcOk, State.gated, hf.1, inPrepare]
+
+/-- **P2.** No retirement destroys a socket a process of the clone opened, a socket a packet made
+with the gate open, or an end of a connection inside the guest whose other end stays. -/
+theorem design_fixedGeneration (hr : Reachable Design.rules C s) : generationBroken s = false :=
+  (reachable_gn hr).gB
+
+/-- **P2, without the record.** When the restoring agent is at its retirement, every socket the
+retirement names, by cookie, in the manifest or on the restore's own list, is one it must
+destroy: it was in the image, or a packet made it behind the closed gate; one the manifest does
+not name has no mirror image among the guest's sockets; and one the manifest names was in the
+image. -/
+theorem design_retiresOnly (hr : Reachable Design.rules C s) (h11 : s.rp = .at 11)
+    (ha : s.ag = true) :
+    ∀ x ∈ s.socks, x.id ∈ s.man.getD [] ++ s.lst →
+      (x.gen = .stale ∨ x.gen = .smuggled)
+      ∧ (x.id ∈ s.man.getD [] → x.gen = .stale)
+      ∧ (x.id ∉ s.man.getD [] → hasMirror s.socks x = false) := by
+  have hg := reachable_gn hr
+  intro x hx hin
+  have hM : x.id ∈ s.man.getD [] → x.gen = .stale := hg.gM 11 h11 x hx
+  have hL : x.id ∈ s.lst → x.gen ≠ .own ∧ x.gen ≠ .fresh ∧ hasMirror s.socks x = false :=
+    hg.gL 11 h11 (by omega) (by omega) ha x hx
+  rw [List.mem_append] at hin
+  refine ⟨?_, hM, ?_⟩
+  · rcases hin with h | h
+    · exact Or.inl (hM h)
+    · obtain ⟨h1, h2, -⟩ := hL h
+      cases hgen : x.gen <;> simp_all
+  · intro hn
+    rcases hin with h | h
+    · exact absurd h hn
+    · exact (hL h).2.2
 
 /-- **P3, first half.** Once a restored guest's ingress is open in either family, it holds no
 socket with its other end outside the guest that was in the image or made behind the closed

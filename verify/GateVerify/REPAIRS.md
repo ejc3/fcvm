@@ -6,8 +6,9 @@ answers (`BREAKS.md`), what the model shows of it, and wording proposed for the 
 documents.
 
 With all six the search finds no break in any configuration (`lake exe gate-breaks design`,
-and the two `all-` runs), and P1, P3, P4, P5, P6 and U1 are proved (`Proofs.lean`). P2 is
-searched and not proved (`README.md`).
+and the two `all-` runs), and P1 to P6 and U1 are proved (`Proofs.lean`, `Ends.lean`). P2 is
+proved for connections inside the guest that keep both their ends; one with an end freed is
+outside the model and breaks it (`Limits.lean`, and `README.md` under "What is proved").
 
 None of this is implemented. The fixes #2113 and #2124 already make are not repeated here: the
 flag rule (`tcpByCt := false`), the restore's own list with the mirror image deciding and a

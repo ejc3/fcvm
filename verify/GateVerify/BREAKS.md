@@ -25,7 +25,7 @@ configurations of `Configs.lean`. A name is the first recorded run of that kind.
 | | `main` | `flags` | `cookieA` | `cookieB` | design |
 |---|---|---|---|---|---|
 | P1 `sourceDisturbed` | `liveReset`, `barrierKill`, `reopenFails` | `barrierKill`, `reopenFails` | the same | the same | proved |
-| P2 `generationBroken` | early snapshot, restart | the same | `twoDumps`, `proxyConnectA`, and those | `proxyConnect`, `restartRetires`, early snapshot | holds |
+| P2 `generationBroken` | early snapshot, restart | the same | `twoDumps`, `proxyConnectA`, and those | `proxyConnect`, `restartRetires`, early snapshot | proved, for connections inside the guest that keep both ends (`Limits.lean`) |
 | P3 `staleAtPublication` | `staleTuple`, `staleTupleGrown`, `loopbackClient`, `earlySnapshot` | `cookieAck`, `loopbackClient`, `earlySnapshot` | `loopbackClientA`, `earlySnapshot` | `earlySnapshot`, `earlySnapshotFails` | proved |
 | P3 `smuggledLate` | `staleTupleLate`, `halfOpenRetransmit` | `cookieAckClone` | `cookiesBackFirst` | holds | proved |
 | P4 `retiredBehindEgress`, `hookMisplaced` | holds | holds | holds | holds | proved |

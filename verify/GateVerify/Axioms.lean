@@ -1,5 +1,7 @@
 import Lean
 import GateVerify.Proofs
+import GateVerify.Ends
+import GateVerify.Limits
 import GateVerify.Breaks
 
 /-!
@@ -30,8 +32,10 @@ elab "#check_gate_axioms" : command => do
     let axioms ← collectAxioms name
     let extra := axioms.toList.filter (!allowed.contains ·)
     if !extra.isEmpty then bad := bad.push s!"{name} depends on {extra}"
-  if theorems.size < 150 || !theorems.contains `Gate.design_neverStuck
+  if theorems.size < 250 || !theorems.contains `Gate.design_neverStuck
       || !theorems.contains `Gate.design_noStaleAtPublication
+      || !theorems.contains `Gate.design_fixedGeneration || !theorems.contains `Gate.design_bounded
+      || !theorems.contains `Gate.design_settles || !theorems.contains `Gate.loneEndRetired
       || !theorems.contains `Gate.reachable_scal || !theorems.contains `Gate.breaks_cookieAck then
     throwError "the axiom sweep found {theorems.size} theorems under Gate and not the ones it must"
   if !bad.isEmpty then
@@ -47,6 +51,24 @@ open Gate
 #guard_msgs in #print axioms design_noStaleAtPublication
 /-- info: 'Gate.reachable_sk' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in #print axioms reachable_sk
+/-- info: 'Gate.design_fixedGeneration' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms design_fixedGeneration
+/-- info: 'Gate.design_retiresOnly' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms design_retiresOnly
+/-- info: 'Gate.reachable_gn' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms reachable_gn
+/-- info: 'Gate.own_decreases' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms own_decreases
+/-- info: 'Gate.design_bounded' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms design_bounded
+/-- info: 'Gate.design_ends' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms design_ends
+/-- info: 'Gate.design_settles' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms design_settles
+/-- info: 'Gate.kill_restart_repeats' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms kill_restart_repeats
+/-- info: 'Gate.loneEndRetired' depends on axioms: [propext] -/
+#guard_msgs in #print axioms loneEndRetired
 /-- info: 'Gate.design_noSmuggledLate' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in #print axioms design_noSmuggledLate
 /-- info: 'Gate.design_egressBeforeRetirement' depends on axioms: [propext, Quot.sound] -/
