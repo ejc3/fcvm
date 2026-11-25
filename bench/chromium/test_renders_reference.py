@@ -1,8 +1,10 @@
 """renders_reference.py: the page's reference file is what the committed summary gives."""
 
 import copy
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -72,6 +74,31 @@ class Reference(unittest.TestCase):
         # a side that completed nothing has no table row
         self.assertIn("no figures", self.refused(
             lambda s: s["regimes"][0]["sides"].update(fcvm=dict(SIDE, failed=7069, renders_per_s=0.0, page_mean_ms=None))))
+
+    def test_a_withdrawn_run_or_campaign_gives_no_reference(self):
+        """A WITHDRAWN marker in the campaign's directory, or in the directory of a run the summary cites,
+        withdraws the reference: nothing is written and --check fails."""
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = os.path.join(tmp, "renders-test-summary.json")
+            with open(summary, "w") as handle:
+                json.dump(SUMMARY, handle)
+            for run in ("c-held", "c-alone"):
+                os.makedirs(os.path.join(tmp, "renders-test", run))
+            text = renders_reference.generate(summary)
+            self.assertIn("export const RENDERS_REFERENCE", text)
+            for where in (("renders-test", "c-alone"), ("renders-test",)):
+                with self.subTest(where=where):
+                    marker = os.path.join(tmp, *where, "WITHDRAWN")
+                    with open(marker, "w") as handle:
+                        handle.write("measured on the wrong bundle\n")
+                    with self.assertRaises(renders_reference.Refused) as caught:
+                        renders_reference.generate(summary)
+                    self.assertIn("measured on the wrong bundle", str(caught.exception))
+                    os.remove(marker)
+            # a cited run whose directory is gone cannot be checked for a marker
+            os.rmdir(os.path.join(tmp, "renders-test", "c-alone"))
+            with self.assertRaises(renders_reference.Refused):
+                renders_reference.generate(summary)
 
     def test_the_reference_is_text_a_typescript_file_can_hold(self):
         text = renders_reference.generate()

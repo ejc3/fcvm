@@ -2477,22 +2477,26 @@ and the time. The record is those seven lines and no other. `bench/chromium/rend
 summary, `bench/chromium/results/renders-<id>-summary.json`, from the runs' records. It writes
 nothing when two runs differ in kernel, fcvm commit, Kitesurf commit, instance type or boot,
 when the kernel is not fcvm's own, when a run's summary names another kernel, when a host record
-says a thing twice or holds anything its writer would not write, or when a run's teardown does
-not say it left nothing. Per regime the summary holds each side's figures over a stated window
+says a thing twice or holds anything its writer would not write, when a run or the campaign
+holds a `WITHDRAWN` marker, or when a run's teardown does not say it left nothing. Per regime the summary holds each side's figures over a stated window
 (`renders_analyze.py`), the levels the search moved through, and the sha256 and size of the run's
 files.
 
 Each run's `summary.json`, `teardown.json` and `host-record.txt` stay in the tree under
 `bench/chromium/results/renders-<id>/<run>/`. Its row per render and its samples are in
 ejc3/fcvm-bench-records at the same path, listed in `results/records-renders-<id>.json`
-(`records.py`).
+(`records.py`). `renders_campaign.py` and `renders_analyze.py` read them through that manifest,
+so with a checkout of the records repository named by `FCVM_BENCH_RECORDS` the summary is
+rebuilt from this tree; the committed one is byte for byte what that gives.
 
 `bench/chromium/renders_reference.py` writes `fleet/web/core/renders-reference.gen.ts` from the
 one summary in the tree: the campaign, its date, instance type, kernel and commits, and each
 regime's figures by label. The regime labelled `held` is the table the page will show: both sides
 held at the limits the module's own search ended on. No figure is typed;
-`test_renders_reference.py` fails when the file is not what the summary gives. Nothing in
-`fleet/web` reads the file yet.
+`test_renders_reference.py` fails when the file is not what the summary gives. A `WITHDRAWN`
+marker in the campaign's directory, or in the directory of a run the summary cites, withdraws the
+file: the generator and its check stop there, holding the directories' shared locks as
+`campaign_summary.py` does. Nothing in `fleet/web` reads the file yet.
 
 The campaign in the tree, `renders-20261125`, has these regimes:
 

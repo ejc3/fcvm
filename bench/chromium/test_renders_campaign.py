@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import renders_campaign  # noqa: E402
@@ -174,6 +175,52 @@ class Summary(unittest.TestCase):
         out = os.path.join(self.root, "summary.json")
         self.assertEqual(renders_campaign.main([self.root, "--name", "c", "--regime", "one=a", "--out", out]), 2)
         self.assertFalse(os.path.exists(out))
+
+    def test_a_run_whose_rows_were_moved_gives_the_summary_it_gave_before(self):
+        """After records.py moves a run's rows and samples out of the tree, the summary is read through the
+        records reader and is byte for byte what it was."""
+        out = write_run(self.root, "a")
+        regimes = [("held", "a", 2.0, 0.0), ("end", "a", 0.0, 5.0)]
+        before = json.dumps(renders_campaign.summarize(self.root, "c", regimes), sort_keys=True)
+        moved = {}
+        for name in ("renders.jsonl", "samples.jsonl"):
+            path = os.path.join(out, name)
+            with open(path, "rb") as handle:
+                moved[os.path.realpath(path)] = handle.read()
+            os.remove(path)
+        real = renders_campaign.records.read_bytes
+
+        def read(path):
+            held = moved.get(os.path.realpath(path))
+            return held if held is not None else real(path)
+
+        with mock.patch.object(renders_campaign.records, "read_bytes", side_effect=read):
+            after = json.dumps(renders_campaign.summarize(self.root, "c", regimes), sort_keys=True)
+        self.assertEqual(after, before)
+        # and with neither the file nor a listed record, the run is refused
+        self.assertIn("no such record", self.refused(regimes))
+
+    def test_a_withdrawn_run_gives_no_summary(self):
+        write_run(self.root, "a")
+        out = write_run(self.root, "b")
+        with open(os.path.join(out, "WITHDRAWN"), "w") as handle:
+            handle.write("the replay was restarted mid-run\n")
+        text = self.refused([("one", "a", 0.0, 0.0), ("two", "b", 0.0, 0.0)])
+        self.assertIn("withdrawn", text)
+        self.assertIn("the replay was restarted mid-run", text)
+        with open(os.path.join(self.root, "WITHDRAWN"), "w") as handle:
+            handle.write("the whole campaign\n")
+        self.assertIn("the whole campaign", self.refused([("one", "a", 0.0, 0.0)]))
+
+    def test_a_teardown_that_counts_sockets_left_must_count_none(self):
+        """The module's teardown does not count sockets it left yet; a record that does must say zero."""
+        ok = {"cgroups_left": [], "resources_left": 0, "run_dir_left": False, "sockets_left": 0}
+        write_run(self.root, "ok", left=ok)
+        renders_campaign.summarize(self.root, "c", [("one", "ok", 0.0, 0.0)])
+        for i, value in enumerate((1, "0", None)):
+            with self.subTest(value=value):
+                write_run(self.root, f"s{i}", left=dict(ok, sockets_left=value))
+                self.refused([("one", f"s{i}", 0.0, 0.0)])
 
     def test_no_regime_or_a_label_twice_is_refused(self):
         write_run(self.root, "a")

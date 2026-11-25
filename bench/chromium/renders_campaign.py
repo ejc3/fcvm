@@ -17,7 +17,8 @@ files, so a figure can be traced to its record.
 
 Nothing is written unless every run agrees on the kernel, the fcvm commit, Kitesurf's commit,
 the instance type and the boot, the kernel is fcvm's own host kernel, each run's summary
-names that kernel, and each run's teardown says it left nothing. A host record that holds
+names that kernel, no run and not the campaign is withdrawn (a WITHDRAWN marker, as
+campaign_summary.py reads it), and each run's teardown says it left nothing. A host record that holds
 anything its writer would not write, a run that is not a directory of DIR, or a window
 without samples is refused the same way.
 """
@@ -30,6 +31,8 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import campaign_summary  # noqa: E402
+import records  # noqa: E402
 import renders_analyze  # noqa: E402
 import renders_host_record  # noqa: E402
 
@@ -112,11 +115,21 @@ def level_changes(samples, side):
 
 
 def file_record(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return {"sha256": digest.hexdigest(), "size": os.path.getsize(path)}
+    """A file's sha256 and size, read where renders_analyze reads it: the tree, or the records
+    manifest once the file has been moved."""
+    try:
+        data = records.read_bytes(path)
+    except OSError as error:
+        raise Refused(f"{path}: {error}") from None
+    return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+
+def withdrawn(directory):
+    """Refuse a directory that holds a WITHDRAWN marker (campaign_summary.py's rule: a withdrawn
+    run is never quoted)."""
+    marker = os.path.join(directory, campaign_summary.WITHDRAWN_MARKER)
+    if os.path.lexists(marker):
+        raise Refused(f"{directory}: withdrawn: {campaign_summary.withdrawal_reason(marker)}")
 
 
 def regime(directory, label, run, skip_s, last_s):
@@ -127,6 +140,7 @@ def regime(directory, label, run, skip_s, last_s):
     out = os.path.join(directory, run)
     if not os.path.isdir(out):
         raise Refused(f"{run}: absent from {directory}")
+    withdrawn(out)
     host = host_record(os.path.join(out, "host-record.txt"))
     summary = read_json(os.path.join(out, "summary.json"))
     teardown = read_json(os.path.join(out, "teardown.json"))
@@ -139,7 +153,11 @@ def regime(directory, label, run, skip_s, last_s):
     if not isinstance(teardown, dict) or type(teardown.get("cgroups_left")) is not list \
             or type(teardown.get("resources_left")) is not int or type(teardown.get("run_dir_left")) is not bool:
         raise Refused(f"{run}: teardown.json does not say nothing was left: {said}")
-    if teardown["cgroups_left"] or teardown["resources_left"] or teardown["run_dir_left"]:
+    # The module's sweep does not count the sockets it left yet; a record that does must count none.
+    if "sockets_left" in teardown and type(teardown["sockets_left"]) is not int:
+        raise Refused(f"{run}: teardown.json does not say nothing was left: {said}")
+    if teardown["cgroups_left"] or teardown["resources_left"] or teardown["run_dir_left"] \
+            or teardown.get("sockets_left"):
         raise Refused(f"{run}: the teardown left something: {said}")
     try:
         figures = renders_analyze.analyze(out, skip_s, last_s)
@@ -147,7 +165,7 @@ def regime(directory, label, run, skip_s, last_s):
     except SystemExit as stopped:  # renders_analyze's own refusals: an empty window
         raise Refused(str(stopped)) from None
     except OSError as error:
-        raise Refused(f"{run}: {error.filename}: {error.strerror}") from None
+        raise Refused(f"{run}: {error}") from None
     sides = {}
     for side, values in figures["sides"].items():
         search = ((summary.get("sides") or {}).get(side) or {}).get("search") or {}
@@ -169,6 +187,7 @@ def summarize(directory, name, regimes):
     """`regimes`: (label, run, skip_s, last_s). Returns the summary; raises Refused."""
     if not regimes:
         raise Refused("no regime named")
+    withdrawn(directory)
     shared, rows = None, []
     for label, run, skip_s, last_s in regimes:
         host, row = regime(directory, label, run, skip_s, last_s)
@@ -216,17 +235,24 @@ def main(argv=None):
     p.add_argument("--regime", action="append", type=parse_regime, default=[], metavar="LABEL=RUN[,skip=S][,last=S]")
     p.add_argument("--out", default="")
     opts = p.parse_args(argv)
-    try:
-        summary = summarize(opts.directory, opts.name, opts.regime)
-    except Refused as refused:
-        print(f"REFUSED: {refused}", file=sys.stderr)
-        return 2
-    text = json.dumps(summary, indent=1, sort_keys=True) + "\n"
-    if opts.out:
-        with open(opts.out, "w") as handle:
-            handle.write(text)
-    else:
-        sys.stdout.write(text)
+    # The reader's side of the withdrawal protocol, from the first read until the summary is written:
+    # a marker is either there before the runs are read, or published after this summary.
+    held = [opts.directory] + [os.path.join(opts.directory, run) for _label, run, _skip, _last in opts.regime
+                               if os.path.basename(run) == run and run not in ("", ".", "..")]
+    with campaign_summary.shared_run_directory_locks([d for d in held if os.path.isdir(d)]) as lock_errors:
+        try:
+            if lock_errors:
+                raise Refused("; ".join(lock_errors))
+            summary = summarize(opts.directory, opts.name, opts.regime)
+        except Refused as refused:
+            print(f"REFUSED: {refused}", file=sys.stderr)
+            return 2
+        text = json.dumps(summary, indent=1, sort_keys=True) + "\n"
+        if opts.out:
+            with open(opts.out, "w") as handle:
+                handle.write(text)
+        else:
+            sys.stdout.write(text)
     return 0
 
 
