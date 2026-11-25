@@ -357,7 +357,7 @@ pub use kernel::{
     ensure_cloud_hypervisor, ensure_kernel, ensure_profile_firecracker,
     get_configured_firecracker_for_profile, get_firecracker_for_profile, get_kernel_path,
     get_kernel_url_hash, get_profile_firecracker_path, install_host_kernel,
-    newest_cached_cloud_hypervisor, rebuild_kernel_from_source,
+    rebuild_kernel_from_source,
 };
 pub use nvidia::{
     ensure_nvidia_driver_image, get_nvidia_driver_image_path, profile_module_type,

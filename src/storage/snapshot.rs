@@ -360,6 +360,13 @@ pub struct SnapshotMetadata {
     /// field existed; those restore on the binary their kernel profile resolves to.
     #[serde(default)]
     pub firecracker_bin: Option<PathBuf>,
+    /// What the Cloud Hypervisor that wrote this snapshot prints for `--version`
+    /// (`cloud-hypervisor v55.0-117-g4969a51a3`). A restore runs only on a build that
+    /// prints the same, because Cloud Hypervisor's saved state is its own build's. None
+    /// for Firecracker snapshots, and for Cloud Hypervisor snapshots written before this
+    /// field existed, which no restore accepts.
+    #[serde(default)]
+    pub cloud_hypervisor_version: Option<String>,
     /// Balloon target in MiB the source VM booted with (--balloon). A memory
     /// restore gets the device from the VMM state. The cold boots, which are a
     /// disk-only clone and a restored clone's relaunch after a guest reboot,
@@ -1202,6 +1209,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                cloud_hypervisor_version: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
@@ -1420,6 +1428,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                cloud_hypervisor_version: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
@@ -1521,6 +1530,7 @@ mod tests {
                     image_disk_identity: None,
                     hypervisor: Default::default(),
                     firecracker_bin: None,
+                cloud_hypervisor_version: None,
                     balloon_mib: None,
                     balloon_free_page_reporting: false,
                     page_reporting_order: None,
@@ -1609,6 +1619,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                cloud_hypervisor_version: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
@@ -1822,6 +1833,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                cloud_hypervisor_version: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
@@ -2021,6 +2033,7 @@ mod tests {
             image_disk_identity: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
+                cloud_hypervisor_version: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
             page_reporting_order: None,

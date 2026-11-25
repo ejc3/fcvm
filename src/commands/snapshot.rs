@@ -4251,6 +4251,7 @@ async fn cmd_snapshot_run_inner(
         hugepages,
         extra_disks: snapshot_config.metadata.extra_disks.clone(),
         snapshot_dir: Some(snapshot_dir),
+        cloud_hypervisor_version: snapshot_config.metadata.cloud_hypervisor_version.clone(),
     };
 
     // Run clone setup using shared restore function
@@ -6397,6 +6398,7 @@ async fn cmd_snapshot_run_raw(
         hugepages: false,
         extra_disks: meta.extra_disks.clone(),
         snapshot_dir: Some(paths::snapshot_dir().join(&snapshot_name)),
+        cloud_hypervisor_version: meta.cloud_hypervisor_version.clone(),
     };
     // The clone's first boot is generation 0 of its own id, served from before it resumes.
     if let Err(e) = super::vm::write_generation(&data_dir, &vm_id, 0) {
@@ -7790,6 +7792,7 @@ mod tests {
             image_disk_identity: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
+            cloud_hypervisor_version: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
             page_reporting_order: None,
