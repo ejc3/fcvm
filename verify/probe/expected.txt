@@ -1,0 +1,6 @@
+plain vCPU, registers replayed: CNTPCT_EL0 reads the value written plus the sleep; CNTVCT_EL0 reads the value written plus the sleep
+plain vCPU, KVM_ARM_SET_COUNTER_OFFSET then the replay: CNTPCT_EL0 reads the value written plus the sleep; CNTVCT_EL0 reads the value written plus the sleep
+EL2 vCPU, CNTVOFF_EL2 = 0, registers replayed: CNTPCT_EL0 reads the value written plus the sleep; CNTVCT_EL0 reads the value written plus the sleep
+EL2 vCPU, CNTVOFF_EL2 = X, registers replayed: CNTPCT_EL0 reads the value written plus the sleep, less CNTVOFF_EL2; CNTVCT_EL0 reads the value written plus the sleep, less twice CNTVOFF_EL2
+EL2 vCPU, CNTVOFF_EL2 = 0, KVM_ARM_SET_COUNTER_OFFSET then the replay: CNTPCT_EL0 reads the value written plus the sleep; CNTVCT_EL0 reads the value written plus the sleep
+EL2 vCPU, CNTVOFF_EL2 = X, KVM_ARM_SET_COUNTER_OFFSET then the replay: CNTPCT_EL0 reads the value written plus the sleep; CNTVCT_EL0 reads the value written plus the sleep, less CNTVOFF_EL2
