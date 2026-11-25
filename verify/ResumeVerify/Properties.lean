@@ -71,6 +71,10 @@ def spins (C : Cfg) (s : State) : Bool :=
 def clockOff (s : State) : Bool :=
   running s && s.vm.ctr != .sync { t := 0, o := 0 }
 
+/-- R4, in a VM that was restored and not paused since: the clock a restore gives a clone,
+apart from what a pause in place does. -/
+def clockOffClone (s : State) : Bool := clockOff s && s.vm.clone
+
 /-- R5: a resume in place found a vCPU's interrupt, timer or power state changed. -/
 def sourceDisturbed (s : State) : Bool := s.disturbed
 
@@ -82,6 +86,7 @@ def checks (C : Cfg) : List (String × (State → Bool)) :=
   [("R1 lostIpi", lostIpi), ("R1 lostDeviceIrq", lostDeviceIrq C), ("R1 timerCannotFire", timerCannotFire),
    ("R2 stuckActive", stuckActive), ("R2 stuckPriority", stuckPriority), ("R2 lostEnable", lostEnable),
    ("R2 strayEnable", strayEnable), ("R2 strayPending", strayPending), ("R3 spins", spins C), ("R4 clockOff", clockOff),
+   ("R4 clockOffClone", clockOffClone),
    ("R5 sourceDisturbed", sourceDisturbed), ("R6 powerWrong", powerWrong)]
 
 /-- Every requirement at once. -/

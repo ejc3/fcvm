@@ -255,6 +255,44 @@ theorem design_keeps_repin_level_lostDeviceIrq :
     (replay Design.cloudHypervisor Cfg.level Run.repin_level_lostDeviceIrq (init Cfg.level)).map (healthy Cfg.level) = some true := by
   decide
 
+/-- R1, `cloud-hypervisor-upstream-preserve` in `level`, 5 steps:
+1. the device raises its interrupt
+2. the VMM pauses the vCPUs
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en] device-waits; counter exact -/
+def Run.upstreamPreserve_level_lostDeviceIrq : List Label :=
+  [.dev, .pause, .save, .restore, .resume]
+
+theorem breaks_upstreamPreserve_level_lostDeviceIrq :
+    (replay (Today.cloudHypervisorUpstream false) Cfg.level Run.upstreamPreserve_level_lostDeviceIrq (init Cfg.level)).map (lostDeviceIrq Cfg.level) = some true := by
+  decide
+
+theorem design_keeps_upstreamPreserve_level_lostDeviceIrq :
+    (replay Design.cloudHypervisor Cfg.level Run.upstreamPreserve_level_lostDeviceIrq (init Cfg.level)).map (healthy Cfg.level) = some true := by
+  decide
+
+/-- R1, `cloud-hypervisor-upstream-advance` in `level`, 5 steps:
+1. the device raises its interrupt
+2. the VMM pauses the vCPUs
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en] device-waits; counter exact -/
+def Run.upstreamAdvance_level_lostDeviceIrq : List Label :=
+  [.dev, .pause, .save, .restore, .resume]
+
+theorem breaks_upstreamAdvance_level_lostDeviceIrq :
+    (replay (Today.cloudHypervisorUpstream true) Cfg.level Run.upstreamAdvance_level_lostDeviceIrq (init Cfg.level)).map (lostDeviceIrq Cfg.level) = some true := by
+  decide
+
+theorem design_keeps_upstreamAdvance_level_lostDeviceIrq :
+    (replay Design.cloudHypervisor Cfg.level Run.upstreamAdvance_level_lostDeviceIrq (init Cfg.level)).map (healthy Cfg.level) = some true := by
+  decide
+
 /-- R1, `fork-default` in `level`, 5 steps:
 1. the device raises its interrupt
 2. the VMM pauses the vCPUs
@@ -489,6 +527,61 @@ theorem design_keeps_repin_dump_clockOff :
     (replay Design.cloudHypervisor Cfg.dump Run.repin_dump_clockOff (init Cfg.dump)).map (healthy Cfg.dump) = some true := by
   decide
 
+/-- R4, `cloud-hypervisor-upstream-preserve` in `dump`, 4 steps:
+1. the VMM pauses the vCPUs
+2. the VMM saves the state
+3. host time passes while the guest does not run
+4. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.upstreamPreserve_dump_clockOff : List Label :=
+  [.pause, .save, .wait, .resume]
+
+theorem breaks_upstreamPreserve_dump_clockOff :
+    (replay (Today.cloudHypervisorUpstream false) Cfg.dump Run.upstreamPreserve_dump_clockOff (init Cfg.dump)).map (clockOff) = some true := by
+  decide
+
+theorem design_keeps_upstreamPreserve_dump_clockOff :
+    (replay Design.cloudHypervisor Cfg.dump Run.upstreamPreserve_dump_clockOff (init Cfg.dump)).map (healthy Cfg.dump) = some true := by
+  decide
+
+/-- R4, `cloud-hypervisor-upstream-advance` in `dump`, 4 steps:
+1. the VMM pauses the vCPUs
+2. the VMM saves the state
+3. host time passes while the guest does not run
+4. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.upstreamAdvance_dump_clockOff : List Label :=
+  [.pause, .save, .wait, .resume]
+
+theorem breaks_upstreamAdvance_dump_clockOff :
+    (replay (Today.cloudHypervisorUpstream true) Cfg.dump Run.upstreamAdvance_dump_clockOff (init Cfg.dump)).map (clockOff) = some true := by
+  decide
+
+theorem design_keeps_upstreamAdvance_dump_clockOff :
+    (replay Design.cloudHypervisor Cfg.dump Run.upstreamAdvance_dump_clockOff (init Cfg.dump)).map (healthy Cfg.dump) = some true := by
+  decide
+
+/-- R4, `cloud-hypervisor-upstream-advance` in `dump`, 5 steps:
+1. the VMM pauses the vCPUs
+2. the VMM saves the state
+3. host time passes while the guest does not run
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.upstreamAdvance_dump_clockOffClone : List Label :=
+  [.pause, .save, .wait, .restore, .resume]
+
+theorem breaks_upstreamAdvance_dump_clockOffClone :
+    (replay (Today.cloudHypervisorUpstream true) Cfg.dump Run.upstreamAdvance_dump_clockOffClone (init Cfg.dump)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_upstreamAdvance_dump_clockOffClone :
+    (replay Design.cloudHypervisor Cfg.dump Run.upstreamAdvance_dump_clockOffClone (init Cfg.dump)).map (healthy Cfg.dump) = some true := by
+  decide
+
 /-- R4, `fork-default` in `dump`, 4 steps:
 1. the VMM pauses the vCPUs
 2. the VMM saves the state
@@ -625,6 +718,25 @@ theorem design_keeps_ch_lags_clockOff :
     (replay Design.cloudHypervisor Cfg.lags Run.ch_lags_clockOff (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
   decide
 
+/-- R4, `cloud-hypervisor` in `lags`, 5 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.ch_lags_clockOffClone : List Label :=
+  [.pause, .wait, .save, .restore, .resume]
+
+theorem breaks_ch_lags_clockOffClone :
+    (replay Today.cloudHypervisor Cfg.lags Run.ch_lags_clockOffClone (init Cfg.lags)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_ch_lags_clockOffClone :
+    (replay Design.cloudHypervisor Cfg.lags Run.ch_lags_clockOffClone (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
+  decide
+
 /-- R4, `cloud-hypervisor-repin` in `lags`, 3 steps:
 1. the VMM pauses the vCPUs
 2. host time passes while the guest does not run
@@ -642,6 +754,99 @@ theorem design_keeps_repin_lags_clockOff :
     (replay Design.cloudHypervisor Cfg.lags Run.repin_lags_clockOff (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
   decide
 
+/-- R4, `cloud-hypervisor-repin` in `lags`, 5 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.repin_lags_clockOffClone : List Label :=
+  [.pause, .wait, .save, .restore, .resume]
+
+theorem breaks_repin_lags_clockOffClone :
+    (replay Today.cloudHypervisorRepin Cfg.lags Run.repin_lags_clockOffClone (init Cfg.lags)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_repin_lags_clockOffClone :
+    (replay Design.cloudHypervisor Cfg.lags Run.repin_lags_clockOffClone (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
+  decide
+
+/-- R4, `cloud-hypervisor-upstream-preserve` in `lags`, 3 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.upstreamPreserve_lags_clockOff : List Label :=
+  [.pause, .wait, .resume]
+
+theorem breaks_upstreamPreserve_lags_clockOff :
+    (replay (Today.cloudHypervisorUpstream false) Cfg.lags Run.upstreamPreserve_lags_clockOff (init Cfg.lags)).map (clockOff) = some true := by
+  decide
+
+theorem design_keeps_upstreamPreserve_lags_clockOff :
+    (replay Design.cloudHypervisor Cfg.lags Run.upstreamPreserve_lags_clockOff (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
+  decide
+
+/-- R4, `cloud-hypervisor-upstream-preserve` in `lags`, 7 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM resumes the vCPUs
+4. the VMM pauses the vCPUs
+5. the VMM saves the state
+6. a new VM is restored from the image
+7. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.upstreamPreserve_lags_clockOffClone : List Label :=
+  [.pause, .wait, .resume, .pause, .save, .restore, .resume]
+
+theorem breaks_upstreamPreserve_lags_clockOffClone :
+    (replay (Today.cloudHypervisorUpstream false) Cfg.lags Run.upstreamPreserve_lags_clockOffClone (init Cfg.lags)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_upstreamPreserve_lags_clockOffClone :
+    (replay Design.cloudHypervisor Cfg.lags Run.upstreamPreserve_lags_clockOffClone (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
+  decide
+
+/-- R4, `cloud-hypervisor-upstream-advance` in `lags`, 3 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.upstreamAdvance_lags_clockOff : List Label :=
+  [.pause, .wait, .resume]
+
+theorem breaks_upstreamAdvance_lags_clockOff :
+    (replay (Today.cloudHypervisorUpstream true) Cfg.lags Run.upstreamAdvance_lags_clockOff (init Cfg.lags)).map (clockOff) = some true := by
+  decide
+
+theorem design_keeps_upstreamAdvance_lags_clockOff :
+    (replay Design.cloudHypervisor Cfg.lags Run.upstreamAdvance_lags_clockOff (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
+  decide
+
+/-- R4, `cloud-hypervisor-upstream-advance` in `lags`, 5 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.upstreamAdvance_lags_clockOffClone : List Label :=
+  [.pause, .wait, .save, .restore, .resume]
+
+theorem breaks_upstreamAdvance_lags_clockOffClone :
+    (replay (Today.cloudHypervisorUpstream true) Cfg.lags Run.upstreamAdvance_lags_clockOffClone (init Cfg.lags)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_upstreamAdvance_lags_clockOffClone :
+    (replay Design.cloudHypervisor Cfg.lags Run.upstreamAdvance_lags_clockOffClone (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
+  decide
+
 /-- R4, `fork-default` in `lags`, 3 steps:
 1. the VMM pauses the vCPUs
 2. host time passes while the guest does not run
@@ -657,6 +862,25 @@ theorem breaks_fork_lags_clockOff :
 
 theorem design_keeps_fork_lags_clockOff :
     (replay Design.firecracker Cfg.lags Run.fork_lags_clockOff (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
+  decide
+
+/-- R4, `fork-default` in `lags`, 5 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.fork_lags_clockOffClone : List Label :=
+  [.pause, .wait, .save, .restore, .resume]
+
+theorem breaks_fork_lags_clockOffClone :
+    (replay Today.forkDefault Cfg.lags Run.fork_lags_clockOffClone (init Cfg.lags)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_fork_lags_clockOffClone :
+    (replay Design.firecracker Cfg.lags Run.fork_lags_clockOffClone (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
   decide
 
 /-- R4, `fork-before-630` in `nv-dump`, 4 steps:
@@ -716,6 +940,25 @@ theorem design_keeps_before630_nvL2_clockOff :
     (replay Design.firecracker Cfg.nvL2 Run.before630_nvL2_clockOff (init Cfg.nvL2)).map (healthy Cfg.nvL2) = some true := by
   decide
 
+/-- R4, `fork-before-630` in `nv-l2`, 5 steps:
+1. CPU 1 (a guest hypervisor) loads a nested vCPU: CNTVOFF_EL2 is not zero
+2. the VMM pauses the vCPUs
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en] L2; spi[en]; counter off by 0 of host time, -1 of CNTVOFF_EL2 -/
+def Run.before630_nvL2_clockOffClone : List Label :=
+  [.g true .l2, .pause, .save, .restore, .resume]
+
+theorem breaks_before630_nvL2_clockOffClone :
+    (replay Today.forkBefore630 Cfg.nvL2 Run.before630_nvL2_clockOffClone (init Cfg.nvL2)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_before630_nvL2_clockOffClone :
+    (replay Design.firecracker Cfg.nvL2 Run.before630_nvL2_clockOffClone (init Cfg.nvL2)).map (healthy Cfg.nvL2) = some true := by
+  decide
+
 /-- R4, `fork-before-630` in `nv-lags`, 3 steps:
 1. the VMM pauses the vCPUs
 2. host time passes while the guest does not run
@@ -731,6 +974,25 @@ theorem breaks_before630_nvLags_clockOff :
 
 theorem design_keeps_before630_nvLags_clockOff :
     (replay Design.firecracker Cfg.nvLags Run.before630_nvLags_clockOff (init Cfg.nvLags)).map (healthy Cfg.nvLags) = some true := by
+  decide
+
+/-- R4, `fork-before-630` in `nv-lags`, 5 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.before630_nvLags_clockOffClone : List Label :=
+  [.pause, .wait, .save, .restore, .resume]
+
+theorem breaks_before630_nvLags_clockOffClone :
+    (replay Today.forkBefore630 Cfg.nvLags Run.before630_nvLags_clockOffClone (init Cfg.nvLags)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_before630_nvLags_clockOffClone :
+    (replay Design.firecracker Cfg.nvLags Run.before630_nvLags_clockOffClone (init Cfg.nvLags)).map (healthy Cfg.nvLags) = some true := by
   decide
 
 /-- R4, `fork-nested` in `nv-lags`, 5 steps:
@@ -750,6 +1012,25 @@ theorem breaks_nested_nvLags_clockOff :
 
 theorem design_keeps_nested_nvLags_clockOff :
     (replay Design.firecracker Cfg.nvLags Run.nested_nvLags_clockOff (init Cfg.nvLags)).map (healthy Cfg.nvLags) = some true := by
+  decide
+
+/-- R4, `fork-nested` in `nv-lags`, 5 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.nested_nvLags_clockOffClone : List Label :=
+  [.pause, .wait, .save, .restore, .resume]
+
+theorem breaks_nested_nvLags_clockOffClone :
+    (replay Today.forkNested Cfg.nvLags Run.nested_nvLags_clockOffClone (init Cfg.nvLags)).map (clockOffClone) = some true := by
+  decide
+
+theorem design_keeps_nested_nvLags_clockOffClone :
+    (replay Design.firecracker Cfg.nvLags Run.nested_nvLags_clockOffClone (init Cfg.nvLags)).map (healthy Cfg.nvLags) = some true := by
   decide
 
 end Resume

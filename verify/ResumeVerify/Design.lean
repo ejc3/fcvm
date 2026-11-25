@@ -23,7 +23,7 @@ namespace Design
 def cloudHypervisor : Rules :=
   { name := "design-cloud-hypervisor",
     slotsFromRestore := false, cntAtPause := true, freeze := true, freezeLoaded := true,
-    levelInfo := true, clearInverted := true,
+    advance := false, levelInfo := true, clearInverted := true,
     restore := [.offset,
                 .create false, .init false false, .cntp false, .cntv false, .regs false, .mp false,
                 .create true, .init true true, .cntp true, .cntv true, .regs true, .mp true,
@@ -32,7 +32,7 @@ def cloudHypervisor : Rules :=
 def firecracker : Rules :=
   { name := "design-firecracker",
     slotsFromRestore := false, cntAtPause := true, freeze := true, freezeLoaded := true,
-    levelInfo := true, clearInverted := true,
+    advance := false, levelInfo := true, clearInverted := true,
     restore := [.offset] ++ Today.fcOrder false ++ [.level] }
 
 end Design

@@ -12,7 +12,8 @@ where one could be.
 | 1 | The save reads vCPU 0's redistributor and CPU interface for every vCPU of a booted VM | `cloud-hypervisor` | R1 lostIpi, R2 stuckActive, stuckPriority, strayPending, strayEnable, R3 spins | real, reachable | high: a clone's vCPU that never takes an interrupt again |
 | 2 | Clear-registers written with the saved bits | `cloud-hypervisor`, every fork pin | R2 strayEnable | real, reachable | low |
 | 3 | No `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` | all of today's | R1 lostDeviceIrq | real, unreachable: no device of either VMM under fcvm holds a level line | none today |
-| 4 | Nothing owns the counter offset: a pause in place moves the clock | `cloud-hypervisor`, `cloud-hypervisor-repin`, `fork-default`, `fork-before-630` | R4 clockOff | real, reachable | low for an ordinary guest; #630 for a guest hypervisor |
+| 4 | Nothing owns the counter offset: a pause in place moves the clock | `cloud-hypervisor`, `cloud-hypervisor-repin`, both `cloud-hypervisor-upstream`, `fork-default`, `fork-before-630` | R4 clockOff | real, reachable | low for an ordinary guest; #630 for a guest hypervisor |
+| 4a | `clock_restore_mode=advance`: a restore adds the wall time since the pause | `cloud-hypervisor-upstream-advance` | R4 clockOffClone | real; unreachable if fcvm passes `preserve` | by design upstream; every armed timer due at once in an old snapshot's clone |
 | 5 | `CNTVCT_EL0` replayed into the physical offset with `CNTVOFF_EL2` not zero | `fork-before-630` | R4 clockOff, R1 timerCannotFire | real, unreachable today: the nested pin sets the offset first | was high |
 | 6 | The image holds the counter of the save; load to resume is not taken out | `fork-nested` (and every book of 4) | R4 clockOff | real, reachable, bounded by fcvm's own latency | low |
 | 7 | CPU-interface registers passed as 32 bits | `cloud-hypervisor` | not modelled | real, reachable | unknown effect; an overrun of four bytes |
@@ -145,6 +146,8 @@ What fcvm's users see today:
 | VMM | A source resumed in place | A clone |
 |---|---|---|
 | Cloud Hypervisor (pinned and fix branch) | clock ahead by the pause | ahead by the gaps of 6 |
+| Cloud Hypervisor upstream, `preserve` | clock ahead by the pause | as the pause left it |
+| Cloud Hypervisor upstream, `advance` | clock ahead by the pause | ahead by the host time since the pause |
 | default fork (2a33289b55b7) | clock ahead by the pause | ahead by the gaps of 6 |
 | nested fork (dbea5779fb37) | clock as the pause left it | ahead by the gaps of 6 |
 
@@ -152,6 +155,35 @@ For an ordinary guest this is what every KVM pause does, and Linux tolerates it:
 fire once and `CLOCK_MONOTONIC` includes the pause. For a guest hypervisor it was #630: the fix
 (0baf5b0b) is on the nested pin only, and was meant for NV2. `fork-before-630` reproduces it
 (`nv-dump`, R4@4); `fork-nested` does not.
+
+**Cloud Hypervisor upstream** (4969a51a3d3f, which fcvm is moving to; `Today.cloudHypervisorUpstream`):
+
+- The counter is captured in `Vm::pause` as soon as the vCPUs are quiesced (vmm/src/vm.rs:
+  2915-2918) and written once, through vCPU 0, at the resume of a restored VM (vm.rs:2877-2888,
+  2946-2947; hypervisor/src/kvm/mod.rs:1257-1295). So both gaps of 6 are closed for a clone.
+- `preserve` writes the saved value: the clone's clock is the one of the pause
+  (`upstreamPreserve_oldSnapshot`). The search finds no break of R4 in a clone except one its
+  source already had (`lags`, clockOffClone@7: the source was paused and resumed in place
+  before the snapshot).
+- `advance`, the default, writes the saved value plus the wall time since the capture: the
+  clone's counter is ahead by the whole time since the pause, and a timer armed before the
+  pause is due the moment the clone runs (`upstreamAdvance_oldSnapshot`; `dump`,
+  clockOffClone@5). That is the forward jump of #630's account, chosen on purpose so that the
+  guest's clock follows wall time; fcvm passing `preserve` avoids it.
+- A resume in place does nothing to the counter in either mode (`SameHostResume` returns at
+  once, kvm/mod.rs:1257-1268): the source's clock is ahead by the pause
+  (`upstream_resumeInPlace`), as with today's pin.
+- Writing through vCPU 0 alone is sound for the other vCPUs because the virtual offset is the
+  VM's: every vCPU's virtual timer context points at `kvm->arch.timer_data.voffset`
+  (v7.3.3 arch_timer.c:1075-1090) and a user write of `KVM_REG_ARM_TIMER_CNT` stores into it
+  (sys_regs.c:1790-1793, include/kvm/arm_arch_timer.h:188-196). Read at v7.3.3 and v6.18.3
+  only. It would not hold for a guest hypervisor's vCPU with `CNTVOFF_EL2` set (5), which
+  upstream refuses to snapshot (vm.rs, "Snapshot not supported with aarch64 nested
+  virtualization").
+- The per-vCPU register replay still writes each vCPU's saved counter (kvm/mod.rs:3256-3261);
+  the write at the resume comes last and wins.
+- Its PL031 RTC still raises no interrupt (devices/src/legacy/rtc_pl031.rs:9-10), so 3 stays
+  unreachable.
 
 ## 5. The fork before 0baf5b0b: a restore with `CNTVOFF_EL2` not zero
 

@@ -102,6 +102,8 @@ structure VM where
   ideal : Nat
   /-- this VM was made by a restore (Cloud Hypervisor then knows its redistributors) -/
   restored : Bool
+  /-- this VM was made by a restore and has not been paused since -/
+  clone : Bool
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 /-- A vCPU index. `false` is vCPU 0. -/
@@ -250,8 +252,11 @@ structure Rules where
   cntAtPause : Bool
   /-- a resume moves the counter offset by the time paused (the guest's clock stood still) -/
   freeze : Bool
-  /-- a restored VM counts as paused from its load, for `freeze` -/
+  /-- the resume of a restored VM takes out the time since its load (or, the same thing, the
+  counter is written at that resume and not at the load) -/
   freezeLoaded : Bool
+  /-- a restore sets the counter to the saved one plus the wall time since the pause -/
+  advance : Bool
   /-- the save reads `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` -/
   levelInfo : Bool
   /-- the restore writes the clear-registers (`ICENABLER`, `ICACTIVER`) with the complement of
@@ -424,7 +429,7 @@ def freshVcpu : Vcpu :=
 /-- The VM a restore starts from: nothing created. -/
 def emptyVM : VM :=
   { c0 := freshVcpu, c1 := freshVcpu, spi := IrqSt.none, dev := false, gicEn := false,
-    ctr := .fresh, offFlag := false, ideal := 0, restored := true }
+    ctr := .fresh, offFlag := false, ideal := 0, restored := true, clone := true }
 
 /-- A clear-register written with `clr`, then its set-register with `set`: a bit that was set
 and is not in `clr` stays (`vgic_uaccess_write_cenable` and `_senable`, vgic-mmio.c:189-228;
@@ -515,7 +520,7 @@ def enter (m : VM) (c : Vcpu) : Vcpu :=
 
 def resumeVM (R : Rules) (s : State) : VM :=
   let m := s.vm
-  let frozen := R.freeze && (s.ph == .paused || R.freezeLoaded)
+  let frozen := if s.ph == .paused then R.freeze else R.freezeLoaded
   let m := if frozen then
       { m with ctr := match m.ctr with
                       | .sync e => .sync { e with t := e.t - s.since }
@@ -568,7 +573,7 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
     if s.ph != .running || s.snaps ≥ C.maxSnaps then none else
       some { s with ph := .paused, since := 0, img := none,
                     kept := some (s.vm.c0.keep, s.vm.c1.keep),
-                    vm := { s.vm with c0 := pauseVcpu s.vm.c0, c1 := pauseVcpu s.vm.c1 } }
+                    vm := { s.vm with c0 := pauseVcpu s.vm.c0, c1 := pauseVcpu s.vm.c1, clone := false } }
   | .save =>
     if s.ph != .paused || s.img.isSome then none else
       some { s with img := some (save R s), snaps := s.snaps + 1 }
@@ -586,8 +591,14 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
     | none => none
     | some i =>
       if s.ph != .paused || s.restores ≥ C.maxRestores then none else
+        let m := build R C i
         some { s with ph := .loaded, since := 0, kept := none, img := none,
-                      restores := s.restores + 1, vm := build R C i }
+                      restores := s.restores + 1,
+                      vm := if R.advance then
+                              { m with ctr := match m.ctr with
+                                              | .sync e => .sync { e with t := e.t + s.since }
+                                              | .fresh => .fresh }
+                            else m }
 
 /-- A guest that has booted: both CPUs running, the interrupts it uses enabled, the priority
 mask open, nothing pending. A CPU the guest took offline has its timer interrupt and its SGI
@@ -601,7 +612,8 @@ def bootVcpu (off : Bool) : Vcpu :=
 def init (C : Cfg) : State :=
   { vm := { c0 := bootVcpu false, c1 := bootVcpu C.cpu1Off,
             spi := { IrqSt.none with en := true }, dev := false, gicEn := true,
-            ctr := .sync { t := 0, o := 0 }, offFlag := false, ideal := 0, restored := false },
+            ctr := .sync { t := 0, o := 0 }, offFlag := false, ideal := 0, restored := false,
+            clone := false },
     ph := .running, img := none, since := 0, kept := none, disturbed := false,
     snaps := 0, restores := 0, waits := 0 }
 

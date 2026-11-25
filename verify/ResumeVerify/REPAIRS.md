@@ -58,8 +58,12 @@ make: Linux tolerates the jump, and it is what every KVM pause does. In order of
   between fcvm's pause and its save, or between a load and its resume, for a nested guest.
 - **Default pin.** The fork has the code for the nested pin; the default pin's branch does not
   carry it. Without it a source resumed in place has its clock moved by the pause.
-- **Cloud Hypervisor.** It has no counter code at all; this is a change to Cloud Hypervisor,
-  not to how fcvm uses it. Lowest priority: fcvm's Cloud Hypervisor guests are not hypervisors.
+- **Cloud Hypervisor.** The pin has no counter code at all. Upstream at 4969a51a3d3f does the
+  clone's half: with `clock_restore_mode=preserve` a clone's clock is the one of the pause
+  (`BREAKS.md`, 4). fcvm has to pass `preserve`; the default, `advance`, puts the whole time
+  since the snapshot into the clone's clock. A source resumed in place still has its clock
+  moved by the pause there. Lowest priority: fcvm's Cloud Hypervisor guests are not
+  hypervisors.
 
 ## 4. Level information
 

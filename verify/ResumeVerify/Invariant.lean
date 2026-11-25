@@ -28,7 +28,7 @@ def rebuilt (i : Image) : VM :=
   { c0 := vcpuOf i.s0, c1 := vcpuOf i.s1,
     spi := { en := i.spi.en, latch := i.spi.latch, line := i.spi.line, act := i.spi.act },
     dev := i.dev, gicEn := i.gicEn, ctr := i.s0.cnt, offFlag := true, ideal := i.ideal,
-    restored := true }
+    restored := true, clone := true }
 
 /-- What the proofs need of a rule book. -/
 structure Sound (R : Rules) : Prop where
@@ -40,6 +40,8 @@ structure Sound (R : Rules) : Prop where
   freeze : R.freeze = true
   /-- repair 2: and the time between a load and its resume -/
   freezeLoaded : R.freezeLoaded = true
+  /-- the restore does not add wall time to the counter -/
+  noAdvance : R.advance = false
   /-- repair 3: the lines of level interrupts are saved -/
   levelInfo : R.levelInfo = true
   /-- the restore, in whatever order, builds the VM the image describes -/

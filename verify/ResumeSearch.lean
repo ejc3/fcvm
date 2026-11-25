@@ -123,7 +123,8 @@ partial def pathTo (f : Found) (i : Nat) : List Label :=
 
 def nvBooks : List Rules := [Today.forkBefore630, Today.forkNested, Design.firecracker]
 def elBooks : List Rules :=
-  [Today.cloudHypervisor, Today.cloudHypervisorRepin, Today.forkDefault, Design.cloudHypervisor, Design.firecracker]
+  [Today.cloudHypervisor, Today.cloudHypervisorRepin, Today.cloudHypervisorUpstream false,
+   Today.cloudHypervisorUpstream true, Today.forkDefault, Design.cloudHypervisor, Design.firecracker]
 
 def booksFor (C : Cfg) : List Rules := if C.nv then nvBooks else elBooks
 
@@ -135,6 +136,7 @@ def mutants : List Rules :=
    { d with name := "ch: image holds the counter of the save", cntAtPause := false },
    { d with name := "ch: resume does not take out the pause", freeze := false },
    { d with name := "ch: load to resume not taken out", freezeLoaded := false },
+   { d with name := "ch: restore adds the wall time since the pause", advance := true },
    { d with name := "ch: lines not saved", levelInfo := false },
    { d with name := "ch: clear-registers written with the saved bits", clearInverted := false },
    { d with name := "ch: no KVM_ARM_SET_COUNTER_OFFSET on restore", restore := d.restore.filter (· != .offset) },

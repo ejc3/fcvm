@@ -42,7 +42,7 @@ namespace Today
 def cloudHypervisor : Rules :=
   { name := "cloud-hypervisor",
     slotsFromRestore := true, cntAtPause := false, freeze := false, freezeLoaded := false,
-    levelInfo := false, clearInverted := false,
+    advance := false, levelInfo := false, clearInverted := false,
     restore := [.create false, .init false false, .cntp false, .cntv false, .regs false, .mp false,
                 .create true, .init true true, .cntp true, .cntv true, .regs true, .mp true,
                 .gic, .dist, .redist false, .redist true, .icc false, .icc true] }
@@ -56,6 +56,39 @@ distinguish. Nothing in the six touches the counter or the level information. -/
 def cloudHypervisorRepin : Rules :=
   { cloudHypervisor with name := "cloud-hypervisor-repin", slotsFromRestore := false,
                          clearInverted := true }
+
+/-- Cloud Hypervisor upstream, cloud-hypervisor/cloud-hypervisor 4969a51a3d3f (main, v55.0 and
+117 commits), which fcvm is moving to, with `clock_restore_mode=preserve` (what fcvm will pass)
+or `advance` (the default).
+
+* Addressing and clear-registers as `cloudHypervisorRepin`
+  (hypervisor/src/kvm/aarch64/gic/mod.rs:357, 428; redist_regs.rs:137; dist_regs.rs:176); the
+  CPU-interface registers at 64 bits (icc_regs.rs:84, 100). Still no `LEVEL_INFO`.
+* The counter is captured at the pause: `Vm::pause` reads the boot vCPU's
+  `KVM_REG_ARM_TIMER_CNT` and the host's wall clock as soon as the vCPUs are quiesced
+  (vmm/src/vm.rs:2915-2918; `snapshot_clock`, hypervisor/src/kvm/mod.rs:1165-1184), and the
+  snapshot holds that (vm.rs:3002).
+* A resume in place does nothing to it: for `SameHostResume`, `restore_clock` returns at once
+  (kvm/mod.rs:1257-1268), so the counter has run through the pause.
+* A restore writes one counter value through vCPU 0 at the resume, before the vCPUs run
+  (`Vm::resume` calls `restore_guest_clock`, vm.rs:2877-2888, 2946-2947): the saved value for
+  `preserve`, the saved value plus the wall time since the capture for `advance`
+  (kvm/mod.rs:1278-1295). One write serves every vCPU because KVM's offset is the VM's
+  (v7.3.3 arch_timer.c:1075-1090, include/kvm/arm_arch_timer.h:188-196). The per-vCPU register
+  replay still writes each vCPU's saved counter first (kvm/mod.rs:3256-3261); the write at the
+  resume is the last and wins.
+* All vCPUs are created, then restored on several threads (vmm/src/cpu.rs:1169-1205). The model
+  restores vCPU 0 then vCPU 1; the order cannot matter for the counter, which is written again
+  at the resume. The rest of the order is taken from a354afd77 and was not read again here. -/
+def cloudHypervisorUpstream (advance : Bool) : Rules :=
+  { name := if advance then "cloud-hypervisor-upstream-advance" else "cloud-hypervisor-upstream-preserve",
+    slotsFromRestore := false, cntAtPause := true, freeze := false, freezeLoaded := !advance,
+    advance := advance, levelInfo := false, clearInverted := true,
+    restore := [.create false, .create true,
+                .init false false, .cntp false, .cntv false, .regs false, .mp false,
+                .init true true, .cntp true, .cntv true, .regs true, .mp true,
+                .gic, .dist, .redist false, .redist true, .icc false, .icc true,
+                .cntv false] }
 
 /-- The order of a Firecracker restore (src/vmm/src/builder.rs `build_microvm_from_snapshot`):
 all vCPUs made, with the vGIC after them (`Vm::create_vcpus`), then each vCPU's
@@ -79,7 +112,7 @@ vCPU's redistributor and CPU interface is addressed by that vCPU's saved MPIDR
 def forkBefore630 : Rules :=
   { name := "fork-before-630",
     slotsFromRestore := false, cntAtPause := false, freeze := false, freezeLoaded := false,
-    levelInfo := false, clearInverted := false, restore := fcOrder false }
+    advance := false, levelInfo := false, clearInverted := false, restore := fcOrder false }
 
 /-- The fork as pinned for every profile but the nested arm64 one, ejc3/firecracker
 2a33289b55b7 (rootfs-config.toml `[firecracker]`). It does not carry 0baf5b0b: for the
@@ -94,7 +127,7 @@ moved by the time since `pause_vm` (src/vmm/src/lib.rs:478-524). A restored VM s
 def forkNested : Rules :=
   { name := "fork-nested",
     slotsFromRestore := false, cntAtPause := false, freeze := true, freezeLoaded := false,
-    levelInfo := false, clearInverted := false, restore := fcOrder true }
+    advance := false, levelInfo := false, clearInverted := false, restore := fcOrder true }
 
 end Today
 

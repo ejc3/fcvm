@@ -1,6 +1,7 @@
 import ResumeVerify.Lemmas
 import ResumeVerify.Today
 import ResumeVerify.Design
+import ResumeVerify.Configs
 
 set_option linter.unusedSimpArgs false
 
@@ -49,7 +50,8 @@ theorem save_wait {R : Rules} {s : State} (hR : Sound R)
 
 theorem resume_ok {R : Rules} {C : Cfg} {s : State} (h : MOk C s.vm) : MOk C (resumeVM R s) := by
   simp only [resumeVM]
-  split <;> exact ⟨enter_ok h.1, enter_ok h.2, h.3, h.4, h.5, h.6, h.7, h.8, h.9⟩
+  repeat' split
+  all_goals exact ⟨enter_ok h.1, enter_ok h.2, h.3, h.4, h.5, h.6, h.7, h.8, h.9⟩
 
 theorem resume_ctr {R : Rules} {s : State} (hR : Sound R)
     (hc : s.vm.ctr = .sync { t := s.since, o := 0 }) :
@@ -145,7 +147,7 @@ theorem step_inv {R : Rules} {C : Cfg} {s t : State} {l : Label} (hR : Sound R)
     · exact nomatch hs
     · rename_i i
       peel
-      simp only [Option.some.injEq] at hs
+      simp only [hR.noAdvance, Option.some.injEq] at hs
       subst hs
       obtain ⟨hp, rfl⟩ := h.img i hi
       have hc := h.held (by rw [hp]; decide)
@@ -270,6 +272,7 @@ theorem sound_healthy (hR : Sound R) (h : Reachable R C s) : healthy C s = true 
   simp [healthy, checks, sound_noLostIpi hR h, sound_noLostDeviceIrq hR h, sound_timerCanFire hR h,
     sound_noStuckActive hR h, sound_noStuckPriority hR h, sound_noLostEnable hR h,
     sound_noStrayEnable hR h, sound_noStrayPending hR h, sound_noSpin hR h, sound_clockRight hR h,
+    clockOffClone,
     sound_sourceUndisturbed hR h, sound_powerRight hR h]
 
 end
@@ -280,12 +283,12 @@ theorem clearSet_inv (c s : Bool) : clearSet c (!s) s = s := by
   cases c <;> cases s <;> rfl
 
 theorem Design.cloudHypervisor_sound : Sound Design.cloudHypervisor :=
-  ⟨rfl, rfl, rfl, rfl, rfl, fun C i => by
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun C i => by
     simp [build, Design.cloudHypervisor, apply, clrOf, clearSet_inv, rebuilt, vcpuOf, emptyVM,
       freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
 theorem Design.firecracker_sound : Sound Design.firecracker :=
-  ⟨rfl, rfl, rfl, rfl, rfl, fun C i => by
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun C i => by
     simp [build, Design.firecracker, Today.fcOrder, apply, clrOf, clearSet_inv, rebuilt, vcpuOf,
       emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
@@ -307,9 +310,40 @@ theorem forkNested_load_not_frozen : Today.forkNested.freezeLoaded = false := rf
 theorem cloudHypervisorRepin_no_freeze : Today.cloudHypervisorRepin.freeze = false := rfl
 theorem cloudHypervisorRepin_not_sound : ¬ Sound Today.cloudHypervisorRepin := fun h => nomatch h.freeze
 
+theorem cloudHypervisorUpstream_no_freeze (a : Bool) :
+    (Today.cloudHypervisorUpstream a).freeze = false := rfl
+theorem cloudHypervisorUpstream_not_sound (a : Bool) : ¬ Sound (Today.cloudHypervisorUpstream a) :=
+  fun h => nomatch h.freeze
+
 theorem cloudHypervisor_not_sound : ¬ Sound Today.cloudHypervisor := fun h => nomatch h.ownSlots
 theorem forkDefault_not_sound : ¬ Sound Today.forkDefault := fun h => nomatch h.freeze
 theorem forkBefore630_not_sound : ¬ Sound Today.forkBefore630 := fun h => nomatch h.freeze
 theorem forkNested_not_sound : ¬ Sound Today.forkNested := fun h => nomatch h.cntAtPause
+
+/-! ## Cloud Hypervisor upstream's two clock modes, on one run -/
+
+/-- The run: CPU 0 arms its timer one unit ahead, the VM is paused and saved, host time passes,
+a clone is restored and resumed. -/
+def Run.oldSnapshot : List Label := [.g false .arm, .pause, .save, .wait, .restore, .resume]
+
+/-- `advance` (the default): the clone's counter is ahead by the host time since the pause, and
+the timer armed before the pause is due the moment the clone runs. -/
+theorem upstreamAdvance_oldSnapshot :
+    (replay (Today.cloudHypervisorUpstream true) Cfg.dump Run.oldSnapshot (init Cfg.dump)).map
+      (fun s => clockOffClone s && s.vm.c0.tmr.line) = some true := by
+  decide
+
+/-- `preserve`: the clone's counter is the one of the pause and the timer is not due. -/
+theorem upstreamPreserve_oldSnapshot :
+    (replay (Today.cloudHypervisorUpstream false) Cfg.dump Run.oldSnapshot (init Cfg.dump)).map
+      (fun s => !clockOff s && !s.vm.c0.tmr.line) = some true := by
+  decide
+
+/-- A pause and a resume in place, in either mode: the source's counter has run through the
+pause. -/
+theorem upstream_resumeInPlace (advance : Bool) :
+    (replay (Today.cloudHypervisorUpstream advance) Cfg.dump [.pause, .save, .wait, .resume]
+      (init Cfg.dump)).map clockOff = some true := by
+  cases advance <;> decide
 
 end Resume
