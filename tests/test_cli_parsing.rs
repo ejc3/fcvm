@@ -307,3 +307,36 @@ fn snapshot_import_takes_no_tag_and_needs_a_file_for_input() {
         ErrorKind::UnknownArgument
     );
 }
+
+/// A command that needs the config, run where none can be found, returns an error: exit
+/// status 1 and the search list on stderr, not a panic (exit status 101). A runner that
+/// reads fcvm's exit status (www_sim's VM runner) cannot tell a panic from a crash.
+#[test]
+fn a_missing_config_is_an_error_not_a_panic() {
+    // The system config is on the search list too, and a host that has one cannot produce
+    // the condition under test.
+    assert!(
+        !std::path::Path::new("/etc/fcvm/rootfs-config.toml").exists(),
+        "this host has /etc/fcvm/rootfs-config.toml, so fcvm always finds a config here"
+    );
+    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
+    let empty = tempfile::tempdir().expect("tempdir");
+    // The binary's own directory is on the search list, so run a copy from the empty one.
+    let fcvm_copy = empty.path().join("fcvm");
+    std::fs::copy(&fcvm_path, &fcvm_copy).expect("copying fcvm");
+    let output = Command::new(&fcvm_copy)
+        .args(["ls", "--json"])
+        .current_dir(empty.path())
+        .env("HOME", empty.path())
+        .env("FCVM_CONFIG_DIR", empty.path())
+        .env_remove("FCVM_DATA_DIR")
+        .output()
+        .expect("failed to run fcvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("No rootfs config found"),
+        "stderr: {stderr}"
+    );
+}
