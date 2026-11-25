@@ -28,9 +28,10 @@ import time
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 RENDERS_SLOTS = ("renders-build", "renders-verify")
 TRACKS = {"pair": SLOTS, "renders": RENDERS_SLOTS}
-# Proofs the renders validator runs on its cold boot only (pipeline_guest.py RENDERS_PROOFS).
-# The frame server's viewer acceptance joins them here once it exists.
-RENDERS_COLD_PROOFS = ("renders-agent",)
+# Proofs the renders validator runs on its cold boot only (pipeline_guest.py RENDERS_PROOFS): the
+# agent check with every case, and the agent unit's own words under its running case. The frame
+# server's viewer acceptance joins them here once it exists.
+RENDERS_COLD_PROOFS = ("renders-agent", "renders-unit")
 ROOT = Path(__file__).resolve().parents[2]
 REMOTE = "/opt/fcvm-image-source"
 GUEST = REMOTE + "/fleet/ami/pipeline_guest.py"
@@ -437,16 +438,23 @@ class Pipeline:
                     "candidate failed the launch-path proof (NIC before cloud-init, EC2 datasource, user data ran)")
             require(result.get("kernel_release") == record["kernel_release"],
                     "candidate booted another kernel than the one its build installed")
-            require(result.get("renders_host") is True,
-                    "candidate failed the renders host check: " + failures_summary(result.get("renders_host_problems")))
-            require(not cold or result.get("renders_agent") is True,
-                    "candidate failed the agent check: " + failures_summary(result.get("renders_agent_failures")))
+            # Each verdict is the guest's own, with the number of failures behind it; a pass
+            # without its count is not a pass.
+            for key, label, what, asked in (("renders_host", "problem", "the renders host check", True),
+                                            ("renders_agent", "failure", "the agent check", cold),
+                                            ("renders_unit", "failure", "the agent unit's own words", cold)):
+                if not asked:
+                    continue
+                count = result.get(key + "_" + label + "_count")
+                require(result.get(key) is True and count == 0,
+                        f"candidate failed {what} ({count if type(count) is int else 'no count of'} {label}s): "
+                        + failures_summary(result.get(key + "_" + label + "s")))
             require(re.fullmatch(r"[0-9a-f-]{36}", result.get("boot_id", "")), "candidate has no boot identity")
             boots.append(result["boot_id"])
         require(len(set(boots)) == 3, "cold boot, reboot and stop/start did not produce three boots")
         result["boot_ids"] = boots
-        # The record is the last boot's result; the agent check passed on the cold boot.
-        result["renders_agent"] = True
+        # The record is the last boot's result; the agent check and the unit passed on the cold boot.
+        result["renders_agent"] = result["renders_unit"] = True
         del result["boot_id"]
         return result
 

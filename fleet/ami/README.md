@@ -74,11 +74,17 @@ the pointer and the dispatcher's slots are ejc3/aws's.
 Validation: the cold boot, the reboot and the stop/start each run the security proofs every image
 carries, the pool and store units up in order after the guard, the launch path, and
 `renders/host-check.py host` (the running kernel is the `-fcvm` kernel the build installed, the
-boot line has each of `RENDERS_BOOT_PARAMS` and no other value for a parameter the campaign's host
-record keeps, 34,000 pages of 2 MiB reserved, `/dev/kvm`, the units enabled, the agent's
-environment, Kitesurf's sealed tree, the bundle and the snapshot). The cold boot also runs
-`make test-fleet-renders-agent` with every case. A failure names the check's problems or the
-agent check's failing cases, and no manifest is written.
+boot line holds each of `RENDERS_BOOT_PARAMS` and nothing but them and the base image's
+parameters, `RENDERS_BOOT_BASE_KEYS`, 34,000 pages of 2 MiB reserved, `/dev/kvm`, the units
+enabled, the agent's environment, Kitesurf's sealed tree, the bundle and the snapshot). The cold
+boot also runs `make test-fleet-renders-agent` with every case the check defines, and the agent
+unit's own words: `systemd-analyze verify` on the installed unit, then the check's running case
+(hello, renders on both sides, an overlay, a stop with nothing left) on a transient unit with the
+installed unit's `[Service]` settings and `ExecStart`, the image's `renders.env`, and a validation
+`agent.env` whose only argument is `--stdio`. Each verdict is decided from the proof's raw result
+(exit status, problem or case list); the record carries each failure (a fixed sentence where its
+text cannot be kept) and their count, a pass without its count does not publish, and no manifest
+is written on a failure.
 
 An accepted request is not a published release. Check the request's AWS status and
 the release manifest for validation and promotion results. Infrastructure, the

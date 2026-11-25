@@ -150,6 +150,36 @@ else: sys.exit(91)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
             return result, calls
 
+    def test_a_renders_builder_of_another_type_is_refused_before_any_ec2_call(self):
+        # A renders builder launches outside the wall's G reserve, so the type is the renders
+        # host's or nothing: TYPE= cannot launch a G instance past the reserve as kind renders.
+        with tempfile.TemporaryDirectory(prefix="fleet-launch-test-") as temporary:
+            directory = Path(temporary)
+            log = directory / "calls.jsonl"
+            binary = directory / "bin"
+            binary.mkdir()
+            fake = binary / "aws"
+            fake.write_text('''#!/usr/bin/python3
+import json,os,sys
+args=sys.argv[1:]
+if args[:1]==['--region']: args=args[2:]
+with open(os.environ['LAUNCH_TEST_LOG'],'a') as output:output.write(json.dumps(args)+'\\n')
+if tuple(args[:2])==('sts','get-caller-identity'): print('111122223333')
+else: sys.exit(91)
+''')
+            fake.chmod(0o755)
+            for type_ in ("g4dn.metal", "m8gd.metal-48xl"):
+                with self.subTest(type=type_):
+                    log.write_text("")
+                    result = subprocess.run(["bash", str(AMI / "build-ami.sh"), "launch", "renders"],
+                                            capture_output=True, text=True, timeout=15,
+                                            env={**os.environ, "PATH": str(binary) + ":/usr/bin:/bin",
+                                                 "LAUNCH_TEST_LOG": str(log), "TYPE": type_})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("not the renders host type", result.stderr)
+                    calls = [json.loads(line) for line in log.read_text().splitlines()]
+                    self.assertFalse([c for c in calls if c[:1] == ["ec2"]], calls)
+
     def test_failed_remote_guard_never_creates_an_image(self):
         result, calls = self.image_branch(False)
         self.assertNotEqual(result.returncode, 0)

@@ -2605,7 +2605,9 @@ m8gd.metal-24xl. The image makes a host the configuration the recorded figures w
   `kvm-arm.mode=nested numa=off arm64.nv2`. The three are `RENDERS_BOOT_PARAMS` in
   `fleet/ami/renders/renders.conf`, which a test holds equal to the nested arm64 profile's
   `boot_args`; the build and every validation boot fail on another kernel, on a missing one of the
-  three, or on another value of a parameter the campaign's host record keeps.
+  three, or on any parameter other than them and the base image's (`RENDERS_BOOT_BASE_KEYS`: the
+  boot loader's and the cloud image's). A test holds every parameter the campaign's host record
+  keeps to one of the three or refused, so none can be present without being recorded.
 - 34,000 pages of 2 MiB (`RENDERS_HUGEPAGES`) reserved through sysfs by
   `fcvm-fleet-hugepages.service` in the first transaction of the boot, before the store's restore.
   A short pool fails the unit and the agent, which requires it, does not start.
@@ -2633,7 +2635,8 @@ either the Kitesurf commit or the boot line changes, the reference is measured a
 campaign, whose summary the test then reads.
 
 The image publishes only after `make test-fleet-renders-agent` has passed every case on its cold
-boot. It is a track of its own: it shares no renderer with the GPU host and tile pair, so neither
+boot, and the check's running case has passed on the agent unit's own words (its settings,
+`ExecStart` and `renders.env`, with `--stdio` standing in for the coordinator's address). It is a track of its own: it shares no renderer with the GPU host and tile pair, so neither
 track's failure holds or publishes the other.
 
 ## Windows mode

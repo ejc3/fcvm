@@ -151,6 +151,7 @@ class Worker:
         self.tls = {}
         self.artifact_fault = None
         self.renders_asks = []
+        self.renders_drop = ()
         self.renders_kernel = RENDERS_RECORD["kernel_release"]
         self.renders_record = dict(RENDERS_RECORD)
         self.secret_writes = 0
@@ -257,13 +258,21 @@ class Worker:
                         value[self.bad_proof] = False
                 elif action == "verify-renders":
                     cold = "renders-agent" in args[3:]
-                    self.renders_asks.append(cold)
+                    self.renders_asks.append(tuple(args[3:]))
                     value = {"boot_id": identity, "guard": True, "sanitized": True, "launch_path": True,
-                        "kernel_release": self.renders_kernel, "renders_host": True, "renders_agent": cold}
+                        "kernel_release": self.renders_kernel, "renders_host": True, "renders_host_problem_count": 0,
+                        "renders_agent": cold, "renders_unit": "renders-unit" in args[3:]}
+                    if cold:
+                        value["renders_agent_failure_count"] = 0
+                    if "renders-unit" in args[3:]:
+                        value["renders_unit_failure_count"] = 0
                     if self.bad_proof in value:
                         value[self.bad_proof] = False
-                        value[self.bad_proof + "_problems" if self.bad_proof == "renders_host" else "renders_agent_failures"] = \
-                            ["held:engines", "kill:running"]
+                        label = "problem" if self.bad_proof == "renders_host" else "failure"
+                        value[self.bad_proof + "_" + label + "s"] = ["held:engines", "kill:running"]
+                        value[self.bad_proof + "_" + label + "_count"] = 2
+                    for key in self.renders_drop:
+                        value.pop(key, None)
                 elif action == "renders-record":
                     value = dict(self.renders_record)
                 else:
@@ -1856,13 +1865,26 @@ class RendersTrackTests(unittest.TestCase):
         prep = next(i for i, text in enumerate(self.commands("renders-build")) if "/renders/build.sh prep" in text)
         self.assertLess(upgrade, prep)
 
-    def test_the_agent_check_runs_on_the_cold_boot_only(self):
-        self.run_driver()
-        self.assertEqual(self.worker.renders_asks, [True, False, False])
+    def test_the_agent_check_and_the_units_own_words_run_on_the_cold_boot_only(self):
+        result = self.run_driver()
+        self.assertEqual(self.worker.renders_asks, [("renders-agent", "renders-unit"), (), ()])
+        self.assertTrue(result["images"]["renders"]["validation"]["renders_unit"])
+
+    def test_a_pass_without_its_count_is_no_pass(self):
+        # A verdict is the guest's raw one, with the number of failures behind it: a result that
+        # says pass but carries no count (an older or damaged guest) does not publish.
+        for drop in ("renders_host_problem_count", "renders_agent_failure_count", "renders_unit_failure_count"):
+            with self.subTest(drop=drop):
+                self.setUp()
+                self.worker.renders_drop = (drop,)
+                with self.assertRaises(RuntimeError):
+                    self.run_driver()
+                self.assertFalse(any(name.endswith("manifest.json") for name in self.worker.objects))
 
     def test_a_failed_renders_proof_publishes_nothing_and_says_why(self):
         for proof, words in (("guard", "security"), ("sanitized", "security"), ("launch_path", "launch-path"),
-                             ("renders_host", "held:engines"), ("renders_agent", "kill:running")):
+                             ("renders_host", "2 .*held:engines"), ("renders_agent", "2 .*kill:running"),
+                             ("renders_unit", "unit.*2 .*kill:running")):
             with self.subTest(proof=proof):
                 self.setUp()
                 self.worker.bad_proof = proof
@@ -2016,7 +2038,7 @@ class RendersRecipeTests(unittest.TestCase):
         arguments = dict(word.split("=", 1) for word in held["arguments"].split())
         self.assertEqual((arguments["MAX_FCVM"], arguments["MAX_ENGINES"]),
                          (conf["RENDERS_MAX_FCVM"], conf["RENDERS_MAX_ENGINES"]))
-        launch = re.search(r"\n    renders\) type=\$\{TYPE:-([^}]+)\}", (HERE / "build-ami.sh").read_text()).group(1)
+        launch = re.search(r"\nRENDERS_TYPE=(\S+)\n", (HERE / "build-ami.sh").read_text()).group(1)
         self.assertEqual(launch, summary["instance_type"])
         # every run's host record names the boot line the image boots with
         records = sorted((summaries[0].parent / summary["campaign"]).glob("*/host-record.txt"))
@@ -2048,6 +2070,12 @@ class RendersRecipeTests(unittest.TestCase):
                      "MAX_FCVM=$RENDERS_CHECK_MAX_FCVM", "MAX_ENGINES=$RENDERS_CHECK_MAX_ENGINES"):
             self.assertIn(word, line)
         self.assertLess(check, build.index('python3 "$HERE/host-check.py" host'))
+        # the build's run asserts its own cases and that none failed, rather than printing them
+        names = json.dumps(list(guest.AGENT_RUNNING_CASES), separators=(",", ":"))
+        assertion = "jq -e '[.rows[].case] == " + names + " and .failed == []' /mnt/fcvm-btrfs/renders/build-check.agent-check.json"
+        self.assertIn(assertion, build)
+        self.assertLess(check, build.index(assertion))
+        self.assertNotIn("jq -c '{cases, failed}'", build)
 
     def test_the_bake_packs_the_store_without_kitesurfs_build_only_state_and_checks_the_host(self):
         _, phases = renders_phases()
@@ -2159,11 +2187,47 @@ class RendersHostCheckTests(unittest.TestCase):
     LINE = "BOOT_IMAGE=/vmlinuz-7.3.3-fcvm-0123456789ab root=PARTUUID=00000000-01 ro console=tty1 console=ttyS0 " \
            "nvme_core.io_timeout=4294967295 kvm-arm.mode=nested numa=off arm64.nv2"
 
+    BASE = "BOOT_IMAGE root ro console nvme_core.io_timeout panic"
+
     def setUp(self):
         self.check = host_check()
 
     def test_the_reference_boot_line_passes(self):
-        self.assertEqual(self.check.boot_problems(self.RELEASE, self.RELEASE, self.LINE, self.PARAMS), [])
+        self.assertEqual(self.check.boot_problems(self.RELEASE, self.RELEASE, self.LINE, self.PARAMS, self.BASE), [])
+
+    def test_the_boot_line_holds_only_the_base_parameters_and_the_three(self):
+        # an allowlist: anything outside the image's base parameters and RENDERS_BOOT_PARAMS fails,
+        # named by its key alone (a value could be an id)
+        for extra in ("kpti=0", "ssbd=force-off", "nospectre_v2", "idle=poll", "irqaffinity=0-3",
+                      "kvm-arm.vgic_v4_enable=1", "arm64.nopauth", "init_on_alloc=0", "quiet"):
+            with self.subTest(extra=extra):
+                problems = self.check.boot_problems(self.RELEASE, self.RELEASE, self.LINE + " " + extra,
+                                                    self.PARAMS, self.BASE)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn(extra.split("=", 1)[0], problems[0])
+                if "=" in extra:
+                    self.assertNotIn(extra.split("=", 1)[1], problems[0])
+        conf = self.conf()
+        self.assertEqual(conf["RENDERS_BOOT_BASE_KEYS"].split(), self.BASE.split())
+
+    def test_no_parameter_the_host_record_keeps_can_be_present_unrecorded(self):
+        # bench/chromium/renders_host_record.py keeps these parameters in a run's record; on the
+        # image's boot line each is one of RENDERS_BOOT_PARAMS or refused by the boot check
+        spec = importlib.util.spec_from_file_location("renders_host_record",
+                                                      HERE.parents[1] / "bench/chromium/renders_host_record.py")
+        record = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(record)
+        conf = self.conf()
+        wanted = {token.split("=", 1)[0] for token in conf["RENDERS_BOOT_PARAMS"].split()}
+        base = set(conf["RENDERS_BOOT_BASE_KEYS"].split())
+        self.assertFalse(wanted & base)
+        for key in record.KERNEL_PARAMETERS:
+            with self.subTest(key=key):
+                self.assertNotIn(key, base)
+                if key not in wanted:
+                    line = self.LINE + " " + key + "=1"
+                    self.assertTrue(self.check.boot_problems(self.RELEASE, self.RELEASE, line,
+                                                             conf["RENDERS_BOOT_PARAMS"], conf["RENDERS_BOOT_BASE_KEYS"]))
 
     def test_a_boot_line_that_differs_from_the_reference_fails(self):
         for line in (self.LINE.replace(" numa=off", ""), self.LINE.replace("numa=off", "numa=on"),
@@ -2172,13 +2236,13 @@ class RendersHostCheckTests(unittest.TestCase):
                      self.LINE + " hugepages=34000", self.LINE + " mitigations=off",
                      self.LINE + " transparent_hugepage=never"):
             with self.subTest(line=line[-40:]):
-                self.assertTrue(self.check.boot_problems(self.RELEASE, self.RELEASE, line, self.PARAMS))
+                self.assertTrue(self.check.boot_problems(self.RELEASE, self.RELEASE, line, self.PARAMS, self.BASE))
 
     def test_a_kernel_that_is_not_the_built_one_fails(self):
         for release, expected in (("7.0.0-1009-aws", "7.0.0-1009-aws"), (self.RELEASE, "7.3.3-fcvm-ba9876543210"),
                                   (self.RELEASE, "")):
             with self.subTest(release=release, expected=expected):
-                self.assertTrue(self.check.boot_problems(release, expected, self.LINE, self.PARAMS))
+                self.assertTrue(self.check.boot_problems(release, expected, self.LINE, self.PARAMS, self.BASE))
 
     def test_the_pool_is_exactly_the_reservation(self):
         self.assertEqual(self.check.pool_problems("34000\n", 34000), [])
@@ -2194,6 +2258,12 @@ class RendersHostCheckTests(unittest.TestCase):
                 self.check.kitesurf_rev({**conf, "RENDERS_KITESURF_REV": bad})
         # the check reads the flavor's pin, never the other benchmark arm's pins file
         self.assertNotIn("kitesurf_pins.sh", (RENDERS / "host-check.py").read_text())
+
+    def test_the_check_refuses_to_run_without_the_images_conf(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(self.check, "CONF", Path(tmp) / "renders.conf"):
+            with self.assertRaises(SystemExit) as raised:
+                self.check.main(["host-check.py", "boot"])
+            self.assertIn("renders.conf", str(raised.exception))
 
     def test_the_conf_parser_takes_only_its_own_format(self):
         conf = self.check.read_conf('# a comment\n\nA=1\nB="two words"\n')
@@ -2258,44 +2328,208 @@ class RendersHostCheckTests(unittest.TestCase):
                                     release=self.RELEASE, conf=self.conf())
 
 
+class RendersVerdictTests(unittest.TestCase):
+    """A verdict comes from the raw result (exit status, raw problems or failed cases), never
+    from the text the record keeps; the record holds one entry for each raw one."""
+
+    PARAMS = "kvm-arm.mode=nested numa=off arm64.nv2"
+    BASE = "BOOT_IMAGE root ro console nvme_core.io_timeout panic"
+    RELEASE = "7.3.3-fcvm-0123456789ab"
+    LINE = "BOOT_IMAGE=/vmlinuz root=LABEL=x ro console=ttyS0 kvm-arm.mode=nested numa=off arm64.nv2"
+
+    def host_check_output(self, line):
+        problems = host_check().boot_problems(self.RELEASE, self.RELEASE, line, self.PARAMS, self.BASE)
+        self.assertTrue(problems)
+        out = json.dumps({"ok": False, "problems": problems}) + "\n"
+        return problems, SimpleNamespace(returncode=1, stdout=out, stderr="")
+
+    def verify(self, **patches):
+        base = dict(sanitized=lambda: True, guard=lambda: True, ordering=lambda kind: None,
+                    launch_path_proof=lambda: True)
+        with patch.multiple(guest, **{**base, **patches}):
+            return guest.verify_renders()
+
+    def test_a_wrong_boot_line_fails_the_boot_and_the_record_counts_its_problems(self):
+        for line in (self.LINE.replace(" numa=off", ""), self.LINE + " mitigations=off"):
+            with self.subTest(line=line[-30:]):
+                problems, done = self.host_check_output(line)
+                with patch.object(guest.subprocess, "run", return_value=done):
+                    result = self.verify()
+                self.assertIs(result["renders_host"], False)
+                self.assertEqual(result["renders_host_problem_count"], len(problems))
+                self.assertEqual(len(result["renders_host_problems"]), len(problems))
+                self.assertTrue(any("numa" in p or "mitigations" in p for p in result["renders_host_problems"]))
+
+    def test_a_check_that_says_ok_with_a_failing_status_or_problems_fails(self):
+        for code, body in ((1, {"ok": True, "problems": []}), (0, {"ok": True, "problems": ["x=y"]}),
+                           (0, {"ok": False, "problems": []}), (0, None)):
+            with self.subTest(code=code, body=body):
+                done = SimpleNamespace(returncode=code, stdout=json.dumps(body) + "\n" if body else "", stderr="")
+                with patch.object(guest.subprocess, "run", return_value=done):
+                    self.assertIs(self.verify()["renders_host"], False)
+
+    def test_a_record_entry_the_sanitiser_drops_is_stood_for_not_lost(self):
+        kept = guest.plain(["the boot line lacks numa=off", "https://example.invalid/x", "a" * 500])
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(kept[0], "the boot line lacks numa=off")
+        self.assertEqual(kept[1], guest.RENDERS_UNREADABLE)
+        self.assertEqual(kept[2], guest.RENDERS_UNREADABLE)
+
+    def agent_proof(self, code, record):
+        """renders_agent_proof against a make that exits `code` and writes `record` (None: none)."""
+        real = tempfile.TemporaryDirectory
+        names = self.all_cases()
+        with real() as directory:
+            def run(argv, **kwargs):
+                out = next(a.split("=", 1)[1] for a in argv if a.startswith("OUT="))
+                if record is not None:
+                    Path(out + ".agent-check.json").write_text(json.dumps(record))
+                return SimpleNamespace(returncode=code)
+            with patch.object(guest, "RENDERS_CONF", RENDERS / "renders.conf"), \
+                 patch.object(guest, "agent_check_cases", lambda path: names), \
+                 patch.object(guest.tempfile, "TemporaryDirectory", lambda dir=None: real(dir=directory)), \
+                 patch.object(guest.os, "chown", lambda *args: None), \
+                 patch.object(guest.subprocess, "run", side_effect=run):
+                return guest.renders_agent_proof()
+
+    def all_cases(self):
+        return guest.agent_check_cases(HERE.parents[1] / "bench/chromium/renders_agent_check.py")
+
+    def test_the_agent_check_passes_only_with_every_case_a_clean_exit_and_nothing_failed(self):
+        names = self.all_cases()
+        rows = [{"case": n, "ok": True} for n in names]
+        self.assertEqual(self.agent_proof(0, {"rows": rows, "cases": len(rows), "failed": []}), (True, []))
+        for code, record in ((1, {"rows": rows, "cases": len(rows), "failed": []}),
+                             (0, {"rows": rows[:-1], "cases": len(rows) - 1, "failed": []}),
+                             (0, None),
+                             (0, {"rows": rows, "cases": len(rows), "failed": ["stop:serve#tail"]})):
+            with self.subTest(code=code, record=None if record is None else record["failed"]):
+                ok, failures = self.agent_proof(code, record)
+                self.assertIs(ok, False)
+                self.assertTrue(failures)
+        # a failing case whose name the record cannot keep: still a failure, still one entry
+        with patch.multiple(guest, sanitized=lambda: True, guard=lambda: True, ordering=lambda kind: None,
+                            launch_path_proof=lambda: True, renders_host_proof=lambda: (True, []),
+                            renders_agent_proof=lambda: (False, ["stop:serve#tail"]),
+                            renders_unit_proof=lambda: (True, [])):
+            result = guest.verify_renders("renders-agent", "renders-unit")
+        self.assertIs(result["renders_agent"], False)
+        self.assertEqual(result["renders_agent_failure_count"], 1)
+        self.assertEqual(result["renders_agent_failures"], [guest.RENDERS_UNREADABLE])
+
+    def test_every_case_is_the_checks_own_list(self):
+        source = (HERE.parents[1] / "bench/chromium/renders_agent_check.py").read_text()
+        running = re.findall(r'self\.run_case\("([a-z]+)"', source)
+        names = self.all_cases()
+        self.assertEqual(names[:len(running)], running)
+        self.assertEqual(running, ["hello", "renders", "overlay", "stop"])
+        self.assertIn("kill:running:TERM", names)
+        self.assertIn("stop:engines-starting", names)
+        # the defaults renders_bench.sh hands the check are the check's own
+        bench = (HERE.parents[1] / "bench/chromium/renders_bench.sh").read_text()
+        check = importlib.util.spec_from_file_location("rac", HERE.parents[1] / "bench/chromium/renders_agent_check.py")
+        stages = re.search(r'agent-check\)\n\s+stages="\$\{1:-([^}]+)\}"', bench).group(1)
+        hold = re.search(r'--hold-stages "\$\{HOLD_STAGES:-([^}]+)\}"', bench).group(1)
+        self.assertEqual([n for n in names if n.startswith("kill:")],
+                         [f"kill:{e.split(':')[0]}:{e.split(':')[1] if ':' in e else 'KILL'}" for e in stages.split(",")])
+        self.assertEqual([n for n in names if n.startswith("stop:")], ["stop:" + h for h in hold.split(",")])
+
+
+class RendersUnitProofTests(unittest.TestCase):
+    """The cold boot starts the image's own unit words: the installed unit's [Service] settings
+    and its ExecStart, with the image's renders.env and a validation agent.env that gives
+    --stdio, under renders_agent_check.py's running case."""
+
+    def test_the_command_is_the_units_own_words(self):
+        unit = (RENDERS / "fcvm-fleet-renders-agent.service").read_text()
+        argv = guest.unit_command(unit, "/tmp/validation-agent.env", "fcvm-fleet-renders-unit-check")
+        self.assertEqual(argv[:6], ["systemd-run", "--unit", "fcvm-fleet-renders-unit-check", "--collect", "--quiet", "--pipe"])
+        settings = unit_settings(RENDERS / "fcvm-fleet-renders-agent.service")
+        props = [argv[i + 1] for i, a in enumerate(argv) if a == "-p"]
+        for key, values in settings.items():
+            if key in ("ExecStart", "Description", "Requires", "After", "Wants", "ConditionPathExists", "WantedBy"):
+                continue
+            for value in values:
+                if value == "/etc/fcvm-fleet/agent.env":
+                    value = "/tmp/validation-agent.env"
+                self.assertIn(key + "=" + value, props)
+        self.assertNotIn("EnvironmentFile=/etc/fcvm-fleet/agent.env", props)
+        self.assertEqual(argv[-6:], settings["ExecStart"][0].split())
+
+    def test_the_census_is_renders_bench_shs(self):
+        conf = host_check().read_conf((RENDERS / "renders.conf").read_text())
+        ours = guest.unit_census(conf, "fcvm-fleet-renders-unit-check")
+        bench = (HERE.parents[1] / "bench/chromium/renders_bench.sh").read_text()
+        fn = re.search(r"\ncensus_args\(\) \{.*?\n\}\n", bench, re.S).group(0)
+        env = {"PATH": "/usr/bin:/bin", "UNIT": "fcvm-fleet-renders-unit-check",
+               "STATUS": conf["RENDERS_OUT"] + ".status.json", "OUT": conf["RENDERS_OUT"],
+               "RUN_DIR": conf["RENDERS_RUN_DIR"], "TAG": conf["RENDERS_SNAPSHOT_TAG"],
+               "MAX_ENGINES": conf["RENDERS_MAX_ENGINES"], "FCVM_DATA_DIR": "/mnt/fcvm-btrfs"}
+        done = subprocess.run(["bash", "-c", fn + "census_args"], capture_output=True, env=env, timeout=10)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(ours, done.stdout.decode().split("\0")[:-1])
+
+    def test_the_proof_needs_the_unit_verified_and_every_running_case(self):
+        names = ["hello", "renders", "overlay", "stop"]
+        def run(verify_code, record):
+            real = tempfile.TemporaryDirectory
+            with real() as directory:
+                def go(argv, **kwargs):
+                    if argv[0] == "systemd-analyze":
+                        return SimpleNamespace(returncode=verify_code, stdout="", stderr="")
+                    out = argv[argv.index("--out") + 1]
+                    if record is not None:
+                        Path(out).write_text(json.dumps(record))
+                    return SimpleNamespace(returncode=0 if record and not record["failed"] else 1)
+                conf = RENDERS / "renders.conf"
+                text = conf.read_text().replace("RENDERS_SRC=/home/ubuntu/fcvm", "RENDERS_SRC=" + str(HERE.parents[1]))
+                local = Path(directory) / "renders.conf"
+                local.write_text(text)
+                with patch.object(guest, "RENDERS_CONF", local), \
+                     patch.object(guest, "RENDERS_UNIT", RENDERS / "fcvm-fleet-renders-agent.service"), \
+                     patch.object(guest.tempfile, "TemporaryDirectory", lambda dir=None: real(dir=directory)), \
+                     patch.object(guest.subprocess, "run", side_effect=go):
+                    return guest.renders_unit_proof()
+        good = {"rows": [{"case": n, "ok": True} for n in names], "cases": 4, "failed": []}
+        self.assertEqual(run(0, good), (True, []))
+        for verify_code, record in ((1, good), (0, None), (0, {**good, "rows": good["rows"][:2], "cases": 2}),
+                                    (0, {**good, "failed": ["renders"]})):
+            with self.subTest(verify=verify_code, record=None if record is None else record["cases"]):
+                ok, failures = run(verify_code, record)
+                self.assertIs(ok, False)
+                self.assertTrue(failures)
+
+
 class RendersGuestTests(unittest.TestCase):
     def test_renders_verification_runs_the_agent_check_only_when_asked(self):
         asked = []
         with patch.multiple(guest, sanitized=lambda: True, guard=lambda: True, ordering=lambda kind: asked.append(kind),
-                            launch_path_proof=lambda: True, renders_host_proof=lambda: [],
-                            renders_agent_proof=lambda: asked.append("agent") or []):
-            cold = guest.verify_renders("renders-agent")
+                            launch_path_proof=lambda: True, renders_host_proof=lambda: (True, []),
+                            renders_agent_proof=lambda: asked.append("agent") or (True, []),
+                            renders_unit_proof=lambda: asked.append("unit") or (True, [])):
+            cold = guest.verify_renders("renders-agent", "renders-unit")
             warm = guest.verify_renders()
-        self.assertEqual(asked, ["renders", "agent", "renders"])
+        self.assertEqual(asked, ["renders", "agent", "unit", "renders"])
         for result in (cold, warm):
             self.assertTrue(result["guard"] and result["sanitized"] and result["launch_path"] and result["renders_host"])
             self.assertEqual(result["kernel_release"], os.uname().release)
-        self.assertTrue(cold["renders_agent"])
-        self.assertFalse(warm["renders_agent"])
+        self.assertTrue(cold["renders_agent"] and cold["renders_unit"])
+        self.assertEqual((cold["renders_agent_failure_count"], cold["renders_unit_failure_count"]), (0, 0))
+        self.assertFalse(warm["renders_agent"] or warm["renders_unit"])
         with self.assertRaisesRegex(RuntimeError, "unknown validator proof"):
             guest.verify_renders("viewer-path")
 
     def test_renders_failures_reach_the_record_as_short_plain_strings(self):
         with patch.multiple(guest, sanitized=lambda: True, guard=lambda: True, ordering=lambda kind: None,
                             launch_path_proof=lambda: True,
-                            renders_host_proof=lambda: ["the pool holds 0 of 34000 2 MiB pages", "x" * 500],
-                            renders_agent_proof=lambda: ["kill:running", "https://example.invalid/?token=secret"]):
-            result = guest.verify_renders("renders-agent")
+                            renders_host_proof=lambda: (False, ["the pool holds 0 of 34000 2 MiB pages", "x" * 500]),
+                            renders_agent_proof=lambda: (False, ["kill:running", "https://example.invalid/?token=secret"]),
+                            renders_unit_proof=lambda: (True, [])):
+            result = guest.verify_renders("renders-agent", "renders-unit")
         self.assertFalse(result["renders_host"])
-        self.assertEqual(result["renders_host_problems"], ["the pool holds 0 of 34000 2 MiB pages"])
+        self.assertEqual(result["renders_host_problems"], ["the pool holds 0 of 34000 2 MiB pages", guest.RENDERS_UNREADABLE])
         self.assertFalse(result["renders_agent"])
-        self.assertEqual(result["renders_agent_failures"], ["kill:running"])
-
-    def test_the_agent_checks_failing_cases_are_read_from_its_record(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "check.agent-check.json"
-            self.assertEqual(guest.agent_check_failures(path), ["the agent check wrote no record"])
-            path.write_text(json.dumps({"rows": [{"case": "running:hello", "ok": True}], "cases": 1, "failed": []}))
-            self.assertEqual(guest.agent_check_failures(path), [])
-            path.write_text(json.dumps({"rows": [], "cases": 2, "failed": ["held:engines", "kill:running"]}))
-            self.assertEqual(guest.agent_check_failures(path), ["held:engines", "kill:running"])
-            path.write_text(json.dumps({"rows": [], "cases": 0, "failed": []}))
-            self.assertEqual(guest.agent_check_failures(path), ["the agent check ran no case"])
+        self.assertEqual(result["renders_agent_failures"], ["kill:running", guest.RENDERS_UNREADABLE])
 
     def test_the_agent_check_runs_as_the_build_user_through_make(self):
         source = (HERE / "pipeline_guest.py").read_text()

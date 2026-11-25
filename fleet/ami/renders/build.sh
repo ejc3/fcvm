@@ -196,7 +196,7 @@ build)
   # snapshot the image carries, as a host's first module would. The validation runs every case.
   install -d -o "$U" -g "$U" /mnt/fcvm-btrfs/renders
   as_user "cd $SRC && make test-fleet-renders-agent OUT=/mnt/fcvm-btrfs/renders/build-check CASES=running FCVM=/usr/local/bin/fcvm TAG=$RENDERS_SNAPSHOT_TAG KITESURF=$RENDERS_KITESURF DIST=$RENDERS_DIST MAX_FCVM=$RENDERS_CHECK_MAX_FCVM MAX_ENGINES=$RENDERS_CHECK_MAX_ENGINES"
-  jq -c '{cases, failed}' /mnt/fcvm-btrfs/renders/build-check.agent-check.json
+  jq -e '[.rows[].case] == ["hello","renders","overlay","stop"] and .failed == []' /mnt/fcvm-btrfs/renders/build-check.agent-check.json
   python3 "$HERE/host-check.py" host
   ;;
 bake)

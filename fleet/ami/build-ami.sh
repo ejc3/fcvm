@@ -100,6 +100,9 @@ wait_ssm() {
   echo "SSM never came online on $1" >&2; return 1
 }
 
+# Pages mode's host type: the only type `launch renders` starts.
+RENDERS_TYPE=m8gd.metal-24xl
+
 case "$1" in
 launch)
   kind=$2
@@ -109,7 +112,9 @@ launch)
     # Pages mode's host (fleet/ami/renders): the type it runs on, arm64, with the GPU host's
     # instance profile (store parts from the asset bucket). The root holds the checkout and the
     # packed store; its Kitesurf tree is the size no build has recorded yet, so it has room.
-    renders) type=${TYPE:-m8gd.metal-24xl}; profile=fcvm-fleet-host; size=128; arch=arm64 ;;
+    renders) type=${TYPE:-$RENDERS_TYPE}; profile=fcvm-fleet-host; size=128; arch=arm64
+      # It launches outside the wall's G reserve, so it is the renders host's type or nothing.
+      [ "$type" = "$RENDERS_TYPE" ] || { say "$type is not the renders host type ($RENDERS_TYPE): nothing launched"; exit 2; } ;;
     *) echo "launch host|tile|renders" >&2; exit 2 ;;
   esac
   # A host builder gets an IPv6 prefix, as a fleet host does: build.sh's root warm-up
@@ -121,8 +126,9 @@ launch)
   ami=${BASE_AMI:-$(ubuntu_ami "$arch")}
   [[ "$ami" == ami-* ]] || { say "no base AMI"; exit 1; }
   image_in_region "$ami" || exit 1
-  # A renders builder is a Standard instance: the wall's G reserve and its ledger do not count it.
-  if [ "$kind" = renders ]; then
+  # A renders builder (RENDERS_TYPE, checked above) is a Standard instance: the wall's G reserve
+  # and its ledger do not count it.
+  if [ "$kind" = renders ] && [ "$type" = "$RENDERS_TYPE" ]; then
     admit_lock() { :; }; admit_held() { :; }; admit_unlock() { :; }; admit_abandon() { :; }
     room_for() { :; }; ledger_add() { :; }
   fi

@@ -21,7 +21,6 @@ import re
 import subprocess
 import sys
 
-HERE = Path(__file__).resolve().parent
 CONF = Path("/etc/fcvm-fleet/renders.conf")
 RECORD = Path("/etc/fcvm-fleet/renders-build.json")
 KERNEL = Path("/etc/fcvm-fleet/renders-kernel")
@@ -30,13 +29,6 @@ POOL = Path("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
 SNAPSHOTS = Path("/mnt/fcvm-btrfs/snapshots")
 UNITS = ("fcvm-fleet-hugepages.service", "fcvm-fleet-store.service", "fcvm-fleet-renders-agent.service")
 
-# The kernel parameters the recorded campaign's host record keeps, the ones that change what a
-# run measures (bench/chromium/renders_host_record.py, KERNEL_PARAMETERS). On the image's boot
-# line each of them is one of RENDERS_BOOT_PARAMS or absent: the 2 MiB pool is reserved through
-# sysfs, not with hugepages=.
-RECORDED = ("kvm-arm.mode", "arm64.nv2", "numa", "mitigations", "nosmt", "maxcpus", "nr_cpus", "isolcpus",
-            "nohz_full", "rcu_nocbs", "preempt", "hugepagesz", "hugepages", "default_hugepagesz",
-            "transparent_hugepage")
 RECORD_FIELDS = ("fcvm_commit", "kitesurf_commit", "bundle_sha256", "kernel_release", "boot_params", "hugepages")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 RELEASE = re.compile(r"[0-9]+\.[0-9]+(\.[0-9]+)?-fcvm-[0-9a-f]{12}")
@@ -58,9 +50,11 @@ def read_conf(text):
     return values
 
 
-def boot_problems(release, expected, cmdline, params):
-    """Why this boot is not the reference's configuration: the kernel the build installed, with
-    every one of `params` on its command line and no other value for a recorded parameter."""
+def boot_problems(release, expected, cmdline, params, base_keys):
+    """Why this boot is not the reference's configuration: the kernel the build installed, and a
+    command line that holds every one of `params` and nothing else but parameters whose keys are
+    in `base_keys` (what the base image and its boot loader put there). Anything else is named
+    by its key alone, since a value could identify the host."""
     problems = []
     if not RELEASE.fullmatch(release):
         problems.append(f"the running kernel {release} is not fcvm's host kernel")
@@ -68,12 +62,14 @@ def boot_problems(release, expected, cmdline, params):
         problems.append(f"the running kernel {release} is not the one the build installed ({expected or 'none recorded'})")
     tokens = cmdline.split()
     wanted = params.split()
+    base = set(base_keys.split())
     for param in wanted:
         if param not in tokens:
             problems.append(f"the boot line lacks {param}")
     for token in tokens:
-        if token.split("=", 1)[0] in RECORDED and token not in wanted:
-            problems.append(f"the boot line has {token}, which the reference's has not")
+        key = token.split("=", 1)[0]
+        if token not in wanted and key not in base:
+            problems.append(f"the boot line has {key}, which is neither a base parameter nor one of the reference's")
     return problems
 
 
@@ -168,7 +164,8 @@ def node_binary(kitesurf):
 
 def check_boot(conf):
     expected = KERNEL.read_text().strip() if KERNEL.is_file() else ""
-    return boot_problems(os.uname().release, expected, Path("/proc/cmdline").read_text(), conf["RENDERS_BOOT_PARAMS"])
+    return boot_problems(os.uname().release, expected, Path("/proc/cmdline").read_text(), conf["RENDERS_BOOT_PARAMS"],
+                         conf["RENDERS_BOOT_BASE_KEYS"])
 
 
 def check_host(conf):
@@ -239,7 +236,10 @@ def check_host(conf):
 
 def main(argv):
     mode = argv[1] if len(argv) > 1 else ""
-    conf = read_conf(CONF.read_text() if CONF.is_file() else (HERE / "renders.conf").read_text())
+    # The image's own conf, which the build installed; the recipe's copy is not the image's.
+    if not CONF.is_file():
+        raise SystemExit(f"host-check.py: {CONF} is missing: this is not a renders image (or its prep did not run)")
+    conf = read_conf(CONF.read_text())
     if mode == "record":
         src = conf["RENDERS_SRC"]
         record = build_record(fcvm_commit=git_head(src), kitesurf_commit=kitesurf_rev(conf),
