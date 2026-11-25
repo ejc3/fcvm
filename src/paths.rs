@@ -15,10 +15,16 @@ const DEFAULT_BASE_DIR: &str = "/mnt/fcvm-btrfs";
 ///
 /// For nested VM support, each nesting level uses a different data_dir
 /// while sharing the same assets_dir for content-addressed files.
-pub fn init_from_config() {
+///
+/// A config that will not load is an error the command returns, so fcvm exits 1 with the
+/// list of places it searched; it is not a panic (exit 101), which a caller that reads the
+/// exit status would take for a crash.
+pub fn init_from_config() -> anyhow::Result<()> {
+    use anyhow::Context;
     let (config, _, _) = crate::setup::rootfs::load_config(None)
-        .expect("Failed to load config - run 'fcvm setup --generate-config' first");
+        .context("Failed to load config - run 'fcvm setup --generate-config' first")?;
     init_from_loaded_config(&config);
+    Ok(())
 }
 
 /// Initialize directories from an already loaded config. The FCVM_DATA_DIR environment

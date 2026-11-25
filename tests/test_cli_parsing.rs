@@ -307,3 +307,28 @@ fn snapshot_import_takes_no_tag_and_needs_a_file_for_input() {
         ErrorKind::UnknownArgument
     );
 }
+
+/// A command that needs the config, run with a config that will not load, returns an error:
+/// exit status 1 and the reason on stderr, not a panic (exit status 101). A runner that reads
+/// fcvm's exit status (www_sim's VM runner) cannot tell a panic from a crash.
+///
+/// The config is made unloadable with a relative FCVM_CONFIG_DIR, which the lookup refuses
+/// before any fallback, so the result does not depend on the build profile (a debug binary
+/// also searches its CARGO_MANIFEST_DIR) or on a system config in /etc/fcvm.
+#[test]
+fn a_config_that_will_not_load_is_an_error_not_a_panic() {
+    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
+    let output = Command::new(&fcvm_path)
+        .args(["ls", "--json"])
+        .env("FCVM_CONFIG_DIR", "relative-config-dir")
+        .env_remove("FCVM_DATA_DIR")
+        .output()
+        .expect("failed to run fcvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("FCVM_CONFIG_DIR must be absolute"),
+        "stderr: {stderr}"
+    );
+}
