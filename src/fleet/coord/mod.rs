@@ -1437,22 +1437,38 @@ pub fn power_managed(args: &FleetCoordArgs) -> bool {
 /// The most on-demand hosts pages mode's group runs: its one host, when spot is refused.
 pub const RENDERS_ON_DEMAND_MAX: u32 = 1;
 
+/// A host group's driver, launching only the types `rates` prices: the table the meter uses
+/// (`spend::on_demand_rates`, the built-in rates and `--spend-rates`). Every group's driver is
+/// made here, so no group launches by another table.
+fn priced_driver(
+    args: &FleetCoordArgs,
+    class: hosts::HostClass,
+    rates: &std::collections::BTreeMap<String, f64>,
+) -> Result<hosts::AwsHosts> {
+    let (templates, subnets) = match class {
+        hosts::HostClass::Gpu => (&args.host_templates, &args.host_subnets),
+        hosts::HostClass::Renders => (&args.renders_templates, &args.renders_subnets),
+    };
+    Ok(
+        hosts::AwsHosts::for_class(templates, subnets, args.fleet_name.clone(), class)?
+            .priced_by(rates.clone()),
+    )
+}
+
 /// The host groups the coordinator launches: the GPU hosts with `--host-template`, and pages
 /// mode's host with `--renders-template` (one host while awake, in the templates' one
 /// region). Each lists and launches only its own class's instances.
 pub fn host_groups(args: &FleetCoordArgs) -> Result<Vec<hosts::HostConfig>> {
     let mut groups = Vec::new();
+    // Each group launches only types this table prices (hosts::unpriced_launch).
+    let rates = spend::on_demand_rates(&args.spend_rates)?;
     if args.host_templates.is_empty() {
         anyhow::ensure!(
             args.host_subnets.is_empty(),
             "--host-subnet needs a --host-template"
         );
     } else {
-        let driver = hosts::AwsHosts::new(
-            &args.host_templates,
-            &args.host_subnets,
-            args.fleet_name.clone(),
-        )?;
+        let driver = priced_driver(args, hosts::HostClass::Gpu, &rates)?;
         groups.push(hosts::HostConfig {
             class: hosts::HostClass::Gpu,
             regions: driver.regions(),
@@ -1474,12 +1490,7 @@ pub fn host_groups(args: &FleetCoordArgs) -> Result<Vec<hosts::HostConfig>> {
             "--renders-subnet needs a --renders-template"
         );
     } else {
-        let driver = hosts::AwsHosts::for_class(
-            &args.renders_templates,
-            &args.renders_subnets,
-            args.fleet_name.clone(),
-            hosts::HostClass::Renders,
-        )?;
+        let driver = priced_driver(args, hosts::HostClass::Renders, &rates)?;
         let regions = driver.regions();
         anyhow::ensure!(
             regions.len() == 1,
@@ -2292,6 +2303,51 @@ mod power_tests {
             .await
             .expect_err("--warm-hours without power management was accepted");
         assert!(e.to_string().contains("--warm-hours needs"), "{e}");
+    }
+
+    /// Every host group's driver prices launches by the meter's table: a type given with
+    /// `--spend-rates` may launch, in both groups, and one given nowhere may not.
+    #[test]
+    fn a_host_groups_driver_prices_by_the_spend_rates() {
+        let base = [
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0",
+            "--renders-template",
+            "us-east-2:fcvm-fleet-renders-arm64",
+            "--renders-subnet",
+            "us-east-2:subnet-0123456789abcdef1",
+        ];
+        let mut with = base.to_vec();
+        with.extend(["--spend-rates", "x9z.metal=3.5"]);
+        for class in [
+            super::hosts::HostClass::Gpu,
+            super::hosts::HostClass::Renders,
+        ] {
+            let args = coord(&with);
+            let rates = super::spend::on_demand_rates(&args.spend_rates).unwrap();
+            let d = super::priced_driver(&args, class, &rates).unwrap();
+            assert!(d.prices("x9z.metal"), "{class:?}");
+            assert!(
+                d.prices("m8gd.metal-24xl") && !d.prices("y1.metal"),
+                "{class:?}"
+            );
+            let args = coord(&base);
+            let rates = super::spend::on_demand_rates(&args.spend_rates).unwrap();
+            assert!(!super::priced_driver(&args, class, &rates)
+                .unwrap()
+                .prices("x9z.metal"));
+        }
+        // and no group makes a driver any other way
+        let source = include_str!("mod.rs");
+        let groups = &source[source.find("pub fn host_groups(").unwrap()..];
+        let groups = &groups[..groups.find("\n}\n").unwrap()];
+        assert!(
+            !groups.contains("AwsHosts::"),
+            "host_groups makes its drivers with priced_driver"
+        );
+        assert_eq!(groups.matches("priced_driver(").count(), 2);
     }
 
     /// With pages mode's templates the fleet sleeps (its host must not run with no viewer),

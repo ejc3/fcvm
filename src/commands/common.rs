@@ -1633,6 +1633,32 @@ fn merge_with(
     Ok(stats)
 }
 
+/// For a confined start, as soon as its Firecracker binary is known and before anything is
+/// created: the binary has the seccomp filter `fcvm setup` compiled for it, unchanged
+/// ([`crate::confine::Decision::require_filter`]). A host that was upgraded and not set up
+/// again is refused here with nothing started. A binary that cannot be found here fails the
+/// start where it is looked up, with that error; the launch makes this check again on the
+/// binary it runs, and hands the VMM the bytes it checked.
+pub fn require_confined_filter(
+    decision: &crate::confine::Decision,
+    runtime_config: &RuntimeConfig,
+) -> Result<()> {
+    if decision.confinement().is_none() {
+        return Ok(());
+    }
+    let firecracker = match runtime_config.firecracker_bin.clone() {
+        Some(path) => path,
+        None => match find_firecracker(runtime_config) {
+            Ok(path) => path,
+            Err(_) => return Ok(()),
+        },
+    };
+    if !firecracker.exists() {
+        return Ok(());
+    }
+    decision.require_filter(&firecracker)
+}
+
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///
@@ -3452,6 +3478,33 @@ fn view_children(view: &Path, wanted: fn(&std::fs::FileType) -> bool) -> Result<
     Ok(children)
 }
 
+/// The mount view of a clone's VMM, or `None` when the snapshot load overrides every source
+/// path and the VMM needs no mount namespace.
+///
+/// With `None` nothing under `view` is read. `view` is the directory every VM's runtime
+/// directory is in, so listing it costs a directory entry per VM alive, and btrfs takes a
+/// directory's lock exclusively to open it for reading and again in each read of it, which
+/// is the lock every other start's `mkdir` of its own runtime directory needs. Two listings
+/// a start (directories, then files) made that lock the one thing every start queued on:
+/// of 1555 ms a clone spent asleep on locks and I/O in a ramp of 1000 at 512 at a time,
+/// 641 ms was these listings waiting for it and 133 ms the `mkdir`s waiting behind them
+/// (c8gd.metal-24xl, 7.0.0-1018-aws, btrfs on NVMe, 2026-11-25).
+fn clone_mount_redirects(
+    overrides: LoadOverrides,
+    view: &Path,
+    pairs: Vec<(PathBuf, PathBuf)>,
+    clone_dir: &Path,
+    vsock_target_dir: &Path,
+) -> Result<Option<crate::utils::MountRedirects>> {
+    if overrides == LoadOverrides::Everything {
+        return Ok(None);
+    }
+    let entries = view_entries(view)?;
+    let mut redirects = clone_mount_view(view, pairs, clone_dir, vsock_target_dir, &entries)?;
+    redirects.keep_files = view_files(view)?;
+    Ok(Some(redirects))
+}
+
 /// The mount namespace for a clone's VMM: `pairs` (from [`build_clone_mount_redirects`])
 /// under a tmpfs over `view`, the directory every VM's runtime directory is in.
 ///
@@ -3933,29 +3986,22 @@ async fn prepare_clone_substrate(
             .context("creating disks backing dir inside the vsock target")?;
     }
     let view = paths::data_dir().join("vm-disks");
-    let redirects = match view_entries(&view).and_then(|entries| {
-        let mut redirects =
-            clone_mount_view(&view, redirects, data_dir, &vsock_target_dir, &entries)?;
-        redirects.keep_files = view_files(&view)?;
-        Ok(redirects)
-    }) {
-        Ok(redirects) => redirects,
+    match clone_mount_redirects(overrides, &view, redirects, data_dir, &vsock_target_dir) {
+        Ok(Some(redirects)) => {
+            info!(
+                view = %redirects.view.display(),
+                redirects = ?redirects.pairs.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
+                "enabling mount namespace for path isolation"
+            );
+            namespace.mount_redirects = Some(redirects);
+        }
+        Ok(None) => info!(
+            "the snapshot load overrides every source path; the VMM runs without a mount namespace"
+        ),
         Err(error) => {
             cleanup_failed_clone_holder(&mut holder_child, "building the clone's mount view").await;
             return Err(error);
         }
-    };
-    info!(
-        view = %redirects.view.display(),
-        redirects = ?redirects.pairs.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
-        "enabling mount namespace for path isolation"
-    );
-    if overrides == LoadOverrides::Everything {
-        info!(
-            "the snapshot load overrides every source path; the VMM runs without a mount namespace"
-        );
-    } else {
-        namespace.mount_redirects = Some(redirects);
     }
 
     // The VMM opens the snapshot's disks at these directories' paths, which its view binds
@@ -4336,6 +4382,10 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
+        // The load built the VM and left it paused. A confined VMM's threads are checked
+        // here, before the guest is resumed, so a clone never runs unfiltered: a failure
+        // leaves this block, whose error path kills the VMM.
+        vm_manager.check_confined().await?;
         if let Some(sender) = prefilled_sender {
             // The load returned, so Firecracker connected and mapped the backing: the sender
             // has finished, and a failure there already failed the load.
@@ -9175,6 +9225,74 @@ mod tests {
                 .pairs,
             same
         );
+    }
+
+    /// A restore whose load overrides every source path reads nothing under the view, the
+    /// directory every VM's runtime directory is in: it needs no mount namespace, and listing
+    /// that directory takes the lock every other start's `mkdir` needs. The other two kinds
+    /// of load list it, for the directories and the files they keep visible.
+    ///
+    /// RED BEFORE THE FIX: every restore listed the view twice and threw the result away
+    /// when the load overrode everything, so here, where the view cannot be listed, it
+    /// failed.
+    #[test]
+    fn a_load_that_overrides_every_path_does_not_list_the_view() {
+        let root = tempfile::tempdir().unwrap();
+        // Not a directory: listing it fails, so a restore that succeeds did not list it.
+        let unlistable = root.path().join("not-a-directory");
+        std::fs::write(&unlistable, b"").unwrap();
+        let clone = unlistable.join("vm-clone");
+        let redirects = clone_mount_redirects(
+            LoadOverrides::Everything,
+            &unlistable,
+            Vec::new(),
+            &clone,
+            &clone,
+        )
+        .expect("a load that overrides everything listed the view");
+        assert!(redirects.is_none(), "it needs no mount namespace");
+        for overrides in [LoadOverrides::None, LoadOverrides::Vsock] {
+            let error = clone_mount_redirects(overrides, &unlistable, Vec::new(), &clone, &clone)
+                .expect_err("a load that needs the view did not list it");
+            assert!(
+                format!("{error:#}").contains("for the clone's mount view"),
+                "{error:#}"
+            );
+        }
+
+        // A load that needs the view gets what the view holds.
+        let view = root.path().join("vm-disks");
+        let (clone, other) = (view.join("vm-clone"), view.join("vm-other"));
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(view.join("ro.img"), b"").unwrap();
+        let redirects =
+            clone_mount_redirects(LoadOverrides::Vsock, &view, Vec::new(), &clone, &clone)
+                .unwrap()
+                .expect("a load that does not override the disks needs the view");
+        assert_eq!(redirects.keep, vec![other]);
+        assert_eq!(redirects.keep_files, vec![view.join("ro.img")]);
+        assert!(clone_mount_redirects(
+            LoadOverrides::Everything,
+            &view,
+            Vec::new(),
+            &clone,
+            &clone
+        )
+        .unwrap()
+        .is_none());
+
+        // The restore goes through that function and lists nothing itself.
+        let source = include_str!("common.rs");
+        let prepare = &source[source.find("async fn prepare_clone_substrate(").unwrap()..];
+        let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
+        assert!(prepare.contains("clone_mount_redirects(overrides, &view,"));
+        for listing in ["view_entries(", "view_files(", "read_dir("] {
+            assert!(
+                !prepare.contains(listing),
+                "prepare_clone_substrate calls {listing} itself"
+            );
+        }
     }
 
     /// A read-only `--disk` under another directory of vm-disks stays reachable,

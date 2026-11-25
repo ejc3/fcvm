@@ -1,0 +1,651 @@
+{
+  "at": 1795626309986,
+  "harness": {
+    "cpu_pressure": 0.02002433252224926,
+    "replay_ms": {
+      "fcvm": 0.606025,
+      "kitesurf": 0.620757
+    }
+  },
+  "module": {
+    "engine_restarts": 0,
+    "fixed_levels": null,
+    "kernel": "7.3.3-fcvm-57abeebe8d9c",
+    "levels": {
+      "fcvm": 15,
+      "kitesurf": 38
+    },
+    "pool_waits": 0,
+    "recycle_ms_median": 1568.30015,
+    "recycles": 45,
+    "respawns": {
+      "fcvm": 0,
+      "kitesurf": 0
+    }
+  },
+  "sides": {
+    "fcvm": {
+      "cpu_ms_per_render": 1441.8488059490085,
+      "cpus_busy": 33.93037755408153,
+      "done": 27605,
+      "failed": 0,
+      "render_ms": 634.677916535793,
+      "renders_per_s": 23.533333333333335,
+      "search": {
+        "backed_off": {
+          "at": 1795626159984,
+          "cause": "render_time",
+          "from": 16,
+          "pressure": 0.17513679999999998,
+          "ratio": 1.314726329743674
+        },
+        "curve": [
+          {
+            "in_flight": 1,
+            "render_ms": 499.65112239276874,
+            "renders_per_s": 2.4166666666666665
+          },
+          {
+            "in_flight": 2,
+            "render_ms": 474.63504125003703,
+            "renders_per_s": 4.2727272727272725
+          },
+          {
+            "in_flight": 3,
+            "render_ms": 471.241561964283,
+            "renders_per_s": 6.222222222222222
+          },
+          {
+            "in_flight": 4,
+            "render_ms": 487.65807232148615,
+            "renders_per_s": 8.142857142857142
+          },
+          {
+            "in_flight": 5,
+            "render_ms": 489.80721699998804,
+            "renders_per_s": 10.498250291618064
+          },
+          {
+            "in_flight": 6,
+            "render_ms": 490.9364167500761,
+            "renders_per_s": 12.2
+          },
+          {
+            "in_flight": 7,
+            "render_ms": 493.7796570357185,
+            "renders_per_s": 14.002800560112023
+          },
+          {
+            "in_flight": 8,
+            "render_ms": 504.1539423214902,
+            "renders_per_s": 15.6
+          },
+          {
+            "in_flight": 9,
+            "render_ms": 505.43255653579826,
+            "renders_per_s": 18.0
+          },
+          {
+            "in_flight": 10,
+            "render_ms": 506.6171499285669,
+            "renders_per_s": 19.5
+          },
+          {
+            "in_flight": 11,
+            "render_ms": 518.3144188928607,
+            "renders_per_s": 21.6
+          },
+          {
+            "in_flight": 12,
+            "render_ms": 506.6546945357199,
+            "renders_per_s": 22.25
+          },
+          {
+            "in_flight": 13,
+            "render_ms": 524.736631964369,
+            "renders_per_s": 25.0
+          },
+          {
+            "in_flight": 14,
+            "render_ms": 551.3965976785065,
+            "renders_per_s": 25.493626593351664
+          },
+          {
+            "in_flight": 15,
+            "render_ms": 631.9704085000402,
+            "renders_per_s": 23.677819527639627
+          },
+          {
+            "in_flight": 16,
+            "render_ms": 662.4082102855482,
+            "renders_per_s": 24.6
+          },
+          {
+            "in_flight": 17,
+            "render_ms": 630.8979337501829,
+            "renders_per_s": 27.4
+          }
+        ],
+        "in_flight": 15,
+        "limit": 15,
+        "phase": "holding"
+      },
+      "setup": {
+        "kernel": "7.3.3-fcvm-57abeebe8d9c",
+        "max_in_flight": "40",
+        "memory_mib": "1024",
+        "page_size": "2 MiB",
+        "pool_pages": "34000",
+        "uffd_mode": "minor",
+        "vcpus": "4",
+        "viewport": "1280x720"
+      },
+      "since": 1795625109983
+    },
+    "kitesurf": {
+      "cpu_ms_per_render": 1242.050723449001,
+      "cpus_busy": 39.37169554348188,
+      "done": 28611,
+      "engines": 48,
+      "failed": 0,
+      "recycles": 45,
+      "render_ms": 1195.6311963571427,
+      "renders_per_s": 31.7,
+      "search": {
+        "backed_off": {
+          "at": 1795625523984,
+          "cause": "cpu_pressure",
+          "from": 37,
+          "pressure": 0.16655522222222224,
+          "ratio": 1.148243327495794
+        },
+        "curve": [
+          {
+            "in_flight": 1,
+            "render_ms": 1118.9472517142858,
+            "renders_per_s": 1.4444444444444444
+          },
+          {
+            "in_flight": 2,
+            "render_ms": 1091.535300785714,
+            "renders_per_s": 1.7916666666666667
+          },
+          {
+            "in_flight": 3,
+            "render_ms": 1097.43027925,
+            "renders_per_s": 2.7057231927533674
+          },
+          {
+            "in_flight": 4,
+            "render_ms": 1114.5919149642855,
+            "renders_per_s": 3.5296193893758456
+          },
+          {
+            "in_flight": 5,
+            "render_ms": 1103.051156857143,
+            "renders_per_s": 4.5
+          },
+          {
+            "in_flight": 6,
+            "render_ms": 1123.8185138214287,
+            "renders_per_s": 5.266666666666667
+          },
+          {
+            "in_flight": 7,
+            "render_ms": 1096.4066794999999,
+            "renders_per_s": 6.166666666666667
+          },
+          {
+            "in_flight": 8,
+            "render_ms": 1104.5145335714285,
+            "renders_per_s": 7.0
+          },
+          {
+            "in_flight": 9,
+            "render_ms": 1121.5300875,
+            "renders_per_s": 8.166666666666666
+          },
+          {
+            "in_flight": 10,
+            "render_ms": 1078.9725199285715,
+            "renders_per_s": 9.272727272727273
+          },
+          {
+            "in_flight": 11,
+            "render_ms": 1093.9939793214287,
+            "renders_per_s": 10.2
+          },
+          {
+            "in_flight": 12,
+            "render_ms": 1065.9544137857142,
+            "renders_per_s": 10.7
+          },
+          {
+            "in_flight": 13,
+            "render_ms": 1071.86553025,
+            "renders_per_s": 11.887568047994668
+          },
+          {
+            "in_flight": 14,
+            "render_ms": 1074.5425127499998,
+            "renders_per_s": 12.88888888888889
+          },
+          {
+            "in_flight": 15,
+            "render_ms": 1082.4285412142858,
+            "renders_per_s": 13.555555555555555
+          },
+          {
+            "in_flight": 16,
+            "render_ms": 1048.5856575714288,
+            "renders_per_s": 14.890543393710413
+          },
+          {
+            "in_flight": 17,
+            "render_ms": 1079.7200205714287,
+            "renders_per_s": 15.553827352516388
+          },
+          {
+            "in_flight": 18,
+            "render_ms": 1068.2501743571427,
+            "renders_per_s": 16.6685187243027
+          },
+          {
+            "in_flight": 19,
+            "render_ms": 1064.095051392857,
+            "renders_per_s": 17.55360515498278
+          },
+          {
+            "in_flight": 20,
+            "render_ms": 1071.2081320357142,
+            "renders_per_s": 18.752344043005376
+          },
+          {
+            "in_flight": 21,
+            "render_ms": 1092.6753281785716,
+            "renders_per_s": 19.125
+          },
+          {
+            "in_flight": 22,
+            "render_ms": 1061.5152576785713,
+            "renders_per_s": 20.11111111111111
+          },
+          {
+            "in_flight": 23,
+            "render_ms": 1067.4819492857143,
+            "renders_per_s": 21.125
+          },
+          {
+            "in_flight": 24,
+            "render_ms": 1054.7926318214286,
+            "renders_per_s": 22.0
+          },
+          {
+            "in_flight": 25,
+            "render_ms": 1076.1635375357143,
+            "renders_per_s": 22.333333333333332
+          },
+          {
+            "in_flight": 26,
+            "render_ms": 1073.6497067142857,
+            "renders_per_s": 24.375
+          },
+          {
+            "in_flight": 27,
+            "render_ms": 1065.9658495714286,
+            "renders_per_s": 24.5
+          },
+          {
+            "in_flight": 28,
+            "render_ms": 1074.99198825,
+            "renders_per_s": 26.108210198866793
+          },
+          {
+            "in_flight": 29,
+            "render_ms": 1088.7542592857142,
+            "renders_per_s": 26.336259584398267
+          },
+          {
+            "in_flight": 30,
+            "render_ms": 1081.6094143214286,
+            "renders_per_s": 27.496562929633797
+          },
+          {
+            "in_flight": 31,
+            "render_ms": 1096.61285375,
+            "renders_per_s": 27.12839104888111
+          },
+          {
+            "in_flight": 32,
+            "render_ms": 1086.072372214286,
+            "renders_per_s": 29.375
+          },
+          {
+            "in_flight": 33,
+            "render_ms": 1094.3164741071428,
+            "renders_per_s": 29.625
+          },
+          {
+            "in_flight": 34,
+            "render_ms": 1147.6080356785715,
+            "renders_per_s": 29.0
+          },
+          {
+            "in_flight": 35,
+            "render_ms": 1099.754363892857,
+            "renders_per_s": 31.121109861267342
+          },
+          {
+            "in_flight": 36,
+            "render_ms": 1133.422197107143,
+            "renders_per_s": 31.2
+          },
+          {
+            "in_flight": 37,
+            "render_ms": 1174.5230787142857,
+            "renders_per_s": 31.1
+          },
+          {
+            "in_flight": 38,
+            "render_ms": 1205.3722011071427,
+            "renders_per_s": 31.555555555555557
+          }
+        ],
+        "in_flight": 38,
+        "limit": 38,
+        "phase": "holding"
+      },
+      "setup": {
+        "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+        "engine_start_ms_median": "1024",
+        "engines": "48",
+        "kernel": "7.3.3-fcvm-57abeebe8d9c",
+        "recycle_mib": "4096",
+        "viewport": "1280x720"
+      },
+      "since": 1795625109983
+    }
+  },
+  "tiles": [
+    {
+      "done": 1973,
+      "failed": 0,
+      "last_at": 1795626309635,
+      "last_ms": 216.1047100007636,
+      "page": "example.com",
+      "renders_per_s": 1.7,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1973,
+      "failed": 0,
+      "last_at": 1795626309748,
+      "last_ms": 273.67353200043,
+      "page": "news.ycombinator.com",
+      "renders_per_s": 1.7,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309352,
+      "last_ms": 484.2378630000894,
+      "page": "developers.cloudflare.com",
+      "renders_per_s": 1.6666666666666667,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309388,
+      "last_ms": 459.7126810003829,
+      "page": "blog.cloudflare.com",
+      "renders_per_s": 1.6666666666666667,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309475,
+      "last_ms": 499.8081779995118,
+      "page": "en.wikipedia.org",
+      "renders_per_s": 1.6666666666666667,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309418,
+      "last_ms": 430.8077080004296,
+      "page": "developer.mozilla.org-en-us",
+      "renders_per_s": 1.6666666666666667,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1968,
+      "failed": 0,
+      "last_at": 1795626309557,
+      "last_ms": 2846.9816349997927,
+      "page": "www.elmundo.es",
+      "renders_per_s": 1.6666666666666667,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1971,
+      "failed": 0,
+      "last_at": 1795626309867,
+      "last_ms": 1366.5283870004714,
+      "page": "www.rtp.pt-noticias",
+      "renders_per_s": 1.7,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309833,
+      "last_ms": 732.2854809999626,
+      "page": "www.theguardian.com-international",
+      "renders_per_s": 1.7,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309492,
+      "last_ms": 297.5866289998521,
+      "page": "todomvc.com-examples-javascript-es6-dist",
+      "renders_per_s": 1.6666666666666667,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309612,
+      "last_ms": 295.5462340005397,
+      "page": "todomvc.com-examples-react-dist-index.html",
+      "renders_per_s": 1.6666666666666667,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309632,
+      "last_ms": 298.5011949995169,
+      "page": "todomvc.com-examples-vue-dist",
+      "renders_per_s": 1.6666666666666667,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309694,
+      "last_ms": 342.43786900060513,
+      "page": "todomvc.com-examples-angular-dist-browser",
+      "renders_per_s": 1.7,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 1972,
+      "failed": 0,
+      "last_at": 1795626309658,
+      "last_ms": 269.61059299992485,
+      "page": "todomvc.com-examples-preact-dist",
+      "renders_per_s": 1.7,
+      "side": "fcvm",
+      "state": "rendering"
+    },
+    {
+      "done": 2046,
+      "failed": 0,
+      "last_at": 1795626309587,
+      "last_ms": 303.968263,
+      "page": "example.com",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2046,
+      "failed": 0,
+      "last_at": 1795626309632,
+      "last_ms": 290.828954,
+      "page": "news.ycombinator.com",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2045,
+      "failed": 0,
+      "last_at": 1795626309912,
+      "last_ms": 943.703652,
+      "page": "developers.cloudflare.com",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2045,
+      "failed": 0,
+      "last_at": 1795626309920,
+      "last_ms": 938.905598,
+      "page": "blog.cloudflare.com",
+      "renders_per_s": 2.3,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2044,
+      "failed": 0,
+      "last_at": 1795626309866,
+      "last_ms": 1276.360635,
+      "page": "en.wikipedia.org",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2044,
+      "failed": 0,
+      "last_at": 1795626309661,
+      "last_ms": 990.84701,
+      "page": "developer.mozilla.org-en-us",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2043,
+      "failed": 0,
+      "last_at": 1795626309561,
+      "last_ms": 1340.201457,
+      "page": "www.elmundo.es",
+      "renders_per_s": 2.2333333333333334,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2030,
+      "failed": 0,
+      "last_at": 1795626309358,
+      "last_ms": 7182.261416,
+      "page": "www.rtp.pt-noticias",
+      "renders_per_s": 2.2,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2042,
+      "failed": 0,
+      "last_at": 1795626309948,
+      "last_ms": 2101.135967,
+      "page": "www.theguardian.com-international",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2046,
+      "failed": 0,
+      "last_at": 1795626309952,
+      "last_ms": 333.234979,
+      "page": "todomvc.com-examples-javascript-es6-dist",
+      "renders_per_s": 2.3,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2045,
+      "failed": 0,
+      "last_at": 1795626309730,
+      "last_ms": 477.000863,
+      "page": "todomvc.com-examples-react-dist-index.html",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2045,
+      "failed": 0,
+      "last_at": 1795626309608,
+      "last_ms": 354.890109,
+      "page": "todomvc.com-examples-vue-dist",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2045,
+      "failed": 0,
+      "last_at": 1795626309849,
+      "last_ms": 578.579854,
+      "page": "todomvc.com-examples-angular-dist-browser",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 2045,
+      "failed": 0,
+      "last_at": 1795626309618,
+      "last_ms": 344.317209,
+      "page": "todomvc.com-examples-preact-dist",
+      "renders_per_s": 2.2666666666666666,
+      "side": "kitesurf",
+      "state": "rendering"
+    }
+  ]
+}

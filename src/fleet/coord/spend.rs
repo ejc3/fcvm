@@ -11,7 +11,9 @@
 //! instance whose price is not available is priced on demand, an instance whose type has no
 //! on-demand rate at the highest rate known, and a region it cannot list keeps its last
 //! listed instances. Each of those marks the `spend` component degraded. The day's spend
-//! reaches CloudWatch as `SpendUsdToday` (`super::metrics`).
+//! reaches CloudWatch as `SpendUsdToday` (`super::metrics`). A host group launches only types
+//! the same table prices (`super::hosts::unpriced_launch`), so the ceiling bounds what it
+//! launches; an instance of an unpriced type that is already running is still metered high.
 
 use super::aws::{set_items, signed, xml_tag, CredentialChain};
 use super::sigv4::uri_encode;
@@ -26,13 +28,17 @@ use tokio::time::Instant;
 
 /// US East (N. Virginia) Linux on-demand list prices, USD per hour, of the instance types the
 /// fleet launches (AWS Price List API, 2026-11-19; the same in us-east-2 and us-west-2).
-/// c8gd.metal-24xl is pages mode's host (2026-11-24).
+/// m8gd.metal-24xl is pages mode's host: 5.53536 (AWS Price List API, US East (N. Virginia),
+/// Linux on demand, shared tenancy, read 2026-11-25). It has 384 GiB because the mode's 2 MiB
+/// pool and its engines do not fit in the 192 GiB of c8gd.metal-24xl, which pages mode's
+/// measurements ran on first (2026-11-24) and which stays priced here.
 pub const DEFAULT_ON_DEMAND: &[(&str, f64)] = &[
     ("c8gd.metal-24xl", 4.70304),
     ("g4dn.metal", 7.824),
     ("g4dn.xlarge", 0.526),
     ("g5g.metal", 2.744),
     ("g5g.xlarge", 0.42),
+    ("m8gd.metal-24xl", 5.53536),
 ];
 
 /// The instance states the meter charges for: from launch until the instance is gone or
@@ -188,8 +194,11 @@ pub fn on_demand_rates(args: &[String]) -> Result<BTreeMap<String, f64>> {
         .map(|(t, r)| (t.to_string(), *r))
         .collect();
     for a in args {
+        // A list written with spaces (`a=1, b=2`) names the same types: a key kept with its
+        // space would price nothing, and a host group launches no type without a rate.
         let (t, r) = a
             .split_once('=')
+            .map(|(t, r)| (t.trim(), r.trim()))
             .filter(|(t, _)| !t.is_empty())
             .with_context(|| {
                 format!("--spend-rates {a:?} is not <instance type>=<USD per hour>")
@@ -1086,6 +1095,10 @@ mod tests {
         assert_eq!(r["c8gd.metal-24xl"], 4.70304);
         let r = on_demand_rates(&["c8gd.metal-24xl=5.1".into()]).unwrap();
         assert_eq!(r["c8gd.metal-24xl"], 5.1);
+        // a list written with spaces names the same types
+        let r = on_demand_rates(&[" x9z.metal = 3.5 ".into()]).unwrap();
+        assert_eq!(r.get("x9z.metal"), Some(&3.5), "{r:?}");
+        assert!(on_demand_rates(&[" =3.5".into()]).is_err());
         // An on-demand renders host is a host in the burn, at that rate.
         let listed = BTreeMap::from([(
             "us-east-2".to_string(),
@@ -1094,6 +1107,16 @@ mod tests {
         let (hosts, tiles, why) =
             burn_rates(&listed, &HashMap::new(), &on_demand_rates(&[]).unwrap());
         assert_eq!((hosts, tiles, why), (4.70304, 0.0, None));
+        // The host the class launches is an m8gd.metal-24xl: charged at its own rate, not at
+        // the highest rate known with the component degraded.
+        assert_eq!(on_demand_rates(&[]).unwrap()["m8gd.metal-24xl"], 5.53536);
+        let listed = BTreeMap::from([(
+            "us-east-1".to_string(),
+            vec![host("i-m", "m8gd.metal-24xl", false, "us-east-1a")],
+        )]);
+        let (hosts, tiles, why) =
+            burn_rates(&listed, &HashMap::new(), &on_demand_rates(&[]).unwrap());
+        assert_eq!((hosts, tiles, why), (5.53536, 0.0, None));
     }
 
     /// With pages mode's host, the meter lists its region too, and the launch cap counts it

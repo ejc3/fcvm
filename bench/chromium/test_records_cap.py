@@ -172,6 +172,24 @@ class RecordsCap(unittest.TestCase):
         with self.assertRaises(SystemExit):
             records.results_dir([run, os.path.join(records.RESULTS, "x")])
 
+    def test_a_renders_campaign_moves_its_rows_and_keeps_what_a_summary_cites(self):
+        """A pages-mode campaign (results/renders-<id>/<run>) moves each run's per-render rows and its samples;
+        the run's own summary, teardown and host record stay. RED BEFORE THE CHANGE: run_raw_files matched the
+        chromium patterns and listed neither file."""
+        campaign = os.path.join(records.RESULTS, "renders-test")
+        names = ["renders.jsonl", "samples.jsonl", "summary.json", "teardown.json", "host-record.txt"]
+        for run in (os.path.join(campaign, "held-a"), campaign):
+            prefix = os.path.relpath(run, records.REPO) + "/"
+            mine = names if run != campaign else ["held-a/" + n for n in names] + ["transforms.json"]
+            with mock.patch.object(records, "committed_files", side_effect=lambda pre, mine=mine: [pre + n for n in mine]):
+                raw = records.run_raw_files(run)
+            self.assertEqual(sorted(raw), sorted(prefix + n for n in mine if n.endswith(("renders.jsonl", "samples.jsonl"))))
+        self.assertEqual(records.results_dir([campaign]), records.RESULTS)
+        # another chromium run's top-level samples.jsonl is not a renders campaign's
+        other = os.path.join(records.RESULTS, "campaign-x")
+        with mock.patch.object(records, "committed_files", side_effect=lambda pre: [pre + "samples.jsonl"]):
+            self.assertEqual(records.run_raw_files(other), [])
+
     def test_manifest_removes_staged_raw_files_that_were_never_committed(self):
         """A boot-race run's raw files are staged, never committed, then moved. RED BEFORE THE FIX (local codex
         review of the boot-race PR): manifest wrote the manifest and then failed in `git rm`, which refuses a file
