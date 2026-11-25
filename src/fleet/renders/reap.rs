@@ -180,6 +180,10 @@ fn remove_run_dir(run_dir: &Path) -> bool {
                 .and_then(|path| Ok(std::fs::OpenOptions::new().write(true).open(path)?))
                 .and_then(|file| Ok(file.set_len(0)?));
         }
+    } else {
+        // An empty directory at a path nobody claimed (a person's `mkdir`) is nothing
+        // left; `remove_dir` removes nothing that holds anything.
+        let _ = std::fs::remove_dir(run_dir);
     }
     !gone(run_dir)
 }
@@ -250,13 +254,14 @@ impl RunLock {
     /// and before anything is made in it. The claim ends when a sweep has removed the
     /// directory ([`remove_run_dir`]).
     pub fn claim(&self, run_dir: &Path) -> anyhow::Result<()> {
-        use std::io::Write;
+        use std::os::unix::fs::FileExt;
         self.usable(run_dir)?;
         if run_dir_owned(run_dir) {
             return Ok(());
         }
         self.file.set_len(0)?;
-        (&self.file).write_all(CLAIMED.as_bytes())?;
+        // at the start of the file, wherever an earlier claim through this descriptor ended
+        self.file.write_all_at(CLAIMED.as_bytes(), 0)?;
         self.file.sync_all()?;
         anyhow::ensure!(
             run_dir_owned(run_dir),
@@ -545,6 +550,29 @@ mod tests {
         std::fs::write(root.path().join("run.lock"), &CLAIMED[..9]).unwrap();
         assert!(!run_dir_owned(&run));
         let lock = RunLock::take(&run).unwrap();
+        lock.claim(&run).unwrap();
+        assert!(run_dir_owned(&run));
+    }
+
+    /// The start's own order (usable, sweep, claim) on a directory that is there, empty
+    /// and nobody's: a person's `mkdir`. The sweep must not report it as left.
+    #[test]
+    fn an_empty_directory_nobody_claimed_is_taken_at_a_start() {
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let lock = RunLock::take(&run).unwrap();
+        lock.usable(&run).unwrap();
+        assert!(
+            !remove_run_dir(&run),
+            "an empty directory is not something left"
+        );
+        lock.claim(&run).unwrap();
+        assert!(run_dir_owned(&run));
+        // a second claim after a sweep emptied the record writes the whole record again
+        std::fs::create_dir(&run).unwrap();
+        assert!(!remove_run_dir(&run));
+        assert!(!run_dir_owned(&run));
         lock.claim(&run).unwrap();
         assert!(run_dir_owned(&run));
     }
