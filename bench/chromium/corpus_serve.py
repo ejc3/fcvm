@@ -52,6 +52,8 @@ main() returns 1 with the reason.
 """
 
 import argparse
+import fcntl
+import hashlib
 import http.server
 import json
 import os
@@ -86,6 +88,30 @@ def load_indexes(root: Path):
             redirects.setdefault((u.netloc, u.path, u.query), r)
             redirects.setdefault((u.netloc, u.path), r)
     return exact, noquery, redirects
+
+
+def main_documents(root: Path):
+    """The key of each capture's main document: its page's own URL, after the
+    captured redirects that lead from it (en.wikipedia.org/ answers with a
+    redirect to /wiki/Main_Page, which is the document)."""
+    keys = set()
+    for idx in sorted(root.glob("*/index.json")):
+        data = json.loads(idx.read_text())
+        url, seen = data.get("url"), set()
+        redirects = data.get("redirects", {})
+        while url in redirects and url not in seen:
+            seen.add(url)
+            url = urllib.parse.urljoin(url, redirects[url].get("location", ""))
+        if url in data.get("resources", {}):
+            u = urllib.parse.urlparse(url)
+            keys.add((u.netloc, u.path, u.query))
+    return keys
+
+
+def inject(document: bytes, extra: bytes) -> bytes:
+    """`extra` before the document's last </body>, or at its end without one."""
+    at = document.lower().rfind(b"</body>")
+    return document + extra if at < 0 else document[:at] + extra + document[at:]
 
 
 class JsonlLog:
@@ -339,6 +365,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # connection closes after its reply. An idle connection closes after
     # IDLE_TIMEOUT_S, as a silent one always has.
     keep_alive = False
+    # --inject-file: bytes put into each page's main document (main_docs) and
+    # into nothing else, before its </body>. The file is read whole for each
+    # such request, so a writer that replaces it by rename is served old or
+    # new, never half; while it is absent or empty the documents go out as
+    # captured. A reply that carries the bytes says so with their sha256
+    # (X-Replay-Injected), so a client can record what its page was given.
+    inject_file = None
+    main_docs = frozenset()
+
+    def _injection(self, host, u):
+        if self.inject_file is None:
+            return b""
+        if (host, u.path, u.query) not in self.main_docs \
+                and not any(k[0] == host and k[1] == u.path for k in self.main_docs):
+            return b""
+        try:
+            return Path(self.inject_file).read_bytes()
+        except OSError:
+            return b""
 
     def handle_one_request(self):
         # One access line per parsed request, written after the response has
@@ -559,6 +604,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         path, status, mime = entry
         data = path.read_bytes()
+        extra = self._injection(host, u)
+        if extra:
+            data = inject(data, extra)
         # Replay the RECORDED status: coercing errors to 200 changed browser
         # behavior for captured 404/400 responses. Body-bearing 3xx entries
         # (no Location header captured) degrade to 200 so the browser does
@@ -582,6 +630,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if extra:
+            self.send_header("X-Replay-Injected", hashlib.sha256(extra).hexdigest())
         self.end_headers()
         if body:
             self.wfile.write(data)
@@ -650,6 +700,15 @@ class ReplayServer(http.server.ThreadingHTTPServer):
     # connections at the corpus's open-loop rates (#1159), and a dropped SYN
     # is retried after 1 s. The kernel caps it at net.core.somaxconn.
     DEFAULT_BACKLOG = 1024
+
+    # --reuse-port: SO_REUSEPORT on the listener, set here and not through
+    # socketserver's allow_reuse_port, which Python has only from 3.11.
+    reuse_port = False
+
+    def server_bind(self):
+        if self.reuse_port:
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        super().server_bind()
 
     def __init__(self, address, handler, peers=None, name="http", backlog=None,
                  handshake_in_handler=False):
@@ -925,6 +984,30 @@ def ca_signed(tmpdir: Path, hosts, ca_out: Path):
     return crt, key
 
 
+def shared_certificate(cert_dir: Path, hosts):
+    """The CA and leaf every replay process started with this --tls-cert-dir
+    serves: made by the first, under a lock, and read by the rest.
+
+    Several processes behind one address (--reuse-port) are one server to a
+    client, so they must present one leaf under one CA; each making its own, as
+    ca_signed does for a single process, gave a verifying client a different
+    chain per connection. The leaf's key stays in the directory for as long as
+    the processes may start, so the directory is the caller's to make private
+    and to remove. Returns (leaf, key, CA certificate).
+    """
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    crt, key, ca = cert_dir / "replay.crt", cert_dir / "replay.key", cert_dir / "ca.pem"
+    with open(cert_dir / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (crt.exists() and key.exists() and ca.exists()):
+            with tempfile.TemporaryDirectory(prefix="mk-", dir=cert_dir) as tmp:
+                made_crt, made_key = ca_signed(Path(tmp), hosts, Path(tmp) / "ca.pem")
+                os.replace(Path(tmp) / "ca.pem", ca)
+                os.replace(made_key, key)
+                os.replace(made_crt, crt)
+    return crt, key, ca
+
+
 def family_of(addr: str) -> int:
     """AF_INET6 for an IPv6 address literal, AF_INET otherwise."""
     return socket.AF_INET6 if ":" in addr else socket.AF_INET
@@ -1076,6 +1159,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--http11", action="store_true",
                     help="answer HTTP/1.1 and keep connections open between requests "
                          "(Handler.keep_alive); default: HTTP/1.0, one reply per connection")
+    ap.add_argument("--reuse-port", action="store_true",
+                    help="bind the HTTP and TLS listeners with SO_REUSEPORT, so several "
+                         "replay processes share one address and the kernel spreads "
+                         "connections over them; give them one --tls-cert-dir")
+    ap.add_argument("--tls-cert-dir", default=None, metavar="DIR",
+                    help="serve the CA-signed leaf kept in DIR, making it (with DIR/ca.pem, "
+                         "the CA to trust) if DIR has none (see shared_certificate)")
+    ap.add_argument("--inject-file", default=None, metavar="PATH",
+                    help="put PATH's bytes into each page's main document before its "
+                         "</body>, read anew for every such request (Handler.inject_file)")
     ap.add_argument("--tls-ca-out", default=None, metavar="PATH",
                     help="serve a leaf naming every captured host, signed by a CA made "
                          "for this run, and write that CA's certificate to PATH "
@@ -1099,6 +1192,13 @@ def main():
         ap.error(f"--answer-ip is not a valid IPv4 or IPv6 address: {args.answer_ip!r}")
 
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
+    if args.inject_file:
+        Handler.inject_file = args.inject_file
+        Handler.main_docs = frozenset(main_documents(Path(args.root)))
+    if args.tls_cert_dir and args.tls_ca_out:
+        ap.error("--tls-cert-dir keeps its CA at DIR/ca.pem; --tls-ca-out is for one process")
+    if args.reuse_port:
+        ReplayServer.reuse_port = True
     Handler.access_log = JsonlLog(args.access_log) if args.access_log else None
     Handler.close_header = args.connection_close
     if args.http11:
@@ -1128,7 +1228,11 @@ def main():
     # The key pair lives only until it is loaded: a fixed path under /tmp was
     # shared by every server on the box, whatever user each ran as.
     with tempfile.TemporaryDirectory(prefix="corpus-replay-cert-") as tmp:
-        if args.tls_ca_out:
+        if args.tls_cert_dir:
+            crt, key, _ = shared_certificate(
+                Path(args.tls_cert_dir),
+                replay_hosts(Handler.exact, Handler.noquery, Handler.redirects))
+        elif args.tls_ca_out:
             crt, key = ca_signed(Path(tmp), replay_hosts(Handler.exact, Handler.noquery,
                                                          Handler.redirects),
                                  Path(args.tls_ca_out))

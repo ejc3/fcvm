@@ -250,6 +250,138 @@ class ReplayKeepAlive(unittest.TestCase):
                 pass
 
 
+class ReplayPool(unittest.TestCase):
+    """Several replay processes behind one address: one certificate, and the
+    kernel spreads connections over them."""
+
+    def test_processes_given_one_cert_dir_serve_one_leaf_under_one_ca(self):
+        d = tempfile.mkdtemp()
+        with ReplayServer("--tls-cert-dir", d) as a, ReplayServer("--tls-cert-dir", d) as b:
+            ctx = ssl.create_default_context(cafile=os.path.join(d, "ca.pem"))
+            leaves = []
+            for s in (a, b):
+                with socket.create_connection(("127.0.0.1", s.tls), timeout=10) as raw:
+                    with ctx.wrap_socket(raw, server_hostname="example.com") as tls:
+                        leaves.append(tls.getpeercert(binary_form=True))
+            self.assertEqual(leaves[0], leaves[1])
+
+    def test_processes_with_their_own_ca_do_not_verify_under_each_others(self):
+        """What --tls-cert-dir is for: two processes each making a CA
+        (--tls-ca-out) present chains a client holding one CA refuses."""
+        d = tempfile.mkdtemp()
+        with ReplayServer("--tls-ca-out", os.path.join(d, "a.pem")) as a, \
+                ReplayServer("--tls-ca-out", os.path.join(d, "b.pem")) as b:
+            ctx = ssl.create_default_context(cafile=os.path.join(d, "a.pem"))
+            with socket.create_connection(("127.0.0.1", a.tls), timeout=10) as raw:
+                ctx.wrap_socket(raw, server_hostname="example.com").close()
+            with socket.create_connection(("127.0.0.1", b.tls), timeout=10) as raw:
+                with self.assertRaises(ssl.SSLError):
+                    ctx.wrap_socket(raw, server_hostname="example.com")
+
+    def test_two_processes_share_one_port(self):
+        d = tempfile.mkdtemp()
+        logs = [os.path.join(d, "a.log"), os.path.join(d, "b.log")]
+        with ReplayServer("--reuse-port", "--tls-cert-dir", d, "--access-log", logs[0]) as a:
+            b = ReplayServer("--reuse-port", "--tls-cert-dir", d, "--access-log", logs[1])
+            b.http, b.tls = a.http, a.tls
+            with b:
+                for _ in range(64):
+                    with socket.create_connection(("127.0.0.1", a.http), timeout=10) as conn:
+                        conn.sendall(b"GET / HTTP/1.0\r\nHost: example.com\r\n\r\n")
+                        data = b""
+                        while True:
+                            chunk = conn.recv(4096)
+                            if not chunk:
+                                break
+                            data += chunk
+                    self.assertTrue(data.startswith(b"HTTP/1.0 200"), data[:40])
+        # Each process logs the requests it answered: both answered some, 64 between them.
+        answered = []
+        for log in logs:
+            with open(log) as handle:
+                answered.append(sum(1 for line in handle if line.strip()))
+        self.assertEqual(sum(answered), 64)
+        self.assertTrue(all(n > 0 for n in answered), answered)
+
+    def test_a_second_process_without_the_flag_cannot_take_the_port(self):
+        with ReplayServer() as a:
+            b = ReplayServer()
+            b.http, b.tls = a.http, a.tls
+            with self.assertRaises(RuntimeError):
+                b.__enter__()
+
+
+class ReplayInjection(unittest.TestCase):
+    """--inject-file: bytes put into each page's main document, and nothing else."""
+
+    def get(self, port, host, path="/"):
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
+            conn.sendall(f"GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+            data = b""
+            while True:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        head, _, body = data.partition(b"\r\n\r\n")
+        return head.decode().lower(), body
+
+    def test_the_main_document_carries_the_bytes_before_its_body_end(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "inject.html")
+        extra = b'<div id="x">hello</div>'
+        with ReplayServer() as plain, ReplayServer("--inject-file", path) as s:
+            _, captured = self.get(plain.http, "example.com")
+            # no file yet: as captured
+            head, body = self.get(s.http, "example.com")
+            self.assertEqual(body, captured)
+            self.assertNotIn("x-replay-injected", head)
+            with open(path, "wb") as handle:
+                handle.write(extra)
+            head, body = self.get(s.http, "example.com")
+            at = captured.lower().rfind(b"</body>")
+            self.assertEqual(body, captured[:at] + extra + captured[at:])
+            self.assertIn(f"content-length: {len(body)}", head)
+            self.assertIn("x-replay-injected: " + hashlib.sha256(extra).hexdigest(), head)
+            # replaced by rename: the next request has the new bytes, whole
+            with open(path + ".tmp", "wb") as handle:
+                handle.write(b"<i>two</i>")
+            os.replace(path + ".tmp", path)
+            _, body = self.get(s.http, "example.com")
+            self.assertIn(b"<i>two</i></body>", body)
+            self.assertNotIn(b"hello", body)
+            os.unlink(path)
+            _, body = self.get(s.http, "example.com")
+            self.assertEqual(body, captured)
+
+    def test_a_main_document_behind_a_redirect_carries_them_and_a_subresource_does_not(self):
+        import corpus_serve
+        from pathlib import Path
+        root = Path(HERE) / "corpus-live"
+        mains = corpus_serve.main_documents(root)
+        self.assertEqual(len(mains), 14)
+        self.assertIn(("en.wikipedia.org", "/wiki/Main_Page", ""), mains)
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "inject.html")
+        with open(path, "wb") as handle:
+            handle.write(b"<b>MARK</b>")
+        exact, _, _ = corpus_serve.load_indexes(root)
+        sub = next(k for k, v in sorted(exact.items())
+                   if k[0] == "en.wikipedia.org" and k not in mains and v[2] == "text/css")
+        with ReplayServer("--inject-file", path) as s:
+            head, body = self.get(s.http, "en.wikipedia.org", "/wiki/Main_Page")
+            self.assertIn(b"<b>MARK</b>", body)
+            head, body = self.get(s.http, sub[0], sub[1] + ("?" + sub[2] if sub[2] else ""))
+            self.assertIn(" 200 ", head.split("\r\n")[0] + " ")
+            self.assertNotIn(b"MARK", body)
+            self.assertNotIn("x-replay-injected", head)
+
+    def test_a_document_without_a_body_end_gets_them_at_its_end(self):
+        import corpus_serve
+        self.assertEqual(corpus_serve.inject(b"<p>a", b"X"), b"<p>aX")
+        self.assertEqual(corpus_serve.inject(b"<body>a</BODY></html>", b"X"), b"<body>aX</BODY></html>")
+
+
 class BlankScreenshots(unittest.TestCase):
     """A page that comes back as one colour is a failure, not a fast render."""
 
