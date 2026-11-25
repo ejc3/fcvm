@@ -96,3 +96,6 @@ jobs:
           # The rule book of this tree's fc-agent. Change it in the pull request that changes
           # the boundary's order (`flags`, `cookieB` and `design` are the ones in flight).
           lake exe gate-seq check ../fc-agent/src/snapshot_network.rs main
+          # The exhaustive search of the default configurations, every rule book, against the
+          # result the documents quote: state counts, which properties break, and how soon.
+          lake exe gate-breaks summary | diff GateVerify/search.expected -

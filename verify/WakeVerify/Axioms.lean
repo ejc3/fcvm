@@ -26,9 +26,11 @@ its declarations would not be looked at), or if it finds too few theorems or not
 must (a sweep that inspects nothing must not pass).
 
 Declarations are chosen by the module they are declared in, not by name: a `private theorem` and
-one outside the namespace are looked at like any other. `lakefile.toml` builds every file of the
-library's directory (`globs`), so a file nothing imports is still compiled, and the check below
-then names it. -/
+one outside the namespace are looked at like any other, and so is whatever this file declares
+above the sweep. The sweep is this file's last command, and `../check-imports.sh` fails if it
+is not, so nothing can be declared after it. `lakefile.toml` builds every file of the library's
+directory (`globs`), so a file nothing imports is still compiled, and `check-imports.sh` names
+it. -/
 elab "#check_wake_axioms" : command => do
   let env ← getEnv
   let allowed : List Name := [``propext, ``Quot.sound, ``Classical.choice]
@@ -46,7 +48,8 @@ elab "#check_wake_axioms" : command => do
   let decls := env.constants.fold (init := #[]) fun acc name info =>
     match env.getModuleIdxFor? name with
     | some idx => if lib.isPrefixOf modules[idx.toNat]! then acc.push (name, info) else acc
-    | none => acc
+    -- declared in this file, above the sweep
+    | none => acc.push (name, info)
   let mut bad : Array String := #[]
   let mut theorems : Array Name := #[]
   for (name, info) in decls do
@@ -64,7 +67,6 @@ elab "#check_wake_axioms" : command => do
   if !bad.isEmpty then
     throwError "theorems resting on more than Lean's own axioms:\n{"\n".intercalate bad.toList}"
 
-#check_wake_axioms
 
 open Wake
 
@@ -102,3 +104,6 @@ open Wake
 #guard_msgs in #print axioms breaks_snapshot
 /-- info: 'Wake.breaks_wakeAll' depends on axioms: [propext] -/
 #guard_msgs in #print axioms breaks_wakeAll
+
+-- The sweep, last: everything above is looked at. Nothing goes below this line.
+#check_wake_axioms

@@ -1907,6 +1907,7 @@ verify-lake:
 verify: verify-lake
 	verify/check-imports.sh
 	cd verify && "$(VERIFY_LAKE)" build
+	cd verify && "$(VERIFY_LAKE)" exe gate-breaks summary | diff GateVerify/search.expected -
 
 verify-search: verify-lake
 	cd verify && "$(VERIFY_LAKE)" exe breaks

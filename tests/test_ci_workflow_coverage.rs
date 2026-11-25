@@ -3284,7 +3284,10 @@ fn host_jobs_install_from_cached_apt_archives_and_save_on_a_miss() {
 /// - a `paths:` filter on the `push` to main lets main go unchecked after a merge that the
 ///   pull request's own run did not cover;
 /// - `continue-on-error`, an `if:` or an `|| true` on the build step turns a broken proof
-///   into a pass.
+///   into a pass;
+/// - a build step without `./check-imports.sh`, without the drift check naming a rule book, or
+///   without the search compared with its committed result still builds every proof, and no
+///   longer checks what those three check.
 #[test]
 fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
     let wf = parse_workflow("verify.yml");
@@ -3308,7 +3311,13 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    for needed in ["verify/**", ".github/workflows/verify.yml"] {
+    // fc-agent/src/snapshot_network.rs is the source the boundary model's order is compared
+    // with: a change to it has to start the job that makes the comparison.
+    for needed in [
+        "verify/**",
+        ".github/workflows/verify.yml",
+        "fc-agent/src/snapshot_network.rs",
+    ] {
         assert!(
             paths.contains(&needed),
             "verify.yml `pull_request.paths` is {paths:?}; without `{needed}` a change there \
@@ -3396,6 +3405,52 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
     assert!(
         script.contains("set -euo pipefail") && !script.contains("|| true"),
         "the `lake build` step must fail when any of its commands fails: {script:?}"
+    );
+
+    // The same step runs the three checks the models' documents rely on beside the build,
+    // each on a line of its own:
+    // - the import check before the build, because lake does not elaborate Axioms.lean again
+    //   when a file nothing imports is added, so the axiom sweep inside it does not see one;
+    // - the boundary model's drift check, naming the rule book of this tree (without a name it
+    //   passes on any order the model knows, an earlier one included);
+    // - the boundary model's search, compared with the result its documents quote.
+    let lines: Vec<&str> = script.lines().map(str::trim).collect();
+    let line_of = |what: &str, wanted: &dyn Fn(&str) -> bool| -> usize {
+        lines
+            .iter()
+            .position(|l| wanted(l))
+            .unwrap_or_else(|| panic!("the `lake build` step does not run {what}: {script:?}"))
+    };
+    let imports = line_of("`./check-imports.sh` on a line of its own", &|l| {
+        l == "./check-imports.sh"
+    });
+    let built = line_of("`lake build`", &|l| l == "lake build");
+    assert!(
+        imports < built,
+        "`./check-imports.sh` must run before `lake build`: {script:?}"
+    );
+    let drift = line_of(
+        "`lake exe gate-seq check ../fc-agent/src/snapshot_network.rs <rule book>`",
+        &|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            words.len() == 6
+                && words[..5]
+                    == [
+                        "lake",
+                        "exe",
+                        "gate-seq",
+                        "check",
+                        "../fc-agent/src/snapshot_network.rs",
+                    ]
+        },
+    );
+    let search = line_of(
+        "`lake exe gate-breaks summary | diff GateVerify/search.expected -`",
+        &|l| l == "lake exe gate-breaks summary | diff GateVerify/search.expected -",
+    );
+    assert!(
+        built < drift && built < search,
+        "the drift check and the search run the executables `lake build` makes: {script:?}"
     );
 
     // The toolchain is the one verify/lean-toolchain pins, read from the file, and its cache

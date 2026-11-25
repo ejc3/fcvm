@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Every Lean file of a library is imported by that library's Axioms.lean, and the library's
-# root imports Axioms.lean. The axiom sweep in Axioms.lean looks at what the modules it imports
-# declare; lake does not elaborate Axioms.lean again when a file it does not import is added, so
-# this is checked here, outside lake, on every run of `make verify` and of the CI job.
+# Every Lean file of a library is imported by that library's Axioms.lean, the library's root
+# imports Axioms.lean, the sweep is the last command of Axioms.lean, and the executables'
+# modules declare no theorem. The axiom sweep in Axioms.lean looks at what the modules it
+# imports declare; lake does not elaborate Axioms.lean again when a file it does not import is
+# added, so this is checked here, outside lake, on every run of `make verify` and of the CI job.
 set -euo pipefail
 cd "$(dirname "$0")"
 rc=0
@@ -21,6 +22,21 @@ for lib in WakeVerify GateVerify; do
   [ "$n" -gt 1 ] || { echo "check-imports: found no Lean files under $lib" >&2; exit 2; }
   if ! grep -qx "import $lib\.Axioms" "$lib.lean"; then
     echo "check-imports: $lib.lean does not import $lib.Axioms" >&2
+    rc=1
+  fi
+  # The sweep is the last command of Axioms.lean, so nothing is declared after it.
+  sweep="#check_$(echo "${lib%Verify}" | tr '[:upper:]' '[:lower:]')_axioms"
+  last=$(grep -v '^[[:space:]]*$' "$lib/Axioms.lean" | tail -n 1)
+  if [ "$last" != "$sweep" ]; then
+    echo "check-imports: the last line of $lib/Axioms.lean is not $sweep" >&2
+    rc=1
+  fi
+done
+# The executables' modules are outside both sweeps: they declare no theorem and no axiom.
+for f in *.lean; do
+  case "$f" in WakeVerify.lean | GateVerify.lean) continue ;; esac
+  if grep -nE '^[[:space:]]*((private|protected|noncomputable|unsafe|partial)[[:space:]]+)*(theorem|lemma|axiom|opaque)[[:space:]]|native_decide|sorry' "$f" >&2; then
+    echo "check-imports: $f, an executable's module, declares a theorem or an axiom the sweeps do not see" >&2
     rc=1
   fi
 done
