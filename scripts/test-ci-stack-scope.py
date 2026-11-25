@@ -172,11 +172,14 @@ class PrScope(Harness):
 
     def test_a_fork_pr_on_this_branch_does_not_defer_it(self):
         fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100':
-                   [pr(13, 'feature-c', 'feature-b', repo='someone/fork')],
+                   [pr(13, 'feature-c', 'feature-b', 'c' * 40, repo='someone/fork')],
+                   # The fork's head would cover this one if the fork counted as a child.
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
                    f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
-        outputs, _, _ = self.scope(fixture)
+        outputs, calls, _ = self.scope(fixture)
         self.assertEqual(outputs['run'], 'true')
         self.assertEqual(outputs['code'], 'true')
+        self.assertFalse([c for c in calls if '/compare/' in c['path']], 'the fork child was looked up')
 
     def test_a_fork_pr_whose_branch_shares_a_stack_branch_name_runs(self):
         # Upstream has a PR stacked on feature-b; this PR's feature-b is a fork's branch.
