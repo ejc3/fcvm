@@ -356,7 +356,18 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
             harness.write_text(script + 'SCRIPT_DIR=' + shlex.quote(str(Path(__file__).resolve().parent)) + r'''
 sleep() { :; }
 git() { printf '%040d\n' 0; }
+# One required tool reads as missing: `command -v` fails for it, as it does when it is not on PATH.
+if [ -n "${AMI_TEST_MISSING_TOOL:-}" ]; then
+  command() {
+    if [ "$1" = -v ] && [ "$2" = "$AMI_TEST_MISSING_TOOL" ]; then return 1; fi
+    builtin command "$@"
+  }
+fi
 compute_pinned_hash() { echo test-build-hash; }
+compute_pinned_host_kernel() {
+  [ -z "${AMI_TEST_NO_EXPECTED_KERNEL:-}" ] || return 1
+  echo "${AMI_TEST_EXPECTED_KERNEL:-7.3.3-fcvm-0123456789ab}"
+}
 check_existing_ami() { echo None; }
 verify_source_commit_fetchable() { return "${AMI_TEST_UNFETCHABLE:-0}"; }
 get_base_ami() { echo ami-00000000000000000; }
@@ -484,6 +495,97 @@ main
                 self.assertFalse(any(call[1] == "create-image" for call in calls))
                 self.assertNotIn("ami_id", self.outputs(result))
 
+    def test_only_the_host_kernel_the_commit_builds_becomes_an_image(self):
+        # The release rule above passes any fcvm build from 7.2 on. The image has to boot the
+        # one build the pinned commit's host kernel inputs give: scripts/check-runner-kernel.py
+        # fails every CI job on a runner that boots another.
+        other = "7.3.3-fcvm-ba9876543210"
+        for arch in ["arm64", "x64"]:
+            with self.subTest(arch=arch):
+                # the builder installed, and the candidate would boot, another fcvm build
+                result, calls = self.run_build(AMI_ARCH=arch, AMI_TEST_BUILDER_KERNEL=other,
+                                               AMI_TEST_KERNEL=other)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"the builder installed {other}, and this commit builds "
+                              "7.3.3-fcvm-0123456789ab", result.stderr)
+                self.assertFalse(any(call[1] == "create-image" for call in calls))
+                self.assertNotIn("ami_id", self.outputs(result))
+                # the same build, when it is the one the commit gives, is published
+                result, calls = self.run_build(AMI_ARCH=arch, AMI_TEST_BUILDER_KERNEL=other,
+                                               AMI_TEST_KERNEL=other, AMI_TEST_EXPECTED_KERNEL=other)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.outputs(result)["boot_kernel"], other)
+        # A commit whose expected release cannot be computed builds nothing.
+        result, calls = self.run_build(AMI_TEST_NO_EXPECTED_KERNEL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot compute the host kernel this commit builds", result.stderr)
+        self.assertFalse(any(call[1] in {"run-instances", "create-image", "create-tags"} for call in calls))
+
+    def test_the_expected_host_kernel_is_computed_from_the_pinned_commit(self):
+        root = Path(__file__).resolve().parent.parent
+        script = Path(__file__).with_name("build-ami.sh").read_text()
+        function = script[script.index("\ncompute_pinned_host_kernel() {"):]
+        function = function[:function.index("\n}\n") + 3]
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              text=True, capture_output=True)
+        if head.returncode != 0:
+            self.skipTest("not a git checkout")
+        dirty = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--", "rootfs-config.toml", "kernel",
+             "scripts/check-runner-kernel.py"], text=True, capture_output=True, check=True).stdout
+
+        def compute(commit, machine, path=None):
+            # The options build-ami.sh sets for itself: with pipefail a `git archive` that
+            # fails is a failure of the function even when tar accepted what it had sent.
+            return subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + function + '\ncompute_pinned_host_kernel "$1" "$2"',
+                 "bash", str(root), commit],
+                text=True, capture_output=True,
+                env={**os.environ, "KERNEL_MACHINE": machine, **({"PATH": path} if path else {})})
+
+        for machine in ["aarch64", "x86_64"]:
+            with self.subTest(machine=machine):
+                result = compute(head.stdout.strip(), machine)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertRegex(result.stdout, r"\A[0-9]+\.[0-9]+\.[0-9]+-fcvm-[0-9a-f]{12}\n\Z")
+                if not dirty:
+                    checkout = subprocess.run(
+                        [sys.executable, str(root / "scripts/check-runner-kernel.py"), "--print-expected",
+                         "--machine", machine], text=True, capture_output=True, check=True).stdout
+                    self.assertEqual(result.stdout, checkout)
+        # A commit that is not there, and a machine with no host kernel, print nothing.
+        for commit, machine in [("0" * 40, "x86_64"), (head.stdout.strip(), "riscv64")]:
+            result = compute(commit, machine)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+        # So does a `git archive` that sends a whole archive and then fails.
+        self.assertTrue(script.startswith("#!/bin/bash\n") and "\nset -euo pipefail\n" in script[:400])
+        with tempfile.TemporaryDirectory(prefix="ami-git-") as temporary:
+            real = shutil.which("git")
+            fake = Path(temporary) / "git"
+            fake.write_text(f'#!/bin/bash\n{real} "$@"\nstatus=$?\n'
+                            'for a in "$@"; do [ "$a" = archive ] && exit 1; done\nexit $status\n')
+            fake.chmod(0o755)
+            result = compute(head.stdout.strip(), "x86_64", path=f"{temporary}:{os.environ['PATH']}")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.stdout, "")
+
+    def test_a_missing_tool_stops_the_build_before_anything_is_read_or_launched(self):
+        for tool in ["aws", "jq", "git", "python3"]:
+            with self.subTest(tool=tool):
+                result, calls = self.run_build(AMI_TEST_MISSING_TOOL=tool)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"required tool '{tool}' is missing", result.stderr)
+                self.assertEqual(calls, [])
+
+    def test_the_builder_checks_the_kernel_it_installed_against_its_checkout(self):
+        build = self.user_data()
+        steps = ["--install-host-kernel\n", "\nBOOT_KERNEL=$(./scripts/grub-boot-kernel.sh)\n",
+                 '\n./scripts/check-runner-kernel.py --current-only --release "$BOOT_KERNEL"\n',
+                 '\naws ec2 create-tags --resources $INSTANCE_ID --tags "Key=KernelVersion,Value=$BOOT_KERNEL" --region us-west-1\n']
+        positions = [build.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
+
     def test_candidates_of_earlier_runs_are_retired_before_anything_is_built(self):
         stale = ["ami-0aaaaaaaaaaaaaaa1", "ami-0bbbbbbbbbbbbbbb2"]
         for arch, ec2_arch in [("arm64", "arm64"), ("x64", "x86_64")]:
@@ -558,7 +660,7 @@ main
                                    text=True, capture_output=True, check=True).stdout
         baked = "/usr/local/sbin/check-bridge-teardown-kernel.sh"
         # no argument: the kernel the instance is running
-        self.assertIn(f"if {baked}; then\n  STATUS=boot-ok\nfi\n", user_data)
+        self.assertIn(f"if {baked} && nic_order_ok; then\n  STATUS=boot-ok\nfi\n", user_data)
         self.assertIn("STATUS=boot-failed\n", user_data.split(f"if {baked}", 1)[0])
         self.assertIn('"Key=KernelVersion,Value=$(uname -r)" "Key=BuildStatus,Value=$STATUS"', user_data)
         # the builder puts that script in the image, after checking the kernel GRUB will boot
@@ -569,6 +671,66 @@ main
                  f"\ninstall -m 0755 scripts/check-bridge-teardown-kernel.sh {baked}\n"]
         positions = [build.index(step) for step in steps]
         self.assertEqual(positions, sorted(positions))
+
+    def test_the_arm64_image_loads_the_nic_driver_before_cloud_init_local(self):
+        # #2174: the arm64 host kernel keeps ENA a module and the image boots without an
+        # initramfs, so without these two files the NIC binds before cloud-init-local only by
+        # winning a race, and a runner that loses it runs no user data and never registers.
+        script = Path(__file__).with_name("build-ami.sh").read_text()
+        build = script[script.index("\ncreate_user_data() {"):script.index("\nUSERDATA\n}")]
+        block = ('if [ "$RUNNER_ARCH" = arm64 ]; then\n'
+                 "  echo ena > /etc/modules-load.d/fcvm-runner-nic.conf\n"
+                 "  install -d /etc/systemd/system/cloud-init-local.service.d\n"
+                 "  printf '[Unit]\\nAfter=systemd-modules-load.service\\n' \\\n"
+                 "    > /etc/systemd/system/cloud-init-local.service.d/10-fcvm-runner-nic.conf\n"
+                 "fi\n")
+        self.assertIn(block, build)
+        # after the architecture is known, and in the image before it reports done
+        self.assertLess(build.index("aarch64) RUNNER_ARCH=arm64 ;;"), build.index(block))
+        self.assertLess(build.index(block), build.index("Key=BuildStatus,Value=complete"))
+
+    def test_the_boot_test_requires_cloud_init_local_ordered_after_the_module_loader(self):
+        # The candidate is published only when systemd's resolved order of the booted image
+        # holds (#2174). An order that cannot be read is a failed boot test, not a pass.
+        script = Path(__file__).with_name("build-ami.sh").read_text()
+        function = script[script.index("create_boot_test_user_data() {"):].split("\nBOOTTEST\n}", 1)[0] + "\nBOOTTEST\n}"
+        user_data = subprocess.run(["bash", "-c", function + "\ncreate_boot_test_user_data"],
+                                   text=True, capture_output=True, check=True).stdout
+        check = user_data[user_data.index("nic_order_ok() {"):user_data.index("\nSTATUS=boot-failed\n")]
+        loader = "systemd-modules-load.service"
+        # the loader's file is named where the function reads it
+        self.assertIn("\nNIC_MODULES_LOAD=/etc/modules-load.d/fcvm-runner-nic.conf\n", user_data.split("nic_order_ok() {")[0])
+        # machine, the resolved After, systemctl show's status, whether the loader is active,
+        # the loader's file (None: absent)
+        cases = [("aarch64", f"systemd-remount-fs.service {loader} system.slice", 0, 0, "ena\n", True),
+                 ("aarch64", "systemd-remount-fs.service system.slice", 0, 0, "ena\n", False),
+                 ("aarch64", f"not-{loader} system.slice", 0, 0, "ena\n", False),
+                 ("aarch64", "", 0, 0, "ena\n", False),
+                 ("aarch64", loader, 1, 0, "ena\n", False),
+                 # ordered after a loader that failed or never ran: the module was not loaded there
+                 ("aarch64", loader, 0, 3, "ena\n", False),
+                 # an active loader that was not told to load the driver
+                 ("aarch64", loader, 0, 0, None, False),
+                 ("aarch64", loader, 0, 0, "enax\n", False),
+                 # a long After with the loader first: the answer does not depend on a reader
+                 # that stops at the first match while the list is still being written
+                 ("aarch64", loader + " example.service" * 20000, 0, 0, "ena\n", True),
+                 ("x86_64", "systemd-remount-fs.service system.slice", 0, 3, None, True)]
+        for machine, after, status, inactive, conf, want in cases:
+            with self.subTest(machine=machine, after=after[:80], status=status, inactive=inactive, conf=conf), \
+                    tempfile.TemporaryDirectory() as tmp:
+                if conf is not None:
+                    Path(tmp, "nic.conf").write_text(conf)
+                for name, body in (("uname", f'[ "$*" = -m ] && echo {machine}'),
+                                   ("systemctl", f'[ "$*" = "is-active --quiet {loader}" ] && exit {inactive}\n'
+                                                 f'[ "$*" = "show cloud-init-local.service -p After --value" ] || exit 9\n'
+                                                 f"echo '{after}'\nexit {status}")):
+                    tool = Path(tmp, name)
+                    tool.write_text("#!/bin/bash\n" + body + "\n")
+                    tool.chmod(0o755)
+                ran = subprocess.run(["bash", "-c", f"set -uo pipefail\nNIC_MODULES_LOAD={tmp}/nic.conf\n" + check + "\nnic_order_ok"],
+                                     env={"PATH": f"{tmp}:/usr/bin:/bin"}, text=True, capture_output=True)
+                self.assertEqual(ran.returncode == 0, want, ran.stderr)
 
     def test_ambiguous_or_missing_network_fails_before_launch(self):
         for subnets in ["None", "", "subnet-1234567890abcdef0\tsubnet-2234567890abcdef0"]:

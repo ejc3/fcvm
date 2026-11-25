@@ -219,7 +219,15 @@ host's GPUs re-tile coarser over the whole side, and the side gets finer again a
 replacement's GPUs render. One host alone keeps the old behaviour: its places stay dark for
 its replacement, which is what a viewer of a one-host fleet sees anyway. The spend meter
 prices every instance the fleet runs, the replacement included, and a budget trip sleeps the
-fleet, which terminates every host.
+fleet, which terminates every host. Because the ceiling is computed from the rates, a host
+group launches only types the rate table prices (built in, and `--spend-rates`): a template
+whose type has no rate gets no CreateFleet, and the group's component (`scale`,
+`scale-renders`) is degraded with the template and the type until a rate is given. One such
+template holds its region's whole request, its priced templates included; the group's other
+regions launch. The rule holds with or without `--daily-spend-usd`. An instance of such a type
+already running is metered at the highest rate known. EC2 tiles are launched from their
+templates without reading the type, and are not checked (#2169); nothing is checked when the
+coordinator starts, because the types are read from the templates at the first launch.
 
 ECS is used for the coordinator only. The GPU hosts stay plain EC2: the ECS GPU AMIs bind
 the NVIDIA driver on the host, and these hosts must leave every GPU to vfio-pci.
@@ -240,7 +248,7 @@ agent's hello may say: an agent on a renders instance must say it runs the mode 
 nothing of the wall's, and one on a GPU instance must not say it runs the mode, or it is
 refused before the hello is applied. The
 spend meter lists its instances with the rest and charges them under the same daily ceiling;
-c8gd.metal-24xl, its type, has a built-in on-demand rate (4.70304 USD/h).
+m8gd.metal-24xl, its type, has a built-in on-demand rate (5.53536 USD/h).
 
 ### EC2 tiles (the comparison)
 

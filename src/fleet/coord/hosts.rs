@@ -1085,6 +1085,10 @@ pub struct AwsHosts {
     pub template_type_ttl: Duration,
     /// Each template's instance type, as its validated default says, and when it was read.
     types: Mutex<HashMap<(String, String), (String, Instant)>>,
+    /// The on-demand rate of every type the group may launch (built in, and `--spend-rates`):
+    /// the spend meter and the daily cap price instances by it, so a template whose type has
+    /// none is not launched ([`unpriced_launch`]).
+    rates: BTreeMap<String, f64>,
     /// By ClientToken, the parameters of each CreateFleet that got no decision, and when they
     /// were sent. A retry with the token sends them again unchanged: EC2 refuses a token with
     /// other parameters (IdempotentParameterMismatch), and the template's instance type can
@@ -1111,7 +1115,8 @@ impl AwsHosts {
         AwsHosts::for_class(templates, subnets, fleet, HostClass::Gpu)
     }
 
-    /// The driver of `class`'s hosts.
+    /// The driver of `class`'s hosts, launching only types the built-in rates price
+    /// ([`AwsHosts::priced_by`] gives it the coordinator's).
     pub fn for_class(
         templates: &[Regional],
         subnets: &[Regional],
@@ -1147,6 +1152,10 @@ impl AwsHosts {
             endpoints: BTreeMap::new(),
             template_type_ttl: TEMPLATE_TYPE_TTL,
             types: Mutex::new(HashMap::new()),
+            rates: super::spend::DEFAULT_ON_DEMAND
+                .iter()
+                .map(|(t, r)| (t.to_string(), *r))
+                .collect(),
             unanswered: Mutex::new(HashMap::new()),
             subnet_zones: Mutex::new(HashMap::new()),
             chain: CredentialChain::new()?,
@@ -1154,6 +1163,17 @@ impl AwsHosts {
                 .timeout(Duration::from_secs(20))
                 .build()?,
         })
+    }
+
+    /// The driver, launching only types `rates` prices (built in and `--spend-rates`).
+    pub fn priced_by(mut self, rates: BTreeMap<String, f64>) -> Self {
+        self.rates = rates;
+        self
+    }
+
+    /// Whether this driver may launch `instance_type`: its table has a rate for it.
+    pub fn prices(&self, instance_type: &str) -> bool {
+        self.rates.contains_key(instance_type)
     }
 
     /// The regions with host templates, in name order.
@@ -1280,6 +1300,23 @@ impl AwsHosts {
 
 fn p(k: impl Into<String>, v: impl Into<String>) -> (String, String) {
     (k.into(), v.into())
+}
+
+/// Why a launch over `templates` (each template name with its instance type) in `region` is
+/// refused, or `None`: every type needs an on-demand rate in `rates`. The spend meter charges
+/// an instance at its type's rate and the daily cap is computed from the rates, so launching a
+/// type the coordinator cannot price would leave the cap without a bound on it. An instance
+/// already running with such a type is still metered, at the highest rate known.
+pub fn unpriced_launch(
+    region: &str,
+    templates: &[(String, String)],
+    rates: &BTreeMap<String, f64>,
+) -> Option<String> {
+    let (template, ty) = templates.iter().find(|(_, ty)| !rates.contains_key(ty))?;
+    Some(format!(
+        "launch template {template} in {region} starts {ty}, which has no on-demand rate: not \
+         launched; add it with --spend-rates {ty}=<USD per hour> or to spend::DEFAULT_ON_DEMAND"
+    ))
 }
 
 /// The `CreateFleet` (instant) parameters for `count` hosts in `market` over `templates` x
@@ -1557,6 +1594,13 @@ impl HostDriver for AwsHosts {
                 let mut typed = Vec::with_capacity(templates.len());
                 for t in templates {
                     typed.push((t.clone(), self.template_type(region, t).await?));
+                }
+                // Refused before any request: nothing is launched and no token is kept.
+                if let Some(why) = unpriced_launch(region, &typed, &self.rates) {
+                    return Ok(Launch {
+                        failed: vec![why],
+                        ..Launch::default()
+                    });
                 }
                 create_fleet_params(
                     &typed,
@@ -1895,6 +1939,67 @@ impl HostDriver for FakeHosts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spend meter and the daily cap price every instance by its type's on-demand rate,
+    /// so a group launches only types the effective table (built in, and `--spend-rates`)
+    /// prices: a type without one is a launch that names the type and how to price it.
+    #[test]
+    fn a_launch_type_needs_an_on_demand_rate() {
+        let typed = vec![("tpl-a".to_string(), "x9z.metal".to_string())];
+        let builtin = super::super::spend::on_demand_rates(&[]).unwrap();
+        let why = unpriced_launch("us-east-1", &typed, &builtin).expect("refused");
+        assert!(why.contains("x9z.metal"), "{why}");
+        assert!(why.contains("tpl-a"), "{why}");
+        assert!(
+            why.contains("--spend-rates x9z.metal=<USD per hour>"),
+            "{why}"
+        );
+        let given = super::super::spend::on_demand_rates(&["x9z.metal=3.5".into()]).unwrap();
+        assert_eq!(unpriced_launch("us-east-1", &typed, &given), None);
+        // pages mode's host launches on the built-in rate
+        let renders = vec![("tpl-r".to_string(), "m8gd.metal-24xl".to_string())];
+        assert_eq!(unpriced_launch("us-east-1", &renders, &builtin), None);
+        // one unpriced template of several holds the whole request
+        let mixed = vec![
+            ("tpl-g".to_string(), "g4dn.metal".to_string()),
+            ("tpl-a".to_string(), "x9z.metal".to_string()),
+        ];
+        assert!(unpriced_launch("us-east-1", &mixed, &builtin).is_some());
+    }
+
+    /// A group whose template starts an unpriced type sends no CreateFleet: the launch comes
+    /// back failed (the class's degraded component carries the text), with no token kept for
+    /// a retry, as no request was sent.
+    #[tokio::test]
+    async fn a_template_whose_type_has_no_rate_launches_nothing() {
+        let regional = |name: &str| Regional {
+            region: "us-east-1".into(),
+            name: name.into(),
+        };
+        let mut d = AwsHosts::for_class(
+            &[regional("tpl-a")],
+            &[regional("subnet-a")],
+            "stage".into(),
+            HostClass::Renders,
+        )
+        .unwrap()
+        .priced_by(super::super::spend::on_demand_rates(&[]).unwrap());
+        // nothing listens here: a request that went out would fail, not come back failed
+        d.endpoints
+            .insert("us-east-1".into(), "http://127.0.0.1:9".into());
+        d.types.lock().unwrap().insert(
+            ("us-east-1".into(), "tpl-a".into()),
+            ("x9z.metal".into(), Instant::now()),
+        );
+        let got = d
+            .launch("us-east-1", Market::Spot, 1, "token-1", &[])
+            .await
+            .expect("a refusal, not an undecided request");
+        assert!(got.ids.is_empty() && got.refused.is_empty(), "{got:?}");
+        assert_eq!(got.failed.len(), 1, "{got:?}");
+        assert!(got.failed[0].contains("x9z.metal"), "{got:?}");
+        assert!(d.unanswered.lock().unwrap().is_empty());
+    }
 
     /// A token whose last ask launched a host just before its time ran out is held, not
     /// dropped: dropping it then would release its on-demand reservation while that host is

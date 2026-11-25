@@ -353,6 +353,11 @@ help:
 	@echo "  install-host-kernel  Build and install host kernel with patches (requires reboot)"
 	@echo "  check-host-kernel-build  Check packages and free space install-host-kernel needs"
 	@echo ""
+	@echo "Formal model (verify/, Lean 4):"
+	@echo "  verify             Check the wake-up model: every proof and every recorded break (lake build)"
+	@echo "  verify-search      Run the exhaustive search for lost wake-ups (about 10 minutes, 2 GB)"
+	@echo "  verify-harness     Compare the model's kernel rules with the kernel's own functions"
+	@echo ""
 	@echo "Kernel patches:"
 	@echo "  kernel-patch-create PROFILE=nested NAME=0004-fix FILE=fs/fuse/dir.c"
 	@echo "  kernel-patch-edit PROFILE=nested PATCH=0002"
@@ -767,6 +772,51 @@ test-unit: show-notes check-disk build _test-unit
 test-agent-unit: show-notes check-disk cargo-target-link _test-agent-unit
 test-fast: show-notes check-disk setup-fcvm _test-fast
 test-all: show-notes check-disk setup-fcvm _test-all
+
+# --confine's CI gate (src/confine.rs): the rootless VM tests that cover each restore path
+# and device, with every VMM confined (FCVM_CONFINE=required) and its syscall allowlist
+# enforcing, run through scripts/confine-gate.sh. An unlisted syscall kills the VMM; the gate
+# runs each test once (no retry, so a stop on one try of two cannot pass as flaky), fails on
+# any policy stop in the lane's output or its per-test logs, fails when a test passed
+# without asserting its VMM confined (tests/common assert_vmm_confined_under_the_gate), and
+# fails when the filter matches fewer tests than CONFINE_TEST_MIN. Needs a kernel with
+# Landlock ABI 9 or later; below it every confined start is refused. It runs the default
+# feature set (integration-fast and integration-slow): the snapshot clone and FUSE snapshot
+# matrix tests are integration-slow. Hugepage tests are privileged-tests, and a root start is
+# not confined yet, so they are not here.
+CONFINE_TEST_FILTER ?= -E 'test(/^test_confine_/) | test(=the_compiled_filter_traps_a_syscall_the_policy_does_not_list) | test(=firecracker::vm::tests::a_trapped_syscall_stops_the_vmm_and_is_reported) | test(=test_sanity_rootless) | test(=test_large_boot_plan_rootless) | test(=test_first_firecracker_log_line_from_the_api_thread_rootless) | test(=test_exec_rootless) | (test(/^test_pmem_/) & !test(/sudo/)) | test(/^test_fuse_snapshot_matrix_/) | test(/snapshot_clone/) | test(=test_clone_while_baseline_running_rootless)'
+# How many tests that filter matches. A filter that matches fewer fails the gate; raise it
+# with the filter.
+CONFINE_TEST_MIN ?= 36
+# The tests in the filter that start no VMM through the test helpers: one loads the compiled
+# filter in a child process, one runs a Firecracker that serves no guest.
+CONFINE_NO_VMM_TESTS ?= the_compiled_filter_traps_a_syscall_the_policy_does_not_list firecracker::vm::tests::a_trapped_syscall_stops_the_vmm_and_is_reported
+test-confine: show-notes check-disk setup-fcvm
+	CONFINE_GATE_NO_VMM_TESTS="$(CONFINE_NO_VMM_TESTS)" ./scripts/confine-gate.sh $(CONFINE_TEST_MIN) \
+		$(MAKE) --no-print-directory _test-all FILTER="$(CONFINE_TEST_FILTER)"
+
+# The confined seccomp policies are generated: the fork's shipped filters for the pinned
+# Firecracker commit (resources/seccomp/fork-*.json) plus resources/seccomp/confined-changes.json.
+# confine-seccomp-refresh fetches the fork's filters for [firecracker] commit after a repin;
+# confine-seccomp-policy writes the policies; the confine:: unit tests fail until both are done.
+confine-seccomp-refresh:
+	@commit=$$(awk '/^\[firecracker\]/{f=1;next} /^\[/{f=0} f && /^commit *=/{gsub(/[" ]/,"",$$3); print $$3}' rootfs-config.toml); \
+	repo=$$(awk '/^\[firecracker\]/{f=1;next} /^\[/{f=0} f && /^repo *=/{gsub(/[" ]/,"",$$3); print $$3}' rootfs-config.toml); \
+	test -n "$$commit" && test -n "$$repo" || { echo "no [firecracker] repo/commit in rootfs-config.toml" >&2; exit 1; }; \
+	for arch in x86_64 aarch64; do \
+	  curl -fsSL "https://raw.githubusercontent.com/$$repo/$$commit/resources/seccomp/$$arch-unknown-linux-musl.json" \
+	    -o resources/seccomp/fork-$$arch-unknown-linux-musl.json || exit 1; \
+	done; \
+	echo "fetched $$repo@$$commit; set fork.commit in resources/seccomp/confined-changes.json and CONFINED_FIRECRACKER_COMMIT in src/confine.rs to it, then make confine-seccomp-policy"
+confine-seccomp-policy:
+	FCVM_WRITE_SECCOMP_POLICY=1 $(MAKE) --no-print-directory test-unit FILTER=the_confined_policies_are_the_fork_filters_plus_the_declared_changes
+
+# Discovery tool for the policy, not a gate: the same tests in log mode, failing on any
+# syscall the policy does not list. Needs auditd: without it the kernel prints the
+# type=1326 records to the kernel log through printk_ratelimit, so a run can drop records
+# and a clean result would mean nothing; the script refuses to run without it.
+test-confine-audit: show-notes check-disk setup-fcvm
+	./scripts/confine-seccomp-audit.sh $(MAKE) --no-print-directory _test-all FILTER="$(CONFINE_TEST_FILTER)"
 test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages setup-cloud-hypervisor _test-root
 test: test-root
 
@@ -1923,3 +1973,22 @@ kernel-patch-edit:
 
 kernel-patch-validate:
 	./scripts/kernel-patch.sh validate $(PROFILE)
+
+# ---- Formal model of the vCPU wake-up path (verify/) ----
+# Lean 4, toolchain pinned in verify/lean-toolchain. elan installs lake under ~/.elan/bin.
+VERIFY_LAKE ?= $(shell command -v lake 2>/dev/null || echo $(HOME)/.elan/bin/lake)
+
+.PHONY: verify verify-search verify-harness verify-lake
+verify-lake:
+	@test -x "$(VERIFY_LAKE)" || { \
+		echo "BLOCKED: lake not found. Install elan (https://github.com/leanprover/elan); it reads verify/lean-toolchain." >&2; \
+		exit 2; }
+
+verify: verify-lake
+	cd verify && "$(VERIFY_LAKE)" build
+
+verify-search: verify-lake
+	cd verify && "$(VERIFY_LAKE)" exe breaks
+
+verify-harness: verify-lake
+	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/harness/run.sh
