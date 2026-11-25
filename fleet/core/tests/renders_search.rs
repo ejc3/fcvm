@@ -170,8 +170,38 @@ fn changes(levels: &[u32]) -> usize {
     levels.windows(2).filter(|w| w[0] != w[1]).count()
 }
 
+/// Steps up: after the first back-off each one is a probe.
+fn probes(levels: &[u32]) -> usize {
+    levels.windows(2).filter(|w| w[1] > w[0]).count()
+}
+
 fn rate(done: &[u32]) -> f64 {
     done.iter().sum::<u32>() as f64 / done.len() as f64
+}
+
+#[test]
+#[ignore = "prints where the search settles on the recorded ladders; run with --ignored --nocapture"]
+fn where_the_search_settles() {
+    for (name, gap, secs) in [("fcvm", 85.0, 1800usize), ("kitesurf", 46.0, 2400)] {
+        let l = ladder(name, gap);
+        for seed in [1, 2, 3, 4, 5] {
+            let r = run(&l, SearchParams::default(), seed, secs as u64);
+            let v = r.search.view();
+            let first = r.levels.windows(2).position(|w| w[1] < w[0]).unwrap();
+            let late = &r.levels[secs - 1200..];
+            println!(
+                "{name} seed {seed}: first step back from {} at {} s; limit {:?}; last 20 min: levels {} to {}, probes {}, changes {}, {:.1} renders/s",
+                r.levels[first],
+                first + 1,
+                v.limit,
+                late.iter().min().unwrap(),
+                late.iter().max().unwrap(),
+                probes(late),
+                changes(late),
+                rate(&r.done[secs - 1200..])
+            );
+        }
+    }
 }
 
 /// fcvm's recorded ladder bends between 16 and 20 in flight (render time 1.19 then 1.47

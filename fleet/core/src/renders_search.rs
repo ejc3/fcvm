@@ -17,11 +17,12 @@
 //!   figure is the median of those over the pages. The level spiked when that is above
 //!   `ratio`, or when the share of the dwell in which some task of the side waited for a CPU
 //!   is above `pressure`.
-//! - **Back-off.** To the level below, which held: it becomes the limit. The side holds it
-//!   for `hold_ms`, judges it again over that hold (a level that held alone may not once the
-//!   other side is at its own limit), and then probes one step up. A level that spikes on
-//!   two probes in a row doubles the hold, up to `hold_max_ms`. A probe that passes the last
-//!   spike's level goes one step above it and holds there.
+//! - **Back-off.** To the level below, which held: it becomes the limit.
+//! - **Hold.** After a back-off a side holds its level for `hold_ms` (five minutes), then
+//!   tries one more render in flight: one probe per hold. A probe that spikes goes back and
+//!   holds again; one that does not becomes the limit and is held. At the end of each hold
+//!   the held level is judged over the whole hold first, and steps down if it no longer
+//!   holds (a level that held alone may not once the other side is at its own limit).
 //! - **Failure.** A failed render at the level backs off at once, to half.
 //!
 //! The other side's load makes this side's renders slower without sharing a core with it, so
@@ -45,9 +46,9 @@ pub struct SearchParams {
     pub min_renders: u32,
     /// The longest a level waits for them.
     pub dwell_max_ms: u64,
-    /// How long a side holds its limit before it probes again, and the most that doubles to.
+    /// How long a side holds its level after a back-off, or after a probe that held, before
+    /// it tries one more render in flight.
     pub hold_ms: u64,
-    pub hold_max_ms: u64,
     /// The most renders in flight the side may run (its engines, its memory).
     pub max_in_flight: u32,
 }
@@ -59,8 +60,7 @@ impl Default for SearchParams {
             pressure: 0.15,
             min_renders: 3,
             dwell_max_ms: 90_000,
-            hold_ms: 60_000,
-            hold_max_ms: 300_000,
+            hold_ms: 300_000,
             max_in_flight: 64,
         }
     }
@@ -107,9 +107,6 @@ pub struct LimitSearch {
     since_ms: Option<u64>,
     pressure_at: Option<u64>,
     hold_until_ms: u64,
-    hold_ms: u64,
-    /// The level of the last spike.
-    spike_level: Option<u32>,
     limit: Option<u32>,
     backed_off: Option<BackOff>,
     curve: BTreeMap<u32, (f64, f64)>,
@@ -133,7 +130,6 @@ fn median(values: &[f64]) -> Option<f64> {
 
 impl LimitSearch {
     pub fn new(params: SearchParams, pages: usize) -> Self {
-        let hold_ms = params.hold_ms;
         LimitSearch {
             params,
             pages,
@@ -145,8 +141,6 @@ impl LimitSearch {
             since_ms: None,
             pressure_at: None,
             hold_until_ms: 0,
-            hold_ms,
-            spike_level: None,
             limit: None,
             backed_off: None,
             curve: BTreeMap::new(),
@@ -252,12 +246,6 @@ impl LimitSearch {
 
     fn back_off(&mut self, cause: SpikeCause, m: &Measured, now_ms: u64, pressure: Option<u64>) {
         let from = self.level;
-        self.hold_ms = if self.spike_level == Some(from) {
-            (self.hold_ms * 2).min(self.params.hold_max_ms)
-        } else {
-            self.params.hold_ms
-        };
-        self.spike_level = Some(from);
         self.level = if cause == SpikeCause::Failed {
             (from / 2).max(1)
         } else {
@@ -272,7 +260,7 @@ impl LimitSearch {
             at: now_ms,
         });
         self.phase = Phase::Holding;
-        self.hold_until_ms = now_ms + self.hold_ms;
+        self.hold_until_ms = now_ms + self.params.hold_ms;
         self.begin(now_ms, pressure);
     }
 
@@ -327,16 +315,12 @@ impl LimitSearch {
                 self.record(&m);
                 if let Some(cause) = self.spiked(&m) {
                     self.back_off(cause, &m, now_ms, pressure_usec);
-                } else if self.level >= self.params.max_in_flight
-                    || self.spike_level.is_some_and(|s| self.level > s)
-                {
-                    // The most the side may run, or one step above the last spike: hold.
+                } else if self.level >= self.params.max_in_flight || self.backed_off.is_some() {
+                    // The most the side may run, or a probe that held: this is the limit now,
+                    // held for a whole hold before the next probe.
                     self.limit = Some(self.level);
                     self.hold(now_ms, pressure_usec);
                 } else {
-                    if self.backed_off.is_some() {
-                        self.limit = Some(self.level);
-                    }
                     self.level += 1;
                     self.begin(now_ms, pressure_usec);
                 }
@@ -627,29 +611,60 @@ mod tests {
     }
 
     #[test]
-    fn a_level_that_spikes_on_two_probes_in_a_row_doubles_the_hold() {
+    fn after_a_back_off_a_side_probes_once_per_hold() {
         let mut s = LimitSearch::new(params(), 2);
         let (mut now, mut psi) = (0, 0);
         let f = |l: u32| if l <= 5 { 100.0 } else { 140.0 };
         climb(&mut s, f, |_| 0.0, &mut now, &mut psi);
-        let mut holds = Vec::new();
-        let mut held_since = now;
-        // Run for half an hour of decisions; record how long each hold at 5 lasted.
-        for _ in 0..1800 {
+        let mut probes = Vec::new();
+        let start = now;
+        // An hour of decisions: every probe is one step up from 5, five minutes after the
+        // last step back, and comes back at the next decision.
+        for _ in 0..3600 {
             let before = s.in_flight();
             feed(&mut s, 2, 3, f(before));
             now += 1000;
             let after = s.step(now, Some(psi));
-            if before == 5 && after == 6 {
-                holds.push(now - held_since);
-            }
-            if before == 6 && after == 5 {
-                held_since = now;
+            if after > before {
+                probes.push(now - start);
+                assert_eq!((before, after), (5, 6));
             }
             assert!(after == 5 || after == 6, "left the limit: {after}");
         }
-        assert_eq!(&holds[..4], &[60_000, 120_000, 240_000, 300_000]);
-        assert!(holds[4..].iter().all(|h| *h == 300_000));
+        assert_eq!(probes.len(), 11);
+        assert!(
+            probes.windows(2).all(|w| w[1] - w[0] == 301_000),
+            "{probes:?}"
+        );
+        assert_eq!(s.limit(), Some(5));
+    }
+
+    #[test]
+    fn a_probe_that_holds_becomes_the_limit_and_is_held() {
+        // The first spike at 6 was noise: 6 holds from then on, 7 does not.
+        let mut s = LimitSearch::new(params(), 2);
+        let (mut now, mut psi) = (0, 0);
+        climb(
+            &mut s,
+            |l| if l <= 5 { 100.0 } else { 140.0 },
+            |_| 0.0,
+            &mut now,
+            &mut psi,
+        );
+        let f = |l: u32| if l <= 6 { 100.0 } else { 140.0 };
+        let mut levels = Vec::new();
+        for _ in 0..1000 {
+            let level = s.in_flight();
+            feed(&mut s, 2, 3, f(level));
+            now += 1000;
+            levels.push(s.step(now, Some(psi)));
+        }
+        // 300 s at 5, a probe to 6 that holds, 300 s at 6, a probe to 7 that does not
+        assert_eq!(levels[298], 5);
+        assert_eq!(levels[299], 6);
+        assert!(levels[300..600].iter().all(|l| *l == 6));
+        assert_eq!((levels[600], levels[601]), (7, 6));
+        assert_eq!(s.limit(), Some(6));
     }
 
     #[test]
@@ -665,7 +680,7 @@ mod tests {
             &mut psi,
         );
         assert_eq!(s.in_flight(), 5);
-        for _ in 0..61 {
+        for _ in 0..301 {
             feed(&mut s, 2, 3, 130.0);
             now += 1000;
             s.step(now, Some(psi));
@@ -694,7 +709,7 @@ mod tests {
         assert_eq!(s.step(now, Some(psi)), 5);
         assert_eq!(s.view().phase, SearchPhase::Holding);
         // 130 ms at 6 was a spike against 100 and is not against 110
-        for _ in 0..60 {
+        for _ in 0..300 {
             feed(&mut s, 2, 3, 110.0);
             now += 1000;
             s.step(now, Some(psi));
@@ -703,12 +718,16 @@ mod tests {
         feed(&mut s, 2, 3, 130.0);
         now += 1000;
         s.step(now, Some(psi));
+        let v = s.view();
         assert_eq!(
-            s.view().backed_off.unwrap().from,
+            v.backed_off.unwrap().from,
             6,
             "the old spike, not a new one"
         );
-        assert_eq!(s.in_flight(), 7);
+        assert_eq!(
+            (v.in_flight, v.limit, v.phase),
+            (6, Some(6), SearchPhase::Holding)
+        );
     }
 
     #[test]
