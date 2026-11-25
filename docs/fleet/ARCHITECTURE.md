@@ -2464,6 +2464,44 @@ each stage, by SIGKILL and by SIGTERM, and counts what is left: processes, the u
 network namespaces, clones' state files and directories, sockets, listening ports, the run
 directory, 2 MiB pages. Every count must be zero.
 
+### The recorded campaign
+
+The page's recorded figures come from one campaign: every regime on one boot of one host, on
+fcvm's own host kernel, at one fcvm commit and one Kitesurf commit, each regime a run of
+`make fleet-renders-bench`. `bench/chromium/renders_campaign.py` writes the campaign's summary,
+`bench/chromium/results/renders-<id>-summary.json`, from the runs' records and a `host-record.txt`
+written beside each when it ended (kernel, fcvm commit, Kitesurf commit, instance type, a hash of
+the boot id, the run's arguments). It writes nothing when two runs differ in any of those, when
+the kernel is not fcvm's own, when a run's summary names another kernel, or when a run's teardown
+left something. Per regime the summary holds each side's figures over a stated window
+(`renders_analyze.py`), the levels the search moved through, and the sha256 and size of the run's
+files.
+
+Each run's `summary.json`, `teardown.json` and `host-record.txt` stay in the tree under
+`bench/chromium/results/renders-<id>/<run>/`. Its row per render and its samples are in
+ejc3/fcvm-bench-records at the same path, listed in `results/records-renders-<id>.json`
+(`records.py`).
+
+`bench/chromium/renders_reference.py` writes `fleet/web/core/renders-reference.gen.ts` from the
+one summary in the tree: the campaign, its date, instance type, kernel and commits, and each
+regime's figures by label. The regime labelled `held` is the page's table: both sides held at the
+limits the module's own search ended on. No figure is typed; `test_renders_reference.py` fails
+when the file is not what the summary gives.
+
+The campaign in the tree, `renders-20261125`, has these regimes:
+
+| label | what ran |
+|---|---|
+| `search`, `search-2`, `search-3` | both sides, the search live, three starts (30, 20 and 20 minutes); scored over the last five minutes |
+| `held`, `held-2` | both sides held at the limits the first search ended on, five scored minutes, taken after the first search and again at the end of the boot |
+| `alone-fcvm`, `alone-kitesurf` | one side at its limit while the other half is idle |
+| `one-fcvm`, `one-kitesurf` | one render at a time |
+| `bundle-default-*`, `bundle-opt-*` | Kitesurf alone on its production bundle built in Bazel's default mode and with `-c opt`, at one render in flight and at its limit, each twice |
+
+Beside them: `teardown-check.json` (the stage kills on that boot), `transforms.json` (the mean
+pixel difference of Kitesurf's screenshots with each transform against its plain ones: which
+transforms it draws at that commit) and `kitesurf-bundles.txt` (the two bundles' digests).
+
 ## Windows mode
 
 `?mode=windows` shows disposable Windows desktops, each a Cloud Hypervisor VM restored from a
