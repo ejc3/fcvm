@@ -45,6 +45,9 @@ STAND_IN_REQBENCH = textwrap.dedent('''
 ''')
 
 STAND_IN_CDPDRIVE = textwrap.dedent('''
+    def parse_viewport(text):
+        if text and "x" not in text:
+            raise ValueError(f"--viewport wants WIDTHxHEIGHT, got {text!r}")
     def drive(ns):
         if "explode" in ns.url:
             raise OSError("refused")
@@ -152,6 +155,19 @@ class WorkerProtocol(unittest.TestCase):
         self.assertEqual((row["detail"]["width"], row["detail"]["height"]), (1280, 720))
         self.assertGreaterEqual(row["ms"], 0.0)
         self.assertEqual((lines[2]["ok"], lines[2]["error"]), (False, "OSError: refused"))
+
+    def test_a_malformed_viewport_ends_the_worker_before_it_is_ready(self):
+        """The module learns at start, from a worker that exits, and no render is tried."""
+        for side in (["--side", "kitesurf"],
+                     ["--side", "fcvm", "--run-id", "r", "--out-dir", self.dir.name,
+                      "--fcvm", "/bin/true", "--serve-pid", "42", "--data-root", self.dir.name,
+                      "--cgroup-procs", "/sys/fs/cgroup/x/cgroup.procs"]):
+            stdout = io.StringIO()
+            with self.assertRaises(SystemExit):
+                renders_worker.main(side + ["--index", "0", "--bench", self.dir.name,
+                                            "--viewport", "1280-720"],
+                                    stdin=io.StringIO(""), stdout=stdout)
+            self.assertEqual(stdout.getvalue(), "")
 
     def test_the_fcvm_side_refuses_to_start_without_its_arguments(self):
         with self.assertRaises(SystemExit):

@@ -186,7 +186,8 @@ impl LimitSearch {
         self.level
     }
 
-    /// The highest level that held, once the side has stepped back from a spike.
+    /// The highest level that held, once the side has stepped back from a spike or reached
+    /// the most it may run.
     pub fn limit(&self) -> Option<u32> {
         self.limit
     }

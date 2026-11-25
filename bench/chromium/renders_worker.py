@@ -161,6 +161,13 @@ def main(argv=None, stdin=None, stdout=None):
         args = fcvm_args(opts, opts.bench)
     else:
         import cdpdrive
+    # A viewport that does not parse is refused here, before the worker says it is ready,
+    # and not once per render.
+    import cdpdrive as driver
+    try:
+        driver.parse_viewport(opts.viewport)
+    except ValueError as error:
+        p.error(str(error))
     emit({"ready": True, "pid": os.getpid()})
 
     rep = 0

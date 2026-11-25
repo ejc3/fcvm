@@ -861,6 +861,8 @@ impl Module {
     }
 
     async fn engine(&mut self, index: usize, result: Result<(Child, f64)>) {
+        // The start that sent this is over: take it, and any other that is, out of the set.
+        while self.starting.try_join_next().is_some() {}
         let e = &mut self.engines[index];
         e.recycling = false;
         let restarting = std::mem::take(&mut e.restarting);
@@ -1036,6 +1038,19 @@ fn setup_values(given: &[String]) -> Result<[BTreeMap<String, String>; 2]> {
         out[i].insert(name.to_string(), value.to_string());
     }
     Ok(out)
+}
+
+/// Why levels held by `--levels` cannot be run, if they cannot: a side's level is above
+/// the most it may run (what was asked for, lowered to what the 2 MiB pool carries for the
+/// fcvm side). Held levels are reported as run, so one the side would be kept below is
+/// refused.
+fn fixed_levels_refusal(fixed: [u32; 2], most: [u32; 2]) -> Option<String> {
+    (0..2).find(|&side| fixed[side] > most[side]).map(|side| {
+        format!(
+            "--levels asks the {} side for {} renders in flight; it may run {} at most",
+            SIDES[side], fixed[side], most[side]
+        )
+    })
 }
 
 /// The harness's CPUs as the two replays' and the drivers': `each` for each replay and the
@@ -1318,6 +1333,7 @@ async fn run(
             max_fcvm = carries;
         }
         fcvm_setup.insert("pool_pages".into(), pool.to_string());
+        fcvm_setup.insert("max_in_flight".into(), max_fcvm.to_string());
     }
 
     // The memory server.
@@ -1529,6 +1545,10 @@ async fn run(
         u64::from(args.window_s) * 1000,
         now,
     );
+    if let Some(refusal) = fixed.and_then(|f| fixed_levels_refusal(f, [max_fcvm, args.max_engines]))
+    {
+        bail!(refusal);
+    }
     wall.cap(FCVM, max_fcvm.max(1));
     wall.cap(KITE, args.max_engines.max(1));
     let viewport = ("viewport".to_string(), args.viewport.clone());
@@ -1898,6 +1918,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn held_levels_above_what_a_side_may_run_are_refused() {
+        assert_eq!(fixed_levels_refusal([16, 36], [16, 48]), None);
+        assert_eq!(fixed_levels_refusal([0, 36], [0, 36]), None);
+        // the pool lowered the fcvm side's most to 16
+        let refused = fixed_levels_refusal([40, 36], [16, 48]).unwrap();
+        assert!(
+            refused.contains("fcvm side for 40") && refused.contains("16 at most"),
+            "{refused}"
+        );
+        let refused = fixed_levels_refusal([8, 49], [40, 48]).unwrap();
+        assert!(refused.contains("kitesurf side for 49"), "{refused}");
+    }
+
     /// An engine start under way when the module ends would put a process into a cgroup
     /// the reaper is removing. The starts are kept in one set, and the module ends them
     /// before it returns to let its reaper go.
@@ -1908,6 +1942,10 @@ mod tests {
         let recycle = &recycle[..recycle.find("\n    }\n").unwrap()];
         assert!(recycle.contains("self.starting.spawn("));
         assert!(!recycle.contains("tokio::spawn("));
+        // and a finished start leaves the set when its result is handled
+        let handled = &source[source.find("    async fn engine(&mut self").unwrap()..];
+        let handled = &handled[..handled.find("\n    }\n").unwrap()];
+        assert!(handled.contains("self.starting.try_join_next()"));
         let run = &source[source.find("async fn run(").unwrap()..];
         // not this test's own text
         let run = &run[..run.find("#[cfg(test)]").unwrap()];

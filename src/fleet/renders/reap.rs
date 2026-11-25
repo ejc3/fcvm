@@ -136,7 +136,7 @@ pub async fn sweep(target: &Target) -> Reaped {
     // Only a directory this module made: a caller's path that holds something else stays,
     // and is reported as left.
     if run_dir_is_ours(&target.run_dir) {
-        let _ = std::fs::remove_dir_all(&target.run_dir);
+        remove_run_dir(&target.run_dir);
     }
     out.run_dir_left = target.run_dir.exists();
     out
@@ -153,6 +153,33 @@ pub fn run_dir_is_ours(dir: &Path) -> bool {
         Ok(mut entries) => dir.join(RUN_MARKER).is_file() || entries.next().is_none(),
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
+}
+
+/// Remove everything in a run directory but its marker. The marker goes last
+/// ([`remove_run_dir`]), so a removal that is cut short (the reaper killed, the host
+/// losing power) leaves a directory the next start still knows as the module's.
+fn remove_run_dir_contents(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name() == RUN_MARKER {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
+/// Remove a run directory: its contents, then its marker, then the directory.
+fn remove_run_dir(dir: &Path) {
+    remove_run_dir_contents(dir);
+    let _ = std::fs::remove_file(dir.join(RUN_MARKER));
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// One module at a time per run directory: an exclusive lock on `<run dir>.lock`, held by
@@ -384,6 +411,31 @@ mod tests {
         std::fs::create_dir_all(ours.join("certs-fcvm")).unwrap();
         std::fs::write(ours.join(RUN_MARKER), "").unwrap();
         assert!(run_dir_is_ours(&ours));
+    }
+
+    /// A removal cut short after any part of the contents leaves the marker, so the next
+    /// start's sweep takes the directory as the module's and finishes the job.
+    #[test]
+    fn a_run_directory_half_removed_is_still_the_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join("run");
+        std::fs::create_dir_all(run.join("certs-fcvm")).unwrap();
+        std::fs::write(run.join("certs-fcvm/ca.pem"), "x").unwrap();
+        std::fs::write(run.join("inject-fcvm.html"), "").unwrap();
+        std::fs::write(run.join(RUN_MARKER), "").unwrap();
+        // as far as a removal gets before its last two steps
+        remove_run_dir_contents(&run);
+        let left: Vec<_> = std::fs::read_dir(&run)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [RUN_MARKER]);
+        assert!(run_dir_is_ours(&run));
+        // and one cut short earlier: something left beside the marker
+        std::fs::write(run.join("inject-kitesurf.html"), "").unwrap();
+        assert!(run_dir_is_ours(&run));
+        remove_run_dir(&run);
+        assert!(!run.exists());
     }
 
     #[test]
