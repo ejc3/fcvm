@@ -611,7 +611,7 @@ Which kernels carry that patch:
 | KVM that runs the restored guest | carries the patch |
 |---|---|
 | fcvm's x86_64 host kernel (`[kernel_profiles.nested.amd64.host_kernel]`, `kernel/patches-x86-host`), on the x64 runners and the fleet's GPU hosts once their images are rebuilt from a main that has it | yes |
-| KVM inside an fcvm guest, for a VM restored inside that guest: `nested.amd64` (6.18.60), `phone.amd64` (7.3.3) and the `mountinfo` pair (6.16.1), each with a port of the patch in its own patch set | yes |
+| KVM inside an fcvm guest, for a VM restored inside that guest: `nested.amd64` (6.18.60, a port in `kernel/patches-x86`), `phone.amd64` (7.3.3, a link to the host's patch in `kernel/patches-phone-7.3`) and the `mountinfo` pair (6.16.1, a port in `kernel/patches-mountinfo`, to which the control's `kernel/patches-mountinfo-base` links) | yes |
 | a distribution's or any other kernel from 6.15 on that fcvm did not build | no |
 
 `every_x86_kernel_that_builds_kvm_carries_the_pv_kick_patch`

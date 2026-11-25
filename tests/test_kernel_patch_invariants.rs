@@ -609,6 +609,62 @@ fn kernel_patch_reads_a_value_that_a_comment_follows() {
     );
 }
 
+/// `kernel-patch.sh` reads `kernel_version` and `patches_dir` as `key = "value"` with an
+/// optional comment after it. A TOML literal string, or a value with an escaped quote, is a
+/// line it cannot read: it must stop and name the line, not go on with a wrong directory.
+#[test]
+fn kernel_patch_refuses_a_value_it_cannot_parse() {
+    for (line, key) in [
+        ("patches_dir = 'kernel/patches-x86'", "patches_dir"),
+        (
+            "patches_dir = \"kernel/patches-\\\"x86\\\"\"",
+            "patches_dir",
+        ),
+        (
+            "patches_dir = \"kernel/patches-x86\" trailing",
+            "patches_dir",
+        ),
+        ("kernel_version = '6.18.60'", "kernel_version"),
+    ] {
+        let root = tempfile::tempdir().expect("create the fixture checkout");
+        fs::create_dir_all(root.path().join("scripts")).unwrap();
+        let script = root.path().join("scripts/kernel-patch.sh");
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/kernel-patch.sh"),
+            &script,
+        )
+        .expect("copy kernel-patch.sh");
+        let mut table = String::from("[kernel_profiles.nested.amd64]\n");
+        if key != "kernel_version" {
+            table.push_str("kernel_version = \"6.18.60\"\n");
+        }
+        table.push_str(line);
+        table.push('\n');
+        if key != "patches_dir" {
+            table.push_str("patches_dir = \"kernel/patches-x86\"\n");
+        }
+        fs::write(root.path().join("rootfs-config.toml"), table).unwrap();
+        let out = Command::new("bash")
+            .arg(&script)
+            .args(["resolve", "nested"])
+            .env("KERNEL_PATCH_ARCH", "x86_64")
+            .output()
+            .expect("run kernel-patch.sh resolve");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains(line),
+            "resolve took `{line}`: status {:?}\n{}",
+            out.status.code(),
+            output_text(&out)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("patches_dir="),
+            "resolve printed a patches_dir for `{line}`: {}",
+            output_text(&out)
+        );
+    }
+}
+
 /// A checkout with `scripts/kernel-patch.sh`, a host kernel profile pinning release 9.9.9
 /// with five patches to one 30-line file, and a work directory holding that release's
 /// source, already extracted, so the script downloads nothing. In glob order `0001-first`,
@@ -1026,6 +1082,44 @@ impl KvmKernel {
     }
 }
 
+/// The (major, minor) of a kernel release written as `<major>.<minor>` or
+/// `<major>.<minor>.<patch>`, every part in digits. None for anything else (`6.15-rc1`,
+/// `v6.18.60`, `6`), which cannot be ordered against 6.15.
+fn release_series(release: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = release.split('.').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    let numbers: Vec<u32> = parts
+        .iter()
+        .map(|part| {
+            (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| part.parse().ok())
+                .flatten()
+        })
+        .collect::<Option<_>>()?;
+    Some((numbers[0], numbers[1]))
+}
+
+#[test]
+fn a_kernel_release_is_ordered_only_when_every_part_is_a_number() {
+    assert_eq!(release_series("6.18.60"), Some((6, 18)));
+    assert_eq!(release_series("7.3"), Some((7, 3)));
+    assert_eq!(release_series("6.14.11"), Some((6, 14)));
+    for refused in [
+        "6.15-rc1",
+        "v6.18.60",
+        "6.18.x",
+        "6",
+        "6.18.60.1",
+        "6..60",
+        "",
+        "+6.18",
+    ] {
+        assert_eq!(release_series(refused), None, "{refused:?}");
+    }
+}
+
 /// Every x86_64 kernel in rootfs-config.toml that builds KVM on Linux 6.15 or later: a host
 /// kernel, which exists to run VMs, and a guest kernel whose `kernel_config` sets
 /// `CONFIG_KVM`. A VM restored under such a kernel loses the kick its restore gave it,
@@ -1067,17 +1161,22 @@ fn x86_kernels_that_build_kvm() -> Vec<KvmKernel> {
                 .as_str()
                 .unwrap_or_else(|| panic!("[{table}] pins no kernel_version"))
                 .to_string();
-            let mut numbers = release.split('.').map(|part| {
-                part.parse::<u32>()
-                    .unwrap_or_else(|_| panic!("[{table}] kernel_version {release:?}"))
+            let series = release_series(&release).unwrap_or_else(|| {
+                panic!(
+                    "[{table}] kernel_version {release:?} is not <major>.<minor> or \
+                     <major>.<minor>.<patch> in digits, so it cannot be compared with 6.15"
+                )
             });
-            let series = (numbers.next().unwrap(), numbers.next().unwrap_or(0));
             if series < (6, 15) {
                 continue;
             }
             kernels.push(KvmKernel {
                 table,
                 release,
+                // A table that names no patches_dir is read as applying none. The build
+                // applies kernel/patches for such a table, so a kernel that got the patch
+                // from there would fail these tests though it carries it: a false alarm,
+                // answered by naming the directory in the table.
                 patches_dir: kernel
                     .get("patches_dir")
                     .and_then(|dir| dir.as_str())
