@@ -964,8 +964,9 @@ impl VmManager {
     /// run unfiltered under a VM recorded as confined. The threads get
     /// [`SECCOMP_VERIFY_DEADLINE`] to install them, since the API call that builds the VM
     /// can return before a new thread has run its first instruction. The caller must not
-    /// let the guest run after an error: a boot goes through [`Self::verify_confined`],
-    /// which kills the VMM, and a restore's failure path kills it.
+    /// let the guest run on after an error: a boot, whose guest is already running, goes
+    /// through [`Self::verify_confined`], which kills the VMM; a restore checks before it
+    /// resumes the guest, and its failure path kills the VMM.
     pub async fn check_confined(&self) -> Result<()> {
         if self.decision.confinement().is_none() {
             return Ok(());
@@ -1007,7 +1008,7 @@ impl VmManager {
         if let Err(kill) = self.kill().await {
             warn!(target: "vm", vm_id = %self.vm_id, error = %kill, "killing the unfiltered VMM");
         }
-        Err(error.context("the confined VMM was killed before its guest ran"))
+        Err(error.context("the confined VMM was killed"))
     }
 
     /// Non-blocking check if the VM process has exited.
@@ -2350,7 +2351,7 @@ mod tests {
         assert!(
             refused.contains("run without a seccomp filter")
                 && refused.contains("Seccomp: 0, Seccomp_filters: 0")
-                && refused.contains("the confined VMM was killed before its guest ran"),
+                && refused.contains("the confined VMM was killed"),
             "{refused}"
         );
         assert!(killed, "the unfiltered VMM {pid} is still running");

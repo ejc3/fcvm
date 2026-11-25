@@ -604,18 +604,19 @@ rootless networking, the Firecracker backend, the default build of Firecracker, 
 kernel with Landlock ABI 9 or later. A kernel profile that pins its own Firecracker is
 refused. `fcvm setup` compiles the allowlist beside each Firecracker it builds from the
 commit the allowlist is derived from, and records the compiled file's SHA-256 beside it
-(`<filter>.sha256`). A confined start reads the filter once, without following a symbolic
-link, refuses one that is not a regular file owned by the user (or root, or the owner of
+(`<filter>.sha256`). A confined start opens the filter without following a symbolic link
+and refuses one that is not a regular file owned by the user (or root, or the owner of
 the Firecracker binary), that other users can write, or whose bytes are not the recorded
-ones, and hands the VMM those bytes in a sealed memory file. The check runs before
-anything is created, so a host that was upgraded and not set up again is told to run
-`fcvm setup` with nothing started; `fcvm setup` rebuilds a filter that does not match its
-record. Another binary (`--firecracker-bin`, or the one an older snapshot recorded) has
-no recorded filter and is refused the same way. Once Firecracker has built the VM, and
-before the guest runs, fcvm reads every thread of the VMM from `/proc` and requires each
-to run under a seccomp filter; otherwise it kills the VMM and fails the start naming the
-thread, because Firecracker accepts a filter file that installs nothing. `fcvm ls` shows
-the layers a VM runs with.
+ones. It checks before anything is created, so a host that was upgraded and not set up
+again is told to run `fcvm setup` with nothing started; `fcvm setup` rebuilds a filter
+that does not match its record. The launch checks again and hands the VMM the bytes it
+checked, in a sealed memory file. Another binary (`--firecracker-bin`, or the one an
+older snapshot recorded) has no recorded filter and is refused the same way. Once
+Firecracker has built the VM, fcvm reads every thread of the VMM from `/proc` and
+requires each to run under a seccomp filter; otherwise it kills the VMM and fails the
+start naming the threads, because Firecracker accepts a filter file that installs
+nothing. A restore is checked before its guest resumes; a boot within 5 s of its guest's
+start. `fcvm ls` shows the layers a VM runs with.
 
 **What the two layers do not stop.** The record and the filter belong to the same user
 as fcvm, so the digest catches a damaged, truncated or half-replaced filter and not a
@@ -630,7 +631,11 @@ not apply yet. Until it does, confinement narrows what a compromised VMM can ask
 kernel for; it is not a boundary between the VMM and the rest of the user's files.
 
 **A syscall outside the allowlist kills the VMM, and the guest with it.** fcvm logs at ERROR
-which Firecracker thread made which syscall. The allowlist covers what fcvm's test suites
+which Firecracker thread made which syscall. One case is known where the thread hangs
+instead: Firecracker's handler for the trap writes a log line, and a syscall trapped while
+that thread was already writing one (glibc reading the time zone file for the first line)
+left the API thread stopped, the guest running and nothing reported. `TZ=<UTC>0` removes
+that call; a trap in the same place from another cause would do the same. The allowlist covers what fcvm's test suites
 ask of Firecracker; a workload that takes Firecracker down a path they do not can hit a
 syscall it does not list. Check a workload first with `FCVM_CONFINE_SECCOMP=log`: a syscall
 outside the allowlist is then allowed and the kernel records it as an audit record of type
