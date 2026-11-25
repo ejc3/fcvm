@@ -3,6 +3,8 @@ import ResumeVerify.Today
 import ResumeVerify.Design
 import ResumeVerify.Properties
 import ResumeVerify.Configs
+import ResumeVerify.Labels
+import ResumeVerify.Mutants
 import Std.Data.HashMap
 
 /-!
@@ -11,19 +13,15 @@ import Std.Data.HashMap
 Breadth-first over every reachable state of each rule book in each configuration, so the first
 state found that breaks a property is at the end of a shortest run. Every state is expanded,
 broken or not. `lake exe resume-breaks` prints one line per rule book and configuration (the
-text of `ResumeVerify/search.expected`); `lake exe resume-breaks traces` adds the runs, and
-`lake exe resume-breaks spins` lists every kind of state with #2155's signature.
+text of `ResumeVerify/search.expected`); `lake exe resume-breaks traces` adds the runs,
+`lake exe resume-breaks spins` lists every kind of state with #2155's signature, and
+`lake exe resume-breaks mutants` searches every mutant of `ResumeVerify/Mutants.lean` (the text
+of `ResumeVerify/mutants.expected`) and exits 1 if one of them has no break.
 -/
 
 open Resume
 
-def vids : List Vid := [false, true]
-
-def allLabels : Array Label :=
-  ((vids.flatMap fun v =>
-      ([GAct.arm, .toIdle, .wfi, .ack .tmr, .ack .sgi, .ack .spi, .eoi, .send, .l2].map (Label.g v))
-        ++ [Label.fire v, Label.wake v])
-    ++ ([.dev, .tick, .wait, .pause, .save, .resume, .restore] : List Label)).toArray
+def labels : Array Label := allLabels.toArray
 
 def vn (v : Vid) : String := if v then "1" else "0"
 
@@ -71,10 +69,11 @@ def showVcpu (c : Vcpu) : String :=
     ++ bstr "STOPPED" c.stopped ++ bstr "offline" c.gOff ++ bstr "AP1R" c.ap
     ++ (if c.pmr then "" else " PMR-shut") ++ (if c.grp then "" else " GRP-off")
     ++ " " ++ showIrq "tmr" c.tmr ++ " " ++ showIrq "sgi" c.sgi
-    ++ (if c.tEn then s!" timer@{c.cv}" else "") ++ bstr "call-owed" c.call ++ bstr "L2" c.l2
+    ++ (if c.tEn then s!" timer@{c.cv}" else "") ++ bstr "tick-owed" c.owed
+    ++ bstr "call-owed" c.call ++ bstr "L2" c.l2 ++ (if c.l2 && !c.ichv then " ICH_VMCR-lost" else "")
 
 def showCtr : Ctr → String
-  | .fresh => "FRESH"
+  | .fresh host => if host then "FRESH (the host's)" else "FRESH (near zero)"
   | .sync e => if e.t == 0 && e.o == 0 then "exact" else s!"off by {e.t} of host time, {e.o} of CNTVOFF_EL2"
 
 def showState (s : State) : String :=
@@ -88,7 +87,7 @@ structure Found where
   complete : Bool
 
 partial def explore (R : Rules) (C : Cfg) (limit : Nat) : Found := Id.run do
-  let cs := (checks C).toArray
+  let cs := (checks C ++ notes).toArray
   let s0 := init C
   let mut states : Array State := #[s0]
   let mut parent : Array (Nat × Nat) := #[(0, 0)]
@@ -100,8 +99,8 @@ partial def explore (R : Rules) (C : Cfg) (limit : Nat) : Found := Id.run do
     let s := states[next]!
     for ci in [0:cs.size] do
       if first[ci]!.isNone && cs[ci]!.2 s then first := first.set! ci (some next)
-    for li in [0:allLabels.size] do
-      match step R C allLabels[li]! s with
+    for li in [0:labels.size] do
+      match step R C labels[li]! s with
       | none => pure ()
       | some t =>
         if !index.contains t then
@@ -118,7 +117,7 @@ partial def pathTo (f : Found) (i : Nat) : List Label :=
   let rec go (i : Nat) (acc : List Label) : List Label :=
     if i == 0 then acc else
       let (p, li) := f.parent[i]!
-      go p (allLabels[li]! :: acc)
+      go p (labels[li]! :: acc)
   go i []
 
 def nvBooks : List Rules := [Today.forkBefore630, Today.forkNested, Design.firecracker]
@@ -127,29 +126,6 @@ def elBooks : List Rules :=
    Today.cloudHypervisorUpstream true, Today.forkDefault, Design.cloudHypervisor, Design.firecracker]
 
 def booksFor (C : Cfg) : List Rules := if C.nv then nvBooks else elBooks
-
-/-- Each repair of the design put back, one at a time (`lake exe resume-breaks mutants`). -/
-def mutants : List Rules :=
-  let d := Design.cloudHypervisor
-  let f := Design.firecracker
-  [{ d with name := "ch: slots read from vCPU 0 again", slotsFromRestore := true },
-   { d with name := "ch: image holds the counter of the save", cntAtPause := false },
-   { d with name := "ch: resume does not take out the pause", freeze := false },
-   { d with name := "ch: load to resume not taken out", freezeLoaded := false },
-   { d with name := "ch: restore adds the wall time since the pause", advance := true },
-   { d with name := "ch: lines not saved", levelInfo := false },
-   { d with name := "ch: clear-registers written with the saved bits", clearInverted := false },
-   { d with name := "ch: no KVM_ARM_SET_COUNTER_OFFSET on restore", restore := d.restore.filter (· != .offset) },
-   { d with name := "ch: lines not restored", restore := d.restore.filter (· != .level) },
-   { d with name := "ch: counter of the last vCPU not replayed, no offset",
-            restore := d.restore.filter (fun o => o != .offset && o != .cntv true && o != .cntp true) },
-   { f with name := "fc: image holds the counter of the save", cntAtPause := false },
-   { f with name := "fc: resume does not take out the pause", freeze := false },
-   { f with name := "fc: load to resume not taken out", freezeLoaded := false },
-   { f with name := "fc: lines not saved", levelInfo := false },
-   { f with name := "fc: clear-registers written with the saved bits", clearInverted := false },
-   { f with name := "fc: no KVM_ARM_SET_COUNTER_OFFSET on restore", restore := f.restore.filter (· != .offset) },
-   { f with name := "fc: lines not restored", restore := f.restore.filter (· != .level) }]
 
 def printRun (R : Rules) (C : Cfg) (title : String) (labels : List Label) : IO Unit := do
   IO.println s!"\n### {title} ({labels.length} steps)"
@@ -169,29 +145,61 @@ def spinKind (C : Cfg) (s : State) (v : Vid) : String :=
   let c := s.vm.get v
   let p := (if pend true c.tmr && c.tmr.en && !c.tmr.act then ["timer PPI pending"] else [])
     ++ (if pend false c.sgi && c.sgi.en && !c.sgi.act then ["SGI pending"] else [])
-    ++ (if !v && pend C.spiLevel s.vm.spi && s.vm.spi.en && !s.vm.spi.act then ["SPI pending"] else [])
+    ++ (if !v && pend C.spiLevel s.vm.spi && s.vm.spi.en && !s.vm.spi.act then ["device interrupt pending"] else [])
   let w := (if c.ap then ["AP1R0 bit set, CPU in no handler"] else [])
     ++ (if !c.grp then ["IGRPEN1 off"] else [])
     ++ (if c.tmr.act then ["timer PPI active, CPU not in its handler"] else [])
     ++ (if c.sgi.act then ["SGI active, CPU not in its handler"] else [])
-  s!"vCPU {vn v}: " ++ ", ".intercalate w ++ "; " ++ ", ".intercalate p
+    ++ (if !c.tmr.en then ["timer PPI disabled"] else [])
+  let how := if c.thr == .guest then "in the guest, WFI returns at once"
+    else if c.stopped then "stopped, in KVM's background-timer loop"
+    else "blocked, in KVM's background-timer loop (its timer is due)"
+  s!"vCPU {vn v} {how}: " ++ ", ".intercalate w ++ "; " ++ ", ".intercalate p
+
+def guestSpins (C : Cfg) (s : State) (v : Vid) : Bool :=
+  let c := s.vm.get v
+  c.thr == .guest && !c.stopped && c.g == .idle && kvmPending C s.vm v
+    && !deliverable C s.vm v .tmr && !deliverable C s.vm v .sgi && !deliverable C s.vm v .spi
+
+def hostLoops (C : Cfg) (s : State) (v : Vid) : Bool :=
+  let c := s.vm.get v
+  c.thr != .user &&
+    ((c.thr == .blocked && !c.stopped && timerStuck s.vm c && !kvmPending C s.vm v) ||
+     (c.stopped && timerDue s.vm c))
 
 def main (args : List String) : IO UInt32 := do
+  let traces := args.contains "traces"
+  let limit := 30000000
   if args.contains "mutants" then
+    let mut bad := false
     for R in mutants do
       let mut line := s!"{R.name}:"
+      let mut shown := false
+      let mut any := false
       for (name, _, C) in runs do
-        let f := explore R C 30000000
+        let f := explore R C limit
+        if !f.complete then
+          bad := true
+          line := line ++ s!" [{name}: LIMIT REACHED]"
         let cs := (checks C).toArray
         let mut found : List String := []
         for ci in [0:cs.size] do
           if f.first[ci]!.isSome then found := found ++ [cs[ci]!.1]
-        if !found.isEmpty then line := line ++ s!" [{name}: {", ".intercalate found}]"
-      IO.println line
-    return 0
-  let traces := args.contains "traces"
+        if !found.isEmpty then
+          any := true
+          line := line ++ s!" [{name}: {", ".intercalate found}]"
+          if traces && !shown then
+            shown := true
+            for ci in [0:cs.size] do
+              if let some i := f.first[ci]! then
+                if cs[ci]!.1 == found.head! then
+                  printRun R C s!"{name}, {R.name}: {cs[ci]!.1}" (pathTo f i)
+      if !traces then IO.println line
+      if !any then
+        bad := true
+        IO.println s!"{R.name}: NO BREAK FOUND"
+    return (if bad then 1 else 0)
   let spinsOnly := args.contains "spins"
-  let limit := 30000000
   let mut total := 0
   let mut incomplete := false
   for (name, what, C) in runs do
@@ -200,22 +208,20 @@ def main (args : List String) : IO UInt32 := do
       let f := explore R C limit
       total := total + f.states.size
       if !f.complete then incomplete := true
-      let cs := (checks C).toArray
+      let cs := (checks C ++ notes).toArray
       if spinsOnly then
         if R.name == "cloud-hypervisor" || R.name == "fork-default" then
           let mut kinds : Std.HashMap String (Nat × Nat) := {}
           for i in [0:f.states.size] do
             let s := f.states[i]!
-            if spins C s then
+            if running s then
               for v in vids do
-                let c := s.vm.get v
-                if c.thr == .guest && !c.stopped && c.g == .idle && kvmPending C s.vm v
-                    && !deliverable C s.vm v .tmr && !deliverable C s.vm v .sgi && !deliverable C s.vm v .spi then
+                if guestSpins C s v || hostLoops C s v then
                   let k := spinKind C s v
                   match kinds[k]? with
                   | some (n, d) => kinds := kinds.insert k (n + 1, d)
                   | none => kinds := kinds.insert k (1, i)
-          IO.println s!"\n## {name}, {R.name}: {kinds.size} kinds of spinning vCPU"
+          IO.println s!"\n## {name}, {R.name}: {kinds.size} kinds of vCPU at a full host CPU with no interrupt possible"
           let sorted := kinds.toArray.qsort (fun a b => a.1 < b.1)
           for (k, (n, i)) in sorted do
             IO.println s!"  {n} states, shortest run {(pathTo f i).length} steps: {k}"
@@ -231,7 +237,9 @@ def main (args : List String) : IO UInt32 := do
         if traces then
           for ci in [0:cs.size] do
             match f.first[ci]! with
-            | some i => printRun R C s!"{name}, {R.name}: {cs[ci]!.1}" (pathTo f i)
+            | some i =>
+              if !cs[ci]!.1.startsWith "--" then
+                printRun R C s!"{name}, {R.name}: {cs[ci]!.1}" (pathTo f i)
             | none => pure ()
   if !spinsOnly then IO.println s!"\n{total} states in all"
   return (if incomplete then 1 else 0)

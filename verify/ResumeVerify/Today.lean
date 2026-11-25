@@ -32,6 +32,11 @@ namespace Today
   (`access_redists_aux`, redist_regs.rs:132-157; `set_dist_regs`, dist_regs.rs:167-180): a bit
   the new VM has set and the image has not is not cleared. KVM enables every SGI of a new vCPU
   (v7.3.3 vgic-init.c:276-286), so an SGI the guest disabled is enabled in the clone.
+* Every resume, in place or of a restored VM, raises each virtio queue's interrupt whether or
+  not the queue has anything new ("to wake up the driver to avoid a livelock",
+  virtio-devices/src/device.rs:404-431; still there upstream at 4969a51a3d3f, device.rs:483-485).
+  Nothing else on the pause, the save or the resume writes to KVM: the pause flushes the
+  pending and ITS tables into guest memory (devices/src/gic.rs:165-173) and the save reads.
 * The restore makes each vCPU and restores it before it makes the next (`create_vcpu`,
   vmm/src/cpu.rs:974-1027, called per vCPU from `create_boot_vcpus`, cpu.rs:1525; vCPUs before
   devices, vmm/src/vm.rs:974, 1059): `KVM_ARM_VCPU_INIT` with `POWER_OFF` for every vCPU but
@@ -43,6 +48,7 @@ def cloudHypervisor : Rules :=
   { name := "cloud-hypervisor",
     slotsFromRestore := true, cntAtPause := false, freeze := false, freezeLoaded := false,
     advance := false, levelInfo := false, clearInverted := false,
+    nestedIcc := false, onSave := [], onResume := [.kick],
     restore := [.create false, .init false false, .cntp false, .cntv false, .regs false, .mp false,
                 .create true, .init true true, .cntp true, .cntv true, .regs true, .mp true,
                 .gic, .dist, .redist false, .redist true, .icc false, .icc true] }
@@ -77,16 +83,35 @@ or `advance` (the default).
   (v7.3.3 arch_timer.c:1075-1090, include/kvm/arm_arch_timer.h:188-196). The per-vCPU register
   replay still writes each vCPU's saved counter first (kvm/mod.rs:3256-3261); the write at the
   resume is the last and wins.
-* All vCPUs are created, then restored on several threads (vmm/src/cpu.rs:1169-1205). The model
-  restores vCPU 0 then vCPU 1; the order cannot matter for the counter, which is written again
-  at the resume. The rest of the order is taken from a354afd77 and was not read again here. -/
+* Every vCPU is created and given its `KVM_ARM_VCPU_INIT` first (`create_vcpu`,
+  vmm/src/cpu.rs:1065-1094), then the saved states are replayed, on several threads
+  (`create_vcpus`, cpu.rs:1169-1205; `Vcpu::restore`, cpu.rs:724-737). So no `KVM_CREATE_VCPU`
+  and no `KVM_ARM_VCPU_INIT` follows a register replay: a later create would reset the VM's
+  counter offsets and a later init would disarm a replayed timer (`Mutant.chInitLate`). The
+  model replays vCPU 0 then vCPU 1; `upstream_replay_order` (`Proofs.lean`) is that the other
+  order builds the same VM. The vGIC is made and restored after the vCPUs
+  (`create_interrupt_controller` after `create_boot_vcpus`), in the order of a354afd77.
+* After the first resume of a restored VM a virtio-net device announces itself: a config-change
+  event with its interrupt (virtio-devices/src/net.rs:54-57, 100-106). That is an event of the
+  device with its own (edge, MSI) interrupt, which the model's device may raise at any time
+  once the guest runs. -/
 def cloudHypervisorUpstream (advance : Bool) : Rules :=
   { name := if advance then "cloud-hypervisor-upstream-advance" else "cloud-hypervisor-upstream-preserve",
     slotsFromRestore := false, cntAtPause := true, freeze := false, freezeLoaded := !advance,
     advance := advance, levelInfo := false, clearInverted := true,
-    restore := [.create false, .create true,
-                .init false false, .cntp false, .cntv false, .regs false, .mp false,
-                .init true true, .cntp true, .cntv true, .regs true, .mp true,
+    nestedIcc := false, onSave := [], onResume := [.kick],
+    restore := [.create false, .init false false, .create true, .init true true,
+                .cntp false, .cntv false, .regs false, .mp false,
+                .cntp true, .cntv true, .regs true, .mp true,
+                .gic, .dist, .redist false, .redist true, .icc false, .icc true,
+                .cntv false] }
+
+/-- The same with the two vCPUs' states replayed in the other order. -/
+def cloudHypervisorUpstreamSwapped (advance : Bool) : Rules :=
+  { cloudHypervisorUpstream advance with
+    restore := [.create false, .init false false, .create true, .init true true,
+                .cntp true, .cntv true, .regs true, .mp true,
+                .cntp false, .cntv false, .regs false, .mp false,
                 .gic, .dist, .redist false, .redist true, .icc false, .icc true,
                 .cntv false] }
 
@@ -108,16 +133,32 @@ def fcOrder (offset : Bool) : List Op :=
 /-- fcvm's Firecracker fork before the fix of #630, ejc3/firecracker ba79650e (NV2 support, no
 counter code): the registers are replayed as saved and nothing owns the counter offset. Each
 vCPU's redistributor and CPU interface is addressed by that vCPU's saved MPIDR
-(src/vmm/src/lib.rs `construct_kvm_mpidrs`, used by `save_state`). -/
+(src/vmm/src/lib.rs `construct_kvm_mpidrs`, used by `save_state`).
+
+What every pin of the fork writes to a paused source:
+
+* At the save, before KVM's state is read (`Vmm::save_state` saves devices first,
+  src/vmm/src/lib.rs), the vsock device publishes a `TRANSPORT_RESET` event in the SOURCE's
+  event queue and raises its interrupt (`prepare_save` and `send_transport_reset_event`,
+  src/vmm/src/devices/virtio/vsock/device.rs:255-290, 468-476 at 2a33289b): `.devEvent`. The
+  source's vsock connections are reset by every snapshot, by Firecracker's design.
+* At every resume `kick_virtio_devices` runs (src/vmm/src/lib.rs `resume_vm`). At ba79650e and
+  on the nested pin the vsock device's `kick` raises the event queue's interrupt whether or not
+  an event was published (vsock/device.rs:408-424 at ba79650e and dbea5779): `.kick`. The
+  default pin raises it only while a reset event waits for the guest (device.rs:411-432 at
+  2a33289b), which in the model is the interrupt the save already raised.
+* No `ICH_*_EL2` register is requested from the vGIC device: none is named anywhere under
+  src/vmm/src/arch/aarch64 (`nestedIcc := false`). -/
 def forkBefore630 : Rules :=
   { name := "fork-before-630",
     slotsFromRestore := false, cntAtPause := false, freeze := false, freezeLoaded := false,
-    advance := false, levelInfo := false, clearInverted := false, restore := fcOrder false }
+    advance := false, levelInfo := false, clearInverted := false,
+    nestedIcc := false, onSave := [.devEvent], onResume := [.kick], restore := fcOrder false }
 
 /-- The fork as pinned for every profile but the nested arm64 one, ejc3/firecracker
 2a33289b55b7 (rootfs-config.toml `[firecracker]`). It does not carry 0baf5b0b: for the
 counter it is `forkBefore630`. Its guests are not hypervisors. -/
-def forkDefault : Rules := { forkBefore630 with name := "fork-default" }
+def forkDefault : Rules := { forkBefore630 with name := "fork-default", onResume := [] }
 
 /-- The fork as pinned for the nested arm64 profile, ejc3/firecracker dbea5779fb37, which has
 0baf5b0b and 865fcab0: `KVM_ARM_SET_COUNTER_OFFSET` at boot, before the register replay of a
@@ -127,7 +168,8 @@ moved by the time since `pause_vm` (src/vmm/src/lib.rs:478-524). A restored VM s
 def forkNested : Rules :=
   { name := "fork-nested",
     slotsFromRestore := false, cntAtPause := false, freeze := true, freezeLoaded := false,
-    advance := false, levelInfo := false, clearInverted := false, restore := fcOrder true }
+    advance := false, levelInfo := false, clearInverted := false,
+    nestedIcc := false, onSave := [.devEvent], onResume := [.kick], restore := fcOrder true }
 
 end Today
 

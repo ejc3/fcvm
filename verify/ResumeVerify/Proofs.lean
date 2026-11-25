@@ -2,6 +2,7 @@ import ResumeVerify.Lemmas
 import ResumeVerify.Today
 import ResumeVerify.Design
 import ResumeVerify.Configs
+import ResumeVerify.Mutants
 
 set_option linter.unusedSimpArgs false
 
@@ -17,8 +18,8 @@ books of `Design.lean`, whose restore orders are shown to build the VM the image
 namespace Resume
 
 theorem init_inv (R : Rules) (C : Cfg) : Inv R C (init C) := by
-  refine ⟨⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
-    ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [init, bootVcpu, IrqSt.none]
+  refine ⟨⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_, ?_⟩ <;> simp [init, bootVcpu, IrqSt.none]
 
 theorem map_some {α β : Type} {f : α → β} {x : Option α} {y : β} (h : x.map f = some y) :
     ∃ a, x = some a ∧ f a = y := by
@@ -31,15 +32,14 @@ theorem ph_running {s : State} (h : ¬(s.ph != .running) = true) : s.ph = .runni
 theorem running_inv {R : Rules} {C : Cfg} {s : State} {m' : VM} (h : Inv R C s)
     (hp : s.ph = .running) (hm : MOk C m') (hc : m'.ctr = s.vm.ctr) :
     Inv R C { s with vm := m' } := by
-  refine ⟨hm, fun _ => hc ▸ h.run hp, fun hn => absurd hp hn, fun hq => ?_, h.calm, fun i hi => ?_⟩
-  · exact absurd (hp ▸ hq) (by decide)
-  · exact absurd (hp ▸ (h.img i hi).1) (by decide)
+  refine ⟨hm, fun _ => hc ▸ h.run hp, fun hn => absurd hp hn, h.calm, fun i hi => ?_⟩
+  exact absurd (hp ▸ (h.img i hi).1) (by decide)
 
 theorem mok_ideal {C : Cfg} {m : VM} (h : MOk C m) (n : Nat) : MOk C { m with ideal := n } :=
-  ⟨h.1, h.2, h.3, h.4, h.5, h.6, h.7, h.8, h.9⟩
+  ⟨h.1, h.2, h.3, h.4, h.5, h.6, h.7, h.8⟩
 
 theorem mok_ctr {C : Cfg} {m : VM} (h : MOk C m) (c : Ctr) : MOk C { m with ctr := c } :=
-  ⟨h.1, h.2, h.3, h.4, h.5, h.6, h.7, h.8, h.9⟩
+  ⟨h.1, h.2, h.3, h.4, h.5, h.6, h.7, h.8⟩
 
 theorem save_wait {R : Rules} {s : State} (hR : Sound R)
     (hc : s.vm.ctr = .sync { t := s.since, o := 0 }) :
@@ -51,7 +51,7 @@ theorem save_wait {R : Rules} {s : State} (hR : Sound R)
 theorem resume_ok {R : Rules} {C : Cfg} {s : State} (h : MOk C s.vm) : MOk C (resumeVM R s) := by
   simp only [resumeVM]
   repeat' split
-  all_goals exact ⟨enter_ok h.1, enter_ok h.2, h.3, h.4, h.5, h.6, h.7, h.8, h.9⟩
+  all_goals exact ⟨enter_ok h.1, enter_ok h.2, h.3, h.4, h.5, h.6, h.7, h.8⟩
 
 theorem resume_ctr {R : Rules} {s : State} (hR : Sound R)
     (hc : s.vm.ctr = .sync { t := s.since, o := 0 }) :
@@ -81,13 +81,10 @@ theorem step_inv {R : Rules} {C : Cfg} {s t : State} {l : Label} (hR : Sound R)
     peel
     obtain ⟨m', hg, rfl⟩ := map_some hs
     obtain ⟨hm, hc, h0, h1⟩ := devRaise_ok h.m hg
-    refine ⟨hm, fun hp => hc ▸ h.run hp, fun hn => hc ▸ h.held hn, fun hq => ?_, h.calm, fun i hi => ?_⟩
-    · show s.kept = some (m'.c0.keep, m'.c1.keep)
-      rw [h0, h1]
-      exact h.kept hq
-    · have hp := (h.img i hi).1
-      have hi' : s.img = some i := hi
-      simp_all
+    refine ⟨hm, fun hp => hc ▸ h.run hp, fun hn => hc ▸ h.held hn, h.calm, fun i hi => ?_⟩
+    have hp := (h.img i hi).1
+    have hi' : s.img = some i := hi
+    simp_all
   | tick =>
     simp only [step] at hs
     peel
@@ -104,7 +101,7 @@ theorem step_inv {R : Rules} {C : Cfg} {s t : State} {l : Label} (hR : Sound R)
     have hc := h.held hne
     simp only [hc, Option.some.injEq] at hs
     subst hs
-    refine ⟨mok_ctr h.m _, fun hp => absurd hp hne, fun _ => ?_, h.kept, h.calm, fun i hi => ?_⟩
+    refine ⟨mok_ctr h.m _, fun hp => absurd hp hne, fun _ => ?_, h.calm, fun i hi => ?_⟩
     · show Ctr.sync { t := (s.since : Int) + 1, o := 0 } = Ctr.sync { t := ((s.since + 1 : Nat) : Int), o := 0 }
       simp
     · obtain ⟨hp, rfl⟩ := h.img i hi
@@ -115,8 +112,8 @@ theorem step_inv {R : Rules} {C : Cfg} {s t : State} {l : Label} (hR : Sound R)
     simp only [Option.some.injEq] at hs
     subst hs
     have hp : s.ph = .running := by simp_all
-    refine ⟨⟨pause_ok h.m.1, pause_ok h.m.2, h.m.3, h.m.4, h.m.5, h.m.6, h.m.7, h.m.8, h.m.9⟩,
-      (fun hq => nomatch hq), fun _ => ?_, fun _ => rfl, h.calm, (fun i hi => nomatch hi)⟩
+    refine ⟨⟨pause_ok h.m.1, pause_ok h.m.2, h.m.3, h.m.4, h.m.5, h.m.6, h.m.7, h.m.8⟩,
+      (fun hq => nomatch hq), fun _ => ?_, h.calm, (fun i hi => nomatch hi)⟩
     simpa using h.run hp
   | save =>
     simp only [step] at hs
@@ -124,23 +121,29 @@ theorem step_inv {R : Rules} {C : Cfg} {s t : State} {l : Label} (hR : Sound R)
     simp only [Option.some.injEq] at hs
     subst hs
     have hp : s.ph = .paused := by simp_all
-    refine ⟨h.m, h.run, h.held, h.kept, h.calm, fun i hi => ?_⟩
-    simp only [Option.some.injEq] at hi
-    exact ⟨hp, hi.symm⟩
+    obtain ⟨hm, hc, hu⟩ := hR.quietSave C s.vm h.m
+    refine ⟨hm, fun hq => absurd (hp ▸ hq) (by decide), fun hn => hc ▸ h.held hn, ?_, fun i hi => ?_⟩
+    · simp [h.calm, hu]
+    · simp only [Option.some.injEq] at hi
+      exact ⟨hp, hi.symm⟩
   | resume =>
     cases hp : s.ph <;> simp only [step, hp] at hs
     · exact nomatch hs
     · simp only [Option.some.injEq] at hs
       subst hs
       have hc := h.held (by rw [hp]; decide)
-      refine ⟨resume_ok h.m, fun _ => resume_ctr hR hc, fun hn => absurd rfl hn, (fun hq => nomatch hq), ?_,
-        (fun i hi => nomatch hi)⟩
-      simp [h.calm, h.kept hp]
+      obtain ⟨hm, hc', hu⟩ := hR.quietResume C s.vm h.m
+      refine ⟨resume_ok (s := { s with vm := srcOps C R.onResume s.vm, ph := .paused }) hm,
+        fun _ => resume_ctr hR (s := { s with vm := srcOps C R.onResume s.vm, ph := .paused }) (hc' ▸ hc),
+        fun hn => absurd rfl hn, ?_, (fun i hi => nomatch hi)⟩
+      simp [h.calm, hu]
     · simp only [Option.some.injEq] at hs
       subst hs
       have hc := h.held (by rw [hp]; decide)
-      refine ⟨resume_ok h.m, fun _ => resume_ctr hR hc, fun hn => absurd rfl hn, (fun hq => nomatch hq), h.calm,
-        fun i hi => ?_⟩
+      obtain ⟨hm, hc', _⟩ := hR.quietResume C s.vm h.m
+      refine ⟨resume_ok (s := { s with vm := srcOps C R.onResume s.vm, ph := .loaded }) hm,
+        fun _ => resume_ctr hR (s := { s with vm := srcOps C R.onResume s.vm, ph := .loaded }) (hc' ▸ hc),
+        fun hn => absurd rfl hn, h.calm, fun i hi => ?_⟩
       exact absurd (hp ▸ (h.img i hi).1) (by decide)
   | restore =>
     cases hi : s.img <;> simp only [step, hi] at hs
@@ -151,7 +154,7 @@ theorem step_inv {R : Rules} {C : Cfg} {s t : State} {l : Label} (hR : Sound R)
       subst hs
       obtain ⟨hp, rfl⟩ := h.img i hi
       have hc := h.held (by rw [hp]; decide)
-      refine ⟨?_, (fun hq => nomatch hq), fun _ => ?_, (fun hq => nomatch hq), h.calm, (fun i hi => nomatch hi)⟩
+      refine ⟨?_, (fun hq => nomatch hq), fun _ => ?_, h.calm, (fun i hi => nomatch hi)⟩
       · show MOk C (build R C (save R s))
         rw [hR.builds]
         exact rebuilt_ok hR h.m
@@ -185,6 +188,17 @@ theorem sound_noLostDeviceIrq (hR : Sound R) (h : Reachable R C s) : lostDeviceI
   have h2 := i.pline
   cases hd : s.vm.dev <;> cases hl : C.spiLevel <;> cases ha : s.vm.spi.act <;>
     simp_all [lostDeviceIrq, pend]
+
+/-- R1: an owed tick still has its timer armed. With `sound_clockRight` the timer fires when
+it should; `roundTrip` (`Lemmas.lean`) is the stronger statement, that a restore changes no
+timer register at all. -/
+theorem sound_noLostTick (hR : Sound R) (h : Reachable R C s) : lostTick s = false := by
+  have i := (reachable_inv hR h).m
+  simp [lostTick, anyVcpu]
+  intro _
+  have o0 := i.v0.owe
+  have o1 := i.v1.owe
+  constructor <;> (intro h1; simp_all)
 
 /-- R1 and R4: the counter is the one the guest should read whenever it runs, so an armed
 timer fires when it should. -/
@@ -221,10 +235,15 @@ theorem sound_noStrayEnable (hR : Sound R) (h : Reachable R C s) : strayEnable s
   have i := (reachable_inv hR h).m
   simp [strayEnable, anyVcpu, i.v0.ten, i.v0.sen, i.v1.ten, i.v1.sen]
 
+/-- R2, for a guest hypervisor: a loaded nested vCPU keeps the mask it was given. -/
+theorem sound_noLostNestedMask (hR : Sound R) (h : Reachable R C s) : lostNestedMask s = false := by
+  have i := (reachable_inv hR h).m
+  simp [lostNestedMask, anyVcpu, i.v0.ich, i.v1.ich]
+
 /-- R2: no SGI is pending that nobody sent, and no latch sits on the timer interrupt. -/
 theorem sound_noStrayPending (hR : Sound R) (h : Reachable R C s) : strayPending s = false := by
   have i := (reachable_inv hR h).m
-  simp [strayPending, anyVcpu, i.v0.call, i.v0.tl, i.v1.call, i.v1.tl]
+  simp [strayPending, anyVcpu, i.v0.call, i.v1.call]
   intro _
   constructor <;> (intro h1; simp_all)
 
@@ -258,7 +277,26 @@ theorem sound_noSpin (hR : Sound R) (h : Reachable R C s) : spins C s = false :=
       have hd := idle_signalled C s.vm true (by simp [VM.get, i.v1.ap, hg]) (by simp [VM.get, i.v1.grp]) hk
       simp [h1, h2, h3] at hd
 
-/-- R5: a resume in place never finds a vCPU changed. -/
+/-- A vCPU of a sound rule book's reachable state is not in KVM's background-timer loop: a
+blocked thread's guest CPU is idle, so its timer interrupt is enabled, not active and not
+masked, and a stopped vCPU's CPU is offline and has no timer armed. -/
+theorem vcpu_noTimerLoop {m : VM} (v : Vid) (c : Vcpu) (hc : VOk c) (hg : m.gicEn = true) :
+    (c.thr != .user &&
+      ((c.thr == .blocked && !c.stopped && timerStuck m c && !kvmPending C m v) ||
+       (c.stopped && timerDue m c))) = false := by
+  obtain ⟨a, _, _, _, e, _, f, _, _, _, k, _, _, _, o, b⟩ := hc
+  rcases ht : c.thr with _ | _ | _ <;> rcases hg' : c.g with _ | _ | (_ | _ | _) <;>
+    cases hs : c.stopped <;> cases hd : timerDue m c <;>
+    simp_all [timerStuck, timerDue]
+
+/-- R3, the host's own loop. -/
+theorem sound_noTimerLoop (hR : Sound R) (h : Reachable R C s) : timerLoops C s = false := by
+  have i := (reachable_inv hR h).m
+  simp only [timerLoops, anyVcpu, vcpu_noTimerLoop false s.vm.c0 i.v0 i.gic,
+    vcpu_noTimerLoop true s.vm.c1 i.v1 i.gic, Bool.or_self, Bool.and_false]
+
+/-- R5: nothing a sound rule book asks of a paused source changes a vCPU's interrupt, timer or
+power state, or takes something from the device's interrupt. -/
 theorem sound_sourceUndisturbed (hR : Sound R) (h : Reachable R C s) : sourceDisturbed s = false :=
   (reachable_inv hR h).calm
 
@@ -270,6 +308,7 @@ theorem sound_powerRight (hR : Sound R) (h : Reachable R C s) : powerWrong s = f
 /-- Every requirement, in every reachable state. -/
 theorem sound_healthy (hR : Sound R) (h : Reachable R C s) : healthy C s = true := by
   simp [healthy, checks, sound_noLostIpi hR h, sound_noLostDeviceIrq hR h, sound_timerCanFire hR h,
+    sound_noLostTick hR h, sound_noLostNestedMask hR h, sound_noTimerLoop hR h,
     sound_noStuckActive hR h, sound_noStuckPriority hR h, sound_noLostEnable hR h,
     sound_noStrayEnable hR h, sound_noStrayPending hR h, sound_noSpin hR h, sound_clockRight hR h,
     clockOffClone,
@@ -283,12 +322,12 @@ theorem clearSet_inv (c s : Bool) : clearSet c (!s) s = s := by
   cases c <;> cases s <;> rfl
 
 theorem Design.cloudHypervisor_sound : Sound Design.cloudHypervisor :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun C i => by
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, quiet_nil, quiet_kick, fun C i => by
     simp [build, Design.cloudHypervisor, apply, clrOf, clearSet_inv, rebuilt, vcpuOf, emptyVM,
       freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
 theorem Design.firecracker_sound : Sound Design.firecracker :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, fun C i => by
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, quiet_devEvent, quiet_nil, fun C i => by
     simp [build, Design.firecracker, Today.fcOrder, apply, clrOf, clearSet_inv, rebuilt, vcpuOf,
       emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
@@ -320,7 +359,87 @@ theorem forkDefault_not_sound : ¬ Sound Today.forkDefault := fun h => nomatch h
 theorem forkBefore630_not_sound : ¬ Sound Today.forkBefore630 := fun h => nomatch h.freeze
 theorem forkNested_not_sound : ¬ Sound Today.forkNested := fun h => nomatch h.cntAtPause
 
+/-! ## A recorded run is a reachable state -/
+
+theorem replay_reachable {R : Rules} {C : Cfg} : ∀ (ls : List Label) (s t : State),
+    Reachable R C s → replay R C ls s = some t → Reachable R C t
+  | [], s, t, h, hr => by
+    simp [replay] at hr
+    exact hr ▸ h
+  | l :: ls, s, t, h, hr => by
+    simp only [replay] at hr
+    cases hst : step R C l s with
+    | none => simp [hst] at hr
+    | some u =>
+      simp [hst] at hr
+      exact replay_reachable ls u t (Reachable.step l h hst) hr
+
+/-- A `breaks_*` theorem of `Breaks.lean` names a reachable state that fails the test. -/
+theorem break_reachable {R : Rules} {C : Cfg} {run : List Label} {test : State → Bool}
+    (h : (replay R C run (init C)).map test = some true) : ∃ s, Reachable R C s ∧ test s = true := by
+  obtain ⟨t, ht, hf⟩ := map_some h
+  exact ⟨t, replay_reachable run _ t .init ht, hf⟩
+
+/-- A rule book with a run that ends unhealthy is not `Sound`. This is how each mutant of
+`Mutants.lean` is shown to need its repair: from a state it reaches, not from its flag. -/
+theorem not_sound_of_run {R : Rules} {C : Cfg} {run : List Label}
+    (h : (replay R C run (init C)).map (healthy C) = some false) : ¬ Sound R := by
+  intro hR
+  obtain ⟨t, ht, hf⟩ := map_some h
+  have := sound_healthy hR (replay_reachable run _ t .init ht)
+  simp_all
+
+/-! ## R5 constrains a rule book -/
+
+/-- A VMM that stops a vCPU at the save has disturbed the source the moment it saves. -/
+theorem r5_fails_saveStops :
+    (replay Mutant.chSaveStopsVcpu1 Cfg.plain [.pause, .save] (init Cfg.plain)).map sourceDisturbed
+      = some true := by
+  decide
+
+/-- One that re-initialises a vCPU has disarmed its timer. -/
+theorem r5_fails_saveInits :
+    (replay Mutant.chSaveInitsVcpu0 Cfg.plain [.g false .arm, .pause, .save] (init Cfg.plain)).map
+      sourceDisturbed = some true := by
+  decide
+
+/-- One that clears a pending register has taken an IPI the guest sent. -/
+theorem r5_fails_saveUnpends :
+    (replay Mutant.chSaveUnpendsVcpu1 Cfg.plain [.g false .send, .pause, .save] (init Cfg.plain)).map
+      sourceDisturbed = some true := by
+  decide
+
+/-- And at the resume. -/
+theorem r5_fails_resumeStops :
+    (replay Mutant.fcResumeStopsVcpu1 Cfg.plain [.pause, .resume] (init Cfg.plain)).map sourceDisturbed
+      = some true := by
+  decide
+
+/-- What today's VMMs do write to a paused source takes nothing from it, and shows as an
+interrupt with nothing behind it: Cloud Hypervisor's resume raises the device's interrupt. -/
+theorem cloudHypervisor_kicks :
+    (replay Today.cloudHypervisor Cfg.plain [.pause, .resume] (init Cfg.plain)).map
+      (fun s => sourceKicked s && !sourceDisturbed s && s.vm.spi.latch && !s.vm.dev) = some true := by
+  decide
+
+/-- Firecracker's save publishes an event of its vsock device on the source, with its
+interrupt: not a kick, and nothing taken. -/
+theorem firecracker_save_raises_device :
+    (replay Today.forkDefault Cfg.plain [.pause, .save, .resume] (init Cfg.plain)).map
+      (fun s => s.vm.dev && s.vm.spi.latch && !sourceKicked s && !sourceDisturbed s) = some true := by
+  decide
+
 /-! ## Cloud Hypervisor upstream's two clock modes, on one run -/
+
+/-- Upstream replays the vCPUs' states on several threads. Either order builds the same VM:
+the counter is written once more, through vCPU 0, after both. -/
+theorem upstream_replay_order (advance : Bool) (C : Cfg) (i : Image) :
+    build (Today.cloudHypervisorUpstream advance) C i
+      = build (Today.cloudHypervisorUpstreamSwapped advance) C i := by
+  cases hnv : C.nv <;> cases h0 : i.s0.l2 <;> cases h1 : i.s1.l2 <;> cases hc0 : i.s0.cnt <;>
+    cases hc1 : i.s1.cnt <;>
+    simp [build, Today.cloudHypervisorUpstream, Today.cloudHypervisorUpstreamSwapped, apply, clrOf,
+      emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none, hnv, h0, h1, hc0, hc1]
 
 /-- The run: CPU 0 arms its timer one unit ahead, the VM is paused and saved, host time passes,
 a clone is restored and resumed. -/

@@ -51,10 +51,12 @@ structure Err where
   o : Int
   deriving DecidableEq, Repr, Hashable, Inhabited
 
-/-- The counter the tick timer compares against: off by `e`, or `fresh`, the offset a new vCPU
-was given (`kvm_timer_vcpu_init`, arch_timer.c:1105-1122), which no restore has replaced. -/
+/-- The counter the tick timer compares against: off by `e`, or `fresh`, the offsets a new vCPU
+was given (`kvm_timer_vcpu_init`, arch_timer.c:1105-1122), which no restore has replaced. A new
+vCPU's virtual offset is the host's counter, so an ordinary guest's counter starts near zero;
+its physical offset is zero, so a guest hypervisor's counter (`host`) reads the host's. -/
 inductive Ctr where
-  | sync (e : Err) | fresh
+  | sync (e : Err) | fresh (host : Bool)
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 structure Vcpu where
@@ -80,11 +82,16 @@ structure Vcpu where
   tEn : Bool
   /-- its compare value, in the guest's counter -/
   cv : Int
+  /-- guest: a tick is owed: the timer was armed and its handler has not run -/
+  owed : Bool
   /-- NV2: `CNTVOFF_EL2` is not zero (the guest hypervisor has a nested vCPU loaded) -/
   l2 : Bool
-  /-- the timer PPI is mapped to the host's (`irq->hw`, set by `kvm_timer_enable` at the
-  vCPU's first `KVM_RUN`, arch_timer.c:1587-1635) -/
-  hw : Bool
+  /-- NV2: `ICH_VMCR_EL2` holds the loaded nested vCPU's priority mask and group enable. It is
+  in the page KVM keeps for a guest hypervisor's EL2 registers (`kvm_vcpu_init_nested`,
+  nested.c:83-125), not in guest memory, hidden from `KVM_GET_REG_LIST` (sys_regs.c:2760-2761,
+  3919-3949) and reached only through `KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS`
+  (vgic-sys-reg-v3.c:366-443) -/
+  ichv : Bool
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 structure VM where
@@ -121,7 +128,9 @@ structure Slot where
   stopped : Bool
   tEn : Bool
   cv : Int
+  owed : Bool
   l2 : Bool
+  ichv : Bool
   /-- the counter read for this vCPU, as an error against `ideal` -/
   cnt : Ctr
   tmr : IrqSt
@@ -151,7 +160,7 @@ inductive Ph where
   | loaded
   deriving DecidableEq, Repr, Hashable, Inhabited
 
-/-- What of a vCPU a pause and a save must leave as they found it (R5). -/
+/-- What of a vCPU the VMM's requests on a paused source must leave as they found it (R5). -/
 structure Keep where
   g : G
   call : Bool
@@ -163,11 +172,12 @@ structure Keep where
   sgi : IrqSt
   tEn : Bool
   cv : Int
+  ichv : Bool
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 def Vcpu.keep (c : Vcpu) : Keep :=
   { g := c.g, call := c.call, stopped := c.stopped, pmr := c.pmr, grp := c.grp, ap := c.ap,
-    tmr := { c.tmr with line := false }, sgi := c.sgi, tEn := c.tEn, cv := c.cv }
+    tmr := { c.tmr with line := false }, sgi := c.sgi, tEn := c.tEn, cv := c.cv, ichv := c.ichv }
 
 structure State where
   vm : VM
@@ -175,10 +185,12 @@ structure State where
   img : Option Image
   /-- host time since the pause or the load, while the guest does not run -/
   since : Nat
-  /-- at the pause: both vCPUs (R5) -/
-  kept : Option (Keep × Keep)
-  /-- R5: a resume in place found a vCPU changed -/
+  /-- R5: a request of the VMM on the paused source changed a vCPU's interrupt, timer or power
+  state, or took something from the device's interrupt -/
   disturbed : Bool
+  /-- a request of the VMM on the paused source left the device's interrupt pending with no
+  event of the device behind it -/
+  kicked : Bool
   snaps : Nat
   restores : Nat
   waits : Nat
@@ -243,6 +255,23 @@ inductive Op where
   | level
   deriving DecidableEq, Repr, Hashable, Inhabited
 
+/-- One request of the VMM that writes to a paused source: at the save, or at the resume. -/
+inductive SrcOp where
+  /-- the device publishes an event of its own and raises its interrupt -/
+  | devEvent
+  /-- the device's interrupt is raised with no event behind it (`kvm_vgic_inject_irq` through
+  the irqfd, vgic.c:533-572): the latch of an edge interrupt -/
+  | kick
+  /-- `KVM_SET_MP_STATE` with `KVM_MP_STATE_STOPPED` -/
+  | mpStop (v : Vid)
+  /-- `KVM_ARM_VCPU_INIT` again: the timer's control register is reset
+  (`kvm_timer_vcpu_reset`, arch_timer.c:1029-1073) -/
+  | vinit (v : Vid)
+  /-- `GICR_ISPENDR0` written with zero: every latch of the vCPU's SGIs and PPIs cleared
+  (`vgic_v3_uaccess_write_pending`, vgic-mmio-v3.c:383-394) -/
+  | unpend (v : Vid)
+  deriving DecidableEq, Repr, Hashable, Inhabited
+
 structure Rules where
   name : String
   /-- the save addresses every redistributor and CPU interface as vCPU 0's until a restore has
@@ -262,6 +291,13 @@ structure Rules where
   /-- the restore writes the clear-registers (`ICENABLER`, `ICACTIVER`) with the complement of
   the saved bits, so that what the new VM has set and the image has not is cleared -/
   clearInverted : Bool
+  /-- the CPU-interface group saved and restored includes a guest hypervisor's
+  `ICH_*_EL2` registers -/
+  nestedIcc : Bool
+  /-- what the VMM writes to the paused source at the save, before it reads KVM's state -/
+  onSave : List SrcOp
+  /-- what the VMM writes to a paused or loaded VM at the resume, before its vCPUs run -/
+  onResume : List SrcOp
   restore : List Op
   deriving Repr, Inhabited
 
@@ -297,19 +333,19 @@ def deliverable (C : Cfg) (m : VM) (v : Vid) (i : Irq) : Bool :=
      | .spi => !v && pend C.spiLevel m.spi && m.spi.en && !m.spi.act)
 
 /-- The tick timer's condition holds: enabled, unmasked and `CVAL <= counter`
-(`kvm_timer_pending`, arch_timer.c:366-406). A fresh offset puts the counter near zero; an
+(`kvm_timer_pending`, arch_timer.c:366-406). A fresh virtual offset puts the counter near zero and a fresh physical one at the host's; an
 error of a whole `CNTVOFF_EL2` decides by its sign. -/
 def timerDue (m : VM) (c : Vcpu) : Bool :=
   c.tEn &&
     (match m.ctr with
-     | .fresh => false
+     | .fresh host => host
      | .sync e => if e.o < 0 then false else if e.o > 0 then true else decide (c.cv ≤ (m.ideal : Int) + e.t))
 
 /-- What the guest reads as its counter, where it is defined. -/
 def counter (m : VM) : Int :=
   match m.ctr with
   | .sync e => (m.ideal : Int) + e.t
-  | .fresh => 0
+  | .fresh _ => 0
 
 /-! ## The guest's steps, and KVM's while the guest runs -/
 
@@ -328,7 +364,8 @@ inductive GAct where
   | eoi
   /-- send the cross-call IPI to the other CPU (`ICC_SGI1R_EL1`, arch/arm64/kernel/smp.c) -/
   | send
-  /-- NV2: load a nested vCPU, `CNTVOFF_EL2` becomes non-zero -/
+  /-- NV2: load a nested vCPU: `CNTVOFF_EL2` becomes non-zero and `ICH_VMCR_EL2` takes the
+  nested vCPU's mask -/
   | l2
   deriving DecidableEq, Repr, Hashable, Inhabited
 
@@ -338,7 +375,7 @@ def guest (C : Cfg) (v : Vid) (a : GAct) (m : VM) : Option VM :=
   match a with
   | .arm =>
     if c.g != .run || c.tEn then none else
-      some (m.set v { c with tEn := true, cv := counter m + 1 })
+      some (m.set v { c with tEn := true, owed := true, cv := counter m + 1 })
   | .toIdle => if c.g != .run then none else some (m.set v { c with g := .idle })
   | .wfi =>
     if c.g != .idle || kvmPending C m v then none else some (m.set v { c with thr := .blocked })
@@ -353,7 +390,8 @@ def guest (C : Cfg) (v : Vid) (a : GAct) (m : VM) : Option VM :=
     match c.g with
     | .hdl .tmr =>
       -- the handler masks the timer, so its line falls (arm_arch_timer.c `timer_handler`)
-      some (m.set v { c with g := .run, ap := false, tEn := false, tmr := { c.tmr with act := false, line := false } })
+      some (m.set v { c with g := .run, ap := false, tEn := false, owed := false,
+                             tmr := { c.tmr with act := false, line := false } })
     | .hdl .sgi =>
       some (m.set v { c with g := .run, ap := false, call := false, sgi := { c.sgi with act := false } })
     | .hdl .spi =>
@@ -364,7 +402,9 @@ def guest (C : Cfg) (v : Vid) (a : GAct) (m : VM) : Option VM :=
     if c.g != .run || w.call || w.gOff then none else
       -- `vgic_v3_dispatch_sgi` (vgic-mmio-v3.c): the latch of the target's SGI
       some (m.set (!v) { w with call := true, sgi := { w.sgi with latch := true } })
-  | .l2 => if !C.nv || !C.l2 || c.l2 || c.g != .run then none else some (m.set v { c with l2 := true })
+  | .l2 =>
+    if !C.nv || !C.l2 || c.l2 || c.g != .run then none else
+      some (m.set v { c with l2 := true, ichv := true })
 
 /-- The timer fires: its output is a level into the vGIC (`kvm_timer_update_irq`,
 arch_timer.c:457-483; `kvm_vgic_inject_irq`, vgic.c:533-572). For a blocked vCPU this is the
@@ -404,12 +444,12 @@ def save (R : Rules) (s : State) : Image :=
   let cnt : Ctr :=
     match m.ctr with
     | .sync e => .sync (if R.cntAtPause then { e with t := e.t - s.since } else e)
-    | .fresh => .fresh
+    | .fresh h => .fresh h
   let slot (v : Vid) : Slot :=
     let c := m.get v
     let r := m.get (source R m v)
     { g := c.g, call := c.call, gOff := c.gOff, stopped := c.stopped, tEn := c.tEn, cv := c.cv,
-      l2 := c.l2, cnt := cnt,
+      owed := c.owed, l2 := c.l2, ichv := R.nestedIcc && r.ichv, cnt := cnt,
       tmr := { r.tmr with line := R.levelInfo && r.tmr.line },
       sgi := { r.sgi with line := false },
       pmr := r.pmr, grp := r.grp, ap := r.ap }
@@ -424,12 +464,14 @@ def freshVcpu : Vcpu :=
   { g := .run, call := false, gOff := false, thr := .user, stopped := false,
     pmr := false, grp := false, ap := false,
     tmr := IrqSt.none, sgi := { IrqSt.none with en := true },
-    tEn := false, cv := 0, l2 := false, hw := false }
+    tEn := false, cv := 0, owed := false, l2 := false, ichv := false }
 
-/-- The VM a restore starts from: nothing created. -/
-def emptyVM : VM :=
-  { c0 := freshVcpu, c1 := freshVcpu, spi := IrqSt.none, dev := false, gicEn := false,
-    ctr := .fresh, offFlag := false, ideal := 0, restored := true, clone := true }
+/-- The VM a restore starts from: no vCPU and no vGIC yet. The device's own state and the time
+the guest has run are not KVM's: the first is restored by the VMM's device model, the second is
+the model's reference. -/
+def emptyVM (i : Image) : VM :=
+  { c0 := freshVcpu, c1 := freshVcpu, spi := IrqSt.none, dev := i.dev, gicEn := false,
+    ctr := .fresh false, offFlag := false, ideal := i.ideal, restored := true, clone := true }
 
 /-- A clear-register written with `clr`, then its set-register with `set`: a bit that was set
 and is not in `clr` stays (`vgic_uaccess_write_cenable` and `_senable`, vgic-mmio.c:189-228;
@@ -445,7 +487,7 @@ def apply (R : Rules) (C : Cfg) (i : Image) (m : VM) : Op → VM
     -- `kvm_timer_vcpu_init` (arch_timer.c:1105-1122): unless the VM's offset was set by
     -- `KVM_ARM_SET_COUNTER_OFFSET`, a new vCPU resets the VM-wide offsets
     let m := m.set v freshVcpu
-    if m.offFlag then m else { m with ctr := .fresh }
+    if m.offFlag then m else { m with ctr := .fresh C.nv }
   | .init v off =>
     -- `kvm_arch_vcpu_ioctl_vcpu_init` (arm.c:1870-1905) and `kvm_timer_vcpu_reset`
     -- (arch_timer.c:1029-1073)
@@ -467,11 +509,12 @@ def apply (R : Rules) (C : Cfg) (i : Image) (m : VM) : Op → VM
     if !C.nv then { m with ctr := (i.slot v).cnt } else
       { m with ctr := match (i.slot v).cnt with
                       | .sync e => .sync (if (i.slot v).l2 then { e with o := e.o - 1 } else e)
-                      | .fresh => .fresh }
+                      | .fresh h => .fresh h }
   | .regs v =>
     let c := m.get v
     let s := i.slot v
-    m.set v { c with g := s.g, call := s.call, gOff := s.gOff, tEn := s.tEn, cv := s.cv, l2 := s.l2 }
+    m.set v { c with g := s.g, call := s.call, gOff := s.gOff, tEn := s.tEn, cv := s.cv,
+                     owed := s.owed, l2 := s.l2 }
   | .mp v =>
     -- `kvm_arch_vcpu_ioctl_set_mpstate` (arm.c:816-840)
     let c := m.get v
@@ -481,27 +524,29 @@ def apply (R : Rules) (C : Cfg) (i : Image) (m : VM) : Op → VM
     -- `GICD_CTLR`, then ICENABLER and ISENABLER, ISPENDR (the latch, exactly:
     -- `vgic_v3_uaccess_write_pending`, vgic-mmio-v3.c:383-394; ICPENDR is ignored,
     -- vgic-mmio-v3.c:649-652), ICACTIVER and ISACTIVER
-    { m with gicEn := i.gicEn, dev := i.dev, ideal := i.ideal,
+    { m with gicEn := i.gicEn,
              spi := { m.spi with en := clearSet m.spi.en (clrOf R i.spi.en) i.spi.en,
                                  latch := i.spi.latch,
                                  act := clearSet m.spi.act (clrOf R i.spi.act) i.spi.act } }
   | .redist v =>
     let c := m.get v
     let s := i.slot v
-    -- a user write of the active bit of a mapped interrupt is dropped
-    -- (`vgic_hw_irq_change_active`, vgic-mmio.c:537-545)
+    -- A user write of the active bit of a MAPPED interrupt is dropped
+    -- (`vgic_hw_irq_change_active`, vgic-mmio.c:537-545). The timer's is mapped at the vCPU's
+    -- first `KVM_RUN` (`kvm_timer_enable`, arch_timer.c:1587-1635), which is after every
+    -- restore here, so the write lands.
     m.set v { c with tmr := { c.tmr with en := clearSet c.tmr.en (clrOf R s.tmr.en) s.tmr.en,
                                          latch := s.tmr.latch,
-                                         act := if c.hw then c.tmr.act
-                                                else clearSet c.tmr.act (clrOf R s.tmr.act) s.tmr.act },
+                                         act := clearSet c.tmr.act (clrOf R s.tmr.act) s.tmr.act },
                      sgi := { c.sgi with en := clearSet c.sgi.en (clrOf R s.sgi.en) s.sgi.en,
                                          latch := s.sgi.latch,
                                          act := clearSet c.sgi.act (clrOf R s.sgi.act) s.sgi.act } }
   | .icc v =>
-    -- `vgic_v3_cpu_sysregs_uaccess` (vgic-sys-reg-v3.c): PMR, IGRPEN1, AP1R0 as given
+    -- `vgic_v3_cpu_sysregs_uaccess` (vgic-sys-reg-v3.c): PMR, IGRPEN1, AP1R0 as given, and
+    -- `ICH_VMCR_EL2` where the image has it
     let c := m.get v
     let s := i.slot v
-    m.set v { c with pmr := s.pmr, grp := s.grp, ap := s.ap }
+    m.set v { c with pmr := s.pmr, grp := s.grp, ap := s.ap, ichv := s.ichv }
   | .level =>
     -- `vgic_write_irq_line_level_info` (vgic-mmio.c:788-820)
     let c0 := m.c0
@@ -510,13 +555,38 @@ def apply (R : Rules) (C : Cfg) (i : Image) (m : VM) : Op → VM
              c0 := { c0 with tmr := { c0.tmr with line := i.s0.tmr.line } },
              c1 := { c1 with tmr := { c1.tmr with line := i.s1.tmr.line } } }
 
-def build (R : Rules) (C : Cfg) (i : Image) : VM := R.restore.foldl (apply R C i) emptyVM
+def build (R : Rules) (C : Cfg) (i : Image) : VM := R.restore.foldl (apply R C i) (emptyVM i)
 
-/-- A vCPU thread enters `KVM_RUN`: the first time maps the timer interrupt
-(`kvm_timer_enable`), and every load recomputes the timer's level from its registers
+/-- A vCPU thread enters `KVM_RUN`: every load recomputes the timer's level from its registers
 (`kvm_timer_vcpu_load_gic`, arch_timer.c:686-707). -/
 def enter (m : VM) (c : Vcpu) : Vcpu :=
-  { c with thr := .guest, hw := true, tmr := { c.tmr with line := timerDue m c } }
+  { c with thr := .guest, tmr := { c.tmr with line := timerDue m c } }
+
+/-- One request of the VMM on a paused source, by the kernel's rules. -/
+def srcApply (C : Cfg) (m : VM) : SrcOp → VM
+  | .devEvent =>
+    if !C.device || m.dev then m else
+      { m with dev := true,
+               spi := if C.spiLevel then { m.spi with line := true } else { m.spi with latch := true } }
+  | .kick =>
+    -- an irqfd write on a level interrupt raises and lowers the line: nothing stays
+    if !C.device || C.spiLevel then m else { m with spi := { m.spi with latch := true } }
+  | .mpStop v => m.set v { m.get v with stopped := true }
+  | .vinit v => m.set v { m.get v with tEn := false }
+  | .unpend v =>
+    let c := m.get v
+    m.set v { c with tmr := { c.tmr with latch := false }, sgi := { c.sgi with latch := false } }
+
+def srcOps (C : Cfg) (ops : List SrcOp) (m : VM) : VM := ops.foldl (srcApply C) m
+
+/-- The requests left the source's interrupt, timer and power state as they found it: each
+vCPU's `keep`, the device interrupt's enable and active bit, and nothing pending taken away.
+A pending device interrupt may be added (`kickedBy` says when one was, with no event). -/
+def undisturbed (a b : VM) : Bool :=
+  b.c0.keep == a.c0.keep && b.c1.keep == a.c1.keep && b.spi.en == a.spi.en && b.spi.act == a.spi.act
+    && (!a.spi.latch || b.spi.latch) && (!a.spi.line || b.spi.line) && (!a.dev || b.dev)
+
+def kickedBy (a b : VM) : Bool := b.spi.latch && !a.spi.latch && !b.dev
 
 def resumeVM (R : Rules) (s : State) : VM :=
   let m := s.vm
@@ -524,7 +594,7 @@ def resumeVM (R : Rules) (s : State) : VM :=
   let m := if frozen then
       { m with ctr := match m.ctr with
                       | .sync e => .sync { e with t := e.t - s.since }
-                      | .fresh => .fresh }
+                      | .fresh h => .fresh h }
     else m
   { m with c0 := enter m m.c0, c1 := enter m m.c1 }
 
@@ -568,14 +638,17 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
       some { s with waits := s.waits + 1, since := s.since + 1,
                     vm := { s.vm with ctr := match s.vm.ctr with
                                             | .sync e => .sync { e with t := e.t + 1 }
-                                            | .fresh => .fresh } }
+                                            | .fresh h => .fresh h } }
   | .pause =>
     if s.ph != .running || s.snaps ≥ C.maxSnaps then none else
       some { s with ph := .paused, since := 0, img := none,
-                    kept := some (s.vm.c0.keep, s.vm.c1.keep),
                     vm := { s.vm with c0 := pauseVcpu s.vm.c0, c1 := pauseVcpu s.vm.c1, clone := false } }
   | .save =>
     if s.ph != .paused || s.img.isSome then none else
+      -- the VMM's writes to the source first, then its reads
+      let m := srcOps C R.onSave s.vm
+      let s := { s with vm := m, disturbed := s.disturbed || !undisturbed s.vm m,
+                        kicked := s.kicked || kickedBy s.vm m }
       some { s with img := some (save R s), snaps := s.snaps + 1 }
   | .resume =>
     match s.ph with
@@ -583,21 +656,26 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
     | .paused =>
       -- the image is dropped: a restore from it later builds the VM the restore explored
       -- from this same state builds
-      some { s with ph := .running, since := 0, kept := none, img := none, vm := resumeVM R s,
-                    disturbed := s.disturbed || s.kept != some (s.vm.c0.keep, s.vm.c1.keep) }
-    | .loaded => some { s with ph := .running, since := 0, vm := resumeVM R s }
+      let m := srcOps C R.onResume s.vm
+      some { s with ph := .running, since := 0, img := none,
+                    vm := resumeVM R { s with vm := m },
+                    disturbed := s.disturbed || !undisturbed s.vm m,
+                    kicked := s.kicked || kickedBy s.vm m }
+    | .loaded =>
+      some { s with ph := .running, since := 0,
+                    vm := resumeVM R { s with vm := srcOps C R.onResume s.vm } }
   | .restore =>
     match s.img with
     | none => none
     | some i =>
       if s.ph != .paused || s.restores ≥ C.maxRestores then none else
         let m := build R C i
-        some { s with ph := .loaded, since := 0, kept := none, img := none,
+        some { s with ph := .loaded, since := 0, img := none,
                       restores := s.restores + 1,
                       vm := if R.advance then
                               { m with ctr := match m.ctr with
                                               | .sync e => .sync { e with t := e.t + s.since }
-                                              | .fresh => .fresh }
+                                              | .fresh h => .fresh h }
                             else m }
 
 /-- A guest that has booted: both CPUs running, the interrupts it uses enabled, the priority
@@ -607,19 +685,28 @@ def bootVcpu (off : Bool) : Vcpu :=
   { g := .run, call := false, gOff := off, thr := .guest, stopped := off,
     pmr := true, grp := true, ap := false,
     tmr := { IrqSt.none with en := !off }, sgi := { IrqSt.none with en := !off },
-    tEn := false, cv := 0, l2 := false, hw := true }
+    tEn := false, cv := 0, owed := false, l2 := false, ichv := false }
 
 def init (C : Cfg) : State :=
   { vm := { c0 := bootVcpu false, c1 := bootVcpu C.cpu1Off,
             spi := { IrqSt.none with en := true }, dev := false, gicEn := true,
             ctr := .sync { t := 0, o := 0 }, offFlag := false, ideal := 0, restored := false,
             clone := false },
-    ph := .running, img := none, since := 0, kept := none, disturbed := false,
+    ph := .running, img := none, since := 0, disturbed := false, kicked := false,
     snaps := 0, restores := 0, waits := 0 }
 
 def replay (R : Rules) (C : Cfg) : List Label → State → Option State
   | [], s => some s
   | l :: ls, s => (step R C l s).bind (replay R C ls)
+
+/-- The run as far as it goes: the state at the first step that is not possible, or at the
+end. -/
+def replayWhile (R : Rules) (C : Cfg) : List Label → State → State
+  | [], s => s
+  | l :: ls, s =>
+    match step R C l s with
+    | some t => replayWhile R C ls t
+    | none => s
 
 inductive Reachable (R : Rules) (C : Cfg) : State → Prop where
   | init : Reachable R C (init C)

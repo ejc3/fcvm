@@ -23,7 +23,7 @@ def Cfg.lags : Cfg :=
   { Cfg.base with device := false, maxSnaps := 1, maxRestores := 1, maxWaits := 2,
                   waitBeforeSave := true, waitLoaded := true }
 def Cfg.nvDump : Cfg := { Cfg.dump with nv := true }
-def Cfg.nvL2 : Cfg := { Cfg.base with nv := true, l2 := true, device := false, maxSnaps := 1, maxRestores := 1 }
+def Cfg.nvL2 : Cfg := { Cfg.base with nv := true, l2 := true, maxSnaps := 1, maxRestores := 1 }
 def Cfg.nvLags : Cfg := { Cfg.lags with nv := true }
 
 /-- name, what it is, the configuration -/

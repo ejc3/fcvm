@@ -6,15 +6,21 @@ import ResumeVerify.Properties
 import ResumeVerify.Configs
 import ResumeVerify.Breaks
 import ResumeVerify.Invariant
+import ResumeVerify.Guest0
+import ResumeVerify.Guest1
 import ResumeVerify.Lemmas
 import ResumeVerify.Proofs
+import ResumeVerify.Labels
+import ResumeVerify.Mutants
+import ResumeVerify.MutantBreaks
 
 /-!
 # What each theorem rests on
 
-`lake build` fails if anything this model declares comes to depend on anything beyond Lean's own
-axioms (`propext`, `Classical.choice`, `Quot.sound`): no `sorry` (`sorryAx`), no added axiom, no
-`native_decide` (which adds an axiom of its own for what the compiled code returned).
+`lake build` fails if anything this model declares comes to depend on anything beyond `propext`
+and `Quot.sound`: no `sorry` (`sorryAx`), no added axiom, no `native_decide` (which adds an
+axiom of its own for what the compiled code returned), and no `Classical.choice`, which nothing
+here needs.
 
 Two checks, as for the other two models. The sweep visits every declaration of every module of the
 library, so one added later is covered without being listed. The `#guard_msgs` lines pin the
@@ -24,7 +30,7 @@ renamed or removed.
 
 open Lean Elab Command in
 /-- Fails if anything declared in a module of this library rests on an axiom outside the allowed
-three, if a module declares an axiom, if a source file of the library is not imported here (so
+two, if a module declares an axiom, if a source file of the library is not imported here (so
 its declarations would not be looked at), or if it finds too few theorems or not the ones it
 must (a sweep that inspects nothing must not pass).
 
@@ -36,7 +42,7 @@ directory (`globs`), so a file nothing imports is still compiled, and `check-imp
 it. -/
 elab "#check_resume_axioms" : command => do
   let env ← getEnv
-  let allowed : List Name := [``propext, ``Quot.sound, ``Classical.choice]
+  let allowed : List Name := [``propext, ``Quot.sound]
   let lib : Name := `ResumeVerify
   -- every source file of the library is imported by this one
   let dir := (System.FilePath.mk (← getFileName)).parent.getD "."
@@ -50,27 +56,33 @@ elab "#check_resume_axioms" : command => do
   -- everything declared in the library's modules
   let decls := env.constants.fold (init := #[]) fun acc name info =>
     match env.getModuleIdxFor? name with
-    | some idx => if lib.isPrefixOf modules[idx.toNat]! then acc.push (name, info) else acc
+    | some idx => if lib.isPrefixOf modules[idx.toNat]! then acc.push (name, info, false) else acc
     -- declared in this file, above the sweep
-    | none => acc.push (name, info)
+    | none => acc.push (name, info, true)
   let mut bad : Array String := #[]
   let mut theorems : Array Name := #[]
-  for (name, info) in decls do
+  for (name, info, here) in decls do
     match info with
     | .axiomInfo _ => bad := bad.push s!"{name} is an axiom"
     | .thmInfo _ | .defnInfo _ | .opaqueInfo _ =>
       if info matches .thmInfo _ then theorems := theorems.push name
       let axioms ← collectAxioms name
-      let extra := axioms.toList.filter (!allowed.contains ·)
+      -- The one declaration of this file that is not a theorem is the sweep's own elaborator,
+      -- which rests on `Classical.choice` through Lean's metaprogramming library.
+      let ok := if here && !(info matches .thmInfo _) then ``Classical.choice :: allowed else allowed
+      let extra := axioms.toList.filter (!ok.contains ·)
       if !extra.isEmpty then bad := bad.push s!"{name} depends on {extra}"
     | _ => pure ()
   let must : List Name := [`Resume.step_inv, `Resume.reachable_inv, `Resume.sound_healthy,
     `Resume.design_cloudHypervisor, `Resume.design_firecracker, `Resume.guest_ok,
-    `Resume.breaks_ch_plain_spins, `Resume.breaks_before630_nvDump_clockOff]
+    `Resume.roundTrip, `Resume.labels_complete, `Resume.not_sound_of_run,
+    `Resume.breaks_ch_plain_spins, `Resume.breaks_ch_plain_timerLoops,
+    `Resume.breaks_before630_nvDump_clockOff, `Resume.breaks_nested_nvL2_lostNestedMask,
+    `Resume.mutant_chInitLate_not_sound, `Resume.mutant_chSaveStopsVcpu1_not_sound]
   if theorems.size < 100 || must.any (!theorems.contains ·) then
     throwError "the axiom sweep found {theorems.size} theorems in {lib} and not the ones it must"
   if !bad.isEmpty then
-    throwError "theorems resting on more than Lean's own axioms:\n{"\n".intercalate bad.toList}"
+    throwError "declarations resting on more than propext and Quot.sound:\n{"\n".intercalate bad.toList}"
 
 
 open Resume
@@ -87,6 +99,10 @@ open Resume
 #guard_msgs in #print axioms breaks_ch_plain_spins
 /-- info: 'Resume.breaks_before630_nvDump_clockOff' depends on axioms: [propext] -/
 #guard_msgs in #print axioms breaks_before630_nvDump_clockOff
+/-- info: 'Resume.roundTrip' depends on axioms: [propext] -/
+#guard_msgs in #print axioms roundTrip
+/-- info: 'Resume.mutant_chInitLate_not_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms mutant_chInitLate_not_sound
 
 -- The sweep, last: everything above is looked at. Nothing goes below this line.
 #check_resume_axioms
