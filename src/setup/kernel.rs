@@ -3030,7 +3030,7 @@ fn pinned_rust_toolchain() -> Result<String> {
 ///
 /// The clone carries the history and tags without file contents
 /// (`--filter=blob:none`), because Cloud Hypervisor's build names its version
-/// with `git describe` (`v55.0-117-g4969a51a3`), which needs both. A commit no
+/// with `git describe` (`v55.0-117-g4969a51a3d3f`), which needs both. A commit no
 /// branch or tag of the clone reaches is fetched by its hash, which GitHub
 /// serves while any of its refs reaches it.
 async fn checkout_cloud_hypervisor_source(url: &str, commit: &str, build_dir: &Path) -> Result<()> {

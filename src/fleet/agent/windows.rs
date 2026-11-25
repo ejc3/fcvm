@@ -1967,7 +1967,7 @@ mod tests {
             .unwrap();
             std::fs::write(dir.path().join("sandbox-password"), password).unwrap();
             let m = Manifest::read(dir.path()).unwrap();
-            gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3").unwrap()
+            gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3d3f").unwrap()
         };
         let first = write("2026-11-07T10:00:00Z", "Sbaaaa!7");
         assert_eq!(
@@ -2018,11 +2018,11 @@ mod tests {
         std::fs::write(dir.path().join("sandbox-password"), "Sbaaaa!7").unwrap();
         let m = Manifest::read(dir.path()).unwrap();
         let old = gold_key(dir.path(), &m, "cloud-hypervisor v52.0-49-ga354afd77").unwrap();
-        let new = gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3").unwrap();
+        let new = gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3d3f").unwrap();
         assert_ne!(old, new);
         assert_eq!(
             new,
-            gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3").unwrap()
+            gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3d3f").unwrap()
         );
 
         // The old build's gold snapshot and reference are there; the new build's key finds

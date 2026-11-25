@@ -361,7 +361,7 @@ pub struct SnapshotMetadata {
     #[serde(default)]
     pub firecracker_bin: Option<PathBuf>,
     /// What the Cloud Hypervisor that wrote this snapshot prints for `--version`
-    /// (`cloud-hypervisor v55.0-117-g4969a51a3`). A restore runs only on a build that
+    /// (`cloud-hypervisor v55.0-117-g4969a51a3d3f`). A restore runs only on a build that
     /// prints the same, because Cloud Hypervisor's saved state is its own build's. None
     /// for Firecracker snapshots, and for Cloud Hypervisor snapshots written before this
     /// field existed, which no restore accepts.
