@@ -1,0 +1,70 @@
+{
+ "pages": [
+  "en-wikipedia-org",
+  "example-com",
+  "news-ycombinator-com",
+  "www-theguardian-com-international"
+ ],
+ "mean_abs_pixel_difference_from_plain": {
+  "none2": [
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "mirror": [
+   24.1,
+   1.4,
+   8.6,
+   11.1
+  ],
+  "flip": [
+   27.6,
+   1.6,
+   13.3,
+   159.2
+  ],
+  "rotate": [
+   20.6,
+   1.6,
+   13.5,
+   36.6
+  ],
+  "scale": [
+   22.2,
+   1.2,
+   13.0,
+   94.1
+  ],
+  "zoom": [
+   22.7,
+   2.9,
+   18.5,
+   59.8
+  ],
+  "skew": [
+   13.3,
+   0.7,
+   8.6,
+   75.0
+  ],
+  "invert": [
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "tilt": [
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "blur": [
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ]
+ }
+}
