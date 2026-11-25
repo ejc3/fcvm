@@ -17,6 +17,8 @@ pub mod phone;
 pub mod potato;
 pub mod protocol;
 pub mod renders;
+pub mod renders_search;
+pub mod renders_wall;
 pub mod scene;
 pub mod spend;
 pub mod state;

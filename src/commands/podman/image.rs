@@ -824,6 +824,12 @@ mod tests {
             "not podman: crun's own flag of that name, its state directory, in the restore \
              hook's `crun state` and `crun exec` and the two tests of their arguments",
         ),
+        (
+            "src/fleet/renders/mod.rs",
+            1,
+            "not podman: corpus_serve.py's flag of that name, the directory of captured \
+             pages a replay process serves",
+        ),
     ];
 
     /// Occurrences of the podman graphroot flag in the code part of `line`. Comments

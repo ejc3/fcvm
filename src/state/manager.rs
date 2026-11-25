@@ -828,6 +828,30 @@ impl StateManager {
         Ok(())
     }
 
+    /// Remove the state files of processes that no longer exist, now. For a caller that
+    /// has just killed a set of VMs and must leave nothing of them behind.
+    /// Takes the sweep's lock, waiting up to 30 s for a launch's own sweep to finish, so two
+    /// sweeps never scan at once.
+    pub async fn sweep_stale(&self) {
+        let Ok(mut file) = open_lock_file(&self.state_dir.join("sweep.lock")) else {
+            return;
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let _guard = loop {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(guard) => break guard,
+                Err((returned, _)) => {
+                    if std::time::Instant::now() >= until {
+                        return;
+                    }
+                    file = returned;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+        self.cleanup_stale_state().await;
+    }
+
     /// Clean up stale state files from processes that no longer exist.
     ///
     /// This frees up loopback IPs that were allocated but not properly cleaned up
