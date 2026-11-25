@@ -62,9 +62,9 @@ theorem rebuilt_ok {R : Rules} {C : Cfg} {s : State} (hR : Sound R) (h : MOk C s
     ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;>
     simp_all [rebuilt, save, vcpuOf, source, VM.get]
 
-theorem save_since {R : Rules} {s : State} {e : Err} (hR : Sound R)
-    (hc : s.vm.ctr = .sync { t := s.since, o := e.o }) :
-    (save R s).s0.cnt = .sync { t := 0, o := e.o } := by
-  simp [save, hR.cntAtPause, hc]
+theorem save_since {R : Rules} {s : State} (hR : Sound R)
+    (hc : s.vm.ctr = .sync { t := s.since, o := 0 }) :
+    (rebuilt (save R s)).ctr = .sync { t := 0, o := 0 } := by
+  simp [rebuilt, save, hR.cntAtPause, hc]
 
 end Resume
