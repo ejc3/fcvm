@@ -580,8 +580,10 @@ const RUNNER_KERNEL_CHECK: &str = "./scripts/check-runner-kernel.py";
 /// one of GitHub's runners (GITHUB_HOSTED) has to run it.
 const NO_RUNNER_KERNEL_CHECK: &[(&str, &str, &str)] = &[
     // These three build the guest kernels a runner image needs before it can be built
-    // (build-runner-ami.yml starts when they finish). They have to run on the image the
-    // new one replaces, however old, and they start no VM.
+    // (build-runner-ami.yml starts when they finish), so they have to run on the image the
+    // new one replaces, however old. That ordering is the whole reason: they are not free
+    // of VMs, since `fcvm setup` boots the Layer 2 setup VM in them when the runner has no
+    // rootfs yet.
     ("kernels.yml", "build-default-kernel", "builds a kernel"),
     ("kernels.yml", "build-nested-kernel", "builds a kernel"),
     ("kernels.yml", "build-btrfs-kernel", "builds a kernel"),
@@ -620,8 +622,35 @@ fn runner_of(job: &Value) -> Result<Runner, String> {
     }
 }
 
+/// Steps a checked job may run before its checkout: they repair what an earlier job left in
+/// the workspace. Nothing else has a reason to run before the kernel check.
+const BEFORE_CHECKOUT: &[&str] = &[
+    "Fix workspace permissions (pre-checkout)",
+    "Clean workspace (pre-checkout)",
+];
+
+/// Steps a checked job may run after a failed kernel check without naming the outcome of a
+/// step that did not: they record or clean up the runner's state and start nothing.
+const AFTER_A_FAILURE: &[&str] = &[
+    "Stray microVM guard (post)",
+    "Capture kernel logs",
+    "Capture host load record",
+    "Save disk I/O record",
+    "Save VMM logs",
+    "Upload test logs",
+    "Upload evidence",
+    "Save cargo tools cache",
+];
+
 /// What is wrong with the runner kernel check of a job on a runner of ours, if anything.
 /// `workflow_shell` is the workflow's own `defaults.run.shell`.
+///
+/// This is a lint over the workflow files of this repository, not a model of GitHub's
+/// runner. What it does not see: what a composite action or a script called from a step
+/// does; a step of AFTER_A_FAILURE whose commands change to start a VM without the word
+/// `make` (the list is by name); an `if` built from anything but `always()`, `failure()`,
+/// `cancelled()`, `&&` and `steps.<id>.outcome == 'success'`, which it reads as text; and a
+/// job-level `if`. Anything it cannot read as one of the shapes below is a finding.
 fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> Option<String> {
     if job.get("continue-on-error").is_some() {
         return Some("the job sets continue-on-error".into());
@@ -682,6 +711,22 @@ fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> O
     if check < checkout {
         return Some("the check runs before the checkout".into());
     }
+    if let Some(key) = ["if", "continue-on-error"]
+        .iter()
+        .find(|key| steps[checkout].get(**key).is_some())
+    {
+        return Some(format!("the checkout sets {key}"));
+    }
+    if let Some(early) = steps[..checkout].iter().find(|step| {
+        !step
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| BEFORE_CHECKOUT.contains(&name))
+    }) {
+        return Some(format!(
+            "a step that is not in BEFORE_CHECKOUT runs before the checkout: {early:?}"
+        ));
+    }
     let between = &steps[checkout + 1..check];
     if let Some(other) = between
         .iter()
@@ -691,9 +736,10 @@ fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> O
             "a step other than the disk preflight runs before the check: {other:?}"
         ));
     }
-    // A step whose `if` has a status function runs after a failed check too. One that runs
-    // make then has to name the outcome of a step that cannot run after a failed check
-    // itself: a later step with an id and no status function in an `if` of its own.
+    // A step whose `if` has a status function runs after a failed check too. It has to name
+    // the outcome of a step that cannot (a later step with an id and no status function in
+    // an `if` of its own), with no `||` beside it, or be one of AFTER_A_FAILURE and not run
+    // make.
     let after_a_failure = |step: &Value| {
         let condition = step.get("if").map(|v| format!("{v:?}")).unwrap_or_default();
         ["always()", "failure()", "cancelled()"]
@@ -705,22 +751,21 @@ fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> O
         let Some(condition) = after_a_failure(step) else {
             continue;
         };
-        let runs_make =
-            run_of(step).is_some_and(|run| run.split_whitespace().any(|word| word == "make"));
-        if !runs_make {
+        let gated = !condition.contains("||")
+            && steps[check + 1..].iter().any(|earlier| {
+                after_a_failure(earlier).is_none()
+                    && earlier.get("id").and_then(Value::as_str).is_some_and(|id| {
+                        condition.contains(&format!("steps.{id}.outcome == 'success'"))
+                    })
+            });
+        if gated {
             continue;
         }
-        let gated = steps[check + 1..].iter().any(|earlier| {
-            after_a_failure(earlier).is_none()
-                && earlier.get("id").and_then(Value::as_str).is_some_and(|id| {
-                    condition.contains(&format!("steps.{id}.outcome == 'success'"))
-                })
-        });
-        if !gated {
-            return Some(format!(
-                "the step `{}` can run make after the check failed",
-                step.get("name").and_then(Value::as_str).unwrap_or("?")
-            ));
+        let name = step.get("name").and_then(Value::as_str).unwrap_or("?");
+        let runs_make =
+            run_of(step).is_some_and(|run| run.split_whitespace().any(|word| word == "make"));
+        if runs_make || !AFTER_A_FAILURE.contains(&name) {
+            return Some(format!("the step `{name}` can run after the check failed"));
         }
     }
     None
@@ -865,7 +910,8 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
     };
     let job = |runs_on: &str, steps: &str| {
         format!(
-            "runs-on: {runs_on}\nsteps:\n  - run: sudo chown -R $USER fcvm\n  \
+            "runs-on: {runs_on}\nsteps:\n  - name: Fix workspace permissions (pre-checkout)\n    \
+             run: sudo chown -R $USER fcvm\n  \
              - uses: actions/checkout@0000000000000000000000000000000000000000\n    \
              with:\n      path: fcvm\n{steps}"
         )
@@ -970,7 +1016,10 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
     let later = |steps: &str| finding(&job(labels, &format!("{check}{steps}")));
     let setup = "  - id: setup\n    run: make setup-fcvm\n";
     assert_eq!(
-        later("  - if: always()\n    run: ./scripts/ci-stray-vm-guard.sh post\n"),
+        later(
+            "  - name: Stray microVM guard (post)\n    if: always()\n    \
+             run: ./scripts/ci-stray-vm-guard.sh post\n"
+        ),
         None
     );
     assert_eq!(
@@ -990,13 +1039,60 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
         "  - id: setup\n    if: always()\n    run: ./prepare.sh\n  - name: gym\n    \
          if: always() && steps.setup.outcome == 'success'\n    run: make fuzz-gym\n"
             .to_string(),
+        // an outcome that an `||` makes optional
+        format!(
+            "{setup}  - name: gym\n    if: always() || steps.setup.outcome == 'success'\n    \
+             run: make fuzz-gym\n"
+        ),
+        // no make: cargo, the binary, a wrapper script, make by its path, a composite action
+        "  - name: gym\n    if: always()\n    run: cargo nextest run --features privileged-tests\n"
+            .to_string(),
+        "  - name: gym\n    if: failure()\n    run: sudo ./target/release/fcvm podman run alpine\n"
+            .to_string(),
+        "  - name: gym\n    if: always()\n    run: ./scripts/run-the-gym.sh\n".to_string(),
+        "  - name: gym\n    if: always()\n    run: /usr/bin/make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: always()\n    uses: ./fcvm/.github/actions/gym\n".to_string(),
+        // a listed name does not cover a step that runs make
+        "  - name: Upload test logs\n    if: always()\n    run: make fuzz-gym\n".to_string(),
     ] {
-        assert_eq!(
-            later(&ungated).as_deref(),
-            Some("the step `gym` can run make after the check failed"),
-            "{ungated}"
+        let found = later(&ungated).unwrap_or_else(|| panic!("no finding: {ungated}"));
+        assert!(
+            found.ends_with("` can run after the check failed"),
+            "{found}: {ungated}"
         );
     }
+
+    // Steps before the checkout, and the checkout itself.
+    let early = |before: &str, checkout_extra: &str| {
+        finding(&format!(
+            "runs-on: {labels}\nsteps:\n{before}  \
+             - uses: actions/checkout@0000000000000000000000000000000000000000\n    \
+             with:\n      path: fcvm\n{checkout_extra}{check}"
+        ))
+    };
+    for name in BEFORE_CHECKOUT {
+        assert_eq!(
+            early(&format!("  - name: {name}\n    run: true\n"), ""),
+            None
+        );
+    }
+    assert_eq!(early("", ""), None);
+    for before in [
+        "  - run: make build\n",
+        "  - name: Warm the cache\n    run: ./target/release/fcvm setup\n",
+        "  - uses: ./fcvm/.github/actions/checkout-deps\n",
+    ] {
+        let found = early(before, "").unwrap_or_else(|| panic!("no finding: {before}"));
+        assert!(found.contains("is not in BEFORE_CHECKOUT"), "{found}");
+    }
+    assert_eq!(
+        early("", "    continue-on-error: true\n").as_deref(),
+        Some("the checkout sets continue-on-error")
+    );
+    assert_eq!(
+        early("", "    if: always()\n").as_deref(),
+        Some("the checkout sets if")
+    );
 
     // Which jobs the rule is applied to at all.
     let runner = |job: &str| runner_of(&serde_norway::from_str::<Value>(job).unwrap());

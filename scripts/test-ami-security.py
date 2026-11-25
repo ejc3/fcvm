@@ -356,6 +356,13 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
             harness.write_text(script + 'SCRIPT_DIR=' + shlex.quote(str(Path(__file__).resolve().parent)) + r'''
 sleep() { :; }
 git() { printf '%040d\n' 0; }
+# One required tool reads as missing: `command -v` fails for it, as it does when it is not on PATH.
+if [ -n "${AMI_TEST_MISSING_TOOL:-}" ]; then
+  command() {
+    if [ "$1" = -v ] && [ "$2" = "$AMI_TEST_MISSING_TOOL" ]; then return 1; fi
+    builtin command "$@"
+  }
+fi
 compute_pinned_hash() { echo test-build-hash; }
 compute_pinned_host_kernel() {
   [ -z "${AMI_TEST_NO_EXPECTED_KERNEL:-}" ] || return 1
@@ -527,10 +534,14 @@ main
             ["git", "-C", str(root), "status", "--porcelain", "--", "rootfs-config.toml", "kernel",
              "scripts/check-runner-kernel.py"], text=True, capture_output=True, check=True).stdout
 
-        def compute(commit, machine):
+        def compute(commit, machine, path=None):
+            # The options build-ami.sh sets for itself: with pipefail a `git archive` that
+            # fails is a failure of the function even when tar accepted what it had sent.
             return subprocess.run(
-                ["bash", "-c", function + '\ncompute_pinned_host_kernel "$1" "$2"', "bash", str(root), commit],
-                text=True, capture_output=True, env={**os.environ, "KERNEL_MACHINE": machine})
+                ["bash", "-c", "set -euo pipefail\n" + function + '\ncompute_pinned_host_kernel "$1" "$2"',
+                 "bash", str(root), commit],
+                text=True, capture_output=True,
+                env={**os.environ, "KERNEL_MACHINE": machine, **({"PATH": path} if path else {})})
 
         for machine in ["aarch64", "x86_64"]:
             with self.subTest(machine=machine):
@@ -547,6 +558,25 @@ main
             result = compute(commit, machine)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(result.stdout, "")
+        # So does a `git archive` that sends a whole archive and then fails.
+        self.assertTrue(script.startswith("#!/bin/bash\n") and "\nset -euo pipefail\n" in script[:400])
+        with tempfile.TemporaryDirectory(prefix="ami-git-") as temporary:
+            real = shutil.which("git")
+            fake = Path(temporary) / "git"
+            fake.write_text(f'#!/bin/bash\n{real} "$@"\nstatus=$?\n'
+                            'for a in "$@"; do [ "$a" = archive ] && exit 1; done\nexit $status\n')
+            fake.chmod(0o755)
+            result = compute(head.stdout.strip(), "x86_64", path=f"{temporary}:{os.environ['PATH']}")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.stdout, "")
+
+    def test_a_missing_tool_stops_the_build_before_anything_is_read_or_launched(self):
+        for tool in ["aws", "jq", "git", "python3"]:
+            with self.subTest(tool=tool):
+                result, calls = self.run_build(AMI_TEST_MISSING_TOOL=tool)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"required tool '{tool}' is missing", result.stderr)
+                self.assertEqual(calls, [])
 
     def test_the_builder_checks_the_kernel_it_installed_against_its_checkout(self):
         build = self.user_data()

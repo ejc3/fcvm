@@ -771,7 +771,7 @@ LAUNCHED=()
 # Main
 main() {
   local hash repo_root source_commit
-  for tool in aws jq git; do
+  for tool in aws jq git python3; do
     command -v "$tool" >/dev/null 2>&1 || {
       echo "ERROR: required tool '$tool' is missing" >&2
       exit 1
