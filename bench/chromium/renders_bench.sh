@@ -4,7 +4,9 @@
 #   renders_bench.sh run [module arguments]     start the module and wait for its end
 #   renders_bench.sh start [module arguments]   start it and return
 #   renders_bench.sh teardown-check [STAGES]    end a module at each stage and count what is
-#                                               left (renders_teardown_check.py)
+#                                               left (renders_teardown_check.py). The stage
+#                                               `golden` exists only while the snapshot is
+#                                               made, so name it with a TAG that has none.
 #
 # The module puts each side in a cpuset of its own, so it runs in a subgroup of a delegated
 # unit: a transient system service of the calling user with Delegate=yes and
@@ -22,8 +24,8 @@
 #   SECONDS_RUN  stop after this many seconds of rendering (default 0: until a signal)
 #   MAX_FCVM, MAX_ENGINES, RECYCLE_MIB, REPLAY_PROCS, VIEWPORT, CPUS_FCVM, CPUS_ENGINES,
 #   CPUS_HARNESS, TIMEOUT_S   the module's flags of those names, when set
-#   GOLDEN_CMD   makes the snapshot when it is absent (default: the corpus campaign's golden,
-#                verify and diag at CPU vCPUs on 2 MiB pages)
+#   IMAGE, CPU, MEM   the snapshot is made from IMAGE with CPU vCPUs and MEM MiB when it is
+#                absent (the module's defaults: the bench image, 4, 1024, on 2 MiB pages)
 #   UNIT, RUN_DIR, STATUS, FCVM, URLS, CORPUS
 set -euo pipefail
 
@@ -44,12 +46,12 @@ CORPUS="${CORPUS:-$HERE/corpus-live}"
 URLS="${URLS:-$(sed -n 's/^URLS="\(https[^"]*\)".*/\1/p' "$HERE/corpus_campaign.sh" | head -1)}"
 [ -n "$URLS" ] || { echo "BLOCKED: no page list (URLS)" >&2; exit 2; }
 [ -x "$FCVM" ] || { echo "BLOCKED: no fcvm binary at $FCVM (make build)" >&2; exit 2; }
-# The campaign reserves its stamp's directory and refuses one that exists, so each launch names its own.
-GOLDEN_CMD="${GOLDEN_CMD:-make -C $REPO bench-chromium-corpus DIAG_ONLY=1 TAG=$TAG CPU=${CPU:-4} HUGEPAGES=1 CORPUS_SERVE_ARGS=--http11 CORPUS_STAMP=$TAG-$(date -u +%Y%m%dT%H%M%S)}"
-
 module_args() {
     printf '%s\0' fleet renders-bench --out "$OUT" --run-dir "$RUN_DIR" --status-file "$STATUS" \
-        --bench "$HERE" --corpus "$CORPUS" --urls "$URLS" --snapshot-tag "$TAG" --golden-cmd "$GOLDEN_CMD"
+        --bench "$HERE" --corpus "$CORPUS" --urls "$URLS" --snapshot-tag "$TAG"
+    [ -z "${IMAGE:-}" ] || printf '%s\0' --image "$IMAGE"
+    [ -z "${CPU:-}" ] || printf '%s\0' --vcpus "$CPU"
+    [ -z "${MEM:-}" ] || printf '%s\0' --mem-mib "$MEM"
     [ -z "${KITESURF:-}" ] || printf '%s\0' --kitesurf "$KITESURF"
     [ -z "${DIST:-}" ] || printf '%s\0' --kitesurf-dist "$DIST"
     [ -z "${LEVELS:-}" ] || printf '%s\0' --levels "$LEVELS"
@@ -84,7 +86,7 @@ case "$mode" in
     run) start_unit wait "$@" ;;
     start) start_unit no-block "$@" ;;
     teardown-check)
-        stages="${1:-start,cgroups,golden,replays,serve-starting,serve,engines-starting,engines,workers,running,running:TERM}"
+        stages="${1:-start,cgroups,replays,serve-starting,serve,engines-starting,engines,workers,running,running:TERM}"
         data="${FCVM_DATA_DIR:-/mnt/fcvm-btrfs}"
         ports=()
         for a in 127.0.0.1 127.0.0.3; do for p in 80 443; do ports+=(--port "$a:$p"); done; done

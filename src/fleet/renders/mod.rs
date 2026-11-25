@@ -6,7 +6,7 @@
 //! |---|---|
 //! | `renders-fcvm` | the memory server and every clone (`fcvm snapshot run`, Firecracker, pasta, the namespace holder). One pool: nothing below it is pinned or limited |
 //! | `renders-engines` | the Kitesurf engines, one child cgroup each (`e<n>`), for its memory |
-//! | `renders-harness` | `replay-fcvm` and `replay-engines` (each side's replay processes) and `drivers` (the workers that drive the renders, and the command that makes the snapshot) |
+//! | `renders-harness` | `replay-fcvm` and `replay-engines` (each side's replay processes) and `drivers` (the workers that drive the renders, and the VM the snapshot is made from) |
 //!
 //! The pure half is `fleet_core::renders_wall::Wall`: it is fed every completed render and
 //! each side's cgroup counters and answers how many renders each side runs in flight, and
@@ -15,8 +15,8 @@
 //! reference figures and the live wall's come from one piece of code.
 //!
 //! Start, in order: sweep what an earlier module left; start the reaper ([`reap`]); make
-//! the cgroups; make the snapshot if it is absent; start the replays, the memory server,
-//! the engines and the workers; render. Each stage is written to `--status-file`. Whatever
+//! the cgroups; start the replays; make the snapshot if it is absent; start the memory
+//! server, the engines and the workers; render. Each stage is written to `--status-file`. Whatever
 //! stage the module ends at, and however it ends, the reaper removes all of it.
 //!
 //! A render in flight is one whose answer is not in hand. A clone's teardown follows its
@@ -1013,62 +1013,7 @@ async fn run(
     let fcvm_join = fcvm_group.join(None).map_err(anyhow::Error::msg)?;
     status.set("cgroups").await;
 
-    // The snapshot. Its command runs the benchmark's own replay on the fcvm side's
-    // address, so it comes before this module's replays.
-    let snapshot = crate::paths::snapshot_dir().join(&args.snapshot_tag);
     let want_fcvm = args.max_fcvm > 0;
-    if want_fcvm && !snapshot.join("config.json").exists() {
-        let Some(golden) = &args.golden_cmd else {
-            bail!(
-                "no snapshot {} and no --golden-cmd to make it",
-                args.snapshot_tag
-            );
-        };
-        status.set("golden").await;
-        let (log_path, log) = log_file(logs, "golden.log")?;
-        let mut cmd = std::process::Command::new("/bin/sh");
-        // Its VMs stay in this cgroup, so they end with the module like everything else.
-        cmd.args(["-c", golden])
-            .env(crate::cgroup::PARENT_ENV, "none");
-        let mut child = spawn_in(&drivers, cmd, log)?;
-        let done = child.wait().await?;
-        anyhow::ensure!(
-            done.success(),
-            "the snapshot's command ended {done}: {}",
-            tail(&log_path)
-        );
-        anyhow::ensure!(
-            snapshot.join("config.json").exists(),
-            "the snapshot's command left no snapshot {}",
-            args.snapshot_tag
-        );
-    }
-    let mut clone_pages = 0;
-    let mut fcvm_setup = setup[FCVM].clone();
-    if want_fcvm {
-        let config: Value =
-            serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json"))?)?;
-        let meta = &config["metadata"];
-        let mib = meta["memory_mib"].as_u64().unwrap_or(0);
-        if meta["hugepages"] == json!(true) {
-            clone_pages = mib / 2;
-        }
-        fcvm_setup.insert("vcpus".into(), meta["vcpu"].to_string());
-        fcvm_setup.insert("memory_mib".into(), mib.to_string());
-        fcvm_setup.insert(
-            "page_size".into(),
-            if clone_pages > 0 { "2 MiB" } else { "4 KiB" }.into(),
-        );
-        fcvm_setup.insert("kernel".into(), release.to_string());
-        let (pool, _) = hugepages(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default());
-        anyhow::ensure!(
-            pool >= clone_pages * 3,
-            "the 2 MiB pool holds {pool} pages; the memory server and one clone in flight and one in teardown need {}",
-            clone_pages * 3
-        );
-        fcvm_setup.insert("pool_pages".into(), pool.to_string());
-    }
-
     // The replays: several processes behind each side's address, one certificate a side.
     let addrs = [args.replay_addr_fcvm, args.replay_addr_engines];
     let mut replays: Vec<Child> = Vec::new();
@@ -1120,6 +1065,65 @@ async fn run(
         inject_files.push(inject);
     }
     status.set("replays").await;
+
+    // The snapshot, made here when it is absent: the benchmark's golden, which is the
+    // image's Chromium at its health gate (warm, a DevTools round trip answered), with the
+    // fcvm side's replay as the guest's resolver. The replays are up by now, so the guest
+    // resolves through one while it starts.
+    let snapshot = crate::paths::snapshot_dir().join(&args.snapshot_tag);
+    if want_fcvm && !snapshot.join("config.json").exists() {
+        status.set("golden").await;
+        let (log_path, log) = log_file(logs, "golden.log")?;
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["podman", "prepare", "--tag", &args.snapshot_tag])
+            .args(args.hugepages.then_some("--hugepages"))
+            .args(["--dns", "10.0.2.2", "--name"])
+            .arg(format!("renders-gold-{}", std::process::id()))
+            .args(["--cpu", &args.vcpus.to_string()])
+            .args(["--mem", &args.mem_mib.to_string()])
+            .args(["--network", "rootless", "--publish", "9222:9222"])
+            .arg(&args.image)
+            .env("RUST_LOG", "fcvm=info")
+            // Its VM stays in this cgroup, so it ends with the module like everything else.
+            .env(crate::cgroup::PARENT_ENV, "none");
+        let mut child = spawn_in(&drivers, cmd, log)?;
+        let done = child.wait().await?;
+        anyhow::ensure!(
+            done.success(),
+            "making the snapshot ended {done}: {}",
+            tail(&log_path)
+        );
+        anyhow::ensure!(
+            snapshot.join("config.json").exists(),
+            "fcvm podman prepare left no snapshot {}",
+            args.snapshot_tag
+        );
+    }
+    let mut clone_pages = 0;
+    let mut fcvm_setup = setup[FCVM].clone();
+    if want_fcvm {
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(snapshot.join("config.json"))?)?;
+        let meta = &config["metadata"];
+        let mib = meta["memory_mib"].as_u64().unwrap_or(0);
+        if meta["hugepages"] == json!(true) {
+            clone_pages = mib / 2;
+        }
+        fcvm_setup.insert("vcpus".into(), meta["vcpu"].to_string());
+        fcvm_setup.insert("memory_mib".into(), mib.to_string());
+        fcvm_setup.insert(
+            "page_size".into(),
+            if clone_pages > 0 { "2 MiB" } else { "4 KiB" }.into(),
+        );
+        fcvm_setup.insert("kernel".into(), release.to_string());
+        let (pool, _) = hugepages(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default());
+        anyhow::ensure!(
+            pool >= clone_pages * 3,
+            "the 2 MiB pool holds {pool} pages; the memory server and one clone in flight and one in teardown need {}",
+            clone_pages * 3
+        );
+        fcvm_setup.insert("pool_pages".into(), pool.to_string());
+    }
 
     // The memory server.
     let mut serve: Option<Child> = None;

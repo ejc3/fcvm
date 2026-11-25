@@ -2416,7 +2416,8 @@ is left.
 ### Start and end
 
 Stages, written to `--status-file` as each completes: `start` (the reaper is running),
-`cgroups`, `golden` (only while the snapshot's command runs), `replays`, `serve`, `engines`,
+`cgroups`, `replays`, `golden` (only while the snapshot is made: `fcvm podman prepare` of the
+bench image, when the snapshot is absent), `serve`, `engines`,
 `workers` (every worker said it is ready), `running`, `stopping`, `stopped`.
 
 Nothing the module starts is trusted to end itself. Before anything else it starts a reaper

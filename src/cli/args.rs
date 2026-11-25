@@ -1046,9 +1046,16 @@ pub struct FleetRendersBenchArgs {
     /// The snapshot every clone is restored from
     #[arg(long)]
     pub snapshot_tag: String,
-    /// A shell command that makes the snapshot when it is absent (the benchmark's golden)
-    #[arg(long)]
-    pub golden_cmd: Option<String>,
+    /// The snapshot is made from this image when it is absent (`fcvm podman prepare`), with
+    /// these vCPUs and memory, on 2 MiB pages unless `--hugepages false`
+    #[arg(long, default_value = "localhost/chromium-bench-req")]
+    pub image: String,
+    #[arg(long, default_value_t = 4)]
+    pub vcpus: u32,
+    #[arg(long, default_value_t = 1024)]
+    pub mem_mib: u32,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub hugepages: bool,
     /// How the memory server fills clone memory
     #[arg(long, default_value = "minor")]
     pub uffd_mode: String,
