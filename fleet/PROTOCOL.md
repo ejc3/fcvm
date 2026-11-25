@@ -1822,7 +1822,7 @@ A `/health` reply carrying `error` (the renderer failed) fails the relaunch at o
  "overlay_seq": 3, "harness": {"cpu_pressure": 0.0, "replay_ms": {"fcvm": 0.4, "kitesurf": 0.5}}}
 ```
 
-Pages mode: the host's summary, at least every 5 s. At the top level only `at` is required. A
+Pages mode: the host's summary, about every 5 s. At the top level only `at` is required. A
 side that is present carries `search` (with `in_flight` and `phase`),
 `renders_per_s`, `cpus_busy`, `done`, `failed` and `since`; a tile carries `page`, `side`,
 `state`, `renders_per_s`, `done` and `failed`. A host says it runs
@@ -1830,10 +1830,14 @@ the mode with `renders` in its hello (`{"pages": [{"id", "url"}], "cpus", "confi
 "build"?}`), and sends this message on a connection only after it has received a `renders`
 order on that connection: a coordinator built before the mode sends none, and would close the
 connection on this message. The agent (`fcvm fleet agent --renders`) sends the module's
-summary while the module renders, and otherwise one with nothing in flight and every tile
-`waiting`: while the order is `run: false`, while the module starts, and, with `withheld`
-set to the error, after a module failed. A failed module is started again after 60 s while
-the order is `run: true`, and at once on the next `run: true` after a `run: false`.
+summary while the module's loop runs (every fifth tick of its one-second loop, so 5 s or a
+little more apart), and otherwise its own every 5 s, with nothing in flight and every tile
+`waiting`: while the order is `run: false`, while the module starts, while it sweeps after
+its loop has ended, and, with `withheld` set to the error, after a module failed. A failed
+module is started again after 60 s while the order is `run: true`, and at once on any new
+order that says `run: true`. An agent started again right after it was killed reports
+`withheld` (the run directory's lock is held) until the killed module's reaper has finished
+its sweep, and starts the module at the next retry.
 
 `build` names, when the host knows them: `instance_type` (on EC2), `kernel`, `fcvm_commit`
 and `kitesurf_commit` (the agent's `--setup fcvm.commit=` and `--setup kitesurf.commit=`
@@ -2136,7 +2140,8 @@ for none: `text` (plain text; the host escapes it), `transform` (a name; the sty
 the host's), `chromium_only` (the transform goes into the `fcvm` side's pages only), and `seq`,
 which the host's reports repeat as `overlay_seq` once its replays serve it. A render sees the
 old overlay or the new one whole. An overlay whose content or `seq` differs from the one the
-replays serve starts both sides' searches again; the same order sent again changes nothing.
+replays serve is written again; one with another `seq` (a clear included) also starts both
+sides' searches again. The same order sent again changes nothing.
 
 ### Grid budget
 

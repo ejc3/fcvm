@@ -1142,7 +1142,11 @@ pub struct FleetRendersBenchArgs {
     /// Values for the Setup lists that the module cannot read itself (`side.name=value`)
     #[arg(long = "setup")]
     pub setup: Vec<String>,
-    /// Wait at this stage until the module is ended (the teardown check's)
+    /// Wait at this stage until the module is ended: the host checks' option
+    /// (renders_teardown_check.py, renders_agent_check.py). Under the agent, an order to stop
+    /// or the end of the connection ends a module held at a stage of its start (`cgroups` to
+    /// `workers`); one held at `start`, `running` or `stopping` is ended only with the agent's
+    /// process, whose end lets the reaper remove everything
     #[arg(long, hide = true)]
     pub hold_at: Option<String>,
 }

@@ -181,6 +181,101 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+/// How much of its records a module keeps, when it is bounded (under the fleet agent, which
+/// runs for as long as its host; the benchmark keeps a run's whole record as its evidence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    /// `renders.jsonl` and `samples.jsonl` are rotated at these sizes ([`Records`]).
+    pub renders_bytes: u64,
+    pub samples_bytes: u64,
+    /// The failed clones' logs kept, newest first ([`prune_clone_logs`]).
+    pub failed_clone_logs: usize,
+}
+
+/// A records file of JSON lines. With a limit, a line that would take it past the limit
+/// first renames it to `<name>.1` (replacing the one before) and starts a new one, so the file
+/// and its previous one hold at most twice the limit and a reader sees whole lines.
+struct Records {
+    path: PathBuf,
+    out: std::io::BufWriter<std::fs::File>,
+    written: u64,
+    limit: Option<u64>,
+}
+
+impl Records {
+    fn create(path: PathBuf, limit: Option<u64>) -> std::io::Result<Self> {
+        let out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        Ok(Records {
+            path,
+            out,
+            written: 0,
+            limit,
+        })
+    }
+
+    fn line(&mut self, line: &str) {
+        let size = line.len() as u64 + 1;
+        if self
+            .limit
+            .is_some_and(|limit| self.written > 0 && self.written + size > limit)
+        {
+            if let Err(e) = self.rotate() {
+                tracing::warn!(target: "renders", "rotating {}: {e}", self.path.display());
+            }
+        }
+        if writeln!(self.out, "{line}").is_ok() {
+            self.written += size;
+        }
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.out.flush()?;
+        let mut previous = self.path.clone().into_os_string();
+        previous.push(".1");
+        std::fs::rename(&self.path, previous)?;
+        self.out = std::io::BufWriter::new(std::fs::File::create(&self.path)?);
+        self.written = 0;
+        Ok(())
+    }
+
+    fn flush(&mut self) {
+        let _ = self.out.flush();
+    }
+}
+
+/// Remove the failed clones' logs under `dir` (one directory a worker) past the newest
+/// `keep`. A file written in the last `settled` is a render's that is still under way and is
+/// neither counted nor removed. Returns how many were removed.
+fn prune_clone_logs(
+    dir: &Path,
+    keep: usize,
+    settled: Duration,
+    now: std::time::SystemTime,
+) -> usize {
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|worker| {
+            std::fs::read_dir(worker.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter_map(|e| {
+            let meta = e.metadata().ok().filter(|m| m.is_file())?;
+            let modified = meta.modified().ok()?;
+            let age = now.duration_since(modified).unwrap_or_default();
+            (age >= settled).then(|| (modified, e.path()))
+        })
+        .collect();
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.iter()
+        .skip(keep)
+        .filter(|(_, path)| std::fs::remove_file(path).is_ok())
+        .count()
+}
+
 /// Write `bytes` to `path` so a reader sees the old file or the new one.
 fn write_by_rename(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
@@ -624,8 +719,12 @@ struct Module {
     clone_pages: u64,
     fixed: Option<[u32; 2]>,
     tx: mpsc::UnboundedSender<Event>,
-    records: std::io::BufWriter<std::fs::File>,
-    samples: std::io::BufWriter<std::fs::File>,
+    records: Records,
+    samples: Records,
+    /// What the module keeps of its records; none keeps all of them.
+    bounds: Option<Bounds>,
+    /// The longest a render takes, after which a clone's log is written no more.
+    render_timeout: Duration,
     harness: CpuCgroup,
     /// Its parts, by name, for their own counters: each side's replay and the drivers.
     harness_parts: Vec<(&'static str, CpuCgroup)>,
@@ -797,7 +896,7 @@ impl Module {
             "stage": row["stage"], "error": row["error"], "inject_sha256": job.inject,
             "detail": row["detail"],
         });
-        let _ = writeln!(self.records, "{line}");
+        self.records.line(&line.to_string());
     }
 
     async fn line(&mut self, side: usize, index: usize, line: &str) {
@@ -978,9 +1077,9 @@ impl Module {
             "replay_ms": {SIDES[0]: self.replay_ms[0], SIDES[1]: self.replay_ms[1]},
             "parts": parts,
         });
-        let _ = writeln!(self.samples, "{sample}");
-        let _ = self.samples.flush();
-        let _ = self.records.flush();
+        self.samples.line(&sample.to_string());
+        self.samples.flush();
+        self.records.flush();
         self.dispatch(FCVM).await;
         self.dispatch(KITE).await;
     }
@@ -997,6 +1096,25 @@ impl Module {
             replay_ms: (0..2)
                 .filter_map(|i| Some((SIDES[i].to_string(), self.replay_ms[i]?)))
                 .collect(),
+        }
+    }
+
+    /// Under [`Bounds`], the failed clones' logs past the newest kept. A render's log is
+    /// written for as long as the render and its teardown take; one untouched for twice the
+    /// render's limit and a minute is settled.
+    fn prune_clone_logs(&self, clones: &Path) {
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        let settled = self.render_timeout * 2 + Duration::from_secs(60);
+        let removed = prune_clone_logs(
+            clones,
+            bounds.failed_clone_logs,
+            settled,
+            std::time::SystemTime::now(),
+        );
+        if removed > 0 {
+            tracing::debug!(target: "renders", removed, "removed failed clones' logs past the newest kept");
         }
     }
 
@@ -1338,7 +1456,7 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
     // Held until the session returns: the order never changes.
     let (_order, orders) = watch::channel(Some(RendersOrder { run: true, overlay }));
     let exe = std::env::current_exe().context("this binary's path")?;
-    let (outcome, reaped) = session(&args, &exe, orders, None, Signals::EndTheModule).await?;
+    let (outcome, reaped) = session(&args, &exe, orders, None, Signals::EndTheModule, None).await?;
     println!("{}", serde_json::to_string(&reaped)?);
     outcome?;
     anyhow::ensure!(
@@ -1373,6 +1491,7 @@ pub async fn session(
     mut orders: watch::Receiver<Option<RendersOrder>>,
     reports: Option<mpsc::UnboundedSender<RendersReport>>,
     signals: Signals,
+    bounds: Option<Bounds>,
 ) -> Result<(Result<()>, reap::Reaped)> {
     let status = Status {
         path: args.status_file.clone(),
@@ -1441,6 +1560,7 @@ pub async fn session(
         &mut orders,
         reports,
         signals,
+        bounds,
     )
     .await;
     status.set("stopping").await;
@@ -1460,7 +1580,8 @@ pub async fn session(
 /// The processes, from the cgroups to the last worker's start, and then the renders until the
 /// order says stop, the agent's connection ends, a signal arrives (`signals`), `--seconds`
 /// pass, or something fails. An order to stop during the start ends the start where it is:
-/// its future is dropped, which kills every child it started, and no task of it runs on.
+/// its future is dropped, which kills every child it started; no task of it can start a
+/// process afterwards ([`start`]).
 #[allow(clippy::too_many_arguments)]
 async fn run(
     args: &FleetRendersBenchArgs,
@@ -1476,9 +1597,10 @@ async fn run(
     orders: &mut watch::Receiver<Option<RendersOrder>>,
     reports: Option<mpsc::UnboundedSender<RendersReport>>,
     signals: Signals,
+    bounds: Option<Bounds>,
 ) -> Result<()> {
     let start = start(
-        args, status, unit, cpus, pages, fixed, setup, exe, logs, release, reports,
+        args, status, unit, cpus, pages, fixed, setup, exe, logs, release, reports, bounds,
     );
     tokio::pin!(start);
     let Started {
@@ -1558,6 +1680,7 @@ async fn run(
                 ticks += 1;
                 if ticks.is_multiple_of(5) {
                     module.write_report("report.json");
+                    module.prune_clone_logs(&logs.join("clones"));
                 }
                 if args.seconds > 0 && started.elapsed() >= Duration::from_secs(args.seconds) {
                     break "its time";
@@ -1579,8 +1702,8 @@ async fn run(
     module.starting.shutdown().await;
     let ended = ended?;
     tracing::info!(target: "renders", "ending at {ended}");
-    let _ = module.records.flush();
-    let _ = module.samples.flush();
+    module.records.flush();
+    module.samples.flush();
     module.write_report("report.json");
     module.write_report("summary.json");
     Ok(())
@@ -1613,8 +1736,10 @@ struct Started {
 }
 
 /// The start: the cgroups, the replays, the snapshot when it is absent, the memory server,
-/// the engines and the workers. It spawns no task: dropping it before it returns ends all of
-/// it, with the children killed on drop and the rest left to the reaper.
+/// the engines and the workers. Dropping it before it returns ends all of it, with the
+/// children killed on drop and the rest left to the reaper: the engines' first starts are
+/// polled here rather than spawned, and the only tasks it spawns are the workers' output
+/// readers, which end with the workers' output and start no process.
 #[allow(clippy::too_many_arguments)]
 async fn start(
     args: &FleetRendersBenchArgs,
@@ -1628,6 +1753,7 @@ async fn start(
     logs: &Path,
     release: &str,
     reports: Option<mpsc::UnboundedSender<RendersReport>>,
+    bounds: Option<Bounds>,
 ) -> Result<Started> {
     let [cpus_fcvm, cpus_engines, cpus_harness] = cpus;
     let run_dir = &args.run_dir;
@@ -2019,8 +2145,16 @@ async fn start(
         clone_pages,
         fixed,
         tx,
-        records: std::io::BufWriter::new(std::fs::File::create(args.out.join("renders.jsonl"))?),
-        samples: std::io::BufWriter::new(std::fs::File::create(args.out.join("samples.jsonl"))?),
+        records: Records::create(
+            args.out.join("renders.jsonl"),
+            bounds.map(|b| b.renders_bytes),
+        )?,
+        samples: Records::create(
+            args.out.join("samples.jsonl"),
+            bounds.map(|b| b.samples_bytes),
+        )?,
+        bounds,
+        render_timeout: Duration::from_secs(u64::from(args.timeout_s)),
         harness,
         harness_parts,
         harness_pressure: Default::default(),
@@ -2647,7 +2781,7 @@ mod tests {
             &rest[..rest.find("\n}\n").unwrap()]
         };
         let bench = body("pub async fn bench(");
-        assert!(bench.contains("session(&args, &exe, orders, None, Signals::EndTheModule)"));
+        assert!(bench.contains("session(&args, &exe, orders, None, Signals::EndTheModule, None)"));
         assert!(!bench.contains("run("));
         let session = body("pub async fn session(");
         let reaper = session.find("reap::Reaper::start(").unwrap();
@@ -2661,15 +2795,21 @@ mod tests {
             2,
             "the definition and the call"
         );
-        // the agent starts the module through the session, with the signals it names
-        // (`agent::renders::AGENT_SIGNALS`, pinned by value there)
+        // the agent starts the module through the session, with the signals and the bounds
+        // it names (`agent::renders::AGENT_SIGNALS` and `AGENT_BOUNDS`, pinned by value there)
         let agent = include_str!("../agent/renders.rs");
         let agent = &agent[..agent.find("#[cfg(test)]").unwrap()];
-        let calls: Vec<&str> = agent
+        let calls: Vec<Vec<&str>> = agent
             .match_indices("crate::fleet::renders::session(")
-            .map(|(at, _)| {
-                let rest = &agent[at..];
-                &rest[..rest.find(".await").unwrap()]
+            .map(|(at, call)| {
+                let rest = &agent[at + call.len()..];
+                let rest = rest[..rest.find(".await").unwrap()].trim_end();
+                rest.strip_suffix(')')
+                    .unwrap()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .collect()
             })
             .collect();
         assert_eq!(
@@ -2677,20 +2817,12 @@ mod tests {
             1,
             "the agent's module is the session: {calls:?}"
         );
-        assert!(
-            calls[0]
-                .trim_end()
-                .trim_end_matches(')')
-                .trim_end()
-                .trim_end_matches(',')
-                .ends_with("AGENT_SIGNALS"),
-            "the agent passes AGENT_SIGNALS: {}",
-            calls[0]
-        );
+        assert_eq!(calls[0][4..], ["AGENT_SIGNALS", "Some(AGENT_BOUNDS)"]);
     }
 
     /// A start ended by an order to stop must leave nothing running: it spawns no task an
-    /// engine start could run on in, and the signal handlers are the benchmark's alone.
+    /// engine start could run on in (the workers' output readers start nothing), and the
+    /// signal handlers are the benchmark's alone.
     #[test]
     fn a_start_spawns_no_task_and_the_agent_registers_no_signal() {
         let source = include_str!("mod.rs");
@@ -2711,6 +2843,93 @@ mod tests {
         let none = run.find("        None\n    };").unwrap();
         assert!(guard < term && term < none);
         assert_eq!(source.matches("SignalKind::terminate()").count(), 1);
+    }
+
+    /// A bounded records file is renamed to `.1` before a line would take it past its limit,
+    /// so it and its previous file hold at most twice the limit, in whole lines; an
+    /// unbounded one (the benchmark's) is never rotated.
+    #[test]
+    fn a_bounded_records_file_keeps_one_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("renders.jsonl");
+        let mut r = Records::create(path.clone(), Some(100)).unwrap();
+        let line = |i: usize| format!("{{\"seq\":{i},\"pad\":\"{}\"}}", "x".repeat(20));
+        for i in 0..40 {
+            r.line(&line(i));
+        }
+        r.flush();
+        let now = std::fs::read_to_string(&path).unwrap();
+        let before = std::fs::read_to_string(dir.path().join("renders.jsonl.1")).unwrap();
+        assert!(
+            now.len() <= 100 && before.len() <= 100,
+            "{} {}",
+            now.len(),
+            before.len()
+        );
+        assert!(now.ends_with(&format!("{}\n", line(39))), "{now}");
+        // the previous file is the lines just before the current one, all whole
+        let first_now: usize = now.lines().count();
+        assert_eq!(
+            before.lines().last().unwrap(),
+            line(39 - first_now),
+            "{before}"
+        );
+        assert!(before
+            .lines()
+            .chain(now.lines())
+            .all(|l| l.ends_with("\"}")));
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(names.len(), 2);
+
+        let path = dir.path().join("samples.jsonl");
+        let mut r = Records::create(path.clone(), None).unwrap();
+        for i in 0..40 {
+            r.line(&line(i));
+        }
+        r.flush();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 40);
+        assert!(!dir.path().join("samples.jsonl.1").exists());
+    }
+
+    /// The failed clones' logs past the newest kept are removed, across the workers'
+    /// directories; a log written lately is a render still under way and is left alone.
+    #[test]
+    fn the_failed_clones_logs_past_the_newest_kept_are_removed() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(1_000_000 + s);
+        let mut all = Vec::new();
+        for (worker, ages) in [(0, [10u64, 30, 50]), (1, [20, 40, 995])] {
+            let sub = dir.path().join(format!("logs-{worker}"));
+            std::fs::create_dir(&sub).unwrap();
+            for age in ages {
+                let path = sub.join(format!("rb-{age}.log"));
+                std::fs::write(&path, "x").unwrap();
+                let f = std::fs::File::options().write(true).open(&path).unwrap();
+                f.set_modified(at(age)).unwrap();
+                all.push((age, path));
+            }
+        }
+        let now = at(1_000);
+        // settled: written over 60 s ago (995 is under way); keep the newest 3 of the five
+        let removed = prune_clone_logs(dir.path(), 3, Duration::from_secs(60), now);
+        assert_eq!(removed, 2);
+        for (age, path) in &all {
+            assert_eq!(path.exists(), ![10, 20].contains(age), "{age}");
+        }
+        assert_eq!(
+            prune_clone_logs(dir.path(), 3, Duration::from_secs(60), now),
+            0
+        );
+        assert_eq!(
+            prune_clone_logs(
+                &dir.path().join("absent"),
+                0,
+                Duration::ZERO,
+                SystemTime::now()
+            ),
+            0
+        );
     }
 
     #[test]

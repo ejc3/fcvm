@@ -10,13 +10,14 @@
 //!
 //! Nothing is sent before the coordinator's first order: a coordinator built before the mode
 //! sends none, and closes the connection on a message it cannot parse. After it, a summary
-//! goes at least every [`REPORT_EVERY`]: the module's own while it renders, and otherwise one
-//! with nothing in flight (stopped, starting, or `withheld` with the error of a module that
-//! failed). A module that failed is started again after [`RETRY_AFTER`] while the order says
-//! run; the agent and its connection go on.
+//! goes about every [`REPORT_EVERY`]: the module's own while its loop runs (every fifth tick
+//! of its one-second loop), and otherwise the agent's, with nothing in flight (stopped,
+//! starting, sweeping after its loop, or `withheld` with the error of a module that failed). A
+//! module that failed is started again after [`RETRY_AFTER`] while the order says run, or at
+//! the next order; the agent and its connection go on.
 
 use crate::cli::FleetRendersBenchArgs;
-use crate::fleet::renders::Signals;
+use crate::fleet::renders::{Bounds, Signals};
 use fleet_core::protocol::AgentMsg;
 use fleet_core::renders::{RendersHost, RendersOrder, RendersReport};
 use fleet_core::renders_search::SearchParams;
@@ -33,7 +34,16 @@ use tokio::time::Instant;
 /// module made).
 pub const AGENT_SIGNALS: Signals = Signals::LeaveToTheProcess;
 
-/// The longest time between two summaries.
+/// What a module keeps of its records under the agent, which runs for as long as its host:
+/// `renders.jsonl` rotated at 64 MiB and `samples.jsonl` at 16 MiB, each with its previous
+/// file, and the newest 50 failed clones' logs.
+pub const AGENT_BOUNDS: Bounds = Bounds {
+    renders_bytes: 64 << 20,
+    samples_bytes: 16 << 20,
+    failed_clone_logs: 50,
+};
+
+/// The time between two of the agent's own summaries.
 pub const REPORT_EVERY: Duration = Duration::from_secs(5);
 /// How long after a module that failed the next one starts, while the order says run.
 pub const RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -76,6 +86,7 @@ impl RendersCfg {
                     orders,
                     Some(reports),
                     AGENT_SIGNALS,
+                    Some(AGENT_BOUNDS),
                 )
                 .await?;
                 outcome?;
@@ -138,20 +149,33 @@ pub async fn run(
             retry_at = None;
         }
         if run && retry_at.is_none_or(|t| Instant::now() >= t) {
+            // An order followed at once by the end of the connection starts nothing.
+            if orders.has_changed().is_err() {
+                return;
+            }
             let (tx, mut rx) = mpsc::unbounded_channel();
             let module = (cfg.start)(orders.clone(), tx);
             tokio::pin!(module);
             next_report = Instant::now() + cfg.report_every;
-            // Until the module's first report: it is starting and has none of its own.
-            let mut starting = true;
+            // The module reports from its first report until its loop ends, when it drops its
+            // sender. Before (it is starting) and after (its reaper sweeps) the agent reports.
+            let mut reporting = false;
+            let mut open = true;
             let ended = loop {
                 tokio::select! {
                     ended = &mut module => break ended,
-                    Some(report) = rx.recv() => {
-                        send(report);
-                        starting = false;
-                    }
-                    _ = tokio::time::sleep_until(next_report), if starting => {
+                    report = rx.recv(), if open => match report {
+                        Some(report) => {
+                            send(report);
+                            reporting = true;
+                            next_report = Instant::now() + cfg.report_every;
+                        }
+                        None => {
+                            open = false;
+                            reporting = false;
+                        }
+                    },
+                    _ = tokio::time::sleep_until(next_report), if !reporting => {
                         send(cfg.idle_report(None));
                         next_report = Instant::now() + cfg.report_every;
                     }
@@ -188,6 +212,9 @@ pub async fn run(
                 if changed.is_err() {
                     return;
                 }
+                // Any new order ends a failed module's wait: a stop and a run that arrive
+                // together read as one change.
+                retry_at = None;
             }
             _ = tokio::time::sleep_until(retry_at.unwrap_or(next_report)), if retry_at.is_some() => {}
         }
@@ -390,6 +417,76 @@ mod tests {
         assert_eq!(f.running.load(Ordering::SeqCst), 0);
     }
 
+    /// A module that has ended its renders sends nothing while its reaper sweeps (it drops its
+    /// report sender with its loop): the agent reports at the cadence meanwhile.
+    #[tokio::test(start_paused = true)]
+    async fn a_module_ending_its_sweep_is_reported_at_the_cadence() {
+        let sweeping = Arc::new(AtomicUsize::new(0));
+        let s = sweeping.clone();
+        let start: StartModule = Arc::new(move |mut orders, reports| {
+            let s = s.clone();
+            Box::pin(async move {
+                let _ = reports.send(RendersReport {
+                    at: 1000,
+                    ..Default::default()
+                });
+                while orders.borrow_and_update().as_ref().is_some_and(|o| o.run) {
+                    if orders.changed().await.is_err() {
+                        break;
+                    }
+                }
+                drop(reports);
+                s.store(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(12)).await;
+                s.store(2, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let cfg = RendersCfg { start, ..fake(0).1 };
+        let (tx, rx) = watch::channel(order(true, None));
+        let (out, mut msgs) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run(cfg, rx, out));
+        until(&mut msgs, |r| r.at == 1000).await;
+        tx.send_replace(order(false, None));
+        let t0 = Instant::now();
+        next(&mut msgs).await;
+        assert_eq!(Instant::now() - t0, REPORT_EVERY);
+        assert_eq!(sweeping.load(Ordering::SeqCst), 1, "still sweeping");
+        next(&mut msgs).await;
+        assert_eq!(Instant::now() - t0, 2 * REPORT_EVERY);
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    /// An order followed at once by the end of the connection starts no module.
+    #[tokio::test(start_paused = true)]
+    async fn an_order_on_a_connection_already_ended_starts_nothing() {
+        let (f, cfg) = fake(0);
+        let (tx, rx) = watch::channel(order(true, None));
+        drop(tx);
+        let (out, _msgs) = mpsc::unbounded_channel();
+        run(cfg, rx, out).await;
+        assert_eq!(f.starts.load(Ordering::SeqCst), 0);
+    }
+
+    /// A stop and a run that arrive together while a failed module waits for its retry still
+    /// start the module at once: any new order ends the wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_order_ends_the_wait_after_a_failure() {
+        let (_f, cfg) = fake(1);
+        let (tx, rx) = watch::channel(order(true, None));
+        let (out, mut msgs) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run(cfg, rx, out));
+        assert!(next(&mut msgs).await.withheld.is_some());
+        let t0 = Instant::now();
+        tx.send_replace(order(false, None));
+        tx.send_replace(order(true, None));
+        until(&mut msgs, |r| r.at == 1001).await;
+        assert!(Instant::now() - t0 < REPORT_EVERY);
+        drop(tx);
+        task.await.unwrap();
+    }
+
     /// A module that is still starting has no report of its own: the host says it renders
     /// nothing yet, at the same cadence.
     #[tokio::test(start_paused = true)]
@@ -518,6 +615,19 @@ mod tests {
     #[test]
     fn the_agents_module_registers_no_signal_handler() {
         assert_eq!(AGENT_SIGNALS, Signals::LeaveToTheProcess);
+    }
+
+    /// The agent's module keeps bounded records (the sizes the docs state).
+    #[test]
+    fn the_agents_module_keeps_bounded_records() {
+        assert_eq!(
+            AGENT_BOUNDS,
+            Bounds {
+                renders_bytes: 64 << 20,
+                samples_bytes: 16 << 20,
+                failed_clone_logs: 50,
+            }
+        );
     }
 
     /// `--renders` turns the mode on and takes renders-bench's options through
