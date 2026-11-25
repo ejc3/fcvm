@@ -332,6 +332,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # connection anyway, finds it closed, and fails the request with "Network
     # connection lost". Off by default, so the other arms' replies are as before.
     close_header = False
+    # --http11: answer HTTP/1.1 and keep the connection open between requests
+    # (protocol_version is set by main()). Every reply carries Content-Length,
+    # so a client can find where it ends. A request body that was not read to
+    # its end leaves bytes the next request would be parsed from, so that
+    # connection closes after its reply. An idle connection closes after
+    # IDLE_TIMEOUT_S, as a silent one always has.
+    keep_alive = False
 
     def handle_one_request(self):
         # One access line per parsed request, written after the response has
@@ -443,12 +450,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         previous = self.connection.gettimeout()
         self._drain_deadline = time.monotonic() + self.DRAIN_TIMEOUT_S
+        whole = False
         try:
-            self._read_body(headers)
+            whole = self._read_body(headers)
         except (OSError, ValueError):
             pass
         finally:
             self.connection.settimeout(previous)
+        if self.keep_alive and not whole:
+            self.close_connection = True
 
     def _take(self, n):
         """Up to n bytes of the body: what the handler's buffer already holds,
@@ -462,6 +472,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.rfile.read1(n)
 
     def _read_body(self, headers):
+        """Read the request body and discard it. True when it was read to its
+        end, which is what lets a kept-alive connection take another request."""
         if "chunked" in (headers.get("Transfer-Encoding") or "").lower():
             pending = b""
 
@@ -490,27 +502,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     size = int(line().split(b";")[0].strip() or b"0", 16)
                 except ValueError:
-                    return
+                    return False
                 if size == 0:
                     while line() not in (b"\r\n", b"\n", b""):
                         pass
-                    return
+                    return True
                 if size < 0 or size > left:
-                    return
+                    return False
                 skip(size + 2)
                 left -= size
-            return
+            return False
         try:
             length = int(headers.get("Content-Length") or 0)
         except ValueError:
-            return
-        if length <= 0 or length > self.MAX_DRAIN:
-            return
+            return False
+        if length <= 0:
+            return True
+        if length > self.MAX_DRAIN:
+            return False
         while length > 0:
             chunk = self._take(min(length, 1 << 16))
             if not chunk:
-                return
+                return False
             length -= len(chunk)
+        return True
 
     def _serve(self, body=True):
         self._drain_body()
@@ -1058,6 +1073,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "net.core.somaxconn")
     ap.add_argument("--connection-close", action="store_true",
                     help="send Connection: close on every reply (Handler.close_header)")
+    ap.add_argument("--http11", action="store_true",
+                    help="answer HTTP/1.1 and keep connections open between requests "
+                         "(Handler.keep_alive); default: HTTP/1.0, one reply per connection")
     ap.add_argument("--tls-ca-out", default=None, metavar="PATH",
                     help="serve a leaf naming every captured host, signed by a CA made "
                          "for this run, and write that CA's certificate to PATH "
@@ -1083,6 +1101,15 @@ def main():
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
     Handler.access_log = JsonlLog(args.access_log) if args.access_log else None
     Handler.close_header = args.connection_close
+    if args.http11:
+        if args.connection_close:
+            ap.error("--http11 keeps connections open; --connection-close closes each one")
+        Handler.keep_alive = True
+        Handler.protocol_version = "HTTP/1.1"
+        # A reply is two writes, headers then body. On a kept connection Nagle's
+        # algorithm holds the body until the client acknowledges the headers, and
+        # the client delays that ACK: 41 ms per request on Linux loopback.
+        Handler.disable_nagle_algorithm = True
     print(f"loaded {len(Handler.exact)} urls", flush=True)
 
     dns_log = JsonlLog(args.dns_log) if args.dns_log else None

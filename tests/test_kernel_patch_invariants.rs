@@ -767,19 +767,26 @@ const VGIC_HCR_PATCH: &str = "vgic-v3-keep-hcr-on-quiet-exits.patch";
 /// The arm64 host kernel's release, one patch of its patch set and the fixture
 /// `tests/fixtures/<fixture>-<major>.<minor>` cut from that release.
 fn host_kernel_port(patch: &str, fixture: &str) -> (String, PathBuf, PathBuf) {
+    host_kernel_port_of("arm64", patch, fixture)
+}
+
+/// The same for the host kernel of `arch` (`arm64` or `amd64`).
+fn host_kernel_port_of(arch: &str, patch: &str, fixture: &str) -> (String, PathBuf, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let config: toml::Value = toml::from_str(
         &fs::read_to_string(root.join("rootfs-config.toml")).expect("read rootfs-config.toml"),
     )
     .expect("parse rootfs-config.toml");
-    let host = &config["kernel_profiles"]["nested"]["arm64"]["host_kernel"];
+    let host = &config["kernel_profiles"]["nested"][arch]["host_kernel"];
     let release = host["kernel_version"]
         .as_str()
-        .expect("[kernel_profiles.nested.arm64.host_kernel] pins a kernel_version")
+        .unwrap_or_else(|| {
+            panic!("[kernel_profiles.nested.{arch}.host_kernel] pins a kernel_version")
+        })
         .to_string();
-    let patches_dir = host["patches_dir"]
-        .as_str()
-        .expect("[kernel_profiles.nested.arm64.host_kernel] names a patches_dir");
+    let patches_dir = host["patches_dir"].as_str().unwrap_or_else(|| {
+        panic!("[kernel_profiles.nested.{arch}.host_kernel] names a patches_dir")
+    });
     let series = release.splitn(3, '.').take(2).collect::<Vec<_>>().join(".");
     (
         release,
@@ -925,6 +932,170 @@ fn quiet_vgic_exits_leave_ich_hcr_el2_programmed_without_a_host_maintenance_inte
         "Linux {release} with{} {VGIC_HCR_PATCH}:\n{}",
         if patched { "" } else { "out" },
         failures.join("\n")
+    );
+}
+
+const PV_KICK_FILES: [&str; 2] = ["arch/x86/kvm/x86.c", "arch/x86/kvm/x86.h"];
+
+const PV_KICK_PATCH: &str = "0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch";
+
+/// The x86_64 host kernel's release, its PV kick patch and the fixture cut from that release.
+fn pv_kick_port() -> (String, PathBuf, PathBuf) {
+    host_kernel_port_of("amd64", PV_KICK_PATCH, "kvm-pv-kick")
+}
+
+#[test]
+fn the_pv_kick_fixture_is_cut_from_the_pinned_x86_host_kernel() {
+    let (release, _, fixture) = pv_kick_port();
+    for file in PV_KICK_FILES {
+        let text = fs::read_to_string(fixture.join(file)).unwrap_or_else(|e| {
+            panic!(
+                "the x86_64 host pins Linux {release}, and {} has no {file} excerpt: {e}",
+                fixture.display()
+            )
+        });
+        assert!(
+            text.contains(&format!("Linux v{release} {file}")),
+            "{}/{file} is not cut from Linux {release}, which the x86_64 host kernel pins. \
+             Cut the same functions again from that release and record its SHA-256 in the \
+             header.",
+            fixture.display()
+        );
+    }
+}
+
+/// Run the x86_64 host kernel's `kvm_arch_async_page_present()` and `kvm_set_mp_state()`,
+/// with its own PV kick patch applied, in a C harness that models the vCPU state they
+/// touch (fcvm #2125).
+///
+/// A PV spinlock waiter checks the lock and then executes HLT, with interrupts off when the
+/// lock is taken from interrupt context. A kick (`KVM_HC_KICK_CPU`) that arrives between the
+/// two sets `pv_unhalted`, and the HLT must then not block. Since Linux 6.15
+/// `kvm_set_mp_state()` clears `pv_unhalted` on every move to runnable, and
+/// `kvm_arch_async_page_present()` goes through it for a vCPU that is already runnable, so a
+/// page-ready completion in that window erased the kick: the HLT blocked, nothing but an NMI
+/// woke the vCPU, and every CPU that sent it an IPI and waited spun for ever. On an
+/// oversubscribed x86_64 host 1 to 3 in 100 two-vCPU guests restored through userfaultfd
+/// hung that way. Without the patch the `kick` scenario fails on it. `wake` and `helper` pass
+/// with or without it: they fail a change that stops a completion waking a vCPU halted for
+/// its page, or that stops `kvm_set_mp_state()` consuming the kick for its other callers.
+#[test]
+fn a_page_ready_completion_keeps_a_pending_pv_kick() {
+    let (release, patch, fixture) = pv_kick_port();
+    let temp = tempfile::tempdir().expect("create the PV kick fixture directory");
+    for file in PV_KICK_FILES {
+        let dest = temp.path().join(file);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::copy(fixture.join(file), &dest)
+            .unwrap_or_else(|e| panic!("copy the {file} excerpt: {e}"));
+    }
+
+    // Without the patch, run the release's own functions and fail on what they do.
+    let patched = patch.exists();
+    if patched {
+        let applied = Command::new("patch")
+            .args(["--batch", "--forward", "--fuzz=0", "-p1", "-i"])
+            .arg(&patch)
+            .current_dir(temp.path())
+            .output()
+            .expect("run patch");
+        assert!(
+            applied.status.success(),
+            "{} does not apply to the {release} excerpts:\n{}{}",
+            patch.display(),
+            String::from_utf8_lossy(&applied.stdout),
+            String::from_utf8_lossy(&applied.stderr)
+        );
+    }
+
+    let read = |file: &str| fs::read_to_string(temp.path().join(file)).unwrap();
+    let mut extracted = String::new();
+    for (file, start) in [
+        (PV_KICK_FILES[1], "static inline void kvm_set_mp_state("),
+        (PV_KICK_FILES[0], "void kvm_arch_async_page_present("),
+    ] {
+        extracted.push_str(
+            &extract_block(&read(file), start, "}")
+                .unwrap_or_else(|| panic!("`{start}` is missing from the {release} excerpts")),
+        );
+    }
+    fs::write(temp.path().join("extracted.c"), extracted).unwrap();
+    fs::copy(fixture.join("harness.c"), temp.path().join("harness.c")).unwrap();
+
+    let harness = SanitizedHarness::build(
+        &temp.path().join("harness.c"),
+        &["-g", "-Wall", "-Werror"],
+        &format!("the {release} PV kick harness"),
+    );
+
+    let mut failures = Vec::new();
+    for scenario in ["kick", "wake", "helper"] {
+        let result = harness.run(&[scenario]);
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let first: Vec<&str> = stderr.lines().take(3).collect();
+            failures.push(format!("{scenario}: {}", first.join("\n  ")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Linux {release} with{} {PV_KICK_PATCH}:\n{}",
+        if patched { "" } else { "out" },
+        failures.join("\n")
+    );
+}
+
+/// The x86_64 host kernel must apply the PV kick patch, and its bytes must be part of what
+/// names the kernel: `build_inputs` of `[kernel_profiles.nested.amd64.host_kernel]` is what
+/// the host kernel's content hash and the runner image's cache key are computed from, so a
+/// patch outside it would change neither and no new kernel or image would be built. arm64
+/// KVM has no async page faults, so the arm64 host does not carry the patch.
+#[test]
+fn the_x86_host_kernel_applies_the_pv_kick_patch() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("rootfs-config.toml")).expect("read rootfs-config.toml"),
+    )
+    .expect("parse rootfs-config.toml");
+    let hosts = &config["kernel_profiles"]["nested"];
+    let dir = |arch: &str| {
+        hosts[arch]["host_kernel"]["patches_dir"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let x86_dir = dir("amd64");
+    let patch = root.join(&x86_dir).join(PV_KICK_PATCH);
+    let text = fs::read_to_string(&patch).unwrap_or_else(|e| {
+        panic!(
+            "the x86_64 host kernel's patch set has no {}: {e}",
+            patch.display()
+        )
+    });
+    assert!(
+        text.contains("--- a/arch/x86/kvm/x86.c")
+            && text.contains("+	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;"),
+        "{PV_KICK_PATCH} no longer sets the run state directly in arch/x86/kvm/x86.c"
+    );
+    assert!(
+        !PV_KICK_PATCH.ends_with(".vm.patch"),
+        "a .vm.patch is applied to guest kernels only"
+    );
+    let inputs: Vec<&str> = hosts["amd64"]["host_kernel"]["build_inputs"]
+        .as_array()
+        .expect("the x86_64 host kernel lists its build_inputs")
+        .iter()
+        .map(|input| input.as_str().unwrap())
+        .collect();
+    assert!(
+        inputs.contains(&format!("{x86_dir}/*.patch").as_str()),
+        "the x86_64 host kernel's build_inputs {inputs:?} do not cover {x86_dir}/*.patch, so \
+         the patch would not change the kernel's content hash"
+    );
+    assert!(
+        !root.join(dir("arm64")).join(PV_KICK_PATCH).exists(),
+        "the arm64 host kernel has no async page faults and must not carry the x86 patch"
     );
 }
 

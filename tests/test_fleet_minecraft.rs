@@ -620,6 +620,66 @@ async fn stopping_the_agent_stops_every_server() {
     }
 }
 
+/// The next status report of the host: each server's phase byte, in the order of its places.
+async fn status_phases(f: &mut Fake) -> Vec<u8> {
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let m = tokio::time::timeout_at(end, f.rx.recv())
+            .await
+            .expect("no status report in 10 s")
+            .expect("the agent's channel closed");
+        match m {
+            AgentMsg::Health(h) => {
+                if let Some(status) = h.minecraft {
+                    let rows = fleet_core::minecraft::unbase64(&status.rows).expect("base64 rows");
+                    return rows
+                        .chunks(fleet_core::minecraft::STATUS_ROW_BYTES)
+                        .map(|r| r[0])
+                        .collect();
+                }
+            }
+            AgentMsg::Slot(r) => f.seen.push(r),
+            _ => {}
+        }
+    }
+}
+
+/// A host whose last server is unassigned says so once: its rows went on calling the server
+/// running, and then it sent nothing more, which left the coordinator its last rows.
+#[tokio::test]
+async fn the_status_rows_say_so_when_the_last_server_is_unassigned() {
+    let mut f = fake().await;
+    f.mc.assign(&[assign("mc-1", 0, 1, None, None)]);
+    f.report("mc-1", "running", 1).await;
+    // the rows name it running (phase 3), and the places with no server as not reported (0)
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let phases = status_phases(&mut f).await;
+        if phases == [3, 0, 0] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < end,
+            "never running: {phases:?}"
+        );
+    }
+    f.mc.assign(&[]);
+    // one report with every server not reported, however many reports of the stopping server
+    // were already on their way
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let phases = status_phases(&mut f).await;
+        if phases == [0, 0, 0] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < end,
+            "never emptied: {phases:?}"
+        );
+    }
+    f.mc.stop().await;
+}
+
 /// A restore runs the tile's restore hook, which drops the scene the VM was copied with, so a
 /// fork's target never serves its source's borrower before the agent posts its own scene.
 #[tokio::test]

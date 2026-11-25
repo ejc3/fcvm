@@ -16,6 +16,7 @@ pub mod minecraft;
 pub mod phone;
 pub mod potato;
 pub mod protocol;
+pub mod renders;
 pub mod scene;
 pub mod spend;
 pub mod state;
@@ -25,7 +26,7 @@ pub mod view;
 pub mod warm;
 pub mod windows;
 
-pub use apply::{apply, precheck_word};
+pub use apply::{apply, precheck_overlay, precheck_word};
 pub use event::{Event, Intent};
 pub use state::{Config, Outcome, Receipt, State, TextCheck};
 pub use view::view;

@@ -149,6 +149,160 @@ fcvm's lockfile.
   handling and timer, the mock coordinator's servers and a mock tile, and Playwright tests on
   desktop and phone layouts.
 
+### Many servers on one host
+
+A host can run hundreds of servers, far more than a page draws. The snapshot would grow with
+them (512 servers listed whole are 271,732 bytes, 525 a server, and every restore sends it
+again), so past 16 servers it lists 16 as tiles and names every server in `minecraft.field`
+(15,810 bytes at 512; `make fleet-snapshot-size`). What each server is doing travels outside
+the snapshot: the agent reads every server's `/health` once a second (64 at a time, 400 ms
+each) and sends one row of 8 bytes a server with the host's own CPU and memory readings; the
+coordinator keeps each host's latest rows, in no state and at no version, and passes them to
+the pages that asked (PROTOCOL.md, "Many servers: the field and the status rows"). A server
+whose `/health` did not answer has a row that says so. A host that stops reporting leaves its
+servers unreported, not at zero and not as they last were: the coordinator stamps each report
+with when it came and sends rows older than 5 s to no page, and a host whose last server is
+unassigned says so in one last report. A lent server is always one of the tiles, whatever its
+number: its holder's page needs its borrow, its join address and its own view.
+
+**Measured through that path**, 2026-11-24, on one boot of one bare-metal arm64 host
+(c8g.metal-48xl: 192 vCPUs, 377 GiB, no local disk), kernel 7.0.0-1018-aws, fcvm from main at
+`2f89b1c97` with this change: one coordinator, its local agent with `--minecraft N` (each server
+a VM of 1 vCPU and 1024 MiB with its three bots, routed networking) and a client that reads the
+status rows as a page does (`fleet/minecraft/bench/fleetfield.sh`). The records are in
+`fleet/minecraft/bench/results/2026-11-24-fleet-path-c8g-metal-48xl/`, one directory a run, and
+every number in the table is from a run's `summary.json` (the run that never had every server
+running also keeps its `samples.jsonl`, whose last line is its row). The store was a btrfs image: on the host's
+30 GiB root volume (network storage) for the first three runs, in RAM for the last two. The
+IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
+
+| run | all N up, from the first restore's start | busy CPUs a server, minute 1 / 5 / 29 | MiB a server at 5 / 30 min | readings under 19.5 TPS or unanswered |
+|---|---|---|---|---|
+| 256, root volume | 24.6 s | 0.195 / 0.206 / 0.165 | 412 / 441 | 327 of 89,344, all between 5.2 and 6.5 min |
+| 512, root volume, limit 1024 | never: at 347 s, 500 ran, 2 were restoring and 10 had failed | | | 325 of the 500 running unanswered at 347 s |
+| 512, root volume | 73.7 s | 0.193 / 0.193 / stalled | 432 / stalled | stalled at 14.6 min (below) |
+| 512, RAM | 29.9 s | 0.262 / 0.245 / 0.199 | 492 / 543 | 43 of 179,200, all in the first 18 s |
+| 256, RAM (100 s) | 6.9 s | 0.201 | | 0 of 5,120 |
+
+- **All N up** is from the coordinator's own log (`all_up_s` in a run's summary; a run keeps
+  the lines it is read from as `coord-up.log`, and a test derives it from them again): from the gold
+  snapshot being made (the 512 RAM run made it) or, where it was already there, from the agent's
+  hello, to the last server's first "server up". The client's own figure (`restore_all_s`)
+  starts at its first sample that shows a restoring server (it samples every 5 s once rows
+  come), and in the 512 RAM run that sample came about 20 s after the gold was made: it read
+  12.2 s there.
+- **A reading** is one server's tick rate in its status row, read every 5 s from when every
+  server ran until the run's reset of all; a running server whose row has no rate is
+  unanswered. Busy CPUs are the host's (`/proc/stat`), and memory is the VMMs' proportional
+  anonymous memory (`smaps_rollup` `Pss_Anon`). The snapshot's memory image is shared and not
+  in it: a VMM's resident memory was 730 MiB at 5 minutes with 512 in RAM.
+- **512 servers held 20 TPS for half an hour** with the store in RAM: after the first 18 s the
+  lowest of 177,152 readings was 19.5. A third of the host's CPUs were idle (129 of 192 busy at
+  5 minutes, 100 at 30), and 56 GiB of memory were available at 30 minutes, with 35 GiB of the
+  rest holding the store and the build tree in RAM.
+- **Reset all.** 512 servers were back 64.8 s after the click: none at 10 s, 2 at 20 s, 55 at
+  30 s, 184 at 40 s, 364 at 50 s, 479 at 60 s. 256 took 16.0 s.
+- **The store.** On the root volume the worlds' first saves
+  showed in the tick rate (256 servers: every low or unanswered reading fell in two windows at
+  5.2 and 6.4 minutes; outside them the lowest was 19.8), restores took four to six times as
+  long, and 512 servers stalled: 14.6 minutes in, status reads began to go unanswered, and at
+  15.3 minutes 499 of 512 were. 513 of the host's processes were then in uninterruptible sleep
+  (`states-at-stall.txt`), 505 of them VMMs; the kernel stacks of 398 of 400 read were in
+  btrfs's space reservation (`btrfs_delalloc_reserve_metadata`), with 17.6 GiB of data in the
+  24 GiB image. A server wrote 29 MiB to its disk in half an hour on the root volume and 38 MiB
+  in RAM. Servers on the faster store also used more CPU and memory at the same age.
+- **What bounds N**, in the order the runs met them:
+  1. The IPv6 neighbour table (`net.ipv6.neigh.default.gc_thresh3`, 1024 on Ubuntu): 512 routed
+     servers overflowed it and did not all start. A server costs about 16.5 entries ("What the
+     host needs for hundreds of servers", below).
+  2. The store's size and speed, as above.
+  3. Memory: 543 MiB a server at 30 minutes, when the coordinator resets it. This host's
+     377 GiB hold about 610 with the store in RAM and about 660 with it on a disk.
+  4. CPU: 0.26 of a CPU a server in its first minutes, 0.20 at 30. 192 CPUs give about 730 at
+     the first figure.
+  5. On a fleet host, before any of these: `fleet/published-ports.json` declares 4 IPv4 ports
+     for Minecraft view sockets, and with `--tls-publish-base` the agent refuses a fifth
+     server. This run gave the agent no base.
+  Addresses do not bound it: a server takes one of the host's /80.
+- **Not measured:** a local NVMe store, an x86 host, the fleet's GPU host with its other modes
+  running, and more than 512 servers through this path.
+
+### What the host needs for hundreds of servers
+
+Every routed VM adds entries to the kernel's neighbour tables: one IPv6 table and one IPv4
+table for every network namespace on the host. A table's hard limit is
+`net.ipv6.neigh.default.gc_thresh3` (`net.ipv4...` for IPv4), 1024 in the kernel for both;
+Ubuntu's cloud image raises the IPv4 one to 16384 and leaves IPv6. At the limit the kernel
+drops packets ("neighbor table overflow"). With IPv6 at 1024, 512 servers did not all start
+(the "limit 1024" row above; its record's `neigh-overflow-count.txt` and `samples.jsonl`).
+
+How many entries a server costs, by the kernel's own count over every namespace
+(`/proc/net/stat/ndisc_cache` and `arp_cache`, first field, read every 5 s). A c8g.metal-48xl,
+kernel 7.0.0-1018-aws, 2026-11-24, a coordinator and its agent as above, the store in RAM, both
+limits at 16384; a later boot than the table above. The records are in
+`fleet/minecraft/bench/results/2026-11-24-neighbour-entries-c8g-metal-48xl/` (a run's
+`disk.log` has the kernel's counts as `ndisc` and `arp`, its `neigh-host.log` the host's own
+namespace's):
+
+| servers | run | IPv6 entries, the most seen (a server) | of them in the host's own namespace | IPv4 entries, the most seen (a server) |
+|---|---|---|---|---|
+| 256 | 200 s | 4,141 (16.2) | 1,172 | 514 (2.0) |
+| 512 | 200 s | 8,427 (16.5) | 2,561 | 1,026 (2.0) |
+| 512 | 30 min | 8,513 (16.6) | 2,561 | 1,026 (2.0) |
+
+- **It does not grow with a server's age.** Over the 30 minutes the IPv6 count peaked while the
+  servers were restored (8,513, 26 s in) and then stayed at 8,066 to 8,069. The IPv4 entries
+  age out to a handful and return (to 514) when the servers are next spoken to.
+- These runs were made back to back for the neighbour counts (each began 16 to 20 s after
+  the one before it ended): their start-up times and tick rates are records of nothing.
+- The count includes permanent entries, which the limit does not count, so it is an upper
+  bound on what the limit must hold.
+- 512 servers hold more IPv4 entries (1,026) than the kernel's default limit (1024). Ubuntu's
+  image hides that; a host that leaves the default would overflow the IPv4 table too.
+- **The agent's check.** `fcvm fleet agent --minecraft N` stops at start-up unless both limits
+  leave room for the Minecraft fleet's own need: 24 IPv6 and 4 IPv4 entries for each of the N
+  servers and their gold VM, and 64 for the host itself (an idle host held 25 and 4)
+  (`check_neighbour_room`, `src/fleet/agent/minecraft.rs`). The error names the value the limit
+  needs. On the kernel's limits that is 39 servers.
+- **A host's other VMs**, counted the same way every 2 s on another boot of that instance type
+  the same day, kernel 7.0.0-1018-aws (the records are in
+  `fleet/minecraft/bench/results/2026-11-24-neighbour-entries-other-vms-c8g-metal-48xl/`):
+  - **A routed VM that stays up holds less than a Minecraft server.** 32 of them, each started
+    with a wall slot's network arguments (its own address in the host's prefix and a published
+    port; no GPU, which this host does not have), held 492 IPv6 and 66 IPv4 entries over the idle
+    host's 5 and 1: 15.2 and 2.0 each. All were gone within 2 s of the VMs' stop
+    (`routed-vms/`).
+  - **A potato ring's entries rise with its wakes, not with its players.**
+    `--potato-players 64 --potato-cpus 32` never had more than 32 player VMs running. In 15
+    minutes and 10,704 wakes at the host image's limits the count reached 1,656 IPv6 and 3,644
+    IPv4 entries and levelled off (the most IPv4 seen in each third of the run: 3,330, 3,574,
+    3,644); nothing was refused (`potato-ring-15min/`). The count includes entries the kernel
+    has not freed yet: it falls when the ring stops (2,991 IPv4 entries to 1,975 in the 29 s
+    the five-minute record `potato-ring/` runs on).
+  - **At the kernel's own limits (1024, both families) that ring overflowed the IPv4 table**
+    239 s after it started: 398 entries were refused in its last minute ("arp_cache: neighbor
+    table overflow!" in the kernel's log), while the IPv6 count stayed under 650 with none
+    refused (`potato-ring-limit-1024/`). Ubuntu's cloud image has the IPv4 limit at 16384, and
+    the host image both at 32768.
+  - Phones and Windows sandboxes were not counted.
+- **They refuse nothing.** If each of a host's other VMs held what a Minecraft server is
+  allowed and a table would then be over its limit, the agent logs a warning and starts. A
+  host with 4 servers beside 64 potato players on the kernel's limits still starts its agent.
+- **The host image** sets `gc_thresh1`, `gc_thresh2` and `gc_thresh3` to 8192, 28672 and 32768
+  for both families (`fleet/ami/host/build.sh`): room for about 1,300 Minecraft servers by that
+  allowance. The agent's unit keeps systemd's default dependencies, so it starts after
+  `systemd-sysctl` has applied them (`fleet/ami/test_pipeline.py` pins both).
+- **Order of arrival.** A fleet host gets the agent and the limits together: the same image
+  build installs `fcvm` and writes `/etc/sysctl.d/99-fcvm.conf`, and a host is launched from
+  the image by its launch template (docs/fleet/ARCHITECTURE.md, "AMI" and "Hosts"), never
+  given a new agent in place. Were an agent with this check to reach a host with the old
+  limits all the same, today's 4 servers need 184 of the 1024 and it starts.
+- **Outside the host's first network namespace** the limits cannot be read: the kernel shows
+  no `neigh/default/gc_thresh3` and no `/proc/net/stat/ndisc_cache` in any other (checked on
+  that host in a namespace made by `ip netns add` and in one made by `unshare -Urn`). An
+  agent started there with `--minecraft` stops with an error that says so. The limit that
+  applies is the host's, whichever namespace a VM is in.
+
 ### The page in 3D
 
 `fleet/web/core/minecraft3d.ts` (the geometry, the cameras, the sky, the fork's flight, the frame
@@ -351,44 +505,80 @@ source to check that the tile's viewer socket still responds and TCP/25565 is cl
 
 ## Density
 
-The headline is servers per vCPU: how many server VMs share one vCPU while every server keeps its
-tick rate at 19.5 or more with three bots playing on it. Measured on a bare-metal arm64 host
-(c8gd.metal-24xl, 96 vCPUs, 188 GiB; never the shared dev host), 2026-11-08, one boot, with
-`fleet/minecraft/bench/mcbench.py`; the records are in
-`fleet/minecraft/bench/results/2026-11-08-c8gd-metal-24xl/`, and the table below is its
-`summary.json` (`summarize.py` over `ladder.jsonl`, `restore.jsonl` and `fork.jsonl`).
-`sweep.jsonl` is the first sweep of the same boot, which found each server's edge; its readings
-had no freshness check (below), so no number here comes from it.
+How many servers one host runs. A table that stood here (2026-11-08: servers per vCPU for
+Pumpkin, Mojang's vanilla server and Paper, with the VMs held to 4 vCPUs and the bots outside
+them) was measured on kernel 7.0.0-1013-aws, which has a known defect. It and its records are
+removed, and the section below supersedes it. The harness for that shape
+(`fleet/minecraft/bench/mcbench.py`, `summarize.py`) remains; the three-server comparison has not
+been run on a kernel with the fix.
 
-- **The shape.** Every server VM has 1 vCPU and 3 GiB (Paper ran out of memory in 2 GiB), bridged
-  networking, and is restored from its arm's gold snapshot: the server booted, three bots
-  joined, the 128 x 128 map around the spawn loaded, and ten readings in a row at 19.5 or more.
-  All the server VMs run in one cgroup whose cpuset holds 4 vCPUs. The bots run on the host's
-  other cores, one `mctile bots` process per server, so the 4 vCPUs hold only the servers.
-- **A run** restores K servers, joins three bots to each, waits 30 s, then reads every server's
-  tick rate about every 5 s for 60 s. A reading counts only while all three bots are online and
-  the server's last game time is under 3 s old; otherwise it is a 0. A count holds when every
-  reading of every server in every run of it is 19.5 or more, and below the lowest count that
-  did not hold.
-- **The servers.** Pumpkin 3ea7d281 (Java Edition 26.3), Mojang's vanilla server 26.3 and Paper
-  26.3 build 244, each with the same seed, view and simulation distance 6, offline and creative;
-  the Java servers with a 1.5 GiB heap on Java 25. Pumpkin does not implement all of vanilla's
-  mechanics, so this compares the servers on this workload, not on the whole game.
+### Servers on one host
 
-| | servers on 4 vCPUs that held in every run | per vCPU | the next count | MiB per added server | restore to first chunk, p50 | fork, p50 |
-|---|---|---|---|---|---|---|
-| Pumpkin | 24 (3 of 3 runs) | 6.0 | 25: 1 of 3 runs | 348 | 870 ms | 1116 ms |
-| vanilla | 6 (3 of 3) | 1.5 | 7: 2 of 3 | 1349 | 775 ms | 2217 ms |
-| Paper | 10 (3 of 3) | 2.5 | 11: 1 of 3 | 1301 | 1175 ms | 1991 ms |
+How many servers one host runs in the fleet's own shape, from one boot of one bare-metal arm64
+host (c8g.metal-48xl: 192 vCPUs, 377 GiB, no local disk) on kernel 7.0.0-1018-aws, 2026-11-24.
+Each server is a VM of 1 vCPU and 1024 MiB with its three bots inside it, as
+`fcvm fleet agent --minecraft N` starts them. fcvm and the tile image were built from this
+branch at `86b7414e8` (main at `c083d7ec6` with this harness), and the steps run with
+`fleet/minecraft/bench/hostramp.py`; the records are in
+`fleet/minecraft/bench/results/2026-11-24-c8g-metal-48xl/` (`host.txt` names the kernel, the
+store and the tree). Two things differ from the fleet: networking was bridged (the fleet's is
+routed), and the store was a btrfs image in RAM (the host's only disk is a 30 GiB network
+volume), so the store's speed bounds nothing here and its contents come out of the host's
+memory.
 
-Pumpkin fits four times as many servers on a vCPU as the vanilla server and 2.4 times as many as
-Paper, in about a quarter of the memory. Near each edge the result varies from run to run: Pumpkin held
-26 servers in 3 of 3 runs but 25 in 1 of 3. Memory is the least-squares slope of the VMs'
-cgroup anonymous memory over the counts that held below the first that failed. Restore to first chunk is from `fcvm snapshot
-run` to a new bot process's first chunk, bot start-up included (a new bot joining the same warm
-server took 136, 347 and 444 ms). A fork is `fcvm snapshot create` of a running server with its
-bots (373, 1331 and 865 ms) and the copy's restore to its first chunk; the source's first bot
-was never disconnected (its login count did not change).
+- **A step** restores K servers from one gold snapshot (taken once the tile is ready and ten
+  readings a second apart are each 19.5 TPS or more, with `snapshot create --stop`) with 16
+  restores in flight, gives each its own scene (so its bots are reseeded), waits 30 s, then
+  reads every tile's `/health` every 5 s for 60 s. A reading counts only with three bots online
+  and a game time under 3 s old, else it is 0. A step holds when every reading is 19.5 or more
+  and every server took its scene.
+
+The steps in the order they ran, each torn down before the next. The first five ran back to
+back; the last ran half an hour later, after the 48-core steps and the first of the two steps
+without bots below (and after the same host had run other VMs from 21:35 to 21:47 UTC, for
+the counts of a host's other VMs in "What the host needs for hundreds of servers"):
+
+| servers | lowest reading, TPS | host cores busy (per server) | K restores | one more restore, to ready | anonymous MiB per server after the step |
+|---|---|---|---|---|---|
+| 8 | 19.89 | 1.3 (0.159) | 0.8 s | 345 to 365 ms | 265 |
+| 64 | 19.86 | 11.6 (0.182) | 3.6 s | 433 to 436 ms | 264 |
+| 256 | 19.88 | 48.9 (0.191) | 16.8 s | 621 to 673 ms | 271 |
+| 512 | 19.86 | 103.0 (0.201) | 90.4 s | 969 to 1037 ms | 350 |
+| 768 | 0.00 | 153.6 (0.200) | 179.4 s | 1485 to 1640 ms | 362 |
+| 512, again at the end | 19.76 | 98.6 (0.193) | 55.0 s | 880 to 967 ms | 310 |
+
+- **512 held its tick rate both times, and by the step's rule held once.** In the first run
+  every one of the 6,144 readings was 19.86 or more, but 66 of the 512 scene posts timed out, so
+  those servers' bots kept the gold snapshot's seed and the step does not count as held. That
+  count is the harness's rule and not the servers' doing: it gave a post 3 s and did not send
+  it again, where the fleet's agent offers a scene again to a tile that did not take it. The
+  harness sends a post that times out again now, three sends at most; these records were taken
+  before that. The first run's restores were the slowest of the two as well (90.4 s, the
+  slowest single one 13.4 s, against 55.0 s and 3.1 s). It began the moment the 256 step's
+  teardown returned; the second run began on a host that had run no VM for a minute, and held,
+  every scene set. What made the first run's restores slower was not measured.
+- **768 did not hold:** 5 servers had a reading under 19.5 (the 1st percentile of the 9,216
+  readings was 19.89), with 154 of the 192 cores busy and 68 GiB of memory available
+  afterwards. No count between 512 and 768 was run.
+- **Cores.** With the VMs' cgroup held to 48 cores (`MC_CORES=48`), 192 and 240 servers held
+  (lowest readings 19.87 and 19.59, 43.8 cores busy at 240) and 288 did not (232 of the 288 had a
+  reading under 19.5): between 5.0 and 6.0 servers a core.
+- **Without bots** (`MCTILE_BOTS=0`, an empty server; a bot measures the tick rate, so there is
+  none to read): 256 servers used 1.2 cores, 0.005 each, and 84 MiB of anonymous memory each.
+  The record holds this step twice. The first ran straight after the 48-core steps and was
+  itself held to those 48 cores (`vm_cores_allowed` 48; 1.3 cores busy): the harness's reset of
+  the cgroup wrote no bytes, which the kernel never sees. With that fixed the step ran again at
+  the end of the boot on all 192 (`host.txt` has the cgroup's CPUs after each).
+  Bots connected but standing still were not measured.
+- **Start rate.** With 16 restores in flight: 17.8 servers a second at 64, 15.2 at 256, 5.7 and
+  9.3 at 512 (the two runs), 4.3 at 768. The "one more restore" column is `fcvm snapshot run` to
+  a ready `/health`, polled every 20 ms, three times; at the high counts it includes the
+  harness's own `fcvm ls --json` over every VM. Each of the three stays up until the step is
+  torn down, so they were restored with K, K+1 and K+2 servers running.
+- **Memory** is read once, about 90 s after the step's last server came up (the 30 s wait and the
+  60 s of readings), so the servers' ages at the reading differ by the time the restores took:
+  3.6 s at 64, 179.4 s at 768, where the first servers were four and a half minutes old. A server
+  grows after that. Memory against a server's age was not measured with this harness.
 
 ## Stack of PRs
 

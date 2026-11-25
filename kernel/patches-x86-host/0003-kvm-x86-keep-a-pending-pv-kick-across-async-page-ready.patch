@@ -1,0 +1,67 @@
+From bf005e828a2806dd4dca9fade8c5ed390ac52d32 Mon Sep 17 00:00:00 2001
+From: ejc3 <ejc3@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 04:58:04 +0000
+Subject: [PATCH] KVM: x86: keep a pending PV kick across an async page-ready
+ completion
+
+kvm_arch_async_page_present() makes the vCPU runnable through
+kvm_set_mp_state(), and since commit e9cb61055fee ("KVM: x86: Clear
+pv_unhalted on all transitions to KVM_MP_STATE_RUNNABLE") that helper also
+clears vcpu->arch.pv.pv_unhalted. A page-ready completion is delivered to
+a vCPU that is usually already runnable, so here the helper is not a
+wake-up from HLT: it erases a PV kick (KVM_HC_KICK_CPU) that has not been
+consumed yet. The guest need not have enabled async page faults: without
+them KVM halts the vCPU artificially and completes through the same
+function.
+
+A PV spinlock waiter checks the lock and then executes HLT, with
+interrupts off when the lock is taken from interrupt context. If the
+holder releases the lock and kicks the waiter between the check and the
+HLT, the kick is recorded in pv_unhalted and the HLT must not block. When
+a page-ready completion for the waiter is handled in that window the
+kick is lost, the HLT blocks, and with interrupts off nothing but an NMI
+wakes the vCPU. Every other CPU that then sends it an IPI and waits
+(a TLB flush in smp_call_function_many_cond(), for example) spins for
+ever: the guest reports soft lockups and stops.
+
+Seen on a 7.3.3 host with 6.18.60 guests restored from a snapshot through
+userfaultfd (many async page faults right after the restore) while the
+host is oversubscribed: 15 of 900 two-vCPU guests. A trace of one:
+
+  vcpu0 kvm_hypercall       nr 0x5 a0 0x0 a1 0x1      (KVM_HC_KICK_CPU)
+  vcpu0 kvm_apic_accept_irq apicid 1 vec 0 (Res3|edge)
+  vcpu1 kvm_async_pf_ready  token 0xe9001 gva 0x4e4cd20
+  vcpu1 kvm_exit            reason HLT
+  (no kvm_vcpu_wakeup for vcpu1 until the guest's watchdog sends an NMI)
+
+Set the state directly, as the function did before the helper existed, so
+the kick survives. No other caller of kvm_set_mp_state() is changed.
+
+Fixes: e9cb61055fee ("KVM: x86: Clear pv_unhalted on all transitions to KVM_MP_STATE_RUNNABLE")
+---
+ arch/x86/kvm/x86.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index c76498d..843a567 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10601,7 +10601,14 @@ void kvm_arch_async_page_present(struct kvm_vcpu *vcpu,
+ 	}
+ 
+ 	vcpu->arch.apf.halted = false;
+-	kvm_set_mp_state(vcpu, KVM_MP_STATE_RUNNABLE);
++	/*
++	 * Not kvm_set_mp_state(): that also clears pv_unhalted, and a page-ready
++	 * completion is not the wake-up a PV kick is waiting to deliver.  A vCPU
++	 * kicked between its last check of a PV spinlock and its HLT is still
++	 * RUNNABLE here; clearing the kick lets that HLT block with interrupts
++	 * off, and nothing but an NMI wakes it.
++	 */
++	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+ }
+ 
+ void kvm_arch_async_page_present_queued(struct kvm_vcpu *vcpu)
+-- 
+2.43.0
+

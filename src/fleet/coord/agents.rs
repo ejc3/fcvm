@@ -143,6 +143,12 @@ where
             bail!("refused the agent for {host}: {why}");
         }
     }
+    let (host_name, minecraft_servers) = match &hello {
+        AgentMsg::Hello {
+            host, minecraft, ..
+        } => (host.clone(), *minecraft),
+        _ => unreachable!("the first message is a hello"),
+    };
     let (tx, writer) = spawn_writer::<CoordMsg, _>(output, "agent");
     let (reply, accepted) = oneshot::channel();
     handle
@@ -159,8 +165,19 @@ where
     if !accepted.await.unwrap_or(false) {
         bail!("the coordinator refused the agent's hello (it names another host than this connection)");
     }
+    // This connection is the host's from now on: a connection it replaced, still open, no
+    // longer publishes the host's Minecraft status rows or takes them away when it closes.
+    handle
+        .minecraft_status
+        .claim(&host_name, conn, minecraft_servers);
     let result = loop {
         match reader.next::<AgentMsg>().await {
+            // A host's Minecraft status rows go straight to the pages that asked: they are no
+            // part of the state, so the actor never sees them.
+            Ok(Some(AgentMsg::Health(fleet_core::protocol::HealthReport {
+                minecraft: Some(status),
+                ..
+            }))) => handle.minecraft_status.publish(&host_name, conn, status),
             Ok(Some(msg)) => {
                 if handle.cmds.send(Cmd::AgentMsg { conn, msg }).await.is_err() {
                     break Ok(());
@@ -171,6 +188,7 @@ where
         }
     };
     let _ = handle.cmds.send(Cmd::AgentClosed { conn }).await;
+    handle.minecraft_status.forget(&host_name, conn);
     writer.abort();
     result
 }

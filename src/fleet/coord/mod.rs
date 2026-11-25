@@ -24,6 +24,7 @@ pub mod lambda_front;
 pub mod live;
 pub mod metrics;
 pub mod minecraft_log;
+pub mod minecraft_status;
 pub mod poster;
 pub mod potato_log;
 pub mod scene_token;
@@ -90,6 +91,8 @@ pub enum Cmd {
     /// Would a `word` be refused before its text check? (`fleet_core::precheck_word`)
     PrecheckWord {
         client: String,
+        /// `word`, or `renders_overlay` (pages mode's text).
+        name: String,
         args: serde_json::Value,
         reply: oneshot::Sender<Option<String>>,
     },
@@ -147,6 +150,8 @@ struct AgentConn {
     last_budget: Option<BudgetPlan>,
     /// Potato mode: the round this host was last told to play (`Some(None)`: told none).
     last_potato: Option<Option<fleet_core::potato::PotatoRound>>,
+    /// The pages-mode order last sent to this host; none to a host that does not run it.
+    last_renders: Option<fleet_core::renders::RendersOrder>,
 }
 
 /// The channels the actor publishes on.
@@ -413,6 +418,24 @@ impl Actor {
                     round: potato.clone(),
                 });
                 conn.last_potato = Some(potato);
+            }
+            // Pages mode: only a host whose hello said it runs the mode gets an order (an
+            // agent built before the mode ends its connection on a message it cannot parse).
+            if self.state.fleet.renders.hosts.contains_key(&conn.host) {
+                let awake = self.state.fleet.power.state != "asleep";
+                let order = self.state.fleet.renders.order(awake);
+                if conn.last_renders.as_ref() != Some(&order) {
+                    tracing::info!(
+                        host = %conn.host,
+                        run = order.run,
+                        overlay = ?order.overlay.as_ref().map(|o| o.seq),
+                        "pages order sent"
+                    );
+                    let _ = conn.tx.send(CoordMsg::Renders {
+                        order: order.clone(),
+                    });
+                    conn.last_renders = Some(order);
+                }
             }
         }
         let f = &self.state.fleet;
@@ -715,11 +738,16 @@ impl Actor {
             }
             Cmd::PrecheckWord {
                 client,
+                name,
                 args,
                 reply,
             } => {
                 let at = self.stamp();
-                let _ = reply.send(fleet_core::precheck_word(&self.state, &client, &args, at));
+                let _ = reply.send(if name == "renders_overlay" {
+                    fleet_core::precheck_overlay(&self.state, &client, &args, at)
+                } else {
+                    fleet_core::precheck_word(&self.state, &client, &args, at)
+                });
             }
             Cmd::Sky { reply } => {
                 let _ = reply.send(fleet_core::apply::sky(&self.state));
@@ -832,6 +860,7 @@ impl Actor {
                         last_scene: None,
                         last_budget: None,
                         last_potato: None,
+                        last_renders: None,
                     },
                 );
                 let _ = reply.send(true);
@@ -1044,6 +1073,9 @@ pub struct Handle {
     pub lambda: watch::Receiver<Vec<AssignSlot>>,
     pub ec2_layout: watch::Receiver<Option<Layout>>,
     pub broadcast_layout: watch::Receiver<Option<Layout>>,
+    /// The hosts' Minecraft status rows, from the agents' connections to the pages' (never
+    /// through the actor: they are no part of the state).
+    pub minecraft_status: minecraft_status::MinecraftStatuses,
 }
 
 impl Handle {
@@ -1132,11 +1164,17 @@ impl Handle {
         rx.await.ok().flatten()
     }
 
-    pub async fn precheck_word(&self, client: &str, args: &serde_json::Value) -> Option<String> {
+    pub async fn precheck_word(
+        &self,
+        client: &str,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
         let (tx, rx) = oneshot::channel();
         self.cmds
             .send(Cmd::PrecheckWord {
                 client: client.to_string(),
+                name: name.to_string(),
                 args: args.clone(),
                 reply: tx,
             })
@@ -1256,6 +1294,7 @@ pub fn start_with_lambda(
         lambda: lambda_rx.clone(),
         ec2_layout: ec2_layout_rx,
         broadcast_layout: broadcast_layout_rx,
+        minecraft_status: Default::default(),
     };
     let tick = handle.clone();
     tokio::spawn(async move {
