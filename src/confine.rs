@@ -62,9 +62,32 @@ impl std::str::FromStr for Mode {
 pub struct ConfineConfig {
     #[serde(default)]
     pub mode: Mode,
+    /// Whether `FCVM_CONFINE_SECCOMP=log` is accepted on a host whose mode is `required`.
+    /// Log mode allows every syscall, so by default it does not satisfy `required`.
+    #[serde(default)]
+    pub allow_seccomp_log: bool,
 }
 
 static CONFIG_MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+static CONFIG_ALLOW_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record the config's `[confine] allow_seccomp_log`; called with [`set_config_mode`].
+pub fn set_config_allow_seccomp_log(allow: bool) {
+    let _ = CONFIG_ALLOW_LOG.set(allow);
+}
+
+/// The config's `[confine] allow_seccomp_log`: the recorded one, else read from the config
+/// file, as [`config_mode`] does for the mode.
+fn config_allow_seccomp_log() -> anyhow::Result<bool> {
+    match CONFIG_ALLOW_LOG.get() {
+        Some(allow) => Ok(*allow),
+        None => {
+            let (config, _, _) = crate::setup::rootfs::load_config(None)
+                .map_err(|e| e.context("reading the fcvm config's [confine] table"))?;
+            Ok(config.confine.allow_seccomp_log)
+        }
+    }
+}
 
 /// Record the config's mode; called once by [`crate::paths::init_from_loaded_config`].
 pub fn set_config_mode(mode: Mode) {
@@ -114,8 +137,12 @@ pub fn host_mode(config: Mode, env: Option<&str>) -> anyhow::Result<Mode> {
 pub enum Layer {
     /// No capabilities and none to regain, `no_new_privs`, no core dumps.
     Process,
-    /// The VMM's syscalls are an allowlist ([`SeccompMode`]).
+    /// The VMM's syscalls are an allowlist ([`SeccompMode::Enforce`]).
     Seccomp,
+    /// The allowlist is installed in log mode ([`SeccompMode::Log`]): every syscall is
+    /// allowed and the ones outside the list are recorded. Not a restriction.
+    #[serde(rename = "seccomp-log")]
+    SeccompLog,
 }
 
 /// What the confined seccomp policy does with a syscall it does not list.
@@ -172,7 +199,14 @@ pub const CONFINED_FIRECRACKER_COMMIT: &str = "3e203733cb9115d1cbdd6857d59703541
 /// API thread's arena while Firecracker parsed it, and under the policy that call stops the
 /// VMM. With one arena every thread allocates from the first, which grows with brk, as
 /// musl's heap does.
-pub const CONFINED_VMM_ENV: &[(&str, &str)] = &[("MALLOC_ARENA_MAX", "1")];
+///
+/// `TZ=<UTC>0`: glibc reads the zone file (`/etc/localtime`) at the first log line of a
+/// process, with fstat, read and lseek, where musl maps it. At Firecracker's Warning and
+/// Error log levels that line is written under a filter, by whichever thread has it, and the
+/// api and vcpu classes list no lseek (vcpu no read either). A POSIX zone string that names
+/// no file costs one failed openat, which every class lists, and no read: measured with
+/// strace on glibc 2.39. Firecracker's own log is then stamped in UTC.
+pub const CONFINED_VMM_ENV: &[(&str, &str)] = &[("MALLOC_ARENA_MAX", "1"), ("TZ", "<UTC>0")];
 
 /// `seccompiler-bin --target-arch` for this architecture.
 #[cfg(target_arch = "aarch64")]
@@ -302,6 +336,8 @@ pub enum Mechanism {
     Debugging,
     /// The process layer itself.
     Process,
+    /// The seccomp filter or its mode.
+    Seccomp,
     /// The command itself.
     Command,
 }
@@ -314,6 +350,7 @@ impl std::fmt::Display for Mechanism {
             Mechanism::Network => "network",
             Mechanism::Debugging => "debugging",
             Mechanism::Process => "process",
+            Mechanism::Seccomp => "seccomp",
             Mechanism::Command => "command",
         })
     }
@@ -393,6 +430,11 @@ pub struct Host {
     /// The commit of the Firecracker the start's kernel profile runs, when the profile names
     /// one ([`CONFINED_FIRECRACKER_COMMIT`] for the default build).
     pub firecracker_commit: Option<String>,
+    /// Whether log mode is acceptable here: the config's mode is `off` (whoever sets
+    /// `FCVM_CONFINE=required` in the environment could as well not set it, so log mode
+    /// loosens nothing the config asks for), or the config says
+    /// `[confine] allow_seccomp_log = true`.
+    pub allow_seccomp_log: bool,
 }
 
 /// The host's mode: the config's, tightened by `FCVM_CONFINE`.
@@ -433,6 +475,8 @@ impl Host {
             .with_context(|| format!("reading kernel profile {profile} for confinement"))?
             .and_then(|profile| profile.firecracker_commit);
         Ok(Host {
+            allow_seccomp_log: config_allow_seccomp_log()?
+                || config_mode(CONFIG_MODE.get().copied(), load_config_mode)? == Mode::Off,
             firecracker_commit,
             mode,
             landlock_abi: landlock_abi(),
@@ -539,6 +583,17 @@ pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
             "FCVM_STRACE_FC runs the VMM under strace, which must fork and ptrace".to_string(),
         );
     }
+    if host.seccomp == SeccompMode::Log && !host.allow_seccomp_log {
+        add(
+            Mechanism::Seccomp,
+            format!(
+                "{SECCOMP_ENV}=log allows every syscall and only records the ones outside \
+                 the allowlist, and this host's config requires confinement; unset it, or \
+                 set [confine] allow_seccomp_log = true in the fcvm config to accept log \
+                 mode here"
+            ),
+        );
+    }
     if host.no_seccomp {
         add(
             Mechanism::Debugging,
@@ -628,7 +683,13 @@ pub fn decide(request: &Request<'_>, host: &Host) -> anyhow::Result<Option<Confi
         return Ok(Some(Confinement {
             landlock_abi: host.landlock_abi.unwrap_or_default(),
             core_limit: core_limit_for(host.core_hard_limit),
-            layers: vec![Layer::Process, Layer::Seccomp],
+            layers: vec![
+                Layer::Process,
+                match host.seccomp {
+                    SeccompMode::Enforce => Layer::Seccomp,
+                    SeccompMode::Log => Layer::SeccompLog,
+                },
+            ],
             seccomp: Some(host.seccomp),
         }));
     }
@@ -658,8 +719,211 @@ pub fn resolve(request: &Request<'_>) -> anyhow::Result<Decision> {
             layers = ?confinement.layers,
             "the VMM will be confined"
         );
+        if confinement.seccomp == Some(SeccompMode::Log) {
+            tracing::warn!(
+                "{SECCOMP_ENV}=log: this VMM's syscall allowlist is installed in log mode, \
+                 which allows every syscall and records the ones outside the list; it \
+                 restricts nothing"
+            );
+        }
     }
     Ok(Decision(decided))
+}
+
+/// Where `fcvm setup` records the SHA-256 of the compiled filter at `filter`.
+///
+/// The record sits beside the filter and has the same owner, so it does not stop a process
+/// of that user from replacing both. It catches a filter that is damaged, truncated, or
+/// replaced without its record, and it lets `fcvm setup` rebuild one that no longer matches.
+pub fn filter_digest_path(filter: &std::path::Path) -> std::path::PathBuf {
+    let mut path = filter.as_os_str().to_owned();
+    path.push(".sha256");
+    path.into()
+}
+
+/// The SHA-256 of a compiled filter's bytes, as hex.
+pub fn filter_bytes_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// The largest filter or record [`read_store_file`] reads. A compiled policy is about 3 KiB.
+const FILTER_READ_LIMIT: u64 = 1 << 20;
+
+/// The bytes of a store file a confined launch depends on, opened once and without following
+/// a symbolic link: a regular file that others cannot write, owned by this user, by root, or
+/// by `binary_owner`, the owner of the Firecracker binary the file is for. That owner
+/// already decides what the VMM runs (under `sudo fcvm` the store belongs to the user who
+/// ran `fcvm setup`), so accepting its filter gives it nothing it lacks.
+fn read_store_file(path: &std::path::Path, binary_owner: u32) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context as _;
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("opening {} (a symbolic link is refused)", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("reading the metadata of {}", path.display()))?;
+    anyhow::ensure!(meta.is_file(), "{} is not a regular file", path.display());
+    // SAFETY: geteuid has no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    anyhow::ensure!(
+        meta.uid() == euid || meta.uid() == 0 || meta.uid() == binary_owner,
+        "{} is owned by uid {}, not by this user ({euid}), root, or the owner of the \
+         Firecracker binary (uid {binary_owner})",
+        path.display(),
+        meta.uid()
+    );
+    anyhow::ensure!(
+        meta.mode() & 0o002 == 0,
+        "{} is writable by every user (mode {:o})",
+        path.display(),
+        meta.mode() & 0o7777
+    );
+    anyhow::ensure!(
+        meta.len() <= FILTER_READ_LIMIT,
+        "{} is {} bytes, more than a compiled filter can be",
+        path.display(),
+        meta.len()
+    );
+    let mut bytes = Vec::new();
+    file.take(FILTER_READ_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(bytes)
+}
+
+/// The compiled filter for `firecracker` in `mode`, read once and checked against the
+/// digest `fcvm setup` recorded for it ([`filter_digest_path`]).
+pub fn verified_filter_bytes(
+    firecracker: &std::path::Path,
+    mode: SeccompMode,
+) -> anyhow::Result<Vec<u8>> {
+    let filter = filter_path(firecracker, mode);
+    let hint = format!(
+        "`fcvm setup` compiles it, with its digest, beside each Firecracker it builds from \
+         commit {CONFINED_FIRECRACKER_COMMIT}, which the confined policy is derived from: \
+         run it if {} is that build; a Firecracker of another commit cannot run confined",
+        firecracker.display()
+    );
+    let binary_owner = {
+        use anyhow::Context as _;
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(firecracker)
+            .with_context(|| format!("reading the metadata of {}", firecracker.display()))?
+            .uid()
+    };
+    let bytes = read_store_file(&filter, binary_owner)
+        .map_err(|e| e.context(format!("the confined seccomp filter is unusable. {hint}")))?;
+    let recorded = read_store_file(&filter_digest_path(&filter), binary_owner).map_err(|e| {
+        e.context(format!(
+            "the digest fcvm setup records for the confined seccomp filter is unusable. {hint}"
+        ))
+    })?;
+    let recorded = String::from_utf8_lossy(&recorded);
+    let actual = filter_bytes_digest(&bytes);
+    anyhow::ensure!(
+        recorded.trim() == actual,
+        "the confined seccomp filter {} has SHA-256 {actual}, and fcvm setup recorded {}: \
+         the file is not the one setup compiled. Run `fcvm setup`, which rebuilds it",
+        filter.display(),
+        recorded.trim()
+    );
+    Ok(bytes)
+}
+
+/// `bytes` in a sealed memfd, for the VMM to read as `/proc/self/fd/<n>`: what the VMM loads
+/// is what was verified, whatever happens to the file afterwards.
+pub fn sealed_memfd(bytes: &[u8]) -> anyhow::Result<std::os::fd::OwnedFd> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    // SAFETY: the name is a NUL-terminated literal; the call returns a new descriptor or -1.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"fcvm-seccomp-filter".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    anyhow::ensure!(
+        fd >= 0,
+        "memfd_create for the seccomp filter: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: fd is a descriptor this call just created and nothing else owns.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.write_all(bytes)
+        .context("writing the seccomp filter to its memfd")?;
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+    // SAFETY: fcntl with integer arguments on a descriptor this function owns.
+    anyhow::ensure!(
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } == 0,
+        "sealing the seccomp filter's memfd: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(file.into())
+}
+
+/// The threads of `pid` that do not run under a seccomp filter, by name: every entry of
+/// `/proc/<pid>/task` whose status lacks `Seccomp: 2` (filter mode) or reports no installed
+/// filter. A thread that exits while it is read is skipped. An error when the process has
+/// no readable thread at all, so a process that is gone is never taken as filtered.
+pub fn unfiltered_threads(pid: u32) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context as _;
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .with_context(|| format!("listing the threads of process {pid}"))?;
+    let mut seen = 0usize;
+    let mut unfiltered = Vec::new();
+    for task in tasks {
+        let Ok(task) = task else { continue };
+        let Ok(status) = std::fs::read_to_string(task.path().join("status")) else {
+            continue;
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix(':'))
+                .map(str::trim)
+        };
+        seen += 1;
+        let filtered = field("Seccomp") == Some("2")
+            && field("Seccomp_filters")
+                .and_then(|count| count.parse::<u32>().ok())
+                .is_some_and(|count| count >= 1);
+        if !filtered {
+            unfiltered.push(format!(
+                "{} (tid {}, Seccomp: {}, Seccomp_filters: {})",
+                field("Name").unwrap_or("?"),
+                task.file_name().to_string_lossy(),
+                field("Seccomp").unwrap_or("absent"),
+                field("Seccomp_filters").unwrap_or("absent"),
+            ));
+        }
+    }
+    anyhow::ensure!(seen > 0, "process {pid} has no readable thread");
+    Ok(unfiltered)
+}
+
+/// How much of the end of a Firecracker log [`last_trapped_syscall`] reads. The SIGSYS
+/// handler's line is among the last the process writes.
+const TRAP_LOG_TAIL: u64 = 64 * 1024;
+
+/// The syscall the confined policy stopped, from the end of the Firecracker log at `path`.
+/// Reads at most [`TRAP_LOG_TAIL`] bytes, whatever the log's size (at Debug level it grows
+/// by gigabytes an hour), and decodes them lossily, so a byte that is not UTF-8 costs
+/// nothing.
+pub fn last_trapped_syscall(path: &std::path::Path) -> Option<TrappedSyscall> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(std::io::SeekFrom::Start(len.saturating_sub(TRAP_LOG_TAIL)))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.take(TRAP_LOG_TAIL).read_to_end(&mut tail).ok()?;
+    trapped_syscall(&String::from_utf8_lossy(&tail))
 }
 
 /// Whether a VMM is confined, as [`resolve`] decided it. It is the only way to get one: it
@@ -673,6 +937,25 @@ impl Decision {
     /// How the VMM is confined, or `None` when [`resolve`] decided it runs unconfined.
     pub fn confinement(&self) -> Option<&Confinement> {
         self.0.as_ref()
+    }
+
+    /// For a confined decision: `firecracker` has the filter `fcvm setup` compiled for it,
+    /// unchanged. Callers run it as soon as the binary is known and before anything is
+    /// created, so a host that was upgraded and not set up again is refused with nothing
+    /// started; the launch checks again and hands the VMM the bytes it checked.
+    pub fn require_filter(&self, firecracker: &std::path::Path) -> anyhow::Result<()> {
+        let Some(mode) = self.0.as_ref().and_then(|confinement| confinement.seccomp) else {
+            return Ok(());
+        };
+        verified_filter_bytes(firecracker, mode)
+            .map(|_| ())
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "this start must be confined and cannot be; nothing was started:\n  \
+                     {}: {e:#}",
+                    Mechanism::Seccomp
+                )
+            })
     }
 
     /// A decision for tests that spawn a process through the VMM pre_exec directly.
@@ -855,6 +1138,7 @@ mod tests {
             core_hard_limit: u64::MAX,
             seccomp: SeccompMode::Enforce,
             firecracker_commit: None,
+            allow_seccomp_log: true,
         }
     }
 
@@ -986,24 +1270,35 @@ mod tests {
         }
     }
 
+    /// Whether `removal` (an entry of the changes' `remove`) takes `rule` out: every rule of
+    /// its syscall, or, when it names an `arg`, only the rules that compare that argument
+    /// with that value.
+    fn removes(removal: &serde_json::Value, rule: &serde_json::Value) -> bool {
+        if removal["syscall"] != rule["syscall"] {
+            return false;
+        }
+        let Some(arg) = removal.get("arg") else {
+            return true;
+        };
+        rule["args"].as_array().is_some_and(|args| {
+            args.iter()
+                .any(|a| a["index"] == arg["index"] && a["val"] == arg["val"])
+        })
+    }
+
     /// The confined policy of `arch`: the fork's shipped filter for that architecture, less
-    /// every rule of a removed syscall, plus the declared additions for that architecture,
+    /// every removed rule ([`removes`]), plus the declared additions for that architecture,
     /// each class's in declaration order after the fork's.
     fn derived_policy(
         fork: &serde_json::Value,
         changes: &serde_json::Value,
         arch: &str,
     ) -> serde_json::Value {
-        let removed: Vec<&str> = changes["remove"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["syscall"].as_str().unwrap())
-            .collect();
+        let removed = changes["remove"].as_array().unwrap();
         let mut policy = fork.clone();
         for (class, filter) in policy.as_object_mut().unwrap().iter_mut() {
             let rules = filter["filter"].as_array_mut().unwrap();
-            rules.retain(|rule| !removed.contains(&rule["syscall"].as_str().unwrap()));
+            rules.retain(|rule| !removed.iter().any(|removal| removes(removal, rule)));
             for add in changes["add"].as_array().unwrap() {
                 let listed = |key: &str, value: &str| {
                     add[key].as_array().unwrap().iter().any(|v| v == value)
@@ -1041,18 +1336,15 @@ mod tests {
                 "fork-{arch}-unknown-linux-musl.json"
             )));
             // Every removal and addition still means something against this fork filter.
-            let fork_names: Vec<&str> = fork
-                .as_object()
-                .unwrap()
-                .values()
-                .flat_map(|class| class["filter"].as_array().unwrap())
-                .map(|rule| rule["syscall"].as_str().unwrap())
-                .collect();
             for removal in changes["remove"].as_array().unwrap() {
                 let syscall = removal["syscall"].as_str().unwrap();
                 assert!(
-                    fork_names.contains(&syscall),
-                    "{arch}: {syscall} is removed but the fork filter does not list it"
+                    fork.as_object()
+                        .unwrap()
+                        .values()
+                        .flat_map(|class| class["filter"].as_array().unwrap())
+                        .any(|rule| removes(removal, rule)),
+                    "{arch}: {removal} removes nothing from the fork filter"
                 );
                 assert!(
                     !removal["why"].as_str().unwrap_or("").is_empty(),
@@ -1173,36 +1465,6 @@ mod tests {
                              {glibc}, and the confined policy does not list {glibc}"
                         );
                     }
-                }
-                // The zone file, read at the first log line of the process: musl maps it
-                // (the fork lists that mmap, flags MAP_SHARED alone, in every class) and
-                // glibc reads it with read and lseek. With the log level at Warning or
-                // Error the first line is written under a filter, by whichever thread has
-                // something to say.
-                let maps_the_zone_file =
-                    fork[class]["filter"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|rule| {
-                            rule["syscall"] == "mmap"
-                                && rule["args"].as_array().is_some_and(|args| {
-                                    args.iter().any(|arg| {
-                                        arg["index"] == 3 && arg["op"] == "eq" && arg["val"] == 1
-                                    })
-                                })
-                        });
-                assert!(
-                    maps_the_zone_file,
-                    "{arch} {class}: the fork's filter no longer maps the zone file; check \
-                     how its build reads the time zone"
-                );
-                for glibc in ["openat", "fstat", "read", "lseek", "close"] {
-                    assert!(
-                        lists(&policy, class, glibc),
-                        "{arch} {class}: glibc reads the zone file with {glibc}, and the \
-                         confined policy does not list it"
-                    );
                 }
             }
         }
@@ -1395,6 +1657,7 @@ mod tests {
             core_hard_limit: u64::MAX,
             seccomp: SeccompMode::Enforce,
             firecracker_commit: None,
+            allow_seccomp_log: true,
         };
         let mechanisms: Vec<Mechanism> = missing(&request, &host)
             .iter()
@@ -2141,6 +2404,420 @@ mod tests {
                 core_limit: core_limit_for(core_hard_limit()),
                 tap_attach_errno: 0,
             }
+        );
+    }
+
+    /// Log mode allows every syscall, so it is refused where the host's config requires
+    /// confinement, unless the config accepts it; where it is accepted the start is
+    /// recorded as `seccomp-log`, never as `seccomp`.
+    #[test]
+    fn log_mode_does_not_pass_as_the_seccomp_layer() {
+        let required = |allow_seccomp_log: bool| Host {
+            mode: Mode::Required,
+            seccomp: SeccompMode::Log,
+            allow_seccomp_log,
+            ..host(Ok(11))
+        };
+        let refused = missing(&request(false), &required(false));
+        assert_eq!(
+            refused.iter().map(|m| m.mechanism).collect::<Vec<_>>(),
+            vec![Mechanism::Seccomp],
+            "{refused:?}"
+        );
+        let error = decide(&request(false), &required(false))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("seccomp: FCVM_CONFINE_SECCOMP=log allows every syscall")
+                && error.contains("allow_seccomp_log = true"),
+            "{error}"
+        );
+        // Enforce is not affected by the refusal.
+        let enforce = Host {
+            seccomp: SeccompMode::Enforce,
+            ..required(false)
+        };
+        assert_eq!(
+            decide(&request(false), &enforce).unwrap().unwrap().layers,
+            vec![Layer::Process, Layer::Seccomp]
+        );
+        // Accepted by the config: confined, and recorded as what it is.
+        let accepted = decide(&request(false), &required(true)).unwrap().unwrap();
+        assert_eq!(accepted.layers, vec![Layer::Process, Layer::SeccompLog]);
+        assert_eq!(accepted.seccomp, Some(SeccompMode::Log));
+        assert_eq!(
+            serde_json::to_value(&accepted.layers).unwrap(),
+            serde_json::json!(["process", "seccomp-log"])
+        );
+    }
+
+    /// A Firecracker stand-in in a new directory, with `filter` (and, when given, a digest
+    /// record holding `recorded`) under the names the enforce filter has.
+    fn store_with_filter(
+        filter: Option<&[u8]>,
+        recorded: Option<&str>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let firecracker = dir.path().join("firecracker");
+        std::fs::write(&firecracker, b"stand-in").unwrap();
+        let path = filter_path(&firecracker, SeccompMode::Enforce);
+        if let Some(filter) = filter {
+            std::fs::write(&path, filter).unwrap();
+        }
+        if let Some(recorded) = recorded {
+            std::fs::write(filter_digest_path(&path), recorded).unwrap();
+        }
+        (dir, firecracker)
+    }
+
+    /// The launch takes the filter only as the bytes `fcvm setup` recorded: a file that is
+    /// merely there under the right name is refused, and so is a symbolic link, a file
+    /// every user can write, and a file whose record does not match.
+    #[test]
+    fn a_filter_is_taken_only_as_the_bytes_setup_recorded() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let good = b"compiled filter";
+        let digest = filter_bytes_digest(good);
+        let refusal = |filter: Option<&[u8]>, recorded: Option<&str>| {
+            let (_dir, firecracker) = store_with_filter(filter, recorded);
+            format!(
+                "{:#}",
+                verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err()
+            )
+        };
+
+        let (_dir, firecracker) = store_with_filter(Some(good), Some(&format!("{digest}\n")));
+        assert_eq!(
+            verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap(),
+            good
+        );
+
+        let missing = refusal(None, None);
+        assert!(
+            missing.contains("the confined seccomp filter is unusable")
+                && missing.contains("fcvm setup"),
+            "{missing}"
+        );
+        // The right name is not enough: no record, or a record of other bytes.
+        let unrecorded = refusal(Some(b"three empty programs"), None);
+        assert!(
+            unrecorded.contains("the digest fcvm setup records"),
+            "{unrecorded}"
+        );
+        let replaced = refusal(Some(b"three empty programs"), Some(&digest));
+        assert!(
+            replaced.contains("is not the one setup compiled"),
+            "{replaced}"
+        );
+
+        // A symbolic link under the filter's name, to a file with the recorded bytes.
+        let (dir, firecracker) = store_with_filter(None, None);
+        let path = filter_path(&firecracker, SeccompMode::Enforce);
+        let elsewhere = dir.path().join("elsewhere.bpf");
+        std::fs::write(&elsewhere, good).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        std::fs::write(filter_digest_path(&path), &digest).unwrap();
+        let linked = format!(
+            "{:#}",
+            verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err()
+        );
+        assert!(linked.contains("a symbolic link is refused"), "{linked}");
+
+        // A filter every user can write.
+        let (_dir, firecracker) = store_with_filter(Some(good), Some(&digest));
+        let path = filter_path(&firecracker, SeccompMode::Enforce);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let writable = format!(
+            "{:#}",
+            verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err()
+        );
+        assert!(writable.contains("writable by every user"), "{writable}");
+
+        // The preflight says nothing was started, by mechanism.
+        let (_dir, firecracker) = store_with_filter(None, None);
+        let confined = Decision::for_test(Some(Confinement {
+            landlock_abi: LANDLOCK_ABI_FLOOR,
+            layers: vec![Layer::Process, Layer::Seccomp],
+            core_limit: 1,
+            seccomp: Some(SeccompMode::Enforce),
+        }));
+        let error = confined
+            .require_filter(&firecracker)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("nothing was started") && error.contains("seccomp: "),
+            "{error}"
+        );
+        // An unconfined start needs no filter.
+        Decision::for_test(None)
+            .require_filter(&firecracker)
+            .unwrap();
+    }
+
+    /// What the VMM opens is a sealed copy of the verified bytes: reading it back through
+    /// `/proc/self/fd` gives them, and nothing can write, grow or shrink it.
+    #[test]
+    fn the_filter_is_handed_over_as_a_sealed_copy() {
+        use std::os::fd::AsRawFd as _;
+        let bytes = b"verified filter bytes".to_vec();
+        let fd = sealed_memfd(&bytes).unwrap();
+        let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"x"));
+        assert!(written.is_err(), "the sealed memfd took a write");
+        // SAFETY: fcntl and ftruncate with integer arguments on a descriptor this test owns.
+        let (seals, truncated) = unsafe {
+            (
+                libc::fcntl(fd.as_raw_fd(), libc::F_GET_SEALS),
+                libc::ftruncate(fd.as_raw_fd(), 0),
+            )
+        };
+        let all = libc::F_SEAL_WRITE | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        assert_eq!(seals & all, all, "seals {seals:#x}");
+        assert_eq!(truncated, -1);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// The trap is found at the end of a log too large to read whole, past a byte that is
+    /// not UTF-8. Reading the whole file as a string, as the report once did, finds nothing.
+    #[test]
+    fn the_trap_is_read_from_the_end_of_a_large_log_with_a_bad_byte() {
+        use std::io::{Seek as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker.log");
+        let mut log = std::fs::File::create(&path).unwrap();
+        // 8 GiB of hole: no blocks, and more than a read of the whole file should cost.
+        log.seek(std::io::SeekFrom::Start(8 << 30)).unwrap();
+        log.write_all(
+            b"\n2026-11-25T01:20:07 [anonymous-instance:fc_vcpu 0] a guest wrote \xff\xfe\n",
+        )
+        .unwrap();
+        log.write_all(
+            b"2026-11-25T01:20:07.607912353 [anonymous-instance:fc_api:ERROR:src/vmm/src/\
+              signal_handler.rs:70] Shutting down VM after intercepting a bad syscall (226).\n",
+        )
+        .unwrap();
+        drop(log);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            last_trapped_syscall(&path),
+            Some(TrappedSyscall {
+                thread: "fc_api".into(),
+                number: 226
+            })
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "reading the end of the log took {:?}",
+            started.elapsed()
+        );
+        // A log shorter than the tail, and one with no trap.
+        std::fs::write(&path, "[anonymous-instance:main] ok\n").unwrap();
+        assert_eq!(last_trapped_syscall(&path), None);
+        assert_eq!(last_trapped_syscall(&dir.path().join("absent.log")), None);
+    }
+
+    const SECCOMP_PROBE_ENV: &str = "FCVM_SECCOMP_PROBE_CHILD";
+
+    /// The child of [`seccomp_probe`]: installs an allow-all seccomp filter on this thread
+    /// (`one`), on every thread (`all`) or on none (`none`), with a second thread named
+    /// `probe-sleeper` alive, says `READY <this thread's tid>` and waits for its stdin to
+    /// close. Run any other way it has no parent to answer and returns.
+    #[test]
+    fn seccomp_probe_child() {
+        let Ok(mode) = std::env::var(SECCOMP_PROBE_ENV) else {
+            return;
+        };
+        let (parked, park) = std::sync::mpsc::channel::<()>();
+        let (started, start) = std::sync::mpsc::channel::<()>();
+        std::thread::Builder::new()
+            .name("probe-sleeper".into())
+            .spawn(move || {
+                started.send(()).unwrap();
+                let _ = park.recv();
+            })
+            .unwrap();
+        start.recv().unwrap();
+        let allow = [libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        }];
+        let program = libc::sock_fprog {
+            len: 1,
+            filter: allow.as_ptr().cast_mut(),
+        };
+        let flags: libc::c_ulong = match mode.as_str() {
+            "none" => u64::MAX as libc::c_ulong,
+            "one" => 0,
+            "all" => libc::SECCOMP_FILTER_FLAG_TSYNC,
+            other => panic!("unknown probe mode {other}"),
+        };
+        if mode != "none" {
+            // SAFETY: prctl and seccomp with a program that outlives the calls.
+            unsafe {
+                assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+                assert_eq!(
+                    libc::syscall(
+                        libc::SYS_seccomp,
+                        libc::SECCOMP_SET_MODE_FILTER,
+                        flags,
+                        &program as *const libc::sock_fprog,
+                    ),
+                    0,
+                    "seccomp: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        // SAFETY: gettid has no arguments and cannot fail.
+        println!("READY {}", unsafe { libc::gettid() });
+        let mut rest = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut rest);
+        drop(parked);
+    }
+
+    /// [`unfiltered_threads`] of a child running [`seccomp_probe_child`] in `mode`, and the
+    /// tid of the child's thread that installed the filter.
+    fn seccomp_probe(mode: &str) -> (Vec<String>, String) {
+        use std::io::BufRead as _;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "confine::tests::seccomp_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SECCOMP_PROBE_ENV, mode)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        // libtest prints the test's name and its output on one line.
+        let tid = lines
+            .find_map(|line| {
+                let line = line.unwrap();
+                line.find("READY ")
+                    .map(|at| line[at + "READY ".len()..].trim().to_string())
+            })
+            .expect("the probe child said READY");
+        let unfiltered = unfiltered_threads(child.id());
+        drop(child.stdin.take());
+        let status = child.wait().unwrap();
+        assert!(status.success(), "probe child ({mode}): {status}");
+        (unfiltered.unwrap(), tid)
+    }
+
+    /// The check a confined start makes of its VMM: a process is filtered only when every
+    /// thread is, and a thread that is not is named.
+    #[test]
+    fn a_thread_without_a_seccomp_filter_is_named() {
+        let (all, _) = seccomp_probe("all");
+        assert_eq!(all, Vec::<String>::new());
+
+        // The filter is on the thread that installed it and on no other.
+        let (one, tid) = seccomp_probe("one");
+        assert!(
+            one.iter().any(|t| t.starts_with("probe-sleeper (tid ")),
+            "{one:?}"
+        );
+        assert!(
+            one.iter()
+                .all(|t| t.contains("Seccomp: 0, Seccomp_filters: 0")),
+            "{one:?}"
+        );
+        assert!(
+            !one.iter().any(|t| t.contains(&format!("(tid {tid},"))),
+            "the filtered thread {tid} is listed: {one:?}"
+        );
+
+        let (none, tid) = seccomp_probe("none");
+        assert!(
+            none.iter().any(|t| t.contains(&format!("(tid {tid},"))),
+            "{none:?}"
+        );
+        assert!(none.len() >= 3, "{none:?}");
+
+        // A process that is gone is an error, never an empty list.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        assert!(unfiltered_threads(pid).is_err());
+    }
+
+    /// Only the Firecracker launch hands a VMM the confined filter, so every other place
+    /// that spawns through the VMM pre_exec must be unable to get a confined decision: its
+    /// request names why confinement is unsupported there, or its backend is one
+    /// confinement refuses. The Firecracker launch itself verifies the filter or bails.
+    #[test]
+    fn every_vmm_spawn_site_adds_the_filter_or_cannot_be_confined() {
+        let sources = sources();
+        let code = |path: &str| {
+            let (_, text) = sources
+                .iter()
+                .find(|(p, _)| p == path)
+                .unwrap_or_else(|| panic!("{path}"));
+            non_test(text).to_string()
+        };
+        // Each resolve in these files asks with a reason confinement is unsupported.
+        for path in ["src/commands/vm.rs", "src/setup/rootfs.rs"] {
+            let text = code(path);
+            let requests: Vec<&str> = text
+                .match_indices("crate::confine::Request {")
+                .map(|(at, _)| &text[at..at + text[at..].find("\n    }").unwrap()])
+                .collect();
+            assert!(!requests.is_empty(), "{path} builds no confinement request");
+            for request in requests {
+                assert!(
+                    request.contains("unsupported: Some("),
+                    "{path} can be given a confined decision and adds no filter: {request}"
+                );
+            }
+        }
+        let unsupported = Request {
+            unsupported: Some("not here"),
+            ..request(true)
+        };
+        assert!(decide(&unsupported, &host(Ok(11))).is_err());
+        let required = Host {
+            mode: Mode::Required,
+            ..host(Ok(11))
+        };
+        assert!(decide(
+            &Request {
+                flag: false,
+                ..unsupported
+            },
+            &required
+        )
+        .is_err());
+        let cloud_hypervisor = Request {
+            backend: Backend::CloudHypervisor,
+            ..request(true)
+        };
+        assert!(decide(&cloud_hypervisor, &host(Ok(11))).is_err());
+
+        let launch = code("src/firecracker/vm.rs");
+        let start = &launch[launch.find("pub async fn start(").unwrap()..];
+        let verify = start
+            .find("crate::confine::verified_filter_bytes(")
+            .expect("the launch verifies the filter");
+        let spawn = start
+            .find("install_namespace_pre_exec(")
+            .expect("the launch spawns through the VMM pre_exec");
+        assert!(
+            verify < spawn,
+            "the launch spawns before it verifies the filter"
+        );
+        assert!(
+            start[..spawn].contains("names no seccomp mode"),
+            "a confined decision without a seccomp mode reaches the spawn"
         );
     }
 }

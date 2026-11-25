@@ -16,6 +16,14 @@
         {
             "syscall": "io_uring_register",
             "why": "io_uring operations (IORING_OP_OPENAT, IORING_OP_SOCKET, IORING_OP_CONNECT) are not seen by seccomp, so a ring would reopen what the filter closes. fcvm's drives use the Sync engine, so the VMM never makes one."
+        },
+        {
+            "syscall": "mmap",
+            "arg": {
+                "index": 3,
+                "val": 32769
+            },
+            "why": "the fork's rule for MAP_SHARED | MAP_POPULATE is the mapping of an io_uring ring, and the VMM can make no ring without io_uring_setup. No mmap with these flags appears in the traces of this policy's audit and enforce passes on either architecture."
         }
     ],
     "add": [
@@ -90,7 +98,7 @@
             ],
             "rule": {
                 "syscall": "statx",
-                "comment": "glibc's fstat and stat (musl uses fstat and newfstatat)"
+                "comment": "Rust std's metadata (fstat and stat) on a gnu target; the musl build makes fstat and newfstatat"
             }
         },
         {
@@ -165,33 +173,6 @@
             "rule": {
                 "syscall": "fstatfs",
                 "comment": "vstate::memory::BackingFileSystem::of: the filesystem of a guest memory backing file (hugetlbfs, shmem or another), read on a File-backed restore; the fork's musl filter does not list it"
-            }
-        },
-        {
-            "arches": [
-                "x86_64",
-                "aarch64"
-            ],
-            "classes": [
-                "api",
-                "vcpu"
-            ],
-            "rule": {
-                "syscall": "lseek",
-                "comment": "glibc reads /etc/localtime with read and lseek at the first log line of the process, where musl maps the file (the mmap the fork's filter lists here); with the log level at Warning or Error that line can be written after the filters are installed, by any thread"
-            }
-        },
-        {
-            "arches": [
-                "x86_64",
-                "aarch64"
-            ],
-            "classes": [
-                "vcpu"
-            ],
-            "rule": {
-                "syscall": "read",
-                "comment": "glibc reads /etc/localtime with read and lseek at the first log line of the process, where musl maps the file (the mmap the fork's filter lists here); with the log level at Warning or Error that line can be written after the filters are installed, by any thread"
             }
         }
     ]

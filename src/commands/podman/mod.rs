@@ -1767,6 +1767,8 @@ async fn prepare_vm_for_lifecycle(
         },
     )
     .await?;
+    // Still before anything is created: a confined start needs this binary's filter.
+    crate::commands::common::require_confined_filter(&decision, &runtime_config)?;
 
     // Get kernel path
     // Priority: --kernel (explicit) > profile (named or "default")

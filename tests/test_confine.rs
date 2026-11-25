@@ -38,30 +38,6 @@ fn thread_credentials(pid: u32) -> Result<Vec<(String, Vec<String>)>> {
     Ok(threads)
 }
 
-/// The firecracker processes whose parent is `parent`. The binary is content-addressed
-/// (`firecracker-default-<sha>.bin`), so its comm is a prefix of that name.
-fn firecracker_children(parent: u32) -> Vec<u32> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
-        };
-        // comm is in parentheses and may hold spaces; the fields after it are plain.
-        let Some(close) = stat.rfind(')') else {
-            continue;
-        };
-        let comm = &stat[stat.find('(').map_or(0, |o| o + 1)..close];
-        let ppid = stat[close + 2..].split_whitespace().nth(1);
-        if comm.starts_with("firecracker") && ppid == Some(parent.to_string().as_str()) {
-            found.push(pid);
-        }
-    }
-    found
-}
-
 #[tokio::test]
 async fn test_confine_rootless_vm() -> Result<()> {
     let floor = fcvm::confine::LANDLOCK_ABI_FLOOR;
@@ -91,36 +67,8 @@ async fn test_confine_rootless_vm() -> Result<()> {
         Err(_) => Some("landlock: Landlock is unavailable".to_string()),
     };
 
-    match refusal {
-        None => {}
-        Some(expected) => {
-            // A start that cannot be confined fails closed, before anything is created.
-            let output = tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                tokio::process::Command::new(common::find_fcvm_binary()?)
-                    .args([
-                        "podman",
-                        "run",
-                        "--name",
-                        &vm_name,
-                        "--network",
-                        "rootless",
-                        "--confine",
-                        common::TEST_IMAGE,
-                    ])
-                    .output(),
-            )
-            .await
-            .context("a refused --confine start did not exit")??;
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!output.status.success(), "stderr: {stderr}");
-            assert!(
-                stderr.contains(&expected) && stderr.contains("nothing was started"),
-                "expected {expected:?} in: {stderr}"
-            );
-            println!("refused, as required: {expected}");
-            return Ok(());
-        }
+    if let Some(expected) = refusal {
+        return assert_a_confined_start_is_refused(&vm_name, &expected).await;
     }
 
     let (mut child, fcvm_pid) = common::spawn_fcvm(&[
@@ -140,29 +88,18 @@ async fn test_confine_rootless_vm() -> Result<()> {
         let out = common::exec_in_container(fcvm_pid, &["echo", "confined-ok"]).await?;
         anyhow::ensure!(out.contains("confined-ok"), "exec output: {out}");
 
-        let firecrackers = firecracker_children(fcvm_pid);
+        let firecrackers = common::firecracker_children(fcvm_pid);
         anyhow::ensure!(
             firecrackers.len() == 1,
             "firecracker children of {fcvm_pid}: {firecrackers:?}"
         );
         let threads = thread_credentials(firecrackers[0])?;
         println!("firecracker threads: {threads:?}");
-        // The VMM was given the confined filter, not its default policy (whose filter would
-        // also read Seccomp 2), and every thread runs under a filter.
-        let cmdline = std::fs::read(format!("/proc/{}/cmdline", firecrackers[0]))?;
-        let args: Vec<String> = cmdline
-            .split(|b| *b == 0)
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
-        let filter = args
-            .iter()
-            .position(|a| a == "--seccomp-filter")
-            .and_then(|i| args.get(i + 1))
-            .with_context(|| format!("no --seccomp-filter in {args:?}"))?;
-        anyhow::ensure!(
-            filter.contains(".confined-enforce-") && std::path::Path::new(filter).is_file(),
-            "seccomp filter {filter}"
-        );
+        // The VMM was given the confined filter as bytes fcvm verified (a descriptor, not
+        // its default policy, whose filter would also read Seccomp 2), and every thread
+        // runs under a filter and holds nothing.
+        let failures = common::vmm_confinement_failures(firecrackers[0]);
+        anyhow::ensure!(failures.is_empty(), "not confined: {failures:?}");
         let zero = "0000000000000000".to_string();
         let expected = vec![
             zero.clone(),
@@ -232,4 +169,449 @@ async fn test_confine_rootless_vm() -> Result<()> {
     common::kill_process(fcvm_pid).await;
     let _ = child.wait().await;
     result
+}
+
+/// On a host that cannot confine, a start that must be confined fails closed, before
+/// anything is created, naming what is missing.
+async fn assert_a_confined_start_is_refused(vm_name: &str, expected: &str) -> Result<()> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new(common::find_fcvm_binary()?)
+            .args([
+                "podman",
+                "run",
+                "--name",
+                vm_name,
+                "--network",
+                "rootless",
+                "--confine",
+                common::TEST_IMAGE,
+            ])
+            .output(),
+    )
+    .await
+    .context("a refused --confine start did not exit")??;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains(expected) && stderr.contains("nothing was started"),
+        "expected {expected:?} in: {stderr}"
+    );
+    println!("refused, as required: {expected}");
+    Ok(())
+}
+
+/// What a host that cannot confine says when asked to, or `None` on one that can (see
+/// `test_confine_rootless_vm`, which asserts the refusal itself).
+fn host_refusal() -> Option<String> {
+    let floor = fcvm::confine::LANDLOCK_ABI_FLOOR;
+    let core_pattern = std::fs::read_to_string("/proc/sys/kernel/core_pattern")
+        .map(|p| p.trim_end().to_string())
+        .ok();
+    let core_hard = fcvm::confine::core_hard_limit();
+    let core_refusal = match core_pattern.as_deref() {
+        None => Some("process: the host's core_pattern cannot be read".to_string()),
+        Some(p) if p.starts_with('@') => Some(format!("process: the host's core_pattern ({p})")),
+        Some(p) if p.starts_with('|') && core_hard < 1 => Some(format!(
+            "process: the host's core_pattern ({p}) pipes core dumps"
+        )),
+        Some(_) => None,
+    };
+    match fcvm::confine::landlock_abi() {
+        Ok(abi) if abi >= floor => core_refusal,
+        Ok(abi) => Some(format!("landlock: the kernel's Landlock ABI is {abi};")),
+        Err(_) => Some("landlock: Landlock is unavailable".to_string()),
+    }
+}
+
+/// The Firecracker `fcvm setup` built for the default profile.
+async fn default_firecracker() -> Result<std::path::PathBuf> {
+    let profile = fcvm::setup::get_kernel_profile("default")?.context("no default profile")?;
+    fcvm::setup::get_configured_firecracker_for_profile(&profile, "default")
+        .await?
+        .context("the default profile configures no Firecracker")
+}
+
+/// The shared assertion fails on a process that is not a confined VMM, naming each reason:
+/// this test process runs under no filter, keeps `no_new_privs` off and was handed no
+/// filter. A helper that cannot fail would let every test in the gate pass unconfined.
+#[test]
+fn the_gate_assertion_fails_on_an_unconfined_process() {
+    let failures = common::vmm_confinement_failures(std::process::id());
+    // A test runner inside a sandbox can itself run under a filter or with no_new_privs;
+    // the command line is never a confined VMM's.
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let mut needles = vec!["no --seccomp-filter /proc/self/fd/<n>"];
+    if status.contains("\nSeccomp:\t0\n") {
+        needles.extend([
+            "threads under no seccomp filter",
+            "Seccomp: 0, Seccomp_filters: 0",
+        ]);
+    }
+    if status.contains("\nNoNewPrivs:\t0\n") {
+        needles.push("NoNewPrivs: 0");
+    }
+    for needle in needles {
+        assert!(
+            failures.iter().any(|f| f.contains(needle)),
+            "missing {needle:?} in {failures:?}"
+        );
+    }
+    // A process that is gone is a failure too, not an empty list.
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    let pid = gone.id();
+    gone.wait().unwrap();
+    assert!(!common::vmm_confinement_failures(pid).is_empty());
+}
+
+/// `fcvm snapshot run --confine --firecracker-bin <firecracker>` of `snapshot`, run to its
+/// exit: its stderr when it exits unsuccessfully within two minutes. A clone that is still
+/// running then was started, which is an error here, and it is stopped.
+async fn refused_clone(
+    snapshot: &str,
+    name: &str,
+    firecracker: &std::path::Path,
+) -> Result<String> {
+    let mut child = tokio::process::Command::new(common::find_fcvm_binary()?)
+        .args(["snapshot", "run", "--snapshot", snapshot, "--name", name])
+        .args(["--confine", "--firecracker-bin"])
+        .arg(firecracker)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawning fcvm snapshot run")?;
+    let pid = child.id().context("fcvm snapshot run has no pid")?;
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let read = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut text).await;
+        text
+    });
+    let exited = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait()).await;
+    if exited.is_err() {
+        common::kill_process(pid).await;
+        let _ = child.wait().await;
+    }
+    let stderr = read.await?;
+    match exited {
+        Ok(status) => {
+            anyhow::ensure!(!status?.success(), "{name} exited successfully: {stderr}");
+            Ok(stderr)
+        }
+        Err(_) => anyhow::bail!("{name} was started and ran for two minutes: {stderr}"),
+    }
+}
+
+/// A confined start whose filter is not the one `fcvm setup` recorded, or whose filter
+/// installs nothing, does not run a guest. With a copy of the default Firecracker in a
+/// directory of its own and `--firecracker-bin`:
+/// - no filter beside it: refused before anything is created;
+/// - the real filter without its recorded digest: refused the same way;
+/// - a filter of three empty programs with a matching digest, which Firecracker accepts
+///   and installs nothing for: the VMM is killed before the guest resumes, and the start
+///   fails naming its unfiltered threads;
+/// - the real filter with its digest: the clone starts and is confined (the control).
+#[tokio::test]
+async fn test_confine_refuses_a_filter_that_does_not_confine() -> Result<()> {
+    let (base_name, clone_name, snapshot, _) = common::unique_names("confine-filter");
+    if let Some(expected) = host_refusal() {
+        // No filter is handed over on a host that cannot confine: the start is refused.
+        return assert_a_confined_start_is_refused(&base_name, &expected).await;
+    }
+    use fcvm::confine::{filter_bytes_digest, filter_digest_path, filter_path, SeccompMode};
+    let store = default_firecracker().await?;
+    let real = fcvm::confine::verified_filter_bytes(&store, SeccompMode::Enforce)
+        .context("the default Firecracker's confined filter")?;
+    let dir = tempfile::tempdir()?;
+    let firecracker = dir.path().join("firecracker-copy");
+    std::fs::copy(&store, &firecracker)?;
+    let filter = filter_path(&firecracker, SeccompMode::Enforce);
+    let install = |bytes: &[u8], record: bool| -> Result<()> {
+        std::fs::write(&filter, bytes)?;
+        let digest = filter_digest_path(&filter);
+        if record {
+            std::fs::write(&digest, filter_bytes_digest(bytes))?;
+        } else {
+            let _ = std::fs::remove_file(&digest);
+        }
+        Ok(())
+    };
+
+    let (mut base, base_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &base_name,
+        "--network",
+        "rootless",
+        "--confine",
+        common::TEST_IMAGE,
+    ])
+    .await?;
+    let mut clone_pid = None;
+    let result = async {
+        common::poll_health_by_pid(base_pid, 300).await?;
+        let created = tokio::process::Command::new(common::find_fcvm_binary()?)
+            .args(["snapshot", "create", "--pid", &base_pid.to_string()])
+            .args(["--tag", &snapshot])
+            .output()
+            .await?;
+        anyhow::ensure!(
+            created.status.success(),
+            "snapshot create: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let vms_named = |name: String| async move {
+            let ls = tokio::process::Command::new(common::find_fcvm_binary()?)
+                .args(["ls", "--json"])
+                .output()
+                .await?;
+            let vms: Vec<serde_json::Value> = serde_json::from_slice(&ls.stdout)?;
+            Ok::<_, anyhow::Error>(vms.iter().filter(|vm| vm["name"] == name.as_str()).count())
+        };
+
+        // No filter beside the binary.
+        let name = format!("{clone_name}-none");
+        let stderr = refused_clone(&snapshot, &name, &firecracker).await?;
+        anyhow::ensure!(
+            stderr.contains("nothing was started")
+                && stderr.contains("the confined seccomp filter is unusable"),
+            "no filter: {stderr}"
+        );
+        anyhow::ensure!(vms_named(name).await? == 0, "a refused clone has state");
+
+        // The real filter under the right name, without the digest setup records.
+        install(&real, false)?;
+        let name = format!("{clone_name}-unrecorded");
+        let stderr = refused_clone(&snapshot, &name, &firecracker).await?;
+        anyhow::ensure!(
+            stderr.contains("nothing was started")
+                && stderr.contains("the digest fcvm setup records"),
+            "unrecorded filter: {stderr}"
+        );
+
+        // Three empty programs, recorded: Firecracker loads the file and installs nothing.
+        let empty: std::collections::HashMap<String, Vec<u64>> = ["vmm", "api", "vcpu"]
+            .into_iter()
+            .map(|class| (class.to_string(), Vec::new()))
+            .collect();
+        install(&bitcode::serialize(&empty)?, true)?;
+        let name = format!("{clone_name}-empty");
+        let stderr = refused_clone(&snapshot, &name, &firecracker).await?;
+        anyhow::ensure!(
+            stderr.contains("run without a seccomp filter")
+                && stderr.contains("Seccomp: 0, Seccomp_filters: 0"),
+            "empty filter: {stderr}"
+        );
+        let leftover: Vec<u32> = std::fs::read_dir("/proc")?
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+            .filter(|pid| {
+                std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == firecracker)
+            })
+            .collect();
+        anyhow::ensure!(
+            leftover.is_empty(),
+            "unfiltered VMMs still run: {leftover:?}"
+        );
+
+        // The control: the real filter with its digest starts, confined.
+        install(&real, true)?;
+        let name = format!("{clone_name}-real");
+        let firecracker_arg = firecracker.to_string_lossy().into_owned();
+        let (mut clone, pid) = common::spawn_fcvm(&[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot,
+            "--name",
+            &name,
+            "--confine",
+            "--firecracker-bin",
+            &firecracker_arg,
+        ])
+        .await?;
+        clone_pid = Some(pid);
+        let confined = async {
+            common::poll_health_by_pid(pid, 300).await?;
+            let vmms = common::firecracker_children(pid);
+            anyhow::ensure!(vmms.len() == 1, "firecracker children of {pid}: {vmms:?}");
+            let failures = common::vmm_confinement_failures(vmms[0]);
+            anyhow::ensure!(
+                failures.is_empty(),
+                "the control is not confined: {failures:?}"
+            );
+            Ok(())
+        }
+        .await;
+        common::kill_process(pid).await;
+        let _ = clone.wait().await;
+        confined
+    }
+    .await;
+    if let Some(pid) = clone_pid {
+        common::kill_process(pid).await;
+    }
+    common::kill_process(base_pid).await;
+    let _ = base.wait().await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&snapshot));
+    result
+}
+
+/// The instructions of a compiled seccomp program, as Firecracker loads them: one
+/// `sock_filter` per word (code, jt, jf, k).
+fn bpf_action(program: &[u64], nr: u32, arch: u32) -> u32 {
+    // struct seccomp_data: nr, arch, instruction_pointer, args[6]; the arguments are zero.
+    let mut data = [0u8; 64];
+    data[0..4].copy_from_slice(&nr.to_le_bytes());
+    data[4..8].copy_from_slice(&arch.to_le_bytes());
+    let mut acc = 0u32;
+    let mut pc = 0usize;
+    loop {
+        let insn = program[pc];
+        let (code, jt, jf, k) = (
+            (insn & 0xffff) as u16,
+            ((insn >> 16) & 0xff) as usize,
+            ((insn >> 24) & 0xff) as usize,
+            (insn >> 32) as u32,
+        );
+        pc += 1;
+        let jump = |taken: bool| if taken { jt } else { jf };
+        match code {
+            0x20 => {
+                let at = k as usize;
+                acc = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+            }
+            0x00 => acc = k,
+            0x54 => acc &= k,
+            0x05 => pc += k as usize,
+            0x15 => pc += jump(acc == k),
+            0x25 => pc += jump(acc > k),
+            0x35 => pc += jump(acc >= k),
+            0x45 => pc += jump(acc & k != 0),
+            0x06 => return k,
+            other => panic!(
+                "BPF instruction {other:#x} at {} is not one this reads",
+                pc - 1
+            ),
+        }
+    }
+}
+
+const SECCOMP_RET_TRAP: u32 = 0x0003_0000;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_KILL_THREAD: u32 = 0;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: (u32, u32) = (0xc000_00b7, 0xc000_003e);
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: (u32, u32) = (0xc000_003e, 0x4000_0003);
+
+/// A child of this process that installs `program` on itself and then makes `syscall`
+/// (with zero arguments beyond the three given), then exits 7. Only raw syscalls run in
+/// the child. Returns its wait status.
+fn status_under_filter(program: &[u64], syscall: libc::c_long, args: [libc::c_long; 3]) -> i32 {
+    let fprog = libc::sock_fprog {
+        len: program.len() as u16,
+        filter: program.as_ptr().cast_mut().cast(),
+    };
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: the child makes only direct syscalls on memory this function owns, and exits.
+    unsafe {
+        let pid = libc::fork();
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::syscall(
+                    libc::SYS_seccomp,
+                    libc::SECCOMP_SET_MODE_FILTER as libc::c_ulong,
+                    0 as libc::c_ulong,
+                    &fprog as *const libc::sock_fprog,
+                ) != 0
+            {
+                libc::_exit(9);
+            }
+            libc::syscall(syscall, args[0], args[1], args[2]);
+            libc::syscall(libc::SYS_exit_group, 7);
+            libc::_exit(8);
+        }
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        status
+    }
+}
+
+/// The compiled filter itself denies what the policy does not list, with no VMM involved:
+/// the bytes `fcvm setup` compiled for the default Firecracker are decoded, each class's
+/// program is evaluated for syscalls the policy must refuse, and the `vcpu` program is
+/// loaded in a child, where `socket` (which no vCPU thread may make) ends it with SIGSYS
+/// and `getpid` does not.
+#[test]
+fn the_compiled_filter_traps_a_syscall_the_policy_does_not_list() -> Result<()> {
+    let store = tokio::runtime::Runtime::new()?.block_on(default_firecracker())?;
+    let bytes = fcvm::confine::verified_filter_bytes(&store, fcvm::confine::SeccompMode::Enforce)
+        .context("the default Firecracker's confined filter")?;
+    let programs: std::collections::HashMap<String, Vec<u64>> = bitcode::deserialize(&bytes)?;
+    let mut classes: Vec<&str> = programs.keys().map(String::as_str).collect();
+    classes.sort();
+    assert_eq!(classes, ["api", "vcpu", "vmm"]);
+    let (native, foreign) = AUDIT_ARCH;
+    let denied = [
+        ("clone", libc::SYS_clone),
+        ("clone3", libc::SYS_clone3),
+        ("execve", libc::SYS_execve),
+        ("execveat", libc::SYS_execveat),
+        ("io_uring_setup", libc::SYS_io_uring_setup),
+        ("ptrace", libc::SYS_ptrace),
+        ("landlock_restrict_self", libc::SYS_landlock_restrict_self),
+    ];
+    for (class, program) in &programs {
+        assert!(!program.is_empty(), "the {class} program is empty");
+        for (name, nr) in denied {
+            assert_eq!(
+                bpf_action(program, nr as u32, native),
+                SECCOMP_RET_TRAP,
+                "{class}: {name}"
+            );
+        }
+        assert_eq!(
+            bpf_action(program, libc::SYS_getpid as u32, native),
+            SECCOMP_RET_ALLOW,
+            "{class}: getpid"
+        );
+        // A syscall of another architecture (on x86_64, `int 0x80` reaches it) gets
+        // libseccomp's default bad-architecture action, which the fork's seccompiler does
+        // not set: the calling thread is killed and the process is not. The same holds for
+        // Firecracker's own filters. Setting it to kill the process is a change to the
+        // fork's seccompiler; when a repin brings it, this value changes.
+        assert_eq!(
+            bpf_action(program, libc::SYS_getpid as u32, foreign),
+            SECCOMP_RET_KILL_THREAD,
+            "{class}: a foreign-architecture syscall"
+        );
+    }
+
+    let vcpu = &programs["vcpu"];
+    assert_eq!(
+        bpf_action(vcpu, libc::SYS_socket as u32, native),
+        SECCOMP_RET_TRAP
+    );
+    let allowed = status_under_filter(vcpu, libc::SYS_getpid, [0, 0, 0]);
+    assert!(
+        libc::WIFEXITED(allowed) && libc::WEXITSTATUS(allowed) == 7,
+        "getpid under the vcpu filter: wait status {allowed:#x}"
+    );
+    let trapped = status_under_filter(
+        vcpu,
+        libc::SYS_socket,
+        [libc::AF_UNIX as _, libc::SOCK_STREAM as _, 0],
+    );
+    assert!(
+        libc::WIFSIGNALED(trapped) && libc::WTERMSIG(trapped) == libc::SIGSYS,
+        "socket under the vcpu filter: wait status {trapped:#x}"
+    );
+    Ok(())
 }

@@ -19,7 +19,11 @@ set -euo pipefail
 GH=${GH:-gh}
 
 emit() {
-  # run reason code bench fleet web
+  # run reason code bench fleet web confine
+  # confine: the change touches the VMM's confinement (the seccomp policies, their
+  # generator, the launch that applies them or their gate), so a pull request also runs
+  # Host-x64, whose test-confine step is the only place the x86_64 policy is exercised
+  # under real confinement.
   {
     echo "run=$1"
     echo "reason=$2"
@@ -27,8 +31,9 @@ emit() {
     echo "bench=$4"
     echo "fleet=$5"
     echo "web=$6"
+    echo "confine=$7"
   } >> "$GITHUB_OUTPUT"
-  echo "run=$1 code_changed=$3 bench_changed=$4 fleet_changed=$5 web_changed=$6: $2"
+  echo "run=$1 code_changed=$3 bench_changed=$4 fleet_changed=$5 web_changed=$6 confine_changed=$7: $2"
 }
 
 # Only a pull_request has a well-defined changed-file set here; every
@@ -41,7 +46,7 @@ emit() {
 # after cancelling the PR-side run. Summary counts skipped as
 # non-failure, so that read as green.
 if [ "$EVENT" != "pull_request" ]; then
-  emit true "event $EVENT: running the full matrix" true true true true
+  emit true "event $EVENT: running the full matrix" true true true true true
   exit 0
 fi
 
@@ -51,12 +56,12 @@ stackable=true
 [ "$HEAD_REPO" = "$REPO" ] || stackable=false
 
 if [ "${ACTION:-}" = "closed" ]; then
-  emit false "closed: this run only cancels the PR's earlier runs" false false false false
+  emit false "closed: this run only cancels the PR's earlier runs" false false false false false
   exit 0
 fi
 
 if [ "$DRAFT" = "true" ]; then
-  emit false "draft: CI runs when the PR is marked ready" false false false false
+  emit false "draft: CI runs when the PR is marked ready" false false false false false
   exit 0
 fi
 
@@ -79,7 +84,7 @@ elif children=$("$GH" api --paginate "repos/$REPO/pulls?state=open&base=$HEAD_RE
     fi
   done <<< "$children"
   if [ -n "$covering" ]; then
-    emit false "stacked under #${covering// /, #}: CI runs on the top of the stack" false false false false
+    emit false "stacked under #${covering// /, #}: CI runs on the top of the stack" false false false false false
     exit 0
   fi
 else
@@ -105,7 +110,7 @@ else
       --jq '(.files | length), (.files[] | .filename, (.previous_filename // empty))'); then
     count=$(head -n1 <<< "$compared")
     if [ "$count" -ge 300 ]; then
-      emit true "$scope: $count files, more than the compare API lists; running the full matrix" true true true true
+      emit true "$scope: $count files, more than the compare API lists; running the full matrix" true true true true true
       exit 0
     fi
     files=$(tail -n +2 <<< "$compared")
@@ -115,7 +120,7 @@ else
 fi
 if [ -z "$files" ]; then
   # An empty or failed file list is unexpected, so fail toward running everything.
-  emit true "$scope: no changed files reported; running the full matrix" true true true true
+  emit true "$scope: no changed files reported; running the full matrix" true true true true true
   exit 0
 fi
 
@@ -130,6 +135,7 @@ code=false
 bench=false
 fleet=false
 web=false
+confine=false
 while IFS= read -r f; do
   # `bench/*` MUST precede the docs arm. A shell `case` glob matches
   # `/`, so `*.md` swallows bench/chromium/README.md and that PR
@@ -186,5 +192,11 @@ while IFS= read -r f; do
     docs/*|*.md) ;;
     *) code=true; echo "code path: $f" ;;
   esac
+  # A second question about the same path, kept out of the arms above (which say which
+  # jobs a path needs): whether it is part of the VMM's confinement.
+  case "$f" in
+    resources/seccomp/*|src/confine.rs|src/firecracker/vm.rs|src/hypervisor/firecracker.rs|scripts/confine-*|tests/test_confine*.rs)
+      confine=true; echo "confinement path: $f" ;;
+  esac
 done <<< "$files"
-emit true "$scope" "$code" "$bench" "$fleet" "$web"
+emit true "$scope" "$code" "$bench" "$fleet" "$web" "$confine"

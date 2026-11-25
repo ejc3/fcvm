@@ -5,7 +5,9 @@
 #
 # It fails closed: when auditd is not running (the kernel then printk's records and
 # rate-limits them, so a clean result would mean nothing), when the audit log cannot be read,
-# when the positive control's record does not appear, when auditd rotated its log during the
+# when a positive control's record does not appear (one runs before the lane and one after
+# it, which is also the wait for auditd to write the lane's records), when auditd stopped or
+# rotated its log during the
 # lane or the kernel dropped a record (auditd keeps num_logs files of max_log_file, 5 of
 # 8 MB by default, so a syscall logged in a loop pushes earlier records out of every file),
 # and when the kernel is below the confinement floor.
@@ -20,10 +22,10 @@ systemctl is-active --quiet auditd || fail "auditd is not running; without it th
 sudo test -r "$log" || fail "cannot read $log"
 
 # Positive control: a process that logs one syscall through a SECCOMP_RET_LOG filter must
-# leave a record, or the lane cannot see anything.
-marker_comm="fcvm-audit-ctl"
-start_line=$(sudo wc -l < "$log")
-python3 - "$marker_comm" <<'PY' || fail "the positive control could not install its filter"
+# leave a record, or the lane cannot see anything. It runs before the lane and again after
+# it: auditd writes records in order, so once the closing control's record is in the log,
+# every record of the lane is too, and an auditd that stopped during the lane is caught.
+control_program=$(cat <<'PY'
 import ctypes, struct, sys
 libc = ctypes.CDLL(None, use_errno=True)
 PR_SET_NAME, PR_SET_NO_NEW_PRIVS, PR_SET_SECCOMP, SECCOMP_MODE_FILTER = 15, 38, 22, 2
@@ -38,9 +40,19 @@ fprog = Fprog(1, ctypes.cast(buf, ctypes.c_void_p))
 assert libc.prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ctypes.byref(fprog), 0, 0) == 0
 libc.getppid()
 PY
-sleep 1
-sudo tail -n +"$((start_line + 1))" "$log" | grep -q "type=SECCOMP.*comm=\"$marker_comm\"" \
-  || fail "the positive control's seccomp record did not reach $log"
+)
+# control COMM FROM_LINE: log one syscall as COMM, then wait up to 10 s for its record.
+control() {
+  python3 -c "$control_program" "$1" || fail "the positive control could not install its filter"
+  local tries
+  for tries in $(seq 50); do
+    sudo tail -n +"$(($2 + 1))" "$log" | grep -q "type=SECCOMP.*comm=\"$1\"" && return 0
+    sleep 0.2
+  done
+  return 1
+}
+start_line=$(sudo wc -l < "$log")
+control fcvm-audit-ctl "$start_line" || fail "the positive control's seccomp record did not reach $log"
 
 # The log file's inode changes when auditd rotates it; `lost` counts the records the kernel
 # could not queue.
@@ -62,7 +74,22 @@ for l in sys.stdin:
 for (comm, nr), n in sorted(c.items()): print(f"  {comm} syscall {nr} x{n}")
 '
 }
-firecracker_records() { grep 'type=SECCOMP' | grep -E 'exe="[^"]*/firecracker[^/"]*"'; }
+# The seccomp records on stdin whose executable is a Firecracker binary. The kernel writes
+# exe quoted, or as hex when the path holds a space or a quote.
+firecracker_records() {
+  python3 -c '
+import os, re, sys
+for l in sys.stdin:
+    if "type=SECCOMP" not in l:
+        continue
+    m = re.search(r" exe=(?:\"([^\"]*)\"|([0-9A-Fa-f]+))(?: |$)", l)
+    if not m:
+        continue
+    exe = m.group(1) if m.group(1) is not None else bytes.fromhex(m.group(2)).decode(errors="replace")
+    if os.path.basename(exe).startswith("firecracker"):
+        sys.stdout.write(l)
+'
+}
 
 start_line=$(sudo wc -l < "$log")
 start_id=$(log_id)
@@ -75,6 +102,12 @@ if [ "$(log_id)" != "$start_id" ] || [ "$end_lost" != "$start_lost" ]; then
   echo "confine-seccomp-audit: Firecracker records in the newest log file (the list is incomplete):" >&2
   sudo cat "$log" | firecracker_records | summary >&2
   fail "audit records are missing: auditd rotated $log during the lane, or the kernel dropped records (lost $start_lost -> $end_lost). A syscall logged in a loop does this; add the ones above to the policy, or raise max_log_file in /etc/audit/auditd.conf, and run again"
+fi
+systemctl is-active --quiet auditd || fail "auditd stopped during the lane, so its records are incomplete"
+control fcvm-audit-end "$start_line" \
+  || fail "the closing control's seccomp record did not reach $log within 10 s: records the lane logged may not be there either"
+if [ "$(log_id)" != "$start_id" ] || [ "$(lost)" != "$start_lost" ]; then
+  fail "audit records are missing: auditd rotated $log or the kernel dropped records while the closing control ran"
 fi
 records=$(sudo tail -n +"$((start_line + 1))" "$log" | firecracker_records)
 if [ -n "$records" ]; then

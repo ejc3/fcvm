@@ -28,6 +28,7 @@ pub fn init_from_config() {
 pub fn init_from_loaded_config(config: &crate::setup::rootfs::Plan) {
     let _ = DATA_DIR.set(resolve_data_dir(&config.paths.data_dir));
     crate::confine::set_config_mode(config.confine.mode);
+    crate::confine::set_config_allow_seccomp_log(config.confine.allow_seccomp_log);
     let _ = ASSETS_DIR.set(resolve_assets_dir(&config.paths.assets_dir));
 }
 

@@ -734,14 +734,25 @@ test-all: show-notes check-disk setup-fcvm _test-all
 
 # --confine's CI gate (src/confine.rs): the rootless VM tests that cover each restore path
 # and device, with every VMM confined (FCVM_CONFINE=required) and its syscall allowlist
-# enforcing. An unlisted syscall kills the VMM, so the test that hit it fails. Needs a kernel
-# with Landlock ABI 9 or later; below it every confined start is refused. It runs the default
+# enforcing, run through scripts/confine-gate.sh. An unlisted syscall kills the VMM; the gate
+# runs each test once (no retry, so a stop on one try of two cannot pass as flaky), fails on
+# any policy stop in the lane's output or its per-test logs, fails when a test passed
+# without asserting its VMM confined (tests/common assert_vmm_confined_under_the_gate), and
+# fails when the filter matches fewer tests than CONFINE_TEST_MIN. Needs a kernel with
+# Landlock ABI 9 or later; below it every confined start is refused. It runs the default
 # feature set (integration-fast and integration-slow): the snapshot clone and FUSE snapshot
 # matrix tests are integration-slow. Hugepage tests are privileged-tests, and a root start is
 # not confined yet, so they are not here.
-CONFINE_TEST_FILTER ?= -E 'test(=test_confine_rootless_vm) | test(=test_sanity_rootless) | test(=test_large_boot_plan_rootless) | test(=test_first_firecracker_log_line_from_the_api_thread_rootless) | test(=test_exec_rootless) | (test(/^test_pmem_/) & !test(/sudo/)) | test(/^test_fuse_snapshot_matrix_/) | test(/snapshot_clone/) | test(=test_clone_while_baseline_running_rootless)'
+CONFINE_TEST_FILTER ?= -E 'test(/^test_confine_/) | test(=the_compiled_filter_traps_a_syscall_the_policy_does_not_list) | test(=firecracker::vm::tests::a_trapped_syscall_stops_the_vmm_and_is_reported) | test(=test_sanity_rootless) | test(=test_large_boot_plan_rootless) | test(=test_first_firecracker_log_line_from_the_api_thread_rootless) | test(=test_exec_rootless) | (test(/^test_pmem_/) & !test(/sudo/)) | test(/^test_fuse_snapshot_matrix_/) | test(/snapshot_clone/) | test(=test_clone_while_baseline_running_rootless)'
+# How many tests that filter matches. A filter that matches fewer fails the gate; raise it
+# with the filter.
+CONFINE_TEST_MIN ?= 36
+# The tests in the filter that start no VMM through the test helpers: one loads the compiled
+# filter in a child process, one runs a Firecracker that serves no guest.
+CONFINE_NO_VMM_TESTS ?= the_compiled_filter_traps_a_syscall_the_policy_does_not_list firecracker::vm::tests::a_trapped_syscall_stops_the_vmm_and_is_reported
 test-confine: show-notes check-disk setup-fcvm
-	FCVM_CONFINE=required FCVM_CONFINE_SECCOMP=enforce $(MAKE) --no-print-directory _test-all FILTER="$(CONFINE_TEST_FILTER)"
+	CONFINE_GATE_NO_VMM_TESTS="$(CONFINE_NO_VMM_TESTS)" ./scripts/confine-gate.sh $(CONFINE_TEST_MIN) \
+		$(MAKE) --no-print-directory _test-all FILTER="$(CONFINE_TEST_FILTER)"
 
 # The confined seccomp policies are generated: the fork's shipped filters for the pinned
 # Firecracker commit (resources/seccomp/fork-*.json) plus resources/seccomp/confined-changes.json.

@@ -80,6 +80,7 @@ jobs:
       bench: ${{ steps.detect.outputs.bench }}
       fleet: ${{ steps.detect.outputs.fleet }}
       web: ${{ steps.detect.outputs.web }}
+      confine: ${{ steps.detect.outputs.confine }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -440,6 +441,7 @@ jobs:
   # never passed on a PR - runs the full matrix.
   skip-check:
     name: Skip Check
+    needs: [changes]
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.check.outputs.skip }}
@@ -457,6 +459,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           REPO: ${{ github.repository }}
+          CONFINE: ${{ needs.changes.outputs.confine }}
         run: |
           set -euo pipefail
           # Names of the jobs that already passed for this tree on a PR, one per line.
@@ -508,6 +511,9 @@ jobs:
               pull_request)
                 case "$1" in
                   *-arm64 | *-arm64-* | Host-Root-x64-SnapshotEnabled) return 0 ;;
+                  # The x86_64 seccomp policy is exercised under real confinement only by
+                  # Host-x64's test-confine step: a PR that touches confinement runs it.
+                  Host-x64) [ "$CONFINE" = true ] ;;
                   *) return 1 ;;
                 esac
                 ;;
@@ -978,8 +984,11 @@ jobs:
         working-directory: fcvm
         run: make test-fast
       # --confine's gate: the rootless VM tests with every VMM confined and its syscall
-      # allowlist enforcing; an unlisted syscall kills the VMM and fails its test. On both
-      # architectures: each has its own policy, and its own libc call shapes. The step took
+      # allowlist enforcing, each run once, through scripts/confine-gate.sh: it fails on a
+      # failed test, on any VMM the policy stopped, on a test that did not assert its VMM
+      # confined, and on a filter that matches fewer tests than the Makefile pins. On both
+      # architectures: each has its own policy, and its own libc call shapes. Host-x64 runs
+      # on a pull request only when the change touches confinement (changes.confine). The step took
       # 12 min on arm64 (run 45517811464; 10 of them building the default-feature test
       # binaries, which test-fast does not build); the cap is twice that.
       - name: test-confine

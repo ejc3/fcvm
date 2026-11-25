@@ -683,6 +683,7 @@ mod confine_tests {
             core_hard_limit: u64::MAX,
             seccomp: SeccompMode::Enforce,
             firecracker_commit: None,
+            allow_seccomp_log: true,
         }
     }
 

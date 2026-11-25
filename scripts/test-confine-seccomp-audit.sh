@@ -37,6 +37,16 @@ cat > "$work/logs-then-rotates.sh" <<EOF2
 "$work/firecracker-audit-test" "$work/log-one-syscall.py"; sleep 1
 sudo pkill -USR1 -x auditd; sleep 2
 EOF2
+mkdir "$work/a dir"
+cp "$work/firecracker-audit-test" "$work/a dir/firecracker-audit-test"
+cat > "$work/logs-from-a-spaced-path.sh" <<EOF2
+#!/bin/bash
+"$work/a dir/firecracker-audit-test" "$work/log-one-syscall.py"; sleep 1
+EOF2
+cat > "$work/stops-auditd.sh" <<EOF2
+#!/bin/bash
+sudo systemctl stop auditd
+EOF2
 chmod +x "$work"/*.sh
 failures=0
 expect() { # NAME WANTED-STATUS WANTED-TEXT COMMAND...
@@ -58,5 +68,12 @@ expect "a vCPU thread's record is named" 1 "fc_vcpu 0 syscall" "$work/logs-as-a-
 # started with: reading on from the old line number in the new file found nothing and said
 # clean.
 expect "a rotated log blocks" 2 "audit records are missing" "$work/logs-then-rotates.sh"
+# The kernel writes an executable path that holds a space as hex; a pattern for the quoted
+# form matched no such record and the lane read as clean.
+expect "a record whose executable path is hex-encoded is counted" 1 "firecracker-aud syscall" "$work/logs-from-a-spaced-path.sh"
+# auditd was checked before the lane only: one that stopped during it left a log with no
+# records, which read as clean.
+expect "an auditd that stopped during the lane blocks" 2 "auditd stopped during the lane" "$work/stops-auditd.sh"
+sudo systemctl start auditd
 [ "$failures" -eq 0 ] || { echo "$failures failed" >&2; exit 1; }
 echo "all passed"

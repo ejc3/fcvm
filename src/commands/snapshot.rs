@@ -3245,6 +3245,7 @@ async fn cmd_snapshot_run_inner(
         unsupported: None,
         kernel_profile: snapshot_config.metadata.kernel_profile.as_deref(),
     })?;
+    crate::commands::common::require_confined_filter(&decision, &runtime_config)?;
 
     // Generate VM ID and name. Restored VMs always get a FRESH vm_id and a
     // fresh state file (vsock_epoch starts at 0) — including the podman-run

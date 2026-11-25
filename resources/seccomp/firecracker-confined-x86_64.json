@@ -323,10 +323,6 @@
             {
                 "comment": "glibc's epoll_wait on x86_64 (musl uses epoll_pwait, which the fork's filter lists)",
                 "syscall": "epoll_wait"
-            },
-            {
-                "comment": "glibc reads /etc/localtime with read and lseek at the first log line of the process, where musl maps the file (the mmap the fork's filter lists here); with the log level at Warning or Error that line can be written after the filters are installed, by any thread",
-                "syscall": "lseek"
             }
         ],
         "filter_action": "allow"
@@ -819,14 +815,6 @@
             {
                 "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists)",
                 "syscall": "openat"
-            },
-            {
-                "comment": "glibc reads /etc/localtime with read and lseek at the first log line of the process, where musl maps the file (the mmap the fork's filter lists here); with the log level at Warning or Error that line can be written after the filters are installed, by any thread",
-                "syscall": "lseek"
-            },
-            {
-                "comment": "glibc reads /etc/localtime with read and lseek at the first log line of the process, where musl maps the file (the mmap the fork's filter lists here); with the log level at Warning or Error that line can be written after the filters are installed, by any thread",
-                "syscall": "read"
             }
         ],
         "filter_action": "allow"
@@ -1161,28 +1149,6 @@
                     }
                 ],
                 "comment": "Used by rust's stdlib, particularly when creating a diff snapshot of a VM with ~16 GB of memory",
-                "syscall": "mmap"
-            },
-            {
-                "args": [
-                    {
-                        "comment": "libc::MAP_SHARED | libc::MAP_POPULATE",
-                        "index": 3,
-                        "op": "eq",
-                        "type": "dword",
-                        "val": 32769
-                    },
-                    {
-                        "comment": "Ensure PROT_EXEC is not set",
-                        "index": 2,
-                        "op": {
-                            "masked_eq": 4
-                        },
-                        "type": "dword",
-                        "val": 0
-                    }
-                ],
-                "comment": "Used by io_uring for mapping the queues",
                 "syscall": "mmap"
             },
             {
@@ -1715,7 +1681,7 @@
                 "syscall": "getpid"
             },
             {
-                "comment": "glibc's fstat and stat (musl uses fstat and newfstatat)",
+                "comment": "Rust std's metadata (fstat and stat) on a gnu target; the musl build makes fstat and newfstatat",
                 "syscall": "statx"
             },
             {
