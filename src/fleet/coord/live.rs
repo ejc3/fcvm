@@ -704,8 +704,13 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
         })
     };
     let mut snapshots = app.handle.snapshot.clone();
+    // Minecraft status rows, for a page whose `visibility` asks for them.
+    let wants_minecraft = Arc::new(AtomicBool::new(false));
+    let mut statuses = app.handle.minecraft_status.subscribe();
+    let wants = wants_minecraft.clone();
     let writer = tokio::spawn(async move {
         let mut sent: Option<u64> = None;
+        let mut status_sent = 0u64;
         loop {
             let snap = snapshots.borrow_and_update().clone();
             if sent.is_none_or(|v| snap.version > v) && !snap.text.is_empty() {
@@ -732,6 +737,24 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     if changed.is_err() {
                         return;
                     }
+                }
+                changed = statuses.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let set = statuses.borrow_and_update().clone();
+                    // A page that does not show Minecraft mode is sent none, and one that
+                    // starts to is sent every host's latest.
+                    if !wants.load(Ordering::Relaxed) {
+                        status_sent = 0;
+                        continue;
+                    }
+                    for text in set.newer(status_sent, std::time::Instant::now()) {
+                        if sink.send(Message::Text(text.to_string().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    status_sent = set.seq;
                 }
             }
         }
@@ -847,7 +870,8 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                 }
             }
             // An unverified connection is not a viewer, so it is neither active nor hidden.
-            Ok(ClientMsg::Visibility { visible }) => {
+            Ok(ClientMsg::Visibility { visible, minecraft }) => {
+                wants_minecraft.store(minecraft, Ordering::Relaxed);
                 if !verified.load(Ordering::SeqCst) {
                     visible_before_join = Some(visible);
                 } else {
@@ -922,7 +946,7 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                     Some(unrecorded_refusal(id, "verify first"))
                 } else if admitted.lock().unwrap().late() && LATE_REFUSED.contains(&name.as_str()) {
                     Some(unrecorded_refusal(id, LATE_CLAIM))
-                } else if name == "word" {
+                } else if name == "word" || name == "renders_overlay" {
                     let admitted = {
                         let mut w = words.lock().unwrap();
                         if w.contains(&id) {
@@ -947,8 +971,16 @@ async fn viewer(socket: WebSocket, app: App, who: Client, page: Page) {
                             let words = words.clone();
                             tasks.retain(|t| !t.is_finished());
                             tasks.push(tokio::spawn(async move {
-                                let r =
-                                    word(&app, &viewer, &client, id.clone(), args, &checking).await;
+                                let r = word(
+                                    &app,
+                                    &viewer,
+                                    &client,
+                                    id.clone(),
+                                    &name,
+                                    args,
+                                    &checking,
+                                )
+                                .await;
                                 words.lock().unwrap().remove(&id);
                                 if let Some(r) = r {
                                     let _ = direct.try_send(r);
@@ -1128,21 +1160,31 @@ async fn tell_claim(
     }
 }
 
-/// A `word` intent: its first receipt if the id is known; otherwise the pre-checks, then
-/// the text check of the whole sky, then the event with the verdict. Returns the receipt
-/// to send, or `None` when another task already holds this id (that task sends it).
+/// A `word` intent, or pages mode's `renders_overlay` (`name`): its first receipt if the id
+/// is known; otherwise the pre-checks, then the text check (a word with the whole sky, an
+/// overlay alone), then the event with the verdict. Returns the receipt to send, or `None`
+/// when another task already holds this id (that task sends it).
 async fn word(
     app: &App,
     viewer: &str,
     client: &str,
     id: String,
+    name: &str,
     args: serde_json::Value,
     checking: &Mutex<Option<String>>,
 ) -> Option<ServerMsg> {
     if let Some(r) = app.handle.receipt(&id).await {
         return Some(ServerMsg::receipt(&r));
     }
-    let check = if app.handle.precheck_word(client, &args).await.is_some() {
+    // Pages mode's overlay text is checked alone: it is drawn on web pages, not beside the
+    // words in the sky.
+    let overlay = name == "renders_overlay";
+    let check = if app
+        .handle
+        .precheck_word(client, name, &args)
+        .await
+        .is_some()
+    {
         // `apply` refuses it for the same reason without a check.
         None
     } else {
@@ -1160,16 +1202,29 @@ async fn word(
         if busy {
             Some(TextCheck {
                 verdict: "error".into(),
-                reason: "another word from this viewer is being checked".into(),
-                sky: app.handle.sky().await,
+                reason: "another text from this viewer is being checked".into(),
+                // An overlay is checked alone; the sky is a word's context.
+                sky: if overlay {
+                    Vec::new()
+                } else {
+                    app.handle.sky().await
+                },
             })
         } else {
             let text = args
                 .get("text")
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
-            let normalised = fleet_core::event::normalise_word(text).unwrap_or_default();
-            let sky = app.handle.sky().await;
+            let normalised = if overlay {
+                fleet_core::renders::normalise_overlay(text).unwrap_or_default()
+            } else {
+                fleet_core::event::normalise_word(text).unwrap_or_default()
+            };
+            let sky = if overlay {
+                Vec::new()
+            } else {
+                app.handle.sky().await
+            };
             let verdict = check_text(app.cfg.checker.as_ref(), &sky, &normalised).await;
             *checking.lock().unwrap() = None;
             // A check that cannot run degrades the coordinator until one runs again. One held
@@ -1192,7 +1247,7 @@ async fn word(
             viewer: viewer.to_string(),
             client: Some(client.to_string()),
             id,
-            name: "word".into(),
+            name: name.into(),
             args,
             check,
             secret: None,

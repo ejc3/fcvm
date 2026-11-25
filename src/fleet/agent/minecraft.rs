@@ -66,6 +66,9 @@ pub struct MinecraftCfg {
     pub ready_deadline: Duration,
     pub snapshot_deadline: Duration,
     pub poll: Duration,
+    /// How long one `/health` attempt of a restore's wait may wait for its answer
+    /// ([`UP_PROBE_TIMEOUT`]; a test sets it far above its own bound).
+    pub up_attempt: Duration,
     /// Polls in a row the gold server must be ready at 20 ticks a second.
     pub steady: u32,
 }
@@ -262,6 +265,18 @@ pub async fn sweep_fork_snapshots(dir: &Path) {
     }
 }
 
+/// How long a server's `snapshot create` waits for that server's own restore to be recorded
+/// as acknowledged (`--await-restore`). A server is up when its bots have a chunk, which its
+/// guest can serve a few milliseconds before `snapshot run` has the acknowledgement, and a
+/// fork asked for in between is refused without the wait.
+const RESTORE_ACKNOWLEDGEMENT_WAIT_SECS: u64 = 10;
+
+/// Why a server that asked for a copy of `slot` restores the gold snapshot when `slot` has
+/// no running server on this host.
+fn source_not_running(slot: &str) -> String {
+    format!("{slot} does not run on this host")
+}
+
 /// `fcvm snapshot create` of a running server; `stop` for the gold VM only.
 pub fn snapshot_argv(pid: u32, tag: &str, stop: bool) -> Vec<String> {
     let mut a = s(&[
@@ -271,6 +286,8 @@ pub fn snapshot_argv(pid: u32, tag: &str, stop: bool) -> Vec<String> {
         &pid.to_string(),
         "--tag",
         tag,
+        "--await-restore",
+        &RESTORE_ACKNOWLEDGEMENT_WAIT_SECS.to_string(),
     ]);
     if stop {
         a.push("--stop".into());
@@ -295,6 +312,9 @@ pub struct Health {
     pub tile: String,
     #[serde(default)]
     pub bots: Option<BotCount>,
+    /// Players on the server, the bots among them.
+    #[serde(default)]
+    pub players: Option<u64>,
 }
 
 /// A tile's bots: connected, and how many it runs.
@@ -365,6 +385,172 @@ pub enum GoldState {
 /// The running servers' fcvm pids and addresses, by index: what a fork snapshots.
 type Running = Arc<Mutex<HashMap<u32, (u32, Place)>>>;
 
+/// What each server (by its place on the host) last reported, for the host's status rows.
+type Board = Arc<Mutex<BTreeMap<u32, Seen>>>;
+
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Seen {
+    phase: String,
+    /// When this launch's bots got their first chunk (Unix ms), with `running`.
+    first_chunk_at: Option<u64>,
+    /// The launch's time to that chunk (`first_chunk_ms`).
+    launch_ms: Option<u64>,
+}
+
+/// How often the host reads its servers for the status rows (`MinecraftStatus`).
+const STATUS_EVERY: Duration = Duration::from_millis(fleet_core::minecraft::STATUS_EVERY_MS);
+/// How many tiles are asked at once, and how long one may take: a tile that does not answer in
+/// time has no tick rate in that second's row.
+const STATUS_PARALLEL: usize = 64;
+const STATUS_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// The host's CPU times from `/proc/stat`'s first line: (busy, total), in ticks.
+fn cpu_times(stat: &str) -> Option<(u64, u64)> {
+    let mut f = stat.lines().next()?.split_ascii_whitespace();
+    if f.next()? != "cpu" {
+        return None;
+    }
+    let v: Vec<u64> = f.take(8).filter_map(|x| x.parse().ok()).collect();
+    if v.len() < 5 {
+        return None;
+    }
+    let total: u64 = v.iter().sum();
+    // idle and iowait are the time nothing ran
+    Some((total - v[3] - v[4], total))
+}
+
+/// `MemTotal` and what is in use (`MemTotal` less `MemAvailable`) from `/proc/meminfo`, in MiB.
+fn mem_mib(meminfo: &str) -> Option<(u64, u64)> {
+    let kb = |key: &str| {
+        meminfo.lines().find_map(|l| {
+            l.strip_prefix(key)?
+                .split_ascii_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+    };
+    let (total, available) = (kb("MemTotal:")?, kb("MemAvailable:")?);
+    Some((total / 1024, total.saturating_sub(available) / 1024))
+}
+
+/// One second's status rows: a row per place, from what each server last reported and what
+/// its tile answered (only a running one is asked).
+fn status_rows(
+    places: usize,
+    seen: &BTreeMap<u32, Seen>,
+    healths: &[Option<Health>],
+    now: u64,
+) -> Vec<u8> {
+    let mut rows = Vec::with_capacity(places * fleet_core::minecraft::STATUS_ROW_BYTES);
+    for i in 0..places {
+        let s = seen.get(&(i as u32));
+        let h = healths.get(i).and_then(Option::as_ref);
+        let running = s.is_some_and(|s| s.phase == "running");
+        rows.extend(fleet_core::minecraft::status_row(
+            s.map_or("", |s| s.phase.as_str()),
+            h.and_then(|h| h.tps),
+            h.and_then(|h| h.players.or(h.bots.as_ref().map(|b| b.online))),
+            s.filter(|_| running)
+                .and_then(|s| s.first_chunk_at)
+                .map(|t| now.saturating_sub(t) / 1000),
+            s.and_then(|s| s.launch_ms),
+        ));
+    }
+    rows
+}
+
+/// Read every server once a second and send the host's status rows. The coordinator passes
+/// them to the pages that show Minecraft mode; nothing else depends on them.
+async fn status_loop(
+    places: Vec<Place>,
+    board: Board,
+    out: mpsc::UnboundedSender<AgentMsg>,
+    http: reqwest::Client,
+    stop: watch::Receiver<bool>,
+) {
+    use futures_util::StreamExt;
+    let mut tick = tokio::time::interval(STATUS_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let read_cpu = || {
+        std::fs::read_to_string("/proc/stat")
+            .ok()
+            .as_deref()
+            .and_then(cpu_times)
+    };
+    let mut cpu = read_cpu();
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .ok();
+    // Whether the last report named a server: when the board then empties, one more report
+    // says so (every row "not reported"), and after that the host is silent.
+    let mut reporting = false;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = stopping(stop.clone()) => return,
+        }
+        let seen = board.lock().unwrap().clone();
+        if seen.is_empty() && !reporting {
+            continue;
+        }
+        reporting = !seen.is_empty();
+        let mut asks = Vec::with_capacity(places.len());
+        for (i, place) in places.iter().enumerate() {
+            let running = seen.get(&(i as u32)).is_some_and(|s| s.phase == "running");
+            let (http, place) = (http.clone(), *place);
+            asks.push(async move {
+                if running {
+                    health_within(&http, &place, STATUS_TIMEOUT).await
+                } else {
+                    None
+                }
+            });
+        }
+        let healths: Vec<Option<Health>> = futures_util::stream::iter(asks)
+            .buffered(STATUS_PARALLEL)
+            .collect()
+            .await;
+        let now = unix_ms();
+        let next = read_cpu();
+        let busy = match (cpu, next, cpus) {
+            (Some((b0, t0)), Some((b1, t1)), Some(n)) if t1 > t0 => Some(
+                ((b1.saturating_sub(b0)) as f64 / (t1 - t0) as f64 * n as f64 * 10.0).round()
+                    / 10.0,
+            ),
+            _ => None,
+        };
+        cpu = next;
+        let mem = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(mem_mib);
+        let status = fleet_core::minecraft::MinecraftStatus {
+            t: now,
+            rows: fleet_core::minecraft::base64(&status_rows(places.len(), &seen, &healths, now)),
+            cpus,
+            busy,
+            mem_total_mib: mem.map(|m| m.0),
+            mem_used_mib: mem.map(|m| m.1),
+        };
+        let report = fleet_core::protocol::HealthReport {
+            id: fleet_core::minecraft::STATUS_ID.to_string(),
+            fps: 0.0,
+            gpu: serde_json::Value::Null,
+            budget_fit: None,
+            t: None,
+            render_ms_max: None,
+            budget_every_pixel: None,
+            boot_id: None,
+            minecraft: Some(status),
+            vm_stats: None,
+        };
+        if out.send(AgentMsg::Health(report)).is_err() {
+            return;
+        }
+    }
+}
+
 struct Handle {
     index: u32,
     desired: watch::Sender<Desired>,
@@ -383,10 +569,12 @@ pub struct Minecraft {
     gold: watch::Receiver<GoldState>,
     scene: watch::Receiver<Option<SharedScene>>,
     running: Running,
+    board: Board,
     servers: BTreeMap<String, Handle>,
     retired: Vec<(u32, JoinHandle<()>)>,
     stop: watch::Sender<bool>,
     flow: JoinHandle<()>,
+    status: JoinHandle<()>,
 }
 
 async fn stopping(mut stop: watch::Receiver<bool>) {
@@ -442,6 +630,14 @@ impl Minecraft {
                 }
             })
         };
+        let board = Board::default();
+        let status = tokio::spawn(status_loop(
+            places.clone(),
+            board.clone(),
+            out.clone(),
+            http.clone(),
+            stop.subscribe(),
+        ));
         Minecraft {
             cfg,
             agent,
@@ -453,10 +649,12 @@ impl Minecraft {
             gold,
             scene,
             running: Arc::default(),
+            board,
             servers: BTreeMap::new(),
             retired: Vec::new(),
             stop,
             flow,
+            status,
         }
     }
 
@@ -475,6 +673,7 @@ impl Minecraft {
             .collect();
         for id in gone {
             let h = self.servers.remove(&id).unwrap();
+            self.board.lock().unwrap().remove(&h.index);
             drop(h.desired);
             self.retired.push((h.index, h.task));
         }
@@ -515,6 +714,7 @@ impl Minecraft {
                 http: self.http.clone(),
                 scene: self.scene.clone(),
                 running: self.running.clone(),
+                board: self.board.clone(),
             };
             let (before, kept) = std::mem::take(&mut self.retired)
                 .into_iter()
@@ -536,6 +736,7 @@ impl Minecraft {
     /// Stop every server and the gold flow, and wait until each VM has exited.
     pub async fn stop(mut self) {
         self.stop.send_replace(true);
+        self.status.abort();
         for (_, h) in std::mem::take(&mut self.servers) {
             drop(h.desired);
             self.retired.push((h.index, h.task));
@@ -569,12 +770,30 @@ async fn health(http: &reqwest::Client, place: &Place) -> Option<Health> {
     health_within(http, place, Duration::from_secs(2)).await
 }
 
-/// How long one `/health` attempt of a restore's wait may take. The wait's first attempts go
-/// out while the clone is still being restored, and a SYN sent then is lost (nothing reads the
-/// tap yet): with the 2 s of [`health`], every restore waited out that attempt and was timed at
-/// 2.0 s whatever it took. A short attempt, retried every poll, sees the tile as soon as it
-/// answers.
+/// How long a `/health` attempt of a restore's wait that has reached the tile may wait for
+/// its answer, and the longest its connect may take once the wait has run past its first
+/// second (see [`super::probe`]).
 pub const UP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How long the connect of one `/health` attempt may take in the first second of a restore's
+/// wait. The first attempts go out while the clone is still being restored, and a SYN sent
+/// then is lost (nothing reads the tap yet): each such connect is over within this, and the
+/// next is already on its way.
+pub const UP_PROBE_FAST_CONNECT: Duration = Duration::from_millis(30);
+
+/// One `/health` attempt of a restore's wait: the connect first, on its own, because the
+/// HTTP client does not say when its connect completes, then the request.
+async fn probe_health(
+    http: &reqwest::Client,
+    place: &Place,
+    budget: super::probe::Budget,
+    connected: super::probe::Connected,
+) -> Option<Health> {
+    if !super::probe::reach(place.http, budget, &connected).await {
+        return None;
+    }
+    health_within(http, place, budget.answer).await
+}
 
 async fn health_within(http: &reqwest::Client, place: &Place, timeout: Duration) -> Option<Health> {
     let url = format!("http://{}/health", place.http);
@@ -722,6 +941,7 @@ struct Server {
     http: reqwest::Client,
     scene: watch::Receiver<Option<SharedScene>>,
     running: Running,
+    board: Board,
 }
 
 struct Live {
@@ -749,6 +969,14 @@ impl Server {
         retry_in: Option<Duration>,
         first_chunk_at: Option<u64>,
     ) {
+        self.board.lock().unwrap().insert(
+            self.index,
+            Seen {
+                phase: phase.to_string(),
+                first_chunk_at,
+                launch_ms: timings.get("first_chunk_ms").copied(),
+            },
+        );
         let (ipv4, v4_port) = self.place.v4_path(self.agent.public_ipv4.as_deref());
         let _ = self.out.send(AgentMsg::Slot(SlotReport {
             id: self.id.clone(),
@@ -818,12 +1046,19 @@ impl Server {
     async fn wait_up(&self, vm: &mut Vm) -> std::result::Result<(), String> {
         let until = tokio::time::sleep(self.cfg.ready_deadline);
         tokio::pin!(until);
-        let mut tick = tokio::time::interval(self.cfg.poll);
+        let pace = super::probe::Pace {
+            every: self.cfg.poll,
+            fast_connect: UP_PROBE_FAST_CONNECT,
+            answer: self.cfg.up_attempt,
+        };
+        // Answers are read in the order their attempts were sent, so `last` is the newest.
+        let mut probes = super::probe::Probes::new(pace, |budget, connected| {
+            probe_health(&self.http, &self.place, budget, connected)
+        });
         let mut last = None;
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    let h = health_within(&self.http, &self.place, UP_PROBE_TIMEOUT).await;
+                h = probes.next() => {
                     if h.as_ref().is_some_and(Health::up) {
                         return Ok(());
                     }
@@ -838,15 +1073,24 @@ impl Server {
     /// Stop what runs and start `want`: a fork of another server when it asks for one and that
     /// server runs, else the gold snapshot.
     /// Stop what runs and start `want`: a copy of another server when it asks for a fork,
-    /// `fork_ok` holds (no copy of this generation failed yet) and that server runs here, else
-    /// the gold snapshot.
+    /// no copy of this generation failed yet and that server runs here, else the gold
+    /// snapshot.
+    ///
+    /// `no_copy` is why this generation gets no copy any more, when an earlier attempt
+    /// settled that (the copy failed, or its source did not run here): the server then
+    /// restores from the gold snapshot. Every gold restore that stands in for a copy says
+    /// so in its reports, with the reason, so a tile that shows the gold world where a copy
+    /// was asked for says why in its state. `copying` is set when this attempt is a copy,
+    /// so the caller can tell a failed copy from a failed gold restore.
     async fn relaunch(
         &self,
         live: &mut Option<Live>,
         gold: &str,
         want: &Desired,
-        fork_ok: bool,
+        no_copy: Option<&str>,
+        copying: &mut bool,
     ) -> std::result::Result<Live, String> {
+        let fork_ok = no_copy.is_none();
         let generation = want.generation;
         let t0 = Instant::now();
         let mut timings = BTreeMap::new();
@@ -862,6 +1106,18 @@ impl Server {
                     .copied()
                     .map(|(pid, place)| (f.clone(), pid, place))
             });
+        *copying = source.is_some();
+        // What the reports of a gold restore that stands in for a copy carry.
+        let instead_of_copy = match &want.fork {
+            Some(f) if source.is_none() && f.index != self.index => Some(format!(
+                "restored from the gold snapshot, not copied from {}: {}",
+                f.slot,
+                no_copy
+                    .map(str::to_string)
+                    .unwrap_or_else(|| source_not_running(&f.slot))
+            )),
+            _ => None,
+        };
         // Dropped on every way out of this function: the copy's snapshot is removed.
         let mut fork_snapshot = None;
         let tag = match source {
@@ -893,7 +1149,14 @@ impl Server {
                 if want.fork.is_some() {
                     tracing::warn!(target: "fcvm::fleet::minecraft", server = %self.id, fork_ok, "no copy of the fork's source this time; restoring from the gold snapshot");
                 }
-                self.report("restoring", generation, BTreeMap::new(), None, None, None);
+                self.report(
+                    "restoring",
+                    generation,
+                    BTreeMap::new(),
+                    instead_of_copy.clone(),
+                    None,
+                    None,
+                );
                 gold.to_string()
             }
         };
@@ -974,7 +1237,7 @@ impl Server {
             "running",
             generation,
             timings,
-            None,
+            instead_of_copy,
             None,
             Some(first_chunk_at),
         );
@@ -1007,9 +1270,13 @@ async fn supervise(
             let _ = old.await;
         }
     }
+    // A task this one replaces may have reported after `assign` took its entry away (or been
+    // aborted above): nothing of it is on the board when this server starts its own reports.
+    ctx.board.lock().unwrap().remove(&ctx.index);
     let mut live: Option<Live> = None;
     // The generation whose fork failed once: its next attempt restores the gold snapshot.
-    let mut fork_failed: Option<u64> = None;
+    // With why it gets no copy.
+    let mut fork_failed: Option<(u64, String)> = None;
     let mut backoff = ctx.agent.backoff_min;
     let mut retry_after: Option<Duration> = None;
     let mut health_tick = tokio::time::interval(ctx.agent.health_interval);
@@ -1048,8 +1315,14 @@ async fn supervise(
                 }
             }
             let want = desired.borrow_and_update().clone();
+            let no_copy = fork_failed
+                .as_ref()
+                .filter(|(generation, _)| *generation == want.generation)
+                .map(|(_, why)| why.as_str());
+            let settled_before = no_copy.is_some();
+            let mut copying = false;
             let r = tokio::select! {
-                r = ctx.relaunch(&mut live, &tag, &want, fork_failed != Some(want.generation)) => Some(r),
+                r = ctx.relaunch(&mut live, &tag, &want, no_copy, &mut copying) => Some(r),
                 _ = removed(&mut desired) => None,
             };
             match r {
@@ -1057,8 +1330,16 @@ async fn supervise(
                 Some(Ok(l)) => live = Some(l),
                 Some(Err(e)) => {
                     tracing::warn!(target: "fcvm::fleet::minecraft", server = %ctx.id, generation = want.generation, error = %e, "relaunch failed");
-                    if want.fork.is_some() {
-                        fork_failed = Some(want.generation);
+                    // One failed attempt settles that this generation gets no copy. The
+                    // reason kept is why there is no copy: the copy's own failure, or that
+                    // its source did not run here. A gold restore's failure is neither.
+                    if let (Some(f), false) = (&want.fork, settled_before) {
+                        let why = if copying {
+                            e.clone()
+                        } else {
+                            source_not_running(&f.slot)
+                        };
+                        fork_failed = Some((want.generation, why));
                     }
                     let delay = backoff;
                     backoff = (backoff * 2).min(ctx.agent.backoff_max);
@@ -1130,6 +1411,97 @@ async fn supervise(
     if let Some(mut l) = live.take() {
         ctx.stop(&mut l).await;
     }
+    // No longer supervised: a launch that was in flight when `assign` took the entry away
+    // reported after it, and the status rows must say nothing of a server that is gone. A
+    // replacement at this index reports only after this task has ended.
+    ctx.board.lock().unwrap().remove(&ctx.index);
+}
+
+/// The kernel's hard limits on neighbour entries, IPv6 and IPv4: one table of each for every
+/// network namespace on the host. At a limit the kernel drops packets ("neighbour: ndisc_cache:
+/// neighbor table overflow!"). The files exist only in the host's initial network namespace.
+pub const NEIGH_LIMIT: &str = "/proc/sys/net/ipv6/neigh/default/gc_thresh3";
+pub const NEIGH_LIMIT_V4: &str = "/proc/sys/net/ipv4/neigh/default/gc_thresh3";
+/// Neighbour entries a limit must leave room for, for each Minecraft VM (a server, or the gold
+/// VM they are restored from). Routed Minecraft servers held 16.2 to 16.6 IPv6 entries and 2.0
+/// IPv4 entries a server, counted by the kernel over every namespace (docs/fleet/minecraft.md,
+/// "What the host needs for hundreds of servers"; the records are under
+/// fleet/minecraft/bench/results/2026-11-24-neighbour-entries-c8g-metal-48xl/).
+pub const NEIGH_PER_VM: u64 = 24;
+pub const NEIGH_PER_VM_V4: u64 = 4;
+/// And for the host itself, whatever it runs: an idle host held 25 IPv6 entries and 4 IPv4
+/// ones in those records.
+pub const NEIGH_HOST: u64 = 64;
+// The allowances stay above what 512 servers were counted holding: 8,513 and 1,026 entries.
+const _: () = assert!(512 * NEIGH_PER_VM > 8513 && 512 * NEIGH_PER_VM_V4 > 1026);
+
+/// A neighbour limit's text. It can be read only in the host's initial network namespace: in
+/// any other the kernel shows no `neigh/default/gc_thresh3` at all.
+pub fn read_neighbour_limit(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading {}, the host's neighbour limit, which --minecraft checks. The kernel shows \
+             it only in the host's initial network namespace: run the agent there",
+            path.display()
+        )
+    })
+}
+
+/// Refuse a Minecraft fleet the host's neighbour tables have no room for: `servers` servers and
+/// their gold VM, at [`NEIGH_PER_VM`] IPv6 and [`NEIGH_PER_VM_V4`] IPv4 entries each, and
+/// [`NEIGH_HOST`] for the host. `limit` and `limit_v4` are [`NEIGH_LIMIT`]'s and
+/// [`NEIGH_LIMIT_V4`]'s text. At the kernel's default of 1024 IPv6 entries, 512 servers did
+/// not all start (docs/fleet/minecraft.md, "Many servers on one host").
+///
+/// Only the Minecraft fleet's own need refuses. The host's `other_vms` (wall tiles, phones,
+/// potato players, Windows sandboxes) refuse nothing: a routed VM that stays up was counted
+/// holding less than a Minecraft server (15.2 IPv6 and 2.0 IPv4 entries), a potato ring's
+/// entries rise with its wakes and not with its players, and phones and sandboxes were not
+/// counted (docs/fleet/minecraft.md, "What the host needs for hundreds of servers"). If each of
+/// them held what a Minecraft server is allowed and a table would then be over its limit, a
+/// warning says so, and the agent starts. The warnings are returned for the caller to log.
+pub fn check_neighbour_room(
+    servers: u32,
+    other_vms: u32,
+    limit: &str,
+    limit_v4: &str,
+) -> Result<Vec<String>> {
+    let own = u64::from(servers) + 1;
+    let mut warnings = Vec::new();
+    for (family, key, path, per, text) in [
+        ("IPv6", "net.ipv6", NEIGH_LIMIT, NEIGH_PER_VM, limit),
+        (
+            "IPv4",
+            "net.ipv4",
+            NEIGH_LIMIT_V4,
+            NEIGH_PER_VM_V4,
+            limit_v4,
+        ),
+    ] {
+        let limit: u64 = text
+            .trim()
+            .parse()
+            .with_context(|| format!("{path} holds {text:?}, not a number"))?;
+        let need = own * per + NEIGH_HOST;
+        anyhow::ensure!(
+            limit >= need,
+            "--minecraft {servers} needs room for {need} {family} neighbour entries ({per} for \
+             each server and their gold VM, {NEIGH_HOST} for the host) and the host's limit is \
+             {limit}. Set {key}.neigh.default.gc_thresh3 to {need} or more, with gc_thresh2 and \
+             gc_thresh1 no higher than it (in /etc/sysctl.d/ to keep them)"
+        );
+        let with_others = need + u64::from(other_vms) * per;
+        if with_others > limit {
+            warnings.push(format!(
+                "this host may run {other_vms} other VMs beside its {servers} Minecraft servers. \
+                 At a Minecraft server's {per} {family} neighbour entries each the table would \
+                 need {with_others} and the limit ({key}.neigh.default.gc_thresh3) is {limit}. \
+                 A potato ring's entries rise with its wakes and can pass that. Watch the kernel \
+                 log for \"neighbor table overflow\""
+            ));
+        }
+    }
+    Ok(warnings)
 }
 
 /// The image's id and the servers' name from its labels (`podman image inspect`).
@@ -1190,6 +1562,93 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_minecraft_fleet_is_refused_when_a_neighbour_table_has_no_room_for_it() {
+        let quiet = |r: Result<Vec<String>>| r.unwrap().is_empty();
+        // The kernel's default limits hold today's fleets and not hundreds of servers.
+        assert!(quiet(check_neighbour_room(4, 0, "1024\n", "1024\n")));
+        let err = check_neighbour_room(512, 9, "1024\n", "16384\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "--minecraft 512 needs room for 12376 IPv6 neighbour entries (24 for each \
+                 server and their gold VM, 64 for the host) and the host's limit is 1024"
+            ) && err.contains("net.ipv6.neigh.default.gc_thresh3 to 12376 or more"),
+            "{err}"
+        );
+        // The value the message names is one the check then takes: it does not send an operator
+        // to a limit that is still too low.
+        assert!(quiet(check_neighbour_room(512, 0, "12376", "16384")));
+        assert!(check_neighbour_room(512, 0, "12375", "16384").is_err());
+        // It is above what 512 servers were counted holding (8,513 IPv6 entries), which the
+        // limit this check once passed (4,096) was not.
+        assert!(check_neighbour_room(512, 0, "4096", "16384").is_err());
+        assert!(check_neighbour_room(512, 0, "8513", "16384").is_err());
+        // The IPv4 table is counted too: 512 servers held 1,026 entries, over the kernel's 1024.
+        let v4 = check_neighbour_room(512, 0, "32768", "1024")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            v4.contains("needs room for 2116 IPv4 neighbour entries (4 for each")
+                && v4.contains("net.ipv4.neigh.default.gc_thresh3 to 2116 or more"),
+            "{v4}"
+        );
+        // the fleet host image's limits (fleet/ami/host/build.sh) hold 512 servers and more
+        assert!(quiet(check_neighbour_room(512, 64, "32768\n", "32768\n")));
+        assert!(quiet(check_neighbour_room(1300, 0, "32768", "32768")));
+        assert!(check_neighbour_room(1400, 0, "32768", "32768").is_err());
+        // a limit that is not a number is not room
+        assert!(check_neighbour_room(8, 0, "", "16384").is_err());
+        assert!(check_neighbour_room(8, 0, "16384", "x").is_err());
+    }
+
+    /// Only the Minecraft fleet's own need refuses. A host with 4 servers beside 64 potato
+    /// players on the kernel's limits must still start its agent, with a warning.
+    #[test]
+    fn the_hosts_other_vms_are_warned_about_and_refuse_nothing() {
+        let warnings = check_neighbour_room(4, 64, "1024", "1024").unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("64 other VMs beside its 4 Minecraft servers")
+                && warnings[0].contains("IPv6")
+                && warnings[0].contains("the table would need 1720")
+                && warnings[0].contains("is 1024")
+                && warnings[0].contains("A potato ring's entries rise with its wakes"),
+            "{warnings:?}"
+        );
+        // however many: a warning for each table it could fill, never a refusal
+        let many = check_neighbour_room(4, 1000, "1024", "1024").unwrap();
+        assert_eq!(many.len(), 2, "{many:?}");
+        assert!(many[1].contains("IPv4"), "{many:?}");
+        // and none when the estimate fits
+        assert!(check_neighbour_room(4, 30, "1024", "1024")
+            .unwrap()
+            .is_empty());
+        assert!(check_neighbour_room(4, 64, "32768", "32768")
+            .unwrap()
+            .is_empty());
+        // the Minecraft fleet's own need still refuses, whatever else runs
+        assert!(check_neighbour_room(64, 0, "1024", "1024").is_err());
+    }
+
+    #[test]
+    fn a_neighbour_limit_that_cannot_be_read_says_where_it_can_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = dir.path().join("gc_thresh3");
+        std::fs::write(&there, "16384\n").unwrap();
+        assert_eq!(read_neighbour_limit(&there).unwrap(), "16384\n");
+        // In a network namespace other than the host's first the file does not exist.
+        let err = format!(
+            "{:#}",
+            read_neighbour_limit(&dir.path().join("absent")).unwrap_err()
+        );
+        assert!(
+            err.contains("only in the host's initial network namespace") && err.contains("absent"),
+            "{err}"
+        );
+    }
+
     fn cfg() -> MinecraftCfg {
         MinecraftCfg {
             count: 2,
@@ -1206,6 +1665,7 @@ mod tests {
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
             poll: Duration::from_millis(20),
+            up_attempt: UP_PROBE_TIMEOUT,
             steady: 5,
         }
     }
@@ -1269,9 +1729,13 @@ mod tests {
             Some("--stop")
         );
         // A fork's snapshot never stops the source it copies.
-        assert!(!snapshot_argv(42, "mc-fork-mc-2-5", false)
-            .iter()
-            .any(|a| a == "--stop"));
+        let fork = snapshot_argv(42, "mc-fork-mc-2-5", false);
+        assert!(!fork.iter().any(|a| a == "--stop"));
+        // It waits for a source whose own restore fcvm has not recorded as acknowledged yet.
+        assert!(
+            fork.windows(2).any(|w| w == ["--await-restore", "10"]),
+            "{fork:?}"
+        );
     }
 
     /// The guest ports a `--publish` list names.
@@ -1361,6 +1825,87 @@ mod tests {
             .up(),
             "a tile that names no bots"
         );
+    }
+
+    /// A retired server's task can report after `assign` took its entry off the board (its
+    /// launch's last report and the removal can fall in one poll of its `select!`), and a task
+    /// its replacement aborts never reaches its own end: the status rows would go on calling a
+    /// stopped server running. `supervise` clears the entry at both ends. The interleaving has
+    /// no deterministic runtime test, so the two places are pinned in the source.
+    #[test]
+    fn supervise_clears_its_board_entry_at_both_ends() {
+        let src = include_str!("minecraft.rs");
+        let body = &src[src.find("async fn supervise(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let clear = "ctx.board.lock().unwrap().remove(&ctx.index);";
+        let first = body.find(clear).expect("cleared before its own reports");
+        let last = body.rfind(clear).unwrap();
+        assert!(first < last, "cleared at both ends");
+        // before any report of its own, once the tasks it replaces have ended
+        assert!(body.find("let _ = old.await;").unwrap() < first);
+        assert!(first < body.find("ctx.report(").unwrap());
+        // and last of all, after its VM is stopped
+        assert!(body.rfind("ctx.stop(&mut l).await;").unwrap() < last);
+        assert_eq!(body[last + clear.len()..].trim(), "");
+    }
+
+    #[test]
+    fn the_host_readings_come_from_proc() {
+        let stat = "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 1 2 3 4 5 6 7 8 9 10\n";
+        assert_eq!(cpu_times(stat), Some((150, 1000)));
+        assert_eq!(cpu_times("intr 1 2 3"), None);
+        assert_eq!(cpu_times(""), None);
+        let meminfo =
+            "MemTotal:       395264000 kB\nMemFree:        1000 kB\nMemAvailable:   374784000 kB\n";
+        assert_eq!(mem_mib(meminfo), Some((386000, 20000)));
+        assert_eq!(mem_mib("MemTotal: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn a_status_row_says_only_what_was_read() {
+        let seen: BTreeMap<u32, Seen> = [
+            (
+                0,
+                Seen {
+                    phase: "running".into(),
+                    first_chunk_at: Some(100_000),
+                    launch_ms: Some(412),
+                },
+            ),
+            (
+                1,
+                Seen {
+                    phase: "restoring".into(),
+                    first_chunk_at: None,
+                    launch_ms: None,
+                },
+            ),
+            // running, but its tile did not answer this second
+            (
+                3,
+                Seen {
+                    phase: "running".into(),
+                    first_chunk_at: Some(90_000),
+                    launch_ms: Some(700),
+                },
+            ),
+        ]
+        .into();
+        let answered = Health {
+            ready: true,
+            tps: Some(20.0),
+            players: Some(3),
+            ..Default::default()
+        };
+        let rows = status_rows(4, &seen, &[Some(answered), None, None, None], 225_000);
+        assert_eq!(rows.len(), 4 * fleet_core::minecraft::STATUS_ROW_BYTES);
+        assert_eq!(rows[..8], [3, 200, 3, 0, 125, 0, 156, 1]);
+        // restoring: no tick rate, no players, no age
+        assert_eq!(rows[8..16], [1, 255, 255, 0, 255, 255, 255, 255]);
+        // a place whose server has reported nothing
+        assert_eq!(rows[16..24], [0, 255, 255, 0, 255, 255, 255, 255]);
+        // no answer is no tick rate, not zero; its age and launch time are the agent's own
+        assert_eq!(rows[24..32], [3, 255, 255, 0, 135, 0, 188, 2]);
     }
 
     #[test]

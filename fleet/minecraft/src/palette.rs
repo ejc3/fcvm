@@ -79,6 +79,28 @@ pub fn index(name: &str) -> u8 {
     MATERIALS.iter().position(|m| *m == name).unwrap_or(0) as u8
 }
 
+fn name_of(material: u8) -> &'static str {
+    MATERIALS
+        .get(material as usize)
+        .copied()
+        .unwrap_or("unknown")
+}
+
+/// What stands over the ground without being it: leaves, a plant and water. The map's `ground`
+/// is the highest block of a column that is none of these.
+pub fn is_cover(material: u8) -> bool {
+    matches!(
+        name_of(material),
+        "leaves" | "plant" | "flower" | "crop" | "water"
+    )
+}
+
+/// Where a bot can stand and build: a column whose top block is known and is not water, lava or
+/// a tree's crown.
+pub fn is_land(material: u8) -> bool {
+    !matches!(name_of(material), "unknown" | "water" | "lava" | "leaves")
+}
+
 /// The material of the block named `name` (its registry name, with or without the namespace).
 pub fn material(name: &str) -> u8 {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
@@ -202,6 +224,28 @@ pub fn material(name: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_is_what_the_ground_layer_looks_under_and_land_is_where_a_bot_builds() {
+        for (name, cover, land) in [
+            ("oak_leaves", true, false),
+            ("water", true, false),
+            ("short_grass", true, true),
+            ("poppy", true, true),
+            ("wheat", true, true),
+            ("grass_block", false, true),
+            ("oak_log", false, true),
+            ("stone", false, true),
+            ("red_wool", false, true),
+            ("lava", false, false),
+        ] {
+            let m = material(name);
+            assert_eq!((is_cover(m), is_land(m)), (cover, land), "{name}");
+        }
+        // a column no chunk has given yet
+        assert!(!is_land(0) && !is_cover(0));
+        assert!(!is_land(200));
+    }
 
     #[test]
     fn common_surface_blocks_have_their_own_material() {

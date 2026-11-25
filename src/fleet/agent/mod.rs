@@ -8,6 +8,8 @@ pub mod joinguard;
 pub mod minecraft;
 pub mod ports;
 pub mod potato;
+pub mod probe;
+pub mod renders;
 pub mod ring_cpus;
 pub mod slot;
 pub mod sni;
@@ -56,6 +58,8 @@ pub struct Agent {
     pub windows: Option<windows::WindowsCfg>,
     /// Minecraft mode: the host's Minecraft servers.
     pub minecraft: Option<minecraft::MinecraftCfg>,
+    /// Pages mode: the renders module, run while the coordinator orders it.
+    pub renders: Option<renders::RendersCfg>,
     /// The IPv4 front on 443 (`sni.rs`): every place's IPv4 path is reported on its port.
     pub ipv4_front: Option<Arc<sni::Front>>,
 }
@@ -381,6 +385,21 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ipv6_prefix.is_some(),
             "--minecraft needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)"
         );
+        // Everything else this agent may run shares the host's neighbour tables: a wall tile
+        // for each place, the phones, the potato players and the sandboxes. They refuse
+        // nothing and are only warned about.
+        let other_vms = args.capacity.unwrap_or(gpus.len())
+            + phones.len()
+            + args.potato_players as usize
+            + args.windows as usize;
+        for warning in minecraft::check_neighbour_room(
+            args.minecraft,
+            u32::try_from(other_vms).unwrap_or(u32::MAX),
+            &minecraft::read_neighbour_limit(std::path::Path::new(minecraft::NEIGH_LIMIT))?,
+            &minecraft::read_neighbour_limit(std::path::Path::new(minecraft::NEIGH_LIMIT_V4))?,
+        )? {
+            tracing::warn!(target: "fcvm::fleet::minecraft", "{warning}");
+        }
         let (image_id, server) =
             minecraft::inspect_image(&args.windows_podman, &args.minecraft_image).await?;
         Some(minecraft::MinecraftCfg {
@@ -398,12 +417,36 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
             poll: Duration::from_millis(20),
+            up_attempt: minecraft::UP_PROBE_TIMEOUT,
             steady: 5,
         })
     } else {
         None
     };
+    let renders = if args.renders {
+        let module = crate::fleet::renders::agent_args(&args.renders_args)?;
+        // Only a host that reads its instance id from the metadata service is on EC2.
+        let instance_type = if args.host_from_imds {
+            match crate::fleet::coord::aws::imds("instance-type").await {
+                Ok(t) => Some(t.trim().to_string()),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "cannot read the instance type; pages mode's hello leaves it out");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let host = crate::fleet::renders::this_host(&module, instance_type.as_deref())?;
+        // The module runs this binary, as `fcvm fleet renders-bench` does: its reaper is
+        // `fleet renders-reap` of the same build.
+        let exe = std::env::current_exe().context("locating this fcvm binary")?;
+        Some(renders::RendersCfg::module(module, exe, host))
+    } else {
+        None
+    };
     let agent = Agent {
+        renders,
         ipv4_front,
         minecraft,
         windows,
@@ -625,8 +668,14 @@ where
             .unwrap_or_default(),
         minecraft: agent.minecraft.as_ref().map_or(0, |m| m.count),
         minecraft_server: agent.minecraft.as_ref().and_then(|m| m.server.clone()),
+        renders: agent.renders.as_ref().map(|r| r.host.clone()),
     })
     .ok();
+    let (renders_tx, renders_rx) = watch::channel(None);
+    let renders_task = agent.renders.clone().map(|cfg| {
+        let out = out.clone();
+        tokio::spawn(renders::run(cfg, renders_rx, out))
+    });
     let (potato_tx, potato_rx) = watch::channel(None);
     let potato_task = agent.potato.clone().map(|cfg| {
         let out = out.clone();
@@ -728,6 +777,14 @@ where
             }
             // The dialing connection keeps the replay (dial.rs); nothing to do here.
             CoordMsg::QuarantineStored { .. } => {}
+            CoordMsg::Renders { order } => {
+                if renders_task.is_none() {
+                    tracing::warn!(
+                        "ordered to render pages, but this agent runs no pages mode (--renders)"
+                    );
+                }
+                renders_tx.send_replace(Some(order));
+            }
             CoordMsg::Potato { round } => {
                 potato_tx.send_replace(round);
             }
@@ -827,6 +884,8 @@ where
     // came out of the time the wall's and phones' VMs have to stop in before systemd kills
     // them.
     drop(potato_tx);
+    // The pages module ends at its next step, and its reaper removes what it made.
+    drop(renders_tx);
 
     tracing::info!(
         slots = slots.len(),
@@ -862,11 +921,17 @@ where
             m.stop().await;
         }
     };
+    let pages_stopped = async {
+        if let Some(t) = renders_task {
+            let _ = t.await;
+        }
+    };
     tokio::join!(
         slots_stopped,
         ring_stopped,
         sandboxes_stopped,
-        servers_stopped
+        servers_stopped,
+        pages_stopped
     );
     drop(out);
     let _ = writer.await;

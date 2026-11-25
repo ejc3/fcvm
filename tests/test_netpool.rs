@@ -383,11 +383,21 @@ impl Helper {
         fcvm::utils::install_namespace_pre_exec(
             &mut command,
             &fcvm::utils::NamespaceParams {
-                vm_id: "netpool-test".to_string(),
                 user_namespace_path: Some(lease.user_namespace_path()),
                 net_namespace_path: Some(lease.net_namespace_path()),
                 keep_fds: vec![lease.fd(), lease.tap_fd()],
-                ..Default::default()
+                // An unconfined stand-in VMM, decided as any VMM start is.
+                ..fcvm::utils::NamespaceParams::new(
+                    "netpool-test",
+                    fcvm::confine::resolve(&fcvm::confine::Request {
+                        flag: false,
+                        backend: fcvm::hypervisor::Backend::Firecracker,
+                        network: fcvm::confine::Network::Rootless,
+                        firecracker_args: None,
+                        unsupported: None,
+                    })
+                    .expect("deciding the stand-in VMM's confinement"),
+                )
             },
         )
         .expect("preparing the helper's namespaces");

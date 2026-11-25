@@ -1,0 +1,12 @@
+kernel 7.0.0-1018-aws
+net.ipv4.neigh.default.gc_thresh1 = 128
+net.ipv4.neigh.default.gc_thresh2 = 512
+net.ipv4.neigh.default.gc_thresh3 = 1024
+net.ipv6.neigh.default.gc_thresh1 = 128
+net.ipv6.neigh.default.gc_thresh2 = 512
+net.ipv6.neigh.default.gc_thresh3 = 1024
+2026-11-24T21:59:42Z
+ring: fcvm fleet agent --potato-players 64 --potato-cpus 32, stopped 2026-11-24T22:04:52Z
+from the coordinator's log: 10 rounds started, 1576 "potato player woke" and 1632 "potato player slept" lines
+kernel log: 30 lines "neighbour: arp_cache: neighbor table overflow!" (rate limited), none for ndisc_cache
+forced_gc_runs and table_fulls in neigh.log count from the boot (0 before this run)

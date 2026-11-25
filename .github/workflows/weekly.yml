@@ -82,6 +82,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
+      # Fail on a runner whose kernel is not a host kernel this checkout or main builds: a
+      # stock kernel, or an image older than the last host kernel change (#1563, #2125).
+      - name: Runner kernel check
+        working-directory: fcvm
+        run: ./scripts/check-runner-kernel.py
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
@@ -136,6 +141,7 @@ jobs:
         working-directory: fcvm
         run: make clean-test-data || true
       - name: setup-fcvm
+        id: setup
         working-directory: fcvm
         run: make setup-fcvm
       - name: Run lifecycle chaos fuzz
@@ -144,8 +150,10 @@ jobs:
           FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
           FUSER: ${{ github.workspace }}/fuser
         run: make fuzz SEEDS=20 OPS=25
+      # Runs when the chaos fuzz above failed, and only when setup finished: with
+      # `always()` it also ran after a failed runner kernel check or a failed build.
       - name: Run the fuzz gym's full cross product
-        if: always()
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         working-directory: fcvm
         env:
           FUSE_BACKEND_RS: ${{ github.workspace }}/fuse-backend-rs
@@ -182,6 +190,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
+      # No benchmark numbers from a kernel other than the host kernel this checkout builds:
+      # not a stock kernel, and not the previous build while a new image rolls out.
+      - name: Runner kernel check
+        working-directory: fcvm
+        run: ./scripts/check-runner-kernel.py --current-only
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |

@@ -4,7 +4,7 @@
 # Writes run, reason, code, bench, fleet and web to $GITHUB_OUTPUT.
 #
 # A pull request runs nothing while it is a draft, or while another open PR
-# from this repository is stacked on it (based on its branch): CI runs once, on
+# from this repository that is not a draft is stacked on it (based on its branch): CI runs once, on
 # the top of the stack, whose head holds every lower PR's commits. The top's run
 # classifies the whole stack's diff against the default branch, not only its own
 # files, so a docs-only top PR cannot skip the matrix for code changed lower down.
@@ -63,14 +63,21 @@ fi
 # Open PRs from this repository based on this PR's branch whose head contains this
 # PR's head: their runs test this commit. A child that does not contain it yet (a fix
 # pushed here before the child was rebased) defers nothing, or the commit would go
-# untested. A failed lookup counts as no child, so this PR runs.
+# untested. Nor does a draft child: a draft runs nothing (above), so deferring to one
+# left this PR with every job skipped and a green `Summary (deferred)`. A child whose
+# draft state is not the literal `false` counts as a draft. A failed lookup counts as
+# no child, so this PR runs.
 if [ "$stackable" = false ]; then
   echo "head branch is in $HEAD_REPO, not $REPO: not part of a stack here"
 elif children=$("$GH" api --paginate "repos/$REPO/pulls?state=open&base=$HEAD_REF&per_page=100" \
-    --jq ".[] | select(.head.repo.full_name == \"$REPO\") | \"\(.number) \(.head.sha)\""); then
+    --jq ".[] | select(.head.repo.full_name == \"$REPO\") | \"\(.number) \(.head.sha) \(.draft)\""); then
   covering=""
-  while read -r number sha; do
+  while read -r number sha child_draft; do
     [[ "$number" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    if [ "$child_draft" != "false" ]; then
+      echo "#$number is stacked here but is a draft, which runs no CI"
+      continue
+    fi
     status=$("$GH" api "repos/$REPO/compare/$HEAD_SHA...$sha" --jq '.status' 2>/dev/null) || status=""
     if [ "$status" = "ahead" ] || [ "$status" = "identical" ]; then
       covering="$covering${covering:+ }$number"
@@ -168,13 +175,18 @@ while IFS= read -r f; do
     # is not built, read or run by anything the VM matrix executes, so
     # the matrix can say nothing about it. It runs fleet-renderer, the
     # renderer's host tests; fleet/web runs fleet-web instead.
-    fleet/core/*) code=true; echo "code path: $f" ;;
+    # fleet/web's tests read fleet/core/tests/vectors/** and the coordinator's view in
+    # fleet/core/src/** (the fixture core/test/fixtures/coordinator.json is generated from
+    # them, and the mock's shape test compares against it), so a change there runs fleet-web.
+    fleet/core/*) code=true; web=true; echo "code path (fleet web reads it): $f" ;;
     # fleet/potato is a workspace member too (the potato player); lint formats it.
     fleet/potato/*) code=true; echo "code path: $f" ;;
     # The fleet web page is TypeScript with its own suite (fleet-web);
     # the VM matrix does not build or run it. Like bench/, it precedes
     # the docs arm so its README still routes to its check.
     fleet/web/*) web=true; echo "fleet web path: $f" ;;
+    # The mock's shape test reads fleet/PROTOCOL.md's example.
+    fleet/PROTOCOL.md) web=true; fleet=true; echo "fleet web reads it: $f" ;;
     fleet/*|.github/workflows/fleet-coordinator-deploy.yml) fleet=true; echo "fleet path, no matrix: $f" ;;
     # This file holds the fleet-renderer and fleet-web jobs, so a change here runs them too.
     .github/workflows/ci.yml) code=true; web=true; fleet=true; echo "ci workflow: $f" ;;

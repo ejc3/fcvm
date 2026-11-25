@@ -124,6 +124,19 @@ vm.unprivileged_userfaultfd=1
 # kernel forwards IPv6 only with this set. systemd-networkd handles the uplink's router
 # advertisements itself (the kernel's accept_ra is 0 there), so its default route stays.
 net.ipv6.conf.all.forwarding=1
+# The kernel keeps one IPv6 and one IPv4 neighbour table for every network namespace on the
+# host, and every routed VM adds to both: 512 Minecraft servers held 8,513 IPv6 entries and
+# 1,026 IPv4 ones (docs/fleet/minecraft.md, "What the host needs for hundreds of servers"). At
+# gc_thresh3 the kernel drops packets ("neighbor table overflow"); its defaults are 128, 512
+# and 1024. The agent refuses a Minecraft fleet these limits have no room for, at 24 IPv6 and
+# 4 IPv4 entries a server (src/fleet/agent/minecraft.rs): 32768 holds about 1,300 of them.
+# This image carries that agent too (the fcvm installed below), so a host gets both at once.
+net.ipv6.neigh.default.gc_thresh1=8192
+net.ipv6.neigh.default.gc_thresh2=28672
+net.ipv6.neigh.default.gc_thresh3=32768
+net.ipv4.neigh.default.gc_thresh1=8192
+net.ipv4.neigh.default.gc_thresh2=28672
+net.ipv4.neigh.default.gc_thresh3=32768
 X
   # -e: fcvm's host kernel, which a revised image already boots, has neither Ubuntu's
   # apparmor key nor Debian's userns_clone key; both only open user namespaces, checked here.
@@ -169,7 +182,7 @@ X
   mapfile -t unused < <(systemctl list-unit-files --no-legend --plain "${unused[@]}" | awk '{print $1}')
   [ "${#unused[@]}" = 0 ] || systemctl disable "${unused[@]}"
   # The host runs fcvm's host kernel ([kernel_profiles.nested.amd64.host_kernel]: the pinned
-  # release with kernel/patches-x86, configured from Ubuntu's own), not Ubuntu's. Ubuntu's 7.0
+  # release with kernel/patches-x86-host, configured from Ubuntu's own), not Ubuntu's. Ubuntu's 7.0
   # kernel lacks Linux 25ae123db10b, so tearing down many VMs at once held RTNL for seconds
   # and stalled every namespace creation (#1563, kernel/README.md). It is built on the instance
   # store (store.sh mounts it empty), installed to /boot as GRUB's default, and booted by the

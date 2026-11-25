@@ -9,8 +9,14 @@
 #   snapshot run --snapshot T --name N      a VM of T: its bots join again, one past T's count
 #
 #   FAKE_UP_SECS        time before a VM's tile answers (default 0.1)
+#   FAKE_ACK_SECS       a VM's restore is acknowledged this long after its tile answers
+#                       ($FAKE_FCVM_DIR/acked-N, logged as `acked`). Until then a snapshot create
+#                       of it is refused as fcvm refuses a clone whose restore is not
+#                       acknowledged, unless it was given --await-restore S, in which case it
+#                       waits up to S seconds for the acknowledgement
 #   FAKE_SNAPSHOT_SECS  a snapshot create takes this long, then logs snapshot_done
 #   FAKE_FAIL_FORK      a VM restored from a mc-fork-* snapshot exits with status 3
+#   FAKE_FAIL_ONCE      the VM of this name exits with status 3 the first time it is started
 #   FAKE_STALL_FORK     a VM restored from a mc-fork-* snapshot holds that snapshot's generation
 #                       lock shared, as fcvm snapshot run does while it restores, and never comes up
 #
@@ -22,18 +28,31 @@ dir="${FAKE_FCVM_DIR:?}"
 snaps="${FAKE_SNAPSHOT_DIR:?}"
 log="$dir/events.log"
 if [ "${1:-}" = snapshot ] && [ "${2:-}" = create ]; then
-    pid="" tag="" stop=""
+    pid="" tag="" stop="" await=0
     shift 2
     while [ $# -gt 0 ]; do
         case "$1" in
             --pid) pid="$2"; shift ;;
             --tag) tag="$2"; shift ;;
             --stop) stop=1 ;;
+            --await-restore) await="$2"; shift ;;
         esac
         shift
     done
     name=$(cat "$dir/pid-$pid")
     echo "snapshot_create $name $pid $tag${stop:+ stop} $(date +%s%N)" >> "$log"
+    if [ -n "${FAKE_ACK_SECS:-}" ]; then
+        waited=0
+        while [ ! -e "$dir/acked-$name" ]; do
+            if [ "$waited" -ge $(( await * 20 )) ]; then
+                echo "snapshot_refused $name $pid $tag $(date +%s%N)" >> "$log"
+                echo "Error: cannot snapshot VM '$name': its restore has not been acknowledged" >&2
+                exit 1
+            fi
+            sleep 0.05
+            waited=$(( waited + 1 ))
+        done
+    fi
     # FAKE_SNAPSHOT_SECS: a slow save; the end is logged so a test sees it ran to completion.
     if [ -n "${FAKE_SNAPSHOT_SECS:-}" ]; then
         sleep "$FAKE_SNAPSHOT_SECS"
@@ -59,7 +78,7 @@ printf '%s\n' "${argv[@]}" > "$dir/args-$name"
 echo "$name" > "$dir/pid-$$"
 echo "$kind $name $$ ${tag:--} $(date +%s%N)" >> "$log"
 stop() {
-    rm -f "$dir/sessions-$name"
+    rm -f "$dir/sessions-$name" "$dir/acked-$name"
     echo "exit $name $$ - $(date +%s%N)" >> "$log"
     exit 0
 }
@@ -71,6 +90,12 @@ if [ -n "${FAKE_STALL_FORK:-}" ] && [ "${tag#mc-fork-}" != "$tag" ]; then
     while true; do sleep 1 & wait $!; done
 fi
 sleep "${FAKE_UP_SECS:-0.1}" & wait $!
+# FAKE_FAIL_ONCE: the named VM's first start fails, whatever it was restored from.
+if [ "${FAKE_FAIL_ONCE:-}" = "$name" ] && [ ! -e "$dir/failed-once-$name" ]; then
+    touch "$dir/failed-once-$name"
+    echo "died $name $$ ${tag:--} $(date +%s%N)" >> "$log"
+    exit 3
+fi
 # FAKE_FAIL_FORK: a restore of a fork's snapshot exits at once, as a copy that cannot run.
 if [ -n "${FAKE_FAIL_FORK:-}" ] && [ "${tag#mc-fork-}" != "$tag" ]; then
     echo "died $name $$ $tag $(date +%s%N)" >> "$log"
@@ -80,5 +105,10 @@ if [ -n "$tag" ]; then
     echo $(( $(cat "$snaps/$tag/sessions") + 1 )) > "$dir/sessions-$name"
 else
     echo 1 > "$dir/sessions-$name"
+fi
+if [ -n "${FAKE_ACK_SECS:-}" ]; then
+    sleep "$FAKE_ACK_SECS" & wait $!
+    touch "$dir/acked-$name"
+    echo "acked $name $$ ${tag:--} $(date +%s%N)" >> "$log"
 fi
 while true; do sleep 1 & wait $!; done

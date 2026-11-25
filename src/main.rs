@@ -125,7 +125,7 @@ async fn run(cli: cli::Cli) -> Result<()> {
         }
         _ => {
             // All other commands require config
-            paths::init_from_config();
+            paths::init_from_config()?;
         }
     }
 
