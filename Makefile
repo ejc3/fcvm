@@ -48,6 +48,12 @@ test-runner-acceptance:
 test-ci-scope:
 	python3 scripts/test-ci-stack-scope.py
 
+# scripts/check-runner-kernel.py against fixture repositories. Needs git 2.29 and Python 3.11.4
+# (tomllib, tarfile's extraction filter, fetch --no-write-fetch-head) or later.
+.PHONY: test-runner-kernel
+test-runner-kernel:
+	python3 -B scripts/test-check-runner-kernel.py
+
 .PHONY: test-ci-security test-ci-workflow-security test-ami-security
 test-ci-security: test-ci-workflow-security test-ami-security
 test-ci-workflow-security:
@@ -634,6 +640,17 @@ fleet-renders-bench:
 test-fleet-renders-teardown:
 	@test -n "$(OUT)" || { echo "test-fleet-renders-teardown needs OUT=DIR" >&2; exit 2; }
 	bench/chromium/renders_bench.sh teardown-check $(STAGES)
+
+# The same module under `fcvm fleet agent --renders`, with the coordinator's side played by
+# bench/chromium/renders_agent_check.py over the agent's --stdio: the hello, renders on both
+# sides, an overlay order, a stop while rendering and while held at HOLD_STAGES (the agent
+# stays up and renders again), and SIGKILL of the agent at each of STAGES (SIGTERM at
+# running:TERM). Every census count must be zero. No build dependency, as above.
+#   make test-fleet-renders-agent OUT=dir KITESURF=dir [STAGES=a,b:TERM] [HOLD_STAGES=a,b] [CASES=running,held,kill]
+.PHONY: test-fleet-renders-agent
+test-fleet-renders-agent:
+	@test -n "$(OUT)" || { echo "test-fleet-renders-agent needs OUT=DIR" >&2; exit 2; }
+	bench/chromium/renders_bench.sh agent-check $(STAGES)
 
 # The directed camera's program with no votes, as JSON (fleet/core/examples/program.rs):
 # make fleet-program SEED=1 SECS=600 OUT=program.json

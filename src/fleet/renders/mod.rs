@@ -11,8 +11,9 @@
 //! The pure half is `fleet_core::renders_wall::Wall`: it is fed every completed render and
 //! each side's cgroup counters and answers how many renders each side runs in flight, and
 //! the report. This module starts and ends the processes and moves the lines between them.
-//! `fcvm fleet renders-bench` runs it without a coordinator or viewers, so the benchmark's
-//! reference figures and the live wall's come from one piece of code.
+//! The fleet agent (`agent::renders`) and `fcvm fleet renders-bench` both run it through
+//! [`session`], the benchmark without a coordinator or viewers, so the benchmark's reference
+//! figures and the live wall's come from one piece of code.
 //!
 //! Start, in order: sweep what an earlier module left; start the reaper ([`reap`]); make
 //! the cgroups; start the replays; make the snapshot if it is absent; start the memory
@@ -36,13 +37,15 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use fleet_core::renders::{Harness, OrderOverlay, RendersOrder, RendersPage};
+use fleet_core::renders::{
+    Harness, OrderOverlay, RendersHost, RendersOrder, RendersPage, RendersReport,
+};
 use fleet_core::renders_search::SearchParams;
 use fleet_core::renders_wall::{Completed, Wall, SIDES};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::cli::FleetRendersBenchArgs;
 use crate::fleet::cpuset::{self, CpuCgroup, Join, Unit};
@@ -62,9 +65,11 @@ const FAILURES_BEFORE_A_WAIT: u32 = 3;
 const WAIT_AFTER_FAILURES: Duration = Duration::from_secs(1);
 
 /// Whether a kernel release has the bridge teardown fix, without which a clone's teardown
-/// stalls for seconds under load and no figure from the host is published: the
-/// repository's own kernels (`-fcvm`), 6.18.60 and later of 6.18, 7.2 and later, and
-/// Ubuntu's `7.0.0-1017-aws` and later.
+/// stalls for seconds under load and the module does not run: the repository's own kernels
+/// (`-fcvm`), 6.18.60 and later of 6.18, 7.2 and later, and Ubuntu's `7.0.0-1017-aws` and
+/// later. This is the floor for running at all, not the rule for what may be shown: a
+/// recorded figure comes only from a campaign on the repository's own host kernel
+/// (`bench/chromium/renders_campaign.py` and `renders_reference.py` take no other).
 pub fn kernel_has_bridge_fix(release: &str) -> bool {
     if release.contains("-fcvm") {
         return true;
@@ -176,6 +181,101 @@ fn pool_cap(total: u64, clone_pages: u64) -> u32 {
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// How much of its records a module keeps, when it is bounded (under the fleet agent, which
+/// runs for as long as its host; the benchmark keeps a run's whole record as its evidence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    /// `renders.jsonl` and `samples.jsonl` are rotated at these sizes ([`Records`]).
+    pub renders_bytes: u64,
+    pub samples_bytes: u64,
+    /// The failed clones' logs kept, newest first ([`prune_clone_logs`]).
+    pub failed_clone_logs: usize,
+}
+
+/// A records file of JSON lines. With a limit, a line that would take it past the limit
+/// first renames it to `<name>.1` (replacing the one before) and starts a new one, so the file
+/// and its previous one hold at most twice the limit and a reader sees whole lines.
+struct Records {
+    path: PathBuf,
+    out: std::io::BufWriter<std::fs::File>,
+    written: u64,
+    limit: Option<u64>,
+}
+
+impl Records {
+    fn create(path: PathBuf, limit: Option<u64>) -> std::io::Result<Self> {
+        let out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        Ok(Records {
+            path,
+            out,
+            written: 0,
+            limit,
+        })
+    }
+
+    fn line(&mut self, line: &str) {
+        let size = line.len() as u64 + 1;
+        if self
+            .limit
+            .is_some_and(|limit| self.written > 0 && self.written + size > limit)
+        {
+            if let Err(e) = self.rotate() {
+                tracing::warn!(target: "renders", "rotating {}: {e}", self.path.display());
+            }
+        }
+        if writeln!(self.out, "{line}").is_ok() {
+            self.written += size;
+        }
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        self.out.flush()?;
+        let mut previous = self.path.clone().into_os_string();
+        previous.push(".1");
+        std::fs::rename(&self.path, previous)?;
+        self.out = std::io::BufWriter::new(std::fs::File::create(&self.path)?);
+        self.written = 0;
+        Ok(())
+    }
+
+    fn flush(&mut self) {
+        let _ = self.out.flush();
+    }
+}
+
+/// Remove the failed clones' logs under `dir` (one directory a worker) past the newest
+/// `keep`. A file written in the last `settled` is a render's that is still under way and is
+/// neither counted nor removed. Returns how many were removed.
+fn prune_clone_logs(
+    dir: &Path,
+    keep: usize,
+    settled: Duration,
+    now: std::time::SystemTime,
+) -> usize {
+    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|worker| {
+            std::fs::read_dir(worker.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter_map(|e| {
+            let meta = e.metadata().ok().filter(|m| m.is_file())?;
+            let modified = meta.modified().ok()?;
+            let age = now.duration_since(modified).unwrap_or_default();
+            (age >= settled).then(|| (modified, e.path()))
+        })
+        .collect();
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.iter()
+        .skip(keep)
+        .filter(|(_, path)| std::fs::remove_file(path).is_ok())
+        .count()
 }
 
 /// Write `bytes` to `path` so a reader sees the old file or the new one.
@@ -592,8 +692,6 @@ struct Side {
     level: u32,
     cursor: usize,
     seq: u64,
-    /// The sha256 of what the side's replays inject now.
-    inject: Option<String>,
     /// Times a clone was not started because the 2 MiB pool had no room for it.
     pool_waits: u64,
     /// Workers started again after one exited.
@@ -623,8 +721,12 @@ struct Module {
     clone_pages: u64,
     fixed: Option<[u32; 2]>,
     tx: mpsc::UnboundedSender<Event>,
-    records: std::io::BufWriter<std::fs::File>,
-    samples: std::io::BufWriter<std::fs::File>,
+    records: Records,
+    samples: Records,
+    /// What the module keeps of its records; none keeps all of them.
+    bounds: Option<Bounds>,
+    /// The longest a render takes, after which a clone's log is written no more.
+    render_timeout: Duration,
     harness: CpuCgroup,
     /// Its parts, by name, for their own counters: each side's replay and the drivers.
     harness_parts: Vec<(&'static str, CpuCgroup)>,
@@ -635,6 +737,11 @@ struct Module {
     /// decision.
     replay_ms: [Option<f64>; 2],
     out: PathBuf,
+    /// The overlay the replays serve, and each side's file they read it from.
+    served: Served,
+    inject_files: Vec<PathBuf>,
+    /// Where each report written to `report.json` also goes (the agent's connection).
+    reports: Option<mpsc::UnboundedSender<RendersReport>>,
 }
 
 impl Module {
@@ -721,6 +828,7 @@ impl Module {
             let Some(page) = self.next_page(side) else {
                 return;
             };
+            let inject = self.served.inject[side].clone();
             let s = &mut self.sides[side];
             s.seq += 1;
             let job = Job {
@@ -728,7 +836,7 @@ impl Module {
                 page,
                 level: s.level,
                 answered: false,
-                inject: s.inject.clone(),
+                inject,
             };
             let mut line = json!({
                 "seq": job.seq, "page": page, "url": self.pages[page].url, "level": job.level,
@@ -790,7 +898,7 @@ impl Module {
             "stage": row["stage"], "error": row["error"], "inject_sha256": job.inject,
             "detail": row["detail"],
         });
-        let _ = writeln!(self.records, "{line}");
+        self.records.line(&line.to_string());
     }
 
     async fn line(&mut self, side: usize, index: usize, line: &str) {
@@ -971,9 +1079,9 @@ impl Module {
             "replay_ms": {SIDES[0]: self.replay_ms[0], SIDES[1]: self.replay_ms[1]},
             "parts": parts,
         });
-        let _ = writeln!(self.samples, "{sample}");
-        let _ = self.samples.flush();
-        let _ = self.records.flush();
+        self.samples.line(&sample.to_string());
+        self.samples.flush();
+        self.records.flush();
         self.dispatch(FCVM).await;
         self.dispatch(KITE).await;
     }
@@ -993,9 +1101,45 @@ impl Module {
         }
     }
 
-    fn report(&self) -> Value {
+    /// Under [`Bounds`], the failed clones' logs past the newest kept. A render's log is
+    /// written for as long as the render and its teardown take; one untouched for twice the
+    /// render's limit and a minute is settled.
+    fn prune_clone_logs(&self, clones: &Path) {
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        let settled = self.render_timeout * 2 + Duration::from_secs(60);
+        let removed = prune_clone_logs(
+            clones,
+            bounds.failed_clone_logs,
+            settled,
+            std::time::SystemTime::now(),
+        );
+        if removed > 0 {
+            tracing::debug!(target: "renders", removed, "removed failed clones' logs past the newest kept");
+        }
+    }
+
+    /// The coordinator's order, applied ([`apply_order`]).
+    fn apply(&mut self, order: Option<&RendersOrder>, now: u64) -> Result<Applied> {
+        apply_order(
+            &mut self.wall,
+            &mut self.served,
+            &self.inject_files,
+            order,
+            now,
+        )
+    }
+
+    /// The wall's report with the harness's health: what the agent sends the coordinator.
+    fn wall_report(&self) -> RendersReport {
         let mut report = self.wall.report(now_ms(), None, None);
         report.harness = Some(self.harness_health());
+        report
+    }
+
+    fn report(&self) -> Value {
+        let report = self.wall_report();
         let mut doc = serde_json::to_value(&report).unwrap_or(Value::Null);
         // Held levels (`--levels`) run no search: the report says what is held.
         if let Some(fixed) = self.fixed {
@@ -1020,6 +1164,11 @@ impl Module {
     }
 
     fn write_report(&self, name: &str) {
+        if name == "report.json" {
+            if let Some(reports) = &self.reports {
+                let _ = reports.send(self.wall_report());
+            }
+        }
         let doc = self.report();
         if let Err(e) = write_by_rename(&self.out.join(name), format!("{doc:#}\n").as_bytes()) {
             tracing::warn!(target: "renders", "writing {name}: {e}");
@@ -1078,8 +1227,278 @@ fn split_harness(cpus: &[u32], each: usize) -> Result<[Vec<u32>; 3]> {
     ])
 }
 
-/// `fcvm fleet renders-bench`.
+/// The three CPU sets of `--cpus-fcvm`, `--cpus-engines` and `--cpus-harness`. The sides'
+/// are equal in size.
+fn cpu_sets(args: &FleetRendersBenchArgs) -> Result<[Vec<u32>; 3]> {
+    let cpus = [&args.cpus_fcvm, &args.cpus_engines, &args.cpus_harness]
+        .map(|list| cpuset::parse_cpu_list(list).filter(|c| !c.is_empty()));
+    let [Some(cpus_fcvm), Some(cpus_engines), Some(cpus_harness)] = cpus else {
+        bail!("a CPU list is empty or not a list");
+    };
+    anyhow::ensure!(
+        cpus_fcvm.len() == cpus_engines.len(),
+        "the sides have {} and {} CPUs: they must be equal",
+        cpus_fcvm.len(),
+        cpus_engines.len()
+    );
+    Ok([cpus_fcvm, cpus_engines, cpus_harness])
+}
+
+/// The module's options under the fleet agent: renders-bench's, each given to the agent with
+/// `--renders-arg`. The benchmark's own (held levels, a run's length, an overlay) are refused:
+/// under the agent the coordinator's orders say when to render and what to inject, and the
+/// search sets the levels.
+pub fn agent_args(argv: &[String]) -> Result<FleetRendersBenchArgs> {
+    #[derive(clap::Parser)]
+    #[command(name = "--renders-arg", no_binary_name = true)]
+    struct Argv {
+        #[command(flatten)]
+        args: FleetRendersBenchArgs,
+    }
+    use clap::Parser as _;
+    let args = Argv::try_parse_from(argv)
+        .map_err(|e| anyhow::anyhow!("--renders-arg: {e}"))?
+        .args;
+    for (given, name) in [
+        (args.levels.is_some(), "--levels"),
+        (args.seconds != 0, "--seconds"),
+        (args.overlay_text.is_some(), "--overlay-text"),
+        (args.overlay_transform.is_some(), "--overlay-transform"),
+    ] {
+        anyhow::ensure!(
+            !given,
+            "--renders-arg {name} is the benchmark's: under the agent the coordinator's orders say when to render and what overlay to serve"
+        );
+    }
+    cpu_sets(&args)?;
+    Ok(args)
+}
+
+/// The sha256 of the engine bundle's `index.js`: the bundle by its content, not by where
+/// this host keeps it.
+fn bundle_sha256(dist: &Path) -> Result<String> {
+    let index = std::fs::read(dist.join("index.js"))
+        .with_context(|| format!("reading {}/index.js", dist.display()))?;
+    Ok(sha256_hex(&index))
+}
+
+/// The engine bundle `args` names: `--kitesurf-dist`, or `<kitesurf>/dist`.
+fn bundle_dir(args: &FleetRendersBenchArgs) -> Option<PathBuf> {
+    args.kitesurf_dist
+        .clone()
+        .or_else(|| args.kitesurf.as_ref().map(|k| k.join("dist")))
+}
+
+/// What the host knows of its module before it runs, for the hello's `renders`.
+pub struct HostFacts<'a> {
+    /// The delegated unit's CPUs; none when this process is in no such unit.
+    pub unit_cpus: Option<&'a [u32]>,
+    pub kernel: &'a str,
+    /// The EC2 instance type, on EC2.
+    pub instance_type: Option<&'a str>,
+    /// The snapshot's `config.json`, when it is made.
+    pub snapshot: Option<&'a Value>,
+    /// The engine bundle's digest ([`bundle_sha256`]), when the host has the bundle.
+    pub bundle_sha256: Option<String>,
+}
+
+/// The hello's `renders`: the pages in the wall's order, the CPUs of each side, whether each
+/// side runs in a cpuset of exactly those CPUs (the module confines both sides or does not run,
+/// so: whether the unit holds every CPU it is given), and what runs for the `Setup` lists.
+/// `vcpus` and `page_size` are the snapshot's when it is made, else what it will be made with;
+/// the commits are `--setup fcvm.commit=` and `--setup kitesurf.commit=`.
+pub fn hello(args: &FleetRendersBenchArgs, facts: &HostFacts) -> Result<RendersHost> {
+    let cpus = cpu_sets(args)?;
+    let setup = setup_values(&args.setup)?;
+    let confined = facts
+        .unit_cpus
+        .is_some_and(|unit| cpus.iter().flatten().all(|c| unit.contains(c)));
+    let meta = facts.snapshot.map(|c| &c["metadata"]);
+    let vcpus = meta
+        .and_then(|m| m["vcpu"].as_u64())
+        .map_or(args.vcpus.to_string(), |v| v.to_string());
+    let huge = meta.map_or(args.hugepages, |m| m["hugepages"] == json!(true));
+    let mut build = BTreeMap::new();
+    let mut put = |k: &str, v: Option<String>| {
+        if let Some(v) = v.filter(|v| !v.is_empty()) {
+            build.insert(k.to_string(), v);
+        }
+    };
+    put("instance_type", facts.instance_type.map(str::to_string));
+    put("kernel", Some(facts.kernel.to_string()));
+    put("fcvm_commit", setup[FCVM].get("commit").cloned());
+    if args.max_engines > 0 {
+        put("kitesurf_commit", setup[KITE].get("commit").cloned());
+        put("bundle_sha256", facts.bundle_sha256.clone());
+        put("recycle_mib", Some(args.recycle_mib.to_string()));
+    }
+    put("viewport", Some(args.viewport.clone()));
+    put("vcpus", Some(vcpus));
+    put(
+        "page_size",
+        Some(if huge { "2 MiB" } else { "4 KiB" }.to_string()),
+    );
+    Ok(RendersHost {
+        pages: args
+            .urls
+            .iter()
+            .map(|url| RendersPage {
+                id: page_id(url),
+                url: url.clone(),
+            })
+            .collect(),
+        cpus: cpus[0].len() as u32,
+        confined,
+        build,
+        // The frame socket's public addresses, once the agent serves frames.
+        ipv6: None,
+        ipv4: None,
+        v4_port: None,
+    })
+}
+
+/// What the hello says of a module run with `args` on this host. Reads the snapshot's
+/// `config.json` and the engine bundle when they are there.
+pub fn this_host(args: &FleetRendersBenchArgs, instance_type: Option<&str>) -> Result<RendersHost> {
+    let unit = Unit::for_this_process();
+    if let Err(reason) = &unit {
+        tracing::warn!(target: "renders", %reason, "pages mode: no cpuset for the sides; the module will not run");
+    }
+    let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let snapshot = std::fs::read_to_string(
+        crate::paths::snapshot_dir()
+            .join(&args.snapshot_tag)
+            .join("config.json"),
+    )
+    .ok()
+    .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let bundle = bundle_dir(args)
+        .filter(|_| args.max_engines > 0)
+        .and_then(|d| std::fs::canonicalize(d).ok())
+        .and_then(|d| bundle_sha256(&d).ok());
+    hello(
+        args,
+        &HostFacts {
+            unit_cpus: unit.as_ref().ok().map(|u| u.cpus()),
+            kernel: kernel.trim(),
+            instance_type,
+            snapshot: snapshot.as_ref(),
+            bundle_sha256: bundle,
+        },
+    )
+}
+
+/// The overlay the replays serve now, and each side's injected bytes by their sha256.
+#[derive(Debug, Default)]
+struct Served {
+    overlay: Option<OrderOverlay>,
+    inject: [Option<String>; 2],
+}
+
+/// What an order does to a module that runs.
+#[derive(Debug, PartialEq)]
+enum Applied {
+    Run,
+    Stop,
+}
+
+/// Apply the coordinator's order. An overlay that is not the one the replays serve (by its
+/// content and its number) is written to both sides' files by rename, so a render sees the old
+/// bytes or the new ones whole, and the wall is told what the replays serve from then on. The
+/// wall then takes the order: a new overlay starts both searches again. No order, or one that
+/// says `run: false`, stops the module.
+fn apply_order(
+    wall: &mut Wall,
+    served: &mut Served,
+    files: &[PathBuf],
+    order: Option<&RendersOrder>,
+    now: u64,
+) -> Result<Applied> {
+    let Some(order) = order.filter(|o| o.run) else {
+        wall.order(order.unwrap_or(&RendersOrder::default()), now);
+        return Ok(Applied::Stop);
+    };
+    if served.overlay != order.overlay {
+        for (side, file) in files.iter().enumerate().take(2) {
+            let bytes = overlay::html(order.overlay.as_ref(), side);
+            write_by_rename(file, bytes.as_bytes())
+                .with_context(|| format!("writing {}", file.display()))?;
+            served.inject[side] = (!bytes.is_empty()).then(|| sha256_hex(bytes.as_bytes()));
+        }
+        served.overlay = order.overlay.clone();
+        wall.serving(served.overlay.as_ref().map(|o| o.seq));
+    }
+    wall.order(order, now);
+    Ok(Applied::Run)
+}
+
+/// Resolves once the order no longer says run (a stop, or none), or its sender is gone (the
+/// agent's connection ended). Every order it reads is marked seen.
+async fn stop_ordered(orders: &mut watch::Receiver<Option<RendersOrder>>) -> &'static str {
+    loop {
+        if !orders.borrow_and_update().as_ref().is_some_and(|o| o.run) {
+            return "an order to stop";
+        }
+        if orders.changed().await.is_err() {
+            return "the end of the agent's connection";
+        }
+    }
+}
+
+/// `fcvm fleet renders-bench`: one session, ordered to run with the overlay its arguments
+/// give, until a signal or `--seconds`.
 pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
+    let overlay =
+        (args.overlay_text.is_some() || args.overlay_transform.is_some()).then(|| OrderOverlay {
+            text: args.overlay_text.clone(),
+            chromium_only: args
+                .overlay_transform
+                .as_deref()
+                .and_then(fleet_core::renders::chromium_only)
+                .unwrap_or(false),
+            transform: args.overlay_transform.clone(),
+            seq: 1,
+        });
+    // Held until the session returns: the order never changes.
+    let (_order, orders) = watch::channel(Some(RendersOrder { run: true, overlay }));
+    let exe = std::env::current_exe().context("this binary's path")?;
+    let (outcome, reaped) = session(&args, &exe, orders, None, Signals::EndTheModule, None).await?;
+    println!("{}", serde_json::to_string(&reaped)?);
+    outcome?;
+    anyhow::ensure!(
+        reaped.clean(),
+        "the module left something behind: {reaped:?}"
+    );
+    Ok(())
+}
+
+/// Whether a module handles SIGTERM and SIGINT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signals {
+    /// The benchmark: either signal ends the module, which then lets its reaper go.
+    EndTheModule,
+    /// The agent: no handler is registered, so either signal ends the process, and the
+    /// reaper removes what the module made.
+    LeaveToTheProcess,
+}
+
+/// One module from its start to its end, for the benchmark command and the fleet agent alike:
+/// the kernel rule, the run directory's lock, the start's sweep, the reaper, the processes
+/// ([`run`]) and the reaper's sweep. `orders` says whether to render and what overlay to serve;
+/// the module ends when it says stop or its sender is gone. Each report the module writes is
+/// also sent to `reports`. Only [`Signals::EndTheModule`] makes the module end at SIGTERM or SIGINT: a handler
+/// stays registered for the life of the process, and the agent's SIGTERM must end the agent.
+///
+/// Returns how the module ended and what the reaper found. An error from before the reaper
+/// started (nothing was made), or from reading the reaper's result, is returned as is.
+pub async fn session(
+    args: &FleetRendersBenchArgs,
+    exe: &Path,
+    mut orders: watch::Receiver<Option<RendersOrder>>,
+    reports: Option<mpsc::UnboundedSender<RendersReport>>,
+    signals: Signals,
+    bounds: Option<Bounds>,
+) -> Result<(Result<()>, reap::Reaped)> {
     let status = Status {
         path: args.status_file.clone(),
         hold_at: args.hold_at.clone(),
@@ -1092,17 +1511,7 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
         kernel_has_bridge_fix(&release),
         "kernel {release} lacks the bridge teardown fix: no figure is recorded on it"
     );
-    let cpus = [&args.cpus_fcvm, &args.cpus_engines, &args.cpus_harness]
-        .map(|list| cpuset::parse_cpu_list(list).filter(|c| !c.is_empty()));
-    let [Some(cpus_fcvm), Some(cpus_engines), Some(cpus_harness)] = cpus else {
-        bail!("a CPU list is empty or not a list");
-    };
-    anyhow::ensure!(
-        cpus_fcvm.len() == cpus_engines.len(),
-        "the sides have {} and {} CPUs: they must be equal",
-        cpus_fcvm.len(),
-        cpus_engines.len()
-    );
+    let [cpus_fcvm, cpus_engines, cpus_harness] = cpu_sets(args)?;
     let fixed = match args.levels.as_deref() {
         Some([f, k]) => Some([*f, *k]),
         Some(_) => bail!("--levels takes two numbers"),
@@ -1117,7 +1526,6 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
         })
         .collect();
     let setup = setup_values(&args.setup)?;
-    let exe = std::env::current_exe().context("this binary's path")?;
     let unit =
         Unit::for_this_process().map_err(|e| anyhow::anyhow!("no cpuset for the sides: {e}"))?;
     let target = reap::Target {
@@ -1140,21 +1548,25 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
     std::fs::create_dir_all(&args.out)?;
     let logs = args.out.join("logs");
     std::fs::create_dir_all(logs.join("clones"))?;
-    let reaper = reap::Reaper::start(&exe, &target, Some(&args.out.join("teardown.json")), &lock)?;
+    let reaper = reap::Reaper::start(exe, &target, Some(&args.out.join("teardown.json")), &lock)?;
     // Nothing is made before this line but the records' directory, and from it on the
     // reaper removes what is.
     status.set("start").await;
     let outcome = run(
-        &args,
+        args,
         &status,
         &unit,
         [cpus_fcvm, cpus_engines, cpus_harness],
         pages,
         fixed,
         setup,
-        &exe,
+        exe,
         &logs,
         &release,
+        &mut orders,
+        reports,
+        signals,
+        bounds,
     )
     .await;
     status.set("stopping").await;
@@ -1168,15 +1580,14 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
             "stopped-unclean"
         })
         .await;
-    println!("{}", serde_json::to_string(&reaped)?);
-    outcome?;
-    anyhow::ensure!(
-        reaped.clean(),
-        "the module left something behind: {reaped:?}"
-    );
-    Ok(())
+    Ok((outcome, reaped))
 }
 
+/// The processes, from the cgroups to the last worker's start, and then the renders until the
+/// order says stop, the agent's connection ends, a signal arrives (`signals`), `--seconds`
+/// pass, or something fails. An order to stop during the start ends the start where it is:
+/// its future is dropped, which kills every child it started; no task of it can start a
+/// process afterwards ([`start`]).
 #[allow(clippy::too_many_arguments)]
 async fn run(
     args: &FleetRendersBenchArgs,
@@ -1189,7 +1600,167 @@ async fn run(
     exe: &Path,
     logs: &Path,
     release: &str,
+    orders: &mut watch::Receiver<Option<RendersOrder>>,
+    reports: Option<mpsc::UnboundedSender<RendersReport>>,
+    signals: Signals,
+    bounds: Option<Bounds>,
 ) -> Result<()> {
+    let start = start(
+        args, status, unit, cpus, pages, fixed, setup, exe, logs, release, reports, bounds,
+    );
+    tokio::pin!(start);
+    let Started {
+        mut module,
+        mut rx,
+        early,
+        mut serve,
+        mut replays,
+        addrs,
+    } = tokio::select! {
+        started = &mut start => started?,
+        why = stop_ordered(orders) => {
+            tracing::info!(target: "renders", "ending at {why}, before the module was started");
+            return Ok(());
+        }
+    };
+    // One request a second to each side's replay, timed from this side of the socket.
+    for (side, addr) in addrs.iter().enumerate() {
+        let addr = SocketAddr::from((*addr, args.replay_http_port));
+        let tx = module.tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let ms = http_get(addr, "example.com", "/", Duration::from_millis(800))
+                    .await
+                    .map(|(_, ms)| ms);
+                if tx.send(Event::Probe { side, ms }).is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    // Under the agent no handler is registered: one stays for the life of the process, and
+    // the agent's SIGTERM must end the agent.
+    let mut signals = if signals == Signals::EndTheModule {
+        use tokio::signal::unix::{signal, SignalKind};
+        Some((
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        ))
+    } else {
+        None
+    };
+    let mut every = tokio::time::interval(Duration::from_secs(1));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let started = Instant::now();
+    let mut ticks = 0u64;
+    // The order as it stands now; a change from here on wakes the loop.
+    let first = module.apply(orders.borrow_and_update().as_ref(), now_ms());
+    for event in early {
+        module.handle(event).await;
+    }
+    status.set("running").await;
+    let ended: Result<&str> = async {
+        if first? == Applied::Stop {
+            return Ok("an order to stop");
+        }
+        Ok(loop {
+        tokio::select! {
+            _ = signal_received(&mut signals) => break "a signal",
+            changed = orders.changed() => {
+                if changed.is_err() {
+                    break "the end of the agent's connection";
+                }
+                let order = orders.borrow_and_update().clone();
+                if module.apply(order.as_ref(), now_ms())? == Applied::Stop {
+                    break "an order to stop";
+                }
+            }
+            event = rx.recv() => match event {
+                Some(event) => module.handle(event).await,
+                None => break "no worker left",
+            },
+            _ = every.tick() => {
+                module.tick().await;
+                ticks += 1;
+                if ticks.is_multiple_of(5) {
+                    module.write_report("report.json");
+                    module.prune_clone_logs(&logs.join("clones"));
+                }
+                if args.seconds > 0 && started.elapsed() >= Duration::from_secs(args.seconds) {
+                    break "its time";
+                }
+                if let Some(Ok(Some(exit))) = serve.as_mut().map(|s| s.try_wait()) {
+                    bail!("the memory server exited ({exit}): {}", tail(&logs.join("serve.log")));
+                }
+                for (i, replay) in replays.iter_mut().enumerate() {
+                    if let Ok(Some(exit)) = replay.try_wait() {
+                        bail!("replay process {i} exited ({exit})");
+                    }
+                }
+            }
+        }
+        })
+    }
+    .await;
+    // Whatever ended the loop: no engine start goes on past this line.
+    module.starting.shutdown().await;
+    let ended = ended?;
+    tracing::info!(target: "renders", "ending at {ended}");
+    module.records.flush();
+    module.samples.flush();
+    module.write_report("report.json");
+    module.write_report("summary.json");
+    Ok(())
+}
+
+/// Resolves at SIGTERM or SIGINT when the handlers are registered, never when they are not.
+async fn signal_received(
+    signals: &mut Option<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)>,
+) {
+    match signals {
+        Some((term, int)) => {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// A module whose processes are started, for [`run`]'s loop.
+struct Started {
+    module: Module,
+    rx: mpsc::UnboundedReceiver<Event>,
+    /// Events that arrived while the workers were starting.
+    early: Vec<Event>,
+    serve: Option<Child>,
+    replays: Vec<Child>,
+    addrs: [Ipv4Addr; 2],
+}
+
+/// The start: the cgroups, the replays, the snapshot when it is absent, the memory server,
+/// the engines and the workers. Dropping it before it returns ends all of it, with the
+/// children killed on drop and the rest left to the reaper: the engines' first starts are
+/// polled here rather than spawned, and the only tasks it spawns are the workers' output
+/// readers, which end with the workers' output and start no process.
+#[allow(clippy::too_many_arguments)]
+async fn start(
+    args: &FleetRendersBenchArgs,
+    status: &Status,
+    unit: &Unit,
+    cpus: [Vec<u32>; 3],
+    pages: Vec<RendersPage>,
+    fixed: Option<[u32; 2]>,
+    setup: [BTreeMap<String, String>; 2],
+    exe: &Path,
+    logs: &Path,
+    release: &str,
+    reports: Option<mpsc::UnboundedSender<RendersReport>>,
+    bounds: Option<Bounds>,
+) -> Result<Started> {
     let [cpus_fcvm, cpus_engines, cpus_harness] = cpus;
     let run_dir = &args.run_dir;
     std::fs::create_dir_all(run_dir)?;
@@ -1424,13 +1995,15 @@ async fn run(
         status.set("engines-starting").await;
         let mut start_ms = Vec::new();
         for first in (0..args.max_engines as usize).step_by(ENGINE_STARTS_AT_ONCE) {
-            let mut batch = tokio::task::JoinSet::new();
+            // Polled here rather than spawned, so that dropping the start (an order to stop)
+            // drops each engine's start with it and none runs on.
+            let mut batch = Vec::new();
             for index in first..(first + ENGINE_STARTS_AT_ONCE).min(args.max_engines as usize) {
                 let join = engines_group
                     .join(Some(&format!("e{index}")))
                     .map_err(anyhow::Error::msg)?;
                 let (spec, j) = (spec.clone(), join.clone());
-                batch.spawn(async move { (index, spec.start(index, &j).await) });
+                batch.push(async move { spec.start(index, &j).await.map(|s| (index, s)) });
                 engines.push(Engine {
                     join,
                     child: None,
@@ -1446,9 +2019,7 @@ async fn run(
                     ),
                 });
             }
-            while let Some(done) = batch.join_next().await {
-                let (index, started) = done?;
-                let (child, ms) = started?;
+            for (index, (child, ms)) in futures_util::future::try_join_all(batch).await? {
                 engines[index].child = Some(child);
                 engines[index].up = true;
                 start_ms.push(ms);
@@ -1506,7 +2077,6 @@ async fn run(
             level: 0,
             cursor: 0,
             seq: 0,
-            inject: None,
             pool_waits: 0,
             respawns: 0,
             failed_in_a_row: 0,
@@ -1560,32 +2130,13 @@ async fn run(
     for (side, values) in [fcvm_setup, kite_setup].into_iter().enumerate() {
         wall.setup(side, values);
     }
-    let overlay =
-        (args.overlay_text.is_some() || args.overlay_transform.is_some()).then(|| OrderOverlay {
-            text: args.overlay_text.clone(),
-            chromium_only: args
-                .overlay_transform
-                .as_deref()
-                .and_then(fleet_core::renders::chromium_only)
-                .unwrap_or(false),
-            transform: args.overlay_transform.clone(),
-            seq: 1,
-        });
-    for side in 0..2 {
-        let bytes = overlay::html(overlay.as_ref(), side);
-        write_by_rename(&inject_files[side], bytes.as_bytes())?;
-        sides[side].inject = (!bytes.is_empty()).then(|| sha256_hex(bytes.as_bytes()));
-    }
-    wall.serving(overlay.as_ref().map(|o| o.seq));
-    wall.order(&RendersOrder { run: true, overlay }, now);
-
     let [replay_fcvm, replay_engines] = replay_groups;
     let harness_parts = vec![
         ("replay-fcvm", replay_fcvm),
         ("replay-engines", replay_engines),
         ("drivers", drivers_group),
     ];
-    let mut module = Module {
+    let module = Module {
         pages,
         wall,
         sides,
@@ -1600,82 +2151,33 @@ async fn run(
         clone_pages,
         fixed,
         tx,
-        records: std::io::BufWriter::new(std::fs::File::create(args.out.join("renders.jsonl"))?),
-        samples: std::io::BufWriter::new(std::fs::File::create(args.out.join("samples.jsonl"))?),
+        records: Records::create(
+            args.out.join("renders.jsonl"),
+            bounds.map(|b| b.renders_bytes),
+        )?,
+        samples: Records::create(
+            args.out.join("samples.jsonl"),
+            bounds.map(|b| b.samples_bytes),
+        )?,
+        bounds,
+        render_timeout: Duration::from_secs(u64::from(args.timeout_s)),
         harness,
         harness_parts,
         harness_pressure: Default::default(),
         replay_ms: [None; 2],
         out: args.out.clone(),
+        served: Served::default(),
+        inject_files,
+        reports,
     };
-
-    // One request a second to each side's replay, timed from this side of the socket.
-    for (side, addr) in addrs.iter().enumerate() {
-        let addr = SocketAddr::from((*addr, args.replay_http_port));
-        let tx = module.tx.clone();
-        tokio::spawn(async move {
-            loop {
-                let ms = http_get(addr, "example.com", "/", Duration::from_millis(800))
-                    .await
-                    .map(|(_, ms)| ms);
-                if tx.send(Event::Probe { side, ms }).is_err() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        });
-    }
-
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut every = tokio::time::interval(Duration::from_secs(1));
-    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let started = Instant::now();
-    let mut ticks = 0u64;
-    for event in early {
-        module.handle(event).await;
-    }
-    status.set("running").await;
-    let ended: Result<&str> = async {
-        Ok(loop {
-        tokio::select! {
-            _ = term.recv() => break "a signal",
-            _ = int.recv() => break "a signal",
-            event = rx.recv() => match event {
-                Some(event) => module.handle(event).await,
-                None => break "no worker left",
-            },
-            _ = every.tick() => {
-                module.tick().await;
-                ticks += 1;
-                if ticks.is_multiple_of(5) {
-                    module.write_report("report.json");
-                }
-                if args.seconds > 0 && started.elapsed() >= Duration::from_secs(args.seconds) {
-                    break "its time";
-                }
-                if let Some(Ok(Some(exit))) = serve.as_mut().map(|s| s.try_wait()) {
-                    bail!("the memory server exited ({exit}): {}", tail(&logs.join("serve.log")));
-                }
-                for (i, replay) in replays.iter_mut().enumerate() {
-                    if let Ok(Some(exit)) = replay.try_wait() {
-                        bail!("replay process {i} exited ({exit})");
-                    }
-                }
-            }
-        }
-        })
-    }
-    .await;
-    // Whatever ended the loop: no engine start goes on past this line.
-    module.starting.shutdown().await;
-    let ended = ended?;
-    tracing::info!(target: "renders", "ending at {ended}");
-    let _ = module.records.flush();
-    let _ = module.samples.flush();
-    module.write_report("report.json");
-    module.write_report("summary.json");
-    Ok(())
+    Ok(Started {
+        module,
+        rx,
+        early,
+        serve,
+        replays,
+        addrs,
+    })
 }
 
 #[cfg(test)]
@@ -1975,6 +2477,465 @@ mod tests {
         let claimed = at("lock.claim(&args.run_dir)?;");
         let reaper = at("reap::Reaper::start(");
         assert!(usable < swept && swept < claimed && claimed < reaper);
+    }
+
+    fn two_pages() -> Vec<RendersPage> {
+        ["https://a.test/", "https://b.test/"]
+            .iter()
+            .map(|u| RendersPage {
+                id: page_id(u),
+                url: u.to_string(),
+            })
+            .collect()
+    }
+
+    fn order(run: bool, overlay: Option<(&str, &str, u64)>) -> RendersOrder {
+        RendersOrder {
+            run,
+            overlay: overlay.map(|(text, transform, seq)| OrderOverlay {
+                text: Some(text.to_string()),
+                transform: Some(transform.to_string()),
+                chromium_only: fleet_core::renders::chromium_only(transform).unwrap(),
+                seq,
+            }),
+        }
+    }
+
+    /// An overlay order writes each side's bytes (the text escaped, a Chromium-only
+    /// transform on the fcvm side alone), the report then names the order the replays serve,
+    /// and both searches start again: the windows are emptied, the counts go on.
+    #[test]
+    fn an_overlay_order_is_written_for_each_side_and_restarts_the_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [dir.path().join("fcvm.html"), dir.path().join("kite.html")];
+        for f in &files {
+            std::fs::write(f, "").unwrap();
+        }
+        let mut wall = Wall::new(two_pages(), SearchParams::default(), 30_000, 0);
+        let mut served = Served::default();
+        let applied = apply_order(&mut wall, &mut served, &files, Some(&order(true, None)), 0);
+        assert_eq!(applied.unwrap(), Applied::Run);
+        assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), "");
+        for at in [1_000, 2_000] {
+            wall.render(&Completed {
+                side: FCVM,
+                page: 0,
+                at,
+                ms: 300.0,
+                level: 1,
+                error: None,
+            });
+        }
+        let before = wall.report(2_000, None, None);
+        assert!(before.sides["fcvm"].renders_per_s > 0.0);
+        assert_eq!(before.overlay_seq, None);
+
+        let o = order(true, Some(("<b>hi</b> & 'you'", "invert", 7)));
+        let applied = apply_order(&mut wall, &mut served, &files, Some(&o), 3_000);
+        assert_eq!(applied.unwrap(), Applied::Run);
+        let fcvm = std::fs::read_to_string(&files[0]).unwrap();
+        let kite = std::fs::read_to_string(&files[1]).unwrap();
+        assert_eq!(fcvm, overlay::html(o.overlay.as_ref(), FCVM));
+        assert_eq!(kite, overlay::html(o.overlay.as_ref(), KITE));
+        assert!(
+            fcvm.contains("&lt;b&gt;hi&lt;/b&gt; &amp; &#39;you&#39;"),
+            "{fcvm}"
+        );
+        assert!(!fcvm.contains("<b>"), "{fcvm}");
+        assert!(fcvm.contains("invert(1)") && !kite.contains("invert(1)"));
+        assert!(
+            kite.contains("fcvm-overlay"),
+            "the text goes to both sides: {kite}"
+        );
+        assert_eq!(served.inject[FCVM], Some(sha256_hex(fcvm.as_bytes())));
+        assert_eq!(served.inject[KITE], Some(sha256_hex(kite.as_bytes())));
+        let after = wall.report(3_000, None, None);
+        assert_eq!(after.overlay_seq, Some(7));
+        assert_eq!(after.sides["fcvm"].renders_per_s, 0.0);
+        assert_eq!(after.sides["fcvm"].done, 2);
+        assert_eq!(after.sides["fcvm"].since, 3_000);
+        assert_eq!(
+            after.sides["fcvm"].search.phase,
+            fleet_core::renders::SearchPhase::Starting
+        );
+
+        // A clear goes back to the pages as captured.
+        let applied = apply_order(
+            &mut wall,
+            &mut served,
+            &files,
+            Some(&order(true, None)),
+            4_000,
+        );
+        assert_eq!(applied.unwrap(), Applied::Run);
+        assert_eq!(std::fs::read_to_string(&files[1]).unwrap(), "");
+        assert_eq!(served.inject, [None, None]);
+        assert_eq!(wall.report(4_000, None, None).overlay_seq, None);
+    }
+
+    /// The same order again (the coordinator sends it at the start of every connection)
+    /// writes nothing: the file is the one the replays already read.
+    #[test]
+    fn an_order_the_replays_already_serve_writes_nothing() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let files = [dir.path().join("fcvm.html"), dir.path().join("kite.html")];
+        let mut wall = Wall::new(two_pages(), SearchParams::default(), 30_000, 0);
+        let mut served = Served::default();
+        let o = order(true, Some(("hello", "mirror", 3)));
+        apply_order(&mut wall, &mut served, &files, Some(&o), 1_000).unwrap();
+        let inode = std::fs::metadata(&files[0]).unwrap().ino();
+        apply_order(&mut wall, &mut served, &files, Some(&o), 2_000).unwrap();
+        assert_eq!(std::fs::metadata(&files[0]).unwrap().ino(), inode);
+        // the same text under another number is another order
+        let renumbered = order(true, Some(("hello", "mirror", 4)));
+        apply_order(&mut wall, &mut served, &files, Some(&renumbered), 3_000).unwrap();
+        assert_ne!(std::fs::metadata(&files[0]).unwrap().ino(), inode);
+        assert_eq!(wall.report(3_000, None, None).overlay_seq, Some(4));
+    }
+
+    /// `run: false`, or no order, stops the module, and the wall runs nothing from then on.
+    #[test]
+    fn an_order_to_stop_stops_the_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [dir.path().join("f"), dir.path().join("k")];
+        for stop in [Some(order(false, Some(("x", "flip", 2)))), None] {
+            let mut wall = Wall::new(two_pages(), SearchParams::default(), 30_000, 0);
+            let mut served = Served::default();
+            apply_order(&mut wall, &mut served, &files, Some(&order(true, None)), 0).unwrap();
+            assert_eq!(wall.step(1_000, [None, None]), [1, 1]);
+            let applied = apply_order(&mut wall, &mut served, &files, stop.as_ref(), 2_000);
+            assert_eq!(applied.unwrap(), Applied::Stop);
+            assert_eq!(wall.step(3_000, [None, None]), [0, 0]);
+            let report = wall.report(3_000, None, None);
+            assert_eq!(report.sides["fcvm"].search.in_flight, 0);
+        }
+    }
+
+    /// A start is ended by an order to stop or by the end of the agent's connection, and by
+    /// nothing else: an overlay change while it starts is applied when the loop begins.
+    #[tokio::test]
+    async fn a_start_is_ended_by_a_stop_and_by_the_end_of_the_connection() {
+        let quick = Duration::from_millis(200);
+        let (tx, mut rx) = watch::channel(Some(order(true, None)));
+        assert!(tokio::time::timeout(quick, stop_ordered(&mut rx))
+            .await
+            .is_err());
+        tx.send_replace(Some(order(true, Some(("hi", "zoom", 1)))));
+        assert!(tokio::time::timeout(quick, stop_ordered(&mut rx))
+            .await
+            .is_err());
+        tx.send_replace(Some(order(false, None)));
+        let why = tokio::time::timeout(quick, stop_ordered(&mut rx)).await;
+        assert_eq!(why.unwrap(), "an order to stop");
+
+        let (tx, mut rx) = watch::channel(Some(order(true, None)));
+        drop(tx);
+        let why = tokio::time::timeout(quick, stop_ordered(&mut rx)).await;
+        assert_eq!(why.unwrap(), "the end of the agent's connection");
+
+        let (_tx, mut rx) = watch::channel(None);
+        let why = tokio::time::timeout(quick, stop_ordered(&mut rx)).await;
+        assert_eq!(why.unwrap(), "an order to stop");
+    }
+
+    fn agent_argv(extra: &[&str]) -> Vec<String> {
+        [
+            "--out=o",
+            "--run-dir=r",
+            "--bench=b",
+            "--corpus=c",
+            "--urls=https://a.test/,https://b.test/",
+            "--snapshot-tag=t",
+        ]
+        .iter()
+        .chain(extra)
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// Under the agent the module takes renders-bench's options, and refuses the benchmark's
+    /// own: the coordinator's orders say when to render and what to inject.
+    #[test]
+    fn the_agent_takes_the_benchs_options_and_refuses_its_own() {
+        let args = agent_args(&agent_argv(&["--max-engines", "36", "--replay-cpus=4"])).unwrap();
+        assert_eq!(args.max_engines, 36);
+        assert_eq!(args.replay_cpus, 4);
+        assert_eq!(args.urls.len(), 2);
+        assert_eq!(args.cpus_fcvm, "0-39");
+        for own in [
+            "--levels=16,36",
+            "--seconds=60",
+            "--overlay-text=hi",
+            "--overlay-transform=flip",
+        ] {
+            let refused = agent_args(&agent_argv(&[own])).unwrap_err().to_string();
+            assert!(refused.contains("the benchmark's"), "{own}: {refused}");
+        }
+        assert!(agent_args(&agent_argv(&["--cpus-engines=40-78"])).is_err());
+        assert!(agent_args(&agent_argv(&["--no-such-option"])).is_err());
+        assert!(agent_args(&["--out=o".to_string()]).is_err());
+    }
+
+    /// The hello says what runs: the pages in order, each side's CPUs, whether the unit holds
+    /// every CPU the sides are given, and the build, the snapshot's shape winning over the
+    /// arguments once it is made.
+    #[test]
+    fn the_hello_says_what_the_module_runs() {
+        let args = agent_args(&agent_argv(&[
+            "--setup=fcvm.commit=abc123",
+            "--setup=kitesurf.commit=def456",
+            "--vcpus=2",
+            "--hugepages=false",
+        ]))
+        .unwrap();
+        let all: Vec<u32> = (0..96).collect();
+        let facts = HostFacts {
+            unit_cpus: Some(&all),
+            kernel: "7.3.3-fcvm-test",
+            instance_type: Some("example.metal"),
+            snapshot: None,
+            bundle_sha256: Some("feed".into()),
+        };
+        let host = hello(&args, &facts).unwrap();
+        assert_eq!(
+            host.pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["a.test", "b.test"]
+        );
+        assert_eq!(host.cpus, 40);
+        assert!(host.confined);
+        let want: BTreeMap<String, String> = [
+            ("instance_type", "example.metal"),
+            ("kernel", "7.3.3-fcvm-test"),
+            ("fcvm_commit", "abc123"),
+            ("kitesurf_commit", "def456"),
+            ("bundle_sha256", "feed"),
+            ("recycle_mib", "4096"),
+            ("viewport", "1280x720"),
+            ("vcpus", "2"),
+            ("page_size", "4 KiB"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(host.build, want);
+
+        // A unit without the harness's CPUs cannot confine the module; a made snapshot says
+        // its own shape.
+        let few: Vec<u32> = (0..80).collect();
+        let config = json!({"metadata": {"vcpu": 4, "memory_mib": 1024, "hugepages": true}});
+        let host = hello(
+            &args,
+            &HostFacts {
+                unit_cpus: Some(&few),
+                instance_type: None,
+                snapshot: Some(&config),
+                ..facts
+            },
+        )
+        .unwrap();
+        assert!(!host.confined);
+        assert_eq!(host.build["vcpus"], "4");
+        assert_eq!(host.build["page_size"], "2 MiB");
+        assert!(!host.build.contains_key("instance_type"));
+        let host = hello(
+            &args,
+            &HostFacts {
+                unit_cpus: None,
+                kernel: "k",
+                instance_type: None,
+                snapshot: None,
+                bundle_sha256: None,
+            },
+        )
+        .unwrap();
+        assert!(!host.confined);
+        // a module without engines says nothing of them
+        let args = agent_args(&agent_argv(&[
+            "--max-engines=0",
+            "--setup=kitesurf.commit=x",
+        ]))
+        .unwrap();
+        let host = hello(
+            &args,
+            &HostFacts {
+                unit_cpus: None,
+                kernel: "k",
+                instance_type: None,
+                snapshot: None,
+                bundle_sha256: Some("feed".into()),
+            },
+        )
+        .unwrap();
+        for k in ["kitesurf_commit", "bundle_sha256", "recycle_mib"] {
+            assert!(!host.build.contains_key(k), "{k}");
+        }
+    }
+
+    /// The benchmark command and the agent go through one session, and in it the reaper is
+    /// running before the module makes anything: a module whose process is killed outright
+    /// leaves the reaper to remove what it made, under the agent as under the benchmark.
+    #[test]
+    fn both_callers_share_one_session_that_starts_the_reaper_first() {
+        let source = include_str!("mod.rs");
+        let source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let body = |name: &str| {
+            let at = source
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} is in the module"));
+            let rest = &source[at..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let bench = body("pub async fn bench(");
+        assert!(bench.contains("session(&args, &exe, orders, None, Signals::EndTheModule, None)"));
+        assert!(!bench.contains("run("));
+        let session = body("pub async fn session(");
+        let reaper = session.find("reap::Reaper::start(").unwrap();
+        let run = session.find("let outcome = run(").unwrap();
+        let finish = session.find("reaper.finish().await").unwrap();
+        assert!(reaper < run && run < finish);
+        // the only call of run() is the session's
+        assert_eq!(source.matches("= run(\n").count(), 1);
+        assert_eq!(
+            source.matches("run(\n").count(),
+            2,
+            "the definition and the call"
+        );
+        // the agent starts the module through the session, with the signals and the bounds
+        // it names (`agent::renders::AGENT_SIGNALS` and `AGENT_BOUNDS`, pinned by value there)
+        let agent = include_str!("../agent/renders.rs");
+        let agent = &agent[..agent.find("#[cfg(test)]").unwrap()];
+        let calls: Vec<Vec<&str>> = agent
+            .match_indices("crate::fleet::renders::session(")
+            .map(|(at, call)| {
+                let rest = &agent[at + call.len()..];
+                let rest = rest[..rest.find(".await").unwrap()].trim_end();
+                rest.strip_suffix(')')
+                    .unwrap()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the agent's module is the session: {calls:?}"
+        );
+        assert_eq!(calls[0][4..], ["AGENT_SIGNALS", "Some(AGENT_BOUNDS)"]);
+    }
+
+    /// A start ended by an order to stop must leave nothing running: it spawns no task an
+    /// engine start could run on in (the workers' output readers start nothing), and the
+    /// signal handlers are the benchmark's alone.
+    #[test]
+    fn a_start_spawns_no_task_and_the_agent_registers_no_signal() {
+        let source = include_str!("mod.rs");
+        let source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let start = &source[source.find("\nasync fn start(\n").unwrap()..];
+        let start = &start[..start.find("\n}\n").unwrap()];
+        // (a worker's output reader is a task of the start, and starts nothing)
+        for spawned in ["tokio::spawn(", ".spawn(async", "spawn_blocking("] {
+            assert!(!start.contains(spawned), "the start uses {spawned}");
+        }
+        assert!(start.contains("try_join_all(batch)"));
+        let run = &source[source.find("\nasync fn run(\n").unwrap()..];
+        let run = &run[..run.find("\n}\n").unwrap()];
+        let guard = run
+            .find("let mut signals = if signals == Signals::EndTheModule {")
+            .unwrap();
+        let term = run.find("signal(SignalKind::terminate())").unwrap();
+        let none = run.find("        None\n    };").unwrap();
+        assert!(guard < term && term < none);
+        assert_eq!(source.matches("SignalKind::terminate()").count(), 1);
+    }
+
+    /// A bounded records file is renamed to `.1` before a line would take it past its limit,
+    /// so it and its previous file hold at most twice the limit, in whole lines; an
+    /// unbounded one (the benchmark's) is never rotated.
+    #[test]
+    fn a_bounded_records_file_keeps_one_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("renders.jsonl");
+        let mut r = Records::create(path.clone(), Some(100)).unwrap();
+        let line = |i: usize| format!("{{\"seq\":{i},\"pad\":\"{}\"}}", "x".repeat(20));
+        for i in 0..40 {
+            r.line(&line(i));
+        }
+        r.flush();
+        let now = std::fs::read_to_string(&path).unwrap();
+        let before = std::fs::read_to_string(dir.path().join("renders.jsonl.1")).unwrap();
+        assert!(
+            now.len() <= 100 && before.len() <= 100,
+            "{} {}",
+            now.len(),
+            before.len()
+        );
+        assert!(now.ends_with(&format!("{}\n", line(39))), "{now}");
+        // the previous file is the lines just before the current one, all whole
+        let first_now: usize = now.lines().count();
+        assert_eq!(
+            before.lines().last().unwrap(),
+            line(39 - first_now),
+            "{before}"
+        );
+        assert!(before
+            .lines()
+            .chain(now.lines())
+            .all(|l| l.ends_with("\"}")));
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(names.len(), 2);
+
+        let path = dir.path().join("samples.jsonl");
+        let mut r = Records::create(path.clone(), None).unwrap();
+        for i in 0..40 {
+            r.line(&line(i));
+        }
+        r.flush();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 40);
+        assert!(!dir.path().join("samples.jsonl.1").exists());
+    }
+
+    /// The failed clones' logs past the newest kept are removed, across the workers'
+    /// directories; a log written lately is a render still under way and is left alone.
+    #[test]
+    fn the_failed_clones_logs_past_the_newest_kept_are_removed() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let at = |s: u64| UNIX_EPOCH + Duration::from_secs(1_000_000 + s);
+        let mut all = Vec::new();
+        for (worker, ages) in [(0, [10u64, 30, 50]), (1, [20, 40, 995])] {
+            let sub = dir.path().join(format!("logs-{worker}"));
+            std::fs::create_dir(&sub).unwrap();
+            for age in ages {
+                let path = sub.join(format!("rb-{age}.log"));
+                std::fs::write(&path, "x").unwrap();
+                let f = std::fs::File::options().write(true).open(&path).unwrap();
+                f.set_modified(at(age)).unwrap();
+                all.push((age, path));
+            }
+        }
+        let now = at(1_000);
+        // settled: written over 60 s ago (995 is under way); keep the newest 3 of the five
+        let removed = prune_clone_logs(dir.path(), 3, Duration::from_secs(60), now);
+        assert_eq!(removed, 2);
+        for (age, path) in &all {
+            assert_eq!(path.exists(), ![10, 20].contains(age), "{age}");
+        }
+        assert_eq!(
+            prune_clone_logs(dir.path(), 3, Duration::from_secs(60), now),
+            0
+        );
+        assert_eq!(
+            prune_clone_logs(
+                &dir.path().join("absent"),
+                0,
+                Duration::ZERO,
+                SystemTime::now()
+            ),
+            0
+        );
     }
 
     #[test]
