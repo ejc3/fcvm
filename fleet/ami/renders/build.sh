@@ -121,16 +121,19 @@ X
   grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo user_allow_other >> /etc/fuse.conf
   echo 'KERNEL=="userfaultfd", MODE="0666"' > /etc/udev/rules.d/70-fcvm-fleet.rules
   printf '* soft nofile 1048576\n* hard nofile 1048576\n' > /etc/security/limits.d/99-fcvm.conf
-  # The arm64 host kernel keeps ENA, the instance's NIC driver, a module (kernel/host-arm64.conf),
-  # and the image boots Ubuntu's initrdless path, as the recorded campaign's host did. A PCI
-  # driver binds a device that is present inside its module load unless its probe is asynchronous:
-  # ENA's pci_driver sets no probe type (drivers/net/ethernet/amazon/ena/ena_netdev.c, 7.3.3), so
-  # only driver_async_probe= on the boot line could make it so, and host-check.py boot refuses a
-  # boot line with a key outside renders.conf. systemd-modules-load.service finishes before
-  # sysinit.target, and neither it nor cloud-init-local.service has default dependencies, so
-  # loading ENA there and ordering cloud-init-local after it binds the NIC before cloud-init-local
-  # looks for one. host-check.py boot checks both files and the order systemd took; the
-  # launch-path proof checks the order the boot took, on every validation boot.
+  # ENA, the instance's NIC driver, is a module of the arm64 host kernel: its config is the
+  # running Ubuntu kernel's, which has it =m, and kernel/host-arm64.conf does not pin it. The image
+  # boots Ubuntu's initrdless path, as the recorded campaign's host did. A PCI driver binds a
+  # device that is present inside its module load unless its probe is asynchronous: ENA's
+  # pci_driver sets no probe type (drivers/net/ethernet/amazon/ena/ena_netdev.c, 7.3.3), and
+  # drivers/base/dd.c makes it asynchronous only through driver_async_probe=, ena.async_probe or
+  # module.async_probe on the boot line, which host-check.py boot refuses (their keys are outside
+  # renders.conf), or an `options ena async_probe` line in modprobe.d, which this recipe does not
+  # write. systemd-modules-load.service finishes before sysinit.target, and neither it nor
+  # cloud-init-local.service has default dependencies, so loading ENA there and ordering
+  # cloud-init-local after it binds the NIC before cloud-init-local looks for one. host-check.py
+  # boot checks both files, that the loader ran, and the order systemd resolved; the launch-path
+  # proof checks the order the boot took, on every validation boot.
   echo ena > /etc/modules-load.d/fcvm-fleet-nic.conf
   install -d /etc/systemd/system/cloud-init-local.service.d
   printf '[Unit]\nAfter=systemd-modules-load.service\n' > /etc/systemd/system/cloud-init-local.service.d/10-fcvm-fleet-nic.conf

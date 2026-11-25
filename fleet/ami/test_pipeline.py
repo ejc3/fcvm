@@ -1950,7 +1950,8 @@ class RendersRecipeTests(unittest.TestCase):
         self.assertIn("with Linux", prep[record - 300:record])
 
     def test_prep_loads_the_nic_driver_before_cloud_init_on_the_initrdless_boot(self):
-        # The arm64 host kernel keeps ENA a module (kernel/host-arm64.conf) and the image boots
+        # ENA is a module of the arm64 host kernel (its config is the running Ubuntu kernel's, which
+        # has it =m; kernel/host-arm64.conf does not pin it) and the image boots
         # Ubuntu's initrdless path, as the campaign host did. systemd-modules-load loads the driver,
         # which binds the present NIC inside the load, and cloud-init-local is ordered after it.
         _, phases = renders_phases()
@@ -2257,9 +2258,11 @@ class RendersHostCheckTests(unittest.TestCase):
     BUILTIN = "kernel/drivers/net/ethernet/amazon/ena/ena.ko\n"
     AFTER = "systemd-remount-fs.service systemd-modules-load.service systemd-journald.socket"
 
+    LOADER = {"LoadState": "loaded", "ActiveState": "active", "Result": "success"}
+
     def test_the_nic_driver_is_loaded_before_cloud_init_looks_for_a_nic(self):
         check = self.check.nic_load_problems
-        self.assertEqual(check("ena", "# a comment\nena\n", True, self.AFTER, ""), [])
+        self.assertEqual(check("ena", "# a comment\nena\n", True, self.AFTER, self.LOADER, ""), [])
         cases = (
             ({"modules_load": None}, "/etc/modules-load.d/fcvm-fleet-nic.conf"),
             ({"modules_load": "enax\n"}, "ena"),
@@ -2267,24 +2270,74 @@ class RendersHostCheckTests(unittest.TestCase):
             ({"dropin": False}, "10-fcvm-fleet-nic.conf"),
             ({"after": "systemd-remount-fs.service"}, "systemd-modules-load.service"),
             ({"after": None}, "is unknown"),
+            # the loader masked, failed or not run: the files and the order are no load
+            ({"loader": {**self.LOADER, "LoadState": "masked", "ActiveState": "inactive"}}, "LoadState=masked"),
+            ({"loader": {**self.LOADER, "ActiveState": "failed", "Result": "exit-code"}}, "Result=exit-code"),
+            ({"loader": {**self.LOADER, "ActiveState": "inactive"}}, "ActiveState=inactive"),
+            ({"loader": {}}, "systemd-modules-load.service"),
+            ({"loader": None}, "is unknown"),
         )
+        texts = []
         for change, words in cases:
             with self.subTest(change=change):
-                args = {"modules_load": "ena\n", "dropin": True, "after": self.AFTER}
+                args = {"modules_load": "ena\n", "dropin": True, "after": self.AFTER, "loader": self.LOADER}
                 args.update(change)
-                problems = check("ena", args["modules_load"], args["dropin"], args["after"], "")
+                problems = check("ena", args["modules_load"], args["dropin"], args["after"], args["loader"], "")
                 self.assertTrue(problems, change)
                 self.assertTrue(any(words in p for p in problems), problems)
+                texts += problems
         # a driver built into the kernel binds during the kernel's own start
-        self.assertEqual(check("ena", None, False, None, self.BUILTIN), [])
+        self.assertEqual(check("ena", None, False, None, None, self.BUILTIN), [])
         # without a NIC driver to look for, nothing passes
-        self.assertTrue(check("", "ena\n", True, self.AFTER, ""))
+        texts += check("", "ena\n", True, self.AFTER, self.LOADER, "")
+        self.assertTrue(texts[-1])
+        # every sentence reaches the validation record as itself, not as the fixed stand-in
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertTrue(guest.RENDERS_TEXT.fullmatch(text) and "//" not in text, text)
+
+    def test_the_nic_driver_is_the_default_route_interfaces_or_none(self):
+        route = ("Iface\tDestination\tGateway\tFlags\n"
+                 "examplenic0\t00000000\t0102A8C0\t0003\n"
+                 "examplenic1\t0000A8C0\t00000000\t0001\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "class/net/examplenic0").mkdir(parents=True)
+            # an interface without a device/driver link has no driver
+            self.assertEqual(self.check.nic_driver(route, root), "")
+            (root / "bus/pci/drivers/examplenet").mkdir(parents=True)
+            (root / "devices/example0").mkdir(parents=True)
+            (root / "devices/example0/driver").symlink_to(root / "bus/pci/drivers/examplenet")
+            (root / "class/net/examplenic0/device").symlink_to(root / "devices/example0")
+            self.assertEqual(self.check.nic_driver(route, root), "examplenet")
+            self.assertEqual(self.check.nic_driver(route.splitlines()[0] + "\n", root), "")
+        problems = self.check.nic_load_problems("", "ena\n", True, self.AFTER, self.LOADER, "")
+        self.assertTrue(problems and "no default route" in problems[0] and "no driver" in problems[0], problems)
+
+    def test_a_systemctl_read_that_fails_is_none_never_text(self):
+        calls = []
+        def runner(code, out):
+            def go(args):
+                calls.append(args)
+                return SimpleNamespace(returncode=code, stdout=out, stderr="")
+            return go
+        text = "LoadState=loaded\nActiveState=active\nResult=success\n"
+        self.assertEqual(self.check.systemctl_show("systemd-modules-load.service", ("LoadState", "ActiveState", "Result"),
+                                                   runner(0, text)), self.LOADER)
+        self.assertEqual(calls[-1], ["systemctl", "show", "systemd-modules-load.service",
+                                     "-p", "LoadState", "-p", "ActiveState", "-p", "Result"])
+        for code in (1, 4):
+            with self.subTest(code=code):
+                self.assertIsNone(self.check.systemctl_show("systemd-modules-load.service", ("LoadState",),
+                                                            runner(code, "LoadState=loaded\n")))
 
     def test_the_boot_check_holds_the_nic_order_and_not_grub(self):
         source = (RENDERS / "host-check.py").read_text()
         body = source.split("def check_boot(conf):", 1)[1].split("\ndef ", 1)[0]
         self.assertIn("nic_load_problems(", body)
-        self.assertIn('"systemctl", "show", "cloud-init-local.service", "-p", "After", "--value"', body)
+        self.assertIn('systemctl_show("cloud-init-local.service", ("After",))', body)
+        self.assertIn('systemctl_show("systemd-modules-load.service", ("LoadState", "ActiveState", "Result"))', body)
+        self.assertNotIn('"systemctl"', body, "both reads go through systemctl_show")
         self.assertNotIn("grub", source.lower())
         self.assertNotIn("lsinitramfs", source)
 
