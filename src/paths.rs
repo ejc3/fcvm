@@ -27,6 +27,7 @@ pub fn init_from_config() {
 /// sharing a directory such as `reclaim/0` with host root fails its ownership check.
 pub fn init_from_loaded_config(config: &crate::setup::rootfs::Plan) {
     let _ = DATA_DIR.set(resolve_data_dir(&config.paths.data_dir));
+    crate::confine::set_config_mode(config.confine.mode);
     let _ = ASSETS_DIR.set(resolve_assets_dir(&config.paths.assets_dir));
 }
 

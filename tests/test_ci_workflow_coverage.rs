@@ -104,6 +104,46 @@ fn main_runs_are_not_cancelled_by_the_next_merge() {
     );
 }
 
+/// A Build Runner AMI run whose job is skipped must stay out of the builds' concurrency group.
+///
+/// Build Runner AMI starts after every finished Build Kernels run, and a run whose only job
+/// is skipped still enters its workflow-level group. On 2026-11-24 such a run cancelled an
+/// image build 44 minutes in: nothing was published and the builder was left running. Among
+/// runs that do build, the newest must still win (it carries the newest content, and the
+/// approval prompt then belongs to the newest commit), so `cancel-in-progress` stays true
+/// and the group is shared only when the job's own `if:` holds. The group repeats that
+/// condition, and this test fails when the two differ.
+#[test]
+fn a_skipped_image_run_stays_out_of_the_builds_concurrency_group() {
+    let workflow = parse_workflow("build-runner-ami.yml");
+    let compact = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let job = workflow_job(&workflow, "build-ami");
+    let condition = compact(job["if"].as_str().expect("build-ami has an `if:`"));
+    let concurrency = workflow
+        .get("concurrency")
+        .expect("build-runner-ami.yml has no `concurrency`");
+    assert_eq!(
+        concurrency
+            .get("cancel-in-progress")
+            .and_then(Value::as_bool),
+        Some(true),
+        "among runs that build, the newest must cancel an older one"
+    );
+    assert_eq!(
+        compact(concurrency["group"].as_str().unwrap()),
+        format!(
+            "${{{{({condition})&&format('{{0}}-{{1}}',github.workflow,github.ref)\
+             ||format('{{0}}-skipped-{{1}}',github.workflow,github.run_id)}}}}"
+        ),
+        "the group must be the shared one exactly when build-ami's `if:` holds, and one of \
+         the run's own otherwise"
+    );
+    assert!(
+        job.get("concurrency").is_none(),
+        "a job-level group would let the two legs of one run cancel each other"
+    );
+}
+
 /// Marking a draft ready must start a CI run.
 ///
 /// With the default `pull_request` types a ready flip fires no event, so a PR whose
@@ -365,6 +405,70 @@ fn fleet_web_changes_run_the_fleet_web_job() {
             "a fail-open branch of `changes` leaves a gate closed: {line}"
         );
     }
+}
+
+/// What fleet/web's tests read outside fleet/web runs the fleet web suite too.
+///
+/// `mock/test/potato.test.ts` compares the mock with `fleet/core/tests/vectors/33_potato.json`
+/// (through the fixture generated from it) and `fleet/PROTOCOL.md`. The potato host stack
+/// changed both and landed with Fleet Web skipped, which left main's unit step red.
+#[test]
+fn fleet_web_runs_when_what_it_reads_changes() {
+    let text = changes_scripts();
+    let core_arm = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("fleet/core/*)"))
+        .expect("`changes` lost its fleet/core arm");
+    assert!(
+        core_arm.contains("web=true"),
+        "a change under fleet/core (the vectors, the coordinator's view) does not run fleet-web: {core_arm}"
+    );
+    let protocol_arm = text
+        .find("fleet/PROTOCOL.md) web=true")
+        .expect("a fleet/PROTOCOL.md change does not run fleet-web");
+    let catch_all = text
+        .find("fleet/*|.github/workflows/fleet-coordinator-deploy.yml)")
+        .expect("`changes` lost its fleet arm");
+    assert!(
+        protocol_arm < catch_all,
+        "the PROTOCOL.md arm must come before the fleet/* arm that would swallow it"
+    );
+}
+
+/// Tree-wide guards run on every pull request that runs CI, whatever paths it touches.
+///
+/// `NoHostIdentifiersInTree` scans every tracked file. It sat only in the path-filtered
+/// `Bench Harness Tests` lane, so #2093 (scripts and workflows only) added a fixture that
+/// tripped it and main went red. The `actionlint` job runs whenever CI runs at all, so the
+/// guard has a step there.
+#[test]
+fn tree_wide_guards_run_on_every_pull_request() {
+    let ci = parse_workflow("ci.yml");
+    let job = ci
+        .get("jobs")
+        .and_then(|j| j.get("actionlint"))
+        .expect("ci.yml has no `actionlint` job");
+    let condition = job
+        .get("if")
+        .and_then(Value::as_str)
+        .expect("`actionlint` has no `if:`");
+    assert!(
+        condition.contains("needs.changes.outputs.run == 'true'") && !condition.contains("outputs.code") && !condition.contains("outputs.bench"),
+        "`actionlint` must run on every pull request that runs CI, not on a path filter ({condition:?})"
+    );
+    let steps = job
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`actionlint` has no steps");
+    let guard = steps
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("NoHostIdentifiersInTree"))
+        .expect("no step of the always-running `actionlint` job runs `NoHostIdentifiersInTree`: a pull request that touches no bench path skips the guard");
+    assert!(
+        guard.contains("unittest"),
+        "the tree-wide guard step does not run the test: {guard:?}"
+    );
 }
 
 /// A failing browser test leaves its Playwright trace (`trace: "retain-on-failure"` in

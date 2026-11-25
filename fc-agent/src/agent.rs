@@ -513,7 +513,7 @@ pub async fn run() -> Result<()> {
         // disk-only snapshot of this VM cold-boots clones without redoing it.
         // The marker deliberately does NOT assert the container exists — a capture
         // taken before `podman run` creates it is still valid (the clone's
-        // container_exists probe falls back to a fresh `podman run` from the
+        // existing_container_id probe falls back to a fresh `podman run` from the
         // preserved image, which is the correct degradation).
         container::write_provisioned_marker();
         image_ref
@@ -541,9 +541,13 @@ pub async fn run() -> Result<()> {
     // start. Unknown counts as yes: the host then asks podman, which is what it did for
     // every container before the start notification carried this.
     let mut image_healthcheck = true;
+    // The image's user and environment, for the restore hook's process. Unknown when
+    // the inspect fails.
+    let mut exec_session = container::ExecSession::of(&plan, user_info.is_some(), None);
     match container::get_image_facts(&image_ref, &cmd_prefix).await {
         Ok(facts) => {
             image_healthcheck = facts.healthcheck;
+            exec_session = container::ExecSession::of(&plan, user_info.is_some(), Some(&facts));
             let cache_result = container::notify_cache_ready_and_wait(&facts.digest, &restore_flag);
             match cache_result {
                 container::CacheResult::ColdStart => {
@@ -667,8 +671,22 @@ pub async fn run() -> Result<()> {
     // Taken before the args: an attach still loading the driver finishes first, and
     // from here a GPU attached by a later restore cannot reach this container.
     let gpu_devices = crate::gpu::launch_devices().await;
-    let podman_args = if provisioned && container::container_exists(&cmd_prefix) {
+    container::begin_container_launch(container::ContainerRuntime {
+        session: exec_session,
+        ..container::ContainerRuntime::new(
+            user_ref.map(|(_, runtime_dir)| runtime_dir),
+            container::podman_user_ids(plan.user.as_deref()),
+        )
+    });
+    let captured = if provisioned {
+        container::existing_container_id(&cmd_prefix)
+    } else {
+        None
+    };
+    let podman_args = if let Some(id) = captured {
         eprintln!("[fc-agent] starting captured fcvm-container (clone cold boot)");
+        // `podman run` leaves the id in the id file; `podman start` writes none.
+        container::record_captured_container(id);
         container::build_start_args(&plan, user_ref)
     } else {
         container::build_podman_args(&plan, &image_ref, user_ref, &gpu_devices)
@@ -959,6 +977,15 @@ pub(crate) struct RetiredChronyd {
     state: tokio::sync::OwnedMutexGuard<LifecycleState>,
     /// This restore's number in [`LifecycleState::restores`].
     restore: u64,
+}
+
+/// A retired chronyd of a lifecycle of its own, for tests of what holds one.
+#[cfg(test)]
+pub(crate) async fn retired_chronyd_for_test() -> RetiredChronyd {
+    RetiredChronyd {
+        state: ChronydLifecycle::new().state.lock_owned().await,
+        restore: 1,
+    }
 }
 
 impl ChronydLifecycle {
