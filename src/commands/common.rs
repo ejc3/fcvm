@@ -4667,10 +4667,11 @@ fn ch_restore_args(clone_ch_dir: &Path) -> String {
     )
 }
 
-/// What a failed `--restore` launch says. A Cloud Hypervisor from before v54.0 rejects
-/// `memory_restore_mode=copyonwrite` while it parses its arguments ("Error parsing --restore"),
-/// before any VM exists, so that failure names the fix. Only a build named by
-/// `FCVM_CLOUD_HYPERVISOR_BIN` or found on PATH can be that old.
+/// What a failed `--restore` launch says. A Cloud Hypervisor without one of the options (a
+/// release before v54.0 has no `copyonwrite`, and no release up to v55.0 has
+/// `clock_restore_mode`) rejects it while it parses its arguments ("Error parsing
+/// --restore"), before any VM exists, so that failure names the fix. Only a build named by
+/// `FCVM_CLOUD_HYPERVISOR_BIN` or found on PATH can be one.
 fn ch_restore_launch_error(error: anyhow::Error, ch_bin: &std::path::Path) -> anyhow::Error {
     if format!("{error:#}").contains("Error parsing --restore") {
         error.context(format!(
@@ -10730,7 +10731,7 @@ mod tests {
         assert_eq!(found, on_path);
     }
 
-    /// A Cloud Hypervisor from before v54.0 (only an override or a PATH binary can be one)
+    /// A Cloud Hypervisor without `copyonwrite` (only an override or a PATH binary can be one)
     /// fails at argument parsing with this stderr; the restore's error then says how to get a
     /// build that takes the options, and any other launch failure is left as it was.
     #[test]
