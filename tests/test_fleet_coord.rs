@@ -1297,6 +1297,7 @@ fn bare_hello(host: &str) -> AgentMsg {
         windows_actions: Vec::new(),
         minecraft: 0,
         minecraft_server: None,
+        renders: None,
     }
 }
 
@@ -1515,6 +1516,7 @@ async fn the_agent_socket_answers_pings() {
         windows_actions: Vec::new(),
         minecraft: 0,
         minecraft_server: None,
+        renders: None,
     };
     ws.send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
         .await
@@ -1568,6 +1570,7 @@ impl FakeAgent {
                 windows_actions: Vec::new(),
                 minecraft: 0,
                 minecraft_server: None,
+                renders: None,
             },
         )
     }
@@ -1784,6 +1787,7 @@ fn minecraft_hello(host: &str, n: u32) -> AgentMsg {
         windows_actions: Vec::new(),
         minecraft: n,
         minecraft_server: Some("Pumpkin 3ea7d281 (Java Edition 26.3)".into()),
+        renders: None,
     }
 }
 
@@ -6652,6 +6656,139 @@ async fn acknowledged_state_survives_a_sigkill() {
 #[tokio::test]
 async fn acknowledged_state_survives_a_sigterm() {
     acknowledged_state_survives(nix::sys::signal::Signal::SIGTERM).await;
+}
+
+/// An agent on the coordinator's `/agent` socket that runs pages mode and nothing else.
+async fn dial_pages_agent(live: &str) -> Ws {
+    let (mut ws, _) = tokio_tungstenite::connect_async(live.replace("/live", "/agent").as_str())
+        .await
+        .unwrap();
+    let hello = json!({"type": "hello", "host": "pages-a", "arch": "aarch64", "capacity": 0,
+        "gpus": [], "renders": {"cpus": 40,
+        "pages": [{"id": "example", "url": "https://example.com/"}]}});
+    ws.send(Message::Text(hello.to_string().into()))
+        .await
+        .unwrap();
+    ws
+}
+
+/// The next pages order the coordinator sends on `ws` that satisfies `f`.
+async fn pages_order(ws: &mut Ws, f: impl Fn(&Value) -> bool) -> Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let m = ws.next().await.expect("the agent socket is open").unwrap();
+            if let Message::Text(t) = m {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "renders" && f(&v["order"]) {
+                    return v["order"].clone();
+                }
+            }
+        }
+    })
+    .await
+    .expect("a pages order within 10 s")
+}
+
+/// Pages mode's overlay is acknowledged state. A viewer sets a transform and is answered;
+/// the process is stopped with `signal` the moment the answer arrives. A new process on the
+/// same state file orders the returning host the same overlay with the same number, shows
+/// it to a new page with the same end time, and answers the intent sent again with its
+/// first receipt.
+async fn a_pages_overlay_survives(signal: nix::sys::signal::Signal) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("fleet.json");
+    let mut first = coord_process(&state).await;
+    let mut agent = dial_pages_agent(&first.url).await;
+    let mut v = Viewer::connect(&first.url).await;
+    v.until(|s| !s["renders"].is_null()).await;
+    v.intent("o-0", "renders_transform", json!({"name": "mirror"}))
+        .await;
+    let r = v.receipt("o-0").await;
+    assert_eq!(r["outcome"], "committed", "{r}");
+    let version = r["version"].as_u64().unwrap();
+    let shown = v.at_least(version).await["renders"]["overlay"].clone();
+    assert_eq!(shown["transform"], "mirror");
+    let ordered = pages_order(&mut agent, |o| !o["overlay"].is_null()).await;
+    assert_eq!(ordered["overlay"]["transform"], "mirror");
+    let pid = nix::unistd::Pid::from_raw(first.child.id().unwrap() as i32);
+    nix::sys::signal::kill(pid, signal).unwrap();
+    tokio::time::timeout(Duration::from_secs(30), first.child.wait())
+        .await
+        .expect("the coordinator exits")
+        .unwrap();
+
+    let second = coord_process(&state).await;
+    let mut agent = dial_pages_agent(&second.url).await;
+    let again = pages_order(&mut agent, |o| !o["overlay"].is_null()).await;
+    assert_eq!(again["overlay"], ordered["overlay"]);
+    let mut w = Viewer::connect(&second.url).await;
+    let s = w.until(|s| !s["renders"]["overlay"].is_null()).await;
+    assert_eq!(s["renders"]["overlay"], shown);
+    w.intent("o-0", "renders_transform", json!({"name": "mirror"}))
+        .await;
+    let r = w.receipt("o-0").await;
+    assert_eq!(r["outcome"], "committed", "{r}");
+    assert_eq!(r["version"].as_u64(), Some(version));
+}
+
+#[tokio::test]
+async fn a_pages_overlay_survives_a_sigkill() {
+    a_pages_overlay_survives(nix::sys::signal::Signal::SIGKILL).await;
+}
+
+#[tokio::test]
+async fn a_pages_overlay_survives_a_sigterm() {
+    a_pages_overlay_survives(nix::sys::signal::Signal::SIGTERM).await;
+}
+
+/// Pages mode's text goes through the wall's text check, alone, before it is set: an
+/// allowed text is ordered to the host, a refused one changes nothing, and a host that does
+/// not run the mode gets no pages order at all.
+#[tokio::test]
+async fn a_pages_overlay_text_needs_an_allow_from_the_text_check() {
+    let checker: Arc<dyn TextChecker> = Arc::new(FakeCheck {
+        refuse: vec!["nasty".into()],
+        fail: false,
+        delay: Duration::from_millis(20),
+    });
+    let (url, _h) = coordinator(checker).await;
+    let mut gpu = dial_agent(&url).await;
+    let mut agent = dial_pages_agent(&url).await;
+    let mut a = Viewer::connect_from(&url, Some("198.51.100.1")).await;
+    let mut b = Viewer::connect_from(&url, Some("198.51.100.2")).await;
+    a.until(|s| !s["renders"].is_null()).await;
+    b.intent("o1", "renders_overlay", json!({"text": "so nasty"}))
+        .await;
+    let r = b.receipt("o1").await;
+    assert_eq!(r["outcome"], "refused", "{r}");
+    assert_eq!(r["check"]["verdict"], "refuse");
+    a.intent("o2", "renders_overlay", json!({"text": "  hello   there "}))
+        .await;
+    let r = a.receipt("o2").await;
+    assert_eq!(r["outcome"], "committed", "{r}");
+    assert_eq!(r["check"]["verdict"], "allow");
+    let order = pages_order(&mut agent, |o| !o["overlay"].is_null()).await;
+    assert_eq!(order["overlay"]["text"], "hello there");
+    // Limited before the check: no verdict.
+    a.intent("o3", "renders_overlay", json!({"text": "again"}))
+        .await;
+    let r = a.receipt("o3").await;
+    assert_eq!(r["reason"], "one change every 30 s");
+    assert!(r.get("check").is_none());
+    let s = a.at_least(r["version"].as_u64().unwrap()).await;
+    assert_eq!(s["renders"]["overlay"]["text"], "hello there");
+    assert!(!s.to_string().contains("nasty"));
+    // The GPU host said nothing of pages in its hello: nothing it was sent is a pages order.
+    // The coordinator goes on sending it scenes, so read for a bounded time.
+    let until = Instant::now() + Duration::from_secs(1);
+    while let Ok(Some(Ok(m))) =
+        tokio::time::timeout(until.saturating_duration_since(Instant::now()), gpu.next()).await
+    {
+        if let Message::Text(t) = m {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            assert_ne!(v["type"], "renders", "{v}");
+        }
+    }
 }
 
 /// A claim's token is the one the page sent with `claim_gpu`, so a page that reconnects

@@ -123,6 +123,23 @@ pub fn precheck_word(
     }
 }
 
+/// Why a `renders_overlay` from `client` would be refused before its text is checked, if it
+/// would be: so a text that cannot be applied costs no check.
+pub fn precheck_overlay(
+    state: &State,
+    client: &str,
+    args: &serde_json::Value,
+    at: u64,
+) -> Option<String> {
+    match Intent::parse("renders_overlay", args) {
+        Err(reason) => Some(reason),
+        Ok(_) => state
+            .fleet
+            .renders
+            .refusal(client, at, &state.config.renders),
+    }
+}
+
 /// The viewers' words in the sky now, which a new word must be checked together with. A
 /// system word is the wall's own and is not part of what is checked, so one placed while a
 /// viewer's word is being checked does not make that check stale.
@@ -231,13 +248,14 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     (Outcome::Refused, Some(reason.clone()), reason)
                 }
             };
-            // A refused word's text is never shown: its args are left out and the summary
-            // is the reason only. Args that are not an object (refused, `args must be an
+            // A refused word's text, and a refused pages overlay's, is never shown: its args
+            // are left out and the summary is the reason only. Args that are not an object (refused, `args must be an
             // object`) are shown as `{}` too: an intent's args are an object on the wire, and
             // a page keeps nothing else.
             // A claim's and a resume's args are the claim's token, which only its viewer may
             // hold.
-            let shown_args = if (name == "word" && outcome == Outcome::Refused)
+            let shown_args = if ((name == "word" || name == "renders_overlay")
+                && outcome == Outcome::Refused)
                 || name == "resume_claim"
                 || name == "claim_gpu"
                 || !args.is_object()
@@ -442,6 +460,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             let awake = state.fleet.power.state != "asleep";
             let cfg = state.config.potato.clone();
             state.fleet.potato.tick(at, awake, &cfg);
+            state.fleet.renders.tick(at);
             None
         }
         Event::Ec2Health { report, .. } | Event::LambdaHealth { report, .. } => {
@@ -466,10 +485,12 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     windows_actions,
                     minecraft,
                     minecraft_server,
+                    renders,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
                         state.fleet.registrations.registered(host, at);
+                        state.fleet.renders.agent_hello(host, renders.as_ref());
                         let cfg = state.config.potato.clone();
                         state.fleet.potato.agent_hello(
                             host,
@@ -581,6 +602,9 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     let cfg = state.config.potato.clone();
                     state.fleet.potato.event(host, e, at, &cfg);
                 }
+                AgentMsg::Renders(report) => {
+                    state.fleet.renders.report(host, report, at);
+                }
                 AgentMsg::WindowsImage(image) => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.windows_image = Some(image.clone());
@@ -592,6 +616,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         Event::AgentGone { host, .. } => {
             let cfg = state.config.potato.clone();
             state.fleet.potato.agent_gone(host, at, &cfg);
+            state.fleet.renders.agent_gone(host);
             let f = &mut state.fleet;
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
@@ -1216,6 +1241,41 @@ fn intent_effect(
                 crate::potato::PotatoIntent::Done => Ok("restart".into()),
                 crate::potato::PotatoIntent::Refused(r) => Err(r),
             }
+        }
+        Intent::RendersOverlay { text } => {
+            let cfg = state.config.renders.clone();
+            // The limits first: a change that would be refused anyway needs no verdict.
+            if let Some(reason) = state.fleet.renders.refusal(c.client, at, &cfg) {
+                return Err(reason);
+            }
+            match check {
+                None => return Err("the text check did not run".into()),
+                Some(k) if k.verdict == "error" => return Err(k.reason.clone()),
+                Some(k) if !k.allowed() => {
+                    return Err(format!("the text check refused it: {}", k.reason))
+                }
+                Some(_) => {}
+            }
+            let change = crate::renders::Change::Text(text.clone());
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &change, at, &cfg)
+        }
+        Intent::RendersTransform { name } => {
+            let cfg = state.config.renders.clone();
+            let change = crate::renders::Change::Transform(name.clone());
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &change, at, &cfg)
+        }
+        Intent::RendersClear => {
+            let cfg = state.config.renders.clone();
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &crate::renders::Change::Clear, at, &cfg)
         }
         Intent::ResumeClaim { token } => resume_claim(&mut state.fleet, c, token),
         Intent::ReleaseGpu { claim } => {
