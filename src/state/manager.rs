@@ -604,10 +604,19 @@ fn old_names_lock_wait() -> std::time::Duration {
 /// message. `None` when it names none (or the holder is outside this PID namespace).
 fn flock_holder(path: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
-    let inode = std::fs::metadata(path).ok()?.ino().to_string();
+    let inode = std::fs::metadata(path).ok()?.ino();
+    flock_holder_in(&std::fs::read_to_string("/proc/locks").ok()?, inode)
+}
+
+/// The one PID that `locks`, the text of /proc/locks, names as holding a flock on an inode
+/// numbered `inode`. /proc/locks gives the superblock's device, which on btrfs is not the
+/// device stat reports for a file in a subvolume, so only the inode number is compared. Two
+/// files on different filesystems can share it, so when the flocks on that number are held
+/// by more than one process, none is named.
+fn flock_holder_in(locks: &str, inode: u64) -> Option<u32> {
+    let inode = inode.to_string();
     // "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF"
-    std::fs::read_to_string("/proc/locks")
-        .ok()?
+    let mut holders = locks
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -615,7 +624,9 @@ fn flock_holder(path: &Path) -> Option<u32> {
                 && fields.get(5)?.rsplit(':').next() == Some(inode.as_str());
             held.then(|| fields.get(4)?.parse::<u32>().ok()).flatten()
         })
-        .find(|pid| *pid > 0)
+        .filter(|pid| *pid > 0);
+    let first = holders.next()?;
+    holders.all(|pid| pid == first).then_some(first)
 }
 
 /// Write the `layout` marker of `state_dir`: under a name of its own, world-readable
@@ -3678,6 +3689,25 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o644, "the marker's mode follows the umask");
+    }
+
+    /// A flock's holder is named from /proc/locks only when one process holds every flock
+    /// on an inode of that number: a file on another filesystem can have the same number,
+    /// and naming its holder would tell the operator to end the wrong process.
+    #[test]
+    fn a_lock_holder_is_named_only_when_one_process_holds_that_inode() {
+        let one = "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF\n\
+                   2: POSIX  ADVISORY  WRITE 99 fd:01:5678 0 EOF\n\
+                   3: FLOCK  ADVISORY  WRITE 77 fd:01:56789 0 EOF\n";
+        assert_eq!(flock_holder_in(one, 5678), Some(1234));
+        assert_eq!(flock_holder_in(one, 1), None);
+        let two = "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF\n\
+                   2: FLOCK  ADVISORY  WRITE 4321 00:2c:5678 0 EOF\n";
+        assert_eq!(
+            flock_holder_in(two, 5678),
+            None,
+            "a holder was named although two processes hold flocks on inodes numbered 5678"
+        );
     }
 
     /// The marker's temporary is synced before the rename that publishes it and the
