@@ -732,6 +732,241 @@ async fn test_cloud_hypervisor_snapshot_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/// Seconds since the guest booted (`/proc/uptime`, CLOCK_BOOTTIME), read through exec.
+async fn guest_uptime(pid: u32) -> Result<f64> {
+    let out = common::exec_in_vm(pid, &["cat", "/proc/uptime"]).await?;
+    out.split_whitespace()
+        .next()
+        .and_then(|seconds| seconds.parse().ok())
+        .with_context(|| format!("no uptime in {out:?}"))
+}
+
+/// Boot the nginx VM the Cloud Hypervisor snapshot tests start from.
+async fn ch_baseline(vm_name: &str) -> Result<(tokio::process::Child, u32)> {
+    let (child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            vm_name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            common::TEST_IMAGE,
+        ],
+        vm_name,
+    )
+    .await
+    .context("spawning the Cloud Hypervisor baseline VM")?;
+    common::poll_health_by_pid(pid, 300)
+        .await
+        .context("the Cloud Hypervisor baseline VM should become healthy")?;
+    Ok((child, pid))
+}
+
+/// `fcvm snapshot create --pid <pid> --tag <tag>`, failing with its stderr.
+async fn ch_snapshot(pid: u32, tag: &str) -> Result<()> {
+    let out = tokio::process::Command::new(common::find_fcvm_binary()?)
+        .args(["snapshot", "create", "--pid", &pid.to_string(), "--tag", tag])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "snapshot create of {tag} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+/// A Cloud Hypervisor clone's clock continues from the snapshot: it does not jump by the
+/// snapshot's age.
+///
+/// Cloud Hypervisor's default on restore (`clock_restore_mode=advance`) adds the wall time
+/// since the snapshot to the guest's counter, so a clone of a day-old snapshot would start
+/// with CLOCK_MONOTONIC a day ahead and every armed timer expired at once. fcvm passes
+/// `preserve`, and the guest's wall clock is set by fc-agent's restore handler. The clone is
+/// restored `AGE` seconds after the snapshot: with `preserve` its uptime is the source's at
+/// the snapshot plus the time it has run since, with `advance` it is `AGE` more.
+///
+/// It also prints how far the SOURCE's clock moved across the snapshot create, which pauses
+/// and resumes it in place (#2173).
+#[tokio::test]
+async fn test_cloud_hypervisor_clone_keeps_the_snapshots_clock() -> Result<()> {
+    use std::time::{Duration, Instant};
+    const AGE: Duration = Duration::from_secs(20);
+    // What the reads through exec and the restore's own bookkeeping can add.
+    const SLACK: f64 = 2.0;
+
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
+        eprintln!("SKIP: cloud-hypervisor not found (`fcvm setup --cloud-hypervisor`)");
+        return Ok(());
+    }
+    let (vm_name, clone_name, snap, _) = common::unique_names("ch-clock");
+    let (mut baseline, baseline_pid) = ch_baseline(&vm_name).await?;
+
+    let before = guest_uptime(baseline_pid).await?;
+    let create_started = Instant::now();
+    ch_snapshot(baseline_pid, &snap).await?;
+    let create_took = create_started.elapsed().as_secs_f64();
+    let after = guest_uptime(baseline_pid).await?;
+    println!(
+        "  source: uptime {before:.2} s before the snapshot create and {after:.2} s after \
+         (+{:.2} s); the create took {create_took:.2} s on the host",
+        after - before
+    );
+    // The pause lies between the two reads, so the snapshot's clock does too.
+    assert!(
+        AGE.as_secs_f64() > (after - before) + 2.0 * SLACK,
+        "the snapshot create moved the source's clock {:.1} s, too close to the {} s the clone \
+         waits for the two restore modes to be told apart",
+        after - before,
+        AGE.as_secs()
+    );
+
+    tokio::time::sleep(AGE).await;
+
+    let restore_started = Instant::now();
+    let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--snapshot", &snap, "--name", &clone_name],
+        &clone_name,
+    )
+    .await
+    .context("spawning the clone")?;
+    common::poll_health_by_pid(clone_pid, 300)
+        .await
+        .context("the clone should become healthy")?;
+    let clone_uptime = guest_uptime(clone_pid).await?;
+    let since_restore = restore_started.elapsed().as_secs_f64();
+    println!(
+        "  clone: uptime {clone_uptime:.2} s, {since_restore:.2} s after its restore began, \
+         {} s after the snapshot",
+        AGE.as_secs()
+    );
+    assert!(
+        clone_uptime >= before,
+        "the clone's clock ({clone_uptime:.2} s) is behind the source's before the snapshot \
+         ({before:.2} s)"
+    );
+    assert!(
+        clone_uptime <= after + since_restore + SLACK,
+        "the clone's clock jumped: uptime {clone_uptime:.2} s, when the source was at \
+         {after:.2} s after the snapshot and the clone has run for at most {since_restore:.2} s \
+         (a restore that adds the snapshot's age would read {:.2} s or more)",
+        before + AGE.as_secs_f64() + since_restore
+    );
+
+    // The wall clock is the host's, set by the guest agent's restore handler.
+    let guest_now: f64 = common::exec_in_vm(clone_pid, &["date", "+%s.%N"])
+        .await?
+        .trim()
+        .parse()
+        .context("parsing the clone's date")?;
+    let host_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs_f64();
+    assert!(
+        (guest_now - host_now).abs() < SLACK,
+        "the clone's wall clock is {:.2} s from the host's",
+        guest_now - host_now
+    );
+
+    common::kill_process(clone_pid).await;
+    common::kill_process(baseline_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), clone.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), baseline.wait()).await;
+    Ok(())
+}
+
+/// A snapshot of a Cloud Hypervisor clone stands on its own: it restores after the snapshot
+/// the clone came from is deleted.
+///
+/// A clone maps its snapshot's memory file, and Cloud Hypervisor writes a snapshot of such a
+/// VM by cloning that file's extents (FICLONERANGE) and then writing only the pages the clone
+/// changed. The new file must hold every page all the same: what the source wrote before the
+/// first snapshot (inherited through the clone, never written by it) and what the clone
+/// wrote. Both are files in the guest's tmpfs, so they exist in guest memory only.
+#[tokio::test]
+async fn test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot() -> Result<()> {
+    use std::time::Duration;
+
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
+        eprintln!("SKIP: cloud-hypervisor not found (`fcvm setup --cloud-hypervisor`)");
+        return Ok(());
+    }
+    let (vm_name, clone_name, parent_snap, _) = common::unique_names("ch-lineage");
+    let child_snap = format!("{parent_snap}-child");
+    let grandchild_name = format!("{clone_name}-2");
+    // 32 MiB of bytes no page of which is zero or repeats, with its checksum.
+    let fill = |name: &str| {
+        format!(
+            "head -c 33554432 /dev/urandom > /dev/shm/{name} && sha256sum /dev/shm/{name} | cut -d' ' -f1"
+        )
+    };
+    let sum = |name: &str| format!("sha256sum /dev/shm/{name} | cut -d' ' -f1");
+
+    let (mut baseline, baseline_pid) = ch_baseline(&vm_name).await?;
+    let from_source = common::exec_in_vm(baseline_pid, &[&fill("from-source")])
+        .await?
+        .trim()
+        .to_string();
+    ch_snapshot(baseline_pid, &parent_snap).await?;
+
+    let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--snapshot", &parent_snap, "--name", &clone_name],
+        &clone_name,
+    )
+    .await?;
+    common::poll_health_by_pid(clone_pid, 300).await?;
+    let from_clone = common::exec_in_vm(clone_pid, &[&fill("from-clone")])
+        .await?
+        .trim()
+        .to_string();
+    ch_snapshot(clone_pid, &child_snap).await?;
+
+    // The clone and the parent snapshot go; the child snapshot is all that is left of them.
+    common::kill_process(clone_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), clone.wait()).await;
+    common::kill_process(baseline_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), baseline.wait()).await;
+    let delete = tokio::process::Command::new(common::find_fcvm_binary()?)
+        .args(["snapshots", "delete", "--force", &parent_snap])
+        .output()
+        .await?;
+    assert!(
+        delete.status.success(),
+        "deleting the parent snapshot failed: {}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+
+    let (mut grandchild, grandchild_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--snapshot", &child_snap, "--name", &grandchild_name],
+        &grandchild_name,
+    )
+    .await?;
+    common::poll_health_by_pid(grandchild_pid, 300)
+        .await
+        .context("a clone of the child snapshot should become healthy without the parent")?;
+    assert_eq!(from_source.len(), 64, "no checksum from the source: {from_source:?}");
+    assert_eq!(
+        common::exec_in_vm(grandchild_pid, &[&sum("from-source")])
+            .await?
+            .trim(),
+        from_source,
+        "memory the source wrote before the first snapshot did not survive"
+    );
+    assert_eq!(
+        common::exec_in_vm(grandchild_pid, &[&sum("from-clone")])
+            .await?
+            .trim(),
+        from_clone,
+        "memory the clone wrote did not survive"
+    );
+
+    common::kill_process(grandchild_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), grandchild.wait()).await;
+    Ok(())
+}
+
 /// Test that container stdout streams to host after snapshot.
 ///
 /// Snapshot creation resets all vsock connections (VIRTIO_VSOCK_EVENT_TRANSPORT_RESET).

@@ -135,8 +135,10 @@ pub fn verdict(installed: Timestamp, expires: Timestamp, now: Timestamp) -> Verd
 /// gold snapshot of the old one would log on with the wrong password and be aged by the
 /// wrong dates. The key also names how the gold flow made the snapshot (`GOLD_FLOW`), so a
 /// change to the flow makes a new one instead of reusing a snapshot and reference made the old
-/// way.
-pub fn gold_key(image_dir: &Path, manifest: &Manifest) -> Result<String> {
+/// way, and the Cloud Hypervisor build the sandboxes run on (`vmm`, what it prints for
+/// `--version`): a snapshot restores only on the build that wrote it, so a host that gets a
+/// new build makes a new gold snapshot instead of failing every restore of the old one.
+pub fn gold_key(image_dir: &Path, manifest: &Manifest, vmm: &str) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(GOLD_FLOW.as_bytes());
@@ -146,6 +148,8 @@ pub fn gold_key(image_dir: &Path, manifest: &Manifest) -> Result<String> {
         h.update((bytes.len() as u64).to_le_bytes());
         h.update(&bytes);
     }
+    h.update((vmm.len() as u64).to_le_bytes());
+    h.update(vmm.as_bytes());
     Ok(format!(
         "{}-{}",
         manifest.id,
@@ -1963,7 +1967,7 @@ mod tests {
             .unwrap();
             std::fs::write(dir.path().join("sandbox-password"), password).unwrap();
             let m = Manifest::read(dir.path()).unwrap();
-            gold_key(dir.path(), &m).unwrap()
+            gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3").unwrap()
         };
         let first = write("2026-11-07T10:00:00Z", "Sbaaaa!7");
         assert_eq!(
@@ -1994,6 +1998,43 @@ mod tests {
         }
         let unversioned = format!("3f9c0a1b2c4d-{}", &hex::encode(h.finalize())[..12]);
         assert_ne!(write("2026-12-01T10:00:00Z", "Sbaaaa!7"), unversioned);
+    }
+
+    /// A gold snapshot is one Cloud Hypervisor build's: fcvm refuses to restore it on
+    /// another. So the build is part of the key, and a host whose build changed finds no
+    /// gold snapshot under its tag and makes one, where it used to find the old build's and
+    /// fail every sandbox's restore.
+    #[test]
+    fn a_new_cloud_hypervisor_build_names_a_new_gold_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::json!({"id": "3f9c0a1b2c4d", "edition": "e", "build": "b",
+                "installed_at": "2026-11-07T10:00:00Z",
+                "eval_expires": "2027-05-06T10:00:00+00:00"})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("sandbox-password"), "Sbaaaa!7").unwrap();
+        let m = Manifest::read(dir.path()).unwrap();
+        let old = gold_key(dir.path(), &m, "cloud-hypervisor v52.0-49-ga354afd77").unwrap();
+        let new = gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3").unwrap();
+        assert_ne!(old, new);
+        assert_eq!(
+            new,
+            gold_key(dir.path(), &m, "cloud-hypervisor v55.0-117-g4969a51a3").unwrap()
+        );
+
+        // The old build's gold snapshot and reference are there; the new build's key finds
+        // neither, so the gold flow runs.
+        let (snaps, state) = (dir.path().join("snapshots"), dir.path().join("state"));
+        std::fs::create_dir_all(snaps.join(gold_tag(&old))).unwrap();
+        std::fs::write(snaps.join(gold_tag(&old)).join("config.json"), "{}").unwrap();
+        let reference = desktop_ref(&state, &old);
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::write(&reference, "P6").unwrap();
+        assert!(gold_ready(&snaps, &state, &old));
+        assert!(!gold_ready(&snaps, &state, &new));
     }
 
     /// Every process the Windows mode starts gets PR_SET_PDEATHSIG: a VM or bridge through

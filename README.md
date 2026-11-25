@@ -461,7 +461,7 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
 **Dependencies:**
 - Rust 1.93 (pinned by `rust-toolchain.toml`) with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH (default backend)
-- Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): build the pinned fork with `fcvm setup --cloud-hypervisor`, or set `FCVM_CLOUD_HYPERVISOR_BIN`, or put `cloud-hypervisor` in PATH (resolved in that order)
+- Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): `fcvm setup --cloud-hypervisor` builds the upstream commit that `[cloud_hypervisor]` in `rootfs-config.toml` pins, and fcvm runs that build and no other. `FCVM_CLOUD_HYPERVISOR_BIN` names another binary instead (v54.0 or later with `clock_restore_mode`, which fcvm's restores pass). `cloud-hypervisor` on PATH is used only with a config that has no `[cloud_hypervisor]` section. A snapshot restores only on the Cloud Hypervisor build that wrote it
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
 - For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set), and `net.ipv6.conf.all.forwarding=1` (fcvm refuses routed mode without it)
@@ -566,7 +566,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
 | `FCVM_CGROUP_PARENT` | `fcvm.slice` | Parent, below the cgroup2 root, of the cgroup each VM and memory server runs in; `none` keeps fcvm in the cgroup it was started in. See [A VM's own cgroup](#a-vms-own-cgroup) |
-| `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
+| `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to a `cloud-hypervisor` binary to run instead of the build `[cloud_hypervisor]` pins |
 | `FCVM_FIRECRACKER_LOG_LEVEL` | `Info` | Level of Firecracker's own per-VM `firecracker.log`: `Error`, `Warning`, `Info` or `Debug`. `Debug` adds one line per vsock packet, which is gigabytes an hour under FUSE-over-vsock volumes. Teardown copies the log's last 16 MiB to `/tmp/fcvm-firecracker-<vm_id>.log` |
 | `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` | `3600` | How long a cached firecracker-fork resolution stays valid before a launch re-queries the remote; `0` forces a query every launch |
 | `RUST_LOG` | `warn` | Logging level (`info`, `debug` for verbose) |

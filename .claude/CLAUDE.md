@@ -2921,7 +2921,7 @@ fuse-pipe/benches/
 1. **Core Implementation** (2025-11-09)
    - Pluggable `Hypervisor` trait (`src/hypervisor/mod.rs`) selecting the VMM behind the same orchestration, with two backends: **Firecracker (default)** and **Cloud Hypervisor**, chosen via `--hypervisor firecracker|cloud-hypervisor` (#632)
    - Firecracker backend: API client using hyper + hyperlocal (Unix sockets); boot plan via MMDS
-   - Cloud Hypervisor backend: cold boot + container run, snapshot/restore/clone via `--restore` + in-process UFFD; boot plan via vsock (no MMDS)
+   - Cloud Hypervisor backend: cold boot + container run, snapshot/restore/clone via `--restore` with the snapshot's memory file mapped copy-on-write (`memory_restore_mode=copyonwrite`); boot plan via vsock (no MMDS). Built from the upstream commit `[cloud_hypervisor]` pins, with no fork
    - Dual networking modes: bridged (iptables) + rootless (pasta)
    - Storage layer with btrfs CoW disk management
    - VM state persistence

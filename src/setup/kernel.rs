@@ -3014,6 +3014,17 @@ pub(crate) fn cloud_hypervisor_store_dir() -> PathBuf {
     paths::assets_dir().join("cloud-hypervisor")
 }
 
+/// The Rust toolchain this fcvm is built with: the `channel` of its `rust-toolchain.toml`.
+fn pinned_rust_toolchain() -> Result<String> {
+    let file: toml::Value = toml::from_str(include_str!("../../rust-toolchain.toml"))
+        .context("parsing fcvm's rust-toolchain.toml")?;
+    file.get("toolchain")
+        .and_then(|toolchain| toolchain.get("channel"))
+        .and_then(|channel| channel.as_str())
+        .map(str::to_string)
+        .context("fcvm's rust-toolchain.toml names no toolchain channel")
+}
+
 /// Put the source of `commit` in `build_dir`, which must not exist yet, and
 /// check that the checkout's HEAD is `commit`.
 ///
@@ -3134,10 +3145,21 @@ pub async fn ensure_cloud_hypervisor(
         return Err(error);
     }
 
-    // Build cloud-hypervisor
+    // Build cloud-hypervisor. `--locked` builds the dependency versions the commit's
+    // Cargo.lock names or fails, and the toolchain is the one this fcvm is built with: the
+    // Cloud Hypervisor tree names none, so its build would otherwise use whichever default
+    // the host's rustup has (and fail where it has none).
+    let toolchain = match pinned_rust_toolchain() {
+        Ok(toolchain) => toolchain,
+        Err(error) => {
+            flock.unlock().map_err(|(_, err)| err)?;
+            return Err(error);
+        }
+    };
     let mut build_cmd = Command::new(&cargo);
     build_cmd
-        .args(["build", "--release", "--bin", "cloud-hypervisor"])
+        .args(["build", "--release", "--locked", "--bin", "cloud-hypervisor"])
+        .env("RUSTUP_TOOLCHAIN", &toolchain)
         .current_dir(&build_dir);
     super::run_build_as_sudo_invoker(&mut build_cmd);
     let status = build_cmd
@@ -3285,6 +3307,65 @@ mod tests {
             .host_kernel
             .clone()
             .expect("amd64 host_kernel")
+    }
+
+    /// The Cloud Hypervisor build is one commit, its lock file's dependencies and one
+    /// toolchain: the embedded config names a full commit of the upstream repository (a
+    /// branch would build whatever it pointed at that day), the build passes `--locked`,
+    /// and the toolchain is the one fcvm's own `rust-toolchain.toml` pins.
+    #[test]
+    fn the_cloud_hypervisor_build_is_one_commit_one_lock_file_and_one_toolchain() {
+        let plan: crate::setup::rootfs::Plan =
+            toml::from_str(crate::setup::rootfs::EMBEDDED_CONFIG).unwrap();
+        let pin = plan
+            .cloud_hypervisor
+            .expect("the embedded config has a [cloud_hypervisor] section");
+        assert_eq!(pin.repo, "cloud-hypervisor/cloud-hypervisor");
+        validate_full_git_commit(&pin.commit, "the embedded cloud-hypervisor commit").unwrap();
+        // A branch in place of the commit does not parse.
+        assert!(toml::from_str::<crate::setup::rootfs::CloudHypervisorConfig>(
+            "repo = \"cloud-hypervisor/cloud-hypervisor\"\nbranch = \"main\"\n"
+        )
+        .is_err());
+
+        let toolchain = pinned_rust_toolchain().unwrap();
+        assert!(
+            toolchain.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "the toolchain {toolchain:?} is a channel name, not a version"
+        );
+        let source = include_str!("kernel.rs");
+        let body = &source[source
+            .find("pub async fn ensure_cloud_hypervisor(")
+            .expect("ensure_cloud_hypervisor is gone")..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("\"--locked\""), "the build does not pass --locked");
+        assert!(
+            body.contains(".env(\"RUSTUP_TOOLCHAIN\", &toolchain)"),
+            "the build does not name its toolchain"
+        );
+        assert!(
+            body.contains("checkout_cloud_hypervisor_source(&clone_url, commit, &build_dir)"),
+            "the build does not check out the configured commit"
+        );
+    }
+
+    /// The name of a Cloud Hypervisor build covers everything that changes its bytes: the
+    /// repository, the commit, the architecture and the libc.
+    #[test]
+    fn a_cloud_hypervisor_build_is_named_for_its_repo_commit_arch_and_libc() {
+        let name = |repo, commit, arch, libc| cloud_hypervisor_file_name(repo, commit, arch, libc);
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let base = name("o/r", &a, "aarch64", "libc-2.39");
+        assert_eq!(base, name("o/r", &a, "aarch64", "libc-2.39"));
+        assert!(base.starts_with("cloud-hypervisor-") && base.ends_with(".bin"), "{base}");
+        for other in [
+            name("o/fork", &a, "aarch64", "libc-2.39"),
+            name("o/r", &b, "aarch64", "libc-2.39"),
+            name("o/r", &a, "x86_64", "libc-2.39"),
+            name("o/r", &a, "aarch64", "libc-2.41"),
+        ] {
+            assert_ne!(base, other);
+        }
     }
 
     /// Run a host config fragment block the way the build script does, in a directory whose
