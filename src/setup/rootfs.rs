@@ -3558,6 +3558,45 @@ branch = "agent/nv2"
         );
     }
 
+    /// The fork commits whose x86_64 snapshot load ends with a paravirtual kick for every
+    /// runnable vCPU (`KvmVm::restore_kvm_state`, ejc3/firecracker), one for each branch an
+    /// x86_64 profile builds. KVM holds a spinlock kick that is pending for a runnable vCPU
+    /// in a flag no ioctl reads, so a snapshot does not hold it, and a clone restored
+    /// without the kick can halt a vCPU with interrupts off for good (#2131).
+    const RESTORE_KICK_COMMITS: [&str; 3] = [
+        // [firecracker]: the default, btrfs and mountinfo profiles.
+        "2a33289b55b7f611959891dd5295438a416f386e",
+        // gpu.amd64 and phone.amd64.
+        "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
+        // nested.amd64.
+        "af888e7aec38fe4727fd75878aaed017a3113028",
+    ];
+
+    /// A pin that moves to a commit without the restore kick brings #2131 back with no test
+    /// of fcvm's failing: the window is a few guest instructions wide.
+    #[test]
+    fn every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let global = &plan.firecracker.as_ref().unwrap().commit;
+        let mut checked = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            let Some(profile) = arches.get("amd64") else {
+                continue;
+            };
+            // A profile that names no fork of its own runs the [firecracker] build.
+            let commit = profile.firecracker_commit.as_ref().unwrap_or(global);
+            checked += 1;
+            assert!(
+                RESTORE_KICK_COMMITS.contains(&commit.as_str()),
+                "{name}.amd64 pins Firecracker {commit}, which is not known to kick runnable \
+                 vCPUs after a snapshot load. Add it to RESTORE_KICK_COMMITS once `git \
+                 merge-base --is-ancestor <a listed commit of its branch> {commit}` succeeds in \
+                 the fork, or the fix has been cherry-picked onto it"
+            );
+        }
+        assert!(checked > 3, "only {checked} amd64 profiles were checked");
+    }
+
     /// Every Firecracker the embedded config builds is pinned, so setup keeps a
     /// built binary without the network and launch resolves it offline.
     #[test]
