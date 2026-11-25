@@ -243,14 +243,23 @@ impl SlotCtx {
     }
 
     fn health_url(&self, path: &str) -> String {
-        format!("http://{}:{}{path}", self.cfg.health_host(), self.port)
+        format!("http://{}{path}", self.health_addr())
+    }
+
+    /// The host and port the renderer's `/health` is reached at.
+    fn health_addr(&self) -> String {
+        format!("{}:{}", self.cfg.health_host(), self.port)
     }
 
     async fn health(&self) -> Option<serde_json::Value> {
+        self.health_within(HEALTH_TIMEOUT).await
+    }
+
+    async fn health_within(&self, timeout: Duration) -> Option<serde_json::Value> {
         let r = self
             .http
             .get(self.health_url("/health"))
-            .timeout(Duration::from_secs(2))
+            .timeout(timeout)
             .send()
             .await
             .ok()?;
@@ -408,6 +417,21 @@ impl Backoff {
         self.next = self.min;
     }
 }
+
+/// How long one `/health` request to a renderer may take.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How a starting VM's renderer is probed (see [`super::probe`]): every 100 ms, with 100 ms
+/// for a connect in the first second, under the kernel's 1 s SYN retransmit, so no lost
+/// connect completes on a retransmit there. An attempt that connected has [`HEALTH_TIMEOUT`]
+/// for its answer, as before, and no other starts while it waits. Where the port is a host
+/// forwarder's, the connect completes at once whatever the guest does, and the wait is the
+/// one-at-a-time wait it was.
+pub(crate) const START_PACE: super::probe::Pace = super::probe::Pace {
+    every: Duration::from_millis(100),
+    fast_connect: Duration::from_millis(100),
+    answer: HEALTH_TIMEOUT,
+};
 
 pub async fn supervise(
     ctx: SlotCtx,
@@ -784,7 +808,12 @@ async fn relaunch(
     let mut restored = vm.restored_watch();
     let deadline = tokio::time::sleep(ctx.cfg.start_timeout);
     tokio::pin!(deadline);
-    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    let mut probes = super::probe::Probes::new(START_PACE, |budget, connected| async move {
+        if !super::probe::reach(ctx.health_addr(), budget, &connected).await {
+            return None;
+        }
+        ctx.health_within(budget.answer).await
+    });
     let mut starting_at: Option<Instant> = None;
     let mut health_at: Option<Instant> = None;
     let mut baseline: Option<u64> = None;
@@ -808,8 +837,8 @@ async fn relaunch(
                 let e = fail(&vm, format!("fcvm exited ({status}) before the renderer's first frame"), starting_at.is_none());
                 return Err(e);
             }
-            _ = poll.tick() => {
-                let Some(h) = ctx.health().await else { continue };
+            h = probes.next() => {
+                let Some(h) = h else { continue };
                 // A renderer that restarted after the scene was posted lost it: post it
                 // again and count frames from there.
                 let b = boot_id(&h);
@@ -842,8 +871,10 @@ async fn relaunch(
                         continue;
                     }
                     posted = Some(body);
-                    // Frames counted from here were drawn with this scene.
+                    // Frames counted from here were drawn with this scene. An answer sent
+                    // before the post describes the renderer without it.
                     baseline = frame_counter_of(&h, phone);
+                    probes.forget_in_flight();
                     continue;
                 }
                 if baseline.is_none() {

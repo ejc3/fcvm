@@ -8,6 +8,7 @@ pub mod joinguard;
 pub mod minecraft;
 pub mod ports;
 pub mod potato;
+pub mod probe;
 pub mod ring_cpus;
 pub mod slot;
 pub mod sni;
@@ -381,6 +382,21 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ipv6_prefix.is_some(),
             "--minecraft needs the host's IPv6 prefix (--ipv6-prefix or --ipv6-prefix-from-imds)"
         );
+        // Everything else this agent may run shares the host's neighbour tables: a wall tile
+        // for each place, the phones, the potato players and the sandboxes. They refuse
+        // nothing and are only warned about.
+        let other_vms = args.capacity.unwrap_or(gpus.len())
+            + phones.len()
+            + args.potato_players as usize
+            + args.windows as usize;
+        for warning in minecraft::check_neighbour_room(
+            args.minecraft,
+            u32::try_from(other_vms).unwrap_or(u32::MAX),
+            &minecraft::read_neighbour_limit(std::path::Path::new(minecraft::NEIGH_LIMIT))?,
+            &minecraft::read_neighbour_limit(std::path::Path::new(minecraft::NEIGH_LIMIT_V4))?,
+        )? {
+            tracing::warn!(target: "fcvm::fleet::minecraft", "{warning}");
+        }
         let (image_id, server) =
             minecraft::inspect_image(&args.windows_podman, &args.minecraft_image).await?;
         Some(minecraft::MinecraftCfg {
@@ -398,6 +414,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             ready_deadline: Duration::from_secs(60),
             snapshot_deadline: Duration::from_secs(120),
             poll: Duration::from_millis(20),
+            up_attempt: minecraft::UP_PROBE_TIMEOUT,
             steady: 5,
         })
     } else {

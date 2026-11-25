@@ -23,6 +23,15 @@ struct VmInfoDisplay {
 /// That is the VM's loopback IP in rootless and routed mode, and the veth's host address
 /// in bridged mode. A routed VM's `host_ip` is the gateway inside its namespace, which
 /// nothing on the host reaches, so a routed VM without a loopback IP shows none.
+/// `yes` for a VM whose VMM is confined (`--confine`), `-` otherwise.
+fn confined_column(vm: &VmState) -> &'static str {
+    if vm.confinement.is_some() {
+        "yes"
+    } else {
+        "-"
+    }
+}
+
 fn host_addr(vm: &VmState) -> &str {
     let network = &vm.config.network;
     let veth_address = match vm.config.network_mode {
@@ -82,10 +91,19 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
     } else {
         // Table output
         println!(
-            "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
-            "NAME", "PID", "STATUS", "HEALTH", "HOST_ADDR", "GUEST_IP", "IMAGE", "MEM(MB)", "STALE"
+            "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<9} {:<6}",
+            "NAME",
+            "PID",
+            "STATUS",
+            "HEALTH",
+            "HOST_ADDR",
+            "GUEST_IP",
+            "IMAGE",
+            "MEM(MB)",
+            "CONFINED",
+            "STALE"
         );
-        println!("{}", "-".repeat(120));
+        println!("{}", "-".repeat(130));
 
         for display in vm_displays {
             let vm = &display.vm;
@@ -107,7 +125,7 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
             let health = format!("{:?}", vm.health_status);
 
             println!(
-                "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<6}",
+                "{:<20} {:<10} {:<12} {:<12} {:<15} {:<15} {:<12} {:<8} {:<9} {:<6}",
                 name,
                 pid_str,
                 status,
@@ -116,6 +134,7 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
                 guest_ip,
                 image,
                 vm.config.memory_mib,
+                confined_column(vm),
                 stale_marker
             );
         }

@@ -1405,10 +1405,14 @@ impl Sandbox {
     }
 
     async fn health(&self) -> Option<serde_json::Value> {
+        self.health_within(HEALTH_TIMEOUT).await
+    }
+
+    async fn health_within(&self, timeout: Duration) -> Option<serde_json::Value> {
         let r = self
             .http
             .get(self.url("/health"))
-            .timeout(Duration::from_secs(2))
+            .timeout(timeout)
             .send()
             .await
             .ok()?;
@@ -1545,7 +1549,22 @@ impl Sandbox {
             actions_done: 0,
             scene: None,
         };
-        let mut tick = tokio::time::interval(self.cfg.poll);
+        // As a renderer is probed (`slot::START_PACE`), at this sandbox's poll.
+        let pace = super::probe::Pace {
+            every: self.cfg.poll,
+            fast_connect: self.cfg.poll,
+            answer: HEALTH_TIMEOUT,
+        };
+        let addr = format!("{}:{}", self.agent.health_host(), self.place.port);
+        let mut probes = super::probe::Probes::new(pace, |budget, connected| {
+            let addr = addr.as_str();
+            async move {
+                if !super::probe::reach(addr, budget, &connected).await {
+                    return None;
+                }
+                self.health_within(budget.answer).await
+            }
+        });
         // The bridge is at the desktop: a deadline while it is, with no scene taken, is the
         // scene's, not Windows'.
         let mut at_desktop = false;
@@ -1558,8 +1577,8 @@ impl Sandbox {
         };
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    let Some(h) = self.health().await else { continue };
+                h = probes.next() => {
+                    let Some(h) = h else { continue };
                     r.scene = self.sync_scene(r.scene.take()).await;
                     let (state, times) = bridge_state(&h);
                     if state == Some("failed") {
@@ -1611,6 +1630,9 @@ impl Sandbox {
         }
     }
 }
+
+/// How long one `/health` request to a bridge may take.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the bridge may take to carry out one action.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(20);

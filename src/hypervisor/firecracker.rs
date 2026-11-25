@@ -33,9 +33,14 @@ pub struct FirecrackerBackend {
 
 impl FirecrackerBackend {
     /// Create a backend that will manage a fresh Firecracker process.
-    pub fn new(vm_id: String, socket_path: PathBuf, log_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        vm_id: String,
+        socket_path: PathBuf,
+        log_path: Option<PathBuf>,
+        decision: crate::confine::Decision,
+    ) -> Self {
         Self {
-            vm: VmManager::new(vm_id, socket_path, log_path),
+            vm: VmManager::new(vm_id, socket_path, log_path, decision),
             vsock_path: None,
             pci_transport: false,
         }
@@ -101,6 +106,9 @@ impl Hypervisor for FirecrackerBackend {
         }
         if let Some(redirects) = &spec.mount_redirects {
             self.vm.set_mount_redirects(redirects.clone());
+        }
+        if spec.tap_owner.is_some() {
+            self.vm.set_tap_owner(spec.tap_owner.clone());
         }
         self.pci_transport = crate::gpu::pci_transport_enabled(spec.extra_args.as_deref());
         self.vm
