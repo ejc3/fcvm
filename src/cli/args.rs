@@ -1779,13 +1779,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_swap: bool,
 
-    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
-    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
-    /// for one, make a new user namespace and hold capabilities there), files or sockets;
-    /// later layers do. Rootless mode and the Firecracker backend only, on a
-    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
-    /// never run unconfined. The host's `[confine] mode = "required"` (or
-    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    /// Confine this VM's VMM: no capabilities, none regained by its exec, no_new_privs,
+    /// no core dumps, and a syscall allowlist per thread. A syscall outside the allowlist
+    /// kills the VMM, and the guest with it; FCVM_CONFINE_SECCOMP=log records such
+    /// syscalls instead, to check a workload before enforcing (README, "Confining the
+    /// VMM"). It does not yet restrict files or sockets; later layers do. Rootless mode,
+    /// the Firecracker backend and the default Firecracker build only, on a kernel with
+    /// Landlock ABI 9 or later; a start that cannot be confined is refused, never run
+    /// unconfined. The host's `[confine] mode = "required"` (or FCVM_CONFINE=required)
+    /// confines every start. Not part of any snapshot key.
     #[arg(long)]
     pub confine: bool,
 }
@@ -2079,13 +2081,15 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub no_swap: bool,
 
-    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
-    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
-    /// for one, make a new user namespace and hold capabilities there), files or sockets;
-    /// later layers do. Rootless mode and the Firecracker backend only, on a
-    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
-    /// never run unconfined. The host's `[confine] mode = "required"` (or
-    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    /// Confine this VM's VMM: no capabilities, none regained by its exec, no_new_privs,
+    /// no core dumps, and a syscall allowlist per thread. A syscall outside the allowlist
+    /// kills the VMM, and the guest with it; FCVM_CONFINE_SECCOMP=log records such
+    /// syscalls instead, to check a workload before enforcing (README, "Confining the
+    /// VMM"). It does not yet restrict files or sockets; later layers do. Rootless mode,
+    /// the Firecracker backend and the default Firecracker build only, on a kernel with
+    /// Landlock ABI 9 or later; a start that cannot be confined is refused, never run
+    /// unconfined. The host's `[confine] mode = "required"` (or FCVM_CONFINE=required)
+    /// confines every start. Not part of any snapshot key.
     #[arg(long)]
     pub confine: bool,
 
