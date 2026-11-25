@@ -7,9 +7,26 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cancel in-progress runs when a new run is triggered
+# The newest image build wins: a newer run cancels an older one, which carries older
+# content, and the approval prompt always belongs to the newest commit. That holds only
+# among runs that build. Every finished Build Kernels run starts a run of this workflow,
+# including one whose only job is then skipped, and on 2026-11-24 such a run cancelled a
+# build 44 minutes in and left its builder running. A run whose job will be skipped gets a
+# group of its own, so it can neither cancel a build in flight nor displace a waiting one.
+# The condition is the build-ami job's `if:`, word for word: the workflow test fails when
+# the two differ.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: >-
+    ${{
+      (github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion != 'cancelled' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository)))
+      && format('{0}-{1}', github.workflow, github.ref)
+      || format('{0}-skipped-{1}', github.workflow, github.run_id)
+    }}
   cancel-in-progress: true
 
 env:

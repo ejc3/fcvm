@@ -2570,10 +2570,29 @@ struct BoundedOutput {
 /// completes, and past this bound the restore fails closed rather than wait.
 const RUN_BOUNDED_REAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the output of a command that has exited is still read. Its own
+/// output is in the pipes by then and is read at once; the wait is only ever
+/// spent when a process the command left behind holds the pipes open.
+const EXITED_OUTPUT_DRAIN: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Run `argv` with a budget. The child is killed when the budget ends (and when
 /// this future is dropped), and at most `RESTORE_HOOK_OUTPUT_LIMIT` bytes of each
 /// stream are kept.
+///
+/// The run ends when the child exits. A process the child left running keeps
+/// running; the pipes it inherited are closed here, so what it writes to them
+/// later fails (or ends it, by SIGPIPE), as it does to a process a `podman exec`
+/// session left behind once the session has returned.
 async fn run_bounded(argv: &[String], budget: std::time::Duration) -> Result<BoundedOutput> {
+    run_bounded_keeping(argv, budget, RESTORE_HOOK_OUTPUT_LIMIT).await
+}
+
+/// [`run_bounded`], keeping at most `limit` bytes of each stream.
+async fn run_bounded_keeping(
+    argv: &[String],
+    budget: std::time::Duration,
+    limit: u64,
+) -> Result<BoundedOutput> {
     use tokio::io::AsyncReadExt;
     let mut child = tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -2588,25 +2607,41 @@ async fn run_bounded(argv: &[String], budget: std::time::Duration) -> Result<Bou
     let run = async {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let (read_out, read_err) = tokio::join!(
-            async {
-                (&mut stdout)
-                    .take(RESTORE_HOOK_OUTPUT_LIMIT)
-                    .read_to_end(&mut out)
-                    .await?;
-                tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await
-            },
-            async {
-                (&mut stderr)
-                    .take(RESTORE_HOOK_OUTPUT_LIMIT)
-                    .read_to_end(&mut err)
-                    .await?;
-                tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await
-            }
-        );
-        read_out.context("reading the hook's stdout")?;
-        read_err.context("reading the hook's stderr")?;
-        let status = child.wait().await.context("waiting for the hook")?;
+        let (status, streams) = {
+            let reads = async {
+                tokio::join!(
+                    async {
+                        (&mut stdout).take(limit).read_to_end(&mut out).await?;
+                        tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await
+                    },
+                    async {
+                        (&mut stderr).take(limit).read_to_end(&mut err).await?;
+                        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await
+                    }
+                )
+            };
+            tokio::pin!(reads);
+            // The command is over when its process exits, not when its output ends: a
+            // process it left running (a hook that starts a daemon) holds the pipes open
+            // for as long as it lives.
+            let (exited, streams) = tokio::select! {
+                exited = child.wait() => (exited, None),
+                streams = &mut reads => (child.wait().await, Some(streams)),
+            };
+            let streams = match streams {
+                Some(streams) => Some(streams),
+                // What the process wrote before it exited is in the pipes already.
+                None => tokio::time::timeout(EXITED_OUTPUT_DRAIN, &mut reads)
+                    .await
+                    .ok(),
+            };
+            (exited, streams)
+        };
+        let status = status.context("waiting for the hook")?;
+        if let Some((read_out, read_err)) = streams {
+            read_out.context("reading the hook's stdout")?;
+            read_err.context("reading the hook's stderr")?;
+        }
         Ok::<_, anyhow::Error>(BoundedOutput {
             status,
             stdout: out,
@@ -2671,60 +2706,116 @@ fn timeout_message(
     format!("did not finish within {budget:?}; {reaped}; {vitals}")
 }
 
-/// The plan's hook, run inside the container through `podman exec`, as the
-/// container's user, under the container's own `timeout` so the command ends
-/// there when the budget does, not only its client here.
+/// The plan's hook, run inside the container by the container's OCI runtime
+/// (`crun exec`), as the container's user, under the container's own `timeout`
+/// so the command ends there when the budget does, not only its client here.
+///
+/// Not through podman: `podman inspect` for the container's state and `podman
+/// exec` for the command are each a podman client's start-up in a just-restored
+/// guest, which was most of a hooked restore's time in the guest. Both calls
+/// are thin over the runtime:
+///
+/// - `inspect`'s `.State.Running` is podman's reading of `crun state`, which the
+///   hook reads itself when podman has not reported the container running
+///   ([`run_hook`]).
+/// - `exec` hands `crun exec` an OCI process made from the container's own
+///   (environment, working directory, user, capabilities, rlimits, labels) with
+///   the command in place of the container's. crun then joins every namespace of
+///   the container and its cgroup, and applies the container's seccomp filter.
+///   [`exec_process`] makes that process from the config crun holds for the
+///   container, and the hook hands it to the same `crun exec`.
+///
+/// podman builds a session's process from the spec in its database, and the
+/// config crun holds is that spec after the start added to it, so two things in
+/// the config are not in a session: `HOSTNAME`, unless the image or the plan
+/// sets it, and some supplementary groups. [`exec_process`] takes both out as
+/// [`crate::container::ExecSession`] says, from what the agent gave podman.
 pub struct ContainerRestoreHook {
     pub command: String,
 }
 
-/// Whether the plan's hook has a running container to run in, read from podman
-/// at publication. A pre-start snapshot restores before the container exists;
-/// a snapshot taken while podman was still starting it finds it not running.
-/// Neither has anything stale to redo: the container that starts after the
-/// restore starts fresh.
+/// Whether the plan's hook has a running container to run in, read from the
+/// container's runtime at publication. A pre-start snapshot restores before the
+/// container exists; a snapshot taken while podman was still starting it finds
+/// it not running. Neither has anything stale to redo: the container that
+/// starts after the restore starts fresh.
 #[derive(Debug, PartialEq, Eq)]
 enum HookEligibility {
     Run,
     Skip(String),
-    /// podman could not say: the restore fails closed rather than publish a
-    /// clone whose stale-state repair was silently left out.
+    /// The runtime could not say, or contradicts podman's own report that the
+    /// container started: the restore fails closed rather than publish a clone
+    /// whose stale-state repair was silently left out.
     Fail(String),
 }
 
-/// Decide from `podman inspect --format {{.State.Running}} fcvm-container`:
-/// `true` runs the hook; `false` skips it (a snapshot taken while podman was
-/// still starting the container); podman's "no such container" skips it (a
-/// pre-start snapshot); any other failure fails the restore.
-fn hook_eligibility(inspect: &BoundedOutput) -> HookEligibility {
-    let stdout = String::from_utf8_lossy(&inspect.stdout);
-    let state = stdout.trim();
-    if inspect.status.success() && state == "true" {
-        return HookEligibility::Run;
+/// The id of the container the hook runs in, from what the launch recorded
+/// (`recorded`: the id, `None` when podman has written none, or why it could not
+/// be read). With no id podman has not created the container, so the hook is
+/// skipped, unless podman already reported that container started
+/// (`reported_running`): then the record is wrong and the restore fails.
+fn hook_container_id(
+    recorded: std::result::Result<Option<String>, String>,
+    reported_running: bool,
+) -> std::result::Result<String, HookEligibility> {
+    match recorded {
+        Ok(Some(id)) if crate::container::is_container_id(id.trim()) => Ok(id.trim().to_string()),
+        Ok(Some(id)) => Err(HookEligibility::Fail(format!(
+            "the recorded id of fcvm-container is not a container id: {:?}",
+            id.chars().take(80).collect::<String>()
+        ))),
+        Ok(None) if reported_running => Err(HookEligibility::Fail(
+            "podman reported fcvm-container started, and no id is recorded for it".to_string(),
+        )),
+        Ok(None) => Err(HookEligibility::Skip(
+            "podman has not created fcvm-container".to_string(),
+        )),
+        Err(error) => Err(HookEligibility::Fail(format!(
+            "reading the id of fcvm-container: {error}"
+        ))),
     }
-    if inspect.status.success() {
-        return HookEligibility::Skip(format!("fcvm-container is not running (Running={state})"));
+}
+
+/// Decide from `crun state <id>`: status `running` runs the hook; any other
+/// status skips it (created and not yet started, stopped, paused); an id the
+/// runtime holds no state for skips it (podman created the container and has
+/// not handed it to the runtime yet, or the runtime already removed it), unless
+/// podman reported the container started and its client is still running
+/// (`reported_running`), which means the hook is asking the wrong runtime or
+/// state root; any other failure fails the restore.
+fn hook_eligibility(state: &BoundedOutput, reported_running: bool) -> HookEligibility {
+    let stdout = String::from_utf8_lossy(&state.stdout);
+    if state.status.success() {
+        let status = serde_json::from_str::<serde_json::Value>(&stdout)
+            .ok()
+            .and_then(|state| Some(state.get("status")?.as_str()?.to_string()));
+        return match status.as_deref() {
+            Some("running") => HookEligibility::Run,
+            Some(status) => {
+                HookEligibility::Skip(format!("fcvm-container is not running (status={status})"))
+            }
+            None => {
+                HookEligibility::Fail(format!("crun state printed no status: {}", stdout.trim()))
+            }
+        };
     }
-    let stderr = String::from_utf8_lossy(&inspect.stderr);
-    let detail = format!(
-        "podman inspect exited {}: {}",
-        inspect.status,
-        stderr.trim()
-    );
-    // Three spellings of "fcvm-container does not exist": podman's for an untyped
-    // inspect ("no such object"), and the two its container lookups give.
-    if stderr.contains("no such container")
-        || stderr.contains("no container with name or ID")
-        || stderr.contains("no such object")
-    {
-        HookEligibility::Skip(detail)
-    } else {
-        HookEligibility::Fail(detail)
+    let stderr = String::from_utf8_lossy(&state.stderr);
+    let detail = format!("crun state exited {}: {}", state.status, stderr.trim());
+    // crun's two spellings of "no state for this id": 1.14 fails to open the id's
+    // status file, later releases say the container does not exist.
+    let unknown = (stderr.contains("/status") && stderr.contains("No such file or directory"))
+        || stderr.contains("does not exist");
+    match (unknown, reported_running) {
+        (true, false) => HookEligibility::Skip(detail),
+        (true, true) => HookEligibility::Fail(format!(
+            "podman reported fcvm-container started, and the runtime has no such container; {detail}"
+        )),
+        (false, _) => HookEligibility::Fail(detail),
     }
 }
 
 /// How long the container-state read may take. A read that does not finish in
-/// time fails the restore closed, like any other inspect failure.
+/// time fails the restore closed, like any other failure of the read.
 ///
 /// The read runs at the moment a restored guest is busiest. In restores of a
 /// 128 GiB www guest that is busy at snapshot time (32 vCPUs, load 107 to 128,
@@ -2735,7 +2826,9 @@ fn hook_eligibility(inspect: &BoundedOutput) -> HookEligibility {
 /// closed. The time is not mostly run-queue wait a priority could buy back: the
 /// inspect used 3.6 to 9.3 s of CPU itself, three quarters of it in the kernel,
 /// and `nice -n -20` took reads that ran side by side from 15 to 19 s only to 12
-/// to 14 s. The budget is a little over twice the slowest read.
+/// to 14 s. The budget is a little over twice the slowest read. `crun state`,
+/// which does the read now, is a far smaller process than a podman client; it has
+/// not been measured in such a guest, so the budget stays where podman's was.
 const HOOK_INSPECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The slowest container-state read measured in a restored guest (see
@@ -2743,76 +2836,428 @@ const HOOK_INSPECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(test)]
 const SLOWEST_RESTORE_TIME_INSPECT: std::time::Duration = std::time::Duration::from_millis(27_420);
 
+/// The most of a container's `config.json` the hook reads. A config past it
+/// fails the restore instead of running the hook from half of one.
+const HOOK_CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
+
+/// Where the hook's OCI process is written for `crun exec --process`. A directory
+/// only root writes, so nothing of the container user's is opened as root; the
+/// file itself is handed to that user, whose crun reads it.
+const HOOK_PROCESS_DIR: &str = "/run/fcvm-restore-hook";
+
+/// The OCI process `crun exec` runs for the hook, as podman makes one for an exec
+/// session with no user, directory or environment of its own
+/// (`prepareProcessExec`, podman 4.9): the container's own process, from the
+/// `config.json` its runtime holds, with
+///
+/// - `args` as the command and no terminal;
+/// - the session's capability sets (`setProcessCapabilitiesExec`): for uid 0 the
+///   container's bounding set as effective and permitted and nothing
+///   inheritable; for any other user the container's effective set as effective,
+///   permitted, inheritable and ambient;
+/// - the supplementary groups of a session: the container's without the primary
+///   group when the container was created with a user, none when it was created
+///   with none, and none when that is unknown, which is never more than a
+///   session has;
+/// - no `HOSTNAME` when neither the image nor the plan sets one. Unknown keeps
+///   the variable, which the container's own processes have.
+fn exec_process(
+    config: &[u8],
+    args: &[String],
+    session: crate::container::ExecSession,
+) -> Result<String> {
+    let config: serde_json::Value =
+        serde_json::from_slice(config).context("parsing the container's config.json")?;
+    let mut process = config
+        .get("process")
+        .filter(|process| process.is_object())
+        .cloned()
+        .context("the container's config.json holds no process")?;
+    process["args"] = serde_json::json!(args);
+    process["terminal"] = serde_json::json!(false);
+    let uid = process
+        .pointer("/user/uid")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if let Some(caps) = process
+        .get_mut("capabilities")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let set = |caps: &serde_json::Map<String, serde_json::Value>, name: &str| {
+            caps.get(name)
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]))
+        };
+        if uid == 0 {
+            let bounding = set(caps, "bounding");
+            caps.insert("effective".to_string(), bounding.clone());
+            caps.insert("permitted".to_string(), bounding);
+            caps.insert("inheritable".to_string(), serde_json::json!([]));
+        } else {
+            let effective = set(caps, "effective");
+            for name in ["effective", "permitted", "inheritable", "ambient"] {
+                caps.insert(name.to_string(), effective.clone());
+            }
+        }
+    }
+    if let Some(user) = process
+        .get_mut("user")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        let primary = user.get("gid").cloned();
+        match (session.user_set, user.get_mut("additionalGids")) {
+            (Some(true), Some(serde_json::Value::Array(groups))) => {
+                groups.retain(|group| Some(group) != primary.as_ref());
+            }
+            _ => {
+                user.remove("additionalGids");
+            }
+        }
+    }
+    if session.hostname_set == Some(false) {
+        if let Some(env) = process
+            .get_mut("env")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            env.retain(|var| !var.as_str().is_some_and(|var| var.starts_with("HOSTNAME=")));
+        }
+    }
+    Ok(process.to_string())
+}
+
+/// What the reader run as the container's user exits with when the file does
+/// not exist. Not a status `env`, `runuser`, `sh` or `cat` gives for a failure
+/// of their own (1, 2, 125, 126, 127).
+const FILE_ABSENT_STATUS: i32 = 66;
+
+/// Read a file the container's podman or its runtime wrote; `None` when it does
+/// not exist. Root's podman writes where only root does, and the agent reads the
+/// file itself. A user's podman writes in that user's runtime directory, and
+/// there the read runs as that user, so the agent opens nothing as root at a
+/// path the user controls.
+async fn read_container_file(path: &std::path::Path, limit: u64) -> Result<Option<Vec<u8>>> {
+    read_file_as(crate::container::podman_cmd_prefix(), path, limit).await
+}
+
+/// [`read_container_file`], under `prefix` (empty: read as root, directly).
+/// Under a prefix the file is absent only when the reader says so with
+/// [`FILE_ABSENT_STATUS`]; any other failure, a prefix that cannot run
+/// included, is an error and never reads as "no such file".
+async fn read_file_as(
+    prefix: &[String],
+    path: &std::path::Path,
+    limit: u64,
+) -> Result<Option<Vec<u8>>> {
+    if prefix.is_empty() {
+        return match tokio::fs::read(path).await {
+            Ok(bytes) if bytes.len() as u64 > limit => {
+                bail!("{} is over {limit} bytes", path.display())
+            }
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+    }
+    let mut argv = prefix.to_vec();
+    argv.extend(["sh".to_string(), "-c".to_string()]);
+    argv.push(format!(
+        r#"[ -e "$1" ] || exit {FILE_ABSENT_STATUS}; exec cat -- "$1""#
+    ));
+    argv.push("sh".to_string());
+    argv.push(path.to_string_lossy().into_owned());
+    // One byte past the limit is kept, to tell a file at the limit from one over it.
+    let output = run_bounded_keeping(&argv, HOOK_INSPECT_BUDGET, limit + 1)
+        .await
+        .with_context(|| format!("reading {}", path.display()))?;
+    if output.status.success() {
+        if output.stdout.len() as u64 > limit {
+            bail!("{} is over {limit} bytes", path.display());
+        }
+        return Ok(Some(output.stdout));
+    }
+    if output.status.code() == Some(FILE_ABSENT_STATUS) {
+        return Ok(None);
+    }
+    bail!(
+        "reading {}: the reader exited {}: {}",
+        path.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+/// Write the hook's OCI process where `crun exec` reads it, readable by `owner`
+/// (the user podman runs as) alone, or by root alone when podman runs as root.
+fn write_hook_process(process: &str, owner: Option<(u32, u32)>) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let dir = std::path::Path::new(HOOK_PROCESS_DIR);
+    match std::fs::DirBuilder::new().mode(0o755).create(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("creating {}", dir.display())),
+    }
+    let path = dir.join("process.json");
+    // One restore runs at a time (the boundary lock is held); a file here is a
+    // killed restore's.
+    let _ = std::fs::remove_file(&path);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(process.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::fchown(&file, Some(uid), Some(gid))
+            .with_context(|| format!("handing {} to uid {uid}", path.display()))?;
+    }
+    Ok(path)
+}
+
 impl ContainerRestoreHook {
-    fn inspect_argv() -> Vec<String> {
+    /// `crun`, run as podman runs it: as root, or as the container's user under
+    /// the prefix podman runs under, against the state root podman's crun uses.
+    fn crun_argv(runtime: &crate::container::ContainerRuntime) -> Vec<String> {
         let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
-        argv.extend(
-            [
-                "podman",
-                "inspect",
-                "--format",
-                "{{.State.Running}}",
-                "fcvm-container",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
+        argv.extend(["crun".to_string(), "--root".to_string()]);
+        argv.push(runtime.crun_root.to_string_lossy().into_owned());
         argv
     }
 
-    fn argv(&self) -> Vec<String> {
-        let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
-        argv.extend(
-            ["podman", "exec", "fcvm-container", "timeout", "-k"]
-                .into_iter()
-                .map(str::to_string),
-        );
-        argv.push(RESTORE_HOOK_KILL_AFTER_SECS.to_string());
-        argv.push(RESTORE_HOOK_COMMAND_SECS.to_string());
-        argv.extend(["sh", "-c"].into_iter().map(str::to_string));
-        argv.push(self.command.clone());
+    fn state_argv(runtime: &crate::container::ContainerRuntime, id: &str) -> Vec<String> {
+        let mut argv = Self::crun_argv(runtime);
+        argv.extend(["state".to_string(), id.to_string()]);
         argv
+    }
+
+    fn exec_argv(
+        runtime: &crate::container::ContainerRuntime,
+        id: &str,
+        process: &std::path::Path,
+    ) -> Vec<String> {
+        let mut argv = Self::crun_argv(runtime);
+        argv.extend(["exec".to_string(), "--process".to_string()]);
+        argv.push(process.to_string_lossy().into_owned());
+        argv.push(id.to_string());
+        argv
+    }
+
+    /// The command as the container runs it: under `timeout`, through `sh -c`.
+    fn args(&self) -> Vec<String> {
+        let mut args: Vec<String> = ["timeout", "-k"].into_iter().map(str::to_string).collect();
+        args.push(RESTORE_HOOK_KILL_AFTER_SECS.to_string());
+        args.push(RESTORE_HOOK_COMMAND_SECS.to_string());
+        args.extend(["sh", "-c"].into_iter().map(str::to_string));
+        args.push(self.command.clone());
+        args
+    }
+
+    /// Run the command in the container `id` names: `crun exec` of the process
+    /// made from the config crun holds for it.
+    async fn exec(
+        &self,
+        runtime: &crate::container::ContainerRuntime,
+        id: &str,
+    ) -> Result<BoundedOutput> {
+        let config_path = runtime.crun_root.join(id).join("config.json");
+        let config = read_container_file(&config_path, HOOK_CONFIG_LIMIT)
+            .await?
+            .with_context(|| format!("{} does not exist", config_path.display()))?;
+        let process = exec_process(&config, &self.args(), runtime.session)?;
+        let process_file = write_hook_process(&process, runtime.owner)?;
+        let output = run_bounded(
+            &Self::exec_argv(runtime, id, &process_file),
+            RESTORE_HOOK_BUDGET,
+        )
+        .await;
+        let _ = std::fs::remove_file(&process_file);
+        output
+    }
+}
+
+/// What the hook asks of the container's runtime: crun in the agent, a fake in
+/// the tests of [`run_hook`].
+trait HookRuntime {
+    /// `crun state`: whether the hook has a running container.
+    async fn state(&self) -> Result<HookEligibility>;
+    /// `crun exec` of the hook's command.
+    async fn exec(&self) -> Result<BoundedOutput>;
+}
+
+/// crun, for the container `id` names.
+struct Crun<'a> {
+    hook: &'a ContainerRestoreHook,
+    runtime: &'a crate::container::ContainerRuntime,
+    id: &'a str,
+}
+
+impl HookRuntime for Crun<'_> {
+    async fn state(&self) -> Result<HookEligibility> {
+        // Timed either way: a read that ran out says how long it waited, and one that
+        // finished gives the healthy distribution to compare a starved one against.
+        let read_started = std::time::Instant::now();
+        let state = run_bounded(
+            &ContainerRestoreHook::state_argv(self.runtime, self.id),
+            HOOK_INSPECT_BUDGET,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "reading fcvm-container's state before the restore hook (elapsed_ms={:.0})",
+                crate::restore::elapsed_ms(read_started)
+            )
+        })?;
+        eprintln!(
+            "[fc-agent] crun state before the restore hook returned code={} elapsed_ms={:.0}",
+            state
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            crate::restore::elapsed_ms(read_started)
+        );
+        // Read only when podman has not reported the container running.
+        Ok(hook_eligibility(&state, false))
+    }
+
+    async fn exec(&self) -> Result<BoundedOutput> {
+        self.hook.exec(self.runtime, self.id).await
+    }
+}
+
+/// What a `crun exec` that did not succeed says of the container, when it is
+/// crun refusing before it starts the command and not the command failing.
+#[derive(Debug, PartialEq, Eq)]
+enum ExecRefusal {
+    /// The container is stopped or paused: there is nothing to run the hook in.
+    NotRunning(String),
+    /// crun holds no container of that id.
+    NoSuchContainer(String),
+}
+
+/// crun's own refusal, read from an exec that exited 1 having printed nothing
+/// but crun's one line. The lines name the container's id (64 hex digits), which
+/// no hook prints by accident, so a hook that fails with a message of its own
+/// about something "not running" is a hook that failed. crun 1.14 checks all
+/// three before it starts the command: a paused container is refused at once
+/// (8 ms measured), not entered and frozen.
+fn exec_refusal(output: &BoundedOutput, id: &str) -> Option<ExecRefusal> {
+    if output.status.code() != Some(1) || !output.stdout.is_empty() {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let said = stderr.trim();
+    if said.lines().count() != 1 {
+        return None;
+    }
+    let detail = format!("crun exec exited {}: {said}", output.status);
+    if said.ends_with(&format!("the container `{id}` is not running"))
+        || said.ends_with(&format!("the container `{id}` is paused"))
+    {
+        return Some(ExecRefusal::NotRunning(detail));
+    }
+    // crun's two spellings of "no state for this id": 1.14 fails to open the id's
+    // status file, later releases say the container does not exist.
+    if (said.contains(&format!("/{id}/status`")) && said.ends_with("No such file or directory"))
+        || said.ends_with(&format!("container `{id}` does not exist"))
+    {
+        return Some(ExecRefusal::NoSuchContainer(detail));
+    }
+    None
+}
+
+/// Run the hook in the container `id` names; its output, or `None` when it has
+/// no running container to run in (the reason is logged). An output whose
+/// status is a failure is the hook's own: it ran, and whatever the container
+/// does afterwards the restore fails.
+///
+/// When podman has reported the container started and its client is still
+/// attached (`reported_running`), the command is run at once: the container was
+/// running when the snapshot was taken, a restore resumes it as it was, and
+/// `crun exec` itself refuses a container that is not running, so a state read
+/// first would start one more process in a just-restored guest to learn what
+/// the exec is about to say. What crun refuses decides as the state read did:
+/// a container that is stopped or paused skips the hook, and a runtime that
+/// holds no such container fails the restore, because podman said it runs.
+///
+/// Without podman's report (a snapshot taken while the container was starting,
+/// or after it exited) the state is read first, and only `running` runs the
+/// hook: the report alone never runs or skips one.
+async fn run_hook(
+    runtime: &impl HookRuntime,
+    id: &str,
+    reported_running: bool,
+) -> Result<Option<BoundedOutput>> {
+    if !reported_running {
+        return match runtime.state().await? {
+            HookEligibility::Run => Ok(Some(runtime.exec().await?)),
+            HookEligibility::Skip(reason) => {
+                eprintln!("[fc-agent] restore hook skipped: {reason}");
+                Ok(None)
+            }
+            HookEligibility::Fail(reason) => {
+                bail!("cannot tell whether the container runs; {reason}")
+            }
+        };
+    }
+    let output = runtime.exec().await?;
+    if output.status.success() {
+        return Ok(Some(output));
+    }
+    match exec_refusal(&output, id) {
+        Some(ExecRefusal::NotRunning(reason)) => {
+            eprintln!("[fc-agent] restore hook skipped: fcvm-container is not running; {reason}");
+            Ok(None)
+        }
+        Some(ExecRefusal::NoSuchContainer(reason)) => bail!(
+            "cannot tell whether the container runs; podman reported fcvm-container \
+             started, and the runtime has no such container; {reason}"
+        ),
+        None => Ok(Some(output)),
     }
 }
 
 impl RestoreHook for ContainerRestoreHook {
     async fn run(&self) -> Result<()> {
-        // Timed either way: a read that ran out says how long it waited, and one that
-        // finished gives the healthy distribution to compare a starved one against.
-        let inspect_started = std::time::Instant::now();
-        let inspect = run_bounded(&Self::inspect_argv(), HOOK_INSPECT_BUDGET)
-            .await
-            .with_context(|| {
-                format!(
-                    "reading fcvm-container's state before the restore hook (elapsed_ms={:.0})",
-                    crate::restore::elapsed_ms(inspect_started)
-                )
-            })?;
-        eprintln!(
-            "[fc-agent] podman inspect before the restore hook returned code={} elapsed_ms={:.0}",
-            inspect
-                .status
-                .code()
-                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
-            crate::restore::elapsed_ms(inspect_started)
-        );
-        match hook_eligibility(&inspect) {
-            HookEligibility::Run => {}
-            HookEligibility::Skip(reason) => {
+        // No record: the agent has not come to launching the container in this boot,
+        // and nothing else starts one.
+        let Some(runtime) = crate::container::container_runtime() else {
+            eprintln!("[fc-agent] restore hook skipped: the agent has not launched fcvm-container");
+            return Ok(());
+        };
+        let reported_running = crate::container::container_reported_running();
+        let recorded = match crate::container::captured_container_id() {
+            Some(id) => Ok(Some(id.to_string())),
+            None => read_container_file(&runtime.id_file, 256)
+                .await
+                .map(|id| id.map(|id| String::from_utf8_lossy(&id).into_owned()))
+                .map_err(|error| format!("{error:#}")),
+        };
+        let id = match hook_container_id(recorded, reported_running) {
+            Ok(id) => id,
+            Err(HookEligibility::Skip(reason)) => {
                 eprintln!("[fc-agent] restore hook skipped: {reason}");
                 return Ok(());
             }
-            HookEligibility::Fail(reason) => {
-                bail!(
-                    "restore hook {:?} cannot tell whether the container runs; {reason}",
-                    self.command
-                );
-            }
-        }
+            Err(HookEligibility::Fail(reason)) => bail!(
+                "restore hook {:?} cannot tell whether the container runs; {reason}",
+                self.command
+            ),
+            Err(HookEligibility::Run) => unreachable!("an id is not a decision to run"),
+        };
         let started = std::time::Instant::now();
-        let output = run_bounded(&self.argv(), RESTORE_HOOK_BUDGET)
+        let crun = Crun {
+            hook: self,
+            runtime,
+            id: &id,
+        };
+        let Some(output) = run_hook(&crun, &id, reported_running)
             .await
-            .with_context(|| format!("restore hook {:?}", self.command))?;
+            .with_context(|| format!("restore hook {:?}", self.command))?
+        else {
+            return Ok(());
+        };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5225,6 +5670,97 @@ mod tests {
         );
     }
 
+    /// A command is over when its process exits. One that leaves a process
+    /// running with its pipes (a hook that starts a daemon) returns then, with
+    /// what it wrote itself; what the process it left writes later is not waited
+    /// for.
+    ///
+    /// RED BEFORE THE FIX: the run waited for the end of the output, which the
+    /// process left behind holds off for as long as it lives, so the run ended at
+    /// its budget and failed.
+    #[tokio::test]
+    async fn a_command_that_leaves_a_process_running_ends_at_its_own_exit() {
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            "sleep 60 & echo left $!; (sleep 0.3; echo late) & echo started",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let output = run_bounded(&argv, std::time::Duration::from_secs(20)).await;
+        let output = output.expect("the run waited for the process the command left behind");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        // The sleeper is this test's to end, whatever the assertions say.
+        let left: Option<i32> = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("left ")?.trim().parse().ok());
+        let alive = left.is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0);
+        if let Some(pid) = left {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(output.status.success(), "{:?}", output.status);
+        assert!(
+            stdout.contains("started") && !stdout.contains("late"),
+            "{stdout:?}"
+        );
+        assert!(
+            alive,
+            "the process the command left running was not left running"
+        );
+    }
+
+    /// Read as the container's user, a file is absent only when the reader says
+    /// so. A reader that cannot run fails the read, even when its error says "No
+    /// such file or directory", as a prefix whose program is missing does.
+    ///
+    /// RED BEFORE THE FIX: any stderr holding "No such file or directory" read as
+    /// an absent file, which skipped the hook.
+    #[tokio::test]
+    async fn a_reader_that_cannot_run_is_not_an_absent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("id");
+        std::fs::write(&file, "abc\n").unwrap();
+        let prefix =
+            |words: &[&str]| -> Vec<String> { words.iter().map(|w| w.to_string()).collect() };
+        let env = prefix(&["env"]);
+        assert_eq!(
+            read_file_as(&env, &file, 16).await.unwrap().as_deref(),
+            Some(&b"abc\n"[..])
+        );
+        assert_eq!(
+            read_file_as(&env, &dir.path().join("absent"), 16)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            read_file_as(&env, &file, 3).await.is_err(),
+            "over the limit"
+        );
+        // With room for the reader's own error, as the id file's read has.
+        let missing = prefix(&["env", "fcvm-test-no-such-program"]);
+        let error = read_file_as(&missing, &file, 256)
+            .await
+            .expect_err("a reader that could not run read as an absent file");
+        assert!(format!("{error:#}").contains("exited"), "{error:#}");
+        assert!(
+            read_file_as(&env, dir.path(), 16).await.is_err(),
+            "a directory was read"
+        );
+        // As root, directly: the same three answers.
+        assert_eq!(
+            read_file_as(&[], &file, 16).await.unwrap().as_deref(),
+            Some(&b"abc\n"[..])
+        );
+        assert_eq!(
+            read_file_as(&[], &dir.path().join("absent"), 16)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
     /// At most 64 KiB of each stream is kept; the rest is drained so the hook is
     /// never blocked on a full pipe.
     #[tokio::test]
@@ -5272,6 +5808,12 @@ mod tests {
         assert!(
             waits < publish,
             "the hook runs before the egress proxy and exec server are back"
+        );
+        // And the fresh chronyd does not start beside the hook, whose vCPU it
+        // would share: it starts after the publication.
+        assert!(
+            publish < at("fresh_chronyd.start();"),
+            "the fresh chronyd starts before the hook has run"
         );
     }
 
@@ -5371,11 +5913,11 @@ mod tests {
     }
 
     /// Whether the hook has a container to run in is the container's state at
-    /// publication, asked of podman, not a marker set when the agent was about to
-    /// start it. A user snapshot taken between that marker and podman's start
-    /// recorded a container that did not exist, and its clones failed their
-    /// restore on `podman exec`; the opposite order would have skipped the hook
-    /// for a container that did exist.
+    /// publication, asked of the container's runtime, not a marker set when the
+    /// agent was about to start it. A user snapshot taken between that marker and
+    /// podman's start recorded a container that did not exist, and its clones
+    /// failed their restore on `podman exec`; the opposite order would have
+    /// skipped the hook for a container that did exist.
     ///
     /// RED BEFORE THE FIX: `CONTAINER_STARTED` was stored in agent.rs and read in
     /// restore.rs.
@@ -5390,12 +5932,189 @@ mod tests {
                 "{name} still carries the container-started marker"
             );
         }
-        let argv = ContainerRestoreHook::inspect_argv();
-        assert!(
-            argv.windows(3)
-                .any(|w| w == ["inspect", "--format", "{{.State.Running}}"]),
-            "the hook does not read the container's state: {argv:?}"
+        let id = "ab".repeat(32);
+        for (runtime_dir, root) in [
+            (None, "/run/crun"),
+            (Some("/run/user/1000"), "/run/user/1000/crun"),
+        ] {
+            let runtime = crate::container::ContainerRuntime::new(runtime_dir, None);
+            let argv = ContainerRestoreHook::state_argv(&runtime, &id);
+            assert_eq!(
+                argv,
+                ["crun", "--root", root, "state", id.as_str()],
+                "the hook does not read the container's state from its runtime"
+            );
+        }
+        // The decision is made from that read: without `running` from the runtime,
+        // podman's report that the container started runs no hook.
+        use std::os::unix::process::ExitStatusExt;
+        let created = BoundedOutput {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: br#"{"status": "created"}"#.to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(matches!(
+            hook_eligibility(&created, true),
+            HookEligibility::Skip(_)
+        ));
+    }
+
+    /// What the hook asked of its runtime, and what the runtime answers.
+    struct FakeRuntime {
+        state: Option<HookEligibility>,
+        exec: std::result::Result<(i32, &'static str, String), &'static str>,
+        asked: Mutex<Vec<&'static str>>,
+    }
+
+    impl HookRuntime for FakeRuntime {
+        async fn state(&self) -> Result<HookEligibility> {
+            self.asked.lock().unwrap().push("state");
+            Ok(match self.state.as_ref().expect("the state was read") {
+                HookEligibility::Run => HookEligibility::Run,
+                HookEligibility::Skip(reason) => HookEligibility::Skip(reason.clone()),
+                HookEligibility::Fail(reason) => HookEligibility::Fail(reason.clone()),
+            })
+        }
+
+        async fn exec(&self) -> Result<BoundedOutput> {
+            self.asked.lock().unwrap().push("exec");
+            match &self.exec {
+                Ok((code, stdout, stderr)) => Ok(BoundedOutput {
+                    status: std::process::ExitStatus::from_raw(code << 8),
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: stderr.as_bytes().to_vec(),
+                }),
+                Err(error) => bail!("{error}"),
+            }
+        }
+    }
+
+    /// What `run_hook` asks of the runtime and what it makes of the answers.
+    ///
+    /// With podman's report that the container runs, the command is run and
+    /// nothing else is asked, whether it succeeds or fails. A hook that ran and
+    /// failed is returned as its failure, whatever the container does after;
+    /// only crun's own refusal to enter a container that is stopped or paused
+    /// skips the hook, and its refusal for want of any such container fails the
+    /// restore. Without podman's report the state is read first.
+    ///
+    /// RED BEFORE THE FIX: every hook was preceded by a `crun state`; then, with
+    /// the command run first, a hook that failed was followed by a state read
+    /// whose answer could skip it, so a failed hook in a container that had since
+    /// stopped published the clone.
+    #[tokio::test]
+    async fn the_hook_asks_its_runtime_only_what_it_does_not_know() {
+        let id = "ab".repeat(32);
+        let run =
+            |reported_running: bool,
+             state: Option<HookEligibility>,
+             exec: std::result::Result<(i32, &'static str, String), &'static str>| {
+                let id = id.clone();
+                async move {
+                    let runtime = FakeRuntime {
+                        state,
+                        exec,
+                        asked: Mutex::new(Vec::new()),
+                    };
+                    let outcome = run_hook(&runtime, &id, reported_running)
+                        .await
+                        .map(|output| output.map(|output| output.status.code()))
+                        .map_err(|error| format!("{error:#}"));
+                    (runtime.asked.into_inner().unwrap(), outcome)
+                }
+            };
+        let none = String::new;
+
+        // podman reported the container running: the command alone.
+        assert_eq!(
+            run(true, None, Ok((0, "done", none()))).await,
+            (vec!["exec"], Ok(Some(Some(0))))
         );
+        // A hook that ran and failed is its failure: no state read can skip it.
+        assert_eq!(
+            run(true, None, Ok((7, "out", "err".to_string()))).await,
+            (vec!["exec"], Ok(Some(Some(7))))
+        );
+        // So is one whose own message resembles crun's, and one that exits 1.
+        assert_eq!(
+            run(
+                true,
+                None,
+                Ok((1, "", "the service is not running".to_string()))
+            )
+            .await,
+            (vec!["exec"], Ok(Some(Some(1))))
+        );
+        assert_eq!(
+            run(
+                true,
+                None,
+                Ok((
+                    1,
+                    "restarting",
+                    format!("the container `{id}` is not running")
+                ))
+            )
+            .await,
+            (vec!["exec"], Ok(Some(Some(1))))
+        );
+        // crun's refusals, as crun 1.14.1 prints them.
+        for refusal in ["is not running", "is paused"] {
+            assert_eq!(
+                run(
+                    true,
+                    None,
+                    Ok((1, "", format!("the container `{id}` {refusal}\n")))
+                )
+                .await,
+                (vec!["exec"], Ok(None)),
+                "{refusal}"
+            );
+        }
+        let (asked, outcome) = run(
+            true,
+            None,
+            Ok((
+                1,
+                "",
+                format!("error opening file `/run/crun/{id}/status`: No such file or directory"),
+            )),
+        )
+        .await;
+        assert_eq!(asked, ["exec"]);
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("the runtime has no such container")),
+            "{outcome:?}"
+        );
+        // The command not ending in its budget fails, and asks nothing more.
+        let (asked, outcome) = run(true, None, Err("did not finish within 60s")).await;
+        assert_eq!(asked, ["exec"]);
+        assert!(outcome.is_err(), "{outcome:?}");
+
+        // No report from podman: the state decides, and only `running` runs.
+        assert_eq!(
+            run(false, Some(HookEligibility::Run), Ok((0, "", none()))).await,
+            (vec!["state", "exec"], Ok(Some(Some(0))))
+        );
+        assert_eq!(
+            run(
+                false,
+                Some(HookEligibility::Skip("created".to_string())),
+                Ok((0, "", none()))
+            )
+            .await,
+            (vec!["state"], Ok(None))
+        );
+        let (asked, outcome) = run(
+            false,
+            Some(HookEligibility::Fail("crun state exited 1".to_string())),
+            Ok((0, "", none())),
+        )
+        .await;
+        assert_eq!(asked, ["state"]);
+        assert!(outcome.is_err(), "{outcome:?}");
     }
 
     /// The container-state read gets at least twice the slowest read measured in
@@ -5413,10 +6132,13 @@ mod tests {
         );
     }
 
-    /// The decision from podman's answer: a running container runs the hook; a
-    /// stopped one, or none at all, skips it with the reason; podman failing for
-    /// any other reason fails the restore closed, because a clone published
-    /// without its stale-state repair is the failure the hook exists to prevent.
+    /// The decision from the runtime's answer: a running container runs the hook; a
+    /// container in any other state, or one the runtime does not hold yet, skips
+    /// it with the reason; the runtime failing for any other reason fails the
+    /// restore closed, because a clone published without its stale-state repair is
+    /// the failure the hook exists to prevent. So does a runtime that holds no
+    /// container while podman's own report says one started: that is the hook
+    /// asking the wrong runtime or state root, not a container yet to start.
     ///
     /// RED BEFORE THE FIX: every nonzero exit skipped the hook.
     #[test]
@@ -5427,52 +6149,214 @@ mod tests {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        assert_eq!(
-            hook_eligibility(&output(0, "true\n", "")),
-            HookEligibility::Run
-        );
-        assert_eq!(
-            hook_eligibility(&output(0, "false\n", "")),
-            HookEligibility::Skip("fcvm-container is not running (Running=false)".to_string())
-        );
-        assert_eq!(
-            hook_eligibility(&output(
-                125,
-                "",
-                "Error: no container with name or ID \"fcvm-container\" found"
-            )),
-            HookEligibility::Skip(
-                "podman inspect exited exit status: 125: Error: no container with name or ID \
-                 \"fcvm-container\" found"
-                    .to_string()
+        // crun 1.14.1's `state` of a running container, as a restored guest prints it.
+        let state = |status: &str| {
+            format!(
+                "{{\n    \"ociVersion\": \"1.0.0\",\n    \"id\": \"{}\",\n    \"pid\": 812,\n    \
+                 \"status\": \"{status}\",\n    \"bundle\": \"/b\",\n    \"owner\": \"root\"\n}}\n",
+                "ab".repeat(32)
             )
-        );
-        // `podman inspect` without a type names a missing container this way. A
-        // restore of a pre-start snapshot, whose container does not exist yet, read
-        // it and failed closed.
-        assert_eq!(
-            hook_eligibility(&output(
-                125,
+        };
+        for reported_running in [false, true] {
+            assert_eq!(
+                hook_eligibility(&output(0, &state("running"), ""), reported_running),
+                HookEligibility::Run
+            );
+            for status in ["created", "stopped", "paused"] {
+                assert_eq!(
+                    hook_eligibility(&output(0, &state(status), ""), reported_running),
+                    HookEligibility::Skip(format!(
+                        "fcvm-container is not running (status={status})"
+                    ))
+                );
+            }
+            assert_eq!(
+                hook_eligibility(&output(0, "{}", ""), reported_running),
+                HookEligibility::Fail("crun state printed no status: {}".to_string())
+            );
+            assert_eq!(
+                hook_eligibility(
+                    &output(1, "", "open `/run/crun`: Permission denied"),
+                    reported_running
+                ),
+                HookEligibility::Fail(
+                    "crun state exited exit status: 1: open `/run/crun`: Permission denied"
+                        .to_string()
+                )
+            );
+        }
+        // Both spellings of an id the runtime holds no state for.
+        for unknown in [
+            "error opening file `/run/crun/abab/status`: No such file or directory",
+            "container `abab` does not exist",
+        ] {
+            assert_eq!(
+                hook_eligibility(&output(1, "", unknown), false),
+                HookEligibility::Skip(format!("crun state exited exit status: 1: {unknown}"))
+            );
+            assert_eq!(
+                hook_eligibility(&output(1, "", unknown), true),
+                HookEligibility::Fail(format!(
+                    "podman reported fcvm-container started, and the runtime has no such \
+                     container; crun state exited exit status: 1: {unknown}"
+                ))
+            );
+        }
+    }
+
+    /// The hook's container is the one whose id the launch recorded. With none
+    /// recorded podman has not created it and the hook is skipped, unless podman
+    /// already reported it started; an unreadable or malformed record fails the
+    /// restore, and never becomes a path or an argument.
+    #[test]
+    fn the_hook_runs_in_the_container_whose_id_the_launch_recorded() {
+        let id = "0123456789abcdef".repeat(4);
+        for reported_running in [false, true] {
+            assert_eq!(
+                hook_container_id(Ok(Some(format!("{id}\n"))), reported_running),
+                Ok(id.clone())
+            );
+            for bad in [
                 "",
-                "Error: no such object: \"fcvm-container\""
-            )),
-            HookEligibility::Skip(
-                "podman inspect exited exit status: 125: Error: no such object: \"fcvm-container\""
-                    .to_string()
-            )
+                "fcvm-container",
+                "../../etc",
+                &id[..63],
+                &id.to_uppercase(),
+            ] {
+                assert!(
+                    matches!(
+                        hook_container_id(Ok(Some(bad.to_string())), reported_running),
+                        Err(HookEligibility::Fail(_))
+                    ),
+                    "{bad:?} was taken as a container id"
+                );
+            }
+            assert!(matches!(
+                hook_container_id(Err("cat exited 1".to_string()), reported_running),
+                Err(HookEligibility::Fail(_))
+            ));
+        }
+        assert_eq!(
+            hook_container_id(Ok(None), false),
+            Err(HookEligibility::Skip(
+                "podman has not created fcvm-container".to_string()
+            ))
+        );
+        assert!(matches!(
+            hook_container_id(Ok(None), true),
+            Err(HookEligibility::Fail(_))
+        ));
+    }
+
+    /// The process `crun exec` runs for the hook is the container's own (its
+    /// environment, working directory, user, rlimits and labels, as its runtime
+    /// holds them) with the hook's command and no terminal, and with what podman
+    /// gives an exec session in place of what the start gave the container: the
+    /// session's capability sets, its supplementary groups, and no `HOSTNAME` the
+    /// start added. The configs are what podman 4.9.3 wrote for a root container
+    /// of an Alpine image and for a `--userns=keep-id` one, cut to their process.
+    #[test]
+    fn the_hook_process_is_a_podman_exec_sessions() {
+        use crate::container::ExecSession;
+        let args = ContainerRestoreHook {
+            command: "mctile restored".to_string(),
+        }
+        .args();
+        let session = |user_set, hostname_set| ExecSession {
+            user_set,
+            hostname_set,
+        };
+        let made = |config: &str, session| -> serde_json::Value {
+            serde_json::from_str(&exec_process(config.as_bytes(), &args, session).unwrap()).unwrap()
+        };
+        let caps = r#"["CAP_CHOWN","CAP_KILL","CAP_NET_BIND_SERVICE"]"#;
+        // No user set: the start gave root the groups Alpine's /etc/group lists for it.
+        let root = format!(
+            r#"{{"ociVersion":"1.1.0","process":{{"terminal":true,
+            "user":{{"uid":0,"gid":0,"umask":18,"additionalGids":[0,1,2,3,4,6,10,11,20,26,27]}},
+            "args":["sleep","600"],"env":["PATH=/usr/bin","container=podman","FOO=bar","HOME=/root","HOSTNAME=tile"],
+            "cwd":"/srv","capabilities":{{"bounding":{caps},"effective":["CAP_KILL"],"permitted":["CAP_KILL"],"inheritable":["CAP_KILL"]}},
+            "rlimits":[{{"type":"RLIMIT_NOFILE","hard":65536,"soft":65536}}],
+            "apparmorProfile":"containers-default-0.57.4","oomScoreAdj":0,"noNewPrivileges":true}},
+            "root":{{"path":"/merged"}},"hostname":"tile"}}"#
+        );
+        let config: serde_json::Value = serde_json::from_str(&root).unwrap();
+        let process = made(&root, session(Some(false), Some(false)));
+        assert_eq!(process["args"], serde_json::json!(args));
+        assert_eq!(process["terminal"], false);
+        for kept in [
+            "cwd",
+            "rlimits",
+            "apparmorProfile",
+            "oomScoreAdj",
+            "noNewPrivileges",
+        ] {
+            assert_eq!(process[kept], config["process"][kept], "{kept}");
+        }
+        let caps: serde_json::Value = serde_json::from_str(caps).unwrap();
+        assert_eq!(process["capabilities"]["bounding"], caps);
+        assert_eq!(process["capabilities"]["effective"], caps);
+        assert_eq!(process["capabilities"]["permitted"], caps);
+        assert_eq!(
+            process["capabilities"]["inheritable"],
+            serde_json::json!([])
+        );
+        assert!(process["capabilities"].get("ambient").is_none());
+        // A session of a container with no user has no supplementary groups, and no
+        // HOSTNAME that only the start set.
+        assert_eq!(
+            process["user"],
+            serde_json::json!({"uid": 0, "gid": 0, "umask": 18})
         );
         assert_eq!(
-            hook_eligibility(&output(
-                125,
-                "",
-                "Error: unable to connect to Podman socket: dial unix /run/podman/podman.sock: connect: no such file or directory"
-            )),
-            HookEligibility::Fail(
-                "podman inspect exited exit status: 125: Error: unable to connect to Podman \
-                 socket: dial unix /run/podman/podman.sock: connect: no such file or directory"
-                    .to_string()
-            )
+            process["env"],
+            serde_json::json!(["PATH=/usr/bin", "container=podman", "FOO=bar", "HOME=/root"])
         );
+        // A HOSTNAME the image or the plan set is the session's too, and one whose
+        // origin is unknown stays, as the container's own processes have it.
+        for hostname_set in [Some(true), None] {
+            assert_eq!(
+                made(&root, session(Some(false), hostname_set))["env"],
+                config["process"]["env"],
+                "{hostname_set:?}"
+            );
+        }
+        // An image that names root as its user: the session has root's groups, less
+        // the primary one the start added.
+        assert_eq!(
+            made(&root, session(Some(true), Some(false)))["user"]["additionalGids"],
+            serde_json::json!([1, 2, 3, 4, 6, 10, 11, 20, 26, 27])
+        );
+        // Unknown takes none: never more groups than a session has.
+        assert!(made(&root, session(None, None))["user"]
+            .get("additionalGids")
+            .is_none());
+
+        // A container user other than root holds what the container's effective set
+        // holds, here nothing: no exec session of it gets the bounding set. Its
+        // primary group is not among a session's supplementary groups.
+        let user = r#"{"process":{"user":{"uid":1000,"gid":1000,"umask":18,"additionalGids":[1000,44]},
+            "args":["sleep","600"],"env":["HOME=/home/app"],"cwd":"/",
+            "capabilities":{"bounding":["CAP_CHOWN","CAP_KILL"]}}}"#;
+        let process = made(user, session(Some(true), Some(false)));
+        assert_eq!(
+            process["user"],
+            serde_json::json!({"uid": 1000, "gid": 1000, "umask": 18, "additionalGids": [44]})
+        );
+        assert_eq!(
+            process["capabilities"]["bounding"],
+            serde_json::json!(["CAP_CHOWN", "CAP_KILL"])
+        );
+        for set in ["effective", "permitted", "inheritable", "ambient"] {
+            assert_eq!(process["capabilities"][set], serde_json::json!([]), "{set}");
+        }
+
+        for broken in ["", "{}", r#"{"process": "sleep"}"#] {
+            assert!(
+                exec_process(broken.as_bytes(), &args, ExecSession::default()).is_err(),
+                "{broken:?}"
+            );
+        }
     }
 
     /// The hook runs with the egress half of the gate open and the ingress half
@@ -5530,20 +6414,15 @@ mod tests {
     }
 
     /// The command runs in the container under its own `timeout`, so a hook that
-    /// hangs ends inside the container too, not only at the podman client.
+    /// hangs ends inside the container too, not only at the runtime's client.
     #[test]
     fn the_hook_runs_under_the_containers_own_timeout() {
         let hook = ContainerRestoreHook {
             command: "curl -sf http://[::1]:8088/x".to_string(),
         };
-        let argv = hook.argv();
-        let container = argv
-            .iter()
-            .position(|a| a == "fcvm-container")
-            .expect("the container");
         assert_eq!(
-            &argv[container + 1..],
-            &[
+            hook.args(),
+            [
                 "timeout",
                 "-k",
                 &RESTORE_HOOK_KILL_AFTER_SECS.to_string(),
@@ -5551,6 +6430,22 @@ mod tests {
                 "sh",
                 "-c",
                 "curl -sf http://[::1]:8088/x",
+            ]
+        );
+        // The process handed to `crun exec` is the one the id names, in the state
+        // root podman's crun uses.
+        let id = "cd".repeat(32);
+        let runtime = crate::container::ContainerRuntime::new(None, None);
+        assert_eq!(
+            ContainerRestoreHook::exec_argv(&runtime, &id, std::path::Path::new("/run/p.json")),
+            [
+                "crun",
+                "--root",
+                "/run/crun",
+                "exec",
+                "--process",
+                "/run/p.json",
+                id.as_str()
             ]
         );
         assert!(

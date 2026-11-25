@@ -131,6 +131,9 @@ pub struct ProcessSpec {
     /// Descriptors the VMM keeps open across its exec
     /// ([`crate::utils::NamespaceParams::keep_fds`]).
     pub keep_fds: Vec<std::os::fd::RawFd>,
+    /// When the backend's decision is confined: the VM's own (unpooled) TAP, made the VMM's before its
+    /// capabilities are dropped. `None` keeps what an earlier spawn set.
+    pub tap_owner: Option<String>,
 }
 
 /// A block device to attach (rootfs or data disk), VMM-neutral.

@@ -222,9 +222,11 @@ async fn view_socket(app: App, mut socket: WebSocket) {
             "driver": s.driver,
         })
     };
-    let map = tile.grid.read().as_ref().map(|g| {
-        serde_json::json!({"type": "map", "seq": tile.map_seq.load(Ordering::Relaxed), "region": g.region, "cells": g.encode()})
-    });
+    let map = tile
+        .grid
+        .read()
+        .as_ref()
+        .map(|g| g.map_message(tile.map_seq.load(Ordering::Relaxed)));
     let mut ok = socket.send(text(hello)).await.is_ok();
     if let Some(m) = map {
         ok = ok && socket.send(text(m)).await.is_ok();
@@ -236,7 +238,7 @@ async fn view_socket(app: App, mut socket: WebSocket) {
                 Ok(m) => ok = socket.send(Message::Text(m.to_string().into())).await.is_ok(),
                 // A socket that fell behind gets the whole map again.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    let map = tile.grid.read().as_ref().map(|g| serde_json::json!({"type": "map", "seq": tile.map_seq.load(Ordering::Relaxed), "region": g.region, "cells": g.encode()}));
+                    let map = tile.grid.read().as_ref().map(|g| g.map_message(tile.map_seq.load(Ordering::Relaxed)));
                     if let Some(m) = map { ok = socket.send(text(m)).await.is_ok(); }
                 }
                 Err(_) => break,
