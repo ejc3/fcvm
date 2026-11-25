@@ -1124,6 +1124,63 @@ class DirWatch:
             self.fd = -1
 
 
+# The fields of `fcvm paths --json` this harness reads (src/commands/paths.rs).
+FCVM_PATHS_FIELDS = ("state_dir", "data_dir")
+# A run's answers, by binary and the variables fcvm resolves its directories from.
+_FCVM_PATHS = {}
+FCVM_PATHS_TIMEOUT_S = 30.0
+
+
+def fcvm_paths(fcvm: str, env=None, run=subprocess.run) -> dict:
+    """fcvm's directories, from `fcvm paths --json`, asked once per run.
+
+    Asked of the binary the run gives its clones, with the environment it gives them
+    (``os.environ`` unless ``env``), so a binary that keeps its state somewhere else is
+    followed and no harness joins ``state`` to a data root of its own. The answer is
+    cached by the binary and FCVM_DATA_DIR and FCVM_CONFIG_DIR, the variables fcvm takes
+    its directories from. A call that fails, or an answer without an absolute path for a
+    field, raises RuntimeError naming the command and its stderr: a harness that guessed
+    the directory would read no state and take every VM for gone.
+    """
+    env = os.environ if env is None else env
+    key = (fcvm, env.get("FCVM_DATA_DIR"), env.get("FCVM_CONFIG_DIR"))
+    cached = _FCVM_PATHS.get(key)
+    if cached is not None:
+        return dict(cached)
+    argv = [fcvm, "paths", "--json"]
+    command = shlex.join(argv)
+    try:
+        done = run(argv, capture_output=True, text=True, env=dict(env),
+                   stdin=subprocess.DEVNULL, timeout=FCVM_PATHS_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"`{command}` could not run: {type(error).__name__}: {error}") from error
+    stderr = (done.stderr or "").strip()[-2000:]
+    if done.returncode != 0:
+        raise RuntimeError(f"`{command}` exited with status {done.returncode}; stderr: {stderr!r}")
+    try:
+        answer = json.loads(done.stdout)
+    except ValueError as error:
+        raise RuntimeError(
+            f"`{command}` printed no JSON object ({error}): {done.stdout[-2000:]!r}; "
+            f"stderr: {stderr!r}") from error
+    if not isinstance(answer, dict):
+        raise RuntimeError(f"`{command}` printed {type(answer).__name__}, not an object: "
+                           f"{done.stdout[-2000:]!r}")
+    for field in FCVM_PATHS_FIELDS:
+        value = answer.get(field)
+        if not isinstance(value, str) or not os.path.isabs(value):
+            raise RuntimeError(f"`{command}` printed no absolute {field}: "
+                               f"{done.stdout[-2000:]!r}; stderr: {stderr!r}")
+    found = {field: answer[field] for field in FCVM_PATHS_FIELDS}
+    _FCVM_PATHS[key] = found
+    return dict(found)
+
+
+def fcvm_state_dir(fcvm: str, env=None, run=subprocess.run) -> str:
+    """The state directory `fcvm` keeps VM state in (`fcvm_paths`)."""
+    return fcvm_paths(fcvm, env, run)["state_dir"]
+
+
 STATE_LAYOUT = "2"
 _BUCKET_NAME = re.compile(r"^[0-9a-f]$")
 
@@ -5191,7 +5248,6 @@ def main_with_resources(resources: ExitStack) -> int:
     p.add_argument("--ws-url", default="")
     p.add_argument("--fcvm", default=os.path.join(HERE, "..", "..", "target", "release", "fcvm"))
     p.add_argument("--data-root", default="/mnt/fcvm-btrfs")
-    p.add_argument("--state-dir", default="")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--timeout", type=float, default=120.0)
     p.add_argument("--teardown-timeout", type=float, default=60.0)
@@ -5210,7 +5266,6 @@ def main_with_resources(resources: ExitStack) -> int:
     # The harness owns these handlers.  Do not inherit a caller's blocked mask:
     # every clone and the harness itself must be able to observe shutdown.
     signal.pthread_sigmask(signal.SIG_UNBLOCK, TERMINATION_SIGNALS)
-    args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
 
     # EXACTLY ONE backend. With neither flag `clone_backend_args` returned
     # `["--pid", "0"]` — a silently wrong invocation that would be recorded as
@@ -5274,6 +5329,12 @@ def main_with_resources(resources: ExitStack) -> int:
             f"snapshot {snapshot_name} does not publish TCP "
             f"{args.cdp_port}:{args.cdp_port}: {snapshot['port_mappings']!r}"
         )
+    # The state directory is fcvm's answer, asked of the binary the clones run, never a
+    # join of the data root (fcvm_paths).
+    try:
+        args.state_dir = fcvm_state_dir(args.fcvm)
+    except RuntimeError as error:
+        p.error(str(error))
     try:
         uffd_mode = (
             serve_uffd_mode(args.state_dir, args.serve_pid, snapshot_name)

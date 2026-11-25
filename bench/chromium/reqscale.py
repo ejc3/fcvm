@@ -4048,7 +4048,6 @@ def main() -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--data-root", default="/mnt/fcvm-btrfs")
-    parser.add_argument("--state-dir", default="")
     parser.add_argument("--cgroup-root", default="/sys/fs/cgroup")
     parser.add_argument("--control-chromium", default="chromium")
     parser.add_argument("--uffd-mode", choices=("copy", "minor"), default="copy",
@@ -4094,7 +4093,6 @@ def main() -> int:
 
     args.run_id = args.run_id or uuid.uuid4().hex
     args.data_root = os.path.abspath(args.data_root)
-    args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
     args.out_dir = os.path.abspath(args.out_dir)
     args.urls = reqbench.parse_urls(args.url)
     if len(args.urls) > 1 and not args.control_url:
@@ -4166,6 +4164,11 @@ def main() -> int:
         parser.error("measured runs must be root so owned accounting cgroups can be created")
     # The bundle reqbench.sh staged this file into: its fcvm is the one measured.
     args.fcvm = os.path.join(HERE, "fcvm")
+    # Where that fcvm keeps VM state: its answer, never a join of the data root.
+    try:
+        args.state_dir = reqbench.fcvm_state_dir(args.fcvm)
+    except RuntimeError as error:
+        parser.error(str(error))
     args.source_repo = os.environ.get("REQBENCH_SOURCE_REPO", "")
     resolved_chromium = (
         args.control_chromium if os.path.isabs(args.control_chromium)

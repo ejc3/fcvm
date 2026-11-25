@@ -15,6 +15,7 @@ import argparse
 import ctypes
 import fcntl
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -3306,9 +3307,7 @@ class SnapshotGenerationIdentity(unittest.TestCase):
             with open(manifest_path, "w") as target:
                 target.write("sealed runtime fixture\n")
             fcvm = os.path.join(runtime_bundle, "fcvm")
-            with open(fcvm, "w") as target:
-                target.write("#!/bin/sh\nexit 0\n")
-            os.chmod(fcvm, 0o755)
+            state_fixture.write_fake_fcvm(fcvm, os.path.join(data_root, "state"), data_root)
 
             lock_path = os.path.join(
                 data_root, "snapshots", f"{self.SNAPSHOT}.lock",
@@ -5313,9 +5312,7 @@ class ServeAcknowledgement(unittest.TestCase):
         with open(manifest_path, "w") as target:
             target.write("sealed runtime fixture\n")
         fcvm = os.path.join(runtime_bundle, "fcvm")
-        with open(fcvm, "w") as target:
-            target.write("#!/bin/sh\nexit 0\n")
-        os.chmod(fcvm, 0o755)
+        state_fixture.write_fake_fcvm(fcvm, os.path.join(data_root, "state"), data_root)
         exact_hashes = {
             os.path.realpath(fcvm): "c" * 64,
             os.path.realpath(manifest_path): "d" * 64,
@@ -5818,6 +5815,8 @@ class TeardownProbeGuards(unittest.TestCase):
             with open(stub, "w") as f:
                 f.write(
                     "#!/bin/bash\n"
+                    + f'if [ "$1" = paths ]; then printf \'{{"state_dir": "%s", "data_dir": "%s"}}\\n\' '
+                    + f'{state_dir} {d}; exit 0; fi\n'
                     + state_fixture.SH_STATE_PATH +
                     f'cat > "$(fixture_state_path {state_dir} vm-$$)" <<EOF\n'
                     '{"vm_id": "vm-22222222222222222222222222222222", "pid": $$, '
@@ -5899,17 +5898,26 @@ class ReqbenchShell(unittest.TestCase):
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             RESULTS=os.path.join(d, "results"),
-            STATE_DIR=os.path.join(d, "state"),
+            FCVM_FAKE_STATE_DIR=os.path.join(d, "state"),
             ALLOW_BUSY="1",
             RUNID=self.RUN_ID,
             FCVM=fcvm,
             FC_AGENT=fc_agent,
         )
         env.update(extra)
-        state_fixture.make_store(env["STATE_DIR"])
+        state_fixture.make_store(env["FCVM_FAKE_STATE_DIR"])
         return env, binx
 
     def _write(self, path, body):
+        # A fake fcvm answers `fcvm paths --json` with the store _env made beside it
+        # (<dir>/state), as the harness asks the binary for its state directory before
+        # anything else. The answer is written into the stub, so a sudo stand-in that
+        # resets the environment does not lose it.
+        shebang = "#!/bin/bash\n"
+        if (os.path.basename(path) == "fcvm" and body.startswith(shebang)
+                and "= paths ]" not in body):
+            state = os.path.join(os.path.dirname(path), "state")
+            body = shebang + state_fixture.sh_fcvm_paths(state) + body[len(shebang):]
         with open(path, "w") as f:
             f.write(body)
         os.chmod(path, 0o755)
@@ -7147,7 +7155,7 @@ case "$1 $2" in
       # beside the snapshot it serves ($3).
       prefetch=on; prev=""
       for a in "$@"; do [ "$prev" = --uffd-prefetch ] && prefetch="$a"; prev="$a"; done
-      [ "$prefetch" = off ] || : > "$(dirname "$STATE_DIR")/snapshots/$3/memory.bin.working-set"
+      [ "$prefetch" = off ] || : > "$(dirname "$FCVM_FAKE_STATE_DIR")/snapshots/$3/memory.bin.working-set"
       echo "Serve PID: $$"; echo "Waiting for VMs"
       sleep 30 & sl=$!
       trap 'echo "torn down serve" >> "$STUB_TEARDOWN_LOG"; kill $sl 2>/dev/null; exit 0' TERM
@@ -7156,8 +7164,8 @@ case "$1 $2" in
       name=""; prev=""
       for a in "$@"; do [ "$prev" = --name ] && name="$a"; prev="$a"; done
       vm_id="vm-$(printf '%s' "$name" | sha256sum | cut -c1-32)"
-      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1); mkdir -p "$STATE_DIR/vms/$bucket"
-      state="$STATE_DIR/vms/$bucket/$vm_id.json"
+      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1); mkdir -p "$FCVM_FAKE_STATE_DIR/vms/$bucket"
+      state="$FCVM_FAKE_STATE_DIR/vms/$bucket/$vm_id.json"
       read -r st < /proc/$$/stat; st=${st##*) }; read -ra f <<< "$st"
       printf '{"vm_id":"%s","name":"%s","pid":%s,"pid_start_time":%s,"config":{"network":{"loopback_ip":"127.0.0.1"}}}\n' \
           "$vm_id" "$name" "$$" "${f[19]}" > "$state"
@@ -7166,7 +7174,7 @@ case "$1 $2" in
       wait $sl; rm -f "$state"; exit 0 ;;
   "ls --json")
       pid=""; [ "${3:-}" = --pid ] && pid="$4"
-      "$STUB_PYTHON" - "$STATE_DIR" "$pid" <<'PY'
+      "$STUB_PYTHON" - "$FCVM_FAKE_STATE_DIR" "$pid" <<'PY'
 import glob, json, os, sys
 rows = [json.load(open(p)) for p in glob.glob(os.path.join(sys.argv[1], "vms", "*", "vm-*.json"))]
 if sys.argv[2]:
@@ -7340,7 +7348,10 @@ exec __PYTHON__ "$@"
         self._write(os.path.join(binx, "python3"),
                     self.DIAG_PYTHON_STUB.replace("__PYTHON__", sys.executable))
         fcvm = os.path.join(d, "fcvm")
-        self._write(fcvm, self.DIAG_FCVM_STUB)
+        shebang = "#!/bin/bash\n"
+        assert self.DIAG_FCVM_STUB.startswith(shebang)
+        self._write(fcvm, shebang + state_fixture.sh_fcvm_paths(state_dir)
+                    + self.DIAG_FCVM_STUB[len(shebang):])
         self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
         env = dict(os.environ)
         # The developer's shell must not decide what the diag renders.
@@ -7351,7 +7362,7 @@ exec __PYTHON__ "$@"
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG="tag-under-test",
-            STATE_DIR=state_dir,
+            FCVM_FAKE_STATE_DIR=state_dir,
             RESULTS=os.path.join(d, "results"),
             RUNID=self.RUN_ID,
             FCVM=fcvm,
@@ -7389,7 +7400,7 @@ exec __PYTHON__ "$@"
     def _diag_sidecar(self, env):
         """Where the fcvm stub's serve publishes a working set for the
         snapshot under test, as the real server would beside the golden."""
-        return os.path.join(os.path.dirname(env["STATE_DIR"]), "snapshots",
+        return os.path.join(os.path.dirname(env["FCVM_FAKE_STATE_DIR"]), "snapshots",
                             "tag-under-test", "memory.bin.working-set")
 
     def test_diag_renders_each_url_on_its_own_clone_and_summarises_the_traces(self):
@@ -10541,6 +10552,92 @@ class CloneEndpointWait(unittest.TestCase):
 
 
 
+class FcvmPaths(unittest.TestCase):
+    """The harness takes fcvm's state directory from `fcvm paths --json`, once per run."""
+
+    def setUp(self):
+        reqbench._FCVM_PATHS.clear()
+        self.addCleanup(reqbench._FCVM_PATHS.clear)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+
+    def fake(self, body):
+        path = os.path.join(self.dir, "fcvm")
+        with open(path, "w") as handle:
+            handle.write("#!/bin/bash\n" + body)
+        os.chmod(path, 0o755)
+        return path
+
+    def test_the_answer_is_fcvm_s(self):
+        fcvm = state_fixture.write_fake_fcvm(
+            os.path.join(self.dir, "fcvm"), "/run/example/state", "/data/example")
+        self.assertEqual(reqbench.fcvm_paths(fcvm),
+                         {"state_dir": "/run/example/state", "data_dir": "/data/example"})
+        self.assertEqual(reqbench.fcvm_state_dir(fcvm), "/run/example/state")
+
+    def test_the_binary_gets_the_clones_environment(self):
+        fcvm = self.fake('printf \'{"state_dir": "%s/state", "data_dir": "%s"}\\n\' '
+                         '"$FCVM_DATA_DIR" "$FCVM_DATA_DIR"\n')
+        env = dict(os.environ, FCVM_DATA_DIR="/data/one")
+        self.assertEqual(reqbench.fcvm_state_dir(fcvm, env), "/data/one/state")
+        # Another data directory is another answer, not the cached one.
+        env["FCVM_DATA_DIR"] = "/data/two"
+        self.assertEqual(reqbench.fcvm_state_dir(fcvm, env), "/data/two/state")
+
+    def test_the_answer_is_asked_once_per_run(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(
+                argv, 0, '{"state_dir": "/s", "data_dir": "/d", "later": 1}\n', "")
+
+        self.assertEqual(reqbench.fcvm_state_dir("/x/fcvm", {}, run), "/s")
+        self.assertEqual(reqbench.fcvm_state_dir("/x/fcvm", {}, run), "/s")
+        self.assertEqual(calls, [["/x/fcvm", "paths", "--json"]])
+
+    def test_a_failed_call_names_the_command_and_its_stderr(self):
+        fcvm = self.fake("echo 'Failed to load config' >&2\nexit 1\n")
+        with self.assertRaises(RuntimeError) as raised:
+            reqbench.fcvm_state_dir(fcvm)
+        text = str(raised.exception)
+        self.assertIn(f"{fcvm} paths --json", text)
+        self.assertIn("status 1", text)
+        self.assertIn("Failed to load config", text)
+        # A failure is not cached: the next call asks again.
+        self.assertEqual(reqbench._FCVM_PATHS, {})
+
+    def test_a_binary_that_cannot_run_is_named(self):
+        missing = os.path.join(self.dir, "no-such-fcvm")
+        with self.assertRaisesRegex(RuntimeError, "no-such-fcvm paths --json` could not run"):
+            reqbench.fcvm_state_dir(missing)
+
+    def test_an_answer_without_a_field_is_refused(self):
+        for printed, field in (('{"data_dir": "/d"}', "state_dir"),
+                               ('{"state_dir": "/s"}', "data_dir"),
+                               ('{"state_dir": "relative", "data_dir": "/d"}', "state_dir"),
+                               ('{"state_dir": 3, "data_dir": "/d"}', "state_dir")):
+            with self.subTest(printed=printed):
+                reqbench._FCVM_PATHS.clear()
+                fcvm = self.fake(f"echo '{printed}'\n")
+                with self.assertRaisesRegex(RuntimeError, f"printed no absolute {field}"):
+                    reqbench.fcvm_state_dir(fcvm)
+
+    def test_an_answer_that_is_not_an_object_is_refused(self):
+        for printed in ("not json", "[1, 2]"):
+            with self.subTest(printed=printed):
+                fcvm = self.fake(f"echo '{printed}'\n")
+                with self.assertRaises(RuntimeError):
+                    reqbench.fcvm_state_dir(fcvm)
+
+    def test_main_takes_the_state_directory_from_fcvm(self):
+        """No harness builds the state directory from its data root (main used to)."""
+        source = inspect.getsource(reqbench.main_with_resources)
+        self.assertIn("fcvm_state_dir(args.fcvm)", source)
+        self.assertNotIn('"--state-dir"', source)
+
+
 class StateLayoutReaders(unittest.TestCase):
     """The harness reads fcvm state layout 2 (vms/<bucket>/, pids/<bucket>/)."""
 
@@ -11272,7 +11369,10 @@ class HugepageGuards(unittest.TestCase):
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG="tag-under-test",
-            STATE_DIR=os.path.join(d, "data", "state"),
+            DATA_ROOT=os.path.join(d, "data"),
+            # The phases ask fcvm for its state directory first.
+            FCVM=state_fixture.write_fake_fcvm(
+                os.path.join(d, "fcvm"), os.path.join(d, "data", "state")),
             HUGEPAGE_POOL_FILE=pool,
             MEM="1024",
             RESULTS=os.path.join(d, "results"),
@@ -11494,9 +11594,7 @@ class ExecArmIsOptional(unittest.TestCase):
             with open(manifest_path, "w") as target:
                 target.write("sealed runtime fixture\n")
             fcvm = os.path.join(runtime_bundle, "fcvm")
-            with open(fcvm, "w") as target:
-                target.write("#!/bin/sh\nexit 0\n")
-            os.chmod(fcvm, 0o755)
+            state_fixture.write_fake_fcvm(fcvm, os.path.join(data_root, "state"), data_root)
 
             def record(arm, rep):
                 return {
@@ -12280,9 +12378,7 @@ class RunMetaGuestDns(unittest.TestCase):
         with open(manifest_path, "w") as target:
             target.write("sealed runtime fixture\n")
         fcvm = os.path.join(runtime_bundle, "fcvm")
-        with open(fcvm, "w") as target:
-            target.write("#!/bin/sh\nexit 0\n")
-        os.chmod(fcvm, 0o755)
+        state_fixture.write_fake_fcvm(fcvm, os.path.join(data_root, "state"), data_root)
         exact_hashes = {
             os.path.realpath(fcvm): "c" * 64,
             os.path.realpath(manifest_path): "d" * 64,
@@ -13199,7 +13295,7 @@ class PublicationGateInvocation(unittest.TestCase):
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG="tag-under-test",
-            STATE_DIR=os.path.join(d, "state"),
+            DATA_ROOT=d,
             RESULTS=results,
         )
         env.update(env_extra)

@@ -41,8 +41,7 @@ RUN_ID = "0" * 32
 
 # Stands in for fcvm. Every exec is appended to $STUB_EXEC_LOG as
 # "<view> <argv...>" so a test can prove which questions HOP D asked the clone.
-FCVM_STUB = r'''#!/bin/bash
-echo "$*" >> "$STUB_ARGV"
+FCVM_STUB = "#!/bin/bash\n" + state_fixture.SH_FCVM_PATHS + r'''echo "$*" >> "$STUB_ARGV"
 case "$1 $2" in
   "snapshot serve")
       # Simulates the snapshot directory vanishing after the hugepage check
@@ -53,8 +52,8 @@ case "$1 $2" in
       name=""; prev=""
       for a in "$@"; do [ "$prev" = --name ] && name="$a"; prev="$a"; done
       vm_id="vm-$(printf '%s' "$name" | sha256sum | cut -c1-32)"
-      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1); mkdir -p "$STATE_DIR/vms/$bucket"
-      state="$STATE_DIR/vms/$bucket/$vm_id.json"
+      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1); mkdir -p "$FCVM_FAKE_STATE_DIR/vms/$bucket"
+      state="$FCVM_FAKE_STATE_DIR/vms/$bucket/$vm_id.json"
       read -r st < /proc/$$/stat; st=${st##*) }; read -ra f <<< "$st"
       printf '{"vm_id":"%s","name":"%s","pid":%s,"pid_start_time":%s,"config":{"network":{"loopback_ip":"127.0.0.1"}}}\n' \
           "$vm_id" "$name" "$$" "${f[19]}" > "$state"
@@ -63,7 +62,7 @@ case "$1 $2" in
       wait $sl; rm -f "$state"; exit 0 ;;
   "ls --json")
       pid=""; [ "${3:-}" = --pid ] && pid="$4"
-      "$STUB_PYTHON" - "$STATE_DIR" "$pid" <<'PY'
+      "$STUB_PYTHON" - "$FCVM_FAKE_STATE_DIR" "$pid" <<'PY'
 import glob, json, os, sys
 rows = [json.load(open(p)) for p in glob.glob(os.path.join(sys.argv[1], "vms", "*", "vm-*.json"))]
 if sys.argv[2]:
@@ -162,7 +161,7 @@ class VerifyDnsHop(unittest.TestCase):
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG=TAG,
-            STATE_DIR=state_dir,
+            FCVM_FAKE_STATE_DIR=state_dir,
             RESULTS=os.path.join(d, "results"),
             RUNID=RUN_ID,
             FCVM=fcvm,
@@ -573,8 +572,7 @@ class GoldenGuestDns(unittest.TestCase):
             },
         })
         fcvm = os.path.join(d, "fcvm")
-        write_exec(fcvm, f'''#!/bin/bash
-case "$1 $2" in
+        write_exec(fcvm, "#!/bin/bash\n" + state_fixture.SH_FCVM_PATHS + f'''case "$1 $2" in
   "podman prepare")
       mkdir -p "$DATA_ROOT/snapshots/$TAG"
       : > "$DATA_ROOT/snapshots/$TAG.lock"
@@ -604,7 +602,7 @@ exit 1
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             RESULTS=os.path.join(d, "results"),
-            STATE_DIR=os.path.join(d, "state"),
+            FCVM_FAKE_STATE_DIR=os.path.join(d, "state"),
             DATA_ROOT=d,
             ALLOW_BUSY="1",
             RUNID=RUN_ID,

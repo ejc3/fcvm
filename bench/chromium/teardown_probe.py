@@ -31,7 +31,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from reqbench import (  # noqa: E402
-    StateWatch, children_of, clone_cdp_endpoint, find_state, pidfd_open, proc_comm,
+    StateWatch, children_of, clone_cdp_endpoint, fcvm_state_dir, find_state, pidfd_open,
+    proc_comm,
     require_state_layout,
     reap_disk, scan_state, wait_port,
 )
@@ -147,7 +148,11 @@ def main():
                     help="how long to wait for the clone's state file to appear")
     a = ap.parse_args()
     a.fcvm = os.path.abspath(a.fcvm)
-    state_dir = os.path.join(a.data_root, "state")
+    # Where this fcvm keeps VM state: its answer, never a join of the data root.
+    try:
+        state_dir = fcvm_state_dir(a.fcvm)
+    except RuntimeError as error:
+        sys.exit(f"teardown_probe: {error}")
     require_state_layout(state_dir)
 
     rows: list = []
