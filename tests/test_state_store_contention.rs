@@ -94,7 +94,7 @@ async fn a_start_and_stop_changes_no_directory_every_vm_shares() {
 /// A start and stop finish while another process holds every lock file in the state
 /// directory itself: none of them is one a start waits for. A lock there is one every VM on
 /// the host would take.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn a_start_and_stop_waits_on_no_lock_every_vm_shares() {
     use nix::fcntl::{Flock, FlockArg};
     let temp_dir = TempDir::new().unwrap();
@@ -116,14 +116,26 @@ async fn a_start_and_stop_waits_on_no_lock_every_vm_shares() {
         .collect();
     let names: Vec<_> = held.iter().map(|(name, _)| name.clone()).collect();
 
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        start_and_stop(&manager, "vm-shared-lock", "shared-lock"),
-    )
-    .await
-    .unwrap_or_else(|_| {
-        panic!("a start and stop waited on a lock in the state directory itself: {names:?}")
+    // On a thread and a runtime of its own: a start that blocks in flock never returns to
+    // its runtime, so a timer on that runtime could not fire and the test would hang.
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(start_and_stop(&manager, "vm-shared-lock", "shared-lock"));
+        let _ = done.send(());
     });
+    match finished.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("a start and stop waited on a lock in the state directory itself: {names:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the start and stop failed; its panic is printed above")
+        }
+    }
     drop(held);
 }
 
