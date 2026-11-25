@@ -73,6 +73,36 @@ def boot_problems(release, expected, cmdline, params, base_keys):
     return problems
 
 
+NIC_MODULES_LOAD = Path("/etc/modules-load.d/fcvm-fleet-nic.conf")
+NIC_DROPIN = Path("/etc/systemd/system/cloud-init-local.service.d/10-fcvm-fleet-nic.conf")
+
+
+def nic_load_problems(driver, modules_load, dropin_exists, cloud_init_after, builtin):
+    """Why the NIC's driver may bind after cloud-init-local looks for a NIC on the initrdless boot:
+    the arm64 host kernel keeps it a module, so systemd-modules-load must load it (`modules_load`,
+    the text of NIC_MODULES_LOAD, None when absent) and cloud-init-local.service must be ordered
+    after systemd-modules-load.service (NIC_DROPIN, and systemd's effective `After`,
+    `cloud_init_after`, None when it could not be read). A driver built into the kernel
+    (modules.builtin) binds during the kernel's start and needs neither."""
+    if not driver:
+        return ["this boot has no default route, so no NIC driver to look for"]
+    module = re.compile(r"(^|/)" + re.escape(driver) + r"\.ko(\.(zst|xz|gz))?$")
+    if any(module.search(line.strip()) for line in builtin.splitlines()):
+        return []
+    problems = []
+    if modules_load is None:
+        problems.append(f"{NIC_MODULES_LOAD} does not exist: nothing loads the {driver} driver early")
+    elif driver not in [line.strip() for line in modules_load.splitlines() if not line.strip().startswith(("#", ";"))]:
+        problems.append(f"{NIC_MODULES_LOAD} does not name the {driver} driver")
+    if not dropin_exists:
+        problems.append(f"{NIC_DROPIN} does not exist")
+    if cloud_init_after is None:
+        problems.append("systemctl show failed: the order of cloud-init-local.service is unknown")
+    elif "systemd-modules-load.service" not in cloud_init_after.split():
+        problems.append("cloud-init-local.service is not ordered after systemd-modules-load.service")
+    return problems
+
+
 def pool_problems(text, want):
     """Why the 2 MiB pool (nr_hugepages) is not the reservation."""
     value = text.strip()
@@ -162,10 +192,25 @@ def node_binary(kitesurf):
     return found[0] if len(found) == 1 else ""
 
 
+def nic_driver():
+    """The driver of the interface the default route uses."""
+    for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+        fields = line.split()
+        if len(fields) > 2 and fields[1] == "00000000":
+            return Path("/sys/class/net", fields[0], "device", "driver").resolve().name
+    return ""
+
+
 def check_boot(conf):
+    release = os.uname().release
     expected = KERNEL.read_text().strip() if KERNEL.is_file() else ""
-    return boot_problems(os.uname().release, expected, Path("/proc/cmdline").read_text(), conf["RENDERS_BOOT_PARAMS"],
-                         conf["RENDERS_BOOT_BASE_KEYS"])
+    problems = boot_problems(release, expected, Path("/proc/cmdline").read_text(), conf["RENDERS_BOOT_PARAMS"],
+                             conf["RENDERS_BOOT_BASE_KEYS"])
+    after = run(["systemctl", "show", "cloud-init-local.service", "-p", "After", "--value"])
+    builtin = Path("/lib/modules", release, "modules.builtin")
+    return problems + nic_load_problems(nic_driver(), NIC_MODULES_LOAD.read_text() if NIC_MODULES_LOAD.is_file() else None,
+                                        NIC_DROPIN.is_file(), after.stdout if after.returncode == 0 else None,
+                                        builtin.read_text() if builtin.is_file() else "")
 
 
 def check_host(conf):

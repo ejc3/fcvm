@@ -68,7 +68,13 @@ the reference's Kitesurf commit and boot line; changing either means measuring t
 again. It shares no renderer, slot, candidate or
 manifest field with the pair, so neither track's failure publishes or holds the other, and a
 Kitesurf re-pin can publish a renders image without new GPU images. Its store goes to
-`factory/<input>/renders/store/`. It publishes to a release pointer of its own; the publisher,
+`factory/<input>/renders/store/`. The arm64 host kernel keeps the NIC driver (ENA) a module
+(`kernel/host-arm64.conf`), and the image boots without an initramfs, as Ubuntu's image and the
+campaign's host do. `systemd-modules-load.service` loads ENA
+(`/etc/modules-load.d/fcvm-fleet-nic.conf`), which binds the NIC during the load, and a drop-in
+orders `cloud-init-local.service` after it, so the NIC is bound before cloud-init-local looks for
+one. `host-check.py boot` checks both files and the order systemd reports, and the launch-path
+proof checks the order the boot took on each of the three validation boots. It publishes to a release pointer of its own; the publisher,
 the pointer and the dispatcher's slots are ejc3/aws's.
 
 Validation: the cold boot, the reboot and the stop/start each run the security proofs every image

@@ -1949,6 +1949,22 @@ class RendersRecipeTests(unittest.TestCase):
         self.assertLess(prep.index("make install-host-kernel"), record)
         self.assertIn("with Linux", prep[record - 300:record])
 
+    def test_prep_loads_the_nic_driver_before_cloud_init_on_the_initrdless_boot(self):
+        # The arm64 host kernel keeps ENA a module (kernel/host-arm64.conf) and the image boots
+        # Ubuntu's initrdless path, as the campaign host did. systemd-modules-load loads the driver,
+        # which binds the present NIC inside the load, and cloud-init-local is ordered after it.
+        _, phases = renders_phases()
+        prep = phases["prep"]
+        self.assertIn("echo ena > /etc/modules-load.d/fcvm-fleet-nic.conf", prep)
+        self.assertIn("install -d /etc/systemd/system/cloud-init-local.service.d", prep)
+        self.assertIn("printf '[Unit]\\nAfter=systemd-modules-load.service\\n' > "
+                      "/etc/systemd/system/cloud-init-local.service.d/10-fcvm-fleet-nic.conf", prep)
+        # the boot path stays Ubuntu's: no initramfs module list, no GRUB_FORCE_PARTUUID override
+        self.assertNotIn("/etc/initramfs-tools/modules", prep)
+        self.assertNotIn("GRUB_FORCE_PARTUUID", prep)
+        self.assertNotIn("95-fcvm-fleet-initrd.cfg", prep)
+        self.assertLess(prep.index("/etc/modules-load.d/fcvm-fleet-nic.conf"), prep.index("systemctl daemon-reload"))
+
     def test_the_build_runs_only_on_the_built_kernel_and_the_reference_boot_line(self):
         _, phases = renders_phases()
         build = phases["build"]
@@ -2237,6 +2253,40 @@ class RendersHostCheckTests(unittest.TestCase):
                      self.LINE + " transparent_hugepage=never"):
             with self.subTest(line=line[-40:]):
                 self.assertTrue(self.check.boot_problems(self.RELEASE, self.RELEASE, line, self.PARAMS, self.BASE))
+
+    BUILTIN = "kernel/drivers/net/ethernet/amazon/ena/ena.ko\n"
+    AFTER = "systemd-remount-fs.service systemd-modules-load.service systemd-journald.socket"
+
+    def test_the_nic_driver_is_loaded_before_cloud_init_looks_for_a_nic(self):
+        check = self.check.nic_load_problems
+        self.assertEqual(check("ena", "# a comment\nena\n", True, self.AFTER, ""), [])
+        cases = (
+            ({"modules_load": None}, "/etc/modules-load.d/fcvm-fleet-nic.conf"),
+            ({"modules_load": "enax\n"}, "ena"),
+            ({"modules_load": "# ena\n"}, "ena"),
+            ({"dropin": False}, "10-fcvm-fleet-nic.conf"),
+            ({"after": "systemd-remount-fs.service"}, "systemd-modules-load.service"),
+            ({"after": None}, "is unknown"),
+        )
+        for change, words in cases:
+            with self.subTest(change=change):
+                args = {"modules_load": "ena\n", "dropin": True, "after": self.AFTER}
+                args.update(change)
+                problems = check("ena", args["modules_load"], args["dropin"], args["after"], "")
+                self.assertTrue(problems, change)
+                self.assertTrue(any(words in p for p in problems), problems)
+        # a driver built into the kernel binds during the kernel's own start
+        self.assertEqual(check("ena", None, False, None, self.BUILTIN), [])
+        # without a NIC driver to look for, nothing passes
+        self.assertTrue(check("", "ena\n", True, self.AFTER, ""))
+
+    def test_the_boot_check_holds_the_nic_order_and_not_grub(self):
+        source = (RENDERS / "host-check.py").read_text()
+        body = source.split("def check_boot(conf):", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn("nic_load_problems(", body)
+        self.assertIn('"systemctl", "show", "cloud-init-local.service", "-p", "After", "--value"', body)
+        self.assertNotIn("grub", source.lower())
+        self.assertNotIn("lsinitramfs", source)
 
     def test_a_kernel_that_is_not_the_built_one_fails(self):
         for release, expected in (("7.0.0-1009-aws", "7.0.0-1009-aws"), (self.RELEASE, "7.3.3-fcvm-ba9876543210"),

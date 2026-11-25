@@ -2608,6 +2608,13 @@ m8gd.metal-24xl. The image makes a host the configuration the recorded figures w
   three, or on any parameter other than them and the base image's (`RENDERS_BOOT_BASE_KEYS`: the
   boot loader's and the cloud image's). A test holds every parameter the campaign's host record
   keeps to one of the three or refused, so none can be present without being recorded.
+- The NIC driver (ENA) stays a module of the arm64 host kernel, the kernel the reference was
+  measured on, and the host boots without an initramfs, as Ubuntu's image and the campaign's host
+  do. `systemd-modules-load.service` loads ENA, which binds the NIC during the load, and
+  `cloud-init-local.service` is ordered after it, so the NIC is bound before cloud-init-local looks
+  for one and the host runs its user data. `host-check.py` checks the two files and the order
+  systemd reports at build and on every validation boot, and the launch-path proof checks the order
+  the boot took on each of the three validation boots.
 - 34,000 pages of 2 MiB (`RENDERS_HUGEPAGES`) reserved through sysfs by
   `fcvm-fleet-hugepages.service` in the first transaction of the boot, before the store's restore.
   A short pool fails the unit and the agent, which requires it, does not start.
