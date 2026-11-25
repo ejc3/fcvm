@@ -192,10 +192,12 @@ progress.) Then:
   have that flag ahead of it. "Ahead" is one case: a vCPU waiting in a cross-CPU call for a vCPU
   that has lost its kick and has not executed its HLT yet.
 
-A dead vCPU with neither, or any dead vCPU under the design, fails the run (exit status 1). In
-the run recorded in BREAKS.md the rule books other than the design had between 532 and 32,928 such
-states in each search that had any, every dead vCPU explained, and the design had none. Every configuration lets interrupts from devices and the
-tick arrive (`Cfg.rescue`), so that a vCPU asleep with interrupts on is not counted dead.
+A dead vCPU with neither, or any dead vCPU under the design, fails the run (exit status 1), and so
+does a search that stops at its state limit, which is not audited. In the run recorded in
+BREAKS.md the rule books other than the design had between 532 and 32,928 such states in each
+search that had any, every dead vCPU explained, and the design had none. Every configuration lets
+interrupts from devices and the tick arrive (`Cfg.rescue`), so that a vCPU asleep with interrupts
+on is not counted dead.
 
 Also checked by the search and not proved: that today's rule books have no kind of break other
 than those listed, and that each recorded run is a shortest one of its kind. The search program is
@@ -428,10 +430,14 @@ directory and running `lake build` (exit status 1 each time, and 0 for the uncha
 
 The search (`make verify-search`) and the harness (`make verify-harness`, which fetches kernel
 source) are not in CI: run them by hand after a change to `Spec.lean`, `Today.lean`, `Design.lean`
-or `Properties.lean`. The search has a gate of its own, observed the same way: with `ownFlag` in
-`Search.lean` made blind to a lost kick and a missing waker, `lake exe breaks` on v7.3.3 without
-the restore kick and without snapshots exits 1 ("2088 dead vCPUs that no property flags", with the run to the first one);
-unchanged, it exits 0.
+or `Properties.lean`. Each has a test of its own gates, also run by hand, each case observed
+failing with its fix reverted:
+
+- `./test-search.sh`: a search that stops at the state limit is not audited and fails the run,
+  under any rule book; and with `ownFlag` in a copy of `Search.lean` made blind to a lost kick
+  and a missing waker, the search of v7.3.3 without the restore kick and without snapshots exits
+  1 ("2088 dead vCPUs that no property flags"), where unchanged it exits 0.
+- `harness/test-run.sh`: `run.sh` ends as BLOCKED (exit 2) when `hostops` or `diff` fails.
 
 ## Conventions
 

@@ -18,7 +18,9 @@ Every search also audits the properties (`audit`). Without using them, it comput
 which some vCPU can never execute another instruction, however the other vCPU, the host and the
 VMM go on (short of a snapshot restore or an NMI, which the audit does not accept as a rescue).
 Each such vCPU must be flagged by a property in that very state, and the designed system must
-have none. A dead vCPU that no property flags fails the run: the exit status is 1.
+have none. A dead vCPU that no property flags fails the run: the exit status is 1. So does a
+search that stops at the state limit, under any rule book: it is not audited, and it establishes
+nothing. `test-search.sh` tests both.
 
 Every configuration lets interrupts from sources the model does not follow (devices, the tick)
 arrive at a blocked vCPU that can take them, so that a vCPU asleep with interrupts on is not
@@ -436,9 +438,11 @@ structure Run where
   cfg : Cfg
   cfgName : String
 
-/-- Search one rule book in one configuration and audit it. Returns whether any property broke,
-and whether the audit found a dead vCPU that no property flags. -/
-def report (r : Run) (limit : Nat) (verbose : Bool) : IO (Bool × Nat × Nat) := do
+/-- Search one rule book in one configuration and audit it. Returns whether the search visited
+every reachable state, whether no property broke, how many states have a dead vCPU, and how many
+dead vCPUs no property flags. A search that stopped at the state limit is not audited: its graph
+has successors for the expanded states only. -/
+def report (r : Run) (limit : Nat) (verbose : Bool) : IO (Bool × Bool × Nat × Nat) := do
   let t0 ← IO.monoMsNow
   let g := explore r.rules r.cfg limit
   let found := findBreaks r.rules r.cfg g
@@ -457,7 +461,7 @@ def report (r : Run) (limit : Nat) (verbose : Bool) : IO (Bool × Nat × Nat) :=
   if !g.complete then
     IO.println "audit: not run, the search did not finish"
     (← IO.getStdout).flush
-    return (false, 0, 1)
+    return (false, found.isEmpty, 0, 0)
   let a := audit g
   IO.println s!"audit: {a.dead} states in which a vCPU can never run again; of those vCPUs, {a.flaggedNow} are flagged by a property of their own there, {a.flaggedAhead} have their own flag ahead, {a.unexplained} have neither"
   match a.witness with
@@ -466,7 +470,7 @@ def report (r : Run) (limit : Nat) (verbose : Bool) : IO (Bool × Nat × Nat) :=
     printTrace r.rules r.cfg (g.trace idx)
   | none => pure ()
   (← IO.getStdout).flush
-  return (found.isEmpty && g.complete, a.dead, a.unexplained)
+  return (true, found.isEmpty, a.dead, a.unexplained)
 
 /-- The fcvm configuration, with host page faults in ordinary code only (the searches' bound). -/
 def fcvm : Cfg := { Cfg.fcvm with kernelFaults := false }
@@ -520,17 +524,23 @@ def main (args : List String) : IO UInt32 := do
   for (bn, rules) in books do
     for (cn, cfg) in cfgs do
       if want s!"{bn}, {cn}" then
-        let (clean, dead, unexplained) ← report { name := bn, rules, cfg, cfgName := cn } limit verbose
+        let (complete, clean, dead, unexplained) ←
+          report { name := bn, rules, cfg, cfgName := cn } limit verbose
+        if !complete then
+          failures := failures.push s!"{bn}, {cn}: the search did not finish, so nothing is established"
         if unexplained > 0 then
           failures := failures.push s!"{bn}, {cn}: {unexplained} dead vCPUs that no property flags"
         if bn.startsWith "Design" && !cfg.userSetMp then
           if !clean then
-            failures := failures.push s!"{bn}, {cn}: a property breaks, or the search did not finish"
+            failures := failures.push s!"{bn}, {cn}: a property breaks"
           if dead > 0 then
             failures := failures.push s!"{bn}, {cn}: {dead} states with a vCPU that can never run again"
   for (bn, rules, cn, cfg) in orders do
     if want s!"{bn}, {cn}" then
-      let (_, _, unexplained) ← report { name := bn, rules, cfg, cfgName := cn } limit verbose
+      let (complete, _, _, unexplained) ←
+        report { name := bn, rules, cfg, cfgName := cn } limit verbose
+      if !complete then
+        failures := failures.push s!"{bn}, {cn}: the search did not finish, so nothing is established"
       if unexplained > 0 then
         failures := failures.push s!"{bn}, {cn}: {unexplained} dead vCPUs that no property flags"
   if !failures.isEmpty then
