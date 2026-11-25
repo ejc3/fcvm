@@ -1543,11 +1543,14 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                 return real_wait_state_owned(*call_args, **call_kwargs)
 
             reqbench.wait_state_owned = mark_owner_wait
+            answers = []
             args = argparse.Namespace(
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
                 timeout=5.0, teardown_timeout=5.0, cdp_port=port,
                 state_dir=state_dir, data_root=d, ws_url="", run_id="test-run",
+                on_answer=lambda record: answers.append(
+                    (dict(record), list(owner_wait_calls))),
             )
             try:
                 rec = reqbench.run_cdp_request(args, 0, fast=True)
@@ -1558,6 +1561,15 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                 server.close()
 
             self.assertTrue(rec["ok"])
+            # A caller that starts its next request while this clone is torn
+            # down is told once, when the answer is in hand: the request's time
+            # is set, and neither the owner wait nor the teardown has begun.
+            self.assertEqual(len(answers), 1)
+            answered, owner_waits_before = answers[0]
+            self.assertTrue(answered["ok"])
+            self.assertEqual(answered["blocking_ms"], rec["blocking_ms"])
+            self.assertNotIn("teardown", answered)
+            self.assertEqual(owner_waits_before, [])
             # reqscale's request function (_make_request_fn) times each corpus
             # scale request from these three monotonic stamps, and refuses a
             # successful record without artifact_ns; run_cdp_request set none

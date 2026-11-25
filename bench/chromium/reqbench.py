@@ -4253,6 +4253,12 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["blocking_ms"] = (t_answer - t_spawn) * 1000
             if rec.get("ok"):
                 rec["artifact_monotonic_ns"] = int(t_answer * 1e9)
+            # A caller that starts its next request while this clone is torn
+            # down (pages mode's worker) is told here, with the record as it
+            # stands. reqbench's own arms set no callback.
+            on_answer = getattr(args, "on_answer", None)
+            if on_answer is not None:
+                on_answer(rec)
             t_owned = time.monotonic()
             state = wait_state_owned(
                 state_path,
