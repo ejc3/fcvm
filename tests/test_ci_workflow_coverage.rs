@@ -393,15 +393,15 @@ fn fleet_web_changes_run_the_fleet_web_job() {
         "a ci.yml-only change does not run `fleet-web`, so a broken fleet-web job merges green"
     );
     // Every fail-open branch opens the web gate too: each `emit true` that is not
-    // the classifier's own verdict opens all four gates.
+    // the classifier's own verdict opens every gate.
     for line in text
         .lines()
         .map(str::trim)
         .filter(|l| l.starts_with("emit true "))
     {
         assert!(
-            line == "emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""
-                || line.ends_with(" true true true true"),
+            line == "emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\" \"$confine\""
+                || line.ends_with(" true true true true true"),
             "a fail-open branch of `changes` leaves a gate closed: {line}"
         );
     }
@@ -1964,7 +1964,7 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
         );
         // `emit` writes each output from its positional argument. A declared
         // output the function does not write is the empty string to every consumer.
-        let position = ["run", "reason", "code", "bench", "fleet", "web"]
+        let position = ["run", "reason", "code", "bench", "fleet", "web", "confine"]
             .iter()
             .position(|k| *k == name)
             .unwrap_or_else(|| panic!("`changes` declares `{name}`, which `emit` does not write"))
@@ -1981,8 +1981,9 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
     // exposed that. The fail-open branches are pinned in
     // fleet_web_changes_run_the_fleet_web_job.
     assert!(
-        scripts.contains("emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""),
-        "the classifier's own verdict is not emitted from $code, $bench, $fleet and $web"
+        scripts
+            .contains("emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\" \"$confine\""),
+        "the classifier's own verdict is not emitted from $code, $bench, $fleet, $web and $confine"
     );
 
     // And the reverse: nothing may gate on an output `changes` does not declare.
@@ -2325,6 +2326,17 @@ fn run_matrix_plan(
     pr_tree_matches: bool,
     pr_jobs: &[&str],
 ) -> BTreeMap<String, String> {
+    run_matrix_plan_for(event, pr_tree_matches, pr_jobs, false)
+}
+
+/// [`run_matrix_plan`], saying whether the `changes` job found the pull request touching
+/// the VMM's confinement (`needs.changes.outputs.confine`).
+fn run_matrix_plan_for(
+    event: &str,
+    pr_tree_matches: bool,
+    pr_jobs: &[&str],
+    touches_confinement: bool,
+) -> BTreeMap<String, String> {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let ci = parse_workflow("ci.yml");
     let run = workflow_job(&ci, "skip-check")
@@ -2383,6 +2395,10 @@ exit 1
         .env("PATH", path)
         .env("EVENT", event)
         .env("REPO", "o/r")
+        .env(
+            "CONFINE",
+            if touches_confinement { "true" } else { "false" },
+        )
         .env("GH_TOKEN", "unused")
         .env("GITHUB_OUTPUT", &out_file)
         .env(
@@ -2503,6 +2519,44 @@ fn a_pull_request_runs_every_arm64_job_and_one_x64_job() {
         arm64, every_arm64,
         "a pull request must still run every arm64 job"
     );
+}
+
+/// A pull request that touches the VMM's confinement also runs Host-x64.
+///
+/// Host-x64's `test-confine` step is the only place the x86_64 seccomp policy runs under
+/// real confinement. Without it, a change to that policy first met an x86_64 kernel on
+/// main. The `changes` job says whether the pull request touches confinement, and the plan
+/// reads it as `needs.changes.outputs.confine`.
+#[test]
+fn a_pull_request_that_touches_confinement_also_runs_host_x64() {
+    let jobs = planned_jobs(&run_matrix_plan_for("pull_request", false, &[], true));
+    let x64: BTreeSet<String> = jobs.iter().filter(|j| j.contains("x64")).cloned().collect();
+    assert_eq!(
+        x64,
+        job_set(&["Host-x64", "Host-Root-x64-SnapshotEnabled"]),
+        "a pull request that touches confinement must run the x64 Host job"
+    );
+    let ci = std::fs::read_to_string(workflow_path("ci.yml")).expect("read ci.yml");
+    assert!(
+        ci.contains("CONFINE: ${{ needs.changes.outputs.confine }}")
+            && ci.contains("confine: ${{ steps.detect.outputs.confine }}"),
+        "the plan no longer reads the changes job's confine output"
+    );
+    let scope = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-pr-scope.sh"),
+    )
+    .expect("read ci-pr-scope.sh");
+    for path in [
+        "resources/seccomp/*",
+        "src/confine.rs",
+        "src/firecracker/vm.rs",
+        "scripts/confine-*",
+    ] {
+        assert!(
+            scope.contains(path),
+            "ci-pr-scope.sh no longer counts {path} as a confinement path"
+        );
+    }
 }
 
 /// Main runs whatever its PR run of the same tree did not.
