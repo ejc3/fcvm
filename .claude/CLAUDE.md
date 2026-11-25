@@ -237,13 +237,19 @@ namespace, and each acts on the agent's own. That is where every listener of
 the workload is: the container runs with `--network=host`. A namespace a
 privileged workload makes for itself is outside all three, as it was outside
 the gate before (its traffic is forwarded, and the gate hooks INPUT and
-OUTPUT). What keeps the 0 out of a snapshot of a clone: the restore holds the
-boundary lock from its first step to publication, and a snapshot's prepare is
-refused from the restore's dispatch until its publication (`restore-under-way`,
-below). A restore that fails keeps the 0, drops the lock and leaves the mark,
-so the prepare stays refused until the agent's power-off lands. What can still
-capture it is a create whose prepare ran before the restore was dispatched and
-whose pause lands in the middle of it, which the host refuses (#2138).
+OUTPUT). What keeps the 0 out of a snapshot of a clone is two intervals, not
+one. From the restore's dispatch to its publication the guest refuses a
+snapshot's prepare (`restore-under-way`, below). The boundary lock is taken
+later: the restore does its early work first (the exec re-register request, the
+neighbour pin, the `restore.pre_boundary` failpoint) and holds the lock from
+`restore_snapshot_network` to publication, so the lock does not cover the
+pre-boundary work and the mark does. A restore that fails keeps the 0, drops
+the lock and leaves the mark, so the prepare stays refused until the agent's
+power-off lands. The guest cannot refuse a prepare that returned before the
+dispatch. `fcvm` sends none: a restore is dispatched only into a VM that was
+just loaded from an image, and `snapshot create` refuses such a VM, under the
+per-VM snapshot lock, until its restore is acknowledged (#2151). A one-shot run
+by hand in that VM before the dispatch is not covered.
 
 A socket the clone opens after that list is in neither list and is never
 retired, whatever tuple it reuses. `ModelDiag` fails if a socket made after the
@@ -347,11 +353,46 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
 - **The watchdog's deadline is for a boundary nobody is working on.** A look while the
   boundary lock is held or a restore is under way is not counted
   (`snapshot_network::boundary_in_progress`), so a restore or a prepare that takes over a
-  minute keeps its container frozen. A source whose host died, or whose gate cannot be
-  opened, is still thawed after 60 counted looks. At most 900 looks at one freeze go
+  minute keeps its container frozen. While a source's boundary is owed and its gate is
+  still installed (`snapshot_network::source_gate_is_owed`), 150 more looks are not
+  counted (`payload_freeze::SOURCE_REOPEN_LOOKS`, the host's whole bound on asking
+  for the resume): nobody holds the lock between two of the host's tries, and those looks
+  used to count, so the thaw could land with the create still in flight. Looks, not the
+  mark's age: the guest takes none while its VM is paused. A source whose host died, or
+  whose gate cannot be opened, is still thawed, 60 counted looks after those. At most 900 looks at one freeze go
   uncounted (15 minutes, the host's bound on a restore's acknowledgement), so a one-shot
   hung under the lock cannot keep a container frozen for good. A lock that cannot be
   opened is not "held".
+- **A resume acts only on the boundary it was sent for** (#2159). A resume the host gave
+  up on can still be delivered later: its exec runs on a blocking thread that goes on
+  connecting after the try is cut off, and a delivered one-shot can wait in the guest for
+  the boundary lock. Landing between a later create's prepare and its pause, it would open
+  the gate and the pause would save an image with the gate open and no manifest. So every
+  create's boundary has a token: `run_snapshot_network_command` writes it on the VM's
+  state (`boundary_token`) and sends it to the prepare, which puts it into the `owed`
+  mark; every resume reads it from the state once, before its first try, and sends it;
+  the guest runs a resume only when its token is the mark's
+  (`BoundaryMarks::resume_is_for_the_owed_boundary`), and refuses any other with exit 5.
+  Exit 3 is the restore's refusal alone. On 5 the host asks no more, keeps the record and
+  the token, and reports the source as possibly left gated (`ReopenFailure::Stale`): the
+  refusal says nothing of the gate, which can be this source's own and closed (a prepare
+  that failed before it wrote its mark, over the mark of a create whose host died). The
+  state keeps the token while the gate is recorded closed, for the later create's one
+  ask, and loses it when the gate is reported open. A state that is there and cannot be
+  read is a failed try, and one that cannot be written fails the create before its
+  prepare is sent: neither is "no token". The token orders resumes. It is not a secret:
+  the one-shot runs as root in the guest, and whatever can run it can read the mark.
+  Both failures begin with the commands to run by hand (`with_the_resume_by_hand`): the
+  resume with the state's token, or, when the guest refused that as stale, a read of
+  `/run/fcvm/snapshot-boundary-owed` and the resume with the token found there. The
+  mark is written whole or not at all (staged and renamed). A resume that opens the gate
+  and cannot remove the manifest or the mark after three tries exits 4, which the host
+  reads as an open gate (`reopen_try_of`), and still does what follows an open gate (the
+  output reconnect). The resume's second look for a restore, right before it touches the
+  gate, narrows the window in which the two meet and does not close it; no path of fcvm
+  sends a resume to a VM whose restore it has yet to dispatch. A clone inherits its
+  source's mark, token included, until its restore is dispatched and clears it; no path
+  sends a clone its source's token, and a create of the clone carries its own.
 - **`rcu_expedited` is put back after a kill** (#2141). The barrier records the switch's
   value in `/run/fcvm/rcu-expedited-before` before it turns it on; the next barrier, the
   next resume and the next start of the agent put it back from the record. The resume
