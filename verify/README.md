@@ -15,13 +15,14 @@ wake-up can be lost, not only those two.
 
 One Lake package, one `lake build`, one CI job. Each model is a library of its own with its own
 search executable and documents. `check-imports.sh` runs before the build (in `make verify` and
-in CI) and fails if a file of either model is not imported by that model's `Axioms.lean`, whose
+in CI) and fails if a file of any model is not imported by that model's `Axioms.lean`, whose
 sweep looks at everything the modules it imports declare.
 
 | Model | Library, namespace | Search | Documents |
 |---|---|---|---|
 | The guest vCPU wake-up path | `WakeVerify`, `Wake` | `lake exe breaks` | this file, `BREAKS.md`, `REPAIRS.md` |
 | The snapshot and restore network boundary in fc-agent | `GateVerify`, `Gate` | `lake exe gate-breaks` | [`GateVerify/README.md`](GateVerify/README.md), [`GateVerify/BREAKS.md`](GateVerify/BREAKS.md), [`GateVerify/REPAIRS.md`](GateVerify/REPAIRS.md) |
+| A vCPU's timer and interrupt state across a snapshot and a restore on arm64 (the vGIC, the timer, Cloud Hypervisor and the Firecracker fork) | `ResumeVerify`, `Resume` | `lake exe resume-breaks` | [`ResumeVerify/README.md`](ResumeVerify/README.md), [`ResumeVerify/BREAKS.md`](ResumeVerify/BREAKS.md), [`ResumeVerify/REPAIRS.md`](ResumeVerify/REPAIRS.md) |
 
 The rest of this file is about the first.
 
@@ -228,7 +229,8 @@ later time, also while the VM is paused.
 ## arm64
 
 The mechanisms of this model do not exist on arm64 KVM, which is why the arm64 lanes show neither
-hang:
+hang. What arm64 has in their place (the vGIC's state and the timer, across a snapshot and a
+restore) is the third model, [`ResumeVerify`](ResumeVerify/README.md).
 
 - **The halt is WFI, and it is not in `mp_state`.** `kvm_handle_wfx` calls `kvm_vcpu_wfi` and then
   moves the PC past the instruction (arch/arm64/kvm/handle_exit.c:130-178, arm.c:1065-1089). A
