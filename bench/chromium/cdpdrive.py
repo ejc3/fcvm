@@ -600,10 +600,12 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
     return {"requests": requests, "summary": summary}
 
 
-def parse_viewport(text: str):
-    """(width, height) of a WIDTHxHEIGHT value, None for an empty one."""
-    if not text:
+def parse_viewport(text):
+    """(width, height) of a WIDTHxHEIGHT value, None for an empty one or None."""
+    if text is None or text == "":
         return None
+    if not isinstance(text, str) or not text.isascii():
+        raise ValueError(f"--viewport wants WIDTHxHEIGHT, got {text!r}")
     width, sep, height = text.partition("x")
     if not sep or not width.isdigit() or not height.isdigit():
         raise ValueError(f"--viewport wants WIDTHxHEIGHT, got {text!r}")
@@ -613,7 +615,16 @@ def parse_viewport(text: str):
     return size
 
 
+def viewport_argument(text: str) -> str:
+    """argparse type for --viewport: the value as given, once it parses."""
+    parse_viewport(text)
+    return text
+
+
 def drive(args) -> dict:
+    # A viewport that does not parse is the caller's error, not a failed render: it is
+    # raised before anything is resolved, connected or sent.
+    viewport = parse_viewport(getattr(args, "viewport", ""))
     render = load_render(args.render_module)
     # getattr, for the same reason as host_header below: reqbench builds a
     # closed Namespace. A missing attribute or None means the trace is off,
@@ -680,7 +691,6 @@ def drive(args) -> dict:
         stages["enable_ms"] = (time.monotonic() - t) * 1000
         stages["connect_total_ms"] = (time.monotonic() - t0) * 1000
 
-        viewport = parse_viewport(getattr(args, "viewport", "") or "")
         if viewport:
             stage = "viewport"
             stage_started = time.monotonic()
@@ -892,7 +902,7 @@ def main() -> int:
     p.add_argument("--host-header", default="",
                    help="override the Host header on /json/list; proves Chromium's "
                         "DevTools host validation rejects non-IP, non-localhost names")
-    p.add_argument("--viewport", default="", metavar="WIDTHxHEIGHT",
+    p.add_argument("--viewport", default="", metavar="WIDTHxHEIGHT", type=viewport_argument,
                    help="the page's CSS viewport at a device scale of 1, set with one "
                         "Emulation.setDeviceMetricsOverride before the navigate")
     p.add_argument("--net-trace", default=None, metavar="PATH",

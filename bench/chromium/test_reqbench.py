@@ -1544,13 +1544,18 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
 
             reqbench.wait_state_owned = mark_owner_wait
             answers = []
+
+            def told(record):
+                answers.append((dict(record), list(owner_wait_calls)))
+                # A callback that fails is the caller's fault, not the request's.
+                raise RuntimeError("the caller's callback failed")
+
             args = argparse.Namespace(
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
                 timeout=5.0, teardown_timeout=5.0, cdp_port=port,
                 state_dir=state_dir, data_root=d, ws_url="", run_id="test-run",
-                on_answer=lambda record: answers.append(
-                    (dict(record), list(owner_wait_calls))),
+                on_answer=told,
             )
             try:
                 rec = reqbench.run_cdp_request(args, 0, fast=True)
@@ -1570,6 +1575,10 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertEqual(answered["blocking_ms"], rec["blocking_ms"])
             self.assertNotIn("teardown", answered)
             self.assertEqual(owner_waits_before, [])
+            # The callback raised: the request is still the answered one, with its owner
+            # wait and teardown done, and the record says what the callback did.
+            self.assertIn("the caller's callback failed", rec["on_answer_error"])
+            self.assertNotIn("error", rec)
             # reqscale's request function (_make_request_fn) times each corpus
             # scale request from these three monotonic stamps, and refuses a
             # successful record without artifact_ns; run_cdp_request set none

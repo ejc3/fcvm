@@ -590,11 +590,23 @@ class NetTraceOff(unittest.TestCase):
         self.assertIn("viewport_ms", out["stages"])
 
     def test_a_malformed_viewport_is_refused(self):
-        for bad in ("1280", "1280x", "x720", "1280x0", "12800x720", "1280X720", "a x b"):
-            with self.assertRaises(ValueError, msg=bad):
+        for bad in ("1280", "1280x", "x720", "1280x0", "12800x720", "1280X720", "a x b",
+                    "\uff11\uff12\uff18\uff10x\uff17\uff12\uff10", "\u00b2x\u00b2", (1280, 720)):
+            with self.assertRaises(ValueError, msg=repr(bad)):
                 cdpdrive.parse_viewport(bad)
         self.assertEqual(cdpdrive.parse_viewport("1280x720"), (1280, 720))
         self.assertIsNone(cdpdrive.parse_viewport(""))
+        self.assertIsNone(cdpdrive.parse_viewport(None))
+
+    def test_a_malformed_viewport_is_the_callers_error_before_anything_is_sent(self):
+        """A viewport that cannot be parsed is not a render failure of the engine: drive()
+        raises before it resolves or connects, and nothing reaches the endpoint."""
+        server = FakeCdpServer(scripted(NAV_EVENTS))
+        self.addCleanup(server.close)
+        with self.assertRaises(ValueError):
+            cdpdrive.drive(args_for(server, viewport="1280X720"))
+        server.close()
+        self.assertEqual(server.messages, [])
 
     def test_the_trace_adds_exactly_one_message(self):
         off_out, off_server = self._drive()
