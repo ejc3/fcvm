@@ -632,3 +632,134 @@ async fn a_syn_cookie_handshake_does_not_reach_a_restored_clone() -> Result<()> 
     checked?;
     deleted
 }
+
+/// A connection the source held from a client of a port published with `/loopback` does
+/// not outlive a restore.
+///
+/// Such a client is on the host, and the guest's nat rules rewrite both its addresses to
+/// 127.0.0.1 (`fc-agent/src/network.rs`, `publish_as_loopback_client`), so the server's
+/// socket records a loopback peer. The snapshot's manifest kept every socket with a
+/// loopback peer out, as a connection inside the guest, and each clone woke with the
+/// source's client connections on that port still established. What says a connection is
+/// inside the guest is that both its sockets are there.
+///
+/// RED BEFORE THE FIX: the clone holds the source's connection from the host.
+#[tokio::test]
+async fn a_loopback_ports_client_connection_does_not_outlive_a_restore() -> Result<()> {
+    let (golden_name, clone_name, snapshot_name, _) = common::unique_names("loopclient");
+    let host_port = common::find_available_high_port()?;
+    let (mut golden_child, golden_pid, _golden_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &golden_name,
+            "--network",
+            "routed",
+            "--publish",
+            &format!("{host_port}:80/loopback"),
+            "--health-check",
+            "http://localhost:80",
+            common::TEST_IMAGE,
+        ],
+        &[("FCVM_NO_SNAPSHOT", "1")],
+    )
+    .await
+    .context("spawning the golden VM with a /loopback port")?;
+    // The server's connections on port 80 with a peer on 127.0.0.1, by the peer's port.
+    // TIME-WAIT is left out: what a finished health check leaves behind is no connection.
+    let loopback_peers = |listing: &str| -> std::collections::BTreeSet<u16> {
+        listing
+            .lines()
+            .filter_map(|line| line.split_whitespace().last())
+            .filter_map(|peer| peer.strip_prefix("127.0.0.1:"))
+            .filter_map(|port| port.parse().ok())
+            .collect()
+    };
+    const SERVER_SOCKETS: &str = "ss -Htn state connected exclude time-wait '( sport = :80 )'";
+    let mut held = None;
+    let prepared: Result<std::collections::BTreeSet<u16>> = async {
+        common::poll_health_by_pid(golden_pid, 180).await?;
+        let published: std::net::IpAddr = common::get_network_field(golden_pid, "loopback_ip")
+            .await?
+            .parse()
+            .context("the VM's loopback_ip")?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let client = loop {
+            match tokio::net::TcpStream::connect((published, host_port)).await {
+                Ok(client) => break client,
+                Err(error) => anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "connecting to the published port: {error}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        // The connection the test holds is the one that is there both times; a health
+        // check's comes and goes.
+        let mut ours = None;
+        for _ in 0..50 {
+            let first = loopback_peers(&common::exec_in_vm(golden_pid, &[SERVER_SOCKETS]).await?);
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let second = loopback_peers(&common::exec_in_vm(golden_pid, &[SERVER_SOCKETS]).await?);
+            let both: std::collections::BTreeSet<u16> =
+                first.intersection(&second).copied().collect();
+            if !both.is_empty() {
+                ours = Some(both);
+                break;
+            }
+        }
+        let ours = ours.context(
+            "the source holds no connection from 127.0.0.1 on port 80, so the /loopback port \
+             did not rewrite its client and nothing would be tested",
+        )?;
+        held = Some(client);
+        common::create_snapshot_by_pid(golden_pid, &snapshot_name).await?;
+        Ok(ours)
+    }
+    .await;
+    common::kill_process(golden_pid).await;
+    let _ = golden_child.wait().await;
+    drop(held);
+    let ours = match prepared {
+        Ok(ours) => ours,
+        Err(error) => {
+            let _ = common::delete_snapshot(&snapshot_name).await;
+            return Err(error);
+        }
+    };
+
+    let (mut clone_child, clone_pid, _clone_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+        ],
+        &[],
+    )
+    .await
+    .context("spawning the restored clone")?;
+    let checked: Result<()> = async {
+        common::poll_health_by_pid(clone_pid, 120).await?;
+        let listing = common::exec_in_vm(clone_pid, &[SERVER_SOCKETS]).await?;
+        let kept: Vec<u16> = loopback_peers(&listing)
+            .intersection(&ours)
+            .copied()
+            .collect();
+        anyhow::ensure!(
+            kept.is_empty(),
+            "the clone holds the source's connection from the host on its /loopback port \
+             (peer ports {kept:?}):\n{listing}"
+        );
+        Ok(())
+    }
+    .await;
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.wait().await;
+    let deleted = common::delete_snapshot(&snapshot_name).await;
+    checked?;
+    deleted
+}
