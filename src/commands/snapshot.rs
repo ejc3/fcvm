@@ -3270,7 +3270,9 @@ async fn cmd_snapshot_run_inner(
         network: snapshot_config.metadata.network_mode.into(),
         firecracker_args: runtime_config.effective_firecracker_args().as_deref(),
         unsupported: None,
+        kernel_profile: snapshot_config.metadata.kernel_profile.as_deref(),
     })?;
+    crate::commands::common::require_confined_filter(&decision, &runtime_config)?;
 
     // Generate VM ID and name. Restored VMs always get a FRESH vm_id and a
     // fresh state file (vsock_epoch starts at 0) — including the podman-run
@@ -6281,6 +6283,7 @@ async fn cmd_snapshot_run_raw(
         network: crate::confine::Network::Rootless,
         firecracker_args: args.firecracker_args.as_deref(),
         unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
+        kernel_profile: None,
     })?;
     anyhow::ensure!(
         port_mappings.is_empty(),

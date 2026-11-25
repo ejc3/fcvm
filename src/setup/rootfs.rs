@@ -2975,6 +2975,7 @@ fn layer2_setup_confinement_request() -> crate::confine::Request<'static> {
             "fcvm setup's Layer 2 VM runs unconfined; run fcvm setup with confinement off \
              first (it is a one-time step), then start VMs confined",
         ),
+        kernel_profile: None,
     }
 }
 

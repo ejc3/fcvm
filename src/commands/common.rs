@@ -1633,6 +1633,32 @@ fn merge_with(
     Ok(stats)
 }
 
+/// For a confined start, as soon as its Firecracker binary is known and before anything is
+/// created: the binary has the seccomp filter `fcvm setup` compiled for it, unchanged
+/// ([`crate::confine::Decision::require_filter`]). A host that was upgraded and not set up
+/// again is refused here with nothing started. A binary that cannot be found here fails the
+/// start where it is looked up, with that error; the launch makes this check again on the
+/// binary it runs, and hands the VMM the bytes it checked.
+pub fn require_confined_filter(
+    decision: &crate::confine::Decision,
+    runtime_config: &RuntimeConfig,
+) -> Result<()> {
+    if decision.confinement().is_none() {
+        return Ok(());
+    }
+    let firecracker = match runtime_config.firecracker_bin.clone() {
+        Some(path) => path,
+        None => match find_firecracker(runtime_config) {
+            Ok(path) => path,
+            Err(_) => return Ok(()),
+        },
+    };
+    if !firecracker.exists() {
+        return Ok(());
+    }
+    decision.require_filter(&firecracker)
+}
+
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///
@@ -4356,6 +4382,10 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
+        // The load built the VM and left it paused. A confined VMM's threads are checked
+        // here, before the guest is resumed, so a clone never runs unfiltered: a failure
+        // leaves this block, whose error path kills the VMM.
+        vm_manager.check_confined().await?;
         if let Some(sender) = prefilled_sender {
             // The load returned, so Firecracker connected and mapped the backing: the sender
             // has finished, and a failure there already failed the load.
