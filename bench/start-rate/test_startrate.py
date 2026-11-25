@@ -46,6 +46,167 @@ class Summary(unittest.TestCase):
             self.assertEqual(s["stages_ms"]["pre-log"]["p50"], 5.0)
 
 
+class RateWithAlive(unittest.TestCase):
+    @staticmethod
+    def rows(healthy_at, exits=None):
+        exits = exits or {}
+        return [{"healthy_at_ms": h, "exit_at_ms": exits.get(i)} for i, h in enumerate(healthy_at)]
+
+    def test_counts_from_the_floor_to_the_last_healthy(self):
+        # 1000 healthy by 2 s, then 500 more over the next 2 s.
+        hs = [2.0 * i for i in range(1, 1001)] + [2000 + 4.0 * i for i in range(1, 501)]
+        r = startrate.rate_with_alive(self.rows(hs))
+        self.assertEqual((r["window_s"], r["healthy_in_window"], r["rate_per_s"]), (2.0, 500, 250.0))
+        self.assertEqual(r["min_alive_in_window"], 1000)
+
+    def test_no_rate_under_the_floor_or_in_a_short_window(self):
+        r = startrate.rate_with_alive(self.rows([float(i) for i in range(999)]))
+        self.assertIsNone(r["rate_per_s"])
+        self.assertIn("at most 999 clones were alive at once, under 1000", r["why"])
+        r = startrate.rate_with_alive(self.rows([float(i) for i in range(1000)] + [1500.0]))
+        self.assertEqual((r["rate_per_s"], r["healthy_in_window"], r["window_s"]), (None, 1, 0.501))
+        self.assertIn("under 1.0 s", r["why"])
+        self.assertIn("no clone turned healthy", startrate.rate_with_alive([])["why"])
+
+    def test_a_clone_that_exits_before_the_floor_is_not_alive(self):
+        # RED BEFORE THE FIX: 1000 healthy counted as 1000 alive whatever had exited.
+        # Clone 998 exits at 500 ms, so the 1000th healthy clone makes 999 alive and the
+        # 1001st makes 1000: the window starts there.
+        hs = [float(i) for i in range(1000)] + [3000.0, 4000.0, 5000.0]
+        r = startrate.rate_with_alive(self.rows(hs, {998: 500.0}))
+        self.assertEqual((r["window_s"], r["healthy_in_window"], r["rate_per_s"]), (2.0, 2, 1.0))
+        # With nothing after it, the 1000th healthy clone's predecessor having exited leaves no rate.
+        r = startrate.rate_with_alive(self.rows([float(i) for i in range(1000)], {998: 500.0}))
+        self.assertIsNone(r["rate_per_s"])
+        self.assertIn("at most 999 clones were alive at once", r["why"])
+
+    def test_no_rate_when_the_alive_count_falls_inside_the_window(self):
+        hs = [float(i) for i in range(1000)] + [3000.0]
+        r = startrate.rate_with_alive(self.rows(hs, {5: 2000.0}))
+        self.assertIsNone(r["rate_per_s"])
+        self.assertEqual(r["min_alive_in_window"], 999)
+        self.assertIn("the alive count fell to 999, under 1000, inside the window", r["why"])
+        # An exit after the last clone is healthy (the run's own teardown) is outside the window.
+        r = startrate.rate_with_alive(self.rows(hs, {i: 9000.0 for i in range(1001)}))
+        self.assertEqual((r["rate_per_s"], r["min_alive_in_window"]), (0.5, 1000))
+
+    def test_a_summary_carries_it_and_names_the_mode(self):
+        with tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            Summary().write_run(d, [float(i) for i in range(1, 2002)])
+            s = startrate.summarize(d)
+            self.assertEqual(s["rate_with_alive"]["rate_per_s"], 1000.0)
+            self.assertIsNone(s["pacing"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                startrate.print_summary(s)
+            self.assertIn("with 1000+ alive (closed loop): 1001 healthy in 1.001 s = 1000.0/s, at least 1000 alive throughout", out.getvalue())
+            s["pacing"] = startrate.pacing_summary([{"spawn_at_ms": 0.0, "due_at_ms": 0.0}], 800.0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                startrate.print_summary(s)
+            self.assertIn("with 1000+ alive (paced at 800.0/s):", out.getvalue())
+
+
+class SteppingClock:
+    """A clock that moves 1 ms each time it is read, and when a test moves it."""
+
+    def __init__(self):
+        self.t = 1_000_000_000
+        self.lock = threading.Lock()
+
+    def __call__(self):
+        with self.lock:
+            self.t += 1_000_000
+            return self.t
+
+    def advance(self, ms):
+        with self.lock:
+            self.t += ms * 1_000_000
+
+
+class Paced(unittest.TestCase):
+    def test_schedule_is_the_first_start_plus_i_over_rate(self):
+        self.assertEqual(startrate.start_due_ns(5, 0, 1000.0), 5)
+        self.assertEqual(startrate.start_due_ns(5, 3, 1000.0), 5 + 3_000_000)
+        self.assertEqual(startrate.start_due_ns(0, 1, 0.5), 2_000_000_000)
+
+    def test_no_start_is_issued_before_it_is_due(self):
+        clock = SteppingClock()
+        p = startrate.Progress(count=6, concurrency=6, rate=100.0, clock=clock)
+        issued = []
+        for _ in range(6):
+            i = p.claim()
+            issued.append((i, clock.t))
+        self.assertEqual([i for i, _ in issued], list(range(6)))
+        for i, at in issued:
+            self.assertEqual(p.due_ns[i], p.t_first + i * 10_000_000)
+            self.assertGreaterEqual(at, p.due_ns[i], f"start {i} was issued before it was due")
+        self.assertIsNone(p.claim())
+
+    def test_a_start_the_cap_holds_back_is_late_and_moves_no_other(self):
+        clock = SteppingClock()
+        p = startrate.Progress(count=3, concurrency=1, rate=1000.0, clock=clock)
+        first = startrate.Clone(p.claim(), "c0")
+        got = []
+        th = threading.Thread(target=lambda: got.append((p.claim(), clock.t)))
+        th.start()
+        time.sleep(0.05)
+        self.assertEqual(got, [], "a second start was issued over the cap")
+        clock.advance(50)
+        p.complete(first, t=clock.t)
+        th.join(timeout=5)
+        self.assertEqual(got[0][0], 1)
+        # Due 1 ms after the first, issued at least 50 ms after it: late, and recorded as due then.
+        self.assertEqual(p.due_ns[1], p.t_first + 1_000_000)
+        self.assertGreaterEqual(got[0][1] - p.due_ns[1], 49_000_000)
+        p.complete(startrate.Clone(1, "c1"), t=clock.t)
+        self.assertEqual(p.claim(), 2)
+        self.assertEqual(p.due_ns[2], p.t_first + 2_000_000, "the schedule moved with the late start")
+
+    def test_a_closed_loop_run_records_no_schedule(self):
+        p = startrate.Progress(count=2, concurrency=2)
+        self.assertEqual([p.claim(), p.claim()], [0, 1])
+        self.assertEqual(p.due_ns, {})
+
+    def test_stop_ends_a_launcher_waiting_for_its_time(self):
+        p = startrate.Progress(count=2, concurrency=2, rate=0.01)
+        self.assertEqual(p.claim(), 0)
+        got = []
+        th = threading.Thread(target=lambda: got.append(p.claim()))
+        th.start()
+        time.sleep(0.05)
+        p.stop()
+        th.join(timeout=5)
+        self.assertEqual(got, [None])
+
+    def test_summary_counts_late_starts_and_starts_never_issued(self):
+        rows = [
+            {"spawn_at_ms": 0.0, "due_at_ms": 0.0},
+            {"spawn_at_ms": 2.5, "due_at_ms": 2.0},     # 0.5 ms after due
+            {"spawn_at_ms": 9.5, "due_at_ms": 4.0},     # 5.5 ms: late
+            {"spawn_at_ms": 60.0, "due_at_ms": 6.0},    # 54 ms: late
+            {"spawn_at_ms": None, "due_at_ms": None},   # the run stopped before it
+        ]
+        s = startrate.pacing_summary(rows, 500.0)
+        self.assertEqual((s["offered_rate_per_s"], s["issued"], s["not_issued"]), (500.0, 4, 1))
+        self.assertEqual((s["late_threshold_ms"], s["late_starts"]), (5.0, 2))
+        self.assertEqual(s["late_ms"]["max"], 54.0)
+        self.assertEqual(s["issued_rate_per_s"], 50.0)
+        # At 100 a second one interval is 10 ms, so 5.5 ms is not late.
+        self.assertEqual(startrate.pacing_summary(rows, 100.0)["late_starts"], 1)
+        self.assertIsNone(startrate.pacing_summary(rows, None))
+
+    def test_rate_must_be_a_number_above_zero(self):
+        parser = startrate.build_parser()
+        base = ["run", "--fcvm", "f", "--prep", "p", "--out", "o", "--count", "1", "--concurrency", "1"]
+        self.assertIsNone(parser.parse_args(base).rate)
+        self.assertEqual(parser.parse_args(base + ["--rate", "250"]).rate, 250.0)
+        for bad in ("0", "-1", "nan", "inf", "fast"):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                parser.parse_args(base + ["--rate", bad])
+
+
 class FailClosed(unittest.TestCase):
     def fake_fcvm(self, d, body):
         p = d / "fcvm"
@@ -273,7 +434,7 @@ class FakeBase(unittest.TestCase):
     def args(self, out, **kw):
         base = dict(
             fcvm=self.fcvm, prep=str(self.prep), out=str(out), count=1, concurrency=1, launchers=1,
-            timeout=30.0, rust_log="fcvm=info", pidstat_interval=2, fail_fast=False, hold=0.0,
+            timeout=30.0, rust_log="fcvm=info", pidstat_interval=2, fail_fast=False, hold=0.0, rate=None,
         )
         return argparse.Namespace(**{**base, **kw})
 
@@ -293,6 +454,28 @@ class FakeFcvm(FakeBase):
         while time.time() < deadline and any(self.alive(p) for p in pids):
             time.sleep(0.05)
         self.assertEqual([p for p in pids if self.alive(p)], [])
+
+    def test_a_paced_run_issues_every_start_on_its_schedule(self):
+        # 6 starts at 20 a second: the last is due 250 ms after the first, and none is early.
+        out = self.d / "paced"
+        # The fake fcvm lists no VM, so the run ends on the log and state disagreeing, after
+        # it has written its records.
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            startrate.cmd_run(self.args(out, count=6, concurrency=6, launchers=3, rate=20.0))
+        rows = [json.loads(ln) for ln in (out / "samples.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 6)
+        first = rows[0]["due_at_ms"]
+        for r in rows:
+            self.assertAlmostEqual(r["due_at_ms"] - first, r["i"] * 50.0, places=3)
+            self.assertGreaterEqual(r["spawn_at_ms"], r["due_at_ms"])
+            # Each clone's exit is stamped when its fcvm closes its output, here at the run's teardown.
+            self.assertIsNotNone(r["exit_at_ms"], "a clone the run stopped has no exit time")
+            self.assertGreaterEqual(r["exit_at_ms"], r["healthy_at_ms"])
+        s = json.loads((out / "summary.json").read_text())
+        self.assertEqual((s["healthy"], s["pacing"]["issued"], s["pacing"]["not_issued"]), (6, 6, 0))
+        self.assertEqual(s["pacing"]["offered_rate_per_s"], 20.0)
+        self.assertEqual(s["config"]["rate_per_s"], 20.0)
+        self.assertGreaterEqual(s["span_s"], 0.25)
 
     def test_interrupt_reaps_every_child(self):
         # A clone that is never healthy keeps the run waiting; SIGTERM must stop everything.
@@ -419,6 +602,59 @@ class PrepOwnsItsChildren(FakeBase):
         self.assertTrue(all(self.alive(p) for p in pids))
         rec = json.loads((out / "prep.json").read_text())
         self.assertEqual((rec["baseline_pid"], rec["serve_pid"]), (4242, 4243))
+
+
+class StoreQueueDepths(unittest.TestCase):
+    def tree(self, root, devices):
+        for path, value in devices.items():
+            p = Path(root) / path / "queue"
+            p.mkdir(parents=True)
+            (p / "nr_requests").write_text(f"{value}\n")
+
+    def test_a_plain_device_reports_its_own_queue(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root, {"loop3": 128})
+            self.assertEqual(startrate.store_queue_depths("loop3", Path(root)), {"loop3": 128})
+
+    def test_an_md_device_reports_its_members(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root, {"md127": 128, "nvme1n1": 127, "nvme2n1": 127})
+            slaves = Path(root) / "md127" / "slaves"
+            slaves.mkdir()
+            for m in ("nvme1n1", "nvme2n1"):
+                (slaves / m).symlink_to(Path(root) / m)
+            self.assertEqual(
+                startrate.store_queue_depths("md127", Path(root)),
+                {"nvme1n1": 127, "nvme2n1": 127},
+            )
+
+    def test_a_missing_device_reports_none(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(startrate.store_queue_depths("nvme9n1", Path(root)))
+            self.assertIsNone(startrate.store_queue_depths("", Path(root)))
+
+    def partition(self, root, disk, part):
+        (Path(root) / disk / part).mkdir(parents=True)
+        (Path(root) / part).symlink_to(Path(root) / disk / part)
+
+    def test_a_partition_reports_its_disk(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root, {"nvme0n1": 255})
+            self.partition(root, "nvme0n1", "nvme0n1p1")
+            self.assertEqual(startrate.store_queue_depths("nvme0n1p1", Path(root)), {"nvme0n1": 255})
+
+    def test_an_md_device_over_partitions_reports_their_disks(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.tree(root, {"md127": 128, "nvme1n1": 127, "nvme2n1": 127})
+            slaves = Path(root) / "md127" / "slaves"
+            slaves.mkdir()
+            for disk in ("nvme1n1", "nvme2n1"):
+                self.partition(root, disk, disk + "p1")
+                (slaves / (disk + "p1")).symlink_to(Path(root) / disk / (disk + "p1"))
+            self.assertEqual(
+                startrate.store_queue_depths("md127", Path(root)),
+                {"nvme1n1": 127, "nvme2n1": 127},
+            )
 
 
 class ChurnVerdict(unittest.TestCase):

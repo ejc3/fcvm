@@ -787,7 +787,8 @@ pub async fn run_streaming(
 ///
 /// VMM-neutral: both Firecracker and Cloud Hypervisor run as a child process inside the
 /// same namespaces with the same parent-death signal. See [`install_namespace_pre_exec`].
-#[derive(Debug, Clone, Default)]
+/// No `Default`: every spawn site names its [`Self::decision`].
+#[derive(Debug, Clone)]
 pub struct NamespaceParams {
     /// VM id, for log context only.
     pub vm_id: String,
@@ -812,6 +813,31 @@ pub struct NamespaceParams {
     /// while it holds the lease (and again from the same lease after a guest reboot), and
     /// drops the lease only after the VMM has exited.
     pub keep_fds: Vec<std::os::fd::RawFd>,
+    /// Whether the VMM is confined, from [`crate::confine::resolve`]. Confined, the
+    /// process layer runs after the namespaces are entered; it needs
+    /// `user_namespace_path`, because it drops capabilities held in that namespace.
+    pub decision: crate::confine::Decision,
+    /// When confined: the namespace's persistent TAP, made owned by the VMM's uid before
+    /// its capabilities are dropped ([`crate::confine::own_tap`]), so the VMM can attach
+    /// to it without CAP_NET_ADMIN. Only an unpooled namespace, which is this VM's alone.
+    pub tap_owner: Option<String>,
+}
+
+impl NamespaceParams {
+    /// No namespace, no redirect, no kept descriptor: what a site adds to with struct update
+    /// syntax. The decision cannot be left out.
+    pub fn new(vm_id: impl Into<String>, decision: crate::confine::Decision) -> Self {
+        Self {
+            vm_id: vm_id.into(),
+            namespace_id: None,
+            user_namespace_path: None,
+            net_namespace_path: None,
+            mount_redirects: None,
+            keep_fds: Vec::new(),
+            decision,
+            tap_owner: None,
+        }
+    }
 }
 
 /// The mount namespace that gives a restored clone's VMM its own directories at the
@@ -995,6 +1021,27 @@ pub fn install_namespace_pre_exec(
     ns: &NamespaceParams,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
+
+    // Confinement is checked before anything is created or registered: a confined spawn
+    // that cannot be set up fails before its mount targets exist.
+    let confined_tap = if let Some(confinement) = ns.decision.confinement() {
+        anyhow::ensure!(
+            ns.user_namespace_path.is_some(),
+            "confining the VMM of {} needs it to enter a user namespace (rootless mode)",
+            ns.vm_id
+        );
+        Some((
+            ns.tap_owner
+                .as_deref()
+                .map(crate::confine::TapName::new)
+                .transpose()?,
+            // The limit the preflight validated; installing it fails the spawn if the hard
+            // limit has since dropped below it.
+            confinement.core_limit,
+        ))
+    } else {
+        None
+    };
 
     if !ns.keep_fds.is_empty() {
         let keep_fds = ns.keep_fds.clone();
@@ -1274,20 +1321,58 @@ pub fn install_namespace_pre_exec(
         }
     }
 
+    if let Some((tap, core_limit)) = confined_tap {
+        // After the namespace step, which needs the capabilities this drops, and before
+        // PR_SET_PDEATHSIG, which stays last. The TAP is owned while CAP_NET_ADMIN is held.
+        // SAFETY: own_tap and apply_process_layer make raw syscalls only and do not
+        // allocate; the name was built before the fork.
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Some(tap) = &tap {
+                    crate::confine::own_tap(tap)?;
+                }
+                crate::confine::apply_process_layer(core_limit)
+            });
+        }
+    }
+
     own_process_group(cmd);
 
     // Kill the VMM if the parent (fcvm) dies, even from SIGKILL. Unconditional; must be the
     // LAST pre_exec so it runs AFTER setns(CLONE_NEWUSER), which clears pdeath_signal.
+    // A parent that exited before the signal was armed sends none, so the child checks that
+    // fcvm is still its parent and exits rather than exec an orphaned VMM.
+    let parent = std::process::id() as libc::pid_t;
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                libc::_exit(1);
             }
             Ok(())
         });
     }
 
     Ok(())
+}
+
+/// Writes `line` and its newline to `out` with one `write_all`.
+///
+/// A caller that sends stdout and stderr to the same file (`> log 2>&1`) reads
+/// whatever order the two streams' write calls landed in. `writeln!` on stderr,
+/// which is unbuffered, writes the text and the newline as two calls, and on
+/// stdout a line longer than its 1 KiB buffer is flushed in pieces. Either way a
+/// line from the other stream can land inside this one: a restored record that
+/// a harness reads from the start of a line ended up after a container stderr
+/// line that was still waiting for its newline, and the harness never saw it.
+pub fn write_whole_line(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    let mut whole = Vec::with_capacity(line.len() + 1);
+    whole.extend_from_slice(line.as_bytes());
+    whole.push(b'\n');
+    out.write_all(&whole)?;
+    out.flush()
 }
 
 /// Ctrl+C as a terminal sends it, SIGINT to this test process's whole process group, for
@@ -1360,6 +1445,121 @@ impl TerminalInterrupt {
 
 #[cfg(test)]
 mod tests {
+
+    /// A writer that records each `write` call, as an unbuffered stderr would
+    /// turn each into its own syscall.
+    struct CallRecorder(Vec<Vec<u8>>);
+
+    impl std::io::Write for CallRecorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn forwarded_lines_and_records_are_written_whole() {
+        // The whole file: it has production code after its first test module.
+        let listeners = include_str!("commands/podman/listeners.rs");
+        for split in ["writeln!(std::io::stdout()", "writeln!(std::io::stderr()"] {
+            assert!(
+                !listeners.contains(split),
+                "listeners.rs forwards a line with {split}"
+            );
+        }
+        let snapshot = include_str!("commands/snapshot.rs");
+        let snapshot = snapshot.split("#[cfg(test)]").next().unwrap();
+        for record in ["serve_ready_record(", "restored_record("] {
+            let calls: Vec<usize> = snapshot
+                .match_indices(record)
+                .map(|(i, _)| i)
+                .filter(|&i| !snapshot[..i].ends_with("fn "))
+                .collect();
+            assert!(!calls.is_empty(), "no call to {record}");
+            for i in calls {
+                let mut start = i.saturating_sub(120);
+                while !snapshot.is_char_boundary(start) {
+                    start -= 1;
+                }
+                let before = &snapshot[start..i];
+                assert!(
+                    before.contains("write_whole_line("),
+                    "{record} is printed some other way"
+                );
+                // A record a caller waits for: a failed write is reported, not dropped.
+                assert!(
+                    !before.contains("let _ ="),
+                    "the result of writing {record} is discarded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_whole_line_is_one_write() {
+        // Longer than stdout's 1 KiB line buffer, as a restored record with its
+        // guest phases is.
+        let line = format!(
+            "{{\"status\":\"restored\",\"pad\":\"{}\"}}",
+            "x".repeat(3000)
+        );
+        let mut out = CallRecorder(Vec::new());
+
+        super::write_whole_line(&mut out, &line).unwrap();
+
+        // Sizes first, so a split prints as two lengths rather than 3 KB of bytes.
+        let sizes: Vec<usize> = out.0.iter().map(Vec::len).collect();
+        assert_eq!(
+            sizes,
+            vec![line.len() + 1],
+            "one write of the line and its newline"
+        );
+        assert_eq!(out.0[0], format!("{line}\n").into_bytes());
+    }
+
+    /// A confined spawn that cannot be set up (no user namespace) fails before it creates
+    /// its mount targets.
+    #[test]
+    fn a_confined_spawn_is_checked_before_its_mount_targets_are_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = dir.path().join("view");
+        // Outside the view: create_mount_targets makes such a mountpoint on the host.
+        let target = dir.path().join("outside").join("vm");
+        let mut cmd = tokio::process::Command::new("true");
+        let error = install_namespace_pre_exec(
+            &mut cmd,
+            &NamespaceParams {
+                mount_redirects: Some(MountRedirects {
+                    view: view.clone(),
+                    pairs: vec![(target.clone(), dir.path().to_path_buf())],
+                    keep: Vec::new(),
+                    keep_files: Vec::new(),
+                }),
+                ..NamespaceParams::new(
+                    "confined-no-userns",
+                    crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+                        landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+                        layers: vec![crate::confine::Layer::Process],
+                        core_limit: 1,
+                    })),
+                )
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("needs it to enter a user namespace"),
+            "{error}"
+        );
+        assert!(
+            !dir.path().join("outside").exists(),
+            "the mount targets were made before the check"
+        );
+    }
+
     use super::thread_sample;
 
     /// Every thread of a process is named with its state and where it sleeps.
@@ -1648,7 +1848,11 @@ mod tests {
         let interrupt = TerminalInterrupt::arm();
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("60").stdin(Stdio::null()).kill_on_drop(true);
-        install_namespace_pre_exec(&mut cmd, &NamespaceParams::default()).unwrap();
+        install_namespace_pre_exec(
+            &mut cmd,
+            &NamespaceParams::new("vm-test", crate::confine::Decision::for_test(None)),
+        )
+        .unwrap();
         let mut vmm = cmd.spawn().expect("spawning the stand-in VMM");
         interrupt.assert_misses(&mut vmm, "the VMM").await;
     }
@@ -1728,7 +1932,7 @@ mod tests {
                     keep: vec![other.clone(), view.join("gone")],
                     keep_files: vec![disk.clone(), view.join("gone.raw")],
                 }),
-                ..Default::default()
+                ..NamespaceParams::new("vm-test", crate::confine::Decision::for_test(None))
             },
         )
         .unwrap();

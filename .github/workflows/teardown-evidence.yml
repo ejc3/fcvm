@@ -44,6 +44,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
+      # Fail on a runner whose kernel is not a host kernel this checkout or main builds: a
+      # stock kernel, or an image older than the last host kernel change (#1563, #2125).
+      - name: Runner kernel check
+        working-directory: fcvm
+        run: ./scripts/check-runner-kernel.py
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |

@@ -1496,6 +1496,15 @@ async fn cmd_snapshot_create_and_stop(args: SnapshotCreateArgs) -> Result<()> {
             || crate::utils::process_start_time(pid) == vm_state.pid_start_time,
         "PID {pid} is no longer the VM's fcvm process"
     );
+    // A clone whose restore is not acknowledged is refused here, before the guard: nothing
+    // has touched it, so it is left running and not stopped. `cmd_snapshot_create` makes
+    // the same check again; a VM acknowledged here passes that one without waiting.
+    let vm_state = super::common::await_restore_acknowledged(
+        &state_manager,
+        vm_state,
+        Duration::from_secs(args.await_restore),
+    )
+    .await?;
     // From here the VM may be paused, so it is stopped on every way out, a panic included
     // (a print to a closed stdout panics while the source is still paused).
     let guard = StopOnDrop {
@@ -1562,6 +1571,15 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             vm_state.vm_id
         );
     }
+    // A clone whose restore is not acknowledged is refused here, before any lock is waited
+    // for, or waited for when --await-restore says so. Checked again below on the state the
+    // create acts on.
+    let vm_state = super::common::await_restore_acknowledged(
+        &state_manager,
+        vm_state,
+        Duration::from_secs(args.await_restore),
+    )
+    .await?;
 
     // Fail fast: the disk-only capture path (freeze -> reflink -> unfreeze, no
     // memory dump) is dispatched below when args.disk_only is set.
@@ -1707,11 +1725,20 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         // lineage. The selector may now resolve to a replacement VM, or a snapshot that won
         // the VM lock first may have advanced snapshot_name while we acquired generation
         // locks. Neither stale observation is safe to use.
-        let vm_lock = super::common::acquire_vm_snapshot_lock(&vm_disk_path).await?;
+        let vm_lock = super::common::acquire_vm_snapshot_lock_for_create(
+            &vm_disk_path,
+            &state_manager,
+            &vm_state.vm_id,
+            super::common::RESTORE_PUBLICATION_LIMIT,
+        )
+        .await?;
         let fresh_state = load_snapshot_create_target(&state_manager, &args)
             .await
             .context("re-reading VM state under lock")?;
         super::common::validate_snapshot_vm_identity(&vm_state, &fresh_state)?;
+        // The state of the process this create is about to snapshot: nothing below
+        // reaches its guest or its VMM unless its restore, if it had one, was acknowledged.
+        super::common::ensure_restore_acknowledged(&fresh_state)?;
         if let Some(name) = fresh_state.config.snapshot_name.as_deref() {
             validate_snapshot_name(name).context("invalid parent snapshot name in VM state")?;
         }
@@ -2530,9 +2557,9 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // queue in the backlog until the accept loop below runs) and the state
     // file exists, so a consumer can clone by pid or find the serve in
     // `fcvm ls --json` the moment it reads this.
-    println!(
-        "{}",
-        serve_ready_record(
+    let written = crate::utils::write_whole_line(
+        &mut std::io::stdout(),
+        &serve_ready_record(
             &args.snapshot_name,
             my_pid,
             &socket_path,
@@ -2540,7 +2567,12 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             matches!(prefetch, Prefetch::On),
             server.recorded_working_set(),
         )
+        .to_string(),
     );
+    if let Err(error) = written {
+        // A caller that waits for this line would otherwise wait with nothing saying why.
+        warn!(%error, "could not write the serve ready record to stdout");
+    }
 
     // Setup signal handlers
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -3223,6 +3255,23 @@ async fn cmd_snapshot_run_inner(
         "loaded snapshot configuration"
     );
 
+    let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
+        &args,
+        snapshot_config.metadata.kernel_profile.as_deref(),
+        snapshot_config.metadata.firecracker_bin.as_deref(),
+    )
+    .await?;
+    // Before any host state changes (reclaim, the clone's owner record, a GPU prefill): a
+    // restore that must be confined and cannot be is refused here. The Firecracker
+    // arguments are the ones the restore will launch with, a kernel profile's included.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: snapshot_config.metadata.hypervisor,
+        network: snapshot_config.metadata.network_mode.into(),
+        firecracker_args: runtime_config.effective_firecracker_args().as_deref(),
+        unsupported: None,
+    })?;
+
     // Generate VM ID and name. Restored VMs always get a FRESH vm_id and a
     // fresh state file (vsock_epoch starts at 0) — including the podman-run
     // snapshot-miss path, which tears its throwaway VM down (deleting its
@@ -3238,12 +3287,6 @@ async fn cmd_snapshot_run_inner(
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
         path: paths::vm_runtime_dir(&vm_id),
     })?;
-    let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
-        &args,
-        snapshot_config.metadata.kernel_profile.as_deref(),
-        snapshot_config.metadata.firecracker_bin.as_deref(),
-    )
-    .await?;
     // A GPU restore's hugepage prefill starts here, as soon as the restore's Firecracker is
     // known, beside the checks and the clone's setup (its state, volume servers and network);
     // the memory backend below waits for it. Only a direct Firecracker restore prefills. GPUs
@@ -3318,6 +3361,7 @@ async fn cmd_snapshot_run_inner(
         args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
     );
     vm_state.name = Some(vm_name.clone());
+    vm_state.confinement = decision.confinement().cloned();
 
     // Save snapshot tracking info in clone state
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
@@ -3797,7 +3841,10 @@ async fn cmd_snapshot_run_inner(
                 .with_loopback_ip(loopback_ip)
                 .with_dns_server(resolvers.mode_server.clone())
                 .with_restore_mode()
-                .with_pooling(vmm_takes_a_tap_queue);
+                .with_pooling(clone_may_pool(
+                    vmm_takes_a_tap_queue,
+                    vm_state.confinement.is_some(),
+                ));
             Box::new(net)
         }
     };
@@ -4354,6 +4401,7 @@ async fn cmd_snapshot_run_inner(
     setup.restore_completion_rx = Some(restore_completion_rx);
 
     let restore_params = RestoreParams {
+        decision: decision.clone(),
         vm_id: &vm_id,
         vm_name: &vm_name,
         data_dir: &data_dir,
@@ -4510,6 +4558,48 @@ async fn cmd_snapshot_run_inner(
         },
         other => other,
     };
+    // The restore is acknowledged: recorded on the VM's state before the restored record
+    // below is printed, so a caller that has read the record may ask for a snapshot of the
+    // clone at once (`common::ensure_restore_acknowledged`). A prepare's disposable VM is
+    // not recorded, so no other command snapshots it.
+    //
+    // This process still has the output handshake and the port check to do, and a snapshot
+    // pauses the guest: a pause under the port check fails the check and tears down the VM
+    // being saved. So the per-VM snapshot lock is taken before the acknowledgement is
+    // recorded and held until the lifecycle is published or the restore has failed
+    // (`publication_lock`), and a create asked for in between waits on it. It is a file
+    // lock on an open file of this process, so every way out of this function gives it
+    // back, a panic and a kill included. Lock order: this lock, then the state lock inside
+    // each state write; no snapshot generation lock is held or taken while it is held.
+    let mut publication_lock: Option<std::fs::File> = None;
+    let restore_completion_result = match restore_completion_result {
+        Ok(RestoreAck::Acked { guest_phases }) if args.prepare.is_none() => {
+            let vm_disk = data_dir.join("disks/rootfs.raw");
+            let locked = tokio::select! {
+                lock = super::common::acquire_vm_snapshot_lock(&vm_disk) => lock.map(Some),
+                _ = cancel.cancelled() => Ok(None),
+            };
+            match locked {
+                Ok(Some(lock)) => {
+                    publication_lock = Some(lock);
+                    super::common::publish_restore_acknowledged(&state_manager, &mut vm_state)
+                        .await
+                        .map(|()| RestoreAck::Acked { guest_phases })
+                }
+                Ok(None) => Ok(RestoreAck::Interrupted),
+                Err(error) => {
+                    Err(error.context("taking the VM's snapshot lock for its publication"))
+                }
+            }
+        }
+        other => other,
+    };
+    // A restore that was not acknowledged (a rejected or late acknowledgement, a guest that
+    // powered off, a failed hook) says so in the state for as long as the teardown leaves it.
+    if restore_completion_result.is_err() {
+        super::common::record_restore_failed(&state_manager, &vm_id).await;
+        drop(publication_lock.take());
+    }
 
     // For routed mode clones: fc-agent reconfigures eth0 with the new vm_ipv6 via MMDS.
     // The state already has the correct guest_ipv6 = vm_ipv6 (set by restore_from_snapshot).
@@ -4553,9 +4643,9 @@ async fn cmd_snapshot_run_inner(
         } else {
             "file"
         };
-        println!(
-            "{}",
-            restored_record(
+        let written = crate::utils::write_whole_line(
+            &mut std::io::stdout(),
+            &restored_record(
                 &vm_name,
                 &snapshot_name,
                 &vm_id,
@@ -4568,13 +4658,21 @@ async fn cmd_snapshot_run_inner(
                 restore_started.elapsed().as_millis() as u64,
                 guest_phases.as_deref(),
             )
+            .to_string(),
         );
+        if let Err(error) = written {
+            warn!(%error, "could not write the restored record to stdout");
+        }
     }
     // The clone is acknowledged; replace the spare it used (once: a later failure finds
     // nothing to give back).
     if let Some(gate) = prefilled_restore.take() {
         gate.settle();
     }
+
+    // Test-only hold between the restored record and this process's own checks of the
+    // clone (the output handshake, the port check), with the publication lock held.
+    failpoint::hit_async("restore.acked_pre_verify").await;
 
     // Handle --exec: run command in container then cleanup and exit
     if let Some(exec_cmd) = &args.exec {
@@ -4599,6 +4697,8 @@ async fn cmd_snapshot_run_inner(
                 }
             }
         };
+        // Published, or not going to be: a snapshot of the clone no longer waits.
+        drop(publication_lock.take());
         let exec_result: Result<i32> = match ready_result {
             Err(error) => Err(error),
             Ok(()) => tokio::select! {
@@ -4904,6 +5004,15 @@ async fn cmd_snapshot_run_inner(
         },
     };
 
+    if verify_result.is_err() {
+        super::common::record_restore_failed(&state_manager, &vm_id).await;
+    }
+    // A restore that will not be published gives the publication lock back here, after
+    // the state says why, so a create that was waiting reads `failed` and is refused.
+    if killed_in_handshake || verify_result.is_err() {
+        drop(publication_lock.take());
+    }
+
     // Set when the VMM exited on its own: the container exit code the guest reported, or
     // None when it reported none. Left None when fcvm stopped the VM (a signal, a memory
     // server's death, an interrupted startup snapshot).
@@ -5002,6 +5111,12 @@ async fn cmd_snapshot_run_inner(
                 Err(error) => lifecycle_ready_result = Err(error),
             }
         }
+        // Published, or failed before it could be: either way a snapshot of the clone no
+        // longer waits. A clone that lost its memory server says so first.
+        if clone_failure.is_some() {
+            super::common::record_restore_failed(&state_manager, &vm_id).await;
+        }
+        drop(publication_lock.take());
 
         if let (Some(prepare), None) = (args.prepare.as_ref(), clone_failure.as_ref()) {
             let restored = restored_prepare(
@@ -6022,6 +6137,7 @@ fn run_args_from_snapshot_metadata(
         // The VM's cgroup, and its swap setting, were entered from the snapshot run's own
         // --no-swap before this runs (`crate::cgroup`).
         no_swap: false,
+        confine: false,
     }
 }
 
@@ -6158,6 +6274,14 @@ async fn cmd_snapshot_run_raw(
 ) -> Result<()> {
     let meta = &snapshot_config.metadata;
     ensure_raw_restore_supported(&args, meta)?;
+    // Before any host state changes. Refused when asked for, or when the host requires it: this path does not confine.
+    let decision = crate::confine::resolve(&crate::confine::Request {
+        flag: args.confine,
+        backend: crate::hypervisor::Backend::Firecracker,
+        network: crate::confine::Network::Rootless,
+        firecracker_args: args.firecracker_args.as_deref(),
+        unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
+    })?;
     anyhow::ensure!(
         port_mappings.is_empty(),
         "the raw VM's snapshot records published ports ({port_mappings:?}); raw VMs publish none"
@@ -6286,6 +6410,7 @@ async fn cmd_snapshot_run_raw(
     let restore_started = std::time::Instant::now();
     let restored = super::common::restore_from_snapshot_ch(
         RestoreParams {
+            decision,
             vm_id: &vm_id,
             vm_name: &vm_name,
             data_dir: &data_dir,
@@ -6412,6 +6537,10 @@ async fn cmd_snapshot_run_disk_only(
         args.host_ipv6,
     );
     let run_args = RunArgs {
+        // The request's --confine, which the snapshot's metadata does not carry: the
+        // disk-only restore boots through `podman run`, which resolves confinement from
+        // these arguments.
+        confine: args.confine,
         publish_limit_per_source: args.publish_limit_per_source,
         ..run_args
     };
@@ -6586,8 +6715,24 @@ async fn record_diff_parent(
         .map(|opt| opt.map(|_| ()))
 }
 
+/// Whether a clone may take its namespace from the pool (`crate::netpool`): its VMM must
+/// take the slot's TAP queue (`vmm_takes_a_tap_queue`), and it must not be confined. A
+/// confined VMM on a pooled slot would use that inherited queue too, which needs no attach
+/// and so no CAP_NET_ADMIN, but no test runs a confined clone on a pool yet, so a confined
+/// clone builds its own namespace until one does.
+fn clone_may_pool(vmm_takes_a_tap_queue: bool, confined: bool) -> bool {
+    vmm_takes_a_tap_queue && !confined
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_confined_clone_builds_its_own_namespace() {
+        assert!(super::clone_may_pool(true, false));
+        assert!(!super::clone_may_pool(true, true));
+        assert!(!super::clone_may_pool(false, false));
+    }
+
     /// Only the File backend carries a write set: its sidecar is named in the branch that
     /// chooses the File backend, after the implicit UFFD server that hugepage and NV2
     /// snapshots restore through (direct_restore_memory, pinned by the tests of that
@@ -8472,6 +8617,7 @@ mod tests {
             prepare: None,
             no_dirty_tracking: false,
             no_swap: false,
+            confine: false,
             vsock_dir: None,
             publish: vec![],
             publish_limit_per_source: None,
@@ -8504,6 +8650,220 @@ mod tests {
         assert_eq!(runtime.firecracker_args, Some("--enable-nv2".to_string()));
     }
 
+    /// `snapshot create` decides whether a restored VM may be snapshotted on the state it
+    /// re-reads under the per-VM snapshot lock, once that state is tied to the process it
+    /// is about to snapshot, and before anything that reaches the VM's guest or its VMM
+    /// (issue 2138). It also refuses before it waits for any lock, and `--stop` refuses
+    /// before it arms the guard that stops the VM, so a refused clone is left running.
+    ///
+    /// RED BEFORE THE FIX: `snapshot create` made no such check.
+    #[test]
+    fn snapshot_create_refuses_an_unacknowledged_restore_before_it_reaches_the_vm() {
+        let source = include_str!("snapshot.rs");
+        let function = |name: &str| {
+            let body = &source[source.find(name).unwrap_or_else(|| panic!("no {name}"))..];
+            &body[..body.find("\n}\n").expect("the function ends")]
+        };
+        let create = function("async fn cmd_snapshot_create(");
+        let at = |what: &str| {
+            create
+                .find(what)
+                .unwrap_or_else(|| panic!("cmd_snapshot_create has no {what}"))
+        };
+        let early = at("await_restore_acknowledged(");
+        assert!(
+            early < at("acquire_snapshot_create_generation_locks("),
+            "the refusal waits for the snapshot's generation locks"
+        );
+        let checked = at("ensure_restore_acknowledged(&fresh_state)");
+        assert!(
+            at("acquire_vm_snapshot_lock_for_create(") < at("validate_snapshot_vm_identity(")
+                && at("validate_snapshot_vm_identity(") < checked,
+            "the restore is not checked on the state of the locked, identified VM"
+        );
+        for reaches_the_vm in [
+            "create_disk_only_snapshot_core(",
+            "capture_remote_inode_tables(",
+            "record_diff_parent(",
+            "FirecrackerClient::new(",
+            "create_snapshot_core(",
+            "create_snapshot_ch(",
+        ] {
+            assert!(
+                checked < at(reaches_the_vm),
+                "{reaches_the_vm} comes before the restore is checked"
+            );
+        }
+
+        let stop = function("async fn cmd_snapshot_create_and_stop(");
+        let refused = stop
+            .find("await_restore_acknowledged(")
+            .expect("--stop does not check the restore");
+        let armed = stop.find("StopOnDrop {").expect("--stop arms no guard");
+        assert!(
+            refused < armed,
+            "--stop arms the guard that stops the VM before it checks the restore"
+        );
+    }
+
+    /// The rule a caller of `snapshot run` can follow: once the restored record is printed,
+    /// `snapshot create` takes the clone. `snapshot run` records the acknowledgement on the
+    /// VM's state after it has the guest's acknowledgement of this restore and before it
+    /// prints that record, and a failure to record it fails the restore. A prepare's
+    /// disposable VM is not recorded. `lifecycle_ready`, which admits a state from before
+    /// the acknowledgement was recorded, is published later still.
+    ///
+    /// RED BEFORE THE FIX: the only record of the acknowledgement was `lifecycle_ready`,
+    /// written after the restored record, the output handshake and the port check, so a
+    /// create issued when the record appeared was refused.
+    #[test]
+    fn the_acknowledgement_is_recorded_before_the_restored_record_is_printed() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source
+            .find("async fn cmd_snapshot_run_inner(")
+            .expect("no cmd_snapshot_run_inner")..];
+        let body = &body[..body
+            .find("\nasync fn restored_prepare(")
+            .expect("restored_prepare no longer follows cmd_snapshot_run_inner")];
+        let at = |what: &str| {
+            body.find(what)
+                .unwrap_or_else(|| panic!("cmd_snapshot_run_inner has no {what}"))
+        };
+        let waited = at("= wait_for_restore_completion(");
+        let recorded = at("publish_restore_acknowledged(&state_manager, &mut vm_state)");
+        assert!(
+            waited < recorded,
+            "the acknowledgement is recorded before it is waited for"
+        );
+        let printed = at("cloned from snapshot '{}' (UFFD mode)");
+        assert!(
+            recorded < printed && recorded < at("&restored_record("),
+            "the restored record is printed before the acknowledgement is recorded"
+        );
+        let guard = &body[waited..recorded];
+        assert!(
+            guard.contains("Ok(RestoreAck::Acked { guest_phases }) if args.prepare.is_none() =>"),
+            "the acknowledgement is recorded for something other than an acknowledged \
+             restore that is not a prepare's"
+        );
+        assert!(
+            body[recorded..printed].contains(".map(|()| RestoreAck::Acked { guest_phases })"),
+            "a failure to record the acknowledgement does not fail the restore"
+        );
+        let publications: Vec<usize> = body
+            .match_indices("lifecycle_gate.publish(")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(
+            !publications.is_empty() && publications.iter().all(|at| *at > recorded),
+            "lifecycle readiness is published before the acknowledgement is recorded"
+        );
+    }
+
+    /// The owner of a restored clone holds the per-VM snapshot lock from before it records
+    /// the acknowledgement until it has published the lifecycle or recorded that the
+    /// restore failed, so a `snapshot create` asked for when the restored record appears
+    /// waits and cannot pause the guest under the owner's output handshake and port check
+    /// (a pause longer than the port check's 5 s failed the check and tore down the VM
+    /// being saved). The lock is given back before the owner's own snapshots, which take
+    /// it themselves, and before the supervise loop; a restore that failed says so in the
+    /// state before it gives the lock back.
+    ///
+    /// RED BEFORE THE FIX: the owner took no lock.
+    #[test]
+    fn the_owner_holds_the_snapshot_lock_from_the_acknowledgement_to_publication() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source
+            .find("async fn cmd_snapshot_run_inner(")
+            .expect("no cmd_snapshot_run_inner")..];
+        let body = &body[..body
+            .find("\nasync fn restored_prepare(")
+            .expect("restored_prepare no longer follows cmd_snapshot_run_inner")];
+        // The code without its comments and its whitespace.
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect();
+        let at = |what: &str| {
+            code.find(what)
+                .unwrap_or_else(|| panic!("cmd_snapshot_run_inner has no {what}"))
+        };
+        const RELEASE: &str = "drop(publication_lock.take());";
+        const FAILED: &str = "super::common::record_restore_failed(&state_manager,&vm_id).await;";
+        let publications: Vec<usize> = code
+            .match_indices("lifecycle_gate.publish(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            publications.len(),
+            2,
+            "a publication site was added or removed"
+        );
+        let (exec_publication, publication) = (publications[0], publications[1]);
+
+        // Taken before the acknowledgement is recorded, and held across the test hold, the
+        // output handshake and the port check, to the publication.
+        let steps = [
+            at("super::common::acquire_vm_snapshot_lock(&vm_disk)"),
+            at("publish_restore_acknowledged(&state_manager,&mutvm_state)"),
+            at("failpoint::hit_async(\"restore.acked_pre_verify\")"),
+            at("wait_for_restored_output("),
+            at("network.verify_port_forwarding()"),
+            publication,
+        ];
+        assert!(
+            steps.windows(2).all(|pair| pair[0] < pair[1]),
+            "the lock, the acknowledgement, the checks and the publication are out of order: \
+             {steps:?}"
+        );
+
+        // The four places it is given back, and no other.
+        let not_acknowledged = at(&format!(
+            "ifrestore_completion_result.is_err(){{{FAILED}{RELEASE}}}"
+        ));
+        let after_exec_publication = exec_publication
+            + code[exec_publication..]
+                .find(RELEASE)
+                .expect("the --exec path never gives the lock back");
+        let not_verified = at(&format!(
+            "ifverify_result.is_err(){{{FAILED}}}ifkilled_in_handshake||verify_result.is_err(){{{RELEASE}}}"
+        ));
+        let after_publication = at(&format!("ifclone_failure.is_some(){{{FAILED}}}{RELEASE}"));
+        assert_eq!(
+            code.matches(RELEASE).count(),
+            4,
+            "the publication lock is given back somewhere this test does not know"
+        );
+        assert!(
+            steps[1] < not_acknowledged && not_acknowledged < steps[2],
+            "a restore that is not acknowledged does not give the lock back at once"
+        );
+        assert!(
+            after_exec_publication < at("letexec_result:Result<i32>="),
+            "the --exec path runs its command with the lock held"
+        );
+        assert!(
+            steps[4] < not_verified && not_verified < publication,
+            "a restore whose port check failed keeps the lock, or gives it back early"
+        );
+        assert!(
+            publication < after_publication
+                && after_publication < at("letrestored=restored_prepare(")
+                && after_publication < at("whileargs.prepare.is_none()"),
+            "the lock is still held when the owner snapshots or supervises the clone"
+        );
+
+        // The create takes the same lock, with the bound for an owner that never publishes.
+        let create = &source[source.find("async fn cmd_snapshot_create(").unwrap()..];
+        let create = &create[..create.find("\n}\n").unwrap()];
+        assert!(
+            create.contains("acquire_vm_snapshot_lock_for_create(")
+                && create.contains("super::common::RESTORE_PUBLICATION_LIMIT"),
+            "snapshot create does not wait for the owner's publication with a bound"
+        );
+    }
+
     /// A disk-only `snapshot create` reads the VM's balloon from Firecracker once it
     /// holds the per-VM snapshot lock. A memory snapshot of the same VM holds that
     /// lock for as long as Firecracker writes the memory file, so a create waits for
@@ -8521,7 +8881,7 @@ mod tests {
             .expect("ensure_not_disk_only no longer follows cmd_snapshot_create");
         let body = &source[start..start + end];
         let locked = body
-            .find("acquire_vm_snapshot_lock(")
+            .find("acquire_vm_snapshot_lock_for_create(")
             .expect("snapshot create takes no per-VM snapshot lock");
         let read = body
             .find("snapshot_config.metadata.record_balloon(")
@@ -8905,6 +9265,7 @@ mod tests {
             gpu_warm: false,
             stop: false,
             expect_vm_id: None,
+            await_restore: 0,
             memory_dir: None,
         };
         let mut state = VmState::new("vm-raw".to_string(), "win.raw".to_string(), 2, 4096);
@@ -8960,6 +9321,7 @@ mod tests {
             prepare: None,
             no_dirty_tracking: false,
             no_swap: false,
+            confine: false,
             vsock_dir: None,
             publish: vec![],
             publish_limit_per_source: None,

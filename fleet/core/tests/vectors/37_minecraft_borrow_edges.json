@@ -956,9 +956,11 @@
       "image_aspect": 2.0,
       "last_fork": null,
       "last_reset_all": {
+        "back": 1,
         "by": "viewer:v3",
         "clicked_at": 3300,
-        "servers": 1
+        "servers": 1,
+        "took_ms": 600
       },
       "server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
       "tiles": [

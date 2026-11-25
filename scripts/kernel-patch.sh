@@ -66,35 +66,56 @@ skips_patch() {
     [[ "$profile" == *.host_kernel && "$patch" == *.vm.patch ]]
 }
 
+# Print the string value of <key> in the table <section> of <config file>.
+# Exit 1 when the table has no such key, and 3, with the line on stderr, when the line is not
+# `key = "value"` with at most a comment after it: a TOML literal string ('value'), an escaped
+# quote or anything else after the closing quote would give a wrong value, so it is refused.
+read_table_string() {
+    local section="$1" key="$2" config_file="$3"
+    awk -v section="$section" -v key="$key" '
+        $0 == section { in_section = 1; next }
+        in_section && /^\[/ { exit }
+        in_section && $0 ~ ("^[[:space:]]*" key "[[:space:]]*=") {
+            if ($0 !~ ("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*\"[^\"\\\\]*\"[[:space:]]*(#.*)?$")) {
+                print $0 > "/dev/stderr"
+                status = 3
+                exit
+            }
+            value = $0
+            sub(/^[^=]*=[[:space:]]*"/, "", value)
+            sub(/".*$/, "", value)
+            print value
+            found = 1
+            exit
+        }
+        END {
+            if (status) exit status
+            if (!found) exit 1
+        }
+    ' "$config_file"
+}
+
 # Get kernel version from config
 get_kernel_version() {
     local profile="$1"
     local config_file="$REPO_ROOT/rootfs-config.toml"
-    local config_arch version
+    local config_arch section version status=0
 
     if [[ ! -f "$config_file" ]]; then
         error "Config file not found: $config_file"
     fi
 
     config_arch=$(get_config_arch) || return 1
+    section=$(profile_section "$profile" "$config_arch")
 
     # Match the exact architecture-specific TOML section. Treating the section
     # name as a grep regex makes its brackets a character class and silently
     # returns an empty version.
-    version=$(awk -v section="$(profile_section "$profile" "$config_arch")" '
-        $0 == section { in_section = 1; next }
-        in_section && /^\[/ { exit }
-        in_section && /^[[:space:]]*kernel_version[[:space:]]*=/ {
-            value = $0
-            sub(/^[^=]*=[[:space:]]*"/, "", value)
-            sub(/"[[:space:]]*$/, "", value)
-            print value
-            exit
-        }
-    ' "$config_file")
+    version=$(read_table_string "$section" kernel_version "$config_file") || status=$?
+    [[ $status -ne 3 ]] || error \
+        "Cannot read kernel_version in $section: write it as kernel_version = \"<release>\""
 
-    [[ -n "$version" ]] || error \
-        "Could not find kernel_version in $(profile_section "$profile" "$config_arch")"
+    [[ -n "$version" ]] || error "Could not find kernel_version in $section"
     printf '%s\n' "$version"
 }
 
@@ -102,35 +123,31 @@ get_kernel_version() {
 get_patches_dir() {
     local profile="$1"
     local config_file="$REPO_ROOT/rootfs-config.toml"
-    local config_arch declared
+    local config_arch section declared status=0
 
     if [[ ! -f "$config_file" ]]; then
         error "Config file not found: $config_file"
     fi
 
     config_arch=$(get_config_arch) || return 1
+    section=$(profile_section "$profile" "$config_arch")
 
     # A profile may name its own patches_dir, and the Rust build reads it
     # (src/setup/kernel.rs). This helper has to agree, or it edits and validates
     # a different set of patches than the one that actually gets built.
-    if declared=$(awk -v section="$(profile_section "$profile" "$config_arch")" '
-        $0 == section { in_section = 1; next }
-        in_section && /^\[/ { exit 1 }
-        in_section && /^[[:space:]]*patches_dir[[:space:]]*=/ {
-            value = $0
-            sub(/^[^=]*=[[:space:]]*"/, "", value)
-            sub(/"[[:space:]]*$/, "", value)
-            print value
-            found = 1
-            exit
-        }
-        END { if (!found) exit 1 }
-    ' "$config_file"); then
-        # An empty string means the profile deliberately applies no patches.
-        [[ -z "$declared" ]] && return
-        printf '%s\n' "$REPO_ROOT/$declared"
-        return
-    fi
+    declared=$(read_table_string "$section" patches_dir "$config_file") || status=$?
+    case $status in
+        0)
+            # An empty string means the profile deliberately applies no patches.
+            [[ -z "$declared" ]] && return
+            printf '%s\n' "$REPO_ROOT/$declared"
+            return
+            ;;
+        1) ;;
+        *)
+            error "Cannot read patches_dir in $section: write it as patches_dir = \"<directory>\""
+            ;;
+    esac
 
     # Preserve the legacy default for profiles without an explicit directory.
     if [[ "$config_arch" == "arm64" && -d "$REPO_ROOT/kernel/patches-arm64" ]]; then

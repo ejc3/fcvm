@@ -82,6 +82,56 @@ async fn serve_tile(dir: &Path, name: &str) -> (SocketAddr, Scenes) {
     (addr, scenes)
 }
 
+/// When a gated tile's port started accepting.
+type Opened = Arc<Mutex<Option<std::time::Instant>>>;
+
+/// A tile whose port answers nothing until its VM is up (the fake fcvm wrote its sessions file),
+/// as a restored guest's does while nothing reads its tap: the listener's accept queue is full,
+/// and Linux drops a SYN that finds it full, so a connection attempt gets no answer at all.
+async fn serve_gated_tile(dir: &Path, name: &str) -> (SocketAddr, Scenes, Opened) {
+    use std::os::fd::AsRawFd;
+    let scenes: Scenes = Arc::default();
+    let opened: Opened = Arc::default();
+    let t = Tile {
+        dir: dir.to_path_buf(),
+        name: name.into(),
+        scenes: scenes.clone(),
+    };
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/scene", post(scene))
+        .with_state(t);
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    // A queue of one, then connections nobody accepts until one gets no answer.
+    assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 0) }, 0);
+    let mut fillers = Vec::new();
+    loop {
+        match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            Ok(c) => fillers.push(c),
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+                break;
+            }
+        }
+        assert!(fillers.len() < 16, "the accept queue never filled");
+    }
+    let sessions = dir.join(format!("sessions-{name}"));
+    let at = opened.clone();
+    tokio::spawn(async move {
+        while !sessions.is_file() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(fillers);
+        assert_eq!(unsafe { libc::listen(l.as_raw_fd(), 1024) }, 0);
+        l.set_nonblocking(true).unwrap();
+        let l = tokio::net::TcpListener::from_std(l).unwrap();
+        *at.lock().unwrap() = Some(std::time::Instant::now());
+        axum::serve(l, app).await.unwrap()
+    });
+    (addr, scenes, opened)
+}
+
 fn wrapper(dir: &Path, snaps: &Path, env: &[(&str, &str)]) -> PathBuf {
     let p = dir.join("fcvm");
     let mut script = format!(
@@ -146,6 +196,7 @@ fn mc_cfg(snaps: &Path) -> MinecraftCfg {
         ready_deadline: Duration::from_secs(20),
         snapshot_deadline: Duration::from_secs(20),
         poll: Duration::from_millis(20),
+        up_attempt: fcvm::fleet::agent::minecraft::UP_PROBE_TIMEOUT,
         steady: 2,
     }
 }
@@ -159,6 +210,8 @@ struct Fake {
     rx: mpsc::UnboundedReceiver<AgentMsg>,
     /// Reports read while waiting for another.
     seen: Vec<SlotReport>,
+    /// When the gated tile's port started accepting, if one is gated.
+    opened: Option<Opened>,
     _scene: watch::Sender<Option<fleet_core::protocol::SharedScene>>,
 }
 
@@ -216,6 +269,16 @@ async fn fake_from(
     tweak: impl FnOnce(&mut MinecraftCfg),
     before: impl FnOnce(&Path),
 ) -> Fake {
+    fake_gated(env, tweak, before, None).await
+}
+
+/// As [`fake_from`], with the tile `gated` names served by [`serve_gated_tile`].
+async fn fake_gated(
+    env: &[(&str, &str)],
+    tweak: impl FnOnce(&mut MinecraftCfg),
+    before: impl FnOnce(&Path),
+    gated: Option<&str>,
+) -> Fake {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
     let snaps = path.join("snapshots");
@@ -224,8 +287,15 @@ async fn fake_from(
     let fcvm = wrapper(&path, &snaps, env);
     let mut places = Vec::new();
     let mut scenes = Vec::new();
+    let mut opened = None;
     for id in IDS {
-        let (addr, s) = serve_tile(&path, id).await;
+        let (addr, s) = if gated == Some(id) {
+            let (addr, s, at) = serve_gated_tile(&path, id).await;
+            opened = Some(at);
+            (addr, s)
+        } else {
+            serve_tile(&path, id).await
+        };
         places.push(Place {
             ipv6: None,
             http: addr,
@@ -266,6 +336,7 @@ async fn fake_from(
         mc,
         rx,
         seen: Vec::new(),
+        opened,
         _scene: scene_tx,
     }
 }
@@ -348,6 +419,47 @@ async fn the_gold_flow_runs_first_and_every_server_restores_from_it() {
     assert_eq!(body["generation"], 1);
     assert_eq!(body["admit_keys"][0], "ab".repeat(32));
     assert!(body["driver"].is_null());
+    f.mc.stop().await;
+}
+
+/// A restored tile is reported up when its port starts answering, not when an attempt that
+/// was sent before then ends. The tile's port answers nothing until its VM is up, some tens of
+/// milliseconds after the spawn, so the wait's first attempts are lost, as they are against a
+/// real clone that is still being restored. An attempt may take 20 s here, so a wait that held
+/// its next attempt for a lost one would see the tile only when the kernel sends that
+/// attempt's SYN again, a second after the first: the bound is half of that.
+///
+/// RED BEFORE THE FIX: the wait sent its next attempt only when the lost first one ended, at
+/// its 250 ms timeout then (226 ms after the port had opened), and at the SYN's retransmit with
+/// this test's 20 s (about 970 ms after).
+#[tokio::test]
+async fn a_restored_tile_is_reported_up_when_its_port_starts_answering() {
+    let attempt = Duration::from_secs(20);
+    let mut f = fake_gated(
+        &[("FAKE_UP_SECS", "0.02")],
+        |c| {
+            c.up_attempt = attempt;
+            c.ready_deadline = attempt * 2;
+        },
+        |_| {},
+        Some("mc-1"),
+    )
+    .await;
+    f.mc.assign(&[assign("mc-1", 0, 1, None, None)]);
+    f.report("mc-1", "running", 1).await;
+    let seen = std::time::Instant::now();
+    let opened = f
+        .opened
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .expect("the port opened");
+    let lag = seen.saturating_duration_since(opened);
+    assert!(
+        lag < Duration::from_millis(500),
+        "the tile was reported up {lag:?} after its port started answering"
+    );
     f.mc.stop().await;
 }
 
@@ -453,7 +565,14 @@ async fn a_fork_whose_source_does_not_run_here_restores_the_gold_snapshot() {
     f.mc.assign(&[assign("mc-2", 1, 1, None, None)]);
     f.report("mc-2", "running", 1).await;
     f.mc.assign(&[assign("mc-2", 1, 2, Some(("mc-1", 0)), None)]);
-    f.report("mc-2", "running", 2).await;
+    let r = f.report("mc-2", "running", 2).await;
+    // The tile shows the gold world where a copy was asked for, and its state says why.
+    assert_eq!(
+        r.error.as_deref(),
+        Some(
+            "restored from the gold snapshot, not copied from mc-1: mc-1 does not run on this host"
+        )
+    );
     let ev = f.events();
     let gold = mc_cfg(&f.snaps).gold_tag();
     assert!(
@@ -508,6 +627,66 @@ async fn stopping_the_agent_stops_every_server() {
     }
 }
 
+/// The next status report of the host: each server's phase byte, in the order of its places.
+async fn status_phases(f: &mut Fake) -> Vec<u8> {
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let m = tokio::time::timeout_at(end, f.rx.recv())
+            .await
+            .expect("no status report in 10 s")
+            .expect("the agent's channel closed");
+        match m {
+            AgentMsg::Health(h) => {
+                if let Some(status) = h.minecraft {
+                    let rows = fleet_core::minecraft::unbase64(&status.rows).expect("base64 rows");
+                    return rows
+                        .chunks(fleet_core::minecraft::STATUS_ROW_BYTES)
+                        .map(|r| r[0])
+                        .collect();
+                }
+            }
+            AgentMsg::Slot(r) => f.seen.push(r),
+            _ => {}
+        }
+    }
+}
+
+/// A host whose last server is unassigned says so once: its rows went on calling the server
+/// running, and then it sent nothing more, which left the coordinator its last rows.
+#[tokio::test]
+async fn the_status_rows_say_so_when_the_last_server_is_unassigned() {
+    let mut f = fake().await;
+    f.mc.assign(&[assign("mc-1", 0, 1, None, None)]);
+    f.report("mc-1", "running", 1).await;
+    // the rows name it running (phase 3), and the places with no server as not reported (0)
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let phases = status_phases(&mut f).await;
+        if phases == [3, 0, 0] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < end,
+            "never running: {phases:?}"
+        );
+    }
+    f.mc.assign(&[]);
+    // one report with every server not reported, however many reports of the stopping server
+    // were already on their way
+    let end = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let phases = status_phases(&mut f).await;
+        if phases == [0, 0, 0] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < end,
+            "never emptied: {phases:?}"
+        );
+    }
+    f.mc.stop().await;
+}
+
 /// A restore runs the tile's restore hook, which drops the scene the VM was copied with, so a
 /// fork's target never serves its source's borrower before the agent posts its own scene.
 #[tokio::test]
@@ -553,6 +732,13 @@ async fn a_failed_copy_falls_back_to_the_gold_snapshot() {
         }
     };
     assert!(!r.timings.contains_key("snapshot_ms"), "{:?}", r.timings);
+    // The tile shows the gold world where a copy was asked for, and its state says why.
+    let why = r.error.as_deref().unwrap_or_default();
+    assert!(
+        why.contains("not copied from mc-1") && why.contains("fcvm exited"),
+        "the server restored from the gold snapshot does not say why it is no copy: {:?}",
+        r.error
+    );
     let ev = f.events();
     let snaps: Vec<_> = ev
         .iter()
@@ -568,6 +754,85 @@ async fn a_failed_copy_falls_back_to_the_gold_snapshot() {
     assert!(
         !f.snaps.join("mc-fork-mc-2-2").exists(),
         "the failed copy's snapshot is left"
+    );
+    f.mc.stop().await;
+}
+
+/// A fork asked for while its source's own restore is not yet acknowledged waits for the
+/// acknowledgement and then copies the source. A server is up for the agent when its tile
+/// answers, which is before fcvm has recorded the restore's acknowledgement, and fcvm refuses
+/// to snapshot a clone before that unless the create waits (`--await-restore`).
+///
+/// RED BEFORE THE FIX: the fork's `snapshot create` carried no wait, was refused, and the
+/// server restored from the gold snapshot instead of the copy.
+#[tokio::test]
+async fn a_fork_asked_for_during_its_sources_restore_waits_and_then_copies() {
+    let mut f = fake_with(&[("FAKE_ACK_SECS", "1.5")], |_| {}).await;
+    f.mc.assign(&[assign("mc-1", 0, 1, None, None)]);
+    f.report("mc-1", "running", 1).await;
+    // At once: the source answers, and its restore is acknowledged 1.5 s from now.
+    f.mc.assign(&[
+        assign("mc-1", 0, 1, None, None),
+        assign("mc-2", 1, 1, Some(("mc-1", 0)), None),
+    ]);
+    f.report("mc-2", "forking", 1).await;
+    let r = f.report("mc-2", "running", 1).await;
+    let ev = f.events();
+    let tag = "mc-fork-mc-2-1";
+    let at = |what: &dyn Fn(&Vec<String>) -> bool| {
+        ev.iter().position(what).unwrap_or_else(|| panic!("{ev:?}"))
+    };
+    let asked = at(&|e| e[0] == "snapshot_create" && e[1] == "mc-1" && e[3] == tag);
+    let acknowledged = at(&|e| e[0] == "acked" && e[1] == "mc-1" && e[3] != "-");
+    let copied = at(&|e| e[0] == "snapshot_run" && e[1] == "mc-2" && e[3] == tag);
+    assert!(
+        asked < acknowledged && acknowledged < copied,
+        "the fork did not wait for its source's acknowledgement: {ev:?}"
+    );
+    assert!(
+        !ev.iter().any(|e| e[0] == "snapshot_refused"),
+        "a snapshot was refused: {ev:?}"
+    );
+    assert!(r.timings.contains_key("snapshot_ms"), "{:?}", r.timings);
+    assert_eq!(r.error, None, "a copy says nothing of the gold snapshot");
+    f.mc.stop().await;
+}
+
+/// A gold restore that fails is not reported as the failure of a copy. Here the fork's source
+/// does not run on this host, so the server restores from the gold snapshot, and that restore
+/// fails once: the next one still says there is no copy because the source does not run here,
+/// and does not give the gold restore's error as the copy's.
+///
+/// RED BEFORE THE FIX: any failed relaunch of a server that asked for a fork was stored as
+/// the fork's failure, and the next report read "not copied from mc-1: fcvm exited ...".
+#[tokio::test]
+async fn a_failed_gold_restore_is_not_reported_as_the_copys_failure() {
+    let mut f = fake_with(&[("FAKE_FAIL_ONCE", "mc-2")], |_| {}).await;
+    f.mc.assign(&[assign("mc-2", 1, 1, Some(("mc-1", 0)), None)]);
+    let end = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut failed = None;
+    let r = loop {
+        let m = tokio::time::timeout_at(end, f.rx.recv())
+            .await
+            .expect("no report")
+            .unwrap();
+        if let AgentMsg::Slot(r) = m {
+            if r.id == "mc-2" && r.phase == "failed" {
+                failed = r.error.clone();
+            }
+            if r.id == "mc-2" && r.phase == "running" && r.generation == 1 {
+                break r;
+            }
+        }
+    };
+    let failed = failed.expect("the gold restore that was to fail once did not");
+    assert!(failed.contains("fcvm exited"), "{failed}");
+    assert_eq!(
+        r.error.as_deref(),
+        Some(
+            "restored from the gold snapshot, not copied from mc-1: mc-1 does not run on this host"
+        ),
+        "the gold restore's failure was: {failed}"
     );
     f.mc.stop().await;
 }

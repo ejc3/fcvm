@@ -995,8 +995,8 @@ pub const PREFETCH_RECORD_WINDOW_ENV: &str = "FCVM_UFFD_PREFETCH_RECORD_WINDOW";
 
 /// How long after its UFFD handshake a clone's demand faults are recorded into the
 /// snapshot's working-set hint. Faults past the window are served normally but no longer
-/// recorded, so the sidecar converges to the union of restore windows instead of the
-/// lifetime footprint of the longest-lived clone (issue #858: one clone that ran for hours
+/// recorded, so the sidecar holds the restore windows of a few clones
+/// ([`crate::uffd::working_set::RECORDING_CLONES`]) instead of the lifetime footprint of the longest-lived clone (issue #858: one clone that ran for hours
 /// grew a 128 GiB guest's hint from 6.5 GiB to 122 GiB).
 ///
 /// 300 s is a safety bound pending empirical tuning, not a measured optimum: the slowest
@@ -1107,8 +1107,9 @@ pub const MAX_FAULT_AROUND: usize = prefetch::CHUNK_BYTES;
 /// right after a restore.
 ///
 /// Recording stays demand-only, and a page that fault-around installed is never recorded,
-/// because the guest never faults on it. With the option on the recorded working set
-/// therefore converges one demanded page per granule per clone, and replay never restores
+/// because the guest never faults on it. With the option on, the recorded working set
+/// therefore holds about one demanded page per granule, from the few clones that record
+/// it, and replay never restores
 /// what fault-around would have installed. Replay does not expand recorded runs to their
 /// granules: right after a restore the demanded pages are sparse, so that would multiply
 /// the replayed memory by up to the granule factor. Record with the option off.
@@ -1176,7 +1177,8 @@ impl FaultAround {
 /// The most of the recorded working set one clone replays, in bytes of the set, or no
 /// bound (#955).
 ///
-/// The recorded set is a union over clones and only grows, and in copy mode every replayed
+/// The recorded set is a union over a generation's first few clones
+/// ([`crate::uffd::working_set::RECORDING_CLONES`]), and in copy mode every replayed
 /// page is a private copy in each clone. Clones that do real work inside their recording
 /// window add the pages that work touched: on one 128 GiB guest, 8.6 M to 14.1 M pages over
 /// four such clones, and a clone of it held 52.7 GiB at healthy against 25.4 GiB for a set
@@ -1800,13 +1802,15 @@ impl UffdServer {
             }
         }
         // Every handler has scheduled its clone's faults by now. Give the writer a bounded
-        // time to publish them before the process exits with them only in memory.
+        // time to publish them before the process exits with them only in memory, and retry
+        // once a publication the busy sidecar skipped after the last handler's own retry.
         if let Some(persistence) = self.working_set_persistence.clone() {
             let started = std::time::Instant::now();
-            let drained =
-                tokio::task::spawn_blocking(move || persistence.drain(WORKING_SET_DRAIN_TIMEOUT))
-                    .await
-                    .unwrap_or(false);
+            let drained = tokio::task::spawn_blocking(move || {
+                persistence.drain_and_retry("shutdown", WORKING_SET_DRAIN_TIMEOUT)
+            })
+            .await
+            .unwrap_or(false);
             if drained {
                 debug!(
                     target: "uffd",
@@ -3268,6 +3272,8 @@ struct VmState {
     /// The most of the recorded set this clone replays (#955).
     replay_limit: ReplayLimit,
     recorded: Option<PageSet>,
+    /// Where `recorded` goes when its window closes or the clone exits (#955).
+    recording_sink: Option<RecordingSink>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
     /// large for the clock to represent). Faults are always SERVED regardless; the deadline
     /// only stops them being recorded, so the persisted hint stays a restore working set
@@ -3278,7 +3284,51 @@ struct VmState {
     trace: Option<FaultTrace>,
 }
 
+/// The store a recording clone reports to, and the writer that publishes it when there is one.
+struct RecordingSink {
+    store: Arc<WorkingSetStore>,
+    persistence: Option<WorkingSetPersistence>,
+}
+
 impl VmState {
+    /// End this clone's recording at `now`: once its window has closed, or at exit
+    /// (`at_exit`) whether or not it has. A recording counts toward the bound only when its
+    /// window closed ([`WorkingSetStore::finish_recording`]); merging at the close, not only at
+    /// exit, publishes it while the clone keeps running (#955). An unbounded window
+    /// (`record_until` is `None`) closes at exit after [`DEFAULT_PREFETCH_RECORD_WINDOW`].
+    fn finish_recording(&mut self, vm_id: &str, now: std::time::Instant, at_exit: bool) {
+        let completed = match self.record_until {
+            Some(deadline) => now >= deadline,
+            None => {
+                at_exit
+                    && now.saturating_duration_since(self.started) >= DEFAULT_PREFETCH_RECORD_WINDOW
+            }
+        };
+        if !(completed || at_exit) {
+            return;
+        }
+        let Some(sink) = self.recording_sink.as_ref() else {
+            return;
+        };
+        let Some(observed) = self.recorded.take() else {
+            // Recorded already, at its window's close. If the sidecar was busy then, no tick
+            // may come before this clone's handler ends: retry here, or the recording stays
+            // only in memory.
+            if at_exit {
+                if let Some(persistence) = &sink.persistence {
+                    persistence.retry_if_unpublished(vm_id);
+                }
+            }
+            return;
+        };
+        match &sink.persistence {
+            Some(persistence) => persistence.finish(vm_id, observed, completed),
+            None => {
+                sink.store.finish_recording(&observed, completed);
+            }
+        }
+    }
+
     /// Stop and join the fault workers, and add the holes they filled to
     /// `hole_zero_filled`, so the exit line counts the handler's and the workers' fills. The
     /// join comes first: a worker can fill a page, wake the guest and only then count it,
@@ -3495,7 +3545,13 @@ async fn handle_vm_page_faults(
         fault_workers: None,
         replay_progress,
         replay_limit,
-        recorded: working_set.as_deref().map(WorkingSetStore::recorder),
+        recorded: working_set
+            .as_deref()
+            .and_then(WorkingSetStore::admit_recorder),
+        recording_sink: working_set.as_ref().map(|store| RecordingSink {
+            store: Arc::clone(store),
+            persistence: working_set_persistence,
+        }),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
         // clock cannot represent (checked_add overflow) means unbounded recording.
@@ -3522,7 +3578,7 @@ async fn handle_vm_page_faults(
     )
     .await;
 
-    let mut persistence = Some((working_set_persistence, state.recorded.take()));
+    let mut persisted = false;
     for step in fault_finalization_steps(result.is_err()) {
         match step {
             FaultFinalizationStep::Kill => {
@@ -3540,26 +3596,14 @@ async fn handle_vm_page_faults(
                 peer.kill_now(&format!("{error:#}"));
             }
             FaultFinalizationStep::Persist => {
-                let (persistence, observed) = persistence
-                    .take()
-                    .expect("working-set persistence runs exactly once");
-                persist_observed_working_set(&vm_id, persistence, observed);
+                assert!(!persisted, "working-set persistence runs exactly once");
+                persisted = true;
+                state.finish_recording(&vm_id, std::time::Instant::now(), true);
             }
         }
     }
 
     result
-}
-
-fn persist_observed_working_set(
-    vm_id: &str,
-    persistence: Option<WorkingSetPersistence>,
-    observed: Option<PageSet>,
-) {
-    let (Some(persistence), Some(observed)) = (persistence, observed) else {
-        return;
-    };
-    persistence.schedule(vm_id, observed);
 }
 
 async fn replay_then_serve(
@@ -4989,11 +5033,19 @@ async fn serve_faults(
             _ = retry_due => {}
 
             _ = progress.tick() => {
+                if let Some(persistence) = state
+                    .recording_sink
+                    .as_ref()
+                    .and_then(|sink| sink.persistence.as_ref())
+                {
+                    persistence.retry_if_unpublished(ctx.vm_id);
+                }
                 report_fault_progress(ctx, state, async_uffd.get_ref().as_raw_fd(), last_count);
                 last_count = state.fault_count;
             }
         }
 
+        state.finish_recording(ctx.vm_id, std::time::Instant::now(), false);
         if !retry_parked_faults(ctx, async_uffd.get_ref(), state)? {
             log_clone_finished(ctx, state, "clone exited during a parked-fault retry");
             return Ok(());
@@ -6329,6 +6381,7 @@ mod tests {
             replay_progress: None,
             replay_limit: ReplayLimit::NONE,
             recorded: None,
+            recording_sink: None,
             record_until: None,
             started: origin,
             trace: Some(FaultTrace {
@@ -6454,11 +6507,7 @@ mod tests {
                 .unwrap();
             started_tx.send(()).unwrap();
             runtime.block_on(async move {
-                persist_observed_working_set(
-                    "vm-parked-persistence",
-                    Some(persistence),
-                    Some(observed),
-                );
+                persistence.schedule("vm-parked-persistence", observed);
             });
             drop(runtime);
             finished_tx.send(()).unwrap();
@@ -6534,6 +6583,7 @@ mod tests {
             replay_progress: None,
             replay_limit: ReplayLimit::NONE,
             recorded: Some(PageSet::empty(mem_len)),
+            recording_sink: None,
             record_until: Some(started), // zero-length window: closed before any fault
             started,
             trace: None,
@@ -6563,6 +6613,7 @@ mod tests {
             replay_progress: None,
             replay_limit: ReplayLimit::NONE,
             recorded: Some(PageSet::empty(mem_len)),
+            recording_sink: None,
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
             started,
             trace: None,
@@ -6594,6 +6645,7 @@ mod tests {
                 .unwrap(),
         );
 
+        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
         let started = std::time::Instant::now();
         let fault_time = started + Duration::from_secs(1);
         let clone_state = |window: Duration| VmState {
@@ -6610,6 +6662,10 @@ mod tests {
             replay_progress: None,
             replay_limit: ReplayLimit::NONE,
             recorded: Some(store.recorder()),
+            recording_sink: Some(RecordingSink {
+                store: Arc::clone(&store),
+                persistence: Some(persistence.clone()),
+            }),
             record_until: started.checked_add(window),
             started,
             trace: None,
@@ -6622,8 +6678,7 @@ mod tests {
                 recorder.insert_range_at(offset, 4096, stamp);
             }
         }
-        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
-        persist_observed_working_set("vm-late", Some(persistence.clone()), late.recorded.take());
+        late.finish_recording("vm-late", fault_time, true);
         assert!(
             store.to_prefetch().is_empty(),
             "faults past the window must not become learned pages in the store"
@@ -6636,11 +6691,167 @@ mod tests {
                 recorder.insert_range_at(offset, 4096, stamp);
             }
         }
-        persist_observed_working_set("vm-timely", Some(persistence), timely.recorded.take());
+        timely.finish_recording("vm-timely", fault_time, true);
         assert_eq!(
             store.to_prefetch().len(),
             3,
             "faults inside the window must still be learned"
+        );
+    }
+
+    /// A recording whose publication a busy sidecar skipped at its window's close is
+    /// published when its clone exits, even with no progress tick in between.
+    #[test]
+    fn a_skipped_publication_is_retried_when_the_clone_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_path = dir.path().join("memory.bin");
+        let config_path = dir.path().join("config.json");
+        let generation_lock_path = dir.path().join("generation.lock");
+        let mem_len = 16 * 4096u64;
+        std::fs::write(&memory_path, vec![0u8; mem_len as usize]).unwrap();
+        std::fs::write(&config_path, b"generation-1").unwrap();
+        let store = Arc::new(
+            WorkingSetStore::open(&memory_path, mem_len, &config_path, &generation_lock_path)
+                .unwrap(),
+        );
+        let persistence = WorkingSetPersistence::new(Arc::clone(&store)).unwrap();
+        let started = std::time::Instant::now();
+        let window = Duration::from_secs(1);
+        let mut clone = VmState {
+            fault_count: 0,
+            fault_around: FaultAroundStats::default(),
+            parked_faults: ParkedFaults::default(),
+            removed: RemovedPages::default(),
+            given_back: GivenBackStats::default(),
+            hole_zero_filled: 0,
+            zero_page_refused: false,
+            replaying: false,
+            read_batch: READ_BATCH,
+            fault_workers: None,
+            replay_progress: None,
+            replay_limit: ReplayLimit::NONE,
+            recorded: store.admit_recorder(),
+            recording_sink: Some(RecordingSink {
+                store: Arc::clone(&store),
+                persistence: Some(persistence.clone()),
+            }),
+            record_until: started.checked_add(window),
+            started,
+            trace: None,
+        };
+        let (recorder, stamp) = clone.fault_recorder(started).unwrap();
+        recorder.insert_range_at(0, 4096, stamp);
+        // The window closes while another holder has the sidecar lock: the publication is
+        // skipped.
+        let held = Flock::lock(
+            std::fs::File::options()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(store.sidecar_lock_path())
+                .unwrap(),
+            FlockArg::LockExclusive,
+        )
+        .map_err(|(_, e)| e)
+        .unwrap();
+        clone.finish_recording("vm-busy", started + window, false);
+        assert!(persistence.drain(Duration::from_secs(10)));
+        assert!(!store.sidecar_path().exists());
+        drop(held);
+        // The clone exits before the next progress tick.
+        clone.finish_recording("vm-busy", started + window * 2, true);
+        assert!(persistence.drain(Duration::from_secs(10)));
+        assert!(
+            store.sidecar_path().exists(),
+            "the recording stayed only in memory"
+        );
+    }
+
+    /// A recording is merged when its window closes, while the clone keeps running, and
+    /// counts as complete: a serve whose first clones run for hours still publishes their
+    /// sets (#955).
+    #[test]
+    fn a_recording_is_merged_when_its_window_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory_path = dir.path().join("memory.bin");
+        let config_path = dir.path().join("config.json");
+        let generation_lock_path = dir.path().join("generation.lock");
+        let mem_len = 16 * 4096u64;
+        std::fs::write(&memory_path, vec![0u8; mem_len as usize]).unwrap();
+        std::fs::write(&config_path, b"generation-1").unwrap();
+        let store = Arc::new(
+            WorkingSetStore::open(&memory_path, mem_len, &config_path, &generation_lock_path)
+                .unwrap(),
+        );
+        let started = std::time::Instant::now();
+        let window = Duration::from_secs(1);
+        let mut clone = VmState {
+            fault_count: 0,
+            fault_around: FaultAroundStats::default(),
+            parked_faults: ParkedFaults::default(),
+            removed: RemovedPages::default(),
+            given_back: GivenBackStats::default(),
+            hole_zero_filled: 0,
+            zero_page_refused: false,
+            replaying: false,
+            read_batch: READ_BATCH,
+            fault_workers: None,
+            replay_progress: None,
+            replay_limit: ReplayLimit::NONE,
+            recorded: store.admit_recorder(),
+            recording_sink: Some(RecordingSink {
+                store: Arc::clone(&store),
+                persistence: None,
+            }),
+            record_until: started.checked_add(window),
+            started,
+            trace: None,
+        };
+        let (recorder, stamp) = clone.fault_recorder(started).unwrap();
+        recorder.insert_range_at(0, 4096, stamp);
+        clone.finish_recording("vm-open", started + window / 2, false);
+        assert!(
+            store.to_prefetch().is_empty(),
+            "merged before its window closed"
+        );
+        clone.finish_recording("vm-open", started + window, false);
+        assert_eq!(
+            store.to_prefetch().len(),
+            1,
+            "not merged when its window closed"
+        );
+        assert!(clone.recorded.is_none());
+        // It counted: three more complete recordings freeze the set.
+        for _ in 1..crate::uffd::working_set::RECORDING_CLONES {
+            let mut more = store.admit_recorder().unwrap();
+            more.insert_range(4096, 4096);
+            store.finish_recording(&more, true);
+        }
+        assert!(store.admit_recorder().is_none());
+    }
+
+    /// Every clone's recorder comes through the bound: handing each clone a plain recorder
+    /// lets every clone's window into the set again (#955).
+    #[test]
+    fn clones_get_their_recorder_through_the_bound() {
+        let source = include_str!("server.rs");
+        let handler = &source[source.find("async fn handle_vm_page_faults(").unwrap()..];
+        let handler = &handler[..handler.find("\n}\n").unwrap()];
+        assert!(handler.contains(".and_then(WorkingSetStore::admit_recorder)"));
+        assert!(!handler.contains("WorkingSetStore::recorder"));
+        // And the serve loop closes a recording's window while the clone runs.
+        let serve = &source[source.find("async fn serve_faults(").unwrap()..];
+        let serve = &serve[..serve.find("\n}\n").unwrap()];
+        assert!(
+            serve.contains("state.finish_recording(ctx.vm_id, std::time::Instant::now(), false);")
+        );
+        // And its progress tick retries a publication a busy sidecar skipped.
+        assert!(serve.contains("persistence.retry_if_unpublished(ctx.vm_id);"));
+        // And a stopping server retries once more after the last handler has gone.
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(
+            code.contains("persistence.drain_and_retry(\"shutdown\", WORKING_SET_DRAIN_TIMEOUT)")
         );
     }
 
@@ -7806,6 +8017,7 @@ mod tests {
                 replay_progress: None,
                 replay_limit: ReplayLimit::NONE,
                 recorded: Some(PageSet::empty(self.mem_size as u64)),
+                recording_sink: None,
                 record_until: None,
                 started: std::time::Instant::now(),
                 trace: None,
@@ -9337,6 +9549,7 @@ mod tests {
                 replay_progress: None,
                 replay_limit: ReplayLimit::NONE,
                 recorded: None,
+                recording_sink: None,
                 record_until: None,
                 started: std::time::Instant::now(),
                 trace: None,
@@ -10615,6 +10828,7 @@ mod tests {
                 replay_progress: None,
                 replay_limit: ReplayLimit::NONE,
                 recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
+                recording_sink: None,
                 record_until: None,
                 started: std::time::Instant::now(),
                 trace: None,
@@ -10954,6 +11168,7 @@ mod tests {
                 replay_progress: None,
                 replay_limit: ReplayLimit::NONE,
                 recorded: None,
+                recording_sink: None,
                 record_until: None,
                 started: std::time::Instant::now(),
                 trace: None,

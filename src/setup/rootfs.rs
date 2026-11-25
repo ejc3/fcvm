@@ -40,6 +40,9 @@ const LAYER2_SIZE: &str = "10G";
 pub struct Plan {
     #[serde(default)]
     pub paths: PathsConfig,
+    /// `[confine]`: whether this host requires every VMM to be confined (`crate::confine`).
+    #[serde(default)]
+    pub confine: crate::confine::ConfineConfig,
     pub base: BaseConfig,
     pub packages: PackagesConfig,
     pub services: ServicesConfig,
@@ -898,6 +901,52 @@ fn fcvm_config_dir_from(
 /// Writes the embedded default config to `$FCVM_CONFIG_DIR/fcvm/rootfs-config.toml`
 /// when the override is set (per-run test isolation), otherwise to the platform
 /// default (`~/.config/fcvm/rootfs-config.toml` on Linux).
+/// The embedded config to write over `existing`, keeping a `[confine] mode = "required"` it
+/// sets: `make build` regenerates the config, and a build must never turn a host's required
+/// confinement off. A config that does not parse is refused rather than overwritten, since
+/// whether it requires confinement cannot be told.
+fn config_keeping_confinement(existing: Option<&str>) -> Result<String> {
+    const OFF: &str = "[confine]\nmode = \"off\"\n";
+    let required = match existing {
+        None => false,
+        Some(text) => {
+            let value: toml::Value = toml::from_str(text).context(
+                "the existing config is not valid TOML, so whether its [confine] mode is \
+                 required cannot be told; fix or remove it",
+            )?;
+            match value.get("confine") {
+                None => false,
+                Some(confine) => {
+                    let table = confine.as_table().context(
+                        "the existing config's [confine] is not a table, so whether it requires \
+                         confinement cannot be told; fix it",
+                    )?;
+                    match table.get("mode") {
+                        None => false,
+                        Some(mode) => match mode.as_str() {
+                            Some("off") => false,
+                            Some("required") => true,
+                            _ => anyhow::bail!(
+                                "the existing config's [confine] mode is {mode:?}, which is neither \
+                                 \"off\" nor \"required\"; fix it rather than have it replaced"
+                            ),
+                        },
+                    }
+                }
+            }
+        }
+    };
+    anyhow::ensure!(
+        EMBEDDED_CONFIG.matches(OFF).count() == 1,
+        "the embedded config has no single [confine] mode = \"off\" to set"
+    );
+    Ok(if required {
+        EMBEDDED_CONFIG.replace(OFF, "[confine]\nmode = \"required\"\n")
+    } else {
+        EMBEDDED_CONFIG.to_string()
+    })
+}
+
 pub fn generate_config(force: bool) -> Result<PathBuf> {
     let config_dir = fcvm_config_dir()?;
     let config_dir = config_dir.as_path();
@@ -911,9 +960,18 @@ pub fn generate_config(force: bool) -> Result<PathBuf> {
         );
     }
 
+    let existing = match std::fs::read_to_string(&config_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", config_path.display()));
+        }
+    };
+    let contents = config_keeping_confinement(existing.as_deref())
+        .with_context(|| format!("regenerating {}", config_path.display()))?;
     std::fs::create_dir_all(config_dir)
         .with_context(|| format!("creating config directory: {}", config_dir.display()))?;
-    std::fs::write(&config_path, EMBEDDED_CONFIG)
+    std::fs::write(&config_path, contents)
         .with_context(|| format!("writing config file: {}", config_path.display()))?;
 
     info!("Generated config at {}", config_path.display());
@@ -2675,6 +2733,10 @@ async fn boot_vm_for_setup(
     use std::time::Duration;
     use tokio::time::timeout;
 
+    // The setup VM does not support confinement: under a host's `required` mode it is
+    // refused here, before this function creates anything.
+    let decision = crate::confine::resolve(&layer2_setup_confinement_request())?;
+
     // Create a temporary directory for this setup VM
     // Use UID in path to avoid permission conflicts between root and non-root
     let uid = unsafe { libc::getuid() };
@@ -2727,10 +2789,7 @@ async fn boot_vm_for_setup(
     // network — so the helper installs only the parent-death hook.
     crate::utils::install_namespace_pre_exec(
         &mut fc_cmd,
-        &crate::utils::NamespaceParams {
-            vm_id: "layer2-setup".to_string(),
-            ..Default::default()
-        },
+        &crate::utils::NamespaceParams::new("layer2-setup", decision),
     )?;
     let mut fc_process = fc_cmd.spawn().context("starting Firecracker")?;
 
@@ -2899,8 +2958,66 @@ fn path_to_str(path: &Path) -> Result<&str> {
         .ok_or_else(|| anyhow::anyhow!("path contains invalid UTF-8: {:?}", path))
 }
 
+/// The setup VM's confinement request: never asked for by a flag, and refused under a
+/// host's `required` mode, with what to do instead.
+#[cfg(test)]
+pub(crate) fn layer2_setup_request_for_test() -> crate::confine::Request<'static> {
+    layer2_setup_confinement_request()
+}
+
+fn layer2_setup_confinement_request() -> crate::confine::Request<'static> {
+    crate::confine::Request {
+        flag: false,
+        backend: crate::hypervisor::Backend::Firecracker,
+        network: crate::confine::Network::Rootless,
+        firecracker_args: None,
+        unsupported: Some(
+            "fcvm setup's Layer 2 VM runs unconfined; run fcvm setup with confinement off \
+             first (it is a one-time step), then start VMs confined",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Regenerating the config (`make build` runs `fcvm setup --generate-config --force`)
+    /// keeps a host's required confinement and otherwise writes the embedded config.
+    #[test]
+    fn regenerating_the_config_never_turns_required_confinement_off() {
+        let required = EMBEDDED_CONFIG.replace(
+            "[confine]\nmode = \"off\"\n",
+            "[confine]\nmode = \"required\"\n",
+        );
+        let written = super::config_keeping_confinement(Some(&required)).unwrap();
+        let plan: Plan = toml::from_str(&written).unwrap();
+        assert_eq!(plan.confine.mode, crate::confine::Mode::Required);
+        let off = super::config_keeping_confinement(Some(EMBEDDED_CONFIG)).unwrap();
+        assert_eq!(off, EMBEDDED_CONFIG);
+        assert_eq!(
+            super::config_keeping_confinement(None).unwrap(),
+            EMBEDDED_CONFIG
+        );
+        assert!(super::config_keeping_confinement(Some("[confine\n")).is_err());
+        // A mode that is neither "off" nor "required" fails closed when loaded; replacing it
+        // with the embedded "off" would turn that host unconfined.
+        for bad in [
+            "[confine]\nmode = \"Required\"\n",
+            "[confine]\nmode = \"on\"\n",
+            "[confine]\nmode = 1\n",
+            "confine = \"required\"\n",
+        ] {
+            assert!(
+                super::config_keeping_confinement(Some(bad)).is_err(),
+                "{bad:?} was replaced"
+            );
+        }
+        assert_eq!(
+            super::config_keeping_confinement(Some("[confine]\n")).unwrap(),
+            EMBEDDED_CONFIG
+        );
+    }
+
     use super::*;
 
     /// Every profile whose guest kernel builds KVM (`CONFIG_KVM=y` or `=m`) runs VMs inside
@@ -3439,6 +3556,45 @@ branch = "agent/nv2"
             pci > 0,
             "no profile on the PCI transport: the check saw nothing"
         );
+    }
+
+    /// The fork commits whose x86_64 snapshot load ends with a paravirtual kick for every
+    /// runnable vCPU (`KvmVm::restore_kvm_state`, ejc3/firecracker), one for each branch an
+    /// x86_64 profile builds. KVM holds a spinlock kick that is pending for a runnable vCPU
+    /// in a flag no ioctl reads, so a snapshot does not hold it, and a clone restored
+    /// without the kick can halt a vCPU with interrupts off for good (#2131).
+    const RESTORE_KICK_COMMITS: [&str; 3] = [
+        // [firecracker]: the default, btrfs and mountinfo profiles.
+        "2a33289b55b7f611959891dd5295438a416f386e",
+        // gpu.amd64 and phone.amd64.
+        "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
+        // nested.amd64.
+        "af888e7aec38fe4727fd75878aaed017a3113028",
+    ];
+
+    /// A pin that moves to a commit without the restore kick brings #2131 back with no test
+    /// of fcvm's failing: the window is a few guest instructions wide.
+    #[test]
+    fn every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let global = &plan.firecracker.as_ref().unwrap().commit;
+        let mut checked = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            let Some(profile) = arches.get("amd64") else {
+                continue;
+            };
+            // A profile that names no fork of its own runs the [firecracker] build.
+            let commit = profile.firecracker_commit.as_ref().unwrap_or(global);
+            checked += 1;
+            assert!(
+                RESTORE_KICK_COMMITS.contains(&commit.as_str()),
+                "{name}.amd64 pins Firecracker {commit}, which is not known to kick runnable \
+                 vCPUs after a snapshot load. Add it to RESTORE_KICK_COMMITS once `git \
+                 merge-base --is-ancestor <a listed commit of its branch> {commit}` succeeds in \
+                 the fork, or the fix has been cherry-picked onto it"
+            );
+        }
+        assert!(checked > 3, "only {checked} amd64 profiles were checked");
     }
 
     /// Every Firecracker the embedded config builds is pinned, so setup keeps a

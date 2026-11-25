@@ -67,7 +67,7 @@ What the boundary needs is narrow, and both halves are non-destructive:
 
 | need | mechanism | reversible? |
 |------|-----------|-------------|
-| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: its chains and hooks added, then removed |
+| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables): a TCP SYN without ACK is reset, read off the packet | yes: its chains and hooks added, then removed |
 | packets already in receive processing must drain | one expedited RCU grace period, `membarrier(MEMBARRIER_CMD_GLOBAL)` in fc-agent's own thread | yes: the kernel's `rcu_expedited` switch is on for the grace period, then put back |
 | restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
 | a restored clone's own page faults must not queue behind its workload's | the container's cgroup frozen (`cgroup.freeze`) from the prepare until the source resumes or the clone is about to publish (`fc-agent/src/payload_freeze.rs`) | yes: a thaw undoes it, and the guest agent's watchdog thread thaws it itself once it has found the freeze on 60 looks a second apart (time the guest ran, which a clock does not measure across a pause or a restore), so a resume that never arrives, a killed prepare or a killed fcvm cannot leave it frozen; the record `/run/fcvm-payload-frozen` names the frozen cgroups, written before they are frozen, under one lock |
@@ -136,6 +136,239 @@ addresses across one snapshot and fails on any difference. The `ModelBarrier`
 and `ModelDiag` invariants in `fc-agent/src/snapshot_network.rs` fail if any
 boundary step takes the link down, on the source or the clone path.
 
+### The gate reads the packet. It does not ask connection tracking.
+
+The gate's TCP rule was `-m conntrack --ctstate NEW` until 2026-11-24 (#2106).
+In a guest with no nat rule (a routed VM without a published port or the egress
+proxy), that rule was the only thing that attached the tracker, and the tracker
+tracks only while a rule needs it: 5 connections made with no such rule left the
+table empty, 5 made with one left 5 entries, 5 more after it was deleted left
+none. Three faults came from it:
+
+- **The snapshot reset the source's connections.** With the tracker attached at
+  the close, the next segment of a connection that was already open was the
+  first the tracker saw of it, which is NEW. An HTTP connection sending a
+  request every 25 ms through `snapshot create` was reset at its 21st.
+- **The gate left state behind.** A connection open when the gate's chains are
+  removed keeps its entry with nobody tracking its FIN: ESTABLISHED, for the
+  5 days an established flow may idle, counted in guest run time, and every
+  later snapshot of that guest carries it. The table holds 8192.
+- **A stale tuple passed the closed gate.** A SYN on a tuple tracked as
+  ESTABLISHED is not NEW, so the listener accepted it and a restored clone
+  answered a client before publication. A fleet potato player answered a probe
+  that way and refused the wake message sent 0.1 ms later: one wake in 13,444
+  and one in 22,352, a round lost each time.
+
+The rule is now `-p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with
+tcp-reset` in both chains and both families (`TCP_NEW_FLOW_REJECT`).
+
+**Rules:**
+
+1. **Nothing the snapshot side installs may use connection tracking.** Attaching
+   the tracker changes what the guest's kernel does with every packet and leaves
+   entries behind.
+2. **What begins a flow is read off the packet where the protocol has such a
+   packet.** The tracker's memory outlives the connections it describes. For
+   TCP that packet is a SYN without ACK, with one exception the rule passes:
+   the ACK that completes a handshake the listener answered with a SYN cookie
+   (#2123). The restore covers it, below.
+3. **The restored clone's UDP rule is the exception, and only on the restore
+   side** (`udp_ingress_rule_args`): UDP has no packet that begins a flow. Its
+   doc says what it promises and what it does not.
+
+**Enforcement:** `a_syn_is_refused_whatever_the_tracker_holds_for_its_tuple`,
+`a_segment_of_an_open_connection_passes_untracked` and
+`no_rule_the_snapshot_side_installs_uses_connection_tracking` run a packet model
+over the chains `gate_chain_rules` builds.
+`a_stale_tracked_tuple_does_not_pass_a_restored_clones_closed_gate` and
+`a_snapshot_leaves_the_sources_tracked_connections_as_it_found_them`
+(`tests/test_snapshot_gate_tcp.rs`) hold both in a routed VM.
+
+### A SYN cookie's socket is the restore's to retire, not the gate's to refuse
+
+A listener whose SYN queue is full answers a SYN with a cookie and keeps
+nothing, so the client's bare ACK is the whole handshake to it, and the flag
+rule passes a bare ACK (#2123). The old `--ctstate NEW` rule reset that ACK
+unless the tracker held the tuple, by the fault that made it reset every other
+segment the tracker had not seen. Measured in a guest whose listener answers
+with cookies, the ACK held back until the clone is restored and its gate still
+closed: reset under the old rule, and under the flag rule an established socket
+in the published clone that no manifest names.
+
+On the source such a socket is the source's own, like any connection it
+accepts, and the snapshot does not touch `tcp_syncookies`: a snapshot does not
+reconfigure its source. On the clone the restore closes it in two steps
+(`restore_boundary_with`):
+
+1. **Its first step writes 0 to `net.ipv4.tcp_syncookies`**
+   (`FirewallGate::refuse_syn_cookies`), and a cookie's ACK is answered with a
+   reset from then on, as the gate answers a SYN. Publication writes back the
+   value read at the restore's start once the ingress half is gone, so a
+   publication that fails leaves the clone unpublished and still taking no
+   cookie. If the write fails three times the clone stays published without
+   SYN cookies, with a warning that names the value.
+2. **It lists the guest's TCP sockets itself**, with both halves of the gate
+   closed and receive processing drained, and retires what the manifest does
+   not name with what it does (`unlisted_sockets`).
+
+**A loopback peer does not say "inside the guest".** A client of a port
+published with `/loopback` is rewritten to 127.0.0.1 on the way in, and the
+manifest, which went by the address, left every such connection of the source
+established in every clone. A connection inside the guest has two sockets in
+the list, each the other's mirror image (`sockets_leaving_the_guest`), a
+dual-stack server's IPv4 client included. The manifest leaves a socket out when
+its peer is loopback and its mirror image is in the list (`manifest_sockets`);
+the restore keeps a socket the manifest does not name when its mirror image is
+in the list. A connection inside the guest over an address that is not loopback
+is in the manifest, as it always was: a routed clone moves to its own IPv6
+address, and the connection would be left with no route between its ends. No
+dump is one instant, so a socket that may stay and has no mirror image is
+looked for in one more dump before it is given up.
+
+Not every socket in the restore's list predates the restore. With the egress
+proxy, nat OUTPUT redirects an outbound connect to the proxy's loopback port
+before the gate's OUTPUT rule sees it, so a process that runs during the
+restore can connect behind the closed egress half. Its two sockets are not
+mirror images. One made before the list is retired with the rest and the
+process connects again; one made after it is in neither list and stays.
+
+The gate's chains, the socket list and the setting are each per network
+namespace, and each acts on the agent's own. That is where every listener of
+the workload is: the container runs with `--network=host`. A namespace a
+privileged workload makes for itself is outside all three, as it was outside
+the gate before (its traffic is forwarded, and the gate hooks INPUT and
+OUTPUT). What keeps the 0 out of a snapshot of a clone: the restore holds the
+boundary lock from its first step to publication, and a snapshot's prepare is
+refused from the restore's dispatch until its publication (`restore-under-way`,
+below). A restore that fails keeps the 0, drops the lock and leaves the mark,
+so the prepare stays refused until the agent's power-off lands. What can still
+capture it is a create whose prepare ran before the restore was dispatched and
+whose pause lands in the middle of it, which the host refuses (#2138).
+
+A socket the clone opens after that list is in neither list and is never
+retired, whatever tuple it reuses. `ModelDiag` fails if a socket made after the
+list is retired, or if the list is taken while cookies are still accepted;
+`ModelHook` if the hook runs while they are.
+`a_syn_cookie_handshake_does_not_reach_a_restored_clone` and
+`a_loopback_ports_client_connection_does_not_outlive_a_restore`
+(`tests/test_snapshot_gate_tcp.rs`) hold these in a routed VM.
+
+### A closed gate is somebody's: a source's boundary is owed until its host's resume opens it
+
+**A source's gate is closed only while a snapshot create is in flight on the host. Every
+exit from that opens it, or leaves the source running, gated and reported failed.** The
+prepare closes the gate and freezes the container;
+the resume one-shot undoes both. Three things used to break that, each a way to leave a
+source refusing new TCP for good or a clone open before its restore (#2142, #2140, #2138,
+and the model's F2):
+
+- a resume whose gate removal failed removed the manifest and thawed the container
+  anyway, and nothing tried again;
+- an fc-agent that died between the prepare and the resume took the exec server with it,
+  so no resume could run, and on Firecracker its successor waited for ever for a boot
+  plan that comes through the closed egress half;
+- the one-shots and the freeze watchdog acted on a restoring clone as on a source.
+
+**A `/loopback` port's client is outside the guest whatever the list holds**
+(#2152). The rewrite gives it a source port of a reserved range
+(`network::LOOPBACK_CLIENT_PORTS`, 61000 to 65535, above the guest's ephemeral
+ports), and the agent records which guest ports are published with `/loopback`
+(`/run/fcvm/loopback-client-ports`). The socket at 127.0.0.1 and one of those
+ports whose peer is 127.0.0.1 at a port of the range never stays. With the
+client's own port kept, a client from source port P to guest port P was its own
+mirror image. Both halves are needed: by the peer's port alone, a connection
+inside the guest to a service that listens in 61000 to 65535 would be reset at
+every restore.
+
+**The guest never opens an owed gate by itself.** A clone whose restore has not been
+dispatched is, byte for byte, its source after the resume, so a rule in the guest that
+opens a source's gate also opens that clone's. Only the host knows which a guest is, and
+it says "a source, and its snapshot is over" by running `--resume-snapshot-network`. The
+guest's part is that the request can always be served and that a served request either
+opens the gate or leaves the boundary owed.
+
+Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
+`fc-agent/src/snapshot_network.rs`); they are in guest memory, so in the image:
+
+| mark | written | removed | while it is there |
+|---|---|---|---|
+| `snapshot-boundary-owed` | by the prepare, under the boundary lock, before the freeze and the gate | by the resume that opened the gate; by a restore when it is dispatched | a resume that fails leaves it, the manifest and the freeze; an fc-agent that starts and finds it opens exec at once, for the resume one-shot alone (`exec::serve_only_the_boundary_resume`) |
+| `restore-under-way` | when a restore's epoch is dispatched, before anything else of the restore | at publication, before the acknowledgement | both one-shots refuse with exit 3, before they wait for the boundary lock, and change nothing; the freeze watchdog does not count its looks |
+
+- **The host asks until the gate is open** (`reopen_source_network`,
+  `src/commands/common.rs`): for 150 s in all, 2 s between tries, every try cut off at
+  what is left (the exec's connect is tried for about 54 s, and the one-shot's run is
+  limited too). The create holds the per-VM snapshot lock and the global permit for that
+  long. An agent that died is back about a second later (`RestartSec=1`), so the first
+  ask usually lands; the bound also covers systemd's 90 s stop timeout. A guest that
+  refuses with exit 3 is not asked again.
+- **A source still gated then is left running and reported failed.** The host does not
+  end it: the connections it has go on working behind the gate. (A source whose agent
+  died is another matter today: see #2158 below.) The create fails with
+  `source VM <id> is LEFT WITH ITS NETWORK GATE CLOSED`. The VM's state records
+  `network_gate_closed` before the first ask, so a create interrupted while it asks, in
+  its first try as in any later one, leaves the record, and the try that opens the gate
+  clears it. A reopen that needs one try leaves the state as it found it. The next
+  `snapshot create` of that VM asks once more, as its first step, and is refused while
+  the gate stays closed (`refuse_a_source_left_gated`).
+- **An agent that starts in the middle of a boundary serves exec first and starts no
+  container.** It opens exec before its boot plan, for the resume alone, and holds the
+  container's start (`hold_the_container_start_through_a_boundary`) while a restore is
+  under way, or while the `owed` mark is there and the gate is installed. The mark alone
+  does not hold: it can outlive its gate. On Cloud Hypervisor the plan comes over vsock,
+  outside the gate, and the restarted agent used to go on to its container start while
+  the prepare believed the guest frozen.
+- **The agent's death still ends the VM** (#2158). systemd kills the container with the
+  agent, the next agent's `podman start` of it fails with 125, and the VM powers off
+  about a second after its boot plan arrives, with or without a snapshot in sight. On
+  Cloud Hypervisor the plan comes at once, so the same happens when the hold on the
+  container's start ends. For a death in the middle of a boundary this section buys a
+  gate that is reopened and no source left running behind a closed gate. It does not
+  keep the source; #2158 is to change that.
+- **A create whose source's agent died in the boundary fails and discards its image.**
+  The agent that starts with the boundary owed writes that into the `owed` mark
+  (`note_the_agent_restarted_in_a_boundary`), the resume reports it on its stderr, and
+  the host fails the create on the report once the gate is open
+  (`resume_paused_source`). An agent that died between the prepare's reply and the pause
+  is in the image, dead or starting, with the container systemd killed; on Firecracker a
+  clone of that image would wait for a boot plan behind its closed gate until the host
+  ended it, and the image can be a cached startup snapshot. The host cannot tell that
+  death from one after the pause, so both fail.
+- **The hold gives up after 300 looks, one a second, that find the gate closed and
+  nobody at work on the boundary, and the agent then goes on to its container start
+  behind the closed gate.** A look that finds someone holding the boundary lock is not
+  counted and starts the count again, so a count begun under one create cannot run out
+  inside a later one's boundary; at most 900 looks go uncounted, as for the watchdog, so
+  a one-shot hung under the lock cannot hold the start for good. 300 looks is twice the
+  host's 150 s, so no create is in flight any more: it has
+  failed and recorded the source gated, or its host is gone, and nothing believes the
+  guest frozen. A create that comes later freezes the container like any running one.
+  The freeze watchdog thaws a frozen container in the same state for the same reason.
+- **The watchdog's deadline is for a boundary nobody is working on.** A look while the
+  boundary lock is held or a restore is under way is not counted
+  (`snapshot_network::boundary_in_progress`), so a restore or a prepare that takes over a
+  minute keeps its container frozen. A source whose host died, or whose gate cannot be
+  opened, is still thawed after 60 counted looks. At most 900 looks at one freeze go
+  uncounted (15 minutes, the host's bound on a restore's acknowledgement), so a one-shot
+  hung under the lock cannot keep a container frozen for good. A lock that cannot be
+  opened is not "held".
+- **`rcu_expedited` is put back after a kill** (#2141). The barrier records the switch's
+  value in `/run/fcvm/rcu-expedited-before` before it turns it on; the next barrier, the
+  next resume and the next start of the agent put it back from the record. The resume
+  does it before it tries the gate and whatever comes of that, so a reopen that never
+  lands does not leave the switch on for the next snapshot to capture. The undo writes
+  the recorded 0 even if someone set the switch to 1 on purpose meanwhile, and a guest
+  whose host died keeps the 1 until its agent restarts or its next snapshot.
+- Not covered: the host's `snapshot create` dying as well (#1936, #1941), and a stray
+  one-shot on a clone before its restore is dispatched, which only the host can refuse
+  (#2138's host half).
+
+`a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and_the_resume` and
+`a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs_deadline`
+(`tests/test_snapshot_gate_tcp.rs`) hold these in a VM. The first reads the host's logs
+only (the one-shot's report, and the new agent's boot plan arriving through the egress
+half): the guest is gone too soon after the restart to be asked anything.
+
 ### On restore, the gate's egress half opens before the stale sockets are retired
 
 The restored clone inherits the gate closed in both directions. Every daemon
@@ -146,9 +379,12 @@ system configs. With the restore hook inside that window (4 to 35 s, where the
 window had been about 0.1 s) a www clone served 500s for as long as it lived
 (2026-10-14, `Sitevar FBLOGGER_CONFIG could not be loaded from Configerator` on
 every request, with a no-op hook as well as the real one). So the OUTPUT half
-of the gate is removed as soon as the receive barrier has drained, before the
-first socket is retired (a socket opened from then on is not in the manifest,
-so the cookie-bound retirement never touches it), the restore remounts NFS and
+of the gate is removed before the first socket is retired. Three steps come
+between the receive barrier and that: a routed clone's move to its own IPv6
+address, the load of the manifest, and the restore's own list of the guest's
+sockets. A socket opened after that list is in neither list, so the
+cookie-bound retirement never touches it; one opened before it with no mirror
+image in the list is retired as unlisted. Then the restore remounts NFS and
 waits for the exec server and the egress proxy, the hook runs last, and the
 INPUT half is removed after it: publication. `ModelDiag` fails if a socket is
 retired with egress closed, `ModelHook` if the hook runs with egress closed or
@@ -245,6 +481,71 @@ forward only (`bootplan::advance_system_clock`): the host's instant is a lower b
 on the present, and the `default` profile keeps the clock running through a pause.
 `test_source_clock_matches_the_host_after_snapshot_create` measures it;
 `every_reopen_after_a_pause_sets_the_sources_clock` pins the host side.
+
+### A clone is snapshotted only after its restore is acknowledged
+
+A restored clone resumes behind the gate, with its container frozen and the source's
+sockets in it, and its guest opens ingress only after it has retired those sockets and run
+the restore hook. The snapshot one-shots do not know whose gate they are handling. Run in a
+clone that has not got there, `--resume-snapshot-network` (or the reopen after a failed
+prepare) removes both halves of the gate and the manifest and thaws the container, and the
+prepare freezes a container a restore hook is running in. On main at 1df89a80e a `snapshot
+create` of a clone held before the boundary exited 0 in 0.2 s; after it a client outside got
+HTTP 200 from a clone `snapshot run` had not reported, with the source's connection still
+established in it, and the clone's restore then failed on the missing manifest (#2138).
+
+So `fcvm snapshot create` refuses a VM whose state says it was restored (`process_type:
+clone`) and not acknowledged (`restore_acknowledged` absent), before anything reaches its
+guest or its VMM (`ensure_restore_acknowledged`, `src/commands/common.rs`). `snapshot run`
+writes `restore_acknowledged` under the state lock when it has the guest's acknowledgement
+and BEFORE it prints the restored record, so the rule for a caller is: the record is
+printed, a create is taken. It is never written for a restore that failed (the state then
+says `failed`) or for `podman prepare`'s disposable VM. The check keys on the
+acknowledgement and not on `lifecycle_ready`, which is written later, after the output
+handshake and the port check: keyed on that, a create issued when the record appeared was
+refused. `lifecycle_ready` still admits a state from before the field existed.
+
+Acknowledged is not yet published. The owner still has its output handshake and its port
+check to do, and a snapshot pauses the guest: a pause longer than the port check's 5 s
+fails the check, and the owner then tears down the VM being saved. So the owner takes the
+per-VM snapshot lock before it records the acknowledgement and holds it until it has
+published `lifecycle_ready` or recorded the failure, and a create asked for at the record
+is taken and WAITS on that lock, then reads the state again. A clone whose state says
+`failed` is refused, acknowledged or not. The lock is an open file of the owner, so every
+exit gives it back. Lock order: snapshot generation locks, then the per-VM snapshot lock,
+then the state lock inside each state write; the owner holds no generation lock while it
+holds the per-VM one. The owner's output handshake has no bound of its own, so the create
+gives up after `RESTORE_PUBLICATION_LIMIT` (60 s; the stretch measured 7 ms) with an error
+that names what it waited for.
+
+The refusal itself needs no lock against the restore. `StateManager` never writes
+`restore_acknowledged` back to false for the same process (a save of a stale copy and an
+update both keep it), and every restore has a VM id of its own, so a state that reads
+acknowledged stays so; the create reads it under the per-VM snapshot lock after it has tied
+the state to the process it snapshots. `--stop` refuses before it arms the guard that
+stops the VM, so a refused clone is left running. A caller that learns a clone is up from
+the clone's own ports (the potato ring, a Minecraft fork) is a few milliseconds ahead of
+the record and passes `--await-restore SECONDS`, which waits on the state file's change
+and ends early when the restore fails. The owner's own snapshots (a startup snapshot,
+`podman prepare`) run in its task after it has given the lock back and are not checked.
+
+This covers `snapshot create`. `fcvm exec` can run the guest's one-shots directly, and the
+guest's own refusal of them during a restore is #2154.
+
+`a_snapshot_of_a_clone_is_refused_until_its_restore_is_acknowledged`
+(`tests/test_snapshot_clone.rs`) holds a clone at `restore.pre_gate_verify`, in its restore
+hook and after a failed restore, and requires the refusal and an unchanged guest each time;
+it also holds a clone's owner between its restored record and its port check and requires a
+create issued at the record to wait for the publication. The state in which main
+opened the gate is one step before that hold, with the boundary lock free, and fc-agent has
+no failpoint there; the test file says what holding it takes.
+`a_snapshot_is_refused_until_the_restore_is_acknowledged`,
+`snapshot_create_refuses_an_unacknowledged_restore_before_it_reaches_the_vm`,
+`the_acknowledgement_is_recorded_before_the_restored_record_is_printed`,
+`the_owner_holds_the_snapshot_lock_from_the_acknowledgement_to_publication`,
+`a_create_waits_for_the_owners_publication_and_no_longer_than_its_limit` and
+`an_acknowledged_restore_is_never_taken_back_by_a_later_write` pin the decision, where it
+sits and what it rests on.
 
 ## A FLEET MODE IS UP ONLY WHEN A VIEWER GETS ITS PIXELS
 
@@ -819,9 +1120,14 @@ Enforcement: `tests/test_ci_workflow_coverage.rs` fails if `ci.yml` reintroduces
 ### CI runs on the top of a stack, not on every layer
 
 A draft PR runs no tests, and neither does a PR that another open PR from this repository is
-stacked on (`scripts/ci-pr-scope.sh`). Their run ends in a check named **`Summary (deferred)`**,
-never `Summary`, so it can never be read as a pass. Push the stack as drafts, mark it ready, and
-the top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
+stacked on (`scripts/ci-pr-scope.sh`), when that other PR is not a draft and its head contains
+this one's. A draft tests nothing, so a ready PR under a draft runs the matrix itself, and so
+does one whose child's draft state cannot be read. Their run ends in a check named
+**`Summary (deferred)`**, never `Summary`, so it can never be read as a pass. Push the stack as
+drafts and mark every layer ready back to back. A layer whose run starts while the PR above it
+is still a draft runs the matrix itself and nothing cancels that run, so flips spaced apart
+from the bottom up can cost one run per layer on the self-hosted fleet; from the tip down they
+cannot. The top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
 `main`, not only the top PR's files, so a docs-only top cannot skip the matrix for code changed
 lower down.
 
@@ -2747,6 +3053,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Network namespace with bridge (br0) connecting TAP and veth for L2 forwarding
 - Proxy NDP on default interface makes VM IPv6 routable from network fabric
 - ip6tables MASQUERADE for AWS VPC source/dest checks (skipped when `--ipv6-prefix` is set)
+- With `--ipv6-prefix`, the host gets one ip6tables rule per prefix (`hairpin_rule`): `FORWARD -i <uplink> -o <uplink> -d <prefix> -j REJECT --reject-with icmp6-addr-unreachable`. The network routes the prefix to the host whether or not a VM holds an address, and a packet for an address no VM held left by the default route and came straight back until its hop limit ran out: 9,560 of the 10,291 packets captured for one address in 64 s were one SYN going out and in again (#2109). The rule answers that packet the first time it comes back and matches nothing else: what the host sends is not forwarded, and a VM's traffic enters or leaves by its veth. It is host configuration fcvm adds once per prefix per boot and never removes (`hold_hairpin_rule`). A record in `/run/fcvm/routed-ipv6` (`hairpin-<network>-<len>.rule`, tmpfs, so a reboot clears it with the ruleset) lists the uplinks it was added for, and a launch that finds its uplink there runs no process. The record is a hint: a ruleset reload (`nft flush ruleset`, a firewalld restart) removes the rule and not the record, and `rm /run/fcvm/routed-ipv6/hairpin-*.rule` makes the next routed launch add it again
 - Port forwarding via built-in TCP proxy (setns + tokio relay). A mapping with a HOSTIP (`--publish '[::]:80:80'`) listens on that address, and `[::]` accepts IPv4 and IPv6 clients. A mapping without one listens on the VM's unique loopback IP (same allocation as rootless), which is allocated only when a mapping needs it
 - IPv4 stays internal to namespace (health checks only); all external traffic uses IPv6
 - Egress proxy is NOT used — IPv6 goes natively through the kernel stack
@@ -3060,12 +3367,26 @@ separately.
   is answered with zeros and recorded like any other. The window starts
   at the clone's UFFD handshake and defaults to 300 s (`--uffd-prefetch-record-window` /
   `FCVM_UFFD_PREFETCH_RECORD_WINDOW`; 0 records nothing; issue #858). Later faults are
-  served but not recorded. On handler exit the bitmap is unioned into the serve
-  process's in-memory set and scheduled onto one bounded, coalescing background writer. The
-  writer publishes `<memory.bin>.working-set` beside the snapshot under an `flock` + atomic
-  rename, and only writes when the union actually grew — so the steady state writes nothing,
-  and a clone that was killed mid-restore gets completed by the next one instead of baking in
-  a truncated set. Persistence is a performance hint: sidecar lock contention skips that
+  served but not recorded. Only a few clones record (#955; before, every clone's window was
+  unioned in, so the set grew with every clone of a snapshot): at most
+  `RECORDING_CLONES` (4) clones of a server record at once, and a set whose sidecar counts
+  four complete recordings is frozen. A recording is complete when its window closed and it
+  saw a page; a clone killed before then, or one that never faulted, merges what it saw and
+  gives its slot to the next clone. The sidecar carries the count (format version 3: a v2
+  sidecar is dropped and re-recorded on upgrade, and an older serve sharing the snapshot
+  rewrites v2 over it, which loses the hint and corrupts nothing). Each publication adds the
+  server's unpublished complete recordings to the count on disk, so servers that record at
+  once sum their counts, and a serve per restore (the implicit server of `snapshot run
+  --snapshot`) freezes the set at the fourth complete restore, not the first. When one wave
+  of overlapping restores passes four together, that wave's union is kept and the count
+  stops at four. A publication the busy sidecar skipped is retried on the fault handler's
+  10 s progress tick, when the clone exits, and once more at shutdown, after the stopping
+  server's writer has drained. The server logs `froze the recorded working set` once; to
+  re-record, stop the serve, delete the sidecar and start it again. A recording clone's
+  bitmap is unioned into the serve process's in-memory set when its window closes, while the
+  clone keeps running, or when it exits first, and scheduled onto one bounded, coalescing
+  background writer. The writer publishes `<memory.bin>.working-set` beside the snapshot under
+  an `flock` + atomic rename, and only writes when the union or the count changed. Persistence is a performance hint: sidecar lock contention skips that
   publication attempt without delaying clone teardown or admission slots; the in-memory union
   remains available for the next request. A stopping server waits up to 10 s for publications
   already scheduled, after its last clone has gone: without the wait a serve stopped right
@@ -3236,13 +3557,12 @@ separately.
   takes only the sidecar's own lock, because the create already holds the generation lock
   exclusively. A parent that is the target itself, a different image length, or any read or
   write failure logs a warning and leaves the snapshot without a set. The inherited
-  set is a hint like any other: serves of the new snapshot keep recording on top of it, and
-  since sets only grow, a long chain of inherited sets grows with it (#955). Measured on a
-  128 GiB guest, one per-diff snapshot: a clone of it with the inherited set (13.7 M pages)
-  was ready in 317 s, the same as with a set recorded for it in a 485 s pass (6.6 M pages, 315 s)
-  and against 606 s with no set, but held 52.7 GiB at healthy against 25.4 GiB. Inheriting
-  skips the recording pass at the price of every clone's memory, until a recording that
-  replaces the set (rather than adding to it) takes its place.
+  set is a hint like any other, and it carries the parent's count of complete recordings
+  (#955): a set the parent froze is replayed as it is, so a snapshot whose workload differs
+  from its parent's keeps the parent's set until its sidecar is deleted, and a set with fewer
+  than four takes recordings on top. Inheriting skips the recording pass; when the parent's
+  set holds more than the child's workload touches, every clone pays for it in memory
+  (#955), and deleting the sidecar makes the next serve record the snapshot's own set.
 - **Import (`snapshot import`)**: an import writes a `config.json` with a new generation id and
   a memory image with a new mtime, so the archived sidecar's key is the key of nothing on the
   importing host. When the import reaches the sidecar's entry it compares the staged memory
@@ -3269,15 +3589,35 @@ separately.
   arm — no recording, no replay, no files. In minor mode the replay line's
   `filled_holes_mapped` counts the pages replay mapped at holes earlier clones filled.
 - **Replay trades memory for latency.** A replaying clone materialises the recorded set at
-  restore instead of faulting it in as it runs. Commit 86a05b9a reports, from a Chromium run
-  that is not committed, that 98% of faults arrived within 750 ms. The set is a union over
-  clones' recording windows and only grows. In copy mode every replayed page is a private
-  copy, so a clone also holds pages it would never have touched, including a clone that is
-  created and destroyed at once. On one 128 GiB guest the set grew from 3.7M pages after one
-  clone to 9.4M after six (issue #955). PR #956 measured two clones on that guest at first
-  healthy. They held 23.0 and 23.2 GiB of private memory when replay planned 3.7M of the
-  9.4M recorded pages (main's run cap at the time), and 35.8 and 35.9 GiB when it planned
-  all 9.4M. Turn replay off for workloads that spawn many clones which never run, or
+  restore instead of faulting it in as it runs. The set is a union over the recording
+  windows of a generation's first few clones (above). With three waves of 1000 rootless
+  nginx clones per snapshot at C=128, each held 330 s, past the 300 s window (256 MiB
+  guests; m8gd.metal-24xl, Ubuntu's 7.0.0-1018-aws, btrfs on NVMe RAID0; one snapshot per
+  arm, #2056), the set held 68 MiB with every clone's window unioned and 66 MiB with the
+  bound, and wave 3's private memory was 68.5 and 69.9 MiB per clone. With the guest's
+  120 s boot burst gone (#2052) these clones' windows record the same pages, so on this
+  workload the bound changes nothing; it bounds growth where windows differ. Where they
+  differ it holds the set. Seven clones in turn, one run per arm, each reading a different
+  128 MiB of an 896 MiB tmpfs file that the snapshot of a 2 GiB alpine guest holds, inside a
+  60 s window, the seventh repeating the first's 128 MiB (c8gd.metal-24xl, Ubuntu's
+  7.0.0-1018-aws, btrfs on NVMe RAID0; private memory is the clone's Firecracker
+  `Anonymous` after its read):
+
+  | clone | set after it, MiB (all windows / bound) | clone private memory, MiB (all windows / bound) |
+  |---|---|---|
+  | 1 | 316 / 321 | 182 / 174 |
+  | 2 | 455 / 456 | 393 / 381 |
+  | 3 | 586 / 587 | 530 / 512 |
+  | 4 | 721 / 718 | 662 / 643 |
+  | 5 | 851 / 718 | 792 / 774 |
+  | 6 | 982 / 718 | 923 / 776 |
+  | 7, as 1 | 982 / 718 | 923 / 645 |
+
+  The repeat clone was no slower with the bound (all windows first, then the bound): 877
+  and 1,216 demand faults, replay 59 and 43 ms, restore acknowledged in 52 and 44 ms. In copy
+  mode every replayed page is a private copy, so a clone also holds pages it would never have
+  touched, including a clone that is created and destroyed at once (#955, #956). Turn replay
+  off for workloads that spawn many clones which never run, or
   bound what each clone replays with `--uffd-prefetch-max-mib` (`FCVM_UFFD_PREFETCH_MAX_MIB`
   for the implicit server): replay stops planning once it has passed that much of the set,
   and the rest faults on demand (#955). Unbounded by default.
@@ -3372,8 +3712,9 @@ with the granule.
 - **Limitation: recording under the option is thin, and replay does not make up for it**:
   only the demanded page is recorded, and a page that fault-around installed is never
   recorded, because the guest never faults on it. So with the option on the recorded working
-  set converges one demanded page per granule per clone: clone 1 faults on A and records A,
-  clone 2 replays A alone, faults on B and records B, and so on. Replay restores the
+  set holds about one demanded page per granule: clone 1 faults on A and records A,
+  clone 2 replays A alone, faults on B and records B, and so on, until four complete
+  recordings freeze the set. Replay restores the
   recorded pages and nothing more, so it never restores what fault-around would have
   installed. That is a reason to record with the option off: a set recorded that way holds
   every page the guest faulted on, not one per granule.
@@ -3382,7 +3723,7 @@ with the granule.
   demanded pages are sparse: at 64 KiB, 14.5 of the 16 pages of a granule were installed
   beyond demand. Expanding every recorded run would multiply the replayed memory by up to
   the granule factor, in a restore the option already slows. Not expanding costs one extra
-  fault per granule per clone until the set converges.
+  fault per missing page in every clone.
   `replay_populates_only_the_recorded_pages_with_fault_around_on` pins it.
 - **What the option leaves behind**: the sidecar stays a record of demand, so it is still
   valid with the option off or with a smaller granule. It is thinner than a record made
