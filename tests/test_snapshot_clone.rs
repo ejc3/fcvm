@@ -3697,7 +3697,9 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
         "\nStep 3: Running clone with --snapshot {} (direct file mode)...",
         snapshot_name
     );
-    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+    // The clone's Firecracker logs at Info whatever the caller's environment says: the check
+    // below reads a line Firecracker writes at that level.
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_env(
         &[
             "snapshot",
             "run",
@@ -3706,7 +3708,7 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
             "--name",
             &clone_name,
         ],
-        &clone_name,
+        &[("FCVM_FIRECRACKER_LOG_LEVEL", "Info")],
     )
     .await
     .context("spawning clone from snapshot (direct mode)")?;
@@ -3717,10 +3719,10 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
     // On x86_64, Firecracker ends a snapshot load with a paravirtual kick for the runnable
-    // vCPUs (#2131) and says so in its log at Info, the level fcvm asks for unless
-    // FCVM_FIRECRACKER_LOG_LEVEL says otherwise. A build without the fix logs nothing of the
-    // kind. The line shows the step ran. It does not show that a vCPU needed the kick (an
-    // idle guest's vCPUs are halted and get none) or that the host kernel kept it.
+    // vCPUs (#2131) and says so in its log at Info, the level the clone was started with. A
+    // build without the fix logs nothing of the kind. The line shows the step ran. It does
+    // not show that a vCPU needed the kick (an idle guest's vCPUs are halted and get none)
+    // or that the host kernel kept it.
     let clone_state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
         .load_state_by_pid(clone_pid)
         .await
@@ -3734,7 +3736,7 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
                 .lines()
                 .any(|line| line.contains("restored vCPUs a paravirtual kick")),
             "Firecracker's log at {} does not say the restore kicked the runnable vCPUs: the \
-             pinned build restores a snapshot without the kick, or its log level is above Info",
+             pinned build restores a snapshot without the kick",
             vmm_log_path.display()
         );
         println!("  ✓ The restore ran its kick of the clone's runnable vCPUs");

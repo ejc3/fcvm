@@ -182,7 +182,7 @@ X
   mapfile -t unused < <(systemctl list-unit-files --no-legend --plain "${unused[@]}" | awk '{print $1}')
   [ "${#unused[@]}" = 0 ] || systemctl disable "${unused[@]}"
   # The host runs fcvm's host kernel ([kernel_profiles.nested.amd64.host_kernel]: the pinned
-  # release with kernel/patches-x86, configured from Ubuntu's own), not Ubuntu's. Ubuntu's 7.0
+  # release with kernel/patches-x86-host, configured from Ubuntu's own), not Ubuntu's. Ubuntu's 7.0
   # kernel lacks Linux 25ae123db10b, so tearing down many VMs at once held RTNL for seconds
   # and stalled every namespace creation (#1563, kernel/README.md). It is built on the instance
   # store (store.sh mounts it empty), installed to /boot as GRUB's default, and booted by the
