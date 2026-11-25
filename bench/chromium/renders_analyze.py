@@ -74,7 +74,19 @@ def analyze(out, skip_s, last_s):
     harness = [s["harness"] for s in window]
     hp = (harness[-1]["pressure_usec"] or 0) - (harness[0]["pressure_usec"] or 0)
     hu = (harness[-1]["usage_usec"] or 0) - (harness[0]["usage_usec"] or 0)
+    parts = {}
+    for name in (harness[0].get("parts") or {}):
+        a, b = harness[0]["parts"][name], harness[-1]["parts"][name]
+        parts[name] = {
+            "cpu_pressure": round(((b["pressure_usec"] or 0) - (a["pressure_usec"] or 0)) / 1e6 / seconds, 3),
+            "cores_busy": round(((b["usage_usec"] or 0) - (a["usage_usec"] or 0)) / 1e6 / seconds, 2),
+        }
+    probes = {side: sorted((h["replay_ms"].get(side) if h["replay_ms"].get(side) is not None else float("inf"))
+                           for h in harness) for side in ("fcvm", "kitesurf")}
     result["harness"] = {
+        "parts": parts,
+        "replay_ms_median": {side: round(statistics.median(v), 2) for side, v in probes.items()},
+        "replay_ms_p90": {side: round(v[int(0.9 * len(v))], 2) for side, v in probes.items()},
         "cpu_pressure": round(hp / 1e6 / seconds, 3), "cores_busy": round(hu / 1e6 / seconds, 1),
         "replay_ms_max": {side: max((h["replay_ms"].get(side) or 0) for h in harness)
                           for side in ("fcvm", "kitesurf")},

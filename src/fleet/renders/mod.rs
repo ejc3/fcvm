@@ -584,6 +584,8 @@ struct Module {
     records: std::io::BufWriter<std::fs::File>,
     samples: std::io::BufWriter<std::fs::File>,
     harness: CpuCgroup,
+    /// Its parts, by name, for their own counters: each side's replay and the drivers.
+    harness_parts: Vec<(&'static str, CpuCgroup)>,
     /// The harness's CPU pressure counter over the last ticks: when (ms), usec.
     harness_pressure: std::collections::VecDeque<(u64, u64)>,
     /// Each side's replay's time to answer one request, as a client sees it; none when it
@@ -900,10 +902,21 @@ impl Module {
         sample["recycles"] = json!(self.recycles);
         sample["restarts"] = json!(self.restarts);
         sample["hugepages"] = json!({"total": pool, "room": room});
+        let parts: BTreeMap<&str, Value> = self
+            .harness_parts
+            .iter()
+            .map(|(name, group)| {
+                let counters = json!({
+                    "pressure_usec": group.pressure_usec(), "usage_usec": group.usage_usec(),
+                });
+                (*name, counters)
+            })
+            .collect();
         sample["harness"] = json!({
             "pressure_usec": self.harness.pressure_usec(),
             "usage_usec": self.harness.usage_usec(),
             "replay_ms": {SIDES[0]: self.replay_ms[0], SIDES[1]: self.replay_ms[1]},
+            "parts": parts,
         });
         let _ = writeln!(self.samples, "{sample}");
         let _ = self.samples.flush();
@@ -972,18 +985,22 @@ fn setup_values(given: &[String]) -> Result<[BTreeMap<String, String>; 2]> {
     Ok(out)
 }
 
-/// The harness's CPUs as the two replays' and the drivers': a quarter, a quarter, the rest.
-fn split_harness(cpus: &[u32]) -> Result<[Vec<u32>; 3]> {
+/// The harness's CPUs as the two replays' and the drivers': `each` for each replay and the
+/// rest for the drivers. With `each` 0 nothing is split: all three run on the whole set,
+/// in cgroups of their own for the counters.
+fn split_harness(cpus: &[u32], each: usize) -> Result<[Vec<u32>; 3]> {
+    if each == 0 {
+        return Ok([cpus.to_vec(), cpus.to_vec(), cpus.to_vec()]);
+    }
     anyhow::ensure!(
-        cpus.len() >= 4,
-        "the harness needs at least 4 CPUs, not {}",
+        cpus.len() > 2 * each,
+        "{} harness CPUs leave none for the drivers beside two replays of {each}",
         cpus.len()
     );
-    let q = cpus.len() / 4;
     Ok([
-        cpus[..q].to_vec(),
-        cpus[q..2 * q].to_vec(),
-        cpus[2 * q..].to_vec(),
+        cpus[..each].to_vec(),
+        cpus[each..2 * each].to_vec(),
+        cpus[2 * each..].to_vec(),
     ])
 }
 
@@ -1104,7 +1121,8 @@ async fn run(
         CpuCgroup::create(unit, CGROUPS[1], &cpus_engines).map_err(anyhow::Error::msg)?;
     engines_group.enable("memory").map_err(anyhow::Error::msg)?;
     let harness = CpuCgroup::create(unit, CGROUPS[2], &cpus_harness).map_err(anyhow::Error::msg)?;
-    let [replay_f, replay_e, driver_cpus] = split_harness(&cpus_harness)?;
+    let [replay_f, replay_e, driver_cpus] =
+        split_harness(&cpus_harness, args.replay_cpus as usize)?;
     let replay_groups = [
         harness
             .child("replay-fcvm", &replay_f)
@@ -1459,6 +1477,12 @@ async fn run(
     wall.serving(overlay.as_ref().map(|o| o.seq));
     wall.order(&RendersOrder { run: true, overlay }, now);
 
+    let [replay_fcvm, replay_engines] = replay_groups;
+    let harness_parts = vec![
+        ("replay-fcvm", replay_fcvm),
+        ("replay-engines", replay_engines),
+        ("drivers", drivers_group),
+    ];
     let mut module = Module {
         pages,
         wall,
@@ -1475,6 +1499,7 @@ async fn run(
         records: std::io::BufWriter::new(std::fs::File::create(args.out.join("renders.jsonl"))?),
         samples: std::io::BufWriter::new(std::fs::File::create(args.out.join("samples.jsonl"))?),
         harness,
+        harness_parts,
         harness_pressure: Default::default(),
         replay_ms: [None; 2],
         out: args.out.clone(),
@@ -1718,11 +1743,15 @@ mod tests {
     #[test]
     fn the_harness_is_split_into_two_replays_and_the_drivers() {
         let cpus: Vec<u32> = (80..96).collect();
-        let [f, e, d] = split_harness(&cpus).unwrap();
+        let [f, e, d] = split_harness(&cpus, 4).unwrap();
         assert_eq!(f, (80..84).collect::<Vec<_>>());
         assert_eq!(e, (84..88).collect::<Vec<_>>());
         assert_eq!(d, (88..96).collect::<Vec<_>>());
-        assert!(split_harness(&[1, 2, 3]).is_err());
+        assert!(split_harness(&cpus, 8).is_err());
+        assert!(split_harness(&[1, 2, 3], 2).is_err());
+        // not split: one pool for all three
+        let [f, e, d] = split_harness(&cpus, 0).unwrap();
+        assert_eq!((f.len(), e.len(), d.len()), (16, 16, 16));
     }
 
     #[test]

@@ -22,7 +22,7 @@
 #   DIST         the engine bundle (default $KITESURF/dist)
 #   LEVELS       F,K: hold these renders in flight and run no search
 #   SECONDS_RUN  stop after this many seconds of rendering (default 0: until a signal)
-#   MAX_FCVM, MAX_ENGINES, RECYCLE_MIB, REPLAY_PROCS, VIEWPORT, CPUS_FCVM, CPUS_ENGINES,
+#   MAX_FCVM, MAX_ENGINES, RECYCLE_MIB, REPLAY_PROCS, REPLAY_CPUS, VIEWPORT, CPUS_FCVM, CPUS_ENGINES,
 #   CPUS_HARNESS, TIMEOUT_S   the module's flags of those names, when set
 #   IMAGE, CPU, MEM   the snapshot is made from IMAGE with CPU vCPUs and MEM MiB when it is
 #                absent (the module's defaults: the bench image, 4, 1024, on 2 MiB pages)
@@ -60,6 +60,7 @@ module_args() {
     [ -z "${MAX_ENGINES:-}" ] || printf '%s\0' --max-engines "$MAX_ENGINES"
     [ -z "${RECYCLE_MIB:-}" ] || printf '%s\0' --recycle-mib "$RECYCLE_MIB"
     [ -z "${REPLAY_PROCS:-}" ] || printf '%s\0' --replay-procs "$REPLAY_PROCS"
+    [ -z "${REPLAY_CPUS:-}" ] || printf '%s\0' --replay-cpus "$REPLAY_CPUS"
     [ -z "${VIEWPORT:-}" ] || printf '%s\0' --viewport "$VIEWPORT"
     [ -z "${CPUS_FCVM:-}" ] || printf '%s\0' --cpus-fcvm "$CPUS_FCVM"
     [ -z "${CPUS_ENGINES:-}" ] || printf '%s\0' --cpus-engines "$CPUS_ENGINES"
