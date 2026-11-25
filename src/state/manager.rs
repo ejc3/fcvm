@@ -236,6 +236,33 @@ fn slot_name(name: &str) -> String {
     hex::encode(sha2::Sha256::digest(name.as_bytes()))
 }
 
+/// What a claim has made and not yet handed to a published state
+/// (`StateManager::claim_name_with_hooks`): its claim directory, and its token once the claim
+/// is renamed onto the name's slot. Dropped while armed, on an error return or when the
+/// claim's future is dropped, it removes both, and the slot when that leaves it empty, so
+/// the name is free again without this process exiting. Everything it removes carries this
+/// claim's own identity in its name, and a slot with another claim's token in it is not
+/// removed. The undo is a few unlinks and an rmdir, blocking calls made from `drop`, as
+/// the error path made them before.
+struct ClaimUndo {
+    claim: PathBuf,
+    token: PathBuf,
+    armed: bool,
+}
+
+impl Drop for ClaimUndo {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        remove_claim_dir(&self.claim);
+        let _ = remove_if_exists(&self.token);
+        if let Some(slot) = self.token.parent() {
+            let _ = std::fs::remove_dir(slot);
+        }
+    }
+}
+
 /// Remove a claim directory and the token in it. Best effort: what a failure leaves names
 /// its owner, and the sweep removes it once that process is gone.
 fn remove_claim_dir(claim: &Path) {
@@ -1115,6 +1142,15 @@ impl StateManager {
     /// With a PID, the state is also entered in the PID index (`pid/<pid>.<vm_id>`), under
     /// the same lock, which is what lets `load_state_by_pid` find it without a scan.
     pub async fn save_state(&self, state: &VmState) -> Result<()> {
+        self.check_layout_for_write().await?;
+        self.write_state(state)
+    }
+
+    /// `save_state` after its layout check. It has no await, so a claim cannot be dropped
+    /// between taking its name and publishing its state (`claim_name`). The write is a few
+    /// kilobytes into the page cache; the flock and the rename that publishes already block
+    /// the calling thread.
+    fn write_state(&self, state: &VmState) -> Result<()> {
         tracing::debug!(
             vm_id = %state.vm_id,
             pid = ?state.pid,
@@ -1122,7 +1158,6 @@ impl StateManager {
             "save_state: starting save"
         );
 
-        self.check_layout_for_write().await?;
         self.bucket_dir(VMS_DIR, &bucket_of(&state.vm_id))
             .context("making the VM's state bucket")?;
         let state_file = self.state_file(&state.vm_id);
@@ -1139,7 +1174,7 @@ impl StateManager {
             .context("acquiring exclusive lock on state file")?;
 
         // Now we have exclusive access, perform the write
-        let result = async {
+        let result = (|| {
             // Update last_updated timestamp before saving
             let mut state = state.clone();
             state.last_updated = jiff::Timestamp::now();
@@ -1155,17 +1190,14 @@ impl StateManager {
             let state_json = serde_json::to_string_pretty(&state)?;
 
             // Write to temp file first
-            fs::write(&temp_file, &state_json)
-                .await
-                .context("writing temp state file")?;
+            std::fs::write(&temp_file, &state_json).context("writing temp state file")?;
 
             // Set file permissions to 0644 (world-readable) so non-root can list VMs
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let permissions = std::fs::Permissions::from_mode(0o644);
-                tokio::fs::set_permissions(&temp_file, permissions)
-                    .await
+                std::fs::set_permissions(&temp_file, permissions)
                     .context("setting file permissions on state file")?;
             }
 
@@ -1195,8 +1227,7 @@ impl StateManager {
             );
 
             Ok::<(), anyhow::Error>(())
-        }
-        .await;
+        })();
 
         // Release lock (happens automatically when flock is dropped, but being explicit)
         // NOTE: We intentionally do NOT delete lock files - see allocate_loopback_ip comment
@@ -1233,6 +1264,23 @@ impl StateManager {
     /// The state is written after the name is held, with this process's PID and start time.
     /// Nothing here reads another VM's state unless that VM holds the name and is dead, so
     /// the cost does not grow with the number of VMs.
+    ///
+    /// A claim that returns an error or whose future is dropped gives back what it made
+    /// (`ClaimUndo`), so the name is free again while this process runs on. What there is
+    /// depends on the await it stopped at:
+    /// - `check_layout_for_write`, which waits only while it converts a store of layout 1:
+    ///   nothing of the claim exists yet.
+    /// - the rename loop, while a dead holder's state is read and deleted (`load_state`,
+    ///   `delete_state`): the claim directory with this claim's token in it, which the undo
+    ///   removes. The slot holds no token of this claim. A dead holder's deletion left half
+    ///   done is finished by the next claim of the name or by the sweep.
+    /// - `maybe_sweep`, after the state is published: the claim is complete, and the VM
+    ///   keeps its name and state until `delete_state`.
+    ///
+    /// From the rename onto the slot until the state is published there is no await
+    /// (`write_state`), so a drop cannot land there. An error or a panic there leaves this
+    /// claim's token in the slot, which the undo removes, with the slot when that empties it;
+    /// no state file or PID index entry exists before the state is published.
     pub async fn claim_name(&self, vm_state: &mut VmState) -> Result<()> {
         self.claim_name_with_hooks(vm_state, || {}, || {}).await
     }
@@ -1278,23 +1326,23 @@ impl StateManager {
         let slot = bucket.join(slot_name(&name));
         let claim = bucket.join(format!("{CLAIM_PREFIX}{}", token.file_name()));
 
-        let held = self
-            .rename_claim_onto_slot(&name, &token, &claim, &slot, before_rename)
-            .await;
-        if held.is_err() {
-            remove_claim_dir(&claim);
-        }
-        held?;
+        // From here until the state is published, an error return or a drop of this future
+        // gives back what the claim made.
+        let mut undo = ClaimUndo {
+            claim: claim.clone(),
+            token: slot.join(token.file_name()),
+            armed: true,
+        };
+        self.rename_claim_onto_slot(&name, &token, &claim, &slot, before_rename)
+            .await?;
         after_rename();
 
         vm_state.pid = Some(pid);
         vm_state.pid_start_time = Some(start);
-        if let Err(error) = self.save_state(vm_state).await {
-            // The name is held by a VM with no state; give it back.
-            let _ = remove_if_exists(&slot.join(token.file_name()));
-            let _ = std::fs::remove_dir(&slot);
-            return Err(error);
-        }
+        // Not `save_state`: the layout is checked above, and `write_state` has no await, so
+        // this future cannot be dropped while it holds the name without a state.
+        self.write_state(vm_state)?;
+        undo.armed = false;
 
         self.maybe_sweep().await;
         Ok(())
@@ -3075,6 +3123,116 @@ mod tests {
                 "deleting the last holder left its slot"
             );
         }
+    }
+
+    /// Wakes the thread that polls a future by hand (`poll_then_drop`).
+    struct Woken(std::sync::Mutex<bool>, std::sync::Condvar);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: std::sync::Arc<Self>) {
+            *self.0.lock().unwrap() = true;
+            self.1.notify_all();
+        }
+    }
+
+    /// Poll `future` up to `polls` times, each poll after the await it stopped at has woken
+    /// it, then drop it. Its output when it completed within those polls. Each poll takes it
+    /// past every await that is ready, so after `n` polls it is stopped at its `n`th await
+    /// that was not.
+    fn poll_then_drop<F: std::future::Future>(future: F, polls: usize) -> Option<F::Output> {
+        let woken = std::sync::Arc::new(Woken(
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        ));
+        let waker = std::task::Waker::from(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        for poll in 0..polls {
+            if poll > 0 {
+                let flag = woken.0.lock().unwrap();
+                let (mut flag, wait) = woken
+                    .1
+                    .wait_timeout_while(flag, std::time::Duration::from_secs(10), |woken| !*woken)
+                    .unwrap();
+                assert!(!wait.timed_out(), "not woken within 10 s of poll {poll}");
+                *flag = false;
+            }
+            if let std::task::Poll::Ready(output) =
+                std::future::Future::poll(future.as_mut(), &mut context)
+            {
+                return Some(output);
+            }
+        }
+        None
+    }
+
+    /// A claim whose future is dropped at any of its awaits leaves nothing of itself, so this
+    /// process can claim the name again at once under another vm_id. The slot is held by a
+    /// dead holder, so the claim reads and deletes that holder's state before its rename,
+    /// which are its awaits. Each round polls a new claim one time more than the last and
+    /// drops it, until a round lets it complete; that claim keeps its name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_dropped_at_any_await_leaves_nothing_of_it() {
+        let me = std::process::id();
+        let mut dropped = 0;
+        for polls in 1..=32 {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = StateManager::new(dir.path().to_path_buf());
+            let dead_holder = dead_token("vm-dead");
+            let mut dead = named_state("vm-dead", "dropped");
+            dead.pid = Some(dead_holder.pid);
+            dead.pid_start_time = Some(dead_holder.start);
+            write_state_file(dir.path(), &dead);
+            plant_token(&manager, "dropped", &dead_holder, b"");
+
+            let mut vm = named_state("vm-dropped", "dropped");
+            if let Some(claimed) = poll_then_drop(manager.claim_name(&mut vm), polls) {
+                claimed.unwrap();
+                assert!(
+                    dropped > 0,
+                    "the claim completed at its first poll, so no await was dropped"
+                );
+                assert_eq!(
+                    tokens_of(&manager, "dropped"),
+                    vec![format!("{me}.{}.vm-dropped", vm.pid_start_time.unwrap())]
+                );
+                let mut other = named_state("vm-other", "dropped");
+                assert!(
+                    manager.claim_name(&mut other).await.is_err(),
+                    "a claim that completed lost its name"
+                );
+                return;
+            }
+            dropped = polls;
+
+            let bucket = manager.name_slot("dropped").parent().unwrap().to_path_buf();
+            let claims: Vec<String> = std::fs::read_dir(&bucket)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().into_string().unwrap())
+                .filter(|name| name.starts_with(CLAIM_PREFIX))
+                .collect();
+            assert!(
+                claims.is_empty(),
+                "a claim dropped after {polls} polls left its claim directory: {claims:?}"
+            );
+            let tokens = tokens_of(&manager, "dropped");
+            assert!(
+                !tokens.iter().any(|token| token.ends_with(".vm-dropped")),
+                "a claim dropped after {polls} polls left its token: {tokens:?}"
+            );
+            assert!(
+                !manager.state_file("vm-dropped").exists()
+                    && !manager.pid_entry(me, "vm-dropped").exists(),
+                "a claim dropped after {polls} polls left a state or a PID index entry"
+            );
+            let mut next = named_state("vm-next", "dropped");
+            manager.claim_name(&mut next).await.unwrap_or_else(|error| {
+                panic!("after a claim dropped after {polls} polls: {error:#}")
+            });
+            manager.delete_state("vm-next").await.unwrap();
+        }
+        panic!("the claim did not complete within 32 polls");
     }
 
     /// One claim running inside another's window, at each seam.
