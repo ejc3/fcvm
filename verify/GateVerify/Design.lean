@@ -15,6 +15,7 @@ it stands for and the wording proposed:
 | `natGate := true` | 5: the proxy's redirect closes with the egress half | a connect behind the closed egress half |
 | `wdMidBoundary := false` | 6: the freeze watchdog leaves a freeze alone while its boundary is in progress | a workload thawed behind the closed gate |
 | `backFails := true` | 7: a write of `tcp_syncookies` back that keeps failing fails the restore | a clone published for good without SYN cookies |
+| `restartKeeps := true` | 9: a restarted fc-agent gets a container running again (#2158) | an agent's death ending the VM, a source's among them |
 | `startWaits := true` | 8: a restarted fc-agent serves exec at once and holds the container's start while a boundary is in progress | a container started, over vsock, while a prepare holds the guest, and captured running |
 
 Repair 1 of the first version of this model (a record of the restore under /run, for an
@@ -39,6 +40,7 @@ def rules : Rules where
   snapUnpublished := false
   reopenRetry := true
   backFails := true
+  restartKeeps := true
   startWaits := true
   guard := true
   rcuUndo := true

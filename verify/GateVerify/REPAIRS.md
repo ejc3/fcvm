@@ -103,6 +103,11 @@ What this asks of the properties, and the model does each:
 Answers: `hostDies`, `reopenFails`, `reopenFailsStuck`, `agentDies`, `agentDiesSource`,
 `agentDiesVsock`.
 
+What is observed today (#2154's author, in VMs): with #2154 a source whose agent dies between
+the prepare and the resume has its gate reopened by the host's ask and its `snapshot create`
+succeeds; the VM then powers off, because the restarted agent cannot start its container
+(#2158). So this repair keeps a source only together with repair 9.
+
 What the model shows: `design_sourceUndisturbed`, `design_neverStuck`, and `design_bounded`
 with `design_settles`: a `snapshot create` that has begun is over within 20 steps of the
 system, with the source running ungated or reported. `sourceReported` in `Ends.lean` is the run
@@ -206,27 +211,56 @@ was at boot.
 
 ## 8. A restarted fc-agent serves exec at once and holds the container's start while a boundary is in progress
 
-Model: `startWaits := true`. `restart` is the agent back with its exec server; `boot` is its
-container started.
+Model: `startWaits := true`. `restart` is the agent back with its exec server; `boot` is what
+it then does about its container.
 
 Change: the restarted agent's boot path brings the exec server up as today, and before it
 starts the container it waits while a boundary is in progress: a `snapshot create` under way
 (the prepare's freeze, the boundary lock, the manifest) or a half of the gate installed.
 
-Answers: `containerMidBoundary` (`BREAKS.md`): Cloud Hypervisor, a guest that booted without
-the snapshot cache, an fc-agent that dies after the prepare's reply and is back before the
-host's pause. On Firecracker the closed egress half already stops the new agent at its boot
-plan.
+Answers: `containerMidBoundary` (`BREAKS.md`), which is a run of `main` with #2158 fixed and
+not of `main` today: Cloud Hypervisor, a guest that booted without the snapshot cache, an
+fc-agent that dies after the prepare's reply and is back before the host's pause. On
+Firecracker the closed egress half already stops the new agent at its boot plan.
+
+Today the run ends differently (observed, #2158): the restarted agent's start of the container
+is refused and it powers the VM off, in the source before the pause or in the clone after the
+restore. Nothing starts behind a closed gate, because nothing starts. So this repair has
+nothing to protect until #2158 is fixed, and it has to be in place when it is.
 
 Why exec first: the gate is opened only by a reopen exec'd through the agent. An agent that
 waited for the gate before serving exec would wait for ever, and every source whose agent died
-behind a closed egress half would be lost, where today a Cloud Hypervisor source recovers when
-the agent is back inside the host's 54 s exec wait. Holding only the container keeps that
-recovery (`sourceRecovers`) and still keeps a container from starting inside a prepare.
+behind a closed egress half would stay gated. Holding only the container keeps the reopen
+reachable (`sourceRecovers`) and still keeps a container from starting inside a prepare.
 
 What the model shows: with `startWaits := false` the build fails at `boot_scal`
 (`Lemmas.lean`): "a guest in a snapshot's prepare has its container frozen" does not hold, and
-`design_workloadEgress` rests on it through the image a clone is restored from.
+`design_workloadEgress` rests on it through the image a clone is restored from. With
+`restartKeeps := false` as well, that lemma holds again: a VM that powers off satisfies it.
+
+## 9. A restarted fc-agent gets a container running again (#2158)
+
+Model: `restartKeeps := true`.
+
+Today (observed in VMs, with no snapshot involved, 4 of 4 runs that reached the container
+start): systemd kills conmon with the rest of the unit, podman's record under /run still says
+the container runs, the new agent's `podman start --attach` is refused on the dead conmon's
+socket, and the agent takes that exit for the container's and powers the VM off, about a second
+after its boot plan arrives. So an fc-agent crash in a guest that is served a boot plan is a VM
+exit, and a source whose agent dies inside a `snapshot create` is not kept whatever the
+boundary does.
+
+Change: not decided in #2158; a fix is being built. The model's design takes the outcome and
+not the mechanism: after the restart a container runs again. If the fix lets the container
+survive the agent's death instead of starting another, the design's `kill` would leave the
+container as it was, frozen if it was frozen, and repair 8 would have less to hold; that
+variant is not modelled.
+
+What the model shows: no property P1 to P6 is about a VM staying up, so with
+`restartKeeps := false` every invariant and every `design_*` property still proves. What stops
+building is the two theorems that say a guest whose agent died is kept: `sourceRecovers` and
+`kill_restart_repeats` (`Ends.lean`). `restartPowersOffToday` is today's outcome as a checked
+run.
 
 ## What carries each repair
 
@@ -243,13 +277,16 @@ import the recorded runs, so these are the proofs failing, not a replayed run):
 | 6: `wdMidBoundary := true` | fails at `watchdog_scal` (`Lemmas.lean`) |
 | 7: `backFails := false` | fails at `agentFail_scal` (`Lemmas.lean`) |
 | 8: `startWaits := false` | fails at `boot_scal` (`Lemmas.lean`) |
+| 9: `restartKeeps := false` | fails at `kill_restart_repeats` and `sourceRecovers` (`Ends.lean`), the two theorems that say a guest whose agent died is kept; every invariant and every `design_*` property builds |
+| 8 and 9 together | fails at the same two and nowhere else: with the VM powered off, repair 8 holds nothing |
 | inherited from #2113: `tcpByCt := true` | fails at `rejected_fl` (`Lemmas.lean`) |
 | inherited from #2124: `look := false` | fails at `manifest_loop` (`Gens.lean`) |
 | inherited from #2124: `list := .addr` | fails at `sk_dump6` (`Socks.lean`) |
 | inherited from #2124: `manAddr := true` | **passes** |
 
-Run on a copy of this directory, one field at a time: eleven exit 1, `manAddr` and the unchanged
-copy exit 0.
+Run on a copy of this directory, one field at a time: twelve exit 1, `manAddr` and the unchanged
+copy exit 0. Of the twelve, eleven are a property's proof failing; the twelfth, repair 9, is not
+(under "9" above).
 
 `manAddr` is redundant in the design, and the search agrees (it finds nothing with the field
 put back). With it the manifest leaves out every socket whose peer address is loopback, a
@@ -267,6 +304,8 @@ what matters where there is no list: on `ctstate` and #2113 (`loopbackClient`).
   By design, as in #2124: the socket is the source's own and the clone's list retires it.
 - **One end of a connection inside the guest left alone by the kernel** (`Limits.lean`): an
   accepted cost of the mirror rule.
+- **A restored guest whose fc-agent dies** has no exec and no container for good, in the
+  design as today: no boot plan is served to it. #2158's fix is for a guest that is served one.
 - **A `/loopback` client that picks its source port (#2152).** The mirror rule keeps its
   connection, at 27add63dd and in the design. The model cannot express a chosen source port, so
   it neither finds the break nor proves its absence (`Limits.lean`). Its fix, a source port

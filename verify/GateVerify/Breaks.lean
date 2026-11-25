@@ -490,7 +490,9 @@ theorem failedCloneSnapshotEnds :
 /-- fc-agent dies between the prepare and the reopen. The one-shots are exec'd through it, so the
 host's resume one-shot cannot run, `snapshot create` returns its error, and the source keeps what
 the prepare had installed. On Firecracker the restarted agent fetches its boot plan over MMDS,
-behind the closed egress half, and never gets it: the source stays gated for good (4 steps). -/
+behind the closed egress half, and never gets it: the source stays gated for good. (Over vsock the
+restarted agent gets its plan, and today its start of the container then fails and it powers the
+VM off, #2158: `restartPowersOffToday` in `Ends.lean`.) (4 steps). -/
 def Run.agentDies : List Label :=
   [.snap, .snap, .kill, .snap]
 
@@ -515,37 +517,44 @@ theorem design_keeps_agentDiesSource :
     (replay Design.rules Runs.kills Run.agentDiesSource (init Runs.kills)).map
       sourceDisturbed = some false := by decide
 
-/-- The same over vsock (Cloud Hypervisor), where a guest that booted without the snapshot cache is
-served its boot plan behind the closed gate: the agent comes back with its exec server and starts
-the container, after the host's exec has given up, and nothing asks for the reopen. (If it is back
-inside the exec's 54 s of connect retries, the reopen lands and nothing is broken.) (6 steps). -/
+/-! ## Once #2158 is fixed and nothing else -/
+
+/-- Not a break of the code today, where this run ends in the power-off. With #2158 fixed (a restarted
+fc-agent gets a container running again), over vsock (Cloud Hypervisor), in a guest that booted
+without the snapshot cache: the agent comes back with its exec server after the host's exec has
+given up, starts the container, and nothing asks for the reopen. (If it is back inside the exec's
+54 s of connect retries, which a restart of about a second is, the reopen lands and nothing is
+broken.) (6 steps). -/
 def Run.agentDiesVsock : List Label :=
   [.snap, .snap, .kill, .snap, .restart, .boot]
 
 theorem breaks_agentDiesVsock :
-    after (replay Today.cookieB Runs.killsVsock Run.agentDiesVsock (init Runs.killsVsock))
-      (stuck Today.cookieB Runs.killsVsock) := by decide
+    after (replay Today.cookieBKept Runs.killsVsock Run.agentDiesVsock (init Runs.killsVsock))
+      (stuck Today.cookieBKept Runs.killsVsock) := by decide
 
 theorem design_refuses_agentDiesVsock :
     replay Design.rules Runs.killsVsock Run.agentDiesVsock (init Runs.killsVsock) = none
     ∧ (replay Design.rules Runs.killsVsock (Run.agentDiesVsock.take 5) (init Runs.killsVsock)).isSome = true := by decide
 
-/-- Over vsock again: fc-agent dies after the prepare one-shot has replied and is back before the
-host's pause, which is the next call the host makes. The image holds the new agent with its
-container not yet started, and the clone's agent starts it during the restore, behind the closed
-egress half. It needs the unit's restart (`RestartSec=1`, and up to the 90 s stop timeout if the
-frozen container does not die on SIGTERM) to fit between two adjacent host calls (13 steps). -/
+/-- Not a break of the code today either. With #2158 fixed, over vsock: fc-agent dies after the
+prepare one-shot has replied and is back before the host's pause, which is the next call the host
+makes. The image holds the new agent with its container not yet started, and the clone's agent
+starts it during the restore, behind the closed egress half. The restart alone takes about a
+second (`RestartSec=1`), so the agent has to die and come back between two adjacent host calls (13
+steps). -/
 def Run.containerMidBoundary : List Label :=
   [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
    .snap, .kill, .restart, .snap, .restore, .boot]
 
 theorem breaks_containerMidBoundary :
-    after (replay Today.cookieB Runs.killsVsock Run.containerMidBoundary (init Runs.killsVsock))
+    after (replay Today.cookieBKept Runs.killsVsock Run.containerMidBoundary (init Runs.killsVsock))
       workloadBehindEgress := by decide
 
 theorem design_refuses_containerMidBoundary :
     replay Design.rules Runs.killsVsock Run.containerMidBoundary (init Runs.killsVsock) = none
     ∧ (replay Design.rules Runs.killsVsock (Run.containerMidBoundary.take 12) (init Runs.killsVsock)).isSome = true := by decide
+
+/-! ## Breaks the search found in PR #2124 at its head, continued -/
 
 /-- The prepare one-shot is killed inside the receive barrier: `/sys/kernel/rcu_expedited` stays 1 on
 the source after the snapshot has failed and the gate is open again. Written by hand: in this

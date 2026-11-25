@@ -12,8 +12,12 @@ Rule books are fixed commits, named for what the boundary does at each and not f
 `cookieB` is #2124 at its head. `README.md`, "The rule books", says which one `main` matches
 now.
 
-Nothing here was run in a VM. Each run is a run of the model, whose rules are read from the
-source at those commits and from Linux v6.18.60; "by source" below means exactly that.
+No run here was run in a VM by this model's author. Each is a run of the model, whose rules
+are read from the source at those commits and from Linux v6.18.60; "by source" below means
+exactly that. Three of the rules have since been observed in VMs by the author of #2154, and
+are marked "observed": that systemd kills the whole unit at once when fc-agent dies, that the
+restart follows about a second later, and that the restarted agent cannot start its container
+again and powers the VM off (#2158).
 
 "Where" says in which of fcvm's configurations the run can happen: rootless (pasta, the egress
 proxy on, so the guest tracks both families all the time), routed (no proxy; the guest tracks a
@@ -25,7 +29,8 @@ Two things decide which runs a real guest can take, and neither is a step of the
 - **Whether the guest was restored.** A guest restored from a memory image is served no boot
   plan, so an fc-agent that dies in it never comes back. Most guests are restored guests: a
   `podman run` that hits the snapshot cache goes through the restore path. "Booted without the
-  cache" below means a guest whose agent can be served its plan again.
+  cache" below means a guest whose agent can be served its plan again. Today that agent then
+  powers the VM off (#2158, observed), so "comes back" means for about a second.
 - **Firecracker or Cloud Hypervisor.** On Firecracker the boot plan is fetched over MMDS, a TCP
   connection the gate's egress half refuses. On Cloud Hypervisor it is over vsock, which the
   gate (iptables rules) does not see. Every configuration here is Firecracker's but the three
@@ -51,10 +56,10 @@ are in the last section.
 | P3 `staleAtPublication` | `staleTuple`, `staleTupleGrown`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `cookieAck`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `loopbackClientA`, `earlySnapshot` | `earlySnapshot`, `earlySnapshotFails` | proved |
 | P3 `smuggledLate` | `staleTupleLate`, `halfOpenRetransmit`, `reusedTuple` | `cookieAckClone` | `cookiesBackFirst` | holds | proved |
 | P4 `retiredBehindEgress`, `hookMisplaced` | holds | holds | holds | holds | proved |
-| P4 `workloadBehindEgress` | `watchdogThaw`, after an early snapshot, and over vsock `containerMidBoundary` | the same | the same | the same | proved |
+| P4 `workloadBehindEgress` | `watchdogThaw`, after an early snapshot | the same | the same | the same | proved |
 | P5 `lastingChange` | holds | holds | `writeBackFails` | the same | proved |
 | P5 `capturedChange` | `barrierKillCaptured`, after an early snapshot | the same | and `failedCloneSnapshot`, `earlySnapshotCaptures`, after `writeBackFails` | the same | proved |
-| P6 `stuck` | `agentDies`, `agentDiesVsock`, `hostDies`, `reopenFailsStuck` | the same | the same | the same | proved |
+| P6 `stuck` | `agentDies`, `hostDies`, `reopenFailsStuck` | the same | the same | the same | proved |
 | U1 `clientDatagram` | `clientDatagram` without the host's gate | the same | the same | the same | the same: assumed, not proved |
 
 What the design does with each recorded run is in `Breaks.lean` beside it: `design_refuses_`
@@ -317,10 +322,10 @@ memory is in the image, so its task goes on with the old restore from the step i
 the watcher then begins the new epoch's (`State.again`). Today's rule books only: the design
 never has an unpublished clone in a snapshot.
 
-### `agentDies`, `agentDiesSource`, `agentDiesVsock`: fc-agent dies between the prepare and the reopen (#2149)
+### `agentDies`, `agentDiesSource`: fc-agent dies between the prepare and the reopen (#2149)
 
-All four. P6 and P1. Run `kills`, 4 steps; run `kills-vsock`, 6 steps. Medium: it needs
-fc-agent to die (an OOM kill, a crash) inside a `snapshot create`. By source, not run in a VM.
+All four. P6 and P1. Run `kills`, 4 steps. Medium: it needs fc-agent to die (an OOM kill, a
+crash) inside a `snapshot create`.
 
 ```
 snapshot create: the prepare one-shot freezes the container; close, IPv4 chains and hooks
@@ -332,30 +337,52 @@ the host runs the resume one-shot: no fc-agent answers the exec
 Both one-shots are exec'd through the long-running agent's exec server
 (src/commands/common.rs:6021). With the agent dead the reopen cannot be delivered. The host
 makes one exec, which tries its connect 41 times over about 54 s (src/commands/exec.rs,
-`MAX_EXEC_CONNECT_ATTEMPTS`), and then `snapshot create` returns its error. The unit restarts
-the agent after `RestartSec=1`, once the old cgroup is gone, which a frozen container that does
-not die on SIGTERM can hold up for systemd's stop timeout (90 s by default, by reading, not
-observed). What the new agent can do decides the outcome:
+`MAX_EXEC_CONNECT_ATTEMPTS`), and then `snapshot create` returns its error. systemd kills
+every process of the unit at once with SIGKILL, the container and conmon among them, and
+restarts the agent about a second later (observed, #2158; an earlier version of this document
+had a frozen container hold the restart up for the 90 s stop timeout, which does not happen).
+What the new agent can do decides the outcome:
 
 - **A restored guest** (most guests) is served no boot plan. The new agent loops for ever
-  before it starts an exec server. Gated for good.
+  before it starts an exec server. Gated for good. By source; #2158 reports the same of `main`
+  for the test that found it ("it used to stay gated for ever, with the next agent waiting for
+  a boot plan it could not fetch").
 - **A guest that booted without the cache, on Firecracker**, fetches its plan over MMDS, which
   the closed egress half answers with a reset. It loops the same way. Gated for good. (If the
   agent died before the prepare closed the IPv4 half, the fetch gets through and this guest
   takes the next leg.)
 - **A guest that booted without the cache, on Cloud Hypervisor**, gets its plan over vsock
-  behind the closed gate and starts its exec server. If that is inside the host's 54 s, the
-  exec connects, the resume one-shot runs and the gate opens: nothing is broken. If the restart
-  takes longer (the 90 s stop), the host has given up, and the guest runs on with an agent, a
-  new container and a closed gate that nothing is going to open (`agentDiesVsock`).
+  behind the closed gate. About a second after the plan arrives its start of the container is
+  refused and it powers the VM off (#2158, observed, with and without a snapshot). If the
+  host's exec reaches the new agent's exec server in that second, the gate is reopened and the
+  create goes on first; either way the source is not kept. `restartPowersOffToday` in
+  `Ends.lean` is both orders.
 
-This is the reopen that cannot be attempted; #2142 is the reopen that is attempted and fails.
-The same holds for a kill at any later step of the create up to the reopen.
+So today the legs are: gated for good, or powered off. This is the reopen that cannot be
+attempted; #2142 is the reopen that is attempted and fails. The same holds for a kill at any
+later step of the create up to the reopen.
 
-### `containerMidBoundary`: a container started inside a prepare, and captured running
+With #2154 (in review; by its author's runs): the host's ask reopens the gate, the create
+succeeds, and the VM then powers off, because #2154 does not change what a restarted agent does
+with its container. The source is kept only once #2158 is fixed as well.
 
-All four. P4. Run `kills-vsock`, 13 steps. Low: Cloud Hypervisor only, a guest that booted
-without the cache only, and a narrow window. By source, not run in a VM.
+### `agentDiesVsock`, `containerMidBoundary`: what the fix of #2158 uncovers
+
+Rule book `cookieB-restart-kept`: `main` with #2158 fixed and nothing else. Not breaks of the
+code today, where both runs end in the power-off above. Run `kills-vsock`, 6 and 13 steps. P6
+and P4. Low: Cloud Hypervisor, a guest that booted without the cache, and for the second a
+window of about a second.
+
+```
+snapshot create: prepare (freeze, close, ...)
+fc-agent is killed; the host's reopen finds no agent and snapshot create returns its error
+systemd restarts fc-agent: it gets its boot plan over vsock and serves exec again
+the restarted fc-agent starts the container     => a running source behind a closed gate
+                                                   that nothing is going to open
+```
+
+That is `agentDiesVsock`. It needs the agent back after the host's 54 s, and a restart takes
+about a second, so on its own it needs the host's exec to fail for another reason.
 
 ```
 snapshot create: prepare (freeze, close, barrier, dump, save); the one-shot exits 0
@@ -366,17 +393,15 @@ a clone is restored from the image
 the clone's agent starts the container           => it runs behind the closed egress half
 ```
 
-Nothing in `agent::run` reads the gate, and a provisioned guest's restarted agent starts the
-existing container (`existing_container_id`). The host notices nothing: the prepare's exec and
-the pause are adjacent calls (src/commands/common.rs:7225-7247 for Cloud Hypervisor), so the
-agent must die after the prepare's reply and be back, through `RestartSec=1` at the least,
-before the next call the host makes. With the container started in the source before the pause
-instead, the image holds it running and every clone resumes it behind its closed gate. A second
-boot path that fails a mount shuts the VM down instead of coming back.
+That is `containerMidBoundary`. Nothing in `agent::run` reads the gate. The host notices
+nothing: the prepare's exec and the pause are adjacent calls (src/commands/common.rs:7227-7246
+for Cloud Hypervisor), so the agent must die after the prepare's reply and be back,
+through `RestartSec=1` at the least, before the next call the host makes. The same run exists
+over MMDS when the agent died and was restarted before the `snapshot create` began and has not
+reached its container yet.
 
-The first version of this document said this was found only by a proof and had no recorded
-run. That was for want of a Cloud Hypervisor configuration in the search; the three `vsock`
-configurations find it on every one of today's rule books.
+Repairs 3 and 8 answer these two (`REPAIRS.md`), and they have to land with the fix of #2158 or
+before it: until then there is nothing for them to protect, because the VM is gone.
 
 ### What a killed fc-agent leaves in a clone (the first version's #2139, corrected)
 
@@ -389,12 +414,14 @@ has no `container-plan` (src/commands/common.rs:4456-4487), and the Cloud Hyperv
 document has none (src/commands/snapshot.rs:4309-4361). systemd has also killed the unit's
 cgroup, the container in it, before the restart. So in every rule book:
 
-- an agent killed inside a restore leaves the clone as it was, gated, until the host's
-  `snapshot run` gives up waiting and ends it (15 minutes). No property is broken
+- an agent killed inside a restore leaves the clone as it was, gated, with the new agent
+  looping on its boot plan, until the host's `snapshot run` gives up waiting and ends it (15
+  minutes; read by #2154's author too, not run). No property is broken
   (`orphanWaits` in `Ends.lean` is the run under the design);
 - an agent killed in a published clone leaves a guest with no exec, no container and no
   boundary held. Since most guests are restored guests, this is what an fc-agent crash does to
-  most running VMs.
+  most running VMs. (A guest that booted without the cache is served its plan again and powers
+  off instead: #2158.)
 
 Not in the model: before its plan loop the new process writes /etc/resolv.conf from the boot
 command line and adds the command line's IPv6 address (agent.rs:66-67,
@@ -469,17 +496,23 @@ is in flight with the others.
 ## Fixes in flight
 
 None of the repairs in `REPAIRS.md` is in this pull request. #2113 and #2124 are in `main`. For
-the rest, two pull requests are open and in review:
+the rest:
 
 | Break | Issue | Fix |
 |---|---|---|
-| `earlySnapshot`, `earlySnapshotFails`, `earlySnapshotCaptures`, `failedCloneSnapshot` | #2138 | #2151: on the host, `snapshot create` refuses a clone whose restore is not acknowledged (repair 2). #2154 has the guest's half |
-| `watchdogThaw` | #2140 | #2154 |
+| `earlySnapshot`, `earlySnapshotFails`, `earlySnapshotCaptures`, `failedCloneSnapshot` | #2138 | #2151, in review: on the host, `snapshot create` refuses a clone whose restore is not acknowledged (repair 2). #2154 has the guest's half |
+| `watchdogThaw` | #2140 | #2154, in review (head 7040f0a32) |
 | `barrierKill`, `barrierKillCaptured` | #2141 | #2154 |
 | `reopenFails`, `reopenFailsStuck` | #2142 | #2154 |
-| `agentDies`, `agentDiesSource`, `agentDiesVsock`, `containerMidBoundary` | #2149 | #2154 |
-| a `/loopback` client that picks its source port | #2152 | #2154 |
+| `agentDies`, `agentDiesSource` | #2149 | #2154 reopens the gate; the source is kept only with #2158 fixed too |
+| `agentDiesVsock`, `containerMidBoundary` (once #2158 is fixed) | #2149 | #2154 |
+| a restarted fc-agent cannot start its container and powers the VM off | #2158 | being built; not decided in the issue. The model's `restartKeeps` |
+| a `/loopback` client that picks its source port | #2152 | #2154: a source port range reserved for the rewrite. Observed in a VM with a two-port range: at the range's limit NAT drops the SYN and takes no other port |
 | `hostDies` | #1936 | #1941 |
+
+Open beside these, and not a break of this model's: #2156, a restore that blocks a runtime
+worker left the exec server unanswered for 15 s (1 try in 9 of #2151's VM test; cause not
+established). It bears on #2138's window, where the model has exec either answer or not.
 
 #2154 is built to the two rulings of `REPAIRS.md`, 3 and 8: a source that cannot be reopened is
 left running and reported, and a restarted fc-agent serves exec before it starts a container.
@@ -521,15 +554,15 @@ them.
 
 | | `all-routed` | `all-proxy` |
 |---|---|---|
-| `ctstate` | capped at 10,000,000 states | 2,914,335 states, complete |
-| `flags` | 7,214,191 states, complete | 2,516,499, complete |
-| `cookieA` | capped | 5,098,605, complete |
-| `cookieB` | capped | 4,984,357, complete |
-| `cookieB` without its second dump | capped | 4,741,741, complete |
+| `ctstate` | capped at 10,000,000 states | 2,844,650 states, complete |
+| `flags` | 7,146,972 states, complete | 2,448,074, complete |
+| `cookieA` | capped | 5,030,180, complete |
+| `cookieB` | capped | 4,889,396, complete |
+| `cookieB` without its second dump | capped | 4,646,780, complete |
 | design | 1,971,774 states, complete, no break | 521,538, complete, no break |
 
-One run each, on a shared dev box: 7 min 50 s and 2.5 GB for today's five rule books, 15 s and 0.5 GB for
-the design. A capped search has looked at the first ten million states in breadth-first order
+One run each, on a shared dev box: 7 min 40 s and 2.5 GB for today's five rule books, 15 s and
+0.5 GB for the design. A capped search has looked at the first ten million states in breadth-first order
 and says nothing of the rest.
 
 In both configurations each of today's rule books breaks only properties it breaks in the

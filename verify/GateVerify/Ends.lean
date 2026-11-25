@@ -240,17 +240,19 @@ theorem restart_decreases {C : Cfg} {s t : State} :
 theorem boot_decreases {R : Rules} {s t : State} :
     boot R s = some t → measure t < measure s := by
   unfold boot
-  repeat' split
-  all_goals (intro h)
-  all_goals (try contradiction)
-  simp only [Option.some.injEq] at h
-  subst h
-  rename_i hc _
-  have hpw : s.pw = true := by
-    cases hp : s.pw <;> simp_all [State.running]
-  have hag : s.ag = true := by simp at hc; exact hc.1.2
-  have hup : s.up = false := by simp at hc; exact hc.2
-  simp [measure, restRank, agentRank, hpw, hag, hup]
+  split
+  · intro h; contradiction
+  · rename_i hc
+    have hpw : s.pw = true := by
+      cases hp : s.pw <;> simp_all [State.running]
+    have hag : s.ag = true := by simp at hc; exact hc.1.2
+    have hup : s.up = false := by simp at hc; exact hc.2
+    repeat' split
+    all_goals (intro h)
+    all_goals (try contradiction)
+    all_goals (simp only [Option.some.injEq] at h; subst h)
+    all_goals (simp [measure, restRank, agentRank, State.dead, hpw, hag, hup])
+    all_goals (try omega)
 
 theorem off_decreases {s t : State} : off s = some t → measure t < measure s := by
   unfold off
@@ -758,6 +760,19 @@ theorem sourceReported :
         (fun s => s.pw && s.reported && s.gated && settled s && !stuck Design.rules Runs.kills s
           && !sourceDisturbed s && (step Design.rules Runs.kills .snap s).isNone)
       = some true := by decide
+
+/-- What the code does today (#2158, observed in VMs): over vsock, the agent of a source dies
+during the prepare and is restarted; its start of the container is refused and it powers the VM
+off, whether the host's reopen landed first (the first run: the gate is reopened and the
+`snapshot create` goes on to its end) or not (the second). -/
+theorem restartPowersOffToday :
+    (replay Today.cookieB Runs.killsVsock [.snap, .snap, .kill, .restart, .snap, .snap]
+      (init Runs.killsVsock)).map (fun s => s.pw && !s.gated && s.sp == .idle && !s.up)
+      = some true
+    ∧ (replay Today.cookieB Runs.killsVsock [.snap, .snap, .kill, .restart, .snap, .snap, .boot]
+      (init Runs.killsVsock)).map (·.pw) = some false
+    ∧ (replay Today.cookieB Runs.killsVsock [.snap, .snap, .kill, .restart, .boot]
+      (init Runs.killsVsock)).map (·.pw) = some false := by decide
 
 /-- The same over vsock (Cloud Hypervisor): the restarted agent serves exec behind the closed
 gate, the reopen lands, and then the container is started. Nothing is reported. -/

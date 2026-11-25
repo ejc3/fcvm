@@ -149,7 +149,9 @@ def describe (R : Rules) (l : Label) (s : State) : String :=
     | none => "restore fails"
   | .kill => "fc-agent is killed; systemd kills the container and any one-shot with it"
   | .restart => "systemd restarts fc-agent: it fetches its boot plan and serves exec again"
-  | .boot => "the restarted fc-agent starts the container"
+  | .boot =>
+    if R.restartKeeps then "the restarted fc-agent starts the container"
+    else "the restarted fc-agent's start of the container is refused: it powers the VM off"
   | .off => "shutdown_vm(1): the clone powers off"
   | .timeout => "the host gives up waiting for the restore and ends the VM"
   | .watchdog => "the payload-freeze watchdog thaws the container"
@@ -262,7 +264,8 @@ structure Run where
 def allRuns : List Run := Gate.runs.map (fun (n, w, c) => { name := n, what := w, cfg := c })
 
 def books : List Rules :=
-  [Today.ctstate, Today.flags, Today.cookieA, Today.cookieB, Today.cookieBOneLook, Design.rules]
+  [Today.ctstate, Today.flags, Today.cookieA, Today.cookieB, Today.cookieBOneLook,
+   Today.cookieBKept, Design.rules]
 
 /-- Print one run: its steps in words, the state it ends in, the run as a Lean term, and the
 same run under the design. -/

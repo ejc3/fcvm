@@ -15,8 +15,11 @@ and #2124, to find the ones no review had drawn yet.
   in the real system, where it can happen, and a severity.
 - [`REPAIRS.md`](REPAIRS.md): what each break needs changed, where, and the wording proposed.
 
-Nothing in it was run in a VM. The rules are read from the source at the commits named and from
-Linux v6.18.60. Two independent reviews of its first version (207b5bc59) found it wrong about
+Its author ran nothing in a VM. The rules are read from the source at the commits named and
+from Linux v6.18.60, and three of them have since been observed in VMs by the author of #2154
+(what systemd kills when fc-agent dies, how soon the restart follows, and that the restarted
+agent powers the VM off, #2158); the documents say "observed" for those and "by source" for
+the rest. Two independent reviews of its first version (207b5bc59) found it wrong about
 what a restarted fc-agent does and blind to an fc-agent that dies in a source, and a review of
 the corrections found one more recorded run that could not happen and no Cloud Hypervisor
 configuration in the search. This version has all three reviews' corrections, and `BREAKS.md`
@@ -41,9 +44,9 @@ already installed. Peak memory is the largest single process:
 |---|---|---|
 | `lake build` from cold, both models | 1 min 32 s | 1.5 GB |
 | `lake build GateVerify gate-breaks gate-seq` from cold, this model alone | 58 s | 1.5 GB |
-| `lake exe gate-breaks` (20 runs, 6 rule books, 2,084,655 states in all) | 8.2 s | 101 MB |
+| `lake exe gate-breaks` (20 runs, 7 rule books, 1,994,314 states in all) | 7.2 s | 96 MB |
 | `lake exe gate-breaks design all-routed all-proxy` (2,493,312 states) | 15 s | 0.5 GB |
-| `lake exe gate-breaks limit=10000000 all-routed all-proxy` for today's five rule books | 7 min 50 s | 2.5 GB |
+| `lake exe gate-breaks limit=10000000 all-routed all-proxy` for today's five rule books | 7 min 40 s | 2.5 GB |
 
 CI runs the first and the third (as `summary`, compared with `search.expected`) in the one job,
 under its 15 minute cap (`../../.github/workflows/verify.yml`).
@@ -59,6 +62,7 @@ branch, because `main` moves from one to the next as the fixes land.
 | `flags` | a1e5fc687 | #2113: the TCP rule reads the packet's flags | from #2113 (a0ef91072) until #2124 landed |
 | `cookieA` | a80e1ad34 | #2124 at its first commit: SYN cookies refused, the restore's own list | never |
 | `cookieB` | 27add63dd | #2124 at its head: the mirror rule, a second dump, the write-back after the gate | since #2124 landed (57aa83bb6) |
+| `cookieB-restart-kept` | none | `cookieB` with #2158 fixed and nothing else: a restarted fc-agent gets a container running again | not yet |
 | `design` | none | `cookieB` with the repairs of `REPAIRS.md` | not yet |
 
 The drift check in CI names the rule book of the tree it runs in (below, "The model against the
@@ -69,8 +73,8 @@ code").
 | File | What it holds |
 |---|---|
 | `Spec.lean` | `State` (one guest: its sockets, tracked connections, rules, settings, files under /run, processes), the kernel's handling of a segment and of a datagram, the guest's own processes, `snapshot create` and the restore one step at a time with each step able to fail or its process to be killed, `step`, `replay`, `Reachable`. `Rules` is a rule book's type; `Cfg` is what exists around the guest and which moves a search allows |
-| `Today.lean` | `Today.main`, `Today.flags`, `Today.cookieA`, `Today.cookieB`: four commits, each field cited. `Today.cookieBOneLook`: the head of #2124 without its second dump |
-| `Design.lean` | `Design.rules`: the head of #2124 with seven repairs |
+| `Today.lean` | `Today.ctstate`, `Today.flags`, `Today.cookieA`, `Today.cookieB`: four commits, each field cited. Two variants that are no state of the code: `Today.cookieBOneLook`, `cookieB` without its second dump, and `Today.cookieBKept`, `cookieB` with #2158 fixed and nothing else |
+| `Design.lean` | `Design.rules`: `main` with eight repairs |
 | `search.expected` | What `lake exe gate-breaks summary` prints: every default configuration and rule book, its state count, the properties it breaks and at how many steps. CI compares the search with it |
 | `Properties.lean` | The properties, as tests on a state |
 | `Configs.lean` | The configurations the search runs, by name |
@@ -175,7 +179,8 @@ reached, and P1 and P5 are about every run and not only the ones that end by the
 configurations searched to the end, which CI does on every run and compares with
 `search.expected`, and the two `all-` configurations as far as `BREAKS.md`, "Everything at
 once", says. 17 of the 20 have the boot plan over MMDS (Firecracker) and 3 over vsock (Cloud
-Hypervisor); the breaks the vsock ones add are `containerMidBoundary` and `agentDiesVsock`. Most of what
+Hypervisor). For the code today the vsock ones add no break: a restarted agent powers the VM
+off (#2158). They add `containerMidBoundary` and `agentDiesVsock` for `cookieB-restart-kept`. Most of what
 breaks `ctstate` and #2113 beyond the known issues breaks the head of #2124 too, because it is in
 code #2124 does not touch: the one-shots, the watchdog, what a dead fc-agent leaves.
 
@@ -225,12 +230,15 @@ invariants, `Classical.choice`), for every value of `Cfg` and every state reacha
   opened has both its ends).
 - Every run in `Breaks.lean` and in `Limits.lean`: replayed step by step and the test
   evaluated, by `decide`.
-- Each of the seven repairs is carried by a proof, and so are three of the four rules the
+- Each of repairs 2 to 8 is carried by a proof, and so are three of the four rules the
   design inherits from #2113 and #2124: with the field put back the proofs do not build
   (`REPAIRS.md`, the last table). The fourth, the manifest leaving a socket out by its mirror
   image and not by its address (`manAddr`), is redundant in the design: its restore's own list
   retires whatever the manifest leaves out, so no proof and no search tells the two rules
   apart. It matters where there is no list, on `ctstate` and #2113 (`loopbackClient`).
+  Repair 9 (`restartKeeps`, #2158) is carried by no property: none of P1 to P6 is about a VM
+  staying up. With it put back the invariants and the `design_*` properties still prove, and
+  the two theorems that say a guest is kept (`sourceRecovers`, `kill_restart_repeats`) do not.
 
 **P2 is proved for the connections `step` can make.** `design_fixedGeneration` says no
 retirement destroys, by cookie or by a reset, what the test above names. `design_retiresOnly`
@@ -340,9 +348,10 @@ Each abstraction, and whether it can hide a break:
 | A step of the agent is atomic | A kill lands between steps. Inside one step the code makes several writes only in `close` (chains, then two hooks) |
 | The restore's steps that touch no network state are left out (clock, NFS remount, exec and proxy waits, GPUs) | They run between the retirement and the thaw and change nothing the properties read |
 | The host's `snapshot run` ends a clone that does not acknowledge (`timeout`) | src/commands/snapshot.rs, 15 minutes. `design_settles` says exactly which states rest on it |
-| systemd kills the unit's cgroup, the container and any one-shot, when fc-agent dies | From the unit file (no `KillMode`, `Delegate=yes`) and systemd's documented default. Not observed. The model keeps the dead container's sockets, which only adds sockets |
+| systemd kills every process of the unit, the container, conmon and any one-shot, when fc-agent dies, and restarts the agent about a second later | Observed in VMs by #2154's author (#2158: the journal). The model keeps the dead container's sockets, which only adds sockets |
+| A restarted fc-agent that is served a boot plan cannot start its container and powers the VM off (`restartKeeps := false` in today's rule books) | Observed in VMs (#2158), with no snapshot involved, 4 of 4 runs that reached the container start. The design supposes it fixed |
 | A guest restored from a memory image is served no boot plan; one that booted without the snapshot cache is, over MMDS only with the egress half open and over vsock always | Read from src/commands/common.rs, snapshot.rs, podman/vm_config.rs, fc-agent/src/agent.rs and bootplan.rs. Not run. Firecracker's answer for the missing key and whether the fork persists its MMDS store were not checked |
-| Timing is order only: the unit's `RestartSec=1`, the stop timeout of a frozen container (up to 90 s), the exec's 54 s of connect retries, the two adjacent host calls of prepare and pause | **Not conservative as a guide to likelihood.** The model allows every order of restart, exec and pause. Which order a real guest takes is decided by those times, and `BREAKS.md` states them for `agentDies` and `containerMidBoundary` |
+| Timing is order only: the unit's `RestartSec=1`, the second or so from the boot plan to the container's start, the exec's 54 s of connect retries, the two adjacent host calls of prepare and pause | **Not conservative as a guide to likelihood.** The model allows every order of restart, exec and pause. Which order a real guest takes is decided by those times, and `BREAKS.md` states them for `agentDies` and `containerMidBoundary` |
 | One `sp` counter a guest: a reopen cannot overtake a prepare that has not taken the boundary lock | **Not conservative.** The open finding on #1941 is that it can; the model cannot express it |
 
 ## The things least sure to be faithful
@@ -350,8 +359,11 @@ Each abstraction, and whether it can hide a break:
 1. **What a dead and restarted fc-agent leaves.** The first version had it run the restore
    again; the faithfulness review showed it cannot. This version has the agent never come back
    in a restored guest, and come back in one that booted without the snapshot cache unless MMDS
-   is behind the closed egress half, with its exec server first and its container after. All of it is read from the source and from systemd's documentation; nobody has
-   killed an fc-agent in a guest and watched. What the new process does before its plan loop
+   is behind the closed egress half, with its exec server first; today its start of the
+   container then fails and it powers the VM off. The kill of the whole unit, the restart a
+   second later and the power-off are observed in VMs (#2158). The rest is read: that a
+   restored guest's new agent loops on its boot plan for good, and that MMDS behind the closed
+   egress half stops a new agent the same way. What the new process does before its plan loop
    (resolv.conf, the boot command line's IPv6 address) and what a returning agent's boot path
    does to a guest a boundary still holds are not in the model.
 2. **Connection tracking.** Four states an entry, hooks attached per family "while a rule uses

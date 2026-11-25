@@ -273,7 +273,11 @@ theorem boot_scal {s t : State} {C : Cfg} :
     boot Design.rules s = some t → Scal C s → Scal C t := by
   unfold boot
   open_step
-  all_goals close_scal
+  -- a VM that powered off satisfies the invariant whatever it was (the case the design does
+  -- not have, and the code today does: `restartKeeps := false`)
+  all_goals first
+    | (unfold Scal; intro hpw; simp [State.dead] at hpw; done)
+    | close_scal
 
 theorem off_scal {C : Cfg} {s t : State} : off s = some t → Scal C s → Scal C t := by
   unfold off

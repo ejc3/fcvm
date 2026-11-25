@@ -42,7 +42,8 @@ lines):
   restored from a memory image is served no plan, so its agent never comes back and the
   restore is never run a second time; the agent of a guest that booted without the snapshot
   cache comes back unless the fetch is over MMDS behind the closed egress half
-  (`Spec.restart`), and then starts the container again (`Spec.boot`). When no agent answers,
+  (`Spec.restart`). Its start of the container is then refused and it powers the VM off
+  (`Spec.boot`, `restartKeeps := false`; #2158, observed in VMs). When no agent answers,
   the host's one exec of the resume one-shot gives up after its 41 connect attempts, about
   54 s (src/commands/exec.rs), and `snapshot create` returns its error. Read from the source;
   not run.
@@ -84,6 +85,7 @@ def ctstate : Rules where
   snapUnpublished := true
   reopenRetry := false
   backFails := false
+  restartKeeps := false
   startWaits := false
   guard := false
   rcuUndo := false
@@ -108,6 +110,7 @@ def flags : Rules where
   snapUnpublished := true
   reopenRetry := false
   backFails := false
+  restartKeeps := false
   startWaits := false
   guard := false
   rcuUndo := false
@@ -137,6 +140,7 @@ def cookieA : Rules where
   snapUnpublished := true
   reopenRetry := false
   backFails := false
+  restartKeeps := false
   startWaits := false
   guard := false
   rcuUndo := false
@@ -182,6 +186,7 @@ def cookieB : Rules where
   snapUnpublished := true
   reopenRetry := false
   backFails := false
+  restartKeeps := false
   startWaits := false
   guard := false
   rcuUndo := false
@@ -193,6 +198,14 @@ def cookieBOneLook : Rules :=
     name := "cookieB-one-dump"
     look := false
     restore := cookieB.restore.filter (· != .look) }
+
+/-- `main` with #2158 fixed and nothing else: a restarted fc-agent gets a container running
+again. Not a state of the code. It shows what the fix of #2158 uncovers on Cloud Hypervisor
+unless repairs 3 and 8 come with it: today those runs end in the power-off. -/
+def cookieBKept : Rules :=
+  { cookieB with
+    name := "cookieB-restart-kept"
+    restartKeeps := true }
 
 end Today
 

@@ -264,6 +264,12 @@ structure Rules where
   /-- a write of `tcp_syncookies` back that fails `retryMax` times fails the restore; otherwise
   the restore goes on with a warning -/
   backFails : Bool
+  /-- a restarted fc-agent gets a container running again. Otherwise its start of the container
+  is refused and it powers the VM off: systemd has killed conmon with the rest of the unit,
+  podman's record under /run still says the container runs, `podman start --attach` is refused
+  on the dead conmon's socket (exit 125), and the agent takes that for the container's exit
+  (#2158, observed in VMs, with no snapshot involved) -/
+  restartKeeps : Bool
   /-- a restarted fc-agent serves exec at once and holds the start of the container while a
   boundary is in progress (a `snapshot create` under way, or a half of the gate installed);
   otherwise it starts the container as soon as its boot path gets there, which over vsock is
@@ -1050,9 +1056,11 @@ def agentFail (R : Rules) (C : Cfg) (s : State) : Option State :=
                     rcu := s.rcu && !s.rcuOwn, rcuOwn := false }
 
 /-- fc-agent is killed (an OOM kill, a crash), in a source or in a clone. What it held in
-memory is gone, and so is its lock. systemd kills the rest of the unit's cgroup with it: the
-container, and a one-shot in progress, which leaves what it had done (`snapKill`). A resume
-one-shot that had opened the gate has not removed the manifest. -/
+memory is gone, and so is its lock. systemd kills every process of the unit with it, at once,
+with SIGKILL: the container, conmon, and a one-shot in progress, which leaves what it had done
+(`snapKill`). Observed in VMs (#2158: the journal's "Killing process ... with signal SIGKILL"
+for podman, conmon and the container's processes). A resume one-shot that had opened the gate
+has not removed the manifest. -/
 def kill (C : Cfg) (s : State) : Option State :=
   if !s.running || !s.ag || !C.kills then none
   else
@@ -1063,19 +1071,21 @@ def kill (C : Cfg) (s : State) : Option State :=
                   rcuOwn := false }
 
 /-- systemd starts fc-agent again (`Restart=on-failure`, `RestartSec=1`, src/setup/rootfs.rs),
-once the old unit's cgroup is gone, which a frozen container that does not die on SIGTERM can
-hold up for the stop timeout (90 s by systemd's default). The new process fetches its boot plan
-before anything else that matters here, in a loop with no end (agent.rs:74-86), and only then
-starts the restore watcher (agent.rs:215) and the exec server.
+about a second after the kill (observed: the unit's cgroup is killed at once, so nothing holds
+the restart up). The new process fetches its boot plan before anything else that matters here,
+in a loop with no end (agent.rs:74-86), and only then starts the restore watcher (agent.rs:215)
+and the exec server.
 
 - A guest restored from a memory image is served no plan (`State.plan`): the loop never ends,
-  the restore is never run again, and exec never comes back. Most guests are restored guests:
-  a `podman run` that hits the snapshot cache goes through the restore path.
+  the restore is never run again, and exec never comes back. In a clone that has not published
+  that lasts until the host's 15 minute timeout (read, not run). Most guests are restored
+  guests: a `podman run` that hits the snapshot cache goes through the restore path.
 - A guest that booted without the cache is served its plan again, unless the fetch is over
   MMDS and the gate's egress half is closed. Over vsock (Cloud Hypervisor) it is served behind
   a closed gate too: the gate is iptables rules and vsock is outside them.
 
-This step is the agent back with its exec server. The container is `boot`.
+This step is the agent back with its exec server. What it then does about the container is
+`boot`.
 
 Before the loop the new process writes /etc/resolv.conf and adds the boot command line's IPv6
 address (agent.rs:66-67), which the model does not hold. -/
@@ -1083,11 +1093,18 @@ def restart (C : Cfg) (s : State) : Option State :=
   if !s.running || s.ag || !s.plan || (C.mmds && s.out4) then none
   else some { s with ag := true }
 
-/-- The restarted agent's boot path reaches the container and starts it (a provisioned guest's
-existing container, `existing_container_id`). With `Rules.startWaits` it holds that while a
+/-- The restarted agent's boot path reaches the container, about a second after its boot plan
+arrives.
+
+Without `Rules.restartKeeps`, which is the code today: the start is refused and the agent
+powers the VM off (#2158; seen in 4 of 4 runs that reached the container start). So a guest
+whose agent died and was served a plan again ends here, whatever a boundary was doing.
+
+With it: the container runs again. And with `Rules.startWaits` the agent holds that while a
 boundary is in progress: a `snapshot create` under way, or a half of the gate installed. -/
 def boot (R : Rules) (s : State) : Option State :=
   if !s.running || !s.ag || s.up then none
+  else if !R.restartKeeps then some s.dead
   else if R.startWaits && (s.sp != .idle || s.gated) then none
   else some { s with up := true, frozen := false }
 
