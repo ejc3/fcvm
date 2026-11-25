@@ -231,5 +231,40 @@ class ServeTimeoutReap(unittest.TestCase):
             )
 
 
+class StateFromFcvm(unittest.TestCase):
+    """The harness asks its fcvm where state lives and reads it in the bucket layout.
+
+    RED BEFORE THE FIX: the killed-restore sweep removed `<data_root>/state/<vm_id>.json`,
+    fcvm state layout 1, so under layout 2 it removed nothing and left the residue.
+    """
+
+    VM = "vm-0123456789abcdef0123456789abcdef"
+
+    def test_the_residue_of_a_killed_clone_is_removed_from_fcvm_s_store(self):
+        import os
+        import tempfile
+
+        import reqbench
+        import state_fixture
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reqbench._FCVM_PATHS.clear()
+            self.addCleanup(reqbench._FCVM_PATHS.clear)
+            data_root = os.path.join(tmp, "data")
+            store = state_fixture.make_store(os.path.join(tmp, "elsewhere", "state"))
+            harness = make_harness(tmp, data_root=data_root)
+            harness.fcvm = state_fixture.write_fake_fcvm(
+                os.path.join(tmp, "fcvm"), store, data_root)
+            state = state_fixture.write_vm_state(store, self.VM, {"vm_id": self.VM, "pid": 1})
+            open(state + ".tmp", "w").close()
+            disk = os.path.join(data_root, "vm-disks", self.VM)
+            os.makedirs(disk)
+            self.assertEqual([str(p) for p in harness.state_files(self.VM)],
+                             [state, state + ".lock", state + ".tmp"])
+            harness.remove_residue(self.VM)
+            self.assertEqual(state_fixture.leftover(store), [])
+            self.assertFalse(os.path.exists(disk))
+
+
 if __name__ == "__main__":
     unittest.main()
