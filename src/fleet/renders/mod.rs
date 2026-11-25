@@ -861,8 +861,14 @@ impl Module {
     }
 
     async fn engine(&mut self, index: usize, result: Result<(Child, f64)>) {
-        // The start that sent this is over: take it, and any other that is, out of the set.
-        while self.starting.try_join_next().is_some() {}
+        // Take the starts that are over out of the set (the one that sent this may take a
+        // moment more to finish and go with the next). One that panicked sent no result,
+        // and its engine stays down: say so.
+        while let Some(done) = self.starting.try_join_next() {
+            if let Err(error) = done {
+                tracing::error!(target: "renders", "an engine start ended without a result: {error}");
+            }
+        }
         let e = &mut self.engines[index];
         e.recycling = false;
         let restarting = std::mem::take(&mut e.restarting);

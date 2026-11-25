@@ -175,11 +175,28 @@ fn remove_run_dir_contents(dir: &Path) {
     }
 }
 
+/// Remove a run directory's marker and the directory, when the marker is all it holds.
+/// Something that could not be removed (a file a surviving process still writes, an entry
+/// that refused) keeps the marker beside it, so the directory stays the module's and the
+/// next sweep tries again.
+fn remove_marker_if_alone(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    if entries
+        .flatten()
+        .any(|entry| entry.file_name() != RUN_MARKER)
+    {
+        return;
+    }
+    let _ = std::fs::remove_file(dir.join(RUN_MARKER));
+    let _ = std::fs::remove_dir(dir);
+}
+
 /// Remove a run directory: its contents, then its marker, then the directory.
 fn remove_run_dir(dir: &Path) {
     remove_run_dir_contents(dir);
-    let _ = std::fs::remove_file(dir.join(RUN_MARKER));
-    let _ = std::fs::remove_dir(dir);
+    remove_marker_if_alone(dir);
 }
 
 /// One module at a time per run directory: an exclusive lock on `<run dir>.lock`, held by
@@ -431,9 +448,13 @@ mod tests {
             .collect();
         assert_eq!(left, [RUN_MARKER]);
         assert!(run_dir_is_ours(&run));
-        // and one cut short earlier: something left beside the marker
+        // Something the contents pass could not remove: the marker stays beside it, and
+        // the directory is still the module's for the next sweep.
         std::fs::write(run.join("inject-kitesurf.html"), "").unwrap();
+        remove_marker_if_alone(&run);
+        assert!(run.join(RUN_MARKER).is_file());
         assert!(run_dir_is_ours(&run));
+        // a whole removal: the contents, then the marker, then the directory
         remove_run_dir(&run);
         assert!(!run.exists());
     }
