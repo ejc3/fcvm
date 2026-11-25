@@ -329,14 +329,9 @@ async fn read_vm_state(pid: u32) -> Result<Vec<VmDisplay>> {
 
 /// State files in the state dir claiming this VM name (post-shutdown oracle).
 fn state_files_for_vm(vm_name: &str) -> Vec<PathBuf> {
-    let dir = fcvm::paths::state_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+    fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .state_files()
+        .into_iter()
         .filter(|p| {
             std::fs::read_to_string(p)
                 .ok()

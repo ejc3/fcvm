@@ -222,14 +222,7 @@ fn find_descendants_with_comm_prefix(ancestor: u32, prefix: &str) -> Vec<Tracked
 
 /// Does any state file in the state dir belong to `vm_name`?
 fn state_file_for_name_exists(vm_name: &str) -> bool {
-    let Ok(rd) = std::fs::read_dir(fcvm::paths::state_dir()) else {
-        return false;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
+    for p in fcvm::state::StateManager::new(fcvm::paths::state_dir()).state_files() {
         let Ok(content) = std::fs::read_to_string(&p) else {
             continue;
         };
@@ -330,19 +323,8 @@ fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
     let state_dir = fcvm::paths::state_dir();
     let mut found = None;
 
-    for entry in std::fs::read_dir(&state_dir)
-        .with_context(|| format!("reading state directory {}", state_dir.display()))?
-    {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).context("reading state directory entry"),
-        };
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
-
+    // The states are in buckets under the state directory.
+    for path in fcvm::state::StateManager::new(state_dir.clone()).state_files() {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -366,7 +348,7 @@ fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
             path.display()
         );
         anyhow::ensure!(
-            path == state_dir.join(format!("{}.json", state.vm_id)),
+            path == fcvm::state::StateManager::new(state_dir.clone()).state_file(&state.vm_id),
             "state file {} does not match its recorded vm_id {}",
             path.display(),
             state.vm_id
@@ -529,8 +511,10 @@ fn cleanup_exact_artifacts(artifacts: &VmArtifacts) -> Result<()> {
     let state_dir = fcvm::paths::state_dir();
     let vm_disks = fcvm::paths::data_dir().join("vm-disks");
     anyhow::ensure!(
-        artifacts.state_path == state_dir.join(format!("{}.json", artifacts.vm_id))
-            && artifacts.lock_path == state_dir.join(format!("{}.json.lock", artifacts.vm_id))
+        artifacts.state_path
+            == fcvm::state::StateManager::new(state_dir.clone()).state_file(&artifacts.vm_id)
+            && artifacts.lock_path
+                == fcvm::state::StateManager::new(state_dir.clone()).lock_file(&artifacts.vm_id)
             && artifacts.data_dir == vm_disks.join(&artifacts.vm_id)
             && !artifacts.vm_id.is_empty(),
         "refusing cleanup for paths that are not one exact VM's artifacts: {artifacts:?}"
@@ -1016,7 +1000,7 @@ async fn test_lifecycle_interleave_healthy_means_live_dataplane() -> Result<()> 
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    let state_path = fcvm::paths::state_dir().join(format!("{}.json", vm_id));
+    let state_path = fcvm::state::StateManager::new(fcvm::paths::state_dir()).state_file(&vm_id);
 
     // 50ms poll for the FIRST Healthy observation.
     let poll_deadline = Instant::now() + Duration::from_secs(300);
@@ -2291,7 +2275,7 @@ async fn test_lifecycle_interleave_resumed_source_survives_late_ack() -> Result<
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
-    let state_path = fcvm::paths::state_dir().join(format!("{}.json", vm_id));
+    let state_path = fcvm::state::StateManager::new(fcvm::paths::state_dir()).state_file(&vm_id);
     let poll_deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let healthy = std::fs::read_to_string(&state_path)

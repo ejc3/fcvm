@@ -82,11 +82,24 @@ pub struct VmState {
     pub vsock_epoch: u64,
     /// A snapshot create closed this VM's network gate and could not open it again: the
     /// guest refuses every new TCP connection, in and out, and keeps the ones it has.
-    /// Set when the create gives up (`commands::common::reopen_source_network`); a later
+    /// Written before a create's first ask of the guest to reopen and cleared by the ask
+    /// that opens the gate (`commands::common::reopen_until_open`), so it is also true
+    /// while a create is asking, and stays true when the guest refuses a resume as
+    /// another boundary's. A later
     /// `snapshot create` asks the guest once more and is refused while the gate stays
     /// closed. Absent from a state file while false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network_gate_closed: bool,
+    /// The token of the snapshot create whose boundary this VM's guest last was, or still
+    /// is, owed a resume for (#2159). The create writes it before its prepare, which puts
+    /// it into the guest's `owed` mark, and every resume carries it; it is cleared when
+    /// the guest reports its gate open. While `network_gate_closed` it is what a later
+    /// create's one ask sends. It can differ from the guest's mark (a prepare that failed
+    /// before it wrote the mark, over an older boundary's): the guest then refuses the
+    /// resume as stale and the create reports it. It orders resumes and is not a secret.
+    /// Absent while none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_token: Option<String>,
     pub created_at: jiff::Timestamp,
     pub last_updated: jiff::Timestamp,
     pub config: VmConfig,
@@ -460,6 +473,7 @@ impl VmState {
             confinement: None,
             vsock_epoch: 0,
             network_gate_closed: false,
+            boundary_token: None,
             created_at: now,
             last_updated: now,
             config: VmConfig {

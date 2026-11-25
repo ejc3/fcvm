@@ -2375,11 +2375,7 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         let artifacts_for =
             |want_pid: u32| -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
                 let dir = fcvm::paths::state_dir();
-                for entry in std::fs::read_dir(&dir).context("reading state dir")? {
-                    let path = entry?.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                        continue;
-                    }
+                for path in fcvm::state::StateManager::new(dir).state_files() {
                     let Ok(text) = std::fs::read_to_string(&path) else {
                         continue;
                     };
