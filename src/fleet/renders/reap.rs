@@ -12,7 +12,7 @@
 //! | a killed clone's runtime directory | fcvm's owner records (`reclaim::reclaim_abandoned`) |
 //! | a killed clone's and a killed memory server's state file | fcvm's stale-state sweep |
 //! | a killed memory server's socket | by name: the snapshot's sockets whose process is gone |
-//! | the run directory (certificates, logs, injected files) | `remove_dir_all` |
+//! | the run directory (certificates, logs, injected files) | `remove_dir_all`, when the path was claimed (`RunLock::claim`) |
 //!
 //! Listening ports, network namespaces and 2 MiB page reservations go with the processes.
 //! No child is trusted to end itself: an engine is a `node` that starts `workerd` and arms
@@ -133,86 +133,56 @@ pub async fn sweep(target: &Target) -> Reaped {
         &|pid, start| crate::utils::process_start_time(pid) == Some(start),
     );
 
-    // Only a directory this module made: a caller's path that holds something else stays,
-    // and is reported as left.
-    if run_dir_is_ours(&target.run_dir) {
-        remove_run_dir(&target.run_dir);
-    }
-    out.run_dir_left = target.run_dir.exists();
+    out.run_dir_left = remove_run_dir(&target.run_dir);
     out
 }
 
-/// The file a module puts in its run directory, so a sweep removes that directory and no
-/// other.
-pub const RUN_MARKER: &str = ".fcvm-renders-run";
-
-/// Whether `dir` may be removed as a run directory: it is absent, empty, or carries the
-/// module's marker.
-pub fn run_dir_is_ours(dir: &Path) -> bool {
-    match std::fs::read_dir(dir) {
-        Ok(mut entries) => dir.join(RUN_MARKER).is_file() || entries.next().is_none(),
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-    }
+/// `<run dir>.lock`, beside the run directory: the lock one module holds, and the record
+/// that the path is a pages-mode run directory.
+fn lock_path(run_dir: &Path) -> anyhow::Result<PathBuf> {
+    let mut name = run_dir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("--run-dir {} has no name", run_dir.display()))?
+        .to_os_string();
+    name.push(".lock");
+    Ok(run_dir.with_file_name(name))
 }
 
-/// Remove everything in a run directory but its marker. The marker goes last
-/// ([`remove_run_dir`]), so a removal that is cut short (the reaper killed, the host
-/// losing power) leaves a directory the next start still knows as the module's.
-fn remove_run_dir_contents(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.file_name() == RUN_MARKER {
-            continue;
-        }
-        let path = entry.path();
-        let _ = if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-    }
+/// What the lock file holds once the path is the module's.
+const CLAIMED: &str = "pages-mode run directory\n";
+
+/// Whether `run_dir` was claimed as a pages-mode run directory ([`RunLock::claim`]). The
+/// record is beside the directory, never in it: nothing a removal does to the directory,
+/// cut short or refused part-way, changes whose it is, and a sweep removes only a claimed
+/// one.
+pub fn run_dir_owned(run_dir: &Path) -> bool {
+    lock_path(run_dir)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|text| text == CLAIMED)
 }
 
-/// Remove a run directory's marker and the directory, when the marker is all it holds.
-/// Something that could not be removed (a file a surviving process still writes, an entry
-/// that refused) keeps the marker beside it, so the directory stays the module's and the
-/// next sweep tries again.
-fn remove_marker_if_alone(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    if entries
-        .flatten()
-        .any(|entry| entry.file_name() != RUN_MARKER)
-    {
-        return;
+/// Remove a run directory with everything in it, when the path was claimed; a path nobody
+/// claimed stays as it is. Returns whether the directory is still there.
+fn remove_run_dir(run_dir: &Path) -> bool {
+    if run_dir_owned(run_dir) {
+        let _ = std::fs::remove_dir_all(run_dir);
     }
-    let _ = std::fs::remove_file(dir.join(RUN_MARKER));
-    let _ = std::fs::remove_dir(dir);
-}
-
-/// Remove a run directory: its contents, then its marker, then the directory.
-fn remove_run_dir(dir: &Path) {
-    remove_run_dir_contents(dir);
-    remove_marker_if_alone(dir);
+    run_dir.exists()
 }
 
 /// One module at a time per run directory: an exclusive lock on `<run dir>.lock`, held by
 /// the module and inherited by its reaper, so it is free only when both are gone. A second
 /// module with the same run directory would otherwise sweep the first one's files at its
 /// start, and a new module's directory could be removed by an old module's reaper.
-pub struct RunLock(std::fs::File);
+pub struct RunLock {
+    file: std::fs::File,
+    path: PathBuf,
+}
 
 impl RunLock {
     pub fn take(run_dir: &Path) -> anyhow::Result<Self> {
-        let mut name = run_dir
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("--run-dir {} has no name", run_dir.display()))?
-            .to_os_string();
-        name.push(".lock");
-        let path = run_dir.with_file_name(name);
+        let path = lock_path(run_dir)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -230,7 +200,36 @@ impl RunLock {
             path.display(),
             std::io::Error::last_os_error()
         );
-        Ok(RunLock(file))
+        Ok(RunLock { file, path })
+    }
+
+    /// Make `run_dir` the module's, under the lock. A path claimed before stays claimed,
+    /// whatever its directory holds now (what a module that lost its host left). A path
+    /// never claimed is claimed only while its directory is absent or empty: one that holds
+    /// files is someone else's, and is refused and never removed.
+    pub fn claim(&self, run_dir: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        if run_dir_owned(run_dir) {
+            return Ok(());
+        }
+        let free = match std::fs::read_dir(run_dir) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+        anyhow::ensure!(
+            free,
+            "--run-dir {} holds files that are not a pages-mode run's; the module removes its run directory at start and at the end, so name a directory of its own",
+            run_dir.display()
+        );
+        self.file.set_len(0)?;
+        (&self.file).write_all(CLAIMED.as_bytes())?;
+        self.file.sync_all()?;
+        anyhow::ensure!(
+            run_dir_owned(run_dir),
+            "{} does not read back as written",
+            self.path.display()
+        );
+        Ok(())
     }
 }
 
@@ -261,7 +260,7 @@ impl Reaper {
         // SAFETY: both descriptors were just returned by pipe2 and are owned here alone.
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         let read_fd = read.as_raw_fd();
-        let lock_fd = lock.0.as_raw_fd();
+        let lock_fd = lock.file.as_raw_fd();
         let mut cmd = std::process::Command::new(exe);
         cmd.args(["fleet", "renders-reap", "--watch-fd", &read_fd.to_string()])
             .args(["--run-dir".as_ref(), target.run_dir.as_os_str()])
@@ -410,53 +409,76 @@ mod tests {
         );
     }
 
+    /// A directory that holds someone's files is refused and stays theirs. An absent or
+    /// empty one becomes the module's, and stays the module's whatever it holds afterwards.
     #[test]
-    fn a_run_directory_is_removed_only_when_it_is_the_modules() {
+    fn a_run_directory_is_claimed_once_and_never_taken_from_someone_else() {
         let root = tempfile::tempdir().unwrap();
-        // absent, and empty: nothing of anyone's
-        assert!(run_dir_is_ours(&root.path().join("absent")));
-        let empty = root.path().join("empty");
-        std::fs::create_dir(&empty).unwrap();
-        assert!(run_dir_is_ours(&empty));
-        // a directory with someone's files in it is not removed
         let theirs = root.path().join("theirs");
         std::fs::create_dir(&theirs).unwrap();
         std::fs::write(theirs.join("notes.txt"), "keep").unwrap();
-        assert!(!run_dir_is_ours(&theirs));
-        // the module's own, by its marker
-        let ours = root.path().join("ours");
-        std::fs::create_dir_all(ours.join("certs-fcvm")).unwrap();
-        std::fs::write(ours.join(RUN_MARKER), "").unwrap();
-        assert!(run_dir_is_ours(&ours));
+        let lock = RunLock::take(&theirs).unwrap();
+        let refused = lock.claim(&theirs).unwrap_err();
+        assert!(
+            refused.to_string().contains("not a pages-mode run's"),
+            "{refused}"
+        );
+        assert!(!run_dir_owned(&theirs));
+        drop(lock);
+
+        for start in ["absent", "empty"] {
+            let run = root.path().join(start);
+            if start == "empty" {
+                std::fs::create_dir(&run).unwrap();
+            }
+            assert!(!run_dir_owned(&run));
+            let lock = RunLock::take(&run).unwrap();
+            lock.claim(&run).unwrap();
+            assert!(run_dir_owned(&run), "{start}");
+        }
     }
 
-    /// A removal cut short after any part of the contents leaves the marker, so the next
-    /// start's sweep takes the directory as the module's and finishes the job.
+    /// However a removal ended, what the module left in its directory is still the module's:
+    /// the record is beside the directory, and nothing in the directory decides.
     #[test]
-    fn a_run_directory_half_removed_is_still_the_modules() {
+    fn what_a_module_left_behind_is_still_its_run_directory() {
         let root = tempfile::tempdir().unwrap();
         let run = root.path().join("run");
+        let lock = RunLock::take(&run).unwrap();
+        lock.claim(&run).unwrap();
+        // the module made it and filled it; then a removal lost some of it and not the rest
         std::fs::create_dir_all(run.join("certs-fcvm")).unwrap();
         std::fs::write(run.join("certs-fcvm/ca.pem"), "x").unwrap();
-        std::fs::write(run.join("inject-fcvm.html"), "").unwrap();
-        std::fs::write(run.join(RUN_MARKER), "").unwrap();
-        // as far as a removal gets before its last two steps
-        remove_run_dir_contents(&run);
-        let left: Vec<_> = std::fs::read_dir(&run)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(left, [RUN_MARKER]);
-        assert!(run_dir_is_ours(&run));
-        // Something the contents pass could not remove: the marker stays beside it, and
-        // the directory is still the module's for the next sweep.
-        std::fs::write(run.join("inject-kitesurf.html"), "").unwrap();
-        remove_marker_if_alone(&run);
-        assert!(run.join(RUN_MARKER).is_file());
-        assert!(run_dir_is_ours(&run));
-        // a whole removal: the contents, then the marker, then the directory
-        remove_run_dir(&run);
+        assert!(run_dir_owned(&run));
+        // and the next module's claim on the path is the one already made
+        lock.claim(&run).unwrap();
+        // someone else's directory with the same contents is not: the record decides
+        let theirs = root.path().join("theirs");
+        std::fs::create_dir_all(theirs.join("certs-fcvm")).unwrap();
+        std::fs::write(theirs.join("certs-fcvm/ca.pem"), "x").unwrap();
+        assert!(!run_dir_owned(&theirs));
+    }
+
+    /// A sweep removes a claimed run directory with everything in it, and leaves alone a
+    /// directory nobody claimed.
+    #[test]
+    fn only_a_claimed_run_directory_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join("run");
+        let lock = RunLock::take(&run).unwrap();
+        lock.claim(&run).unwrap();
+        std::fs::create_dir_all(run.join("logs")).unwrap();
+        std::fs::write(run.join("logs/engine-0.log"), "x").unwrap();
+        assert!(!remove_run_dir(&run));
         assert!(!run.exists());
+        // gone, and still the module's for the next start
+        assert!(run_dir_owned(&run));
+
+        let theirs = root.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::write(theirs.join("notes.txt"), "keep").unwrap();
+        assert!(remove_run_dir(&theirs));
+        assert!(theirs.join("notes.txt").is_file());
     }
 
     #[test]
@@ -475,8 +497,15 @@ mod tests {
             !run_dir.exists(),
             "the lock is beside the directory, not in it"
         );
+        // Dropping it frees the lock. A process another thread is starting holds a copy of
+        // the descriptor from its fork to its exec, and the lock with it, so the lock is
+        // free a moment after the drop and not always at once.
         drop(first);
-        RunLock::take(&run_dir).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while let Err(held) = RunLock::take(&run_dir) {
+            assert!(std::time::Instant::now() < deadline, "{held}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     #[test]

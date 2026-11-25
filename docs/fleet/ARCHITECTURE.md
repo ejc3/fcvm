@@ -2442,10 +2442,12 @@ it found to `teardown.json`. The same sweep runs when a module starts. The modul
 engine start that is under way before it lets the reaper go, and the reaper writes
 `cgroup.kill` again for as long as a cgroup is populated.
 
-The run directory is the module's own: it carries a marker file, and a directory that holds
-anything else without the marker is refused at start and never removed. One module runs per run
-directory: the module takes an exclusive lock beside it (`<run dir>.lock`), and its reaper
-inherits the lock, so a new module starts only when both are gone.
+One module runs per run directory: the module takes an exclusive lock beside it
+(`<run dir>.lock`), and its reaper inherits the lock, so a new module starts only when both are
+gone. The same file records that the path is the module's. A path is claimed while its directory
+is absent or empty; a directory that holds files and was never claimed is refused at start and
+never removed. A claimed path stays claimed whatever its directory holds, so a removal that was
+cut short, or that could not remove an entry, is finished by the next sweep.
 
 The module runs as a systemd service unit. Its children are ended by the reaper and, with the
 reaper gone too, by systemd stopping the unit: no child arms a parent-death signal, so under a

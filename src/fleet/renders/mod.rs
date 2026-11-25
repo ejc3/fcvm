@@ -1128,11 +1128,7 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
     };
     // One module per run directory, and never a directory that is someone else's.
     let lock = reap::RunLock::take(&args.run_dir)?;
-    anyhow::ensure!(
-        reap::run_dir_is_ours(&args.run_dir),
-        "--run-dir {} holds files that are not a pages-mode run's; it is removed at start and at the end, so name a directory of its own",
-        args.run_dir.display()
-    );
+    lock.claim(&args.run_dir)?;
     // What a module that lost its host left, before anything is made.
     let left = reap::sweep(&target).await;
     anyhow::ensure!(
@@ -1195,7 +1191,6 @@ async fn run(
     let [cpus_fcvm, cpus_engines, cpus_harness] = cpus;
     let run_dir = &args.run_dir;
     std::fs::create_dir_all(run_dir)?;
-    std::fs::write(run_dir.join(reap::RUN_MARKER), "")?;
 
     // The cgroups. Memory is counted for each side and each engine.
     unit.enable("memory").map_err(anyhow::Error::msg)?;
