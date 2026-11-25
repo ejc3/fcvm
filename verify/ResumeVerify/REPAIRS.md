@@ -11,7 +11,7 @@ where a pin moves.
 | 2 | Write the clear-registers with the complement of the saved bits | Cloud Hypervisor fork; Firecracker fork | 2 | Cloud Hypervisor: on the same branch (4c327e57), upstream 1ede69b5b. Firecracker: not done, in the fork or upstream (#2172) |
 | 3 | Own the counter offset | Cloud Hypervisor; the default Firecracker pin; two gaps on the nested pin | 4, 6 | nested pin: partly (0baf5b0b). Upstream Cloud Hypervisor with `preserve`: the clone's half. Elsewhere: not done (#2173) |
 | 4 | Save and restore `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` | both VMMs | 3 | not done; nothing under fcvm needs it today |
-| 5 | Save and restore a guest hypervisor's `ICH_*_EL2` registers | Firecracker fork, nested pin | 8 | not done |
+| 5 | Save and restore a guest hypervisor's `ICH_*_EL2` registers | Firecracker fork, nested pin | 8 | not done (#2179) |
 | 6 | Pass the CPU-interface registers at 64 bits | Cloud Hypervisor fork | 7 | on the branch (35d0e9ab), upstream 2018dd4b0 |
 | 7 | Correct the project's record of #630 | CLAUDE.md | "Least sure", 1 | proposed below, with the measurement |
 

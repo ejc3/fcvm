@@ -267,7 +267,7 @@ variable: an overrun of four bytes on every read.
 
 ## 8. The fork does not save a guest hypervisor's `ICH_*_EL2` registers
 
-**Every pin of the fork.** Read, not observed. Found by the faithfulness review of this model;
+**Every pin of the fork.** Read, not observed. #2179. Found by the faithfulness review of this model;
 `lostNestedMask` is the part of it the model has.
 
 - `ICH_HCR_EL2`, `ICH_VMCR_EL2`, `ICH_LR0..15_EL2`, `ICH_AP0Rn_EL2` and `ICH_AP1Rn_EL2` of a
@@ -323,8 +323,9 @@ kind as `-- sourceKicked`.
   the device's receive path on an acknowledgement the guest sends only after a reset event. On
   a pause and resume with no save there is no such event, and the default pin's own comment
   (device.rs:411-432 at 2a33289b) says what follows: host-initiated connections hang. The
-  default pin signals and arms only when an event was published. On the nested pin a pause
-  whose save does not happen (a snapshot that fails after the pause) is the case.
+  default pin signals and arms only when an event was published (a34d51c9, which the nested
+  pin's branch does not carry). On the nested pin a pause whose save does not happen (a
+  snapshot that fails after the pause) is the case. #2180.
 - **The nested pin's resume issues `KVM_ARM_SET_COUNTER_OFFSET`** (the freeze, 4).
 - Nothing else on either VMM's pause, save or resume writes to KVM: the vGIC and vCPU saves
   are reads, and `KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES` and the ITS table save write guest
