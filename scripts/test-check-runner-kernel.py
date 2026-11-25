@@ -346,7 +346,12 @@ class Rollout(Case):
 
         at_checkout = refs()
         self.assertIn("refs/remotes/origin/main", at_checkout)
+        # A FETCH_HEAD the caller has not read yet.
+        fetch_head = work / ".git/FETCH_HEAD"
+        fetch_head.write_text("0123456789abcdef0123456789abcdef01234567\t\tbranch 'topic' of example\n")
         self.assertEqual(check(work, before)[0], 0)
+        self.assertEqual(fetch_head.read_text(),
+                         "0123456789abcdef0123456789abcdef01234567\t\tbranch 'topic' of example\n")
         after = refs()
         tip = self.origin.git("rev-parse", "main")
         self.assertEqual(after.pop("refs/runner-kernel-check/main"), tip)
@@ -537,6 +542,44 @@ class CannotEvaluate(Case):
                            "is unknown: `git ls-tree .*` failed: fatal: unable to read tree",
                      release=before, path=path)
 
+    def test_a_history_commit_whose_inputs_cannot_be_read_blocks(self):
+        # main's tip has a config that does not parse, and its parent gives the running
+        # kernel. What main builds now cannot be computed, so the kernel is neither "the
+        # previous build" nor "a stale image": the check cannot say.
+        self.origin.commit(72, "first build")
+        on_parent = expected(self.origin.path)
+        self.origin.git("checkout", "--quiet", "-b", "change")
+        self.origin.commit(40, "a host patch of the pull request's own", **{X86_ONLY: "other\n"})
+        self.origin.git("checkout", "--quiet", "main")
+        broken = self.origin.commit(2, "a config that does not parse",
+                                    **{"rootfs-config.toml": "[kernel_profiles.nested\n"})
+        wanted = (f"is unknown: the host kernel main gave at commit {broken[:12]} cannot be "
+                  "computed: cannot read rootfs-config.toml")
+        work = self.origin.checkout(self.tmp / "work", branch="change")
+        self.blocked(work, wanted, release=on_parent)
+        # Deeper in the window: main's tip is readable again, and the unreadable commit is
+        # between it and the commit that gave the running kernel.
+        self.origin.commit(1, "the config again", **{"rootfs-config.toml": CONFIG,
+                                                     "kernel/host-x86.conf": "CONFIG_ENA_ETHERNET=m\n"})
+        tip = self.origin.checkout(self.tmp / "tip")
+        self.blocked(tip, wanted, release=on_parent)
+        # The build the readable tip gives is still judged without its history.
+        self.assertEqual(check(tip, expected(tip))[0], 0)
+
+    def test_a_history_commit_without_the_host_table_gives_no_build(self):
+        # A readable config with no host kernel for this architecture is "no build", not an
+        # error: the walk goes on to the commit before it.
+        self.origin.commit(72, "first build")
+        before = expected(self.origin.path)
+        self.origin.commit(5, "no x86 host kernel",
+                           **{"rootfs-config.toml": CONFIG.replace("nested.amd64.host_kernel", "other")})
+        self.origin.commit(3, "the table again, with a patch",
+                           **{"rootfs-config.toml": CONFIG, X86_ONLY: "pv kick\n"})
+        work = self.origin.checkout(self.tmp / "work")
+        status, out, err = check(work, before)
+        self.assertEqual(status, 0, out + err)
+        self.assertIn(f"accepted until {utc(NOW + 19 * HOUR)}", out)
+
     def test_a_history_commit_from_before_the_config_gives_no_build(self):
         # main's first commit has no config: it is walked, gives no build, and is no error.
         self.origin.write("README", "first\n")
@@ -552,29 +595,59 @@ class CannotEvaluate(Case):
         self.assertFalse((work / ".git/shallow").exists())
         self.assertEqual(check(work, "7.3.3-fcvm-0123456789ab")[0], 1)
 
-    def test_a_fetch_that_hangs_is_killed_and_leaves_no_lock(self):
+    def no_process(self, pattern):
+        """Fail unless pgrep ran and found no process whose command line is `pattern`."""
+        found = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, check=False)
+        self.assertEqual(found.returncode, 1,
+                         f"pgrep -f {pattern!r}: status {found.returncode}, found "
+                         f"{found.stdout.split()}, stderr {found.stderr!r}")
+
+    def test_the_process_probe_fails_when_it_cannot_run(self):
+        # pgrep prints nothing both when it finds nothing (status 1) and when it fails
+        # (status 2, here a pattern that is not a regular expression).
+        with self.assertRaisesRegex(AssertionError, "status 2"):
+            self.no_process("(")
+
+    def test_a_fetch_that_hangs_is_stopped_with_sigterm_first(self):
+        # git removes the lock files it holds when it gets SIGTERM, and not when it gets
+        # SIGKILL. The stand-in does the same, so a script that went straight to SIGKILL
+        # would leave the lock.
         before, _, work = self.rollout(changed_hours_ago=4)
         lock = work / ".git/shallow.lock"
         nap = f"60.{os.getpid()}"  # a duration no other process on the host sleeps for
         path = fake_git(self.tmp / "fake-bin", f"""
-            fetch) touch {lock}; sleep {nap} & wait ;;
+            fetch) trap 'rm -f {lock}; exit 143' TERM; touch {lock}; sleep {nap} & wait ;;
         """)
         module = load_script()
         module.GIT_TIMEOUT = 1
         started = time.monotonic()
         with mock.patch.dict(os.environ, {"PATH": path}):
-            with self.assertRaisesRegex(module.Blocked, "`git fetch` did not finish in 1 s"):
+            with self.assertRaisesRegex(module.Blocked,
+                                        "`git fetch` did not finish in 1 s and was stopped$"):
                 module.verdict(before, "x86_64", work, NOW, False)
-            self.assertLess(time.monotonic() - started, 30)
-            self.assertFalse(lock.exists(), "the killed fetch left shallow.lock")
-            # The fetch's children are gone too: the session was killed, not only git.
-            sleeping = subprocess.run(["pgrep", "-f", f"^sleep {nap}$"], capture_output=True, text=True)
-            self.assertEqual(sleeping.stdout, "", "the killed fetch left a child running")
-            # A lock that was there before the fetch is someone else's and stays.
-            lock.touch()
-            with self.assertRaisesRegex(module.Blocked, "did not finish"):
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertFalse(lock.exists(), "the stopped fetch kept its lock: it was not sent SIGTERM")
+        # The fetch's children are gone too: the signal went to its process group.
+        self.no_process(f"^sleep {nap}$")
+
+    def test_a_fetch_that_ignores_sigterm_is_killed_and_no_lock_is_deleted(self):
+        before, _, work = self.rollout(changed_hours_ago=4)
+        lock = work / ".git/shallow.lock"
+        nap = f"61.{os.getpid()}"
+        # The stand-in does not start the sleep in the background: bash runs a trap only
+        # between commands, so SIGTERM waits behind the sleep and only SIGKILL ends it.
+        path = fake_git(self.tmp / "fake-bin", f"""
+            fetch) trap '' TERM; touch {lock}; sleep {nap} ;;
+        """)
+        module = load_script()
+        module.GIT_TIMEOUT = 1
+        module.GIT_KILL_GRACE = 1
+        with mock.patch.dict(os.environ, {"PATH": path}):
+            with self.assertRaisesRegex(module.Blocked, "was killed, and may have left a lock file"):
                 module.verdict(before, "x86_64", work, NOW, False)
-            self.assertTrue(lock.exists())
+        self.no_process(f"^sleep {nap}$")
+        # Whose lock that is cannot be known from the file, so it is left where it is.
+        self.assertTrue(lock.exists())
 
     def test_a_python_without_the_tar_filter_blocks(self):
         before, _, work = self.rollout(changed_hours_ago=4)

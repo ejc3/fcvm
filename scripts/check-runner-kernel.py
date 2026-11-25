@@ -25,7 +25,8 @@ Verdicts, each named in what the script prints:
   exit 1  any other kernel: a distribution kernel, or an fcvm build main stopped giving
           more than ROLLOUT_HOURS hours ago (a stale runner image).
   exit 2  the check could not evaluate: no readable config, a release or machine it
-          cannot read, no git, or main's history could not be fetched.
+          cannot read, no git, main's history could not be fetched, or a commit of it
+          in the window has host kernel inputs that cannot be read.
 
 --current-only accepts the first verdict alone, for a job whose results must not come
 from a build that lacks a change (a benchmark).
@@ -35,12 +36,14 @@ checkout (one commit deep) does not hold. The script fetches it from `origin`, o
 the running kernel is an fcvm build other than the one the checkout gives. What that
 changes in the checkout: the ref refs/runner-kernel-check/main is created or moved, the
 fetched objects are added, and in a shallow repository the `shallow` file moves as that
-ref is deepened as far as the window needs. No other ref is written: the fetch names its
-one refspec, takes no tags and turns the remote-tracking update off (`--refmap=`). In a
-full repository it fetches without a depth, which would otherwise make the repository
-shallow. A git command that outlives GIT_TIMEOUT is killed with its children, and a
-`shallow.lock` or ref lock the killed fetch left is removed, so later git steps of the
-job are not refused.
+ref is deepened as far as the window needs. No other ref is written, and FETCH_HEAD is
+left alone: the fetch names its one refspec, takes no tags, turns the remote-tracking
+update off (`--refmap=`) and passes `--no-write-fetch-head`. In a full repository it
+fetches without a depth, which would otherwise make the repository shallow. A git
+command that outlives GIT_TIMEOUT gets SIGTERM, on which git removes the lock files it
+holds itself, and its whole process group gets SIGKILL if it is still there
+GIT_KILL_GRACE seconds later. The script deletes no lock file: it cannot tell a lock its
+own git left from one another git process holds.
 
 A consequence of the second and third verdicts: a pull request that changes a host
 kernel input runs its VM tests on main's kernel, and after it merges main's jobs pass on
@@ -53,8 +56,9 @@ says so.
 The window is measured against commit times with the runner's clock, which is trusted: a
 clock ahead of true time shortens the window and one behind lengthens it.
 
-The script needs Python 3.11.4 or later (tomllib, and tarfile's extraction filter); the
-runner image and GitHub's ubuntu-24.04 have 3.12. An older Python, like any error this
+The script needs Python 3.11.4 or later (tomllib, and tarfile's extraction filter) and,
+for the fetch, git 2.29 or later (`--no-write-fetch-head`); the runner image has Python
+3.12.3 and git 2.43.0, as GitHub's ubuntu-24.04 does. An older Python, like any error this
 script does not expect, exits 2.
 
 --release, --machine, --now and --root replace `uname -r`, `uname -m`, the clock and
@@ -106,8 +110,10 @@ IMAGE_WORKFLOW = ".github/workflows/build-runner-ami.yml"
 # launched just before that can still be on the previous build 13 h 30 min later.
 ROLLOUT_HOURS = 24
 
-# Seconds one git command may take before it is killed.
+# Seconds one git command may take before it gets SIGTERM, and seconds it then has to
+# exit (removing its own lock files) before its process group gets SIGKILL.
 GIT_TIMEOUT = 300
+GIT_KILL_GRACE = 10
 
 # Depths tried, in order, when main's history has to be fetched into a shallow
 # repository. main had 35 first-parent commits in the 24 hours before this was written.
@@ -122,6 +128,10 @@ VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 
 class IdentityError(Exception):
     """The host kernel release of a tree cannot be computed."""
+
+
+class NoHostKernel(IdentityError):
+    """The tree has a readable config with no host kernel table for the architecture."""
 
 
 class Blocked(Exception):
@@ -139,7 +149,7 @@ def host_kernel_release(root, config_arch):
     for key in ("kernel_profiles", PROFILE, config_arch, "host_kernel"):
         table = table.get(key) if isinstance(table, dict) else None
     if not isinstance(table, dict):
-        raise IdentityError(f"rootfs-config.toml has no {section}")
+        raise NoHostKernel(f"rootfs-config.toml has no {section}")
     version = table.get("kernel_version")
     if not (isinstance(version, str) and VERSION.fullmatch(version)):
         raise IdentityError(f"{section} kernel_version is {version!r}, not a kernel version")
@@ -179,15 +189,12 @@ def git_path(root, name):
     return path if path.is_absolute() else root / path
 
 
-def git(root, *args, binary=False, locks=()):
-    """Run git in `root` and return its output; any failure blocks the check. `locks` are
-    lock files the command takes: one that did not exist before a command that had to be
-    killed is removed, since a killed git does not remove its own."""
+def git(root, *args, binary=False):
+    """Run git in `root` and return its output; any failure blocks the check."""
     command = ["git", "-C", str(root), *args]
-    held = {lock for lock in locks if lock.exists()}
     try:
-        # A session of its own, so a kill reaches the helpers git starts (git-remote-https,
-        # index-pack) as well.
+        # A session of its own, so the signals below reach the helpers git starts
+        # (git-remote-https, index-pack) as well.
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -200,15 +207,22 @@ def git(root, *args, binary=False, locks=()):
     try:
         stdout, stderr = process.communicate(timeout=GIT_TIMEOUT)
     except subprocess.TimeoutExpired as error:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.communicate()
-        for lock in locks:
-            if lock not in held:
-                lock.unlink(missing_ok=True)
-        raise Blocked(f"`git {args[0]}` did not finish in {GIT_TIMEOUT} s and was killed") from error
+        # SIGTERM first: git removes the lock files it holds on that signal, which is the
+        # only way a lock is removed by the process that is known to own it.
+        how = "stopped"
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                break
+            try:
+                process.communicate(timeout=GIT_KILL_GRACE)
+                break
+            except subprocess.TimeoutExpired:
+                how = "killed, and may have left a lock file in the repository"
+        raise Blocked(
+            f"`git {args[0]}` did not finish in {GIT_TIMEOUT} s and was {how}"
+        ) from error
     if process.returncode != 0:
         detail = stderr.decode(errors="replace").strip().splitlines()
         raise Blocked(f"`git {' '.join(args)}` failed: {detail[-1] if detail else 'no output'}")
@@ -216,8 +230,10 @@ def git(root, *args, binary=False, locks=()):
 
 
 def release_at(root, commit, config_arch, cache):
-    """The host kernel release a commit's inputs give, or None when they give none. A git
-    command that fails blocks: "no build" is said only of a commit git could read."""
+    """The host kernel release a commit's inputs give, or None when the commit has no host
+    kernel for the architecture (no config, no kernel directory, or no table). Anything
+    else that keeps the release from being computed blocks: a git command that fails, or
+    inputs that cannot be read. "No build" is said only of a commit that was read."""
     # One line per path the commit has, so a commit from before the config or the kernel
     # directory existed lists fewer than two and is not an error.
     listed = git(root, "ls-tree", commit, "--", "rootfs-config.toml", "kernel")
@@ -239,8 +255,13 @@ def release_at(root, commit, config_arch, cache):
                 tar.extractall(tree, filter="data")
             try:
                 cache[key] = host_kernel_release(pathlib.Path(tree), config_arch)
-            except IdentityError:
+            except NoHostKernel:
                 cache[key] = None
+            except IdentityError as error:
+                raise Blocked(
+                    f"the host kernel {IMAGE_BRANCH} gave at commit {commit[:12]} cannot be "
+                    f"computed: {error}"
+                ) from error
     return cache[key]
 
 
@@ -249,14 +270,13 @@ def image_branch_commits(root, start):
     first one at or before `start`: every state main was in from `start` to now."""
     shallow = git(root, "rev-parse", "--is-shallow-repository") == "true"
     shallow_file = git_path(root, "shallow")
-    locks = (git_path(root, "shallow.lock"), git_path(root, f"{HISTORY_REF}.lock"))
     tip = None
     yielded = 0
     for depth in FETCH_DEPTHS if shallow else (None,):
         depth_args = [] if depth is None else [f"--depth={depth}"]
         # --refmap= with no value: the fetch writes HISTORY_REF and no remote-tracking ref.
-        git(root, "fetch", "--quiet", "--no-tags", "--refmap=", *depth_args, "origin",
-            f"+refs/heads/{IMAGE_BRANCH}:{HISTORY_REF}", locks=locks)
+        git(root, "fetch", "--quiet", "--no-tags", "--refmap=", "--no-write-fetch-head",
+            *depth_args, "origin", f"+refs/heads/{IMAGE_BRANCH}:{HISTORY_REF}")
         if tip is None:
             # main may move between two fetches; the walk keeps the first tip it saw.
             tip = git(root, "rev-parse", "--verify", HISTORY_REF)

@@ -691,6 +691,38 @@ fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> O
             "a step other than the disk preflight runs before the check: {other:?}"
         ));
     }
+    // A step whose `if` has a status function runs after a failed check too. One that runs
+    // make then has to name the outcome of a step that cannot run after a failed check
+    // itself: a later step with an id and no status function in an `if` of its own.
+    let after_a_failure = |step: &Value| {
+        let condition = step.get("if").map(|v| format!("{v:?}")).unwrap_or_default();
+        ["always()", "failure()", "cancelled()"]
+            .iter()
+            .any(|status| condition.contains(status))
+            .then_some(condition)
+    };
+    for step in &steps[check + 1..] {
+        let Some(condition) = after_a_failure(step) else {
+            continue;
+        };
+        let runs_make =
+            run_of(step).is_some_and(|run| run.split_whitespace().any(|word| word == "make"));
+        if !runs_make {
+            continue;
+        }
+        let gated = steps[check + 1..].iter().any(|earlier| {
+            after_a_failure(earlier).is_none()
+                && earlier.get("id").and_then(Value::as_str).is_some_and(|id| {
+                    condition.contains(&format!("steps.{id}.outcome == 'success'"))
+                })
+        });
+        if !gated {
+            return Some(format!(
+                "the step `{}` can run make after the check failed",
+                step.get("name").and_then(Value::as_str).unwrap_or("?")
+            ));
+        }
+    }
     None
 }
 
@@ -811,8 +843,12 @@ fn every_self_hosted_job_checks_the_runner_kernel() {
                 |step| step.get("run").and_then(Value::as_str).map(str::trim)
                     == Some("make test-runner-kernel")
                     && step.get("if").is_none()
-            ),
-        "ci.yml's actionlint job must run `make test-runner-kernel`"
+                    && step.get("continue-on-error").is_none()
+            )
+            && workflow_job(&ci, "actionlint")
+                .get("continue-on-error")
+                .is_none(),
+        "ci.yml's actionlint job must run `make test-runner-kernel`, and fail when it fails"
     );
 }
 
@@ -929,6 +965,38 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
         runner_kernel_check_finding(&checked, Some(&Value::String("sh".into()))).as_deref(),
         Some("a default shell is set for the job's steps")
     );
+
+    // Steps after the check that run when an earlier step failed.
+    let later = |steps: &str| finding(&job(labels, &format!("{check}{steps}")));
+    let setup = "  - id: setup\n    run: make setup-fcvm\n";
+    assert_eq!(
+        later("  - if: always()\n    run: ./scripts/ci-stray-vm-guard.sh post\n"),
+        None
+    );
+    assert_eq!(
+        later(&format!(
+            "{setup}  - if: ${{{{ !cancelled() && steps.setup.outcome == 'success' }}}}\n    \
+             run: make fuzz-gym\n"
+        )),
+        None
+    );
+    for ungated in [
+        "  - name: gym\n    if: always()\n    run: FCVM_GYM_SAMPLES=16 make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: failure()\n    run: |\n      cd fcvm\n      make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: ${{ !cancelled() }}\n    run: make fuzz-gym\n".to_string(),
+        // the outcome of a step that does not exist, and of one that runs after a failure too
+        "  - name: gym\n    if: always() && steps.setup.outcome == 'success'\n    run: make fuzz-gym\n"
+            .to_string(),
+        "  - id: setup\n    if: always()\n    run: ./prepare.sh\n  - name: gym\n    \
+         if: always() && steps.setup.outcome == 'success'\n    run: make fuzz-gym\n"
+            .to_string(),
+    ] {
+        assert_eq!(
+            later(&ungated).as_deref(),
+            Some("the step `gym` can run make after the check failed"),
+            "{ungated}"
+        );
+    }
 
     // Which jobs the rule is applied to at all.
     let runner = |job: &str| runner_of(&serde_norway::from_str::<Value>(job).unwrap());
