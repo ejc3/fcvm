@@ -518,7 +518,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm balloon` | Print a VM's balloon target and size as one JSON line; with a MIB argument, set the target first |
 | `fcvm ls` | List running VMs (`--json` for JSON) |
-| `fcvm snapshot create` | Snapshot a running VM |
+| `fcvm snapshot create` | Snapshot a running VM (a clone only once its restore is acknowledged; `--await-restore` waits for that) |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Clone from snapshot (`--publish` chooses where its ports listen) |
 | `fcvm snapshot export` | Write a Firecracker snapshot as one archive, with the image disk and the pmem images it reads, to stdout or `--output <FILE>` |

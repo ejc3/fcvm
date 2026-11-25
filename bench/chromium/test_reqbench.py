@@ -10400,6 +10400,7 @@ class NoHostIdentifiersInTree(unittest.TestCase):
         "i-" + "0aaaaaaaaaaaaaaa1",
         "i-" + "0aaaaaaaaaaaaaaa2",
         "i-" + "0bbbbbbbbbbbbbbb1",
+        "i-" + "0ccccccccccccccc1",
     }
     # Spelled in pieces so this file does not contain the forbidden keys.
     FIELDS = ("instance" + "_id", "host_" + "ipv4", "host_" + "ipv6")

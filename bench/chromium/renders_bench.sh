@@ -7,6 +7,12 @@
 #                                               left (renders_teardown_check.py). The stage
 #                                               `golden` exists only while the snapshot is
 #                                               made, so name it with a TAG that has none.
+#   renders_bench.sh agent-check [STAGES]       the same module under `fcvm fleet agent
+#                                               --renders`, ordered by this script as the
+#                                               coordinator would (renders_agent_check.py):
+#                                               hello, renders, an overlay, a stop while
+#                                               rendering and while held at HOLD_STAGES, and
+#                                               SIGKILL at each of STAGES. CASES=running,held,kill
 #
 # The module puts each side in a cpuset of its own, so it runs in a subgroup of a delegated
 # unit: a transient system service of the calling user with Delegate=yes and
@@ -27,6 +33,8 @@
 #   IMAGE, CPU, MEM   the snapshot is made from IMAGE with CPU vCPUs and MEM MiB when it is
 #                absent (the module's defaults: the bench image, 4, 1024, on 2 MiB pages)
 #   UNIT, RUN_DIR, STATUS, FCVM, URLS, CORPUS
+#   AFTER_S, STAGE_TIMEOUT_S   the checks' seconds of rendering before a kill, and per stage
+#   HOLD_STAGES, CASES          agent-check: stages to stop at, and which cases to run
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,16 +54,15 @@ CORPUS="${CORPUS:-$HERE/corpus-live}"
 URLS="${URLS:-$(sed -n 's/^URLS="\(https[^"]*\)".*/\1/p' "$HERE/corpus_campaign.sh" | head -1)}"
 [ -n "$URLS" ] || { echo "BLOCKED: no page list (URLS)" >&2; exit 2; }
 [ -x "$FCVM" ] || { echo "BLOCKED: no fcvm binary at $FCVM (make build)" >&2; exit 2; }
-module_args() {
-    printf '%s\0' fleet renders-bench --out "$OUT" --run-dir "$RUN_DIR" --status-file "$STATUS" \
+# The module's options shared by the benchmark command and the agent (`--renders-arg`).
+module_opts() {
+    printf '%s\0' --out "$OUT" --run-dir "$RUN_DIR" --status-file "$STATUS" \
         --bench "$HERE" --corpus "$CORPUS" --urls "$URLS" --snapshot-tag "$TAG"
     [ -z "${IMAGE:-}" ] || printf '%s\0' --image "$IMAGE"
     [ -z "${CPU:-}" ] || printf '%s\0' --vcpus "$CPU"
     [ -z "${MEM:-}" ] || printf '%s\0' --mem-mib "$MEM"
     [ -z "${KITESURF:-}" ] || printf '%s\0' --kitesurf "$KITESURF"
     [ -z "${DIST:-}" ] || printf '%s\0' --kitesurf-dist "$DIST"
-    [ -z "${LEVELS:-}" ] || printf '%s\0' --levels "$LEVELS"
-    [ -z "${SECONDS_RUN:-}" ] || printf '%s\0' --seconds "$SECONDS_RUN"
     [ -z "${MAX_FCVM:-}" ] || printf '%s\0' --max-fcvm "$MAX_FCVM"
     [ -z "${MAX_ENGINES:-}" ] || printf '%s\0' --max-engines "$MAX_ENGINES"
     [ -z "${RECYCLE_MIB:-}" ] || printf '%s\0' --recycle-mib "$RECYCLE_MIB"
@@ -68,19 +75,50 @@ module_args() {
     [ -z "${TIMEOUT_S:-}" ] || printf '%s\0' --timeout-s "$TIMEOUT_S"
 }
 
-start_unit() {  # wait|no-block, then the module's further arguments
-    local how=$1; shift
-    local args=()
-    while IFS= read -r -d '' a; do args+=("$a"); done < <(module_args)
-    local wait=(--wait)
-    [ "$how" = wait ] || wait=()
-    mkdir -p "$(dirname "$OUT")"
-    sudo systemd-run --unit "$UNIT" --collect --quiet "${wait[@]}" \
+module_args() {
+    printf '%s\0' fleet renders-bench
+    module_opts
+    [ -z "${LEVELS:-}" ] || printf '%s\0' --levels "$LEVELS"
+    [ -z "${SECONDS_RUN:-}" ] || printf '%s\0' --seconds "$SECONDS_RUN"
+}
+
+# The agent, with harmless values for its own required options: a host name, a renderer
+# image and a first port that no slot uses (it finds no GPU under a missing sysfs root).
+agent_args() {
+    printf '%s\0' fleet agent --stdio --host renders-agent-check --image unused \
+        --base-port 1 --sysfs-root "$OUT.no-sysfs" --renders
+    local o
+    while IFS= read -r -d '' o; do printf '%s\0' "--renders-arg=$o"; done < <(module_opts)
+}
+
+# The unit's properties, for the benchmark command and the agent alike.
+unit_props() {
+    printf '%s\0' --unit "$UNIT" --collect --quiet \
         -p Delegate=yes -p DelegateSubgroup=agent -p "User=$(id -un)" \
         -p LimitNOFILE=1048576 -p TasksMax=infinity \
         --setenv=HOME="$HOME" --setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
-        --setenv=PATH="$PATH" --setenv=RUST_LOG="${RUST_LOG:-info}" \
-        "$FCVM" "${args[@]}" "$@"
+        --setenv=PATH="$PATH" --setenv=RUST_LOG="${RUST_LOG:-info}"
+}
+
+start_unit() {  # wait|no-block, then the module's further arguments
+    local how=$1; shift
+    local args=() props=()
+    while IFS= read -r -d '' a; do args+=("$a"); done < <(module_args)
+    while IFS= read -r -d '' a; do props+=("$a"); done < <(unit_props)
+    local wait=(--wait)
+    [ "$how" = wait ] || wait=()
+    mkdir -p "$(dirname "$OUT")"
+    sudo systemd-run "${props[@]}" "${wait[@]}" "$FCVM" "${args[@]}" "$@"
+}
+
+census_args() {  # what renders_teardown_check.py counts, for both checks
+    local data="${FCVM_DATA_DIR:-/mnt/fcvm-btrfs}" a p n
+    printf '%s\0' --unit "$UNIT" --status "$STATUS" --teardown "$OUT/teardown.json" \
+        --run-dir "$RUN_DIR" --state-dir "$data/state" --vm-dir "$data/vm-disks" \
+        --data-dir "$data" --snapshot-tag "$TAG"
+    for a in 127.0.0.1 127.0.0.3; do for p in 80 443; do printf '%s\0' --port "$a:$p"; done; done
+    printf '%s\0' --port 127.0.0.1:53
+    for n in $(seq 0 $(( ${MAX_ENGINES:-48} - 1 ))); do printf '%s\0' --port "127.0.0.1:$((28800 + n))"; done
 }
 
 case "$mode" in
@@ -88,16 +126,27 @@ case "$mode" in
     start) start_unit no-block "$@" ;;
     teardown-check)
         stages="${1:-start,cgroups,replays,serve-starting,serve,engines-starting,engines,workers,running,running:TERM}"
-        data="${FCVM_DATA_DIR:-/mnt/fcvm-btrfs}"
-        ports=()
-        for a in 127.0.0.1 127.0.0.3; do for p in 80 443; do ports+=(--port "$a:$p"); done; done
-        ports+=(--port 127.0.0.1:53)
-        for n in $(seq 0 $(( ${MAX_ENGINES:-48} - 1 ))); do ports+=(--port "127.0.0.1:$((28800 + n))"); done
-        python3 "$HERE/renders_teardown_check.py" --unit "$UNIT" --status "$STATUS" \
-            --teardown "$OUT/teardown.json" --run-dir "$RUN_DIR" --stages "$stages" \
-            --state-dir "$data/state" --vm-dir "$data/vm-disks" --data-dir "$data" --snapshot-tag "$TAG" \
+        count=()
+        while IFS= read -r -d '' a; do count+=("$a"); done < <(census_args)
+        python3 "$HERE/renders_teardown_check.py" "${count[@]}" --stages "$stages" \
             --after-s "${AFTER_S:-20}" --timeout-s "${STAGE_TIMEOUT_S:-1800}" --out "$OUT.teardown-check.json" \
-            "${ports[@]}" -- "$0" start
+            -- "$0" start
         ;;
-    *) echo "usage: OUT=DIR $0 run|start|teardown-check [...]" >&2; exit 2 ;;
+    agent-check)
+        stages="${1:-start,cgroups,replays,serve-starting,serve,engines-starting,engines,workers,running,running:TERM}"
+        count=() props=() agent=()
+        while IFS= read -r -d '' a; do count+=("$a"); done < <(census_args)
+        while IFS= read -r -d '' a; do props+=("$a"); done < <(unit_props)
+        while IFS= read -r -d '' a; do agent+=("$a"); done < <(agent_args)
+        engines=(--engines)
+        [ "${MAX_ENGINES:-48}" != 0 ] || engines=()
+        mkdir -p "$(dirname "$OUT")"
+        python3 "$HERE/renders_agent_check.py" "${count[@]}" "${engines[@]}" \
+            --pages "$(printf '%s' "$URLS" | tr ',' '\n' | grep -c .)" --stages "$stages" \
+            --hold-stages "${HOLD_STAGES:-replays,serve,engines-starting}" --cases "${CASES:-running,held,kill}" \
+            --after-s "${AFTER_S:-20}" --timeout-s "${STAGE_TIMEOUT_S:-1800}" \
+            --log "$OUT.agent-check.log" --out "$OUT.agent-check.json" \
+            -- sudo systemd-run "${props[@]}" --pipe "$FCVM" "${agent[@]}"
+        ;;
+    *) echo "usage: OUT=DIR $0 run|start|teardown-check|agent-check [...]" >&2; exit 2 ;;
 esac

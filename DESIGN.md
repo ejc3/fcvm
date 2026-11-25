@@ -1614,6 +1614,8 @@ fcvm snapshot create [--pid <PID> | <VM_NAME>] [--tag <TAG>]
 ```
 --pid <PID>               fcvm process PID to snapshot
 --tag <TAG>               Snapshot name (defaults to VM name)
+--await-restore <SECONDS> Wait this long for a restored VM's restore to be acknowledged
+                          before refusing to snapshot it (default 0: refuse at once)
 <VM_NAME>                 VM name to snapshot (alternative to --pid)
 ```
 
@@ -1625,6 +1627,22 @@ fcvm snapshot create --pid 12345 --tag my-snapshot
 # Create snapshot by name
 fcvm snapshot create my-vm --tag warm-nginx
 ```
+
+**A restored VM is snapshotted only after its restore is acknowledged**: a VM restored from a memory snapshot
+(`snapshot run`, or `podman run` on a snapshot cache hit) resumes behind its snapshot's network gate with its
+container frozen, and its guest acknowledges the restore only after it has retired the source's connections, run the
+restore hook and opened the gate. A snapshot taken before that would open the gate early and capture a restore part
+way through, so `snapshot create` refuses such a VM, `--stop` included, and leaves it as it was. The test is the VM's
+state: `process_type` is `clone` and `restore_acknowledged` is not set. `snapshot run` records the acknowledgement on
+the state and then prints its restored record, so once the record is printed a create is taken; `fcvm ls --json --pid
+<PID>` shows `"restore_acknowledged": true`. Taken is not yet run: `snapshot run` still has its own checks of the clone
+to do (the guest's output connection, the port check) and holds the VM's snapshot lock until it has published
+`lifecycle_ready`, so a create asked for in that stretch (7 ms measured) waits for it and does not pause the guest
+under those checks; it gives up after 60 s if the clone is never published. A clone whose state says `failed` is
+refused, whether its restore failed before the acknowledgement or after it; the state says so until the VM's teardown
+removes it. A caller that learns a clone is up from the clone's own ports can be a few
+milliseconds ahead of the record; `--await-restore <SECONDS>` waits for it, and ends early when the restore fails,
+the VM's fcvm exits or its state is removed. A VM that was booted is not checked.
 
 **Zero pages are holes**: with the default Firecracker build (`[firecracker]` in `rootfs-config.toml`, used by every
 kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves
