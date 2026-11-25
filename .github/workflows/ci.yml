@@ -936,6 +936,7 @@ jobs:
           # exit 125 before any test ran, 2026-08-13).
           ./fcvm/scripts/runner-podman-hygiene.sh
       - name: Create test log directory
+        id: test-logs
         run: |
           sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
           # Teardown's VMM log copies from an earlier job on this runner are not this job's.
@@ -1004,7 +1005,8 @@ jobs:
           mkdir -p /tmp/fcvm-test-logs
           cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Save VMM logs
-        if: always()
+        # Only this job's files: not when the job failed before it emptied the directory (#2164).
+        if: ${{ always() && steps.test-logs.outcome == 'success' }}
         run: |
           # Teardown keeps the end of each VM's VMM log in /tmp (Firecracker's, or Cloud
           # Hypervisor's at -v). Without a copy here a guest that hung left no record of what
@@ -1016,7 +1018,8 @@ jobs:
             -exec cp -t /tmp/fcvm-test-logs/vmm/ {} + || echo "no VMM logs were kept"
           sudo chmod -R a+rX /tmp/fcvm-test-logs/vmm
       - name: Upload test logs
-        if: always()
+        # Only this job's files: not when the job failed before it emptied the directory (#2164).
+        if: ${{ always() && steps.test-logs.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-logs-host-${{ matrix.arch }}
@@ -1257,6 +1260,7 @@ jobs:
           # Install iperf3 for network benchmarks
           ./fcvm/scripts/ci-apt-get.sh update && ./fcvm/scripts/ci-apt-get.sh install -y iperf3 || true
       - name: Create test log directory
+        id: test-logs
         run: |
           sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
           # Teardown's VMM log copies from an earlier job on this runner are not this job's.
@@ -1383,7 +1387,8 @@ jobs:
           mkdir -p /tmp/fcvm-test-logs
           cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Save VMM logs
-        if: always()
+        # Only this job's files: not when the job failed before it emptied the directory (#2164).
+        if: ${{ always() && steps.test-logs.outcome == 'success' }}
         run: |
           # Teardown keeps the end of each VM's VMM log in /tmp (Firecracker's, or Cloud
           # Hypervisor's at -v). Without a copy here a guest that hung left no record of what
@@ -1395,7 +1400,8 @@ jobs:
             -exec cp -t /tmp/fcvm-test-logs/vmm/ {} + || echo "no VMM logs were kept"
           sudo chmod -R a+rX /tmp/fcvm-test-logs/vmm
       - name: Upload test logs
-        if: always()
+        # Only this job's files: not when the job failed before it emptied the directory (#2164).
+        if: ${{ always() && steps.test-logs.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-logs-host-root-${{ matrix.arch }}-${{ matrix.mode }}
@@ -1516,6 +1522,7 @@ jobs:
           key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Create test log directory
+        id: test-logs
         run: |
           sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
           # Teardown's VMM log copies from an earlier job on this runner are not this job's.
@@ -1572,7 +1579,8 @@ jobs:
           mkdir -p /tmp/fcvm-test-logs
           cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Upload test logs
-        if: always()
+        # Only this job's files: not when the job failed before it emptied the directory (#2164).
+        if: ${{ always() && steps.test-logs.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-logs-container-${{ matrix.arch }}

@@ -1018,6 +1018,231 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
     }
 }
 
+/// What is wrong with how a job on a runner of ours uploads `/tmp/fcvm-test-logs`, if anything.
+/// `None` also for a job that uploads nothing from there.
+fn test_log_upload_finding(job: &Value) -> Option<String> {
+    let steps = job.get("steps").and_then(Value::as_sequence)?;
+    fn run_of(step: &Value) -> &str {
+        step.get("run").and_then(Value::as_str).unwrap_or_default()
+    }
+    fn name_of(step: &Value) -> &str {
+        step.get("name").and_then(Value::as_str).unwrap_or("?")
+    }
+    let upload_paths = |step: &Value| -> Vec<String> {
+        let is_upload = step
+            .get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"));
+        let paths = step
+            .get("with")
+            .and_then(|with| with.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if is_upload && paths.contains("/tmp/fcvm-test-logs") {
+            paths
+                .lines()
+                .map(|line| line.trim().trim_end_matches('/').to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+    // Steps that put files of /tmp into the directory the upload takes.
+    let collects = |step: &Value| run_of(step).contains("-exec cp -t /tmp/fcvm-test-logs/");
+    let first_upload = steps
+        .iter()
+        .position(|step| !upload_paths(step).is_empty())?;
+
+    // The step that empties the directory for this job: a command, not a comment, and one
+    // that runs only when everything before it succeeded.
+    let removes = |step: &Value, path: &str| {
+        run_of(step)
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or(""))
+            .any(|line| {
+                line.contains("rm -rf")
+                    && line
+                        .split_whitespace()
+                        .any(|word| word.trim_end_matches('/') == path)
+            })
+    };
+    let Some(reset) = steps[..first_upload]
+        .iter()
+        .find(|step| removes(step, "/tmp/fcvm-test-logs"))
+    else {
+        return Some("no step before the upload removes /tmp/fcvm-test-logs".into());
+    };
+    if reset.get("if").is_some() {
+        return Some(format!("the reset step `{}` has an `if`", name_of(reset)));
+    }
+    let Some(id) = reset.get("id").and_then(Value::as_str) else {
+        return Some(format!("the reset step `{}` has no id", name_of(reset)));
+    };
+    let gate = format!("steps.{id}.outcome == 'success'");
+    for step in steps {
+        let paths = upload_paths(step);
+        if paths.is_empty() && !collects(step) {
+            continue;
+        }
+        let condition = step.get("if").map(|v| format!("{v:?}")).unwrap_or_default();
+        if !condition.contains(&gate) {
+            return Some(format!(
+                "the step `{}` runs when the reset step `{id}` did not",
+                name_of(step)
+            ));
+        }
+        if let Some(path) = paths.iter().find(|path| !removes(reset, path)) {
+            return Some(format!(
+                "the step `{}` uploads {path}, which the reset step `{id}` does not remove",
+                name_of(step)
+            ));
+        }
+    }
+    None
+}
+
+/// Our runners keep `/tmp` from job to job. A job empties `/tmp/fcvm-test-logs` in a step that
+/// comes after its checkout, the disk preflight, the runner kernel check and the build setup,
+/// and uploads the directory in a step that runs after a failure too. A job that failed before
+/// the reset therefore uploaded the previous job's logs under its own artifact name (#2164).
+/// Every such upload, and every step that copies files into the directory for it, names the
+/// outcome of the reset step, and the reset step removes every path the upload takes.
+#[test]
+fn test_log_uploads_require_the_jobs_own_log_reset() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut uploading = BTreeSet::new();
+    let mut findings = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+        let workflow = parse_workflow(&file);
+        for (name, job) in workflow["jobs"].as_mapping().unwrap() {
+            let name = name.as_str().unwrap();
+            if !matches!(runner_of(job), Ok(Runner::Ours)) {
+                continue;
+            }
+            let uploads = job
+                .get("steps")
+                .and_then(Value::as_sequence)
+                .is_some_and(|steps| {
+                    steps.iter().any(|step| {
+                        format!("{:?}", step.get("with")).contains("/tmp/fcvm-test-logs")
+                    })
+                });
+            if uploads {
+                uploading.insert(format!("{file}/{name}"));
+            }
+            if let Some(finding) = test_log_upload_finding(job) {
+                findings.push(format!("{file}/{name}: {finding}"));
+            }
+        }
+    }
+    assert!(findings.is_empty(), "{findings:#?}");
+    assert_eq!(
+        uploading.into_iter().collect::<Vec<_>>(),
+        [
+            "ci.yml/container",
+            "ci.yml/host",
+            "ci.yml/host-root",
+            "teardown-evidence.yml/evidence",
+            "weekly.yml/fuzz",
+        ]
+    );
+
+    // The rule itself, on fixture jobs.
+    let finding = |steps: &str| {
+        let job: Value = serde_norway::from_str(&format!(
+            "runs-on: [self-hosted, Linux, ARM64]\nsteps:\n{steps}"
+        ))
+        .unwrap();
+        test_log_upload_finding(&job)
+    };
+    let reset = "  - name: reset\n    id: logs\n    run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs\n";
+    let upload = |condition: &str, paths: &str| {
+        format!(
+            "  - name: upload\n    if: {condition}\n    \
+             uses: actions/upload-artifact@0000000000000000000000000000000000000000\n    \
+             with:\n      path: |\n{paths}"
+        )
+    };
+    let logs = "        /tmp/fcvm-test-logs/\n";
+    let gated = "always() && steps.logs.outcome == 'success'";
+    assert_eq!(finding(&format!("{reset}{}", upload(gated, logs))), None);
+    assert_eq!(
+        finding(&format!(
+            "{reset}{}",
+            upload("failure() && steps.logs.outcome == 'success'", logs)
+        )),
+        None
+    );
+    assert_eq!(finding("  - run: make build\n"), None);
+    let wrong = |steps: String, wanted: &str| {
+        let found = finding(&steps).unwrap_or_else(|| panic!("no finding: {steps}"));
+        assert!(found.contains(wanted), "{found}");
+    };
+    wrong(
+        format!("{reset}{}", upload("always()", logs)),
+        "the step `upload` runs when the reset step `logs` did not",
+    );
+    wrong(
+        format!("{reset}{}", upload("failure()", logs)),
+        "runs when the reset step",
+    );
+    wrong(
+        format!("{}{reset}", upload(gated, logs)),
+        "no step before the upload removes",
+    );
+    wrong(
+        format!(
+            "  - name: reset\n    id: logs\n    run: |\n      # sudo rm -rf /tmp/fcvm-test-logs\n      \
+             mkdir -p /tmp/fcvm-test-logs\n{}",
+            upload(gated, logs)
+        ),
+        "no step before the upload removes",
+    );
+    wrong(
+        format!(
+            "{}{}",
+            reset.replace("    id: logs\n", ""),
+            upload(gated, logs)
+        ),
+        "has no id",
+    );
+    wrong(
+        format!(
+            "{}{}",
+            reset.replace("    id: logs\n", "    id: logs\n    if: always()\n"),
+            upload(gated, logs)
+        ),
+        "has an `if`",
+    );
+    wrong(
+        format!(
+            "{reset}{}",
+            upload(
+                gated,
+                "        /tmp/fcvm-teardown-evidence/\n        /tmp/fcvm-test-logs/\n"
+            )
+        ),
+        "uploads /tmp/fcvm-teardown-evidence, which the reset step `logs` does not remove",
+    );
+    wrong(
+        format!(
+            "{reset}  - name: copy\n    if: always()\n    run: sudo find /tmp -name 'x-*.log' \
+             -exec cp -t /tmp/fcvm-test-logs/vmm/ {{}} +\n{}",
+            upload(gated, logs)
+        ),
+        "the step `copy` runs when the reset step `logs` did not",
+    );
+}
+
 /// Every self-hosted job that checks out must first repair workspace ownership.
 ///
 /// Self-hosted runners keep their workspace between jobs. fcvm's privileged
@@ -3617,10 +3842,11 @@ fn host_jobs_upload_the_vmm_logs_teardown_keeps() {
             clear.contains("-name 'fcvm-firecracker-*.log' -delete"),
             "job {job} uploads VMM logs earlier jobs left: {clear}"
         );
+        // After a failed test step too, and only when this job cleared the directory (#2164).
         let step = &steps[save];
         assert_eq!(
             step.get("if").and_then(Value::as_str),
-            Some("always()"),
+            Some("${{ always() && steps.test-logs.outcome == 'success' }}"),
             "job {job}"
         );
         let run = step.get("run").and_then(Value::as_str).unwrap_or("");
