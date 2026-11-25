@@ -7,6 +7,14 @@
 # prints: every rule on every input, then every recorded run of WakeVerify/Breaks.lean. Any
 # difference between what the kernel's functions do and what the model expects fails.
 #
+# Cut: the halt (__kvm_emulate_halt, kvm_vcpu_has_events, kvm_arch_vcpu_runnable, vcpu_block),
+# the kick (__apic_accept_irq), KVM_GET_MP_STATE and KVM_SET_MP_STATE, and the whole path of a
+# completion: queued by the MSR write (kvm_pv_enable_async_pf, kvm_async_pf_wakeup_all), dequeued
+# on entry (kvm_check_async_pf_completion, kvm_arch_can_dequeue_async_page_present,
+# apf_pageready_slot_free) and delivered (kvm_arch_async_page_present, apf_put_user_ready,
+# kvm_apic_set_irq). Not cut, and set by hand where a run needs it: vcpu_enter_guest itself,
+# the async page fault worker, the guest's interrupt handler, the LAPIC's own state.
+#
 # The kernel source is fetched, not kept in this repository.
 #
 # usage: harness/run.sh            from verify/, or through `make verify-harness`
@@ -60,20 +68,37 @@ fi
 
 x86_functions="kvm_vcpu_running kvm_vcpu_has_events kvm_arch_vcpu_runnable vcpu_block
   __kvm_emulate_halt kvm_arch_vcpu_ioctl_get_mpstate kvm_arch_vcpu_ioctl_set_mpstate
-  kvm_arch_async_page_present"
+  apf_put_user_ready apf_pageready_slot_free kvm_arch_async_page_present
+  kvm_arch_async_page_present_queued kvm_arch_can_dequeue_async_page_present"
+async_functions="kvm_flush_and_free_async_pf_work kvm_check_async_pf_completion
+  kvm_async_pf_wakeup_all"
 
+# The functions are cut in an order that defines each before its first use. Two of them live in
+# different files in the two releases: kvm_pv_async_pf_enabled (x86.c in v6.14, x86.h with its
+# helper in v7.3.3) and kvm_pv_enable_async_pf (x86.c in v6.14, msrs.c in v7.3.3).
 build_one() {
-  local variant=$1 src="$build/src/$1/arch/x86/kvm" out="$build/$1"
+  local variant=$1 src="$build/src/$1" out="$build/$1"
+  local kvm="$src/arch/x86/kvm"
   mkdir -p "$out"
   {
-    if [ -f "$src/x86.h" ] && grep -q '^static inline void kvm_set_mp_state' "$src/x86.h"; then
-      python3 "$here/cut.py" "$src/x86.h" kvm_set_mp_state
+    if [ -f "$kvm/x86.h" ]; then
+      python3 "$here/cut.py" "$kvm/x86.h" kvm_set_mp_state __kvm_pv_async_pf_enabled \
+        kvm_pv_async_pf_enabled
+    else
+      python3 "$here/cut.py" "$kvm/x86.c" kvm_pv_async_pf_enabled
     fi
+    python3 "$here/cut.py" "$kvm/lapic.c" __apic_accept_irq kvm_apic_set_irq
     # shellcheck disable=SC2086
-    python3 "$here/cut.py" "$src/x86.c" $x86_functions
-    python3 "$here/cut.py" "$src/lapic.c" __apic_accept_irq
+    python3 "$here/cut.py" "$kvm/x86.c" $x86_functions
+    # shellcheck disable=SC2086
+    python3 "$here/cut.py" "$src/virt/kvm/async_pf.c" $async_functions
+    if [ -f "$kvm/msrs.c" ]; then
+      python3 "$here/cut.py" "$kvm/msrs.c" kvm_pv_enable_async_pf
+    else
+      python3 "$here/cut.py" "$kvm/x86.c" kvm_pv_enable_async_pf
+    fi
   } > "$out/cut.c"
-  cc -std=gnu11 -O1 -Wall -Werror -Wno-unused-function -Wno-unused-value \
+  cc -std=gnu11 -O1 -Wall -Werror -Wno-unused-function -Wno-unused-value -Wno-unused-variable \
     -DCUT="\"$out/cut.c\"" -I"$here" -o "$out/harness" "$here/harness.c"
 }
 

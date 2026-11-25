@@ -34,6 +34,7 @@ def Vid.other : Vid → Vid
 /-- `vcpu->arch.mp_state`, the values a vCPU of a running guest takes. -/
 inductive Mp where
   | runnable       -- KVM_MP_STATE_RUNNABLE
+  | uninitialized  -- KVM_MP_STATE_UNINITIALIZED: an application processor before its first INIT
   | halted         -- KVM_MP_STATE_HALTED
   | initReceived   -- KVM_MP_STATE_INIT_RECEIVED (wait for SIPI)
   | apResetHold    -- KVM_MP_STATE_AP_RESET_HOLD (SEV-ES)
@@ -197,11 +198,16 @@ structure Vcpu where
   hashed : Bool := false
   /-- a cross-CPU call is queued for this vCPU and not yet run -/
   csd : Bool := false
+  /-- the page-ready slot in guest memory is occupied: `apf_reason.token != 0`, from KVM's write
+  of a token (`apf_put_user_ready`) until the guest's handler clears it -/
+  slot : Bool := false
   loc : Loc := .guest
   h : Hv := {}
   apf : Apf := .none
   /-- the call-function vector is pending in this vCPU's IRR -/
   ipi : Bool := false
+  /-- the page-ready vector (`apf.vec`) is pending in this vCPU's IRR -/
+  apfIrq : Bool := false
   tmr : Tmr := .off
   deriving DecidableEq, Repr, Hashable, Inhabited
 
@@ -215,10 +221,11 @@ def Vcpu.ifOn (v : Vcpu) : Bool :=
   | .idChk | .idHlt | .idHltT | .off | .hdHlt | .ndHlt => false
   | _ => v.irqsOn
 
-/-- `kvm_vcpu_has_events()` without the kick: a completion on the done list, or an interrupt the
-guest can take now. -/
+/-- `kvm_vcpu_has_events()` without the kick: a completion on the done list (v7.3.3
+x86.c:8524-8525), or an interrupt the guest can take now (x86.c:8552-8553). The NMI, INIT and SMI
+arms of that function are the `nmi` and `init` steps. -/
 def Vcpu.events (v : Vcpu) : Bool :=
-  v.apf.isDone || (v.ifOn && (v.ipi || v.tmr == .irr))
+  v.apf.isDone || (v.ifOn && (v.ipi || v.apfIrq || v.tmr == .irr))
 
 /-- `kvm_vcpu_running()` -/
 def Vcpu.running (v : Vcpu) : Bool :=
@@ -237,7 +244,8 @@ structure State where
   lock : Lock := .free
   /-- the VMM has paused the VM: every vCPU thread is out of KVM_RUN -/
   paused : Bool := false
-  /-- this VM is the one restored from the snapshot (one snapshot and restore per run) -/
+  /-- this VM was restored from a snapshot (of the first VM, or of a restored one: any number of
+  generations) -/
   cloned : Bool := false
   deriving DecidableEq, Repr, Hashable, Inhabited
 
@@ -296,6 +304,9 @@ structure Cfg where
   pvApf : Bool := true
   /-- host page faults that need I/O happen (memory served through userfaultfd) -/
   faults : Bool := true
+  /-- they also happen in the lock, call and idle paths, wherever interrupts are on (the theorems
+  hold either way; a search with this off is smaller) -/
+  kernelFaults : Bool := true
   /-- locks are taken with interrupts off -/
   irqLocks : Bool := true
   /-- locks are taken with interrupts on -/
@@ -306,8 +317,9 @@ structure Cfg where
   idle : Bool := true
   /-- the VMM pauses, snapshots, restores and resumes -/
   snapshot : Bool := true
-  /-- interrupts from sources the model does not follow (devices, the tick) may arrive -/
-  rescue : Bool := false
+  /-- interrupts from sources the model does not follow (devices, the tick) may arrive at a
+  blocked vCPU that can take them -/
+  rescue : Bool := true
   /-- NMIs may arrive -/
   nmi : Bool := false
   /-- the idle loop programs the APIC timer -/
@@ -319,15 +331,15 @@ structure Cfg where
   /-- userspace reads `mp_state` of a paused, live VM and writes it back (Firecracker does not;
   a VMM that synchronises vCPU state in place does) -/
   userSetMp : Bool := false
-  /-- CPU hotplug: vCPU b goes offline and is restarted with INIT and SIPI -/
+  /-- CPU hotplug: a vCPU goes offline and is restarted with INIT and SIPI -/
   hotplug : Bool := false
   /-- SEV-ES and SEV-SNP application processor paths (never under fcvm) -/
   sev : Bool := false
   deriving DecidableEq, Repr, Inhabited
 
 /-- The fcvm configuration: two vCPUs, paravirtual spinlocks, the async page fault interface on,
-memory served through userfaultfd, snapshots and restores; no nested guest on x86, no Xen, no
-SEV, no CPU hotplug, and a VMM that never writes `mp_state` to a live VM. -/
+memory served through userfaultfd, snapshots and restores, devices and a tick; no nested guest on
+x86, no Xen, no SEV, no CPU hotplug, and a VMM that never writes `mp_state` to a live VM. -/
 def Cfg.fcvm : Cfg := {}
 
 /-! ## Labels -/
@@ -356,6 +368,8 @@ inductive Act where
   | irq
   /-- the guest takes the timer interrupt -/
   | irqTmr
+  /-- the guest takes the page-ready interrupt: its handler clears the slot and acknowledges -/
+  | irqApf
   /-- one iteration of `vcpu_run()`: enter the guest, or leave `vcpu_block()` -/
   | hostRun
   /-- the async page fault worker finishes -/
@@ -376,6 +390,13 @@ inductive Act where
   | offline | init | sipi | sevHold | snpCreate
   deriving DecidableEq, Repr, Hashable, Inhabited
 
+/-- Every action. `Proofs.lean` proves the list complete (`allActs_complete`), so a search over it
+misses no transition. -/
+def allActs : List Act :=
+  [.lockIrq, .lockPlain, .call, .idle, .step, .idArm, .faultPv, .faultSynth, .refault, .irq,
+   .irqTmr, .irqApf, .hostRun, .apfDone, .tmrFire, .tmrInject, .nmi, .extIrq, .l2Enter, .l2Hlt,
+   .l2Exit, .xenPoll, .xenWake, .setMpSame, .offline, .init, .sipi, .sevHold, .snpCreate]
+
 inductive Label where
   | vcpu (i : Vid) (act : Act)
   /-- the VMM pauses the VM: every vCPU thread leaves KVM_RUN -/
@@ -386,6 +407,10 @@ inductive Label where
   new VM -/
   | clone
   deriving DecidableEq, Repr, Hashable, Inhabited
+
+/-- Every label (`allLabels_complete`). -/
+def allLabels : List Label :=
+  (allActs.map (Label.vcpu .a)) ++ (allActs.map (Label.vcpu .b)) ++ [.pause, .resume, .clone]
 
 /-! ## The guest
 
@@ -458,7 +483,7 @@ def advance (K : Kernel) (me o : Vcpu) (lock : Lock) : Option View :=
   | .ndCas => some ({ me with pc := .ndSpin }, o, lock)
   -- arch_mcs_spin_unlock_contended(&next->locked) (qspinlock.c:370)
   | .hoSet => some ({ me with pc := .hoKick }, { o with mcs := true }, lock)
-  -- pv_kick_node (qspinlock.c:371, pvq.h:353-389): if the successor's state is VCPU_HALTED, make
+  -- pv_kick_node (qspinlock.c:371, pvq.h:357-389): if the successor's state is VCPU_HALTED, make
   -- it VCPU_HASHED and the lock byte _Q_SLOW_VAL
   | .hoKick =>
     if o.pc.nodeHalted && !o.hashed then
@@ -476,11 +501,15 @@ def advance (K : Kernel) (me o : Vcpu) (lock : Lock) : Option View :=
   -- delivers as APIC_DM_REMRD (v7.3.3 x86.c:7244-7256, 7383-7389). With two vCPUs the hashed
   -- node is the other one.
   | .ulKick => some ({ me with pc := .run, irqsOn := true }, { o with h := K.kick o.h }, lock)
-  -- smp_call_function_many_cond: csd_lock, queue, send_call_function_ipi_mask (smp.c:829-859)
+  -- smp_call_function_many_cond: csd_lock, queue, send_call_function_ipi_mask (smp.c:829-859).
+  -- A target that is polling in the idle loop gets need_resched set and no interrupt
+  -- (call_function_single_prep_ipi, smp.c:115-120); it leaves the poll and runs the queue, which
+  -- for the model is the same as taking the interrupt at once.
   | .ccSend => some ({ me with pc := .ccWait }, { o with csd := true, ipi := true }, lock)
   -- csd_lock_wait (smp.c:877)
   | .ccWait => if o.csd then none else some ({ me with pc := .run }, o, lock)
-  -- do_idle: local_irq_disable, then cpuidle_idle_call (idle.c:298-350)
+  -- do_idle: local_irq_disable, need_resched read (idle.c:298-330); default_idle_call reads it
+  -- once more with interrupts off (current_clr_polling_and_test, idle.c:116)
   | .idChk => some ({ me with pc := .idHlt }, o, lock)
   -- default_idle: raw_safe_halt (process.c:765-768)
   | .idHlt => some (me.hlt K .halted .idWoke, o, lock)
@@ -491,9 +520,8 @@ def advance (K : Kernel) (me o : Vcpu) (lock : Lock) : Option View :=
   | .off => some (me.hlt K .halted .off, o, lock)
   | _ => none
 
-/-- What `me` does in guest mode. `second` says it is vCPU b, the one hotplug takes offline. -/
-def guest (K : Kernel) (C : Cfg) (second : Bool) (act : Act) (me o : Vcpu) (lock : Lock) :
-    Option View :=
+/-- What `me` does in guest mode. -/
+def guest (K : Kernel) (C : Cfg) (act : Act) (me o : Vcpu) (lock : Lock) : Option View :=
   if me.loc != .guest then none else
   match act with
   | .lockIrq =>
@@ -508,7 +536,7 @@ def guest (K : Kernel) (C : Cfg) (second : Bool) (act : Act) (me o : Vcpu) (lock
   | .idle =>
     if C.idle && me.pc == .run then some ({ me with pc := .idChk }, o, lock) else none
   | .step => advance K me o lock
-  -- tick_nohz_idle_stop_tick programs the next event before the halt (idle.c:337-350); the
+  -- tick_nohz_idle_stop_tick programs the next event before the halt (idle.c:226); the
   -- write of MSR_IA32_TSC_DEADLINE arms the timer (v7.3.3 lapic.c:2749-2759)
   | .idArm =>
     if C.timer && me.pc == .idChk && me.tmr == .off then
@@ -516,20 +544,23 @@ def guest (K : Kernel) (C : Cfg) (second : Bool) (act : Act) (me o : Vcpu) (lock
   -- A host page fault that needs I/O, taken where the guest can take interrupts
   -- (kvm_can_do_async_pf, v7.3.3 x86.c:10533-10548; mmu/mmu.c:4670-4678). In user mode with the
   -- interface on, "page not present" is injected and the guest schedules something else
-  -- (x86.c:10550-10567, kvm_can_deliver_async_pf x86.c:10507-10531).
+  -- (x86.c:10550-10567; kvm_can_deliver_async_pf, x86.c:10507-10531, refuses kernel mode because
+  -- the guest does not set KVM_ASYNC_PF_SEND_ALWAYS). User mode is ordinary code here.
   | .faultPv =>
     if C.faults && C.pvApf && me.pc == .run && me.apf == .none then
       some ({ me with apf := .flight .pv }, o, lock) else none
   -- Otherwise (kernel mode, or no interface) KVM_REQ_APF_HALT: the vCPU is halted artificially
-  -- (x86.c:10568-10579, 8147-8152).
+  -- (x86.c:10568-10579, 8147-8152). Anywhere interrupts are on: in the lock paths too.
   | .faultSynth =>
-    if C.faults && me.pc == .run && me.apf == .none then
+    if C.faults && me.ifOn && (C.kernelFaults || me.pc == .run) && me.apf == .none then
       some ({ me with apf := .flight .synth, h := { me.h with apfHalted := true }, loc := .host },
             o, lock)
     else none
-  -- The instruction faults again while its page is in flight (mmu/mmu.c:4672-4675).
+  -- The instruction faults again while its page is in flight (mmu/mmu.c:4672-4675). The code
+  -- halts again for a repeated fault on the same frame after either kind of first fault; the
+  -- model does it after a synthetic one only. A halt that is not modelled is a wake-up that is.
   | .refault =>
-    if me.pc == .run && me.apf == .flight .synth then
+    if me.ifOn && (C.kernelFaults || me.pc == .run) && me.apf == .flight .synth then
       some ({ me with h := { me.h with apfHalted := true }, loc := .host }, o, lock) else none
   -- generic_smp_call_function_single_interrupt runs the queued call and unlocks its csd
   -- (smp.c:461-464, 547)
@@ -537,6 +568,13 @@ def guest (K : Kernel) (C : Cfg) (second : Bool) (act : Act) (me o : Vcpu) (lock
     if me.ifOn && me.ipi then some ({ me with ipi := false, csd := false }, o, lock) else none
   | .irqTmr =>
     if me.ifOn && me.tmr == .irr then some ({ me with tmr := .off }, o, lock) else none
+  -- sysvec_kvm_asyncpf_interrupt (kvm.c:317-334): wake the task the token names, clear
+  -- apf_reason.token, write MSR_KVM_ASYNC_PF_ACK. The write makes KVM run
+  -- kvm_check_async_pf_completion again (v7.3.3 msrs.c:1695-1707): that second caller is the
+  -- `hostRun` step below, which a vCPU in guest mode may take at any position.
+  | .irqApf =>
+    if me.ifOn && me.apfIrq then some ({ me with apfIrq := false, slot := false }, o, lock)
+    else none
   | .l2Enter =>
     if C.nested && me.pc == .run then some ({ me with pc := .l2 }, o, lock) else none
   -- the nested guest's HLT, when L1 does not intercept it
@@ -549,7 +587,7 @@ def guest (K : Kernel) (C : Cfg) (second : Bool) (act : Act) (me o : Vcpu) (lock
     if C.xen && me.pc == .run then
       some ({ me with pc := .xenWoke, h := K.xenBlock me.h, loc := .host }, o, lock) else none
   | .offline =>
-    if C.hotplug && second && me.pc == .run && !me.csd && o.pc != .ccSend then
+    if C.hotplug && me.pc == .run && !me.csd && o.pc != .ccSend then
       some ({ me with pc := .off }, o, lock) else none
   -- SEV-ES: an AP parks with the AP_RESET_HOLD exit instead of HLT (kvm_emulate_ap_reset_hold)
   | .sevHold =>
@@ -558,22 +596,45 @@ def guest (K : Kernel) (C : Cfg) (second : Bool) (act : Act) (me o : Vcpu) (lock
 
 /-! ## The host -/
 
+/-- `kvm_arch_async_page_present()` for a completion of kind `k` (v7.3.3 x86.c:10582-10605). For
+the wake-everyone completion and for one whose "page not present" was injected, it writes the
+token into the guest's page-ready slot and raises the page-ready interrupt (x86.c:10596-10601).
+For the completion of a synthetic halt it does neither. Then the rule book's tail. -/
+def Vcpu.present (K : Kernel) (k : ApfKind) (v : Vcpu) : Vcpu :=
+  { v with h := K.present v.h, apf := .none,
+           slot := v.slot || k != .synth, apfIrq := v.apfIrq || k != .synth }
+
 /-- One iteration of the loop in `vcpu_run()` (v7.3.3 x86.c:8643-8691) for a vCPU thread that is in
 KVM_RUN. A vCPU that is running enters the guest, after `kvm_check_async_pf_completion` if a
-completion is on the done list (x86.c:8216-8217, virt/kvm/async_pf.c:153-174); a vCPU already in
-the guest is brought out and back in for that by the worker's `kvm_vcpu_kick` (x86.c:10607-10616).
-One that is not running goes through `vcpu_block()` (x86.c:8575-8640): it stays blocked until
-`kvm_arch_vcpu_runnable()`, then the switch at the end makes it run. -/
+completion is on the done list (x86.c:8216-8217, virt/kvm/async_pf.c:153-174) and the guest's
+page-ready slot is free (`kvm_arch_can_dequeue_async_page_present`, x86.c:10618-10624; the slot is
+only ever occupied when the guest enabled the interface). A vCPU already in the guest is brought
+out and back in for that by the worker's `kvm_vcpu_kick` (x86.c:10607-10616), or runs it from its
+own write of `MSR_KVM_ASYNC_PF_ACK` (msrs.c:1695-1707). With the slot occupied the completion
+stays on the done list, where it keeps `kvm_vcpu_has_events()` true.
+
+A vCPU that is not running goes through `vcpu_block()` (x86.c:8575-8640): it stays blocked until
+`kvm_arch_vcpu_runnable()`, then the switch at the end makes it run. (An UNINITIALIZED vCPU
+blocks in `kvm_arch_vcpu_ioctl_run` itself, x86.c:8910-8941; no modelled restore leaves one.) -/
 def hostRun (K : Kernel) (v : Vcpu) : Option Vcpu :=
   if v.loc == .user then none
   else if v.running then
     match v.apf with
-    | .done _ => some { v with h := K.present v.h, apf := .none, loc := .guest }
+    | .done k =>
+      if v.slot then (if v.loc == .host then some { v with loc := .guest } else none)
+      else some { v.present K k with loc := .guest }
     | _ => if v.loc == .host then some { v with loc := .guest } else none
   else if v.loc == .guest then none
-  else if v.pc == .xenWoke && v.h.mp == .halted then none
+  else if v.pc == .xenWoke then none
   else if v.runnable then some { v with h := K.unhalt v.h }
   else none
+
+/-- `kvm_vcpu_halt()` returns at a blocked vCPU because an event arrived. In `vcpu_block` the
+switch at its end runs. In Xen's `SCHEDOP_poll` the hypercall returns to the guest, runnable,
+whatever ended the wait (xen.c:1583-1592). -/
+def Vcpu.wake (K : Kernel) (v : Vcpu) : Vcpu :=
+  if v.pc == .xenWoke then { v with pc := .run, h := K.xenWake v.h }
+  else { v with h := K.unhalt v.h }
 
 /-- What the host does to `me`, or for it. -/
 def host (K : Kernel) (C : Cfg) (paused : Bool) (act : Act) (me o : Vcpu) (lock : Lock) :
@@ -594,43 +655,42 @@ def host (K : Kernel) (C : Cfg) (paused : Bool) (act : Act) (me o : Vcpu) (lock 
     if me.tmr == .pending && me.loc != .user then some ({ me with tmr := .irr }, o, lock)
     else none
   -- An NMI makes kvm_vcpu_has_events true whatever RFLAGS.IF is (x86.c:8534-8537): the blocked
-  -- vCPU leaves vcpu_block.
+  -- vCPU's kvm_vcpu_halt returns.
   | .nmi =>
-    if C.nmi && me.loc == .host && !me.running && me.pc != .xenWoke then
-      some ({ me with h := K.unhalt me.h }, o, lock) else none
+    if C.nmi && me.loc == .host && !me.running then some (me.wake K, o, lock) else none
   -- So does an interrupt from a device or the tick, with interrupts on (x86.c:8552-8553).
   | .extIrq =>
-    if C.rescue && me.loc == .host && !me.running && me.ifOn && me.pc != .xenWoke then
-      some ({ me with h := K.unhalt me.h }, o, lock) else none
-  -- kvm_xen_schedop_poll after kvm_vcpu_halt returns (xen.c:1581-1592)
+    if C.rescue && me.loc == .host && !me.running && me.ifOn then some (me.wake K, o, lock)
+    else none
+  -- kvm_xen_schedop_poll after kvm_vcpu_halt returns because the vCPU is runnable
+  -- (xen.c:1581-1592)
   | .xenWake =>
-    if me.loc == .host && me.pc == .xenWoke && me.h.mp == .halted && me.runnable then
-      some ({ me with pc := .run, h := K.xenWake me.h }, o, lock) else none
+    if me.loc == .host && me.pc == .xenWoke && me.runnable then some (me.wake K, o, lock)
+    else none
   | .setMpSame =>
     if C.userSetMp && paused then
       some ({ me with h := K.setMpState (K.getMpState me.h) me.h }, o, lock) else none
-  -- The other vCPU sends INIT to an offline one; kvm_apic_accept_events resets it and leaves it
-  -- waiting for SIPI (lapic.c:3587-3623). kvm_vcpu_reset drops its async page faults
-  -- (x86.c:9607-9609).
+  -- INIT arrives at an offline vCPU; kvm_apic_accept_events resets it and leaves it waiting for
+  -- SIPI (lapic.c:3587-3623). kvm_vcpu_reset drops its async page faults (x86.c:9607-9609).
+  -- Linux sends INIT to an offline CPU only, and the proofs need that: an INIT at a vCPU asleep in
+  -- kvm_wait would reset it under the lock path it is in.
   | .init =>
-    if C.hotplug && me.pc == .off && me.loc == .host && o.pc == .run && o.loc == .guest
-        && me.h.mp != .initReceived then
+    if C.hotplug && me.pc == .off && me.loc == .host && me.h.mp != .initReceived then
       some ({ me with h := K.initAp me.h, apf := .none }, o, lock) else none
   | .sipi =>
-    if C.hotplug && me.pc == .off && me.loc == .host && o.pc == .run && o.loc == .guest
-        && me.h.mp == .initReceived then
+    if C.hotplug && me.pc == .off && me.loc == .host && me.h.mp == .initReceived then
       some ({ me with pc := .run, irqsOn := true, mcs := false, hashed := false,
                       h := K.sipi me.h }, o, lock) else none
   | .snpCreate =>
-    if C.sev && me.pc == .off && me.loc == .host && o.pc == .run && o.loc == .guest then
+    if C.sev && me.pc == .off && me.loc == .host then
       some ({ me with pc := .run, irqsOn := true, mcs := false, hashed := false,
                       h := K.snpReset me.h }, o, lock) else none
   | _ => none
 
 /-- One step of vCPU `me`: in the guest if the action is a guest's and enabled, else the host's. -/
-def vstep (K : Kernel) (C : Cfg) (paused second : Bool) (act : Act) (me o : Vcpu) (lock : Lock) :
+def vstep (K : Kernel) (C : Cfg) (paused : Bool) (act : Act) (me o : Vcpu) (lock : Lock) :
     Option View :=
-  match guest K C second act me o lock with
+  match guest K C act me o lock with
   | some w => some w
   | none => host K C paused act me o lock
 
@@ -643,59 +703,80 @@ def State.put (s : State) (i : Vid) (w : View) : State :=
 /-! ## The VMM: pause, snapshot, restore, resume -/
 
 /-- What a snapshot holds of one vCPU's KVM state. The guest's memory and registers (everything
-in `Vcpu` before `loc`) are saved whole. `pv_unhalted` of a runnable vCPU, `apf.halted` and the
-async page fault queues are in no ioctl's answer. -/
+in `Vcpu` before `loc`, the page-ready slot included) are saved whole. `pv_unhalted` of a runnable
+vCPU, `apf.halted` and the async page fault queues are in no ioctl's answer. -/
 structure Saved where
   /-- KVM_GET_MP_STATE -/
   mp : Mp
   /-- KVM_GET_LAPIC: the IRR -/
   ipi : Bool
+  apfIrq : Bool
   tmrIrr : Bool
   /-- KVM_GET_MSRS: MSR_IA32_TSC_DEADLINE is not zero -/
   deadline : Bool
 
+/-- Firecracker's `save_state` (arch/x86_64/vcpu.rs:591-650). Two things the code does and the
+model does not, both of which can only add a wake-up to the restored VM: `KVM_GET_MP_STATE` first
+runs `kvm_apic_accept_events` (v7.3.3 x86.c:9020), which matters only with an INIT or SIPI
+pending, and Firecracker replaces a zero `MSR_IA32_TSC_DEADLINE` with the current TSC
+(`fix_zero_tsc_deadline_msr`, vcpu.rs:417-448), which makes a timer fire at once. -/
 def save (K : Kernel) (v : Vcpu) : Saved :=
-  { mp := K.getMpState v.h, ipi := v.ipi, tmrIrr := v.tmr == .irr,
+  { mp := K.getMpState v.h, ipi := v.ipi, apfIrq := v.apfIrq, tmrIrr := v.tmr == .irr,
     deadline := v.tmr == .armed || v.tmr == .pending }
 
-/-- A vCPU of the new VM before any state is set: `kvm_arch_vcpu_create`, with the guest's memory
-and registers from the snapshot. -/
-def Vcpu.fresh (v : Vcpu) : Vcpu :=
-  { v with loc := .user, h := {}, apf := .none, ipi := false, tmr := .off }
+/-- `mp_state` of a new vCPU: `kvm_arch_vcpu_create` makes the boot processor runnable and every
+other vCPU UNINITIALIZED (v7.3.3 x86.c:9376-9379). -/
+def freshHv (second : Bool) : Hv :=
+  if second then { mp := .uninitialized } else {}
+
+/-- A vCPU of the new VM before any state is set, with the guest's memory and registers from the
+snapshot. `second` says it is not the boot processor. -/
+def Vcpu.fresh (second : Bool) (v : Vcpu) : Vcpu :=
+  { v with loc := .user, h := freshHv second, apf := .none, ipi := false, apfIrq := false,
+           tmr := .off }
 
 /-- One restore ioctl. The Bool carried along says whether KVM_SET_LAPIC has run, because
 `kvm_set_lapic_tscdeadline_msr` drops a deadline written before the timer is in deadline mode
 (v7.3.3 lapic.c:2749-2759). -/
 def restoreOne (K : Kernel) (C : Cfg) (sv : Saved) (acc : Vcpu × Bool) : Ioctl → Vcpu × Bool
   | .setMpState => ({ acc.1 with h := K.setMpState sv.mp acc.1.h }, acc.2)
-  | .setLapic => ({ acc.1 with ipi := sv.ipi, tmr := if sv.tmrIrr then .irr else acc.1.tmr }, true)
-  -- MSR_KVM_ASYNC_PF_EN: kvm_pv_enable_async_pf queues the "wake everyone" completion
-  -- (v7.3.3 msrs.c:1384-1417, virt/kvm/async_pf.c:216-241)
+  | .setLapic =>
+    ({ acc.1 with ipi := sv.ipi, apfIrq := sv.apfIrq,
+                  tmr := if sv.tmrIrr then .irr else acc.1.tmr }, true)
+  -- MSR_KVM_ASYNC_PF_EN: kvm_pv_enable_async_pf queues the "wake everyone" completion, whether
+  -- or not the write comes from the host (v7.3.3 msrs.c:1384-1417, virt/kvm/async_pf.c:216-241)
   | .setMsrs =>
     ({ acc.1 with apf := if C.pvApf then .done .all else acc.1.apf,
                   tmr := if sv.deadline && acc.2 then .armed else acc.1.tmr }, acc.2)
   | .kick => ({ acc.1 with h := if sv.mp == .runnable then K.kick acc.1.h else acc.1.h }, acc.2)
 
 /-- A vCPU of the new VM after the restore's ioctls, in the rule book's order. -/
-def restoreVcpu (R : Rules) (C : Cfg) (v : Vcpu) : Vcpu :=
-  (R.restore.foldl (restoreOne R.kernel C (save R.kernel v)) (v.fresh, false)).1
+def restoreVcpu (R : Rules) (C : Cfg) (second : Bool) (v : Vcpu) : Vcpu :=
+  (R.restore.foldl (restoreOne R.kernel C (save R.kernel v)) (v.fresh second, false)).1
+
+/-- A vCPU thread leaves KVM_RUN for the VMM's signal. A vCPU blocked in `vcpu_block` keeps its
+state (v7.3.3 x86.c:8601-8607). One in Xen's `SCHEDOP_poll` has the hypercall return first, which
+makes it runnable (xen.c:1583-1592). -/
+def Vcpu.pause (K : Kernel) (v : Vcpu) : Vcpu :=
+  if v.pc == .xenWoke then { v with pc := .run, h := K.xenWake v.h, loc := .user }
+  else { v with loc := .user }
 
 /-- One step of the whole system. `none` when the label is not enabled. -/
 def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
   match l with
   | .vcpu i act =>
-    (vstep R.kernel C s.paused (i == .b) act (s.get i) (s.get i.other) s.lock).map (s.put i)
+    (vstep R.kernel C s.paused act (s.get i) (s.get i.other) s.lock).map (s.put i)
   | .pause =>
     if C.snapshot && !s.paused then
-      some { s with a := { s.a with loc := .user }, b := { s.b with loc := .user }, paused := true }
+      some { s with a := s.a.pause R.kernel, b := s.b.pause R.kernel, paused := true }
     else none
   | .resume =>
     if s.paused then
       some { s with a := { s.a with loc := .host }, b := { s.b with loc := .host }, paused := false }
     else none
   | .clone =>
-    if s.paused && !s.cloned then
-      some { s with a := restoreVcpu R C s.a, b := restoreVcpu R C s.b, cloned := true }
+    if s.paused then
+      some { s with a := restoreVcpu R C false s.a, b := restoreVcpu R C true s.b, cloned := true }
     else none
 
 /-- Both vCPUs running ordinary code, the lock free, nothing pending. -/

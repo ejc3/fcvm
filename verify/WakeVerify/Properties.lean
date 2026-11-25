@@ -30,7 +30,7 @@ completion on its way, no interrupt it can take, no timer it can take. -/
 def State.nothingPending (s : State) (i : Vid) : Bool :=
   let v := s.get i
   !v.h.pv && (s.get i.other).pc != .ulKick && v.apf == .none
-    && !(v.ifOn && (v.ipi || v.tmr != .off))
+    && !(v.ifOn && (v.ipi || v.apfIrq || v.tmr != .off))
 
 /-- The kick vCPU `i` is due is gone. -/
 def State.lostKick (s : State) (i : Vid) : Bool :=
@@ -44,9 +44,13 @@ def State.lostKickHard (s : State) (i : Vid) : Bool :=
 def State.lostKickSoft (s : State) (i : Vid) : Bool :=
   s.lostKick i && (s.get i).ifOn
 
-/-- vCPU `i` waits in a cross-CPU call for a vCPU that has lost its kick with interrupts off. -/
+/-- vCPU `i` waits in a cross-CPU call whose target sleeps in `kvm_wait` with interrupts off and
+no kick recorded. The target cannot take the call's interrupt, and the caller, which is the only
+other vCPU, is not in the lock's unlock path to kick it. Stated without `lostKick`: it does not
+ask whether the lock byte has been released. -/
 def State.stuckCall (s : State) (i : Vid) : Bool :=
-  (s.get i).pc == .ccWait && (s.get i.other).csd && s.lostKickHard i.other
+  let t := s.get i.other
+  (s.get i).pc == .ccWait && t.csd && s.sleeps i.other && !t.ifOn && !t.h.pv
 
 /-- A cross-CPU call is queued for vCPU `i` and its interrupt is not pending. -/
 def State.lostIpi (s : State) (i : Vid) : Bool :=
@@ -56,10 +60,23 @@ def State.lostIpi (s : State) (i : Vid) : Bool :=
 def State.orphanHalt (s : State) (i : Vid) : Bool :=
   (s.get i).h.apfHalted && (s.get i).apf == .none
 
-/-- vCPU `i` sleeps in the idle loop for a timer that no longer exists. -/
+/-- vCPU `i` sleeps in the idle loop for a timer that no longer exists, with nothing else pending
+that would wake it. -/
 def State.lostTimer (s : State) (i : Vid) : Bool :=
   let v := s.get i
   v.pc == .idWokeT && v.h.mp == .halted && v.tmr == .off
+    && !v.h.pv && v.apf == .none && !v.ipi && !v.apfIrq
+
+/-- vCPU `i` sleeps in `kvm_wait` and nothing stands to wake it: no kick is recorded or about to
+be sent, the other vCPU does not own the lock (an owner's unlock sends the kick when the byte is
+`_Q_SLOW_VAL`), and, for a queue node that `pv_kick_node` has not hashed, the other vCPU is not
+the queue head that will hand the queue over to it. Unlike `lostKick` this does not wait for the
+lock byte to be released. -/
+def State.orphan (s : State) (i : Vid) : Bool :=
+  let v := s.get i
+  let o := s.get i.other
+  s.sleeps i && !v.h.pv && o.pc != .ulKick && !o.pc.holds
+    && !(v.pc == .ndWoke && !v.hashed && o.pc.isHead)
 
 /-- A queue node sleeps although the queue head was handed to it and `pv_kick_node` has run: a
 break in the guest's own protocol. -/
@@ -77,8 +94,8 @@ def NoLostKick (s : State) : Prop :=
 def NoHang (s : State) : Prop :=
   ∀ i, s.lostKickHard i = false
 
-/-- **P2, NoStuckCall.** No vCPU waits in a cross-CPU call for a vCPU that P1 says never wakes, and
-no queued call is without its interrupt. -/
+/-- **P2, NoStuckCall.** No vCPU waits in a cross-CPU call for a vCPU that sleeps in `kvm_wait`
+with interrupts off and no kick recorded, and no queued call is without its interrupt. -/
 def NoStuckCall (s : State) : Prop :=
   ∀ i, s.stuckCall i = false ∧ s.lostIpi i = false
 
@@ -88,6 +105,18 @@ a loop that reads the lock again. `hlt_rechecks` in `Proofs.lean` is the same st
 guest paths alone. -/
 def MutualExclusion (s : State) : Prop :=
   ¬ ((s.get .a).pc.holds = true ∧ (s.get .b).pc.holds = true)
+
+/-- **P1 before the release, HasWaker.** Every vCPU asleep in `kvm_wait` has a kick recorded or
+about to be sent, or has the other vCPU ahead of it in the lock's path: as the owner, whose unlock
+will find `_Q_SLOW_VAL` and kick (`unlock_slow_kicks` in `Proofs.lean`), or as the queue head that
+hands over to an unhashed node. This is a statement about one state. That the other vCPU then
+takes its steps is not part of it. -/
+def HasWaker (s : State) : Prop :=
+  ∀ i, s.orphan i = false
+
+/-- The two vCPUs are never both asleep in `kvm_wait` with no kick recorded for either. -/
+def NoMutualSleep (s : State) : Prop :=
+  ¬ (s.sleeps .a = true ∧ s.sleeps .b = true ∧ s.a.h.pv = false ∧ s.b.h.pv = false)
 
 /-- A synthetic halt always has its completion coming. -/
 def NoOrphanHalt (s : State) : Prop :=
@@ -120,6 +149,14 @@ instance : DecidablePred NoStuckCall := fun s =>
 instance : DecidablePred MutualExclusion := fun s => by
   unfold MutualExclusion; exact inferInstance
 
+instance : DecidablePred HasWaker := fun s =>
+  if h : s.orphan .a = false ∧ s.orphan .b = false then
+    isTrue (fun i => by cases i; exact h.1; exact h.2)
+  else isFalse (fun k => h ⟨k .a, k .b⟩)
+
+instance : DecidablePred NoMutualSleep := fun s => by
+  unfold NoMutualSleep; exact inferInstance
+
 instance : DecidablePred NoOrphanHalt := fun s =>
   if h : s.orphanHalt .a = false ∧ s.orphanHalt .b = false then
     isTrue (fun i => by cases i; exact h.1; exact h.2)
@@ -135,15 +172,26 @@ instance : DecidablePred NoStrandedNode := fun s =>
     isTrue (fun i => by cases i; exact h.1; exact h.2)
   else isFalse (fun k => h ⟨k .a, k .b⟩)
 
-/-- The property holds after the run, when the run is possible. -/
+/-- The run is possible and the property holds after it. -/
 def after (r : Option State) (P : State → Prop) : Prop :=
   match r with
   | some s => P s
-  | none => True
+  | none => False
 
 instance (r : Option State) (P : State → Prop) [DecidablePred P] : Decidable (after r P) :=
   match r with
   | some s => inferInstanceAs (Decidable (P s))
-  | none => isTrue trivial
+  | none => isFalse (fun h => h)
+
+/-- The run is possible and the property fails after it. -/
+def breaks (r : Option State) (P : State → Prop) : Prop :=
+  match r with
+  | some s => ¬ P s
+  | none => False
+
+instance (r : Option State) (P : State → Prop) [DecidablePred P] : Decidable (breaks r P) :=
+  match r with
+  | some s => inferInstanceAs (Decidable (¬ P s))
+  | none => isFalse (fun h => h)
 
 end Wake
