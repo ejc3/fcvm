@@ -1855,18 +1855,33 @@ A `/health` reply carrying `error` (the renderer failed) fails the relaunch at o
  "overlay_seq": 3, "harness": {"cpu_pressure": 0.0, "replay_ms": {"fcvm": 0.4, "kitesurf": 0.5}}}
 ```
 
-Pages mode: the host's summary, every few seconds. At the top level only `at` is required. A
+Pages mode: the host's summary, about every 5 s. At the top level only `at` is required. A
 side that is present carries `search` (with `in_flight` and `phase`),
 `renders_per_s`, `cpus_busy`, `done`, `failed` and `since`; a tile carries `page`, `side`,
 `state`, `renders_per_s`, `done` and `failed`. A host says it runs
 the mode with `renders` in its hello (`{"pages": [{"id", "url"}], "cpus", "confined"?,
-"build"?, "ipv6"?, "ipv4"?, "v4_port"?}`), and sends this message only after it has received a
-`renders` order: a coordinator built before the mode sends none, and would close the
-connection on this message. `ipv6` and `ipv4` are the public addresses of the host's frame
-socket (port 443 on IPv6, `v4_port` on IPv4, 443 when absent). With its subzone the
-coordinator names them as it names a host's aggregator: `renders-<host>-<token>` AAAA the IPv6
-address and `renders-<host>-<token>-v4` A the IPv4 address, a label minted once for those
-addresses and never answered before it is minted; `state.renders.frame_url` and
+"build"?, "ipv6"?, "ipv4"?, "v4_port"?}`), and sends this message on a connection only after it
+has received a `renders` order on that connection: a coordinator built before the mode sends
+none, and would close the connection on this message. The agent (`fcvm fleet agent --renders`)
+sends the module's summary while the module's loop runs (every fifth tick of its one-second
+loop, so 5 s or a little more apart), and otherwise its own every 5 s, with nothing in flight
+and every tile `waiting`: while the order is `run: false`, while the module starts, while it
+sweeps after its loop has ended, and, with `withheld` set to the error, after a module failed.
+A failed module is started again after 60 s while the order is `run: true`, and at once on any
+new order that says `run: true`. An agent started again right after it was killed reports
+`withheld` (the run directory's lock is held) until the killed module's reaper has finished
+its sweep, and starts the module at the next retry.
+
+`build` names, when the host knows them: `instance_type` (on EC2), `kernel`, `fcvm_commit`
+and `kitesurf_commit` (the agent's `--setup fcvm.commit=` and `--setup kitesurf.commit=`
+module options), `bundle_sha256` (the engine bundle's `index.js`), `viewport`, `vcpus` and
+`page_size` (the snapshot's once it is made), and `recycle_mib`.
+
+`ipv6` and `ipv4` are the public addresses of the host's frame socket (port 443 on IPv6,
+`v4_port` on IPv4, 443 when absent); the agent sends none until it serves frames. With its
+subzone the coordinator names them as it names a host's aggregator: `renders-<host>-<token>`
+AAAA the IPv6 address and `renders-<host>-<token>-v4` A the IPv4 address, a label minted once
+for those addresses and never answered before it is minted; `state.renders.frame_url` and
 `frame_url_v4` are then those names.
 
 - `sides`, by `fcvm` and `kitesurf`. `search` is the side's search for its limit: `in_flight`
@@ -2164,7 +2179,9 @@ order changes. `run` is false while the fleet is asleep: the host stops every cl
 for none: `text` (plain text; the host escapes it), `transform` (a name; the style behind it is
 the host's), `chromium_only` (the transform goes into the `fcvm` side's pages only), and `seq`,
 which the host's reports repeat as `overlay_seq` once its replays serve it. A render sees the
-old overlay or the new one whole.
+old overlay or the new one whole. An overlay whose content or `seq` differs from the one the
+replays serve is written again; one with another `seq` (a clear included) also starts both
+sides' searches again. The same order sent again changes nothing.
 
 ### Grid budget
 

@@ -635,6 +635,17 @@ test-fleet-renders-teardown:
 	@test -n "$(OUT)" || { echo "test-fleet-renders-teardown needs OUT=DIR" >&2; exit 2; }
 	bench/chromium/renders_bench.sh teardown-check $(STAGES)
 
+# The same module under `fcvm fleet agent --renders`, with the coordinator's side played by
+# bench/chromium/renders_agent_check.py over the agent's --stdio: the hello, renders on both
+# sides, an overlay order, a stop while rendering and while held at HOLD_STAGES (the agent
+# stays up and renders again), and SIGKILL of the agent at each of STAGES (SIGTERM at
+# running:TERM). Every census count must be zero. No build dependency, as above.
+#   make test-fleet-renders-agent OUT=dir KITESURF=dir [STAGES=a,b:TERM] [HOLD_STAGES=a,b] [CASES=running,held,kill]
+.PHONY: test-fleet-renders-agent
+test-fleet-renders-agent:
+	@test -n "$(OUT)" || { echo "test-fleet-renders-agent needs OUT=DIR" >&2; exit 2; }
+	bench/chromium/renders_bench.sh agent-check $(STAGES)
+
 # The directed camera's program with no votes, as JSON (fleet/core/examples/program.rs):
 # make fleet-program SEED=1 SECS=600 OUT=program.json
 .PHONY: fleet-program

@@ -2398,10 +2398,11 @@ engines on workerd, each side on its own equal set of pinned CPUs. The protocol,
 coordinator's state and the `/live` view are in `fleet/PROTOCOL.md`, "Pages mode". The
 coordinator launches and terminates the host as a host group of its own ("Hosts and
 capacity" above) and names its frame socket `renders-<host>-<token>` in its subzone, from
-the addresses the host's hello gives. This section is the host's half. No fleet agent runs it
-yet: the module runs on its own as `fcvm fleet renders-bench` (`make fleet-renders-bench`),
-which is the agent's module without a coordinator or viewers, so the benchmark's reference
-figures and the live wall's come from one piece of code.
+the addresses the host's hello gives. This section is the host's half. The fleet agent runs the
+module with `--renders` (below), and `fcvm fleet renders-bench` (`make fleet-renders-bench`)
+runs the same module without a coordinator or viewers, through the same function
+(`renders::session`), so the benchmark's reference figures and the live wall's come from one
+piece of code.
 
 ### The host module
 
@@ -2483,6 +2484,65 @@ sends SIGKILL to every process left the moment the main process is gone, the rea
 each stage, by SIGKILL and by SIGTERM, and counts what is left: processes, the unit's cgroup,
 network namespaces, clones' state files and directories, sockets, listening ports, the run
 directory, 2 MiB pages. Every count must be zero.
+
+### In the fleet agent
+
+`fcvm fleet agent --renders` takes the module's options as renders-bench takes them, one per
+`--renders-arg` (`--renders-arg=--corpus=/srv/corpus`). The benchmark's own options
+(`--levels`, `--seconds`, `--overlay-text`, `--overlay-transform`) are refused: the
+coordinator's orders say when to render and what to inject, and the search sets the levels.
+The module runs the agent's own binary, and the agent must run in a subgroup of a delegated
+unit, as renders-bench must. Without `--renders` the agent says no `renders` in its hello and
+starts nothing of the mode.
+
+| who | owns | ends it |
+|---|---|---|
+| `serve` | the order (a watch channel) and the mode's task (`agent/renders.rs`) | the end of its connection drops the order's sender, then it waits for the task |
+| the mode's task | one module at a time, as a future it awaits | the order's sender gone, once the module has ended |
+| the module (`renders::session`) | its lock, its reaper, its processes and cgroups | an order to stop, the sender gone, or an error; then the reaper's sweep |
+
+- **An order to run** starts a module: the same sequence as the benchmark's, from the kernel
+  rule and the lock to the reaper and the stages. The module applies each later order itself.
+- **An overlay order** is written to each side's injected file by rename (a Chromium-only
+  transform to the fcvm side's alone) when its content or its `seq` differs from what the
+  replays serve, and the next reports carry its `seq` as `overlay_seq`. A new `seq` also starts
+  both searches again. An order equal to the one the replays serve writes nothing.
+- **An order to stop** ends the module: during its start the start is dropped where it is
+  (every child it started is killed with its handle; the only tasks the start spawns are the
+  workers' output readers, which end with the workers' output and start no process, and the
+  engines' first starts are polled in the start itself), during the renders the loop ends;
+  then the reaper sweeps and the agent stays up. The next order to run starts a new module.
+  A module held by `--hold-at` (the host checks' option) at a stage of its start (`cgroups` to
+  `workers`) ends the same way; one held at `start`, `running` or `stopping` waits outside
+  the start and the loop, and ends only with the agent's process, whose end lets the reaper
+  remove everything.
+- **The agent killed outright**, by SIGKILL or by SIGTERM (the module registers no signal
+  handler in the agent), closes the reaper's pipe, and the reaper removes everything, as it
+  does for the benchmark. A module started inside the agent's connection is ended when the
+  connection ends (`--stdio`); a dialing agent keeps it across reconnects, as it keeps its VMs.
+- **The host check.** `make test-fleet-renders-agent OUT=dir KITESURF=dir`
+  (`bench/chromium/renders_agent_check.py`, through `renders_bench.sh agent-check`) starts the
+  agent as a transient unit with the bench's unit properties and `--stdio` on its pipes
+  (`systemd-run --pipe`), with `--host renders-agent-check`, `--image unused`, `--base-port 1`
+  and `--sysfs-root` at a missing directory (no GPU) for the agent's own options. It plays the
+  coordinator, and counts what is left as `renders_teardown_check.py` does (it imports that
+  census): the hello and no report before the first order; renders on both sides; an overlay
+  order end to end (the report's `overlay_seq`, each side's injected file); `run: false` while
+  rendering and while held at `HOLD_STAGES` (nothing left, the agent up and rendering again);
+  SIGKILL of the agent at each stage and SIGTERM while rendering (nothing left). One line per
+  case, all of them in `<OUT>.agent-check.json`; the exit status is 1 when any fails.
+- **Reports** go only after the connection's first `renders` order (the dialing agent keeps
+  that rule per connection), about every 5 s: the module's own while its loop runs (every
+  fifth tick of a one-second loop), and the agent's every 5 s with nothing in flight while the
+  module is stopped, starting, or sweeping after its loop. A module that fails reports
+  `withheld` with its error, and is started again after 60 s while the order says run, or at
+  once on any new order. An agent started again right after it was killed reports `withheld`
+  (the run directory's lock) until the killed module's reaper has finished its sweep.
+- **Records are bounded** under the agent, which runs as long as its host (`AGENT_BOUNDS`):
+  `renders.jsonl` is rotated at 64 MiB and `samples.jsonl` at 16 MiB, each keeping one
+  previous file (`.1`), and only the newest 50 failed clones' logs are kept (a log is counted
+  once it has been untouched for twice the render timeout and a minute). The benchmark keeps
+  its whole record: a run's record is its evidence.
 
 ## Windows mode
 

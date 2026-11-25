@@ -95,6 +95,26 @@ def census(opts):
     }
 
 
+def leftovers(opts, before, after, reaped, cgroups):
+    """What the module left, by kind: `before` and `after` are censuses, `reaped` the reaper's
+    report, and `cgroups` the cgroups (below the cgroup2 root) that must be gone. Every list is
+    empty when nothing is left."""
+    ports = sorted(set(opts.port) & listening())
+    sockets = glob.glob(os.path.join(opts.data_dir, f"uffd-{opts.snapshot_tag}-*.sock")) \
+        if opts.data_dir and opts.snapshot_tag else []
+    return {
+        "processes": sorted(cmd for pid, cmd in after["processes"].items() if pid not in before["processes"]),
+        "cgroup": [c for c in cgroups if os.path.exists(f"/sys/fs/cgroup{c}")],
+        "namespaces": sorted(after["namespaces"] - before["namespaces"]),
+        "clones": sorted((after["states"] - before["states"]) | (after["vms"] - before["vms"])),
+        "sockets": sockets,
+        "ports": ports,
+        "run dir": [opts.run_dir] if os.path.exists(opts.run_dir) else [],
+        "2 MiB pages": [f"{before['pages'] - after['pages']} fewer free"] if after["pages"] < before["pages"] else [],
+        "reaper": [f"{k}={reaped[k]}" for k in ("cgroups_left", "resources_left", "run_dir_left") if reaped.get(k)],
+    }
+
+
 def unit_state(unit):
     return out(["systemctl", "is-active", unit]).strip()
 
@@ -150,20 +170,7 @@ def one(opts, stage, signame):
     after = census(opts)
     with open(opts.teardown) as handle:
         reaped = json.load(handle)
-    ports = sorted(set(opts.port) & listening())
-    sockets = glob.glob(os.path.join(opts.data_dir, f"uffd-{opts.snapshot_tag}-*.sock")) \
-        if opts.data_dir and opts.snapshot_tag else []
-    left = {
-        "processes": sorted(cmd for pid, cmd in after["processes"].items() if pid not in before["processes"]),
-        "cgroup": [cgroup] if cgroup and os.path.exists(f"/sys/fs/cgroup{cgroup}") else [],
-        "namespaces": sorted(after["namespaces"] - before["namespaces"]),
-        "clones": sorted((after["states"] - before["states"]) | (after["vms"] - before["vms"])),
-        "sockets": sockets,
-        "ports": ports,
-        "run dir": [opts.run_dir] if os.path.exists(opts.run_dir) else [],
-        "2 MiB pages": [f"{before['pages'] - after['pages']} fewer free"] if after["pages"] < before["pages"] else [],
-        "reaper": [f"{k}={reaped[k]}" for k in ("cgroups_left", "resources_left", "run_dir_left") if reaped.get(k)],
-    }
+    left = leftovers(opts, before, after, reaped, [cgroup] if cgroup else [])
     return {
         "stage": stage, "signal": signame, "ended_s": round(ended_s, 2),
         "running_at_the_kill": {
