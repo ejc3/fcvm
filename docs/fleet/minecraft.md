@@ -213,7 +213,8 @@ IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
   in RAM. Servers on the faster store also used more CPU and memory at the same age.
 - **What bounds N**, in the order the runs met them:
   1. The IPv6 neighbour table (`net.ipv6.neigh.default.gc_thresh3`, 1024 on Ubuntu): 512 routed
-     servers overflowed it and did not all start.
+     servers overflowed it and did not all start. A server costs about 16.5 entries ("What the
+     host needs for hundreds of servers", below).
   2. The store's size and speed, as above.
   3. Memory: 543 MiB a server at 30 minutes, when the coordinator resets it. This host's
      377 GiB hold about 610 with the store in RAM and about 660 with it on a disk.
@@ -225,6 +226,82 @@ IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
   Addresses do not bound it: a server takes one of the host's /80.
 - **Not measured:** a local NVMe store, an x86 host, the fleet's GPU host with its other modes
   running, and more than 512 servers through this path.
+
+### What the host needs for hundreds of servers
+
+Every routed VM adds entries to the kernel's neighbour tables: one IPv6 table and one IPv4
+table for every network namespace on the host. A table's hard limit is
+`net.ipv6.neigh.default.gc_thresh3` (`net.ipv4...` for IPv4), 1024 in the kernel for both;
+Ubuntu's cloud image raises the IPv4 one to 16384 and leaves IPv6. At the limit the kernel
+drops packets ("neighbor table overflow"). With IPv6 at 1024, 512 servers did not all start
+(the "limit 1024" row above; its record's `neigh-overflow-count.txt` and `samples.jsonl`).
+
+How many entries a server costs, by the kernel's own count over every namespace
+(`/proc/net/stat/ndisc_cache` and `arp_cache`, first field, read every 5 s). A c8g.metal-48xl,
+kernel 7.0.0-1018-aws, 2026-11-24, a coordinator and its agent as above, the store in RAM, both
+limits at 16384; a later boot than the table above. The records are in
+`fleet/minecraft/bench/results/2026-11-24-neighbour-entries-c8g-metal-48xl/` (a run's
+`disk.log` has the kernel's counts as `ndisc` and `arp`, its `neigh-host.log` the host's own
+namespace's):
+
+| servers | run | IPv6 entries, the most seen (a server) | of them in the host's own namespace | IPv4 entries, the most seen (a server) |
+|---|---|---|---|---|
+| 256 | 200 s | 4,141 (16.2) | 1,172 | 514 (2.0) |
+| 512 | 200 s | 8,427 (16.5) | 2,561 | 1,026 (2.0) |
+| 512 | 30 min | 8,513 (16.6) | 2,561 | 1,026 (2.0) |
+
+- **It does not grow with a server's age.** Over the 30 minutes the IPv6 count peaked while the
+  servers were restored (8,513, 26 s in) and then stayed at 8,066 to 8,069. The IPv4 entries
+  age out to a handful and return (to 514) when the servers are next spoken to.
+- These runs were made back to back for the neighbour counts (each began 16 to 20 s after
+  the one before it ended): their start-up times and tick rates are records of nothing.
+- The count includes permanent entries, which the limit does not count, so it is an upper
+  bound on what the limit must hold.
+- 512 servers hold more IPv4 entries (1,026) than the kernel's default limit (1024). Ubuntu's
+  image hides that; a host that leaves the default would overflow the IPv4 table too.
+- **The agent's check.** `fcvm fleet agent --minecraft N` stops at start-up unless both limits
+  leave room for the Minecraft fleet's own need: 24 IPv6 and 4 IPv4 entries for each of the N
+  servers and their gold VM, and 64 for the host itself (an idle host held 25 and 4)
+  (`check_neighbour_room`, `src/fleet/agent/minecraft.rs`). The error names the value the limit
+  needs. On the kernel's limits that is 39 servers.
+- **A host's other VMs**, counted the same way every 2 s on another boot of that instance type
+  the same day, kernel 7.0.0-1018-aws (the records are in
+  `fleet/minecraft/bench/results/2026-11-24-neighbour-entries-other-vms-c8g-metal-48xl/`):
+  - **A routed VM that stays up holds less than a Minecraft server.** 32 of them, each started
+    with a wall slot's network arguments (its own address in the host's prefix and a published
+    port; no GPU, which this host does not have), held 492 IPv6 and 66 IPv4 entries over the idle
+    host's 5 and 1: 15.2 and 2.0 each. All were gone within 2 s of the VMs' stop
+    (`routed-vms/`).
+  - **A potato ring's entries rise with its wakes, not with its players.**
+    `--potato-players 64 --potato-cpus 32` never had more than 32 player VMs running. In 15
+    minutes and 10,704 wakes at the host image's limits the count reached 1,656 IPv6 and 3,644
+    IPv4 entries and levelled off (the most IPv4 seen in each third of the run: 3,330, 3,574,
+    3,644); nothing was refused (`potato-ring-15min/`). The count includes entries the kernel
+    has not freed yet: it falls when the ring stops (2,991 IPv4 entries to 1,975 in the 29 s
+    the five-minute record `potato-ring/` runs on).
+  - **At the kernel's own limits (1024, both families) that ring overflowed the IPv4 table**
+    239 s after it started: 398 entries were refused in its last minute ("arp_cache: neighbor
+    table overflow!" in the kernel's log), while the IPv6 count stayed under 650 with none
+    refused (`potato-ring-limit-1024/`). Ubuntu's cloud image has the IPv4 limit at 16384, and
+    the host image both at 32768.
+  - Phones and Windows sandboxes were not counted.
+- **They refuse nothing.** If each of a host's other VMs held what a Minecraft server is
+  allowed and a table would then be over its limit, the agent logs a warning and starts. A
+  host with 4 servers beside 64 potato players on the kernel's limits still starts its agent.
+- **The host image** sets `gc_thresh1`, `gc_thresh2` and `gc_thresh3` to 8192, 28672 and 32768
+  for both families (`fleet/ami/host/build.sh`): room for about 1,300 Minecraft servers by that
+  allowance. The agent's unit keeps systemd's default dependencies, so it starts after
+  `systemd-sysctl` has applied them (`fleet/ami/test_pipeline.py` pins both).
+- **Order of arrival.** A fleet host gets the agent and the limits together: the same image
+  build installs `fcvm` and writes `/etc/sysctl.d/99-fcvm.conf`, and a host is launched from
+  the image by its launch template (docs/fleet/ARCHITECTURE.md, "AMI" and "Hosts"), never
+  given a new agent in place. Were an agent with this check to reach a host with the old
+  limits all the same, today's 4 servers need 184 of the 1024 and it starts.
+- **Outside the host's first network namespace** the limits cannot be read: the kernel shows
+  no `neigh/default/gc_thresh3` and no `/proc/net/stat/ndisc_cache` in any other (checked on
+  that host in a namespace made by `ip netns add` and in one made by `unshare -Urn`). An
+  agent started there with `--minecraft` stops with an error that says so. The limit that
+  applies is the host's, whichever namespace a VM is in.
 
 ### The page in 3D
 

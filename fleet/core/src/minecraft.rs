@@ -248,6 +248,15 @@ pub struct ResetAll {
     pub by: String,
     /// The servers it reset.
     pub servers: usize,
+    /// How many of them are back: the launch this reset began reported its first chunk. A
+    /// server reset again before that, by a viewer or a borrow ending, is never counted, and
+    /// neither is a server this reset did not touch. None in a record from before the
+    /// coordinator counted; a page then reads the reset from the status rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub back: Option<usize>,
+    /// The click to the first chunk of the last of them back, ms. None while none is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub took_ms: Option<u64>,
 }
 
 /// The last fork that reached `running`, with the agent's times: `snapshot_ms` the source's

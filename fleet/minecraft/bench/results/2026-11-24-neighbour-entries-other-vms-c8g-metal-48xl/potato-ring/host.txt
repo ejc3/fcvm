@@ -1,0 +1,10 @@
+kernel 7.0.0-1018-aws
+cpus 192
+net.ipv4.neigh.default.gc_thresh1 = 128
+net.ipv4.neigh.default.gc_thresh2 = 15360
+net.ipv4.neigh.default.gc_thresh3 = 16384
+net.ipv6.neigh.default.gc_thresh1 = 8192
+net.ipv6.neigh.default.gc_thresh2 = 15360
+net.ipv6.neigh.default.gc_thresh3 = 16384
+ring: fcvm fleet agent --potato-players 64 --potato-cpus 32, started 2026-11-24T21:36:06Z, stopped 21:41:06Z
+from the coordinator's log: 7 rounds started, 2321 "potato player woke" and 2358 "potato player slept" lines

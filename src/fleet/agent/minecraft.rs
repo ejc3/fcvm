@@ -1360,6 +1360,93 @@ async fn supervise(
     ctx.board.lock().unwrap().remove(&ctx.index);
 }
 
+/// The kernel's hard limits on neighbour entries, IPv6 and IPv4: one table of each for every
+/// network namespace on the host. At a limit the kernel drops packets ("neighbour: ndisc_cache:
+/// neighbor table overflow!"). The files exist only in the host's initial network namespace.
+pub const NEIGH_LIMIT: &str = "/proc/sys/net/ipv6/neigh/default/gc_thresh3";
+pub const NEIGH_LIMIT_V4: &str = "/proc/sys/net/ipv4/neigh/default/gc_thresh3";
+/// Neighbour entries a limit must leave room for, for each Minecraft VM (a server, or the gold
+/// VM they are restored from). Routed Minecraft servers held 16.2 to 16.6 IPv6 entries and 2.0
+/// IPv4 entries a server, counted by the kernel over every namespace (docs/fleet/minecraft.md,
+/// "What the host needs for hundreds of servers"; the records are under
+/// fleet/minecraft/bench/results/2026-11-24-neighbour-entries-c8g-metal-48xl/).
+pub const NEIGH_PER_VM: u64 = 24;
+pub const NEIGH_PER_VM_V4: u64 = 4;
+/// And for the host itself, whatever it runs: an idle host held 25 IPv6 entries and 4 IPv4
+/// ones in those records.
+pub const NEIGH_HOST: u64 = 64;
+// The allowances stay above what 512 servers were counted holding: 8,513 and 1,026 entries.
+const _: () = assert!(512 * NEIGH_PER_VM > 8513 && 512 * NEIGH_PER_VM_V4 > 1026);
+
+/// A neighbour limit's text. It can be read only in the host's initial network namespace: in
+/// any other the kernel shows no `neigh/default/gc_thresh3` at all.
+pub fn read_neighbour_limit(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading {}, the host's neighbour limit, which --minecraft checks. The kernel shows \
+             it only in the host's initial network namespace: run the agent there",
+            path.display()
+        )
+    })
+}
+
+/// Refuse a Minecraft fleet the host's neighbour tables have no room for: `servers` servers and
+/// their gold VM, at [`NEIGH_PER_VM`] IPv6 and [`NEIGH_PER_VM_V4`] IPv4 entries each, and
+/// [`NEIGH_HOST`] for the host. `limit` and `limit_v4` are [`NEIGH_LIMIT`]'s and
+/// [`NEIGH_LIMIT_V4`]'s text. At the kernel's default of 1024 IPv6 entries, 512 servers did
+/// not all start (docs/fleet/minecraft.md, "Many servers on one host").
+///
+/// Only the Minecraft fleet's own need refuses. The host's `other_vms` (wall tiles, phones,
+/// potato players, Windows sandboxes) refuse nothing: a routed VM that stays up was counted
+/// holding less than a Minecraft server (15.2 IPv6 and 2.0 IPv4 entries), a potato ring's
+/// entries rise with its wakes and not with its players, and phones and sandboxes were not
+/// counted (docs/fleet/minecraft.md, "What the host needs for hundreds of servers"). If each of
+/// them held what a Minecraft server is allowed and a table would then be over its limit, a
+/// warning says so, and the agent starts. The warnings are returned for the caller to log.
+pub fn check_neighbour_room(
+    servers: u32,
+    other_vms: u32,
+    limit: &str,
+    limit_v4: &str,
+) -> Result<Vec<String>> {
+    let own = u64::from(servers) + 1;
+    let mut warnings = Vec::new();
+    for (family, key, path, per, text) in [
+        ("IPv6", "net.ipv6", NEIGH_LIMIT, NEIGH_PER_VM, limit),
+        (
+            "IPv4",
+            "net.ipv4",
+            NEIGH_LIMIT_V4,
+            NEIGH_PER_VM_V4,
+            limit_v4,
+        ),
+    ] {
+        let limit: u64 = text
+            .trim()
+            .parse()
+            .with_context(|| format!("{path} holds {text:?}, not a number"))?;
+        let need = own * per + NEIGH_HOST;
+        anyhow::ensure!(
+            limit >= need,
+            "--minecraft {servers} needs room for {need} {family} neighbour entries ({per} for \
+             each server and their gold VM, {NEIGH_HOST} for the host) and the host's limit is \
+             {limit}. Set {key}.neigh.default.gc_thresh3 to {need} or more, with gc_thresh2 and \
+             gc_thresh1 no higher than it (in /etc/sysctl.d/ to keep them)"
+        );
+        let with_others = need + u64::from(other_vms) * per;
+        if with_others > limit {
+            warnings.push(format!(
+                "this host may run {other_vms} other VMs beside its {servers} Minecraft servers. \
+                 At a Minecraft server's {per} {family} neighbour entries each the table would \
+                 need {with_others} and the limit ({key}.neigh.default.gc_thresh3) is {limit}. \
+                 A potato ring's entries rise with its wakes and can pass that. Watch the kernel \
+                 log for \"neighbor table overflow\""
+            ));
+        }
+    }
+    Ok(warnings)
+}
+
 /// The image's id and the servers' name from its labels (`podman image inspect`).
 pub async fn inspect_image(podman: &Path, image: &str) -> Result<(String, Option<String>)> {
     let out = child(podman)
@@ -1417,6 +1504,93 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_minecraft_fleet_is_refused_when_a_neighbour_table_has_no_room_for_it() {
+        let quiet = |r: Result<Vec<String>>| r.unwrap().is_empty();
+        // The kernel's default limits hold today's fleets and not hundreds of servers.
+        assert!(quiet(check_neighbour_room(4, 0, "1024\n", "1024\n")));
+        let err = check_neighbour_room(512, 9, "1024\n", "16384\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "--minecraft 512 needs room for 12376 IPv6 neighbour entries (24 for each \
+                 server and their gold VM, 64 for the host) and the host's limit is 1024"
+            ) && err.contains("net.ipv6.neigh.default.gc_thresh3 to 12376 or more"),
+            "{err}"
+        );
+        // The value the message names is one the check then takes: it does not send an operator
+        // to a limit that is still too low.
+        assert!(quiet(check_neighbour_room(512, 0, "12376", "16384")));
+        assert!(check_neighbour_room(512, 0, "12375", "16384").is_err());
+        // It is above what 512 servers were counted holding (8,513 IPv6 entries), which the
+        // limit this check once passed (4,096) was not.
+        assert!(check_neighbour_room(512, 0, "4096", "16384").is_err());
+        assert!(check_neighbour_room(512, 0, "8513", "16384").is_err());
+        // The IPv4 table is counted too: 512 servers held 1,026 entries, over the kernel's 1024.
+        let v4 = check_neighbour_room(512, 0, "32768", "1024")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            v4.contains("needs room for 2116 IPv4 neighbour entries (4 for each")
+                && v4.contains("net.ipv4.neigh.default.gc_thresh3 to 2116 or more"),
+            "{v4}"
+        );
+        // the fleet host image's limits (fleet/ami/host/build.sh) hold 512 servers and more
+        assert!(quiet(check_neighbour_room(512, 64, "32768\n", "32768\n")));
+        assert!(quiet(check_neighbour_room(1300, 0, "32768", "32768")));
+        assert!(check_neighbour_room(1400, 0, "32768", "32768").is_err());
+        // a limit that is not a number is not room
+        assert!(check_neighbour_room(8, 0, "", "16384").is_err());
+        assert!(check_neighbour_room(8, 0, "16384", "x").is_err());
+    }
+
+    /// Only the Minecraft fleet's own need refuses. A host with 4 servers beside 64 potato
+    /// players on the kernel's limits must still start its agent, with a warning.
+    #[test]
+    fn the_hosts_other_vms_are_warned_about_and_refuse_nothing() {
+        let warnings = check_neighbour_room(4, 64, "1024", "1024").unwrap();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("64 other VMs beside its 4 Minecraft servers")
+                && warnings[0].contains("IPv6")
+                && warnings[0].contains("the table would need 1720")
+                && warnings[0].contains("is 1024")
+                && warnings[0].contains("A potato ring's entries rise with its wakes"),
+            "{warnings:?}"
+        );
+        // however many: a warning for each table it could fill, never a refusal
+        let many = check_neighbour_room(4, 1000, "1024", "1024").unwrap();
+        assert_eq!(many.len(), 2, "{many:?}");
+        assert!(many[1].contains("IPv4"), "{many:?}");
+        // and none when the estimate fits
+        assert!(check_neighbour_room(4, 30, "1024", "1024")
+            .unwrap()
+            .is_empty());
+        assert!(check_neighbour_room(4, 64, "32768", "32768")
+            .unwrap()
+            .is_empty());
+        // the Minecraft fleet's own need still refuses, whatever else runs
+        assert!(check_neighbour_room(64, 0, "1024", "1024").is_err());
+    }
+
+    #[test]
+    fn a_neighbour_limit_that_cannot_be_read_says_where_it_can_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let there = dir.path().join("gc_thresh3");
+        std::fs::write(&there, "16384\n").unwrap();
+        assert_eq!(read_neighbour_limit(&there).unwrap(), "16384\n");
+        // In a network namespace other than the host's first the file does not exist.
+        let err = format!(
+            "{:#}",
+            read_neighbour_limit(&dir.path().join("absent")).unwrap_err()
+        );
+        assert!(
+            err.contains("only in the host's initial network namespace") && err.contains("absent"),
+            "{err}"
+        );
+    }
 
     fn cfg() -> MinecraftCfg {
         MinecraftCfg {
