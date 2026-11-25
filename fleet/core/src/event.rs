@@ -269,6 +269,16 @@ pub enum Intent {
     PotatoFaster,
     /// Potato mode: start the current size again.
     PotatoRestart,
+    /// Pages mode: put a short text on every page. Needs the text check's verdict.
+    RendersOverlay {
+        text: String,
+    },
+    /// Pages mode: apply one of the named transforms to every page.
+    RendersTransform {
+        name: String,
+    },
+    /// Pages mode: take the text and the transform away.
+    RendersClear,
 }
 
 fn opt_str(args: &serde_json::Value, key: &str, what: &str) -> Result<Option<String>, String> {
@@ -462,6 +472,34 @@ impl Intent {
             }),
             "potato_faster" => Ok(Intent::PotatoFaster),
             "potato_restart" => Ok(Intent::PotatoRestart),
+            "renders_overlay" => Ok(Intent::RendersOverlay {
+                text: crate::renders::normalise_overlay(
+                    args.get("text")
+                        .and_then(|v| v.as_str())
+                        .ok_or("args.text must be a string")?,
+                )?,
+            }),
+            "renders_transform" => {
+                let name = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or("args.name must be a string")?;
+                if crate::renders::chromium_only(name).is_none() {
+                    return Err(format!(
+                        "args.name must be one of {}",
+                        crate::renders::TRANSFORMS_BOTH
+                            .iter()
+                            .chain(crate::renders::TRANSFORMS_CHROMIUM_ONLY.iter())
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                Ok(Intent::RendersTransform {
+                    name: name.to_string(),
+                })
+            }
+            "renders_clear" => Ok(Intent::RendersClear),
             "phones_zoom" => Ok(Intent::PhonesZoom {
                 out: args
                     .get("out")

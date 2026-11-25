@@ -1653,6 +1653,58 @@ a snapshot of 271,732 bytes (525 a server). So:
   an agent's connection on a message it cannot parse: a coordinator from before the field reads
   it as a health report for a slot it does not have, and drops it.
 
+### Pages mode
+
+`?mode=pages` ("One VM per page"). A renders host renders a fixed set of web pages from a local
+replay on two sides at once, each on its own equal set of pinned CPUs: `fcvm` (every render
+restores a new microVM running Chromium and discards it) and `kitesurf` (Kitesurf engines on
+workerd). Each side searches for the number of renders in flight its CPUs carry. Every figure
+is measured on the host from completed renders. Screenshots and per-render events go from the
+host to the page on the host's frame socket; the coordinator carries the summary below.
+
+`state.renders` is absent while no host runs the mode. With one:
+
+| field | what |
+|-------|------|
+| `host` | the host's name |
+| `pages` | `[{"id", "url"}]`, the wall's tiles in order; `url` is the live site the tile's name links to |
+| `cpus`, `confined` | the pinned CPUs of each side, and whether each side runs in a cpuset of exactly that many |
+| `build` | what runs, by name, for the `Setup` lists (absent when empty) |
+| `report`, `report_at` | the host's last report as it sent it (below), and when the coordinator received it; absent before the first |
+| `overlay` | `{"text"?, "transform"?, "chromium_only", "until", "seq"}`: what viewers put on every page; absent with none |
+| `transforms` | `{"both": [...], "chromium_only": [...]}`: the names a viewer may pick from |
+| `max_overlay_chars`, `change_interval_s` | the text's limit, and the least seconds between two changes from one viewer |
+
+While `overlay.chromium_only` is true the transform is in the `fcvm` side's pages only, the two
+sides render different work, and a page compares nothing across them.
+
+| intent | args | effect |
+|--------|------|--------|
+| `renders_overlay` | `{"text": "hello"}` | the text on every page: 1 to 40 characters after collapsing runs of spaces, plain text (the host escapes it into the page). Refused with a control character (a tab or a newline is one), with a character that changes the direction of the text around it (the embeddings, overrides and isolates, U+202A to U+202E and U+2066 to U+2069), and when it shows nothing (only spaces, zero-width characters, fillers and the like). Checked alone by the text check as a `word` is, and its receipt carries the `check` |
+| `renders_transform` | `{"name": "mirror"}` | one of `transforms`; any other name is refused |
+| `renders_clear` | `{}` | the text and the transform go; refused with nothing set |
+
+A change is refused with no host of the mode, within 30 s of the same client's last change, and
+within 10 s of anyone's (every change starts both sides' searches again). A change keeps the
+other part of the overlay and sets `until` to two minutes on, so an overlay goes two minutes
+after its last change, whoever made it. A change that arrives after `until` starts from
+nothing. The overlay leaves `/live` and the hosts' order at the coordinator's next tick, up to
+a second after `until`, so a page treats an overlay whose `until` has passed as gone. Each
+change, an expiry included, takes the next `seq`. The overlay is in the stored state before its receipt is sent,
+and a restarted coordinator keeps it, its `until` and its `seq`.
+
+The order a change gives the host is sent when the change is applied, which can be before the
+state holding it is stored, as with every other order. A coordinator that dies in between comes
+back without the change and can give its `seq` to another one. A host's connection ends with
+the coordinator, and the order at the start of the next one replaces whatever the host served,
+so a host or a page compares an overlay by its content and its `seq` within one connection,
+never by a `seq` kept across connections.
+
+In the recent-actions list a pages intent shows what was parsed and committed and nothing else:
+a committed `renders_overlay` its text as kept, a committed `renders_transform` its `name`, and
+`{}` for a `renders_clear` and for any of the three that was refused. Its args as sent can hold
+text nobody checked.
+
 ## Agent
 
 `fcvm fleet agent` runs on a GPU host, one per host. It speaks newline-delimited JSON:
@@ -1756,6 +1808,45 @@ reports `standby` once its GPU is free (and scrubbed, with `--scrub`) and no VM 
 | `total_ms` | the agent starts the relaunch | the first frame |
 
 A `/health` reply carrying `error` (the renderer failed) fails the relaunch at once.
+
+```json
+{"type": "renders", "at": 1795560000000, "frame_url": "wss://renders-h1-4f2a.tiles.example/frames",
+ "frame_url_v4": "wss://renders-h1-4f2a-v4.tiles.example/frames",
+ "sides": {"fcvm": {"search": {"in_flight": 16, "phase": "holding", "limit": 16,
+     "backed_off": {"from": 18, "cause": "render_time", "ratio": 1.3, "at": 1795559990000},
+     "curve": [{"in_flight": 1, "renders_per_s": 1.9, "render_ms": 300.0}]},
+   "renders_per_s": 23.0, "render_ms": 360.0, "cpus_busy": 32.5, "cpu_ms_per_render": 1400.0,
+   "done": 500, "failed": 0, "since": 1795559000000, "setup": {"vcpus": "4"}}},
+ "tiles": [{"page": "example", "side": "fcvm", "state": "rendering", "renders_per_s": 1.7,
+   "last_ms": 180.0, "last_at": 1795559999000, "done": 40, "failed": 0}],
+ "overlay_seq": 3, "harness": {"cpu_pressure": 0.0, "replay_ms": {"fcvm": 0.4, "kitesurf": 0.5}}}
+```
+
+Pages mode: the host's summary, every few seconds. At the top level only `at` is required. A
+side that is present carries `search` (with `in_flight` and `phase`),
+`renders_per_s`, `cpus_busy`, `done`, `failed` and `since`; a tile carries `page`, `side`,
+`state`, `renders_per_s`, `done` and `failed`. A host says it runs
+the mode with `renders` in its hello (`{"pages": [{"id", "url"}], "cpus", "confined"?,
+"build"?}`), and sends this message only after it has received a `renders` order: a
+coordinator built before the mode sends none, and would close the connection on this message.
+
+- `sides`, by `fcvm` and `kitesurf`. `search` is the side's search for its limit: `in_flight`
+  now; `phase` `starting` (no baseline at one in flight yet), `adding` or `holding`;
+  `backed_off`, the last step back (`from`, `cause` one of `render_time`, `cpu_pressure`,
+  `failed`, with the `ratio` or `pressure` measured there); `limit`, the highest level that
+  held, absent before a side has found one; `curve`, what each level last measured. The rest
+  is over the host's window: `renders_per_s`, `render_ms` (the mean over the pages of each
+  page's median render time, as in a `curve` point), `cpus_busy` of the side's set, the mean `cpu_ms_per_render`, `done` and `failed` since `since`, and for
+  `kitesurf` the `engines` running and `recycles`. `setup` holds the live values of the
+  side's `Setup` list.
+- `tiles`, one per page and side: `state` is `waiting` (no render yet), `rendering`, `stopped`
+  (repeated failures) or `unsupported`, with the host's `reason` for the last two.
+- `overlay_seq`: the `seq` of the overlay order the replays serve now; absent while they serve
+  the pages as captured.
+- `harness`: the replays', drivers' and frame server's own CPU pressure and each replay's
+  response time to a probe. The page shows none of it; the smoke fails on it.
+- `withheld`: why the host renders nothing, when it does not.
+
 
 A Windows sandbox (Windows mode) reports as a slot with its `win-<n>` id, its phases
 `stopping`, `restoring` (fcvm started the clone), `connecting` (fcvm reports it healthy; the
@@ -2022,6 +2113,19 @@ and throws the first ball to `ring[0]` once that player accepts; a round it no l
 ends, and every awake player sleeps, so a ball still in the air drops. A new `pace_ms` in the
 same round goes to the awake players, whose next throws hold no longer than it. `flight_ms`
 is the most a thrower retries for: a player retries for its hold when that is shorter.
+
+```json
+{"type": "renders", "order": {"run": true, "overlay": {"text": "hello", "transform": "invert", "chromium_only": true, "seq": 3}}}
+```
+
+Pages mode, only to a host whose hello carried `renders` (an agent built before the mode ends
+its connection on a message it cannot parse), at the start of its connection and whenever the
+order changes. `run` is false while the fleet is asleep: the host stops every clone and engine.
+`overlay` is what the replays put into every page's main document before it is rendered, absent
+for none: `text` (plain text; the host escapes it), `transform` (a name; the style behind it is
+the host's), `chromium_only` (the transform goes into the `fcvm` side's pages only), and `seq`,
+which the host's reports repeat as `overlay_seq` once its replays serve it. A render sees the
+old overlay or the new one whole.
 
 ### Grid budget
 
