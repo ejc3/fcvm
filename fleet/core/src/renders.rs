@@ -293,6 +293,9 @@ pub struct HostState {
     /// its hello gave.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published: Option<crate::state::Published>,
+    /// The host reported a spot interruption notice: it renders until EC2 takes it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub draining: bool,
 }
 
 /// The mode's part of the fleet state.
@@ -357,6 +360,9 @@ pub struct RendersView {
     pub frame_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_url_v4: Option<String>,
+    /// The host reported a spot interruption notice; absent otherwise.
+    #[serde(skip_serializing_if = "is_false")]
+    pub draining: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay: Option<OverlayView>,
     pub transforms: TransformsView,
@@ -446,6 +452,8 @@ impl Renders {
             Some(h) => {
                 let state = self.hosts.entry(host.to_string()).or_default();
                 state.hello = h.clone();
+                // A new agent: no notice of its own yet.
+                state.draining = false;
             }
             None => {
                 self.hosts.remove(host);
@@ -591,6 +599,7 @@ impl Renders {
             report_at: h.report.as_ref().map(|_| h.report_at),
             frame_url: None,
             frame_url_v4: None,
+            draining: h.draining,
             overlay: self.overlay.as_ref().map(|o| OverlayView {
                 text: o.text.clone(),
                 transform: o.transform.clone(),

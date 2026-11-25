@@ -2405,3 +2405,56 @@ fn a_renders_hosts_frame_socket_is_named_for_the_addresses_it_gave() {
     assert_eq!(v["renders"]["frame_url"], "wss://r1.example.test/frames");
     assert!(v["renders"]["frame_url_v4"].is_null());
 }
+
+/// Pages mode's host is no host of the wall's views. Connected beside a GPU host, it is not
+/// in `fleet.hosts` (the count the phones, Windows and Minecraft pages read); its spot notice
+/// and its loss change pages mode's state only (`renders.draining`, then no `renders`),
+/// never `reclaimed` or the wall's failures. A host that said hello as a GPU host and then
+/// as pages mode's host on the same name leaves the wall too.
+#[test]
+fn a_renders_host_is_not_a_host_of_the_wall_views() {
+    let config = config_with(serde_json::json!({"ec2_max": 0}));
+    let mut s = State::new(config, 0);
+    s = apply(s, &renders_hello(1000, "r1"));
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(v["fleet"]["hosts"], serde_json::json!([]), "{}", v["fleet"]);
+    s = apply(s, &hello(2000, "h1", 1));
+    s = apply(s, &running(3000, "h1", "slot-1"));
+    let wall_hosts = serde_json::to_value(view(&s)).unwrap()["fleet"]["hosts"].clone();
+    assert_eq!(wall_hosts.as_array().unwrap().len(), 1, "{wall_hosts}");
+    let draining: Event = serde_json::from_value(serde_json::json!({
+        "type": "agent", "at": 4000, "host": "r1",
+        "msg": {"type": "draining", "reason": "spot interruption notice"}
+    }))
+    .unwrap();
+    s = apply(s, &draining);
+    assert!(s.fleet.reclaimed.is_empty(), "{:?}", s.fleet.reclaimed);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(v["renders"]["draining"], true, "{}", v["renders"]);
+    assert_eq!(v["failures"], serde_json::json!([]), "{}", v["failures"]);
+    assert_eq!(v["fleet"]["hosts"], wall_hosts);
+    s = apply(
+        s,
+        &Event::AgentGone {
+            at: 5000,
+            host: "r1".into(),
+        },
+    );
+    assert!(s.fleet.reclaimed.is_empty(), "{:?}", s.fleet.reclaimed);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert!(v["renders"].is_null(), "{}", v["renders"]);
+    assert_eq!(v["failures"], serde_json::json!([]), "{}", v["failures"]);
+    assert_eq!(v["fleet"]["hosts"], wall_hosts);
+    // The same name says hello as a GPU host, then as pages mode's host: its slot and its
+    // place among the wall's hosts go.
+    s = apply(s, &hello(6000, "h2", 1));
+    assert!(s.fleet.hosts.contains_key("h2"));
+    s = apply(s, &renders_hello(7000, "h2"));
+    assert!(!s.fleet.hosts.contains_key("h2"));
+    assert!(s
+        .fleet
+        .slots
+        .values()
+        .all(|x| x.host.as_deref() != Some("h2")));
+    assert!(s.fleet.renders.hosts.contains_key("h2"));
+}

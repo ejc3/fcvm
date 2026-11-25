@@ -233,7 +233,12 @@ spot is refused for capacity, at most one on demand, apart from the GPU hosts' c
 while it sleeps, adopted by its tags after a restart. With one host, a spot notice waits for
 EC2 to take the instance. A quota refusal marks the component `scale-renders` degraded. It is
 not a GPU host: no slot, no place in the wall's tiling or the potato ring, no phone, sandbox
-or server, no entry in a wake's record, and none of the hosts the fcvm side waits for. The
+or server, no entry in a wake's record, none of the hosts the fcvm side waits for, and not one
+of the hosts the other modes' pages count. Its spot notice and its loss change pages mode's
+state only, never the wall's reclaimed-host failure. The instance's class decides what its
+agent's hello may say: an agent on a renders instance must say it runs the mode and offer
+nothing of the wall's, and one on a GPU instance must not say it runs the mode, or it is
+refused before the hello is applied. The
 spend meter lists its instances with the rest and charges them under the same daily ceiling;
 c8gd.metal-24xl, its type, has a built-in on-demand rate (4.70304 USD/h).
 

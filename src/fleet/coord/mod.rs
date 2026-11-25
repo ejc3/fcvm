@@ -482,13 +482,21 @@ impl Actor {
             *cur = power.clone();
             changed
         });
+        // The wall's hosts and pages mode's host: each launcher keeps the notices of its own
+        // instances.
+        let f = &self.state.fleet;
         self.out.draining.publish(
-            self.state
-                .fleet
-                .hosts
+            f.hosts
                 .iter()
                 .filter(|(_, h)| h.draining)
                 .map(|(name, _)| name.clone())
+                .chain(
+                    f.renders
+                        .hosts
+                        .iter()
+                        .filter(|(_, h)| h.draining)
+                        .map(|(name, _)| name.clone()),
+                )
                 .collect(),
         );
         let ec2 = ec2_assignment(&self.state);

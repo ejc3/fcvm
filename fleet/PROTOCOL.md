@@ -1054,7 +1054,7 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   coordinator degraded as for the GPU hosts, under the component `scale-renders`, and logs
   `EC2 refused a renders host launch`. The host is no GPU host: it has no slot, takes no part
   in a wake's record (`fleet.power.hosts`) or the hosts the fcvm side waits for, and its agent
-  passes the check below as an instance of this group.
+  passes the check below as an instance of this group, with a hello that fits it.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication, so the coordinator refuses to start when the address
@@ -1691,10 +1691,17 @@ host to the page on the host's frame socket; the coordinator carries the summary
 | `cpus`, `confined` | the pinned CPUs of each side, and whether each side runs in a cpuset of exactly that many |
 | `build` | what runs, by name, for the `Setup` lists (absent when empty) |
 | `report`, `report_at` | the host's last report as it sent it (below), and when the coordinator received it; absent before the first |
+| `draining` | true once the host reported a spot interruption notice; absent otherwise |
 | `frame_url`, `frame_url_v4` | the host's frame socket and its IPv4-only name: with the coordinator's subzone, the names it published for the addresses the hello gave (`renders-<host>-<token>`, below; absent until published), otherwise the report's |
 | `overlay` | `{"text"?, "transform"?, "chromium_only", "until", "seq"}`: what viewers put on every page; absent with none |
 | `transforms` | `{"both": [...], "chromium_only": [...]}`: the names a viewer may pick from |
 | `max_overlay_chars`, `change_interval_s` | the text's limit, and the least seconds between two changes from one viewer |
+
+The host is no host of the wall's: it is not in `fleet.hosts` (the hosts the phones, Windows
+and Minecraft pages count), it has no slot and no entry in `fleet.power.hosts`, and its spot
+interruption notice and its loss change only this section (`draining`, then no `renders`),
+never `failures` (no `host_reclaimed`) or the wall's tiling. A host that said hello as a wall
+host and then with `renders` on the same name leaves the wall.
 
 While `overlay.chromium_only` is true the transform is in the `fcvm` side's pages only, the two
 sides render different work, and a page compares nothing across them.
@@ -1756,7 +1763,11 @@ address in one of its delegated IPv6 prefixes (the source is `CF-Connecting-IP` 
 peer address). Instance ids appear in snapshots, so the name alone proves nothing. Any other
 name (another fleet's instance, a terminated one, no instance), a connection from elsewhere,
 or a listing that fails, closes the connection before the hello is applied, and the agent
-dials again. Both refusals are
+dials again. So does a hello that does not fit the class of the instance: an agent on a
+`fcvm-fleet-renders` instance must carry `renders` and no GPU, phone, Windows sandbox,
+Minecraft server or potato player, and an agent on a `fcvm-fleet-host` instance must not carry
+`renders`; the refusal names the instance's class and what the hello said. Without host
+templates nothing is checked and the hello alone says what a host runs. Both refusals are
 logged at warn with `marker=fleet-agent-refused`. Agents started with `--agent-cmd` are not
 checked.
 

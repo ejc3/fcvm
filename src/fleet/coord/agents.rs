@@ -35,8 +35,59 @@ pub const AGENT_REFUSED_MARKER: &str = "fleet-agent-refused";
 /// Whether the host an agent's hello names may join this fleet.
 #[async_trait]
 pub trait AgentIdentity: Send + Sync {
-    /// `Err` says why `host` may not join over a connection from `source` (`None`: unknown).
-    async fn check(&self, host: &str, source: Option<IpAddr>) -> std::result::Result<(), String>;
+    /// The class of the instance `host` is, or why it may not join over a connection from
+    /// `source` (`None`: unknown).
+    async fn check(
+        &self,
+        host: &str,
+        source: Option<IpAddr>,
+    ) -> std::result::Result<HostClass, String>;
+}
+
+/// Whether a hello fits the class of the instance its agent runs on: pages mode's host says
+/// it runs the mode and offers nothing of the wall's, and a GPU host does not say it runs the
+/// mode. `Err` names the class and what the hello said.
+pub fn hello_fits(class: HostClass, hello: &AgentMsg) -> std::result::Result<(), String> {
+    let AgentMsg::Hello {
+        host,
+        gpus,
+        phones,
+        potato_players,
+        windows,
+        minecraft,
+        renders,
+        ..
+    } = hello
+    else {
+        return Err("not a hello".into());
+    };
+    let wall: Vec<String> = [
+        (gpus.len(), "GPU", "GPUs"),
+        (phones.len(), "phone", "phones"),
+        (*windows as usize, "Windows sandbox", "Windows sandboxes"),
+        (*minecraft as usize, "Minecraft server", "Minecraft servers"),
+        (*potato_players as usize, "potato player", "potato players"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
+    .collect();
+    let said = match (class, renders.is_some()) {
+        (HostClass::Renders, false) => Some("no renders".to_string()),
+        (HostClass::Renders, true) if !wall.is_empty() => {
+            Some(format!("renders and {}", wall.join(", ")))
+        }
+        (HostClass::Gpu, true) => Some("renders".to_string()),
+        _ => None,
+    };
+    match said {
+        None => Ok(()),
+        Some(said) => Err(format!(
+            "instance {host} is a {} (Purpose={}), and its hello says {said}",
+            class.noun(),
+            class.purpose()
+        )),
+    }
 }
 
 /// One host group an agent's host may belong to: its class, driver and regions.
@@ -58,7 +109,11 @@ pub struct FleetHosts {
 
 #[async_trait]
 impl AgentIdentity for FleetHosts {
-    async fn check(&self, host: &str, source: Option<IpAddr>) -> std::result::Result<(), String> {
+    async fn check(
+        &self,
+        host: &str,
+        source: Option<IpAddr>,
+    ) -> std::result::Result<HostClass, String> {
         let source = source.ok_or("the connection's source address is unknown")?;
         for g in &self.groups {
             for region in &g.regions {
@@ -73,7 +128,7 @@ impl AgentIdentity for FleetHosts {
                         return Err(format!("instance {host} is {}", h.state));
                     }
                     return if h.sources.iter().any(|s| owns(s, source)) {
-                        Ok(())
+                        Ok(g.class)
                     } else {
                         Err(format!(
                             "the connection comes from {source}, not from instance {host}"
@@ -149,12 +204,16 @@ where
         None => bail!("agent closed before its hello"),
     };
     if let (Some(identity), AgentMsg::Hello { host, .. }) = (identity, &hello) {
-        if let Err(why) = identity.check(host, source).await {
+        if let Err(why) = identity
+            .check(host, source)
+            .await
+            .and_then(|class| hello_fits(class, &hello))
+        {
             tracing::warn!(
                 marker = AGENT_REFUSED_MARKER,
                 host = %host,
                 reason = %why,
-                "refusing an agent: its host is not one of this fleet's"
+                "refusing an agent: its host is not one of this fleet's, or its hello does not fit the host's class"
             );
             bail!("refused the agent for {host}: {why}");
         }
@@ -269,5 +328,67 @@ fn arm_pdeathsig(command: &mut std::process::Command) {
             }
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello(v: serde_json::Value) -> AgentMsg {
+        let mut base = serde_json::json!({"type": "hello", "host": "i-0123456789abcdef0",
+            "arch": "aarch64", "capacity": 0, "gpus": []});
+        for (k, x) in v.as_object().unwrap() {
+            base[k] = x.clone();
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
+    /// The class of the instance an agent runs on decides what its hello may say. Pages
+    /// mode's host carries `renders` and nothing of the wall's (no GPU, phone, sandbox,
+    /// server or potato player); a GPU host carries no `renders`. The refusal names the class
+    /// and what the hello said.
+    #[test]
+    fn a_hello_must_fit_its_instance_class() {
+        let pages = serde_json::json!({"cpus": 40, "pages": []});
+        let t4 = serde_json::json!([{"sbdf": "0000:01:00.0", "name": "Tesla T4"}]);
+        assert!(hello_fits(
+            HostClass::Renders,
+            &hello(serde_json::json!({"renders": pages}))
+        )
+        .is_ok());
+        assert!(hello_fits(HostClass::Gpu, &hello(serde_json::json!({"gpus": t4}))).is_ok());
+        for (class, h, said) in [
+            (HostClass::Renders, serde_json::json!({}), "no renders"),
+            (
+                HostClass::Renders,
+                serde_json::json!({"renders": pages, "gpus": t4}),
+                "1 GPU",
+            ),
+            (
+                HostClass::Renders,
+                serde_json::json!({"renders": pages, "minecraft": 2}),
+                "2 Minecraft servers",
+            ),
+            (
+                HostClass::Renders,
+                serde_json::json!({"renders": pages, "windows": 1}),
+                "1 Windows sandbox",
+            ),
+            (
+                HostClass::Renders,
+                serde_json::json!({"renders": pages, "potato_players": 4}),
+                "4 potato players",
+            ),
+            (
+                HostClass::Gpu,
+                serde_json::json!({"renders": pages}),
+                "renders",
+            ),
+        ] {
+            let e = hello_fits(class, &hello(h.clone())).expect_err(&h.to_string());
+            assert!(e.contains(class.purpose()), "{e}");
+            assert!(e.contains(said), "{said}: {e}");
+        }
     }
 }

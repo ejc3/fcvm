@@ -1386,7 +1386,7 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
         ],
     );
     // Pages mode's host is an instance of the other group, in another region.
-    let renders = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
     renders.hosts.lock().unwrap().insert(
         "us-east-2".into(),
         vec![host("i-0ccccccccccccccc1", "running")],
@@ -1457,6 +1457,34 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
     }
     *fake.fail_lists.lock().unwrap() = [("us-east-1".to_string(), 1)].into_iter().collect();
     closes(dial("i-0aaaaaaaaaaaaaaa1").await).await;
+    // The instance's class decides what its hello may say: pages mode's host says it runs the
+    // mode and has no GPU, and a GPU host does not say it runs the mode. Each hello that does
+    // not fit is refused before it reaches the state.
+    let dial_msg = |msg: AgentMsg| {
+        let url = url.clone();
+        async move {
+            let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            ws.send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+                .await
+                .unwrap();
+            ws
+        }
+    };
+    let pages_hello = |host: &str, gpus: serde_json::Value| -> AgentMsg {
+        serde_json::from_value(json!({"type": "hello", "host": host, "arch": "aarch64",
+            "capacity": 1, "gpus": gpus, "renders": {"cpus": 40,
+            "pages": [{"id": "example", "url": "https://example.com/"}]}}))
+        .unwrap()
+    };
+    let t4 = json!([{"sbdf": "0000:01:00.0", "name": "Tesla T4"}]);
+    closes(dial_msg(bare_hello("i-0ccccccccccccccc1")).await).await;
+    closes(dial_msg(pages_hello("i-0ccccccccccccccc1", t4.clone())).await).await;
+    closes(dial_msg(pages_hello("i-0aaaaaaaaaaaaaaa1", json!([]))).await).await;
+    let mut before = Viewer::connect(&c.url).await;
+    let s = before.until(|s| !s["scene"].is_null()).await;
+    assert_eq!(s["fleet"]["agents"]["hosts"], json!([]), "{}", s["fleet"]);
+    assert_eq!(s["fleet"]["hosts"], json!([]), "{}", s["fleet"]);
+    assert!(s["renders"].is_null(), "{}", s["renders"]);
     // This fleet's running host registers, over IPv4 or from its IPv6 prefix.
     let mut req = url.as_str().into_client_request().unwrap();
     req.headers_mut()
@@ -1470,7 +1498,7 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
     .await
     .unwrap();
     let _ok = dial("i-0aaaaaaaaaaaaaaa1").await;
-    let _pages = dial("i-0ccccccccccccccc1").await;
+    let _pages = dial_msg(pages_hello("i-0ccccccccccccccc1", json!([]))).await;
     let mut v = Viewer::connect(&c.url).await;
     let s = tokio::time::timeout(
         Duration::from_secs(10),
@@ -4273,6 +4301,15 @@ fn renders_config(
     }
 }
 
+/// Pages mode's hosts in memory, as a second group's driver lists them. Its instance ids
+/// (`i-0f...`) are none of the GPU hosts' fake's (`i-00...`), so a test sees whose instance a
+/// notice or an agent names.
+fn renders_fake() -> Arc<fcvm::fleet::coord::hosts::FakeHosts> {
+    Arc::new(fcvm::fleet::coord::hosts::FakeHosts::numbered_from(
+        0xf << 60,
+    ))
+}
+
 /// A coordinator with the GPU hosts' group over `gpu` and pages mode's host group over
 /// `renders`.
 fn start_two_groups(
@@ -4412,7 +4449,7 @@ async fn no_active_viewer_terminates_the_gpu_hosts_and_one_launches_them() {
         ..Config::default()
     };
     let fake = Arc::new(FakeHosts::default());
-    let renders = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
     let (handle, _actor) = start_two_groups(
         State::new(config, now_ms()),
         None,
@@ -5120,7 +5157,7 @@ async fn a_restart_keeps_the_hosts_it_finds() {
 async fn a_spot_refused_renders_host_launches_on_demand_under_its_own_cap() {
     use fcvm::fleet::coord::hosts::{FakeHosts, Market};
     let gpu = Arc::new(FakeHosts::default());
-    let renders = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
     for f in [&gpu, &renders] {
         f.capacity
             .lock()
@@ -5159,7 +5196,7 @@ async fn a_spot_refused_renders_host_launches_on_demand_under_its_own_cap() {
 async fn a_quota_refused_renders_launch_marks_its_class_degraded() {
     use fcvm::fleet::coord::hosts::{FakeHosts, Market};
     let gpu = Arc::new(FakeHosts::default());
-    let renders = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
     for m in [Market::Spot, Market::OnDemand] {
         renders
             .capacity
@@ -5233,8 +5270,8 @@ async fn a_quota_refused_renders_launch_marks_its_class_degraded() {
 /// would replace the GPU hosts' and leave the fcvm side waiting for a host with no GPU).
 #[tokio::test]
 async fn a_renders_group_reports_no_gpu_hosts() {
-    use fcvm::fleet::coord::hosts::{run, FakeHosts};
-    let renders = Arc::new(FakeHosts::default());
+    use fcvm::fleet::coord::hosts::run;
+    let renders = renders_fake();
     *renders.launch_state.lock().unwrap() = Some("running".into());
     let (handle, _reports, events) = recorder();
     let (power_tx, power_rx) = tokio::sync::watch::channel("waking".to_string());
@@ -5275,7 +5312,7 @@ async fn a_renders_group_reports_no_gpu_hosts() {
 async fn a_renders_host_notice_waits_for_ec2_to_take_it() {
     use fcvm::fleet::coord::hosts::FakeHosts;
     let gpu = Arc::new(FakeHosts::default());
-    let renders = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
     *renders.launch_state.lock().unwrap() = Some("running".into());
     let (handle, _actor) = start_two_groups(
         State::new(Config::default(), now_ms()),
@@ -5300,6 +5337,13 @@ async fn a_renders_host_notice_waits_for_ec2_to_take_it() {
         ))
         .await
         .unwrap();
+    // The notice reached the state (and the launchers) before the window starts.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| s["renders"]["draining"] == true),
+    )
+    .await
+    .expect("the notice is in the state");
     // Many polls later: the host still runs and nothing was launched beside it.
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(launches(&renders).len(), 1, "{:?}", renders.calls());
@@ -5311,6 +5355,82 @@ async fn a_renders_host_notice_waits_for_ec2_to_take_it() {
     })
     .await;
     assert_eq!(launches(&renders).len(), 2, "{:?}", renders.calls());
+}
+
+/// Each launcher keeps only the notices of its own instances. With two awake GPU hosts a
+/// GPU host's notice launches its replacement at once; pages mode's host's notice launches
+/// nothing in either group, and the GPU host's notice launches nothing in pages mode's.
+#[tokio::test]
+async fn a_notice_reaches_only_the_launcher_of_its_instance() {
+    use fcvm::fleet::coord::hosts::FakeHosts;
+    let gpu = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
+    for f in [&gpu, &renders] {
+        *f.launch_state.lock().unwrap() = Some("running".into());
+    }
+    let (handle, _actor) = start_two_groups(
+        State::new(Config::default(), now_ms()),
+        None,
+        host_config(&gpu, &["us-east-1"], 2, 8),
+        renders_config(&renders, "us-east-1"),
+    );
+    until_hosts(&gpu, "the GPU hosts", |f| f.present("us-east-1").len() == 2).await;
+    until_hosts(&renders, "the renders host", |f| {
+        f.present("us-east-1").len() == 1
+    })
+    .await;
+    let url = page_url(&handle).await;
+    let renders_id = renders.present("us-east-1")[0].id.clone();
+    let gpu_id = gpu.present("us-east-1")[0].id.clone();
+    let mut pages = dial_pages_agent_on(&url, &renders_id).await;
+    let (mut wall, _) = tokio_tungstenite::connect_async(url.replace("/live", "/agent").as_str())
+        .await
+        .unwrap();
+    let hello = json!({"type": "hello", "host": gpu_id, "arch": "x86_64", "capacity": 1,
+        "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}]});
+    wall.send(Message::Text(hello.to_string().into()))
+        .await
+        .unwrap();
+    let mut v = Viewer::connect(&url).await;
+    let s = tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| {
+            !s["renders"].is_null() && s["fleet"]["hosts"].as_array().is_some_and(|h| h.len() == 1)
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("both agents in the state: {}", v.latest().1));
+    let _ = s;
+    let notice = || {
+        Message::Text(
+            json!({"type": "draining", "reason": "spot interruption notice"})
+                .to_string()
+                .into(),
+        )
+    };
+    pages.send(notice()).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| s["renders"]["draining"] == true),
+    )
+    .await
+    .expect("the renders host's notice is in the state");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(launches(&gpu).len(), 1, "{:?}", gpu.calls());
+    assert_eq!(launches(&renders).len(), 1, "{:?}", renders.calls());
+    wall.send(notice()).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        v.until(|s| s["fleet"]["hosts"][0]["draining"] == true),
+    )
+    .await
+    .expect("the GPU host's notice is in the state");
+    until_hosts(&gpu, "the GPU host's replacement", |f| {
+        launches(f).len() == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(launches(&renders).len(), 1, "{:?}", renders.calls());
 }
 
 /// Pages mode's host and its overlay survive the coordinator. The first coordinator
@@ -5328,7 +5448,7 @@ async fn a_restarted_coordinator_adopts_the_renders_host_and_orders_it_again() {
         ..Config::default()
     };
     let gpu = Arc::new(FakeHosts::default());
-    let renders = Arc::new(FakeHosts::default());
+    let renders = renders_fake();
     *renders.launch_state.lock().unwrap() = Some("running".into());
     let (handle, actor) = start_two_groups(
         State::new(config.clone(), now_ms()),

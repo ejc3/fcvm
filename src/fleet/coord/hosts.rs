@@ -1650,6 +1650,15 @@ pub struct FakeHosts {
 }
 
 impl FakeHosts {
+    /// Hosts whose instance ids start at `first` (`i-` and 17 hex digits), so two fakes, one
+    /// per host group, mint ids that differ as two classes' instances do.
+    pub fn numbered_from(first: u64) -> Self {
+        FakeHosts {
+            next: std::sync::atomic::AtomicU64::new(first),
+            ..FakeHosts::default()
+        }
+    }
+
     /// Every host of `region` in a present state (not shutting down or terminated).
     pub fn present(&self, region: &str) -> Vec<Host> {
         self.hosts
