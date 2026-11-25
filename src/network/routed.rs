@@ -267,7 +267,7 @@ async fn release_address_in(
     masquerade: bool,
 ) -> crate::reclaim::Undo {
     use crate::reclaim::Undo;
-    let lease = match lease_address(lease_dir, address, "reclaim") {
+    let lease = match lease_address(lease_dir, address, RECLAIM_LEASE) {
         Ok(LeaseAttempt::Leased(lease)) => lease,
         // Another VM holds the address now, or holds it while it checks for leftovers
         // like these; either way not now.
@@ -478,6 +478,9 @@ pub struct RoutedNetwork {
     /// Held from the moment `vm_ipv6` is chosen until `cleanup` has removed everything
     /// that names it.
     address_lease: Option<AddressLease>,
+    /// The explicit prefix this VM holds the hairpin rule for (`hold_hairpin_rule`), once
+    /// its lease is held.
+    hairpin_prefix: Option<(u128, u8)>,
     default_iface: Option<String>,
     /// Listeners a VM torn down in this process handed over (`with_port_listeners`);
     /// `setup` listens on them instead of binding their addresses again.
@@ -517,6 +520,7 @@ impl RoutedNetwork {
             host_veth: None,
             vm_ipv6: None,
             address_lease: None,
+            hairpin_prefix: None,
             default_iface: None,
             handed_listeners: tcp_proxy::PortListeners::default(),
             port_listeners: tcp_proxy::PortListeners::default(),
@@ -783,6 +787,20 @@ impl RoutedNetwork {
         Ok(())
     }
 
+    /// Give up this VM's address lease, and the prefix's hairpin rule with it when this is
+    /// the prefix's last VM (`give_up_lease`).
+    async fn give_up_address(&mut self) {
+        let Some(lease) = self.address_lease.take() else {
+            return;
+        };
+        give_up_lease(
+            std::path::Path::new(ADDRESS_LEASE_DIR),
+            lease,
+            self.hairpin_prefix,
+        )
+        .await;
+    }
+
     /// Get the unique per-clone vm_ipv6 address.
     pub fn vm_ipv6(&self) -> Option<&str> {
         self.vm_ipv6.as_deref()
@@ -921,9 +939,6 @@ impl NetworkManager for RoutedNetwork {
             let (network, len) = Self::parse_ipv6_prefix(prefix)?;
             let host_addr = std::net::Ipv6Addr::from(network | 1).to_string();
             info!(prefix = %prefix, "using explicit --ipv6-prefix (routable, no MASQUERADE)");
-            // Before this VM's address is chosen: its /128 route comes many steps later,
-            // and whoever is already calling the address must not circle until then.
-            answer_for_the_prefix(network, len).await;
             (host_addr, network, len)
         } else {
             let (host_addr, prefix) = Self::detect_host_ipv6().context(
@@ -993,6 +1008,16 @@ impl NetworkManager for RoutedNetwork {
             }
             chosen.context("no free IPv6 address after 10 derived candidates")?
         };
+        // The uplink: where the VM's address is answered for (proxy NDP) and, for an
+        // explicit prefix, where a packet for an address no VM holds would go back out.
+        let default_iface = detect_default_ipv6_interface()
+            .await
+            .unwrap_or_else(|| "eth0".to_string());
+        self.default_iface = Some(default_iface.clone());
+        if self.ipv6_prefix.is_some() {
+            self.hairpin_prefix = Some((network, prefix_len));
+            hold_hairpin_rule(lease_dir, network, prefix_len, &default_iface).await;
+        }
         self.address_lease = Some(lease);
         // Record state as soon as it's known so cleanup() can tear down a
         // partially-completed setup if a later step fails.
@@ -1178,12 +1203,6 @@ impl NetworkManager for RoutedNetwork {
             &[(&format!("net/ipv6/conf/{}/forwarding", host_veth), "1")],
         )
         .await;
-
-        // Detect default interface early — used for sysctl checks AND proxy NDP below.
-        let default_iface = detect_default_ipv6_interface()
-            .await
-            .unwrap_or_else(|| "eth0".to_string());
-        self.default_iface = Some(default_iface.clone());
 
         // Verify host routing is set up correctly. These sysctls are the user's
         // responsibility (host sysctl configuration), not fcvm's — but warn
@@ -1499,7 +1518,7 @@ impl NetworkManager for RoutedNetwork {
                 && !matches!(r, crate::reclaim::Resource::Netns { .. })
                 && !(address_left && matches!(r, crate::reclaim::Resource::RoutedAddress { .. }))
         }) {
-            self.address_lease.take();
+            self.give_up_address().await;
             anyhow::bail!(
                 "dropping the records of the routed network, so its veth and namespace stay \
                  for the next launch: {e:#}"
@@ -1511,7 +1530,7 @@ impl NetworkManager for RoutedNetwork {
             }
         }
         // Only now that nothing on the host names the address may another VM take it.
-        self.address_lease.take();
+        self.give_up_address().await;
 
         // Delete namespace
         if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
@@ -1764,133 +1783,197 @@ async fn detect_ipv6_dns(selected: Option<String>) -> Option<String> {
     None
 }
 
-/// The calling thread's IPv6 routes and addresses as the kernel prints them. `thread-self`
-/// and not `self`: every thread of fcvm is in one network namespace, and a test that
-/// moves one thread into a namespace of its own must read that one.
-const IPV6_ROUTE_TABLE: &str = "/proc/thread-self/net/ipv6_route";
-const IPV6_ADDRESS_TABLE: &str = "/proc/thread-self/net/if_inet6";
+/// The built-in chain the hairpin rule is in.
+const HAIRPIN_CHAIN: &str = "FORWARD";
 
-/// `RTF_REJECT`: the route answers instead of forwarding (unreachable, prohibit, blackhole).
-const RTF_REJECT: u32 = 0x0200;
-
-/// The metric of the VM prefix's `unreachable` route. Worse than what the kernel gives a
-/// connected prefix (256) and than a route added by hand (1024), so it decides only when
-/// nothing else names the prefix.
-const PREFIX_UNREACHABLE_METRIC: &str = "2147483647";
-
-/// One line of `ipv6_route`: destination, its length, the flags and the device.
-fn route_table_line(line: &str) -> Option<(u128, u8, u32, &str)> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    let [destination, length, _, _, _, _, _, _, flags, device] = fields.as_slice() else {
-        return None;
-    };
-    Some((
-        u128::from_str_radix(destination, 16).ok()?,
-        u8::from_str_radix(length, 16).ok()?,
-        u32::from_str_radix(flags, 16).ok()?,
-        device,
-    ))
+/// The host's rule for a VM prefix given with `--ipv6-prefix`: a packet for the prefix that
+/// came in on the uplink and would be forwarded back out of it is answered with an ICMPv6
+/// address-unreachable.
+///
+/// Such a prefix is routed to the host by the network. A packet for one of its addresses
+/// that no VM holds (a VM that is still starting, or stopped, or a client's stray
+/// connection) matches only the default route, leaves by the uplink and comes straight
+/// back, until its hop limit runs out: 9,560 of 10,291 packets captured for one address in
+/// 64 s were one SYN going out and in again (#2109). The rule answers it the first time it
+/// comes back.
+///
+/// It matches that packet and nothing else. What the host itself sends is not forwarded, so
+/// the host still reaches every address of the prefix by its routes; a VM's traffic comes in
+/// on its veth; and traffic for a VM goes out on its veth. So a prefix shared with other
+/// hosts on the link keeps working, and a prefix given by mistake loses nothing. The rule
+/// reads the packet's devices and destination only: no connection tracking.
+fn hairpin_rule(uplink: &str, prefix: &str) -> [String; 10] {
+    [
+        "-i",
+        uplink,
+        "-o",
+        uplink,
+        "-d",
+        prefix,
+        "-j",
+        "REJECT",
+        "--reject-with",
+        "icmp6-addr-unreachable",
+    ]
+    .map(str::to_string)
 }
 
-/// Whether the route table holds a reject route for exactly `network/len`.
-fn has_reject_route(table: &str, network: u128, len: u8) -> bool {
-    table
-        .lines()
-        .filter_map(route_table_line)
-        .any(|(destination, length, flags, _)| {
-            destination == network && length == len && flags & RTF_REJECT != 0
+/// Run `ip6tables -w <action> FORWARD <the hairpin rule>` and say whether it exited 0, with
+/// what it wrote to stderr.
+async fn hairpin_rule_command(action: &str, uplink: &str, prefix: &str) -> (bool, String) {
+    match crate::utils::helper_command("ip6tables")
+        .args(["-w", action, HAIRPIN_CHAIN])
+        .args(hairpin_rule(uplink, prefix))
+        .output()
+        .await
+    {
+        Ok(output) => (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ),
+        Err(error) => (false, error.to_string()),
+    }
+}
+
+/// Whether a VM other than the holder of `own` holds a lease on an address inside
+/// `network/len`: what a VM that stops asks before it removes the prefix's hairpin rule.
+/// The caller holds the lease table (`lock_lease_table`), so no other process is between
+/// its open and its lock of a lease file. A file nobody holds (its VM was killed) is not a
+/// lease, and neither is the one a reclaim pass holds for a moment.
+fn another_vm_leases_in(
+    dir: &std::path::Path,
+    own: &std::path::Path,
+    network: u128,
+    len: u8,
+) -> bool {
+    use nix::fcntl::{Flock, FlockArg};
+    // the top `len` bits
+    let mask = !u128::MAX.checked_shr(u32::from(len)).unwrap_or(0);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path != own && path.extension().is_some_and(|ext| ext == "lock"))
+        .filter(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<std::net::Ipv6Addr>().ok())
+                .is_some_and(|address| u128::from(address) & mask == network)
+        })
+        .any(|path| {
+            let Ok(file) = std::fs::File::open(&path) else {
+                return false;
+            };
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                // nobody holds it; the probe's lock goes with this value
+                Ok(_) => false,
+                Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
+                    let holder = std::fs::read_to_string(&path).unwrap_or_default();
+                    holder.split_whitespace().nth(1) != Some(RECLAIM_LEASE)
+                }
+                Err(_) => false,
+            }
         })
 }
 
-/// The devices the host's default routes leave by.
-fn uplinks(table: &str) -> Vec<&str> {
-    let mut devices: Vec<&str> = table
-        .lines()
-        .filter_map(route_table_line)
-        .filter(|(_, length, flags, _)| *length == 0 && flags & RTF_REJECT == 0)
-        .map(|(_, _, _, device)| device)
-        .collect();
-    devices.sort_unstable();
-    devices.dedup();
-    devices
+/// The name a reclaim pass leases an abandoned address under while it removes what the
+/// address's VM left.
+const RECLAIM_LEASE: &str = "reclaim";
+
+/// The lease table's record that a prefix's hairpin rule is in place. It holds the name of
+/// the uplink the rule was added for. Its name does not end in `.lock`, so the sweep of
+/// abandoned leases leaves it.
+fn hairpin_record(dir: &std::path::Path, network: u128, len: u8) -> std::path::PathBuf {
+    dir.join(format!(
+        "hairpin-{}-{len}.rule",
+        std::net::Ipv6Addr::from(network)
+    ))
 }
 
-/// Whether one of `devices` holds a global address inside `network/len`, by the kernel's
-/// `if_inet6` listing (address, interface index, prefix length, scope, flags, device).
-/// The prefix's suffix 1 does not count: it is the host's own side of a VM prefix, which no
-/// VM is given, and a fleet host puts it on its uplink for the aggregator.
-fn a_device_holds_an_address_in(addresses: &str, devices: &[&str], network: u128, len: u8) -> bool {
-    // the top `len` bits
-    let mask = !u128::MAX.checked_shr(u32::from(len)).unwrap_or(0);
-    addresses.lines().any(|line| {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let [address, _, _, scope, _, device] = fields.as_slice() else {
-            return false;
-        };
-        *scope == "00"
-            && devices.contains(device)
-            && u128::from_str_radix(address, 16)
-                .is_ok_and(|address| address & mask == network && address != network | 1)
-    })
-}
-
-/// Make the host answer for the whole VM prefix: an `unreachable` route for it, which every
-/// VM's /128 route overrides.
+/// Make sure the prefix's hairpin rule is in place. The caller holds its address's lease.
 ///
-/// A prefix given with `--ipv6-prefix` is routed to this host by the network. A packet for
-/// one of its addresses that no VM holds (a VM that is still starting, or stopped, or a
-/// client's stray connection) matched only the default route, left by the uplink, and came
-/// straight back, until its hop limit ran out: 9,560 of 10,291 packets captured for one
-/// address in 64 s were one SYN going out and in again (#2109). With this route the host
-/// drops such a packet and says so (ICMPv6 destination unreachable; a local sender gets
-/// `EHOSTUNREACH` at once).
+/// One rule serves every VM of a prefix, so no VM's teardown can own it. It belongs to the
+/// lease table, and it and its record (`hairpin_record`) change only under the table's
+/// lock: a VM that finds the record does nothing and runs no process, a VM that does not
+/// adds the rule and writes the record, and the last VM to give its lease up removes both
+/// (`give_up_lease`). The record, not "does another VM hold a lease", is what a starting
+/// VM reads, because two VMs that both hold a lease before either looks would each take
+/// the other for the one that added the rule.
 ///
-/// A prefix that holds one of the uplink's own addresses (other than the prefix's suffix 1,
-/// the host's side of a VM prefix) is the uplink's subnet, shared with its neighbours:
-/// nothing routes it back here, so nothing loops, and an unreachable route would cut the
-/// host off from them. It is left alone.
-///
-/// Every routed launch calls this. The steady state is one read of the route table and no
-/// process. The route is added with `replace`, so launches that start together each add the
-/// same route and none can fail on another's. It is not removed when a VM stops: the
-/// network routes the prefix here whether or not a VM is running, and removing it would race
-/// the next launch's check. It goes with the host's routes at reboot, or with
-/// `ip -6 route del unreachable <prefix>`.
-async fn answer_for_the_prefix(network: u128, len: u8) {
+/// The record is trusted: a rule removed by hand (`ip6tables -F FORWARD`) is not added
+/// again until the prefix's last VM has stopped. A VM that is killed gives up its lease
+/// without removing the rule, which then stays until the prefix's next last VM stops; it
+/// rejects hairpins and nothing else. The lease directory is on `/run`, so a reboot clears
+/// the record with the rule.
+async fn hold_hairpin_rule(dir: &std::path::Path, network: u128, len: u8, uplink: &str) {
     let prefix = format!("{}/{len}", std::net::Ipv6Addr::from(network));
-    let table = match std::fs::read_to_string(IPV6_ROUTE_TABLE) {
+    let _table = match lock_lease_table(dir) {
         Ok(table) => table,
         Err(error) => {
-            warn!(%prefix, %error, "cannot read {IPV6_ROUTE_TABLE}; adding the prefix's unreachable route unseen");
-            String::new()
+            warn!(%prefix, error = %format!("{error:#}"), "the prefix's hairpin rule was not checked");
+            return;
         }
     };
-    if has_reject_route(&table, network, len) {
+    let record = hairpin_record(dir, network, len);
+    let recorded = std::fs::read_to_string(&record).unwrap_or_default();
+    let recorded = recorded.trim();
+    if recorded == uplink {
         return;
     }
-    let uplinks = uplinks(&table);
-    let addresses = std::fs::read_to_string(IPV6_ADDRESS_TABLE).unwrap_or_default();
-    if a_device_holds_an_address_in(&addresses, &uplinks, network, len) {
-        info!(%prefix, ?uplinks, "the prefix is the uplink's own subnet; no unreachable route for it");
+    if !recorded.is_empty() {
+        // The default route has moved to another device since the rule was added.
+        hairpin_rule_command("-D", recorded, &prefix).await;
+    }
+    // A VM killed between adding the rule and recording it has left it.
+    if !hairpin_rule_command("-C", uplink, &prefix).await.0 {
+        let (added, stderr) = hairpin_rule_command("-I", uplink, &prefix).await;
+        if !added {
+            warn!(%prefix, %uplink, %stderr, "adding the prefix's hairpin rule failed; a packet for an address no VM holds circles until its hop limit");
+            return;
+        }
+        info!(%prefix, %uplink, "the host answers a packet for the prefix that would go back out of the uplink");
+    }
+    if let Err(error) = std::fs::write(&record, uplink) {
+        warn!(path = %record.display(), %error, "recording the prefix's hairpin rule; the next VM checks for it again");
+    }
+}
+
+/// Give up `own`, and with it the prefix's hairpin rule when no other VM holds a lease in
+/// the prefix. Under the lease table's lock: a VM that starts meanwhile either holds its
+/// lease before this looks, and the rule stays, or looks for the record after this has
+/// removed it, and adds the rule again.
+///
+/// The record goes before the rule. A process killed between the two leaves a rule with
+/// no record, which the next VM finds (`-C`); the other order would leave a record with no
+/// rule, which every later VM would trust.
+async fn give_up_lease(dir: &std::path::Path, own: AddressLease, prefix: Option<(u128, u8)>) {
+    let Some((network, len)) = prefix else {
         return;
+    };
+    let prefix = format!("{}/{len}", std::net::Ipv6Addr::from(network));
+    let table = match lock_lease_table(dir) {
+        Ok(table) => table,
+        Err(error) => {
+            warn!(%prefix, error = %format!("{error:#}"), "the prefix's hairpin rule was left in place");
+            return;
+        }
+    };
+    let record = hairpin_record(dir, network, len);
+    // No record: no rule was added, or another VM's teardown has removed it.
+    if let Ok(uplink) = std::fs::read_to_string(&record) {
+        if !another_vm_leases_in(dir, &own.path, network, len) {
+            if let Err(error) = crate::state::manager::remove_if_exists(&record) {
+                warn!(path = %record.display(), %error, "removing the record of the prefix's hairpin rule");
+            }
+            let (removed, stderr) = hairpin_rule_command("-D", uplink.trim(), &prefix).await;
+            if !removed {
+                warn!(%prefix, %stderr, "removing the prefix's hairpin rule failed");
+            }
+        }
     }
-    if run_host_command(
-        "adding the VM prefix's unreachable route",
-        "ip",
-        &[
-            "-6",
-            "route",
-            "replace",
-            "unreachable",
-            &prefix,
-            "metric",
-            PREFIX_UNREACHABLE_METRIC,
-        ],
-    )
-    .await
-    {
-        info!(%prefix, "the host answers unreachable for prefix addresses no VM holds");
-    }
+    drop(own);
+    drop(table);
 }
 
 /// Detect the default IPv6 outgoing interface
@@ -2451,227 +2534,580 @@ mod tests {
         assert!(host_route_for("2001:db8:ffff::77").await.unwrap().is_none());
     }
 
-    /// The kernel's `ipv6_route` in a namespace with an uplink `up0` at 2001:db8:ffff::2/64,
-    /// a default route through it, and the unreachable route for 2001:db8:2109::/64
-    /// (captured on Linux 7.0). The last line is the kernel's own reject entry for `::/0`.
-    const ROUTE_TABLE: &str = "\
-20010db8210900000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 7fffffff 00000002 00000000 00200200       lo
-20010db8ffff00000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000002 00000000 00000001      up0
-fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001      up0
-00000000000000000000000000000000 00 00000000000000000000000000000000 00 20010db8ffff00000000000000000001 00000400 00000002 00000000 00000003      up0
-20010db8ffff00000000000000000002 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000002 00000000 80200001      up0
-00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
-";
-
-    /// The same namespace's `if_inet6`: a link-local and a global address on `up0`.
-    const ADDRESS_TABLE: &str = "\
-fe80000000000000742b74fffe8683d8 02 40 20 80      up0
-00000000000000000000000000000001 01 80 10 80       lo
-20010db8ffff00000000000000000002 02 40 00 82      up0
-";
-
+    /// The rule is in place once this VM's lease is held and before anything of the VM's
+    /// network exists, and both ways out of `cleanup` give the lease up through the lease
+    /// table, never by dropping it.
     #[test]
-    fn the_route_table_names_the_prefixes_reject_route_and_the_uplinks() {
-        let (vms, len) = prefix("2001:db8:2109::/64");
-        assert!(has_reject_route(ROUTE_TABLE, vms, len));
-        // another length, another prefix, and a prefix with an ordinary route are not it
-        assert!(!has_reject_route(ROUTE_TABLE, vms, 80));
-        let (other, len) = prefix("2001:db8:2110::/64");
-        assert!(!has_reject_route(ROUTE_TABLE, other, len));
-        let (connected, len) = prefix("2001:db8:ffff::/64");
-        assert!(!has_reject_route(ROUTE_TABLE, connected, len));
-        // the kernel's reject entry for ::/0 is not an uplink
-        assert_eq!(uplinks(ROUTE_TABLE), ["up0"]);
-        assert!(uplinks("").is_empty() && !has_reject_route("not a table\n", vms, 64));
-    }
-
-    /// A prefix that holds one of the uplink's own global addresses is the uplink's subnet.
-    /// A link-local address, or an address on another device, does not make it one.
-    #[test]
-    fn a_prefix_holding_an_uplink_address_is_the_uplinks_subnet() {
-        let held = |cidr: &str, devices: &[&str]| {
-            let (network, len) = prefix(cidr);
-            a_device_holds_an_address_in(ADDRESS_TABLE, devices, network, len)
-        };
-        assert!(held("2001:db8:ffff::/64", &["up0"]));
-        assert!(held("2001:db8:ffff::/112", &["up0"]));
-        assert!(!held("2001:db8:2109::/64", &["up0"]));
-        assert!(!held("2001:db8:ffff:1::/80", &["up0"]));
-        assert!(!held("2001:db8:ffff::/64", &["eth9"]));
-        assert!(!held("fe80::/64", &["up0"]), "a link-local address");
-        // the host's side of a VM prefix on the uplink is not a neighbour's subnet
-        let own_side = "20010db8210900000000000000000001 02 80 00 80      up0\n";
-        let (vms, len) = prefix("2001:db8:2109::/64");
-        assert!(!a_device_holds_an_address_in(own_side, &["up0"], vms, len));
-        let (other, len) = prefix("2001:db8:2109::/112");
-        assert!(a_device_holds_an_address_in(
-            "20010db8210900000000000000000002 02 80 00 80      up0\n",
-            &["up0"],
-            other,
-            len
-        ));
-        assert!(!held("2001:db8:ffff::/64", &[]));
-    }
-
-    /// The prefix's route is there before this VM's address is chosen: whoever calls the
-    /// address while the VM starts gets an answer from the first moment.
-    #[test]
-    fn the_prefix_is_answered_for_before_an_address_is_leased() {
+    fn the_hairpin_rule_is_held_with_the_lease_and_given_up_with_it() {
         let source = include_str!("routed.rs");
         let setup = &source[source.find("    async fn setup(&mut self)").unwrap()..];
-        let answered = setup
-            .find("answer_for_the_prefix(network, len).await")
-            .unwrap();
+        let held = setup.find("hold_hairpin_rule(lease_dir, network").unwrap();
         let leased = setup.find("lease_address(lease_dir").unwrap();
-        assert!(answered < leased);
+        let reserved = setup.find("names::reserve(").unwrap();
+        assert!(leased < held && held < reserved);
+        let cleanup = &source[source.find("    async fn cleanup(&mut self)").unwrap()..];
+        let cleanup = &cleanup[..cleanup.find("\n    fn take_port_listeners").unwrap()];
+        assert_eq!(cleanup.matches("self.give_up_address().await").count(), 2);
+        assert!(!cleanup.contains("address_lease.take()"));
     }
 
-    /// #2109: a packet for an address of the VM prefix that no VM holds left by the
-    /// uplink, and on a host the prefix is routed to it came straight back, until its hop
-    /// limit ran out. In a network namespace with an uplink and a default route: before,
-    /// such an address routes out of the uplink; once the prefix is answered for, it has
-    /// no route out (a sender is told at once), a VM's own /128 still wins, a second call
-    /// changes nothing, and a prefix that is the uplink's own subnet is left alone.
-    ///
-    /// RED WITHOUT THE ROUTE: the address still routes `dev up0`.
-    #[cfg(feature = "privileged-tests")]
+    /// The rule reads devices and a destination, and nothing that attaches connection
+    /// tracking or looks at a route.
     #[test]
-    fn a_prefix_address_no_vm_holds_does_not_leave_by_the_uplink() {
-        std::thread::spawn(|| {
-            // SAFETY: unshare(2) takes plain flags and moves this thread alone.
-            assert_eq!(
-                unsafe { libc::unshare(libc::CLONE_NEWNET) },
-                0,
-                "{}",
-                std::io::Error::last_os_error()
-            );
-            // children are forked from this thread and inherit its namespace
-            let ip = |args: &[&str]| {
-                let out = std::process::Command::new("ip")
-                    .args(args)
-                    .output()
-                    .unwrap();
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                )
-            };
-            for setup in [
-                &["link", "set", "lo", "up"][..],
-                // a veth pair, which every host that runs routed VMs can make
-                &["link", "add", "up0", "type", "veth", "peer", "name", "up1"],
-                &["link", "set", "up0", "up"],
-                &["link", "set", "up1", "up"],
-                &[
-                    "-6",
-                    "addr",
-                    "add",
-                    "2001:db8:ffff::2/64",
-                    "dev",
-                    "up0",
-                    "nodad",
-                ],
-                &[
-                    "-6",
-                    "route",
-                    "add",
-                    "default",
-                    "via",
-                    "2001:db8:ffff::1",
-                    "dev",
-                    "up0",
-                ],
-            ] {
-                assert_eq!(ip(setup), "", "ip {setup:?}");
-            }
-            let route_of = |address: &str| ip(&["-6", "route", "get", address]);
-            let send_to = |address: &str| {
-                std::net::UdpSocket::bind("[::]:0")
-                    .unwrap()
-                    .send_to(b"x", (address, 9))
-            };
-            // the host's own side of the VM prefix, where a fleet host's aggregator listens
-            assert_eq!(
-                ip(&[
-                    "-6",
-                    "addr",
-                    "add",
-                    "2001:db8:2109::1/128",
-                    "dev",
-                    "up0",
-                    "nodad"
-                ]),
-                ""
-            );
-            let nobody = "2001:db8:2109::5";
-            assert!(route_of(nobody).contains("dev up0"), "the test's premise");
-            send_to(nobody).expect("before: the datagram leaves by the uplink");
+    fn the_hairpin_rule_matches_only_uplink_to_uplink_for_the_prefix() {
+        assert_eq!(
+            hairpin_rule("up0", "2001:db8:2109::/64").join(" "),
+            "-i up0 -o up0 -d 2001:db8:2109::/64 -j REJECT --reject-with icmp6-addr-unreachable"
+        );
+    }
 
-            let runtime = tokio::runtime::Builder::new_current_thread()
+    /// Who else holds a lease in a prefix: a live VM does, in this process or another;
+    /// a killed VM's file, a lease outside the prefix, the asker's own lease and a reclaim
+    /// pass's do not.
+    #[test]
+    fn another_vms_lease_is_one_a_live_vm_holds_inside_the_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let (vms, len) = prefix("2001:db8:2109::/64");
+        let lease = |address: &str, vm: &str| {
+            leased(lease_address(dir.path(), address.parse().unwrap(), vm).unwrap()).unwrap()
+        };
+        // the rule's record is in the same directory, and the sweep every lease runs
+        // leaves it
+        let record = hairpin_record(dir.path(), vms, len);
+        std::fs::write(&record, "up0").unwrap();
+        let own = lease("2001:db8:2109::5", "vm-own");
+        assert!(record.exists());
+        let others = || another_vm_leases_in(dir.path(), &own.path, vms, len);
+        assert!(!others(), "its own lease");
+
+        let outside = lease("2001:db8:2110::5", "vm-elsewhere");
+        assert!(!others(), "a lease in another prefix");
+
+        let killed = dir.path().join("2001:db8:2109::6.lock");
+        hold_in_child(&killed).kill();
+        assert!(killed.exists() && !others(), "a killed VM's file");
+
+        let reclaiming = lease("2001:db8:2109::7", RECLAIM_LEASE);
+        assert!(!others(), "a reclaim pass");
+        drop(reclaiming);
+
+        let second = lease("2001:db8:2109::8", "vm-second");
+        assert!(others(), "a lease of this process");
+        drop(second);
+        assert!(!others());
+
+        let child = dir.path().join("2001:db8:2109::9.lock");
+        std::fs::write(&child, "4242 vm-child\n").unwrap();
+        let mut holder = hold_in_child(&child);
+        assert!(others(), "a lease another process holds");
+        holder.kill();
+        assert!(!others());
+        drop(outside);
+    }
+
+    /// A network of namespaces for the hairpin rule's tests: a router `r`, two hosts `h1`
+    /// and `h2` each on a link of its own to the router, and a VM behind each host.
+    ///
+    /// ```text
+    ///   v1 (2001:db8:d::7) -- h1 (2001:db8:a1::1) -- r -- (2001:db8:a2::1) h2 -- v2 (2001:db8:b::22)
+    /// ```
+    ///
+    /// The router routes `2001:db8:d::/64` to h1 (a prefix delegated to one host), holds
+    /// `2001:db8:b::/64` on-link towards h2, which answers neighbour solicitations for v2
+    /// there (a prefix shared on the link, with proxy NDP), and holds `2001:db8:c::9`
+    /// itself. Each host's default route is the router.
+    #[cfg(feature = "privileged-tests")]
+    struct Lan {
+        tag: String,
+    }
+
+    #[cfg(feature = "privileged-tests")]
+    impl Lan {
+        fn ns(&self, name: &str) -> String {
+            format!("hp{}-{name}", self.tag)
+        }
+
+        fn build() -> Lan {
+            let lan = Lan {
+                tag: uuid::Uuid::new_v4().simple().to_string()[..6].to_string(),
+            };
+            let (r, h1, h2, v1, v2) = (
+                lan.ns("r"),
+                lan.ns("h1"),
+                lan.ns("h2"),
+                lan.ns("v1"),
+                lan.ns("v2"),
+            );
+            for ns in [&r, &h1, &h2, &v1, &v2] {
+                Lan::ip(&["netns", "add", ns]);
+                Lan::ip(&["-n", ns, "link", "set", "dev", "lo", "up"]);
+            }
+            // (one end, its namespace, its addresses, the other end, its namespace, its addresses)
+            let links: [(&str, &String, &[&str], &str, &String, &[&str]); 4] = [
+                (
+                    "r1",
+                    &r,
+                    &["2001:db8:a1::ff/64"],
+                    "uplink",
+                    &h1,
+                    &["2001:db8:a1::1/64"],
+                ),
+                (
+                    "r2",
+                    &r,
+                    &["2001:db8:a2::ff/64"],
+                    "uplink",
+                    &h2,
+                    &["2001:db8:a2::1/64"],
+                ),
+                (
+                    "vm",
+                    &h1,
+                    &["fd00:1::1/64"],
+                    "eth0",
+                    &v1,
+                    &["fd00:1::2/64", "2001:db8:d::7/128"],
+                ),
+                (
+                    "vm",
+                    &h2,
+                    &["fd00:2::1/64"],
+                    "eth0",
+                    &v2,
+                    &["fd00:2::2/64", "2001:db8:b::22/128"],
+                ),
+            ];
+            for (i, (a, a_ns, a_addrs, b, b_ns, b_addrs)) in links.into_iter().enumerate() {
+                let (tmp_a, tmp_b) = (format!("hp{}a{i}", lan.tag), format!("hp{}b{i}", lan.tag));
+                Lan::ip(&[
+                    "link", "add", &tmp_a, "type", "veth", "peer", "name", &tmp_b,
+                ]);
+                for (tmp, name, ns, addrs) in
+                    [(&tmp_a, a, a_ns, a_addrs), (&tmp_b, b, b_ns, b_addrs)]
+                {
+                    Lan::ip(&["link", "set", tmp, "netns", ns, "name", name]);
+                    Lan::ip(&["-n", ns, "link", "set", "dev", name, "up"]);
+                    for addr in addrs {
+                        Lan::ip(&["-n", ns, "-6", "addr", "add", addr, "dev", name, "nodad"]);
+                    }
+                }
+            }
+            for ns in [&r, &h1, &h2] {
+                Lan::exec(ns, &["sysctl", "-qw", "net.ipv6.conf.all.forwarding=1"]);
+            }
+            Lan::ip(&[
+                "-n",
+                &h1,
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                "2001:db8:a1::ff",
+                "dev",
+                "uplink",
+            ]);
+            Lan::ip(&[
+                "-n",
+                &h2,
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                "2001:db8:a2::ff",
+                "dev",
+                "uplink",
+            ]);
+            Lan::ip(&[
+                "-n",
+                &v1,
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                "fd00:1::1",
+                "dev",
+                "eth0",
+            ]);
+            Lan::ip(&[
+                "-n",
+                &v2,
+                "-6",
+                "route",
+                "add",
+                "default",
+                "via",
+                "fd00:2::1",
+                "dev",
+                "eth0",
+            ]);
+            // a VM's /128 on each host, as routed mode adds it
+            Lan::ip(&[
+                "-n",
+                &h1,
+                "-6",
+                "route",
+                "add",
+                "2001:db8:d::7/128",
+                "dev",
+                "vm",
+            ]);
+            Lan::ip(&[
+                "-n",
+                &h2,
+                "-6",
+                "route",
+                "add",
+                "2001:db8:b::22/128",
+                "dev",
+                "vm",
+            ]);
+            // the delegated prefix, the shared one with h2 answering for its VM, the router's own
+            Lan::ip(&[
+                "-n",
+                &r,
+                "-6",
+                "route",
+                "add",
+                "2001:db8:d::/64",
+                "via",
+                "2001:db8:a1::1",
+                "dev",
+                "r1",
+            ]);
+            Lan::ip(&[
+                "-n",
+                &r,
+                "-6",
+                "route",
+                "add",
+                "2001:db8:b::/64",
+                "dev",
+                "r2",
+            ]);
+            Lan::exec(
+                &h2,
+                &[
+                    "sysctl",
+                    "-qw",
+                    "net.ipv6.conf.uplink.proxy_ndp=1",
+                    "net.ipv6.neigh.uplink.proxy_delay=0",
+                ],
+            );
+            Lan::ip(&[
+                "-n",
+                &h2,
+                "-6",
+                "neigh",
+                "add",
+                "proxy",
+                "2001:db8:b::22",
+                "dev",
+                "uplink",
+            ]);
+            Lan::ip(&[
+                "-n",
+                &r,
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:c::9/128",
+                "dev",
+                "lo",
+                "nodad",
+            ]);
+            lan
+        }
+
+        fn ip(args: &[&str]) -> String {
+            let out = std::process::Command::new("ip")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "ip {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).to_string()
+        }
+
+        fn exec(ns: &str, command: &[&str]) -> String {
+            let mut args = vec!["netns", "exec", ns];
+            args.extend(command);
+            Lan::ip(&args)
+        }
+
+        /// Run `work` on a thread of its own inside namespace `name`. What it starts and
+        /// the sockets it opens are in that namespace.
+        fn within<T: Send + 'static>(
+            &self,
+            name: &str,
+            work: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
+            let path = format!("/run/netns/{}", self.ns(name));
+            std::thread::spawn(move || {
+                let ns = std::fs::File::open(&path).unwrap();
+                nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+                work()
+            })
+            .join()
+            .unwrap()
+        }
+
+        /// A listener on port 9000 of every address of namespace `name`, which accepts and
+        /// drops connections for as long as the test runs.
+        fn listen(&self, name: &str) {
+            let listener = self.within(name, || std::net::TcpListener::bind("[::]:9000").unwrap());
+            std::thread::spawn(move || for _connection in listener.incoming() {});
+        }
+
+        /// One connection from namespace `from` to port 9000 of `address`.
+        fn connect(&self, from: &str, address: &'static str) -> std::io::Result<()> {
+            self.within(from, move || {
+                let to = std::net::SocketAddr::new(address.parse().unwrap(), 9000);
+                std::net::TcpStream::connect_timeout(&to, std::time::Duration::from_secs(5))
+                    .map(drop)
+            })
+        }
+
+        /// Packets `device` of namespace `name` has received.
+        fn received(&self, name: &str, device: &str) -> u64 {
+            let stats = Lan::ip(&[
+                "-n",
+                &self.ns(name),
+                "-j",
+                "-s",
+                "link",
+                "show",
+                "dev",
+                device,
+            ]);
+            let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+            stats[0]["stats64"]["rx"]["packets"].as_u64().unwrap()
+        }
+
+        /// Run routed mode's two lease-table steps in namespace `name` for one VM of
+        /// `cidr`: take a lease in `dir`, and add the rule unless the table records it.
+        fn start_vm(
+            &self,
+            name: &str,
+            dir: &std::path::Path,
+            cidr: &str,
+            address: &str,
+        ) -> AddressLease {
+            let (network, len) = prefix(cidr);
+            let dir = dir.to_path_buf();
+            let address: std::net::Ipv6Addr = address.parse().unwrap();
+            self.within(name, move || {
+                let lease = leased(lease_address(&dir, address, "vm-test").unwrap()).unwrap();
+                Lan::runtime().block_on(hold_hairpin_rule(&dir, network, len, "uplink"));
+                lease
+            })
+        }
+
+        /// The other one: give the lease up, and the rule with it if it is the last.
+        fn stop_vm(&self, name: &str, dir: &std::path::Path, cidr: &str, lease: AddressLease) {
+            let cidr = prefix(cidr);
+            let dir = dir.to_path_buf();
+            self.within(name, move || {
+                Lan::runtime().block_on(give_up_lease(&dir, lease, Some(cidr)))
+            })
+        }
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
-            let (vms, len) = prefix("2001:db8:2109::/64");
-            runtime.block_on(answer_for_the_prefix(vms, len));
-            let route = route_of(nobody);
-            assert!(
-                !route.contains("dev up0") && route.contains("No route to host"),
-                "an address no VM holds still leaves by the uplink: {route}"
-            );
-            let refused = send_to(nobody).expect_err("the sender is told at once");
-            assert_eq!(
+                .unwrap()
+        }
+
+        fn forward_rules(&self, name: &str) -> String {
+            Lan::exec(&self.ns(name), &["ip6tables", "-w", "-S", "FORWARD"])
+        }
+    }
+
+    #[cfg(feature = "privileged-tests")]
+    impl Drop for Lan {
+        fn drop(&mut self) {
+            for name in ["r", "h1", "h2", "v1", "v2"] {
+                let _ = std::process::Command::new("ip")
+                    .args(["netns", "del", &self.ns(name)])
+                    .output();
+            }
+        }
+    }
+
+    /// #2109: a packet for an address of a prefix routed to the host, which no VM holds,
+    /// went out of the uplink and came back until its hop limit ran out. With the rule the
+    /// host answers it the first time it comes back, whether the network or the host itself
+    /// sent it, and a VM's own address is reached as before. The rule is added by the
+    /// prefix's first VM and removed by its last, and passing traffic attaches no
+    /// connection tracking.
+    ///
+    /// A connect in this network sends two SYNs. The answer to the first comes back inside
+    /// the connect call, the namespaces being on one machine, and the kernel only notes an
+    /// error that arrives while the caller holds the socket; the answer to the retransmitted
+    /// one ends the connect. With the rule each SYN is on the host's uplink once.
+    ///
+    /// RED WITHOUT THE RULE: 64 to 66 packets on the host's uplink for one connect.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn a_packet_for_an_address_no_vm_holds_is_answered_the_first_time_it_comes_back() {
+        const DELEGATED: &str = "2001:db8:d::/64";
+        let lan = Lan::build();
+        let leases = tempfile::tempdir().unwrap();
+        lan.listen("v1");
+        let circled = |from: &str| {
+            let before = lan.received("h1", "uplink");
+            let refused = lan
+                .connect(from, "2001:db8:d::5")
+                .expect_err("nobody holds it");
+            (
+                lan.received("h1", "uplink") - before,
                 refused.raw_os_error(),
-                Some(libc::EHOSTUNREACH),
-                "{refused}"
-            );
+            )
+        };
+        // the premise: without the rule the packet circles between h1 and the router
+        let (packets, _) = circled("r");
+        assert!(
+            packets > 20,
+            "the network does not loop here: {packets} packets"
+        );
 
-            // the host still answers on its own side of the prefix
+        let first = lan.start_vm("h1", leases.path(), DELEGATED, "2001:db8:d::7");
+        for from in ["r", "h1"] {
+            let (packets, error) = circled(from);
             assert!(
-                route_of("2001:db8:2109::1").contains("local"),
-                "{}",
-                route_of("2001:db8:2109::1")
+                packets <= 4,
+                "a connect from {from} to an address no VM holds put {packets} packets on the \
+                 host's uplink"
             );
+            assert_eq!(error, Some(libc::EHOSTUNREACH), "from {from}");
+        }
+        // as `ip6tables -S` prints it, which puts the destination first
+        let rules = lan.forward_rules("h1");
+        assert!(
+            rules.contains(
+                "-A FORWARD -d 2001:db8:d::/64 -i uplink -o uplink -j REJECT --reject-with \
+                 icmp6-addr-unreachable"
+            ),
+            "{rules}"
+        );
+        // a VM's address: from the network, and from the host
+        lan.connect("r", "2001:db8:d::7")
+            .expect("the VM, from the network");
+        lan.connect("h1", "2001:db8:d::7")
+            .expect("the VM, from its host");
 
-            // a VM's own route is more specific and wins
-            assert_eq!(
-                ip(&["-6", "route", "add", "2001:db8:2109::7/128", "dev", "up0"]),
-                ""
-            );
-            assert!(route_of("2001:db8:2109::7").contains("dev up0"));
+        // a second VM adds nothing; the rule goes with the last one
+        let rules = || {
+            lan.forward_rules("h1")
+                .matches("icmp6-addr-unreachable")
+                .count()
+        };
+        let record = hairpin_record(leases.path(), prefix(DELEGATED).0, 64);
+        let second = lan.start_vm("h1", leases.path(), DELEGATED, "2001:db8:d::8");
+        assert_eq!(rules(), 1);
+        lan.stop_vm("h1", leases.path(), DELEGATED, first);
+        assert_eq!(rules(), 1);
+        lan.stop_vm("h1", leases.path(), DELEGATED, second);
+        assert_eq!(rules(), 0);
+        assert!(!record.exists());
 
-            // every launch calls it: nothing changes
-            runtime.block_on(answer_for_the_prefix(vms, len));
-            let unreachable = ip(&["-6", "route", "show", "type", "unreachable"]);
-            assert_eq!(
-                unreachable.matches("2001:db8:2109::/64").count(),
-                1,
-                "{unreachable}"
-            );
+        // two VMs that both hold a lease before either looks: one of them adds the rule
+        let lease = |address: &str| {
+            leased(lease_address(leases.path(), address.parse().unwrap(), "vm-test").unwrap())
+                .unwrap()
+        };
+        let (a, b) = (lease("2001:db8:d::7"), lease("2001:db8:d::8"));
+        let (network, len) = prefix(DELEGATED);
+        for _vm in [&a, &b] {
+            let dir = leases.path().to_path_buf();
+            lan.within("h1", move || {
+                Lan::runtime().block_on(hold_hairpin_rule(&dir, network, len, "uplink"))
+            });
+        }
+        assert_eq!(rules(), 1, "neither VM added the rule, or both did");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "uplink");
+        // a killed VM leaves the rule, and the last VM to stop removes it
+        drop(a);
+        assert_eq!(rules(), 1);
+        lan.stop_vm("h1", leases.path(), DELEGATED, b);
+        assert_eq!(rules(), 0);
 
-            // the uplink's own subnet stays reachable through the uplink
-            let (subnet, len) = prefix("2001:db8:ffff::/64");
-            runtime.block_on(answer_for_the_prefix(subnet, len));
-            assert!(route_of("2001:db8:ffff::9").contains("dev up0"));
-            // and so does one with no connected route, which only the default route carried
-            assert_eq!(
-                ip(&[
-                    "-6",
-                    "addr",
-                    "add",
-                    "2001:db8:eeee::2/128",
-                    "dev",
-                    "up0",
-                    "nodad"
-                ]),
-                ""
-            );
-            let (bare, len) = prefix("2001:db8:eeee::/64");
-            runtime.block_on(answer_for_the_prefix(bare, len));
-            assert!(route_of("2001:db8:eeee::9").contains("dev up0"));
-        })
-        .join()
-        .unwrap();
+        // a VM killed after adding the rule and before recording it: the next VM finds
+        // the rule and adds no second
+        let killed = lan.start_vm("h1", leases.path(), DELEGATED, "2001:db8:d::7");
+        drop(killed);
+        std::fs::remove_file(&record).unwrap();
+        let next = lan.start_vm("h1", leases.path(), DELEGATED, "2001:db8:d::8");
+        assert_eq!(rules(), 1);
+        lan.stop_vm("h1", leases.path(), DELEGATED, next);
+        assert_eq!(rules(), 0);
+
+        // nothing above made the host track connections
+        let tracked = Lan::exec(
+            &lan.ns("h1"),
+            &[
+                "sh",
+                "-c",
+                "cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0",
+            ],
+        );
+        assert_eq!(tracked.trim(), "0", "the rule attached connection tracking");
+    }
+
+    /// Two hosts share a prefix on their link, each answering neighbour solicitations for
+    /// its own VMs, and their own addresses are outside it. Each runs a VM of the prefix,
+    /// so each holds the rule. A host still reaches the other host's VM: what a host sends
+    /// is not forwarded, so the rule does not see it.
+    ///
+    /// RED WITH AN UNREACHABLE ROUTE FOR THE PREFIX (what this rule replaced): h1 has no
+    /// route to h2's VM but that one.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn hosts_sharing_a_prefix_still_reach_each_others_vms() {
+        const SHARED: &str = "2001:db8:b::/64";
+        let lan = Lan::build();
+        let leases = tempfile::tempdir().unwrap();
+        lan.listen("v2");
+        lan.connect("h1", "2001:db8:b::22")
+            .expect("the test's premise");
+        // each host's leases are its own
+        let (on_h1, on_h2) = (leases.path().join("h1"), leases.path().join("h2"));
+        std::fs::create_dir_all(&on_h1).unwrap();
+        std::fs::create_dir_all(&on_h2).unwrap();
+        let _a = lan.start_vm("h1", &on_h1, SHARED, "2001:db8:b::11");
+        let _b = lan.start_vm("h2", &on_h2, SHARED, "2001:db8:b::22");
+        for host in ["h1", "h2"] {
+            assert!(lan.forward_rules(host).contains("icmp6-addr-unreachable"));
+        }
+        lan.connect("h1", "2001:db8:b::22")
+            .expect("h1 reaches h2's VM in the prefix they share");
+        lan.connect("v1", "2001:db8:b::22")
+            .expect("h1's VM reaches h2's VM in the prefix they share");
+    }
+
+    /// A prefix given by mistake, one the network does not route to this host, stays
+    /// reachable from the host and from its VMs.
+    ///
+    /// RED WITH AN UNREACHABLE ROUTE FOR THE PREFIX: the host has no route to it left.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn a_prefix_given_by_mistake_stays_reachable() {
+        const MISTAKEN: &str = "2001:db8:c::/64";
+        let lan = Lan::build();
+        let leases = tempfile::tempdir().unwrap();
+        lan.listen("r");
+        let _vm = lan.start_vm("h1", leases.path(), MISTAKEN, "2001:db8:c::5");
+        assert!(lan.forward_rules("h1").contains("icmp6-addr-unreachable"));
+        lan.connect("h1", "2001:db8:c::9")
+            .expect("the host reaches the prefix it was wrongly given");
+        lan.connect("v1", "2001:db8:c::9")
+            .expect("a VM reaches the prefix its host was wrongly given");
     }
 
     // --- parse_ipv6_prefix tests ---
