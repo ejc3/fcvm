@@ -168,13 +168,18 @@ while IFS= read -r f; do
     # is not built, read or run by anything the VM matrix executes, so
     # the matrix can say nothing about it. It runs fleet-renderer, the
     # renderer's host tests; fleet/web runs fleet-web instead.
-    fleet/core/*) code=true; echo "code path: $f" ;;
+    # fleet/web's tests read fleet/core/tests/vectors/** and the coordinator's view in
+    # fleet/core/src/** (the fixture core/test/fixtures/coordinator.json is generated from
+    # them, and the mock's shape test compares against it), so a change there runs fleet-web.
+    fleet/core/*) code=true; web=true; echo "code path (fleet web reads it): $f" ;;
     # fleet/potato is a workspace member too (the potato player); lint formats it.
     fleet/potato/*) code=true; echo "code path: $f" ;;
     # The fleet web page is TypeScript with its own suite (fleet-web);
     # the VM matrix does not build or run it. Like bench/, it precedes
     # the docs arm so its README still routes to its check.
     fleet/web/*) web=true; echo "fleet web path: $f" ;;
+    # The mock's shape test reads fleet/PROTOCOL.md's example.
+    fleet/PROTOCOL.md) web=true; fleet=true; echo "fleet web reads it: $f" ;;
     fleet/*|.github/workflows/fleet-coordinator-deploy.yml) fleet=true; echo "fleet path, no matrix: $f" ;;
     # This file holds the fleet-renderer and fleet-web jobs, so a change here runs them too.
     .github/workflows/ci.yml) code=true; web=true; fleet=true; echo "ci workflow: $f" ;;

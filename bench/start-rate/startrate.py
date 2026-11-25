@@ -102,6 +102,27 @@ def imds(path):
         return None
 
 
+def store_queue_depths(dev, sys_block=Path("/sys/class/block")):
+    """`nr_requests` of the store's devices: of each member when the device has members (an
+    md RAID0 over NVMe disks, whose own queue says nothing about theirs), else of the device
+    itself. A partition has no queue of its own, so its disk's is read. A device or value that
+    cannot be read is left out; none at all gives None."""
+    if not dev:
+        return None
+    base = sys_block / dev
+    members = sorted((base / "slaves").glob("*")) if (base / "slaves").is_dir() else []
+    depths = {}
+    for d in members or [base]:
+        d = d.resolve()
+        if not (d / "queue").is_dir():
+            d = d.parent
+        try:
+            depths[d.name] = int((d / "queue" / "nr_requests").read_text())
+        except (OSError, ValueError):
+            pass
+    return depths or None
+
+
 def host_facts(repo):
     store = sh(["stat", "-f", "-c", "%T", "/mnt/fcvm-btrfs"]).strip()
     src = ""
@@ -110,11 +131,14 @@ def host_facts(repo):
         if len(parts) > 2 and parts[1] == "/mnt/fcvm-btrfs":
             src = parts[0]
     backing = None
+    backing_fs = None
     if src.startswith("/dev/loop"):
         try:
             backing = Path(f"/sys/block/{Path(src).name}/loop/backing_file").read_text().strip()
-        except OSError:
-            backing = "unknown"
+            backing_fs = sh(["stat", "-f", "-c", "%T", backing]).strip()
+        except (OSError, subprocess.CalledProcessError):
+            backing = backing or "unknown"
+    queue_depth = store_queue_depths(Path(src).name)
     mem_kb = int(
         next(ln for ln in Path("/proc/meminfo").read_text().splitlines() if ln.startswith("MemTotal")).split()[1]
     )
@@ -128,6 +152,8 @@ def host_facts(repo):
         "store_fs": store,
         "store_device": src,
         "store_backing_file": backing,
+        "store_backing_fs": backing_fs,
+        "store_queue_depths": queue_depth,
         "source_revision": rev,
         "source_dirty": dirty,
     }

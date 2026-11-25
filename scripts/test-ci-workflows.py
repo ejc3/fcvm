@@ -158,6 +158,8 @@ class WorkflowSecurityTest(unittest.TestCase):
         self.assertNotIn('role/github-actions-terraform', content)
         self.assertIn('persist-credentials: false', content)
         self.assertIn('fetch-depth: 0', content)
+        # The job log is public, and an AWS error message names the account in an ARN.
+        self.assertRegex(content, r'(?m)^          mask-aws-account-id: true$')
         self.assertRegex(content, r'uses: actions/checkout@[0-9a-f]{40}')
         self.assertRegex(content, r'uses: aws-actions/configure-aws-credentials@[0-9a-f]{40}')
 
