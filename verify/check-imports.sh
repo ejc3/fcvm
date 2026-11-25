@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 rc=0
-for lib in WakeVerify GateVerify; do
+for lib in WakeVerify GateVerify ResumeVerify; do
   [ -f "$lib/Axioms.lean" ] || { echo "check-imports: $lib/Axioms.lean is missing" >&2; exit 2; }
   n=0
   while IFS= read -r f; do
@@ -32,9 +32,9 @@ for lib in WakeVerify GateVerify; do
     rc=1
   fi
 done
-# The executables' modules are outside both sweeps: they declare no theorem and no axiom.
+# The executables' modules are outside the sweeps: they declare no theorem and no axiom.
 for f in *.lean; do
-  case "$f" in WakeVerify.lean | GateVerify.lean) continue ;; esac
+  case "$f" in WakeVerify.lean | GateVerify.lean | ResumeVerify.lean) continue ;; esac
   if grep -nE '^[[:space:]]*((private|protected|noncomputable|unsafe|partial)[[:space:]]+)*(theorem|lemma|axiom|opaque)[[:space:]]|native_decide|sorry' "$f" >&2; then
     echo "check-imports: $f, an executable's module, declares a theorem or an axiom the sweeps do not see" >&2
     rc=1

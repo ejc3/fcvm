@@ -348,11 +348,12 @@ help:
 	@echo "  check-host-kernel-build  Check packages and free space install-host-kernel needs"
 	@echo ""
 	@echo "Formal models (verify/, Lean 4):"
-	@echo "  verify             Check both models: every proof and every recorded break (lake build)"
+	@echo "  verify             Check the models: every proof and every recorded break (lake build)"
 	@echo "  verify-search      Run the exhaustive search for lost wake-ups (about 10 minutes, 2 GB)"
 	@echo "  verify-harness     Compare the model's kernel rules with the kernel's own functions"
 	@echo "  verify-gate-search Run the exhaustive search of the snapshot network boundary (about 5 seconds)"
 	@echo "  verify-gate-drift  Compare the boundary model's restore order with the order fc-agent's tests pin"
+	@echo "  verify-resume-search Run the exhaustive search of arm64 timer and interrupt state across restore (3 seconds)"
 	@echo ""
 	@echo "Kernel patches:"
 	@echo "  kernel-patch-create PROFILE=nested NAME=0004-fix FILE=fs/fuse/dir.c"
@@ -1895,11 +1896,11 @@ kernel-patch-edit:
 kernel-patch-validate:
 	./scripts/kernel-patch.sh validate $(PROFILE)
 
-# ---- Formal models (verify/): the vCPU wake-up path, the snapshot network boundary ----
+# ---- Formal models (verify/): the vCPU wake-up path, the snapshot network boundary, arm64 resume ----
 # Lean 4, toolchain pinned in verify/lean-toolchain. elan installs lake under ~/.elan/bin.
 VERIFY_LAKE ?= $(shell command -v lake 2>/dev/null || echo $(HOME)/.elan/bin/lake)
 
-.PHONY: verify verify-search verify-harness verify-lake verify-gate-search verify-gate-drift
+.PHONY: verify verify-search verify-harness verify-lake verify-gate-search verify-gate-drift verify-resume-search
 verify-lake:
 	@test -x "$(VERIFY_LAKE)" || { \
 		echo "BLOCKED: lake not found. Install elan (https://github.com/leanprover/elan); it reads verify/lean-toolchain." >&2; \
@@ -1909,12 +1910,17 @@ verify: verify-lake
 	verify/check-imports.sh
 	cd verify && "$(VERIFY_LAKE)" build
 	cd verify && "$(VERIFY_LAKE)" exe gate-breaks summary | diff GateVerify/search.expected -
+	cd verify && "$(VERIFY_LAKE)" exe resume-breaks | diff ResumeVerify/search.expected -
 
 verify-search: verify-lake
 	cd verify && "$(VERIFY_LAKE)" exe breaks
 
 verify-harness: verify-lake
 	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/harness/run.sh
+
+# RESUME_ARGS=traces prints every shortest run; RESUME_ARGS=spins lists the spinning states.
+verify-resume-search: verify-lake
+	cd verify && "$(VERIFY_LAKE)" exe resume-breaks $(RESUME_ARGS)
 
 verify-gate-search: verify-lake
 	cd verify && "$(VERIFY_LAKE)" exe gate-breaks $(GATE_ARGS)

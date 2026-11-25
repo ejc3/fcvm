@@ -3413,7 +3413,8 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
     //   when a file nothing imports is added, so the axiom sweep inside it does not see one;
     // - the boundary model's drift check, naming the rule book of this tree (without a name it
     //   passes on any order the model knows, an earlier one included);
-    // - the boundary model's search, compared with the result its documents quote.
+    // - the boundary model's search, compared with the result its documents quote;
+    // - the resume model's search, likewise.
     let lines: Vec<&str> = script.lines().map(str::trim).collect();
     let line_of = |what: &str, wanted: &dyn Fn(&str) -> bool| -> usize {
         lines
@@ -3448,9 +3449,13 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
         "`lake exe gate-breaks summary | diff GateVerify/search.expected -`",
         &|l| l == "lake exe gate-breaks summary | diff GateVerify/search.expected -",
     );
+    let resume_search = line_of(
+        "`lake exe resume-breaks | diff ResumeVerify/search.expected -`",
+        &|l| l == "lake exe resume-breaks | diff ResumeVerify/search.expected -",
+    );
     assert!(
-        built < drift && built < search,
-        "the drift check and the search run the executables `lake build` makes: {script:?}"
+        built < drift && built < search && built < resume_search,
+        "the drift check and the searches run the executables `lake build` makes: {script:?}"
     );
 
     // The toolchain is the one verify/lean-toolchain pins, read from the file, and its cache

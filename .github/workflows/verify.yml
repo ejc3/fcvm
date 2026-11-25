@@ -1,7 +1,7 @@
 name: Verify
 
-# Checks the Lean models under verify/ (the vCPU wake-up path, and the snapshot and restore
-# network boundary): `lake build` elaborates every proof, replays every recorded break, and
+# Checks the Lean models under verify/ (the vCPU wake-up path, the snapshot and restore network
+# boundary, and a vCPU's timer and interrupt state across a snapshot and restore on arm64): `lake build` elaborates every proof, replays every recorded break, and
 # runs the axiom checks. A broken proof, an axiom beyond Lean's own, a `sorry`, or a recorded
 # run that no longer breaks its property fails it. `gate-seq check` then compares the boundary
 # model's restore order with the order fc-agent's own tests pin, so a change to the Rust source
@@ -90,7 +90,7 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.elan/bin:$PATH"
           lean --version
-          # every file of both models is imported by its axiom sweep
+          # every file of every model is imported by its axiom sweep
           ./check-imports.sh
           lake build
           # The rule book of this tree's fc-agent (verify/GateVerify/README.md, "The rule
@@ -99,3 +99,5 @@ jobs:
           # The exhaustive search of the default configurations, every rule book, against the
           # result the documents quote: state counts, which properties break, and how soon.
           lake exe gate-breaks summary | diff GateVerify/search.expected -
+          # The same for the resume model: every configuration and rule book.
+          lake exe resume-breaks | diff ResumeVerify/search.expected -
