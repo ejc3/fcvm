@@ -19,8 +19,8 @@
 //!
 //! [`reclaim_abandoned`] is the sweep. It lists every bucket and takes every owner lock it
 //! can without waiting, so its cost grows with the owners alive. The commands that need the
-//! room a killed process left (setup, snapshot import and export, compaction) run it when
-//! they start. A VM launch runs it through [`reclaim_abandoned_if_due`]: at most one launch
+//! room a killed process left (setup, snapshot import and export) run it when they
+//! start. A VM launch runs it through [`reclaim_abandoned_if_due`]: at most one launch
 //! in each [`RECLAIM_EVERY`] sweeps, and the others read one stamp and go on, so a launch
 //! lists or locks nothing whose size grows with the VMs running. What a killed owner
 //! recorded is therefore reclaimed by the first launch that starts `RECLAIM_EVERY` or more
