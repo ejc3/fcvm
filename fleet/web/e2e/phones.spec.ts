@@ -325,20 +325,23 @@ async function takeOver(page: Page, n: number): Promise<void> {
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
 }
 const tapTarget = async (page: Page, name: "video" | "mirror") => (await view(page)).taps?.targets.find((t) => t.name === name) ?? null;
-/** The tap target once its box has stopped moving. The phone is fitted again whenever the panel
- *  beside it, the sheet under it or the window changes size, and the page maps a click through the
- *  box it draws at click time, so a box read before an earlier step is not where to aim (#2177). */
+/** The tap target once its box has stopped changing: the same box on three reads 100 ms apart.
+ *  The phone is fitted again whenever the panel beside it, the sheet under it or the window changes
+ *  size, and the page maps a click through the box it draws at click time, so a box read before an
+ *  earlier step is not where to aim (#2177). */
 async function settledTarget(page: Page, name: "video" | "mirror") {
-  let last = "";
+  type Target = NonNullable<Awaited<ReturnType<typeof tapTarget>>>;
+  let last: Target | null = null;
+  let equal = 0;
   await expect
     .poll(async () => {
-      const now = JSON.stringify((await tapTarget(page, name))?.box ?? null);
-      const same = now !== "null" && now === last;
+      const now = await tapTarget(page, name);
+      equal = now !== null && last !== null && JSON.stringify(now.box) === JSON.stringify(last.box) ? equal + 1 : 0;
       last = now;
-      return same;
-    }, { intervals: [120] })
-    .toBe(true);
-  return (await tapTarget(page, name))!;
+      return equal;
+    }, { intervals: [100] })
+    .toBeGreaterThanOrEqual(2);
+  return last!;
 }
 /** Click near the fraction (fx, fy) of the tap target as it is drawn now, on a whole pixel: a mouse
  *  event carries whole CSS pixels, and one pixel of the phone-sized layout's screen (about 150 px
@@ -350,6 +353,8 @@ async function clickTarget(page: Page, name: "video" | "mirror", fx: number, fy:
   const px = Math.round(t.box.x + fx * t.box.w);
   const py = Math.round(t.box.y + fy * t.box.h);
   await page.mouse.click(px, py);
+  // a fit during the click would make the fractions below those of another box
+  expect((await tapTarget(page, name))?.box, "the phone was fitted again during the click").toEqual(t.box);
   return { ...t, fx: (px - t.box.x) / t.box.w, fy: (py - t.box.y) / t.box.h };
 }
 
@@ -382,8 +387,6 @@ for (const screen of SCREENS)
   await expect.poll(async () => (await taps()).length).toBe(1);
   const [first] = await taps();
   expect([first!.phone, first!.session]).toEqual(["phone-3", session]);
-  // within a pixel of the point aimed at
-  expect(Math.abs(t.fx - 0.25) * t.box.w).toBeLessThanOrEqual(0.5);
   expect(first!.x).toBeCloseTo(t.fx, 3);
   expect(first!.y).toBeCloseTo(t.fy * t.yScale, 3);
   // the bezel: inside the body, outside the screen
