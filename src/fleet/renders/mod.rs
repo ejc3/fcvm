@@ -232,7 +232,34 @@ async fn wait_for_line(
     }
 }
 
-/// One HTTP GET with `Connection: close`: the body and how long the whole answer took.
+/// The body of an HTTP/1.x answer in `bytes`, once all of it is there: `Content-Length`
+/// bytes after the head, or everything up to the last chunk of a chunked body (returned
+/// as sent). `None` while more is to come; an answer with neither is whole at end of file.
+fn http_body(bytes: &[u8], at_eof: bool) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let (head, body) = text.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.") {
+        return at_eof.then(String::new);
+    }
+    let header = |name: &str| {
+        head.lines().skip(1).find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_string())
+        })
+    };
+    if let Some(length) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        return (body.len() >= length).then(|| body[..length].to_string());
+    }
+    if header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
+        return body.ends_with("0\r\n\r\n").then(|| body.to_string());
+    }
+    at_eof.then(|| body.to_string())
+}
+
+/// One HTTP GET: the body and how long the whole answer took. The answer is whole when its
+/// length says so; a server that keeps the connection open is not waited for.
 async fn http_get(
     addr: SocketAddr,
     host: &str,
@@ -240,20 +267,26 @@ async fn http_get(
     limit: Duration,
 ) -> Option<(String, f64)> {
     let started = Instant::now();
-    let answer = tokio::time::timeout(limit, async {
+    let body = tokio::time::timeout(limit, async {
         let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
         let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).await.ok()?;
         let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes).await.ok()?;
-        Some(bytes)
+        let mut chunk = [0u8; 16384];
+        loop {
+            let n = stream.read(&mut chunk).await.ok()?;
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(body) = http_body(&bytes, n == 0) {
+                return Some(body);
+            }
+            if n == 0 {
+                return None;
+            }
+        }
     })
     .await
     .ok()??;
-    let text = String::from_utf8_lossy(&answer);
-    let (head, body) = text.split_once("\r\n\r\n")?;
-    head.starts_with("HTTP/1.")
-        .then(|| (body.to_string(), started.elapsed().as_secs_f64() * 1000.0))
+    Some((body, started.elapsed().as_secs_f64() * 1000.0))
 }
 
 /// What an engine process is started from.
@@ -1481,6 +1514,58 @@ mod tests {
         assert_eq!(args.levels, Some(vec![16, 36]));
         assert_eq!(args.urls.len(), 2);
         assert!(parse("16,x").is_err());
+    }
+
+    /// An engine answers `/health` with a length and keeps the connection open: the answer
+    /// is whole at its length, not at end of file.
+    #[test]
+    fn an_answer_is_whole_at_its_length() {
+        let kept_open = b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nContent-Type: text/plain\r\n\r\nkitesurf: OK\n";
+        assert_eq!(
+            http_body(kept_open, false).as_deref(),
+            Some("kitesurf: OK\n")
+        );
+        assert_eq!(http_body(&kept_open[..60], false), None);
+        assert_eq!(
+            http_body(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nokextra",
+                false
+            )
+            .as_deref(),
+            Some("ok")
+        );
+        // no length: whole at end of file only
+        let closed = b"HTTP/1.0 200 OK\r\nServer: x\r\n\r\nhello";
+        assert_eq!(http_body(closed, false), None);
+        assert_eq!(http_body(closed, true).as_deref(), Some("hello"));
+        let chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert!(http_body(chunked, false).unwrap().contains("hello"));
+        assert_eq!(http_body(&chunked[..50], false), None);
+        assert_eq!(http_body(b"not http\r\n\r\n", true).as_deref(), Some(""));
+    }
+
+    /// The same over a socket: a server that answers and keeps the connection open.
+    #[tokio::test]
+    async fn a_get_does_not_wait_for_a_kept_connection_to_close() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nkitesurf: OK\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let (body, ms) = http_get(addr, "127.0.0.1", "/health", Duration::from_secs(2))
+            .await
+            .expect("an answer within the limit");
+        assert_eq!(body.trim(), "kitesurf: OK");
+        assert!(ms < 1500.0, "{ms} ms");
+        server.abort();
     }
 
     #[test]
