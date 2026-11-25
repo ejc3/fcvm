@@ -1914,7 +1914,7 @@ async fn prepare_vm_for_lifecycle(
     let boot_inputs = GuestBootInputs::resolve(args.dns.as_deref(), &runtime_config);
 
     // What VMs of processes killed without teardown left on the host goes first.
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     // Generated before the snapshot key so the staging path of a read-only --disk-dir
     // is in this VM's data directory, which teardown removes.
     let vm_id = generate_vm_id();
@@ -4764,7 +4764,7 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("prepare_vm_for_lifecycle has no {needle:?}"))
         };
-        let reclaimed = at("crate::reclaim::reclaim_abandoned().await");
+        let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
         let staged = at("DiskDirStaging::resolve(");
@@ -4787,7 +4787,7 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("cmd_snapshot_run_inner has no {needle:?}"))
         };
-        let reclaimed = at("crate::reclaim::reclaim_abandoned().await");
+        let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
         let created = at("tokio::fs::create_dir_all(&data_dir)");

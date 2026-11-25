@@ -3232,7 +3232,7 @@ async fn cmd_snapshot_run_inner(
     // What VMs of processes killed without teardown left on the host goes first. The
     // clone's data directory is recorded before anything creates it, so a SIGKILLed
     // clone leaves it to the next launch to reclaim (crate::reclaim).
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
@@ -6170,7 +6170,7 @@ async fn cmd_snapshot_run_raw(
         "restoring a raw VM"
     );
 
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {

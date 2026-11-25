@@ -579,7 +579,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
 
     // What VMs of processes killed without teardown left goes first, then this VM's
     // runtime directory is recorded before anything creates it (crate::reclaim).
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {

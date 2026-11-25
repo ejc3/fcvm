@@ -543,7 +543,7 @@ mod store_ownership_tests {
             .collect();
         assert!(left.is_empty(), "{left:?}");
         assert_eq!(
-            std::fs::read_dir(&owners).unwrap().count(),
+            crate::reclaim::record_files(&owners).len(),
             0,
             "the temps' records were left"
         );

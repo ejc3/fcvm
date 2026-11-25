@@ -1215,7 +1215,7 @@ pub(crate) mod tests {
         /// The names in the reclaim owner directory that belong to an export.
         fn export_records(&self) -> Vec<String> {
             let dir = crate::reclaim::owner_dir_in(&self.host.data_dir).unwrap();
-            names_in(&dir)
+            crate::reclaim::record_file_names(&dir)
                 .into_iter()
                 .filter(|name| name.contains("export-"))
                 .collect()

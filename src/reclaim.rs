@@ -7,7 +7,9 @@
 //! other resource stays.
 //!
 //! An owner record makes each of them reclaimable. Its files live in
-//! `<data_dir>/reclaim/<euid>/`:
+//! `<data_dir>/reclaim/<euid>/<b>/`, where `<b>` is the bucket of the owner's id
+//! (`state::manager::bucket_of`, 16 buckets), so that owners beginning and completing
+//! together do not all take one directory's lock:
 //!
 //! | step | what the owner does |
 //! |------|----------------------|
@@ -15,7 +17,18 @@
 //! | [`record`] | adds the resource to `<id>.json` (written under a temporary name and renamed) before creating it |
 //! | [`complete`] | at the end of teardown, undoes what is still recorded and deletes both files |
 //!
-//! [`reclaim_abandoned`] runs when a VM launch starts. It takes every owner lock it can
+//! [`reclaim_abandoned`] is the sweep. It lists every bucket and takes every owner lock it
+//! can without waiting, so its cost grows with the owners alive. The commands that need the
+//! room a killed process left (setup, snapshot import and export, compaction) run it when
+//! they start. A VM launch runs it through [`reclaim_abandoned_if_due`]: at most one launch
+//! in each [`RECLAIM_EVERY`] sweeps, and the others read one stamp and go on, so a launch
+//! lists or locks nothing whose size grows with the VMs running. What a killed owner
+//! recorded is therefore reclaimed by the first launch that starts `RECLAIM_EVERY` or more
+//! after the last sweep began, or by the next of those commands. Nothing a launch makes
+//! depends on an earlier sweep: names are random or settled against what exists, and an
+//! owner that dies just after a sweep listed it was never seen by that sweep either.
+//!
+//! The sweep takes every owner lock it can
 //! without waiting. A lock nobody holds belongs to an owner that exited without completing,
 //! so the resources in its record are undone and the record is deleted. The flock is the
 //! owner's liveness: the kernel releases it when the process dies however it dies, and a
@@ -43,6 +56,10 @@
 //! records before it deletes the veth and the namespace, which is when another VM can
 //! take the names (`forget`). Kernel objects are gone after a reboot and their names
 //! can be taken again, so a record from another boot is never acted on for them.
+//!
+//! Records an fcvm before the buckets wrote sit in the owner directory itself, and the
+//! sweep reads them there. Such an fcvm does not read the buckets: it leaves what a newer
+//! one recorded to a newer one's sweep.
 //!
 //! Each user reclaims only the records in its own directory, which it creates mode 0700
 //! and refuses when anyone else can write it, so root never acts on a record another user
@@ -345,7 +362,11 @@ impl OwnerDir {
             nix::sys::stat::Mode::empty(),
         )
         .with_context(|| format!("opening owner directory {}", path.display()))?;
-        let fd = File::from(fd);
+        Self::checked(path.to_path_buf(), File::from(fd))
+    }
+
+    /// The checks of [`OwnerDir::open`], on an open descriptor.
+    fn checked(path: PathBuf, fd: File) -> Result<Self> {
         let metadata = fd
             .metadata()
             .with_context(|| format!("reading owner directory {}", path.display()))?;
@@ -359,10 +380,57 @@ impl OwnerDir {
                 metadata.mode() & 0o7777
             );
         }
-        Ok(Self {
-            path: path.to_path_buf(),
-            fd,
-        })
+        Ok(Self { path, fd })
+    }
+
+    /// The bucket directory `name` of this owner directory, opened through this descriptor
+    /// and held to the rules of the owner directory itself, or `None` when there is none.
+    fn open_bucket(&self, name: &str) -> Result<Option<Self>> {
+        use nix::fcntl::OFlag;
+        let path = self.path.join(name);
+        match nix::fcntl::openat(
+            &self.fd,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        ) {
+            Ok(fd) => Self::checked(path, File::from(fd)).map(Some),
+            Err(nix::errno::Errno::ENOENT) => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("opening owner bucket {}", path.display()))
+            }
+        }
+    }
+
+    /// The bucket directory that holds the files of the owner `id`, made if it is missing.
+    fn bucket_of(&self, id: &str) -> Result<Self> {
+        let name = crate::state::manager::bucket_of(id);
+        match nix::sys::stat::mkdirat(
+            &self.fd,
+            name.as_str(),
+            nix::sys::stat::Mode::from_bits_truncate(0o700),
+        ) {
+            Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating owner bucket {}", self.display(&name)))
+            }
+        }
+        self.open_bucket(&name)?
+            .with_context(|| format!("the owner bucket {} is gone", self.display(&name)))
+    }
+
+    /// Every directory of this owner directory that can hold records: the buckets that
+    /// exist, and the owner directory itself, where an fcvm before the buckets kept them.
+    fn record_dirs(self) -> Result<Vec<Self>> {
+        let mut dirs = Vec::new();
+        for name in BUCKETS.chars().map(String::from) {
+            if let Some(bucket) = self.open_bucket(&name)? {
+                dirs.push(bucket);
+            }
+        }
+        dirs.push(self);
+        Ok(dirs)
     }
 
     fn display(&self, name: &str) -> String {
@@ -433,6 +501,35 @@ impl OwnerDir {
     }
 }
 
+/// The names of an owner directory's buckets: every value of `state::manager::bucket_of`.
+const BUCKETS: &str = "0123456789abcdef";
+
+/// The lock of the launch that is sweeping an owner directory, and the stamp of the last
+/// sweep that began: the boot it ran in, and its time as the file's mtime. No owner id
+/// begins with a dot, and neither name ends as a record's files do, so no sweep, of this
+/// build or of one that kept its records in the owner directory, takes them for an owner's.
+const SWEEP_LOCK: &str = ".sweep-lock";
+const SWEEP_STAMP: &str = ".sweep-stamp";
+
+/// How often a VM launch sweeps ([`reclaim_abandoned_if_due`]). A sweep lists every bucket
+/// and tries every owner's lock, so its cost grows with the VMs running; one a second is one
+/// launch in hundreds during a ramp, and bounds how long a killed VM's directory, namespace
+/// and rules outlive it on a host that keeps launching.
+pub const RECLAIM_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `FCVM_RECLAIM_EVERY_MS` replaces [`RECLAIM_EVERY`] when it holds a number of
+/// milliseconds. `0` makes every launch sweep before it does anything else, whatever
+/// another launch is doing, which is what a launch did before the interval existed.
+pub const RECLAIM_EVERY_ENV: &str = "FCVM_RECLAIM_EVERY_MS";
+
+/// The interval in force, from the value of [`RECLAIM_EVERY_ENV`] if any.
+fn reclaim_every(value: Option<&str>) -> std::time::Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(RECLAIM_EVERY)
+}
+
 fn lock_name(id: &str) -> String {
     format!("{id}.lock")
 }
@@ -445,9 +542,49 @@ fn record_temp_name(id: &str) -> String {
     format!("{id}.json.tmp")
 }
 
-#[cfg(test)]
-fn record_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(record_name(id))
+/// Where the owner `id`'s record is, in the owner directory `dir`.
+#[doc(hidden)]
+pub fn record_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(crate::state::manager::bucket_of(id))
+        .join(record_name(id))
+}
+
+/// Every record and lock file in the owner directory `dir`, in its buckets and in the
+/// directory itself, sorted. For tests and tools that look at what owners left.
+#[doc(hidden)]
+pub fn record_files(dir: &Path) -> Vec<PathBuf> {
+    let is_record_file = |path: &PathBuf| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| !name.starts_with('.'))
+            && path.is_file()
+    };
+    let list = |dir: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
+    };
+    let mut files: Vec<PathBuf> = list(dir).into_iter().filter(is_record_file).collect();
+    for bucket in BUCKETS.chars() {
+        files.extend(
+            list(&dir.join(bucket.to_string()))
+                .into_iter()
+                .filter(is_record_file),
+        );
+    }
+    files.sort();
+    files
+}
+
+/// The file names of [`record_files`], sorted.
+#[doc(hidden)]
+pub fn record_file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = record_files(dir)
+        .iter()
+        .filter_map(|path| Some(path.file_name()?.to_string_lossy().into_owned()))
+        .collect();
+    names.sort();
+    names
 }
 
 /// Lock the owner `id`'s lock file exclusively, creating it if needed. `None` when `wait`
@@ -564,7 +701,7 @@ impl Owner {
         if owners.get(id).and_then(Weak::upgrade).is_some() {
             bail!("resources under {id} already have an owner in this process");
         }
-        let owner_dir = OwnerDir::open(dir)?;
+        let owner_dir = OwnerDir::open(dir)?.bucket_of(id)?;
         let lock = lock_owner_file(&owner_dir, id, true)?
             .context("an owner lock taken with waiting returned none")?;
         if owner_dir.identity(&record_name(id))?.is_some() {
@@ -1154,10 +1291,23 @@ pub struct Reclaimed {
 }
 
 /// Reclaim what every owner that exited without completing recorded, in this user's
-/// owner directory. Called when a VM launch starts. Never waits on a live owner, and never
-/// fails the launch: what it cannot undo is logged and left for the next one.
+/// owner directory: the sweep. Called when a command that needs the room starts, and by a
+/// VM launch through [`reclaim_abandoned_if_due`]. Never waits on a live owner, and never
+/// fails its caller: what it cannot undo is logged and left for the next sweep.
 pub async fn reclaim_abandoned() -> Reclaimed {
-    // The pmem store keeps its own record of who is using `tmp/`: its lock.
+    collect_pmem_temps().await;
+    let dir = match owner_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "cannot reclaim resources of exited fcvm processes");
+            return Reclaimed::default();
+        }
+    };
+    reclaim_abandoned_in(&dir).await
+}
+
+/// The pmem store keeps its own record of who is using `tmp/`: its lock.
+async fn collect_pmem_temps() {
     let data_dir = crate::paths::data_dir();
     match tokio::task::spawn_blocking(move || {
         crate::storage::pmem_store::collect_abandoned_temps(&data_dir)
@@ -1169,6 +1319,12 @@ pub async fn reclaim_abandoned() -> Reclaimed {
         Ok(Err(error)) => warn!(error = %format!("{error:#}"), "cannot collect pmem store temps"),
         Err(error) => warn!(%error, "cannot collect pmem store temps"),
     }
+}
+
+/// [`reclaim_abandoned`] for a VM launch: the sweep, unless one began in this boot less
+/// than [`RECLAIM_EVERY`] ago or another launch is sweeping now. A launch that does not
+/// sweep opens and reads one stamp, whatever the number of VMs running.
+pub async fn reclaim_abandoned_if_due() -> Reclaimed {
     let dir = match owner_dir() {
         Ok(dir) => dir,
         Err(error) => {
@@ -1176,21 +1332,126 @@ pub async fn reclaim_abandoned() -> Reclaimed {
             return Reclaimed::default();
         }
     };
-    reclaim_abandoned_in(&dir).await
+    let every = reclaim_every(std::env::var(RECLAIM_EVERY_ENV).ok().as_deref());
+    reclaim_abandoned_if_due_in(&dir, every).await
 }
 
-/// [`reclaim_abandoned`] in an explicit owner directory.
+/// [`reclaim_abandoned_if_due`] in an explicit owner directory, with an explicit interval.
+/// The pmem store's temps are collected with the sweep, as [`reclaim_abandoned`] does.
+pub async fn reclaim_abandoned_if_due_in(path: &Path, every: std::time::Duration) -> Reclaimed {
+    if every.is_zero() {
+        // Every launch sweeps, beside whichever launch is sweeping.
+        collect_pmem_temps().await;
+        return reclaim_abandoned_in(path).await;
+    }
+    let _sweeping = match take_sweep(path, every) {
+        Ok(Some(lock)) => Some(lock),
+        // Swept lately, or being swept by another launch.
+        Ok(None) => return Reclaimed::default(),
+        Err(error) => {
+            warn!(dir = %path.display(), error = %format!("{error:#}"), "cannot tell whether a sweep is due; sweeping");
+            None
+        }
+    };
+    collect_pmem_temps().await;
+    reclaim_abandoned_in(path).await
+}
+
+/// Whether the sweep of the owner directory `dir` that last began did so in this boot and
+/// less than `every` ago.
+fn swept_lately(dir: &OwnerDir, every: std::time::Duration) -> Result<bool> {
+    use std::io::Read;
+    let mut stamp = match dir.open_file(SWEEP_STAMP, nix::fcntl::OFlag::O_RDONLY) {
+        Ok(stamp) => stamp,
+        Err(nix::errno::Errno::ENOENT) => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening {}", dir.display(SWEEP_STAMP)))
+        }
+    };
+    let began = stamp
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .with_context(|| format!("reading the time of {}", dir.display(SWEEP_STAMP)))?;
+    let mut boot = String::new();
+    stamp
+        .read_to_string(&mut boot)
+        .with_context(|| format!("reading {}", dir.display(SWEEP_STAMP)))?;
+    // A stamp from the future (the clock was set back) says nothing about now.
+    Ok(boot == boot_id() && began.elapsed().is_ok_and(|age| age < every))
+}
+
+/// The right to sweep the owner directory at `path` now: `None` when a sweep began less
+/// than `every` ago or another process holds the sweep lock. Otherwise the stamp is
+/// rewritten and the lock returned, to be held for the length of the sweep, so that the
+/// launches that arrive while it runs find either the lock held or the stamp new. A killed
+/// sweeper's lock goes with it, and its stamp delays the next sweep by `every` at most.
+fn take_sweep(path: &Path, every: std::time::Duration) -> Result<Option<Flock<File>>> {
+    use nix::fcntl::OFlag;
+    use std::io::Write;
+    let dir = OwnerDir::open(path)?;
+    if swept_lately(&dir, every)? {
+        return Ok(None);
+    }
+    let lock = dir
+        .open_file(SWEEP_LOCK, OFlag::O_CREAT | OFlag::O_WRONLY)
+        .with_context(|| format!("opening {}", dir.display(SWEEP_LOCK)))?;
+    let lock = match Flock::lock(lock, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => return Ok(None),
+        Err((_, error)) => {
+            return Err(error).with_context(|| format!("locking {}", dir.display(SWEEP_LOCK)))
+        }
+    };
+    // The launch that held the lock before this one may have stamped and swept already.
+    if swept_lately(&dir, every)? {
+        return Ok(None);
+    }
+    let mut stamp = dir
+        .open_file(
+            SWEEP_STAMP,
+            OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_TRUNC,
+        )
+        .with_context(|| format!("opening {}", dir.display(SWEEP_STAMP)))?;
+    stamp
+        .write_all(boot_id().as_bytes())
+        .with_context(|| format!("writing {}", dir.display(SWEEP_STAMP)))?;
+    Ok(Some(lock))
+}
+
+/// [`reclaim_abandoned`] in an explicit owner directory: every bucket of it, and the
+/// directory itself.
 pub async fn reclaim_abandoned_in(path: &Path) -> Reclaimed {
     let mut done = Reclaimed::default();
-    let names = match OwnerDir::open(path).and_then(|dir| dir.names().map(|names| (dir, names))) {
-        Ok(listed) => listed,
+    let dirs = match OwnerDir::open(path).and_then(OwnerDir::record_dirs) {
+        Ok(dirs) => dirs,
         Err(error) => {
             warn!(dir = %path.display(), error = %format!("{error:#}"), "cannot read owner records");
             return done;
         }
     };
-    let (dir, names) = names;
-    let dir = &dir;
+    for dir in &dirs {
+        reclaim_dir(dir, &mut done).await;
+    }
+    if done != Reclaimed::default() {
+        info!(
+            owners = done.owners,
+            resources = done.resources,
+            remaining = done.remaining,
+            "reclaimed resources of fcvm processes that exited without teardown"
+        );
+    }
+    done
+}
+
+/// One directory of records in a sweep: a bucket, or the owner directory itself.
+async fn reclaim_dir(dir: &OwnerDir, done: &mut Reclaimed) {
+    let names = match dir.names() {
+        Ok(names) => names,
+        Err(error) => {
+            warn!(dir = %dir.path.display(), error = %format!("{error:#}"), "cannot read owner records");
+            return;
+        }
+    };
     let mut ids = std::collections::BTreeSet::new();
     for name in &names {
         if let Some(id) = name
@@ -1267,15 +1528,6 @@ pub async fn reclaim_abandoned_in(path: &Path) -> Reclaimed {
         }
         release(lock);
     }
-    if done != Reclaimed::default() {
-        info!(
-            owners = done.owners,
-            resources = done.resources,
-            remaining = done.remaining,
-            "reclaimed resources of fcvm processes that exited without teardown"
-        );
-    }
-    done
 }
 
 #[cfg(test)]
@@ -1358,13 +1610,21 @@ mod tests {
         (root, dir)
     }
 
+    /// The names of the record and lock files in an owner directory, in whichever of its
+    /// directories they are.
     fn files_in(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
+        record_file_names(dir)
+    }
+
+    /// Put `record` where the owner `id`'s record goes, with no owner having begun.
+    fn write_by_hand(dir: &Path, id: &str, record: &Record) {
+        let path = record_path(dir, id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(path.parent().unwrap())
+            .unwrap();
+        std::fs::write(path, serde_json::to_vec(record).unwrap()).unwrap();
     }
 
     /// The resources the child test process creates under `root`.
@@ -1540,7 +1800,7 @@ mod tests {
             })
             .unwrap();
         drop(owner);
-        let path = dir.join("vm-old.json");
+        let path = record_path(&dir, "vm-old");
         let mut record: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         record["resources"]
@@ -2110,7 +2370,8 @@ mod tests {
         forget("vm-forget", Resource::is_network).unwrap();
         drop(owner);
         let record: Record =
-            serde_json::from_slice(&std::fs::read(dir.join("vm-forget.json")).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(record_path(&dir, "vm-forget")).unwrap())
+                .unwrap();
         assert_eq!(record.resources, [Resource::Temp { path: kept.clone() }]);
         assert!(kept.exists(), "forget undid a resource");
         forget("vm-without-owner", |_| true).unwrap();
@@ -2136,11 +2397,7 @@ mod tests {
                 Resource::Temp { path: temp.clone() },
             ],
         };
-        std::fs::write(
-            record_path(&dir, "vm-before-reboot"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
+        write_by_hand(&dir, "vm-before-reboot", &record);
         assert_eq!(
             reclaim_abandoned_in(&dir).await,
             Reclaimed {
@@ -2175,11 +2432,7 @@ mod tests {
                 Resource::Temp { path: temp.clone() },
             ],
         };
-        std::fs::write(
-            record_path(&dir, "vm-other-namespace"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
+        write_by_hand(&dir, "vm-other-namespace", &record);
         assert_eq!(
             reclaim_abandoned_in(&dir).await,
             Reclaimed {
@@ -2250,7 +2503,7 @@ mod tests {
         owner.record(twice.clone()).unwrap();
         owner.record(twice.clone()).unwrap();
         let record: Record =
-            serde_json::from_slice(&std::fs::read(dir.join("vm-twice.json")).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(record_path(&dir, "vm-twice")).unwrap()).unwrap();
         assert_eq!(record.resources, [twice.clone(), twice]);
         drop(owner);
     }
@@ -2265,7 +2518,7 @@ mod tests {
         };
         owner.record(netns.clone()).unwrap();
         // A directory in the record's place makes the rename onto it fail, as root too.
-        let record = dir.join("vm-forget-fails.json");
+        let record = record_path(&dir, "vm-forget-fails");
         std::fs::remove_file(&record).unwrap();
         std::fs::create_dir_all(record.join("blocker")).unwrap();
         assert!(forget("vm-forget-fails", Resource::is_network).is_err());
@@ -2273,6 +2526,250 @@ mod tests {
         assert_eq!(state.resources, [netns]);
         drop(state);
         drop(owner);
+    }
+
+    /// An owner's files are in the bucket of its id and nowhere else, and the bucket is a
+    /// directory of this user's that no one else can write.
+    #[tokio::test]
+    async fn an_owners_files_are_in_the_bucket_of_its_id() {
+        let (root, dir) = test_dir();
+        let owner = Owner::begin_in(&dir, "vm-bucketed").unwrap();
+        owner
+            .record(Resource::Temp {
+                path: root.path().join("t.tmp"),
+            })
+            .unwrap();
+        let bucket = dir.join(crate::state::manager::bucket_of("vm-bucketed"));
+        assert_eq!(
+            record_files(&dir),
+            [
+                bucket.join("vm-bucketed.json"),
+                bucket.join("vm-bucketed.lock")
+            ]
+        );
+        let metadata = std::fs::metadata(&bucket).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        owner.complete().await.unwrap();
+        assert!(record_files(&dir).is_empty());
+    }
+
+    /// The sweep reclaims a record in any bucket, and one in the owner directory itself,
+    /// where an fcvm before the buckets kept its records. The sweep's own lock and stamp
+    /// are not taken for an owner's files, by this sweep or by that fcvm's.
+    #[tokio::test]
+    async fn the_sweep_reads_every_bucket_and_the_owner_directory_itself() {
+        let (root, dir) = test_dir();
+        let mut temps = Vec::new();
+        for n in 0..64 {
+            let temp = root.path().join(format!("{n}.tmp"));
+            std::fs::write(&temp, b"x").unwrap();
+            let owner = Owner::begin_in(&dir, &format!("vm-{n}")).unwrap();
+            owner.record(Resource::Temp { path: temp.clone() }).unwrap();
+            drop(owner);
+            temps.push(temp);
+        }
+        let buckets: std::collections::BTreeSet<_> = record_files(&dir)
+            .iter()
+            .map(|path| path.parent().unwrap().to_path_buf())
+            .collect();
+        assert!(
+            buckets.len() > 8,
+            "64 ids fell in {} buckets",
+            buckets.len()
+        );
+        // A record of an older fcvm, beside the buckets.
+        let old = root.path().join("old.tmp");
+        std::fs::write(&old, b"x").unwrap();
+        let record = Record {
+            pid: 1,
+            boot_id: boot_id(),
+            user_namespace: current_user_namespace(),
+            resources: vec![Resource::Temp { path: old.clone() }],
+        };
+        std::fs::write(
+            dir.join("vm-flat.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("vm-flat.lock"), b"").unwrap();
+
+        // A launch's sweep, which leaves its lock and stamp in the owner directory.
+        let swept = reclaim_abandoned_if_due_in(&dir, std::time::Duration::from_secs(3600)).await;
+        assert_eq!(
+            (swept.owners, swept.resources, swept.remaining),
+            (65, 65, 0)
+        );
+        assert!(temps.iter().all(|temp| !temp.exists()) && !old.exists());
+        assert!(record_files(&dir).is_empty());
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.len() > 1)
+            .collect();
+        left.sort();
+        assert_eq!(left, [SWEEP_LOCK, SWEEP_STAMP]);
+        for name in [SWEEP_LOCK, SWEEP_STAMP] {
+            assert!(!name.ends_with(".lock") && !name.ends_with(".json"));
+        }
+        // An unconditional sweep leaves them where they are.
+        assert_eq!(reclaim_abandoned_in(&dir).await, Reclaimed::default());
+        assert!(dir.join(SWEEP_LOCK).exists() && dir.join(SWEEP_STAMP).exists());
+    }
+
+    /// A launch sweeps when no sweep began in this boot within the interval, and otherwise
+    /// reclaims nothing and leaves the records for the sweep that is due next. A stamp of
+    /// another boot, a stamp from the future and a missing stamp all make a sweep due.
+    #[tokio::test]
+    async fn a_launch_sweeps_only_when_a_sweep_is_due() {
+        let (root, dir) = test_dir();
+        let hour = std::time::Duration::from_secs(3600);
+        let abandon = |id: &str| {
+            let temp = root.path().join(format!("{id}.tmp"));
+            std::fs::write(&temp, b"x").unwrap();
+            let owner = Owner::begin_in(&dir, id).unwrap();
+            owner.record(Resource::Temp { path: temp.clone() }).unwrap();
+            drop(owner);
+            temp
+        };
+        let stamp = dir.join(SWEEP_STAMP);
+        let set_time = |time: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(&stamp)
+                .unwrap()
+                .set_modified(time)
+                .unwrap()
+        };
+
+        // No stamp: due.
+        let first = abandon("vm-first");
+        assert_eq!(reclaim_abandoned_if_due_in(&dir, hour).await.owners, 1);
+        assert!(!first.exists());
+        assert_eq!(std::fs::read_to_string(&stamp).unwrap(), boot_id());
+
+        // Swept within the interval: not due, and the record stays whole.
+        let second = abandon("vm-second");
+        assert_eq!(
+            reclaim_abandoned_if_due_in(&dir, hour).await,
+            Reclaimed::default()
+        );
+        assert!(second.exists() && record_path(&dir, "vm-second").exists());
+
+        // The interval has passed: due.
+        set_time(std::time::SystemTime::now() - 2 * hour);
+        assert_eq!(reclaim_abandoned_if_due_in(&dir, hour).await.owners, 1);
+        assert!(!second.exists());
+
+        // A stamp of another boot, however new: due.
+        let third = abandon("vm-third");
+        std::fs::write(&stamp, "another-boot").unwrap();
+        assert_eq!(reclaim_abandoned_if_due_in(&dir, hour).await.owners, 1);
+        assert!(!third.exists());
+
+        // A stamp from the future (the clock was set back): due.
+        let fourth = abandon("vm-fourth");
+        set_time(std::time::SystemTime::now() + hour);
+        assert_eq!(reclaim_abandoned_if_due_in(&dir, hour).await.owners, 1);
+        assert!(!fourth.exists());
+    }
+
+    /// While one launch holds the sweep lock, another launch does not sweep and does not
+    /// wait, although no sweep has stamped; a sweeper that is killed gives the lock back.
+    #[tokio::test]
+    async fn a_launch_does_not_sweep_or_wait_while_another_sweeps() {
+        use std::os::unix::process::CommandExt;
+        let (root, dir) = test_dir();
+        let temp = root.path().join("left.tmp");
+        std::fs::write(&temp, b"x").unwrap();
+        let owner = Owner::begin_in(&dir, "vm-left").unwrap();
+        owner.record(Resource::Temp { path: temp.clone() }).unwrap();
+        drop(owner);
+
+        let mut sweeper = std::process::Command::new("flock")
+            .args(["-x", "-o"])
+            .arg(dir.join(SWEEP_LOCK))
+            .args(["sh", "-c", "echo held; exec sleep 60"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(sweeper.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "held");
+        // Any interval finds a sweep due: nothing has stamped.
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(
+            reclaim_abandoned_if_due_in(&dir, hour).await,
+            Reclaimed::default()
+        );
+        assert!(temp.exists(), "swept beside the launch that holds the lock");
+        assert!(!dir.join(SWEEP_STAMP).exists(), "stamped without sweeping");
+
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(sweeper.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        sweeper.wait().unwrap();
+        assert_eq!(reclaim_abandoned_if_due_in(&dir, hour).await.owners, 1);
+        assert!(!temp.exists());
+
+        // With the interval set to nothing a launch sweeps whatever the lock and the stamp.
+        let again = root.path().join("again.tmp");
+        std::fs::write(&again, b"x").unwrap();
+        let owner = Owner::begin_in(&dir, "vm-again").unwrap();
+        owner
+            .record(Resource::Temp {
+                path: again.clone(),
+            })
+            .unwrap();
+        drop(owner);
+        let _held = take_sweep(&dir, std::time::Duration::from_nanos(1))
+            .unwrap()
+            .expect("the sweep lock");
+        assert_eq!(
+            reclaim_abandoned_if_due_in(&dir, hour).await,
+            Reclaimed::default()
+        );
+        let zero = std::time::Duration::ZERO;
+        assert_eq!(reclaim_abandoned_if_due_in(&dir, zero).await.owners, 1);
+        assert!(!again.exists());
+        assert_eq!(reclaim_every(None), RECLAIM_EVERY);
+        assert_eq!(reclaim_every(Some(" 0\n")), zero);
+        assert_eq!(reclaim_every(Some("250")).as_millis(), 250);
+        assert_eq!(reclaim_every(Some("soon")), RECLAIM_EVERY);
+    }
+
+    /// The launch commands sweep through the gate, and the commands that need the room a
+    /// killed process left sweep whenever they start.
+    #[test]
+    fn launches_sweep_when_due_and_the_rest_always() {
+        let gated = "crate::reclaim::reclaim_abandoned_if_due().await";
+        let always = "crate::reclaim::reclaim_abandoned().await";
+        for (name, source, gated_calls, always_calls) in [
+            ("podman", include_str!("commands/podman/mod.rs"), 1, 0),
+            ("snapshot", include_str!("commands/snapshot.rs"), 2, 0),
+            ("vm", include_str!("commands/vm.rs"), 1, 0),
+            ("setup", include_str!("commands/setup.rs"), 0, 2),
+            ("import", include_str!("commands/snapshot_import.rs"), 0, 1),
+        ] {
+            let shipped = &source[..source
+                .find("\n#[cfg(test)]\nmod tests {")
+                .unwrap_or(source.len())];
+            assert_eq!(
+                (
+                    shipped.matches(gated).count(),
+                    shipped.matches(always).count()
+                ),
+                (gated_calls, always_calls),
+                "{name}: sweeps through the gate, and sweeps always"
+            );
+        }
+        let export = include_str!("commands/snapshot_export.rs");
+        assert!(export.contains("crate::reclaim::reclaim_abandoned_in(&owner_dir).await"));
     }
 
     /// Records are read through the owner directory's own descriptor, opened without

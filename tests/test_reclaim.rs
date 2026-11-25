@@ -66,7 +66,10 @@ async fn stop(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Run a VM to completion. Its launch reclaims what killed fcvm processes left.
+/// Run a VM to completion. Its launch sweeps: it reclaims what killed fcvm processes left.
+/// A launch sweeps when none began within `RECLAIM_EVERY`, and another launch of the suite
+/// may have swept just before the kill, so these launches set the interval to nothing
+/// (`FCVM_RECLAIM_EVERY_MS=0`) and always sweep, as every launch did before the interval.
 async fn next_launch() -> Result<()> {
     next_launch_on("rootless").await
 }
@@ -80,6 +83,8 @@ async fn next_launch_on(network: &str) -> Result<()> {
 /// [`next_launch_on`] with `env` set for the launch, such as a data dir of its own.
 async fn next_launch_with(network: &str, env: &[(&str, &str)]) -> Result<()> {
     let (name, _, _, _) = common::unique_names("reclaim-next");
+    let mut env = env.to_vec();
+    env.push((fcvm::reclaim::RECLAIM_EVERY_ENV, "0"));
     let (mut child, _) = common::spawn_fcvm_with_env(
         &[
             "podman",
@@ -92,7 +97,7 @@ async fn next_launch_with(network: &str, env: &[(&str, &str)]) -> Result<()> {
             common::TEST_IMAGE,
             "true",
         ],
-        env,
+        &env,
     )
     .await?;
     let status = tokio::time::timeout(Duration::from_secs(180), child.wait())
@@ -940,7 +945,7 @@ async fn a_sigkilled_import_leaves_its_staged_image_disk_to_the_next_import() ->
         };
         let owners = fcvm::reclaim::owner_dir_in(data.path())?;
         let temp_records = || -> Result<Vec<String>> {
-            Ok(names_in(&owners)?
+            Ok(fcvm::reclaim::record_file_names(&owners)
                 .into_iter()
                 .filter(|name| name.starts_with("store-temp-") && name.ends_with(".json"))
                 .collect())
@@ -981,7 +986,7 @@ async fn a_sigkilled_import_leaves_its_staged_image_disk_to_the_next_import() ->
             anyhow::ensure!(
                 temp_records()?.len() == 1,
                 "the staged image disk has no reclaim record: {:?}",
-                names_in(&owners)?
+                fcvm::reclaim::record_file_names(&owners)
             );
             Ok(())
         }
@@ -1086,12 +1091,9 @@ fn cache_temps(key: &str) -> Vec<PathBuf> {
 
 /// Every temporary a record of the fcvm process `pid` lists, in the owner directory `dir`.
 fn recorded_temps(dir: &Path, pid: u32) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
     let mut temps = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(bytes) = std::fs::read(entry.path()) else {
+    for path in fcvm::reclaim::record_files(dir) {
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -1113,16 +1115,13 @@ fn recorded_temps(dir: &Path, pid: u32) -> Vec<PathBuf> {
 
 /// The lock files of the records the fcvm process `pid` wrote in the owner directory `dir`.
 fn record_locks(dir: &Path, pid: u32) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
+    fcvm::reclaim::record_files(dir)
+        .into_iter()
+        .filter_map(|path| {
             let record: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+                serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
             (record.get("pid").and_then(|p| p.as_u64()) == Some(u64::from(pid)))
-                .then(|| entry.path().with_extension("lock"))
+                .then(|| path.with_extension("lock"))
         })
         .collect()
 }
