@@ -365,7 +365,18 @@ pub(crate) fn thaw_in(env: &Env) -> usize {
 pub(crate) struct Watch {
     id: Option<u64>,
     looks: u32,
+    /// Looks at this freeze that were not counted because its boundary was being worked
+    /// on.
+    uncounted: u32,
 }
+
+/// How many looks at one freeze may go uncounted. 15 minutes of the guest running: the
+/// host ends a clone whose restore is not acknowledged by then
+/// (`RESTORE_COMPLETION_ACK_TIMEOUT` in src/commands/snapshot.rs), and no prepare or
+/// resume holds the boundary lock for a fraction of it. Past the cap every look counts,
+/// so a one-shot that hangs while it holds the lock keeps a container frozen for
+/// `UNCOUNTED_LOOKS_CAP + DEADLINE_LOOKS` looks at most, not for good.
+const UNCOUNTED_LOOKS_CAP: u32 = 900;
 
 /// One watchdog look: count it against the recorded freeze, and thaw that freeze once
 /// [`DEADLINE_LOOKS`] looks have found it.
@@ -374,7 +385,7 @@ pub(crate) struct Watch {
 /// prepare, a resume or a restore inside its boundary, or a restore under way at any
 /// step. The deadline is for a boundary nobody is working on (a host that died between
 /// the prepare and the resume, a resume that cannot open the gate), and those looks
-/// count as before. Thawed in the middle of a clone's restore, the container ran behind
+/// count as before. At most [`UNCOUNTED_LOOKS_CAP`] looks at one freeze go uncounted. Thawed in the middle of a clone's restore, the container ran behind
 /// the closed gate, where each connection it made was answered with a reset.
 pub(crate) fn watchdog_in(env: &Env, watch: &mut Watch) -> usize {
     let Ok(_held) = lock(env.lock) else {
@@ -384,17 +395,18 @@ pub(crate) fn watchdog_in(env: &Env, watch: &mut Watch) -> usize {
         *watch = Watch::default();
         return 0;
     };
-    if (env.boundary_in_progress)() {
-        return 0;
-    }
-    if watch.id == Some(record.id) {
-        watch.looks = watch.looks.saturating_add(1);
-    } else {
+    if watch.id != Some(record.id) {
         *watch = Watch {
             id: Some(record.id),
-            looks: 1,
+            looks: 0,
+            uncounted: 0,
         };
     }
+    if (env.boundary_in_progress)() && watch.uncounted < UNCOUNTED_LOOKS_CAP {
+        watch.uncounted += 1;
+        return 0;
+    }
+    watch.looks = watch.looks.saturating_add(1);
     if watch.looks < DEADLINE_LOOKS {
         return 0;
     }
@@ -589,16 +601,17 @@ mod tests {
         after(&tree, &running, &paused);
     }
 
-    /// fcvm was SIGKILLed between the prepare and the resume, and the snapshot it took is
-    /// restored later. The source (if anything resumes it) and the clone each hold the
-    /// record, and each one's watchdog thaws its container at the deadline, with no host.
-    /// The watchdog does not thaw a freeze whose boundary is being worked on, however many
-    /// looks find it (#2140): a clone's restore that takes over a minute before its own
-    /// thaw, a prepare that takes that long. Its looks count again once nobody is working
-    /// on the boundary, and the deadline is then the whole of [`DEADLINE_LOOKS`], so a
-    /// boundary that is abandoned afterwards is still thawed.
+    /// The watchdog does not thaw a freeze whose boundary is being worked on (#2140): a
+    /// clone's restore that takes over a minute before its own thaw, a prepare that takes
+    /// that long. Such looks are not counted. Looks count again once nobody is working on
+    /// the boundary, on top of the ones counted before, so a boundary that is abandoned
+    /// afterwards is still thawed at [`DEADLINE_LOOKS`] counted looks.
+    ///
+    /// The looks that go uncounted are capped, so a one-shot that hangs while it holds
+    /// the boundary lock cannot keep the container frozen for good.
     ///
     /// RED BEFORE THE FIX: the freeze was thawed at the 60th look of a restore.
+    /// RED WITHOUT THE CAP: a boundary that stays in progress is never thawed.
     #[test]
     fn the_watchdog_leaves_a_freeze_alone_while_its_boundary_is_in_progress() {
         let tree = Tree::new();
@@ -621,8 +634,33 @@ mod tests {
             "an abandoned boundary's freeze was never thawed"
         );
         assert!(!tree.record_exists());
+
+        // A boundary that stays in progress: uncounted up to the cap, then counted.
+        let tree = Tree::new();
+        let running = tree.cgroup("libpod-payload-a", false);
+        tree.run(freeze_in);
+        tree.in_progress.set(true);
+        assert_eq!(tree.watchdog(UNCOUNTED_LOOKS_CAP + DEADLINE_LOOKS - 1), 0);
+        assert!(frozen(&running));
+        assert_eq!(tree.watchdog(1), 1);
+        assert!(
+            !frozen(&running),
+            "a boundary hung in progress kept its freeze for good"
+        );
+        // The cap is the host's bound on a restore's acknowledgement, one look a second.
+        let host = include_str!("../../src/commands/snapshot.rs");
+        assert!(host.contains(
+            "const RESTORE_COMPLETION_ACK_TIMEOUT: Duration = Duration::from_secs(15 * 60);"
+        ));
+        assert_eq!(
+            u64::from(UNCOUNTED_LOOKS_CAP) * WATCHDOG_PERIOD.as_secs(),
+            15 * 60
+        );
     }
 
+    /// fcvm was SIGKILLed between the prepare and the resume, and the snapshot it took is
+    /// restored later. The source (if anything resumes it) and the clone each hold the
+    /// record, and each one's watchdog thaws its container at the deadline, with no host.
     #[test]
     fn fcvm_sigkill_the_watchdog_thaws_without_the_host() {
         let tree = Tree::new();

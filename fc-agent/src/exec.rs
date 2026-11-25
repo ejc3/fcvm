@@ -410,6 +410,16 @@ pub fn serve_everything() {
     RESUME_ONLY.store(false, Ordering::Release);
 }
 
+/// What a client whose command is refused while the server runs the resume alone is sent.
+fn refusal_frame() -> Vec<u8> {
+    exec_proto::Message::Error(
+        "fc-agent is restarting in the middle of a snapshot of this VM and runs nothing but \
+         that snapshot's resume until its boot has its plan; try again"
+            .to_string(),
+    )
+    .encode()
+}
+
 /// Whether `request` is the host's `fc-agent --resume-snapshot-network`, run in the guest.
 fn is_the_boundary_resume(request: &ExecRequest) -> bool {
     !request.in_container
@@ -441,6 +451,10 @@ async fn handle_connection(client_fd: OwnedFd) {
              boot has its plan ({:?})",
             request.command.first()
         );
+        // The client is past its handshake and reads frames: tell it why, or `fcvm exec`
+        // ends with a closed connection and nothing to print.
+        use std::io::Write;
+        let _ = std::fs::File::from(conn).write_all(&refusal_frame());
         return;
     }
 
@@ -554,6 +568,17 @@ mod tests {
             false
         )));
         assert!(!is_the_boundary_resume(&request(&[], false)));
+        // A refused client is sent the reason as the protocol's error frame, which the
+        // host's exec prints (`read_exec_frames`).
+        let frame = refusal_frame();
+        match exec_proto::Message::read_from(&mut frame.as_slice()).unwrap() {
+            exec_proto::Message::Error(reason) => assert!(reason.contains("snapshot")),
+            other => panic!("the refusal is {other:?}"),
+        }
+        let source = include_str!("exec.rs");
+        let handle = &source[source.find("async fn handle_connection(").unwrap()..];
+        assert!(handle[..handle.find("crate::tty::run_session(").unwrap()]
+            .contains("write_all(&refusal_frame())"));
         // What the host sends is that command.
         let host = include_str!("../../src/commands/common.rs");
         assert!(host.contains("const FC_AGENT_PATH: &str = \"/usr/local/bin/fc-agent\";"));

@@ -255,8 +255,9 @@ list is retired, or if the list is taken while cookies are still accepted;
 
 ### A closed gate is somebody's: a source's boundary is owed until its host's resume opens it
 
-**A source's gate is closed only while a snapshot create is in flight on the host, and
-every exit from that opens it.** The prepare closes the gate and freezes the container;
+**A source's gate is closed only while a snapshot create is in flight on the host. Every
+exit from that opens it, or leaves the source running, gated and reported failed.** The
+prepare closes the gate and freezes the container;
 the resume one-shot undoes both. Three things used to break that, each a way to leave a
 source refusing new TCP for good or a clone open before its restore (#2142, #2140, #2138,
 and the model's F2):
@@ -271,9 +272,13 @@ and the model's F2):
 **A `/loopback` port's client is outside the guest whatever the list holds**
 (#2152). The rewrite gives it a source port of a reserved range
 (`network::LOOPBACK_CLIENT_PORTS`, 61000 to 65535, above the guest's ephemeral
-ports), and a 127.0.0.1 peer at a port of that range never stays. With the
+ports), and the agent records which guest ports are published with `/loopback`
+(`/run/fcvm/loopback-client-ports`). The socket at 127.0.0.1 and one of those
+ports whose peer is 127.0.0.1 at a port of the range never stays. With the
 client's own port kept, a client from source port P to guest port P was its own
-mirror image.
+mirror image. Both halves are needed: by the peer's port alone, a connection
+inside the guest to a service that listens in 61000 to 65535 would be reset at
+every restore.
 
 **The guest never opens an owed gate by itself.** A clone whose restore has not been
 dispatched is, byte for byte, its source after the resume, so a rule in the guest that
@@ -288,42 +293,65 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
 | mark | written | removed | while it is there |
 |---|---|---|---|
 | `snapshot-boundary-owed` | by the prepare, under the boundary lock, before the freeze and the gate | by the resume that opened the gate; by a restore when it is dispatched | a resume that fails leaves it, the manifest and the freeze; an fc-agent that starts and finds it opens exec at once, for the resume one-shot alone (`exec::serve_only_the_boundary_resume`) |
-| `restore-under-way` | when a restore's epoch is dispatched, before anything else of the restore | at publication, before the acknowledgement | both one-shots refuse with exit 3 and change nothing; the freeze watchdog does not count its looks |
+| `restore-under-way` | when a restore's epoch is dispatched, before anything else of the restore | at publication, before the acknowledgement | both one-shots refuse with exit 3, before they wait for the boundary lock, and change nothing; the freeze watchdog does not count its looks |
 
 - **The host asks until the gate is open** (`reopen_source_network`,
-  `src/commands/common.rs`): every 2 s for up to 150 s. Each ask is itself an exec whose
-  connect is tried for about 54 s, and an agent that died is back about a second later
-  (`RestartSec=1`), so the first ask usually lands; the bound also covers systemd's 90 s
-  stop timeout. A guest that refuses with exit 3 is not asked again.
+  `src/commands/common.rs`): for 150 s in all, 2 s between tries, every try cut off at
+  what is left (the exec's connect is tried for about 54 s, and the one-shot's run is
+  limited too). The create holds the per-VM snapshot lock and the global permit for that
+  long. An agent that died is back about a second later (`RestartSec=1`), so the first
+  ask usually lands; the bound also covers systemd's 90 s stop timeout. A guest that
+  refuses with exit 3 is not asked again.
 - **A source still gated then is left running and reported failed.** It is not ended:
   the connections it has go on working behind the gate. The create fails with
-  `source VM <id> is LEFT WITH ITS NETWORK GATE CLOSED`, the VM's state records
-  `network_gate_closed`, and the next `snapshot create` of it asks once more and is
-  refused while the gate stays closed (`refuse_a_source_left_gated`).
+  `source VM <id> is LEFT WITH ITS NETWORK GATE CLOSED`. The VM's state records
+  `network_gate_closed` from the first try that fails, so a create interrupted while it
+  asks leaves the record too, and the try that opens the gate clears it. The next
+  `snapshot create` of that VM asks once more, as its first step, and is refused while
+  the gate stays closed (`refuse_a_source_left_gated`).
 - **An agent that starts in the middle of a boundary serves exec first and starts no
   container.** It opens exec before its boot plan, for the resume alone, and holds the
-  container's start until no mark is left
-  (`hold_the_container_start_through_a_boundary`). On Cloud Hypervisor the plan comes over
-  vsock, outside the gate, and the restarted agent used to start the container while the
-  prepare believed the guest frozen; an image taken then resumed every clone with a
-  container running behind its closed gate.
+  container's start (`hold_the_container_start_through_a_boundary`) while a restore is
+  under way, or while the `owed` mark is there and the gate is installed. The mark alone
+  does not hold: it can outlive its gate. On Cloud Hypervisor the plan comes over vsock,
+  outside the gate, and the restarted agent used to go on to its container start while
+  the prepare believed the guest frozen.
+- **The agent's death still ends the VM** (#2158). systemd kills the container with the
+  agent, the next agent's `podman start` of it fails with 125, and the VM powers off
+  about a second after its boot plan arrives, with or without a snapshot in sight. For a
+  death in the middle of a boundary this section buys a gate that is reopened, a
+  `snapshot create` that succeeds and leaves a good snapshot, and no source left running
+  behind a closed gate. It does not keep the source.
+- **The hold gives up after 300 looks, one a second, that find the gate closed and
+  nobody at work on the boundary, and the agent then goes on to its container start
+  behind the closed gate.** That is twice the host's 150 s, so no create is in flight any more: it has
+  failed and recorded the source gated, or its host is gone, and nothing believes the
+  guest frozen. A create that comes later freezes the container like any running one.
+  The freeze watchdog thaws a frozen container in the same state for the same reason.
 - **The watchdog's deadline is for a boundary nobody is working on.** A look while the
   boundary lock is held or a restore is under way is not counted
   (`snapshot_network::boundary_in_progress`), so a restore or a prepare that takes over a
   minute keeps its container frozen. A source whose host died, or whose gate cannot be
-  opened, is still thawed after 60 looks.
+  opened, is still thawed after 60 counted looks. At most 900 looks at one freeze go
+  uncounted (15 minutes, the host's bound on a restore's acknowledgement), so a one-shot
+  hung under the lock cannot keep a container frozen for good. A lock that cannot be
+  opened is not "held".
 - **`rcu_expedited` is put back after a kill** (#2141). The barrier records the switch's
   value in `/run/fcvm/rcu-expedited-before` before it turns it on; the next barrier, the
   next resume and the next start of the agent put it back from the record. The resume
   does it before it tries the gate and whatever comes of that, so a reopen that never
-  lands does not leave the switch on for the next snapshot to capture.
+  lands does not leave the switch on for the next snapshot to capture. The undo writes
+  the recorded 0 even if someone set the switch to 1 on purpose meanwhile, and a guest
+  whose host died keeps the 1 until its agent restarts or its next snapshot.
 - Not covered: the host's `snapshot create` dying as well (#1936, #1941), and a stray
   one-shot on a clone before its restore is dispatched, which only the host can refuse
   (#2138's host half).
 
 `a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and_the_resume` and
 `a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs_deadline`
-(`tests/test_snapshot_gate_tcp.rs`) hold these in a VM.
+(`tests/test_snapshot_gate_tcp.rs`) hold these in a VM. The first reads the host's logs
+only (the one-shot's report, and the new agent's boot plan arriving through the egress
+half): the guest is gone too soon after the restart to be asked anything.
 
 ### On restore, the gate's egress half opens before the stale sockets are retired
 

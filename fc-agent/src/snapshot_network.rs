@@ -223,23 +223,41 @@ fn acquire_boundary_lock() -> Result<std::fs::File> {
     acquire_boundary_lock_at(Path::new(BOUNDARY_LOCK_PATH))
 }
 
-/// The boundary lock if nobody holds it: None while a prepare, a resume or a restore is
-/// inside its boundary, and when the lock cannot be opened.
-fn try_boundary_lock_at(path: &Path) -> Option<std::fs::File> {
+/// What a try at the boundary lock found.
+enum BoundaryLock {
+    /// Nobody held it; it is held here until the file is dropped.
+    Free(#[allow(dead_code)] std::fs::File),
+    /// A prepare, a resume or a restore is inside its boundary.
+    Held,
+    /// The lock could not be opened or asked. Not "held": a caller that waits for the
+    /// lock to be free would otherwise wait for ever on a `/run` it cannot write.
+    Unknown,
+}
+
+fn try_boundary_lock_at(path: &Path) -> BoundaryLock {
     use fs2::FileExt;
     use std::os::unix::fs::OpenOptionsExt;
 
-    std::fs::create_dir_all(path.parent()?).ok()?;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)
-        .ok()?;
-    FileExt::try_lock_exclusive(&file).ok()?;
-    Some(file)
+    let opened = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+        });
+    let Ok(file) = opened else {
+        return BoundaryLock::Unknown;
+    };
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => BoundaryLock::Free(file),
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => BoundaryLock::Held,
+        Err(_) => BoundaryLock::Unknown,
+    }
 }
 
 /// Who a closed gate belongs to, as two files under `/run/fcvm`. They are in guest memory,
@@ -300,12 +318,49 @@ impl BoundaryMarks {
     fn source_owed(&self) -> bool {
         self.owed.exists() && !self.restore_under_way()
     }
+}
 
-    /// Whether a boundary holds the container's start: a prepare's gate that no resume
-    /// has opened, or a restore that has not published.
-    fn hold_the_container(&self) -> bool {
-        self.owed.exists() || self.restore_under_way()
+/// Whether any part of the snapshot gate is installed, in either family: a gate chain,
+/// or a hook that jumps to one.
+async fn gate_is_installed_with<R: CommandRunner>(runner: &R) -> Result<bool> {
+    for program in ["iptables", "ip6tables"] {
+        let args = ["-w", "-S"];
+        let output = runner
+            .output(program, &args)
+            .await
+            .with_context(|| format!("spawning {program}"))?;
+        if !output.status.success() {
+            bail!(
+                "snapshot network gate state read failed: {}",
+                command_failure(program, &args, &output)
+            );
+        }
+        let rules = String::from_utf8_lossy(&output.stdout);
+        if rules.contains(GATE_INPUT_CHAIN) || rules.contains(GATE_OUTPUT_CHAIN) {
+            return Ok(true);
+        }
     }
+    Ok(false)
+}
+
+/// How often the hold on the container's start looks at the boundary.
+const HOLD_LOOK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many looks may find a source's gate closed with nobody working on its boundary
+/// before the hold gives up: five minutes of the guest running, twice the 150 s the host
+/// keeps asking a source to reopen (`SOURCE_REOPEN_BOUND` in src/commands/common.rs).
+/// Looks, not a clock, as for the freeze watchdog: a guest does not run while its VM is
+/// paused for the save.
+const HOLD_ABANDONED_LOOKS: u32 = 300;
+
+/// How a hold on the container's start ended.
+#[derive(Debug, PartialEq, Eq)]
+enum HoldEnd {
+    /// No boundary held it, or the one that did is over.
+    Over,
+    /// A source's gate stayed closed for `HOLD_ABANDONED_LOOKS` looks with nobody working
+    /// on the boundary.
+    Abandoned,
 }
 
 /// Wait until no snapshot boundary holds the container's start.
@@ -316,30 +371,88 @@ impl BoundaryMarks {
 /// by starting the container: on Cloud Hypervisor its boot plan comes over vsock, outside
 /// the gate, and it got as far as `podman start` while the host was about to pause the
 /// guest, so every clone of that image resumed with a container running behind its
-/// closed gate. So the start waits for the resume that opens the gate, and in a clone
-/// for the restore's publication. An agent that is not in a boundary waits for nothing.
+/// closed gate. An agent that is not in a boundary waits for nothing.
+///
+/// What holds the start, one look a second:
+/// - **A restore that is under way**, until it publishes. A restore that fails powers the
+///   VM off, so this ends either way.
+/// - **A source's gate that a prepare closed**: the `owed` mark with the gate installed.
+///   The mark alone does not hold. It outlives its gate when a failed prepare's rollback
+///   opened the gate and the host died before its resume, and when a resume was killed
+///   between opening the gate and removing the mark, and a container must not wait for
+///   ever on a mark with nothing behind it.
+///
+/// **When the hold gives up, and why the container then starts.** A look that finds the
+/// gate closed while someone holds the boundary lock is not counted: a prepare or a
+/// resume is at work. `HOLD_ABANDONED_LOOKS` counted looks mean no snapshot create is in
+/// flight any more: the host asks a source to reopen for 150 s and then fails the create
+/// and records the source gated, or the host is gone. From there nothing believes the
+/// guest frozen, so the container starts behind the closed gate, with a warning, as the
+/// freeze watchdog thaws one there after its own deadline. A create that comes later
+/// freezes it like any running container. Not starting it would leave a guest with a
+/// closed gate and no workload for good, with nothing gained: the gate still refuses
+/// every new connection either way, and the resume that opens it finds the workload up.
 pub async fn hold_the_container_start_through_a_boundary() {
-    let marks = BoundaryMarks::system();
-    wait_while(
-        || marks.hold_the_container(),
-        std::time::Duration::from_millis(100),
-        || {
+    let runner = SystemCommandRunner;
+    let end = hold_the_container_start_with(
+        &BoundaryMarks::system(),
+        Path::new(BOUNDARY_LOCK_PATH),
+        || gate_is_installed_with(&runner),
+        HOLD_LOOK,
+    )
+    .await;
+    if end == HoldEnd::Abandoned {
+        eprintln!(
+            "[fc-agent] WARNING: this guest's snapshot gate has been closed for \
+             {HOLD_ABANDONED_LOOKS} looks with no snapshot at work on it; starting the \
+             container behind it. The gate refuses every new TCP connection until \
+             `fc-agent --resume-snapshot-network` opens it"
+        );
+    }
+}
+
+async fn hold_the_container_start_with<F, Fut>(
+    marks: &BoundaryMarks,
+    lock: &Path,
+    gate_is_installed: F,
+    look: std::time::Duration,
+) -> HoldEnd
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<bool>>,
+{
+    let mut announced = false;
+    let mut counted = 0u32;
+    loop {
+        let held = if marks.restore_under_way() {
+            true
+        } else if marks.owed.exists() {
+            // A gate that cannot be read is taken for closed.
+            let closed = gate_is_installed().await.unwrap_or_else(|error| {
+                eprintln!("[fc-agent] WARNING: {error:#}; taking the snapshot gate for closed");
+                true
+            });
+            if closed && !matches!(try_boundary_lock_at(lock), BoundaryLock::Held) {
+                counted += 1;
+                if counted >= HOLD_ABANDONED_LOOKS {
+                    return HoldEnd::Abandoned;
+                }
+            }
+            closed
+        } else {
+            false
+        };
+        if !held {
+            return HoldEnd::Over;
+        }
+        if !announced {
+            announced = true;
             eprintln!(
                 "[fc-agent] a snapshot boundary is in progress; the container starts when it \
                  is over"
-            )
-        },
-    )
-    .await;
-}
-
-async fn wait_while(held: impl Fn() -> bool, poll: std::time::Duration, announce: impl FnOnce()) {
-    if !held() {
-        return;
-    }
-    announce();
-    while held() {
-        tokio::time::sleep(poll).await;
+            );
+        }
+        tokio::time::sleep(look).await;
     }
 }
 
@@ -397,14 +510,15 @@ pub fn boundary_in_progress() -> bool {
 }
 
 fn boundary_in_progress_at(marks: &BoundaryMarks, lock: &Path) -> bool {
-    marks.restore_under_way() || (lock.exists() && try_boundary_lock_at(lock).is_none())
+    marks.restore_under_way()
+        || (lock.exists() && matches!(try_boundary_lock_at(lock), BoundaryLock::Held))
 }
 
 /// Put `rcu_expedited` back if a barrier that was killed left it on (#2141). Under the
 /// boundary lock, which every barrier runs under; when someone holds it, their own
 /// barrier does this first.
 pub fn put_back_rcu_expedited_after_a_kill() {
-    if let Some(_lock) = try_boundary_lock_at(Path::new(BOUNDARY_LOCK_PATH)) {
+    if let BoundaryLock::Free(_lock) = try_boundary_lock_at(Path::new(BOUNDARY_LOCK_PATH)) {
         ExpeditedGracePeriods::put_back(
             Path::new(RCU_EXPEDITED_KNOB),
             Path::new(RCU_EXPEDITED_RECORD),
@@ -682,6 +796,12 @@ impl PacketReceiveBarrier for SystemPacketReceiveBarrier {
 /// back. A record that is found says a barrier was killed with the switch on: the next
 /// barrier, the next resume one-shot and the next start of the agent put the switch back
 /// from it (`put_back`). The barrier never turns the switch on without the record.
+///
+/// Two limits. `put_back` writes the recorded value, which is 0, also when someone
+/// turned the switch on on purpose between the kill and the undo: the record cannot tell
+/// their 1 from the barrier's. And until one of the three runs, the 1 stays: a guest whose
+/// host died with the prepare keeps expediting until its agent restarts or its next
+/// snapshot.
 struct ExpeditedGracePeriods<'a> {
     knob: &'a Path,
     record: &'a Path,
@@ -2090,14 +2210,20 @@ pub struct RestoreNetworkReport {
 /// its mirror image is in the list. A socket with no mirror image has its other end
 /// outside the guest, or has lost it, whatever address it records for it.
 ///
-/// One socket never stays, whatever the list holds: one whose peer is 127.0.0.1 at a port
-/// of `network::LOOPBACK_CLIENT_PORTS`. That is a client of a `/loopback` port, which the
-/// guest's nat rules gave that address and a port of that range, and its other end is on
-/// the host. Without the range the client's own source port was kept, and a client that
-/// connected from port P to guest port P made a socket that is its own mirror image, and
-/// two clients crossing two such ports made each other's (#2152). A process in the guest
-/// that binds a port of the range itself and connects over loopback loses that
-/// connection at a restore, which is the safe direction.
+/// One socket never stays, whatever the list holds: the server's end of a `/loopback`
+/// port's client. The guest's nat rules give such a client the address 127.0.0.1 and a
+/// port of `network::LOOPBACK_CLIENT_PORTS`, so the socket is the one at 127.0.0.1 and a
+/// `/loopback` guest port (`SocketDiagnostic::loopback_client_ports`) whose peer is
+/// 127.0.0.1 at a port of that range, and its other end is on the host. Without the
+/// range the client's own source port was kept, and a client that connected from port P
+/// to guest port P made a socket that is its own mirror image, and two clients crossing
+/// two such ports made each other's (#2152).
+///
+/// Both halves of the test are needed. The peer's port alone would take every
+/// connection inside the guest to a service that listens in 61000 to 65535 for a
+/// client's, and reset it at each restore. What is still retired without being a client
+/// from the host: a connection a guest process makes to a `/loopback` guest port from a
+/// source port it bound in the range itself. That is the safe direction.
 ///
 /// The list is two dumps, IPv4 and then IPv6, and no dump is one instant, so a connection
 /// made inside the guest while it is taken can have only one end in it. When a socket
@@ -2108,6 +2234,7 @@ fn sockets_leaving_the_guest<D: SocketDiagnostic>(
     diagnostic: &mut D,
     may_stay: impl Fn(&TcpSocketIdentity) -> Result<bool>,
 ) -> Result<Vec<TcpSocketIdentity>> {
+    let loopback_ports = diagnostic.loopback_client_ports()?;
     let first = diagnostic.dump_tcp_sockets()?;
     let mut ends = std::collections::HashSet::with_capacity(first.len());
     for socket in &first {
@@ -2117,8 +2244,9 @@ fn sockets_leaving_the_guest<D: SocketDiagnostic>(
     let mut leaving = Vec::new();
     for socket in first {
         let [own, peer] = socket.ends()?;
-        let other_end =
-            (!is_a_loopback_ports_client(peer) && may_stay(&socket)?).then_some([peer, own]);
+        let other_end = (!is_a_loopback_ports_client(own, peer, &loopback_ports)
+            && may_stay(&socket)?)
+        .then_some([peer, own]);
         if !other_end.is_some_and(|end| ends.contains(&end)) {
             leaving.push((socket, other_end));
         }
@@ -2136,10 +2264,18 @@ fn sockets_leaving_the_guest<D: SocketDiagnostic>(
     Ok(leaving.into_iter().map(|(socket, _)| socket).collect())
 }
 
-/// Whether `peer` is the address a `/loopback` port's client is given: 127.0.0.1, at a
-/// port of the range reserved for the rewrite.
-fn is_a_loopback_ports_client(peer: (IpAddr, u16)) -> bool {
-    peer.0 == IpAddr::V4(Ipv4Addr::LOCALHOST)
+/// Whether the socket at `own` with peer `peer` is the server's end of a `/loopback`
+/// port's client: at 127.0.0.1 and one of the guest's `/loopback` ports, with a peer at
+/// 127.0.0.1 and a port of the range reserved for the rewrite.
+fn is_a_loopback_ports_client(
+    own: (IpAddr, u16),
+    peer: (IpAddr, u16),
+    loopback_ports: &std::collections::HashSet<u16>,
+) -> bool {
+    let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    own.0 == loopback
+        && loopback_ports.contains(&own.1)
+        && peer.0 == loopback
         && crate::network::LOOPBACK_CLIENT_PORTS.contains(&peer.1)
 }
 
@@ -2235,6 +2371,9 @@ const ACK_CHARGE_BOUND: usize = 2048;
 
 trait SocketDiagnostic {
     fn dump_tcp_sockets(&mut self) -> Result<Vec<TcpSocketIdentity>>;
+    /// The guest ports published with `/loopback`, whose clients the guest's nat rules
+    /// rewrite to 127.0.0.1 (`network::loopback_client_guest_ports`).
+    fn loopback_client_ports(&self) -> Result<std::collections::HashSet<u16>>;
     /// Retire `sockets` by cookie and return one outcome per socket, in order.
     /// A socket the kernel could not retire fails the whole call.
     fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>>;
@@ -2261,6 +2400,11 @@ impl SocketDiagnostic for SystemSocketDiagnostic {
             sockets.extend(dump_family(family)?);
         }
         Ok(sockets)
+    }
+
+    fn loopback_client_ports(&self) -> Result<std::collections::HashSet<u16>> {
+        crate::network::loopback_client_guest_ports()
+            .context("reading which guest ports are published with /loopback")
     }
 
     fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
@@ -2955,10 +3099,13 @@ async fn publish_with<G: FirewallGate, H: RestoreHook>(
 #[derive(Debug)]
 pub struct PrepareFailure {
     pub error: anyhow::Error,
-    /// Whether this prepare froze the container, which its caller then thaws: the host
-    /// resumes the source on its own when the prepare fails. False when the prepare was
-    /// refused before it changed anything.
-    pub froze: bool,
+    /// Whether the caller thaws the container: this prepare froze it, and the gate is
+    /// open again (the prepare's own rollback removed it). False when the prepare was
+    /// refused before it changed anything, and when the gate is still installed or could
+    /// not be read: thawed behind a closed gate, each connection the container made was
+    /// answered with a reset, and the resume the host sends after a failed prepare thaws
+    /// it once the gate is open.
+    pub thaw: bool,
 }
 
 /// The source side of a snapshot's boundary. `freeze` freezes the container
@@ -2980,6 +3127,7 @@ pub async fn prepare_snapshot_network(
         &BoundaryMarks::system(),
         Path::new(BOUNDARY_LOCK_PATH),
         freeze,
+        || gate_is_installed_with(&SystemCommandRunner),
         || async {
             let gate = IptablesGate::new(SystemCommandRunner);
             let receive_barrier = SystemPacketReceiveBarrier::new();
@@ -3007,20 +3155,20 @@ pub async fn prepare_snapshot_network(
     .await
 }
 
-async fn prepare_snapshot_network_in<F, Fut>(
+async fn prepare_snapshot_network_in<F, Fut, G, GFut>(
     marks: &BoundaryMarks,
     lock: &Path,
     freeze: impl FnOnce(),
+    gate_is_installed: G,
     boundary: F,
 ) -> std::result::Result<(), PrepareFailure>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
+    G: FnOnce() -> GFut,
+    GFut: std::future::Future<Output = Result<bool>>,
 {
-    let refused = |error: anyhow::Error| PrepareFailure {
-        error,
-        froze: false,
-    };
+    let refused = |error: anyhow::Error| PrepareFailure { error, thaw: false };
     if marks.restore_under_way() {
         return Err(refused(RestoreUnderWay("a snapshot's prepare").into()));
     }
@@ -3033,9 +3181,12 @@ where
         .context("recording that this snapshot's boundary is owed a resume")
         .map_err(refused)?;
     freeze();
-    boundary()
-        .await
-        .map_err(|error| PrepareFailure { error, froze: true })
+    let Err(error) = boundary().await else {
+        return Ok(());
+    };
+    // A gate that cannot be read is taken for closed.
+    let thaw = matches!(gate_is_installed().await, Ok(false));
+    Err(PrepareFailure { error, thaw })
 }
 
 /// The host's clock that `--resume-snapshot-network` was given, as decimal
@@ -3077,11 +3228,16 @@ pub fn resume_host_time(args: &[String]) -> Option<&str> {
 /// has passed, and then says which VM is left gated.
 pub async fn resume_source_network(host_time: Option<&str>) -> SourceResume {
     let marks = BoundaryMarks::system();
+    // Before the lock, which a restore holds until it publishes: the host's reopen after
+    // a refused prepare is answered at once, not when the restore is over. And again
+    // under it, for a restore dispatched meanwhile (#2138).
+    if marks.restore_under_way() {
+        return SourceResume::owed(RestoreUnderWay("a source's resume").into());
+    }
     let _transaction_lock = match acquire_boundary_lock() {
         Ok(lock) => lock,
         Err(error) => return SourceResume::owed(error),
     };
-    // Under the lock: a restore that was dispatched holds the gate from here on (#2138).
     if marks.restore_under_way() {
         return SourceResume::owed(RestoreUnderWay("a source's resume").into());
     }
@@ -4189,7 +4345,7 @@ mod tests {
     /// (`network::publish_as_loopback_client`). No socket in the guest is its other end.
     fn loopback_client_port_socket(cookie: u32) -> TcpSocketIdentity {
         let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        end_at(cookie, (loopback, 8097), (loopback, 61000))
+        end_at(cookie, (loopback, LOOPBACK_PORT), (loopback, 61000))
     }
 
     /// A `/loopback` port's client is outside the guest whatever the socket list holds
@@ -4203,10 +4359,17 @@ mod tests {
     ///   whose server end is gone, is the mirror image of a later `/loopback` client that
     ///   arrives from port x.
     ///
-    /// The rewrite gives such a client a port of a reserved range, and a loopback peer
-    /// at a port of that range never stays.
+    /// The rewrite gives such a client a port of a reserved range, and the socket at a
+    /// `/loopback` guest port whose peer is 127.0.0.1 at a port of that range never stays.
     ///
-    /// RED BEFORE THE FIX: each of the three was kept by the manifest and by the restore.
+    /// The socket's own port is half of the test. A service of the guest that listens on
+    /// 127.0.0.1 in the reserved range, with a client inside the guest, is a connection
+    /// inside the guest and stays.
+    ///
+    /// RED BEFORE THE FIX: each of the three shapes was kept by the manifest and by the
+    /// restore.
+    /// RED WITH THE PEER'S PORT ALONE: the client's end of a connection inside the guest
+    /// to a service listening on 127.0.0.1:61000 is named and reset in every clone.
     #[test]
     fn a_loopback_ports_client_never_stays_whatever_the_list_holds() {
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -4217,39 +4380,63 @@ mod tests {
             routes: Vec::new(),
             sockets: Vec::new(),
         };
-        let both = |sockets: &[TcpSocketIdentity], leaving: &[TcpSocketIdentity]| {
+        let both = |published: &[u16],
+                    sockets: &[TcpSocketIdentity],
+                    leaving: &[TcpSocketIdentity]| {
             assert_eq!(
-                manifest_sockets(&mut Dumps::of(&[sockets])).unwrap(),
+                manifest_sockets(&mut Dumps::of(&[sockets]).publishing(published)).unwrap(),
                 leaving.to_vec(),
                 "the manifest"
             );
             assert_eq!(
-                unlisted_sockets(&mut Dumps::of(&[sockets]), &empty).unwrap(),
+                unlisted_sockets(&mut Dumps::of(&[sockets]).publishing(published), &empty).unwrap(),
                 leaving.to_vec(),
                 "the restore's list"
             );
         };
-        // its own mirror image: guest port P, from source port P
+        // its own mirror image: `/loopback` guest port P, from source port P
         let own_image = end_at(1, (lo, p1), (lo, p1));
-        both(&[own_image], &[own_image]);
-        // two clients, two ports, each the other's mirror image
+        both(&[p1, p2], &[own_image], &[own_image]);
+        // two clients, two `/loopback` ports, each the other's mirror image
         let crossing = [end_at(2, (lo, p1), (lo, p2)), end_at(3, (lo, p2), (lo, p1))];
-        both(&crossing, &crossing);
+        both(&[p1, p2], &crossing, &crossing);
         // a leaked in-guest client end that a later `/loopback` client happens to mirror
-        let leaked = end_at(4, (lo, p2), (lo, 8097));
-        let later_client = end_at(5, (lo, 8097), (lo, p2));
-        both(&[leaked, later_client], &[later_client]);
+        let leaked = end_at(4, (lo, p2), (lo, LOOPBACK_PORT));
+        let later_client = end_at(5, (lo, LOOPBACK_PORT), (lo, p2));
+        both(&[LOOPBACK_PORT], &[leaked, later_client], &[later_client]);
+
         // A connection inside the guest from an ephemeral port stays, as before.
         let inside = connection(6, 7, "127.0.0.1", "127.0.0.1");
-        both(&inside, &[]);
+        both(&[LOOPBACK_PORT], &inside, &[]);
         assert!(!crate::network::LOOPBACK_CLIENT_PORTS.contains(&40000));
-        // only 127.0.0.1 is the rewrite's address
-        assert!(!is_a_loopback_ports_client((
-            "127.0.0.53".parse().unwrap(),
-            p1
-        )));
-        assert!(!is_a_loopback_ports_client(("::1".parse().unwrap(), p1)));
-        assert!(is_a_loopback_ports_client((lo, 65535)));
+        // A service of the guest that listens in the reserved range, on a port that is
+        // not published with `/loopback`, and its client inside the guest: stays.
+        let service = [
+            end_at(8, (lo, 40000), (lo, p1)),
+            end_at(9, (lo, p1), (lo, 40000)),
+        ];
+        both(&[LOOPBACK_PORT], &service, &[]);
+        both(&[], &service, &[]);
+        // And the same two sockets when p1 is a `/loopback` port: the client's port is
+        // not of the range, so this is no rewritten client either.
+        both(&[p1], &service, &[]);
+
+        let ports: std::collections::HashSet<u16> = [LOOPBACK_PORT].into_iter().collect();
+        let client =
+            |own: (IpAddr, u16), peer: (IpAddr, u16)| is_a_loopback_ports_client(own, peer, &ports);
+        assert!(client((lo, LOOPBACK_PORT), (lo, 65535)));
+        assert!(!client((lo, LOOPBACK_PORT), (lo, 60999)));
+        assert!(!client((lo, 8080), (lo, p1)), "not a /loopback guest port");
+        // only 127.0.0.1 is the rewrite's address, on both ends
+        assert!(!client(
+            (lo, LOOPBACK_PORT),
+            ("127.0.0.53".parse().unwrap(), p1)
+        ));
+        assert!(!client((lo, LOOPBACK_PORT), ("::1".parse().unwrap(), p1)));
+        assert!(!client(
+            ("10.0.2.100".parse().unwrap(), LOOPBACK_PORT),
+            (lo, p1)
+        ));
     }
 
     /// A diagnostic that answers each dump with the next of the lists it was given, and
@@ -4257,14 +4444,25 @@ mod tests {
     struct Dumps {
         lists: Vec<Vec<TcpSocketIdentity>>,
         taken: usize,
+        /// The guest ports published with `/loopback`.
+        loopback_ports: Vec<u16>,
     }
+
+    /// The `/loopback` guest port of the test doubles' guest.
+    const LOOPBACK_PORT: u16 = 8097;
 
     impl Dumps {
         fn of(lists: &[&[TcpSocketIdentity]]) -> Dumps {
             Dumps {
                 lists: lists.iter().map(|list| list.to_vec()).collect(),
                 taken: 0,
+                loopback_ports: vec![LOOPBACK_PORT],
             }
+        }
+
+        fn publishing(mut self, loopback_ports: &[u16]) -> Dumps {
+            self.loopback_ports = loopback_ports.to_vec();
+            self
         }
     }
 
@@ -4273,6 +4471,10 @@ mod tests {
             let list = self.lists[self.taken.min(self.lists.len() - 1)].clone();
             self.taken += 1;
             Ok(list)
+        }
+
+        fn loopback_client_ports(&self) -> Result<std::collections::HashSet<u16>> {
+            Ok(self.loopback_ports.iter().copied().collect())
         }
 
         fn destroy(&mut self, _sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
@@ -4705,6 +4907,10 @@ mod tests {
             Ok(listed)
         }
 
+        fn loopback_client_ports(&self) -> Result<std::collections::HashSet<u16>> {
+            Ok([LOOPBACK_PORT].into_iter().collect())
+        }
+
         fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
             let mut state = self.0.lock().unwrap();
             state.destroy_calls += 1;
@@ -5003,6 +5209,10 @@ mod tests {
         /// The model kernel holds the manifest's sockets and no other.
         fn dump_tcp_sockets(&mut self) -> Result<Vec<TcpSocketIdentity>> {
             Ok(Vec::new())
+        }
+
+        fn loopback_client_ports(&self) -> Result<std::collections::HashSet<u16>> {
+            Ok(Default::default())
         }
 
         fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
@@ -9036,10 +9246,14 @@ mod tests {
         let marks = marks_in(dir.path());
         let lock = dir.path().join("run").join("lock");
         let events = Mutex::new(Vec::new());
+        // What a read of the gate finds after a failed prepare: installed, gone, or no
+        // answer.
+        let gate = Mutex::new(Some(false));
         let run = |fail: bool| {
             let events = &events;
             let marks = &marks;
             let lock = &lock;
+            let gate = &gate;
             async move {
                 prepare_snapshot_network_in(
                     marks,
@@ -9047,6 +9261,12 @@ mod tests {
                     || {
                         assert!(marks.owed.exists(), "frozen before the boundary is owed");
                         events.lock().unwrap().push("freeze");
+                    },
+                    || async {
+                        match *gate.lock().unwrap() {
+                            Some(installed) => Ok(installed),
+                            None => bail!("injected gate read failure"),
+                        }
                     },
                     || async {
                         events.lock().unwrap().push("boundary");
@@ -9063,7 +9283,7 @@ mod tests {
         begin_restore_boundary_in(&marks).unwrap();
         let refused = run(false).await.unwrap_err();
         assert!(
-            !refused.froze,
+            !refused.thaw,
             "a refused prepare's caller would thaw the restore's freeze"
         );
         assert!(refused.error.downcast_ref::<RestoreUnderWay>().is_some());
@@ -9083,13 +9303,26 @@ mod tests {
         assert!(marks.source_owed());
 
         events.lock().unwrap().clear();
+        // The prepare's rollback removed the gate: the caller thaws.
         let failed = run(true).await.unwrap_err();
-        assert!(failed.froze);
+        assert!(failed.thaw);
         assert!(failed.error.downcast_ref::<RestoreUnderWay>().is_none());
         assert!(
             marks.source_owed(),
             "a failed prepare's boundary is still owed its resume"
         );
+        // The gate is still installed, or cannot be read: the container stays frozen for
+        // the resume that opens it.
+        // RED BEFORE THE FIX: a failed prepare thawed whatever the gate's state.
+        for still_closed in [Some(true), None] {
+            *gate.lock().unwrap() = still_closed;
+            let failed = run(true).await.unwrap_err();
+            assert!(
+                !failed.thaw,
+                "thawed behind a gate read as {still_closed:?}"
+            );
+        }
+        *gate.lock().unwrap() = Some(false);
 
         // A restore dispatched while the prepare waits for the boundary lock.
         events.lock().unwrap().clear();
@@ -9103,62 +9336,187 @@ mod tests {
         });
         let refused = run(false).await.unwrap_err();
         dispatched.join().unwrap();
-        assert!(!refused.froze);
+        assert!(!refused.thaw);
         assert!(refused.error.downcast_ref::<RestoreUnderWay>().is_some());
         assert!(events.lock().unwrap().is_empty());
         assert!(!marks.owed.exists());
     }
 
-    /// The container's start waits out a boundary: a prepare's gate that no resume has
-    /// opened, and a restore that has not published. With neither it waits for nothing.
+    /// The container's start waits out a boundary, and no longer.
     ///
-    /// RED BEFORE THE FIX: nothing in the agent's start looked at the boundary.
+    /// - With no mark it waits for nothing.
+    /// - A restore under way holds it until the restore publishes.
+    /// - A source's `owed` mark holds it only while the gate is installed. A mark whose
+    ///   gate is gone (a failed prepare's rollback opened it and the host died, or a
+    ///   resume was killed between the gate and the mark) holds nothing.
+    /// - With the gate closed, a look while someone holds the boundary lock is not
+    ///   counted; `HOLD_ABANDONED_LOOKS` counted looks end the hold as abandoned.
+    ///
+    /// RED BEFORE THE FIX: nothing in the agent's start looked at the boundary. Then: a
+    /// stale `owed` mark with the gate open, and a closed gate nobody would ever open,
+    /// each held the container's start for ever.
     #[tokio::test]
     async fn the_containers_start_waits_for_the_boundary_to_be_over() {
         let dir = tempfile::tempdir().unwrap();
         let marks = marks_in(dir.path());
-        let poll = std::time::Duration::from_millis(5);
-        let events = Mutex::new(Vec::new());
-        let wait = || {
-            wait_while(
-                || marks.hold_the_container(),
-                poll,
-                || events.lock().unwrap().push("announced"),
+        let lock = dir.path().join("run").join("lock");
+        let look = std::time::Duration::from_millis(1);
+        let gate_closed = std::sync::atomic::AtomicBool::new(true);
+        let looks = AtomicU32::new(0);
+        let hold = || {
+            hold_the_container_start_with(
+                &marks,
+                &lock,
+                || async {
+                    looks.fetch_add(1, Ordering::SeqCst);
+                    Ok(gate_closed.load(Ordering::SeqCst))
+                },
+                look,
             )
         };
-        // no boundary: at once, and nothing said
-        tokio::time::timeout(std::time::Duration::from_secs(5), wait())
+        let within = |limit_ms: u64| std::time::Duration::from_millis(limit_ms);
+
+        // no boundary: at once, and the gate is not even read
+        assert_eq!(hold().await, HoldEnd::Over);
+        assert_eq!(looks.load(Ordering::SeqCst), 0);
+
+        // a stale mark, its gate open: nothing to wait for
+        BoundaryMarks::mark(&marks.owed).unwrap();
+        gate_closed.store(false, Ordering::SeqCst);
+        assert_eq!(
+            tokio::time::timeout(within(5_000), hold()).await.unwrap(),
+            HoldEnd::Over
+        );
+
+        // a prepare's gate, a boundary someone is working on: held, and not counted
+        gate_closed.store(true, Ordering::SeqCst);
+        let working = acquire_boundary_lock_at(&lock).unwrap();
+        looks.store(0, Ordering::SeqCst);
+        tokio::time::timeout(within(3_000), hold())
+            .await
+            .expect_err("the hold gave up on a boundary someone is working on");
+        assert!(
+            looks.load(Ordering::SeqCst) > HOLD_ABANDONED_LOOKS,
+            "the test did not look often enough to tell"
+        );
+        drop(working);
+        // ... until the resume opens the gate
+        let opened = async {
+            tokio::time::sleep(within(30)).await;
+            gate_closed.store(false, Ordering::SeqCst);
+        };
+        let (end, ()) = tokio::time::timeout(within(5_000), async { tokio::join!(hold(), opened) })
             .await
             .unwrap();
-        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(end, HoldEnd::Over);
 
-        // a prepare's gate: until the resume
-        BoundaryMarks::mark(&marks.owed).unwrap();
-        tokio::time::timeout(std::time::Duration::from_millis(100), wait())
-            .await
-            .expect_err("the container started behind a gate that is owed its resume");
-        // the image's clone: the restore takes the boundary, and the start still waits
+        // the gate closed and nobody working on it: abandoned after the counted looks
+        gate_closed.store(true, Ordering::SeqCst);
+        looks.store(0, Ordering::SeqCst);
+        assert_eq!(
+            tokio::time::timeout(within(30_000), hold()).await.unwrap(),
+            HoldEnd::Abandoned
+        );
+        assert_eq!(looks.load(Ordering::SeqCst), HOLD_ABANDONED_LOOKS);
+
+        // the image's clone: the restore takes the boundary, and the start waits for its
+        // publication whatever the gate
         begin_restore_boundary_in(&marks).unwrap();
         assert!(!marks.owed.exists());
-        tokio::time::timeout(std::time::Duration::from_millis(100), wait())
+        tokio::time::timeout(within(100), hold())
             .await
             .expect_err("the container started in the middle of a restore");
         let published = async {
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            tokio::time::sleep(within(30)).await;
             BoundaryMarks::clear(&marks.restore).unwrap();
-            events.lock().unwrap().push("published");
         };
-        let started = async {
-            wait().await;
-            events.lock().unwrap().push("container");
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(published, started)
-        })
-        .await
-        .unwrap();
-        let events = events.lock().unwrap();
-        assert_eq!(&events[events.len() - 2..], ["published", "container"]);
+        let (end, ()) =
+            tokio::time::timeout(within(5_000), async { tokio::join!(hold(), published) })
+                .await
+                .unwrap();
+        assert_eq!(end, HoldEnd::Over);
+
+        // The hold outlasts the host's asking: no create is in flight when it gives up.
+        let host = include_str!("../../src/commands/common.rs");
+        assert!(host.contains(
+            "const SOURCE_REOPEN_BOUND: std::time::Duration = std::time::Duration::from_secs(150);"
+        ));
+        assert!(u64::from(HOLD_ABANDONED_LOOKS) * HOLD_LOOK.as_secs() >= 2 * 150);
+    }
+
+    /// Any part of the gate, in either family, is a gate that is installed; a read that
+    /// fails is an error, not "open".
+    #[tokio::test]
+    async fn a_gate_is_installed_while_any_of_its_chains_or_hooks_is() {
+        struct Rules(&'static str, &'static str, bool);
+        impl CommandRunner for Rules {
+            async fn output(
+                &self,
+                program: &str,
+                args: &[&str],
+            ) -> io::Result<std::process::Output> {
+                assert_eq!(args, ["-w", "-S"]);
+                let rules = if program == "iptables" {
+                    self.0
+                } else {
+                    self.1
+                };
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(if self.2 { 0 } else { 256 }),
+                    stdout: rules.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                })
+            }
+            async fn output_with_input(
+                &self,
+                _program: &str,
+                _args: &[&str],
+                _input: &[u8],
+            ) -> io::Result<std::process::Output> {
+                unreachable!("a read of the gate writes nothing")
+            }
+        }
+        let none = "-P INPUT ACCEPT\n-P OUTPUT ACCEPT\n";
+        assert!(!gate_is_installed_with(&Rules(none, none, true))
+            .await
+            .unwrap());
+        for part in ["-N FCVM_SNAPSHOT_IN\n", "-A OUTPUT -j FCVM_SNAPSHOT_OUT\n"] {
+            assert!(gate_is_installed_with(&Rules(part, none, true))
+                .await
+                .unwrap());
+            assert!(gate_is_installed_with(&Rules(none, part, true))
+                .await
+                .unwrap());
+        }
+        assert!(gate_is_installed_with(&Rules(none, none, false))
+            .await
+            .is_err());
+        assert!(none.len() > 1 && !none.contains(GATE_INPUT_CHAIN));
+    }
+
+    /// The boundary lock is "held" only when someone holds it. A lock that cannot be
+    /// opened is not held: the watchdog and the container's start wait on "held", and a
+    /// `/run` that cannot be written must not make them wait for ever.
+    ///
+    /// RED BEFORE THE FIX: a lock that could not be opened read as held.
+    #[test]
+    fn a_boundary_lock_that_cannot_be_opened_is_not_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = marks_in(dir.path());
+        let lock = dir.path().join("run").join("lock");
+        assert!(matches!(try_boundary_lock_at(&lock), BoundaryLock::Free(_)));
+        let held = acquire_boundary_lock_at(&lock).unwrap();
+        assert!(matches!(try_boundary_lock_at(&lock), BoundaryLock::Held));
+        assert!(boundary_in_progress_at(&marks, &lock));
+        drop(held);
+        // a directory where the lock file should be: it exists, and cannot be opened
+        let unopenable = dir.path().join("run").join("a-directory");
+        std::fs::create_dir_all(&unopenable).unwrap();
+        assert!(matches!(
+            try_boundary_lock_at(&unopenable),
+            BoundaryLock::Unknown
+        ));
+        assert!(!boundary_in_progress_at(&marks, &unopenable));
     }
 
     /// Whose a closed gate is. A restore that is dispatched takes the boundary: its mark
@@ -9208,15 +9566,14 @@ mod tests {
         let end = at("crate::snapshot_network::end_restore_boundary();");
         assert!(at("crate::restore::handle_clone_restore(") < end);
         assert!(end < at("crate::vsock::notify_restore_complete("));
-        // The resume one-shot refuses under the lock.
+        // The resume one-shot refuses before it waits for the lock, which a restore holds
+        // until it publishes, and again under it.
         let source = include_str!("snapshot_network.rs");
         let resume = function_body(source, "pub async fn resume_source_network(");
-        assert!(
-            resume.find("acquire_boundary_lock()").unwrap()
-                < resume
-                    .find("RestoreUnderWay(\"a source's resume\")")
-                    .unwrap()
-        );
+        let locked = resume.find("acquire_boundary_lock()").unwrap();
+        let refusal = "RestoreUnderWay(\"a source's resume\")";
+        assert!(resume.find(refusal).unwrap() < locked);
+        assert!(resume.rfind(refusal).unwrap() > locked);
     }
 
     /// The barrier waits its grace period in its own thread. Releasing a

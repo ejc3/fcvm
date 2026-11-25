@@ -114,12 +114,13 @@ async fn main() {
             // restore is under way and before it closes the gate: frozen, the container
             // opens no socket and faults no page while the boundary closes, and a
             // restored clone starts with it frozen (payload_freeze). A prepare that froze
-            // and then failed thaws it again: the host resumes the source on its own
-            // when the prepare fails. One that was refused froze nothing and thaws
-            // nothing, because the freeze it would undo is a restore's.
+            // and then failed thaws it again when the gate is open again, as the resume
+            // does: the host resumes the source on its own when the prepare fails. One
+            // that was refused froze nothing and thaws nothing, because the freeze it
+            // would undo is a restore's.
             let prepared = snapshot_network::prepare_snapshot_network(payload_freeze::freeze).await;
             Some(prepared.map_err(|failure| {
-                if failure.froze {
+                if failure.thaw {
                     payload_freeze::thaw();
                 }
                 failure.error
@@ -254,7 +255,8 @@ fn fatal_error_line(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     /// The container is frozen by the boundary's prepare and thawed when a prepare that
-    /// froze it fails and when the source's resume has opened the gate; a restored clone
+    /// froze it fails with the gate open again and when the source's resume has opened
+    /// the gate; a restored clone
     /// thaws it before publication (payload_freeze). A freeze with no thaw on one of those
     /// paths would leave the container stopped, so each is pinned.
     ///
@@ -272,11 +274,11 @@ mod tests {
             .expect("no prepare one-shot");
         let freeze = squeezed[prepare..].contains(
             "letprepared=snapshot_network::prepare_snapshot_network(payload_freeze::freeze).await;\
-             Some(prepared.map_err(|failure|{iffailure.froze{payload_freeze::thaw();}failure.error}))",
+             Some(prepared.map_err(|failure|{iffailure.thaw{payload_freeze::thaw();}failure.error}))",
         );
         assert!(
             freeze,
-            "the prepare is not handed the freeze, or does not thaw exactly when it froze"
+            "the prepare is not handed the freeze, or does not thaw exactly when it is told to"
         );
         assert!(
             squeezed.contains("ifresumed.gate_open{payload_freeze::thaw();}Some(resumed.result)"),
@@ -320,6 +322,19 @@ mod tests {
             .expect("the agent starts no freeze watchdog");
         let agent = squeezed.find("agent::run()").expect("no agent run");
         assert!(watchdog < agent && prepare < watchdog);
+    }
+
+    /// A boundary one-shot that is refused because a restore is under way exits with the
+    /// status the host reads as "do not ask again" (`reopen_source_network`).
+    #[test]
+    fn a_refused_one_shot_exits_with_the_status_the_host_reads() {
+        let host = include_str!("../../src/commands/common.rs");
+        assert!(host.contains(&format!(
+            "const ONE_SHOT_REFUSED_EXIT: i32 = {};",
+            super::REFUSED_EXIT
+        )));
+        let main = include_str!("main.rs");
+        assert!(main.contains("std::process::exit(if refused { REFUSED_EXIT } else { 1 });"));
     }
 
     use super::fatal_error_line;

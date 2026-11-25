@@ -63,6 +63,42 @@ async fn wait_for_log(path: &std::path::Path, marker: &str) -> Result<()> {
     Ok(())
 }
 
+/// Wait for `path` to hold `marker` somewhere after its first `after`. The log is a VM's,
+/// and a VM that is gone will log nothing more: fail two seconds after it went (what it
+/// wrote last may still be on its way to the file), not at the deadline.
+async fn wait_for_log_after(
+    path: &std::path::Path,
+    vm_pid: u32,
+    after: &str,
+    marker: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut gone_since: Option<Instant> = None;
+    loop {
+        if gone_since.is_none() && !std::path::Path::new(&format!("/proc/{vm_pid}")).exists() {
+            gone_since = Some(Instant::now());
+        }
+        let logged = std::fs::read_to_string(path).unwrap_or_default();
+        if logged
+            .split_once(after)
+            .is_some_and(|(_, rest)| rest.contains(marker))
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            gone_since.is_none_or(|gone| gone.elapsed() < Duration::from_secs(2)),
+            "the VM is gone and {} holds no {marker:?} after {after:?}",
+            path.display()
+        );
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{} never logged {marker:?} after {after:?}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Leave the guest tracking a connection from the host's port `port` to its port 80 as
 /// ESTABLISHED although the connection is over: attach connection tracking with a rule
 /// that uses it, connect and hold the connection, delete the rule, and end the
@@ -802,6 +838,18 @@ const GATE_CHAINS: &str =
 /// systemd starts the next agent about a second after the kill (`RestartSec=1`), which is
 /// inside the 54 s the host's exec keeps trying to connect, so the first ask lands.
 ///
+/// What says the gate is open is read on the host, from two logs:
+///
+/// - the resume one-shot's own report, which the host logs when the one-shot succeeds;
+/// - the new agent fetching its boot plan after it started with the boundary owed. That
+///   fetch is a TCP connection out of the guest, which the gate's egress half refuses.
+///
+/// Nothing is asked of the guest after the restart, because it does not live: systemd
+/// killed the container with the agent, the new agent cannot start it again, and the VM
+/// powers off about a second after the plan arrives, as it does after any death of the
+/// agent with no snapshot in sight (#2158). An exec sent then is a race with the
+/// poweroff, which this test lost in 3 runs of 6 while it sent one.
+///
 /// RED BEFORE THE FIX: `snapshot create` fails after its one ask and the gate stays.
 #[tokio::test]
 async fn a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and_the_resume(
@@ -845,12 +893,18 @@ async fn a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and
                     hold.display()
                 ),
             )
+            // The host logs the one-shot's report at debug.
+            .env("RUST_LOG", "fcvm=debug")
             .stdout(log.try_clone()?)
             .stderr(log)
             .kill_on_drop(true)
             .spawn()
             .context("spawning snapshot create")?;
-        wait_for_log(&create_log, "FAILPOINT snapshot.post_resume_pre_reopen reached").await?;
+        wait_for_log(
+            &create_log,
+            "FAILPOINT snapshot.post_resume_pre_reopen reached",
+        )
+        .await?;
 
         // The source runs behind its closed gate, with a boundary owed.
         let gated = common::exec_in_vm(golden_pid, &[GATE_CHAINS]).await?;
@@ -876,37 +930,30 @@ async fn a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and
             "snapshot create failed after the source's agent died between its prepare and \
              its resume ({status}):\n{logged}"
         );
-        // The resume was served by an agent that started behind the closed gate.
+        // The guest's own account of the resume, as the host logged it.
+        anyhow::ensure!(
+            logged.contains("source VM snapshot network reopened: gate=open"),
+            "snapshot create succeeded without the guest reporting its gate open:\n{logged}"
+        );
+        // The resume was served by an agent that started behind the closed gate, and
+        // that agent then reached MMDS: a connection out of the guest.
+        const OWED: &str =
+            "a snapshot's boundary is owed its resume and the agent that served it is gone";
         anyhow::ensure!(
             std::fs::read_to_string(&golden_log)
                 .unwrap_or_default()
-                .contains("a snapshot's boundary is owed its resume and the agent that served it is gone"),
+                .contains(OWED),
             "no agent started with the boundary owed, so the agent the test killed served the \
              resume itself and nothing was tested:\n{logged}"
         );
-
-        // The new agent serves every command once its boot is far enough along.
-        let deadline = Instant::now() + Duration::from_secs(120);
-        let chains = loop {
-            match common::exec_in_vm(golden_pid, &[GATE_CHAINS]).await {
-                Ok(chains) => break chains,
-                Err(error) => anyhow::ensure!(
-                    Instant::now() < deadline,
-                    "the restarted agent never served an exec: {error:#}"
-                ),
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        };
-        anyhow::ensure!(
-            chains.trim().is_empty(),
-            "the source's gate is still closed:\n{chains}"
-        );
-        let owed = common::exec_in_vm(
+        wait_for_log_after(
+            &golden_log,
             golden_pid,
-            &["ls /run/fcvm/snapshot-boundary-owed /run/fcvm/snapshot-network.json 2>/dev/null || true"],
+            OWED,
+            "received container plan successfully",
         )
-        .await?;
-        anyhow::ensure!(owed.trim().is_empty(), "the boundary is still marked owed: {owed}");
+        .await
+        .context("the restarted agent never got its boot plan through the gate")?;
         Ok(())
     }
     .await;
@@ -917,21 +964,23 @@ async fn a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and
     deleted
 }
 
-/// A clone whose restore is under way refuses a snapshot's prepare, and its container
-/// stays frozen until the restore thaws it, however long the restore takes.
+/// A clone whose restore is under way refuses a snapshot, and its container stays frozen
+/// until the restore thaws it, however long the restore takes.
 ///
 /// The clone is held for 75 s before its restore verifies the gate, with both halves of
 /// the gate closed and the container frozen as the snapshot left it.
 ///
-/// - `fc-agent --prepare-snapshot-network`, as a `snapshot create` of the clone would run
-///   it, is refused with the status the host does not retry, and the container is still
-///   frozen afterwards (#2138). It used to wait for the restore's lock, then close the
-///   published clone's gate with nothing to open it again.
+/// - `fcvm snapshot create` of the clone fails within 20 s and changes nothing in the
+///   guest: the gate is still closed and the container still frozen (#2138). The guest
+///   refuses the prepare, and refuses the reopen the host sends after a failed prepare,
+///   each before it waits for the boundary lock, with the status the host does not
+///   retry. The prepare used to wait for the restore's lock, then close the published
+///   clone's gate; the reopen waited for the lock too.
 /// - 66 s into the hold the container is still frozen (#2140). The freeze watchdog used
 ///   to thaw it at its 60th look, behind the closed gate, where each connection the
 ///   workload made was answered with a reset.
 ///
-/// RED BEFORE THE FIX: the prepare does not return within 10 s, and the container's
+/// RED BEFORE THE FIX: the create does not end within 20 s, and the container's
 /// `cgroup.freeze` reads 0 at 66 s.
 #[tokio::test]
 async fn a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs_deadline(
@@ -1000,26 +1049,47 @@ async fn a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs
                 .contains(marker)
         };
 
-        let refused = tokio::time::timeout(
-            Duration::from_secs(10),
-            common::exec_in_vm(
-                clone_pid,
-                &["/usr/local/bin/fc-agent --prepare-snapshot-network 2>&1; echo status=$?"],
-            ),
-        )
-        .await
-        .context(
-            "a snapshot's prepare did not return within 10 s on a clone whose restore is \
-             under way: it is waiting for the restore's lock, to act on the published clone",
-        )??;
+        let stray = format!("{snapshot_name}-stray");
+        let create = tokio::process::Command::new(common::find_fcvm_binary()?)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &clone_pid.to_string(),
+                "--tag",
+                &stray,
+            ])
+            .kill_on_drop(true)
+            .output();
+        let create = tokio::time::timeout(Duration::from_secs(20), create)
+            .await
+            .context(
+                "snapshot create of a clone whose restore is under way did not end within \
+                 20 s: a one-shot is waiting for the restore's lock, to act on the published \
+                 clone",
+            )??;
+        if create.status.success() {
+            let _ = common::delete_snapshot(&stray).await;
+            anyhow::bail!("a snapshot was taken of a clone whose restore is under way");
+        }
+        let refused = String::from_utf8_lossy(&create.stderr);
         anyhow::ensure!(
-            refused.contains("status=3") && refused.contains("a restore is under way"),
-            "the prepare was not refused on a restoring clone: {refused}"
+            refused.contains("restore"),
+            "snapshot create of a restoring clone failed for another reason: {refused}"
         );
         let frozen = common::exec_in_vm(clone_pid, &[FREEZE]).await?;
         anyhow::ensure!(
             frozen.trim() == "1",
-            "the refused prepare thawed the restoring clone's container: {frozen:?}"
+            "the refused snapshot thawed the restoring clone's container: {frozen:?}"
+        );
+        let gate = common::exec_in_vm(clone_pid, &[GATE_CHAINS]).await?;
+        anyhow::ensure!(
+            gate.contains("FCVM_SNAPSHOT_IN") && gate.contains("FCVM_SNAPSHOT_OUT"),
+            "the refused snapshot opened the restoring clone's gate:\n{gate}"
+        );
+        anyhow::ensure!(
+            !logged("FAILPOINT restore.pre_gate_verify released"),
+            "the hold ended before the snapshot was refused, so nothing was tested"
         );
 
         tokio::time::sleep(Duration::from_secs(66).saturating_sub(held.elapsed())).await;
