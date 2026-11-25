@@ -56,6 +56,21 @@ members, and its reads waited 60% longer; at this load the start rate is the sam
 
 ## Churn: starts and stops at one rate
 
+`run` starts clones in one of two ways. Without `RATE` the loop is closed: `CONCURRENCY`
+clones start at the same instant and each is replaced as it turns healthy, so clones that
+started together tend to reach each stage together. With `RATE=N` the starts are paced: clone
+`i` is due `i / N` seconds after the first, on the monotonic clock, and `CONCURRENCY` only
+caps how many are starting at once. The schedule is fixed, so a start the cap holds back is
+issued when a slot frees and the ones after it are not moved; the summary's `pacing` gives
+the rate offered, the rate issued, and how many starts were late by more than one interval
+(5 ms at least) and by how much. Every start is issued inside the measured window, by the
+same `fcvm snapshot run` as the closed loop's; nothing is prepared for a clone before its
+start. Both modes report `rate_with_alive`: clones reaching healthy per second from the
+moment 1000 are alive (healthy, and their fcvm not exited) to the last one turning healthy.
+There is no rate, and the summary says why, when the run never has 1000 alive (a run of
+1000 clones), when the alive count falls under 1000 inside the window, or when the window
+is under 1 s. `min_alive_in_window` is beside the rate.
+
 `run` measures a ramp: every clone stays up, so nothing is torn down while clones start and
 no namespace is used twice. `churn` measures a rate a host can hold: each clone runs
 `LIFETIME` seconds after it is healthy (uniform in `LIFETIME` plus or minus 20%, so the

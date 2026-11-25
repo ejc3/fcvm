@@ -51,8 +51,9 @@ FAKE_GH = textwrap.dedent('''\
 REPO = 'example-owner/example-repo'
 
 
-def pr(number, head_ref, base_ref, sha='0' * 40, repo=REPO):
-    return {'number': number, 'head': {'ref': head_ref, 'sha': sha, 'repo': {'full_name': repo}},
+def pr(number, head_ref, base_ref, sha='0' * 40, repo=REPO, draft=False):
+    return {'number': number, 'draft': draft,
+            'head': {'ref': head_ref, 'sha': sha, 'repo': {'full_name': repo}},
             'base': {'ref': base_ref}}
 
 
@@ -120,6 +121,38 @@ class PrScope(Harness):
         self.assertEqual(outputs['code'], 'false')
         self.assertIn('#13', outputs['reason'])
 
+    def test_a_draft_child_defers_nothing(self):
+        # A draft runs no CI, so a draft stacked here tests nothing: deferring to it
+        # left this PR's head with every job skipped and a green Summary (deferred).
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100':
+                   [pr(13, 'feature-c', 'feature-b', 'c' * 40, draft=True)],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
+                   f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
+        outputs, _, stdout = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
+        self.assertEqual(outputs['code'], 'true')
+        self.assertIn('#13 is stacked here but is a draft', stdout)
+
+    def test_a_ready_child_beside_a_draft_one_still_defers(self):
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100':
+                   [pr(13, 'feature-c', 'feature-b', 'c' * 40, draft=True),
+                    pr(14, 'feature-d', 'feature-b', 'd' * 40)],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
+                   f'repos/{REPO}/compare/{"b" * 40}...{"d" * 40}': {'status': 'ahead'}}
+        outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'false')
+        self.assertIn('#14', outputs['reason'])
+        self.assertNotIn('#13', outputs['reason'])
+
+    def test_a_child_whose_draft_state_is_unknown_defers_nothing(self):
+        child = pr(13, 'feature-c', 'feature-b', 'c' * 40)
+        del child['draft']
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [child],
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
+                   f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
+        outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
+
     def test_a_child_that_does_not_contain_this_head_defers_nothing(self):
         # A fix pushed here before the child was rebased: the child's runs do not
         # test this commit, so this PR runs.
@@ -139,11 +172,14 @@ class PrScope(Harness):
 
     def test_a_fork_pr_on_this_branch_does_not_defer_it(self):
         fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100':
-                   [pr(13, 'feature-c', 'feature-b', repo='someone/fork')],
+                   [pr(13, 'feature-c', 'feature-b', 'c' * 40, repo='someone/fork')],
+                   # The fork's head would cover this one if the fork counted as a child.
+                   f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
                    f'repos/{REPO}/pulls/12/files': files('src/lib.rs')}
-        outputs, _, _ = self.scope(fixture)
+        outputs, calls, _ = self.scope(fixture)
         self.assertEqual(outputs['run'], 'true')
         self.assertEqual(outputs['code'], 'true')
+        self.assertFalse([c for c in calls if '/compare/' in c['path']], 'the fork child was looked up')
 
     def test_a_fork_pr_whose_branch_shares_a_stack_branch_name_runs(self):
         # Upstream has a PR stacked on feature-b; this PR's feature-b is a fork's branch.

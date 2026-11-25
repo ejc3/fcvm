@@ -4129,6 +4129,10 @@ def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
             # bare Namespaces that predate the knob.
             resolve_poll_ms=getattr(args, "resolve_poll_ms", 5.0),
             render_module=os.path.join(HERE, "render.py"),
+            # A caller that compares two CDP engines sets one viewport on both
+            # (cdpdrive --viewport). reqbench's own arms set none, and the
+            # WebKit driver above takes none.
+            viewport=getattr(args, "viewport", ""),
         )
         result = cdpdrive.drive(drive_args)
     return result
@@ -4136,6 +4140,10 @@ def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
 
 def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
+
+    # A viewport that does not parse is the caller's error and costs no clone:
+    # it is refused here, before anything is spawned.
+    cdpdrive.parse_viewport(getattr(args, "viewport", ""))
 
     if op == "html":
         arm_name = "html-fast" if fast else "html"
@@ -4250,6 +4258,20 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["blocking_ms"] = (t_answer - t_spawn) * 1000
             if rec.get("ok"):
                 rec["artifact_monotonic_ns"] = int(t_answer * 1e9)
+            # A caller that starts its next request while this clone is torn
+            # down (pages mode's worker) is told here, once, with the record as
+            # it stands: `ok` may be false (the driver answered with a failure),
+            # and a record that is ok here can still fail in the owner wait or
+            # the teardown below. The callback's time is outside blocking_ms. A
+            # callback that raises is the caller's fault and does not change the
+            # request: it is recorded and the owner wait and teardown go on.
+            # reqbench's own arms set no callback.
+            on_answer = getattr(args, "on_answer", None)
+            if on_answer is not None:
+                try:
+                    on_answer(rec)
+                except Exception as callback_error:  # noqa: BLE001 - recorded
+                    rec["on_answer_error"] = f"{type(callback_error).__name__}: {callback_error}"
             t_owned = time.monotonic()
             state = wait_state_owned(
                 state_path,
