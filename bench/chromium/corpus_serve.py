@@ -1214,7 +1214,11 @@ def main():
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
     if args.inject_file:
         Handler.inject_file = args.inject_file
-        Handler.main_docs = frozenset(main_documents(Path(args.root)).values())
+        # The body each document's key is answered with: where two captures hold one
+        # URL the first one's body is served (load_indexes), and that is the document.
+        Handler.main_docs = frozenset(
+            Handler.exact[key][0] for key in main_documents(Path(args.root))
+            if key in Handler.exact)
     if args.tls_cert_dir and args.tls_ca_out:
         ap.error("--tls-cert-dir keeps its CA at DIR/ca.pem; --tls-ca-out is for one process")
     if args.reuse_port:
