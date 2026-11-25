@@ -5383,6 +5383,10 @@ async fn lock_vm_snapshots(
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     use fs2::FileExt;
     let mut noted_wait = false;
+    // A holder that is about to let go (a restore publishing its clone holds this for a
+    // few milliseconds) is not waited out in 100 ms steps: the wait starts short and
+    // doubles up to that.
+    let mut pause = std::time::Duration::from_millis(2);
     loop {
         match lock_file.try_lock_exclusive() {
             Ok(()) => break,
@@ -5395,7 +5399,11 @@ async fn lock_vm_snapshots(
                     noted_wait = true;
                 }
                 debug!("waiting for per-VM snapshot lock");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let left = give_up_at
+                    .map(|at| at.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or(pause);
+                tokio::time::sleep(pause.min(left)).await;
+                pause = (pause * 2).min(std::time::Duration::from_millis(100));
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("acquiring per-VM snapshot lock: {}", e));
@@ -5404,6 +5412,75 @@ async fn lock_vm_snapshots(
     }
     debug!(lock = %lock_path.display(), "acquired per-VM snapshot lock");
     Ok(Some(lock_file))
+}
+
+/// How long `snapshot create` waits for the per-VM snapshot lock of a restored clone whose
+/// owner has the acknowledgement and has not published the lifecycle.
+///
+/// The owner holds the lock for exactly that stretch (`cmd_snapshot_run_inner`), through
+/// its output handshake and its port check, so that a snapshot does not pause the guest
+/// under them. The port check is bounded (about 5 s per port) and the stretch measured
+/// 7 ms on a 1 GiB guest, but the output handshake has no bound of its own: it ends when
+/// the guest reconnects its output, the VMM exits or the owner is signalled. A guest that
+/// stays up and never reconnects would hold a create for ever, so the create gives up here
+/// with an error that says what it was waiting for.
+pub(crate) const RESTORE_PUBLICATION_LIMIT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Whether the owner of this restored VM is between the acknowledgement and its lifecycle
+/// publication, which is when it holds the per-VM snapshot lock.
+fn restore_publication_pending(state: &VmState) -> bool {
+    state.config.process_type == Some(crate::state::ProcessType::Clone)
+        && state.restore_acknowledged
+        && !state.lifecycle_ready
+        && !matches!(state.status, VmStatus::Failed)
+}
+
+/// The per-VM snapshot lock for `snapshot create`.
+///
+/// A create asked for when a clone's restored record appears finds the lock held by the
+/// clone's owner and waits for it, up to `publication_limit`
+/// ([`RESTORE_PUBLICATION_LIMIT`]). Behind any other holder (another snapshot of the VM, a
+/// balloon command) it waits as long as that takes, as it always did. Which of the two it
+/// is waiting behind is read from the VM's state, once a second.
+pub(crate) async fn acquire_vm_snapshot_lock_for_create(
+    disk_path: &Path,
+    state_manager: &StateManager,
+    vm_id: &str,
+    publication_limit: std::time::Duration,
+) -> Result<std::fs::File> {
+    const LOOK: std::time::Duration = std::time::Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let mut said = false;
+    loop {
+        let slice = LOOK.min(publication_limit.max(std::time::Duration::from_millis(1)));
+        if let Some(lock) = acquire_vm_snapshot_lock_within(disk_path, slice).await? {
+            return Ok(lock);
+        }
+        let Ok(state) = state_manager.load_state(vm_id).await else {
+            continue;
+        };
+        if !restore_publication_pending(&state) {
+            continue;
+        }
+        if !said {
+            info!(
+                vm_id,
+                "waiting for the VM's fcvm to publish its restored clone before snapshotting it"
+            );
+            said = true;
+        }
+        anyhow::ensure!(
+            started.elapsed() < publication_limit,
+            "cannot snapshot VM '{}' yet: its restore was acknowledged {} s or more ago and \
+             its fcvm process{} has not finished its own checks of the clone (the guest's \
+             output connection, the port check), during which it holds the VM's snapshot \
+             lock. `fcvm ls --json` shows \"lifecycle_ready\": true once it has.",
+            state.name.as_deref().unwrap_or(vm_id),
+            publication_limit.as_secs(),
+            state.pid.map(|pid| format!(" {pid}")).unwrap_or_default()
+        );
+    }
 }
 
 /// Sibling path for a snapshot directory's auxiliary files (lock, .creating,
@@ -5574,6 +5651,214 @@ pub async fn acquire_snapshot_create_generation_locks(
         files.push(acquire_snapshot_stage_lock(parent_dir, false).await?);
     }
     Ok(SnapshotCreateGenerationLocks { _files: files })
+}
+
+/// Refuse a snapshot of a restored VM whose restore has not been acknowledged.
+///
+/// A VM restored from a memory snapshot resumes behind the network gate its snapshot was
+/// taken behind, with its container frozen and its source's sockets still in it. Its guest
+/// retires those sockets, runs the restore hook, opens the gate and only then acknowledges
+/// the restore. A snapshot's guest one-shots know none of that: run in a guest that has not
+/// got there, the resume one-shot (or a failed prepare's rollback) opens the gate with the
+/// source's sockets alive, the container thawed and no hook run, and the image is of a
+/// restore part way through (issue 2138).
+///
+/// The process that owns the VM (`snapshot run`, or `podman run` on a cache hit) writes
+/// `restore_acknowledged` when it has the guest's acknowledgement, before it prints the
+/// restored record ([`publish_restore_acknowledged`]), and never for a restore that failed
+/// or for `podman prepare`'s disposable VM. So a caller that has read the restored record
+/// may ask for a snapshot at once, and a restored VM without the flag is refused before
+/// anything reaches its guest or its VMM. `lifecycle_ready`, which an owner writes later in
+/// the same restore, admits the two restored VMs that have no such record: a raw guest's
+/// clone, which has no agent to acknowledge anything and no gate, and a state written
+/// before `restore_acknowledged` existed. A restored VM whose state says `failed` is
+/// refused whatever else it says: a restore can fail after its acknowledgement (the
+/// owner's port check, a memory server that died), and its owner is then tearing it down.
+/// A VM that was booted has no inherited gate and is not checked.
+///
+/// Acknowledged is not yet published: the owner goes on to its output handshake and its
+/// port check, and holds the per-VM snapshot lock from before it records the
+/// acknowledgement until it has published the lifecycle or recorded the failure. A create
+/// asked for in that stretch is taken and waits on that lock
+/// ([`acquire_vm_snapshot_lock_for_create`]), so it never pauses the guest under those
+/// checks, and it reads this state again once it has the lock.
+///
+/// The refusal itself needs no lock against the owner. The flag goes from false to
+/// true once and `StateManager` never writes it back, and every restore runs under a VM id
+/// of its own, so a state that reads acknowledged cannot go back to restoring. The create
+/// checks the state it re-reads under the per-VM snapshot lock, after
+/// [`validate_snapshot_vm_identity`] has tied that state to the process it is about to
+/// snapshot. A check that reads false while the acknowledgement lands refuses a VM that is
+/// acknowledged a moment later, which `--await-restore` waits for.
+pub(crate) fn ensure_restore_acknowledged(state: &crate::state::VmState) -> Result<()> {
+    let restored = state.config.process_type == Some(crate::state::ProcessType::Clone);
+    if !restored {
+        return Ok(());
+    }
+    let name = state.name.as_deref().unwrap_or(&state.vm_id);
+    let owner = match state.pid {
+        Some(pid) => format!("fcvm process {pid}"),
+        None => "no fcvm process".to_string(),
+    };
+    // Failed before the acknowledgement or after it (the owner's port check, a memory
+    // server that died): its owner is tearing it down either way.
+    if matches!(state.status, VmStatus::Failed) {
+        anyhow::bail!(
+            "cannot snapshot VM '{name}' ({owner}): its restore failed and it is being \
+             stopped. Its fcvm's output says why."
+        );
+    }
+    if state.restore_acknowledged || state.lifecycle_ready {
+        return Ok(());
+    }
+    let source = match state.config.snapshot_name.as_deref() {
+        Some(snapshot) => format!("snapshot '{snapshot}'"),
+        None => "a snapshot".to_string(),
+    };
+    let listing = match state.pid {
+        Some(pid) => format!("fcvm ls --json --pid {pid}"),
+        None => "fcvm ls --json".to_string(),
+    };
+    anyhow::bail!(
+        "cannot snapshot VM '{name}' ({owner}): it was restored from {source} and its \
+         restore has not been acknowledged. `{listing}` shows \"restore_acknowledged\": \
+         true once it has, which is when `fcvm snapshot run` prints the restored record; \
+         `fcvm snapshot create --await-restore SECONDS` waits for it."
+    )
+}
+
+/// Record that the guest has acknowledged this VM's restore, so that `snapshot create`
+/// takes it ([`ensure_restore_acknowledged`]).
+///
+/// The identity predicate is evaluated under the state lock, as in
+/// [`publish_lifecycle_ready`]: a state that now belongs to another process is not marked.
+pub async fn publish_restore_acknowledged(
+    state_manager: &StateManager,
+    vm_state: &mut VmState,
+) -> Result<()> {
+    let identity = (vm_state.pid, vm_state.pid_start_time);
+    anyhow::ensure!(
+        identity.0.is_some() && identity.1.is_some(),
+        "cannot record a restore's acknowledgement for a state without a process identity"
+    );
+    let mut identity_matched = false;
+    let updated = state_manager
+        .update_state(&vm_state.vm_id, |state| {
+            if (state.pid, state.pid_start_time) == identity {
+                state.restore_acknowledged = true;
+                identity_matched = true;
+            }
+        })
+        .await
+        .context("recording the restore's acknowledgement")?;
+    anyhow::ensure!(
+        updated.is_some(),
+        "VM state disappeared before the restore's acknowledgement could be recorded"
+    );
+    anyhow::ensure!(
+        identity_matched,
+        "VM state identity changed before the restore's acknowledgement could be recorded"
+    );
+    vm_state.restore_acknowledged = true;
+    Ok(())
+}
+
+/// Record on the VM's state that its restore failed, so a `snapshot create` waiting for
+/// its acknowledgement stops waiting and `fcvm ls` shows the failure while the VM is torn
+/// down. Best-effort: the restore's own error is what the caller reports.
+pub async fn record_restore_failed(state_manager: &StateManager, vm_id: &str) {
+    let recorded = state_manager
+        .update_state(vm_id, |state| {
+            state.status = VmStatus::Failed;
+            state.health_status = crate::state::HealthStatus::Unhealthy;
+        })
+        .await;
+    if let Err(error) = recorded {
+        warn!(vm_id, error = %format!("{error:#}"), "could not record the failed restore in state");
+    }
+}
+
+/// How often `snapshot create --await-restore` re-reads the state of a clone it waits for
+/// when nothing tells it of a change: the owner's death changes no file, and a watch can
+/// fail to start.
+const RESTORE_ACKNOWLEDGEMENT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// [`ensure_restore_acknowledged`] for the VM `snapshot create` selected, waiting up to
+/// `wait` (`--await-restore`) for the owner of a restored VM to record the acknowledgement.
+/// Returns the state as last read, which is the acknowledged one after a wait.
+///
+/// The wait watches the state file, so it ends when the owner's write lands, not at the
+/// next poll. It ends with the refusal as soon as there is nothing left to wait for: the
+/// owner recorded the restore as failed, the owner is gone, or the state is gone or names
+/// another process.
+pub(crate) async fn await_restore_acknowledged(
+    state_manager: &StateManager,
+    selected: VmState,
+    wait: std::time::Duration,
+) -> Result<VmState> {
+    await_restore_acknowledged_polling(state_manager, selected, wait, RESTORE_ACKNOWLEDGEMENT_POLL)
+        .await
+}
+
+/// [`await_restore_acknowledged`] with its fallback poll interval given.
+async fn await_restore_acknowledged_polling(
+    state_manager: &StateManager,
+    selected: VmState,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<VmState> {
+    if wait.is_zero() || ensure_restore_acknowledged(&selected).is_ok() {
+        return ensure_restore_acknowledged(&selected).map(|()| selected);
+    }
+    let started = std::time::Instant::now();
+    // The watch begins before the state is read again, so a write between the two is seen.
+    let mut watch = match state_manager.watch_state(&selected.vm_id) {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            debug!(error = %format!("{error:#}"), "waiting for the restore by polling its state");
+            None
+        }
+    };
+    let mut current = selected;
+    loop {
+        let refusal = match ensure_restore_acknowledged(&current) {
+            Ok(()) => return Ok(current),
+            Err(refusal) => refusal,
+        };
+        let reread = match state_manager.load_state(&current.vm_id).await {
+            Ok(reread) => reread,
+            Err(_) => return Err(refusal.context("the VM's state is gone")),
+        };
+        if (reread.pid, reread.pid_start_time) != (current.pid, current.pid_start_time) {
+            return Err(refusal.context("the VM's state now names another fcvm process"));
+        }
+        current = reread;
+        let refusal = match ensure_restore_acknowledged(&current) {
+            Ok(()) => return Ok(current),
+            Err(refusal) => refusal,
+        };
+        if matches!(current.status, VmStatus::Failed) {
+            return Err(refusal.context("the VM's restore failed"));
+        }
+        if !crate::state::owner_is_live(&current) {
+            return Err(refusal.context("the VM's fcvm process has exited"));
+        }
+        let left = wait.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(refusal.context(format!(
+                "no acknowledgement of the VM's restore within the {} s of --await-restore",
+                wait.as_secs()
+            )));
+        }
+        let pause = tokio::time::sleep(left.min(poll));
+        match watch.as_mut() {
+            Some(watch) => tokio::select! {
+                _ = watch.changed() => {}
+                _ = pause => {}
+            },
+            None => pause.await,
+        }
+    }
 }
 
 /// Fail closed if the state selected before snapshot locking no longer identifies the same
@@ -9046,6 +9331,451 @@ mod tests {
         let mut reused = current.clone();
         reused.pid_start_time = Some(start + 1);
         assert!(validate_snapshot_vm_identity(&reused, &reused).is_err());
+    }
+
+    /// The state `snapshot run` leaves on disk for a clone of `base` before the guest has
+    /// acknowledged its restore.
+    fn restoring_clone(vm_id: &str) -> VmState {
+        let mut state = make_vm_state(vm_id, Some("vm-source"));
+        state.name = Some(format!("{vm_id}-name"));
+        state.pid = Some(4242);
+        state.status = crate::state::VmStatus::Running;
+        state.config.snapshot_name = Some("base".to_string());
+        state.config.process_type = Some(crate::state::ProcessType::Clone);
+        state
+    }
+
+    /// [`restoring_clone`] owned by this test process, saved.
+    async fn saved_restoring_clone(manager: &crate::state::StateManager, vm_id: &str) -> VmState {
+        let pid = std::process::id();
+        let mut clone = restoring_clone(vm_id);
+        clone.pid = Some(pid);
+        clone.pid_start_time = crate::utils::process_start_time(pid);
+        manager.save_state(&clone).await.unwrap();
+        clone
+    }
+
+    /// `snapshot create` refuses a VM that was restored from a snapshot until the process
+    /// that owns it has recorded the guest's acknowledgement, and takes a VM that was booted
+    /// as it always did (issue 2138). Each state is one an owner leaves on disk. `snapshot
+    /// run` saves a clone's state before it resumes the guest and records the acknowledgement
+    /// when it has it. A restore that failed is marked failed and never acknowledged, and a
+    /// prepare's restore is never recorded either.
+    ///
+    /// RED BEFORE THE FIX: nothing read the restore's state. With the check admitting every
+    /// state, as `snapshot create` did, the restoring, failed and served cases are admitted.
+    #[test]
+    fn a_snapshot_is_refused_until_the_restore_is_acknowledged() {
+        let restoring = restoring_clone("vm-clone");
+        let refusal = ensure_restore_acknowledged(&restoring)
+            .expect_err("a clone whose restore is not acknowledged was admitted")
+            .to_string();
+        for part in [
+            "VM 'vm-clone-name'",
+            "fcvm process 4242",
+            "restored from snapshot 'base'",
+            "has not been acknowledged",
+            "`fcvm ls --json --pid 4242` shows \"restore_acknowledged\": true once it has",
+            "--await-restore",
+        ] {
+            assert!(refusal.contains(part), "no {part:?} in: {refusal}");
+        }
+        // The refusal says what the state says, and nothing of the guest's gate, which the
+        // guest may have opened already.
+        assert!(!refusal.contains("gate"), "{refusal}");
+
+        // A restore that failed, as `snapshot run` records it before it tears the VM down:
+        // before its acknowledgement, and after it (the owner's port check, a memory
+        // server that died), when the state still says acknowledged or even published.
+        let mut failed = restoring.clone();
+        failed.status = crate::state::VmStatus::Failed;
+        failed.health_status = crate::state::HealthStatus::Unhealthy;
+        for (acknowledged, published) in [(false, false), (true, false), (true, true)] {
+            failed.restore_acknowledged = acknowledged;
+            failed.lifecycle_ready = published;
+            let refusal = ensure_restore_acknowledged(&failed)
+                .expect_err("a clone whose restore failed was admitted")
+                .to_string();
+            assert!(
+                refusal.contains("VM 'vm-clone-name'") && refusal.contains("its restore failed"),
+                "{refusal}"
+            );
+        }
+        // A booted VM that its owner marked failed is not this check's business.
+        let mut failed_boot = make_vm_state("vm-failed-boot", None);
+        failed_boot.status = crate::state::VmStatus::Failed;
+        ensure_restore_acknowledged(&failed_boot).unwrap();
+
+        // A clone served by a memory server is a restore like one from the snapshot's files.
+        let mut served = restoring.clone();
+        served.config.serve_pid = Some(77);
+        assert!(ensure_restore_acknowledged(&served).is_err());
+
+        // A state with neither a name nor a process still says which VM and how to look.
+        let mut anonymous = restoring.clone();
+        anonymous.name = None;
+        anonymous.pid = None;
+        anonymous.config.snapshot_name = None;
+        let refusal = ensure_restore_acknowledged(&anonymous)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("VM 'vm-clone'") && refusal.contains("`fcvm ls --json`"),
+            "{refusal}"
+        );
+
+        let mut acknowledged = restoring.clone();
+        acknowledged.restore_acknowledged = true;
+        ensure_restore_acknowledged(&acknowledged)
+            .expect("a clone whose restore was acknowledged was refused");
+
+        // A state from before the acknowledgement was recorded: its owner published the
+        // lifecycle, which it does only after the acknowledgement.
+        let mut published = restoring.clone();
+        published.lifecycle_ready = true;
+        ensure_restore_acknowledged(&published)
+            .expect("a published clone of an fcvm from before the field was refused");
+
+        // A VM that was booted, during its setup and after: unchanged.
+        let mut booted = make_vm_state("vm-booted", None);
+        assert_eq!(
+            booted.config.process_type,
+            Some(crate::state::ProcessType::Vm)
+        );
+        ensure_restore_acknowledged(&booted).expect("a booted VM in setup was refused");
+        booted.lifecycle_ready = true;
+        ensure_restore_acknowledged(&booted).expect("a booted VM was refused");
+    }
+
+    /// The acknowledgement that admits a snapshot is the owner's one locked write: a create
+    /// that reads the clone's state before it refuses, and one that reads it after is
+    /// admitted. A state that has passed to another process is not marked.
+    #[tokio::test]
+    async fn the_owners_record_of_the_acknowledgement_is_what_admits_a_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+        let pid = std::process::id();
+
+        let mut clone = saved_restoring_clone(&manager, "vm-admit").await;
+        let on_disk = manager.load_state_by_pid(pid).await.unwrap();
+        assert!(ensure_restore_acknowledged(&on_disk).is_err());
+
+        publish_restore_acknowledged(&manager, &mut clone)
+            .await
+            .unwrap();
+        assert!(clone.restore_acknowledged);
+        let on_disk = manager.load_state_by_pid(pid).await.unwrap();
+        assert!(on_disk.restore_acknowledged && !on_disk.lifecycle_ready);
+        validate_snapshot_vm_identity(&clone, &on_disk).unwrap();
+        ensure_restore_acknowledged(&on_disk).unwrap();
+
+        let mut stale = saved_restoring_clone(&manager, "vm-admit-stale").await;
+        stale.pid_start_time = stale.pid_start_time.map(|start| start + 1);
+        assert!(publish_restore_acknowledged(&manager, &mut stale)
+            .await
+            .is_err());
+        assert!(
+            !manager
+                .load_state("vm-admit-stale")
+                .await
+                .unwrap()
+                .restore_acknowledged,
+            "a stale process identity recorded an acknowledgement"
+        );
+    }
+
+    /// Why `snapshot create` needs no lock against a restore: a state that reads
+    /// acknowledged never reads restoring again, whatever writes the state afterwards. The
+    /// owner saving a copy of the state it made before the acknowledgement, a health update,
+    /// a later publication and a closure that clears the flag outright all leave it set, and
+    /// a save does the same for `lifecycle_ready`. Another process's state under the same
+    /// VM id starts unacknowledged.
+    ///
+    /// RED BEFORE THE FIX: `save_state` wrote the copy it was given, so the stale copy
+    /// cleared both flags, and `update_state` wrote what the closure left.
+    #[tokio::test]
+    async fn an_acknowledged_restore_is_never_taken_back_by_a_later_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+        let vm_id = "vm-sticky";
+        let mut clone = saved_restoring_clone(&manager, vm_id).await;
+        let before = clone.clone();
+
+        publish_restore_acknowledged(&manager, &mut clone)
+            .await
+            .unwrap();
+        publish_lifecycle_ready(&manager, &mut clone).await.unwrap();
+
+        // A save of the copy made before either was written.
+        manager.save_state(&before).await.unwrap();
+        let on_disk = manager.load_state(vm_id).await.unwrap();
+        assert!(
+            on_disk.restore_acknowledged && on_disk.lifecycle_ready,
+            "a save of a stale copy took the publication back"
+        );
+
+        // The writers that follow an acknowledgement in a clone's life.
+        manager
+            .update_health_status(vm_id, crate::state::HealthStatus::Healthy, None)
+            .await
+            .unwrap();
+        manager.bump_vsock_epoch(vm_id).await.unwrap();
+        record_restore_failed(&manager, vm_id).await;
+        assert!(
+            manager
+                .load_state(vm_id)
+                .await
+                .unwrap()
+                .restore_acknowledged
+        );
+
+        // A closure that clears it.
+        manager
+            .update_state(vm_id, |state| state.restore_acknowledged = false)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .load_state(vm_id)
+                .await
+                .unwrap()
+                .restore_acknowledged,
+            "an update took the acknowledgement back"
+        );
+
+        // An update that hands the state to another process does not hand it the flag.
+        let start = clone.pid_start_time.unwrap();
+        manager
+            .update_state(vm_id, |state| {
+                state.pid_start_time = Some(start + 1);
+                state.restore_acknowledged = false;
+            })
+            .await
+            .unwrap();
+        assert!(
+            !manager
+                .load_state(vm_id)
+                .await
+                .unwrap()
+                .restore_acknowledged,
+            "an update kept the acknowledgement for another process's state"
+        );
+
+        // Nor is a state with no start time on record this restore's: a PID alone does not
+        // say which process. A file left by a process that is gone, then a save for the
+        // same PID.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        let mut left = restoring_clone("vm-sticky-gone");
+        left.pid = Some(gone);
+        left.pid_start_time = None;
+        left.restore_acknowledged = true;
+        left.lifecycle_ready = true;
+        std::fs::write(
+            tmp.path().join("vm-sticky-gone.json"),
+            serde_json::to_string(&left).unwrap(),
+        )
+        .unwrap();
+        left.restore_acknowledged = false;
+        left.lifecycle_ready = false;
+        manager.save_state(&left).await.unwrap();
+        let on_disk = manager.load_state("vm-sticky-gone").await.unwrap();
+        assert!(
+            !on_disk.restore_acknowledged && !on_disk.lifecycle_ready,
+            "a state with no start time inherited another's publication"
+        );
+    }
+
+    /// A create asked for when a clone's restored record appears waits for the clone's
+    /// owner, which holds the per-VM snapshot lock until it has published the clone, and
+    /// gives up with an error that says so when the owner does not publish within the
+    /// limit. Behind any other holder of the lock it waits as long as that takes.
+    ///
+    /// RED BEFORE THE FIX: the create took the lock with no regard to who held it and no
+    /// bound, so behind an owner that never published it waited for ever.
+    #[tokio::test]
+    async fn a_create_waits_for_the_owners_publication_and_no_longer_than_its_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().join("state"));
+        manager.init().await.unwrap();
+        let disk = tmp.path().join("vm-held/disks/rootfs.raw");
+        std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+        let vm_id = "vm-held";
+        let limit = std::time::Duration::from_secs(1);
+
+        // The owner: acknowledged, holding the lock, not yet published.
+        let mut clone = saved_restoring_clone(&manager, vm_id).await;
+        let held = acquire_vm_snapshot_lock(&disk).await.unwrap();
+        publish_restore_acknowledged(&manager, &mut clone)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let gave_up = tokio::time::timeout(
+            limit * 10,
+            acquire_vm_snapshot_lock_for_create(&disk, &manager, vm_id, limit),
+        )
+        .await
+        .expect("a create waited behind an owner that had not published, past its limit")
+        .expect_err("a create got the lock its clone's owner holds")
+        .to_string();
+        assert!(started.elapsed() >= limit);
+        assert!(
+            gave_up.contains("has not finished its own checks")
+                && gave_up.contains("vm-held-name")
+                && gave_up.contains("\"lifecycle_ready\": true"),
+            "{gave_up}"
+        );
+
+        // Published while the create waits: it gets the lock when the owner lets go.
+        let waiting = acquire_vm_snapshot_lock_for_create(&disk, &manager, vm_id, limit);
+        let owner = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            publish_lifecycle_ready(&manager, &mut clone).await.unwrap();
+            drop(held);
+        };
+        let (got, ()) = tokio::join!(waiting, owner);
+        let got = got.expect("a create did not get the lock its clone's owner gave back");
+
+        // Behind another holder (here the lock just taken) there is no limit to run into:
+        // the VM is published, so the wait is the ordinary one.
+        let waiting = acquire_vm_snapshot_lock_for_create(&disk, &manager, vm_id, limit);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(limit * 3, &mut waiting).await.is_err(),
+            "a create gave up, or got a lock that was held"
+        );
+        drop(got);
+        tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("the lock was free and the create did not get it")
+            .unwrap();
+    }
+
+    /// `--await-restore` waits for the owner's record of the acknowledgement and no longer:
+    /// it returns the acknowledged state once the owner has written it, and gives the
+    /// refusal at the deadline, or at once when the restore is recorded as failed, the owner
+    /// has exited or the state is gone. Without the flag an unacknowledged clone is refused
+    /// at once.
+    #[tokio::test]
+    async fn awaiting_a_restore_ends_at_its_acknowledgement_its_failure_or_the_deadline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+        let long = std::time::Duration::from_secs(60);
+        // With no poll to fall back on, a wait ends before its deadline only when the watch
+        // on the state file wakes it.
+        let never = std::time::Duration::from_secs(3600);
+        // A host that cannot give a watch fails here, at once, and not at the end of a
+        // wait that nothing wakes.
+        drop(
+            manager
+                .watch_state("vm-await-probe")
+                .expect("this test needs an inotify watch on the state directory"),
+        );
+        let ended_early = |started: std::time::Instant| {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the wait ran to its deadline"
+            );
+        };
+
+        // No wait: refused at once, with the plain refusal.
+        let clone = saved_restoring_clone(&manager, "vm-await-none").await;
+        let refusal = await_restore_acknowledged(&manager, clone, std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.to_string().starts_with("cannot snapshot VM"),
+            "{refusal:#}"
+        );
+
+        // Acknowledged while the create waits: the acknowledged state comes back, woken by
+        // the owner's write. Another VM's write in between wakes nothing.
+        let mut clone = saved_restoring_clone(&manager, "vm-await-acknowledged").await;
+        let started = std::time::Instant::now();
+        let waited = await_restore_acknowledged_polling(&manager, clone.clone(), long, never);
+        let written = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            saved_restoring_clone(&manager, "vm-await-bystander").await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            publish_restore_acknowledged(&manager, &mut clone)
+                .await
+                .unwrap();
+        };
+        let (admitted, ()) = tokio::join!(waited, written);
+        assert!(admitted.unwrap().restore_acknowledged);
+        ended_early(started);
+
+        // Recorded as failed while the create waits.
+        saved_restoring_clone(&manager, "vm-await-failed").await;
+        let clone = manager.load_state("vm-await-failed").await.unwrap();
+        let started = std::time::Instant::now();
+        let waited = await_restore_acknowledged_polling(&manager, clone, long, never);
+        let failed = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            record_restore_failed(&manager, "vm-await-failed").await;
+        };
+        let (refused, ()) = tokio::join!(waited, failed);
+        let refusal = format!("{:#}", refused.unwrap_err());
+        assert!(refusal.contains("restore failed"), "{refusal}");
+        ended_early(started);
+
+        // The state removed while the create waits, as the owner's teardown does.
+        let clone = saved_restoring_clone(&manager, "vm-await-gone").await;
+        let started = std::time::Instant::now();
+        let waited = await_restore_acknowledged_polling(&manager, clone, long, never);
+        let removed = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            manager.delete_state("vm-await-gone").await.unwrap();
+        };
+        let (refused, ()) = tokio::join!(waited, removed);
+        let refusal = format!("{:#}", refused.unwrap_err());
+        assert!(refusal.contains("state is gone"), "{refusal}");
+        ended_early(started);
+
+        // An owner that has exited: nothing will ever acknowledge.
+        let mut orphan = restoring_clone("vm-await-orphan");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        orphan.pid = Some(child.id());
+        child.wait().unwrap();
+        manager.save_state(&orphan).await.unwrap();
+        let started = std::time::Instant::now();
+        let refusal = format!(
+            "{:#}",
+            await_restore_acknowledged(&manager, orphan, long)
+                .await
+                .unwrap_err()
+        );
+        assert!(refusal.contains("has exited"), "{refusal}");
+        ended_early(started);
+
+        // Never acknowledged: refused at the deadline, which the refusal names.
+        let clone = saved_restoring_clone(&manager, "vm-await-deadline").await;
+        let started = std::time::Instant::now();
+        let refusal = format!(
+            "{:#}",
+            await_restore_acknowledged(&manager, clone, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        assert!(
+            refusal.contains("within the 1 s of --await-restore")
+                && refusal.contains("cannot snapshot VM"),
+            "{refusal}"
+        );
+
+        // A booted VM is never waited for.
+        let mut booted = make_vm_state("vm-await-booted", None);
+        booted.pid = Some(std::process::id());
+        let started = std::time::Instant::now();
+        await_restore_acknowledged(&manager, booted, long)
+            .await
+            .unwrap();
+        ended_early(started);
     }
 
     #[tokio::test]
