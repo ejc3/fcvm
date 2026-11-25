@@ -148,6 +148,20 @@ impl LimitSearch {
         }
     }
 
+    /// The most renders in flight this side may run (its workers, its engines, its memory).
+    /// The sides share every other parameter; this one is each side's own, and a restart
+    /// keeps it. A level above the new most comes down at the next decision.
+    pub fn set_max_in_flight(&mut self, most: u32) {
+        self.params.max_in_flight = most.max(1);
+        if self.level > self.params.max_in_flight {
+            self.level = self.params.max_in_flight;
+            for v in &mut self.at_level {
+                v.clear();
+            }
+            self.failed_at_level = 0;
+        }
+    }
+
     /// Renders in flight the side should run now.
     pub fn in_flight(&self) -> u32 {
         self.level
@@ -432,6 +446,40 @@ impl Pair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each side has its own most renders in flight, and starting again keeps it.
+    #[test]
+    fn a_sides_own_most_survives_a_restart_and_caps_its_level() {
+        let mut pair = Pair::new(SearchParams::default(), 2);
+        pair.sides[0].set_max_in_flight(3);
+        pair.sides[1].set_max_in_flight(5);
+        pair.restart();
+        let mut now = 0;
+        pair.step(now, [Some(0), Some(0)]);
+        for _ in 0..200 {
+            for side in 0..2 {
+                let level = pair.sides[side].in_flight();
+                for page in 0..2 {
+                    for _ in 0..3 {
+                        pair.sides[side].render(Render {
+                            page,
+                            ms: 100.0,
+                            ok: true,
+                            level,
+                        });
+                    }
+                }
+            }
+            now += 1000;
+            let levels = pair.step(now, [Some(0), Some(0)]);
+            assert!(levels[0] <= 3 && levels[1] <= 5, "{levels:?}");
+        }
+        assert_eq!(pair.sides[0].limit(), Some(3));
+        assert_eq!(pair.sides[1].limit(), Some(5));
+        // lowered while running: the level comes down with it
+        pair.sides[1].set_max_in_flight(2);
+        assert_eq!(pair.sides[1].in_flight(), 2);
+    }
 
     fn params() -> SearchParams {
         SearchParams {

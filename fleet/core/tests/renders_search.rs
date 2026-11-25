@@ -175,6 +175,62 @@ fn probes(levels: &[u32]) -> usize {
     levels.windows(2).filter(|w| w[1] > w[0]).count()
 }
 
+/// The shortest time, in simulated seconds, between two steps up after the side first
+/// stepped back: the time between two probes. None with fewer than two probes.
+fn shortest_time_between_probes(levels: &[u32]) -> Option<usize> {
+    let first_back = levels.windows(2).position(|w| w[1] < w[0])?;
+    let ups: Vec<usize> = levels
+        .windows(2)
+        .enumerate()
+        .skip(first_back)
+        .filter(|(_, w)| w[1] > w[0])
+        .map(|(i, _)| i)
+        .collect();
+    ups.windows(2).map(|w| w[1] - w[0]).min()
+}
+
+/// The rule the page states: after a back-off a side holds for five minutes, then tries one
+/// more render in flight. On both recorded ladders, from every seed, two probes are never
+/// less than a hold apart, and a probe is one step: up one, and back one if it spiked.
+#[test]
+fn a_settled_side_probes_once_per_hold() {
+    let hold_s = (SearchParams::default().hold_ms / 1000) as usize;
+    assert_eq!(hold_s, 300);
+    for (name, gap) in [("fcvm", 85.0), ("kitesurf", 46.0)] {
+        let l = ladder(name, gap);
+        for seed in [1, 2, 3, 4, 5] {
+            let secs = 3600;
+            let r = run(&l, SearchParams::default(), seed, secs as u64);
+            let between = shortest_time_between_probes(&r.levels)
+                .unwrap_or_else(|| panic!("{name} seed {seed}: fewer than two probes in an hour"));
+            assert!(
+                between >= hold_s,
+                "{name} seed {seed}: two probes {between} s apart"
+            );
+            // Any ten minutes after the climb hold at most two probes: four level changes
+            // when both spiked, and one more when a held level stepped down at a hold's end.
+            let settled = r.levels.windows(2).position(|w| w[1] < w[0]).unwrap() + 1;
+            for start in (settled..secs - 600).step_by(60) {
+                let window = &r.levels[start..start + 600];
+                assert!(
+                    probes(window) <= 2,
+                    "{name} seed {seed}: {} probes in the ten minutes from {start} s",
+                    probes(window)
+                );
+                assert!(
+                    changes(window) <= 5,
+                    "{name} seed {seed}: {} level changes in the ten minutes from {start} s",
+                    changes(window)
+                );
+                assert!(
+                    window.windows(2).all(|w| w[0].abs_diff(w[1]) <= 1),
+                    "{name} seed {seed}: a change of more than one level from {start} s"
+                );
+            }
+        }
+    }
+}
+
 fn rate(done: &[u32]) -> f64 {
     done.iter().sum::<u32>() as f64 / done.len() as f64
 }

@@ -239,6 +239,13 @@ impl Wall {
         }
     }
 
+    /// The most renders in flight `side` may run on this host.
+    pub fn cap(&mut self, side: usize, most: u32) {
+        if let Some(s) = self.pair.sides.get_mut(side) {
+            s.set_max_in_flight(most);
+        }
+    }
+
     /// The coordinator's order. A new overlay changes the work of every render, so both
     /// sides' searches start again and the windows are emptied; the counts go on.
     pub fn order(&mut self, order: &RendersOrder, now: u64) {
