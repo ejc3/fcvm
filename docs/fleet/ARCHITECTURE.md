@@ -2413,7 +2413,12 @@ is left.
   pool has room for it, and counts the times it waited (`pool_waits`); a pool too small is never
   a failed render.
 - **An engine is started again** between renders once its anonymous memory passes
-  `--recycle-mib`: every process in its cgroup is ended and a new engine takes its port.
+  `--recycle-mib`: every process in its cgroup is ended and a new engine takes its port. The
+  engines start together and render the same pages, so each engine's first threshold is spread
+  between half of `--recycle-mib` and all of it; otherwise they are all started again within a
+  few minutes of each other and the side loses a tenth of its rate while they are. An engine
+  that died, or on which three renders in a row failed, is started again too
+  (`engine_restarts`).
 - **Three failed renders in a row** on a side make it start nothing for a second.
 - **The kernel rule.** The module refuses to run on a kernel without the bridge teardown fix
   (`kernel_has_bridge_fix`).

@@ -415,6 +415,20 @@ struct Engine {
     failed_in_a_row: u32,
     /// When to try again after a start that failed.
     retry_at: Option<Instant>,
+    /// The anonymous memory at which it is started again; 0 never.
+    recycle_at: u64,
+}
+
+/// The memory at which engine `index` of `count` is first started again. The engines start
+/// together and render the same pages in rotation, so they would all reach the threshold
+/// within minutes of each other, and a side that starts its engines again in one wave
+/// loses a tenth of its rate while it does. The first thresholds are spread evenly from
+/// half the threshold up to the whole of it; every later one is the whole.
+fn first_recycle_at(index: usize, count: usize, threshold: u64) -> u64 {
+    if threshold == 0 || count <= 1 {
+        return threshold;
+    }
+    threshold / 2 + threshold / 2 * (index as u64 + 1) / count as u64
 }
 
 /// Whether an engine is started again now: its process exited, its renders failed
@@ -639,7 +653,7 @@ impl Module {
                 continue;
             }
             let anon = cpuset::stat_field(&e.join.dir().join("memory.stat"), "anon").unwrap_or(0);
-            if self.recycle_bytes > 0 && anon >= self.recycle_bytes {
+            if e.recycle_at > 0 && anon >= e.recycle_at {
                 self.recycle(index);
                 continue;
             }
@@ -826,6 +840,7 @@ impl Module {
                 e.up = true;
                 e.failed_in_a_row = 0;
                 e.retry_at = None;
+                e.recycle_at = self.recycle_bytes;
                 if restarting {
                     self.restarts += 1;
                 } else {
@@ -1357,6 +1372,11 @@ async fn run(
                     restarting: false,
                     failed_in_a_row: 0,
                     retry_at: None,
+                    recycle_at: first_recycle_at(
+                        index,
+                        args.max_engines as usize,
+                        args.recycle_mib * 1024 * 1024,
+                    ),
                 });
             }
             while let Some(done) = batch.join_next().await {
@@ -1693,6 +1713,23 @@ mod tests {
         assert_eq!(body.trim(), "kitesurf: OK");
         assert!(ms < 1500.0, "{ms} ms");
         server.abort();
+    }
+
+    /// 36 engines at 4 GiB: first thresholds from just over 2 GiB to 4 GiB, evenly, the last
+    /// at the threshold itself.
+    #[test]
+    fn the_engines_first_recycles_are_spread() {
+        let gib = 1u64 << 30;
+        let at: Vec<u64> = (0..36).map(|i| first_recycle_at(i, 36, 4 * gib)).collect();
+        assert!(at.windows(2).all(|w| w[1] > w[0]));
+        assert!(at[0] > 2 * gib && at[0] < 2 * gib + gib / 8, "{}", at[0]);
+        assert_eq!(at[35], 4 * gib);
+        let steps: Vec<u64> = at.windows(2).map(|w| w[1] - w[0]).collect();
+        let (least, most) = (steps.iter().min().unwrap(), steps.iter().max().unwrap());
+        assert!(most - least <= 1, "the steps differ: {least} to {most}");
+        // one engine, or no recycle: nothing to spread
+        assert_eq!(first_recycle_at(0, 1, 4 * gib), 4 * gib);
+        assert_eq!(first_recycle_at(3, 36, 0), 0);
     }
 
     #[test]
