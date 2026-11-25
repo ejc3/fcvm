@@ -1817,8 +1817,8 @@ coordinator built before the mode sends none, and would close the connection on 
   `backed_off`, the last step back (`from`, `cause` one of `render_time`, `cpu_pressure`,
   `failed`, with the `ratio` or `pressure` measured there); `limit`, the highest level that
   held, absent before a side has found one; `curve`, what each level last measured. The rest
-  is over the host's window: `renders_per_s`, the median `render_ms`, `cpus_busy` of the
-  side's set, the mean `cpu_ms_per_render`, `done` and `failed` since `since`, and for
+  is over the host's window: `renders_per_s`, `render_ms` (the mean over the pages of each
+  page's median render time, as in a `curve` point), `cpus_busy` of the side's set, the mean `cpu_ms_per_render`, `done` and `failed` since `since`, and for
   `kitesurf` the `engines` running and `recycles`. `setup` holds the live values of the
   side's `Setup` list.
 - `tiles`, one per page and side: `state` is `waiting` (no render yet), `rendering`, `stopped`

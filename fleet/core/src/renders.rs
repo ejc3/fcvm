@@ -122,6 +122,7 @@ pub struct BackOff {
 pub struct CurvePoint {
     pub in_flight: u32,
     pub renders_per_s: f64,
+    /// The mean over the pages of each page's median render time at the level.
     pub render_ms: f64,
 }
 
@@ -147,7 +148,8 @@ pub struct Search {
 pub struct SideReport {
     pub search: Search,
     pub renders_per_s: f64,
-    /// The median render time over the window; none with no render in it.
+    /// The render time over the window: the mean over the pages of each page's median (the
+    /// time to render one of each page, divided by the pages); none with no render in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_ms: Option<f64>,
     /// CPUs busy of the side's set, from its cgroup.
