@@ -2471,8 +2471,9 @@ on fcvm's own host kernel, at one fcvm commit and one Kitesurf commit, each regi
 `make fleet-renders-bench`. When a run has ended, `bench/chromium/renders_host_record.py` writes
 `host-record.txt` beside its records: the kernel release, the kernel parameters that change what
 is measured (from a list in that file; the rest of the command line is dropped), the fcvm
-commit, Kitesurf's commit, the instance type, a hash of the boot id, the run's arguments (a
-path's last name only) and the time. `bench/chromium/renders_campaign.py` writes the campaign's
+commit, Kitesurf's commit, the instance type, a hash of the boot id, the run's arguments (the
+launcher's variables from a list, each with a value of its shape, a path cut to its last name)
+and the time. The record is those seven lines and no other. `bench/chromium/renders_campaign.py` writes the campaign's
 summary, `bench/chromium/results/renders-<id>-summary.json`, from the runs' records. It writes
 nothing when two runs differ in kernel, fcvm commit, Kitesurf commit, instance type or boot,
 when the kernel is not fcvm's own, when a run's summary names another kernel, when a host record

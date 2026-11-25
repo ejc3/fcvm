@@ -54,9 +54,8 @@ def host_record(path):
         raise Refused(f"{path}: {error.strerror}") from None
     for line in lines:
         key, sep, value = line.partition(":")
-        key = key.strip()
         if not sep or key not in HOST_FIELDS:
-            continue
+            raise Refused(f"{path}: {line[:40]!r} is a line that is not one of the record's")
         if key in fields:
             raise Refused(f"{path}: says `{key}` twice")
         fields[key] = value.strip()
@@ -73,7 +72,7 @@ def host_record(path):
         if fields["arguments"] != " ".join(renders_host_record.argument(t) for t in fields["arguments"].split()):
             raise ValueError("a path")
     except ValueError:
-        raise Refused(f"{path}: `arguments` holds more than NAME=value with plain values") from None
+        raise Refused(f"{path}: `arguments` holds more than the launcher's variables with values of their shape") from None
     if not renders_host_record.INSTANCE_TYPE.fullmatch(found.group(1)):
         raise Refused(f"{path}: {found.group(1)!r} is not an instance type")
     if not ENDED.fullmatch(fields["ended"]):

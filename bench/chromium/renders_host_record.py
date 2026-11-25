@@ -9,8 +9,9 @@ renders_campaign.py holds every run of a campaign to: the kernel release, the ke
 parameters that change what is measured (from a list: KERNEL_PARAMETERS), the fcvm commit the
 binary was built from, Kitesurf's commit, the instance type and a hash of the boot id, the
 run's arguments and the time. Nothing else of the host is written: the boot id is hashed, the
-rest of the kernel command line is dropped, and an argument whose value is a path keeps its
-last name only.
+rest of the kernel command line is dropped, and an argument is one of the launcher's variables
+(ARGUMENTS) with a value of its shape, a path cut to its last name. What a shape cannot tell
+(a directory's last name, a snapshot's tag) is the operator's own word.
 """
 
 import argparse
@@ -33,9 +34,17 @@ PARAMETER_VALUE = re.compile(r"^[A-Za-z0-9_,-]{1,40}$")
 NO_PARAMETERS = "(none of the recorded parameters)"
 # An instance type: a family and a size, as EC2 names them.
 INSTANCE_TYPE = re.compile(r"^[a-z][a-z0-9]{1,8}(-[a-z0-9]+)?\.(nano|micro|small|medium|large|[0-9]{0,2}xlarge|metal(-[0-9]{1,2}xl)?)$")
-# One argument of a run: a make variable and a plain value.
-ARGUMENT = re.compile(r"^[A-Z][A-Z0-9_]*=[A-Za-z0-9_,-]*(\.[A-Za-z0-9_-]+)*$")
-ADDRESS = re.compile(r"^\d+(\.\d+){3}$")
+# The arguments of a run a record keeps: the launcher's variables (renders_bench.sh), each with the
+# shape of its value. A name outside the list, or a value of another shape, is refused: the line
+# is the operator's text, and only what a run's arguments look like is written.
+NUMBER, NAME = r"[0-9]{1,6}", r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}"
+ARGUMENTS = {
+    "MAX_FCVM": NUMBER, "MAX_ENGINES": NUMBER, "SECONDS_RUN": NUMBER, "RECYCLE_MIB": NUMBER,
+    "REPLAY_PROCS": NUMBER, "REPLAY_CPUS": NUMBER, "TIMEOUT_S": NUMBER, "CPU": NUMBER, "MEM": NUMBER,
+    "LEVELS": NUMBER + "," + NUMBER, "VIEWPORT": r"[0-9]{2,5}x[0-9]{2,5}",
+    "CPUS_FCVM": r"[0-9,-]{1,40}", "CPUS_ENGINES": r"[0-9,-]{1,40}", "CPUS_HARNESS": r"[0-9,-]{1,40}",
+    "DIST": NAME, "TAG": NAME,
+}
 
 
 def kept_parameters(cmdline):
@@ -49,14 +58,13 @@ def kept_parameters(cmdline):
 
 
 def argument(token):
-    """NAME=value with a path's value cut to its last name; raises ValueError on anything else."""
+    """A listed NAME=value, a path's value cut to its last name; raises ValueError on anything else."""
     name, sep, value = token.partition("=")
     if sep and "/" in value:
         value = os.path.basename(value.rstrip("/"))
-    out = f"{name}{sep}{value}"
-    if not ARGUMENT.fullmatch(out) or ADDRESS.fullmatch(value):
-        raise ValueError(f"argument {token!r} is not NAME=value with a plain value")
-    return out
+    if not sep or name not in ARGUMENTS or not re.fullmatch(ARGUMENTS[name], value):
+        raise ValueError(f"argument {token!r} is not one of {', '.join(sorted(ARGUMENTS))} with a value of its shape")
+    return f"{name}={value}"
 
 
 def record(kernel, cmdline, boot_id, source, kitesurf, instance_type, arguments, ended):

@@ -148,6 +148,11 @@ class Summary(unittest.TestCase):
             ("path", good.replace("MAX_FCVM=40", "DIST=/home/someone/dist"), "`arguments`"),
             ("addr", good.replace("MAX_FCVM=40", "HOST=10.1.2.3"), "`arguments`"),
             ("type", good.replace("m8gd.metal-24xl", "host1.internal"), "instance type"),
+            ("extra", good + "hostname: build-host-7\n", "a line that is not one of the record's"),
+            ("bare", good + "root=PARTUUID=4a97390b\n", "a line that is not one of the record's"),
+            ("blank", good + "\n", "a line that is not one of the record's"),
+            ("argname", good.replace("MAX_FCVM=40", "HOST=build-host-7"), "`arguments`"),
+            ("argvalue", good.replace("MAX_FCVM=40", "MAX_FCVM=build-host-7"), "`arguments`"),
             ("nohost", good.replace("host: m8gd.metal-24xl  boot: 0123456789abcdef\n", "host: m8gd.metal-24xl\n"), "no `host: TYPE  boot: HASH`"),
             ("commit", good.replace(SOURCE, "abc123"), "is not a commit"),
         ):

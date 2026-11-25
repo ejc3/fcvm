@@ -51,9 +51,13 @@ class HostRecord(unittest.TestCase):
         self.assertEqual(self.text(cmdline="quiet splash\n").splitlines()[1], "cmdline: (none of the recorded parameters)")
 
     def test_an_arguments_value_that_is_a_path_keeps_its_last_name_only(self):
-        text = self.text(arguments="MAX_FCVM=0 LEVELS=0,38 DIST=/home/someone/kitesurf/dist-opt KITESURF=/srv/k/ TAG=golden")
-        self.assertIn("arguments: MAX_FCVM=0 LEVELS=0,38 DIST=dist-opt KITESURF=k TAG=golden\n", text)
-        for bad in ("MAX_FCVM", "lower=1", "X=a b;c", "HOST=10.1.2.3", "X=$(id)"):
+        text = self.text(arguments="MAX_FCVM=0 LEVELS=0,38 DIST=/home/someone/kitesurf/dist-opt TAG=golden")
+        self.assertIn("arguments: MAX_FCVM=0 LEVELS=0,38 DIST=dist-opt TAG=golden\n", text)
+        self.assertIn("arguments: LEVELS=15,38 SECONDS_RUN=360 VIEWPORT=1280x720 CPUS_FCVM=0-39 RECYCLE_MIB=0\n",
+                      self.text(arguments="LEVELS=15,38 SECONDS_RUN=360 VIEWPORT=1280x720 CPUS_FCVM=0-39 RECYCLE_MIB=0"))
+        for bad in ("MAX_FCVM", "lower=1", "X=a b;c", "HOST=10.1.2.3", "X=$(id)", "HOST=build-host-7",
+                    "MAX_FCVM=build-host-7", "LEVELS=10.1.2.3", "SECONDS_RUN=1,2", "DIST=a.internal.example",
+                    "DIST=/", "TAG=", "KITESURF=/srv/k"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.text(arguments=bad)
 
