@@ -17,10 +17,15 @@ import os
 import statistics
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import records  # noqa: E402
+
 
 def rows(path):
-    with open(path) as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+    """The rows of a run's file: from the tree, or, once records.py has moved it, from where its
+    manifest says (held to the manifest's size and sha256)."""
+    text = records.read_bytes(path).decode("utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def pct(values, q):

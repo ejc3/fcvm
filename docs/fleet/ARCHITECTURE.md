@@ -2552,6 +2552,57 @@ starts nothing of the mode.
   once it has been untouched for twice the render timeout and a minute). The benchmark keeps
   its whole record: a run's record is its evidence.
 
+### The recorded campaign
+
+The recorded figures for the page come from one campaign: every regime on one boot of one host,
+on fcvm's own host kernel, at one fcvm commit and one Kitesurf commit, each regime a run of
+`make fleet-renders-bench`. When a run has ended, `bench/chromium/renders_host_record.py` writes
+`host-record.txt` beside its records: the kernel release, the kernel parameters that change what
+is measured (from a list in that file; the rest of the command line is dropped), the fcvm
+commit, Kitesurf's commit, the instance type, a hash of the boot id, the run's arguments (the
+launcher's variables from a list, each with a value of its shape, a path cut to its last name)
+and the time. The record is those seven lines and no other. `bench/chromium/renders_campaign.py` writes the campaign's
+summary, `bench/chromium/results/renders-<id>-summary.json`, from the runs' records. It writes
+nothing when two runs differ in kernel, fcvm commit, Kitesurf commit, instance type or boot,
+when the kernel is not fcvm's own, when a run's summary names another kernel, when a host record
+says a thing twice or holds anything its writer would not write, when a run or the campaign
+holds a `WITHDRAWN` marker, or when a run's teardown does not say it left nothing. Per regime the summary holds each side's figures over a stated window
+(`renders_analyze.py`), the levels the search moved through, and the sha256 and size of the run's
+files.
+
+Each run's `summary.json`, `teardown.json` and `host-record.txt` stay in the tree under
+`bench/chromium/results/renders-<id>/<run>/`. Its row per render and its samples are in
+ejc3/fcvm-bench-records at the same path, listed in `results/records-renders-<id>.json`
+(`records.py`). `renders_campaign.py` and `renders_analyze.py` read them through that manifest,
+so with a checkout of the records repository named by `FCVM_BENCH_RECORDS` the summary is
+rebuilt from this tree; the committed one is byte for byte what that gives.
+
+`bench/chromium/renders_reference.py` writes `fleet/web/core/renders-reference.gen.ts` from the
+one summary in the tree: the campaign, its date, instance type, kernel and commits, and each
+regime's figures by label. The regime labelled `held` is the table the page will show: both sides
+held at the limits the module's own search ended on. The generator takes a `held` regime only
+from a run held at fixed levels on both sides, each side's renders in flight at its level; a
+search run under that label gives no file. No figure is typed;
+`test_renders_reference.py` fails when the file is not what the summary gives. A `WITHDRAWN`
+marker in the campaign's directory, or in the directory of a run the summary cites, withdraws the
+file: the generator and its check stop there, holding the directories' shared locks as
+`campaign_summary.py` does. Nothing in `fleet/web` reads the file yet.
+
+The campaign in the tree, `renders-20261125`, has these regimes:
+
+| label | what ran |
+|---|---|
+| `search`, `search-2`, `search-3` | both sides, the search live, three starts (30, 20 and 20 minutes); scored over the last five minutes |
+| `held`, `held-2` | both sides held at the limits the first search ended on, five scored minutes, taken after the first search and again after the last regime that runs both sides |
+| `alone-fcvm`, `alone-kitesurf` | one side at its limit while the other half is idle |
+| `one-fcvm`, `one-kitesurf` | one render at a time |
+| `bundle-default-*`, `bundle-opt-*` | Kitesurf alone on its production bundle built in Bazel's default mode and with `-c opt`, at one render in flight and at its limit, each twice |
+
+Beside them: `teardown-check.json` (the stage kills, taken in the same session; the file names
+no kernel or commit), `transforms.json` (the mean
+pixel difference of Kitesurf's screenshots with each transform against its plain ones: which
+transforms it draws at that commit) and `kitesurf-bundles.txt` (the two bundles' digests).
+
 ## Windows mode
 
 `?mode=windows` shows disposable Windows desktops, each a Cloud Hypervisor VM restored from a

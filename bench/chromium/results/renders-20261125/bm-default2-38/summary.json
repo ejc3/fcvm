@@ -1,0 +1,322 @@
+{
+  "at": 1795629277944,
+  "harness": {
+    "cpu_pressure": 0.0022266333333333336,
+    "replay_ms": {
+      "fcvm": 0.5508550000000001,
+      "kitesurf": 0.540377
+    }
+  },
+  "module": {
+    "engine_restarts": 0,
+    "fixed_levels": [
+      0,
+      38
+    ],
+    "kernel": "7.3.3-fcvm-57abeebe8d9c",
+    "levels": {
+      "fcvm": 0,
+      "kitesurf": 38
+    },
+    "pool_waits": 0,
+    "recycle_ms_median": null,
+    "recycles": 0,
+    "respawns": {
+      "fcvm": 0,
+      "kitesurf": 0
+    }
+  },
+  "sides": {
+    "fcvm": {
+      "cpus_busy": 0.0,
+      "done": 0,
+      "failed": 0,
+      "renders_per_s": 0.0,
+      "search": {
+        "in_flight": 0,
+        "phase": "holding"
+      },
+      "setup": {
+        "viewport": "1280x720"
+      },
+      "since": 1795629127943
+    },
+    "kitesurf": {
+      "cpu_ms_per_render": 1138.6877612225405,
+      "cpus_busy": 39.740202866666664,
+      "done": 4778,
+      "engines": 48,
+      "failed": 0,
+      "recycles": 0,
+      "render_ms": 1085.874452392857,
+      "renders_per_s": 34.9,
+      "search": {
+        "in_flight": 38,
+        "phase": "holding"
+      },
+      "setup": {
+        "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+        "engine_start_ms_median": "1025",
+        "engines": "48",
+        "kernel": "7.3.3-fcvm-57abeebe8d9c",
+        "recycle_mib": "0",
+        "viewport": "1280x720"
+      },
+      "since": 1795629127943
+    }
+  },
+  "tiles": [
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "example.com",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "news.ycombinator.com",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "developers.cloudflare.com",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "blog.cloudflare.com",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "en.wikipedia.org",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "developer.mozilla.org-en-us",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "www.elmundo.es",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "www.rtp.pt-noticias",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "www.theguardian.com-international",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "todomvc.com-examples-javascript-es6-dist",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "todomvc.com-examples-react-dist-index.html",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "todomvc.com-examples-vue-dist",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "todomvc.com-examples-angular-dist-browser",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 0,
+      "failed": 0,
+      "page": "todomvc.com-examples-preact-dist",
+      "renders_per_s": 0.0,
+      "side": "fcvm",
+      "state": "waiting"
+    },
+    {
+      "done": 344,
+      "failed": 0,
+      "last_at": 1795629277721,
+      "last_ms": 203.987077,
+      "page": "example.com",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 344,
+      "failed": 0,
+      "last_at": 1795629277818,
+      "last_ms": 272.204204,
+      "page": "news.ycombinator.com",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 343,
+      "failed": 0,
+      "last_at": 1795629277907,
+      "last_ms": 781.377746,
+      "page": "developers.cloudflare.com",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 342,
+      "failed": 0,
+      "last_at": 1795629277546,
+      "last_ms": 773.662962,
+      "page": "blog.cloudflare.com",
+      "renders_per_s": 2.466666666666667,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 341,
+      "failed": 0,
+      "last_at": 1795629277633,
+      "last_ms": 1201.812135,
+      "page": "en.wikipedia.org",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 342,
+      "failed": 0,
+      "last_at": 1795629277773,
+      "last_ms": 881.678245,
+      "page": "developer.mozilla.org-en-us",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 341,
+      "failed": 0,
+      "last_at": 1795629277641,
+      "last_ms": 1169.377359,
+      "page": "www.elmundo.es",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 326,
+      "failed": 0,
+      "last_at": 1795629277001,
+      "last_ms": 7287.438054,
+      "page": "www.rtp.pt-noticias",
+      "renders_per_s": 2.433333333333333,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 340,
+      "failed": 0,
+      "last_at": 1795629277930,
+      "last_ms": 1845.969039,
+      "page": "www.theguardian.com-international",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 343,
+      "failed": 0,
+      "last_at": 1795629277659,
+      "last_ms": 314.515998,
+      "page": "todomvc.com-examples-javascript-es6-dist",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 343,
+      "failed": 0,
+      "last_at": 1795629277747,
+      "last_ms": 394.199001,
+      "page": "todomvc.com-examples-react-dist-index.html",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 343,
+      "failed": 0,
+      "last_at": 1795629277703,
+      "last_ms": 324.209022,
+      "page": "todomvc.com-examples-vue-dist",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 343,
+      "failed": 0,
+      "last_at": 1795629277822,
+      "last_ms": 398.254016,
+      "page": "todomvc.com-examples-angular-dist-browser",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    },
+    {
+      "done": 343,
+      "failed": 0,
+      "last_at": 1795629277761,
+      "last_ms": 307.121409,
+      "page": "todomvc.com-examples-preact-dist",
+      "renders_per_s": 2.5,
+      "side": "kitesurf",
+      "state": "rendering"
+    }
+  ]
+}
