@@ -4129,6 +4129,9 @@ def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
             # bare Namespaces that predate the knob.
             resolve_poll_ms=getattr(args, "resolve_poll_ms", 5.0),
             render_module=os.path.join(HERE, "render.py"),
+            # A caller that compares two engines sets one viewport on both
+            # (cdpdrive --viewport). reqbench's own arms set none.
+            viewport=getattr(args, "viewport", ""),
         )
         result = cdpdrive.drive(drive_args)
     return result

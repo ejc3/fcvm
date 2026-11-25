@@ -2997,6 +2997,27 @@ class CdpDriveHostHeader(unittest.TestCase):
         self.assertEqual(out["stage"], "resolve", f"never reached resolve: {out}")
 
 
+    def test_a_clones_driver_gets_the_callers_viewport_and_none_by_default(self):
+        """reqbench's arms set no viewport, so their wire sequence is unchanged;
+        a caller that sets one (two engines compared at one size) has it reach
+        cdpdrive."""
+        import cdpdrive
+        import reqbench
+
+        seen = []
+
+        def record(ns):
+            seen.append(ns.viewport)
+            return {"ok": True}
+
+        base = dict(url="http://x/", format="jpeg", quality=80, ws_url="")
+        with _subreaper_mock.patch.object(cdpdrive, "drive", record):
+            for extra in ({}, {"viewport": "1280x720"}):
+                reqbench._drive_clone(argparse.Namespace(**base, **extra), 0, "screenshot",
+                                      "127.0.0.1:1", time.monotonic() + 5, 1, {})
+        self.assertEqual(seen, ["", "1280x720"])
+
+
 class CdpDriveResolveThrottling(unittest.TestCase):
     """Target resolution must be bounded by the DEADLINE, not by burning retries.
 
