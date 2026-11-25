@@ -6303,8 +6303,68 @@ pub(crate) fn recorded_vsock_socket_path(vm_state: &VmState) -> Result<&Path> {
 /// The caller supplies the exact socket recorded in the running VM's state.
 /// This is intentionally part of both snapshot APIs: deriving a conventional
 /// runtime path here would silently bypass `--vsock-dir`.
+///
+/// This is the prepare, and it begins a boundary: the create's token goes into the VM's
+/// state first and then to the guest, which writes it into its `owed` mark (#2159). Every
+/// resume reads the token back from the state ([`ask_source_to_reopen`]), so the reopen
+/// after a prepare whose reply was lost carries it too.
 async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &str) -> Result<()> {
-    run_fc_agent_one_shot(vsock_socket, vm_id, flag).await
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let token = begin_source_boundary(&state_manager, vm_id).await;
+    let mut args = vec![flag];
+    if let Some(token) = &token {
+        args.extend(["--boundary", token]);
+    }
+    run_fc_agent_command(vsock_socket, vm_id, &args)
+        .await
+        .map(|_| ())
+}
+
+/// Give a snapshot create's boundary its token and write it on the VM's state.
+///
+/// A resume the host gave up on can still be delivered later: its exec runs on a blocking
+/// thread that goes on connecting after the try was cut off, and a delivered one-shot can
+/// wait in the guest for the boundary lock. Landing between a later create's prepare and
+/// its pause it would open the gate, and the pause would save an image with the gate open
+/// and no manifest. The guest obeys a resume only when its token is the one in the mark,
+/// so that resume finds the later create's token and does nothing.
+///
+/// `None` when the state cannot hold it (a VM with no state file): the prepare is then
+/// sent no token and the resumes, which read the state, send none either, which the guest
+/// takes as a pair.
+async fn begin_source_boundary(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+) -> Option<String> {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let written = state_manager
+        .update_state(vm_id, |state| state.boundary_token = Some(token.clone()))
+        .await;
+    match written {
+        Ok(Some(_)) => Some(token),
+        Ok(None) => None,
+        Err(error) => {
+            warn!(
+                vm_id,
+                error = %format!("{error:#}"),
+                "could not write the snapshot boundary's token on the VM's state; this \
+                 boundary runs without one"
+            );
+            None
+        }
+    }
+}
+
+/// The token of the boundary the VM's guest is owed a resume for, from its state.
+async fn owed_boundary_token(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+) -> Option<String> {
+    state_manager
+        .load_state(vm_id)
+        .await
+        .ok()
+        .and_then(|state| state.boundary_token)
 }
 
 /// Reopen the source's network once a pause has been invoked, and set the source's
@@ -6446,12 +6506,26 @@ async fn reopen_source_network(
     .map_err(ReopenFailure::into_error)
 }
 
-/// Write `network_gate_closed` on the VM's state. Best-effort: the create's own error
+/// Write `network_gate_closed` on the VM's state, and take the boundary's token off it
+/// when the gate is open: no resume is owed then. Best-effort: the create's own error
 /// already names the VM, and a VM being torn down has no state to write.
 async fn record_source_gate(vm_id: &str, closed: bool) {
     let state_manager = crate::state::StateManager::new(paths::state_dir());
+    record_source_gate_in(&state_manager, vm_id, closed).await
+}
+
+async fn record_source_gate_in(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+    closed: bool,
+) {
     match state_manager
-        .update_state(vm_id, |state| state.network_gate_closed = closed)
+        .update_state(vm_id, |state| {
+            state.network_gate_closed = closed;
+            if !closed {
+                state.boundary_token = None;
+            }
+        })
         .await
     {
         Ok(_) => {}
@@ -6507,6 +6581,12 @@ async fn ask_source_to_reopen(
     max_tries: u32,
     gated: bool,
 ) -> std::result::Result<bool, ReopenFailure> {
+    // The token of the boundary that is owed, as the prepare wrote it. Read once: a later
+    // create writes its own, and a try of this one that is delivered late must not carry
+    // that.
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let token = owed_boundary_token(&state_manager, vm_id).await;
+    let token = token.as_deref();
     reopen_until_open(
         vm_id,
         bound,
@@ -6518,6 +6598,9 @@ async fn ask_source_to_reopen(
             let mut args = vec!["--resume-snapshot-network"];
             if pause_preceded {
                 args.extend(["--host-time-ns", &host_time]);
+            }
+            if let Some(token) = token {
+                args.extend(["--boundary", token]);
             }
             match run_fc_agent_command_any_exit(vsock_socket, vm_id, &args, Some(limit)).await {
                 Ok(output) if output.exit_code == 0 => {
@@ -6618,7 +6701,8 @@ where
                 }
                 return Err(ReopenFailure::Refused(error.context(format!(
                     "guest {vm_id} refused to reopen its network: a restore is under way in \
-                     it, and its gate is that restore's"
+                     it and its gate is that restore's, or this resume is not the one its \
+                     owed boundary is waiting for"
                 ))));
             }
             ReopenTry::Failed(error) => error,
@@ -6636,7 +6720,9 @@ where
                  has, and refuses every new TCP connection, in and out, until \
                  `{FC_AGENT_PATH} --resume-snapshot-network` succeeds in it. Its state \
                  records the closed gate; the next `fcvm snapshot create` of it asks again, \
-                 clears the record when the gate opens, and is refused while it stays closed",
+                 clears the record when the gate opens, and is refused while it stays \
+                 closed. By hand the resume needs `--boundary` and the `boundary_token` of \
+                 the VM's state: the guest obeys only the resume of the boundary it owes",
                 started.elapsed()
             ))));
         }
@@ -10991,6 +11077,7 @@ mod tests {
         let saved = serde_json::to_string(&state).unwrap();
         let loaded: crate::state::VmState = serde_json::from_str(&saved).unwrap();
         assert!(loaded.network_gate_closed);
+        assert!(!saved.contains("boundary_token"));
 
         // The status the guest refuses with is the one the host reads: fc-agent's
         // `a_refused_one_shot_exits_with_the_status_the_host_reads` reads this constant.
@@ -10999,6 +11086,88 @@ mod tests {
         // the exec's 54 s of connect retries.
         assert!(SOURCE_REOPEN_BOUND > Duration::from_secs(90 + 30));
         assert!(SOURCE_REOPEN_ONE_ASK > Duration::from_secs(54));
+    }
+
+    /// A snapshot create's boundary has a token, on the VM's state from before its
+    /// prepare until its gate is reported open (#2159).
+    ///
+    /// The prepare sends it to the guest, which writes it into its `owed` mark, and every
+    /// resume reads it from the state and sends it: the reopen after the VMM resume, the
+    /// reopen after a prepare whose reply was lost, and the one ask of a later create to
+    /// a source recorded gated. A resume the host gave up on carries the token it read
+    /// when it was sent, so one delivered into a later create's boundary carries the
+    /// earlier token and the guest does nothing (fc-agent's
+    /// `a_resume_acts_only_on_the_boundary_it_was_sent_for`).
+    ///
+    /// RED BEFORE THE FIX: no one-shot carried anything that said which snapshot it
+    /// belonged to.
+    #[tokio::test]
+    async fn a_boundarys_token_is_on_the_state_from_its_prepare_until_its_gate_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_manager = crate::state::StateManager::new(dir.path().to_path_buf());
+        state_manager.init().await.unwrap();
+        // a VM with no state: no token, for the prepare and so for the resumes
+        assert_eq!(begin_source_boundary(&state_manager, "vm-gone").await, None);
+        assert_eq!(owed_boundary_token(&state_manager, "vm-gone").await, None);
+
+        let state = crate::state::VmState::new("vm-source".into(), "alpine".into(), 1, 128);
+        state_manager.save_state(&state).await.unwrap();
+        assert_eq!(owed_boundary_token(&state_manager, "vm-source").await, None);
+        let first = begin_source_boundary(&state_manager, "vm-source")
+            .await
+            .expect("a VM with a state gets a token");
+        // what fc-agent's `boundary_token` accepts
+        assert!(first.len() == 32 && first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(
+            owed_boundary_token(&state_manager, "vm-source")
+                .await
+                .as_deref(),
+            Some(first.as_str())
+        );
+        // left gated: the token stays for the later create's one ask
+        record_source_gate_in(&state_manager, "vm-source", true).await;
+        let gated = state_manager.load_state("vm-source").await.unwrap();
+        assert!(gated.network_gate_closed);
+        assert_eq!(gated.boundary_token.as_deref(), Some(first.as_str()));
+        // open: nothing is owed, and the state is as it was before the create
+        record_source_gate_in(&state_manager, "vm-source", false).await;
+        let open = state_manager.load_state("vm-source").await.unwrap();
+        assert!(!open.network_gate_closed && open.boundary_token.is_none());
+        // the next create's boundary is another one
+        let second = begin_source_boundary(&state_manager, "vm-source")
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+
+        // The prepare of both creators sends the token, and every resume reads it from
+        // the state before its first try and sends it.
+        let source = include_str!("common.rs");
+        let prepare = body_of(source, "async fn run_snapshot_network_command(");
+        assert!(
+            prepare
+                .find("begin_source_boundary(&state_manager, vm_id)")
+                .unwrap()
+                < prepare
+                    .find("args.extend([\"--boundary\", token]);")
+                    .unwrap()
+        );
+        let ask = body_of(source, "async fn ask_source_to_reopen(");
+        let read = ask
+            .find("owed_boundary_token(&state_manager, vm_id)")
+            .unwrap();
+        assert!(read < ask.find("reopen_until_open(").unwrap());
+        assert!(ask.contains(
+            "if let Some(token) = token {\n                args.extend([\"--boundary\", token]);"
+        ));
+        for creator in [
+            "pub async fn create_snapshot_core(",
+            "async fn prepare(&self, vm_id: &str)",
+        ] {
+            assert!(
+                body_of(source, creator).contains("run_snapshot_network_command("),
+                "{creator} does not prepare through the token"
+            );
+        }
     }
 
     /// Every reopen of the source's network after a pause has been invoked sets the

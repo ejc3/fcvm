@@ -30,6 +30,7 @@ async fn test_state_persistence() {
         confinement: None,
         vsock_epoch: 0,
         network_gate_closed: false,
+        boundary_token: None,
         created_at: now,
         last_updated: now,
         config: VmConfig {
@@ -155,6 +156,7 @@ async fn test_list_vms() {
             confinement: None,
             vsock_epoch: 0,
             network_gate_closed: false,
+            boundary_token: None,
             created_at: now,
             last_updated: now,
             config: VmConfig {
@@ -250,6 +252,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             confinement: None,
             vsock_epoch: 0,
             network_gate_closed: false,
+            boundary_token: None,
             created_at: now,
             last_updated: now,
             config: VmConfig {
@@ -340,6 +343,7 @@ async fn test_load_state_by_name_duplicate_detection() {
         confinement: None,
         vsock_epoch: 0,
         network_gate_closed: false,
+        boundary_token: None,
         created_at: now,
         last_updated: now,
         config: VmConfig {
@@ -475,6 +479,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
         confinement: None,
         vsock_epoch: 0,
         network_gate_closed: false,
+        boundary_token: None,
         created_at: Timestamp::now(),
         last_updated: Timestamp::now(),
         config: VmConfig {

@@ -44,6 +44,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
         confinement: None,
         vsock_epoch: 0,
         network_gate_closed: false,
+        boundary_token: None,
         created_at: now,
         last_updated: now,
         config: VmConfig {

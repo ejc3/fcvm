@@ -352,6 +352,23 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
   uncounted (15 minutes, the host's bound on a restore's acknowledgement), so a one-shot
   hung under the lock cannot keep a container frozen for good. A lock that cannot be
   opened is not "held".
+- **A resume acts only on the boundary it was sent for** (#2159). A resume the host gave
+  up on can still be delivered later: its exec runs on a blocking thread that goes on
+  connecting after the try is cut off, and a delivered one-shot can wait in the guest for
+  the boundary lock. Landing between a later create's prepare and its pause, it would open
+  the gate and the pause would save an image with the gate open and no manifest. So every
+  create's boundary has a token: `run_snapshot_network_command` writes it on the VM's
+  state (`boundary_token`) and sends it to the prepare, which puts it into the `owed`
+  mark; every resume reads it from the state once, before its first try, and sends it;
+  the guest runs a resume only when its token is the mark's
+  (`BoundaryMarks::resume_is_for_the_owed_boundary`), and refuses any other with exit 3.
+  The state keeps the token while the gate is recorded closed, for the later create's one
+  ask, and loses it when the gate is reported open. A resume with no token acts only on a
+  mark that holds none, so a resume by hand needs `--boundary` and the state's token. The
+  token orders resumes. It is not a secret: the one-shot runs as root in the guest, and
+  whatever can run it can read the mark. A clone inherits its source's mark, token
+  included, until its restore is dispatched and clears it; no path sends a clone its
+  source's token, and a create of the clone carries its own.
 - **`rcu_expedited` is put back after a kill** (#2141). The barrier records the switch's
   value in `/run/fcvm/rcu-expedited-before` before it turns it on; the next barrier, the
   next resume and the next start of the agent put it back from the record. The resume

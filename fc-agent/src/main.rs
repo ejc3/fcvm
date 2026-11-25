@@ -118,25 +118,40 @@ async fn main() {
             // does: the host resumes the source on its own when the prepare fails. One
             // that was refused froze nothing and thaws nothing, because the freeze it
             // would undo is a restore's.
-            let prepared = snapshot_network::prepare_snapshot_network(payload_freeze::freeze).await;
-            Some(prepared.map_err(|failure| {
-                if failure.thaw {
-                    payload_freeze::thaw();
+            let args: Vec<String> = std::env::args().collect();
+            Some(match snapshot_network::boundary_token(&args) {
+                Err(error) => Err(error),
+                Ok(token) => {
+                    snapshot_network::prepare_snapshot_network(token, payload_freeze::freeze)
+                        .await
+                        .map_err(|failure| {
+                            if failure.thaw {
+                                payload_freeze::thaw();
+                            }
+                            failure.error
+                        })
                 }
-                failure.error
-            }))
+            })
         }
         Some("--resume-snapshot-network") => {
             let args: Vec<String> = std::env::args().collect();
-            let resumed =
-                snapshot_network::resume_source_network(snapshot_network::resume_host_time(&args))
+            Some(match snapshot_network::boundary_token(&args) {
+                Err(error) => Err(error),
+                Ok(token) => {
+                    let resumed = snapshot_network::resume_source_network(
+                        snapshot_network::resume_host_time(&args),
+                        token,
+                    )
                     .await;
-            // Only behind an open gate. A resume that could not open it leaves the
-            // boundary owed and the container frozen for the resume that does.
-            if resumed.gate_open {
-                payload_freeze::thaw();
-            }
-            Some(resumed.result)
+                    // Only behind an open gate. A resume that could not open it, or that
+                    // was another snapshot's, leaves the boundary owed and the container
+                    // frozen for the resume that does.
+                    if resumed.gate_open {
+                        payload_freeze::thaw();
+                    }
+                    resumed.result
+                }
+            })
         }
         _ => None,
     };
@@ -146,7 +161,10 @@ async fn main() {
             // The host does not run a refused one-shot again.
             let refused = error
                 .downcast_ref::<snapshot_network::RestoreUnderWay>()
-                .is_some();
+                .is_some()
+                || error
+                    .downcast_ref::<snapshot_network::StaleResume>()
+                    .is_some();
             std::process::exit(if refused { REFUSED_EXIT } else { 1 });
         }
         return;
@@ -273,15 +291,15 @@ mod tests {
             .find("Some(\"--prepare-snapshot-network\")=>{")
             .expect("no prepare one-shot");
         let freeze = squeezed[prepare..].contains(
-            "letprepared=snapshot_network::prepare_snapshot_network(payload_freeze::freeze).await;\
-             Some(prepared.map_err(|failure|{iffailure.thaw{payload_freeze::thaw();}failure.error}))",
+            "snapshot_network::prepare_snapshot_network(token,payload_freeze::freeze).await\
+             .map_err(|failure|{iffailure.thaw{payload_freeze::thaw();}failure.error})",
         );
         assert!(
             freeze,
             "the prepare is not handed the freeze, or does not thaw exactly when it is told to"
         );
         assert!(
-            squeezed.contains("ifresumed.gate_open{payload_freeze::thaw();}Some(resumed.result)"),
+            squeezed.contains("ifresumed.gate_open{payload_freeze::thaw();}resumed.result"),
             "the source resume does not thaw exactly when the gate is open"
         );
         // Inside the prepare: refused before the freeze, and frozen before the gate.
@@ -293,9 +311,7 @@ mod tests {
         let refuse = body
             .rfind("RestoreUnderWay(")
             .expect("a prepare never refuses");
-        let owed = body
-            .find("BoundaryMarks::mark(&marks.owed)")
-            .expect("no owed mark");
+        let owed = body.find(".mark_owed(token)").expect("no owed mark");
         let froze = body.find("freeze();").expect("the prepare never freezes");
         let boundary = body.find("boundary()").expect("no boundary");
         assert!(
