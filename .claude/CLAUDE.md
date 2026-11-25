@@ -2749,9 +2749,9 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
   relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
   share no lock. A slot that frees while clones of the snapshot are taking subvolume snapshots is not taken: each such
-  clone holds a shared `flock` on `subvolume-snapshot.lock` beside the slots for its snapshot and 100 ms after it
+  clone holds a read lock (`F_OFD_SETLK`) on `subvolume-snapshot.lock` beside the slots for its snapshot and 100 ms after it
   (`SUBVOLUME_SNAPSHOT_LINGER`: the snapshots that share a commit end together, and the clones that arrive next must
-  still find a mark), and a clone that finds it held (`subvolume_snapshot_in_flight`) takes the subvolume snapshot too. A reflink joins a
+  still find a mark), and a clone that finds it held (`subvolume_snapshot_in_flight`, an `F_OFD_GETLK` query that takes no lock) takes the subvolume snapshot too. A reflink joins a
   transaction for every extent and waits out each commit that starts meanwhile, and the commits carry what the
   reflinks dirtied: in 1000 whole clones at 128 at a time (c8gd.metal-24xl, 7.0.0-1018-aws, btrfs on NVMe, an
   864-extent disk) the 212 that reflinked took 107 ms at the median in the disk step and the 788 that snapshotted

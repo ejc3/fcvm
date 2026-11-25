@@ -116,27 +116,41 @@ pub fn take_reflink_slot(base_dir: &Path, slots: usize) -> std::io::Result<Optio
     Ok(None)
 }
 
-/// The file a clone holds a shared `flock` on while it takes the subvolume snapshot of the
+/// The file a clone holds a read lock on while it takes the subvolume snapshot of the
 /// snapshot whose disk directory is `base_dir`: beside the reflink slots.
 fn subvolume_snapshot_mark_path(base_dir: &Path) -> Option<PathBuf> {
     Some(base_dir.parent()?.join("subvolume-snapshot.lock"))
 }
 
+/// A lock request over the whole of a file, for the open-file-description lock commands.
+fn whole_file_lock(kind: libc::c_int) -> libc::flock {
+    // SAFETY: `flock` is plain integers, and all zero is a valid value of it.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = kind as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock
+}
+
 /// Mark that this clone is taking the subvolume snapshot of `base_dir`, until the returned
-/// file is closed ([`keep_subvolume_snapshot_mark`] closes it a moment after the snapshot). A shared `flock` taken without waiting: the kernel drops it when its
-/// holder exits, killed or not. `None` when the mark could not be taken (no file, or a
-/// probe held it for that instant); the clone then goes unmarked, which only lets one
-/// later clone reflink beside it.
+/// file is closed ([`keep_subvolume_snapshot_mark`] closes it a moment after the snapshot).
+/// The mark is a read lock on the file's open file description (`F_OFD_SETLK`), taken
+/// without waiting: any number of clones hold it together, and the kernel drops one when its
+/// holder exits, killed or not. `None` when the mark could not be taken (no file); the clone
+/// then goes unmarked, which only lets a later clone reflink beside it.
 pub fn mark_subvolume_snapshot(base_dir: &Path) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(subvolume_snapshot_mark_path(base_dir)?)
         .ok()?;
-    // SAFETY: flock on a descriptor this function owns.
-    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0).then_some(file)
+    let lock = whole_file_lock(libc::F_RDLCK);
+    let request: *const libc::flock = &lock;
+    // SAFETY: fcntl on a descriptor this function owns, with a lock request that outlives
+    // the call.
+    (unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, request) } == 0).then_some(file)
 }
 
 /// How long a clone's mark outlives its subvolume snapshot. Snapshots that are waiting
@@ -161,22 +175,29 @@ fn keep_subvolume_snapshot_mark(mark: Option<std::fs::File>) {
 }
 
 /// Whether a clone of the snapshot whose disk directory is `base_dir` holds
-/// [`mark_subvolume_snapshot`]'s mark now. The probe is an exclusive `flock` taken without
-/// waiting and dropped at once. The answer steers a choice between two correct ways to make
-/// the disk and is not held: a clone that starts its subvolume snapshot just after it is
-/// answered runs beside one reflink.
+/// [`mark_subvolume_snapshot`]'s mark now. The probe asks the kernel whether a write lock
+/// would be refused (`F_OFD_GETLK`) and takes nothing, so clones that ask at the same
+/// moment do not see each other, and a clone that marks while another asks is not refused.
+/// An exclusive `flock` tried and dropped would itself be a lock for a microsecond: of 8
+/// clones started together, one takes another's probe for a mark and snapshots, and its
+/// mark sends every later clone the same way. The answer steers a choice between two
+/// correct ways to make the disk and is not held: a clone that starts its subvolume
+/// snapshot just after it is answered runs beside one reflink.
 pub fn subvolume_snapshot_in_flight(base_dir: &Path) -> bool {
     use std::os::fd::AsRawFd;
     let Some(path) = subvolume_snapshot_mark_path(base_dir) else {
         return false;
     };
-    let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         // No clone of this snapshot has taken a subvolume snapshot yet.
         return false;
     };
-    // SAFETY: flock on a descriptor this function owns; closing it drops the lock.
-    let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    !free && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+    let mut lock = whole_file_lock(libc::F_WRLCK);
+    let answer: *mut libc::flock = &mut lock;
+    // SAFETY: fcntl on a descriptor this function owns; the kernel writes the lock that
+    // stands in the way, or F_UNLCK, into `lock`.
+    let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, answer) } == 0;
+    asked && lock.l_type != libc::F_UNLCK as libc::c_short
 }
 
 /// `ioctl(FICLONE)`: make the destination share the source's extents.
@@ -1649,7 +1670,7 @@ mod snapshot_dir_tests {
     /// A snapshot no clone has snapshotted has none in flight.
     #[test]
     fn a_subvolume_snapshot_is_in_flight_while_its_mark_is_held() {
-        use std::io::BufRead;
+        use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
         let root = tempfile::tempdir().unwrap();
         let base_dir = root.path().join("disk");
@@ -1669,21 +1690,27 @@ mod snapshot_dir_tests {
         // The probe left nothing held: the mark can be taken again.
         drop(mark_subvolume_snapshot(&base_dir).expect("the mark, after a probe"));
 
-        // Another process holds the mark, and is killed.
-        let mut holder = std::process::Command::new("flock")
-            .args(["-s", "-o"])
-            .arg(subvolume_snapshot_mark_path(&base_dir).unwrap())
-            .args(["sh", "-c", "echo held; exec sleep 60"])
-            .stdout(std::process::Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        std::io::BufReader::new(holder.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        assert_eq!(line.trim(), "held");
-        assert!(subvolume_snapshot_in_flight(&base_dir));
+        // Another process holds the mark, and is killed. It holds it as a VMM or a helper
+        // started during the linger would: by inheriting the descriptor.
+        let inherited = mark_subvolume_snapshot(&base_dir).expect("the mark, to hand on");
+        let fd = inherited.as_raw_fd();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("60").process_group(0);
+        // SAFETY: fcntl is async-signal-safe; the descriptor is open in the child.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut holder = command.spawn().unwrap();
+        drop(inherited);
+        assert!(
+            subvolume_snapshot_in_flight(&base_dir),
+            "the other process holds the mark"
+        );
         nix::sys::signal::killpg(
             nix::unistd::Pid::from_raw(holder.id() as i32),
             nix::sys::signal::Signal::SIGKILL,
@@ -1698,6 +1725,65 @@ mod snapshot_dir_tests {
         assert!(take_reflink_slot(&base_dir, REFLINK_SLOTS)
             .unwrap()
             .is_some());
+    }
+
+    /// Clones that ask at the same moment whether a subvolume snapshot is in flight do not
+    /// see each other, and a clone that marks while others ask gets its mark.
+    ///
+    /// RED BEFORE THE FIX: the probe was an exclusive `flock` tried and dropped, so a probe
+    /// that ran inside another's took it for a mark, and a mark tried inside a probe was
+    /// refused. In a 200-clone run at 8 at a time one such answer sent 196 clones to the
+    /// subvolume snapshot.
+    #[test]
+    fn probes_see_marks_and_never_each_other() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let base_dir = root.path().join("disk");
+        std::fs::create_dir(&base_dir).unwrap();
+        // The mark file exists and nothing holds it.
+        drop(mark_subvolume_snapshot(&base_dir).expect("the mark"));
+
+        const PROBERS: usize = 8;
+        const PROBES: usize = 20_000;
+        let seen = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..PROBERS {
+                scope.spawn(|| {
+                    for _ in 0..PROBES {
+                        if subvolume_snapshot_in_flight(&base_dir) {
+                            seen.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            0,
+            "of {} probes with no mark held, some saw one",
+            PROBERS * PROBES
+        );
+
+        let stop = AtomicBool::new(false);
+        let refused = std::thread::scope(|scope| {
+            for _ in 0..PROBERS {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        subvolume_snapshot_in_flight(&base_dir);
+                    }
+                });
+            }
+            let refused = (0..PROBES)
+                .filter(|_| mark_subvolume_snapshot(&base_dir).is_none())
+                .count();
+            stop.store(true, Ordering::Relaxed);
+            refused
+        });
+        assert_eq!(
+            refused, 0,
+            "of {PROBES} marks taken while {PROBERS} threads probed, some were refused"
+        );
+        assert!(!subvolume_snapshot_in_flight(&base_dir));
     }
 
     /// A mark outlives its snapshot by the linger and no longer, so that the clones that
