@@ -103,6 +103,9 @@ pub struct LimitSearch {
     /// Render times of the renders that started at the current level, by page.
     at_level: Vec<Vec<f64>>,
     failed_at_level: u32,
+    /// Renders completed since the current level began, whatever level they started at:
+    /// the level's rate.
+    completed: u32,
     /// When the current level began, and the pressure total then; none before the first step.
     since_ms: Option<u64>,
     pressure_at: Option<u64>,
@@ -150,6 +153,7 @@ impl LimitSearch {
             baseline: vec![None; pages],
             at_level: vec![Vec::new(); pages],
             failed_at_level: 0,
+            completed: 0,
             since_ms: None,
             pressure_at: None,
             hold_until_ms: 0,
@@ -171,6 +175,7 @@ impl LimitSearch {
                 v.clear();
             }
             self.failed_at_level = 0;
+            self.completed = 0;
         }
     }
 
@@ -193,10 +198,17 @@ impl LimitSearch {
         self.phase == Phase::Baseline
     }
 
-    /// A render completed. One that started at another level than the current one says
-    /// nothing about this level and is dropped.
+    /// A render completed. It counts toward the rate of the level the side runs now. Its
+    /// time and its failure say something about the level it started at only, so one that
+    /// started at another level is not kept beyond that.
     pub fn render(&mut self, r: Render) {
-        if r.level != self.level || r.page >= self.pages {
+        if r.page >= self.pages {
+            return;
+        }
+        if r.ok {
+            self.completed += 1;
+        }
+        if r.level != self.level {
             return;
         }
         if !r.ok {
@@ -211,6 +223,7 @@ impl LimitSearch {
             v.clear();
         }
         self.failed_at_level = 0;
+        self.completed = 0;
         self.since_ms = Some(now_ms);
         self.pressure_at = pressure_usec;
     }
@@ -229,9 +242,7 @@ impl LimitSearch {
             .saturating_sub(self.since_ms.unwrap_or(now_ms))
             .max(1);
         let mut ratios = Vec::new();
-        let mut all = Vec::new();
         for (page, times) in self.at_level.iter().enumerate() {
-            all.extend_from_slice(times);
             if let (Some(m), Some(base)) = (median(times), self.baseline[page]) {
                 if base > 0.0 {
                     ratios.push(m / base);
@@ -249,7 +260,7 @@ impl LimitSearch {
         Measured {
             ratio,
             pressure,
-            renders_per_s: all.len() as f64 * 1000.0 / dwell_ms as f64,
+            renders_per_s: f64::from(self.completed) * 1000.0 / dwell_ms as f64,
             render_ms: page_mean_ms(self.at_level.iter().map(Vec::as_slice)),
         }
     }
@@ -536,6 +547,37 @@ mod tests {
             s.step(*now, Some(*psi));
         }
         panic!("no back-off in 200 steps");
+    }
+
+    /// A level's rate is every render the side completed while it ran the level. Renders
+    /// that were in flight when the level began complete in its first second or so; left
+    /// out, a short dwell reads low by the mean render time over the dwell (on a host, a
+    /// 5 s probe of 16 in flight read 20.8 renders a second while the side completed 24.2).
+    /// The level's render time is still of the renders that started at it.
+    #[test]
+    fn a_levels_rate_counts_the_renders_that_complete_during_it() {
+        let mut s = LimitSearch::new(params(), 2);
+        s.step(0, Some(0));
+        // the baseline at one in flight: three renders a page, 1,000 ms each, in 6 s
+        feed(&mut s, 2, 3, 1000.0);
+        assert_eq!(s.step(6_000, Some(0)), 2);
+        // Level 2 for four seconds, completing two renders a second throughout. Those of
+        // the first second started before the level began.
+        for page in 0..2 {
+            s.render(Render {
+                page,
+                ms: 1000.0,
+                ok: true,
+                level: 1,
+            });
+        }
+        assert_eq!(s.step(7_000, Some(0)), 2, "no render of this level yet");
+        feed(&mut s, 2, 3, 1100.0);
+        assert_eq!(s.step(10_000, Some(0)), 3);
+        let at = s.view().curve[1].clone();
+        assert_eq!(at.in_flight, 2);
+        assert!((at.renders_per_s - 2.0).abs() < 1e-9, "{at:?}");
+        assert_eq!(at.render_ms, 1100.0);
     }
 
     #[test]
