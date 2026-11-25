@@ -530,6 +530,16 @@ class CannotEvaluate(Case):
         self.blocked(work, "is unknown: `git fetch .*` failed", release=before)
 
 
+    def test_a_failed_git_command_keeps_its_last_lines(self):
+        # git's reason is often on the lines before its last one.
+        before, _, work = self.rollout(changed_hours_ago=4)
+        path = fake_git(self.tmp / "fake-bin", """
+            fetch) printf 'one\\ntwo\\nerror: RPC failed; HTTP 503\\n\\nfatal: the remote end hung up\\nfatal: early EOF\\n' >&2; exit 128 ;;
+        """)
+        self.blocked(work, r"is unknown: `git fetch .*` failed: two \| error: RPC failed; HTTP 503 \| "
+                           r"fatal: the remote end hung up \| fatal: early EOF$",
+                     release=before, path=path)
+
     def test_a_history_commit_git_cannot_read_blocks(self):
         # The stale-image verdict blames the runner image. A commit git could not list must
         # not count as "this commit gives no build" on the way to it.

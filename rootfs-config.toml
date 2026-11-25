@@ -23,6 +23,10 @@ btrfs_size = "60G"
 # and one that cannot be fails. FCVM_CONFINE=required tightens this; it cannot loosen it.
 [confine]
 mode = "off"
+# FCVM_CONFINE_SECCOMP=log installs the syscall allowlist in log mode, which allows every
+# syscall and records the ones outside the list. With mode = "required" it is refused unless
+# this is true; a start in log mode warns and is shown as "seccomp-log", never "seccomp".
+allow_seccomp_log = false
 
 # Pinned pasta (passt) build
 # This upstream commit keeps `-a`, `-g` and `-n` on a host with no IPv4

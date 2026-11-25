@@ -136,7 +136,10 @@ jobs:
           printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/fcvm-btrfs/containers/storage"\n' > ~/.config/containers/storage.conf
           podman system migrate || true
       - name: Create test log directory
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        id: test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -161,7 +164,8 @@ jobs:
           FCVM_GYM_SAMPLES: '16'
         run: FCVM_GYM_SHARD="$(( 10#$(date -u +%j) % 7 ))/7" make fuzz-gym
       - name: Upload test logs
-        if: failure()
+        # Only this job's files: not when the job failed before it emptied the directory (#2164).
+        if: ${{ failure() && steps.test-logs.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-logs-${{ github.run_id }}

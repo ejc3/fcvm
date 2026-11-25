@@ -1088,6 +1088,158 @@ pub fn find_fcvm_binary() -> anyhow::Result<PathBuf> {
 
 /// Poll VM health status, checking child process for early exit.
 /// Fails immediately if the child process exits.
+/// The firecracker processes whose parent is `parent`. The binary is content-addressed
+/// (`firecracker-default-<sha>.bin`), so its comm is a prefix of that name.
+pub fn firecracker_children(parent: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // comm is in parentheses and may hold spaces; the fields after it are plain.
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let comm = &stat[stat.find('(').map_or(0, |o| o + 1)..close];
+        let ppid = stat[close + 2..].split_whitespace().nth(1);
+        if comm.starts_with("firecracker") && ppid == Some(parent.to_string().as_str()) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+/// Why the process `vmm` is not a confined VMM, read from /proc and not from anything fcvm
+/// reports: a thread under no seccomp filter, a thread that can gain privileges or holds a
+/// capability, or a command line that was not handed the confined filter. Empty when it is
+/// confined.
+pub fn vmm_confinement_failures(vmm: u32) -> Vec<String> {
+    let mut failures = Vec::new();
+    match fcvm::confine::unfiltered_threads(vmm) {
+        Ok(unfiltered) if unfiltered.is_empty() => {}
+        Ok(unfiltered) => failures.push(format!(
+            "threads under no seccomp filter: {}",
+            unfiltered.join(", ")
+        )),
+        Err(error) => failures.push(format!("its threads cannot be read: {error:#}")),
+    }
+    for task in std::fs::read_dir(format!("/proc/{vmm}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let Ok(status) = std::fs::read_to_string(task.path().join("status")) else {
+            continue;
+        };
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name)?.strip_prefix(':'))
+                .map(str::trim)
+                .unwrap_or("absent")
+        };
+        for (name, want) in [
+            ("NoNewPrivs", "1"),
+            ("CapEff", "0000000000000000"),
+            ("CapPrm", "0000000000000000"),
+        ] {
+            if field(name) != want {
+                failures.push(format!(
+                    "thread {} has {name}: {} (a confined VMM has {want})",
+                    field("Name"),
+                    field(name)
+                ));
+            }
+        }
+    }
+    let args: Vec<String> = std::fs::read(format!("/proc/{vmm}/cmdline"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    let filter = args
+        .iter()
+        .position(|a| a == "--seccomp-filter")
+        .and_then(|i| args.get(i + 1));
+    // The verified bytes in a descriptor fcvm passed, never a path in the store.
+    if !filter.is_some_and(|path| path.starts_with("/proc/self/fd/")) {
+        failures.push(format!(
+            "its command line has no --seccomp-filter /proc/self/fd/<n>: {args:?}"
+        ));
+    }
+    if args.iter().any(|a| a == "--no-seccomp") {
+        failures.push("its command line has --no-seccomp".to_string());
+    }
+    failures
+}
+
+/// The name nextest gave this test (`--exact <name>`), else the test thread's name.
+fn current_test_name() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|a| a == "--exact")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .or_else(|| std::thread::current().name().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Under the confinement gate (`FCVM_CONFINE=required`, as `make test-confine` runs the
+/// tests), the VMM of the fcvm process `fcvm_pid` is confined
+/// ([`vmm_confinement_failures`]), or the test fails. Every helper that waits for a VM to
+/// become healthy calls this, so a test in the gate cannot pass on an unconfined VMM. The
+/// test's name is appended to `FCVM_CONFINE_ASSERT_LOG`, which is how
+/// scripts/confine-gate.sh knows the assertion ran in each test it counts.
+pub fn assert_vmm_confined_under_the_gate(fcvm_pid: u32) -> anyhow::Result<()> {
+    if std::env::var("FCVM_CONFINE").as_deref() != Ok("required") {
+        return Ok(());
+    }
+    let vmms = firecracker_children(fcvm_pid);
+    anyhow::ensure!(
+        !vmms.is_empty(),
+        "FCVM_CONFINE=required and fcvm {fcvm_pid} has no firecracker child to check"
+    );
+    for vmm in vmms {
+        let failures = vmm_confinement_failures(vmm);
+        anyhow::ensure!(
+            failures.is_empty(),
+            "FCVM_CONFINE=required and the VMM {vmm} of fcvm {fcvm_pid} is not confined: {}",
+            failures.join("; ")
+        );
+    }
+    record_confinement_assertion()
+}
+
+/// Append this test's name to `FCVM_CONFINE_ASSERT_LOG`, when the gate set one.
+fn record_confinement_assertion() -> anyhow::Result<()> {
+    if let Some(log) = std::env::var_os("FCVM_CONFINE_ASSERT_LOG") {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .and_then(|mut file| file.write_all(format!("{}\n", current_test_name()).as_bytes()))
+            .map_err(|e| anyhow::anyhow!("recording the confinement assertion: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Under the gate, inside a health poll: whether a VMM of `fcvm_pid` was seen confined
+/// just now, in which case the assertion is recorded. A test whose VM is meant to fail
+/// before it turns healthy never reaches [`assert_vmm_confined_under_the_gate`]; its VMM
+/// still runs the guest for a while, and this sees it then. Before Firecracker builds the
+/// VM its main thread has no filter yet, so an unconfined reading here is not a failure:
+/// the poll looks again, and a VM that turns healthy is asserted strictly.
+fn saw_confined_vmm_under_the_gate(fcvm_pid: u32) -> bool {
+    std::env::var("FCVM_CONFINE").as_deref() == Ok("required")
+        && firecracker_children(fcvm_pid)
+            .into_iter()
+            .any(|vmm| vmm_confinement_failures(vmm).is_empty())
+        && record_confinement_assertion().is_ok()
+}
+
 pub async fn poll_health(
     child: &mut tokio::process::Child,
     timeout_secs: u64,
@@ -1144,6 +1296,7 @@ pub async fn poll_health(
         // Check if VM is healthy using proper enum comparison
         for display in &vms {
             if matches!(display.vm.health_status, fcvm::state::HealthStatus::Healthy) {
+                assert_vmm_confined_under_the_gate(pid)?;
                 return Ok(());
             }
         }
@@ -1156,11 +1309,13 @@ pub async fn poll_health(
 pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
+    let mut seen_confined = false;
 
     loop {
         if start.elapsed() > timeout {
             anyhow::bail!("timeout waiting for VM to become healthy");
         }
+        seen_confined = seen_confined || saw_confined_vmm_under_the_gate(pid);
 
         // Check if process exited (zombie or gone)
         let is_gone = std::fs::read_to_string(format!("/proc/{}/stat", pid))
@@ -1195,6 +1350,7 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
         {
             for d in &vms {
                 if matches!(d.vm.health_status, fcvm::state::HealthStatus::Healthy) {
+                    assert_vmm_confined_under_the_gate(pid)?;
                     return Ok(());
                 }
             }
@@ -1262,6 +1418,9 @@ pub async fn poll_health_status_by_pid(
                     last_status = Some(current);
                 }
                 if current == expected {
+                    if expected == fcvm::state::HealthStatus::Healthy {
+                        assert_vmm_confined_under_the_gate(pid)?;
+                    }
                     return Ok(());
                 }
             }

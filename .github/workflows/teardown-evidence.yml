@@ -91,8 +91,13 @@ jobs:
           mkdir -p ~/.config/containers
           printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/fcvm-btrfs/containers/storage"\n' > ~/.config/containers/storage.conf
           podman system migrate || true
+      # Both directories the upload below takes: an earlier job's files are not this job's.
       - name: Create test log directory
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        id: test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
+          sudo rm -rf /tmp/fcvm-teardown-evidence
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -120,7 +125,8 @@ jobs:
               ./scripts/teardown-folio-lock-red.sh
           fi
       - name: Upload evidence
-        if: always()
+        # Only this job's files: not when the job failed before it emptied the directories (#2164).
+        if: ${{ always() && steps.test-logs.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: teardown-evidence-${{ github.run_id }}

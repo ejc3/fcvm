@@ -228,6 +228,22 @@ class PrScope(Harness):
         self.assertEqual(outputs['run'], 'true')
         self.assertEqual(outputs['code'], 'true')
 
+    def test_a_change_to_the_vmm_confinement_asks_for_the_x64_host_lane(self):
+        # Host-x64's test-confine step is the only place the x86_64 seccomp policy runs
+        # under real confinement, and a pull request leaves that job out unless asked.
+        for path, confine in (('resources/seccomp/confined-changes.json', 'true'),
+                              ('src/confine.rs', 'true'),
+                              ('src/firecracker/vm.rs', 'true'),
+                              ('src/hypervisor/firecracker.rs', 'true'),
+                              ('scripts/confine-gate.sh', 'true'),
+                              ('tests/test_confine.rs', 'true'),
+                              ('src/main.rs', 'false'),
+                              ('docs/x.md', 'false')):
+            fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [],
+                       f'repos/{REPO}/pulls/12/files': files(path)}
+            outputs, _, _ = self.scope(fixture)
+            self.assertEqual(outputs['confine'], confine, path)
+
     def test_a_stack_diff_the_compare_api_may_truncate_runs_everything(self):
         many = files(*[f'docs/{i}.md' for i in range(300)])
         fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [],
