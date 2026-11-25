@@ -1256,6 +1256,7 @@ mod tests {
             reassert_ms: 0.0,
             barrier_ms: 20.0,
             destroy_ms: 600.0,
+            listing_ms: 0.0,
             egress_open_ms: 30.0,
             hook_ms: 0.0,
             reopen_ms: 0.0,

@@ -169,9 +169,9 @@ tcp-reset` in both chains and both families (`TCP_NEW_FLOW_REJECT`).
    entries behind.
 2. **What begins a flow is read off the packet where the protocol has such a
    packet.** The tracker's memory outlives the connections it describes. For
-   TCP that packet is a SYN without ACK, with one exception the rule does not
-   cover: the ACK that completes a handshake the listener answered with a SYN
-   cookie (#2123).
+   TCP that packet is a SYN without ACK, with one exception the rule passes:
+   the ACK that completes a handshake the listener answered with a SYN cookie
+   (#2123). The restore covers it, below.
 3. **The restored clone's UDP rule is the exception, and only on the restore
    side** (`udp_ingress_rule_args`): UDP has no packet that begins a flow. Its
    doc says what it promises and what it does not.
@@ -183,6 +183,50 @@ over the chains `gate_chain_rules` builds.
 `a_stale_tracked_tuple_does_not_pass_a_restored_clones_closed_gate` and
 `a_snapshot_leaves_the_sources_tracked_connections_as_it_found_them`
 (`tests/test_snapshot_gate_tcp.rs`) hold both in a routed VM.
+
+### A SYN cookie's socket is the restore's to retire, not the gate's to refuse
+
+A listener whose SYN queue is full answers a SYN with a cookie and keeps
+nothing, so the client's bare ACK is the whole handshake to it, and the flag
+rule passes a bare ACK (#2123). The old `--ctstate NEW` rule reset that ACK
+unless the tracker held the tuple, by the fault that made it reset every other
+segment the tracker had not seen. Measured in a guest whose listener answers
+with cookies, the ACK held back until the clone is restored and its gate still
+closed: reset under the old rule, and under the flag rule an established socket
+in the published clone that no manifest names.
+
+On the source such a socket is the source's own, like any connection it
+accepts, and the snapshot does not touch `tcp_syncookies`: a snapshot does not
+reconfigure its source. On the clone the restore closes it in two steps
+(`restore_boundary_with`):
+
+1. **Its first step writes 0 to `net.ipv4.tcp_syncookies`**
+   (`FirewallGate::refuse_syn_cookies`), and a cookie's ACK is answered with a
+   reset from then on, as the gate answers a SYN. Publication writes back the
+   value read at the restore's start, before the ingress half opens. If that
+   write fails three times the clone is published without SYN cookies, with a
+   warning that names the value.
+2. **It lists the guest's TCP sockets itself**, with both halves of the gate
+   closed and receive processing drained, and retires what the manifest does
+   not name with what it does (`unlisted_sockets`). Kept: a loopback peer, and a
+   connection whose other end is a socket in the same list (the guest
+   connecting to its own address crosses the loopback device, which the gate
+   exempts).
+
+The gate's chains, the socket list and the setting are each per network
+namespace, and each acts on the agent's own. That is where every listener of
+the workload is: the container runs with `--network=host`. A namespace a
+privileged workload makes for itself is outside all three, as it was outside
+the gate before (its traffic is forwarded, and the gate hooks INPUT and
+OUTPUT). A snapshot of a clone cannot capture the 0: the prepare takes the
+boundary lock, which the restore holds until publication.
+
+A socket the clone opens after that list is in neither list and is never
+retired, whatever tuple it reuses. `ModelDiag` fails if a socket made after the
+list is retired, or if the list is taken while cookies are still accepted;
+`ModelHook` if the hook runs while they are.
+`a_syn_cookie_handshake_does_not_reach_a_restored_clone`
+(`tests/test_snapshot_gate_tcp.rs`) holds both steps in a routed VM.
 
 ### On restore, the gate's egress half opens before the stale sockets are retired
 

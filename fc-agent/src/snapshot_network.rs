@@ -30,6 +30,15 @@ pub(crate) const SYSFS_NET_PATH: &str = "/sys/class/net";
 const BOUNDARY_LOCK_PATH: &str = "/run/fcvm/snapshot-network.lock";
 const GATE_INPUT_CHAIN: &str = "FCVM_SNAPSHOT_IN";
 const GATE_OUTPUT_CHAIN: &str = "FCVM_SNAPSHOT_OUT";
+/// Whether a listener may answer a SYN with a cookie and complete the handshake from the
+/// client's ACK alone. One setting for IPv4 and IPv6: `cookie_v6_check`
+/// (net/ipv6/syncookies.c) reads `net->ipv4.sysctl_tcp_syncookies`, as `cookie_v4_check`
+/// does. It is per network namespace, like the gate's chains and the socket dump, and all
+/// three act on the agent's namespace: the container runs with `--network=host`
+/// (`container.rs`), so that is where every listener of the workload is.
+const SYN_COOKIES_SETTING: &str = "/proc/sys/net/ipv4/tcp_syncookies";
+/// How often publication tries to write the SYN cookie setting back.
+const SYN_COOKIES_WRITE_ATTEMPTS: usize = 3;
 
 const NETLINK_SOCK_DIAG: i32 = 4;
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
@@ -94,19 +103,41 @@ struct TcpSocketIdentity {
 
 impl TcpSocketIdentity {
     fn peer_ip(&self) -> Result<IpAddr> {
+        self.address(&self.id.destination)
+    }
+
+    fn address(&self, words: &[u32; 4]) -> Result<IpAddr> {
         match self.family as i32 {
-            libc::AF_INET => Ok(IpAddr::V4(Ipv4Addr::from(
-                self.id.destination[0].to_ne_bytes(),
-            ))),
+            libc::AF_INET => Ok(IpAddr::V4(Ipv4Addr::from(words[0].to_ne_bytes()))),
             libc::AF_INET6 => {
                 let mut bytes = [0u8; 16];
-                for (index, word) in self.id.destination.iter().enumerate() {
+                for (index, word) in words.iter().enumerate() {
                     bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_ne_bytes());
                 }
                 Ok(IpAddr::V6(Ipv6Addr::from(bytes)))
             }
             family => bail!("unsupported socket family in snapshot manifest: {family}"),
         }
+    }
+
+    /// This socket's own end and its peer's, each an address and a port, with an
+    /// IPv4-mapped address as the IPv4 address it stands for: the two sockets of one
+    /// connection name the same two ends, whichever family each was opened in.
+    fn ends(&self) -> Result<[(IpAddr, u16); 2]> {
+        let plain = |address: IpAddr| match address {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, IpAddr::V4),
+            v4 => v4,
+        };
+        Ok([
+            (
+                plain(self.address(&self.id.source)?),
+                u16::from_be(self.id.source_port_be),
+            ),
+            (
+                plain(self.peer_ip()?),
+                u16::from_be(self.id.destination_port_be),
+            ),
+        ])
     }
 
     /// A loopback connection has both ends in the guest, so it survives the restore. That
@@ -311,6 +342,21 @@ trait FirewallGate {
     /// snapshot must not disturb the VM it is taken from, and this rule would
     /// answer a live client's datagram with an ICMP unreachable.
     async fn gate_udp_ingress(&self) -> Result<()>;
+    /// Restore side only: stop the guest's listeners completing a handshake from a SYN
+    /// cookie, until `open()` publishes the clone and puts the setting back.
+    ///
+    /// A listener that answered a SYN with a cookie holds nothing for that client. The
+    /// client's next segment is a bare ACK, which the gate passes, and the listener makes
+    /// an established socket from it alone (#2123). With `net.ipv4.tcp_syncookies` at 0
+    /// the listener answers that ACK with a reset, as the gate answers a SYN. The setting
+    /// is the clone's own, read here and written back by `open()` in the step that
+    /// publishes the clone. The value to write back is held by this gate, which lives
+    /// with the guest-wide boundary lock from the restore's start to publication
+    /// (`RestoredNetwork`), and a snapshot's prepare takes that lock first: no snapshot
+    /// can be taken of a clone while its setting is 0 on the restore's account. The
+    /// snapshot side never calls this: a snapshot does not reconfigure its source, and a
+    /// cookie handshake the source completes makes a socket that is the source's own.
+    fn refuse_syn_cookies(&self) -> Result<()>;
     /// Report whether the gate is already fully installed: both directional
     /// chains present with exactly the boundary rules, each hooked from its
     /// built-in chain, in both address families.
@@ -519,6 +565,11 @@ struct IptablesGate<R, N: NetfilterOpener = SystemNetfilter> {
     /// With it the restore verifies the gate and inserts the UDP rule over
     /// nfnetlink; without it, with iptables.
     template: Option<std::sync::Arc<GateTemplate>>,
+    /// The kernel's SYN cookie setting, for `refuse_syn_cookies`. None leaves it alone.
+    syn_cookies: Option<std::path::PathBuf>,
+    /// What the setting held before `refuse_syn_cookies` wrote 0, for `open()` to put
+    /// back. Guards the value only, never held across an await.
+    syn_cookies_before: std::sync::Mutex<Option<String>>,
 }
 
 /// Whether `dump`, `iptables -S` in the scratch namespace after the UDP rule
@@ -795,12 +846,50 @@ impl<R, N: NetfilterOpener> IptablesGate<R, N> {
             halves: std::sync::Mutex::new([[HalfKnown::Unknown; 2]; 2]),
             timings: std::sync::Mutex::new(GateTimings::default()),
             template: None,
+            syn_cookies: None,
+            syn_cookies_before: std::sync::Mutex::new(None),
         }
     }
 
     fn with_template(mut self, template: Option<std::sync::Arc<GateTemplate>>) -> Self {
         self.template = template;
         self
+    }
+
+    /// The gate also switches SYN cookies, through the setting at `path`.
+    fn with_syn_cookies(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.syn_cookies = Some(path.into());
+        self
+    }
+
+    /// Write back the SYN cookie setting `refuse_syn_cookies` replaced, if it replaced one:
+    /// the value read on this clone at the restore's start, whatever it was.
+    ///
+    /// A write that fails is tried again, and after `SYN_COOKIES_WRITE_ATTEMPTS` the clone
+    /// is published all the same, with a warning that names the value: a clone without
+    /// SYN cookies answers a SYN flood by dropping SYNs, and a clone that never publishes
+    /// serves nobody.
+    fn restore_syn_cookies(&self) {
+        let (Some(path), Some(before)) = (
+            &self.syn_cookies,
+            self.syn_cookies_before.lock().unwrap().take(),
+        ) else {
+            return;
+        };
+        let mut failure = None;
+        for _ in 0..SYN_COOKIES_WRITE_ATTEMPTS {
+            match std::fs::write(path, &before) {
+                Ok(()) => return,
+                Err(error) => failure = Some(error),
+            }
+        }
+        if let Some(error) = failure {
+            eprintln!(
+                "[fc-agent] WARNING: {} was not put back to {before} and stays 0; the clone \
+                 is published without SYN cookies: {error}",
+                path.display()
+            );
+        }
     }
 
     fn mark(&self, family: Family, directions: &[Direction], known: HalfKnown) {
@@ -949,12 +1038,17 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
 /// either direction, so the rule reads the packet and asks connection tracking
 /// nothing.
 ///
-/// One connection it does not cover begins without that segment reaching the
-/// closed gate (#2123): a listener whose SYN queue is full answers a SYN with a
-/// cookie and keeps no request socket (`tcp_syncookies`), so the client's bare
-/// ACK creates the established socket by itself. A cookie sent before the gate
-/// closed is completed by an ACK that passes this rule, and the socket it
-/// creates is in no manifest.
+/// One connection begins without that segment reaching the closed gate (#2123):
+/// a listener whose SYN queue is full answers a SYN with a cookie and keeps no
+/// request socket (`tcp_syncookies`), so the client's bare ACK creates the
+/// established socket by itself. A cookie sent before the gate closed is
+/// completed by an ACK that passes this rule. The rule does not refuse it; the
+/// restore covers it. On the source the socket is the source's own, as any
+/// connection it accepts is. It is in the image and in no manifest when it is
+/// made after the snapshot's dump, so a restored clone lists its sockets itself
+/// and retires what the manifest does not name (`unlisted_sockets`), and takes
+/// no cookie from its first step until it is published
+/// (`FirewallGate::refuse_syn_cookies`).
 ///
 /// It used to be `-m conntrack --ctstate NEW`, which has two faults (#2106):
 ///
@@ -1590,8 +1684,29 @@ impl<R: CommandRunner + Sync, N: NetfilterOpener + Sync> FirewallGate for Iptabl
     }
 
     async fn open(&self) -> Result<()> {
+        // Before the ingress half goes, so the first client the clone admits finds the
+        // setting it was restored with.
+        self.restore_syn_cookies();
         self.remove_halves(&[Direction::Input, Direction::Output])
             .await
+    }
+
+    fn refuse_syn_cookies(&self) -> Result<()> {
+        let Some(path) = &self.syn_cookies else {
+            return Ok(());
+        };
+        let before = match std::fs::read_to_string(path) {
+            Ok(before) => before.trim().to_string(),
+            // A kernel built without SYN cookies sends none.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        if before == "0" {
+            return Ok(());
+        }
+        std::fs::write(path, "0").with_context(|| format!("writing 0 to {}", path.display()))?;
+        *self.syn_cookies_before.lock().unwrap() = Some(before);
+        Ok(())
     }
 
     async fn gate_udp_ingress(&self) -> Result<()> {
@@ -1660,6 +1775,9 @@ enum DestroyOutcome {
 pub(crate) struct CleanupTally {
     pub(crate) destroyed: usize,
     pub(crate) already_gone: usize,
+    /// Sockets retired that the manifest does not name: made behind the closed gate after
+    /// the snapshot's dump (`unlisted_sockets`).
+    pub(crate) unlisted: usize,
     pub(crate) datagrams: usize,
 }
 
@@ -1695,8 +1813,12 @@ pub struct RestoreNetworkReport {
     /// Milliseconds the receive barrier took (one RCU grace period); also
     /// counted in `reassert_ms` when the gate was reinstalled.
     pub barrier_ms: f64,
-    /// Milliseconds loading the manifest and retiring its sockets.
+    /// Milliseconds loading the manifest, listing the sockets it does not name
+    /// (`unlisted_sockets`) and retiring both.
     pub destroy_ms: f64,
+    /// The part of `destroy_ms` before egress opens: loading the manifest and listing
+    /// the guest's TCP sockets.
+    pub listing_ms: f64,
     /// Milliseconds removing the gate's egress half, after the receive barrier
     /// and before the first socket is retired, so the workload's reconnects
     /// and the hook reach out.
@@ -1710,6 +1832,51 @@ pub struct RestoreNetworkReport {
     pub(crate) tally: CleanupTally,
     /// Per-operation gate timings, refreshed at the end of each phase.
     pub gate: GateTimings,
+}
+
+/// The TCP sockets of `live` that a restore retires and `manifest` does not name.
+///
+/// The manifest is the snapshot's dump. A socket made after that dump is in the image and
+/// in no manifest, and one kind with a peer outside the guest passes the closed gate: the
+/// gate refuses the SYN that asks for a connection, and a listener that answered a SYN
+/// with a cookie keeps nothing, so the client's bare ACK is the whole handshake to it
+/// (#2123). The source makes such a socket between its dump and its pause, where it is
+/// the source's own, and the clone between its resume and the moment the restore stops
+/// taking cookies (`FirewallGate::refuse_syn_cookies`).
+///
+/// The restore takes `live` as the snapshot took its dump: both halves of the gate closed
+/// and receive processing drained. Nothing of the clone's own has left the guest yet, so
+/// a socket whose peer is outside the guest predates the restore, and is retired, by
+/// cookie, with the manifest's.
+///
+/// A connection with both ends in the guest is kept. A loopback peer says so by its
+/// address, as for the manifest (`is_preserved`). A connection over one of the guest's
+/// own addresses crosses the loopback device, which the gate exempts, so one can be made
+/// behind the closed gate; its other end is a socket in the same list.
+fn unlisted_sockets(
+    live: Vec<TcpSocketIdentity>,
+    manifest: &SnapshotNetworkManifest,
+) -> Result<Vec<TcpSocketIdentity>> {
+    let listed: std::collections::HashSet<[u32; 2]> = manifest
+        .sockets
+        .iter()
+        .map(|socket| socket.id.cookie)
+        .collect();
+    let mut ends = std::collections::HashSet::with_capacity(live.len());
+    for socket in &live {
+        ends.insert(socket.ends()?);
+    }
+    let mut unlisted = Vec::new();
+    for socket in live {
+        if listed.contains(&socket.id.cookie) || socket.is_preserved()? {
+            continue;
+        }
+        let [own, peer] = socket.ends()?;
+        if !ends.contains(&[peer, own]) {
+            unlisted.push(socket);
+        }
+    }
+    Ok(unlisted)
 }
 
 /// Total budget for retiring every socket named by the manifest.
@@ -2251,6 +2418,10 @@ async fn restore_boundary_with<
     // failpoint: hold before the gate is read, so a test can tamper with the restored gate
     // and drive the reinstall below in a real guest (#806).
     failpoint::hit_async("restore.pre_gate_verify").await;
+    // First, before anything is read: from here to publication no listener makes a
+    // socket from a SYN cookie. One made before this line is in the list taken below.
+    gate.refuse_syn_cookies()
+        .context("stopping SYN cookie handshakes on the restored clone")?;
     let verify_started = std::time::Instant::now();
     let verified_armed = match gate.is_closed().await {
         Ok(verdict) => verdict,
@@ -2296,13 +2467,25 @@ async fn restore_boundary_with<
         .await
         .context("the restore step before egress opens")?;
     let before_egress_ms = before_egress_started.elapsed().as_secs_f64() * 1000.0;
+    // The restore's own list, taken while both halves of the gate are still closed
+    // (`unlisted_sockets`). Its sockets are retired with the manifest's below, once
+    // egress is open.
+    let listing_started = std::time::Instant::now();
+    let manifest = store.load()?;
+    let unlisted = unlisted_sockets(
+        diagnostic
+            .dump_tcp_sockets()
+            .context("listing the TCP sockets made behind the closed gate")?,
+        &manifest,
+    )?;
+    let listing_ms = listing_started.elapsed().as_secs_f64() * 1000.0;
     // Egress opens here, before the first socket is retired. Every daemon whose
     // connection the retirement kills reconnects at once; with this half still
     // closed those connects were answered with a reset (the gate rejects with
     // tcp-reset), which clients treat as a definitive refusal: ServiceRouter
     // marked the hosts down, the configerator clients fell back to system
     // configs, and a www clone served 500s for as long as it lived. A socket a
-    // daemon opens from here on is not in the manifest, so the cookie-bound
+    // daemon opens from here on is in neither list, so the cookie-bound
     // retirement below never touches it, whatever four-tuple it reuses.
     // Ingress stays closed until publication, so no published-port client
     // reaches the clone yet.
@@ -2312,10 +2495,12 @@ async fn restore_boundary_with<
         .context("opening the egress half of the snapshot NEW-flow gate")?;
     let egress_open_ms = egress_started.elapsed().as_secs_f64() * 1000.0;
     let destroy_started = std::time::Instant::now();
-    let manifest = store.load()?;
+    let retiring: Vec<TcpSocketIdentity> =
+        manifest.sockets.iter().chain(&unlisted).copied().collect();
     let started = std::time::Instant::now();
     let mut tally = CleanupTally::default();
-    for batch in manifest.sockets.chunks(DESTROY_BATCH) {
+    let mut retired = 0;
+    for batch in retiring.chunks(DESTROY_BATCH) {
         let elapsed = started.elapsed();
         if elapsed >= budget {
             bail!(
@@ -2323,17 +2508,16 @@ async fn restore_boundary_with<
                  {} of {} sockets retired; the clone stays unpublished",
                 budget,
                 elapsed,
-                tally.destroyed + tally.already_gone,
-                manifest.sockets.len()
+                retired,
+                retiring.len()
             );
         }
-        let retired = tally.destroyed + tally.already_gone;
         let outcomes = diagnostic.destroy(batch).with_context(|| {
             format!(
                 "retiring snapshot-time TCP sockets {} to {} of {}",
                 retired + 1,
                 retired + batch.len(),
-                manifest.sockets.len()
+                retiring.len()
             )
         })?;
         if outcomes.len() != batch.len() {
@@ -2345,9 +2529,14 @@ async fn restore_boundary_with<
             );
         }
         for outcome in outcomes {
-            match outcome {
-                DestroyOutcome::Destroyed => tally.destroyed += 1,
-                DestroyOutcome::AlreadyGone => tally.already_gone += 1,
+            let listed = retired < manifest.sockets.len();
+            retired += 1;
+            match (listed, outcome) {
+                (true, DestroyOutcome::Destroyed) => tally.destroyed += 1,
+                (true, DestroyOutcome::AlreadyGone) => tally.already_gone += 1,
+                (false, DestroyOutcome::Destroyed) => tally.unlisted += 1,
+                // Closed by its owner since the listing.
+                (false, DestroyOutcome::AlreadyGone) => {}
             }
         }
     }
@@ -2358,7 +2547,7 @@ async fn restore_boundary_with<
     store
         .remove()
         .context("retiring snapshot network manifest after cookie-bound cleanup")?;
-    let destroy_ms = destroy_started.elapsed().as_secs_f64() * 1000.0;
+    let destroy_ms = listing_ms + destroy_started.elapsed().as_secs_f64() * 1000.0;
     Ok(RestoreNetworkReport {
         tally,
         verified_armed,
@@ -2371,6 +2560,7 @@ async fn restore_boundary_with<
         reassert_ms,
         barrier_ms,
         destroy_ms,
+        listing_ms,
         egress_open_ms,
         hook_ms: 0.0,
         reopen_ms: 0.0,
@@ -2962,7 +3152,9 @@ where
         acquire_boundary_lock,
         || {
             (
-                IptablesGate::new(SystemCommandRunner).with_template(gate_template()),
+                IptablesGate::new(SystemCommandRunner)
+                    .with_template(gate_template())
+                    .with_syn_cookies(SYN_COOKIES_SETTING),
                 SystemPacketReceiveBarrier::new(),
                 SystemSocketDiagnostic::new(),
                 FileManifestStore::default(),
@@ -2973,8 +3165,12 @@ where
         |report| {
             eprintln!(
                 "[fc-agent] snapshot network cleanup complete: destroyed={} already_gone={} \
-                 verified_armed={} link=UNTOUCHED gate=egress-open",
-                report.tally.destroyed, report.tally.already_gone, report.verified_armed
+                 verified_armed={} link=UNTOUCHED gate=egress-open unlisted={} listing_ms={:.3}",
+                report.tally.destroyed,
+                report.tally.already_gone,
+                report.verified_armed,
+                report.tally.unlisted,
+                report.listing_ms
             );
         },
     )
@@ -3015,6 +3211,28 @@ mod tests {
                 cookie: [cookie, 0],
             },
         }
+    }
+
+    /// The two sockets of one connection the guest made to its own address, 10.0.2.100:
+    /// a client on port 40000 and the server's accepted socket on port 8080.
+    fn in_guest_connection(client_cookie: u32, server_cookie: u32) -> [TcpSocketIdentity; 2] {
+        let own = [u32::from_ne_bytes([10, 0, 2, 100]), 0, 0, 0];
+        let end = |cookie, from: u16, to: u16| TcpSocketIdentity {
+            family: libc::AF_INET as u8,
+            state: 1,
+            id: InetDiagSockId {
+                source_port_be: from.to_be(),
+                destination_port_be: to.to_be(),
+                source: own,
+                destination: own,
+                interface_id: 0,
+                cookie: [cookie, 0],
+            },
+        };
+        [
+            end(client_cookie, 40000, 8080),
+            end(server_cookie, 8080, 40000),
+        ]
     }
 
     fn socket6(peer: Ipv6Addr) -> TcpSocketIdentity {
@@ -3115,6 +3333,12 @@ mod tests {
         fail_hook: bool,
         /// Calls to the model diagnostic's destroy, one datagram each.
         destroy_calls: usize,
+        /// Sockets the guest's own daemons open once egress is open.
+        opened_after_egress: Vec<TcpSocketIdentity>,
+        /// Those sockets once they are open: made after the restore's list.
+        made_after_the_list: Vec<TcpSocketIdentity>,
+        /// Whether the guest's listeners refuse a handshake from a SYN cookie.
+        syn_cookies_refused: bool,
     }
 
     #[derive(Clone)]
@@ -3136,6 +3360,9 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             state.egress_closed = false;
             state.events.push("gate-open-egress");
+            let opened = std::mem::take(&mut state.opened_after_egress);
+            state.live.extend(opened.iter().copied());
+            state.made_after_the_list.extend(opened);
             Ok(())
         }
 
@@ -3144,7 +3371,20 @@ mod tests {
             state.gate_closed = false;
             state.egress_closed = false;
             state.udp_gated = false;
+            state.syn_cookies_refused = false;
             state.events.push("gate-open");
+            Ok(())
+        }
+
+        fn refuse_syn_cookies(&self) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            assert!(
+                !state.udp_gated,
+                "SYN cookies were refused after the restore's UDP rejection: a restore \
+                 refuses them before anything else"
+            );
+            state.syn_cookies_refused = true;
+            state.events.push("syn-cookies-off");
             Ok(())
         }
 
@@ -3198,6 +3438,11 @@ mod tests {
                 state.gate_closed && state.udp_gated,
                 "the restore hook ran after the clone was published, or without the UDP rejection"
             );
+            assert!(
+                state.syn_cookies_refused,
+                "the restore hook ran while a listener still completes a handshake from a SYN \
+                 cookie: a client reaches the clone before it is published"
+            );
             state.events.push("restore-hook");
             if state.fail_hook {
                 bail!("injected restore hook failure");
@@ -3246,6 +3491,13 @@ mod tests {
                 state.events.contains(&"rx-barrier"),
                 "cookie dump raced ahead of the receive barrier"
             );
+            // The UDP rejection marks a restore. Its list is the last look at what was
+            // made behind the gate, so nothing may be made behind it afterwards.
+            assert!(
+                !state.udp_gated || state.syn_cookies_refused,
+                "the restore listed the guest's sockets while a listener still completes a \
+                 handshake from a SYN cookie: a socket made after the list is in neither"
+            );
             assert!(
                 !state.link_down,
                 "the snapshot boundary took the link down: it must not disturb \
@@ -3279,6 +3531,12 @@ mod tests {
             );
             let mut outcomes = Vec::with_capacity(sockets.len());
             for socket in sockets {
+                assert!(
+                    !state.made_after_the_list.contains(socket),
+                    "restore retired a socket the guest opened after the restore's list: \
+                     {}",
+                    socket.describe()
+                );
                 state.events.push("cookie-destroy");
                 if state.fail_destroy {
                     bail!("injected cookie destroy failure");
@@ -3547,8 +3805,9 @@ mod tests {
     struct ChannelDiag<F>(CookieDestroyer<ModelChannel, F>);
 
     impl<F: FnMut() -> Result<ModelChannel>> SocketDiagnostic for ChannelDiag<F> {
+        /// The model kernel holds the manifest's sockets and no other.
         fn dump_tcp_sockets(&mut self) -> Result<Vec<TcpSocketIdentity>> {
-            bail!("a restore never dumps sockets")
+            Ok(Vec::new())
         }
 
         fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
@@ -5103,7 +5362,7 @@ mod tests {
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
             egress_closed: true,
-            live: vec![replacement],
+            opened_after_egress: vec![replacement],
             ..Default::default()
         }));
         let store = MemoryStore::default();
@@ -5120,10 +5379,11 @@ mod tests {
         let mut diag = ModelDiag(state.clone());
 
         // The manifest names the stale socket, which the kernel has already
-        // retired, and the live table holds only its tuple-identical
-        // replacement. A cookie-bound destroy must therefore report
-        // already_gone and leave the replacement alone; a tuple-based one would
-        // report a destroy and take the wrong socket with it.
+        // retired, and a daemon opens its tuple-identical replacement as soon
+        // as egress is open, before the first socket is retired. A cookie-bound
+        // destroy must therefore report already_gone and leave the replacement
+        // alone; a tuple-based one would report a destroy and take the wrong
+        // socket with it.
         let report = restore_with(
             &gate,
             &barrier,
@@ -5139,6 +5399,7 @@ mod tests {
             CleanupTally {
                 destroyed: 0,
                 already_gone: 1,
+                unlisted: 0,
                 datagrams: 1,
             }
         );
@@ -5148,9 +5409,11 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy",
                 "gate-open",
@@ -5158,6 +5421,290 @@ mod tests {
         );
         assert!(!state.gate_closed);
         assert!(!state.link_down);
+    }
+
+    /// #2123: a socket made behind the closed gate after the snapshot's dump is in the
+    /// image and in no manifest. A listener that answered a SYN with a cookie takes the
+    /// client's bare ACK, which the gate passes, for the whole handshake. The restore lists
+    /// the guest's sockets itself before egress opens and retires what the manifest does
+    /// not name with what it does. Connections with both ends in the guest are kept (a
+    /// loopback one, and one over the guest's own address), and so is a connection the
+    /// clone opens once egress is open.
+    ///
+    /// RED WITHOUT THE RESTORE'S OWN LIST: the cookie-born socket is live after the restore.
+    #[tokio::test]
+    async fn a_socket_made_behind_the_closed_gate_is_retired_with_the_manifests() {
+        let listed = socket(31, [198, 51, 100, 8]);
+        let cookie_born = socket(32, [198, 51, 100, 9]);
+        let loopback = socket(33, [127, 0, 0, 1]);
+        let [client, server] = in_guest_connection(36, 37);
+        let reconnect = socket(34, [198, 51, 100, 8]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            egress_closed: true,
+            live: vec![listed, cookie_born, loopback, client, server],
+            opened_after_egress: vec![reconnect],
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: Vec::new(),
+                sockets: vec![listed],
+            })
+            .unwrap();
+        let mut diag = ModelDiag(state.clone());
+
+        let report = restore_with(
+            &ModelGate(state.clone()),
+            &ModelBarrier(state.clone()),
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.tally,
+            CleanupTally {
+                destroyed: 1,
+                already_gone: 0,
+                unlisted: 1,
+                datagrams: 1,
+            }
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.live, vec![loopback, client, server, reconnect]);
+        assert_eq!(
+            state.events,
+            vec![
+                "syn-cookies-off",
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "cookie-dump",
+                "gate-open-egress",
+                "cookie-destroy",
+                "cookie-destroy",
+                "gate-open",
+            ]
+        );
+        assert!(!state.syn_cookies_refused, "publication puts cookies back");
+    }
+
+    /// A four-tuple is not a socket identity, before egress opens as after it. The one
+    /// connection that can reuse a retired socket's tuple behind the closed gate has both
+    /// ends in the guest, over the guest's own address: the loopback device carries it
+    /// and the gate exempts that device. The manifest names the old pair, which is gone;
+    /// the new pair has the same tuples and is kept. (With a peer outside the guest the
+    /// same thing is the cookie-born socket of the test above, and is retired.)
+    #[tokio::test]
+    async fn a_tuple_reused_inside_the_guest_behind_the_gate_is_kept() {
+        let gone = in_guest_connection(41, 42);
+        let reused = in_guest_connection(43, 44);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            egress_closed: true,
+            live: reused.to_vec(),
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: Vec::new(),
+                sockets: gone.to_vec(),
+            })
+            .unwrap();
+        let mut diag = ModelDiag(state.clone());
+
+        let report = restore_with(
+            &ModelGate(state.clone()),
+            &ModelBarrier(state.clone()),
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            report.tally,
+            CleanupTally {
+                destroyed: 0,
+                already_gone: 2,
+                unlisted: 0,
+                datagrams: 1,
+            }
+        );
+        assert_eq!(state.lock().unwrap().live, reused.to_vec());
+    }
+
+    /// The two sockets of a connection name the same two ends, also when a dual-stack
+    /// server holds its end as an IPv6 socket with IPv4-mapped addresses. A socket whose
+    /// peer has no socket in the list has its other end outside the guest.
+    #[test]
+    fn a_connection_inside_the_guest_has_both_its_ends_in_the_list() {
+        let [client, server] = in_guest_connection(51, 52);
+        let mapped = |address: [u8; 4]| {
+            let v6 = Ipv4Addr::from(address).to_ipv6_mapped().octets();
+            let word = |i: usize| u32::from_ne_bytes(v6[i * 4..i * 4 + 4].try_into().unwrap());
+            [word(0), word(1), word(2), word(3)]
+        };
+        let dual_stack_server = TcpSocketIdentity {
+            family: libc::AF_INET6 as u8,
+            id: InetDiagSockId {
+                source: mapped([10, 0, 2, 100]),
+                destination: mapped([10, 0, 2, 100]),
+                ..server.id
+            },
+            ..server
+        };
+        let outside = socket(53, [198, 51, 100, 9]);
+        let manifest = SnapshotNetworkManifest {
+            version: MANIFEST_VERSION,
+            routes: Vec::new(),
+            sockets: Vec::new(),
+        };
+        for server in [server, dual_stack_server] {
+            assert_eq!(
+                unlisted_sockets(vec![client, server, outside], &manifest).unwrap(),
+                vec![outside]
+            );
+        }
+        // one end closed: what is left is no connection, and is retired
+        assert_eq!(
+            unlisted_sockets(vec![client, outside], &manifest).unwrap(),
+            vec![client, outside]
+        );
+    }
+
+    /// The clone stops taking SYN cookies before it reads anything, and gets its setting
+    /// back when it is published, whatever the setting was. A kernel without the setting
+    /// sends no cookies, and a gate that was given no setting touches none.
+    #[test]
+    fn the_clone_refuses_syn_cookies_until_it_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let setting = dir.path().join("tcp_syncookies");
+        for before in ["1\n", "2\n"] {
+            std::fs::write(&setting, before).unwrap();
+            let gate = IptablesGate::new(RecordingRunner::default()).with_syn_cookies(&setting);
+            gate.refuse_syn_cookies().unwrap();
+            assert_eq!(std::fs::read_to_string(&setting).unwrap(), "0");
+            gate.restore_syn_cookies();
+            assert_eq!(std::fs::read_to_string(&setting).unwrap(), before.trim());
+            // once: a second publication writes nothing
+            std::fs::write(&setting, "7").unwrap();
+            gate.restore_syn_cookies();
+            assert_eq!(std::fs::read_to_string(&setting).unwrap(), "7");
+        }
+        // already off: nothing to put back
+        std::fs::write(&setting, "0\n").unwrap();
+        let gate = IptablesGate::new(RecordingRunner::default()).with_syn_cookies(&setting);
+        gate.refuse_syn_cookies().unwrap();
+        std::fs::write(&setting, "1").unwrap();
+        gate.restore_syn_cookies();
+        assert_eq!(std::fs::read_to_string(&setting).unwrap(), "1");
+        // no such setting, and no setting given
+        std::fs::remove_file(&setting).unwrap();
+        gate.refuse_syn_cookies().unwrap();
+        gate.restore_syn_cookies();
+        assert!(!setting.exists());
+        let plain = IptablesGate::new(RecordingRunner::default());
+        plain.refuse_syn_cookies().unwrap();
+        plain.restore_syn_cookies();
+        // a value that cannot be written back does not stop publication
+        std::fs::write(&setting, "1").unwrap();
+        let gate = IptablesGate::new(RecordingRunner::default()).with_syn_cookies(&setting);
+        gate.refuse_syn_cookies().unwrap();
+        std::fs::remove_file(&setting).unwrap();
+        std::fs::create_dir(&setting).unwrap();
+        gate.restore_syn_cookies();
+        assert!(gate.syn_cookies_before.lock().unwrap().is_none());
+
+        // the restore's first step, and publication's first
+        let source = include_str!("snapshot_network.rs");
+        let restore = function_body(source, "async fn restore_boundary_with<");
+        assert!(
+            restore.find("gate.refuse_syn_cookies()").unwrap()
+                < restore.find("gate.is_closed()").unwrap()
+        );
+        let open = function_body(
+            source,
+            "    async fn open(&self) -> Result<()> {\n        // Before",
+        );
+        assert!(
+            open.find("self.restore_syn_cookies();").unwrap()
+                < open.find("self.remove_halves(").unwrap()
+        );
+        // only the restore: a snapshot does not reconfigure its source
+        assert!(!function_body(source, "async fn prepare_with<").contains("syn_cookies"));
+        assert!(
+            !function_body(source, "pub async fn prepare_snapshot_network(")
+                .contains("syn_cookies")
+        );
+        // A snapshot of this clone waits for its publication: the prepare takes the lock
+        // the restore holds, with the gate that knows the value, until `publish` ends.
+        let prepare = function_body(source, "pub async fn prepare_snapshot_network(");
+        assert!(prepare
+            .trim_start_matches("pub async fn prepare_snapshot_network() -> Result<()> {")
+            .trim_start()
+            .starts_with("let _transaction_lock = acquire_boundary_lock()?;"));
+        let restored = function_body(source, "pub struct RestoredNetwork {");
+        assert!(restored.contains("_transaction_lock: std::fs::File,"));
+        assert!(restored.contains("gate: IptablesGate<SystemCommandRunner>,"));
+        // One network namespace holds the gate, the socket list, the setting and every
+        // listener of the workload.
+        assert!(include_str!("container.rs").contains("args.push(\"--network=host\".to_string());"));
+    }
+
+    /// A restore that cannot list the guest's sockets cannot say none was made behind the
+    /// gate, so it stays unpublished, with egress still closed and no socket retired.
+    #[tokio::test]
+    async fn a_failed_listing_keeps_the_restored_clone_closed() {
+        let listed = socket(35, [198, 51, 100, 8]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            egress_closed: true,
+            live: vec![listed],
+            fail_dump: true,
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: Vec::new(),
+                sockets: vec![listed],
+            })
+            .unwrap();
+        let mut diag = ModelDiag(state.clone());
+
+        restore_with(
+            &ModelGate(state.clone()),
+            &ModelBarrier(state.clone()),
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect_err("a restore that cannot list sockets must not publish");
+        let state = state.lock().unwrap();
+        assert!(state.gate_closed && state.egress_closed);
+        assert_eq!(state.live, vec![listed]);
+        assert_eq!(
+            state.events,
+            vec![
+                "syn-cookies-off",
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "cookie-dump"
+            ]
+        );
     }
 
     /// A gate probe that cannot READ the chains is not a verdict about them:
@@ -5202,10 +5749,12 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-close",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy",
                 "gate-open",
@@ -5314,9 +5863,11 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy",
                 "gate-open",
@@ -5362,10 +5913,12 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-close",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy",
                 "gate-open",
@@ -5412,9 +5965,11 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy"
             ]
@@ -5470,9 +6025,11 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy"
             ]
@@ -5833,9 +6390,11 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy",
                 "restore-hook",
@@ -5915,9 +6474,11 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy",
                 "restore-hook",
@@ -5968,9 +6529,11 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress",
                 "cookie-destroy",
                 "restore-hook"
@@ -6024,9 +6587,11 @@ mod tests {
         assert_eq!(
             state.events,
             vec![
+                "syn-cookies-off",
                 "gate-verify",
                 "gate-udp-ingress",
                 "rx-barrier",
+                "cookie-dump",
                 "gate-open-egress"
             ]
         );
@@ -6140,6 +6705,7 @@ mod tests {
             CleanupTally {
                 destroyed: 1000,
                 already_gone: 0,
+                unlisted: 0,
                 datagrams: 16,
             }
         );
