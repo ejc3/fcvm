@@ -101,6 +101,9 @@ pub(crate) struct Env<'a> {
     /// Whether the boundary that made the freeze is being worked on right now
     /// (`snapshot_network::boundary_in_progress`). The watchdog asks before each look.
     pub(crate) boundary_in_progress: &'a dyn Fn() -> bool,
+    /// Whether a source's boundary is owed its resume
+    /// (`snapshot_network::source_boundary_is_owed`).
+    pub(crate) source_owed: &'a dyn Fn() -> bool,
 }
 
 impl Env<'static> {
@@ -111,6 +114,7 @@ impl Env<'static> {
             lock: Path::new(FROZEN_LOCK),
             froze: &|_| {},
             boundary_in_progress: &crate::snapshot_network::boundary_in_progress,
+            source_owed: &crate::snapshot_network::source_boundary_is_owed,
         }
     }
 }
@@ -368,7 +372,20 @@ pub(crate) struct Watch {
     /// Looks at this freeze that were not counted because its boundary was being worked
     /// on.
     uncounted: u32,
+    /// Looks at this freeze that were not counted because a source's boundary was owed
+    /// and its host could still be asking for the resume.
+    asked: u32,
 }
+
+/// How many looks at one freeze go uncounted while a source's boundary is owed: the
+/// host's whole bound on asking for the resume (`SOURCE_REOPEN_BOUND`, 150 s, at one look
+/// a second). Between two of the host's tries nobody holds the boundary lock, so those
+/// looks used to count, and the thaw could land about 90 s into the 150: a container
+/// running behind its closed gate with a snapshot create still in flight. Looks, not the
+/// mark's age: the guest takes no look while its VM is paused for the save, and a clock
+/// that ran through the pause would have used the allowance up before the host began to
+/// ask. A source whose host never returns is thawed that many looks later.
+pub(crate) const SOURCE_REOPEN_LOOKS: u32 = 150;
 
 /// How many looks at one freeze may go uncounted. 15 minutes of the guest running: the
 /// host ends a clone whose restore is not acknowledged by then
@@ -400,10 +417,15 @@ pub(crate) fn watchdog_in(env: &Env, watch: &mut Watch) -> usize {
             id: Some(record.id),
             looks: 0,
             uncounted: 0,
+            asked: 0,
         };
     }
     if (env.boundary_in_progress)() && watch.uncounted < UNCOUNTED_LOOKS_CAP {
         watch.uncounted += 1;
+        return 0;
+    }
+    if (env.source_owed)() && watch.asked < SOURCE_REOPEN_LOOKS {
+        watch.asked += 1;
         return 0;
     }
     watch.looks = watch.looks.saturating_add(1);
@@ -478,6 +500,7 @@ mod tests {
         watch: RefCell<Watch>,
         /// What the watchdog is told when it asks whether the boundary is being worked on.
         in_progress: std::cell::Cell<bool>,
+        owed: std::cell::Cell<bool>,
     }
 
     impl Tree {
@@ -486,6 +509,7 @@ mod tests {
                 dir: tempfile::tempdir().unwrap(),
                 watch: RefCell::new(Watch::default()),
                 in_progress: std::cell::Cell::new(false),
+                owed: std::cell::Cell::new(false),
             }
         }
 
@@ -508,6 +532,7 @@ mod tests {
                 lock: &lock,
                 froze,
                 boundary_in_progress: &|| self.in_progress.get(),
+                source_owed: &|| self.owed.get(),
             })
         }
 
@@ -614,6 +639,30 @@ mod tests {
     /// RED WITHOUT THE CAP: a boundary that stays in progress is never thawed.
     #[test]
     fn the_watchdog_leaves_a_freeze_alone_while_its_boundary_is_in_progress() {
+        // A source whose boundary is owed, with nobody holding the lock: between two of
+        // the host's tries at the resume. The host asks for SOURCE_REOPEN_LOOKS seconds;
+        // those looks are not counted, and the deadline runs from there, so a source whose
+        // host never returns is still thawed.
+        //
+        // RED BEFORE THE FIX: the thaw came at DEADLINE_LOOKS, with the host still asking
+        // and a snapshot create still in flight.
+        let asked = Tree::new();
+        let source = asked.cgroup("libpod-payload-a", false);
+        asked.run(freeze_in);
+        asked.owed.set(true);
+        assert_eq!(asked.watchdog(SOURCE_REOPEN_LOOKS + DEADLINE_LOOKS - 1), 0);
+        assert!(
+            frozen(&source),
+            "thawed while its host could still be asking"
+        );
+        assert_eq!(asked.watchdog(1), 1);
+        assert!(!frozen(&source));
+        // one look a second, for the host's whole bound
+        let host = include_str!("../../src/commands/common.rs");
+        assert!(host.contains(&format!(
+            "const SOURCE_REOPEN_BOUND: std::time::Duration = std::time::Duration::from_secs({SOURCE_REOPEN_LOOKS});"
+        )));
+
         let tree = Tree::new();
         let running = tree.cgroup("libpod-payload-a", false);
         tree.run(freeze_in);

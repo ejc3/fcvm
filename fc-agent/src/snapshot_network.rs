@@ -457,12 +457,24 @@ async fn gate_is_installed_with<R: CommandRunner>(runner: &R) -> Result<bool> {
                 command_failure(program, &args, &output)
             );
         }
-        let rules = String::from_utf8_lossy(&output.stdout);
-        if rules.contains(GATE_INPUT_CHAIN) || rules.contains(GATE_OUTPUT_CHAIN) {
+        if rules_hold_the_gate(&String::from_utf8_lossy(&output.stdout)) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Whether an `iptables -S` listing holds a gate chain or a jump to one: `-N <chain>`,
+/// `-A <chain>`, `-j <chain>` or `-g <chain>`. A chain's name anywhere else on a line (a
+/// rule's comment) is not the gate.
+fn rules_hold_the_gate(rules: &str) -> bool {
+    rules.lines().any(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        words.windows(2).any(|pair| {
+            matches!(pair[0], "-N" | "-A" | "-j" | "-g")
+                && (pair[1] == GATE_INPUT_CHAIN || pair[1] == GATE_OUTPUT_CHAIN)
+        })
+    })
 }
 
 /// How often the hold on the container's start looks at the boundary.
@@ -628,14 +640,15 @@ fn begin_restore_boundary_in(marks: &BoundaryMarks) -> Result<()> {
     BoundaryMarks::clear(&marks.owed)
 }
 
-/// The restore published: the guest's boundary is nobody's.
-pub fn end_restore_boundary() {
-    if let Err(error) = BoundaryMarks::clear(&BoundaryMarks::system().restore) {
-        eprintln!(
-            "[fc-agent] WARNING: {error:#}; snapshots of this clone are refused until it is \
-             removed"
-        );
-    }
+/// The restore published: the guest's boundary is nobody's. A mark that is already gone
+/// is removed; one that cannot be removed is the caller's to fail the restore on.
+pub fn end_restore_boundary() -> Result<()> {
+    end_restore_boundary_in(&BoundaryMarks::system())
+}
+
+fn end_restore_boundary_in(marks: &BoundaryMarks) -> Result<()> {
+    BoundaryMarks::clear(&marks.restore)
+        .context("removing the restore-under-way mark at publication")
 }
 
 /// Whether a prepare closed this guest's gate and no resume has opened it (and no restore
@@ -3477,6 +3490,18 @@ async fn resume_source_network_with<G: FirewallGate, S: ManifestStore>(
     // still closed, leaving the source unpublished until an operator noticed --
     // the same "snapshot disturbed the source" failure this boundary exists to
     // avoid, arriving by the error path instead.
+    // A restore dispatched while this one-shot waited above takes the boundary without
+    // the lock (`begin_restore_boundary`). Looked at once more, after the last wait and
+    // before anything of the gate or the manifest is touched, so the two never both
+    // change the boundary and the restore never waits for a resume.
+    if marks.restore_under_way() {
+        if chronyd_offline {
+            if let Err(error) = chronyc(&["online"]).await {
+                eprintln!("[fc-agent] WARNING: {error:#}; chronyd stays offline until set online");
+            }
+        }
+        return SourceResume::owed(RestoreUnderWay("a source's resume").into());
+    }
     let reopened = reopen_owed_gate(gate, REOPEN_PAUSE).await;
     if let Some(host_time) = host_time {
         crate::bootplan::advance_system_clock(host_time, started.elapsed());
@@ -3489,7 +3514,10 @@ async fn resume_source_network_with<G: FirewallGate, S: ManifestStore>(
     // Read before the mark goes.
     let agent_restarted = marks.agent_restarted();
     let resumed = retire_source_boundary(reopened, store, marks);
-    if resumed.result.is_err() {
+    // A gate that is open is a source back in service, whatever became of the manifest
+    // and the mark: what follows is for the running source and is done either way. The
+    // caller thaws on `gate_open` and exits with `OPEN_UNCLEAN_EXIT` on the error.
+    if !resumed.gate_open {
         return resumed;
     }
     eprintln!(
@@ -5619,8 +5647,10 @@ mod tests {
         let step = body
             .find("crate::bootplan::advance_system_clock(host_time, started.elapsed())")
             .expect("the source no longer steps its clock to the host's");
+        // The last one: a resume refused for a restore, before the reopen, also sets
+        // chronyd online again on its way out.
         let online = body
-            .find("chronyc(&[\"online\"])")
+            .rfind("chronyc(&[\"online\"])")
             .expect("the source no longer brings chronyd back online");
         assert!(
             offline < reopen && reopen < step && step < online,
@@ -9725,6 +9755,92 @@ mod tests {
         assert!(read < retired && retired < reported);
     }
 
+    /// The gate is a chain or a jump to one, in a rules listing: not the chain's name in
+    /// some other rule's comment, which held a restarted agent's container start for 300
+    /// looks on an open gate.
+    #[test]
+    fn a_gate_is_a_chain_or_a_jump_to_one_not_a_name_in_a_comment() {
+        for gate in [
+            "-N FCVM_SNAPSHOT_IN",
+            "-P INPUT ACCEPT\n-A INPUT -j FCVM_SNAPSHOT_IN",
+            "-A OUTPUT -p tcp -j FCVM_SNAPSHOT_OUT",
+            "-A FCVM_SNAPSHOT_OUT -p tcp -j REJECT --reject-with tcp-reset",
+            "-A INPUT -g FCVM_SNAPSHOT_IN",
+        ] {
+            assert!(rules_hold_the_gate(gate), "{gate}");
+        }
+        for not_gate in [
+            "",
+            "-P INPUT ACCEPT\n-P OUTPUT ACCEPT",
+            "-A INPUT -m comment --comment FCVM_SNAPSHOT_IN -j ACCEPT",
+            "-A INPUT -m comment --comment \"before FCVM_SNAPSHOT_OUT\" -j ACCEPT",
+            "-N FCVM_SNAPSHOT_INNER\n-A INPUT -j FCVM_SNAPSHOT_INNER",
+        ] {
+            assert!(!rules_hold_the_gate(not_gate), "{not_gate}");
+        }
+    }
+
+    /// A restore whose `restore-under-way` mark cannot be removed is not acknowledged:
+    /// with the mark left, the clone would refuse every snapshot for the rest of its
+    /// life while its host believed it restored. A mark that is already gone is fine.
+    ///
+    /// RED BEFORE THE FIX: the failure was a warning, and the acknowledgement followed.
+    #[test]
+    fn a_restore_whose_mark_cannot_be_removed_is_not_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = marks_in(dir.path());
+        end_restore_boundary_in(&marks).expect("a mark already gone is removed");
+        begin_restore_boundary_in(&marks).unwrap();
+        end_restore_boundary_in(&marks).unwrap();
+        assert!(!marks.restore_under_way());
+        // a mark that cannot be removed: a directory with something in it
+        std::fs::create_dir_all(marks.restore.join("held")).unwrap();
+        assert!(end_restore_boundary_in(&marks).is_err());
+
+        let watcher: String = include_str!("mmds.rs").split_whitespace().collect();
+        let ended = watcher
+            .find("ifletErr(error)=crate::snapshot_network::end_restore_boundary(){signals.restore_status.fail();")
+            .expect("the watcher does not fail the restore on the mark");
+        assert!(
+            ended
+                < watcher
+                    .find("crate::vsock::notify_restore_complete(current,&phases)")
+                    .unwrap()
+        );
+    }
+
+    /// The resume looks for a restore once more after its last wait and before it touches
+    /// the gate, and what follows an open gate is done whatever became of the cleanup.
+    ///
+    /// - A restore takes the boundary at its dispatch without the lock, so one dispatched
+    ///   while a resume waited for the console's release found the resume already past its
+    ///   checks: the resume then opened the gate and retired the manifest of a clone in
+    ///   the middle of its restore.
+    /// - A resume that opened the gate and could not clear `owed` returned before it asked
+    ///   the output writer to reconnect, and the container's output after the snapshot was
+    ///   lost.
+    #[test]
+    fn a_resume_looks_for_a_restore_before_the_gate_and_recovers_behind_an_open_one() {
+        let source = include_str!("snapshot_network.rs");
+        let resume = &source[source.find("async fn resume_source_network_with<").unwrap()..];
+        let resume = &resume[..resume.find("\nasync fn reopen_owed_gate<").unwrap()];
+        let released = resume
+            .find("crate::console::request_source_release().await")
+            .unwrap();
+        let offline = resume.find("chronyc(&[\"offline\"]).await").unwrap();
+        let looked = resume.rfind("if marks.restore_under_way() {").unwrap();
+        let reopened = resume
+            .find("reopen_owed_gate(gate, REOPEN_PAUSE).await")
+            .unwrap();
+        assert!(released < looked && offline < looked && looked < reopened);
+        let closed = resume
+            .find("if !resumed.gate_open {\n        return resumed;")
+            .unwrap();
+        assert!(!resume.contains("if resumed.result.is_err() {"));
+        assert!(closed < resume.find("crate::output::request_reconnect()").unwrap());
+        assert!(closed < resume.find("chrony_burst().await").unwrap());
+    }
+
     /// A resume acts only on the boundary it was sent for (#2159).
     ///
     /// The host gives every snapshot create a token. The prepare writes it into the
@@ -9968,7 +10084,7 @@ mod tests {
         let begin = at("crate::snapshot_network::begin_restore_boundary()");
         assert!(begin < at("crate::console::release_source_snapshot_hold("));
         assert!(begin < at("signals.restore_status.begin()"));
-        let end = at("crate::snapshot_network::end_restore_boundary();");
+        let end = at("crate::snapshot_network::end_restore_boundary()");
         assert!(at("crate::restore::handle_clone_restore(") < end);
         assert!(end < at("crate::vsock::notify_restore_complete("));
         // The resume one-shot refuses before it waits for the lock, which a restore holds

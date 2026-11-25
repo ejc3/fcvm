@@ -90,6 +90,12 @@ fn event_prefix(level: &tracing::Level) -> &'static str {
 /// src/commands/common.rs) and does not try again.
 const REFUSED_EXIT: i32 = 3;
 
+/// The exit status of a resume that opened the gate and then could not retire the
+/// manifest or the `owed` mark. The gate is open and the source is back in service; the
+/// host must not record it closed (`ONE_SHOT_OPEN_UNCLEAN_EXIT` in
+/// src/commands/common.rs).
+const OPEN_UNCLEAN_EXIT: i32 = 4;
+
 #[tokio::main]
 async fn main() {
     // `fc-agent --notify-reboot`: a one-shot invoked by the systemd system-shutdown
@@ -148,6 +154,13 @@ async fn main() {
                     // frozen for the resume that does.
                     if resumed.gate_open {
                         payload_freeze::thaw();
+                        if let Err(error) = &resumed.result {
+                            eprintln!(
+                                "[fc-agent] the gate is open, and the boundary's manifest or \
+                                 mark could not be removed: {error:#}"
+                            );
+                            std::process::exit(OPEN_UNCLEAN_EXIT);
+                        }
                     }
                     resumed.result
                 }
@@ -299,7 +312,9 @@ mod tests {
             "the prepare is not handed the freeze, or does not thaw exactly when it is told to"
         );
         assert!(
-            squeezed.contains("ifresumed.gate_open{payload_freeze::thaw();}resumed.result"),
+            squeezed.contains(
+                "ifresumed.gate_open{payload_freeze::thaw();ifletErr(error)=&resumed.result{"
+            ) && squeezed.contains("std::process::exit(OPEN_UNCLEAN_EXIT);}}resumed.result"),
             "the source resume does not thaw exactly when the gate is open"
         );
         // Inside the prepare: refused before the freeze, and frozen before the gate.
@@ -351,6 +366,13 @@ mod tests {
         )));
         let main = include_str!("main.rs");
         assert!(main.contains("std::process::exit(if refused { REFUSED_EXIT } else { 1 });"));
+        // A resume that opened the gate and could not clean up says so with a status of
+        // its own, which the host reads as an open gate.
+        assert!(host.contains(&format!(
+            "const ONE_SHOT_OPEN_UNCLEAN_EXIT: i32 = {};",
+            super::OPEN_UNCLEAN_EXIT
+        )));
+        assert_ne!(super::OPEN_UNCLEAN_EXIT, super::REFUSED_EXIT);
     }
 
     use super::fatal_error_line;

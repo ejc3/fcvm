@@ -6419,6 +6419,52 @@ const SOURCE_AGENT_RESTARTED_REPORT: &str =
 /// nothing, and the guest's gate is its restore's, not this snapshot's to open.
 const ONE_SHOT_REFUSED_EXIT: i32 = 3;
 
+/// The exit status of a resume that opened the gate and could not remove the boundary's
+/// manifest or mark afterwards (`OPEN_UNCLEAN_EXIT` in fc-agent's main.rs). The gate is
+/// open: the state must say so, and the next prepare writes both anew.
+const ONE_SHOT_OPEN_UNCLEAN_EXIT: i32 = 4;
+
+/// What a resume one-shot's result says about the gate.
+fn reopen_try_of(vm_id: &str, output: crate::commands::exec::ExecOutput) -> ReopenTry {
+    let open = |output: &crate::commands::exec::ExecOutput| {
+        if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {
+            ReopenTry::OpenAfterAgentRestart
+        } else {
+            ReopenTry::Open
+        }
+    };
+    match output.exit_code {
+        0 => {
+            // The one-shot's own report, including the size of the clock step, reaches no
+            // console: it is this exec's stderr.
+            debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
+            open(&output)
+        }
+        ONE_SHOT_OPEN_UNCLEAN_EXIT => {
+            warn!(
+                vm_id,
+                guest = %output.stderr.trim(),
+                "the source's network gate is open, and its guest could not remove the \
+                 boundary's manifest or mark; the next snapshot's prepare writes both anew"
+            );
+            open(&output)
+        }
+        code => {
+            let error = anyhow::anyhow!(
+                "`fc-agent --resume-snapshot-network` failed in guest {vm_id} with exit code \
+                 {code}: stdout={:?}, stderr={:?}",
+                output.stdout,
+                output.stderr
+            );
+            if code == ONE_SHOT_REFUSED_EXIT {
+                ReopenTry::Refused(error)
+            } else {
+                ReopenTry::Failed(error)
+            }
+        }
+    }
+}
+
 /// How long a snapshot create keeps asking its source to reopen, in all: every try is
 /// cut off at what is left of it, so the create is over `SOURCE_REOPEN_BOUND` after its
 /// first ask at the latest. The create holds the per-VM snapshot lock and the global
@@ -6603,36 +6649,23 @@ async fn ask_source_to_reopen(
                 args.extend(["--boundary", token]);
             }
             match run_fc_agent_command_any_exit(vsock_socket, vm_id, &args, Some(limit)).await {
-                Ok(output) if output.exit_code == 0 => {
-                    // The one-shot's own report, including the size of the clock step,
-                    // reaches no console: it is this exec's stderr.
-                    debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
-                    if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {
-                        ReopenTry::OpenAfterAgentRestart
-                    } else {
-                        ReopenTry::Open
-                    }
-                }
-                Ok(output) => {
-                    let error = anyhow::anyhow!(
-                        "`fc-agent --resume-snapshot-network` failed in guest {vm_id} with \
-                         exit code {}: stdout={:?}, stderr={:?}",
-                        output.exit_code,
-                        output.stdout,
-                        output.stderr
-                    );
-                    if output.exit_code == ONE_SHOT_REFUSED_EXIT {
-                        ReopenTry::Refused(error)
-                    } else {
-                        ReopenTry::Failed(error)
-                    }
-                }
+                Ok(output) => reopen_try_of(vm_id, output),
                 Err(error) => ReopenTry::Failed(error),
             }
         },
         |closed| record_source_gate(vm_id, closed),
     )
     .await
+    .map_err(|failure| match (failure, token) {
+        // What an operator would run by hand, with the token the guest's mark holds.
+        (ReopenFailure::LeftGated(error), Some(token)) => {
+            ReopenFailure::LeftGated(error.context(format!(
+                "by hand, in guest {vm_id}: `{FC_AGENT_PATH} --resume-snapshot-network \
+                 --boundary {token}`"
+            )))
+        }
+        (failure, _) => failure,
+    })
 }
 
 /// The loop of [`reopen_source_network`], with the try and the state's record as
@@ -6721,8 +6754,8 @@ where
                  `{FC_AGENT_PATH} --resume-snapshot-network` succeeds in it. Its state \
                  records the closed gate; the next `fcvm snapshot create` of it asks again, \
                  clears the record when the gate opens, and is refused while it stays \
-                 closed. By hand the resume needs `--boundary` and the `boundary_token` of \
-                 the VM's state: the guest obeys only the resume of the boundary it owes",
+                 closed. The guest obeys only the resume of the boundary it owes, which \
+                 carries that boundary's token",
                 started.elapsed()
             ))));
         }
@@ -11029,8 +11062,9 @@ mod tests {
         assert!(ask.contains("|closed| record_source_gate(vm_id, closed),"));
         // A create whose source's agent died in the boundary fails once the gate is
         // open, and both creators discard the image on that error.
-        assert!(ask.contains(
-            "if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {\n                        ReopenTry::OpenAfterAgentRestart"
+        assert!(ask.contains("Ok(output) => reopen_try_of(vm_id, output),"));
+        assert!(body_of(source, "fn reopen_try_of(").contains(
+            "if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {\n            ReopenTry::OpenAfterAgentRestart"
         ));
         let resume = body_of(source, "async fn resume_paused_source(");
         assert!(resume.contains("if reopen_source_network(vsock_socket, vm_id, true).await? {"));
@@ -11086,6 +11120,45 @@ mod tests {
         // the exec's 54 s of connect retries.
         assert!(SOURCE_REOPEN_BOUND > Duration::from_secs(90 + 30));
         assert!(SOURCE_REOPEN_ONE_ASK > Duration::from_secs(54));
+    }
+
+    /// What the host takes a resume one-shot's result for. A resume that opened the gate
+    /// and could not remove the manifest or the mark exits with a status of its own, and
+    /// is an open gate: read as a failed try, it had the host record a closed gate over an
+    /// open one and refuse every later snapshot of the VM.
+    #[test]
+    fn a_resume_that_opened_the_gate_and_could_not_clean_up_is_an_open_gate() {
+        let said = |exit_code: i32, stderr: &str| {
+            reopen_try_of(
+                "vm-source",
+                crate::commands::exec::ExecOutput {
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                    exit_code,
+                },
+            )
+        };
+        assert!(matches!(said(0, "gate=open"), ReopenTry::Open));
+        assert!(matches!(
+            said(0, SOURCE_AGENT_RESTARTED_REPORT),
+            ReopenTry::OpenAfterAgentRestart
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_OPEN_UNCLEAN_EXIT, "the gate is open, and"),
+            ReopenTry::Open
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_OPEN_UNCLEAN_EXIT, SOURCE_AGENT_RESTARTED_REPORT),
+            ReopenTry::OpenAfterAgentRestart
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_REFUSED_EXIT, ""),
+            ReopenTry::Refused(_)
+        ));
+        assert!(matches!(said(1, ""), ReopenTry::Failed(_)));
+        // the left-gated error gives the command an operator would run, token and all
+        let ask = body_of(include_str!("common.rs"), "async fn ask_source_to_reopen(");
+        assert!(ask.contains("--boundary {token}`"));
     }
 
     /// A snapshot create's boundary has a token, on the VM's state from before its
