@@ -48,6 +48,12 @@ test-runner-acceptance:
 test-ci-scope:
 	python3 scripts/test-ci-stack-scope.py
 
+# scripts/check-runner-kernel.py against fixture repositories. Needs git 2.29 and Python 3.11.4
+# (tomllib, tarfile's extraction filter, fetch --no-write-fetch-head) or later.
+.PHONY: test-runner-kernel
+test-runner-kernel:
+	python3 -B scripts/test-check-runner-kernel.py
+
 .PHONY: test-ci-security test-ci-workflow-security test-ami-security
 test-ci-security: test-ci-workflow-security test-ami-security
 test-ci-workflow-security:

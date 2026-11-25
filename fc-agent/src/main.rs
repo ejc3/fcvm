@@ -85,6 +85,11 @@ fn event_prefix(level: &tracing::Level) -> &'static str {
     }
 }
 
+/// The exit status of a boundary one-shot that was refused because a restore is under
+/// way in the guest. The host reads it (`ONE_SHOT_REFUSED_EXIT` in
+/// src/commands/common.rs) and does not try again.
+const REFUSED_EXIT: i32 = 3;
+
 #[tokio::main]
 async fn main() {
     // `fc-agent --notify-reboot`: a one-shot invoked by the systemd system-shutdown
@@ -105,31 +110,44 @@ async fn main() {
     let one_shot = std::env::args().nth(1);
     let one_shot_result = match one_shot.as_deref() {
         Some("--prepare-snapshot-network") => {
-            // The container is frozen first, so it opens no socket and faults no page
-            // while the boundary closes, and a restored clone starts with it frozen
-            // (payload_freeze). A failed prepare thaws it again: the host resumes the
-            // source on its own when the prepare fails.
-            payload_freeze::freeze();
-            let prepared = snapshot_network::prepare_snapshot_network().await;
-            if prepared.is_err() {
-                payload_freeze::thaw();
-            }
-            Some(prepared)
+            // The prepare freezes the container itself, once it has refused a guest whose
+            // restore is under way and before it closes the gate: frozen, the container
+            // opens no socket and faults no page while the boundary closes, and a
+            // restored clone starts with it frozen (payload_freeze). A prepare that froze
+            // and then failed thaws it again when the gate is open again, as the resume
+            // does: the host resumes the source on its own when the prepare fails. One
+            // that was refused froze nothing and thaws nothing, because the freeze it
+            // would undo is a restore's.
+            let prepared = snapshot_network::prepare_snapshot_network(payload_freeze::freeze).await;
+            Some(prepared.map_err(|failure| {
+                if failure.thaw {
+                    payload_freeze::thaw();
+                }
+                failure.error
+            }))
         }
         Some("--resume-snapshot-network") => {
             let args: Vec<String> = std::env::args().collect();
             let resumed =
                 snapshot_network::resume_source_network(snapshot_network::resume_host_time(&args))
                     .await;
-            payload_freeze::thaw();
-            Some(resumed)
+            // Only behind an open gate. A resume that could not open it leaves the
+            // boundary owed and the container frozen for the resume that does.
+            if resumed.gate_open {
+                payload_freeze::thaw();
+            }
+            Some(resumed.result)
         }
         _ => None,
     };
     if let Some(result) = one_shot_result {
         if let Err(error) = result {
             eprintln!("[fc-agent] snapshot network boundary failed: {error:#}");
-            std::process::exit(1);
+            // The host does not run a refused one-shot again.
+            let refused = error
+                .downcast_ref::<snapshot_network::RestoreUnderWay>()
+                .is_some();
+            std::process::exit(if refused { REFUSED_EXIT } else { 1 });
         }
         return;
     }
@@ -177,6 +195,9 @@ async fn main() {
         .init();
 
     eprintln!("[fc-agent] starting");
+
+    // A receive barrier that was killed with `rcu_expedited` on (#2141).
+    snapshot_network::put_back_rcu_expedited_after_a_kill();
 
     // Thaws a snapshot boundary's container freeze whose deadline passed with no thaw: a
     // resume that never reached the guest, an fcvm that died mid-snapshot (payload_freeze).
@@ -233,10 +254,16 @@ fn fatal_error_line(error: &anyhow::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// The container is frozen before the boundary's prepare and thawed when the prepare
-    /// fails and when the source resumes; a restored clone thaws it before publication
-    /// (payload_freeze). A freeze with no thaw on one of those paths would leave the
-    /// container stopped, so each is pinned.
+    /// The container is frozen by the boundary's prepare and thawed when a prepare that
+    /// froze it fails with the gate open again and when the source's resume has opened
+    /// the gate; a restored clone
+    /// thaws it before publication (payload_freeze). A freeze with no thaw on one of those
+    /// paths would leave the container stopped, so each is pinned.
+    ///
+    /// Two ways out thaw nothing, on purpose. A prepare that was refused because a
+    /// restore is under way froze nothing: the freeze it would undo is the restore's
+    /// (#2138). A resume that could not open the gate leaves the container frozen for the
+    /// resume that does (#2142).
     #[test]
     fn the_container_is_frozen_across_the_boundary_and_thawed_on_every_way_out() {
         let main = include_str!("main.rs");
@@ -245,15 +272,35 @@ mod tests {
         let prepare = squeezed
             .find("Some(\"--prepare-snapshot-network\")=>{")
             .expect("no prepare one-shot");
-        let freeze = squeezed[prepare..]
-            .contains("payload_freeze::freeze();letprepared=snapshot_network::prepare_snapshot_network().await;ifprepared.is_err(){payload_freeze::thaw();}");
-        assert!(
-            freeze,
-            "the prepare does not freeze first and thaw on failure"
+        let freeze = squeezed[prepare..].contains(
+            "letprepared=snapshot_network::prepare_snapshot_network(payload_freeze::freeze).await;\
+             Some(prepared.map_err(|failure|{iffailure.thaw{payload_freeze::thaw();}failure.error}))",
         );
         assert!(
-            squeezed.contains(".await;payload_freeze::thaw();Some(resumed)"),
-            "the source resume does not thaw"
+            freeze,
+            "the prepare is not handed the freeze, or does not thaw exactly when it is told to"
+        );
+        assert!(
+            squeezed.contains("ifresumed.gate_open{payload_freeze::thaw();}Some(resumed.result)"),
+            "the source resume does not thaw exactly when the gate is open"
+        );
+        // Inside the prepare: refused before the freeze, and frozen before the gate.
+        let network = include_str!("snapshot_network.rs");
+        let start = network
+            .find("async fn prepare_snapshot_network_in<")
+            .expect("no prepare");
+        let body = &network[start..start + network[start..].find("\n}\n").unwrap()];
+        let refuse = body
+            .rfind("RestoreUnderWay(")
+            .expect("a prepare never refuses");
+        let owed = body
+            .find("BoundaryMarks::mark(&marks.owed)")
+            .expect("no owed mark");
+        let froze = body.find("freeze();").expect("the prepare never freezes");
+        let boundary = body.find("boundary()").expect("no boundary");
+        assert!(
+            refuse < owed && owed < froze && froze < boundary,
+            "refuse={refuse} owed={owed} freeze={froze} boundary={boundary}"
         );
 
         let restore: String = crate::restore::handle_clone_restore_source()
@@ -275,6 +322,19 @@ mod tests {
             .expect("the agent starts no freeze watchdog");
         let agent = squeezed.find("agent::run()").expect("no agent run");
         assert!(watchdog < agent && prepare < watchdog);
+    }
+
+    /// A boundary one-shot that is refused because a restore is under way exits with the
+    /// status the host reads as "do not ask again" (`reopen_source_network`).
+    #[test]
+    fn a_refused_one_shot_exits_with_the_status_the_host_reads() {
+        let host = include_str!("../../src/commands/common.rs");
+        assert!(host.contains(&format!(
+            "const ONE_SHOT_REFUSED_EXIT: i32 = {};",
+            super::REFUSED_EXIT
+        )));
+        let main = include_str!("main.rs");
+        assert!(main.contains("std::process::exit(if refused { REFUSED_EXIT } else { 1 });"));
     }
 
     use super::fatal_error_line;
