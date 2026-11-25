@@ -1897,7 +1897,23 @@ pub fn publish_to_loopback(ports: &[String]) {
 ///
 /// A failure is logged and the port keeps working with the relay's address as client.
 pub fn publish_as_loopback_client(ports: &[String]) {
-    for port in wanted_ports(ports) {
+    let wanted = wanted_ports(ports);
+    if wanted.is_empty() {
+        return;
+    }
+    // The record first: the snapshot boundary tells these ports' clients from connections
+    // inside the guest by it, so a rewrite that is not recorded is not installed.
+    if let Err(e) =
+        record_loopback_client_ports(std::path::Path::new(LOOPBACK_CLIENT_PORTS_RECORD), &wanted)
+    {
+        eprintln!(
+            "[fc-agent] WARNING: recording the loopback-client ports in \
+             {LOOPBACK_CLIENT_PORTS_RECORD} failed: {e}. Their clients reach the service with \
+             the relay's address."
+        );
+        return;
+    }
+    for port in wanted {
         match run_iptables(&loopback_client_snat_args("-A", port)) {
             Ok(()) => eprintln!(
                 "[fc-agent] published port {port} reaches its service as a loopback client"
@@ -1910,9 +1926,58 @@ pub fn publish_as_loopback_client(ports: &[String]) {
     }
 }
 
+/// The source ports a `/loopback` port's clients are given, and nobody else: above the
+/// guest's ephemeral range (`ip_local_port_range`, 32768 to 60999), so no connection the
+/// guest makes to itself has one unless a process binds it on purpose.
+///
+/// The snapshot boundary reads the port to tell such a client from a connection inside
+/// the guest (`snapshot_network::sockets_leaving_the_guest`). Both are a socket with a
+/// 127.0.0.1 peer, and with the client's own port kept a client could make its socket
+/// look like the second: from source port P to guest port P it is its own mirror image
+/// (#2152). At most 4,536 clients of one `/loopback` port are connected at a time.
+pub const LOOPBACK_CLIENT_PORTS: std::ops::RangeInclusive<u16> = 61000..=65535;
+
+/// Where the guest ports published with `/loopback` are recorded, one a line. Under
+/// `/run`, so in a snapshot's image: a clone reads its source's.
+const LOOPBACK_CLIENT_PORTS_RECORD: &str = "/run/fcvm/loopback-client-ports";
+
+fn record_loopback_client_ports(record: &std::path::Path, ports: &[u16]) -> std::io::Result<()> {
+    if let Some(parent) = record.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lines: String = ports.iter().map(|port| format!("{port}\n")).collect();
+    std::fs::write(record, lines)
+}
+
+/// The guest ports published with `/loopback`: none when the agent recorded none.
+pub fn loopback_client_guest_ports() -> std::io::Result<std::collections::HashSet<u16>> {
+    read_loopback_client_ports(std::path::Path::new(LOOPBACK_CLIENT_PORTS_RECORD))
+}
+
+fn read_loopback_client_ports(
+    record: &std::path::Path,
+) -> std::io::Result<std::collections::HashSet<u16>> {
+    let text = match std::fs::read_to_string(record) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(error),
+    };
+    text.lines()
+        .map(|line| {
+            line.trim().parse::<u16>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}: {line:?}: {error}", record.display()),
+                )
+            })
+        })
+        .collect()
+}
+
 /// `iptables -w -t nat <op> INPUT -i eth0 -p tcp -d 127.0.0.1 --dport P -j SNAT
-/// --to-source 127.0.0.1`: the connections `loopback_dnat_args` rewrote, arriving from
-/// the host side, take loopback as their source as well.
+/// --to-source 127.0.0.1:61000-65535`: the connections `loopback_dnat_args` rewrote,
+/// arriving from the host side, take loopback as their source as well, from a port in
+/// `LOOPBACK_CLIENT_PORTS`.
 fn loopback_client_snat_args(op: &str, port: u16) -> Vec<String> {
     [
         "-w",
@@ -1931,11 +1996,12 @@ fn loopback_client_snat_args(op: &str, port: u16) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .chain([port.to_string()])
-    .chain(
-        ["-j", "SNAT", "--to-source", "127.0.0.1"]
-            .iter()
-            .map(|s| s.to_string()),
-    )
+    .chain(["-j", "SNAT", "--to-source"].iter().map(|s| s.to_string()))
+    .chain([format!(
+        "127.0.0.1:{}-{}",
+        LOOPBACK_CLIENT_PORTS.start(),
+        LOOPBACK_CLIENT_PORTS.end()
+    )])
     .collect()
 }
 
@@ -2255,12 +2321,40 @@ mod loopback_publish_tests {
     }
 
     /// A loopback-client port's SNAT matches only the DNAT'd connections from eth0, and
-    /// rewrites their source to loopback (#1034).
+    /// rewrites their source to loopback (#1034), from a port of the range reserved for
+    /// them (#2152), which is above the ports the guest gives its own connections.
     #[test]
     fn loopback_client_snat_rewrites_the_source_of_dnatd_connections_from_eth0() {
         assert_eq!(
             loopback_client_snat_args("-A", 8097).join(" "),
-            "-w -t nat -A INPUT -i eth0 -p tcp -d 127.0.0.1 --dport 8097 -j SNAT --to-source 127.0.0.1"
+            "-w -t nat -A INPUT -i eth0 -p tcp -d 127.0.0.1 --dport 8097 -j SNAT --to-source 127.0.0.1:61000-65535"
+        );
+        // The kernel's default ephemeral range ends at 60999.
+        assert!(*LOOPBACK_CLIENT_PORTS.start() > 60999);
+    }
+
+    /// The `/loopback` guest ports are recorded for the snapshot boundary and read back;
+    /// no record is no such port, and a record that does not parse is an error, not none.
+    #[test]
+    fn the_loopback_client_ports_are_recorded_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("run").join("ports");
+        assert!(read_loopback_client_ports(&record).unwrap().is_empty());
+        record_loopback_client_ports(&record, &[8097, 61000]).unwrap();
+        assert_eq!(
+            read_loopback_client_ports(&record).unwrap(),
+            [8097, 61000].into_iter().collect()
+        );
+        std::fs::write(&record, "8097\nnot a port\n").unwrap();
+        assert!(read_loopback_client_ports(&record).is_err());
+        // The rewrite is installed only once the ports are recorded.
+        let source = include_str!("network.rs");
+        let publish = &source[source.find("pub fn publish_as_loopback_client(").unwrap()..];
+        assert!(
+            publish.find("record_loopback_client_ports(").unwrap()
+                < publish
+                    .find("loopback_client_snat_args(\"-A\", port)")
+                    .unwrap()
         );
     }
 
