@@ -4141,6 +4141,10 @@ def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
 def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
+    # A viewport that does not parse is the caller's error and costs no clone:
+    # it is refused here, before anything is spawned.
+    cdpdrive.parse_viewport(getattr(args, "viewport", ""))
+
     if op == "html":
         arm_name = "html-fast" if fast else "html"
     else:
