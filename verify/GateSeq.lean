@@ -8,19 +8,30 @@ fc-agent's own tests log the boundary's steps as events (`ModelGate`, `ModelBarr
 `ModelHook` in fc-agent/src/snapshot_network.rs) and pin their order in `vec![...]` literals.
 
 `lake exe gate-seq` prints each rule book's order in those event names. `lake exe gate-seq check
-<snapshot_network.rs>` reads every pinned sequence out of the Rust source and compares: it
-prints the rule books whose order the source pins, and fails when there is none, so the model
-cannot drift from the code without this failing. `lake exe gate-seq check <file> <rule book>`
-also fails unless that rule book is among them.
+<snapshot_network.rs> <rule book>` reads every pinned sequence out of the Rust source and
+compares: it prints the rule books whose order the source pins, and fails unless the one named
+is among them. CI names the rule book of the tree it runs in, so a tree that goes back to an
+earlier order fails as one that goes to an unknown order does. Without a rule book it fails only
+when the source's order is no rule book's.
 
 What is compared. A restore's pinned sequence (it begins with `syn-cookies-off` or `gate-verify`)
 must be a beginning of the rule book's sequence, with these left out where the test's run has
 none: `gate-close` (the inherited gate verified), `cookie-destroy` (nothing to retire),
 `restore-hook` (no hook). A snapshot's (it begins with `gate-close`) must be a beginning of
 `gate-close rx-barrier cookie-dump`, with `gate-open` after it where the run rolled back. The
-source must pin the whole of both at least once. The events say nothing of the steps the Rust
-models do not log (the thaw, the manifest's removal, `tcp_syncookies` written back): those are
-pinned by the source-order tests of `handle_clone_restore` in fc-agent/src/restore.rs.
+source must pin the whole of both at least once, and for a rule book with a second dump
+(`RStep.look`) at least one restore with two `cookie-dump` events in a row.
+
+What it cannot see:
+
+- anything but the `vec![...]` literals of the tests: no production code is read, so the tests
+  pinning an order the code no longer has is outside it;
+- the steps the Rust models log no event for: the manifest's load and removal, the thaw, the
+  write of `tcp_syncookies` back, the two halves of the barrier as two steps. `cookieA` and
+  `cookieB` differ in the place of the write-back, which is one of those;
+- the gate's rules themselves (`Rules.tcpByCt`, `natGate`), the manifest's and the list's rules;
+- every file but snapshot_network.rs: the order of `handle_clone_restore` in restore.rs, the
+  host's `snapshot create`, the agent's start.
 -/
 
 open Gate
@@ -32,6 +43,8 @@ def events : RStep → List (String × Bool)
   | .udp => [("gate-udp-ingress", false)]
   | .barOut => [("rx-barrier", false)]
   | .dump6 => [("cookie-dump", false)]
+  -- the second dump is taken only when a socket that may stay has no mirror image
+  | .look => [("cookie-dump", true)]
   | .egress => [("gate-open-egress", false)]
   | .retire => [("cookie-destroy", true)]
   | .hook => [("restore-hook", true)]
@@ -62,10 +75,17 @@ def isAllOf : List (String × Bool) → List String → Bool
     if e == x then isAllOf r v
     else optional && isAllOf r (x :: v)
 
-/-- Drop an event that repeats the one before it (one `cookie-destroy` a socket). -/
+/-- One `cookie-destroy` is logged a socket: keep one of a run of them. Nothing else is dropped:
+two `cookie-dump` events are two dumps. -/
 def collapse : List String → List String
-  | a :: b :: l => if a == b then collapse (b :: l) else a :: collapse (b :: l)
+  | a :: b :: l =>
+    if a == b && a == "cookie-destroy" then collapse (b :: l) else a :: collapse (b :: l)
   | l => l
+
+/-- Two `cookie-dump` events in a row. -/
+def twoDumps : List String → Bool
+  | a :: b :: l => (a == "cookie-dump" && b == "cookie-dump") || twoDumps (b :: l)
+  | _ => false
 
 def isEvent (s : String) : Bool :=
   !s.isEmpty && s.all (fun c => c.isLower || c.isDigit || c == '-')
@@ -91,13 +111,14 @@ def okPrepare (v : List String) : Bool :=
   let w := if v.getLast? == some "gate-open" then v.dropLast else v
   w.isPrefixOf prepareSeq
 
-/-- The source pins `R`'s order: every pinned restore begins it, and one is all of it with a
-hook and something retired. -/
+/-- The source pins `R`'s order: every pinned restore begins it, one is all of it with a hook
+and something retired, and when `R` has a second dump one has two dumps in a row. -/
 def matchesBook (vs : List (List String)) (R : Rules) : Bool :=
   let rs := vs.filter isRestore
   rs.all (beginsWith (restoreSeq R))
     && rs.any (fun v => isAllOf (restoreSeq R) v && v.contains "restore-hook"
                           && v.contains "cookie-destroy")
+    && (!R.restore.contains .look || rs.any twoDumps)
 
 def main (args : List String) : IO UInt32 := do
   match args with

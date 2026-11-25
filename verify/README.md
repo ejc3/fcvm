@@ -14,7 +14,9 @@ wake-up can be lost, not only those two.
 ## The models in this directory
 
 One Lake package, one `lake build`, one CI job. Each model is a library of its own with its own
-search executable and documents.
+search executable and documents. `check-imports.sh` runs before the build (in `make verify` and
+in CI) and fails if a file of either model is not imported by that model's `Axioms.lean`, whose
+sweep looks at everything the modules it imports declare.
 
 | Model | Library, namespace | Search | Documents |
 |---|---|---|---|

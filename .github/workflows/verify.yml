@@ -90,5 +90,9 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.elan/bin:$PATH"
           lean --version
+          # every file of both models is imported by its axiom sweep
+          ./check-imports.sh
           lake build
-          lake exe gate-seq check ../fc-agent/src/snapshot_network.rs
+          # The rule book of this tree's fc-agent. Change it in the pull request that changes
+          # the boundary's order (`flags`, `cookieB` and `design` are the ones in flight).
+          lake exe gate-seq check ../fc-agent/src/snapshot_network.rs main

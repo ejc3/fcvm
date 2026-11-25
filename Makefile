@@ -1905,6 +1905,7 @@ verify-lake:
 		exit 2; }
 
 verify: verify-lake
+	verify/check-imports.sh
 	cd verify && "$(VERIFY_LAKE)" build
 
 verify-search: verify-lake
@@ -1916,5 +1917,7 @@ verify-harness: verify-lake
 verify-gate-search: verify-lake
 	cd verify && "$(VERIFY_LAKE)" exe gate-breaks $(GATE_ARGS)
 
+# The rule book of this tree's fc-agent (verify/GateVerify/Today.lean).
+GATE_BOOK ?= main
 verify-gate-drift: verify-lake
-	cd verify && "$(VERIFY_LAKE)" exe gate-seq check ../fc-agent/src/snapshot_network.rs
+	cd verify && "$(VERIFY_LAKE)" exe gate-seq check ../fc-agent/src/snapshot_network.rs $(GATE_BOOK)

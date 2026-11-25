@@ -5,9 +5,11 @@ defaultTargets = ["WakeVerify", "breaks", "hostops", "GateVerify", "gate-breaks"
 # only partly check.
 leanOptions = { warningAsError = true }
 
-# The guest vCPU wake-up path (namespace `Wake`).
+# The guest vCPU wake-up path (namespace `Wake`). `globs` builds every file of the directory,
+# imported by the root or not, so no file escapes the build or the axiom sweep.
 [[lean_lib]]
 name = "WakeVerify"
+globs = ["WakeVerify.*"]
 
 # `lake exe breaks`: the exhaustive search of every rule book for lost wake-ups.
 [[lean_exe]]
@@ -23,6 +25,7 @@ root = "HostOps"
 # The snapshot and restore network boundary (namespace `Gate`).
 [[lean_lib]]
 name = "GateVerify"
+globs = ["GateVerify.*"]
 
 # `lake exe gate-breaks`: the exhaustive search of every rule book of the boundary.
 [[lean_exe]]
