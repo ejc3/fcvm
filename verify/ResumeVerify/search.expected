@@ -1,0 +1,47 @@
+
+## plain: two CPUs, an edge-triggered device, two snapshots, two restores; no host time passes while the guest does not run
+cloud-hypervisor: 124260 states; R1 lostIpi@5 R2 stuckActive@6 R2 stuckPriority@6 R2 strayPending@5 R3 spins@8
+fork-default: 36948 states;
+design-cloud-hypervisor: 38700 states;
+design-firecracker: 38700 states;
+
+## level: the device's interrupt is level-triggered and the device holds its line
+cloud-hypervisor: 42436 states; R1 lostIpi@5 R1 lostDeviceIrq@5 R2 stuckActive@6 R2 stuckPriority@6 R2 strayPending@5 R3 spins@8
+fork-default: 17690 states; R1 lostDeviceIrq@5
+design-cloud-hypervisor: 16398 states;
+design-firecracker: 16398 states;
+
+## offline: guest CPU 1 is offline
+cloud-hypervisor: 326 states; R2 stuckActive@8 R2 stuckPriority@6
+fork-default: 259 states;
+design-cloud-hypervisor: 264 states;
+design-firecracker: 264 states;
+
+## dump: host time passes after the save: the memory dump, and the wait for a resume or a restore
+cloud-hypervisor: 24411 states; R1 lostIpi@5 R2 stuckActive@6 R2 stuckPriority@6 R2 strayPending@5 R3 spins@9 R4 clockOff@4
+fork-default: 13139 states; R4 clockOff@4
+design-cloud-hypervisor: 11825 states;
+design-firecracker: 11825 states;
+
+## lags: host time passes between the pause and the save, and between a load and its resume
+cloud-hypervisor: 117754 states; R1 lostIpi@5 R2 stuckActive@6 R2 stuckPriority@6 R2 strayPending@5 R3 spins@9 R4 clockOff@3
+fork-default: 61212 states; R4 clockOff@3
+design-cloud-hypervisor: 28746 states;
+design-firecracker: 28746 states;
+
+## nv-dump: a guest hypervisor (NV2); host time passes after the save
+fork-before-630: 13139 states; R4 clockOff@4
+fork-nested: 11335 states;
+design-firecracker: 11825 states;
+
+## nv-l2: a guest hypervisor with a nested vCPU loaded (CNTVOFF_EL2 not zero); no host time passes
+fork-before-630: 29520 states; R1 timerCannotFire@6 R4 clockOff@5
+fork-nested: 27400 states;
+design-firecracker: 28380 states;
+
+## nv-lags: a guest hypervisor; host time passes between the pause and the save, and between a load and its resume
+fork-before-630: 61212 states; R4 clockOff@3
+fork-nested: 40605 states; R4 clockOff@5
+design-firecracker: 28746 states;
+
+882463 states in all

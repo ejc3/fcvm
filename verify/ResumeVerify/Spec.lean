@@ -532,7 +532,7 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
   | .wake v => if s.ph != .running then none else (wake C s.vm v).map ({ s with vm := · })
   | .dev =>
     -- a device may raise its interrupt while the vCPUs are paused and before the save
-    if s.ph == .loaded || (s.ph == .paused && s.img.isSome) then none else
+    if s.ph != .running && !(s.ph == .paused && s.img.isNone) then none else
       (devRaise C s.vm).map ({ s with vm := · })
   | .tick =>
     if s.ph != .running || s.vm.ideal ≥ C.maxIdeal then none else
@@ -559,7 +559,9 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
     match s.ph with
     | .running => none
     | .paused =>
-      some { s with ph := .running, since := 0, kept := none, vm := resumeVM R s,
+      -- the image is dropped: a restore from it later builds the VM the restore explored
+      -- from this same state builds
+      some { s with ph := .running, since := 0, kept := none, img := none, vm := resumeVM R s,
                     disturbed := s.disturbed || s.kept != some (s.vm.c0.keep, s.vm.c1.keep) }
     | .loaded => some { s with ph := .running, since := 0, vm := resumeVM R s }
   | .restore =>
@@ -567,8 +569,8 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
     | none => none
     | some i =>
       if s.ph != .paused || s.restores ≥ C.maxRestores then none else
-        some { s with ph := .loaded, since := 0, kept := none, restores := s.restores + 1,
-                      vm := build R C i }
+        some { s with ph := .loaded, since := 0, kept := none, img := none,
+                      restores := s.restores + 1, vm := build R C i }
 
 /-- A guest that has booted: both CPUs running, the interrupts it uses enabled, the priority
 mask open, nothing pending. -/
