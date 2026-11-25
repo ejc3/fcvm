@@ -123,7 +123,7 @@ order and `KVM_SET_MP_STATE`, then the vGIC: the distributor, then per vCPU its 
 and its CPU interface (src/vmm/src/arch/aarch64/gic/gicv3/regs/mod.rs `restore_state`).
 Every register is written with the saved value, the clear-registers included
 (src/vmm/src/arch/aarch64/gic/regs.rs:116-129; the lists at gicv3/regs/redist_regs.rs:39-49
-and dist_regs.rs:27-40), as in Cloud Hypervisor. -/
+and dist_regs.rs:36-49), as in Cloud Hypervisor. -/
 def fcOrder (offset : Bool) : List Op :=
   [.create false, .create true, .gic] ++ (if offset then [.offset] else []) ++
   [.init false false, .cntp false, .cntv false, .regs false, .mp false,
@@ -140,7 +140,7 @@ What every pin of the fork writes to a paused source:
 * At the save, before KVM's state is read (`Vmm::save_state` saves devices first,
   src/vmm/src/lib.rs), the vsock device publishes a `TRANSPORT_RESET` event in the SOURCE's
   event queue and raises its interrupt (`prepare_save` and `send_transport_reset_event`,
-  src/vmm/src/devices/virtio/vsock/device.rs:255-290, 468-476 at 2a33289b): `.devEvent`. The
+  src/vmm/src/devices/virtio/vsock/device.rs:255-290, 467-475 at 2a33289b): `.devEvent`. The
   source's vsock connections are reset by every snapshot, by Firecracker's design.
 * At every resume `kick_virtio_devices` runs (src/vmm/src/lib.rs `resume_vm`). At ba79650e and
   on the nested pin the vsock device's `kick` raises the event queue's interrupt whether or not
