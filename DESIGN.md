@@ -1626,14 +1626,15 @@ fcvm snapshot create my-vm --tag warm-nginx
 
 **A restored VM is snapshotted only after its restore is acknowledged**: a VM restored from a memory snapshot
 (`snapshot run`, or `podman run` on a snapshot cache hit) resumes behind its snapshot's network gate with its
-container frozen, and its guest opens the gate only after it has retired the source's connections and run the
-restore hook. A snapshot taken before that would open the gate early and capture a restore part way through, so
-`snapshot create` refuses such a VM, `--stop` included, and leaves it as it was. The test is the VM's state:
-`process_type` is `clone` and `lifecycle_ready` is false. `snapshot run` writes `lifecycle_ready` after the guest's
-acknowledgement, and `fcvm ls --json --pid <PID>` shows it. A restore that failed is never acknowledged. A caller
-that learns a clone is up from the clone's own ports can be a moment ahead of that write; `--await-restore
-<SECONDS>` waits for it, and ends early when the restore fails or the VM's fcvm exits. A VM that was booted is not
-checked.
+container frozen, and its guest acknowledges the restore only after it has retired the source's connections, run the
+restore hook and opened the gate. A snapshot taken before that would open the gate early and capture a restore part
+way through, so `snapshot create` refuses such a VM, `--stop` included, and leaves it as it was. The test is the VM's
+state: `process_type` is `clone` and `restore_acknowledged` is not set. `snapshot run` records the acknowledgement on
+the state and then prints its restored record, so once the record is printed a create is taken; `fcvm ls --json --pid
+<PID>` shows `"restore_acknowledged": true`. A restore that failed is never acknowledged, and its state says `failed`
+until the VM's teardown removes it. A caller that learns a clone is up from the clone's own ports can be a few
+milliseconds ahead of the record; `--await-restore <SECONDS>` waits for it, and ends early when the restore fails,
+the VM's fcvm exits or its state is removed. A VM that was booted is not checked.
 
 **Zero pages are holes**: with the default Firecracker build (`[firecracker]` in `rootfs-config.toml`, used by every
 kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves

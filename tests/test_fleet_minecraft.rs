@@ -725,6 +725,13 @@ async fn a_failed_copy_falls_back_to_the_gold_snapshot() {
         }
     };
     assert!(!r.timings.contains_key("snapshot_ms"), "{:?}", r.timings);
+    // The tile shows the gold world where a copy was asked for, and its state says why.
+    let why = r.error.as_deref().unwrap_or_default();
+    assert!(
+        why.contains("not copied from mc-1") && why.contains("fcvm exited"),
+        "the server restored from the gold snapshot does not say why it is no copy: {:?}",
+        r.error
+    );
     let ev = f.events();
     let snaps: Vec<_> = ev
         .iter()
@@ -741,6 +748,46 @@ async fn a_failed_copy_falls_back_to_the_gold_snapshot() {
         !f.snaps.join("mc-fork-mc-2-2").exists(),
         "the failed copy's snapshot is left"
     );
+    f.mc.stop().await;
+}
+
+/// A fork asked for while its source's own restore is not yet acknowledged waits for the
+/// acknowledgement and then copies the source. A server is up for the agent when its tile
+/// answers, which is before fcvm has recorded the restore's acknowledgement, and fcvm refuses
+/// to snapshot a clone before that unless the create waits (`--await-restore`).
+///
+/// RED BEFORE THE FIX: the fork's `snapshot create` carried no wait, was refused, and the
+/// server restored from the gold snapshot instead of the copy.
+#[tokio::test]
+async fn a_fork_asked_for_during_its_sources_restore_waits_and_then_copies() {
+    let mut f = fake_with(&[("FAKE_ACK_SECS", "1.5")], |_| {}).await;
+    f.mc.assign(&[assign("mc-1", 0, 1, None, None)]);
+    f.report("mc-1", "running", 1).await;
+    // At once: the source answers, and its restore is acknowledged 1.5 s from now.
+    f.mc.assign(&[
+        assign("mc-1", 0, 1, None, None),
+        assign("mc-2", 1, 1, Some(("mc-1", 0)), None),
+    ]);
+    f.report("mc-2", "forking", 1).await;
+    let r = f.report("mc-2", "running", 1).await;
+    let ev = f.events();
+    let tag = "mc-fork-mc-2-1";
+    let at = |what: &dyn Fn(&Vec<String>) -> bool| {
+        ev.iter().position(what).unwrap_or_else(|| panic!("{ev:?}"))
+    };
+    let asked = at(&|e| e[0] == "snapshot_create" && e[1] == "mc-1" && e[3] == tag);
+    let acknowledged = at(&|e| e[0] == "acked" && e[1] == "mc-1" && e[3] != "-");
+    let copied = at(&|e| e[0] == "snapshot_run" && e[1] == "mc-2" && e[3] == tag);
+    assert!(
+        asked < acknowledged && acknowledged < copied,
+        "the fork did not wait for its source's acknowledgement: {ev:?}"
+    );
+    assert!(
+        !ev.iter().any(|e| e[0] == "snapshot_refused"),
+        "a snapshot was refused: {ev:?}"
+    );
+    assert!(r.timings.contains_key("snapshot_ms"), "{:?}", r.timings);
+    assert_eq!(r.error, None, "a copy says nothing of the gold snapshot");
     f.mc.stop().await;
 }
 

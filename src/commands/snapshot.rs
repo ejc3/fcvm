@@ -1497,8 +1497,9 @@ async fn cmd_snapshot_create_and_stop(args: SnapshotCreateArgs) -> Result<()> {
         "PID {pid} is no longer the VM's fcvm process"
     );
     // A clone whose restore is not acknowledged is refused here, before the guard: nothing
-    // has touched it, so it is left running and not stopped.
-    let vm_state = super::common::await_restore_published(
+    // has touched it, so it is left running and not stopped. `cmd_snapshot_create` makes
+    // the same check again; a VM acknowledged here passes that one without waiting.
+    let vm_state = super::common::await_restore_acknowledged(
         &state_manager,
         vm_state,
         Duration::from_secs(args.await_restore),
@@ -1573,7 +1574,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // A clone whose restore is not acknowledged is refused here, before any lock is waited
     // for, or waited for when --await-restore says so. Checked again below on the state the
     // create acts on.
-    let vm_state = super::common::await_restore_published(
+    let vm_state = super::common::await_restore_acknowledged(
         &state_manager,
         vm_state,
         Duration::from_secs(args.await_restore),
@@ -1731,7 +1732,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         super::common::validate_snapshot_vm_identity(&vm_state, &fresh_state)?;
         // The state of the process this create is about to snapshot: nothing below
         // reaches its guest or its VMM unless its restore, if it had one, was acknowledged.
-        super::common::ensure_restore_published(&fresh_state)?;
+        super::common::ensure_restore_acknowledged(&fresh_state)?;
         if let Some(name) = fresh_state.config.snapshot_name.as_deref() {
             validate_snapshot_name(name).context("invalid parent snapshot name in VM state")?;
         }
@@ -4551,6 +4552,24 @@ async fn cmd_snapshot_run_inner(
         },
         other => other,
     };
+    // The restore is acknowledged: recorded on the VM's state before the restored record
+    // below is printed, so a caller that has read the record may snapshot the clone at
+    // once (`common::ensure_restore_acknowledged`). A prepare's disposable VM is not
+    // recorded, so no other command snapshots it.
+    let restore_completion_result = match restore_completion_result {
+        Ok(RestoreAck::Acked { guest_phases }) if args.prepare.is_none() => {
+            match super::common::publish_restore_acknowledged(&state_manager, &mut vm_state).await {
+                Ok(()) => Ok(RestoreAck::Acked { guest_phases }),
+                Err(error) => Err(error),
+            }
+        }
+        other => other,
+    };
+    // A restore that was not acknowledged (a rejected or late acknowledgement, a guest that
+    // powered off, a failed hook) says so in the state for as long as the teardown leaves it.
+    if restore_completion_result.is_err() {
+        super::common::record_restore_failed(&state_manager, &vm_id).await;
+    }
 
     // For routed mode clones: fc-agent reconfigures eth0 with the new vm_ipv6 via MMDS.
     // The state already has the correct guest_ipv6 = vm_ipv6 (set by restore_from_snapshot).
@@ -4948,6 +4967,10 @@ async fn cmd_snapshot_run_inner(
             }
         },
     };
+
+    if verify_result.is_err() {
+        super::common::record_restore_failed(&state_manager, &vm_id).await;
+    }
 
     // Set when the VMM exited on its own: the container exit code the guest reported, or
     // None when it reported none. Left None when fcvm stopped the VM (a signal, a memory
@@ -8588,7 +8611,7 @@ mod tests {
     ///
     /// RED BEFORE THE FIX: `snapshot create` made no such check.
     #[test]
-    fn snapshot_create_refuses_an_unpublished_restore_before_it_reaches_the_vm() {
+    fn snapshot_create_refuses_an_unacknowledged_restore_before_it_reaches_the_vm() {
         let source = include_str!("snapshot.rs");
         let function = |name: &str| {
             let body = &source[source.find(name).unwrap_or_else(|| panic!("no {name}"))..];
@@ -8600,12 +8623,12 @@ mod tests {
                 .find(what)
                 .unwrap_or_else(|| panic!("cmd_snapshot_create has no {what}"))
         };
-        let early = at("await_restore_published(");
+        let early = at("await_restore_acknowledged(");
         assert!(
             early < at("acquire_snapshot_create_generation_locks("),
             "the refusal waits for the snapshot's generation locks"
         );
-        let checked = at("ensure_restore_published(&fresh_state)");
+        let checked = at("ensure_restore_acknowledged(&fresh_state)");
         assert!(
             at("acquire_vm_snapshot_lock(") < at("validate_snapshot_vm_identity(")
                 && at("validate_snapshot_vm_identity(") < checked,
@@ -8627,7 +8650,7 @@ mod tests {
 
         let stop = function("async fn cmd_snapshot_create_and_stop(");
         let refused = stop
-            .find("await_restore_published(")
+            .find("await_restore_acknowledged(")
             .expect("--stop does not check the restore");
         let armed = stop.find("StopOnDrop {").expect("--stop arms no guard");
         assert!(
@@ -8636,10 +8659,18 @@ mod tests {
         );
     }
 
-    /// What `ensure_restore_published` rests on: `snapshot run` publishes a clone's
-    /// lifecycle only after it has waited for the guest's acknowledgement of this restore.
+    /// The rule a caller of `snapshot run` can follow: once the restored record is printed,
+    /// `snapshot create` takes the clone. `snapshot run` records the acknowledgement on the
+    /// VM's state after it has the guest's acknowledgement of this restore and before it
+    /// prints that record, and a failure to record it fails the restore. A prepare's
+    /// disposable VM is not recorded. `lifecycle_ready`, which admits a state from before
+    /// the acknowledgement was recorded, is published later still.
+    ///
+    /// RED BEFORE THE FIX: the only record of the acknowledgement was `lifecycle_ready`,
+    /// written after the restored record, the output handshake and the port check, so a
+    /// create issued when the record appeared was refused.
     #[test]
-    fn a_clone_is_published_only_after_its_restore_is_acknowledged() {
+    fn the_acknowledgement_is_recorded_before_the_restored_record_is_printed() {
         let source = include_str!("snapshot.rs");
         let body = &source[source
             .find("async fn cmd_snapshot_run_inner(")
@@ -8647,20 +8678,38 @@ mod tests {
         let body = &body[..body
             .find("\nasync fn restored_prepare(")
             .expect("restored_prepare no longer follows cmd_snapshot_run_inner")];
-        let waited = body
-            .find("= wait_for_restore_completion(")
-            .expect("snapshot run does not wait for the restore's acknowledgement");
+        let at = |what: &str| {
+            body.find(what)
+                .unwrap_or_else(|| panic!("cmd_snapshot_run_inner has no {what}"))
+        };
+        let waited = at("= wait_for_restore_completion(");
+        let recorded = at("publish_restore_acknowledged(&state_manager, &mut vm_state)");
+        assert!(
+            waited < recorded,
+            "the acknowledgement is recorded before it is waited for"
+        );
+        let printed = at("cloned from snapshot '{}' (UFFD mode)");
+        assert!(
+            recorded < printed && recorded < at("&restored_record("),
+            "the restored record is printed before the acknowledgement is recorded"
+        );
+        let guard = &body[waited..recorded];
+        assert!(
+            guard.contains("Ok(RestoreAck::Acked { guest_phases }) if args.prepare.is_none() =>"),
+            "the acknowledgement is recorded for something other than an acknowledged \
+             restore that is not a prepare's"
+        );
+        assert!(
+            body[recorded..printed].contains("Err(error) => Err(error),"),
+            "a failure to record the acknowledgement does not fail the restore"
+        );
         let publications: Vec<usize> = body
             .match_indices("lifecycle_gate.publish(")
             .map(|(at, _)| at)
             .collect();
         assert!(
-            !publications.is_empty(),
-            "snapshot run publishes no lifecycle"
-        );
-        assert!(
-            publications.iter().all(|at| *at > waited),
-            "snapshot run publishes a clone before it has waited for its acknowledgement"
+            !publications.is_empty() && publications.iter().all(|at| *at > recorded),
+            "lifecycle readiness is published before the acknowledgement is recorded"
         );
     }
 

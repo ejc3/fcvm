@@ -1731,12 +1731,15 @@ pub struct SnapshotCreateArgs {
     /// snapshot to be acknowledged, before refusing to snapshot it. The default refuses at
     /// once.
     ///
-    /// A restored VM stays behind its snapshot's network gate until its guest has retired
-    /// the source's connections and run the restore hook, and a snapshot taken before that
-    /// would open the gate, so it is refused. `snapshot run` records the acknowledgement a
-    /// moment after the guest opens its ports, so a caller that learns a clone is up from
-    /// the clone itself (a port that answers) gives a wait here. The wait ends early when
-    /// the restore fails or the VM's fcvm exits. A VM that was booted is never waited for.
+    /// A restored VM is snapshotted only once its guest has acknowledged the restore, which
+    /// it does after it has retired the snapshot's connections, run the restore hook and
+    /// opened its network gate. `snapshot run` records the acknowledgement on the VM's
+    /// state (`restore_acknowledged` in `fcvm ls --json`) and then prints its restored
+    /// record, so a caller that has read the record needs no wait. A caller that learns a
+    /// clone is up from the clone itself (a port that answers) can be a few milliseconds
+    /// ahead of the record and gives a wait here. The wait ends early when the restore
+    /// fails, the VM's fcvm exits or its state is removed. A VM that was booted is never
+    /// waited for.
     #[arg(long, value_name = "SECONDS", default_value_t = 0)]
     pub await_restore: u64,
 

@@ -372,28 +372,41 @@ HTTP 200 from a clone `snapshot run` had not reported, with the source's connect
 established in it, and the clone's restore then failed on the missing manifest (#2138).
 
 So `fcvm snapshot create` refuses a VM whose state says it was restored (`process_type:
-clone`) and not published (`lifecycle_ready: false`), before anything reaches its guest or
-its VMM (`ensure_restore_published`, `src/commands/common.rs`). `snapshot run` writes
-`lifecycle_ready` after the guest's acknowledgement and never for a restore that failed or
-was interrupted. It is written once per VM, from false to true, and every restore has a VM
-id of its own, so the check needs no lock against the restore: a state that reads true stays
-true, and the create reads it under the per-VM snapshot lock after it has tied the state to
-the process it snapshots. `--stop` refuses before it arms the guard that stops the VM, so a
-refused clone is left running. A caller that learns a clone is up from the clone's own ports
-(the potato ring) is a moment ahead of that write and passes `--await-restore SECONDS`,
-which waits for it. The owner's own snapshots (a startup snapshot, `podman prepare`) run in
-its task after the acknowledgement and are not checked.
+clone`) and not acknowledged (`restore_acknowledged` absent), before anything reaches its
+guest or its VMM (`ensure_restore_acknowledged`, `src/commands/common.rs`). `snapshot run`
+writes `restore_acknowledged` under the state lock when it has the guest's acknowledgement
+and BEFORE it prints the restored record, so the rule for a caller is: the record is
+printed, a create is taken. It is never written for a restore that failed (the state then
+says `failed`) or for `podman prepare`'s disposable VM. The check keys on the
+acknowledgement and not on `lifecycle_ready`, which is written later, after the output
+handshake and the port check: keyed on that, a create issued when the record appeared was
+refused. `lifecycle_ready` still admits a state from before the field existed.
+
+The check needs no lock against the restore. `StateManager` never writes
+`restore_acknowledged` back to false (a save of a stale copy and an update both keep it),
+and every restore has a VM id of its own, so a state that reads acknowledged stays so; the
+create reads it under the per-VM snapshot lock after it has tied the state to the process
+it snapshots. `--stop` refuses before it arms the guard that stops the VM, so a refused
+clone is left running. A caller that learns a clone is up from the clone's own ports (the
+potato ring, a Minecraft fork) is a few milliseconds ahead of the record and passes
+`--await-restore SECONDS`, which waits on the state file's change and ends early when the
+restore fails. The owner's own snapshots (a startup snapshot, `podman prepare`) run in its
+task after the acknowledgement and are not checked.
+
+This covers `snapshot create`. `fcvm exec` can run the guest's one-shots directly, and the
+guest's own refusal of them during a restore is #2154.
 
 `a_snapshot_of_a_clone_is_refused_until_its_restore_is_acknowledged`
 (`tests/test_snapshot_clone.rs`) holds a clone at `restore.pre_gate_verify`, in its restore
-hook and after a failed restore, and requires the refusal and an unchanged guest each time.
-The state in which main opened the gate is one step before that hold, with the boundary lock
-free, and fc-agent has no failpoint there; it was reproduced by hand.
+hook and after a failed restore, and requires the refusal and an unchanged guest each time;
+it also snapshots a clone the moment its restored record appears. The state in which main
+opened the gate is one step before that hold, with the boundary lock free, and fc-agent has
+no failpoint there; the test file says what holding it takes.
 `a_snapshot_is_refused_until_the_restore_is_acknowledged`,
-`snapshot_create_refuses_an_unpublished_restore_before_it_reaches_the_vm`,
-`a_clone_is_published_only_after_its_restore_is_acknowledged` and
-`lifecycle_readiness_is_never_taken_back` pin the decision, where it sits and what it rests
-on.
+`snapshot_create_refuses_an_unacknowledged_restore_before_it_reaches_the_vm`,
+`the_acknowledgement_is_recorded_before_the_restored_record_is_printed` and
+`an_acknowledged_restore_is_never_taken_back_by_a_later_write` pin the decision, where it
+sits and what it rests on.
 
 ## A FLEET MODE IS UP ONLY WHEN A VIEWER GETS ITS PIXELS
 
