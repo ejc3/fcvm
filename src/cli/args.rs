@@ -1072,7 +1072,7 @@ pub struct FleetRendersBenchArgs {
     #[arg(long, default_value_t = 48)]
     pub max_engines: u32,
     /// Hold these renders in flight (fcvm,engines) and run no search
-    #[arg(long, value_delimiter = ',', num_args = 2)]
+    #[arg(long, value_delimiter = ',')]
     pub levels: Option<Vec<u32>>,
     /// Start an engine again, between renders, once its anonymous memory passes this; 0
     /// never does

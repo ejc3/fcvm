@@ -1442,6 +1442,43 @@ mod tests {
         }
     }
 
+    /// `--levels F,K` is one argument of two numbers, as the launcher passes it.
+    #[test]
+    fn the_levels_are_one_argument_of_two_numbers() {
+        use clap::Parser;
+        let parse = |levels: &str| {
+            crate::cli::Cli::try_parse_from([
+                "fcvm",
+                "fleet",
+                "renders-bench",
+                "--out",
+                "o",
+                "--run-dir",
+                "r",
+                "--bench",
+                "b",
+                "--corpus",
+                "c",
+                "--urls",
+                "https://a.test/,https://b.test/",
+                "--snapshot-tag",
+                "t",
+                "--levels",
+                levels,
+            ])
+        };
+        let cli = parse("16,36").unwrap();
+        let crate::cli::Commands::Fleet(fleet) = cli.cmd else {
+            panic!("not the fleet command");
+        };
+        let crate::cli::FleetCommand::RendersBench(args) = fleet.cmd else {
+            panic!("not renders-bench");
+        };
+        assert_eq!(args.levels, Some(vec![16, 36]));
+        assert_eq!(args.urls.len(), 2);
+        assert!(parse("16,x").is_err());
+    }
+
     #[test]
     fn a_page_id_is_its_host_and_path() {
         assert_eq!(page_id("https://example.com/"), "example.com");
