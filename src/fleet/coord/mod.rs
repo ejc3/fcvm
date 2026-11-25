@@ -24,6 +24,7 @@ pub mod lambda_front;
 pub mod live;
 pub mod metrics;
 pub mod minecraft_log;
+pub mod minecraft_status;
 pub mod poster;
 pub mod potato_log;
 pub mod scene_token;
@@ -1044,6 +1045,9 @@ pub struct Handle {
     pub lambda: watch::Receiver<Vec<AssignSlot>>,
     pub ec2_layout: watch::Receiver<Option<Layout>>,
     pub broadcast_layout: watch::Receiver<Option<Layout>>,
+    /// The hosts' Minecraft status rows, from the agents' connections to the pages' (never
+    /// through the actor: they are no part of the state).
+    pub minecraft_status: minecraft_status::MinecraftStatuses,
 }
 
 impl Handle {
@@ -1256,6 +1260,7 @@ pub fn start_with_lambda(
         lambda: lambda_rx.clone(),
         ec2_layout: ec2_layout_rx,
         broadcast_layout: broadcast_layout_rx,
+        minecraft_status: Default::default(),
     };
     let tick = handle.clone();
     tokio::spawn(async move {

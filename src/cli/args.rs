@@ -1602,6 +1602,16 @@ pub struct RunArgs {
     /// refuses to start without it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
+    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
+    /// for one, make a new user namespace and hold capabilities there), files or sockets;
+    /// later layers do. Rootless mode and the Firecracker backend only, on a
+    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
+    /// never run unconfined. The host's `[confine] mode = "required"` (or
+    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    #[arg(long)]
+    pub confine: bool,
 }
 
 // ============================================================================
@@ -1685,7 +1695,9 @@ pub struct SnapshotCreateArgs {
     /// the guest touches, until a clone records one. A snapshot of a restored clone is the
     /// parent's memory with the clone's writes merged in at the same offsets, so the parent's
     /// set names the same guest pages. The set only says which pages to copy; the bytes come
-    /// from the new memory file. Serves of the new snapshot keep recording on top of it.
+    /// from the new memory file. A set already holding four complete recordings is frozen,
+    /// so a new snapshot whose workload differs from its parent's keeps the parent's set until
+    /// its sidecar is deleted; one holding fewer takes recordings on top.
     /// Firecracker memory snapshots only; a failure to inherit is logged and leaves the
     /// snapshot without a set.
     #[arg(long, conflicts_with = "disk_only")]
@@ -1769,7 +1781,8 @@ pub struct SnapshotServeArgs {
     /// working set that already covered that page did better on both time and memory.
     ///
     /// Limitation: with the option on, a page that fault-around installed is never recorded,
-    /// so the recorded working set converges one demanded page per granule per clone, and
+    /// so the recorded working set holds about one demanded page per granule, from the few
+    /// clones that record it, and
     /// replay never restores what fault-around would have installed. Record the working set
     /// with the option off.
     ///
@@ -1870,6 +1883,16 @@ pub struct SnapshotRunArgs {
     /// refuses to start without it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
+    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
+    /// for one, make a new user namespace and hold capabilities there), files or sockets;
+    /// later layers do. Rootless mode and the Firecracker backend only, on a
+    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
+    /// never run unconfined. The host's `[confine] mode = "required"` (or
+    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    #[arg(long)]
+    pub confine: bool,
 
     /// Place the clone's vsock control socket at DIR/vsock.sock instead of its
     /// runtime directory (predictable path for external tooling). The snapshot

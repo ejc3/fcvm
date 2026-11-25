@@ -1092,6 +1092,7 @@
         "/assign/h2/0/generation": 2,
         "/receipts/r7/outcome": "committed",
         "/view/minecraft/last_reset_all": {
+          "back": 0,
           "by": "viewer:v3",
           "clicked_at": 18000,
           "servers": 2
@@ -1102,8 +1103,18 @@
       "note": "reset all skips lent servers and drops a fork not yet run"
     },
     {
+      "after": 41,
+      "checks": {
+        "/view/minecraft/last_reset_all/back": 1,
+        "/view/minecraft/last_reset_all/took_ms": 900
+      },
+      "note": "the reset of every server counts its own back: mc-4's first chunk came 900 ms after the click"
+    },
+    {
       "after": 42,
       "checks": {
+        "/view/minecraft/last_reset_all/back": 2,
+        "/view/minecraft/last_reset_all/took_ms": 900,
         "/view/minecraft/tiles/2/last_relaunch/first_frame_at": 18000
       },
       "note": "a host clock behind the coordinator cannot put the first chunk before the click"
@@ -1708,9 +1719,11 @@
         "total_ms": 2800
       },
       "last_reset_all": {
+        "back": 2,
         "by": "viewer:v3",
         "clicked_at": 18000,
-        "servers": 2
+        "servers": 2,
+        "took_ms": 900
       },
       "server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
       "tiles": [
