@@ -59,6 +59,9 @@ def analyze(out, skip_s, last_s):
             "in_flight_range": [min(levels), max(levels)],
             "renders": len(mine), "failed": len(mine) - len(ok),
             "renders_per_s": round(len(ok) / seconds, 2) if seconds else None,
+            # The mean over the pages of each page's median: the wall's render time. The median
+            # over all renders falls between two groups of pages and is kept only as a record.
+            "page_mean_ms": round(statistics.fmean(statistics.median(v) for v in by_page.values()), 1) if by_page else None,
             "median_ms": round(statistics.median(ok), 1) if ok else None,
             "p90_ms": round(pct(ok, 0.9), 1) if ok else None,
             "mean_ms": round(statistics.fmean(ok), 1) if ok else None,
@@ -111,7 +114,8 @@ def main(argv=None):
         for side, s in result["sides"].items():
             print(f"  {side}: in flight {s['in_flight_median']} {s['in_flight_range']}, "
                   f"{s['renders_per_s']} renders/s, failed {s['failed']} of {s['renders']}, "
-                  f"median {s['median_ms']} ms, p90 {s['p90_ms']}, mean {s['mean_ms']}, "
+                  f"one of each page {s['page_mean_ms']} ms (mean of the pages' medians), "
+                  f"all renders: median {s['median_ms']} ms, p90 {s['p90_ms']}, mean {s['mean_ms']}, "
                   f"cores busy {s['cores_busy']}, CPU pressure {s['cpu_pressure']}, "
                   f"CPU per render {s['cpu_ms_per_render']} ms, pool waits {s['pool_waits']}")
             print(f"    image sizes: {s['image_sizes']}")
