@@ -16,6 +16,7 @@
 //! run; the agent and its connection go on.
 
 use crate::cli::FleetRendersBenchArgs;
+use crate::fleet::renders::Signals;
 use fleet_core::protocol::AgentMsg;
 use fleet_core::renders::{RendersHost, RendersOrder, RendersReport};
 use fleet_core::renders_search::SearchParams;
@@ -26,6 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
+
+/// The module under the agent registers no signal handler: one stays registered for the life
+/// of the process, and the agent's SIGTERM must end the agent (the reaper then removes what the
+/// module made).
+pub const AGENT_SIGNALS: Signals = Signals::LeaveToTheProcess;
 
 /// The longest time between two summaries.
 pub const REPORT_EVERY: Duration = Duration::from_secs(5);
@@ -64,9 +70,14 @@ impl RendersCfg {
         let start: StartModule = Arc::new(move |orders, reports| {
             let (args, exe) = (args.clone(), exe.clone());
             Box::pin(async move {
-                let (outcome, reaped) =
-                    crate::fleet::renders::session(&args, &exe, orders, Some(reports), false)
-                        .await?;
+                let (outcome, reaped) = crate::fleet::renders::session(
+                    &args,
+                    &exe,
+                    orders,
+                    Some(reports),
+                    AGENT_SIGNALS,
+                )
+                .await?;
                 outcome?;
                 anyhow::ensure!(
                     reaped.clean(),
@@ -404,6 +415,109 @@ mod tests {
         assert_eq!(started.load(Ordering::SeqCst), 1);
         drop(tx);
         task.await.unwrap();
+    }
+
+    /// The messages `bench/chromium/renders_agent_check.py` reads and sends, in the file its
+    /// own test drives a stand-in agent with: the hello and a report are this build's
+    /// serialisation, and the orders are what this build parses.
+    #[test]
+    fn the_host_checks_recorded_messages_are_this_builds() {
+        use fleet_core::protocol::CoordMsg;
+        use fleet_core::renders_wall::Completed;
+        let args = crate::fleet::renders::agent_args(
+            &[
+                "--out=o",
+                "--run-dir=r",
+                "--bench=b",
+                "--corpus=c",
+                "--urls=https://example.com/,https://news.example.org/front",
+                "--snapshot-tag=t",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+        let all: Vec<u32> = (0..96).collect();
+        let host = crate::fleet::renders::hello(
+            &args,
+            &crate::fleet::renders::HostFacts {
+                unit_cpus: Some(&all),
+                kernel: "7.3.3-fcvm-test",
+                instance_type: None,
+                snapshot: None,
+                bundle_sha256: Some("feed".into()),
+            },
+        )
+        .unwrap();
+        let hello = AgentMsg::Hello {
+            host: "renders-agent-check".into(),
+            arch: "aarch64".into(),
+            gpus: vec![],
+            capacity: 0,
+            store_ready_at: None,
+            boot: Default::default(),
+            phones: vec![],
+            phone_actions: vec![],
+            potato_players: 0,
+            potato_cpus: 0,
+            potato_confined: false,
+            windows: 0,
+            windows_actions: vec![],
+            minecraft: 0,
+            minecraft_server: None,
+            renders: Some(host.clone()),
+        };
+        let mut wall = Wall::new(host.pages.clone(), SearchParams::default(), 30_000, 1_000);
+        wall.order(
+            &RendersOrder {
+                run: true,
+                overlay: None,
+            },
+            1_000,
+        );
+        wall.serving(Some(1));
+        for side in 0..2 {
+            wall.render(&Completed {
+                side,
+                page: 0,
+                at: 2_000,
+                ms: 300.0,
+                level: 1,
+                error: None,
+            });
+        }
+        let report = AgentMsg::Renders(wall.report(3_000, None, None));
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/bench/chromium/renders_agent_protocol.jsonl"
+        );
+        let recorded = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<serde_json::Value> = recorded
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let ours = [
+            serde_json::to_value(&hello).unwrap(),
+            serde_json::to_value(&report).unwrap(),
+        ];
+        assert_eq!(
+            lines[..2],
+            ours,
+            "{path} is not this build's; its first two lines are:\n{}\n{}",
+            ours[0],
+            ours[1]
+        );
+        assert!(lines.len() > 2, "the orders follow");
+        for order in &lines[2..] {
+            let parsed: CoordMsg = serde_json::from_value(order.clone()).unwrap();
+            assert!(matches!(parsed, CoordMsg::Renders { .. }), "{order}");
+        }
+    }
+
+    /// The agent's module leaves SIGTERM and SIGINT to the process (the session's source
+    /// test pins that the agent passes this constant).
+    #[test]
+    fn the_agents_module_registers_no_signal_handler() {
+        assert_eq!(AGENT_SIGNALS, Signals::LeaveToTheProcess);
     }
 
     /// `--renders` turns the mode on and takes renders-bench's options through

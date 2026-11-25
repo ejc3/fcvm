@@ -2493,6 +2493,17 @@ starts nothing of the mode.
   handler in the agent), closes the reaper's pipe, and the reaper removes everything, as it
   does for the benchmark. A module started inside the agent's connection is ended when the
   connection ends (`--stdio`); a dialing agent keeps it across reconnects, as it keeps its VMs.
+- **The host check.** `make test-fleet-renders-agent OUT=dir KITESURF=dir`
+  (`bench/chromium/renders_agent_check.py`, through `renders_bench.sh agent-check`) starts the
+  agent as a transient unit with the bench's unit properties and `--stdio` on its pipes
+  (`systemd-run --pipe`), with `--host renders-agent-check`, `--image unused`, `--base-port 1`
+  and `--sysfs-root` at a missing directory (no GPU) for the agent's own options. It plays the
+  coordinator, and counts what is left as `renders_teardown_check.py` does (it imports that
+  census): the hello and no report before the first order; renders on both sides; an overlay
+  order end to end (the report's `overlay_seq`, each side's injected file); `run: false` while
+  rendering and while held at `HOLD_STAGES` (nothing left, the agent up and rendering again);
+  SIGKILL of the agent at each stage and SIGTERM while rendering (nothing left). One line per
+  case, all of them in `<OUT>.agent-check.json`; the exit status is 1 when any fails.
 - **Reports** go only after the connection's first `renders` order (the dialing agent keeps
   that rule per connection), at least every 5 s: the module's own while it renders, and one
   with nothing in flight while it is stopped or starting. A module that fails reports

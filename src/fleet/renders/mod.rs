@@ -1338,7 +1338,7 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
     // Held until the session returns: the order never changes.
     let (_order, orders) = watch::channel(Some(RendersOrder { run: true, overlay }));
     let exe = std::env::current_exe().context("this binary's path")?;
-    let (outcome, reaped) = session(&args, &exe, orders, None, true).await?;
+    let (outcome, reaped) = session(&args, &exe, orders, None, Signals::EndTheModule).await?;
     println!("{}", serde_json::to_string(&reaped)?);
     outcome?;
     anyhow::ensure!(
@@ -1348,11 +1348,21 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
     Ok(())
 }
 
+/// Whether a module handles SIGTERM and SIGINT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signals {
+    /// The benchmark: either signal ends the module, which then lets its reaper go.
+    EndTheModule,
+    /// The agent: no handler is registered, so either signal ends the process, and the
+    /// reaper removes what the module made.
+    LeaveToTheProcess,
+}
+
 /// One module from its start to its end, for the benchmark command and the fleet agent alike:
 /// the kernel rule, the run directory's lock, the start's sweep, the reaper, the processes
 /// ([`run`]) and the reaper's sweep. `orders` says whether to render and what overlay to serve;
 /// the module ends when it says stop or its sender is gone. Each report the module writes is
-/// also sent to `reports`. Only `signals` makes the module end at SIGTERM or SIGINT: a handler
+/// also sent to `reports`. Only [`Signals::EndTheModule`] makes the module end at SIGTERM or SIGINT: a handler
 /// stays registered for the life of the process, and the agent's SIGTERM must end the agent.
 ///
 /// Returns how the module ended and what the reaper found. An error from before the reaper
@@ -1362,7 +1372,7 @@ pub async fn session(
     exe: &Path,
     mut orders: watch::Receiver<Option<RendersOrder>>,
     reports: Option<mpsc::UnboundedSender<RendersReport>>,
-    signals: bool,
+    signals: Signals,
 ) -> Result<(Result<()>, reap::Reaped)> {
     let status = Status {
         path: args.status_file.clone(),
@@ -1465,7 +1475,7 @@ async fn run(
     release: &str,
     orders: &mut watch::Receiver<Option<RendersOrder>>,
     reports: Option<mpsc::UnboundedSender<RendersReport>>,
-    signals: bool,
+    signals: Signals,
 ) -> Result<()> {
     let start = start(
         args, status, unit, cpus, pages, fixed, setup, exe, logs, release, reports,
@@ -1504,7 +1514,7 @@ async fn run(
 
     // Under the agent no handler is registered: one stays for the life of the process, and
     // the agent's SIGTERM must end the agent.
-    let mut signals = if signals {
+    let mut signals = if signals == Signals::EndTheModule {
         use tokio::signal::unix::{signal, SignalKind};
         Some((
             signal(SignalKind::terminate())?,
@@ -2637,7 +2647,7 @@ mod tests {
             &rest[..rest.find("\n}\n").unwrap()]
         };
         let bench = body("pub async fn bench(");
-        assert!(bench.contains("session(&args, &exe, orders, None, true)"));
+        assert!(bench.contains("session(&args, &exe, orders, None, Signals::EndTheModule)"));
         assert!(!bench.contains("run("));
         let session = body("pub async fn session(");
         let reaper = session.find("reap::Reaper::start(").unwrap();
@@ -2651,15 +2661,31 @@ mod tests {
             2,
             "the definition and the call"
         );
-        // the agent starts the module through the session, without the signal handlers
+        // the agent starts the module through the session, with the signals it names
+        // (`agent::renders::AGENT_SIGNALS`, pinned by value there)
         let agent = include_str!("../agent/renders.rs");
-        assert!(
-            agent.contains("crate::fleet::renders::session("),
-            "the agent's module is the session"
+        let agent = &agent[..agent.find("#[cfg(test)]").unwrap()];
+        let calls: Vec<&str> = agent
+            .match_indices("crate::fleet::renders::session(")
+            .map(|(at, _)| {
+                let rest = &agent[at..];
+                &rest[..rest.find(".await").unwrap()]
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the agent's module is the session: {calls:?}"
         );
         assert!(
-            agent.contains("false,\n"),
-            "the agent registers no signal handler"
+            calls[0]
+                .trim_end()
+                .trim_end_matches(')')
+                .trim_end()
+                .trim_end_matches(',')
+                .ends_with("AGENT_SIGNALS"),
+            "the agent passes AGENT_SIGNALS: {}",
+            calls[0]
         );
     }
 
@@ -2678,7 +2704,9 @@ mod tests {
         assert!(start.contains("try_join_all(batch)"));
         let run = &source[source.find("\nasync fn run(\n").unwrap()..];
         let run = &run[..run.find("\n}\n").unwrap()];
-        let guard = run.find("let mut signals = if signals {").unwrap();
+        let guard = run
+            .find("let mut signals = if signals == Signals::EndTheModule {")
+            .unwrap();
         let term = run.find("signal(SignalKind::terminate())").unwrap();
         let none = run.find("        None\n    };").unwrap();
         assert!(guard < term && term < none);
