@@ -549,7 +549,7 @@ Each VM has:
 - Regenerate machine IDs
 - Update MMDS with new config
 
-### A Restore Kicks Every Runnable vCPU (x86_64)
+### A Restore Gives Runnable vCPUs a PV Kick (x86_64)
 
 On x86_64, a guest with paravirtual spinlocks waits for a lock by checking the lock word and
 then executing HLT (`kvm_wait()`), with interrupts off when it took the lock in interrupt
@@ -561,15 +561,15 @@ interrupts off and only an NMI, an SMI or an INIT wakes it, the next vCPU to sen
 and wait spins, and every clone of that snapshot hangs the same way (#2131).
 
 The Firecracker fork therefore ends a snapshot load, after every vCPU's state is set and
-before the guest runs, by giving each vCPU the snapshot holds as runnable one kick
-(`KvmVm::kick_runnable_vcpus`). It is delivered as KVM delivers a guest's: an interrupt with
-the reserved "remote read" delivery mode, sent with `KVM_SIGNAL_MSI` to the vCPU's APIC id.
-Firecracker does nothing between the load and the guest's next instruction that clears it, so
-loading paused (`resume_vm: false`) and resuming later needs no second one. Firecracker's log
-says how many vCPUs it kicked.
+before the guest runs, by giving one kick to each vCPU the snapshot holds as runnable, in a
+guest whose CPUID offers `KVM_FEATURE_PV_UNHALT` (`KvmVm::kick_runnable_vcpus`). It is
+delivered as KVM delivers a guest's: an interrupt with the reserved "remote read" delivery
+mode, sent with `KVM_SIGNAL_MSI` to the vCPU's APIC id. Firecracker does nothing between the
+load and the guest's next instruction that clears it, so loading paused (`resume_vm: false`)
+and resuming later needs no second one. Firecracker's log says how many vCPUs it kicked.
 
-- A vCPU that was not waiting for a kick sees its next HLT return early once. The spinlock
-  wait and the idle loop check again and halt again.
+Which vCPUs get one:
+
 - A halted vCPU gets none: KVM reports a halted vCPU with a kick pending as runnable, so one
   saved as halted had none to lose.
 - A vCPU that waits for INIT or SIPI gets none. With a kick recorded KVM takes it for
@@ -582,18 +582,42 @@ says how many vCPUs it kicked.
 - arm64 has no such kick. Its queued spinlocks spin, and a vCPU in WFI wakes on an interrupt
   that the vGIC state in the snapshot holds.
 
+What the kick does to a vCPU that was not waiting for one:
+
+- Its next HLT returns early once. The spinlock wait and the idle loop check again and halt
+  again.
+- If it receives an INIT before that HLT, a vCPU other than the boot CPU enters the
+  wait for SIPI with the flag still set, and its `KVM_RUN` spins in the kernel until the SIPI
+  arrives, which clears it. KVM does the same after a guest's own kick. The restore puts
+  the flag on every runnable vCPU, where before only a kicked one carried it.
+- A vCPU saved while it ran a nested guest holds the flag as the L1 vCPU. The first exit
+  from L2 to L1 clears it. An L2 that executes HLT first, with HLT not intercepted by L1,
+  has that HLT return early once.
+
 **The host kernel has to keep the kick.** From Linux 6.15 on, `kvm_arch_async_page_present()`
 clears a pending kick, and a restored vCPU runs that function on its first `KVM_RUN`, before
-it runs an instruction: restoring `MSR_KVM_ASYNC_PF_EN`, which every vCPU of a Linux guest
-has set, queues a completion that wakes every waiter in the guest (#2132). It runs inside
-`KVM_RUN`, so no order of the restore's ioctls avoids it. On such a host the kick reaches the
-HLT only with
-`kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch`
-(#2125, kernel/README.md), which the repo's x86_64 host kernel carries and which the same
-host needs for the guest's own kicks. A host on 6.14 or earlier keeps the kick as it is.
-Measured on Linux 7.0.0 with a vCPU set up as Linux sets one up: with the distribution's KVM
-the restored vCPU was still halted after 10 s, and with the same KVM rebuilt with that one
-change it ran on.
+it runs an instruction: restoring `MSR_KVM_ASYNC_PF_EN` with async page faults enabled queues
+a completion that wakes every waiter in the guest (#2132). A Linux guest enables them unless
+it was booted with `no-kvmapf` or was not offered `KVM_FEATURE_ASYNC_PF_INT`, and fcvm's
+guests enable them. The completion runs inside `KVM_RUN`, so no order of the restore's ioctls
+avoids it. One case keeps the kick without help: a vCPU whose page-ready slot was still
+occupied at the snapshot, because KVM holds the completion back until the guest frees the
+slot. Otherwise, on such a kernel, the kick reaches the HLT only when KVM carries
+`0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch` (#2125,
+kernel/README.md). A kernel on 6.14 or earlier keeps the kick as it is.
+
+Which kernels carry that patch today:
+
+| KVM that runs the restored guest | carries the patch |
+|---|---|
+| fcvm's x86_64 host kernel (`[kernel_profiles.nested.amd64.host_kernel]`, `kernel/patches-x86-host`), on the x64 runners and the fleet's GPU hosts once their images are rebuilt from a main that has it | yes |
+| a distribution's or any other kernel from 6.15 on that fcvm did not build | no |
+| KVM inside an fcvm guest, for a VM restored inside that guest: `nested.amd64` (6.18.60), `phone.amd64` (7.3.3) and the `mountinfo` pair (6.16.1) | no |
+
+Where the patch is missing, the kick is given and then cleared, #2131 stays as it was, and
+the same kernel loses the guest's own kicks to #2125. Measured on Linux 7.0.0 with a vCPU
+set up as Linux sets one up: with the distribution's KVM the restored vCPU was still halted
+after 10 s, and with the same KVM rebuilt with that one change it ran on.
 
 A snapshot restores on the Firecracker binary that took it while that file exists, so a
 snapshot taken before this build restores without the kick until it is taken again, or is
@@ -602,8 +626,10 @@ run with `--firecracker-bin` naming the current build.
 `every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore` (`src/setup/rootfs.rs`) is a
 tripwire: it fails when an x86_64 pin moves to a commit nobody has listed as carrying the
 kick. It cannot tell whether a commit does. The fork's own tests do that
-(`arch::x86_64::vm::tests`, on KVM), and on x86_64 the direct snapshot run tests require the
-kick line in the clone's Firecracker log, which shows the `[firecracker]` build ran the step.
+(`cargo test -p vmm --lib -- arch::x86_64::vm::tests`, on KVM); fcvm's CI does not run them,
+and nothing at run time tells a kernel that keeps the kick from one that clears it. On
+x86_64 the direct snapshot run tests require the kick line in the clone's Firecracker log,
+which shows the `[firecracker]` build ran the step, not that the kick lasted.
 
 ### Disk-Only Snapshots & Cold-Boot Clones
 

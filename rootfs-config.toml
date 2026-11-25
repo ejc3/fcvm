@@ -72,13 +72,16 @@ archives = [
 # A net device takes host_dev_fd, a TAP queue the process inherited, which is how a clone
 # in a pooled namespace gets its TAP (`tap-fd` in the same build metadata).
 # On x86_64 a snapshot load ends with a paravirtual kick for every vCPU the snapshot holds
-# as runnable: KVM keeps a spinlock kick that is pending for a runnable vCPU in a flag no
-# ioctl reads, so the snapshot does not hold it, and without the kick a vCPU restored just
-# before the HLT of its lock wait halts with interrupts off for good (#2131). On a host
-# kernel from 6.15 on the kick lasts until that HLT only with the x86_64 host kernel's
-# patch 0003 (kernel/README.md). The gpu, phone and nested amd64 profiles pin the same fix
-# on their own branches, and every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore
-# fails when one of these pins moves to a commit that is not listed as carrying it.
+# as runnable, in a guest that was offered KVM_FEATURE_PV_UNHALT: KVM keeps a spinlock kick
+# that is pending for a runnable vCPU in a flag no ioctl reads, so the snapshot does not
+# hold it, and without the kick a vCPU restored just before the HLT of its lock wait halts
+# with interrupts off for good (#2131). KVM from 6.15 on clears the kick again on the
+# vCPU's first entry (#2132) unless it carries the x86_64 host kernel's patch 0003
+# (kernel/README.md), which today only [kernel_profiles.nested.amd64.host_kernel] does: no
+# distribution kernel, and none of the guest kernels below that run KVM themselves. The
+# gpu, phone and nested amd64 profiles pin the same fix on their own branches, and
+# every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore fails when one of these
+# pins moves to a commit that is not listed as carrying it.
 # v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
 # build cannot restore format 12. A restore uses the binary the snapshot
 # recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
@@ -96,7 +99,7 @@ archives = [
 [firecracker]
 repo = "ejc3/firecracker"
 branch = "agent/uffd-minor-v1.17.0-pv-kick-restore"
-commit = "3a4d73f25cf7cfd72c313542bdf4c957aa5ba483"
+commit = "2a33289b55b7f611959891dd5295438a416f386e"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
@@ -402,7 +405,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # load gives every runnable vCPU (#2131, see [firecracker]).
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "agent/vfio-pv-kick-restore"
-firecracker_commit = "b44583cb02d5f77bec8970610a824375e2b200aa"
+firecracker_commit = "6ab54b9fe17f81cbfe6e127807c37870313ee3a5"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -451,7 +454,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # snapshot load gives every runnable vCPU (#2131, see [firecracker]).
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "agent/vfio-pv-kick-restore"
-firecracker_commit = "b44583cb02d5f77bec8970610a824375e2b200aa"
+firecracker_commit = "6ab54b9fe17f81cbfe6e127807c37870313ee3a5"
 firecracker_args = "--enable-pci"
 boot_args = "net.ifnames=0"
 
@@ -567,7 +570,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # No special boot_args needed for x86.
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "agent/uffd-minor-v1.17.0-nested-state-pv-kick-restore"
-firecracker_commit = "6d4013b4140c80ae151f355e6e9f0b2e33497c16"
+firecracker_commit = "af888e7aec38fe4727fd75878aaed017a3113028"
 
 # Host kernel configuration for x86 nested profile
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,

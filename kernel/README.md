@@ -121,10 +121,12 @@ there is no upstream commit to take. arm64 KVM has no async page faults, so the 
 does not carry it. `a_page_ready_completion_keeps_a_pending_pv_kick`
 (tests/test_kernel_patch_invariants.rs) runs the release's two functions in a C harness and
 fails without the patch.
-The kick a snapshot load gives every runnable vCPU (#2131, DESIGN.md "A Restore Kicks Every
-Runnable vCPU") needs this patch as well: a restored vCPU's first `KVM_RUN` completes the
+The kick a snapshot load gives the runnable vCPUs (#2131, DESIGN.md "A Restore Gives Runnable
+vCPUs a PV Kick") needs this patch as well: a restored vCPU's first `KVM_RUN` completes the
 page-ready wake-up that restoring `MSR_KVM_ASYNC_PF_EN` queued, through the same function,
-before the guest runs an instruction.
+before the guest runs an instruction (#2132). Only this host kernel carries the patch. The
+guest kernels that run KVM themselves (`nested.amd64`, `phone.amd64`, the `mountinfo` pair)
+do not, so a VM restored inside one of those guests has its kick cleared.
 
 `kernel/patches-arm64-host/vgic-v3-keep-hcr-on-quiet-exits.patch` gives back most of what
 6.19's vgic rework added to every KVM exit (#659). Since Linux 6.19 (the vgic-lr-overflow

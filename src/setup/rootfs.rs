@@ -3565,11 +3565,11 @@ branch = "agent/nv2"
     /// without the kick can halt a vCPU with interrupts off for good (#2131).
     const RESTORE_KICK_COMMITS: [&str; 3] = [
         // [firecracker]: the default, btrfs and mountinfo profiles.
-        "3a4d73f25cf7cfd72c313542bdf4c957aa5ba483",
+        "2a33289b55b7f611959891dd5295438a416f386e",
         // gpu.amd64 and phone.amd64.
-        "b44583cb02d5f77bec8970610a824375e2b200aa",
+        "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
         // nested.amd64.
-        "6d4013b4140c80ae151f355e6e9f0b2e33497c16",
+        "af888e7aec38fe4727fd75878aaed017a3113028",
     ];
 
     /// A pin that moves to a commit without the restore kick brings #2131 back with no test

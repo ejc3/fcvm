@@ -3716,18 +3716,17 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
-    // On x86_64 a snapshot load ends with a paravirtual kick for every runnable vCPU
-    // (#2131), and the Firecracker that gives it says so in its log at Info, the level fcvm
-    // asks for unless FCVM_FIRECRACKER_LOG_LEVEL says otherwise. A build without the fix
-    // logs nothing of the kind. The line shows the step ran, not that a vCPU needed it: an
-    // idle guest's vCPUs are halted and get none.
-    if cfg!(target_arch = "x86_64") {
-        let clone_vm_id = fcvm::state::StateManager::new(fcvm::paths::state_dir())
-            .load_state_by_pid(clone_pid)
-            .await
-            .context("loading the clone's state")?
-            .vm_id;
-        let vmm_log_path = fcvm::paths::vm_runtime_dir(&clone_vm_id).join("firecracker.log");
+    // On x86_64, Firecracker ends a snapshot load with a paravirtual kick for the runnable
+    // vCPUs (#2131) and says so in its log at Info, the level fcvm asks for unless
+    // FCVM_FIRECRACKER_LOG_LEVEL says otherwise. A build without the fix logs nothing of the
+    // kind. The line shows the step ran. It does not show that a vCPU needed the kick (an
+    // idle guest's vCPUs are halted and get none) or that the host kernel kept it.
+    let clone_state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .load_state_by_pid(clone_pid)
+        .await
+        .context("loading the clone's state")?;
+    if cfg!(target_arch = "x86_64") && clone_state.config.hypervisor.is_firecracker() {
+        let vmm_log_path = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("firecracker.log");
         let vmm_log = std::fs::read_to_string(&vmm_log_path)
             .with_context(|| format!("reading {}", vmm_log_path.display()))?;
         anyhow::ensure!(
