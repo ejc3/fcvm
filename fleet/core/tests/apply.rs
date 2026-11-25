@@ -2286,3 +2286,122 @@ fn a_phones_cpu_is_held_to_0_to_100_and_a_bad_one_is_dropped() {
         assert!(phone_stats(&s).1.is_null(), "{bad}");
     }
 }
+
+/// A hello from pages mode's host: no GPU, the mode's pages, and its frame socket's
+/// addresses.
+fn renders_hello(at: u64, host: &str) -> Event {
+    serde_json::from_value(serde_json::json!({
+        "type": "agent", "at": at, "host": host,
+        "msg": {"type": "hello", "host": host, "arch": "aarch64", "capacity": 0, "gpus": [],
+            "renders": {"cpus": 40, "pages": [{"id": "example", "url": "https://example.com/"}],
+                "ipv6": "2001:db8:7:7::5", "ipv4": "198.51.100.5", "v4_port": 8443}}
+    }))
+    .unwrap()
+}
+
+/// Pages mode's host is never one of the wall's GPU hosts: it has no slot, no assignment,
+/// no place in the potato ring or the phones, sandboxes and servers, and no entry in the
+/// wake's record, so the wake closes once the GPU hosts render (a host recorded there that
+/// never renders would hold the record open until the fleet sleeps).
+#[test]
+fn a_renders_host_is_no_gpu_host_of_the_wall_or_the_wake() {
+    let config = config_with(serde_json::json!({
+        "power_managed": true, "idle_scale_down_secs": 60, "ec2_max": 0
+    }));
+    let mut s = State::new(config, 0);
+    for e in events(serde_json::json!([
+        {"type": "viewer_joined", "at": 1000, "viewer": "v1", "client": "192.0.2.70"},
+        {"type": "visibility", "at": 1100, "viewer": "v1", "visible": false},
+        {"type": "tick", "at": 62000},
+        {"type": "visibility", "at": 100000, "viewer": "v1", "visible": true},
+        {"type": "tick", "at": 100500},
+    ])) {
+        s = apply(s, &e);
+    }
+    assert_eq!(s.fleet.power.state, "waking");
+    s = apply(s, &renders_hello(110000, "r1"));
+    s = apply(s, &hello(111000, "h1", 1));
+    s = apply(s, &running(120000, "h1", "slot-1"));
+    s = apply(s, &Event::Tick { at: 121000 });
+    assert!(
+        !s.fleet.power.hosts.contains_key("r1"),
+        "{:?}",
+        s.fleet.power.hosts
+    );
+    assert_eq!(s.fleet.power.state, "awake");
+    assert!(
+        !fleet_core::apply::wake_open(&s.fleet.power),
+        "the wake's record stays open: {:?}",
+        s.fleet.power.hosts
+    );
+    assert!(s
+        .fleet
+        .slots
+        .values()
+        .all(|x| x.host.as_deref() != Some("r1")));
+    assert!(host_assignments(&s).get("r1").is_none_or(|a| a.is_empty()));
+    assert_eq!(s.fleet.potato.host, None);
+    assert!(s.fleet.phones.is_empty() && s.fleet.windows.is_empty());
+    assert!(s.fleet.minecraft.is_empty());
+    assert!(s.fleet.renders.hosts.contains_key("r1"));
+}
+
+/// Pages mode's host's frame socket is named like a host's aggregator: `renders-<host>`
+/// gets the coordinator's names for the addresses its hello gave, and a page is given those
+/// names; names minted for other addresses are not taken. Without the subzone the page gets
+/// the URLs of the host's report.
+#[test]
+fn a_renders_hosts_frame_socket_is_named_for_the_addresses_it_gave() {
+    assert_eq!(
+        fleet_core::state::renders_id("i-0123456789abcdef0").as_deref(),
+        Some("renders-i-0123456789abcdef0")
+    );
+    assert_eq!(fleet_core::state::renders_id("Not A Label"), None);
+    let names = |ipv6: &str, label: &str| {
+        serde_json::json!({
+            "type": "published", "at": 2000, "slot": "renders-r1",
+            "names": {"generation": 0, "label": label, "ipv6": ipv6, "ipv4": "198.51.100.5",
+                "v4_port": 8443,
+                "frame_url": format!("wss://{label}.fleet.example.test/frames"),
+                "frame_url_v4": format!("wss://{label}-v4.fleet.example.test:8443/frames")}
+        })
+    };
+    let report: Event = serde_json::from_value(serde_json::json!({
+        "type": "agent", "at": 1500, "host": "r1",
+        "msg": {"type": "renders", "at": 1490, "frame_url": "wss://r1.example.test/frames"}
+    }))
+    .unwrap();
+    let published = Config {
+        names_published: true,
+        ..Config::default()
+    };
+    let mut s = State::new(published, 0);
+    s = apply(s, &renders_hello(1000, "r1"));
+    s = apply(s, &report);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert!(v["renders"]["frame_url"].is_null(), "{}", v["renders"]);
+    // Minted for an address the host did not give: not its names.
+    let other: Event =
+        serde_json::from_value(names("2001:db8:7:7::6", "renders-r1-aaaaaaaa")).unwrap();
+    s = apply(s, &other);
+    assert_eq!(s.fleet.renders.hosts["r1"].published, None);
+    let mine: Event =
+        serde_json::from_value(names("2001:db8:7:7::5", "renders-r1-bbbbbbbb")).unwrap();
+    s = apply(s, &mine);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(
+        v["renders"]["frame_url"],
+        "wss://renders-r1-bbbbbbbb.fleet.example.test/frames"
+    );
+    assert_eq!(
+        v["renders"]["frame_url_v4"],
+        "wss://renders-r1-bbbbbbbb-v4.fleet.example.test:8443/frames"
+    );
+    // No subzone: the report's URL.
+    let mut s = State::new(Config::default(), 0);
+    s = apply(s, &renders_hello(1000, "r1"));
+    s = apply(s, &report);
+    let v = serde_json::to_value(view(&s)).unwrap();
+    assert_eq!(v["renders"]["frame_url"], "wss://r1.example.test/frames");
+    assert!(v["renders"]["frame_url_v4"].is_null());
+}

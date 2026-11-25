@@ -342,6 +342,23 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 return None;
             }
             let f = &mut state.fleet;
+            // Pages mode's host's frame socket, for the addresses its hello gave.
+            if let Some(h) = f
+                .renders
+                .hosts
+                .iter_mut()
+                .find(|(name, _)| crate::state::renders_id(name).as_deref() == Some(slot.as_str()))
+                .map(|(_, h)| h)
+            {
+                if names.names(
+                    h.hello.ipv6.as_deref(),
+                    h.hello.ipv4.as_deref(),
+                    h.hello.v4_port,
+                ) {
+                    h.published = Some(names.clone());
+                }
+                return None;
+            }
             // A host aggregator's names, for the addresses it reports now.
             if let Some(h) = f
                 .hosts
@@ -534,7 +551,9 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         windows_hello(&mut state.fleet, host, *windows, at);
                         minecraft_hello(&mut state.fleet, host, *minecraft, at);
                         let p = &mut state.fleet.power;
-                        if wake_open(p) {
+                        // Pages mode's host has no GPU and no place on the wall: it is no
+                        // host of the wake, whose record closes once its hosts render.
+                        if wake_open(p) && renders.is_none() {
                             let woke = p.woke_at;
                             let w = p.hosts.entry(host.clone()).or_default();
                             // The host's own clock: kept only when it falls inside this wake.

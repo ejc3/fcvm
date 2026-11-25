@@ -1,10 +1,11 @@
 //! The spend meter (`--daily-spend-usd`): what the fleet's EC2 instances cost per hour, reported
 //! to the state as `Event::Burn`; the ledger and the forced sleep are `fleet_core::spend`.
 //!
-//! Every [`MeterConfig::every`] the meter lists this fleet's GPU hosts and EC2 tiles in every
-//! region it launches in (`DescribeInstances`, `tag:Fleet=<fleet>`, `tag:Purpose` host or
-//! tile, pending to shutting-down) and prices each one: a spot instance at the current spot
-//! price of its type in its availability zone (`DescribeSpotPriceHistory`, cached for
+//! Every [`MeterConfig::every`] the meter lists this fleet's GPU hosts, pages mode's host and
+//! EC2 tiles in every region it launches in (`DescribeInstances`, `tag:Fleet=<fleet>`,
+//! `tag:Purpose` host, tile or renders, pending to shutting-down) and prices each one: a spot
+//! instance at the current spot price of its type in its availability zone
+//! (`DescribeSpotPriceHistory`, cached for
 //! [`MeterConfig::spot_ttl`]), an on-demand one at its type's on-demand rate
 //! (`--spend-rates`, over [`DEFAULT_ON_DEMAND`]). It errs high where it cannot know: a spot
 //! instance whose price is not available is priced on demand, an instance whose type has no
@@ -25,7 +26,9 @@ use tokio::time::Instant;
 
 /// US East (N. Virginia) Linux on-demand list prices, USD per hour, of the instance types the
 /// fleet launches (AWS Price List API, 2026-11-19; the same in us-east-2 and us-west-2).
+/// c8gd.metal-24xl is pages mode's host (2026-11-24).
 pub const DEFAULT_ON_DEMAND: &[(&str, f64)] = &[
+    ("c8gd.metal-24xl", 4.70304),
     ("g4dn.metal", 7.824),
     ("g4dn.xlarge", 0.526),
     ("g5g.metal", 2.744),
@@ -44,7 +47,8 @@ pub struct Billed {
     pub instance_type: String,
     pub spot: bool,
     pub zone: String,
-    /// An EC2 tile (`Purpose=fcvm-fleet-tile`); otherwise a GPU host.
+    /// An EC2 tile (`Purpose=fcvm-fleet-tile`); otherwise a host (a GPU host, or pages
+    /// mode's host).
     pub tile: bool,
 }
 
@@ -125,8 +129,9 @@ pub fn lambda_burn(
 pub const STALE_AFTER: Duration = Duration::from_secs(300);
 
 /// The most the fleet can be running: in each host region its awake hosts and the
-/// replacement a spot interruption notice launches, and with EC2 tiles each tile plus a
-/// relaunch in flight, all at the highest on-demand rate known.
+/// replacement a spot interruption notice launches, pages mode's host and a replacement
+/// beside one still shutting down, and with EC2 tiles each tile plus a relaunch in flight,
+/// all at the highest on-demand rate known.
 pub fn launch_cap_usd_per_hour(
     args: &crate::cli::FleetCoordArgs,
     on_demand: &BTreeMap<String, f64>,
@@ -138,7 +143,12 @@ pub fn launch_cap_usd_per_hour(
         .collect();
     host_regions.sort();
     host_regions.dedup();
-    let hosts = host_regions.len() as f64 * (args.awake_hosts as f64 + 1.0);
+    let renders = if args.renders_templates.is_empty() {
+        0.0
+    } else {
+        2.0
+    };
+    let hosts = host_regions.len() as f64 * (args.awake_hosts as f64 + 1.0) + renders;
     let lambda_tiles = if args.lambda == crate::cli::FleetLambda::Aws {
         args.lambda_tiles.min(args.ec2_tiles)
     } else {
@@ -361,11 +371,12 @@ pub fn meter(args: &crate::cli::FleetCoordArgs) -> Result<Option<MeterConfig>> {
     );
     anyhow::ensure!(
         super::power_managed(args),
-        "--daily-spend-usd sleeps the fleet at the ceiling, so it needs --host-template or --sleep-when-idle"
+        "--daily-spend-usd sleeps the fleet at the ceiling, so it needs --host-template, --renders-template or --sleep-when-idle"
     );
     let mut regions: Vec<String> = args
         .host_templates
         .iter()
+        .chain(&args.renders_templates)
         .map(|t| t.region.clone())
         .collect();
     if args.ec2 == crate::cli::FleetEc2::Aws {
@@ -375,7 +386,7 @@ pub fn meter(args: &crate::cli::FleetCoordArgs) -> Result<Option<MeterConfig>> {
     regions.dedup();
     anyhow::ensure!(
         !regions.is_empty(),
-        "--daily-spend-usd meters the instances the coordinator launches: it needs --host-template or --ec2 aws"
+        "--daily-spend-usd meters the instances the coordinator launches: it needs --host-template, --renders-template or --ec2 aws"
     );
     let on_demand = on_demand_rates(&args.spend_rates)?;
     Ok(Some(MeterConfig {
@@ -682,6 +693,10 @@ impl MeterDriver for AwsMeter {
             p("Filter.2.Name", "tag:Purpose"),
             p("Filter.2.Value.1", "fcvm-fleet-host"),
             p("Filter.2.Value.2", "fcvm-fleet-tile"),
+            p(
+                "Filter.2.Value.3",
+                super::hosts::HostClass::Renders.purpose(),
+            ),
             p("Filter.3.Name", "instance-state-name"),
         ];
         for (i, s) in BILLED_STATES.iter().enumerate() {
@@ -1061,6 +1076,74 @@ mod tests {
             m.cap_usd_per_hour
         );
         assert_eq!(m.lambda_usd_per_instance_hour, Some(lane));
+    }
+
+    /// Pages mode's host type has a built-in on-demand rate, which `--spend-rates` replaces
+    /// like any other.
+    #[test]
+    fn the_renders_host_type_has_a_built_in_on_demand_rate() {
+        let r = on_demand_rates(&[]).unwrap();
+        assert_eq!(r["c8gd.metal-24xl"], 4.70304);
+        let r = on_demand_rates(&["c8gd.metal-24xl=5.1".into()]).unwrap();
+        assert_eq!(r["c8gd.metal-24xl"], 5.1);
+        // An on-demand renders host is a host in the burn, at that rate.
+        let listed = BTreeMap::from([(
+            "us-east-2".to_string(),
+            vec![host("i-r", "c8gd.metal-24xl", false, "us-east-2c")],
+        )]);
+        let (hosts, tiles, why) =
+            burn_rates(&listed, &HashMap::new(), &on_demand_rates(&[]).unwrap());
+        assert_eq!((hosts, tiles, why), (4.70304, 0.0, None));
+    }
+
+    /// With pages mode's host, the meter lists its region too, and the launch cap counts it
+    /// and the replacement that can overlap a reclaimed one shutting down.
+    #[test]
+    fn the_meter_counts_the_renders_host_in_its_regions_and_launch_cap() {
+        let base = [
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0",
+            "--daily-spend-usd",
+            "750",
+            "--fleet-name",
+            "prod",
+        ];
+        let without = meter(&coord(&base)).unwrap().unwrap();
+        let mut args = base.to_vec();
+        args.extend([
+            "--renders-template",
+            "us-east-2:fcvm-fleet-renders-arm64",
+            "--renders-subnet",
+            "us-east-2:subnet-0123456789abcdef1",
+        ]);
+        let with = meter(&coord(&args)).unwrap().unwrap();
+        assert_eq!(with.regions, ["us-east-1", "us-east-2"]);
+        let highest = on_demand_rates(&[])
+            .unwrap()
+            .values()
+            .copied()
+            .fold(0.0, f64::max);
+        assert!(
+            (with.cap_usd_per_hour - (without.cap_usd_per_hour + 2.0 * highest)).abs() < 1e-9,
+            "{} {}",
+            with.cap_usd_per_hour,
+            without.cap_usd_per_hour
+        );
+        // The renders host alone is something to meter, in a fleet that sleeps.
+        let alone = [
+            "--renders-template",
+            "us-east-2:fcvm-fleet-renders-arm64",
+            "--renders-subnet",
+            "us-east-2:subnet-0123456789abcdef1",
+            "--daily-spend-usd",
+            "750",
+        ];
+        assert_eq!(
+            meter(&coord(&alone)).unwrap().unwrap().regions,
+            ["us-east-2"]
+        );
     }
 
     fn coord(extra: &[&str]) -> crate::cli::FleetCoordArgs {

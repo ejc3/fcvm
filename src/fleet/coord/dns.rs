@@ -8,6 +8,9 @@
 //! - `<label>-v4.<subzone>` A: an IPv4 address: a GPU host's public address, shared by its
 //!   slots, each forwarded on its own port (`SlotReport::v4_port`), or a tile's own.
 //!
+//! Pages mode's host's frame socket is named the same way under `renders-<host>-<token>`
+//! (`fleet_core::state::renders_id`), with the addresses its hello gave.
+//!
 //! A host's aggregator is named the same way under `agg-<host>-<token>`
 //! (`fleet_core::state::aggregate_id`): AAAA its own IPv6 address (port 443) and the `-v4` A
 //! the host's IPv4 address, on the aggregator's port. Its label lasts while it reports the
@@ -65,6 +68,17 @@ pub fn facts(state: &State) -> Vec<Fact> {
             published: h.aggregate_published.clone(),
         })
     });
+    // Pages mode's host's frame socket, for the addresses its hello gave.
+    let renders = f.renders.hosts.iter().filter_map(|(name, h)| {
+        Some(Fact {
+            id: fleet_core::state::renders_id(name)?,
+            generation: 0,
+            ipv6: h.hello.ipv6.clone(),
+            ipv4: h.hello.ipv4.clone(),
+            v4_port: h.hello.v4_port,
+            published: h.published.clone(),
+        })
+    });
     let c = &state.config;
     let ec2_aggregator = Fact {
         id: fleet_core::state::EC2_AGGREGATE_ID.into(),
@@ -76,6 +90,7 @@ pub fn facts(state: &State) -> Vec<Fact> {
     };
     units
         .chain(aggregators)
+        .chain(renders)
         .chain(std::iter::once(ec2_aggregator))
         .collect()
 }

@@ -4,14 +4,15 @@
 //!
 //! A dialed agent names its host in its hello, and the coordinator checks that name
 //! ([`AgentIdentity`]): with host templates configured, it must be an EC2 instance of this
-//! fleet's hosts (`Purpose=fcvm-fleet-host`, `Fleet=<--fleet-name>`, pending or running), and
+//! fleet's hosts (`Purpose=fcvm-fleet-host`, or `Purpose=fcvm-fleet-renders` for pages mode's
+//! host, and `Fleet=<--fleet-name>`, pending or running), and
 //! the connection must come from that instance (its public IPv4 address, or one of its IPv6
 //! addresses or delegated prefixes, as `CF-Connecting-IP` names it). A host of another fleet
 //! cannot join, and a machine holding a stolen agent token cannot pass for a host by naming
 //! its instance id, which snapshots show. A refusal is logged at warn with
 //! `marker=fleet-agent-refused`.
 
-use super::hosts::HostDriver;
+use super::hosts::{HostClass, HostDriver};
 use super::{Cmd, Handle};
 use crate::fleet::lines::{spawn_writer, LineReader};
 use anyhow::{bail, Context, Result};
@@ -38,12 +39,19 @@ pub trait AgentIdentity: Send + Sync {
     async fn check(&self, host: &str, source: Option<IpAddr>) -> std::result::Result<(), String>;
 }
 
-/// An agent's host must be one of this fleet's GPU hosts: an EC2 instance, pending or running,
-/// that the host driver lists in one of the host regions (`Purpose=fcvm-fleet-host`,
-/// `Fleet=<fleet>`). A listing that fails refuses the agent; it dials again.
-pub struct FleetHosts {
+/// One host group an agent's host may belong to: its class, driver and regions.
+pub struct FleetGroup {
+    pub class: HostClass,
     pub driver: Arc<dyn HostDriver>,
     pub regions: Vec<String>,
+}
+
+/// An agent's host must be one of this fleet's hosts: an EC2 instance, pending or running,
+/// that a group's driver lists in one of the group's regions (`Purpose=fcvm-fleet-host` for
+/// the GPU hosts, `Purpose=fcvm-fleet-renders` for pages mode's host, and
+/// `Fleet=<fleet>`). When a listing fails the agent is refused, and it dials again.
+pub struct FleetHosts {
+    pub groups: Vec<FleetGroup>,
     /// For the refusal's text.
     pub fleet: String,
 }
@@ -52,29 +60,37 @@ pub struct FleetHosts {
 impl AgentIdentity for FleetHosts {
     async fn check(&self, host: &str, source: Option<IpAddr>) -> std::result::Result<(), String> {
         let source = source.ok_or("the connection's source address is unknown")?;
-        for region in &self.regions {
-            let hosts = self
-                .driver
-                .hosts(region)
-                .await
-                .map_err(|e| format!("listing this fleet's hosts in {region}: {e:#}"))?;
-            if let Some(h) = hosts.iter().find(|h| h.id == host) {
-                if !h.live() {
-                    return Err(format!("instance {host} is {}", h.state));
+        for g in &self.groups {
+            for region in &g.regions {
+                let hosts = g.driver.hosts(region).await.map_err(|e| {
+                    format!(
+                        "listing this fleet's {}s in {region}: {e:#}",
+                        g.class.noun()
+                    )
+                })?;
+                if let Some(h) = hosts.iter().find(|h| h.id == host) {
+                    if !h.live() {
+                        return Err(format!("instance {host} is {}", h.state));
+                    }
+                    return if h.sources.iter().any(|s| owns(s, source)) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "the connection comes from {source}, not from instance {host}"
+                        ))
+                    };
                 }
-                return if h.sources.iter().any(|s| owns(s, source)) {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "the connection comes from {source}, not from instance {host}"
-                    ))
-                };
             }
         }
+        let tags: Vec<String> = self
+            .groups
+            .iter()
+            .map(|g| format!("Purpose={} in {}", g.class.purpose(), g.regions.join(", ")))
+            .collect();
         Err(format!(
-            "{host} is not an instance tagged Purpose=fcvm-fleet-host and Fleet={} in {}",
+            "{host} is not an instance tagged Fleet={} and {}",
             self.fleet,
-            self.regions.join(", ")
+            tags.join(" or ")
         ))
     }
 }
