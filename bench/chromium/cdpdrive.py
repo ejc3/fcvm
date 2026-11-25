@@ -16,6 +16,7 @@ per-request setup cost and a lumped number would hide which hop to attack:
     tcp_ms       TCP connect to the WebSocket endpoint
     upgrade_ms   RFC 6455 handshake (the 101 exchange)
     enable_ms    Page.enable + Page.setLifecycleEventsEnabled
+    viewport_ms  Emulation.setDeviceMetricsOverride, only with --viewport
     navigate_command_ms  Page.navigate send -> command response
     navigate_load_event_ms command response -> Page.loadEventFired
     navigate_ms  Sum of the two navigation phases above
@@ -32,6 +33,12 @@ WebSocket framing comes from render.py so the host-driven arm and the in-guest
 per-request arm speak CDP through identical code; a divergence there would
 silently invalidate the A/B. Only the connect path is reimplemented here, to time
 its two halves separately.
+
+`--viewport WIDTHxHEIGHT` sets the page's CSS viewport, at a device scale of 1,
+with one `Emulation.setDeviceMetricsOverride` between the enable stage and the
+navigate. Two engines driven with the same value lay out and paint the same
+area (a Chromium started with `--window-size=1280,800` screenshots 1280x657,
+and Kitesurf 1280x720 by default). Without the flag the message is not sent.
 
 `--net-trace PATH` is a diagnostic, not a measurement. It sends `Network.enable`
 before the navigate, collects requestWillBeSent / requestServedFromCache /
@@ -593,6 +600,19 @@ def reduce_net_trace(events: list, load_ts, drain_ms: float) -> dict:
     return {"requests": requests, "summary": summary}
 
 
+def parse_viewport(text: str):
+    """(width, height) of a WIDTHxHEIGHT value, None for an empty one."""
+    if not text:
+        return None
+    width, sep, height = text.partition("x")
+    if not sep or not width.isdigit() or not height.isdigit():
+        raise ValueError(f"--viewport wants WIDTHxHEIGHT, got {text!r}")
+    size = (int(width), int(height))
+    if not (1 <= size[0] <= 10000 and 1 <= size[1] <= 10000):
+        raise ValueError(f"--viewport {text!r} is out of range")
+    return size
+
+
 def drive(args) -> dict:
     render = load_render(args.render_module)
     # getattr, for the same reason as host_header below: reqbench builds a
@@ -659,6 +679,17 @@ def drive(args) -> dict:
             cdp.cmd("Network.enable", deadline=deadline)
         stages["enable_ms"] = (time.monotonic() - t) * 1000
         stages["connect_total_ms"] = (time.monotonic() - t0) * 1000
+
+        viewport = parse_viewport(getattr(args, "viewport", "") or "")
+        if viewport:
+            stage = "viewport"
+            stage_started = time.monotonic()
+            t = time.monotonic()
+            cdp.cmd("Emulation.setDeviceMetricsOverride",
+                    {"width": viewport[0], "height": viewport[1],
+                     "deviceScaleFactor": 1, "mobile": False}, deadline=deadline)
+            stages["viewport_ms"] = (time.monotonic() - t) * 1000
+            out["viewport"] = f"{viewport[0]}x{viewport[1]}"
 
         stage = "navigate-command-response"
         stage_started = time.monotonic()
@@ -861,6 +892,9 @@ def main() -> int:
     p.add_argument("--host-header", default="",
                    help="override the Host header on /json/list; proves Chromium's "
                         "DevTools host validation rejects non-IP, non-localhost names")
+    p.add_argument("--viewport", default="", metavar="WIDTHxHEIGHT",
+                   help="the page's CSS viewport at a device scale of 1, set with one "
+                        "Emulation.setDeviceMetricsOverride before the navigate")
     p.add_argument("--net-trace", default=None, metavar="PATH",
                    help="write the navigation's Network.* events as per-request rows plus "
                         "a summary to PATH; adds Network.enable and a post-load drain, "

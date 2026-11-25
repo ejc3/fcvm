@@ -573,6 +573,29 @@ class NetTraceOff(unittest.TestCase):
         out, server = self._drive(net_trace=None, net_trace_drain_ms=5000.0)
         self._assert_measured_wire(out, server)
 
+    def test_no_viewport_sends_no_emulation_message(self):
+        out, server = self._drive(viewport="")
+        self._assert_measured_wire(out, server)
+        self.assertNotIn("viewport", out)
+        self.assertNotIn("viewport_ms", out["stages"])
+
+    def test_a_viewport_adds_exactly_one_message_before_the_navigate(self):
+        out, server = self._drive(viewport="1280x720")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual([m for m, _ in server.messages],
+                         self.TODAY[:1] + ["Emulation.setDeviceMetricsOverride"] + self.TODAY[1:])
+        self.assertEqual(server.messages[1][1],
+                         {"width": 1280, "height": 720, "deviceScaleFactor": 1, "mobile": False})
+        self.assertEqual(out["viewport"], "1280x720")
+        self.assertIn("viewport_ms", out["stages"])
+
+    def test_a_malformed_viewport_is_refused(self):
+        for bad in ("1280", "1280x", "x720", "1280x0", "12800x720", "1280X720", "a x b"):
+            with self.assertRaises(ValueError, msg=bad):
+                cdpdrive.parse_viewport(bad)
+        self.assertEqual(cdpdrive.parse_viewport("1280x720"), (1280, 720))
+        self.assertIsNone(cdpdrive.parse_viewport(""))
+
     def test_the_trace_adds_exactly_one_message(self):
         off_out, off_server = self._drive()
         with tempfile.TemporaryDirectory() as d:
