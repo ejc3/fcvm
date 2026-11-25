@@ -121,6 +121,22 @@ there is no upstream commit to take. arm64 KVM has no async page faults, so the 
 does not carry it. `a_page_ready_completion_keeps_a_pending_pv_kick`
 (tests/test_kernel_patch_invariants.rs) runs the release's two functions in a C harness and
 fails without the patch.
+The kick a snapshot load gives the runnable vCPUs (#2131, DESIGN.md "A Restore Gives Runnable
+vCPUs a PV Kick") needs this patch as well: a restored vCPU's first `KVM_RUN` completes the
+page-ready wake-up that restoring `MSR_KVM_ASYNC_PF_EN` queued, through the same function,
+before the guest runs an instruction (#2132).
+
+The guest kernels that run KVM themselves carry the same change, for the VMs that run and
+are restored inside them: `kernel/patches-x86/0008-...` for `nested.amd64` (6.18.60),
+`kernel/patches-mountinfo/0004-...` for the `mountinfo` pair (6.16.1; the control's
+`kernel/patches-mountinfo-base` links to it), and for `phone.amd64` (7.3.3, the host's
+release) a link to the host's patch in `kernel/patches-phone-7.3`, beside links to the gpu
+profile's two patches. The function is the same in the three releases but for one
+`WRITE_ONCE`. `every_x86_kernel_that_builds_kvm_carries_the_pv_kick_patch` takes the kernels
+from rootfs-config.toml (every x86_64 host kernel, and every x86_64 guest kernel whose config
+sets `CONFIG_KVM`, on 6.15 or later) and fails for one whose patch set lacks the change, and
+`a_page_ready_completion_keeps_a_pending_pv_kick` runs each release's functions with its own
+port.
 
 `kernel/patches-arm64-host/vgic-v3-keep-hcr-on-quiet-exits.patch` gives back most of what
 6.19's vgic rework added to every KVM exit (#659). Since Linux 6.19 (the vgic-lr-overflow
@@ -147,10 +163,12 @@ switch. `a_guest_hypervisors_quiet_exit_does_not_mask_its_hcr_el2_copies` runs t
 masking; `the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit` fails without it on
 the `static inline` declarations.
 
-The gpu and phone profiles apply `kernel/patches-gpu-7.3` on both arches: the
+The gpu profile applies `kernel/patches-gpu-7.3` on both arches: the
 fuse attribute patch, linked, plus one Kconfig patch that gives
 `CONFIG_MMU_NOTIFIER` a prompt. NVIDIA's nvidia-uvm needs MMU notifiers, the
-option has no prompt upstream, and nothing in this kernel selects it. The gpu
+option has no prompt upstream, and nothing in this kernel selects it. The phone
+profile applies `kernel/patches-phone-7.3`: links to those two and, because its
+guest runs KVM, to the host's PV kick patch (above). The gpu
 profile is not published as a release yet; `make setup-gpu` builds it.
 
 ## Release identity
