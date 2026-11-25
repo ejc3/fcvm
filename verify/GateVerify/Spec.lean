@@ -369,7 +369,7 @@ inductive RP where
   | none
   /-- a clone whose agent has completed the first `n` steps of `Rules.restore` -/
   | at (n : Nat)
-  /-- a step failed: the agent is on its way to `shutdown_vm(1)` (mmds.rs:448-465) -/
+  /-- a step failed: the agent is on its way to `shutdown_vm(1)` (mmds.rs:425-475) -/
   | failed
   /-- published and acknowledged -/
   | done

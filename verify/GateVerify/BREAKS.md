@@ -468,20 +468,25 @@ is in flight with the others.
 
 ## Fixes in flight
 
-None of the repairs in `REPAIRS.md` is in this pull request. As of this writing:
+None of the repairs in `REPAIRS.md` is in this pull request. #2113 and #2124 are in `main`. For
+the rest, two pull requests are open and in review:
 
 | Break | Issue | Fix |
 |---|---|---|
-| `earlySnapshot`, `earlySnapshotFails`, `earlySnapshotCaptures`, `failedCloneSnapshot` | #2138 | #2151: on the host, `snapshot create` refuses a clone whose restore is not acknowledged (repair 2) |
-| `watchdogThaw` | #2140 | a pull request stacked on #2124 by its author, built to the two rulings of `REPAIRS.md`, 3 and 8 |
-| `barrierKill`, `barrierKillCaptured` | #2141 | the same |
-| `reopenFails`, `reopenFailsStuck` | #2142 | the same |
-| `agentDies`, `agentDiesSource`, `agentDiesVsock`, `containerMidBoundary` | #2149 | the same |
-| a `/loopback` client that picks its source port | #2152 | the same |
+| `earlySnapshot`, `earlySnapshotFails`, `earlySnapshotCaptures`, `failedCloneSnapshot` | #2138 | #2151: on the host, `snapshot create` refuses a clone whose restore is not acknowledged (repair 2). #2154 has the guest's half |
+| `watchdogThaw` | #2140 | #2154 |
+| `barrierKill`, `barrierKillCaptured` | #2141 | #2154 |
+| `reopenFails`, `reopenFailsStuck` | #2142 | #2154 |
+| `agentDies`, `agentDiesSource`, `agentDiesVsock`, `containerMidBoundary` | #2149 | #2154 |
+| a `/loopback` client that picks its source port | #2152 | #2154 |
 | `hostDies` | #1936 | #1941 |
 
+#2154 is built to the two rulings of `REPAIRS.md`, 3 and 8: a source that cannot be reopened is
+left running and reported, and a restarted fc-agent serves exec before it starts a container.
+
 The rule book of each fix is not written yet: when one lands, its commit gets a rule book in
-`Today.lean` and the search says which of these runs it closes.
+`Today.lean`, the search says which of these runs it closes, and the drift check's name moves
+to it.
 
 ## UDP (#2112)
 

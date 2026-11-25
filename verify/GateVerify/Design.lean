@@ -3,8 +3,8 @@ import GateVerify.Today
 /-!
 # The repaired system
 
-`Design.rules` is PR #2124 at its head (27add63dd, `Today.cookieB`) with the repairs the search
-and the proofs called for. Each is one field, and `verify/GateVerify/REPAIRS.md` has the change
+`Design.rules` is `main` since #2124 landed (27add63dd, `Today.cookieB`) with the repairs the
+search and the proofs called for. Each is one field, and `verify/GateVerify/REPAIRS.md` has the change
 it stands for and the wording proposed:
 
 | field | repair | against |

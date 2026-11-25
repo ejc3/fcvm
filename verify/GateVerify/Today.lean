@@ -13,12 +13,13 @@ boundary does there, not for a branch: `main` has moved through three of them
 | `Today.ctstate` | 4adc1dee6 | `main` before #2113: the gate's TCP rule is `--ctstate NEW` |
 | `Today.flags` | a1e5fc687 | PR #2113, `gate-syn-flags` |
 | `Today.cookieA` | a80e1ad34 | PR #2124, its first commit, the one that was reviewed |
-| `Today.cookieB` | 27add63dd | PR #2124, its head |
+| `Today.cookieB` | 27add63dd | PR #2124, its head, and `main` since #2124 landed (57aa83bb6) |
 
-What all four share, cited at 27add63dd (the same code is in the other three, at other lines):
+What all four share, cited at `main` 57aa83bb6 (the same code is in the other three, at other
+lines):
 
 - `snapshot create` on the host: the prepare one-shot, pause, resume, the resume one-shot, and
-  the resume one-shot alone after a prepare that failed (src/commands/common.rs:6548-6600,
+  the resume one-shot alone after a prepare that failed (src/commands/common.rs:6568-6622,
   6021). No check of the guest's restore state before the prepare (`snapUnpublished`).
 - The prepare one-shot: freeze, then `prepare_with` under the boundary lock: close, barrier,
   dump, save (fc-agent/src/main.rs:108-118; sn.rs:2331-2393), and `rollback_preparation` on a
@@ -140,13 +141,27 @@ def cookieA : Rules where
   guard := false
   rcuUndo := false
 
-/-- PR #2124 at its head, 27add63dd.
+/-- PR #2124 at its head, 27add63dd, and `main` since it landed: cited at `main` 57aa83bb6. The
+merge of `main` into #2124 (26b7de0ed, the restore hook's phases of #2088) changed nothing in
+the functions cited from sn.rs, which are line for line where 27add63dd has them.
 
-- `restore` (`restore_boundary_with`, sn.rs:2432-2621): `refuse_syn_cookies` (2479), `is_closed`
-  and `close` (2482, 2496), `gate_udp_ingress` (2502), the barrier (2512), `store.load()` (2530),
-  `unlisted_sockets` (2531), `open_egress` (2545), `destroy` (2567), `store.remove()` (2599);
-  thaw (restore.rs:795); the hook (sn.rs:2678); and `open` (sn.rs:1684-1694), which removes the
-  gate and then writes `tcp_syncookies` back.
+- `restore`, in the order `handle_clone_restore` (restore.rs:388) runs it. First
+  `restore_snapshot_network` (restore.rs:566), which is `restore_boundary_with`
+  (sn.rs:2432-2621): `refuse_syn_cookies` (2479), `is_closed` and `close` (2482, 2496),
+  `gate_udp_ingress` (2502), the barrier (2512), the routed clone's move to its own IPv6 address
+  (`before_egress`, 2522; restore.rs:539), `store.load()` (2530), `unlisted_sockets` (2531),
+  `open_egress` (2545), `destroy` (2567), `store.remove()` (2599). Then, back in
+  `handle_clone_restore`: the clock step (restore.rs:593), journald's restart (616), the NFS
+  remount (624-725), the waits for the exec server and the egress proxy (747, 759), and the
+  thaw (792). Then `publish` (restore.rs:814; sn.rs:3612, `publish_with` at 2672): the hook and
+  the retired addresses' reconcile after it (2678), and `open` (sn.rs:1684-1694), which removes
+  the gate and then writes `tcp_syncookies` back (1692). Last, chronyd's start (restore.rs:817)
+  and the acknowledgement (`restore_status.succeed`, mmds.rs:477).
+- The steps of that order the rule book leaves out touch nothing a property reads, with one
+  exception: the address move, which is why a retired socket's reset does not always reach its
+  other end in a routed clone (`Limits.lean`). Left out: the address move, the clock, journald,
+  NFS, the two waits, the reconcile, chronyd, the acknowledgement (the model's `advance` to
+  `done` after the last step).
 - `manAddr := false`: `manifest_sockets` (sn.rs:1902-1907) leaves a socket out only when its
   peer is loopback and its mirror image is in the list (`sockets_leaving_the_guest`,
   sn.rs:1854-1883).

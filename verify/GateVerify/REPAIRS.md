@@ -1,6 +1,7 @@
 # What the breaks need
 
-`Design.rules` (`Design.lean`) is PR #2124 at its head, 27add63dd, with the changes below. Each
+`Design.rules` (`Design.lean`) is PR #2124 at its head, 27add63dd, which is `main` since
+57aa83bb6, with the changes below. Each
 is one field of the rule book. For each: what it is in the real system, where, the break it
 answers (`BREAKS.md`), what the model shows of it, and wording proposed for the code or its
 documents.
@@ -17,10 +18,11 @@ Each repair is carried by a proof: with its field put back, `lake build GateVeri
 fails (the table at the end). Of the four rules the design inherits from #2113 and #2124, three
 are carried the same way and one is redundant in the design.
 
-None of this is in this pull request. Fixes are in flight for most of it: #2151 for repair 2
-(the host's side), and a pull request stacked on #2124 by its author for repairs 3, 4, 6 and 8
-and for #2152, built to the two rulings recorded under repairs 3 and 8 (`BREAKS.md`, "Fixes in
-flight"). The fixes #2113 and #2124 already make are not repeated here: the flag rule
+None of this is in this pull request. Two pull requests are open and in review for most of it:
+#2151 for repair 2 (the host's half of #2138), and #2154 for the guest's half of #2138, for
+repairs 3, 4, 6 and 8 (#2142 and #2149, #2141, #2140) and for #2152, built to the two rulings
+recorded under repairs 3 and 8 (`BREAKS.md`, "Fixes in flight"). Repairs 5 and 7 have no pull
+request. The fixes #2113 and #2124 already make are not repeated here: the flag rule
 (`tcpByCt := false`), the restore's own list with the mirror image deciding and a second dump,
 `tcp_syncookies` refused from the restore's first step and written back after the gate is
 removed.

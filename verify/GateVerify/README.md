@@ -56,9 +56,9 @@ branch, because `main` moves from one to the next as the fixes land.
 | Rule book | Commit | What it is | `main` |
 |---|---|---|---|
 | `ctstate` | 4adc1dee6 | the gate's TCP rule is `--ctstate NEW`; the manifest leaves out by address; no list | until #2113 landed |
-| `flags` | a1e5fc687 | #2113: the TCP rule reads the packet's flags | since #2113 landed (a0ef91072) |
+| `flags` | a1e5fc687 | #2113: the TCP rule reads the packet's flags | from #2113 (a0ef91072) until #2124 landed |
 | `cookieA` | a80e1ad34 | #2124 at its first commit: SYN cookies refused, the restore's own list | never |
-| `cookieB` | 27add63dd | #2124 at its head: the mirror rule, a second dump, the write-back after the gate | once #2124 lands |
+| `cookieB` | 27add63dd | #2124 at its head: the mirror rule, a second dump, the write-back after the gate | since #2124 landed (57aa83bb6) |
 | `design` | none | `cookieB` with the repairs of `REPAIRS.md` | not yet |
 
 The drift check in CI names the rule book of the tree it runs in (below, "The model against the
@@ -433,7 +433,7 @@ src/commands/common.rs; the unit file in src/setup/rootfs.rs.
 of events that fc-agent's own model tests pin (`ModelGate`, `ModelBarrier`, `ModelDiag`,
 `ModelHook`: the `vec![...]` literals of event names) and compares them with each rule book's
 restore order. It prints the rule books the source pins and fails unless the one named is among
-them. CI names `ctstate`, the rule book of this tree, so a tree that goes to an order the model
+them. CI names `cookieB`, the rule book of this tree, so a tree that goes to an order the model
 does not have fails, and so does one that goes back to an earlier order once the name has been
 moved on. A pull request that changes that file starts the job.
 
@@ -441,7 +441,7 @@ moved on. A pull request that changes that file starts the job.
 |---|---|
 | 4adc1dee6, a1e5fc687 | `ctstate`, `flags` |
 | a80e1ad34 | `cookieA` |
-| 27add63dd | `cookieB`, `design` |
+| 27add63dd, and `main` at 57aa83bb6 | `cookieB`, `design` |
 | 27add63dd with the second `cookie-dump` deleted from the one test that pins two | `cookieA`: naming `cookieB` exits 1 |
 | 4adc1dee6 with `gate-udp-ingress` and `rx-barrier` swapped in one test | none: exit 1 |
 
@@ -503,8 +503,9 @@ closed with the egress half). The second is the abstraction `Limits.lean` is abo
   for good through the retired-address chain. The design does not change that.
 - **What a returning fc-agent's boot path does** to the rules of a guest a boundary holds (the
   nat rules appended a second time, the containment rule).
-- **The pending merge of `main` into #2124**, which reorders `handle_clone_restore` (#2088).
-  `Today.cookieB` is 27add63dd.
+- **The steps of `handle_clone_restore` that touch no network state**: the clock, journald,
+  the NFS remount, the waits for the exec server and the egress proxy, the retired addresses'
+  reconcile, chronyd. `Today.cookieB` says where each sits in `main`'s order.
 
 ## Conventions
 
