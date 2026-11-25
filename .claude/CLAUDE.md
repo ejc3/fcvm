@@ -2936,13 +2936,16 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   clone that takes the subvolume snapshot holds a read lock (`F_OFD_SETLK`) on one byte, drawn at random among 64, of
   `subvolume-snapshot.lock` beside the slots, for its snapshot and 100 ms after it (`SUBVOLUME_SNAPSHOT_LINGER`: the
   snapshots that share a commit end together, and the clones that arrive next must still find the burst), and a clone
-  with a free slot takes the subvolume snapshot too while at least 4 such bytes are held (`SNAPSHOT_BURST`;
-  `subvolume_snapshot_burst` asks with `F_OFD_GETLK`, which takes no lock). A reflink joins a transaction for every
+  with a free slot takes the subvolume snapshot too while at least 4 of the 64 bytes are held (`SNAPSHOT_BURST`).
+  `subvolume_snapshot_burst` counts the held bytes with `F_OFD_GETLK`, which takes no lock. The kernel answers with
+  the first lock in the way in the order the locks were taken, not the lowest byte, so the count asks both sides of
+  every byte it finds. Clones that drew the same byte count as one: 4 clones hold 4 different bytes in 91 draws of
+  100, and 5 hold at least 4 in 99. A reflink joins a transaction for every
   extent and waits out each commit that starts meanwhile, and the commits carry what the reflinks dirtied, so the two
-  paths running together slow each other. Fewer marks than 4 are a clone or two that found every slot held; the
+  paths running together slow each other. Fewer held bytes than 4 are a clone or two that found every slot held; the
   clones after them reflink, as before the mark, which matters where a subvolume snapshot is the slower path (a host
   writing snapshots at the same time). A burst lasts while about 4 clones arrive per snapshot duration plus 100 ms.
-  The measurements are in #2136. On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
+  On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
   none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
   against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
   subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes

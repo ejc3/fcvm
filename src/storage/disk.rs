@@ -74,11 +74,12 @@ pub const REFLINK_MAX_EXTENTS_ENV: &str = "FCVM_REFLINK_MAX_EXTENTS";
 /// once, which stay on reflinks; a ninth clone in the queue takes the subvolume snapshot.
 ///
 /// A slot that frees in the middle of a burst is not taken: while at least
-/// [`SNAPSHOT_BURST`] clones of the snapshot hold its subvolume-snapshot mark
-/// ([`subvolume_snapshot_burst`]), a clone takes the subvolume snapshot too. A reflink joins
-/// a transaction for every extent and waits out each commit that starts meanwhile, and the
-/// commits carry what the reflinks dirtied, so the two paths running together slow each
-/// other. The figures are in the pull request that added the mark (#2136).
+/// [`SNAPSHOT_BURST`] bytes of the snapshot's mark file are held
+/// ([`subvolume_snapshot_burst`]), a clone takes the subvolume snapshot too. A clone holds
+/// one byte, drawn at random, while it takes the subvolume snapshot and for
+/// [`SUBVOLUME_SNAPSHOT_LINGER`] after it. A reflink joins a transaction for every extent
+/// and waits out each commit that starts meanwhile, and the commits carry what the reflinks
+/// dirtied, so the two paths running together slow each other.
 pub const REFLINK_SLOTS: usize = 8;
 
 /// The slot files of the snapshot whose disk directory is `base_dir`: beside the disk
@@ -124,13 +125,16 @@ fn subvolume_snapshot_mark_path(base_dir: &Path) -> Option<PathBuf> {
 /// count as one, so the bytes are many more than [`SNAPSHOT_BURST`].
 pub const SNAPSHOT_MARK_BYTES: u8 = 64;
 
-/// How many clones of one snapshot must hold its mark before a clone with a free reflink
-/// slot takes the subvolume snapshot instead. One or two marks are a clone that found every
-/// slot held, and perhaps one more: on main that clone alone took the snapshot, and the
-/// clones after it still reflink, which matters on a store where a subvolume snapshot is the
-/// slower path (a host that is writing snapshots at the same time: 193 ms against 17 ms at
-/// the median, docs/fleet/ARCHITECTURE.md). Several at once are a burst, where the two paths
-/// running together slow each other.
+/// How many bytes of a snapshot's mark file must be held before a clone with a free reflink
+/// slot takes the subvolume snapshot instead. Every clone that is taking the subvolume
+/// snapshot, or took it less than [`SUBVOLUME_SNAPSHOT_LINGER`] ago, holds one byte, and
+/// clones that drew the same byte count as one: four such clones hold four different bytes
+/// of the 64 in 91 draws of 100, and five hold at least four in 99. One or two held bytes
+/// are a clone that found every reflink slot held, and perhaps one more. The clones that
+/// arrive after those still reflink, which matters on a store where a subvolume snapshot is
+/// the slower path (a host that is writing snapshots at the same time: 193 ms against 17 ms
+/// at the median, docs/fleet/ARCHITECTURE.md). Several at once are a burst, where the two
+/// paths running together slow each other.
 pub const SNAPSHOT_BURST: usize = 4;
 
 /// A lock request over `len` bytes of a file from `start`, for the open-file-description
@@ -194,10 +198,11 @@ pub fn mark_subvolume_snapshot_at(base_dir: &Path, byte: u8) -> Option<std::fs::
 /// few milliseconds find none and reflink, up to 8 of them after every commit.
 ///
 /// The rule this gives: a clone with a free reflink slot takes the subvolume snapshot while
-/// at least [`SNAPSHOT_BURST`] clones of its snapshot are taking one or finished one less
-/// than this long ago. Each such clone marks in turn, so the burst lasts for as long as
-/// that many marks stay held: about `SNAPSHOT_BURST` arrivals per (snapshot duration plus
-/// this) keep it going, and a slower trickle falls back to reflinks.
+/// at least [`SNAPSHOT_BURST`] bytes of the mark file are held, each by a clone of the
+/// snapshot that is taking a subvolume snapshot or finished one less than this long ago.
+/// Each clone that takes the snapshot marks in turn, so the burst lasts for as long as that
+/// many bytes stay held: about `SNAPSHOT_BURST` arrivals per (snapshot duration plus this)
+/// keep it going, and a slower trickle falls back to reflinks.
 pub const SUBVOLUME_SNAPSHOT_LINGER: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Keep `mark` for [`SUBVOLUME_SNAPSHOT_LINGER`] and then drop it, without holding up the
@@ -212,12 +217,13 @@ fn keep_subvolume_snapshot_mark(mark: Option<std::fs::File>) {
 }
 
 /// How many bytes of the mark file of the snapshot whose disk directory is `base_dir` are
-/// held by [`mark_subvolume_snapshot`], counted up to `limit`. Each question asks the kernel
-/// which read lock would refuse a write lock on the bytes not yet looked at (`F_OFD_GETLK`)
-/// and takes nothing, so clones that ask at the same moment do not see each other, and a
-/// clone that marks while another asks is not refused. An exclusive lock tried and dropped
-/// would itself be a lock for a microsecond, and clones started together would take each
-/// other's questions for marks.
+/// held by [`mark_subvolume_snapshot`], counted up to `limit`, in whatever order the marks
+/// were taken. Marks on one byte count once. Each question asks the kernel for a read lock
+/// that would refuse a write lock on a range of bytes not yet looked at (`F_OFD_GETLK`) and
+/// takes nothing, so clones that ask at the same moment do not see each other, and a clone
+/// that marks while another asks is not refused. An exclusive lock tried and dropped would
+/// itself be a lock for a microsecond, and clones started together would take each other's
+/// questions for marks.
 pub fn subvolume_snapshot_marks_held(base_dir: &Path, limit: usize) -> usize {
     use std::os::fd::AsRawFd;
     let Some(path) = subvolume_snapshot_mark_path(base_dir) else {
@@ -227,31 +233,43 @@ pub fn subvolume_snapshot_marks_held(base_dir: &Path, limit: usize) -> usize {
         // No clone of this snapshot has taken a subvolume snapshot yet.
         return 0;
     };
-    let (mut held, mut from) = (0, 0u8);
-    while held < limit && from < SNAPSHOT_MARK_BYTES {
-        let mut lock = byte_lock(libc::F_WRLCK, from, SNAPSHOT_MARK_BYTES - from);
-        let answer: *mut libc::flock = &mut lock;
-        // SAFETY: fcntl on a descriptor this function owns; the kernel writes the first
-        // lock that stands in the way, or F_UNLCK, into `lock`.
-        let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, answer) } == 0;
-        if !asked || lock.l_type == libc::F_UNLCK as libc::c_short {
+    // The kernel answers with the first lock in the way in the order the locks were taken,
+    // not the lowest byte, so a hit at one byte says nothing about the bytes below it: both
+    // sides of it are asked. Every question finds a byte not yet counted or rules its range
+    // out, so a count of n takes at most 2n + 1 questions.
+    let mut held = 0;
+    let mut unasked = vec![(0u8, SNAPSHOT_MARK_BYTES)];
+    while held < limit {
+        let Some((from, to)) = unasked.pop() else {
             break;
+        };
+        if from >= to {
+            continue;
+        }
+        let mut lock = byte_lock(libc::F_WRLCK, from, to - from);
+        let answer: *mut libc::flock = &mut lock;
+        // SAFETY: fcntl on a descriptor this function owns; the kernel writes a lock that
+        // stands in the way, or F_UNLCK, into `lock`.
+        let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_GETLK, answer) } == 0;
+        if !asked {
+            break;
+        }
+        if lock.l_type == libc::F_UNLCK as libc::c_short {
+            continue;
         }
         held += 1;
-        // A mark is one byte; the next question starts after it.
-        let next = (lock.l_start as i64).max(from as i64) + 1;
-        if next >= SNAPSHOT_MARK_BYTES as i64 {
-            break;
-        }
-        from = next as u8;
+        // A mark is one byte.
+        let byte = (lock.l_start as i64).clamp(from as i64, to as i64 - 1) as u8;
+        unasked.push((from, byte));
+        unasked.push((byte + 1, to));
     }
     held
 }
 
-/// Whether at least [`SNAPSHOT_BURST`] clones of the snapshot whose disk directory is
-/// `base_dir` hold its mark now. The answer steers a choice between two correct ways to
-/// make the disk and is not held: a clone that starts its subvolume snapshot just after it
-/// is answered runs beside one reflink.
+/// Whether at least [`SNAPSHOT_BURST`] bytes of the mark file of the snapshot whose disk
+/// directory is `base_dir` are held now. The answer steers a choice between two correct
+/// ways to make the disk and is not held: a clone that starts its subvolume snapshot just
+/// after it is answered runs beside one reflink.
 pub fn subvolume_snapshot_burst(base_dir: &Path) -> bool {
     subvolume_snapshot_marks_held(base_dir, SNAPSHOT_BURST) >= SNAPSHOT_BURST
 }
@@ -831,8 +849,9 @@ impl DiskManager {
         // REFLINK_MAX_EXTENTS extents is snapshotted, and a smaller one is
         // reflinked while one of the snapshot's REFLINK_SLOTS reflink slots is
         // free, and snapshotted when the queue of reflinks is that deep, or in a
-        // burst (SNAPSHOT_BURST clones of the snapshot being snapshotted):
-        // reflinks and commits running together slow each other.
+        // burst (SNAPSHOT_BURST bytes of the snapshot's mark file held, each by
+        // a clone that is being snapshotted or was within the linger): reflinks
+        // and commits running together slow each other.
         let limit = reflink_max_extents(std::env::var(REFLINK_MAX_EXTENTS_ENV).ok().as_deref());
         let base_dir = self
             .base_rootfs
@@ -1727,6 +1746,41 @@ mod snapshot_dir_tests {
         drop(freed);
     }
 
+    /// Marks are counted whatever order they were taken in. The kernel answers a question
+    /// with the first lock in the way in the order the locks were taken, so marks taken on
+    /// descending bytes are each below the one found before.
+    ///
+    /// RED BEFORE THE FIX: the count moved past each byte it found and never looked below
+    /// it, so four marks taken on bytes 50, 30, 10 and 5 counted as one and were no burst.
+    #[test]
+    fn marks_are_counted_in_any_order_they_were_taken() {
+        for order in [
+            vec![50u8, 30, 10, 5],
+            vec![5, 10, 30, 50],
+            vec![30, 5, 50, 10],
+            vec![63, 0, 31, 32, 1, 62],
+            (0..SNAPSHOT_MARK_BYTES).rev().collect(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let base_dir = root.path().join("disk");
+            std::fs::create_dir(&base_dir).unwrap();
+            let marks: Vec<_> = order
+                .iter()
+                .map(|byte| mark_subvolume_snapshot_at(&base_dir, *byte).expect("a mark"))
+                .collect();
+            assert_eq!(
+                subvolume_snapshot_marks_held(&base_dir, usize::MAX),
+                marks.len(),
+                "marks taken on bytes {order:?}"
+            );
+            assert!(
+                subvolume_snapshot_burst(&base_dir),
+                "marks taken on bytes {order:?} are a burst"
+            );
+            assert_eq!(subvolume_snapshot_marks_held(&base_dir, 3), 3, "{order:?}");
+        }
+    }
+
     /// Marks are counted by the bytes they hold: a closed mark is gone, the mark of a holder
     /// that is killed is gone, and it takes SNAPSHOT_BURST of them to make a burst. A
     /// snapshot no clone has snapshotted has none.
@@ -1741,8 +1795,8 @@ mod snapshot_dir_tests {
         assert_eq!(held(usize::MAX), 0, "no mark file yet");
         assert!(!subvolume_snapshot_burst(&base_dir));
 
-        // One clone that found every slot held is not a burst, and neither are two: on main
-        // they alone took the snapshot path.
+        // One clone that found every slot held is not a burst, and neither are two: without
+        // the mark they alone took the snapshot path.
         for one_or_two in [1u8, 2] {
             let few: Vec<_> = (0..one_or_two)
                 .map(|byte| mark_subvolume_snapshot_at(&base_dir, 9 + byte).expect("a mark"))

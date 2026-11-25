@@ -8873,12 +8873,16 @@ async fn a_clone_made_beside_fewer_snapshots_than_a_burst_reflinks() -> anyhow::
 /// the clones that arrive just after a commit take the snapshot too.
 ///
 /// The mark is watched from outside the clone, every millisecond, while the clone is made
-/// with every reflink slot held. The time it was seen held must exceed the snapshot's own
-/// duration (the clone logs it) by at least half the linger, and it must be gone 2 s after
-/// the linger at the latest.
+/// with every reflink slot held. The mark was held for at least the time between the first
+/// and the last probe that saw it, and for at most that plus the watcher's gap before the
+/// first and its gap after the last. That upper bound must exceed the snapshot's own
+/// duration (the clone logs it) by at least half the linger, so a watcher that a loaded
+/// host kept off the CPU around either edge does not fail a mark that was held. The mark
+/// must be gone 2 s after the linger at the latest.
 ///
 /// RED WITHOUT THE MARK: no probe sees it held. RED WITHOUT THE LINGER: it is held for the
-/// snapshot's duration and no longer.
+/// snapshot's duration and no longer, unless the watcher's two gaps add up to half the
+/// linger (50 ms against the 1 ms it sleeps between probes).
 #[tokio::test]
 #[cfg_attr(not(feature = "privileged-tests"), ignore)]
 async fn a_clone_holds_the_mark_for_its_snapshot_and_the_linger_after_it() -> anyhow::Result<()> {
@@ -8896,10 +8900,80 @@ async fn a_clone_holds_the_mark_for_its_snapshot_and_the_linger_after_it() -> an
     Ok(())
 }
 
+/// What a [`MarkWatch`] saw.
+#[derive(Default)]
+struct MarkSeen {
+    /// The first and the last probe that found the mark held.
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    /// From the probe before `first` (or the watcher's start) to `first`.
+    gap_before: std::time::Duration,
+    /// From `last` to the first probe after it, which found the mark gone, or to the
+    /// watcher's stop.
+    gap_after: std::time::Duration,
+    probes: u64,
+}
+
+impl MarkSeen {
+    /// The time between the first and the last probe that saw the mark, which is the
+    /// shortest it can have been held. `None` when no probe saw it.
+    fn held_at_least(&self) -> Option<std::time::Duration> {
+        Some(self.last? - self.first?)
+    }
+
+    /// The longest the mark can have been held: it was taken after the probe before
+    /// `first` and dropped before the probe after `last`.
+    fn held_at_most(&self) -> Option<std::time::Duration> {
+        Some(self.held_at_least()? + self.gap_before + self.gap_after)
+    }
+
+    /// Whether the mark can have outlived a snapshot that took `snapshot` by half of
+    /// `linger`.
+    fn outlived(&self, snapshot: std::time::Duration, linger: std::time::Duration) -> bool {
+        self.held_at_most()
+            .is_some_and(|held| held >= snapshot + linger / 2)
+    }
+}
+
+/// The bound `a_clone_holds_the_mark_for_its_snapshot_and_the_linger_after_it` puts on what
+/// its watcher saw, on two made-up watches of a 30 ms snapshot with a 100 ms linger.
+///
+/// RED BEFORE THE WATCHER'S GAPS WERE COUNTED: the first watch, of a mark held for all
+/// 130 ms by a watcher that was off the CPU for 60 ms around each edge, saw the mark for
+/// 20 ms and was failed.
+#[test]
+fn a_starved_watcher_does_not_fail_a_mark_that_was_held() {
+    let ms = std::time::Duration::from_millis;
+    let (snapshot, linger) = (ms(30), ms(100));
+    let taken = std::time::Instant::now();
+    let starved = MarkSeen {
+        first: Some(taken + ms(55)),
+        last: Some(taken + ms(75)),
+        gap_before: ms(60),
+        gap_after: ms(60),
+        probes: 100,
+    };
+    assert_eq!(starved.held_at_least(), Some(ms(20)));
+    assert!(starved.outlived(snapshot, linger));
+    // A mark dropped with its snapshot, seen by a watcher that probed every millisecond.
+    let no_linger = MarkSeen {
+        first: Some(taken + ms(1)),
+        last: Some(taken + ms(29)),
+        gap_before: ms(1),
+        gap_after: ms(1),
+        probes: 100,
+    };
+    assert!(!no_linger.outlived(snapshot, linger));
+    assert!(!MarkSeen::default().outlived(snapshot, linger));
+}
+
+/// How long a [`MarkWatch`] sleeps between probes.
+const MARK_WATCH_SLEEP_MS: u64 = 1;
+
 /// Probes a snapshot's subvolume-snapshot mark every millisecond from a thread of its own.
 struct MarkWatch {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    thread: std::thread::JoinHandle<(Option<std::time::Instant>, Option<std::time::Instant>, u64)>,
+    thread: std::thread::JoinHandle<MarkSeen>,
 }
 
 impl MarkWatch {
@@ -8907,17 +8981,34 @@ impl MarkWatch {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = stop.clone();
         let thread = std::thread::spawn(move || {
-            let (mut first, mut last, mut probes) = (None, None, 0u64);
+            let mut seen = MarkSeen::default();
+            // The time of the probe before this one, and whether `last` still waits for
+            // the probe that finds the mark gone.
+            let mut previous = std::time::Instant::now();
+            let mut open = false;
             while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
-                if fcvm::storage::disk::subvolume_snapshot_marks_held(&snapshot_disk_dir, 1) > 0 {
-                    let now = std::time::Instant::now();
-                    first.get_or_insert(now);
-                    last = Some(now);
+                let held =
+                    fcvm::storage::disk::subvolume_snapshot_marks_held(&snapshot_disk_dir, 1) > 0;
+                let now = std::time::Instant::now();
+                if held {
+                    if seen.first.is_none() {
+                        seen.first = Some(now);
+                        seen.gap_before = now - previous;
+                    }
+                    seen.last = Some(now);
+                    open = true;
+                } else if open {
+                    seen.gap_after = now - previous;
+                    open = false;
                 }
-                probes += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                seen.probes += 1;
+                previous = now;
+                std::thread::sleep(std::time::Duration::from_millis(MARK_WATCH_SLEEP_MS));
             }
-            (first, last, probes)
+            if open {
+                seen.gap_after = previous.elapsed();
+            }
+            seen
         });
         Self { stop, thread }
     }
@@ -8933,10 +9024,11 @@ impl MarkWatch {
         // The linger is over well before a clone is healthy; give it the bound checked below.
         tokio::time::sleep(linger + std::time::Duration::from_secs(2)).await;
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let (first, last, probes) = self
+        let seen = self
             .thread
             .join()
             .map_err(|_| anyhow::anyhow!("the mark watcher panicked"))?;
+        let probes = seen.probes;
         let log = std::fs::read_to_string(clone_log)?;
         let snapshot_ms = log
             .lines()
@@ -8958,13 +9050,13 @@ impl MarkWatch {
                 )
             })?;
         let snapshot = std::time::Duration::from_millis(snapshot_ms);
-        let (Some(first), Some(last)) = (first, last) else {
+        let (Some(held), Some(held_at_most)) = (seen.held_at_least(), seen.held_at_most()) else {
             anyhow::bail!("the clone took a subvolume snapshot ({snapshot_ms} ms) and no probe of {probes} saw its mark held");
         };
-        let held = last - first;
+        let (gap_before, gap_after) = (seen.gap_before, seen.gap_after);
         anyhow::ensure!(
-            held >= snapshot + linger / 2,
-            "the mark was seen held for {held:?}: the snapshot took {snapshot_ms} ms and the mark must outlive it by the linger ({linger:?})"
+            seen.outlived(snapshot, linger),
+            "the mark was seen held for {held:?} (at most {held_at_most:?}: the watcher's gaps were {gap_before:?} before and {gap_after:?} after): the snapshot took {snapshot_ms} ms and the mark must outlive it by the linger ({linger:?})"
         );
         anyhow::ensure!(
             held <= snapshot + linger + std::time::Duration::from_secs(2),
