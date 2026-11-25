@@ -2411,7 +2411,9 @@ is left.
   is torn down (it has more workers than its most renders in flight).
 - **2 MiB pages.** A clone reserves its memory when it starts. The side starts one only while the
   pool has room for it, and counts the times it waited (`pool_waits`); a pool too small is never
-  a failed render.
+  a failed render. The side's most renders in flight is lowered at start to what the pool
+  carries (the memory server's copy and a clone for each of the side's workers), so the search
+  never sits at a level the pool keeps it from reaching.
 - **An engine is started again** between renders once its anonymous memory passes
   `--recycle-mib`: every process in its cgroup is ended and a new engine takes its port. The
   engines start together and render the same pages, so each engine's first threshold is spread
@@ -2425,17 +2427,29 @@ is left.
 
 ### Start and end
 
-Stages, written to `--status-file` as each completes: `start` (the reaper is running),
-`cgroups`, `replays`, `golden` (only while the snapshot is made: `fcvm podman prepare` of the
-bench image, when the snapshot is absent), `serve`, `engines`,
-`workers` (every worker said it is ready), `running`, `stopping`, `stopped`.
+Stages, written to `--status-file` as the module reaches each: `start` (the reaper is
+running), `cgroups`, `replays`, `golden` (written before the snapshot is made, and only when it
+is absent: `fcvm podman prepare` of the bench image), `serve-starting`, `serve`,
+`engines-starting`, `engines`, `workers` (every worker said it is ready), `running`,
+`stopping`, then `stopped`, or `stopped-unclean` when the reaper could not remove something.
 
 Nothing the module starts is trusted to end itself. Before anything else it starts a reaper
 (`fcvm fleet renders-reap`) that holds the read end of a pipe. When the module is gone, however
 it went, the reaper kills the three cgroups, waits until they are empty, removes them, runs
-fcvm's own sweeps for what killed clones leave (owner records, state files), removes the memory
-server's socket and the run directory, and writes what it found to `teardown.json`. The same
-sweep runs when a module starts.
+fcvm's own sweeps for what killed clones leave (owner records, state files), removes the
+sockets of the snapshot's memory servers that are gone and the run directory, and writes what
+it found to `teardown.json`. The same sweep runs when a module starts. The module ends every
+engine start that is under way before it lets the reaper go, and the reaper writes
+`cgroup.kill` again for as long as a cgroup is populated.
+
+The run directory is the module's own: it carries a marker file, and a directory that holds
+anything else without the marker is refused at start and never removed. One module runs per run
+directory: the module takes an exclusive lock beside it (`<run dir>.lock`), and its reaper
+inherits the lock, so a new module starts only when both are gone.
+
+The module runs as a systemd service unit. Its children are ended by the reaper and, with the
+reaper gone too, by systemd stopping the unit: no child arms a parent-death signal, so under a
+scope or outside systemd a module and reaper killed together would leave them running.
 
 The unit must keep systemd's default `KillMode=control-group`. With `KillMode=mixed` systemd
 sends SIGKILL to every process left the moment the main process is gone, the reaper included.

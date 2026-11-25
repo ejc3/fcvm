@@ -133,9 +133,61 @@ pub async fn sweep(target: &Target) -> Reaped {
         &|pid, start| crate::utils::process_start_time(pid) == Some(start),
     );
 
-    let _ = std::fs::remove_dir_all(&target.run_dir);
+    // Only a directory this module made: a caller's path that holds something else stays,
+    // and is reported as left.
+    if run_dir_is_ours(&target.run_dir) {
+        let _ = std::fs::remove_dir_all(&target.run_dir);
+    }
     out.run_dir_left = target.run_dir.exists();
     out
+}
+
+/// The file a module puts in its run directory, so a sweep removes that directory and no
+/// other.
+pub const RUN_MARKER: &str = ".fcvm-renders-run";
+
+/// Whether `dir` may be removed as a run directory: it is absent, empty, or carries the
+/// module's marker.
+pub fn run_dir_is_ours(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(mut entries) => dir.join(RUN_MARKER).is_file() || entries.next().is_none(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// One module at a time per run directory: an exclusive lock on `<run dir>.lock`, held by
+/// the module and inherited by its reaper, so it is free only when both are gone. A second
+/// module with the same run directory would otherwise sweep the first one's files at its
+/// start, and a new module's directory could be removed by an old module's reaper.
+pub struct RunLock(std::fs::File);
+
+impl RunLock {
+    pub fn take(run_dir: &Path) -> anyhow::Result<Self> {
+        let mut name = run_dir
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("--run-dir {} has no name", run_dir.display()))?
+            .to_os_string();
+        name.push(".lock");
+        let path = run_dir.with_file_name(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("opening {}: {e}", path.display()))?;
+        // SAFETY: flock on a descriptor this function owns.
+        let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        anyhow::ensure!(
+            taken,
+            "another pages-mode module, or its reaper, holds {} ({})",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        Ok(RunLock(file))
+    }
 }
 
 /// The module's hold on its reaper: dropping it (or dying) starts the sweep.
@@ -147,7 +199,12 @@ pub struct Reaper {
 impl Reaper {
     /// Start `exe fleet renders-reap` for `target`, with `report` as a file it also writes
     /// its result to (for a caller that will not be there to read it).
-    pub fn start(exe: &Path, target: &Target, report: Option<&Path>) -> anyhow::Result<Self> {
+    pub fn start(
+        exe: &Path,
+        target: &Target,
+        report: Option<&Path>,
+        lock: &RunLock,
+    ) -> anyhow::Result<Self> {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: a two-element array for pipe2 to fill. O_CLOEXEC keeps both ends out of
         // every other child: one that inherited the write end would hold the reaper off
@@ -160,6 +217,7 @@ impl Reaper {
         // SAFETY: both descriptors were just returned by pipe2 and are owned here alone.
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
         let read_fd = read.as_raw_fd();
+        let lock_fd = lock.0.as_raw_fd();
         let mut cmd = std::process::Command::new(exe);
         cmd.args(["fleet", "renders-reap", "--watch-fd", &read_fd.to_string()])
             .args(["--run-dir".as_ref(), target.run_dir.as_os_str()])
@@ -183,8 +241,11 @@ impl Reaper {
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::fcntl(read_fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
+                // The run directory's lock too: the reaper holds it until its sweep is done.
+                for fd in [read_fd, lock_fd] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -303,6 +364,46 @@ mod tests {
                 "uffd-other-44-3000.sock"
             ]
         );
+    }
+
+    #[test]
+    fn a_run_directory_is_removed_only_when_it_is_the_modules() {
+        let root = tempfile::tempdir().unwrap();
+        // absent, and empty: nothing of anyone's
+        assert!(run_dir_is_ours(&root.path().join("absent")));
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(run_dir_is_ours(&empty));
+        // a directory with someone's files in it is not removed
+        let theirs = root.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::write(theirs.join("notes.txt"), "keep").unwrap();
+        assert!(!run_dir_is_ours(&theirs));
+        // the module's own, by its marker
+        let ours = root.path().join("ours");
+        std::fs::create_dir_all(ours.join("certs-fcvm")).unwrap();
+        std::fs::write(ours.join(RUN_MARKER), "").unwrap();
+        assert!(run_dir_is_ours(&ours));
+    }
+
+    #[test]
+    fn one_module_holds_a_run_directory_at_a_time() {
+        let root = tempfile::tempdir().unwrap();
+        let run_dir = root.path().join("fcvm-renders");
+        let first = RunLock::take(&run_dir).unwrap();
+        let refused = RunLock::take(&run_dir)
+            .err()
+            .expect("a second module is refused");
+        assert!(
+            refused.to_string().contains("fcvm-renders.lock"),
+            "{refused}"
+        );
+        assert!(
+            !run_dir.exists(),
+            "the lock is beside the directory, not in it"
+        );
+        drop(first);
+        RunLock::take(&run_dir).unwrap();
     }
 
     #[test]

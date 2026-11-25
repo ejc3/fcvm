@@ -73,7 +73,9 @@ pub struct Render {
     pub page: usize,
     pub ms: f64,
     pub ok: bool,
-    /// Renders in flight on the side when this one started.
+    /// The level the side ran (the renders in flight it was asked to keep) when this one
+    /// started. A side kept below its level by something else (an engine being started
+    /// again) still tags its renders with the level.
     pub level: u32,
 }
 
@@ -189,9 +191,10 @@ impl LimitSearch {
         self.limit
     }
 
-    /// The side found a limit and holds a level.
+    /// The side found a limit (it stepped back from a spike, or reached the most it may
+    /// run) and holds a level.
     pub fn settled(&self) -> bool {
-        self.backed_off.is_some() && self.phase == Phase::Holding
+        self.limit.is_some() && self.phase == Phase::Holding
     }
 
     pub fn taking_baseline(&self) -> bool {
@@ -578,6 +581,42 @@ mod tests {
         assert_eq!(at.in_flight, 2);
         assert!((at.renders_per_s - 2.0).abs() < 1e-9, "{at:?}");
         assert_eq!(at.render_ms, 1100.0);
+    }
+
+    /// A side that reaches its most renders in flight without a spike has found its limit
+    /// as much as one that stepped back, so the pair takes both baselines again. Without
+    /// that, the other side keeps a baseline taken while this one was idle.
+    #[test]
+    fn a_side_held_at_its_cap_counts_as_settled_for_the_baselines() {
+        let mut pair = Pair::new(params(), 2);
+        pair.sides[1].set_max_in_flight(3);
+        let mut now = 0;
+        pair.step(now, [Some(0), Some(0)]);
+        let mut again = [false; 2];
+        let mut held = [false; 2];
+        for _ in 0..400 {
+            for side in 0..2 {
+                let level = pair.sides[side].in_flight();
+                // side 0 spikes at 5 in flight; side 1 never does, and is capped at 3
+                let ms = if side == 0 && level >= 5 {
+                    140.0
+                } else {
+                    100.0
+                };
+                feed(&mut pair.sides[side], 2, 3, ms);
+                if pair.sides[side].limit().is_some() {
+                    held[side] = true;
+                }
+                if held[side] && pair.sides[side].taking_baseline() {
+                    again[side] = true;
+                }
+            }
+            now += 1000;
+            pair.step(now, [Some(0), Some(0)]);
+        }
+        assert!(pair.sides[1].settled(), "held at its cap of 3");
+        assert_eq!(again, [true, true], "both baselines taken again");
+        assert_eq!(pair.sides[1].limit(), Some(3));
     }
 
     #[test]

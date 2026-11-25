@@ -343,16 +343,21 @@ pub fn populated(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// End a cgroup that may still hold processes: `cgroup.kill`, wait until it is empty (at
-/// most `deadline`), then remove it, children first. True when the directory is gone. For a
-/// process that outlives the one that made the cgroup, so it blocks.
+/// End a cgroup that may still hold processes: `cgroup.kill` until it is empty (at most
+/// `deadline`), then remove it, children first. True when the directory is gone. The kill is
+/// written again on every pass, because a process can join after one write (a start that
+/// was under way when its starter ended). For a process that outlives the one that made the
+/// cgroup, so it blocks.
 pub fn destroy(dir: &Path, deadline: Duration) -> bool {
     if !dir.exists() {
         return true;
     }
-    let _ = std::fs::write(dir.join("cgroup.kill"), "1");
     let until = std::time::Instant::now() + deadline;
-    while populated(dir) && std::time::Instant::now() < until {
+    loop {
+        let _ = std::fs::write(dir.join("cgroup.kill"), "1");
+        if !populated(dir) || std::time::Instant::now() >= until {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     remove_tree(dir);
@@ -591,6 +596,29 @@ pub(crate) mod tests {
         .unwrap();
         let refused = harness.child("drivers", &[88, 89]).unwrap_err();
         assert!(refused.contains("asked for"), "{refused}");
+    }
+
+    /// A process can join a cgroup after `cgroup.kill` was written (a start that was under
+    /// way). `destroy` writes it again for as long as the cgroup is populated, so a late
+    /// joiner is ended too and does not hold the cgroup for the whole deadline.
+    #[test]
+    fn destroy_kills_again_while_the_cgroup_is_populated() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("renders-engines");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("cgroup.events"), "populated 1\n").unwrap();
+        let (kill, events) = (dir.join("cgroup.kill"), dir.join("cgroup.events"));
+        let late = std::thread::spawn(move || {
+            // the first kill has been written; a late joiner arrives
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::write(&kill, "").unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+            let killed_again = std::fs::read_to_string(&kill).unwrap() == "1";
+            std::fs::write(&events, "populated 0\n").unwrap();
+            killed_again
+        });
+        destroy(&dir, Duration::from_secs(5));
+        assert!(late.join().unwrap(), "cgroup.kill was written once only");
     }
 
     #[test]

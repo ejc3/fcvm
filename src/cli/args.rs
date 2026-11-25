@@ -1028,7 +1028,8 @@ pub struct FleetRendersBenchArgs {
     /// Where the records go: renders.jsonl, samples.jsonl, report.json, summary.json, logs
     #[arg(long)]
     pub out: std::path::PathBuf,
-    /// Scratch for the run (certificates, name files, injected bytes); removed at the end
+    /// Scratch for the run (certificates, name files, injected bytes): a directory of the
+    /// module's own, removed at its start and at its end
     #[arg(long)]
     pub run_dir: std::path::PathBuf,
     /// A file the module writes its stage to, by rename, as it starts and stops

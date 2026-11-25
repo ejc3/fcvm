@@ -152,6 +152,27 @@ fn pool_has_room(total: u64, room: u64, clone_pages: u64, busy: u64) -> bool {
     (busy + 2) * clone_pages <= total && room >= clone_pages
 }
 
+/// Workers of the fcvm side for `most` renders in flight: half as many again, and two more,
+/// because a clone's teardown outlasts its answer and the next clone starts meanwhile.
+fn fcvm_workers(most: u32) -> u32 {
+    most + most / 2 + 2
+}
+
+/// The most renders in flight a pool of `total` 2 MiB pages carries with no wait: each of
+/// the side's workers may hold a clone, and the memory server holds one clone's worth. A
+/// side asked for more would sit at levels it never reaches and report them as its limit.
+fn pool_cap(total: u64, clone_pages: u64) -> u32 {
+    if clone_pages == 0 {
+        return u32::MAX;
+    }
+    let clones = total / clone_pages;
+    let mut most = 0u32;
+    while u64::from(fcvm_workers(most + 1)) < clones {
+        most += 1;
+    }
+    most
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
@@ -245,8 +266,11 @@ async fn wait_for_line(
 /// bytes after the head, or everything up to the last chunk of a chunked body (returned
 /// as sent). `None` while more is to come; an answer with neither is whole at end of file.
 fn http_body(bytes: &[u8], at_eof: bool) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let (head, body) = text.split_once("\r\n\r\n")?;
+    // The head is ASCII; the body is counted and cut in bytes and decoded afterwards.
+    let split = bytes.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&bytes[..split]);
+    let body = &bytes[split + 4..];
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
     if !head.starts_with("HTTP/1.") {
         return at_eof.then(String::new);
     }
@@ -259,12 +283,12 @@ fn http_body(bytes: &[u8], at_eof: bool) -> Option<String> {
         })
     };
     if let Some(length) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
-        return (body.len() >= length).then(|| body[..length].to_string());
+        return (body.len() >= length).then(|| text(&body[..length]));
     }
     if header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked")) {
-        return body.ends_with("0\r\n\r\n").then(|| body.to_string());
+        return body.ends_with(b"0\r\n\r\n").then(|| text(body));
     }
-    at_eof.then(|| body.to_string())
+    at_eof.then(|| text(body))
 }
 
 /// One HTTP GET: the body and how long the whole answer took. The answer is whole when its
@@ -591,6 +615,10 @@ struct Module {
     recycle_ms: Vec<f64>,
     /// Engines started again because they died or kept failing.
     restarts: u64,
+    /// Engine starts under way (recycles and restarts).
+    starting: tokio::task::JoinSet<()>,
+    /// The host's kernel release, for every record.
+    kernel: String,
     /// 2 MiB pages a clone reserves; 0 when the snapshot is not on huge pages.
     clone_pages: u64,
     fixed: Option<[u32; 2]>,
@@ -670,7 +698,9 @@ impl Module {
         e.recycling = true;
         e.up = false;
         let (join, old, tx) = (e.join.clone(), e.child.take(), self.tx.clone());
-        tokio::spawn(async move {
+        // Kept, so the module can end every start that is under way before it lets its
+        // reaper go: a start that ran on would put a process into a cgroup being removed.
+        self.starting.spawn(async move {
             let result = spec.recycle(index, join, old).await;
             let _ = tx.send(Event::Engine { index, result });
         });
@@ -969,6 +999,7 @@ impl Module {
         let mut sorted = self.recycle_ms.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
         doc["module"] = json!({
+            "kernel": self.kernel,
             "fixed_levels": self.fixed,
             "recycles": self.recycles,
             "engine_restarts": self.restarts,
@@ -1074,6 +1105,13 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
         snapshot_tag: args.snapshot_tag.clone(),
         deadline: Duration::from_secs(20),
     };
+    // One module per run directory, and never a directory that is someone else's.
+    let lock = reap::RunLock::take(&args.run_dir)?;
+    anyhow::ensure!(
+        reap::run_dir_is_ours(&args.run_dir),
+        "--run-dir {} holds files that are not a pages-mode run's; it is removed at start and at the end, so name a directory of its own",
+        args.run_dir.display()
+    );
     // What a module that lost its host left, before anything is made.
     let left = reap::sweep(&target).await;
     anyhow::ensure!(
@@ -1083,7 +1121,7 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
     std::fs::create_dir_all(&args.out)?;
     let logs = args.out.join("logs");
     std::fs::create_dir_all(logs.join("clones"))?;
-    let reaper = reap::Reaper::start(&exe, &target, Some(&args.out.join("teardown.json")))?;
+    let reaper = reap::Reaper::start(&exe, &target, Some(&args.out.join("teardown.json")), &lock)?;
     // Nothing is made before this line but the records' directory, and from it on the
     // reaper removes what is.
     status.set("start").await;
@@ -1101,7 +1139,8 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
     )
     .await;
     status.set("stopping").await;
-    // Every child handle is dropped by now; the reaper ends what they started.
+    // Every child handle is dropped by now and no engine start is under way; the reaper
+    // ends what they started.
     let reaped = reaper.finish().await?;
     status
         .set(if reaped.clean() {
@@ -1135,6 +1174,7 @@ async fn run(
     let [cpus_fcvm, cpus_engines, cpus_harness] = cpus;
     let run_dir = &args.run_dir;
     std::fs::create_dir_all(run_dir)?;
+    std::fs::write(run_dir.join(reap::RUN_MARKER), "")?;
 
     // The cgroups. Memory is counted for each side and each engine.
     unit.enable("memory").map_err(anyhow::Error::msg)?;
@@ -1247,6 +1287,8 @@ async fn run(
         );
     }
     let mut clone_pages = 0;
+    // The most clones in flight: what was asked for, or fewer when the pool carries fewer.
+    let mut max_fcvm = args.max_fcvm;
     let mut fcvm_setup = setup[FCVM].clone();
     if want_fcvm {
         let config: Value =
@@ -1264,11 +1306,17 @@ async fn run(
         );
         fcvm_setup.insert("kernel".into(), release.to_string());
         let (pool, _) = hugepages(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default());
+        let carries = pool_cap(pool, clone_pages);
         anyhow::ensure!(
-            pool >= clone_pages * 3,
-            "the 2 MiB pool holds {pool} pages; the memory server and one clone in flight and one in teardown need {}",
-            clone_pages * 3
+            carries >= 1,
+            "the 2 MiB pool holds {pool} pages; one render in flight needs {} (the memory server's copy and {} clones of {clone_pages})",
+            (u64::from(fcvm_workers(1)) + 1) * clone_pages,
+            fcvm_workers(1)
         );
+        if carries < max_fcvm {
+            tracing::warn!(target: "renders", pool, asked = max_fcvm, carries, "the 2 MiB pool carries fewer renders in flight than asked for");
+            max_fcvm = carries;
+        }
         fcvm_setup.insert("pool_pages".into(), pool.to_string());
     }
 
@@ -1394,6 +1442,7 @@ async fn run(
             format!("{:.0}", start_ms[start_ms.len() / 2]),
         );
         kite_setup.insert("recycle_mib".into(), args.recycle_mib.to_string());
+        kite_setup.insert("kernel".into(), release.to_string());
         // The bundle by its content, not by where this host keeps it.
         let index = std::fs::read(dist.join("index.js"))
             .with_context(|| format!("reading {}/index.js", dist.display()))?;
@@ -1415,11 +1464,7 @@ async fn run(
         run_id: run_id.clone(),
     };
     let counts = [
-        if want_fcvm {
-            args.max_fcvm + args.max_fcvm / 2 + 2
-        } else {
-            0
-        },
+        if want_fcvm { fcvm_workers(max_fcvm) } else { 0 },
         engines.len() as u32,
     ];
     let mut sides = Vec::new();
@@ -1459,7 +1504,10 @@ async fn run(
             .await
             .map_err(|_| anyhow::anyhow!("{waiting} workers were not ready within 120 s"))?;
         match event {
-            Some(Event::Line { side, index, line }) if line.contains("\"ready\"") => {
+            Some(Event::Line { side, index, line })
+                if serde_json::from_str::<Value>(&line)
+                    .is_ok_and(|row| row["ready"] == json!(true)) =>
+            {
                 sides[side].workers[index].ready = true;
                 waiting -= 1;
             }
@@ -1481,7 +1529,7 @@ async fn run(
         u64::from(args.window_s) * 1000,
         now,
     );
-    wall.cap(FCVM, args.max_fcvm.max(1));
+    wall.cap(FCVM, max_fcvm.max(1));
     wall.cap(KITE, args.max_engines.max(1));
     let viewport = ("viewport".to_string(), args.viewport.clone());
     fcvm_setup.insert(viewport.0.clone(), viewport.1.clone());
@@ -1524,6 +1572,8 @@ async fn run(
         recycles: 0,
         recycle_ms: Vec::new(),
         restarts: 0,
+        starting: tokio::task::JoinSet::new(),
+        kernel: release.to_string(),
         clone_pages,
         fixed,
         tx,
@@ -1563,7 +1613,8 @@ async fn run(
         module.handle(event).await;
     }
     status.set("running").await;
-    let ended = loop {
+    let ended: Result<&str> = async {
+        Ok(loop {
         tokio::select! {
             _ = term.recv() => break "a signal",
             _ = int.recv() => break "a signal",
@@ -1590,7 +1641,12 @@ async fn run(
                 }
             }
         }
-    };
+        })
+    }
+    .await;
+    // Whatever ended the loop: no engine start goes on past this line.
+    module.starting.shutdown().await;
+    let ended = ended?;
     tracing::info!(target: "renders", "ending at {ended}");
     let _ = module.records.flush();
     let _ = module.samples.flush();
@@ -1761,6 +1817,105 @@ mod tests {
         // the smallest pool the module starts with: the server, one in flight, one in teardown
         assert!(pool_has_room(1_536, 1_024, 512, 1));
         assert!(!pool_has_room(1_536, 1_024, 512, 2));
+    }
+
+    /// A body is counted and cut in bytes. An answer that ends inside a character (more is
+    /// to come) is not whole, and nothing is sliced inside a character.
+    #[test]
+    fn an_answers_length_is_in_bytes() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        // "a", "é" (2 bytes), then the first byte of another "é": 4 of the 5 bytes
+        let mut partial = head.to_vec();
+        partial.extend_from_slice(&[0x61, 0xC3, 0xA9, 0xC3]);
+        assert_eq!(http_body(&partial, false), None);
+        let mut whole = partial.clone();
+        whole.push(0xA9);
+        assert_eq!(http_body(&whole, false).as_deref(), Some("aéé"));
+        // bytes that are not text at all still have a length
+        let mut binary = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n".to_vec();
+        binary.extend_from_slice(&[0xFF, 0xFE, 0xFD, 0x00]);
+        assert!(http_body(&binary, false).is_some());
+    }
+
+    /// The module starts the harness's programs with options and reads fields that the
+    /// harness must have. Without them the module ends at its `replays` stage, or runs
+    /// with no viewport and no early answer and says nothing.
+    #[test]
+    fn the_harness_has_what_the_module_passes_it() {
+        let bench = Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/chromium");
+        let read = |name: &str| std::fs::read_to_string(bench.join(name)).unwrap();
+        let replay = read("corpus_serve.py");
+        for option in [
+            "--reuse-port",
+            "--tls-cert-dir",
+            "--inject-file",
+            "--http11",
+        ] {
+            assert!(
+                replay.contains(&format!("\"{option}\"")),
+                "corpus_serve.py has no {option}"
+            );
+        }
+        assert!(
+            read("cdpdrive.py").contains("\"--viewport\""),
+            "cdpdrive.py has no --viewport"
+        );
+        let reqbench = read("reqbench.py");
+        assert!(
+            reqbench.contains("on_answer"),
+            "reqbench.py tells no caller of an answer"
+        );
+        assert!(
+            reqbench.contains("viewport=getattr(args, \"viewport\""),
+            "reqbench.py forwards no viewport to a clone's driver"
+        );
+        // and the worker asks for each of them
+        let worker = read("renders_worker.py");
+        for used in ["on_answer", "viewport=opts.viewport"] {
+            assert!(
+                worker.contains(used),
+                "renders_worker.py does not use {used}"
+            );
+        }
+    }
+
+    /// 512 pages a clone. The pool holds the memory server's copy and a clone for each of
+    /// the side's workers, or the side is capped at what it does hold.
+    #[test]
+    fn the_pool_caps_the_renders_in_flight_it_cannot_carry() {
+        assert_eq!(fcvm_workers(40), 62);
+        assert_eq!(pool_cap(34_000, 512), 42); // 66 clones: 63 workers and the server
+        assert_eq!(pool_cap(14_000, 512), 16); // 27 clones: 26 workers and the server
+        assert_eq!(pool_cap(2_048, 512), 1);
+        assert_eq!(pool_cap(1_536, 512), 0);
+        assert_eq!(pool_cap(0, 512), 0);
+        assert_eq!(pool_cap(0, 0), u32::MAX);
+        // at its cap every worker can hold a clone and the check never refuses one
+        for (total, pages) in [(34_000u64, 512u64), (14_000, 512), (2_048, 512)] {
+            let most = pool_cap(total, pages);
+            let busy = u64::from(fcvm_workers(most)) - 1;
+            assert!(pool_has_room(total, total, pages, busy), "{total}");
+        }
+    }
+
+    /// An engine start under way when the module ends would put a process into a cgroup
+    /// the reaper is removing. The starts are kept in one set, and the module ends them
+    /// before it returns to let its reaper go.
+    #[test]
+    fn engine_starts_are_ended_before_the_reaper_is_let_go() {
+        let source = include_str!("mod.rs");
+        let recycle = &source[source.find("    fn recycle(&mut self").unwrap()..];
+        let recycle = &recycle[..recycle.find("\n    }\n").unwrap()];
+        assert!(recycle.contains("self.starting.spawn("));
+        assert!(!recycle.contains("tokio::spawn("));
+        let run = &source[source.find("async fn run(").unwrap()..];
+        // not this test's own text
+        let run = &run[..run.find("#[cfg(test)]").unwrap()];
+        let stop = run
+            .find("module.starting.shutdown().await;")
+            .expect("the starts are ended");
+        let returned = run.find("let ended = ended?;").unwrap();
+        assert!(stop < returned, "ended before an error leaves run()");
     }
 
     #[test]
