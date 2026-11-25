@@ -165,6 +165,67 @@ with when it came and sends rows older than 5 s to no page, and a host whose las
 unassigned says so in one last report. A lent server is always one of the tiles, whatever its
 number: its holder's page needs its borrow, its join address and its own view.
 
+**Measured through that path**, 2026-11-24, on one boot of one bare-metal arm64 host
+(c8g.metal-48xl: 192 vCPUs, 377 GiB, no local disk), kernel 7.0.0-1018-aws, fcvm from main at
+`2f89b1c97` with this change: one coordinator, its local agent with `--minecraft N` (each server
+a VM of 1 vCPU and 1024 MiB with its three bots, routed networking) and a client that reads the
+status rows as a page does (`fleet/minecraft/bench/fleetfield.sh`). The records are in
+`fleet/minecraft/bench/results/2026-11-24-fleet-path-c8g-metal-48xl/`, one directory a run, and
+every number in the table is from a run's `summary.json` (the run that never had every server
+running also keeps its `samples.jsonl`, whose last line is its row). The store was a btrfs image: on the host's
+30 GiB root volume (network storage) for the first three runs, in RAM for the last two. The
+IPv6 neighbour limit was Ubuntu's 1024 for the first two runs and 16384 after.
+
+| run | all N up, from the first restore's start | busy CPUs a server, minute 1 / 5 / 29 | MiB a server at 5 / 30 min | readings under 19.5 TPS or unanswered |
+|---|---|---|---|---|
+| 256, root volume | 24.6 s | 0.195 / 0.206 / 0.165 | 412 / 441 | 327 of 89,344, all between 5.2 and 6.5 min |
+| 512, root volume, limit 1024 | never: at 347 s, 500 ran, 2 were restoring and 10 had failed | | | 325 of the 500 running unanswered at 347 s |
+| 512, root volume | 73.7 s | 0.193 / 0.193 / stalled | 432 / stalled | stalled at 14.6 min (below) |
+| 512, RAM | 29.9 s | 0.262 / 0.245 / 0.199 | 492 / 543 | 43 of 179,200, all in the first 18 s |
+| 256, RAM (100 s) | 6.9 s | 0.201 | | 0 of 5,120 |
+
+- **All N up** is from the coordinator's own log (`all_up_s` in a run's summary; a run keeps
+  the lines it is read from as `coord-up.log`, and a test derives it from them again): from the gold
+  snapshot being made (the 512 RAM run made it) or, where it was already there, from the agent's
+  hello, to the last server's first "server up". The client's own figure (`restore_all_s`)
+  starts at its first sample that shows a restoring server (it samples every 5 s once rows
+  come), and in the 512 RAM run that sample came about 20 s after the gold was made: it read
+  12.2 s there.
+- **A reading** is one server's tick rate in its status row, read every 5 s from when every
+  server ran until the run's reset of all; a running server whose row has no rate is
+  unanswered. Busy CPUs are the host's (`/proc/stat`), and memory is the VMMs' proportional
+  anonymous memory (`smaps_rollup` `Pss_Anon`). The snapshot's memory image is shared and not
+  in it: a VMM's resident memory was 730 MiB at 5 minutes with 512 in RAM.
+- **512 servers held 20 TPS for half an hour** with the store in RAM: after the first 18 s the
+  lowest of 177,152 readings was 19.5. A third of the host's CPUs were idle (129 of 192 busy at
+  5 minutes, 100 at 30), and 56 GiB of memory were available at 30 minutes, with 35 GiB of the
+  rest holding the store and the build tree in RAM.
+- **Reset all.** 512 servers were back 64.8 s after the click: none at 10 s, 2 at 20 s, 55 at
+  30 s, 184 at 40 s, 364 at 50 s, 479 at 60 s. 256 took 16.0 s.
+- **The store.** On the root volume the worlds' first saves
+  showed in the tick rate (256 servers: every low or unanswered reading fell in two windows at
+  5.2 and 6.4 minutes; outside them the lowest was 19.8), restores took four to six times as
+  long, and 512 servers stalled: 14.6 minutes in, status reads began to go unanswered, and at
+  15.3 minutes 499 of 512 were. 513 of the host's processes were then in uninterruptible sleep
+  (`states-at-stall.txt`), 505 of them VMMs; the kernel stacks of 398 of 400 read were in
+  btrfs's space reservation (`btrfs_delalloc_reserve_metadata`), with 17.6 GiB of data in the
+  24 GiB image. A server wrote 29 MiB to its disk in half an hour on the root volume and 38 MiB
+  in RAM. Servers on the faster store also used more CPU and memory at the same age.
+- **What bounds N**, in the order the runs met them:
+  1. The IPv6 neighbour table (`net.ipv6.neigh.default.gc_thresh3`, 1024 on Ubuntu): 512 routed
+     servers overflowed it and did not all start.
+  2. The store's size and speed, as above.
+  3. Memory: 543 MiB a server at 30 minutes, when the coordinator resets it. This host's
+     377 GiB hold about 610 with the store in RAM and about 660 with it on a disk.
+  4. CPU: 0.26 of a CPU a server in its first minutes, 0.20 at 30. 192 CPUs give about 730 at
+     the first figure.
+  5. On a fleet host, before any of these: `fleet/published-ports.json` declares 4 IPv4 ports
+     for Minecraft view sockets, and with `--tls-publish-base` the agent refuses a fifth
+     server. This run gave the agent no base.
+  Addresses do not bound it: a server takes one of the host's /80.
+- **Not measured:** a local NVMe store, an x86 host, the fleet's GPU host with its other modes
+  running, and more than 512 servers through this path.
+
 ### The page in 3D
 
 `fleet/web/core/minecraft3d.ts` (the geometry, the cameras, the sky, the fork's flight, the frame
