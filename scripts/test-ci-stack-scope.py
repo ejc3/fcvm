@@ -166,6 +166,22 @@ class PrScope(Harness):
         self.assertEqual(self.flags(outputs), dict(run='true', code='false', bench='false', fleet='false', web='false'))
         self.assertNotIn(f'repos/{REPO}/compare/main...' + 'b' * 40, [c['path'] for c in calls])
 
+    def test_a_scripts_only_pr_still_runs_ci(self):
+        # The tree-wide guards sit in the actionlint job, which runs whenever `run` is true.
+        fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [],
+                   f'repos/{REPO}/pulls/12/files': files('scripts/ci-pr-scope.sh')}
+        outputs, _, _ = self.scope(fixture)
+        self.assertEqual(outputs['run'], 'true')
+        self.assertEqual(outputs['bench'], 'false')
+
+    def test_what_fleet_web_reads_outside_fleet_web_runs_fleet_web(self):
+        # mock/test/potato.test.ts compares the mock with fleet/core/tests/vectors and fleet/PROTOCOL.md.
+        for changed in ('fleet/core/tests/vectors/33_potato.json', 'fleet/core/src/potato.rs', 'fleet/PROTOCOL.md'):
+            fixture = {f'repos/{REPO}/pulls?state=open&base=feature-b&per_page=100': [],
+                       f'repos/{REPO}/pulls/12/files': files(changed)}
+            outputs, _, _ = self.scope(fixture)
+            self.assertEqual(outputs['web'], 'true', changed)
+
     def test_the_top_of_a_stack_classifies_the_whole_stack(self):
         # The top PR changes only docs; the PR below it changed code. Classifying the
         # top's own files would skip the matrix for that code.

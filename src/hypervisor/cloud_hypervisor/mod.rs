@@ -104,12 +104,16 @@ pub struct CloudHypervisorBackend {
 impl CloudHypervisorBackend {
     /// Create a backend that will manage a Cloud Hypervisor process whose REST API
     /// listens on `api_socket`.
-    pub fn new(vm_id: String, api_socket: PathBuf, log_path: Option<PathBuf>) -> Self {
+    /// `decision` comes from the caller's [`crate::confine::resolve`]; confinement supports
+    /// the Firecracker backend only, so `spawn` refuses a confined one.
+    pub fn new(
+        vm_id: String,
+        api_socket: PathBuf,
+        log_path: Option<PathBuf>,
+        decision: crate::confine::Decision,
+    ) -> Self {
         Self {
-            namespace: NamespaceParams {
-                vm_id: vm_id.clone(),
-                ..Default::default()
-            },
+            namespace: NamespaceParams::new(vm_id.clone(), decision),
             vm_id,
             vm_name: None,
             api_socket,
@@ -377,6 +381,10 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn spawn(&mut self, spec: &ProcessSpec) -> Result<()> {
+        anyhow::ensure!(
+            self.namespace.decision.confinement().is_none(),
+            "confinement supports the Firecracker backend only"
+        );
         self.stop_reboot_monitor().await;
         // A reboot relaunch re-enters spawn() with a minimal spec (binary + args). Update
         // retained state only when the spec provides a value, so the namespace isolation
@@ -1282,6 +1290,7 @@ mod tests {
             "vm-test".to_string(),
             PathBuf::from("/tmp/ch-test.sock"),
             None,
+            crate::confine::Decision::for_test(None),
         )
     }
 
@@ -1320,6 +1329,7 @@ mod tests {
             "vm-test".to_string(),
             PathBuf::from("/tmp/ch-test.sock"),
             Some(PathBuf::from("/vm/firecracker.log")),
+            crate::confine::Decision::for_test(None),
         )
     }
 

@@ -1,10 +1,12 @@
-//! The tile's bots (azalea): they join the server, walk about the map's region and build small
-//! towers of their own colour, and the first of them is the one a viewer drives when they take
-//! the tile over. Their shared view of the world is what the map is read from.
+//! The tile's bots (azalea): they join the server, walk about the dry land of the map's region
+//! and build walls, the outlines of houses and towers of their own colour (`plan`), and the
+//! first of them is the one a viewer drives when they take the tile over. Their shared view of
+//! the world is what the map is read from.
 
 use crate::drive::{self, Action, Key};
 use crate::map::{Cell, Grid, Region};
 use crate::palette;
+use crate::plan::{self, Shape, Step};
 use crate::tile::{Player, Tile, unix_ms};
 use azalea::pathfinder::PathfinderClientExt;
 use azalea::pathfinder::goals::XZGoal;
@@ -132,22 +134,31 @@ fn give_wool(bot: &Client, n: usize) {
 #[derive(Debug, Clone)]
 enum Pilot {
     /// Walking to a column.
-    Walk {
-        x: i32,
-        z: i32,
-        until: u64,
-    },
-    /// Building a tower beside where it stands: blocks placed so far.
+    Walk { x: i32, z: i32, until: u64 },
+    /// In the water: swimming straight for a dry column (up, and forward) until it stands on
+    /// land or the time runs out.
+    Swim { x: i32, z: i32, until: u64 },
+    /// Building: the columns left to raise, the one it is on, and its progress there.
     Build {
-        x: i32,
-        z: i32,
-        placed: u32,
+        steps: Vec<Step>,
+        at: usize,
+        /// Walking to the column's standing place until this time; 0 when not yet sent there.
+        walk_until: u64,
+        /// Blocks tried on this column.
+        tries: u32,
         next: u64,
     },
-    Idle {
-        until: u64,
-    },
+    /// Standing until `until`. `near`: the next walk is a short one (a bot just restored or
+    /// forked builds at once, so a copy and its source differ within seconds).
+    Idle { until: u64, near: bool },
 }
+
+/// How far a walk goes: across the map, or a few columns for a bot that has just been reseeded.
+const WALK_REACH: i32 = 28;
+const NEAR_REACH: i32 = 6;
+/// A bot places a block on a column no further than this from its eyes (the server refuses a
+/// block out of reach).
+const REACH: f64 = 4.0;
 
 /// What the bots' choices are reseeded on: a new session (the bots joined again) or a new scene
 /// (the agent posted this tile's own name and generation, as it does to a fork's copy).
@@ -177,7 +188,13 @@ fn seed(tile: &Tile) -> u64 {
 /// The control loop: the driven bot follows the take-over, the others their pilots, and the map
 /// and status go to the page. Runs until the process ends.
 pub async fn control(tile: Arc<Tile>) {
-    let mut pilots: Vec<Pilot> = vec![Pilot::Idle { until: 0 }; tile.cfg.bots];
+    let mut pilots: Vec<Pilot> = vec![
+        Pilot::Idle {
+            until: 0,
+            near: true
+        };
+        tile.cfg.bots
+    ];
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed(&tile));
     // Choices are reseeded on each new session and each new scene: a restore keeps the bots
     // connected (their loopback connections survive it), so the scene the agent posts to the
@@ -194,9 +211,12 @@ pub async fn control(tile: Arc<Tile>) {
         if s != session {
             session = s;
             rng = rand::rngs::StdRng::seed_from_u64(seed(&tile));
-            pilots
-                .iter_mut()
-                .for_each(|p| *p = Pilot::Idle { until: now + 500 });
+            pilots.iter_mut().for_each(|p| {
+                *p = Pilot::Idle {
+                    until: now + 300,
+                    near: true,
+                }
+            });
         }
         let bots: Vec<Option<Client>> = tile.bots.lock().clone();
         let Some(first) = bots.iter().flatten().find(|c| c.logged_in()).cloned() else {
@@ -223,13 +243,16 @@ pub async fn control(tile: Arc<Tile>) {
             let driven = n == 0 && tile.drive.lock().driver.is_some();
             if driven {
                 drive_bot(&tile, bot, now);
-                pilots[n] = Pilot::Idle { until: now + 2_000 };
+                pilots[n] = Pilot::Idle {
+                    until: now + 2_000,
+                    near: false,
+                };
             } else {
                 fly(&tile, bot, &mut pilots[n], region, &mut rng, now);
             }
         }
         if n_tick.is_multiple_of(2) {
-            map_tick(&tile, &first, region);
+            map_tick(&tile, &first, region, n_tick / 2);
         }
         status_tick(&tile, &bots, now);
     }
@@ -279,8 +302,20 @@ fn drive_bot(tile: &Tile, bot: &Client, now: u64) {
     }
 }
 
-/// The highest non-air block of a column, from the world the bots share.
-fn top(world: &azalea::world::World, x: i32, z: i32) -> Option<(i32, azalea::block::BlockState)> {
+/// How far under a column's top block its ground is looked for: a canopy stands this far over
+/// the forest floor at most, and deeper water than this is drawn this deep.
+const GROUND_DEPTH: i32 = 48;
+
+/// A column from the world the bots share: its top block (the highest that is not air) and its
+/// ground (the highest that is not leaves, a plant or water: `palette::is_cover`) as the map
+/// holds them, with the top block's name and y. `prev` is what the map held for the column:
+/// while its top block is the same, its ground is taken from there and not read again.
+fn column(
+    world: &azalea::world::World,
+    x: i32,
+    z: i32,
+    prev: Option<(Cell, Cell)>,
+) -> Option<(Cell, Cell, &'static str, i32)> {
     use azalea::core::heightmap_kind::HeightmapKind;
     use azalea::core::position::{ChunkBlockPos, ChunkPos};
     let cp = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
@@ -293,14 +328,49 @@ fn top(world: &azalea::world::World, x: i32, z: i32) -> Option<(i32, azalea::blo
         .get(&HeightmapKind::WorldSurface)
         .or_else(|| chunk.heightmaps.get(&HeightmapKind::MotionBlocking))?;
     let mut y = hm.get_first_available(lx, lz) - 1;
-    while y >= min_y {
+    let (name, material) = loop {
+        if y < min_y {
+            return None;
+        }
         let s = chunk.get_block_state(&ChunkBlockPos::new(lx, y, lz), min_y)?;
         if !s.is_air() {
-            return Some((y, s));
+            let name = block_name(s);
+            break (name, palette::material(name));
         }
         y -= 1;
+    };
+    let top = Cell::new(material, y);
+    if !palette::is_cover(material) {
+        return Some((top, top, name, y));
     }
-    None
+    if let Some((was, ground)) = prev
+        && was == top
+    {
+        return Some((top, ground, name, y));
+    }
+    // Under leaves, a plant or water: down to the first block that is none of them. A column
+    // covered all the way down has the lowest block read as its ground.
+    let mut ground = top;
+    let mut below = y - 1;
+    while below >= min_y && below >= y - GROUND_DEPTH {
+        let Some(s) = chunk.get_block_state(&ChunkBlockPos::new(lx, below, lz), min_y) else {
+            break;
+        };
+        if !s.is_air() {
+            let m = palette::material(block_name(s));
+            ground = Cell::new(m, below);
+            if !palette::is_cover(m) {
+                break;
+            }
+        }
+        below -= 1;
+    }
+    Some((top, ground, name, y))
+}
+
+/// The y of a column's highest non-air block.
+fn top_y(world: &azalea::world::World, x: i32, z: i32) -> Option<i32> {
+    column(world, x, z, None).map(|c| c.3)
 }
 
 fn block_name(s: azalea::block::BlockState) -> &'static str {
@@ -308,75 +378,281 @@ fn block_name(s: azalea::block::BlockState) -> &'static str {
     k.to_str()
 }
 
+/// A build carried on from its column `at`, not before `next`.
+fn build_from(steps: &[Step], at: usize, next: u64) -> Pilot {
+    Pilot::Build {
+        steps: steps.to_vec(),
+        at,
+        walk_until: 0,
+        tries: 0,
+        next,
+    }
+}
+
+/// The column a bot stands in.
+fn column_of(bot: &Client) -> Option<(i32, i32)> {
+    let p = bot.position().ok()?;
+    Some((p.x.floor() as i32, p.z.floor() as i32))
+}
+
+fn near(bot: &Client, x: i32, z: i32, within: f64) -> bool {
+    bot.position().is_ok_and(|q| {
+        (q.x - x as f64 - 0.5).abs() < within && (q.z - z as f64 - 0.5).abs() < within
+    })
+}
+
+/// A bot that found no dry column in reach looks again this long after.
+const MISS_WAIT_MS: u64 = 1_000;
+
+/// What a bot does after it found no dry column in reach: nothing, for [`MISS_WAIT_MS`].
+fn after_miss(now: u64, near: bool) -> Pilot {
+    Pilot::Idle {
+        until: now + MISS_WAIT_MS,
+        near,
+    }
+}
+
 fn fly(tile: &Tile, bot: &Client, p: &mut Pilot, region: Region, rng: &mut impl Rng, now: u64) {
-    // A quarter of the region at most, so the range is never empty (the side is at least 32).
-    let margin = (region.w.min(region.h) as i32 / 4).min(12);
+    let _ = region;
     match p.clone() {
-        Pilot::Idle { until } if now >= until => {
-            let x = rng.random_range(region.x0 + margin..region.x0 + region.w as i32 - margin);
-            let z = rng.random_range(region.z0 + margin..region.z0 + region.h as i32 - margin);
-            bot.start_goto(XZGoal { x, z });
-            *p = Pilot::Walk {
-                x,
-                z,
-                until: now + 25_000,
+        Pilot::Idle { until, near: short } if now >= until => {
+            let Some((x, z)) = column_of(bot) else { return };
+            let grid = tile.grid.read();
+            let Some(grid) = grid.as_ref() else { return };
+            // A bot in the water leaves it before anything else: half the time it swims
+            // straight for the nearest shore, half the time the pathfinder takes it there (one
+            // gets it out where the other is stuck). The shore is looked for once.
+            let wet = plan::in_water(grid, x, z);
+            let shore = if wet {
+                plan::nearest_land(grid, x, z, 64)
+            } else {
+                None
             };
-        }
-        Pilot::Idle { .. } => {}
-        Pilot::Walk { x, z, until } => {
-            let near = bot.position().is_ok_and(|q| {
-                (q.x - x as f64 - 0.5).abs() < 2.0 && (q.z - z as f64 - 0.5).abs() < 2.0
-            });
-            if near || now >= until || bot.is_goto_target_reached() {
+            if let Some((tx, tz)) = shore
+                && rng.random::<bool>()
+            {
                 bot.stop_pathfinding();
-                let Ok(q) = bot.position() else { return };
-                *p = Pilot::Build {
-                    x: q.x.floor() as i32 + 1,
-                    z: q.z.floor() as i32,
-                    placed: 0,
-                    next: now + 300,
+                *p = Pilot::Swim {
+                    x: tx,
+                    z: tz,
+                    until: now + 8_000,
                 };
+                return;
+            }
+            let target = if wet {
+                shore
+            } else {
+                let reach = if short { NEAR_REACH } else { WALK_REACH };
+                let picks: Vec<(i32, i32)> = (0..24)
+                    .map(|_| {
+                        (
+                            rng.random_range(-reach..=reach),
+                            rng.random_range(-reach..=reach),
+                        )
+                    })
+                    .collect();
+                plan::walk_target(grid, x, z, reach, &picks)
+            };
+            match target {
+                Some((tx, tz)) if (tx, tz) != (x, z) => {
+                    bot.start_goto(XZGoal { x: tx, z: tz });
+                    *p = Pilot::Walk {
+                        x: tx,
+                        z: tz,
+                        until: now + 25_000,
+                    };
+                }
+                // Already there: build where it stands.
+                Some(_) => *p = Pilot::Walk { x, z, until: now },
+                // Nothing dry in reach (the map still loading, a region of water, a driven bot
+                // far outside the map): look again in a while, not at the next tick.
+                None => *p = after_miss(now, short),
             }
         }
-        Pilot::Build { x, z, placed, next } => {
+        Pilot::Idle { .. } => {}
+        Pilot::Swim { x, z, until } => {
+            let Some((bx, bz)) = column_of(bot) else {
+                return;
+            };
+            let dry = tile
+                .grid
+                .read()
+                .as_ref()
+                .is_some_and(|g| plan::land(g, bx, bz).is_some());
+            if dry || now >= until {
+                bot.walk(WalkDirection::None);
+                let _ = bot.set_jumping(false);
+                *p = Pilot::Idle {
+                    until: now,
+                    near: true,
+                };
+                return;
+            }
+            // Head for the shore at eye level; holding jump in water is swimming up.
+            let eye = bot.position().map_or(64, |q| q.y.floor() as i32 + 1);
+            bot.look_at(BlockPos::new(x, eye, z).center());
+            bot.walk(WalkDirection::Forward);
+            let _ = bot.set_jumping(true);
+        }
+        Pilot::Walk { x, z, until } => {
+            if !(near(bot, x, z, 2.0) || now >= until || bot.is_goto_target_reached()) {
+                return;
+            }
+            bot.stop_pathfinding();
+            let Some((bx, bz)) = column_of(bot) else {
+                return;
+            };
+            let grid = tile.grid.read();
+            let Some(grid) = grid.as_ref() else { return };
+            if plan::land(grid, bx, bz).is_none() {
+                // The walk ended in the water or on a tree: go on to dry ground at once.
+                *p = Pilot::Idle {
+                    until: now,
+                    near: false,
+                };
+                return;
+            }
+            // Mostly walls and houses; the first shape that has a column to raise here.
+            let dir = rng.random_range(0..4usize);
+            let first = match rng.random_range(0..10u32) {
+                0..=3 => Shape::Wall,
+                4..=7 => Shape::House,
+                _ => Shape::Tower,
+            };
+            let steps = [first, Shape::Wall, Shape::Tower]
+                .into_iter()
+                .map(|shape| {
+                    let (len, rise) = match shape {
+                        Shape::Wall => (rng.random_range(4..=7), 2),
+                        Shape::House => (rng.random_range(4..=5), 2),
+                        Shape::Tower => (1, plan::MAX_RISE),
+                    };
+                    plan::plan(shape, grid, bx, bz, dir, len, rise)
+                })
+                .find(|s| !s.is_empty());
+            *p = match steps {
+                Some(steps) => Pilot::Build {
+                    steps,
+                    at: 0,
+                    walk_until: 0,
+                    tries: 0,
+                    next: now + 300,
+                },
+                None => Pilot::Idle {
+                    until: now + 500,
+                    near: false,
+                },
+            };
+        }
+        Pilot::Build {
+            steps,
+            at,
+            walk_until,
+            tries,
+            next,
+        } => {
+            let Some(step) = steps.get(at).copied() else {
+                *p = Pilot::Idle {
+                    until: now + rng.random_range(500..2_500),
+                    near: false,
+                };
+                return;
+            };
+            // Walk to the column's standing place first: straight there, a step or two over
+            // level ground. The pathfinder is for the long walk: a search for every column
+            // (and a block every 350 ms) took 7% more CPU at 256 servers, and the search shares
+            // the guest's one CPU with the server.
+            if !near(bot, step.stand.0, step.stand.1, 0.4) {
+                if walk_until != 0 && now >= walk_until {
+                    // It could not get there: leave this column out.
+                    bot.walk(WalkDirection::None);
+                    let _ = bot.set_jumping(false);
+                    *p = build_from(&steps, at + 1, now);
+                    return;
+                }
+                let Ok(q) = bot.position() else { return };
+                let feet = q.y.floor() as i32;
+                // Jump when the place is higher than where it stands.
+                let up = tile.grid.read().as_ref().is_some_and(|g| {
+                    plan::land(g, step.stand.0, step.stand.1).is_some_and(|y| y + 1 > feet)
+                });
+                bot.look_at(BlockPos::new(step.stand.0, feet + 1, step.stand.1).center());
+                bot.walk(WalkDirection::Forward);
+                let _ = bot.set_jumping(up);
+                if walk_until == 0 {
+                    *p = Pilot::Build {
+                        steps,
+                        at,
+                        walk_until: now + 4_000,
+                        tries,
+                        next,
+                    };
+                }
+                return;
+            }
+            if walk_until != 0 {
+                bot.walk(WalkDirection::None);
+                let _ = bot.set_jumping(false);
+            }
             if now < next {
                 return;
             }
-            if placed >= 3 + (rng.random::<u8>() % 3) as u32 {
-                *p = Pilot::Idle {
-                    until: now + rng.random_range(500..3_000),
-                };
+            let Ok(world) = bot.world() else { return };
+            let Some(y) = top_y(&world.read(), step.x, step.z) else {
+                *p = build_from(&steps, at + 1, now);
+                return;
+            };
+            // Raised to its height, or more blocks tried than it needs: the next column.
+            if y >= step.top || tries > (plan::MAX_RISE as u32) + 2 {
+                *p = build_from(&steps, at + 1, now + 300);
                 return;
             }
-            let Ok(world) = bot.world() else { return };
-            let Some((y, _)) = top(&world.read(), x, z) else {
-                *p = Pilot::Idle { until: now + 1_000 };
-                return;
-            };
-            bot.look_at(BlockPos::new(x, y, z).center());
-            bot.block_interact(BlockPos::new(x, y, z));
+            let block = BlockPos::new(step.x, y, step.z);
+            let in_reach = bot
+                .eye_position()
+                .is_ok_and(|e| e.distance_to(block.center()) <= REACH);
+            if in_reach {
+                // Facing the column and looking far over it, so that the bot is not looking at
+                // the block: the click is then on the block's top face, and the new block goes
+                // on top of it (looking at its side would put the block beside it).
+                bot.look_at(BlockPos::new(step.x, y + 40, step.z).center());
+                bot.block_interact(block);
+            }
             *p = Pilot::Build {
-                x,
-                z,
-                placed: placed + 1,
-                next: now + 400,
+                steps,
+                at,
+                walk_until: 0,
+                tries: tries + 1,
+                next: now + 600,
             };
-            let _ = tile;
         }
     }
 }
 
-fn map_tick(tile: &Tile, bot: &Client, region: Region) {
+/// Every this many map reads, a row's ground is read again from the world whatever its top
+/// blocks are: a block placed under a canopy or a lake changes the ground and not the top.
+const GROUND_REFRESH: u64 = 16;
+
+fn map_tick(tile: &Tile, bot: &Client, region: Region, tick: u64) {
     let Ok(world) = bot.world() else { return };
     let world = world.read();
     let mut g = Grid::new(region);
     let mut names: std::collections::BTreeMap<&'static str, u32> = Default::default();
+    // What the map held: a column whose top block has not changed keeps its ground.
+    let prev = tile.grid.read().clone().filter(|p| p.region == region);
     for j in 0..region.h as i32 {
+        let fresh = j as u64 % GROUND_REFRESH == tick % GROUND_REFRESH;
         for i in 0..region.w as i32 {
-            if let Some((y, s)) = top(&world, region.x0 + i, region.z0 + j) {
-                let name = block_name(s);
+            let at = (j * region.w as i32 + i) as usize;
+            let was = prev
+                .as_ref()
+                .filter(|_| !fresh)
+                .map(|p| (p.cells[at], p.ground[at]));
+            if let Some((top, ground, name, _)) = column(&world, region.x0 + i, region.z0 + j, was)
+            {
                 *names.entry(name).or_default() += 1;
-                g.cells[(j * region.w as i32 + i) as usize] = Cell::new(palette::material(name), y);
+                g.cells[at] = top;
+                g.ground[at] = ground;
                 g.known += 1;
             }
         }
@@ -390,14 +666,11 @@ fn map_tick(tile: &Tile, bot: &Client, region: Region) {
     let seq = tile.map_seq.fetch_add(1, Ordering::Relaxed) + 1;
     match cur.as_ref() {
         Some(old) if old.region == g.region => {
-            let d = old.delta(&g);
-            if !d.is_empty() {
-                tile.send(&serde_json::json!({"type": "delta", "seq": seq, "cells": d}));
+            if let Some(d) = old.delta_message(&g, seq) {
+                tile.send(&d);
             }
         }
-        _ => tile.send(
-            &serde_json::json!({"type": "map", "seq": seq, "region": region, "cells": g.encode()}),
-        ),
+        _ => tile.send(&g.map_message(seq)),
     }
     if g.known == g.cells.len() && tile.times.lock().map_ready.is_none() {
         tile.times.lock().map_ready = Some(unix_ms());
@@ -471,6 +744,30 @@ fn status_tick(tile: &Tile, bots: &[Option<Client>], now: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bot with nothing dry in reach (the map loading, a region of water, a driven bot far
+    /// outside the map) looked again at the very next tick, and each look was a whole search.
+    #[test]
+    fn a_bot_that_finds_no_dry_column_waits_before_it_looks_again() {
+        for near in [true, false] {
+            match after_miss(5_000, near) {
+                Pilot::Idle { until, near: n } => {
+                    assert_eq!((until, n), (5_000 + MISS_WAIT_MS, near));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(MISS_WAIT_MS >= 1_000);
+        // and a tick's decision looks for the shore once, and leaves the miss to that wait
+        let src = include_str!("bots.rs");
+        let fly = &src[src.find("fn fly(").unwrap()..src.find("fn map_tick(").unwrap()];
+        assert_eq!(
+            fly.matches("plan::nearest_land(").count(),
+            1,
+            "one search a tick"
+        );
+        assert!(fly.contains("None => *p = after_miss(now, short),"));
+    }
 
     /// A restore keeps the bots connected, so the session count stays; the copy's own scene is
     /// what changes the bots' choices, so a fork and its source do not walk the same paths.
