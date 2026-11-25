@@ -1602,6 +1602,16 @@ pub struct RunArgs {
     /// refuses to start without it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
+    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
+    /// for one, make a new user namespace and hold capabilities there), files or sockets;
+    /// later layers do. Rootless mode and the Firecracker backend only, on a
+    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
+    /// never run unconfined. The host's `[confine] mode = "required"` (or
+    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    #[arg(long)]
+    pub confine: bool,
 }
 
 // ============================================================================
@@ -1870,6 +1880,16 @@ pub struct SnapshotRunArgs {
     /// refuses to start without it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
+
+    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
+    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
+    /// for one, make a new user namespace and hold capabilities there), files or sockets;
+    /// later layers do. Rootless mode and the Firecracker backend only, on a
+    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
+    /// never run unconfined. The host's `[confine] mode = "required"` (or
+    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    #[arg(long)]
+    pub confine: bool,
 
     /// Place the clone's vsock control socket at DIR/vsock.sock instead of its
     /// runtime directory (predictable path for external tooling). The snapshot

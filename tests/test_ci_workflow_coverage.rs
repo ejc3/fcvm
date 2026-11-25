@@ -104,6 +104,46 @@ fn main_runs_are_not_cancelled_by_the_next_merge() {
     );
 }
 
+/// A Build Runner AMI run whose job is skipped must stay out of the builds' concurrency group.
+///
+/// Build Runner AMI starts after every finished Build Kernels run, and a run whose only job
+/// is skipped still enters its workflow-level group. On 2026-11-24 such a run cancelled an
+/// image build 44 minutes in: nothing was published and the builder was left running. Among
+/// runs that do build, the newest must still win (it carries the newest content, and the
+/// approval prompt then belongs to the newest commit), so `cancel-in-progress` stays true
+/// and the group is shared only when the job's own `if:` holds. The group repeats that
+/// condition, and this test fails when the two differ.
+#[test]
+fn a_skipped_image_run_stays_out_of_the_builds_concurrency_group() {
+    let workflow = parse_workflow("build-runner-ami.yml");
+    let compact = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+    let job = workflow_job(&workflow, "build-ami");
+    let condition = compact(job["if"].as_str().expect("build-ami has an `if:`"));
+    let concurrency = workflow
+        .get("concurrency")
+        .expect("build-runner-ami.yml has no `concurrency`");
+    assert_eq!(
+        concurrency
+            .get("cancel-in-progress")
+            .and_then(Value::as_bool),
+        Some(true),
+        "among runs that build, the newest must cancel an older one"
+    );
+    assert_eq!(
+        compact(concurrency["group"].as_str().unwrap()),
+        format!(
+            "${{{{({condition})&&format('{{0}}-{{1}}',github.workflow,github.ref)\
+             ||format('{{0}}-skipped-{{1}}',github.workflow,github.run_id)}}}}"
+        ),
+        "the group must be the shared one exactly when build-ami's `if:` holds, and one of \
+         the run's own otherwise"
+    );
+    assert!(
+        job.get("concurrency").is_none(),
+        "a job-level group would let the two legs of one run cancel each other"
+    );
+}
+
 /// Marking a draft ready must start a CI run.
 ///
 /// With the default `pull_request` types a ready flip fires no event, so a PR whose

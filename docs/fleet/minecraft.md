@@ -14,9 +14,15 @@ of a running server next to its source.
 ## What a viewer sees
 
 - `?mode=minecraft` opens it; without the parameter the wall is unchanged.
-- **The tiles.** Every server is a tile showing its world from above, drawn by the page: one
-  flat colour per block material, shaded by height, with each player as a marker and its name.
-  Three bots walk about each world and build small towers of their own colour. A tile is
+- **The tiles.** Every server is a tile showing its world in 3D, drawn by the page from the top
+  block of each column: plain boxes, one flat colour per block material, with each player as a
+  block figure and its name. Each tile's camera flies through its own world, cutting every 10 s
+  between a bot, something the bots built and the whole region, and to a column that just
+  changed. A fork's picture flies from its source to the tile taking the copy for as long as the
+  fork runs, and the copy then outlines and counts the columns that differ from its source. A
+  browser with no WebGL2 gets the map from above, and the tile says so ("The page in 3D" below).
+  Three bots walk about each world's dry land and build walls, the outlines of houses and
+  towers of their own colour. A tile is
   labelled with its slot (`mc-3`), its ticks per second, and "Up in X.XX s": the time from the
   click that asked for a fresh server to the first chunk its bots received.
 - **The header.** Servers up, the server's name and version, the median and slowest time to
@@ -74,8 +80,15 @@ fcvm's lockfile.
   the swing bug in the issue and the particles bug in
   [a comment](https://github.com/azalea-rs/azalea/issues/404#issuecomment-6841991366); once
   upstream fixes both, the pin moves back to azalea-rs/azalea. Three bots join over
-  the guest's loopback. A bot that nobody drives walks to a random column of the map's region
-  with azalea's pathfinder and builds a tower of 3 to 5 blocks of its wool there. A restore keeps
+  the guest's loopback. A bot that nobody drives walks with azalea's pathfinder to a column of
+  dry land that has dry land all round it, and builds there in its wool (`plan.rs`): a wall of 4
+  to 7 columns, the outline of a house 4 or 5 columns a side with a gap for its door, or a tower,
+  each raised two blocks (a tower three). It walks to the place beside each column before it
+  raises it, and leaves out a column on water, on a tree, or off the level of the first. A bot's
+  targets and standing places are dry columns, and one that is in water swims or walks to the
+  nearest shore before anything else; a walk between two of them can cross water, and that is
+  how it leaves again. After a restore or a new scene a bot's first walk is at most 6 columns, so a
+  copy starts building, and differs from its source, within seconds. A restore keeps
   the bots connected: their connections to Pumpkin are loopback inside the guest, which fcvm's
   restore keeps (it retires only sockets whose peer is outside the guest). When the agent posts
   the copy's scene, the program reseeds its choices from the guest's random pool, the tile's
@@ -85,7 +98,11 @@ fcvm's lockfile.
   sends, then the block below the first empty one) and turns its registry name into one of 48
   materials of our own (`palette.rs`: water, grass, sand, wood, leaves, the 16 dye colours and
   so on). The page holds the colours. No texture, colour table, sound or other asset of the game
-  is used anywhere.
+  is used anywhere. Beside each top block the map carries the column's ground: the highest block
+  that is not leaves, a plant or water, up to 48 blocks down, so the page draws the forest floor
+  under a canopy and a lake's bed from what is there. A column whose top block has not changed
+  keeps the ground it had; one row in 16 is read again each time, so a block placed under a
+  canopy shows within 3.2 s.
 - **Ticks per second**, as a client measures them: the server's game time in its `set_time`
   packets against the program's own clock over 10 s.
 - **The view socket** (`GET /view`, fleet/PROTOCOL.md "Minecraft tile"): the page's only route to
@@ -128,9 +145,103 @@ fcvm's lockfile.
   `minecraft_fork`. The borrow rules are `claim_windows`'s. Every event goes through
   `fleet_core::apply`, so it replays. Driving is not an intent: it goes from the page to the tile.
 - **The page.** A view model in `fleet/web/core` from the snapshot's `minecraft` section, the
-  tile renderer (a canvas per tile from its view socket), the take-over panel with its key
+  tile renderer (3D on one WebGL2 canvas from the tiles' view sockets), the take-over panel with its key
   handling and timer, the mock coordinator's servers and a mock tile, and Playwright tests on
   desktop and phone layouts.
+
+### The page in 3D
+
+`fleet/web/core/minecraft3d.ts` (the geometry, the cameras, the sky, the fork's flight, the frame
+guard; pure and unit-tested) and `fleet/web/app/_wall/minecraft-gl.ts` and `minecraft-stage.ts`
+(WebGL2, no library).
+
+- **One context.** One WebGL2 canvas the size of the stage sits under the tiles. Each world is
+  drawn into its tile's rectangle with viewport and scissor, in six draw calls: sky, the columns'
+  tops, their sides, the world's boxes, the figures, water. The canvas is held to 2.5 M device
+  pixels.
+- **A world on the GPU** is three lists of column instances of 8 bytes (x, z, material, height,
+  how far down its sides reach, flags): a top for every column and every canopy column, sides
+  only for the ones that stand above a neighbour (the two that face the camera are drawn), and
+  the water's surface. Trunks, plants, lone trees and the figures are boxes of 44 bytes. It is
+  rebuilt and uploaded when the world, its fork's source or its glowing columns change, at most
+  every 200 ms a tile (`REBUILD_MIN_MS`; a new launch or a new level of detail is built at
+  once). The page takes a grid of at most 262,144 columns, 1,024 a side, which is the
+  largest region a tile serves (512 x 512): a rebuild took 4 ms for the tile's 128 x 128, 16 ms
+  for 256 x 256 and 66 ms for 512 x 512 (node, a shared development host).
+- **What one block per column cannot say is guessed**: a cliff is solid down to its lowest
+  neighbour; the ground under leaves is taken from the columns beside them that are not leaves,
+  spreading inward, with a trunk under each canopy's top; a lake's bed deepens up to 4 blocks from
+  its shore; a plant is a small box on the block under it. The optional `map.ground`
+  (fleet/PROTOCOL.md, "Minecraft tile") replaces each guess.
+- **The camera** keeps above the ground, leaves out the canopy between it and what it looks at,
+  and circles from a side its subject can be seen from when a hill is in the way.
+- **The sky** is the world's time of day when the tile sends `status.day_time`, else mid-morning.
+- **Within a device's means.** Frame times on a laptop's and a phone's GPU are not measured. The
+  page draws no frame while the GPU is still drawing the last (a fence sync), so a slow renderer
+  is never queued behind, and it carries a guard (`FrameBudget`): each frame's time until the GPU
+  had drawn it is sampled, and when the median of 20 is over 40 ms, or three in a row are over
+  160 ms, the page
+  gives up a level: first detail (one column for every 2 x 2 blocks), then frames (10 a second),
+  then the flight (one still view a second, a column for every 4 x 4 blocks). A reduced view says
+  "Reduced detail" on its tile, and a coarse column is outlined when any column it stands for
+  differs from the fork's source, so the outline agrees with the count. After 20 s of frames
+  that keep up with the display (done by its next tick, whatever its rate) the page tries one
+  level up; a recovery that fails doubles the wait before the next, to 320 s, and one that holds
+  starts it over. A frame the GPU never reports done is drawn past after 5 s and counted. A
+  software renderer starts at the last level. The floor, measured on Chromium's software renderer
+  (the kind CI has) on a shared development host: four tiles in a 1232 x 541 canvas took 1.8 s a
+  frame at full detail, the guard reached its last level, and a frame there took 0.16 s.
+- **What it holds.** A tile off the screen and a hidden tab hold no buffers on the GPU; they are
+  uploaded again when next drawn. No WebGL2 is the flat map with "Flat map: no WebGL2 in this
+  browser." on each tile; a lost context is the flat map with "3D view lost; showing the flat
+  map.", and the 3D view returns when the browser restores the context.
+- **What is drawn from data and what is filled in** is said once under the header: "Drawn from
+  each column's top block; trunks are filled in, and so are the forest floor and lake beds of a
+  server that does not send them." The sky does not move until a server sends its clock.
+- **Reduced motion:** one still wide view per tile, each from its own side, drawn again (at most
+  four times a second) only when its world or its players change; no flight for a fork. A bot
+  another viewer drives does not move the tile; the viewer who drives it keeps the view from
+  behind it.
+- **A column that just changed** takes a tile's next cut, chosen when the cut begins and kept
+  for it, and never two cuts in a row: bots that build without pause do not hold the camera.
+- **Opening a tile** (a click, or Enter on it) gives one server the whole stage; Escape or "All
+  servers" brings the wall back, and focus goes to "All servers" and back to the tile. The other
+  servers keep their sockets.
+- **A fork's flight** is drawn only when it can be: in 3D, with motion, both tiles on the stage
+  and the source's world in. Otherwise, and when the copy fails, the tile keeps its own timer or
+  error.
+
+### A field of servers
+
+A snapshot that carries `minecraft.field` (PROTOCOL.md, "Many servers: the field and the status
+rows") names more servers than the page can draw. The page then shows two things side by side
+(the field above the tiles on a phone):
+
+- **The field:** every server a cell on one canvas, with no element per cell, coloured by what
+  its host's last status row says: running at 19.5 TPS or more, running slower, restoring,
+  forking, failed. A server whose host has sent no row, or none for 5 s, is an outline: not
+  reported, never zero and never running. Hovering, tapping or the arrow keys give one cell's
+  line: its state, TPS, players, time since its restore and how long the restore took. A cell
+  is lighter for the first minute after its server's restore. The cells shrink to 9 px to fit;
+  under that the field scrolls.
+- **Six 3D tiles**, each a real view socket to one server. They cut to other running servers
+  every 12 s; a click or Enter on a cell brings that server into the first tile for a minute.
+  Only the six servers in tiles, and any lent one, have a socket and a world on the GPU.
+- **The headline** counts the servers and their states from the rows, and gives servers per busy
+  CPU and per GiB in use from the hosts' own readings (`busy`, `mem_used_mib`). With a host
+  silent, or a reading absent, that part is not shown.
+- **Reset all** is counted as it comes back: "Reset all: 212 of 512 back · 31.8 a second ·
+  6.7 s", then the whole time once every server the reset was sent to is back. A reset is over
+  then, or 180 s after its click (`WAVE_END_S`), whichever comes first: a reset that ends short
+  reads "509 of 512 back after 36 s". Before its end, with nothing being restored and none back
+  for 10 s the count reads as stopped, and runs again if more come back. The line goes a minute
+  after the reset is over. The count and the time are the coordinator's when the snapshot's
+  `last_reset_all` carries them (`back`, `took_ms`), and otherwise read from the rows, which do
+  not say which servers a reset was sent to. A cell flashes when its server returns.
+
+The page asks for the rows by sending `"minecraft": true` with its visibility; the other pages do
+not get them. The field's canvas is painted only when a cell, the cursor or the tiles change, or
+while a flash runs.
 
 ### Invariants (each becomes a test)
 
