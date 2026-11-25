@@ -232,7 +232,10 @@ inductive Op where
   | create (v : Vid)
   /-- `KVM_ARM_VCPU_INIT`, with `KVM_ARM_VCPU_POWER_OFF` or not -/
   | init (v : Vid) (off : Bool)
-  /-- `KVM_ARM_SET_COUNTER_OFFSET` from vCPU 0's saved counter -/
+  /-- `KVM_ARM_SET_COUNTER_OFFSET` from vCPU 0's saved counter. The model has one counter per
+  VM, the one the guest's tick is on. The ioctl sets the virtual and the physical offset alike
+  (arch_timer.c:1745-1754), so the saved counter it is computed from has to be that one:
+  `CNTVCT_EL0` for an ordinary guest, `CNTPCT_EL0` for a guest hypervisor (`REPAIRS.md`, 3) -/
   | offset
   /-- `KVM_SET_ONE_REG` of `CNTPCT_EL0` -/
   | cntp (v : Vid)
@@ -281,8 +284,10 @@ structure Rules where
   cntAtPause : Bool
   /-- a resume moves the counter offset by the time paused (the guest's clock stood still) -/
   freeze : Bool
-  /-- the resume of a restored VM takes out the time since its load (or, the same thing, the
-  counter is written at that resume and not at the load) -/
+  /-- the resume of a restored VM takes out the time since its load: by moving an offset the
+  VMM owns, or by writing the counter at that resume and not at the load (upstream Cloud
+  Hypervisor). The two cannot be combined: once `KVM_ARM_SET_COUNTER_OFFSET` has been used, a
+  counter write is ignored (sys_regs.c:1791-1796) -/
   freezeLoaded : Bool
   /-- a restore sets the counter to the saved one plus the wall time since the pause -/
   advance : Bool
