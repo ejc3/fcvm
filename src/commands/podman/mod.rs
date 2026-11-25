@@ -7614,12 +7614,12 @@ mod tests {
             512,
         );
         state_manager.save_state(&vm_state).await.unwrap();
-        assert!(state_dir.join("vm-test-cleanup.json").exists());
+        assert!(state_manager.state_file("vm-test-cleanup").exists());
 
         cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
 
         assert!(
-            !state_dir.join("vm-test-cleanup.json").exists(),
+            !state_manager.state_file("vm-test-cleanup").exists(),
             "state file should be removed after a failed prepare"
         );
         assert!(

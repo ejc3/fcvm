@@ -512,12 +512,13 @@ fn race_gym_only_run_owned_locks_make_a_pair_infeasible() {
         "snapshots/#.lock",
         "vm-disks/vm-#",
         "vm-#/snapshot.lock",
-        "state/vm-#.json.lock",
+        "state/vms/#/vm-#.json.lock",
+        "state/vms/a/vm-#.json.lock",
     ] {
         assert!(race_gym::run_owned_lock(owned), "{owned}");
     }
     for shared in [
-        "state/names.lock",
+        "state/sweep.lock",
         "state/loopback-ip.lock",
         "image-cache/#.lock",
         "rootfs/.rootfs-creation.lock",
