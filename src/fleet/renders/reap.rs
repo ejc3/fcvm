@@ -159,8 +159,9 @@ impl Reaper {
         );
         // SAFETY: both descriptors were just returned by pipe2 and are owned here alone.
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let read_fd = read.as_raw_fd();
         let mut cmd = std::process::Command::new(exe);
-        cmd.args(["fleet", "renders-reap", "--watch-fd", "3"])
+        cmd.args(["fleet", "renders-reap", "--watch-fd", &read_fd.to_string()])
             .args(["--run-dir".as_ref(), target.run_dir.as_os_str()])
             .args(["--snapshot-tag", &target.snapshot_tag])
             .args(["--deadline-ms", &target.deadline.as_millis().to_string()]);
@@ -173,16 +174,16 @@ impl Reaper {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
-        let read_fd = read.as_raw_fd();
-        // SAFETY: runs in the forked child before exec; setsid and dup2 are
-        // async-signal-safe. dup2 onto 3 clears close-on-exec for the copy.
+        // SAFETY: runs in the forked child before exec; setsid and fcntl are
+        // async-signal-safe. The reaper inherits the read end under its own number: only
+        // its close-on-exec flag is cleared, so no descriptor of the child is replaced.
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(move || {
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::dup2(read_fd, 3) < 0 {
+                if libc::fcntl(read_fd, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())

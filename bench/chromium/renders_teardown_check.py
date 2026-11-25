@@ -127,8 +127,16 @@ def one(opts, stage, signame):
     # snapshot's command runs, and at "running" the sides render, each for --after-s first.
     hold = [] if stage in UNHELD else ["--hold-at", stage]
     subprocess.run(opts.command + hold, check=True)
-    reached = wait_for(f"stage {stage}", lambda: (s := stage_now(opts.status)).get("stage") == stage and s,
-                       opts.timeout_s)
+    def at_stage():
+        now = stage_now(opts.status)
+        if now.get("stage") == stage:
+            return now
+        # A module that ended before the stage (a start that failed) is not waited for.
+        if now.get("stage", "").startswith("stopped") or unit_state(opts.unit) in ("failed", "inactive"):
+            raise RuntimeError(f"the module ended at {now.get('stage')!r} before stage {stage!r}; see the unit's journal")
+        return None
+
+    reached = wait_for(f"stage {stage}", at_stage, opts.timeout_s)
     cgroup = out(["systemctl", "show", "-p", "ControlGroup", "--value", opts.unit]).strip()
     if opts.after_s and stage in UNHELD:
         time.sleep(opts.after_s)
