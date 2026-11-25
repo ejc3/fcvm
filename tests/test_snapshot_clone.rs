@@ -3697,7 +3697,9 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
         "\nStep 3: Running clone with --snapshot {} (direct file mode)...",
         snapshot_name
     );
-    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+    // The clone's Firecracker logs at Info whatever the caller's environment says: the check
+    // below reads a line Firecracker writes at that level.
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_env(
         &[
             "snapshot",
             "run",
@@ -3706,7 +3708,7 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
             "--name",
             &clone_name,
         ],
-        &clone_name,
+        &[("FCVM_FIRECRACKER_LOG_LEVEL", "Info")],
     )
     .await
     .context("spawning clone from snapshot (direct mode)")?;
@@ -3715,6 +3717,30 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     println!("\nStep 4: Waiting for clone to become healthy...");
     common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
+
+    // On x86_64, Firecracker ends a snapshot load with a paravirtual kick for the runnable
+    // vCPUs (#2131) and says so in its log at Info, the level the clone was started with. A
+    // build without the fix logs nothing of the kind. The line shows the step ran. It does
+    // not show that a vCPU needed the kick (an idle guest's vCPUs are halted and get none)
+    // or that the host kernel kept it.
+    let clone_state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .load_state_by_pid(clone_pid)
+        .await
+        .context("loading the clone's state")?;
+    if cfg!(target_arch = "x86_64") && clone_state.config.hypervisor.is_firecracker() {
+        let vmm_log_path = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("firecracker.log");
+        let vmm_log = std::fs::read_to_string(&vmm_log_path)
+            .with_context(|| format!("reading {}", vmm_log_path.display()))?;
+        anyhow::ensure!(
+            vmm_log
+                .lines()
+                .any(|line| line.contains("restored vCPUs a paravirtual kick")),
+            "Firecracker's log at {} does not say the restore kicked the runnable vCPUs: the \
+             pinned build restores a snapshot without the kick",
+            vmm_log_path.display()
+        );
+        println!("  ✓ The restore ran its kick of the clone's runnable vCPUs");
+    }
 
     // Step 5: Verify clone works by executing a command
     println!("\nStep 5: Verifying clone works with exec...");
@@ -9620,4 +9646,613 @@ async fn a_file_clone_records_its_write_set_and_the_next_clone_populates_it() ->
     // The set and its claim live in the snapshot directory and go with the generation.
     anyhow::ensure!(!sidecar.exists(), "the write set outlived its snapshot");
     Ok(())
+}
+
+/// What a restoring clone's guest shows of its restore, one `key=value` per line: the
+/// snapshot gate's two chains, the socket manifest, the container's freeze, the boundary
+/// lock and the connections to the container's port 80.
+const RESTORE_PROGRESS_VIEW: &str = r#"rules=$(/usr/sbin/iptables -w -S)
+echo "ingress_rules=$(echo "$rules" | grep -c FCVM_SNAPSHOT_IN)"
+echo "egress_rules=$(echo "$rules" | grep -c FCVM_SNAPSHOT_OUT)"
+test -e /run/fcvm/snapshot-network.json && echo manifest=present || echo manifest=absent
+frozen=0
+for f in /sys/fs/cgroup/system.slice/fc-agent.service/libpod-payload-*/cgroup.freeze; do
+  [ "$(cat "$f")" = 1 ] && frozen=1
+done
+echo "container_frozen=$frozen"
+/usr/bin/flock -n /run/fcvm/snapshot-network.lock true && echo boundary_lock=free || echo boundary_lock=held
+echo "port_80_connections=$(/usr/bin/ss -Htn state established '( sport = :80 )' | wc -l)""#;
+
+/// [`RESTORE_PROGRESS_VIEW`] of the VM whose fcvm is `pid`.
+async fn restore_progress(pid: u32) -> Result<std::collections::BTreeMap<String, String>> {
+    let said = common::exec_in_vm(pid, &[RESTORE_PROGRESS_VIEW]).await?;
+    let view: std::collections::BTreeMap<String, String> = said
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.trim().to_string()))
+        .collect();
+    anyhow::ensure!(view.len() == 6, "the guest's view is incomplete: {said:?}");
+    Ok(view)
+}
+
+/// `fcvm snapshot create --pid <pid> --tag <tag> <extra>` to its end: its exit status and
+/// everything it printed.
+async fn snapshot_create_said(
+    pid: u32,
+    tag: &str,
+    extra: &[&str],
+) -> Result<(std::process::ExitStatus, String)> {
+    let output = tokio::process::Command::new(common::find_fcvm_binary()?)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            tag,
+        ])
+        .args(extra)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("running snapshot create")?;
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok((output.status, said))
+}
+
+/// The refusal `snapshot create` gives a clone whose restore is not acknowledged.
+const RESTORE_NOT_ACKNOWLEDGED: &str = "its restore has not been acknowledged";
+
+/// The guest hold every restore of the test's snapshot stops at: inside the boundary,
+/// before the restore reads its gate.
+const GATE_HOLD: &str = "restore.pre_gate_verify";
+
+/// Wait until `log` holds `marker`.
+async fn log_shows(log: &std::path::Path, marker: &str, limit: Duration) -> Result<()> {
+    let deadline = Instant::now() + limit;
+    while !std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .contains(marker)
+    {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "no {marker:?} in {} within {limit:?}",
+            log.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// `snapshot create` refuses a clone whose restore has not been acknowledged, leaves the
+/// refused clone as it was, and takes a clone from the moment `snapshot run` has printed
+/// its restored record (issue 2138). Three clones of one snapshot:
+///
+/// 1. The first is stopped at the guest hold `restore.pre_gate_verify`, a sleep the source
+///    booted with: the gate closed both ways, the socket manifest present, the container
+///    frozen, and a connection the source held still established. A create, a create with
+///    `--stop` and a create that waits one second are each refused; the guest shows the
+///    same state after them, the clone still runs, no snapshot exists, and a client
+///    outside is still refused. The test checks afterwards that the hold had not ended.
+/// 2. The same clone, in its restore hook, which waits for a file: egress open, ingress
+///    closed, the container running the hook. A create is refused and the hook is not
+///    frozen. A create given `--await-restore` waits, and takes its snapshot once the hook
+///    has been let go and the restore is acknowledged.
+/// 3. A clone whose hook fails, its fcvm held at the start of its teardown: its state says
+///    the restore failed, a create is refused with nothing sent to the guest, and a create
+///    that would wait a minute is refused at once.
+/// 4. A clone with no hook, its fcvm held between its restored record and its own checks of
+///    the clone (`restore.acked_pre_verify`): a create with no wait, issued when the record
+///    appears, is not refused and does not run yet. It waits for the owner, takes its
+///    snapshot once the owner has published the clone, and the clone goes on to healthy.
+///
+/// WHAT THE HOLD AT 1 IS NOT. It is inside the boundary, with the boundary lock held by
+/// the restore. The state in which main opened the gate is one step earlier: the restore
+/// has asked for the exec server and has not yet taken the lock. fc-agent has no failpoint
+/// there, and this change does not touch the file it would go in. Holding a restore there
+/// in a test takes a guest failpoint in `handle_clone_restore` (fc-agent/src/restore.rs)
+/// between the exec re-register request and `restore_snapshot_network`, listed in
+/// `failpoint::GUEST_POINTS`; a clone held at it would show `boundary_lock=free`, and on
+/// main a create of it exits 0 with the gate open. It was reproduced by hand with a FIFO
+/// in place of the guest's /etc/resolv.conf, which stops the restore where it reads that
+/// file. That read blocks a worker of the agent's runtime, and in 1 try of 9 the guest
+/// then answered no exec for 15 s, so the FIFO is not used here.
+///
+/// RED BEFORE THE FIX, on main at 1df89a80e. Held before the boundary lock (the FIFO), a
+/// create exited 0 in 0.2 s and left a snapshot; after it the guest had no gate rule and
+/// no manifest, its container was thawed, the source's connection was still established,
+/// and a client outside got HTTP 200 from a clone that `snapshot run` had not reported.
+/// At this test's hold a create ran its prepare one-shot in the guest and waited behind
+/// the restore's lock instead of being refused. A create during the hook froze the
+/// container the hook ran in, so the hook ran out its 60 s and the restore failed. With
+/// the check keyed on `lifecycle_ready`, which `snapshot run` writes after the record, the
+/// output handshake and the port check, the create at 4 was refused, and the state at 3
+/// still said `running`. With the owner holding no lock, the create at 4 ran at once, while
+/// the owner's port check was still to come: a pause longer than that check's 5 s fails it,
+/// and the owner then tears down the VM being saved.
+#[tokio::test]
+async fn a_snapshot_of_a_clone_is_refused_until_its_restore_is_acknowledged() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const BLOCKING_HOOK: &str = "touch /tmp/fcvm-hook-started; \
+         while [ ! -e /tmp/fcvm-hook-release ]; do sleep 0.1; done";
+    // How long a refusal may take. The refusal reads one state file; main's create waits
+    // behind the restore's lock for the rest of the hold and the hook.
+    const REFUSAL_LIMIT: Duration = Duration::from_secs(10);
+    let (vm_name, clone_name, snap_tag, clone_snap_tag) = common::unique_names("unacked");
+    let refused_tag = format!("{clone_snap_tag}-refused");
+    let failed_name = format!("{clone_name}-failed");
+    let reported_name = format!("{clone_name}-reported");
+    let reported_tag = format!("{clone_snap_tag}-reported");
+    let host_port = common::find_available_high_port().context("finding a host port")?;
+    let publish = format!("{host_port}:80");
+    let teardown_go = std::env::temp_dir().join(format!("{failed_name}-teardown-go"));
+    let _ = std::fs::remove_file(&teardown_go);
+    let publication_go = std::env::temp_dir().join(format!("{reported_name}-publication-go"));
+    let _ = std::fs::remove_file(&publication_go);
+    let reached = format!("FAILPOINT {GATE_HOLD} reached");
+    let released = format!("FAILPOINT {GATE_HOLD} released");
+
+    // The source cold-boots with the hold armed and without a pre-start snapshot, so only
+    // a restore of its snapshot reaches the hold.
+    let (mut source, source_pid, _) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--publish",
+            &publish,
+            "--health-check",
+            "http://localhost/",
+            common::TEST_IMAGE,
+        ],
+        &[
+            (
+                "FCVM_GUEST_FAILPOINT",
+                "restore.pre_gate_verify:sleep:20000",
+            ),
+            ("FCVM_NO_SNAPSHOT", "1"),
+        ],
+    )
+    .await
+    .context("spawning the source VM")?;
+    let prepared: Result<()> = async {
+        common::poll_health(&mut source, 300).await?;
+        // A connection the source holds when it is snapshotted: one request answered,
+        // kept alive.
+        let source_ip = common::get_loopback_ip(source_pid).await?;
+        let mut held = tokio::net::TcpStream::connect((source_ip.as_str(), host_port))
+            .await
+            .context("connecting to the source's published port")?;
+        held.write_all(b"GET / HTTP/1.1\r\nHost: source\r\n\r\n")
+            .await?;
+        let mut answer = [0u8; 64];
+        let read = held.read(&mut answer).await?;
+        anyhow::ensure!(
+            answer[..read].starts_with(b"HTTP/1.1 200"),
+            "the source did not answer on its published port"
+        );
+        let view = restore_progress(source_pid).await?;
+        anyhow::ensure!(
+            view["port_80_connections"] != "0",
+            "the source's guest shows no connection to port 80: {view:?}"
+        );
+        common::create_snapshot_by_pid(source_pid, &snap_tag).await
+    }
+    .await;
+    common::kill_process(source_pid).await;
+    let _ = source.wait().await;
+
+    let checked: Result<()> = async {
+        prepared?;
+        let state_manager = fcvm::state::StateManager::new(fcvm::paths::state_dir());
+
+        // 1 and 2. A restore held in its boundary, and then in its hook.
+        let a_held_restore = async {
+            let (mut clone, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--snapshot",
+                    &snap_tag,
+                    "--name",
+                    &clone_name,
+                    "--on-restore",
+                    BLOCKING_HOOK,
+                ],
+                &[],
+            )
+            .await
+            .context("spawning the clone")?;
+            let on_clone: Result<()> = async {
+                // 1. At the hold inside the boundary. The exec server comes back early in the
+                // restore; retry until it answers.
+                log_shows(&clone_log, &reached, Duration::from_secs(120)).await?;
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let held = loop {
+                    match restore_progress(clone_pid).await {
+                        Ok(view) => break view,
+                        Err(error) => anyhow::ensure!(
+                            Instant::now() < deadline,
+                            "the restoring clone answered no exec: {error:#}"
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                };
+                let clone_ip = common::get_loopback_ip(clone_pid).await?;
+                let answers =
+                    || async { common::curl_check(&clone_ip, host_port, 3).await.success };
+                anyhow::ensure!(
+                    held["ingress_rules"] != "0"
+                        && held["egress_rules"] != "0"
+                        && held["manifest"] == "present"
+                        && held["container_frozen"] == "1"
+                        && held["port_80_connections"] != "0",
+                    "the restore is not held with its gate closed, so nothing below is tested: \
+                 {held:?}"
+                );
+                let state = state_manager.load_state_by_pid(clone_pid).await?;
+                anyhow::ensure!(
+                    !state.restore_acknowledged && !state.lifecycle_ready,
+                    "the held clone's restore is already recorded as acknowledged"
+                );
+                anyhow::ensure!(!answers().await, "a held clone answered a client outside");
+
+                let refused = tokio::time::timeout(
+                    REFUSAL_LIMIT,
+                    snapshot_create_said(clone_pid, &refused_tag, &[]),
+                )
+                .await;
+                let (status, said) = match refused {
+                    Ok(outcome) => outcome?,
+                    Err(_) => anyhow::bail!(
+                        "snapshot create of a clone held in its restore was not refused: it had \
+                     not returned after {REFUSAL_LIMIT:?}. The guest then: {:?}",
+                        restore_progress(clone_pid).await
+                    ),
+                };
+                anyhow::ensure!(
+                    !status.success() && said.contains(RESTORE_NOT_ACKNOWLEDGED),
+                    "snapshot create of a clone held in its restore was not refused ({status}). \
+                 It left a snapshot: {}. The guest before: {held:?}; after: {:?}. It said:\n{said}",
+                    common::snapshot_exists(&refused_tag),
+                    restore_progress(clone_pid).await
+                );
+
+                let (status, said) =
+                    snapshot_create_said(clone_pid, &refused_tag, &["--stop"]).await?;
+                anyhow::ensure!(
+                    !status.success() && said.contains(RESTORE_NOT_ACKNOWLEDGED),
+                    "snapshot create --stop of the held clone was not refused ({status}):\n{said}"
+                );
+                anyhow::ensure!(
+                    clone.try_wait()?.is_none(),
+                    "the refused snapshot create --stop stopped the clone"
+                );
+
+                let waited = Instant::now();
+                let (status, said) =
+                    snapshot_create_said(clone_pid, &refused_tag, &["--await-restore", "1"])
+                        .await?;
+                anyhow::ensure!(
+                    !status.success()
+                        && said.contains(RESTORE_NOT_ACKNOWLEDGED)
+                        && said.contains("within the 1 s of --await-restore")
+                        && waited.elapsed() >= Duration::from_secs(1),
+                    "a one second wait for the held restore did not end in the refusal \
+                 ({status}, {:?}):\n{said}",
+                    waited.elapsed()
+                );
+                anyhow::ensure!(
+                    restore_progress(clone_pid).await? == held && !answers().await,
+                    "the refused creates changed the clone"
+                );
+                anyhow::ensure!(
+                    !common::snapshot_exists(&refused_tag),
+                    "a refused create left a snapshot"
+                );
+                anyhow::ensure!(
+                    !std::fs::read_to_string(&clone_log)
+                        .unwrap_or_default()
+                        .contains(&released),
+                    "the hold ended before the creates were refused, so they were not tested in it"
+                );
+
+                // 2. In the restore hook, which starts once the hold has ended and the restore
+                // has opened egress.
+                log_shows(&clone_log, &released, Duration::from_secs(60)).await?;
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while common::exec_in_container(clone_pid, &["test -e /tmp/fcvm-hook-started"])
+                    .await
+                    .is_err()
+                {
+                    anyhow::ensure!(
+                        clone.try_wait()?.is_none(),
+                        "the clone exited before its restore hook started"
+                    );
+                    anyhow::ensure!(Instant::now() < deadline, "the restore hook never started");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let in_hook = restore_progress(clone_pid).await?;
+                anyhow::ensure!(
+                    in_hook["ingress_rules"] != "0"
+                        && in_hook["egress_rules"] == "0"
+                        && in_hook["container_frozen"] == "0"
+                        && in_hook["boundary_lock"] == "held",
+                    "the restore is not in its hook with only ingress closed: {in_hook:?}"
+                );
+                let (status, said) = snapshot_create_said(clone_pid, &refused_tag, &[]).await?;
+                anyhow::ensure!(
+                    !status.success() && said.contains(RESTORE_NOT_ACKNOWLEDGED),
+                    "snapshot create during the restore hook was not refused ({status}):\n{said}"
+                );
+                anyhow::ensure!(
+                    restore_progress(clone_pid).await? == in_hook && !answers().await,
+                    "the create refused during the hook changed the clone"
+                );
+
+                // A create that waits takes its snapshot once the restore is acknowledged.
+                let mut waiting = tokio::process::Command::new(common::find_fcvm_binary()?)
+                    .args(["snapshot", "create", "--pid", &clone_pid.to_string()])
+                    .args(["--tag", &clone_snap_tag, "--await-restore", "180"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .context("spawning the waiting snapshot create")?;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                anyhow::ensure!(
+                    waiting.try_wait()?.is_none() && !common::snapshot_exists(&clone_snap_tag),
+                    "a create given --await-restore did not wait for the restore"
+                );
+                // The waiting create pauses the VM within milliseconds of the hook's end, and
+                // the pause can drop this exec's answer on its way back. What shows that the
+                // hook was let go is the restore going on, so the answer is kept only to explain
+                // a failure.
+                let let_go =
+                    common::exec_in_container(clone_pid, &["touch /tmp/fcvm-hook-release"]).await;
+                let status = tokio::time::timeout(Duration::from_secs(240), waiting.wait())
+                    .await
+                    .with_context(|| {
+                        format!(
+                        "the waiting snapshot create did not end; the hook's release: {let_go:?}"
+                    )
+                    })??;
+                anyhow::ensure!(
+                    status.success() && common::snapshot_exists(&clone_snap_tag),
+                    "the create that waited for the restore did not take its snapshot ({status}); \
+                 the hook's release: {let_go:?}"
+                );
+                common::poll_health(&mut clone, 180).await?;
+                let state = state_manager.load_state_by_pid(clone_pid).await?;
+                anyhow::ensure!(
+                    state.restore_acknowledged && state.lifecycle_ready,
+                    "the healthy clone's state does not say its restore was acknowledged"
+                );
+                let published = restore_progress(clone_pid).await?;
+                anyhow::ensure!(
+                    published["ingress_rules"] == "0" && published["egress_rules"] == "0",
+                    "the acknowledged clone still has a gate: {published:?}"
+                );
+                anyhow::ensure!(
+                    answers().await,
+                    "the acknowledged clone does not answer a client outside"
+                );
+                Ok(())
+            }
+            .await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            on_clone
+        };
+
+        // 3. A restore that failed: the clone's fcvm is held as its teardown starts, with
+        // the clone's state still on disk.
+        let a_failed_restore = async {
+            let hold = format!(
+                "teardown.pre_kill:block_until_file:{}",
+                teardown_go.display()
+            );
+            let (mut failed, failed_pid, failed_log) = common::spawn_fcvm_with_env_and_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--snapshot",
+                    &snap_tag,
+                    "--name",
+                    &failed_name,
+                    "--on-restore",
+                    "exit 7",
+                ],
+                &[("FCVM_FAILPOINT", hold.as_str())],
+            )
+            .await
+            .context("spawning the clone whose restore fails")?;
+            let on_failed: Result<()> = async {
+                log_shows(
+                    &failed_log,
+                    "FAILPOINT teardown.pre_kill reached",
+                    Duration::from_secs(180),
+                )
+                .await?;
+                let state = state_manager.load_state_by_pid(failed_pid).await?;
+                anyhow::ensure!(
+                    matches!(state.status, fcvm::state::VmStatus::Failed)
+                        && !state.restore_acknowledged,
+                    "the state of a clone whose restore failed does not say so: status {:?}, \
+                     restore_acknowledged {}",
+                    state.status,
+                    state.restore_acknowledged
+                );
+                let (status, said) = snapshot_create_said(failed_pid, &refused_tag, &[]).await?;
+                anyhow::ensure!(
+                    !status.success()
+                        && said.contains("its restore failed")
+                        && !said.contains("preparing guest network"),
+                    "snapshot create of a clone whose restore failed was not refused before \
+                     it reached for the guest ({status}):\n{said}"
+                );
+                let asked = Instant::now();
+                let (status, said) =
+                    snapshot_create_said(failed_pid, &refused_tag, &["--await-restore", "60"])
+                        .await?;
+                anyhow::ensure!(
+                    !status.success()
+                        && said.contains("the VM's restore failed")
+                        && asked.elapsed() < Duration::from_secs(30),
+                    "a create waiting for a restore that had failed was not refused at once \
+                     ({status}, {:?}):\n{said}",
+                    asked.elapsed()
+                );
+                anyhow::ensure!(
+                    !common::snapshot_exists(&refused_tag),
+                    "a create of a failed clone left a snapshot"
+                );
+                Ok(())
+            }
+            .await;
+            std::fs::write(&teardown_go, b"")?;
+            let status = tokio::time::timeout(Duration::from_secs(60), failed.wait()).await;
+            common::kill_process(failed_pid).await;
+            on_failed?;
+            anyhow::ensure!(
+                !status
+                    .context("the failed clone's fcvm did not exit")??
+                    .success(),
+                "a clone whose restore hook exited 7 ran to a clean exit"
+            );
+            anyhow::Ok(())
+        };
+
+        // 4. The rule a caller can follow: the restored record is printed, so a create
+        // with no wait is taken. The clone's owner is held between the record and its own
+        // checks of the clone (the output handshake, the port check), and the create waits
+        // for it instead of pausing the guest under those checks.
+        let a_reported_restore = async {
+            let hold = format!(
+                "restore.acked_pre_verify:block_until_file:{}",
+                publication_go.display()
+            );
+            let (mut reported, reported_pid, reported_log) =
+                common::spawn_fcvm_with_env_and_log_path(
+                    &[
+                        "snapshot",
+                        "run",
+                        "--snapshot",
+                        &snap_tag,
+                        "--name",
+                        &reported_name,
+                    ],
+                    &[("FCVM_FAILPOINT", hold.as_str())],
+                )
+                .await
+                .context("spawning the clone that is snapshotted when it is reported")?;
+            let on_reported: Result<()> = async {
+                let deadline = Instant::now() + Duration::from_secs(180);
+                while !std::fs::read_to_string(&reported_log)
+                    .unwrap_or_default()
+                    .contains("\"status\":\"restored\"")
+                {
+                    anyhow::ensure!(
+                        reported.try_wait()?.is_none(),
+                        "the clone exited before it printed its restored record"
+                    );
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "no restored record in {}",
+                        reported_log.display()
+                    );
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                let mut create = tokio::process::Command::new(common::find_fcvm_binary()?)
+                    .args(["snapshot", "create", "--pid", &reported_pid.to_string()])
+                    .args(["--tag", &reported_tag])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .context("spawning snapshot create at the restored record")?;
+                // The owner is held, so its checks of the clone are still to come: a create
+                // that ran now would pause the guest under them.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let state = state_manager.load_state_by_pid(reported_pid).await?;
+                anyhow::ensure!(
+                    state.restore_acknowledged && !state.lifecycle_ready,
+                    "the owner is not held between the acknowledgement and its publication: \
+                     restore_acknowledged {}, lifecycle_ready {}",
+                    state.restore_acknowledged,
+                    state.lifecycle_ready
+                );
+                if let Some(status) = create.try_wait()? {
+                    anyhow::bail!(
+                        "snapshot create of a clone whose restored record was printed did \
+                         not wait for the clone's owner: it ended ({status}, a snapshot \
+                         left: {}) while the owner was still between the acknowledgement \
+                         and its port check, which is where a snapshot's pause fails that \
+                         check",
+                        common::snapshot_exists(&reported_tag)
+                    );
+                }
+                anyhow::ensure!(
+                    !common::snapshot_exists(&reported_tag),
+                    "a snapshot exists while the create still waits"
+                );
+                // Let the owner go on: it publishes, and the create is taken.
+                std::fs::write(&publication_go, b"")?;
+                let output =
+                    tokio::time::timeout(Duration::from_secs(240), create.wait_with_output())
+                        .await
+                        .context("the create that waited for the clone's owner did not end")??;
+                anyhow::ensure!(
+                    output.status.success() && common::snapshot_exists(&reported_tag),
+                    "snapshot create of a clone whose restored record was printed was not \
+                     taken ({}):\n{}{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                anyhow::ensure!(
+                    state_manager
+                        .load_state_by_pid(reported_pid)
+                        .await?
+                        .lifecycle_ready,
+                    "the create ended before the clone's owner had published it"
+                );
+                common::poll_health(&mut reported, 180).await
+            }
+            .await;
+            let _ = std::fs::write(&publication_go, b"");
+            common::kill_process(reported_pid).await;
+            let _ = reported.wait().await;
+            on_reported
+        };
+
+        // The three clones run side by side, and every one that fails is reported.
+        let (held, failed, reported) =
+            tokio::join!(a_held_restore, a_failed_restore, a_reported_restore);
+        let failures: Vec<String> = [
+            ("the held restore", held),
+            ("the failed restore", failed),
+            ("the reported restore", reported),
+        ]
+        .into_iter()
+        .filter_map(|(which, outcome)| outcome.err().map(|error| format!("{which}: {error:#}")))
+        .collect();
+        anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n\n"));
+        Ok(())
+    }
+    .await;
+    let _ = std::fs::remove_file(&teardown_go);
+    let _ = std::fs::remove_file(&publication_go);
+    for tag in [&snap_tag, &clone_snap_tag, &refused_tag, &reported_tag] {
+        let _ = common::delete_snapshot(tag).await;
+    }
+    checked
 }

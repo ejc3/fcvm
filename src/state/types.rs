@@ -47,6 +47,18 @@ pub struct VmState {
     /// racing the earlier PID/state write performed during setup.
     #[serde(default)]
     pub lifecycle_ready: bool,
+    /// For a VM restored from a memory snapshot: its guest has acknowledged this restore.
+    /// The guest acknowledges after it has retired the snapshot's connections, run the
+    /// restore hook and opened its network gate. The owning fcvm writes this under the
+    /// state lock when it has the acknowledgement, before it prints the restored record,
+    /// and `snapshot create` refuses a restored VM without it
+    /// (`commands::common::ensure_restore_acknowledged`). Never written for a VM that was
+    /// booted, for a raw guest's clone (it has no agent; `lifecycle_ready` admits it), for a
+    /// restore that failed, or for `podman prepare`'s disposable VM. Once
+    /// true it stays true: `StateManager` keeps it through every later write of this
+    /// process's state. Absent from a state file while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restore_acknowledged: bool,
     /// Namespace holder PID for rootless networking (used for nsenter health checks)
     #[serde(default)]
     pub holder_pid: Option<u32>,
@@ -435,6 +447,7 @@ impl VmState {
             pid: None,
             pid_start_time: None,
             lifecycle_ready: false,
+            restore_acknowledged: false,
             holder_pid: None,
             netpool: None,
             confinement: None,

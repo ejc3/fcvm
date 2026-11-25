@@ -32,6 +32,7 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
             windows_actions: Vec::new(),
             minecraft: 0,
             minecraft_server: None,
+            renders: None,
         },
     }
 }
@@ -351,6 +352,7 @@ fn a_host_that_comes_up_after_the_fleet_is_awake_still_records_its_wake() {
             windows_actions: Vec::new(),
             minecraft: 0,
             minecraft_server: None,
+            renders: None,
         },
     }];
     later.push(running(240000, "h1", "slot-1"));
@@ -724,6 +726,7 @@ fn phone_gpus_take_no_place_on_the_wall() {
                 windows_actions: Vec::new(),
                 minecraft: 0,
                 minecraft_server: None,
+                renders: None,
             },
         },
     );
@@ -2165,6 +2168,7 @@ fn phone_host(at: u64) -> Event {
             windows_actions: Vec::new(),
             minecraft: 0,
             minecraft_server: None,
+            renders: None,
         },
     }
 }

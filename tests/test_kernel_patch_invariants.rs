@@ -572,6 +572,99 @@ fn kernel_patch_resolves_a_host_kernel_profile_from_its_own_table() {
     );
 }
 
+/// A value in rootfs-config.toml can be followed by a comment on its line.
+/// `kernel-patch.sh` took the comment for part of the value: for a `patches_dir` it then
+/// looked in a directory that does not exist, `create` set up a tree with none of the
+/// profile's patches applied, and `finish` could not write the new patch.
+#[test]
+fn kernel_patch_reads_a_value_that_a_comment_follows() {
+    let root = tempfile::tempdir().expect("create the fixture checkout");
+    fs::create_dir_all(root.path().join("scripts")).unwrap();
+    let script = root.path().join("scripts/kernel-patch.sh");
+    fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/kernel-patch.sh"),
+        &script,
+    )
+    .expect("copy kernel-patch.sh");
+    fs::write(
+        root.path().join("rootfs-config.toml"),
+        "[kernel_profiles.nested.amd64]\n\
+         kernel_version = \"6.18.60\"  # the guest's release\n\
+         patches_dir = \"kernel/patches-x86\"  # FUSE and \"KVM\" patches\n",
+    )
+    .unwrap();
+    let out = Command::new("bash")
+        .arg(&script)
+        .args(["resolve", "nested"])
+        .env("KERNEL_PATCH_ARCH", "x86_64")
+        .output()
+        .expect("run kernel-patch.sh resolve");
+    assert!(out.status.success(), "{}", output_text(&out));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!(
+            "version=6.18.60\npatches_dir={}/kernel/patches-x86\n",
+            root.path().display()
+        )
+    );
+}
+
+/// `kernel-patch.sh` reads `kernel_version` and `patches_dir` as `key = "value"` with an
+/// optional comment after it. A TOML literal string, or a value with an escaped quote, is a
+/// line it cannot read: it must stop and name the line, not go on with a wrong directory.
+#[test]
+fn kernel_patch_refuses_a_value_it_cannot_parse() {
+    for (line, key) in [
+        ("patches_dir = 'kernel/patches-x86'", "patches_dir"),
+        (
+            "patches_dir = \"kernel/patches-\\\"x86\\\"\"",
+            "patches_dir",
+        ),
+        (
+            "patches_dir = \"kernel/patches-x86\" trailing",
+            "patches_dir",
+        ),
+        ("kernel_version = '6.18.60'", "kernel_version"),
+    ] {
+        let root = tempfile::tempdir().expect("create the fixture checkout");
+        fs::create_dir_all(root.path().join("scripts")).unwrap();
+        let script = root.path().join("scripts/kernel-patch.sh");
+        fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/kernel-patch.sh"),
+            &script,
+        )
+        .expect("copy kernel-patch.sh");
+        let mut table = String::from("[kernel_profiles.nested.amd64]\n");
+        if key != "kernel_version" {
+            table.push_str("kernel_version = \"6.18.60\"\n");
+        }
+        table.push_str(line);
+        table.push('\n');
+        if key != "patches_dir" {
+            table.push_str("patches_dir = \"kernel/patches-x86\"\n");
+        }
+        fs::write(root.path().join("rootfs-config.toml"), table).unwrap();
+        let out = Command::new("bash")
+            .arg(&script)
+            .args(["resolve", "nested"])
+            .env("KERNEL_PATCH_ARCH", "x86_64")
+            .output()
+            .expect("run kernel-patch.sh resolve");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains(line),
+            "resolve took `{line}`: status {:?}\n{}",
+            out.status.code(),
+            output_text(&out)
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("patches_dir="),
+            "resolve printed a patches_dir for `{line}`: {}",
+            output_text(&out)
+        );
+    }
+}
+
 /// A checkout with `scripts/kernel-patch.sh`, a host kernel profile pinning release 9.9.9
 /// with five patches to one 30-line file, and a work directory holding that release's
 /// source, already extracted, so the script downloads nothing. In glob order `0001-first`,
@@ -939,34 +1032,246 @@ const PV_KICK_FILES: [&str; 2] = ["arch/x86/kvm/x86.c", "arch/x86/kvm/x86.h"];
 
 const PV_KICK_PATCH: &str = "0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch";
 
-/// The x86_64 host kernel's release, its PV kick patch and the fixture cut from that release.
-fn pv_kick_port() -> (String, PathBuf, PathBuf) {
-    host_kernel_port_of("amd64", PV_KICK_PATCH, "kvm-pv-kick")
+/// One x86_64 kernel that fcvm builds with KVM in it, from a release whose
+/// `kvm_arch_async_page_present()` clears a pending PV kick (Linux 6.15 and later).
+struct KvmKernel {
+    /// Its table in rootfs-config.toml, e.g. `kernel_profiles.nested.amd64.host_kernel`.
+    table: String,
+    release: String,
+    /// The table's `patches_dir`: empty when it names none.
+    patches_dir: String,
+    build_inputs: Vec<String>,
+    /// A host kernel's build skips `*.vm.patch`.
+    host: bool,
 }
 
-#[test]
-fn the_pv_kick_fixture_is_cut_from_the_pinned_x86_host_kernel() {
-    let (release, _, fixture) = pv_kick_port();
-    for file in PV_KICK_FILES {
-        let text = fs::read_to_string(fixture.join(file)).unwrap_or_else(|e| {
-            panic!(
-                "the x86_64 host pins Linux {release}, and {} has no {file} excerpt: {e}",
-                fixture.display()
-            )
-        });
-        assert!(
-            text.contains(&format!("Linux v{release} {file}")),
-            "{}/{file} is not cut from Linux {release}, which the x86_64 host kernel pins. \
-             Cut the same functions again from that release and record its SHA-256 in the \
-             header.",
-            fixture.display()
-        );
+impl KvmKernel {
+    /// The patch of this kernel's patch set that makes `kvm_arch_async_page_present()` set the
+    /// run state directly, which is what keeps the kick. Found by what it changes, so each
+    /// release can carry its own port under its own number.
+    fn pv_kick_patch(&self, root: &Path) -> Option<PathBuf> {
+        if self.patches_dir.is_empty() {
+            return None;
+        }
+        let mut patches: Vec<PathBuf> = fs::read_dir(root.join(&self.patches_dir))
+            .unwrap_or_else(|e| panic!("[{}] read {}: {e}", self.table, self.patches_dir))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "patch"))
+            .filter(|path| !(self.host && path.to_string_lossy().ends_with(".vm.patch")))
+            .collect();
+        patches.sort();
+        patches.into_iter().find(|path| {
+            let text =
+                fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            text.contains("--- a/arch/x86/kvm/x86.c")
+                && text.contains("void kvm_arch_async_page_present(")
+                && text.contains("-\tkvm_set_mp_state(vcpu, KVM_MP_STATE_RUNNABLE);")
+                && text.contains("+\tvcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;")
+        })
+    }
+
+    /// `tests/fixtures/kvm-pv-kick-<major>.<minor>`, the excerpts cut from this release.
+    fn fixture(&self, root: &Path) -> PathBuf {
+        let series = self
+            .release
+            .splitn(3, '.')
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(".");
+        root.join(format!("tests/fixtures/kvm-pv-kick-{series}"))
     }
 }
 
-/// Run the x86_64 host kernel's `kvm_arch_async_page_present()` and `kvm_set_mp_state()`,
-/// with its own PV kick patch applied, in a C harness that models the vCPU state they
-/// touch (fcvm #2125).
+/// The (major, minor) of a kernel release written as `<major>.<minor>` or
+/// `<major>.<minor>.<patch>`, every part in digits. None for anything else (`6.15-rc1`,
+/// `v6.18.60`, `6`), which cannot be ordered against 6.15.
+fn release_series(release: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = release.split('.').collect();
+    if !(2..=3).contains(&parts.len()) {
+        return None;
+    }
+    let numbers: Vec<u32> = parts
+        .iter()
+        .map(|part| {
+            (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| part.parse().ok())
+                .flatten()
+        })
+        .collect::<Option<_>>()?;
+    Some((numbers[0], numbers[1]))
+}
+
+#[test]
+fn a_kernel_release_is_ordered_only_when_every_part_is_a_number() {
+    assert_eq!(release_series("6.18.60"), Some((6, 18)));
+    assert_eq!(release_series("7.3"), Some((7, 3)));
+    assert_eq!(release_series("6.14.11"), Some((6, 14)));
+    for refused in [
+        "6.15-rc1",
+        "v6.18.60",
+        "6.18.x",
+        "6",
+        "6.18.60.1",
+        "6..60",
+        "",
+        "+6.18",
+    ] {
+        assert_eq!(release_series(refused), None, "{refused:?}");
+    }
+}
+
+/// Every x86_64 kernel in rootfs-config.toml that builds KVM on Linux 6.15 or later: a host
+/// kernel, which exists to run VMs, and a guest kernel whose `kernel_config` sets
+/// `CONFIG_KVM`. A VM restored under such a kernel loses the kick its restore gave it,
+/// unless the kernel carries the patch (fcvm #2132), and so does any VM whose own kick
+/// meets a page-ready completion (fcvm #2125).
+fn x86_kernels_that_build_kvm() -> Vec<KvmKernel> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config: toml::Value = toml::from_str(
+        &fs::read_to_string(root.join("rootfs-config.toml")).expect("read rootfs-config.toml"),
+    )
+    .expect("parse rootfs-config.toml");
+
+    let mut kernels = Vec::new();
+    for (name, arches) in config["kernel_profiles"]
+        .as_table()
+        .expect("[kernel_profiles] is a table")
+    {
+        let Some(guest) = arches.get("amd64") else {
+            continue;
+        };
+        let guest_table = format!("kernel_profiles.{name}.amd64");
+        let guest_builds_kvm = {
+            let kernel_config = guest["kernel_config"]
+                .as_str()
+                .unwrap_or_else(|| panic!("[{guest_table}] names no kernel_config"));
+            fs::read_to_string(root.join(kernel_config))
+                .unwrap_or_else(|e| panic!("[{guest_table}] read {kernel_config}: {e}"))
+                .lines()
+                .any(|line| matches!(line.trim(), "CONFIG_KVM=y" | "CONFIG_KVM=m"))
+        };
+        let tables = [
+            guest_builds_kvm.then(|| (guest_table.clone(), guest, false)),
+            guest
+                .get("host_kernel")
+                .map(|host| (format!("{guest_table}.host_kernel"), host, true)),
+        ];
+        for (table, kernel, host) in tables.into_iter().flatten() {
+            let release = kernel["kernel_version"]
+                .as_str()
+                .unwrap_or_else(|| panic!("[{table}] pins no kernel_version"))
+                .to_string();
+            let series = release_series(&release).unwrap_or_else(|| {
+                panic!(
+                    "[{table}] kernel_version {release:?} is not <major>.<minor> or \
+                     <major>.<minor>.<patch> in digits, so it cannot be compared with 6.15"
+                )
+            });
+            if series < (6, 15) {
+                continue;
+            }
+            kernels.push(KvmKernel {
+                table,
+                release,
+                // A table that names no patches_dir is read as applying none. The build
+                // applies kernel/patches for such a table, so a kernel that got the patch
+                // from there would fail these tests though it carries it: a false alarm,
+                // answered by naming the directory in the table.
+                patches_dir: kernel
+                    .get("patches_dir")
+                    .and_then(|dir| dir.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                build_inputs: kernel
+                    .get("build_inputs")
+                    .and_then(|inputs| inputs.as_array())
+                    .into_iter()
+                    .flatten()
+                    .map(|input| input.as_str().unwrap().to_string())
+                    .collect(),
+                host,
+            });
+        }
+    }
+    assert!(
+        kernels.iter().any(|kernel| kernel.host) && kernels.iter().any(|kernel| !kernel.host),
+        "rootfs-config.toml should hold an x86_64 host kernel and a guest kernel that runs KVM, \
+         both on Linux 6.15 or later; found {:?}",
+        kernels.iter().map(|k| &k.table).collect::<Vec<_>>()
+    );
+    kernels
+}
+
+/// Every x86_64 kernel that builds KVM on Linux 6.15 or later applies the PV kick patch, and
+/// the patch is part of what names the kernel. The host kernel got it first (#2130). The
+/// guest kernels that run KVM themselves need it for the VMs restored inside them: the
+/// Firecracker they run gives a restored vCPU its kick, and their own
+/// `kvm_arch_async_page_present()` cleared it on the vCPU's first entry (#2132).
+#[test]
+fn every_x86_kernel_that_builds_kvm_carries_the_pv_kick_patch() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut missing = Vec::new();
+    for kernel in x86_kernels_that_build_kvm() {
+        let Some(patch) = kernel.pv_kick_patch(&root) else {
+            missing.push(format!(
+                "[{}] builds KVM on Linux {} and its patches_dir {:?} holds no patch that makes \
+                 kvm_arch_async_page_present() set mp_state directly",
+                kernel.table, kernel.release, kernel.patches_dir
+            ));
+            continue;
+        };
+        let name = patch.file_name().unwrap().to_string_lossy().to_string();
+        let covered = kernel.build_inputs.iter().any(|input| {
+            *input == format!("{}/*.patch", kernel.patches_dir)
+                || *input == format!("{}/{name}", kernel.patches_dir)
+        });
+        if !covered {
+            missing.push(format!(
+                "[{}] build_inputs {:?} do not cover {}/{name}, so the patch would not change \
+                 the kernel's content hash and no new kernel would be built",
+                kernel.table, kernel.build_inputs, kernel.patches_dir
+            ));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "a VM restored under these kernels loses its restore kick (#2132), and any VM under \
+         them can lose a spinlock kick to a page-ready completion (#2125). Port \
+         kernel/patches-x86-host/{PV_KICK_PATCH} to the release with scripts/kernel-patch.sh, \
+         or link it into the patch set when the release is the host's:\n{}",
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn the_pv_kick_fixtures_are_cut_from_the_pinned_x86_kernels() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for kernel in x86_kernels_that_build_kvm() {
+        let fixture = kernel.fixture(&root);
+        for file in PV_KICK_FILES {
+            let text = fs::read_to_string(fixture.join(file)).unwrap_or_else(|e| {
+                panic!(
+                    "[{}] pins Linux {}, and {} has no {file} excerpt: {e}",
+                    kernel.table,
+                    kernel.release,
+                    fixture.display()
+                )
+            });
+            assert!(
+                text.contains(&format!("Linux v{} {file}", kernel.release)),
+                "{}/{file} is not cut from Linux {}, which [{}] pins. Cut the same functions \
+                 again from that release and record its SHA-256 in the header.",
+                fixture.display(),
+                kernel.release,
+                kernel.table
+            );
+        }
+    }
+}
+
+/// Run `kvm_arch_async_page_present()` and `kvm_set_mp_state()` of every x86_64 kernel that
+/// builds KVM, each from its own release with its own PV kick patch applied, in a C harness
+/// that models the vCPU state they touch (fcvm #2125).
 ///
 /// A PV spinlock waiter checks the lock and then executes HLT, with interrupts off when the
 /// lock is taken from interrupt context. A kick (`KVM_HC_KICK_CPU`) that arrives between the
@@ -981,68 +1286,72 @@ fn the_pv_kick_fixture_is_cut_from_the_pinned_x86_host_kernel() {
 /// its page, or that stops `kvm_set_mp_state()` consuming the kick for its other callers.
 #[test]
 fn a_page_ready_completion_keeps_a_pending_pv_kick() {
-    let (release, patch, fixture) = pv_kick_port();
-    let temp = tempfile::tempdir().expect("create the PV kick fixture directory");
-    for file in PV_KICK_FILES {
-        let dest = temp.path().join(file);
-        fs::create_dir_all(dest.parent().unwrap()).unwrap();
-        fs::copy(fixture.join(file), &dest)
-            .unwrap_or_else(|e| panic!("copy the {file} excerpt: {e}"));
-    }
-
-    // Without the patch, run the release's own functions and fail on what they do.
-    let patched = patch.exists();
-    if patched {
-        let applied = Command::new("patch")
-            .args(["--batch", "--forward", "--fuzz=0", "-p1", "-i"])
-            .arg(&patch)
-            .current_dir(temp.path())
-            .output()
-            .expect("run patch");
-        assert!(
-            applied.status.success(),
-            "{} does not apply to the {release} excerpts:\n{}{}",
-            patch.display(),
-            String::from_utf8_lossy(&applied.stdout),
-            String::from_utf8_lossy(&applied.stderr)
-        );
-    }
-
-    let read = |file: &str| fs::read_to_string(temp.path().join(file)).unwrap();
-    let mut extracted = String::new();
-    for (file, start) in [
-        (PV_KICK_FILES[1], "static inline void kvm_set_mp_state("),
-        (PV_KICK_FILES[0], "void kvm_arch_async_page_present("),
-    ] {
-        extracted.push_str(
-            &extract_block(&read(file), start, "}")
-                .unwrap_or_else(|| panic!("`{start}` is missing from the {release} excerpts")),
-        );
-    }
-    fs::write(temp.path().join("extracted.c"), extracted).unwrap();
-    fs::copy(fixture.join("harness.c"), temp.path().join("harness.c")).unwrap();
-
-    let harness = SanitizedHarness::build(
-        &temp.path().join("harness.c"),
-        &["-g", "-Wall", "-Werror"],
-        &format!("the {release} PV kick harness"),
-    );
-
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut failures = Vec::new();
-    for scenario in ["kick", "wake", "helper"] {
-        let result = harness.run(&[scenario]);
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            let first: Vec<&str> = stderr.lines().take(3).collect();
-            failures.push(format!("{scenario}: {}", first.join("\n  ")));
+    for kernel in x86_kernels_that_build_kvm() {
+        let (release, fixture) = (&kernel.release, kernel.fixture(&root));
+        let temp = tempfile::tempdir().expect("create the PV kick fixture directory");
+        for file in PV_KICK_FILES {
+            let dest = temp.path().join(file);
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::copy(fixture.join(file), &dest)
+                .unwrap_or_else(|e| panic!("[{}] copy the {file} excerpt: {e}", kernel.table));
+        }
+
+        // Without the patch, run the release's own functions and fail on what they do.
+        let patch = kernel.pv_kick_patch(&root);
+        if let Some(patch) = &patch {
+            let applied = Command::new("patch")
+                .args(["--batch", "--forward", "--fuzz=0", "-p1", "-i"])
+                .arg(patch)
+                .current_dir(temp.path())
+                .output()
+                .expect("run patch");
+            assert!(
+                applied.status.success(),
+                "{} does not apply to the {release} excerpts:\n{}{}",
+                patch.display(),
+                String::from_utf8_lossy(&applied.stdout),
+                String::from_utf8_lossy(&applied.stderr)
+            );
+        }
+
+        let read = |file: &str| fs::read_to_string(temp.path().join(file)).unwrap();
+        let mut extracted = String::new();
+        for (file, start) in [
+            (PV_KICK_FILES[1], "static inline void kvm_set_mp_state("),
+            (PV_KICK_FILES[0], "void kvm_arch_async_page_present("),
+        ] {
+            extracted.push_str(
+                &extract_block(&read(file), start, "}")
+                    .unwrap_or_else(|| panic!("`{start}` is missing from the {release} excerpts")),
+            );
+        }
+        fs::write(temp.path().join("extracted.c"), extracted).unwrap();
+        fs::copy(fixture.join("harness.c"), temp.path().join("harness.c"))
+            .unwrap_or_else(|e| panic!("copy {}/harness.c: {e}", fixture.display()));
+
+        let harness = SanitizedHarness::build(
+            &temp.path().join("harness.c"),
+            &["-g", "-Wall", "-Werror"],
+            &format!("the {release} PV kick harness"),
+        );
+
+        for scenario in ["kick", "wake", "helper"] {
+            let result = harness.run(&[scenario]);
+            if !result.status.success() {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                let first: Vec<&str> = stderr.lines().take(3).collect();
+                failures.push(format!(
+                    "[{}] Linux {release} with{} a PV kick patch, {scenario}: {}",
+                    kernel.table,
+                    if patch.is_some() { "" } else { "out" },
+                    first.join("\n  ")
+                ));
+            }
         }
     }
-    assert!(
-        failures.is_empty(),
-        "Linux {release} with{} {PV_KICK_PATCH}:\n{}",
-        if patched { "" } else { "out" },
-        failures.join("\n")
-    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The x86_64 host kernel must apply the PV kick patch, and its bytes must be part of what
