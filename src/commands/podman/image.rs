@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use tracing::{info, warn};
 
 /// An owner for the temporaries of one image-cache operation, so a SIGKILLed one leaves
-/// them to the next launch to reclaim (`crate::reclaim`). The temporaries sit in the
+/// them to the next sweep to reclaim (`crate::reclaim`). The temporaries sit in the
 /// shared assets directory, but the record is in this nesting level's data directory,
 /// where its flock is authoritative.
 pub(super) fn temp_owner() -> Result<crate::reclaim::Owner> {
@@ -619,7 +619,7 @@ pub async fn build_storage_image(
     let tmp_img = crate::setup::store_temp_path(output_path);
 
     // Both temporaries are recorded before they exist, so a SIGKILLed build leaves them
-    // to the next launch to reclaim (crate::reclaim). Completing the owner removes
+    // to the next sweep to reclaim (crate::reclaim). Completing the owner removes
     // whatever the build did not remove or rename into place.
     let temps = temp_owner()?;
     for path in [&tmp_dir, &tmp_img] {
@@ -632,7 +632,7 @@ pub async fn build_storage_image(
 
 /// Complete an owner of image-cache temporaries. A temporary that cannot be removed does
 /// not fail the operation, as it did not before it was recorded: it stays recorded, and
-/// the next launch tries again.
+/// the next sweep tries again.
 pub(super) async fn complete_temps(temps: crate::reclaim::Owner) {
     if let Err(error) = temps.complete().await {
         warn!(error = %format!("{error:#}"), "image-cache temporaries remain");

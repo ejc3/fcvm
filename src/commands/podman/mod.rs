@@ -1261,7 +1261,7 @@ pub(crate) async fn cleanup_failed_prepare(
 
 /// End the owner of a launch that a cache hit served, which made nothing of its own
 /// beyond what its record lists. A failure here does not fail the run that already
-/// finished: what remains stays recorded for the next launch.
+/// finished: what remains stays recorded for the next sweep.
 async fn complete_unused_owner(owner: crate::reclaim::Owner) {
     if let Err(e) = owner.complete().await {
         warn!(error = %format!("{e:#}"), "resources of a launch served from a snapshot remain");
@@ -1481,7 +1481,7 @@ async fn export_localhost_image_disk(
             anyhow::anyhow!("internal: localhost image id was not captured at inspect time")
         })?;
         // A UUID-keyed orphan is never overwritten by the next run, so the temp is
-        // recorded before it exists and a SIGKILLed export leaves it to the next launch
+        // recorded before it exists and a SIGKILLed export leaves it to the next sweep
         // to reclaim (crate::reclaim).
         let temps = image::temp_owner()?;
         temps.record(crate::reclaim::Resource::Temp {
@@ -4753,7 +4753,7 @@ mod tests {
     /// #1183: a launch records its runtime directory with its owner before anything in
     /// it exists (the --disk-dir staging, then the directory itself), and reclaims what
     /// killed launches left before it records anything. A launch killed in between
-    /// leaves the directory to the next launch only if the record comes first.
+    /// leaves the directory to the next sweep only if the record comes first.
     #[test]
     fn a_launch_records_its_runtime_dir_before_creating_it() {
         let source = include_str!("mod.rs");

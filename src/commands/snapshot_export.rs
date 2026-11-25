@@ -210,7 +210,7 @@ pub(crate) async fn export_to_file(
     match write_output_file(host, tag, &temp, &output, replaces).await {
         Ok(entries) => {
             // The temporary has its final name. A record that stays names a path that no
-            // longer exists, which the next launch's reclaim finds gone.
+            // longer exists, which the next sweep finds gone.
             if let Err(error) = owner.discard() {
                 warn!(error = %format!("{error:#}"), "could not delete the export's reclaim record");
             }

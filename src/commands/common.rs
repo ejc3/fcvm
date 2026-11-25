@@ -2657,7 +2657,7 @@ async fn cleanup_vm_inner(
     failures.record("saving the container's output", logs_saved);
     failures.record("removing VM data directory", data_dir_removed);
     // Teardown removed what it made. This deletes the VM's owner record; a resource it
-    // cannot remove stays recorded for the next launch (crate::reclaim).
+    // cannot remove stays recorded for the next sweep (crate::reclaim).
     failures.record(
         "reclaiming the VM's recorded resources",
         crate::reclaim::complete(&vm_id).await,
@@ -6487,7 +6487,7 @@ pub async fn create_snapshot_core(
         let created = match memory_dir {
             Some(dir) => {
                 // Recorded before it exists: a create killed before it publishes leaves the
-                // file to the next launch's reclaim instead of to the memory directory forever.
+                // file to the next sweep instead of to the memory directory forever.
                 let target = crate::storage::disk::linked_memory_target(dir);
                 begin_memory_file_owner(&target)
                     .and_then(|owner| {

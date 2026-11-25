@@ -3502,7 +3502,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
 ├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
-├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
+├── reclaim/{euid}/<b>/{id}.json   # what a live fcvm made on the host, in buckets; a dead one's is reclaimed by the first launch 1 s or more after the last sweep began, or the next setup, snapshot import or export (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy
 └── snapshots/{name}/             # Firecracker snapshots
