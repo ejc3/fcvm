@@ -1,7 +1,7 @@
 //! Replayed vectors: each `tests/vectors/*.json` is a sequence of events and, after chosen
 //! events, values the state must hold. The doc read by a check is
-//! `{"version", "view", "receipts", "assign", "ec2_assign", "lambda_assign"}`, addressed by
-//! JSON pointer.
+//! `{"version", "view", "receipts", "assign", "ec2_assign", "lambda_assign", "renders_order"}`,
+//! addressed by JSON pointer.
 //!
 //! A vector may also carry `final_view`, the whole browser view after the last event.
 //! `FLEET_VECTORS_BLESS=1` rewrites `final_view` from the current code; review the diff.
@@ -30,6 +30,13 @@ fn doc(state: &State) -> Value {
         "assign": serde_json::to_value(host_assignments(state)).unwrap(),
         "ec2_assign": serde_json::to_value(ec2_assignment(state)).unwrap(),
         "lambda_assign": serde_json::to_value(lambda_assignment(state)).unwrap(),
+        "renders_order": serde_json::to_value(
+            state
+                .fleet
+                .renders
+                .order(state.fleet.power.state != "asleep"),
+        )
+        .unwrap(),
     })
 }
 

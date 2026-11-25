@@ -72,7 +72,8 @@ x86-only patch today.
 
 The host kernels (`make install-host-kernel`) apply the `patches_dir` of their
 own `host_kernel` table, minus the `.vm.patch` files, both on 7.3.3:
-`kernel/patches-x86-host` on x86_64, which links the 7.3 fuse patches, and
+`kernel/patches-x86-host` on x86_64, which links the 7.3 fuse patches and holds the KVM
+patch below, and
 `kernel/patches-arm64-host` on arm64, which links the patches it shares with the
 7.3.3 nested guest from `kernel/patches-arm64` and holds the host-only KVM patches
 below. Each host also sets the Kconfig lines of its `config_fragment` on top of the
@@ -102,6 +103,41 @@ from it and runs the check on its running kernel, and only an image that passes 
 operation for 6.6 s and 5.9 s while namespaces died, and nine tests lost their namespace
 holder at its 5 s readiness deadline.
 
+`kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch`
+keeps a paravirtual spinlock kick that KVM erased (#2125). A PV spinlock waiter checks the
+lock and then executes HLT, with interrupts off when the lock is taken from interrupt
+context; a kick (`KVM_HC_KICK_CPU`) that arrives between the two sets `pv_unhalted`, and the
+HLT must then not block. Since Linux 6.15 (e9cb61055fee) `kvm_set_mp_state()` clears
+`pv_unhalted` on every move to runnable, and `kvm_arch_async_page_present()` goes through it
+for a vCPU that is already runnable, so a page-ready completion in that window erased the
+kick: the HLT blocked, only an NMI could wake the vCPU, and every CPU that sent it an IPI and
+waited spun for ever. On an oversubscribed x86_64 host 15 of 900 two-vCPU guests restored
+through userfaultfd hung that way; the trace of each showed the kick hypercall, its
+`kvm_apic_accept_irq`, a `kvm_async_pf_ready` for the kicked vCPU 40 to 104 us later and then
+its HLT with no wakeup. Guest `no-kvmapf` does not avoid it: without the guest interface KVM
+halts the vCPU artificially and completes through the same function. The patch sets the run
+state directly in that one function, as 6.14 did. Upstream has the same code today (7.4-rc4);
+there is no upstream commit to take. arm64 KVM has no async page faults, so the arm64 host
+does not carry it. `a_page_ready_completion_keeps_a_pending_pv_kick`
+(tests/test_kernel_patch_invariants.rs) runs the release's two functions in a C harness and
+fails without the patch.
+The kick a snapshot load gives the runnable vCPUs (#2131, DESIGN.md "A Restore Gives Runnable
+vCPUs a PV Kick") needs this patch as well: a restored vCPU's first `KVM_RUN` completes the
+page-ready wake-up that restoring `MSR_KVM_ASYNC_PF_EN` queued, through the same function,
+before the guest runs an instruction (#2132).
+
+The guest kernels that run KVM themselves carry the same change, for the VMs that run and
+are restored inside them: `kernel/patches-x86/0008-...` for `nested.amd64` (6.18.60),
+`kernel/patches-mountinfo/0004-...` for the `mountinfo` pair (6.16.1; the control's
+`kernel/patches-mountinfo-base` links to it), and for `phone.amd64` (7.3.3, the host's
+release) a link to the host's patch in `kernel/patches-phone-7.3`, beside links to the gpu
+profile's two patches. The function is the same in the three releases but for one
+`WRITE_ONCE`. `every_x86_kernel_that_builds_kvm_carries_the_pv_kick_patch` takes the kernels
+from rootfs-config.toml (every x86_64 host kernel, and every x86_64 guest kernel whose config
+sets `CONFIG_KVM`, on 6.15 or later) and fails for one whose patch set lacks the change, and
+`a_page_ready_completion_keeps_a_pending_pv_kick` runs each release's functions with its own
+port.
+
 `kernel/patches-arm64-host/vgic-v3-keep-hcr-on-quiet-exits.patch` gives back most of what
 6.19's vgic rework added to every KVM exit (#659). Since Linux 6.19 (the vgic-lr-overflow
 series) every entry and exit runs the vgic flush and sync in full when no interrupt is in
@@ -127,10 +163,12 @@ switch. `a_guest_hypervisors_quiet_exit_does_not_mask_its_hcr_el2_copies` runs t
 masking; `the_world_switch_inlines_the_nv_accessors_it_calls_on_every_exit` fails without it on
 the `static inline` declarations.
 
-The gpu and phone profiles apply `kernel/patches-gpu-7.3` on both arches: the
+The gpu profile applies `kernel/patches-gpu-7.3` on both arches: the
 fuse attribute patch, linked, plus one Kconfig patch that gives
 `CONFIG_MMU_NOTIFIER` a prompt. NVIDIA's nvidia-uvm needs MMU notifiers, the
-option has no prompt upstream, and nothing in this kernel selects it. The gpu
+option has no prompt upstream, and nothing in this kernel selects it. The phone
+profile applies `kernel/patches-phone-7.3`: links to those two and, because its
+guest runs KVM, to the host's PV kick patch (above). The gpu
 profile is not published as a release yet; `make setup-gpu` builds it.
 
 ## Release identity

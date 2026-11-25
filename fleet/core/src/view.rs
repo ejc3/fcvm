@@ -502,6 +502,10 @@ pub struct View {
     /// host has run players.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub potato: Option<crate::potato::PotatoView>,
+    /// Pages mode (`?mode=pages`): the renders host's last report and the overlay. Absent
+    /// while no host runs the mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renders: Option<crate::renders::RendersView>,
 }
 
 impl PhonesView {
@@ -902,6 +906,7 @@ pub fn view(state: &State) -> View {
         windows: windows_view(state),
         minecraft: minecraft_view(state),
         potato: state.fleet.potato.view(&state.config.potato),
+        renders: state.fleet.renders.view(&state.config.renders),
     }
 }
 
