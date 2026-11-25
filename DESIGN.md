@@ -549,6 +549,62 @@ Each VM has:
 - Regenerate machine IDs
 - Update MMDS with new config
 
+### A Restore Kicks Every Runnable vCPU (x86_64)
+
+On x86_64, a guest with paravirtual spinlocks waits for a lock by checking the lock word and
+then executing HLT (`kvm_wait()`), with interrupts off when it took the lock in interrupt
+context. When the lock holder's kick (`KVM_HC_KICK_CPU`) lands between the check and the HLT,
+KVM holds it in `vcpu->arch.pv.pv_unhalted` and the HLT returns at once. No ioctl reads that
+flag for a runnable vCPU (`KVM_GET_MP_STATE` folds it in only for a halted one), so a snapshot
+taken at that moment does not hold the kick. Restored without it, the vCPU halts with
+interrupts off and only an NMI, an SMI or an INIT wakes it, the next vCPU to send it an IPI
+and wait spins, and every clone of that snapshot hangs the same way (#2131).
+
+The Firecracker fork therefore ends a snapshot load, after every vCPU's state is set and
+before the guest runs, by giving each vCPU the snapshot holds as runnable one kick
+(`KvmVm::kick_runnable_vcpus`). It is delivered as KVM delivers a guest's: an interrupt with
+the reserved "remote read" delivery mode, sent with `KVM_SIGNAL_MSI` to the vCPU's APIC id.
+Firecracker does nothing between the load and the guest's next instruction that clears it, so
+loading paused (`resume_vm: false`) and resuming later needs no second one. Firecracker's log
+says how many vCPUs it kicked.
+
+- A vCPU that was not waiting for a kick sees its next HLT return early once. The spinlock
+  wait and the idle loop check again and halt again.
+- A halted vCPU gets none: KVM reports a halted vCPU with a kick pending as runnable, so one
+  saved as halted had none to lose.
+- A vCPU that waits for INIT or SIPI gets none. With a kick recorded KVM takes it for
+  runnable, and its `KVM_RUN` returns at once or spins in the kernel where it would block.
+- A guest whose CPUID does not offer `KVM_FEATURE_PV_UNHALT` gets none: a Linux guest
+  without it has no paravirtual spinlocks.
+- A vCPU whose local APIC is off, or has the id 0xff, gets none: a kick cannot reach the
+  first, and the second is the address of every local APIC.
+- The source VM needs nothing: saving reads its state, and its flag stays in the kernel.
+- arm64 has no such kick. Its queued spinlocks spin, and a vCPU in WFI wakes on an interrupt
+  that the vGIC state in the snapshot holds.
+
+**The host kernel has to keep the kick.** From Linux 6.15 on, `kvm_arch_async_page_present()`
+clears a pending kick, and a restored vCPU runs that function on its first `KVM_RUN`, before
+it runs an instruction: restoring `MSR_KVM_ASYNC_PF_EN`, which every vCPU of a Linux guest
+has set, queues a completion that wakes every waiter in the guest (#2132). It runs inside
+`KVM_RUN`, so no order of the restore's ioctls avoids it. On such a host the kick reaches the
+HLT only with
+`kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch`
+(#2125, kernel/README.md), which the repo's x86_64 host kernel carries and which the same
+host needs for the guest's own kicks. A host on 6.14 or earlier keeps the kick as it is.
+Measured on Linux 7.0.0 with a vCPU set up as Linux sets one up: with the distribution's KVM
+the restored vCPU was still halted after 10 s, and with the same KVM rebuilt with that one
+change it ran on.
+
+A snapshot restores on the Firecracker binary that took it while that file exists, so a
+snapshot taken before this build restores without the kick until it is taken again, or is
+run with `--firecracker-bin` naming the current build.
+
+`every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore` (`src/setup/rootfs.rs`) is a
+tripwire: it fails when an x86_64 pin moves to a commit nobody has listed as carrying the
+kick. It cannot tell whether a commit does. The fork's own tests do that
+(`arch::x86_64::vm::tests`, on KVM), and on x86_64 the direct snapshot run tests require the
+kick line in the clone's Firecracker log, which shows the `[firecracker]` build ran the step.
+
 ### Disk-Only Snapshots & Cold-Boot Clones
 
 `fcvm snapshot create --disk-only` captures only the disk (`kind: DiskOnly`):

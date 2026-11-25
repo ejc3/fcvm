@@ -3716,6 +3716,31 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     common::poll_health_by_pid(clone_pid, 120).await?;
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
+    // On x86_64 a snapshot load ends with a paravirtual kick for every runnable vCPU
+    // (#2131), and the Firecracker that gives it says so in its log at Info, the level fcvm
+    // asks for unless FCVM_FIRECRACKER_LOG_LEVEL says otherwise. A build without the fix
+    // logs nothing of the kind. The line shows the step ran, not that a vCPU needed it: an
+    // idle guest's vCPUs are halted and get none.
+    if cfg!(target_arch = "x86_64") {
+        let clone_vm_id = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+            .load_state_by_pid(clone_pid)
+            .await
+            .context("loading the clone's state")?
+            .vm_id;
+        let vmm_log_path = fcvm::paths::vm_runtime_dir(&clone_vm_id).join("firecracker.log");
+        let vmm_log = std::fs::read_to_string(&vmm_log_path)
+            .with_context(|| format!("reading {}", vmm_log_path.display()))?;
+        anyhow::ensure!(
+            vmm_log
+                .lines()
+                .any(|line| line.contains("restored vCPUs a paravirtual kick")),
+            "Firecracker's log at {} does not say the restore kicked the runnable vCPUs: the \
+             pinned build restores a snapshot without the kick, or its log level is above Info",
+            vmm_log_path.display()
+        );
+        println!("  ✓ The restore ran its kick of the clone's runnable vCPUs");
+    }
+
     // Step 5: Verify clone works by executing a command
     println!("\nStep 5: Verifying clone works with exec...");
     let output = tokio::process::Command::new(&fcvm_path)

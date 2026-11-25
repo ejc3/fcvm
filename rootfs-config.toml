@@ -71,6 +71,14 @@ archives = [
 # installed a copy (one kernel BPF program per thread to compile and to free).
 # A net device takes host_dev_fd, a TAP queue the process inherited, which is how a clone
 # in a pooled namespace gets its TAP (`tap-fd` in the same build metadata).
+# On x86_64 a snapshot load ends with a paravirtual kick for every vCPU the snapshot holds
+# as runnable: KVM keeps a spinlock kick that is pending for a runnable vCPU in a flag no
+# ioctl reads, so the snapshot does not hold it, and without the kick a vCPU restored just
+# before the HLT of its lock wait halts with interrupts off for good (#2131). On a host
+# kernel from 6.15 on the kick lasts until that HLT only with the x86_64 host kernel's
+# patch 0003 (kernel/README.md). The gpu, phone and nested amd64 profiles pin the same fix
+# on their own branches, and every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore
+# fails when one of these pins moves to a commit that is not listed as carrying it.
 # v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
 # build cannot restore format 12. A restore uses the binary the snapshot
 # recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
@@ -87,8 +95,8 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-tap-fd-drive-random"
-commit = "3e203733cb9115d1cbdd6857d59703541b85ddf6"
+branch = "agent/uffd-minor-v1.17.0-pv-kick-restore"
+commit = "3a4d73f25cf7cfd72c313542bdf4c957aa5ba483"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
@@ -390,9 +398,11 @@ build_inputs = [
 kernel_config = "kernel/gpu-x86.conf"
 patches_dir = "kernel/patches-gpu-7.3"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+# The fork's VFIO branch (agent/vfio-uffd-populate) plus the paravirtual kick a snapshot
+# load gives every runnable vCPU (#2131, see [firecracker]).
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-uffd-populate"
-firecracker_commit = "4fc14097b96701d5c382a24a7b8bbaec025445e4"
+firecracker_branch = "agent/vfio-pv-kick-restore"
+firecracker_commit = "b44583cb02d5f77bec8970610a824375e2b200aa"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -437,10 +447,11 @@ kernel_config = "kernel/phone-x86.conf"
 patches_dir = "kernel/patches-gpu-7.3"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 # The fork's VFIO branch with the nested state in snapshots (ejc3/firecracker#23) and the
-# Prefilled memory backend (ejc3/firecracker#24) merged.
+# Prefilled memory backend (ejc3/firecracker#24) merged, plus the paravirtual kick a
+# snapshot load gives every runnable vCPU (#2131, see [firecracker]).
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-uffd-populate"
-firecracker_commit = "4fc14097b96701d5c382a24a7b8bbaec025445e4"
+firecracker_branch = "agent/vfio-pv-kick-restore"
+firecracker_commit = "b44583cb02d5f77bec8970610a824375e2b200aa"
 firecracker_args = "--enable-pci"
 boot_args = "net.ifnames=0"
 
@@ -551,10 +562,12 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # (ejc3/firecracker#23, on the default branch's pinned commit). Without it a
 # restored L1 comes back outside VMX operation and its L2 never starts, which
 # kept the x86_64 L2 tests off the SnapshotEnabled runners (#664).
+# The pin adds the paravirtual kick a snapshot load gives every runnable vCPU (#2131, see
+# [firecracker]).
 # No special boot_args needed for x86.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/uffd-minor-v1.17.0-nested-state"
-firecracker_commit = "ddc1969f8dba126a1c771aa7be9d4ec09ffc177c"
+firecracker_branch = "agent/uffd-minor-v1.17.0-nested-state-pv-kick-restore"
+firecracker_commit = "6d4013b4140c80ae151f355e6e9f0b2e33497c16"
 
 # Host kernel configuration for x86 nested profile
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,
