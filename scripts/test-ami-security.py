@@ -558,7 +558,7 @@ main
                                    text=True, capture_output=True, check=True).stdout
         baked = "/usr/local/sbin/check-bridge-teardown-kernel.sh"
         # no argument: the kernel the instance is running
-        self.assertIn(f"if {baked}; then\n  STATUS=boot-ok\nfi\n", user_data)
+        self.assertIn(f"if {baked} && nic_order_ok; then\n  STATUS=boot-ok\nfi\n", user_data)
         self.assertIn("STATUS=boot-failed\n", user_data.split(f"if {baked}", 1)[0])
         self.assertIn('"Key=KernelVersion,Value=$(uname -r)" "Key=BuildStatus,Value=$STATUS"', user_data)
         # the builder puts that script in the image, after checking the kernel GRUB will boot
@@ -569,6 +569,55 @@ main
                  f"\ninstall -m 0755 scripts/check-bridge-teardown-kernel.sh {baked}\n"]
         positions = [build.index(step) for step in steps]
         self.assertEqual(positions, sorted(positions))
+
+    def test_the_arm64_image_loads_the_nic_driver_before_cloud_init_local(self):
+        # #2174: the arm64 host kernel keeps ENA a module and the image boots without an
+        # initramfs, so without these two files the NIC binds before cloud-init-local only by
+        # winning a race, and a runner that loses it runs no user data and never registers.
+        script = Path(__file__).with_name("build-ami.sh").read_text()
+        build = script[script.index("\ncreate_user_data() {"):script.index("\nUSERDATA\n}")]
+        block = ('if [ "$RUNNER_ARCH" = arm64 ]; then\n'
+                 "  echo ena > /etc/modules-load.d/fcvm-runner-nic.conf\n"
+                 "  install -d /etc/systemd/system/cloud-init-local.service.d\n"
+                 "  printf '[Unit]\\nAfter=systemd-modules-load.service\\n' \\\n"
+                 "    > /etc/systemd/system/cloud-init-local.service.d/10-fcvm-runner-nic.conf\n"
+                 "fi\n")
+        self.assertIn(block, build)
+        # after the architecture is known, and in the image before it reports done
+        self.assertLess(build.index("aarch64) RUNNER_ARCH=arm64 ;;"), build.index(block))
+        self.assertLess(build.index(block), build.index("Key=BuildStatus,Value=complete"))
+
+    def test_the_boot_test_requires_cloud_init_local_ordered_after_the_module_loader(self):
+        # The candidate is published only when systemd's resolved order of the booted image
+        # holds (#2174). An order that cannot be read is a failed boot test, not a pass.
+        script = Path(__file__).with_name("build-ami.sh").read_text()
+        function = script[script.index("create_boot_test_user_data() {"):].split("\nBOOTTEST\n}", 1)[0] + "\nBOOTTEST\n}"
+        user_data = subprocess.run(["bash", "-c", function + "\ncreate_boot_test_user_data"],
+                                   text=True, capture_output=True, check=True).stdout
+        check = user_data[user_data.index("nic_order_ok() {"):user_data.index("\nSTATUS=boot-failed\n")]
+        loader = "systemd-modules-load.service"
+        # machine, the resolved After, systemctl show's status, whether the loader is active
+        cases = [("aarch64", f"systemd-remount-fs.service {loader} system.slice", 0, 0, True),
+                 ("aarch64", "systemd-remount-fs.service system.slice", 0, 0, False),
+                 ("aarch64", f"not-{loader} system.slice", 0, 0, False),
+                 ("aarch64", "", 0, 0, False),
+                 ("aarch64", loader, 1, 0, False),
+                 # ordered after a loader that failed or never ran: the module was not loaded there
+                 ("aarch64", loader, 0, 3, False),
+                 ("x86_64", "systemd-remount-fs.service system.slice", 0, 3, True)]
+        for machine, after, status, inactive, want in cases:
+            with self.subTest(machine=machine, after=after, status=status, inactive=inactive), \
+                    tempfile.TemporaryDirectory() as tmp:
+                for name, body in (("uname", f'[ "$*" = -m ] && echo {machine}'),
+                                   ("systemctl", f'[ "$*" = "is-active --quiet {loader}" ] && exit {inactive}\n'
+                                                 f'[ "$*" = "show cloud-init-local.service -p After --value" ] || exit 9\n'
+                                                 f"echo '{after}'\nexit {status}")):
+                    tool = Path(tmp, name)
+                    tool.write_text("#!/bin/bash\n" + body + "\n")
+                    tool.chmod(0o755)
+                ran = subprocess.run(["bash", "-c", "set -uo pipefail\n" + check + "\nnic_order_ok"],
+                                     env={"PATH": f"{tmp}:/usr/bin:/bin"}, text=True, capture_output=True)
+                self.assertEqual(ran.returncode == 0, want, ran.stderr)
 
     def test_ambiguous_or_missing_network_fails_before_launch(self):
         for subnets in ["None", "", "subnet-1234567890abcdef0\tsubnet-2234567890abcdef0"]:

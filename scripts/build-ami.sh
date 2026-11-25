@@ -480,6 +480,21 @@ echo "ubuntu:100000:65536" >> /etc/subgid
 # FUSE config
 echo "user_allow_other" > /etc/fuse.conf
 
+# The NIC before cloud-init-local, on arm64 (#2174). The arm64 host kernel keeps ENA a module
+# and the image boots without an initramfs, so udev loads ENA from the root disk, and whether
+# it binds before cloud-init-local looks for a NIC is a race: won by 3.5 s when measured, lost
+# on an x86 host whose kernel had ENA as a module (ejc3/aws#823; kernel/host-x86.conf now
+# builds it in). A runner that loses it runs no user data and never registers.
+# systemd-modules-load loads ENA, which binds the present device inside its module load (its
+# pci_driver sets no probe type), and the drop-in orders cloud-init-local after the loader:
+# neither unit has default dependencies. The boot test checks the order systemd resolved.
+if [ "$RUNNER_ARCH" = arm64 ]; then
+  echo ena > /etc/modules-load.d/fcvm-runner-nic.conf
+  install -d /etc/systemd/system/cloud-init-local.service.d
+  printf '[Unit]\nAfter=systemd-modules-load.service\n' \
+    > /etc/systemd/system/cloud-init-local.service.d/10-fcvm-runner-nic.conf
+fi
+
 # GitHub Actions Runner
 mkdir -p /opt/actions-runner
 RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/v//')
@@ -595,8 +610,18 @@ TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-meta
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
 unset TOKEN
 set -x
+# On arm64 the image orders cloud-init-local after the loader of the NIC's driver (#2174).
+# The loader must have run without a failure this boot, and the order systemd resolved must
+# name it; an order that cannot be read fails.
+nic_order_ok() {
+  local after
+  [ "$(uname -m)" = aarch64 ] || return 0
+  systemctl is-active --quiet systemd-modules-load.service || return 1
+  after=$(systemctl show cloud-init-local.service -p After --value) || return 1
+  printf '%s\n' $after | grep -qx systemd-modules-load.service
+}
 STATUS=boot-failed
-if /usr/local/sbin/check-bridge-teardown-kernel.sh; then
+if /usr/local/sbin/check-bridge-teardown-kernel.sh && nic_order_ok; then
   STATUS=boot-ok
 fi
 /usr/local/bin/aws ec2 create-tags --resources "$INSTANCE_ID" --region us-west-1 \
