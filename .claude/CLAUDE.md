@@ -1962,18 +1962,18 @@ The ubuntu user has KVM access (`kvm` group), so `fcvm podman run` works without
 # PREFERRED - Rootless mode (no sudo needed, use run_in_background: true)
 ./target/release/fcvm podman run --name test alpine:latest 2>&1 | tee /tmp/vm.log
 # Defaults to --network rootless
-# Get PID from state and use exec:
-./target/release/fcvm ls --json | jq -r '.[-1].pid'
-./target/release/fcvm exec --pid <PID> -- hostname
+# Get the PID of the VM named "test" (jq fails unless exactly one VM has that name):
+PID=$(./target/release/fcvm ls --json | jq -er '[.[] | select(.name == "test")] | if length == 1 then .[0].pid else error("VMs named test: \(length)") end')
+./target/release/fcvm exec --pid "$PID" -- hostname
 
 # ONLY WHEN NEEDED - Bridged mode (requires sudo)
 sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine 2>&1 | tee /tmp/vm.log
 # Then sleep and check logs:
 sleep 30
 grep healthy /tmp/vm.log
-# Get PID from state and use exec:
-sudo ./target/release/fcvm ls --json | jq -r '.[-1].pid'
-sudo ./target/release/fcvm exec --pid <PID> -- curl -s ifconfig.me
+# Get the PID of the VM named "test" (jq fails unless exactly one VM has that name):
+PID=$(sudo ./target/release/fcvm ls --json | jq -er '[.[] | select(.name == "test")] | if length == 1 then .[0].pid else error("VMs named test: \(length)") end')
+sudo ./target/release/fcvm exec --pid "$PID" -- curl -s ifconfig.me
 ```
 
 **Testing egress connectivity:**
@@ -2018,8 +2018,8 @@ sleep 60  # Wait for VM to boot and run commands
 
 **Inspecting namespace state for running VM:**
 ```bash
-# Get holder PID from state file
-HOLDER_PID=$(fcvm ls --json | jq -r '.[0].holder_pid')
+# Get the holder PID of the VM named $NAME (jq fails unless exactly one VM has that name)
+HOLDER_PID=$(fcvm ls --json | jq -er --arg name "$NAME" '[.[] | select(.name == $name)] | if length == 1 then .[0].holder_pid else error("VMs named \($name): \(length)") end')
 # Check namespace network config
 sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip addr
 sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
@@ -2879,9 +2879,11 @@ both.
   is written like a lock file (0666). Nothing is made world-writable.
 - **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
   by every command while a VM of it is running: the error lists each one's name and PID,
-  and they are stopped with the fcvm that started them. A command that only reads decides
-  refuse or proceed and writes nothing (`check_layout_for_read`), so `fcvm ls` needs no
-  write access and removes nothing of an older launch in progress. A launch
+  and they are stopped with the fcvm that started them. The layout check of a command
+  that only reads (`check_layout_for_read`) decides refuse or proceed and writes nothing,
+  so `fcvm ls`, which only lists, needs no write access and removes nothing of an older
+  launch in progress. A lookup by PID that misses still runs the sweep
+  (`load_state_by_pid`), which removes stale states. A launch
   (`check_layout_for_write`) removes what layout 1 left with no VM running, under layout
   1's own `names.lock`, held across a second scan and the removal, and writes the marker;
   the lock file stays, so an older launch and a conversion always exclude each other.
@@ -2894,7 +2896,9 @@ both.
   read that fails for another reason fails a name claim and removes nothing.
 - **A state file a host crash left empty or cut short** is removed by the sweep when it
   was written before this boot (`/proc/stat` btime), and warned about once per process
-  otherwise. Nothing on the state path is synced.
+  otherwise. No state file is synced. The one synced file is the layout marker
+  (`write_layout_marker`), written once per store: an empty marker after a host crash
+  would have every command refuse the store.
 
 No master state file: `list_vms()` reads every bucket of `vms/`.
 
