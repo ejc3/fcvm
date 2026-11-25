@@ -278,32 +278,37 @@ would be a half-open connection in every clone, which Windows holds until it tim
 
 ## Memory
 
-Before stack PR 5 a Cloud Hypervisor restore read the whole memory file into anonymous
-memory (`memory_restore_mode=copy`): every clone paid a read of the full guest size before it
-ran, and held a private copy of every page, including the zeros. Every Cloud Hypervisor
-clone now restores with `map` from a symbolic link to the snapshot's memory file
-(`prepare_ch_restore_files` in `src/commands/common.rs`). The measurement section gives
-both numbers for 1, 4 and 8 clones.
+A Cloud Hypervisor restore that copies (`memory_restore_mode=copy`) reads the whole memory
+file into anonymous memory: every clone pays a read of the full guest size before it runs,
+and holds a private copy of every page, including the zeros. Every Cloud Hypervisor clone
+restores with `memory_restore_mode=copyonwrite` from a symbolic link to the snapshot's memory
+file (`prepare_ch_restore_files` and `ch_restore_args` in `src/commands/common.rs`). The
+measurement section gives both numbers for 1, 4 and 8 clones.
 
-The target is the sharing Firecracker's File backend already gives: map the snapshot's
-memory file `MAP_PRIVATE` over guest RAM, so a restore reads nothing before the guest runs, a
-page is read from the page cache when the guest first touches it, clean pages are shared by
-every clone of the snapshot through the page cache, and a page becomes private to a clone
-only when it writes it. Cloud Hypervisor restores by copying (`copy`) or with its own
-in-process userfaultfd handler (`ondemand`), which copies each page into the VM's own memory
-on its first fault, so it gives laziness but no sharing. The change is a third restore mode
-in our Cloud Hypervisor fork, `memory_restore_mode=map`: after the memory manager has created
-guest RAM, each saved range of the memory file is mapped `MAP_PRIVATE | MAP_FIXED` over the
-RAM that backs it, from its offset in the file. KVM's memory slots already point at those
-host addresses and follow the new mapping through its MMU notifiers. It refuses shared and
-hugetlbfs guest RAM. Page-cache sharing needs every clone to map the same inode, and a
-reflink is a new inode with its own page cache, so each clone's `ch-restore` directory holds a
-symbolic link to the snapshot's memory file (immutable once published) and its own copy of
-the configuration. A hard link would do the same, but the snapshot directory is a btrfs
-subvolume and a link across subvolumes fails with `EXDEV`. Against `copy` on the same host it
-cut the first desktop update at 8 clones from 8.67 to 8.77 s to 2.95 to 3.00 s and the PSS
-of each clone from 4,097 to about 840 MiB (the measurement section). A Cloud Hypervisor
-without `map` fails the restore with an error naming `fcvm setup --cloud-hypervisor`.
+It is the sharing Firecracker's File backend gives: the snapshot's memory file is mapped
+`MAP_PRIVATE` over guest RAM, so a restore reads nothing before the guest runs, a page is
+read from the page cache when the guest first touches it, clean pages are shared by every
+clone of the snapshot through the page cache, and a page becomes private to a clone only
+when it writes it. Cloud Hypervisor's other modes are `copy` and its in-process userfaultfd
+handler (`ondemand`), which copies each page into the VM's own memory on its first fault, so
+it gives laziness but no sharing. The mode was first a patch in a fork fcvm kept
+(`memory_restore_mode=map`, stack PR 5); upstream has had it since v54.0 as `copyonwrite`,
+and fcvm now builds upstream with no patch (DESIGN.md, "Cloud Hypervisor: the build and its
+snapshots"). Upstream's mode falls back to copying when it judges the guest's RAM
+unsuitable (shared or huge pages, hotplug, a passthrough device); a sandbox configures none
+of those, and fcvm fails a restore whose VMM did not map the file. Page-cache sharing needs
+every clone to map the same inode, and a reflink is a new inode with its own page cache, so
+each clone's `ch-restore` directory holds a symbolic link to the snapshot's memory file
+(immutable once published) and its own copy of the configuration. A hard link would do the
+same, but the snapshot directory is a btrfs subvolume and a link across subvolumes fails
+with `EXDEV`. Against `copy` on the same host the fork's mode cut the first desktop update
+at 8 clones from 8.67 to 8.77 s to 2.95 to 3.00 s and the PSS of each clone from 4,097 to
+about 840 MiB (the measurement section).
+
+A clone's clock continues from the snapshot (`clock_restore_mode=preserve`), and the guest
+agent sets the wall clock from the namespace's clock line, as above. A gold snapshot is one
+Cloud Hypervisor build's: its key includes the build, so a host whose build changed makes a
+new one.
 
 fcvm's UFFD memory server (`src/uffd/`, minor mode with working-set replay) would add
 prefetching on top of the same sharing, at the cost of a userfaultfd handshake in the fork.
@@ -434,7 +439,8 @@ done when the screen changed.
    tests that fail first.
 5. Our Cloud Hypervisor fork: `memory_restore_mode=map` (the memory file mapped privately
    over guest RAM), and fcvm restoring Cloud Hypervisor clones with it; lands only if it
-   measures faster than copy mode.
+   measures faster than copy mode. (Landed, and since replaced by upstream's
+   `memory_restore_mode=copyonwrite` on an unpatched build.)
 6. Fleet: the bridge, the agent's Windows slots and gold flow, the coordinator's
    `state.windows` and intents, the page's `?mode=windows`.
 7. ejc3/aws: the host image with the Windows image's inputs and the bridge.

@@ -635,6 +635,57 @@ and nothing at run time tells a kernel that keeps the kick from one that clears 
 x86_64 the direct snapshot run tests require the kick line in the clone's Firecracker log,
 which shows the `[firecracker]` build ran the step, not that the kick lasted.
 
+### Cloud Hypervisor: the build and its snapshots
+
+fcvm's Cloud Hypervisor is upstream's main branch at the commit `[cloud_hypervisor]` in
+`rootfs-config.toml` names, with no patch of fcvm's own. Until 2026-11 it was a fork branch
+49 commits past v52.0 carrying a restore mode of fcvm's (`memory_restore_mode=map`). Upstream
+has had the same mechanism since v54.0 as `copyonwrite`, and in the 2,412 commits between
+the two it fixed three defects in arm64 snapshot and restore that fcvm hit on the fork
+(#2155).
+
+- **One build.** `fcvm setup --cloud-hypervisor` clones the repository, checks out the
+  configured commit, refuses a checkout whose HEAD is anything else, and builds it with
+  `--locked` and the toolchain in fcvm's `rust-toolchain.toml`. The binary is
+  `cloud-hypervisor-<hash>.bin` in the store, the hash over the repository, the commit, the
+  architecture and the libc. Launch computes that name from the config and runs that file.
+  When it is absent the launch fails and names the setup command: no other build in the
+  store and nothing on PATH stands in. `FCVM_CLOUD_HYPERVISOR_BIN` names another binary on
+  purpose.
+- **What a restore passes** (`ch_restore_args`, `src/commands/common.rs`):
+  - `memory_restore_mode=copyonwrite` maps the snapshot's memory file `MAP_PRIVATE` over
+    guest RAM, so clones of one snapshot share its clean pages through the page cache.
+    Upstream falls back to reading the whole file, with one line in its log, when it
+    judges the guest's RAM unsuitable. fcvm configures nothing that triggers it, and reads
+    the VMM's `/proc/<pid>/maps` after the resume: a restore whose VMM does not map the
+    memory file fails.
+  - `clock_restore_mode=preserve` resumes the guest's clock at its value when the source
+    was paused. Upstream's default (`advance`) adds the wall time since the snapshot, so a
+    clone of a day-old snapshot would start a day ahead on CLOCK_MONOTONIC with every armed
+    timer expired. The guest's wall clock is fcvm's to set: fc-agent's restore handler
+    steps it from the host's time, and a raw guest's agent sets it from the clock line its
+    namespace serves. `preserve` is on upstream's main (2026-11-23) and in no release.
+- **A snapshot belongs to the build that wrote it.** The snapshot's metadata records what
+  its VMM printed for `--version`, and a restore on a build that prints anything else is
+  refused before it creates anything, with both builds named. Cloud Hypervisor's
+  `state.json` is that build's device state, and upstream promises compatibility for live
+  migration from the two previous releases only. The snapshot cache key holds the binary's
+  path, which holds the commit, so a cached snapshot is taken again after the pin moves.
+  The fleet's Windows gold snapshot is keyed by the build too
+  (`gold_key`, `src/fleet/agent/windows.rs`).
+- **A snapshot of a clone** is written by cloning the extents of the memory file the clone
+  maps (FICLONERANGE) and then writing the pages the clone changed. The result holds every
+  page: `test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot` deletes the
+  parent snapshot and reads back memory from both generations.
+- **`vm.create`** asks for the virtio-net offloads (checksum, TSO, UFO), which upstream
+  stopped offering by default in v54.0.
+
+**Moving the pin.** Change `commit`, read upstream's release notes and the commits since
+the old one for the options and defaults above, then run the Cloud Hypervisor tests
+(`make test-root FILTER="-E 'test(/cloud_hypervisor/) | test(/^gym_pairs_/)'"`) on arm64 and
+`fleet/windows/measure-restore.sh` on an x86_64 host. Every Cloud Hypervisor snapshot is
+created again afterwards.
+
 ### Disk-Only Snapshots & Cold-Boot Clones
 
 `fcvm snapshot create --disk-only` captures only the disk (`kind: DiskOnly`):

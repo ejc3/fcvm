@@ -3156,10 +3156,16 @@ pub async fn ensure_cloud_hypervisor(
             return Err(error);
         }
     };
+    // The build names its version with `git describe`, whose abbreviated hash grows with
+    // the repository. A snapshot restores only on a build that prints the version it
+    // recorded, so the length is fixed: two builds of one commit print the same.
     let mut build_cmd = Command::new(&cargo);
     build_cmd
         .args(["build", "--release", "--locked", "--bin", "cloud-hypervisor"])
         .env("RUSTUP_TOOLCHAIN", &toolchain)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.abbrev")
+        .env("GIT_CONFIG_VALUE_0", "12")
         .current_dir(&build_dir);
     super::run_build_as_sudo_invoker(&mut build_cmd);
     let status = build_cmd
@@ -3342,6 +3348,10 @@ mod tests {
         assert!(
             body.contains(".env(\"RUSTUP_TOOLCHAIN\", &toolchain)"),
             "the build does not name its toolchain"
+        );
+        assert!(
+            body.contains(".env(\"GIT_CONFIG_KEY_0\", \"core.abbrev\")"),
+            "the build's version string depends on the size of the clone"
         );
         assert!(
             body.contains("checkout_cloud_hypervisor_source(&clone_url, commit, &build_dir)"),
