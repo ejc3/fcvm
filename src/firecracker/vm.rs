@@ -613,13 +613,19 @@ impl VmManager {
             let filter = crate::confine::filter_path(firecracker_bin, mode);
             anyhow::ensure!(
                 filter.is_file(),
-                "the VMM of {} is confined, and its seccomp filter {} is missing: run `fcvm \
-                 setup`, which compiles it for {}",
+                "the VMM of {} is confined, and its seccomp filter {} is missing. `fcvm \
+                 setup` compiles it beside each Firecracker it builds from commit {}, which \
+                 the confined policy is derived from: run it if {} is that build; a \
+                 Firecracker of another commit cannot run confined",
                 self.vm_id,
                 filter.display(),
+                crate::confine::CONFINED_FIRECRACKER_COMMIT,
                 firecracker_bin.display()
             );
             cmd.arg("--seccomp-filter").arg(&filter);
+            // One malloc arena, so glibc grows the heap with brk, as the musl build the
+            // policy is derived from does (confine::CONFINED_VMM_ENV).
+            cmd.envs(crate::confine::CONFINED_VMM_ENV.iter().copied());
         }
         if std::env::var("FCVM_NO_SECCOMP").is_ok() {
             warn!("Seccomp disabled via FCVM_NO_SECCOMP - reduced security");
@@ -880,29 +886,29 @@ impl VmManager {
         }
     }
 
-    /// A confined VMM that exits [`crate::confine::BAD_SYSCALL_EXIT`] was stopped by its
-    /// seccomp filter: say so at ERROR with the syscall number Firecracker logged, so a
-    /// syscall the policy misses fails loudly and names itself.
-    fn report_confinement_exit(&self, status: &std::process::ExitStatus) {
-        if self.decision.confinement().is_none()
-            || status.code() != Some(crate::confine::BAD_SYSCALL_EXIT)
-        {
+    /// After a confined VMM was reaped, however it ended (it exits on its own after its
+    /// SIGSYS handler logs the syscall, or fcvm kills it when a restore it was serving
+    /// fails): if its policy stopped it, say so at ERROR, naming the thread and the syscall
+    /// from Firecracker's log, so a syscall the policy misses fails loudly and names itself.
+    fn report_confinement_stop(&self) {
+        if self.decision.confinement().is_none() {
             return;
         }
-        let logged = self
+        let trapped = self
             .log_path
             .as_ref()
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|log| crate::confine::trapped_syscall(&log));
-        error!(
-            target: "vm",
-            vm_id = %self.vm_id,
-            syscall = ?logged,
-            "Firecracker was stopped by its confinement policy: syscall {} is not in the \
-             confined allowlist (resources/seccomp/firecracker-confined-{}.json)",
-            logged.map_or_else(|| "(not found in its log)".to_string(), |nr| nr.to_string()),
-            crate::confine::SECCOMP_ARCH,
-        );
+        if let Some(trapped) = trapped {
+            error!(
+                target: "vm",
+                vm_id = %self.vm_id,
+                thread = %trapped.thread,
+                syscall = trapped.number,
+                "{}",
+                crate::confine::trapped_syscall_report(&trapped)
+            );
+        }
     }
 
     /// Non-blocking check if the VM process has exited.
@@ -917,7 +923,7 @@ impl VmManager {
                     self.process = None;
                     self.memory_in_use = None;
                     self.stop_log_follower();
-                    self.report_confinement_exit(&status);
+                    self.report_confinement_stop();
                     Ok(Some(status))
                 }
                 None => Ok(None),
@@ -941,7 +947,7 @@ impl VmManager {
             self.process = None;
             self.memory_in_use = None;
             self.stop_log_follower();
-            self.report_confinement_exit(&status);
+            self.report_confinement_stop();
             Ok(status)
         } else {
             bail!("VM process not running")
@@ -1006,11 +1012,17 @@ impl VmManager {
     /// The bulk of the wait is the kernel reclaiming the guest's address space, so this
     /// returning means the guest memory is genuinely released — not just signalled.
     pub async fn reap(&mut self) {
-        if let Some(mut process) = self.process.take() {
+        let reaped = if let Some(mut process) = self.process.take() {
             let _ = process.wait().await;
-        }
+            true
+        } else {
+            false
+        };
         self.memory_in_use = None;
         self.stop_log_follower();
+        if reaped {
+            self.report_confinement_stop();
+        }
     }
 
     /// SIGKILL the Firecracker process and reap it. For callers that have nothing else to
@@ -1092,6 +1104,62 @@ fn log_firecracker_line(clean: &str, is_stderr: bool) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every function that reaps the Firecracker process reports a syscall the confined
+    /// policy stopped, whatever the exit status: on an x64 runner fcvm killed a VMM its
+    /// policy had stopped (the restore it served failed first), and the exit-status check
+    /// that stood here said nothing.
+    #[test]
+    fn every_reap_of_the_vmm_reports_a_trapped_syscall() {
+        let source = include_str!("vm.rs");
+        let body = |signature: &str| {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let rest = &source[start..];
+            &rest[..rest.find("\n    }\n").unwrap()]
+        };
+        let code = &source[..source.find(concat!("#[cfg", "(test)]")).unwrap()];
+        let reaps = code.matches(concat!(".wait", "()")).count()
+            + code.matches(concat!(".try", "_wait()")).count()
+            - code.matches(concat!("self.try", "_wait()")).count();
+        let reapers = [
+            "pub fn try_wait(&mut self)",
+            "pub async fn wait(&mut self)",
+            "pub async fn reap(&mut self)",
+        ];
+        assert_eq!(
+            reaps,
+            reapers.len(),
+            "a new place reaps the VMM: add it here"
+        );
+        for signature in reapers {
+            assert!(
+                body(signature).contains(concat!("self.report_confinement", "_stop()")),
+                "{signature} does not report a trapped syscall"
+            );
+        }
+    }
+
+    /// The launch that hands a VMM the confined filter also gives it the confined
+    /// environment: one malloc arena. Without it glibc grows a thread's own arena with
+    /// mprotect, which the policy's api and vcpu classes do not list: a large boot plan
+    /// stopped the VMM (tests/test_sanity.rs, test_large_boot_plan_rootless).
+    #[test]
+    fn a_confined_launch_sets_the_confined_environment() {
+        let source = include_str!("vm.rs");
+        let code = &source[..source.find(concat!("#[cfg", "(test)]")).unwrap()];
+        let filter = code
+            .find(concat!("cmd.arg(\"--seccomp", "-filter\")"))
+            .expect("the launch passes the confined filter");
+        let block = &code[filter..];
+        let block = &block[..block.find("\n        }\n").unwrap()];
+        assert!(
+            block.contains(concat!("cmd.envs(crate::confine::CONFINED", "_VMM_ENV")),
+            "the confined launch does not set the confined environment: {block}"
+        );
+        assert!(crate::confine::CONFINED_VMM_ENV.contains(&("MALLOC_ARENA_MAX", "1")));
+    }
 
     /// A confined manager refuses launch arguments that turn seccomp off or set a filter,
     /// before it touches its log or socket, whatever the caller resolved.

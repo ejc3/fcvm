@@ -2836,6 +2836,11 @@ async fn ensure_confined_seccomp_or_warn(
 /// Compile the confined seccomp policy ([`crate::confine::seccomp_policy`]) in every mode
 /// for the Firecracker at `firecracker`, with a `seccompiler-bin` built once from the same
 /// commit. Both are content-addressed beside the binary.
+///
+/// Only for a build of the commit the policy was derived from
+/// ([`crate::confine::policy_is_for`]). A Firecracker of another commit (the GPU, phone and
+/// nested profiles) gets no filter, and a confined launch refuses a binary without one, so
+/// such a build cannot run under a policy its syscalls were never checked against.
 async fn ensure_confined_seccomp(
     firecracker: &Path,
     repo: &str,
@@ -2844,6 +2849,14 @@ async fn ensure_confined_seccomp(
     source: FirecrackerSource,
 ) -> Result<()> {
     use crate::confine::{filter_path, seccompiler_path, SeccompMode, SECCOMP_ARCH};
+    if !crate::confine::policy_is_for(commit) {
+        debug!(
+            firecracker = %firecracker.display(),
+            commit,
+            "no confined seccomp filter for a Firecracker of another commit than the policy's"
+        );
+        return Ok(());
+    }
     let missing: Vec<(SeccompMode, PathBuf)> = SeccompMode::ALL
         .iter()
         .map(|mode| (*mode, filter_path(firecracker, *mode)))
@@ -3420,6 +3433,37 @@ async fn update_grub_config_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Firecracker of another commit than the confined policy's gets no filter: nothing
+    /// is built or written beside it, so a confined launch finds no filter and refuses it.
+    /// Setup used to compile the default build's policy beside every profile's Firecracker,
+    /// so `snapshot run --confine --firecracker-bin` could run the nested or a GPU build
+    /// under a policy its syscalls were never checked against. On x86_64 the nested
+    /// build's vCPU threads make an ioctl the policy does not list, which stops the VMM.
+    #[tokio::test]
+    async fn a_firecracker_of_another_commit_gets_no_confined_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let firecracker = dir.path().join("firecracker-nested-0123456789ab.bin");
+        std::fs::write(&firecracker, b"").unwrap();
+        ensure_confined_seccomp(
+            &firecracker,
+            "example/firecracker",
+            "example-branch",
+            "0000000000000000000000000000000000000000",
+            FirecrackerSource::Pin,
+        )
+        .await
+        .unwrap();
+        let entries: Vec<std::ffi::OsString> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            [firecracker.file_name().unwrap().to_owned()],
+            "something was written beside a Firecracker of another commit"
+        );
+    }
 
     fn amd64_host_kernel() -> HostKernelConfig {
         let plan: crate::setup::rootfs::Plan =

@@ -739,9 +739,25 @@ test-all: show-notes check-disk setup-fcvm _test-all
 # feature set (integration-fast and integration-slow): the snapshot clone and FUSE snapshot
 # matrix tests are integration-slow. Hugepage tests are privileged-tests, and a root start is
 # not confined yet, so they are not here.
-CONFINE_TEST_FILTER ?= -E 'test(=test_confine_rootless_vm) | test(=test_sanity_rootless) | test(=test_exec_rootless) | (test(/^test_pmem_/) & !test(/sudo/)) | test(/^test_fuse_snapshot_matrix_/) | test(/snapshot_clone/) | test(=test_clone_while_baseline_running_rootless)'
+CONFINE_TEST_FILTER ?= -E 'test(=test_confine_rootless_vm) | test(=test_sanity_rootless) | test(=test_large_boot_plan_rootless) | test(=test_first_firecracker_log_line_from_the_api_thread_rootless) | test(=test_exec_rootless) | (test(/^test_pmem_/) & !test(/sudo/)) | test(/^test_fuse_snapshot_matrix_/) | test(/snapshot_clone/) | test(=test_clone_while_baseline_running_rootless)'
 test-confine: show-notes check-disk setup-fcvm
 	FCVM_CONFINE=required FCVM_CONFINE_SECCOMP=enforce $(MAKE) --no-print-directory _test-all FILTER="$(CONFINE_TEST_FILTER)"
+
+# The confined seccomp policies are generated: the fork's shipped filters for the pinned
+# Firecracker commit (resources/seccomp/fork-*.json) plus resources/seccomp/confined-changes.json.
+# confine-seccomp-refresh fetches the fork's filters for [firecracker] commit after a repin;
+# confine-seccomp-policy writes the policies; the confine:: unit tests fail until both are done.
+confine-seccomp-refresh:
+	@commit=$$(awk '/^\[firecracker\]/{f=1;next} /^\[/{f=0} f && /^commit *=/{gsub(/[" ]/,"",$$3); print $$3}' rootfs-config.toml); \
+	repo=$$(awk '/^\[firecracker\]/{f=1;next} /^\[/{f=0} f && /^repo *=/{gsub(/[" ]/,"",$$3); print $$3}' rootfs-config.toml); \
+	test -n "$$commit" && test -n "$$repo" || { echo "no [firecracker] repo/commit in rootfs-config.toml" >&2; exit 1; }; \
+	for arch in x86_64 aarch64; do \
+	  curl -fsSL "https://raw.githubusercontent.com/$$repo/$$commit/resources/seccomp/$$arch-unknown-linux-musl.json" \
+	    -o resources/seccomp/fork-$$arch-unknown-linux-musl.json || exit 1; \
+	done; \
+	echo "fetched $$repo@$$commit; set fork.commit in resources/seccomp/confined-changes.json and CONFINED_FIRECRACKER_COMMIT in src/confine.rs to it, then make confine-seccomp-policy"
+confine-seccomp-policy:
+	FCVM_WRITE_SECCOMP_POLICY=1 $(MAKE) --no-print-directory test-unit FILTER=the_confined_policies_are_the_fork_filters_plus_the_declared_changes
 
 # Discovery tool for the policy, not a gate: the same tests in log mode, failing on any
 # syscall the policy does not list. Needs auditd: without it the kernel prints the

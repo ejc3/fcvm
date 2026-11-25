@@ -569,6 +569,8 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
 | `FCVM_FIRECRACKER_LOG_LEVEL` | `Info` | Level of Firecracker's own per-VM `firecracker.log`: `Error`, `Warning`, `Info` or `Debug`. `Debug` adds one line per vsock packet, which is gigabytes an hour under FUSE-over-vsock volumes. Teardown copies the log's last 16 MiB to `/tmp/fcvm-firecracker-<vm_id>.log` |
 | `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` | `3600` | How long a cached firecracker-fork resolution stays valid before a launch re-queries the remote; `0` forces a query every launch |
+| `FCVM_CONFINE` | config | `required` confines every VMM this host starts (see [Confining the VMM](#confining-the-vmm---confine)); it can tighten the config's `[confine] mode`, never loosen it |
+| `FCVM_CONFINE_SECCOMP` | `enforce` | `log` allows a confined VMM the syscalls its allowlist does not list and has the kernel record each one, to check a workload before enforcing |
 | `RUST_LOG` | `warn` | Logging level (`info`, `debug` for verbose) |
 
 **Firecracker fork resolution.** When a kernel profile builds firecracker from a
@@ -579,6 +581,47 @@ cached in `assets_dir/firecracker/<profile>.resolved.json` and reused for
 that file, so rebuilding the fork takes effect for launches immediately rather
 than after the TTL. `<binary> --version` probes are cached the same way, keyed by
 the binary's path + mtime + size, so a rebuilt binary is always re-checked.
+
+### Confining the VMM (`--confine`)
+
+`--confine` on `podman run` or `snapshot run` (or, for every start on a host,
+`[confine] mode = "required"` in the config or `FCVM_CONFINE=required`) runs the VM's
+Firecracker with two layers:
+
+- **Process:** no capabilities and none regained by its exec, `no_new_privs`, no core dumps.
+- **Syscalls:** an allowlist per Firecracker thread
+  (`resources/seccomp/firecracker-confined-<arch>.json`): Firecracker's own shipped filter
+  for the pinned commit, less io_uring, plus the calls glibc makes where musl makes others
+  and `fstatfs`, which that Firecracker calls and its filter omits. It has no process
+  creation, exec, ptrace, mount, bpf, unshare or setns. The VMM runs
+  with `MALLOC_ARENA_MAX=1`, so that glibc grows the heap with `brk`, which the allowlist
+  has, and not a thread's own arena with `mprotect`, which two of its three classes lack.
+
+A start that cannot be confined is refused, never run unconfined. Confinement needs
+rootless networking, the Firecracker backend, the default build of Firecracker, and a
+kernel with Landlock ABI 9 or later. A kernel profile that pins its own Firecracker is
+refused, and so is any other binary (`--firecracker-bin`, or the one an older snapshot
+recorded): `fcvm setup` compiles the allowlist only beside a build of the commit it is
+derived from. `fcvm ls` shows the layers a VM runs with.
+
+**A syscall outside the allowlist kills the VMM, and the guest with it.** fcvm logs at ERROR
+which Firecracker thread made which syscall. The allowlist covers what fcvm's test suites
+ask of Firecracker; a workload that takes Firecracker down a path they do not can hit a
+syscall it does not list. Check a workload first with `FCVM_CONFINE_SECCOMP=log`: a syscall
+outside the allowlist is then allowed and the kernel records it as an audit record of type
+`SECCOMP` that names the thread (`comm=`, in hex when the name holds a space, as a vCPU
+thread's `fc_vcpu 0` does) and the syscall number (`syscall=`):
+
+```bash
+FCVM_CONFINE_SECCOMP=log fcvm podman run --confine --name check my-image
+sudo grep -h 'type=SECCOMP' /var/log/audit/audit.log* | grep 'exe="[^"]*firecracker'
+```
+
+Without auditd the records go to the kernel log, rate-limited, so a run can lose some.
+auditd rotates its log (by default it keeps five files of 8 MB), so a syscall made in a
+loop can push earlier records out of all of them: read every file, and raise
+`max_log_file` in `/etc/audit/auditd.conf` if they filled. No record over a representative
+run means enforce mode would not have stopped it.
 
 ### A VM's own cgroup
 

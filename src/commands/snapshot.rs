@@ -3243,6 +3243,7 @@ async fn cmd_snapshot_run_inner(
         network: snapshot_config.metadata.network_mode.into(),
         firecracker_args: runtime_config.effective_firecracker_args().as_deref(),
         unsupported: None,
+        kernel_profile: snapshot_config.metadata.kernel_profile.as_deref(),
     })?;
 
     // Generate VM ID and name. Restored VMs always get a FRESH vm_id and a
@@ -6191,6 +6192,7 @@ async fn cmd_snapshot_run_raw(
         network: crate::confine::Network::Rootless,
         firecracker_args: args.firecracker_args.as_deref(),
         unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
+        kernel_profile: None,
     })?;
     anyhow::ensure!(
         port_mappings.is_empty(),

@@ -1,0 +1,198 @@
+{
+    "fork": {
+        "repo": "ejc3/firecracker",
+        "commit": "3e203733cb9115d1cbdd6857d59703541b85ddf6",
+        "files": "resources/seccomp/fork-<arch>-unknown-linux-musl.json, the fork's resources/seccomp/<arch>-unknown-linux-musl.json at that commit"
+    },
+    "remove": [
+        {
+            "syscall": "io_uring_setup",
+            "why": "io_uring operations (IORING_OP_OPENAT, IORING_OP_SOCKET, IORING_OP_CONNECT) are not seen by seccomp, so a ring would reopen what the filter closes. fcvm's drives use the Sync engine, so the VMM never makes one."
+        },
+        {
+            "syscall": "io_uring_enter",
+            "why": "io_uring operations (IORING_OP_OPENAT, IORING_OP_SOCKET, IORING_OP_CONNECT) are not seen by seccomp, so a ring would reopen what the filter closes. fcvm's drives use the Sync engine, so the VMM never makes one."
+        },
+        {
+            "syscall": "io_uring_register",
+            "why": "io_uring operations (IORING_OP_OPENAT, IORING_OP_SOCKET, IORING_OP_CONNECT) are not seen by seccomp, so a ring would reopen what the filter closes. fcvm's drives use the Sync engine, so the VMM never makes one."
+        }
+    ],
+    "add": [
+        {
+            "arches": [
+                "x86_64",
+                "aarch64"
+            ],
+            "classes": [
+                "vmm",
+                "api",
+                "vcpu"
+            ],
+            "rule": {
+                "syscall": "tgkill",
+                "comment": "glibc's raise and abort (musl uses tkill)",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 6,
+                        "comment": "SIGABRT"
+                    }
+                ]
+            }
+        },
+        {
+            "arches": [
+                "x86_64",
+                "aarch64"
+            ],
+            "classes": [
+                "vmm"
+            ],
+            "rule": {
+                "syscall": "tgkill",
+                "comment": "glibc's pthread_kill: the vCPU kick, SIGRTMIN() + VCPU_RTSIG_OFFSET, where glibc's SIGRTMIN is 34 (musl's 35)",
+                "args": [
+                    {
+                        "index": 2,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 34,
+                        "comment": "SIGRTMIN() + 0 under glibc"
+                    }
+                ]
+            }
+        },
+        {
+            "arches": [
+                "x86_64",
+                "aarch64"
+            ],
+            "classes": [
+                "vmm",
+                "api",
+                "vcpu"
+            ],
+            "rule": {
+                "syscall": "getpid",
+                "comment": "glibc's raise and pthread_kill pass its own pid to tgkill (musl's tkill takes none)"
+            }
+        },
+        {
+            "arches": [
+                "x86_64",
+                "aarch64"
+            ],
+            "classes": [
+                "vmm"
+            ],
+            "rule": {
+                "syscall": "statx",
+                "comment": "glibc's fstat and stat (musl uses fstat and newfstatat)"
+            }
+        },
+        {
+            "arches": [
+                "x86_64",
+                "aarch64"
+            ],
+            "classes": [
+                "vmm"
+            ],
+            "rule": {
+                "syscall": "futex",
+                "comment": "glibc's timed wait on a process-shared futex",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 265,
+                        "comment": "FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME"
+                    }
+                ]
+            }
+        },
+        {
+            "arches": [
+                "x86_64"
+            ],
+            "classes": [
+                "vmm",
+                "api",
+                "vcpu"
+            ],
+            "rule": {
+                "syscall": "openat",
+                "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists)"
+            }
+        },
+        {
+            "arches": [
+                "x86_64"
+            ],
+            "classes": [
+                "vmm"
+            ],
+            "rule": {
+                "syscall": "newfstatat",
+                "comment": "glibc's stat and lstat on x86_64 (musl uses stat and lstat, which the fork's filter lists)"
+            }
+        },
+        {
+            "arches": [
+                "x86_64"
+            ],
+            "classes": [
+                "vmm",
+                "api"
+            ],
+            "rule": {
+                "syscall": "epoll_wait",
+                "comment": "glibc's epoll_wait on x86_64 (musl uses epoll_pwait, which the fork's filter lists)"
+            }
+        },
+        {
+            "arches": [
+                "x86_64",
+                "aarch64"
+            ],
+            "classes": [
+                "vmm"
+            ],
+            "rule": {
+                "syscall": "fstatfs",
+                "comment": "vstate::memory::BackingFileSystem::of: the filesystem of a guest memory backing file (hugetlbfs, shmem or another), read on a File-backed restore; the fork's musl filter does not list it"
+            }
+        },
+        {
+            "arches": [
+                "x86_64",
+                "aarch64"
+            ],
+            "classes": [
+                "api",
+                "vcpu"
+            ],
+            "rule": {
+                "syscall": "lseek",
+                "comment": "glibc reads /etc/localtime with read and lseek at the first log line of the process, where musl maps the file (the mmap the fork's filter lists here); with the log level at Warning or Error that line can be written after the filters are installed, by any thread"
+            }
+        },
+        {
+            "arches": [
+                "x86_64",
+                "aarch64"
+            ],
+            "classes": [
+                "vcpu"
+            ],
+            "rule": {
+                "syscall": "read",
+                "comment": "glibc reads /etc/localtime with read and lseek at the first log line of the process, where musl maps the file (the mmap the fork's filter lists here); with the log level at Warning or Error that line can be written after the filters are installed, by any thread"
+            }
+        }
+    ]
+}

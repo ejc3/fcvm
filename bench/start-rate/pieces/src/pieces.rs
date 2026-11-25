@@ -658,6 +658,7 @@ fn vmm_request() -> fcvm::confine::Request<'static> {
         network: fcvm::confine::Network::Rootless,
         firecracker_args: None,
         unsupported: Some("the start-rate pieces harness measures unconfined VMMs"),
+        kernel_profile: None,
     }
 }
 
@@ -681,6 +682,7 @@ mod confine_tests {
             core_pattern: Some("core".to_string()),
             core_hard_limit: u64::MAX,
             seccomp: SeccompMode::Enforce,
+            firecracker_commit: None,
         }
     }
 

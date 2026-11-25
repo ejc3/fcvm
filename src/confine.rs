@@ -122,8 +122,8 @@ pub enum Layer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeccompMode {
-    /// `SECCOMP_RET_TRAP`: Firecracker's SIGSYS handler logs the syscall number and the
-    /// VMM exits with status [`BAD_SYSCALL_EXIT`].
+    /// `SECCOMP_RET_TRAP`: Firecracker's SIGSYS handler logs the thread and the syscall
+    /// number and shuts the VM down, so a syscall outside the policy stops the VMM.
     Enforce,
     /// `SECCOMP_RET_LOG`: allowed, and recorded by the kernel's audit subsystem. For
     /// finding what the policy misses, never for running workloads.
@@ -151,15 +151,29 @@ impl SeccompMode {
 /// Selects [`SeccompMode`]: `enforce` (the default) or `log`.
 pub const SECCOMP_ENV: &str = "FCVM_CONFINE_SECCOMP";
 
-/// Firecracker's exit status after its SIGSYS handler caught a syscall its filter traps.
-pub const BAD_SYSCALL_EXIT: i32 = 148;
-
 /// The confined policy for this architecture, in Firecracker's seccompiler JSON: per thread
 /// class (`vmm`, `api`, `vcpu`), the syscalls Firecracker uses in fcvm.
 #[cfg(target_arch = "aarch64")]
 const SECCOMP_POLICY: &str = include_str!("../resources/seccomp/firecracker-confined-aarch64.json");
 #[cfg(target_arch = "x86_64")]
 const SECCOMP_POLICY: &str = include_str!("../resources/seccomp/firecracker-confined-x86_64.json");
+/// The Firecracker commit whose shipped seccomp filters the confined policies are derived
+/// from (resources/seccomp/confined-changes.json); `[firecracker] commit` in
+/// rootfs-config.toml must be this commit. A VMM built from another commit is not confined:
+/// its syscalls were never checked against the policy.
+pub const CONFINED_FIRECRACKER_COMMIT: &str = "3e203733cb9115d1cbdd6857d59703541b85ddf6";
+
+/// The environment a confined VMM starts with, on top of fcvm's own.
+///
+/// `MALLOC_ARENA_MAX=1`: the policy is the filter of a musl-built Firecracker, and fcvm runs
+/// a glibc build. musl's allocator grows the heap with brk and mmap, which every thread
+/// class lists. glibc gives each thread but the first an arena of its own and grows it with
+/// mprotect, which the api and vcpu classes do not list: a boot plan of 22 KB grew the
+/// API thread's arena while Firecracker parsed it, and under the policy that call stops the
+/// VMM. With one arena every thread allocates from the first, which grows with brk, as
+/// musl's heap does.
+pub const CONFINED_VMM_ENV: &[(&str, &str)] = &[("MALLOC_ARENA_MAX", "1")];
+
 /// `seccompiler-bin --target-arch` for this architecture.
 #[cfg(target_arch = "aarch64")]
 pub const SECCOMP_ARCH: &str = "aarch64";
@@ -180,23 +194,74 @@ pub fn seccomp_policy(mode: SeccompMode) -> String {
     serde_json::to_string_pretty(&policy).expect("serializing JSON")
 }
 
-/// The compiled filter for `mode`, beside the content-addressed `firecracker` it was built
-/// for, named after the policy's digest so a policy change makes a new file.
-pub fn filter_path(firecracker: &std::path::Path, mode: SeccompMode) -> std::path::PathBuf {
+/// Whether the confined policy was derived from the Firecracker at `commit`. `fcvm setup`
+/// compiles the filter only beside a build of that commit, and a confined launch refuses a
+/// binary without its filter, so no other build runs confined, whichever way it was chosen:
+/// a kernel profile, `--firecracker-bin`, or the binary a snapshot recorded.
+pub fn policy_is_for(commit: &str) -> bool {
+    commit == CONFINED_FIRECRACKER_COMMIT
+}
+
+/// The digest in a filter's file name: of the Firecracker commit the policy was derived from
+/// and of the policy, so a repin and a policy change each make a new file, and a binary
+/// built before either is left without one.
+fn filter_digest(commit: &str, policy: &str) -> String {
     use sha2::Digest;
-    let digest = hex::encode(sha2::Sha256::digest(seccomp_policy(mode).as_bytes()));
+    let mut hash = sha2::Sha256::new();
+    hash.update(commit.as_bytes());
+    hash.update(b"\n");
+    hash.update(policy.as_bytes());
+    hex::encode(hash.finalize())[..16].to_string()
+}
+
+/// The compiled filter for `mode`, beside the content-addressed `firecracker` it was built
+/// for, named after [`filter_digest`].
+pub fn filter_path(firecracker: &std::path::Path, mode: SeccompMode) -> std::path::PathBuf {
+    let digest = filter_digest(CONFINED_FIRECRACKER_COMMIT, &seccomp_policy(mode));
     let mut path = firecracker.as_os_str().to_owned();
-    path.push(format!(".confined-{}-{}.bpf", mode.name(), &digest[..16]));
+    path.push(format!(".confined-{}-{digest}.bpf", mode.name()));
     path.into()
 }
 
-/// The syscall number in the last "bad syscall" line of a Firecracker log, which its SIGSYS
-/// handler writes before it exits [`BAD_SYSCALL_EXIT`].
-pub fn trapped_syscall(log: &str) -> Option<u64> {
+/// A syscall the confined policy stopped: the Firecracker thread that made it and its number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrappedSyscall {
+    pub thread: String,
+    pub number: u64,
+}
+
+/// The last "bad syscall" line of a Firecracker log, which its SIGSYS handler writes before
+/// it shuts the VM down: `[<instance>:<thread>:ERROR:<file>:<line>] Shutting down VM after
+/// intercepting a bad syscall (<number>).`
+pub fn trapped_syscall(log: &str) -> Option<TrappedSyscall> {
     const MARK: &str = "intercepting a bad syscall (";
     let line = log.lines().rev().find(|line| line.contains(MARK))?;
     let rest = &line[line.find(MARK)? + MARK.len()..];
-    rest[..rest.find(')')?].parse().ok()
+    let number = rest[..rest.find(')')?].parse().ok()?;
+    let tag = &line[line.find('[')? + 1..];
+    let thread = tag[..tag.find(']')?]
+        .split(':')
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
+    Some(TrappedSyscall { thread, number })
+}
+
+/// What fcvm logs when the confined policy stopped a VMM, naming the thread and the syscall.
+pub fn trapped_syscall_report(trapped: &TrappedSyscall) -> String {
+    format!(
+        "Firecracker was stopped by its confinement policy: its {} thread made syscall {}, \
+         which resources/seccomp/firecracker-confined-{}.json does not allow. A syscall \
+         outside the policy stops the VMM; {SECCOMP_ENV}=log runs the workload with such \
+         syscalls recorded by the kernel's audit log instead, to check it before enforcing",
+        if trapped.thread.is_empty() {
+            "(unnamed)"
+        } else {
+            &trapped.thread
+        },
+        trapped.number,
+        SECCOMP_ARCH,
+    )
 }
 
 /// `seccompiler-bin` built from the same Firecracker commit as `firecracker`.
@@ -300,6 +365,9 @@ pub struct Request<'a> {
     pub firecracker_args: Option<&'a str>,
     /// Why this command cannot confine its VMM at all, when it cannot.
     pub unsupported: Option<&'static str>,
+    /// The kernel profile the VMM starts with (`None`: default); it names the Firecracker
+    /// build the VMM runs.
+    pub kernel_profile: Option<&'a str>,
 }
 
 /// What the host offers, read once per start.
@@ -322,6 +390,9 @@ pub struct Host {
     pub core_hard_limit: u64,
     /// `FCVM_CONFINE_SECCOMP`.
     pub seccomp: SeccompMode,
+    /// The commit of the Firecracker the start's kernel profile runs, when the profile names
+    /// one ([`CONFINED_FIRECRACKER_COMMIT`] for the default build).
+    pub firecracker_commit: Option<String>,
 }
 
 /// The host's mode: the config's, tightened by `FCVM_CONFINE`.
@@ -355,8 +426,14 @@ fn needs_host_read(flag: bool, mode: Mode) -> bool {
 impl Host {
     /// Read this host for a start under `mode`: the kernel's Landlock ABI, the core
     /// pattern and the debugging environment variables.
-    pub fn read(mode: Mode) -> anyhow::Result<Self> {
+    pub fn read(mode: Mode, kernel_profile: Option<&str>) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let profile = kernel_profile.unwrap_or("default");
+        let firecracker_commit = crate::setup::get_kernel_profile(profile)
+            .with_context(|| format!("reading kernel profile {profile} for confinement"))?
+            .and_then(|profile| profile.firecracker_commit);
         Ok(Host {
+            firecracker_commit,
             mode,
             landlock_abi: landlock_abi(),
             core_pattern: std::fs::read_to_string("/proc/sys/kernel/core_pattern")
@@ -424,6 +501,21 @@ pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
         add(
             Mechanism::Backend,
             "confinement supports the Firecracker backend only".to_string(),
+        );
+    }
+    if let Some(commit) = host
+        .firecracker_commit
+        .as_deref()
+        .filter(|commit| *commit != CONFINED_FIRECRACKER_COMMIT)
+    {
+        add(
+            Mechanism::Backend,
+            format!(
+                "kernel profile {} runs Firecracker {commit}; the confined syscall policy is \
+                 derived from Firecracker {CONFINED_FIRECRACKER_COMMIT}, and another build's \
+                 syscalls were never checked against it",
+                request.kernel_profile.unwrap_or("default")
+            ),
         );
     }
     match request.network {
@@ -558,7 +650,7 @@ pub fn resolve(request: &Request<'_>) -> anyhow::Result<Decision> {
     if !needs_host_read(request.flag, mode) {
         return Ok(Decision(None));
     }
-    let host = Host::read(mode)?;
+    let host = Host::read(mode, request.kernel_profile)?;
     let decided = decide(request, &host)?;
     if let Some(confinement) = &decided {
         tracing::info!(
@@ -762,6 +854,7 @@ mod tests {
             core_pattern: Some("core".to_string()),
             core_hard_limit: u64::MAX,
             seccomp: SeccompMode::Enforce,
+            firecracker_commit: None,
         }
     }
 
@@ -772,6 +865,7 @@ mod tests {
             network: Network::Rootless,
             firecracker_args: None,
             unsupported: None,
+            kernel_profile: None,
         }
     }
 
@@ -821,6 +915,15 @@ mod tests {
             filter_path(bin, SeccompMode::Enforce),
             filter_path(bin, SeccompMode::Log)
         );
+        // A repin names a new file even when the fork's filters, and so the policy, are
+        // unchanged: the filter beside a binary of the old commit is not found again.
+        let policy = seccomp_policy(SeccompMode::Enforce);
+        assert_ne!(
+            filter_digest(CONFINED_FIRECRACKER_COMMIT, &policy),
+            filter_digest("0000000000000000000000000000000000000000", &policy)
+        );
+        assert!(policy_is_for(CONFINED_FIRECRACKER_COMMIT));
+        assert!(!policy_is_for("4fc14097b96701d5c382a24a7b8bbaec025445e4"));
     }
 
     #[test]
@@ -828,8 +931,33 @@ mod tests {
         let log = "2026-11-23 [vmm] ok\n\
                    2026-11-23T17:00:00 [anonymous-instance:main] Shutting down VM after \
                    intercepting a bad syscall (220).\n";
-        assert_eq!(trapped_syscall(log), Some(220));
+        assert_eq!(
+            trapped_syscall(log),
+            Some(TrappedSyscall {
+                thread: "main".into(),
+                number: 220
+            })
+        );
         assert_eq!(trapped_syscall("nothing here\n"), None);
+        // As Firecracker wrote it on an x64 runner, where the API thread was stopped.
+        let log = "2026-11-25T01:20:07.607904286 [anonymous-instance:fc_api:ERROR:src/vmm/src/\
+                   signal_handler.rs:110] Shutting down VM after intercepting signal 31, code 1.\n\
+                   2026-11-25T01:20:07.607912353 [anonymous-instance:fc_api:ERROR:src/vmm/src/\
+                   signal_handler.rs:70] Shutting down VM after intercepting a bad syscall (232).\n";
+        let trapped = trapped_syscall(log).unwrap();
+        assert_eq!(
+            trapped,
+            TrappedSyscall {
+                thread: "fc_api".into(),
+                number: 232
+            }
+        );
+        let report = trapped_syscall_report(&trapped);
+        assert!(
+            report.contains("its fc_api thread made syscall 232"),
+            "{report}"
+        );
+        assert!(report.contains("FCVM_CONFINE_SECCOMP=log"), "{report}");
     }
 
     /// io_uring operations are not seen by seccomp, so the policy must not let the VMM
@@ -837,22 +965,391 @@ mod tests {
     /// exec either.
     #[test]
     fn the_seccomp_policy_denies_io_uring_process_creation_and_exec() {
-        let policy: serde_json::Value = serde_json::from_str(SECCOMP_POLICY).unwrap();
-        for class in ["vmm", "api", "vcpu"] {
-            for rule in policy[class]["filter"].as_array().unwrap() {
-                let syscall = rule["syscall"].as_str().unwrap();
-                assert!(
-                    !syscall.starts_with("io_uring")
-                        && !["fork", "vfork", "clone", "clone3", "execve", "execveat"]
-                            .contains(&syscall)
-                        && !["ptrace", "process_vm_readv", "process_vm_writev"].contains(&syscall)
-                        && !["pidfd_open", "pidfd_getfd", "kill", "unshare", "setns"]
-                            .contains(&syscall)
-                        && !["mount", "bpf", "perf_event_open", "keyctl"].contains(&syscall),
-                    "{class} allows {syscall}"
-                );
+        for arch in SECCOMP_ARCHES {
+            let policy = read_json(&seccomp_file(&format!("firecracker-confined-{arch}.json")));
+            for class in ["vmm", "api", "vcpu"] {
+                for rule in policy[class]["filter"].as_array().unwrap() {
+                    let syscall = rule["syscall"].as_str().unwrap();
+                    assert!(
+                        !syscall.starts_with("io_uring")
+                            && !["fork", "vfork", "clone", "clone3", "execve", "execveat"]
+                                .contains(&syscall)
+                            && !["ptrace", "process_vm_readv", "process_vm_writev"]
+                                .contains(&syscall)
+                            && !["pidfd_open", "pidfd_getfd", "kill", "unshare", "setns"]
+                                .contains(&syscall)
+                            && !["mount", "bpf", "perf_event_open", "keyctl"].contains(&syscall),
+                        "{arch} {class} allows {syscall}"
+                    );
+                }
             }
         }
+    }
+
+    /// The confined policy of `arch`: the fork's shipped filter for that architecture, less
+    /// every rule of a removed syscall, plus the declared additions for that architecture,
+    /// each class's in declaration order after the fork's.
+    fn derived_policy(
+        fork: &serde_json::Value,
+        changes: &serde_json::Value,
+        arch: &str,
+    ) -> serde_json::Value {
+        let removed: Vec<&str> = changes["remove"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["syscall"].as_str().unwrap())
+            .collect();
+        let mut policy = fork.clone();
+        for (class, filter) in policy.as_object_mut().unwrap().iter_mut() {
+            let rules = filter["filter"].as_array_mut().unwrap();
+            rules.retain(|rule| !removed.contains(&rule["syscall"].as_str().unwrap()));
+            for add in changes["add"].as_array().unwrap() {
+                let listed = |key: &str, value: &str| {
+                    add[key].as_array().unwrap().iter().any(|v| v == value)
+                };
+                if listed("arches", arch) && listed("classes", class) {
+                    rules.push(add["rule"].clone());
+                }
+            }
+        }
+        policy
+    }
+
+    fn seccomp_file(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources/seccomp")
+            .join(name)
+    }
+
+    fn read_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap())
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    const SECCOMP_ARCHES: [&str; 2] = ["x86_64", "aarch64"];
+
+    /// Each confined policy is the fork's shipped filter for that architecture plus the
+    /// changes in confined-changes.json, so a change to the fork's filter or to the declared
+    /// changes cannot leave a policy behind. `make confine-seccomp-policy` writes the files
+    /// (FCVM_WRITE_SECCOMP_POLICY=1); this test then reads them back.
+    #[test]
+    fn the_confined_policies_are_the_fork_filters_plus_the_declared_changes() {
+        let changes = read_json(&seccomp_file("confined-changes.json"));
+        for arch in SECCOMP_ARCHES {
+            let fork = read_json(&seccomp_file(&format!(
+                "fork-{arch}-unknown-linux-musl.json"
+            )));
+            // Every removal and addition still means something against this fork filter.
+            let fork_names: Vec<&str> = fork
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|class| class["filter"].as_array().unwrap())
+                .map(|rule| rule["syscall"].as_str().unwrap())
+                .collect();
+            for removal in changes["remove"].as_array().unwrap() {
+                let syscall = removal["syscall"].as_str().unwrap();
+                assert!(
+                    fork_names.contains(&syscall),
+                    "{arch}: {syscall} is removed but the fork filter does not list it"
+                );
+                assert!(
+                    !removal["why"].as_str().unwrap_or("").is_empty(),
+                    "{syscall}: no reason"
+                );
+            }
+            for add in changes["add"].as_array().unwrap() {
+                let rule = &add["rule"];
+                assert!(
+                    !rule["comment"].as_str().unwrap_or("").is_empty(),
+                    "an added rule has no comment: {rule}"
+                );
+                for class in add["classes"].as_array().unwrap() {
+                    let class = class.as_str().unwrap();
+                    assert!(fork.get(class).is_some(), "{class} is not a thread class");
+                    if add["arches"].as_array().unwrap().iter().any(|a| a == arch) {
+                        assert!(
+                            !fork[class]["filter"].as_array().unwrap().contains(rule),
+                            "{arch} {class}: the fork filter already has {rule}"
+                        );
+                    }
+                }
+            }
+            let derived = derived_policy(&fork, &changes, arch);
+            let path = seccomp_file(&format!("firecracker-confined-{arch}.json"));
+            let mut out = Vec::new();
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
+            serde::Serialize::serialize(&derived, &mut ser).unwrap();
+            out.push(b'\n');
+            if std::env::var_os("FCVM_WRITE_SECCOMP_POLICY").is_some() {
+                std::fs::write(&path, &out).unwrap();
+            }
+            // Byte for byte, so the file is what the generator writes and writing it again
+            // changes nothing.
+            assert!(
+                std::fs::read(&path).unwrap() == out,
+                "{} is not the fork filter plus confined-changes.json as \
+                 `make confine-seccomp-policy` writes it: run that",
+                path.display()
+            );
+        }
+    }
+
+    /// The fork filters the policies are derived from are the ones of the Firecracker the
+    /// default profile builds: a repin of `[firecracker] commit` fails here until the
+    /// filters are refreshed (`make confine-seccomp-refresh`) and the policies regenerated.
+    #[test]
+    fn the_confined_policies_are_derived_from_the_pinned_firecracker() {
+        let changes = read_json(&seccomp_file("confined-changes.json"));
+        let config: toml::Table = toml::from_str(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rootfs-config.toml"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let firecracker = &config["firecracker"];
+        assert_eq!(
+            changes["fork"]["repo"].as_str(),
+            firecracker["repo"].as_str()
+        );
+        assert_eq!(
+            changes["fork"]["commit"].as_str(),
+            firecracker["commit"].as_str(),
+            "the confined seccomp policies were derived from another Firecracker commit"
+        );
+        assert_eq!(
+            changes["fork"]["commit"].as_str(),
+            Some(CONFINED_FIRECRACKER_COMMIT)
+        );
+    }
+
+    /// Where glibc and musl make different syscalls for one libc function, measured with
+    /// scripts/confine-libc-probe on Ubuntu 24.04 (glibc 2.39, musl 1.2.4) on each
+    /// architecture: (architecture, musl's syscall, glibc's). The fork's filter is written
+    /// for a musl Firecracker and fcvm runs a glibc one, so wherever a class of the fork's
+    /// filter lists musl's call, the confined policy's class must list glibc's. The forms
+    /// that differ only for calls Firecracker never makes (creat, alarm, sysconf) are left
+    /// out, and so is thread creation, which happens before any filter is installed.
+    const GLIBC_FOR_MUSL: &[(&str, &str, &str)] = &[
+        ("x86_64", "open", "openat"),
+        ("x86_64", "stat", "newfstatat"),
+        ("x86_64", "lstat", "newfstatat"),
+        ("x86_64", "epoll_pwait", "epoll_wait"),
+        ("x86_64", "select", "pselect6"),
+        ("x86_64", "pipe", "pipe2"),
+        ("x86_64", "tkill", "tgkill"),
+        ("x86_64", "tkill", "getpid"),
+        ("x86_64", "nanosleep", "clock_nanosleep"),
+        ("x86_64", "faccessat", "faccessat2"),
+        ("aarch64", "tkill", "tgkill"),
+        ("aarch64", "tkill", "getpid"),
+        ("aarch64", "nanosleep", "clock_nanosleep"),
+        ("aarch64", "faccessat", "faccessat2"),
+    ];
+
+    #[test]
+    fn glibcs_call_is_listed_wherever_the_fork_filter_lists_musls() {
+        for arch in SECCOMP_ARCHES {
+            let fork = read_json(&seccomp_file(&format!(
+                "fork-{arch}-unknown-linux-musl.json"
+            )));
+            let policy = read_json(&seccomp_file(&format!("firecracker-confined-{arch}.json")));
+            let lists = |filter: &serde_json::Value, class: &str, syscall: &str| {
+                filter[class]["filter"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|rule| rule["syscall"] == syscall)
+            };
+            for class in ["vmm", "api", "vcpu"] {
+                for (_, musl, glibc) in GLIBC_FOR_MUSL.iter().filter(|(a, ..)| *a == arch) {
+                    if lists(&fork, class, musl) {
+                        assert!(
+                            lists(&policy, class, glibc),
+                            "{arch} {class}: the fork's filter lists {musl}, where glibc calls \
+                             {glibc}, and the confined policy does not list {glibc}"
+                        );
+                    }
+                }
+                // The zone file, read at the first log line of the process: musl maps it
+                // (the fork lists that mmap, flags MAP_SHARED alone, in every class) and
+                // glibc reads it with read and lseek. With the log level at Warning or
+                // Error the first line is written under a filter, by whichever thread has
+                // something to say.
+                let maps_the_zone_file =
+                    fork[class]["filter"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|rule| {
+                            rule["syscall"] == "mmap"
+                                && rule["args"].as_array().is_some_and(|args| {
+                                    args.iter().any(|arg| {
+                                        arg["index"] == 3 && arg["op"] == "eq" && arg["val"] == 1
+                                    })
+                                })
+                        });
+                assert!(
+                    maps_the_zone_file,
+                    "{arch} {class}: the fork's filter no longer maps the zone file; check \
+                     how its build reads the time zone"
+                );
+                for glibc in ["openat", "fstat", "read", "lseek", "close"] {
+                    assert!(
+                        lists(&policy, class, glibc),
+                        "{arch} {class}: glibc reads the zone file with {glibc}, and the \
+                         confined policy does not list it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two architectures' policies list the same syscalls with the same arguments in
+    /// every thread class, apart from the lists below: the names that exist on one
+    /// architecture only or are the call one libc makes there, and the KVM ioctl requests
+    /// one architecture has and the other does not. A syscall, an argument rule or an ioctl
+    /// request added to one policy and not the other fails here, and so does a list entry
+    /// the policies no longer need.
+    #[test]
+    fn the_two_architectures_policies_differ_only_in_listed_names() {
+        // On x86_64 only: the musl forms the fork's x86_64 filter lists (open, stat; aarch64
+        // has neither syscall) and glibc's epoll_wait (aarch64 has only epoll_pwait).
+        const X86_64_ONLY: &[(&str, &str)] = &[
+            ("vmm", "open"),
+            ("api", "open"),
+            ("vcpu", "open"),
+            ("vmm", "stat"),
+            ("vmm", "epoll_wait"),
+            ("api", "epoll_wait"),
+        ];
+        // On aarch64 only: none. Its openat and newfstatat are in the x86_64 policy too.
+        const AARCH64_ONLY: &[(&str, &str)] = &[];
+        // ioctl requests one architecture's KVM has and the other's does not: (class, the
+        // request's name in the fork's filter).
+        const X86_64_ONLY_IOCTLS: &[(&str, &str)] = &[
+            ("vmm", "KVM_GET_CLOCK"),
+            ("vmm", "KVM_GET_PIT2"),
+            ("vmm", "KVM_GET_IRQCHIP"),
+            ("vcpu", "KVM_GET_TSC_KHZ"),
+            ("vcpu", "KVM_KVMCLOCK_CTRL"),
+            ("vcpu", "KVM_GET_VCPU_EVENTS"),
+            ("vcpu", "KVM_GET_DEBUGREGS"),
+            ("vcpu", "KVM_GET_REGS"),
+            ("vcpu", "KVM_GET_SREGS"),
+            ("vcpu", "KVM_GET_XCRS"),
+            ("vcpu", "KVM_GET_LAPIC"),
+            ("vcpu", "KVM_GET_XSAVE"),
+            ("vcpu", "KVM_GET_XSAVE2"),
+            ("vcpu", "KVM_GET_MSRS"),
+            ("vcpu", "KVM_GET_CPUID2"),
+        ];
+        const AARCH64_ONLY_IOCTLS: &[(&str, &str)] = &[
+            ("vmm", "KVM_SET_DEVICE_ATTR"),
+            ("vmm", "KVM_GET_DEVICE_ATTR"),
+            ("vcpu", "KVM_GET_ONE_REG"),
+            ("vcpu", "KVM_GET_REG_LIST"),
+        ];
+        type Rules = std::collections::BTreeMap<(String, String), Vec<String>>;
+        // Per (class, syscall): each rule's conditions, and for ioctl each request's name
+        // (the first word of its comment) keyed by its conditions.
+        let rules = |arch: &str| {
+            let policy = read_json(&seccomp_file(&format!("firecracker-confined-{arch}.json")));
+            let mut out = Rules::new();
+            let mut ioctls = std::collections::BTreeMap::<(String, String), String>::new();
+            for (class, filter) in policy.as_object().unwrap() {
+                for rule in filter["filter"].as_array().unwrap() {
+                    let name = rule["syscall"].as_str().unwrap().to_string();
+                    let mut args = rule["args"].clone();
+                    let mut request = String::new();
+                    // Comments are prose; only the conditions are compared.
+                    if let Some(list) = args.as_array_mut() {
+                        for arg in list {
+                            if let Some(comment) = arg.as_object_mut().unwrap().remove("comment") {
+                                if request.is_empty() {
+                                    request = comment
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string();
+                                }
+                            }
+                        }
+                    }
+                    if name == "ioctl" {
+                        ioctls.insert((class.clone(), args.to_string()), request);
+                    }
+                    out.entry((class.clone(), name))
+                        .or_default()
+                        .push(args.to_string());
+                }
+            }
+            for list in out.values_mut() {
+                list.sort();
+            }
+            (out, ioctls)
+        };
+        let ((x86, x86_ioctls), (arm, arm_ioctls)) = (rules("x86_64"), rules("aarch64"));
+        // What `ours` has and `theirs` does not, as (class, name), sorted.
+        let only =
+            |ours: &Rules,
+             theirs: &Rules,
+             names: &std::collections::BTreeMap<(String, String), String>| {
+                let mut syscalls = Vec::new();
+                let mut requests = Vec::new();
+                for ((class, name), args) in ours {
+                    match theirs.get(&(class.clone(), name.clone())) {
+                        None => syscalls.push((class.clone(), name.clone())),
+                        Some(their_args) if name == "ioctl" => {
+                            for arg in args.iter().filter(|arg| !their_args.contains(arg)) {
+                                requests.push((
+                                    class.clone(),
+                                    names[&(class.clone(), arg.clone())].clone(),
+                                ));
+                            }
+                        }
+                        Some(their_args) => assert!(
+                            args == their_args,
+                            "{class}: {name} has other arguments on one architecture ({args:?}) \
+                         than on the other ({their_args:?})"
+                        ),
+                    }
+                }
+                syscalls.sort();
+                requests.sort();
+                (syscalls, requests)
+            };
+        let listed = |list: &[(&str, &str)]| {
+            let mut list: Vec<(String, String)> = list
+                .iter()
+                .map(|(class, name)| (class.to_string(), name.to_string()))
+                .collect();
+            list.sort();
+            list
+        };
+        let (x86_syscalls, x86_requests) = only(&x86, &arm, &x86_ioctls);
+        let (arm_syscalls, arm_requests) = only(&arm, &x86, &arm_ioctls);
+        assert_eq!(x86_syscalls, listed(X86_64_ONLY), "syscalls on x86_64 only");
+        assert_eq!(
+            arm_syscalls,
+            listed(AARCH64_ONLY),
+            "syscalls on aarch64 only"
+        );
+        assert_eq!(
+            x86_requests,
+            listed(X86_64_ONLY_IOCTLS),
+            "ioctl requests on x86_64 only"
+        );
+        assert_eq!(
+            arm_requests,
+            listed(AARCH64_ONLY_IOCTLS),
+            "ioctl requests on aarch64 only"
+        );
     }
 
     /// The x64 CI runners' 6.14 kernel has ABI 6 and stock 7.0 has 8: both are refused,
@@ -886,6 +1383,7 @@ mod tests {
             network: Network::Bridged,
             firecracker_args: Some("--enable-nv2 --no-seccomp"),
             unsupported: None,
+            kernel_profile: None,
         };
         let host = Host {
             mode: Mode::Off,
@@ -896,6 +1394,7 @@ mod tests {
             core_pattern: Some("|/usr/lib/systemd/systemd-coredump %P".to_string()),
             core_hard_limit: u64::MAX,
             seccomp: SeccompMode::Enforce,
+            firecracker_commit: None,
         };
         let mechanisms: Vec<Mechanism> = missing(&request, &host)
             .iter()
@@ -924,6 +1423,33 @@ mod tests {
         ] {
             assert!(error.contains(needle), "missing {needle:?} in {error}");
         }
+    }
+
+    /// A kernel profile that runs another Firecracker build (the GPU profiles pin their own
+    /// fork commits, with VFIO and PCI) is refused: the policy was derived and audited for
+    /// the default build only, and its VFIO ioctls would stop the VMM.
+    #[test]
+    fn a_profile_running_another_firecracker_build_is_refused() {
+        let gpu = Host {
+            firecracker_commit: Some("4fc14097b96701d5c382a24a7b8bbaec025445e4".to_string()),
+            ..host(Ok(11))
+        };
+        let gpu_request = Request {
+            kernel_profile: Some("gpu"),
+            ..request(true)
+        };
+        let error = decide(&gpu_request, &gpu).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "kernel profile gpu runs Firecracker 4fc14097b96701d5c382a24a7b8bbaec025445e4"
+            ),
+            "{error}"
+        );
+        let default = Host {
+            firecracker_commit: Some(CONFINED_FIRECRACKER_COMMIT.to_string()),
+            ..host(Ok(11))
+        };
+        assert!(decide(&request(true), &default).unwrap().is_some());
     }
 
     #[test]

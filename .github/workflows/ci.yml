@@ -705,11 +705,12 @@ jobs:
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
     # it again (#834).
     runs-on: ${{ fromJSON(vars.ON_DEMAND_RERUNS == 'true' && github.run_attempt > 1 && format('["self-hosted","Linux","{0}","on-demand"]', matrix.arch) || format('["self-hosted","Linux","{0}"]', matrix.arch)) }}
-    # Longest of the last 6 successful runs: 12 min. GitHub's default is SIX HOURS, which is
+    # Measured 2026-11-25 (run 45517811464): 49 min on arm64 with test-confine (12 min of
+    # it), 43 min on x64 before it ran that step. GitHub's default is SIX HOURS, which is
     # how a wedged runner held a job all day on 2026-08-06 (one job stuck >5h) while the
     # AWS-side lease logic kept renewing its lease because GitHub still reported it busy.
-    # 5x headroom covers a cold runner (kernel/rootfs rebuilds) and is nowhere near 6h.
-    timeout-minutes: 60
+    # 90 is about 1.6 times the longer job with the step and is nowhere near 6h.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       # arm64 and x64, as planned by skip-check (arm64 only on a pull_request).
@@ -977,11 +978,12 @@ jobs:
         working-directory: fcvm
         run: make test-fast
       # --confine's gate: the rootless VM tests with every VMM confined and its syscall
-      # allowlist enforcing; an unlisted syscall kills the VMM and fails its test. arm64
-      # only: the x64 runners' 6.14 kernel is below the Landlock floor, where a confined
-      # start is refused, which test_confine_rootless_vm asserts in test-fast there.
+      # allowlist enforcing; an unlisted syscall kills the VMM and fails its test. On both
+      # architectures: each has its own policy, and its own libc call shapes. The step took
+      # 12 min on arm64 (run 45517811464; 10 of them building the default-feature test
+      # binaries, which test-fast does not build); the cap is twice that.
       - name: test-confine
-        if: matrix.arch == 'arm64'
+        timeout-minutes: 25
         working-directory: fcvm
         run: make test-confine
       # And what THIS job left behind. A non-zero count here means the run leaked microVMs:

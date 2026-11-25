@@ -1649,6 +1649,7 @@ async fn prepare_vm_for_lifecycle(
         // A kernel profile's arguments as well as FCVM_FIRECRACKER_ARGS, which Host reads.
         firecracker_args: profile_firecracker_args(&args).as_deref(),
         unsupported: None,
+        kernel_profile: args.kernel_profile.as_deref(),
     })?;
     info!(
         lifecycle = ?lifecycle,
