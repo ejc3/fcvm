@@ -38,10 +38,12 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
         pid: Some(pid),
         pid_start_time: None,
         lifecycle_ready: false,
+        restore_acknowledged: false,
         holder_pid: None,
         netpool: None,
         confinement: None,
         vsock_epoch: 0,
+        network_gate_closed: false,
         created_at: now,
         last_updated: now,
         config: VmConfig {

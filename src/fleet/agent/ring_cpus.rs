@@ -16,9 +16,11 @@
 //! agent says so (`confined: false`).
 
 use std::collections::BTreeSet;
-use std::ffi::CString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
+
+pub use crate::fleet::cpuset::{own_cgroup, parse_cpu_list, systemd_delegated};
+use crate::fleet::cpuset::{CpuCgroup, Join, Unit};
 
 /// The fewest CPUs a ring can be played on: one machine holds the ball, one is saving and
 /// one must be waking.
@@ -106,78 +108,22 @@ impl Cpus {
     }
 }
 
-/// The cgroup the ring's processes run in, confined to K host CPUs.
+/// The cgroup the ring's processes run in, confined to K host CPUs
+/// ([`crate::fleet::cpuset`], which pages mode's cgroups share).
 #[derive(Debug)]
 pub struct RingCgroup {
-    /// `<delegated unit>/potato`: its `cpuset.cpus` is the K CPUs.
-    dir: PathBuf,
-    /// `<dir>/tools/cgroup.procs`: a process the agent starts for the ring writes itself here
-    /// before it executes. `fcvm snapshot create` stays there; an fcvm that runs a VM then
-    /// moves to its own scope under `dir`.
-    join: CString,
-    /// `dir` below the cgroup2 root: the `FCVM_CGROUP_PARENT` of the ring's fcvm commands.
-    parent: String,
-    cpus: Vec<u32>,
+    /// `<delegated unit>/potato`: its `cpuset.cpus` is the K CPUs. Its path below the
+    /// cgroup2 root is the `FCVM_CGROUP_PARENT` of the ring's fcvm commands.
+    group: CpuCgroup,
+    /// `<potato>/tools`: a process the agent starts for the ring writes itself here before
+    /// it executes. `fcvm snapshot create` stays there; an fcvm that runs a VM then moves to
+    /// its own scope under the ring's cgroup.
+    join: Join,
 }
 
 /// The ring's cgroup, by name, under the delegated unit.
 const RING: &str = "potato";
 const TOOLS: &str = "tools";
-
-/// Parse a cpuset list (`0-3,8,10-11`).
-pub fn parse_cpu_list(list: &str) -> Option<Vec<u32>> {
-    let mut cpus = Vec::new();
-    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
-        match part.split_once('-') {
-            Some((a, b)) => {
-                let (a, b): (u32, u32) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
-                if b < a {
-                    return None;
-                }
-                cpus.extend(a..=b);
-            }
-            None => cpus.push(part.trim().parse().ok()?),
-        }
-    }
-    cpus.sort_unstable();
-    cpus.dedup();
-    Some(cpus)
-}
-
-fn cpu_list(cpus: &[u32]) -> String {
-    cpus.iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// The cgroup a process is in, below the cgroup2 root, from its `/proc/<pid>/cgroup`.
-pub fn own_cgroup(proc_cgroup: &str) -> Option<PathBuf> {
-    let path = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
-    Some(PathBuf::from(path.trim().trim_start_matches('/')))
-}
-
-/// Whether systemd delegated `dir` (`Delegate=`): it marks such a cgroup with the
-/// `trusted.delegate` or `user.delegate` attribute. Anything else in the tree is systemd's
-/// to write, whatever the agent's uid allows.
-pub fn systemd_delegated(dir: &Path) -> bool {
-    let Ok(path) = CString::new(dir.as_os_str().as_encoded_bytes()) else {
-        return false;
-    };
-    [c"trusted.delegate", c"user.delegate"].iter().any(|name| {
-        let mut value = [0u8; 8];
-        // SAFETY: NUL-terminated path and name, and a buffer of the length given.
-        let n = unsafe {
-            libc::getxattr(
-                path.as_ptr(),
-                name.as_ptr(),
-                value.as_mut_ptr().cast(),
-                value.len(),
-            )
-        };
-        n == 1 && value[0] == b'1'
-    })
-}
 
 impl RingCgroup {
     /// Make the ring's cgroup for `k` CPUs. `root` is the cgroup2 mount, `own` the agent's
@@ -194,40 +140,8 @@ impl RingCgroup {
         delegated: &dyn Fn(&Path) -> bool,
         k: u32,
     ) -> Result<Self, String> {
-        let read = |p: &Path| {
-            std::fs::read_to_string(p).map_err(|e| format!("reading {}: {e}", p.display()))
-        };
-        let write = |p: &Path, v: &str| {
-            std::fs::write(p, v).map_err(|e| format!("writing {v:?} to {}: {e}", p.display()))
-        };
-        let mkdir = |p: &Path| match std::fs::create_dir(p) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(e) => Err(format!("creating {}: {e}", p.display())),
-        };
-        let unit = own
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .ok_or_else(|| format!("the agent's cgroup /{} has no parent", own.display()))?;
-        let unit_dir = root.join(unit);
-        if !delegated(&unit_dir) {
-            return Err(format!(
-                "{} is not delegated to the agent (systemd Delegate=yes with DelegateSubgroup=)",
-                unit_dir.display()
-            ));
-        }
-        let controllers = read(&unit_dir.join("cgroup.controllers"))?;
-        if !controllers.split_whitespace().any(|c| c == "cpuset") {
-            return Err(format!(
-                "{} has no cpuset controller ({})",
-                unit_dir.display(),
-                controllers.trim()
-            ));
-        }
-        write(&unit_dir.join("cgroup.subtree_control"), "+cpuset")?;
-        let available = read(&unit_dir.join("cpuset.cpus.effective"))?;
-        let available = parse_cpu_list(&available)
-            .ok_or_else(|| format!("cpuset.cpus.effective is not a CPU list: {available:?}"))?;
+        let unit = Unit::open(root, own, delegated)?;
+        let available = unit.cpus();
         if (available.len() as u32) < k {
             return Err(format!(
                 "the agent may use {} CPUs, fewer than the {k} of the ring",
@@ -235,30 +149,9 @@ impl RingCgroup {
             ));
         }
         let cpus = available[available.len() - k as usize..].to_vec();
-        let dir = unit_dir.join(RING);
-        mkdir(&dir)?;
-        write(&dir.join("cpuset.cpus"), &cpu_list(&cpus))?;
-        // what the kernel made of it: the claim is the effective set, not the request
-        let effective = read(&dir.join("cpuset.cpus.effective"))?;
-        if parse_cpu_list(&effective).as_deref() != Some(&cpus[..]) {
-            return Err(format!(
-                "{} runs on CPUs {:?}, not the {} asked for",
-                dir.display(),
-                effective.trim(),
-                cpu_list(&cpus)
-            ));
-        }
-        let tools = dir.join(TOOLS);
-        mkdir(&tools)?;
-        let join = CString::new(tools.join("cgroup.procs").as_os_str().as_encoded_bytes())
-            .map_err(|e| e.to_string())?;
-        let parent = unit.join(RING).display().to_string();
-        Ok(RingCgroup {
-            dir,
-            join,
-            parent,
-            cpus,
-        })
+        let group = CpuCgroup::create(&unit, RING, &cpus)?;
+        let join = group.join(Some(TOOLS))?;
+        Ok(RingCgroup { group, join })
     }
 
     /// The ring's cgroup on this host, or why the ring is not confined.
@@ -276,7 +169,7 @@ impl RingCgroup {
 
     /// The K CPUs.
     pub fn cpus(&self) -> &[u32] {
-        &self.cpus
+        self.group.cpus()
     }
 
     /// Make `cmd` a process of the ring: it joins the ring's cgroup after the fork and before
@@ -284,69 +177,33 @@ impl RingCgroup {
     /// makes that VM's scope under the ring's cgroup. A process that cannot join does not
     /// start.
     pub fn confine(&self, cmd: &mut std::process::Command) {
-        use std::os::unix::process::CommandExt;
-        cmd.env(crate::cgroup::PARENT_ENV, &self.parent);
-        let join = self.join.clone();
-        // SAFETY: runs in the forked child before exec and makes three async-signal-safe
-        // calls (open, write, close) on memory allocated before the fork.
-        unsafe {
-            cmd.pre_exec(move || {
-                let fd = libc::open(join.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // "0" is the writing process
-                let n = libc::write(fd, b"0".as_ptr().cast(), 1);
-                let result = if n == 1 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                };
-                libc::close(fd);
-                result
-            });
-        }
+        cmd.env(crate::cgroup::PARENT_ENV, self.group.below());
+        self.join.confine(cmd);
     }
 
     /// The CPU time the ring's processes have used, in microseconds (`cpu.stat`'s
     /// `usage_usec`, which counts every cgroup under the ring's).
     pub fn usage_usec(&self) -> Option<u64> {
-        let stat = std::fs::read_to_string(self.dir.join("cpu.stat")).ok()?;
-        stat.lines()
-            .find_map(|l| l.strip_prefix("usage_usec "))
-            .and_then(|v| v.trim().parse().ok())
-    }
-
-    /// Whether any process is left in the ring's cgroup.
-    fn populated(&self) -> bool {
-        std::fs::read_to_string(self.dir.join("cgroup.events"))
-            .map(|e| e.lines().any(|l| l.trim() == "populated 1"))
-            .unwrap_or(false)
+        self.group.usage_usec()
     }
 
     /// SIGKILL every process left in the ring's cgroup (`cgroup.kill`).
     pub fn kill(&self) -> std::io::Result<()> {
-        std::fs::write(self.dir.join("cgroup.kill"), "1")
+        self.group.kill()
     }
 
     /// Wait until no process of the ring is left, for at most `deadline`. The ring's cgroup
     /// is inside the agent's unit, so whatever is left when the agent exits is killed by
     /// systemd with SIGKILL, and an fcvm killed that way leaves its VM's network behind.
     pub async fn emptied(&self, deadline: Duration) -> bool {
-        let until = tokio::time::Instant::now() + deadline;
-        while self.populated() {
-            if tokio::time::Instant::now() >= until {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        true
+        self.group.emptied(deadline).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn the_ledger_never_holds_more_than_its_cap() {
@@ -438,7 +295,7 @@ mod tests {
             "12,13,14,15"
         );
         assert!(unit.join("potato/tools").is_dir());
-        assert_eq!(ring.parent, "system.slice/agent.service/potato");
+        assert_eq!(ring.group.below(), "system.slice/agent.service/potato");
         std::fs::write(
             unit.join("potato/cpu.stat"),
             "usage_usec 1234567\nuser_usec 1\nsystem_usec 2\n",

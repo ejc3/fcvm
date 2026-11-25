@@ -318,6 +318,7 @@ impl Coord {
             store_ready_file: None,
             boot: Default::default(),
             ipv4_front: None,
+            renders: None,
             potato: None,
             windows: Some(windows),
             minecraft: None,

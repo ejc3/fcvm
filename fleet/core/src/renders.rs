@@ -74,6 +74,15 @@ pub struct RendersHost {
     /// fcvm commit, the Kitesurf commit and seal, and the like, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build: BTreeMap<String, String>,
+    /// The public addresses of the host's frame socket, which the coordinator names
+    /// `renders-<host>-<token>` in its subzone: its IPv6 address (port 443) and its IPv4
+    /// address, on `v4_port` (443 when absent). None before the host has a frame socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v4_port: Option<u16>,
 }
 
 /// Where a side's search is.
@@ -280,6 +289,13 @@ pub struct HostState {
     /// When the coordinator received `report` (its own clock).
     #[serde(default)]
     pub report_at: u64,
+    /// The names of the host's frame socket in the coordinator's subzone, for the addresses
+    /// its hello gave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<crate::state::Published>,
+    /// The host reported a spot interruption notice: it renders until EC2 takes it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub draining: bool,
 }
 
 /// The mode's part of the fleet state.
@@ -337,6 +353,16 @@ pub struct RendersView {
     pub report: Option<RendersReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub report_at: Option<u64>,
+    /// The host's frame socket, and the IPv4-only name for it: with the coordinator's
+    /// subzone, the names it published for the addresses the hello gave (none until they
+    /// are); otherwise the URLs of the host's last report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_url_v4: Option<String>,
+    /// The host reported a spot interruption notice; absent otherwise.
+    #[serde(skip_serializing_if = "is_false")]
+    pub draining: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay: Option<OverlayView>,
     pub transforms: TransformsView,
@@ -376,12 +402,13 @@ fn draws_nothing(c: char) -> bool {
         || matches!(c,
             '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
             | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}'
-            | '\u{2060}'..='\u{2064}' | '\u{206A}'..='\u{206F}' | '\u{2800}' | '\u{3164}'
-            | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{2060}'..='\u{2065}' | '\u{206A}'..='\u{206F}' | '\u{2800}' | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{16FE4}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D159}' | '\u{1D173}'..='\u{1D17A}'
             | '\u{E0000}'..='\u{E0FFF}')
 }
 
-/// An overlay's text as it is kept: runs of spaces collapsed, 1 to [`MAX_OVERLAY_CHARS`]
+/// An overlay's text as it is kept: trimmed, each run of whitespace one space, 1 to [`MAX_OVERLAY_CHARS`]
 /// characters. Refused: a control character (a tab or a newline is one), a character that
 /// changes the direction of the text around it, and a text that shows nothing. Plain text:
 /// the host escapes it into the page.
@@ -425,6 +452,8 @@ impl Renders {
             Some(h) => {
                 let state = self.hosts.entry(host.to_string()).or_default();
                 state.hello = h.clone();
+                // A new agent: no notice of its own yet.
+                state.draining = false;
             }
             None => {
                 self.hosts.remove(host);
@@ -568,6 +597,9 @@ impl Renders {
             build: h.hello.build.clone(),
             report: h.report.clone(),
             report_at: h.report.as_ref().map(|_| h.report_at),
+            frame_url: None,
+            frame_url_v4: None,
+            draining: h.draining,
             overlay: self.overlay.as_ref().map(|o| OverlayView {
                 text: o.text.clone(),
                 transform: o.transform.clone(),
@@ -602,6 +634,9 @@ mod tests {
             cpus: 40,
             confined: true,
             build: BTreeMap::new(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         }
     }
 
@@ -690,6 +725,36 @@ mod tests {
         }
         assert_eq!(normalise_overlay("   "), Err("text is empty".into()));
         assert_eq!(normalise_overlay(""), Err("text is empty".into()));
+        // more that draws nothing: unassigned and supplementary-plane format characters
+        for blank in [
+            "\u{2065}",
+            "\u{FFF0}\u{FFF8}",
+            "\u{1BCA0}",
+            "\u{1D173}\u{1D17A}",
+            "\u{1D159}",
+            "\u{16FE4}",
+        ] {
+            assert_eq!(
+                normalise_overlay(blank),
+                Err("text shows nothing".into()),
+                "{blank:?}"
+            );
+        }
+        // the reason is the first that applies: a control before a direction control, and
+        // nothing shown before the length
+        assert_eq!(
+            normalise_overlay("a\n\u{202E}b"),
+            Err("text holds control characters".into())
+        );
+        assert_eq!(
+            normalise_overlay(&"\u{200B}".repeat(MAX_OVERLAY_CHARS + 5)),
+            Err("text shows nothing".into())
+        );
+        // any whitespace that is not a control is one space, and the ends are trimmed
+        assert_eq!(
+            normalise_overlay("\u{3000}a\u{2028}\u{00A0}b ").as_deref(),
+            Ok("a b")
+        );
         // a tab or a newline is a control character and is refused, not collapsed
         assert!(normalise_overlay("a\tb").is_err());
         assert_eq!(normalise_overlay("  a   b  ").as_deref(), Ok("a b"));

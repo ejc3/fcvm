@@ -407,6 +407,20 @@ async fn apply_restore_epoch(
     egress_gen_at_last_stable: Option<u64>,
     metadata: &crate::types::LatestMetadata,
 ) {
+    // 0. The boundary this guest was captured behind is this restore's from here to its
+    //    publication: a snapshot one-shot the host runs meanwhile is refused, and the
+    //    freeze watchdog leaves the container frozen (`snapshot_network::BoundaryMarks`).
+    //    Without the mark a stray one-shot could open the gate, so a restore that cannot
+    //    write it does not go on.
+    if let Err(error) = crate::snapshot_network::begin_restore_boundary() {
+        signals.restore_status.fail();
+        eprintln!(
+            "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}; shutting down \
+             clone",
+            current, error
+        );
+        crate::system::shutdown_vm(1).await;
+    }
     // A snapshot of a running VM was taken with the agent's console held quiet
     // (`--prepare-snapshot-network`), and this clone inherits that hold. Release it
     // first, so no line of this restore waits behind it. With a host that takes the
@@ -464,6 +478,10 @@ async fn apply_restore_epoch(
             crate::system::shutdown_vm(1).await
         }
     };
+    // Published: the gate is open and the boundary is nobody's. Before the
+    // acknowledgement, so a host that snapshots this clone the moment it is told the
+    // restore is done is not refused.
+    crate::snapshot_network::end_restore_boundary();
     if let Err(error) = crate::vsock::notify_restore_complete(current, &phases).await {
         signals.restore_status.fail();
         eprintln!(

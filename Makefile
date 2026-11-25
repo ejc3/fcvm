@@ -622,6 +622,36 @@ test-fleet-coordinator: private SHELL := $(TARGET_LEASE_SHELL)
 test-fleet-coordinator: cargo-target-link dep-provenance
 	CARGO_TARGET_DIR=target $(CARGO) test --locked --release --no-default-features -p fcvm --test test_fleet_coord
 
+# Pages mode's host module on its own, as a systemd unit started with sudo
+# (bench/chromium/renders_bench.sh lists the knobs; command-line variables reach it):
+#   make fleet-renders-bench OUT=dir KITESURF=dir [TAG=] [LEVELS=F,K] [SECONDS_RUN=]
+# It runs target/release/fcvm as built and has no build dependency: a figure is taken from
+# the binary the snapshot was made with.
+.PHONY: fleet-renders-bench
+fleet-renders-bench:
+	@test -n "$(OUT)" || { echo "fleet-renders-bench needs OUT=DIR" >&2; exit 2; }
+	bench/chromium/renders_bench.sh run
+
+# End a pages-mode module at each stage (SIGKILL, and SIGTERM while it renders) and count
+# what is left: processes, cgroups, namespaces, clones, sockets, ports, the run directory.
+# Needs what fleet-renders-bench needs, on a host that is otherwise idle.
+#   make test-fleet-renders-teardown OUT=dir KITESURF=dir [STAGES=a,b:TERM]
+.PHONY: test-fleet-renders-teardown
+test-fleet-renders-teardown:
+	@test -n "$(OUT)" || { echo "test-fleet-renders-teardown needs OUT=DIR" >&2; exit 2; }
+	bench/chromium/renders_bench.sh teardown-check $(STAGES)
+
+# The same module under `fcvm fleet agent --renders`, with the coordinator's side played by
+# bench/chromium/renders_agent_check.py over the agent's --stdio: the hello, renders on both
+# sides, an overlay order, a stop while rendering and while held at HOLD_STAGES (the agent
+# stays up and renders again), and SIGKILL of the agent at each of STAGES (SIGTERM at
+# running:TERM). Every census count must be zero. No build dependency, as above.
+#   make test-fleet-renders-agent OUT=dir KITESURF=dir [STAGES=a,b:TERM] [HOLD_STAGES=a,b] [CASES=running,held,kill]
+.PHONY: test-fleet-renders-agent
+test-fleet-renders-agent:
+	@test -n "$(OUT)" || { echo "test-fleet-renders-agent needs OUT=DIR" >&2; exit 2; }
+	bench/chromium/renders_bench.sh agent-check $(STAGES)
+
 # The directed camera's program with no votes, as JSON (fleet/core/examples/program.rs):
 # make fleet-program SEED=1 SECS=600 OUT=program.json
 .PHONY: fleet-program
