@@ -3407,14 +3407,15 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
         "the `lake build` step must fail when any of its commands fails: {script:?}"
     );
 
-    // The same step runs the three checks the models' documents rely on beside the build,
+    // The same step runs the checks the models' documents rely on beside the build,
     // each on a line of its own:
     // - the import check before the build, because lake does not elaborate Axioms.lean again
     //   when a file nothing imports is added, so the axiom sweep inside it does not see one;
     // - the boundary model's drift check, naming the rule book of this tree (without a name it
     //   passes on any order the model knows, an earlier one included);
     // - the boundary model's search, compared with the result its documents quote;
-    // - the resume model's search, likewise.
+    // - the resume model's search, likewise;
+    // - the resume model's mutants, each of which must have a break.
     let lines: Vec<&str> = script.lines().map(str::trim).collect();
     let line_of = |what: &str, wanted: &dyn Fn(&str) -> bool| -> usize {
         lines
@@ -3453,8 +3454,12 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
         "`lake exe resume-breaks | diff ResumeVerify/search.expected -`",
         &|l| l == "lake exe resume-breaks | diff ResumeVerify/search.expected -",
     );
+    let resume_mutants = line_of(
+        "`lake exe resume-breaks mutants | diff ResumeVerify/mutants.expected -`",
+        &|l| l == "lake exe resume-breaks mutants | diff ResumeVerify/mutants.expected -",
+    );
     assert!(
-        built < drift && built < search && built < resume_search,
+        built < drift && built < search && built < resume_search && built < resume_mutants,
         "the drift check and the searches run the executables `lake build` makes: {script:?}"
     );
 

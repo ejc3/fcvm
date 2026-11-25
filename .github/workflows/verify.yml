@@ -36,7 +36,7 @@ jobs:
   lean:
     name: Lean
     runs-on: ubuntu-latest
-    # A cold build of both models measured 1 min 27 s on an arm64 dev box, after the toolchain
+    # A cold build of the first two models measured 1 min 27 s on an arm64 dev box, after the toolchain
     # download.
     timeout-minutes: 15
     steps:
@@ -90,7 +90,8 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.elan/bin:$PATH"
           lean --version
-          # every file of every model is imported by its axiom sweep
+          # every file of every model is imported by its axiom sweep, and every library and
+          # executable is a default target of `lake build`
           ./check-imports.sh
           lake build
           # The rule book of this tree's fc-agent (verify/GateVerify/README.md, "The rule
@@ -101,3 +102,6 @@ jobs:
           lake exe gate-breaks summary | diff GateVerify/search.expected -
           # The same for the resume model: every configuration and rule book.
           lake exe resume-breaks | diff ResumeVerify/search.expected -
+          # Every mutant of the resume model's designs (each repair put back, each thing a VMM
+          # must not do) has a break: the command exits 1 if one has none.
+          lake exe resume-breaks mutants | diff ResumeVerify/mutants.expected -
