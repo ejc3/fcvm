@@ -2256,7 +2256,7 @@ class RendersHostCheckTests(unittest.TestCase):
                 self.assertTrue(self.check.boot_problems(self.RELEASE, self.RELEASE, line, self.PARAMS, self.BASE))
 
     BUILTIN = "kernel/drivers/net/ethernet/amazon/ena/ena.ko\n"
-    AFTER = "systemd-remount-fs.service systemd-modules-load.service systemd-journald.socket"
+    AFTER = {"After": "systemd-remount-fs.service systemd-modules-load.service systemd-journald.socket"}
 
     LOADER = {"LoadState": "loaded", "ActiveState": "active", "Result": "success"}
 
@@ -2268,11 +2268,13 @@ class RendersHostCheckTests(unittest.TestCase):
             ({"modules_load": "enax\n"}, "ena"),
             ({"modules_load": "# ena\n"}, "ena"),
             ({"dropin": False}, "10-fcvm-fleet-nic.conf"),
-            ({"after": "systemd-remount-fs.service"}, "systemd-modules-load.service"),
+            ({"after": {"After": "systemd-remount-fs.service"}}, "systemd-modules-load.service"),
+            ({"after": {}}, "is not ordered after"),
             ({"after": None}, "is unknown"),
             # the loader masked, failed or not run: the files and the order are no load
             ({"loader": {**self.LOADER, "LoadState": "masked", "ActiveState": "inactive"}}, "LoadState=masked"),
-            ({"loader": {**self.LOADER, "ActiveState": "failed", "Result": "exit-code"}}, "Result=exit-code"),
+            ({"loader": {**self.LOADER, "ActiveState": "failed", "Result": "exit-code"}}, "did not run with success"),
+            ({"loader": {**self.LOADER, "Result": "exit-code"}}, "Result=exit-code"),
             ({"loader": {**self.LOADER, "ActiveState": "inactive"}}, "ActiveState=inactive"),
             ({"loader": {}}, "systemd-modules-load.service"),
             ({"loader": None}, "is unknown"),
@@ -2338,6 +2340,8 @@ class RendersHostCheckTests(unittest.TestCase):
         self.assertIn('systemctl_show("cloud-init-local.service", ("After",))', body)
         self.assertIn('systemctl_show("systemd-modules-load.service", ("LoadState", "ActiveState", "Result"))', body)
         self.assertNotIn('"systemctl"', body, "both reads go through systemctl_show")
+        # each read reaches the check as read, None included: the check decides what a failed read means
+        self.assertIn("NIC_DROPIN.is_file(), after, loader,", body)
         self.assertNotIn("grub", source.lower())
         self.assertNotIn("lsinitramfs", source)
 

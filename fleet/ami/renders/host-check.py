@@ -77,14 +77,16 @@ NIC_MODULES_LOAD = Path("/etc/modules-load.d/fcvm-fleet-nic.conf")
 NIC_DROPIN = Path("/etc/systemd/system/cloud-init-local.service.d/10-fcvm-fleet-nic.conf")
 
 
-def nic_load_problems(driver, modules_load, dropin_exists, cloud_init_after, loader, builtin):
+def nic_load_problems(driver, modules_load, dropin_exists, cloud_init, loader, builtin):
     """Why the NIC's driver may bind after cloud-init-local looks for a NIC on the initrdless boot.
     The driver is a module of the arm64 host kernel, so systemd-modules-load must load it
     (`modules_load`, the text of NIC_MODULES_LOAD, None when absent) and must have run this boot
     (`loader`, its LoadState, ActiveState and Result, None when they could not be read), and
-    cloud-init-local.service must be ordered after it (NIC_DROPIN, and systemd's resolved `After`,
-    `cloud_init_after`, None when it could not be read). A driver built into the kernel
-    (modules.builtin) binds during the kernel's start and needs none of it."""
+    cloud-init-local.service must be ordered after it (NIC_DROPIN, and systemd's resolved `After`
+    in `cloud_init`, None when it could not be read). The loader's Result covers every file in
+    modules-load.d, so another module's load error fails this check too: a loader that failed is
+    not taken to have loaded this driver. A driver built into the kernel (modules.builtin) binds
+    during the kernel's start and needs none of it."""
     if not driver:
         return ["no NIC driver to look for: this boot has no default route, or its interface has no driver"]
     module = re.compile(r"(^|/)" + re.escape(driver) + r"\.ko(\.(zst|xz|gz))?$")
@@ -97,16 +99,16 @@ def nic_load_problems(driver, modules_load, dropin_exists, cloud_init_after, loa
         problems.append(f"{NIC_MODULES_LOAD} does not name the {driver} driver")
     if not dropin_exists:
         problems.append(f"{NIC_DROPIN} does not exist")
-    if cloud_init_after is None:
+    if cloud_init is None:
         problems.append("systemctl show failed: the order of cloud-init-local.service is unknown")
-    elif "systemd-modules-load.service" not in cloud_init_after.split():
+    elif "systemd-modules-load.service" not in cloud_init.get("After", "").split():
         problems.append("cloud-init-local.service is not ordered after systemd-modules-load.service")
     if loader is None:
         problems.append("systemctl show failed: the state of systemd-modules-load.service is unknown")
     else:
         state = {key: loader.get(key, "") for key in ("LoadState", "ActiveState", "Result")}
         if state != {"LoadState": "loaded", "ActiveState": "active", "Result": "success"}:
-            problems.append("systemd-modules-load.service did not run this boot ("
+            problems.append("systemd-modules-load.service did not run with success this boot ("
                             + ", ".join(f"{k}={v or 'none'}" for k, v in state.items()) + ")")
     return problems
 
@@ -235,8 +237,8 @@ def check_boot(conf):
     builtin = Path("/lib/modules", release, "modules.builtin")
     return problems + nic_load_problems(nic_driver(Path("/proc/net/route").read_text()),
                                         NIC_MODULES_LOAD.read_text() if NIC_MODULES_LOAD.is_file() else None,
-                                        NIC_DROPIN.is_file(), after.get("After", "") if after is not None else None,
-                                        loader, builtin.read_text() if builtin.is_file() else "")
+                                        NIC_DROPIN.is_file(), after, loader,
+                                        builtin.read_text() if builtin.is_file() else "")
 
 
 def check_host(conf):
