@@ -1,5 +1,5 @@
 name = "WakeVerify"
-defaultTargets = ["WakeVerify", "breaks", "hostops", "GateVerify", "gate-breaks", "gate-seq"]
+defaultTargets = ["WakeVerify", "breaks", "hostops", "GateVerify", "gate-breaks", "gate-seq", "ResumeVerify", "resume-breaks"]
 
 # A warning fails the build: `sorry` is a warning, and so is a `#guard_msgs` that Lean could
 # only partly check.
@@ -37,3 +37,14 @@ root = "GateSearch"
 [[lean_exe]]
 name = "gate-seq"
 root = "GateSeq"
+
+# A vCPU's timer and interrupt state across a snapshot and a restore on arm64 (namespace
+# `Resume`).
+[[lean_lib]]
+name = "ResumeVerify"
+globs = ["ResumeVerify.*"]
+
+# `lake exe resume-breaks`: the exhaustive search of every rule book of that model.
+[[lean_exe]]
+name = "resume-breaks"
+root = "ResumeSearch"
