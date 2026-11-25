@@ -10,16 +10,22 @@ release, machine and clock given as arguments. Run with make test-runner-kernel.
 """
 
 import datetime
+import contextlib
 import hashlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
+import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts/check-runner-kernel.py"
@@ -75,10 +81,11 @@ class Origin:
         self.write("kernel/host-x86.conf", "CONFIG_ENA_ETHERNET=y\n")
         self.write("kernel/host-arm64.conf", "CONFIG_WEXT_CORE=n\n")
 
-    def git(self, *args, when=None):
+    def git(self, *args, when=None, authored=None):
         env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
         if when is not None:
-            env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = f"@{when} +0000"
+            env["GIT_COMMITTER_DATE"] = f"@{when} +0000"
+            env["GIT_AUTHOR_DATE"] = f"@{when if authored is None else authored} +0000"
         return subprocess.run(
             ["git", "-C", str(self.path), "-c", "user.name=test", "-c", "user.email=test@example.com",
              "-c", "commit.gpgsign=false", *args],
@@ -90,13 +97,15 @@ class Origin:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
 
-    def commit(self, hours_ago, message="change", **files):
-        """Commit `files` (path -> text) to the current branch, dated `hours_ago` before NOW."""
+    def commit(self, hours_ago, message="change", authored_hours_ago=None, **files):
+        """Commit `files` (path -> text) to the current branch, committed `hours_ago` before
+        NOW and authored then too, or `authored_hours_ago` before NOW."""
         for name, text in files.items():
             self.write(name, text)
         self.git("add", "--all")
         self.git("commit", "--quiet", "--allow-empty", "-m", message,
-                 when=NOW - int(hours_ago * HOUR))
+                 when=NOW - int(hours_ago * HOUR),
+                 authored=None if authored_hours_ago is None else NOW - int(authored_hours_ago * HOUR))
         return self.git("rev-parse", "HEAD")
 
     def checkout(self, into, branch="main", depth=1):
@@ -134,6 +143,27 @@ def expected(root, machine="x86_64"):
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
+
+
+def load_script():
+    """The script as a module, for the cases that replace one of its parts."""
+    spec = importlib.util.spec_from_file_location("check_runner_kernel", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fake_git(directory, case_arms):
+    """A `git` in `directory` that runs `case_arms` (the arms of a shell `case` on the git
+    subcommand) and hands every other command to the real git. Returns a PATH with it first."""
+    directory.mkdir()
+    script = directory / "git"
+    script.write_text(
+        f'#!/bin/bash\nreal={shutil.which("git")}\nfor argument in "$@"; do\n  case "$argument" in\n'
+        f'{textwrap.indent(textwrap.dedent(case_arms).strip(), "    ")}\n  esac\ndone\nexec "$real" "$@"\n'
+    )
+    script.chmod(0o755)
+    return f"{directory}:{os.environ['PATH']}"
 
 
 class Case(unittest.TestCase):
@@ -283,6 +313,46 @@ class Rollout(Case):
         self.assertIn(f"accepted until {utc(NOW + 21 * HOUR)}", out)
         self.assertEqual(check(work, before, now=NOW + 21 * HOUR)[0], 1)
 
+    def test_a_rebased_change_counts_from_when_it_was_committed_to_main(self):
+        # A rebase or squash merge: one commit on main, authored three days ago, committed
+        # 3 hours ago.
+        self.origin.commit(72, "first build")
+        before = expected(self.origin.path)
+        self.origin.commit(3, "x86 host patch, rebased onto main", authored_hours_ago=70,
+                           **{X86_ONLY: "pv kick\n"})
+        work = self.origin.checkout(self.tmp / "work")
+        status, out, err = check(work, before)
+        self.assertEqual(status, 0, out + err)
+        self.assertIn(f"accepted until {utc(NOW + 21 * HOUR)}", out)
+        self.assertEqual(check(work, before, now=NOW + 21 * HOUR)[0], 1)
+
+    def test_the_fetch_writes_its_own_ref_and_no_other(self):
+        self.origin.commit(72, "first build")
+        before = expected(self.origin.path)
+        self.origin.commit(4, "x86 host patch", **{X86_ONLY: "pv kick\n"})
+        work = self.origin.checkout(self.tmp / "work")
+        # main moves and gains a tag after the checkout was made, as it does under a job.
+        self.origin.commit(1, "unrelated", README="later\n")
+        self.origin.git("tag", "v-later")
+
+        def refs():
+            listed = subprocess.run(
+                ["git", "-C", str(work), "for-each-ref", "--format=%(refname) %(objectname)"],
+                capture_output=True, text=True, check=True,
+            ).stdout.split("\n")
+            head = subprocess.run(["git", "-C", str(work), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            return {line.split()[0]: line.split()[1] for line in listed if line} | {"HEAD": head}
+
+        at_checkout = refs()
+        self.assertIn("refs/remotes/origin/main", at_checkout)
+        self.assertEqual(check(work, before)[0], 0)
+        after = refs()
+        tip = self.origin.git("rev-parse", "main")
+        self.assertEqual(after.pop("refs/runner-kernel-check/main"), tip)
+        self.assertEqual(after, at_checkout)
+        self.assertNotEqual(at_checkout["refs/remotes/origin/main"], tip)
+
     def test_history_deeper_than_the_first_fetch_is_fetched(self):
         # 80 commits after the change: more than the 64 the second fetch asks for.
         before, _, work = self.rollout(changed_hours_ago=23, later_commits=80)
@@ -292,9 +362,7 @@ class Rollout(Case):
 
     def test_more_history_than_the_check_fetches_blocks(self):
         before, _, work = self.rollout(changed_hours_ago=23, later_commits=5)
-        spec = importlib.util.spec_from_file_location("check_runner_kernel", SCRIPT)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_script()
         module.FETCH_DEPTHS = (1, 2)
         with self.assertRaisesRegex(module.Blocked, "more than 2 commits in the last 24 hours"):
             module.verdict(before, "x86_64", work, NOW, False)
@@ -332,6 +400,8 @@ class OtherCheckouts(Case):
         self.assertTrue(out.startswith("::notice title=Runner kernel::"), out)
         self.assertIn(f"runner kernel {on_main} is the host kernel main builds for x86_64.", out)
         self.assertIn("does not test this checkout's host kernel", out)
+        self.assertIn("is not tested by this job", out.splitlines()[0])
+        self.assertIn("`make install-host-kernel`", out)
         self.assertEqual(check(work, on_main, extra=["--current-only"])[0], 1)
 
     def test_a_checkout_behind_main_runs_on_mains_build(self):
@@ -455,6 +525,84 @@ class CannotEvaluate(Case):
         self.blocked(work, "is unknown: `git fetch .*` failed", release=before)
 
 
+    def test_a_history_commit_git_cannot_read_blocks(self):
+        # The stale-image verdict blames the runner image. A commit git could not list must
+        # not count as "this commit gives no build" on the way to it.
+        before, after, work = self.rollout(changed_hours_ago=4)
+        path = fake_git(self.tmp / "fake-bin", """
+            ls-tree) echo 'fatal: unable to read tree' >&2; exit 128 ;;
+        """)
+        self.blocked(work, f"runner kernel {before} is not the build this checkout gives "
+                           rf"\({re.escape(after)}\), and whether main gave it in the last 24 hours "
+                           "is unknown: `git ls-tree .*` failed: fatal: unable to read tree",
+                     release=before, path=path)
+
+    def test_a_history_commit_from_before_the_config_gives_no_build(self):
+        # main's first commit has no config: it is walked, gives no build, and is no error.
+        self.origin.write("README", "first\n")
+        self.origin.git("add", "README")
+        self.origin.git("commit", "--quiet", "-m", "before the config", when=NOW - 10 * HOUR)
+        self.origin.commit(8, "the config and the host sets")
+        work = self.origin.checkout(self.tmp / "work")
+        status, _, err = check(work, "7.3.3-fcvm-0123456789ab")
+        self.assertEqual(status, 1, err)
+        self.assertIn("The runner image is stale", err)
+        # Deepening reached the first commit, so the checkout is a full repository now, and
+        # a second run reads it as one.
+        self.assertFalse((work / ".git/shallow").exists())
+        self.assertEqual(check(work, "7.3.3-fcvm-0123456789ab")[0], 1)
+
+    def test_a_fetch_that_hangs_is_killed_and_leaves_no_lock(self):
+        before, _, work = self.rollout(changed_hours_ago=4)
+        lock = work / ".git/shallow.lock"
+        nap = f"60.{os.getpid()}"  # a duration no other process on the host sleeps for
+        path = fake_git(self.tmp / "fake-bin", f"""
+            fetch) touch {lock}; sleep {nap} & wait ;;
+        """)
+        module = load_script()
+        module.GIT_TIMEOUT = 1
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {"PATH": path}):
+            with self.assertRaisesRegex(module.Blocked, "`git fetch` did not finish in 1 s"):
+                module.verdict(before, "x86_64", work, NOW, False)
+            self.assertLess(time.monotonic() - started, 30)
+            self.assertFalse(lock.exists(), "the killed fetch left shallow.lock")
+            # The fetch's children are gone too: the session was killed, not only git.
+            sleeping = subprocess.run(["pgrep", "-f", f"^sleep {nap}$"], capture_output=True, text=True)
+            self.assertEqual(sleeping.stdout, "", "the killed fetch left a child running")
+            # A lock that was there before the fetch is someone else's and stays.
+            lock.touch()
+            with self.assertRaisesRegex(module.Blocked, "did not finish"):
+                module.verdict(before, "x86_64", work, NOW, False)
+            self.assertTrue(lock.exists())
+
+    def test_a_python_without_the_tar_filter_blocks(self):
+        before, _, work = self.rollout(changed_hours_ago=4)
+        module = load_script()
+        module.tarfile = types.SimpleNamespace(open=module.tarfile.open)
+        with self.assertRaisesRegex(module.Blocked, "tarfile has no extraction filter"):
+            module.verdict(before, "x86_64", work, NOW, False)
+
+    def test_an_error_the_script_does_not_expect_blocks(self):
+        self.origin.commit(1)
+        module = load_script()
+
+        def broken(*_):
+            raise RuntimeError("not a verdict")
+
+        module.verdict = broken
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = module.main(["check-runner-kernel.py", "--root", str(self.origin.path),
+                                  "--release", "7.3.3-fcvm-0123456789ab", "--machine", "x86_64"])
+        self.assertEqual(status, 2)
+        self.assertEqual(out.getvalue(), "::error title=Runner kernel check blocked::unexpected "
+                                         "RuntimeError: not a verdict\n")
+        self.assertIn("BLOCKED: the runner kernel check cannot evaluate: unexpected RuntimeError",
+                      err.getvalue())
+        self.assertIn("Traceback", err.getvalue())
+
+
 class ThisRepository(unittest.TestCase):
     """What the script assumes about the repository it is checked out in."""
 
@@ -466,9 +614,7 @@ class ThisRepository(unittest.TestCase):
             self.assertEqual((status, err), (0, ""), out)
 
     def test_the_image_installs_the_profile_and_is_built_from_the_branch_the_script_names(self):
-        spec = importlib.util.spec_from_file_location("check_runner_kernel", SCRIPT)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_script()
         ami = (ROOT / "scripts/build-ami.sh").read_text()
         self.assertRegex(
             ami, rf"fcvm setup --kernel-profile {module.PROFILE}\b[^\n]*--install-host-kernel\n")
@@ -482,9 +628,7 @@ class ThisRepository(unittest.TestCase):
                                 capture_output=True, text=True)
         if inside.returncode != 0:
             self.skipTest("not a git checkout")
-        spec = importlib.util.spec_from_file_location("check_runner_kernel", SCRIPT)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = load_script()
         dirty = subprocess.run(
             ["git", "-C", str(ROOT), "status", "--porcelain", "--", "rootfs-config.toml", "kernel"],
             capture_output=True, text=True, check=True,

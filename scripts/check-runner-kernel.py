@@ -31,11 +31,31 @@ Verdicts, each named in what the script prints:
 from a build that lacks a change (a benchmark).
 
 The second and third verdicts need main's recent first-parent history, which a CI
-checkout (one commit deep) does not hold. The script fetches it from `origin` into
-refs/runner-kernel-check/main, only when the running kernel is an fcvm build other than
-the one the checkout gives. In a shallow repository it deepens that one ref as far as
-the window needs; in a full one it fetches without a depth, which would otherwise make
-the repository shallow.
+checkout (one commit deep) does not hold. The script fetches it from `origin`, only when
+the running kernel is an fcvm build other than the one the checkout gives. What that
+changes in the checkout: the ref refs/runner-kernel-check/main is created or moved, the
+fetched objects are added, and in a shallow repository the `shallow` file moves as that
+ref is deepened as far as the window needs. No other ref is written: the fetch names its
+one refspec, takes no tags and turns the remote-tracking update off (`--refmap=`). In a
+full repository it fetches without a depth, which would otherwise make the repository
+shallow. A git command that outlives GIT_TIMEOUT is killed with its children, and a
+`shallow.lock` or ref lock the killed fetch left is removed, so later git steps of the
+job are not refused.
+
+A consequence of the second and third verdicts: a pull request that changes a host
+kernel input runs its VM tests on main's kernel, and after it merges main's jobs pass on
+the previous build until replacement runners boot the new image. The new kernel is first
+booted by the image build's boot test and first runs VM tests when those runners take
+jobs, hours after the merge. Such a change is tested before merge by installing its
+kernel on a box (`make install-host-kernel`) and running the VM lanes there; the notice
+says so.
+
+The window is measured against commit times with the runner's clock, which is trusted: a
+clock ahead of true time shortens the window and one behind lengthens it.
+
+The script needs Python 3.11.4 or later (tomllib, and tarfile's extraction filter); the
+runner image and GitHub's ubuntu-24.04 have 3.12. An older Python, like any error this
+script does not expect, exits 2.
 
 --release, --machine, --now and --root replace `uname -r`, `uname -m`, the clock and
 the checkout, for the tests (scripts/test-check-runner-kernel.py) and for asking what a
@@ -51,11 +71,13 @@ import io
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+import traceback
 
 try:
     import tomllib
@@ -80,7 +102,12 @@ IMAGE_WORKFLOW = ".github/workflows/build-runner-ami.yml"
 # 13 h 30 min (the fleet's hard ceiling, ejc3/aws runner-autoscale.tf), and the image
 # pipeline (Build Kernels, the approved Build Runner AMI run, the hourly copy to the
 # runner region) took about 4 h 20 min from merge to the last replaced runner on 2026-11-25.
+# So the new image has to be published within about 10 h 30 min of the merge: a runner
+# launched just before that can still be on the previous build 13 h 30 min later.
 ROLLOUT_HOURS = 24
+
+# Seconds one git command may take before it is killed.
+GIT_TIMEOUT = 300
 
 # Depths tried, in order, when main's history has to be fetched into a shallow
 # repository. main had 35 first-parent commits in the 24 hours before this was written.
@@ -146,33 +173,63 @@ def host_kernel_release(root, config_arch):
     return f"{version}-fcvm-{digest.hexdigest()[:12]}"
 
 
-def git(root, *args, binary=False):
-    """Run git in `root` and return its output; any failure blocks the check."""
+def git_path(root, name):
+    """Where git keeps `name` (a file of the repository) for the checkout at `root`."""
+    path = pathlib.Path(git(root, "rev-parse", "--git-path", name))
+    return path if path.is_absolute() else root / path
+
+
+def git(root, *args, binary=False, locks=()):
+    """Run git in `root` and return its output; any failure blocks the check. `locks` are
+    lock files the command takes: one that did not exist before a command that had to be
+    killed is removed, since a killed git does not remove its own."""
     command = ["git", "-C", str(root), *args]
+    held = {lock for lock in locks if lock.exists()}
     try:
-        result = subprocess.run(
+        # A session of its own, so a kill reaches the helpers git starts (git-remote-https,
+        # index-pack) as well.
+        process = subprocess.Popen(
             command,
-            capture_output=True,
-            timeout=300,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
     except FileNotFoundError as error:
         raise Blocked("git is not on PATH") from error
+    try:
+        stdout, stderr = process.communicate(timeout=GIT_TIMEOUT)
     except subprocess.TimeoutExpired as error:
-        raise Blocked(f"`git {args[0]}` did not finish in 300 s") from error
-    if result.returncode != 0:
-        detail = result.stderr.decode(errors="replace").strip().splitlines()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        for lock in locks:
+            if lock not in held:
+                lock.unlink(missing_ok=True)
+        raise Blocked(f"`git {args[0]}` did not finish in {GIT_TIMEOUT} s and was killed") from error
+    if process.returncode != 0:
+        detail = stderr.decode(errors="replace").strip().splitlines()
         raise Blocked(f"`git {' '.join(args)}` failed: {detail[-1] if detail else 'no output'}")
-    return result.stdout if binary else result.stdout.decode().strip()
+    return stdout if binary else stdout.decode().strip()
 
 
 def release_at(root, commit, config_arch, cache):
-    """The host kernel release a commit's inputs give, or None when they give none."""
-    try:
-        key = git(root, "rev-parse", f"{commit}:rootfs-config.toml", f"{commit}:kernel")
-    except Blocked:
-        return None  # a commit from before the config or the kernel directory existed
+    """The host kernel release a commit's inputs give, or None when they give none. A git
+    command that fails blocks: "no build" is said only of a commit git could read."""
+    # One line per path the commit has, so a commit from before the config or the kernel
+    # directory existed lists fewer than two and is not an error.
+    listed = git(root, "ls-tree", commit, "--", "rootfs-config.toml", "kernel")
+    key = tuple(sorted(line.split("\t")[0] for line in listed.splitlines()))
+    if len(key) != 2:
+        return None
     if key not in cache:
+        if not hasattr(tarfile, "data_filter"):
+            raise Blocked(
+                "this Python's tarfile has no extraction filter (3.11.4 or later is needed), "
+                "so a commit's kernel inputs cannot be read"
+            )
         archive = git(root, "archive", "--format=tar", commit, "rootfs-config.toml", "kernel",
                       binary=True)
         with tempfile.TemporaryDirectory(prefix="runner-kernel-") as tree:
@@ -191,15 +248,20 @@ def image_branch_commits(root, start):
     """main's first-parent commits as (hash, commit time), newest first, through the
     first one at or before `start`: every state main was in from `start` to now."""
     shallow = git(root, "rev-parse", "--is-shallow-repository") == "true"
+    shallow_file = git_path(root, "shallow")
+    locks = (git_path(root, "shallow.lock"), git_path(root, f"{HISTORY_REF}.lock"))
     tip = None
     yielded = 0
     for depth in FETCH_DEPTHS if shallow else (None,):
         depth_args = [] if depth is None else [f"--depth={depth}"]
-        git(root, "fetch", "--quiet", "--no-tags", *depth_args, "origin",
-            f"+refs/heads/{IMAGE_BRANCH}:{HISTORY_REF}")
+        # --refmap= with no value: the fetch writes HISTORY_REF and no remote-tracking ref.
+        git(root, "fetch", "--quiet", "--no-tags", "--refmap=", *depth_args, "origin",
+            f"+refs/heads/{IMAGE_BRANCH}:{HISTORY_REF}", locks=locks)
         if tip is None:
             # main may move between two fetches; the walk keeps the first tip it saw.
             tip = git(root, "rev-parse", "--verify", HISTORY_REF)
+        # %ct, the committer date: when the commit was made on main. A rebase or squash merge
+        # keeps the author date of the day the change was written.
         commits = [
             (line.split()[0], int(line.split()[1]))
             for line in git(root, "log", "--first-parent", "--format=%H %ct", tip).splitlines()
@@ -211,11 +273,10 @@ def image_branch_commits(root, start):
                 return
         boundary = set()
         if shallow:
-            shallow_file = pathlib.Path(git(root, "rev-parse", "--git-path", "shallow"))
-            if not shallow_file.is_absolute():
-                shallow_file = root / shallow_file
             try:
                 boundary = set(shallow_file.read_text().split())
+            except FileNotFoundError:
+                pass  # the fetch reached the branch's first commit: nothing is cut off now
             except OSError as error:
                 raise Blocked(f"cannot read {shallow_file}: {error}") from error
         if commits[-1][0] not in boundary:
@@ -287,11 +348,14 @@ def verdict(release, machine, root, now, current_only):
             if built == release and newer is None:
                 return 0, [
                     f"::notice title=Runner kernel::runner kernel {release} is the host kernel "
-                    f"{IMAGE_BRANCH} builds; this checkout builds {expected}, which no runner runs",
+                    f"{IMAGE_BRANCH} builds; this checkout builds {expected}, which no runner runs, so "
+                    "a host kernel change here is not tested by this job",
                     f"runner kernel {release} is the host kernel {IMAGE_BRANCH} builds for {machine}.",
                     f"This checkout builds {expected}: it changes the host kernel inputs, or is",
                     f"behind {IMAGE_BRANCH}. Runner images are built from {IMAGE_BRANCH} only, so this job",
-                    f"runs on {release} and does not test this checkout's host kernel.",
+                    f"runs on {release} and does not test this checkout's host kernel: a change",
+                    "to it is tested before merge on a box that boots it (`make install-host-kernel`,",
+                    "then the VM lanes there).",
                 ]
             if built == release:
                 changed, changed_at = newer
@@ -361,6 +425,12 @@ def main(argv):
     except Blocked as error:
         print(f"::error title=Runner kernel check blocked::{error}", flush=True)
         print(f"BLOCKED: the runner kernel check cannot evaluate: {error}", file=sys.stderr)
+        return 2
+    except Exception as error:  # anything this script did not expect is not a verdict
+        summary = f"unexpected {type(error).__name__}: {error}"
+        print(f"::error title=Runner kernel check blocked::{summary}", flush=True)
+        print(f"BLOCKED: the runner kernel check cannot evaluate: {summary}", file=sys.stderr)
+        traceback.print_exc()
         return 2
     # The annotation line goes to stdout, where the runner reads it; an error's detail
     # goes to stderr.

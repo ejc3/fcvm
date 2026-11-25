@@ -103,24 +103,48 @@ from it and runs the check on its running kernel, and only an image that passes 
 operation for 6.6 s and 5.9 s while namespaces died, and nine tests lost their namespace
 holder at its 5 s readiness deadline.
 
-Every self-hosted job that starts VMs runs `scripts/check-runner-kernel.py` before it builds
-anything. The script computes the host kernel release the checkout's `host_kernel` table gives
-for the runner's architecture (`<kernel_version>-fcvm-<hash>`, the hash `fcvm setup` computes
-from the table's `kernel_version` and `build_inputs`) and compares it with `uname -r`, so a
-patch added to a host set changes what the script expects with no edit to it. An x86-only
-patch changes the x86_64 release alone. The job fails on a kernel fcvm did not build, and on
-an fcvm build that is neither the checkout's nor one main's inputs gave in the last 24 hours.
+Every job on our runners that starts VMs runs `scripts/check-runner-kernel.py` before it
+builds anything. The script computes the host kernel release the checkout's `host_kernel`
+table gives for the runner's architecture (`<kernel_version>-fcvm-<hash>`, the hash
+`fcvm setup` computes from the table's `kernel_version` and `build_inputs`) and compares it
+with `uname -r`, so a patch added to a host set changes what the script expects with no edit
+to it. An x86-only patch changes the x86_64 release alone. The job fails on a kernel fcvm did
+not build, and on an fcvm build that is neither the checkout's nor one main's inputs gave in
+the last 24 hours. A check that cannot evaluate (no readable config, no git, main's history
+not fetchable, any error the script does not expect) exits 2.
+
 The 24 hours cover the image that follows a host kernel change: the change starts Build
 Kernels (it is under `kernel/` or in `rootfs-config.toml`), which starts Build Runner AMI,
-which waits for approval, and runners then boot the new image as they are replaced. That took
-about 4 h 20 min on 2026-11-25, and a runner lives at most 13 h 30 min. Inside the window a job on the
-previous build passes with a warning that names the commit and the deadline. A checkout whose
-own inputs differ from main's (a pull request that changes a host patch, or a branch behind
-main) passes on main's build with a notice, since images are built from main only.
+which waits for approval, and runners then boot the new image as they are replaced. That
+took about 4 h 20 min on 2026-11-25. Inside the window a job on the previous build passes
+with a warning that names the commit and the deadline. A checkout whose own inputs differ
+from main's (a pull request that changes a host patch, or a branch behind main) passes on
+main's build with a notice, since images are built from main only.
+
+What follows from that for a change to a host kernel input:
+
+- Its pull request runs its VM tests on main's kernel. The notice is the only sign, and no
+  CI job of the pull request boots the new kernel.
+- After it merges, main's jobs also pass on the previous build, for up to 24 hours. The new
+  kernel is first booted by the image build's boot test, and first runs VM tests when
+  replacement runners take jobs. A patch that boots and breaks VMs turns lanes red hours
+  after its merge.
+- So test it before merge: install the kernel on a box (`make install-host-kernel`, then
+  reboot), run the VM lanes there (`make test-root`), and put the result in the pull
+  request. #2130 did the equivalent for patch 0003 on one x86_64 bare-metal host: its
+  reproduction of the hang on the unpatched build, then the same rounds on the patched one.
+- A runner lives at most 13 h 30 min, so the new image has to be published within about
+  10 h 30 min of the merge: a runner launched just before it is published can still be on
+  the previous build when the 24 hours end. The approval of the Build Runner AMI run is
+  the step that can use that time up.
+- Rolling the runners back to an older image fails every job on it once 24 hours have
+  passed since main stopped giving that image's build. Revert main's inputs too.
+
 `weekly.yml`'s benchmark job passes `--current-only`, which accepts the checkout's build and
 no other. The kernel build jobs do not run the check: they build what the next image needs,
-on whatever image the runners have. `every_self_hosted_job_checks_the_runner_kernel` lists the
-jobs that run it and the ones that do not, and fails for a new self-hosted job in neither list.
+on whatever image the runners have. `every_self_hosted_job_checks_the_runner_kernel` reads
+every job of every workflow that is not on one of GitHub's own runners, and fails for one
+that neither runs the step first nor is listed there with a reason.
 
 `kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch`
 keeps a paravirtual spinlock kick that KVM erased (#2125). A PV spinlock waiter checks the
