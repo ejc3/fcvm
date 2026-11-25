@@ -325,6 +325,33 @@ async function takeOver(page: Page, n: number): Promise<void> {
   await expect(page.getByTestId("phone-borrow")).toHaveAttribute("data-kind", "yours");
 }
 const tapTarget = async (page: Page, name: "video" | "mirror") => (await view(page)).taps?.targets.find((t) => t.name === name) ?? null;
+/** The tap target once its box has stopped moving. The phone is fitted again whenever the panel
+ *  beside it, the sheet under it or the window changes size, and the page maps a click through the
+ *  box it draws at click time, so a box read before an earlier step is not where to aim (#2177). */
+async function settledTarget(page: Page, name: "video" | "mirror") {
+  let last = "";
+  await expect
+    .poll(async () => {
+      const now = JSON.stringify((await tapTarget(page, name))?.box ?? null);
+      const same = now !== "null" && now === last;
+      last = now;
+      return same;
+    }, { intervals: [120] })
+    .toBe(true);
+  return (await tapTarget(page, name))!;
+}
+/** Click near the fraction (fx, fy) of the tap target as it is drawn now, on a whole pixel: a mouse
+ *  event carries whole CSS pixels, and one pixel of the phone-sized layout's screen (about 150 px
+ *  wide) is 0.0066 of its width. Returns the target and the fractions of the pixel clicked, which
+ *  is what the phone must be sent (#2177: aiming at 0.75 and expecting 0.75 failed on a layout
+ *  whose box put that point 0.9 px from a whole pixel). */
+async function clickTarget(page: Page, name: "video" | "mirror", fx: number, fy: number) {
+  const t = await settledTarget(page, name);
+  const px = Math.round(t.box.x + fx * t.box.w);
+  const py = Math.round(t.box.y + fy * t.box.h);
+  await page.mouse.click(px, py);
+  return { ...t, fx: (px - t.box.x) / t.box.w, fy: (py - t.box.y) / t.box.h };
+}
 
 // Two layouts: the panel beside the phone, and a phone-sized screen, where the panel is a sheet
 // under it and the phone's screen is small.
@@ -348,16 +375,17 @@ for (const screen of SCREENS)
   const session = (await mockPhones()).tiles[2]!.borrowed!.session;
   await expect(page.getByTestId("phone-tap-video")).toBeVisible();
   expect(await page.getByTestId("phone-tap-video").evaluate((el) => getComputedStyle(el).cursor)).toBe("pointer");
-  const t = (await tapTarget(page, "video"))!;
-  const card = (await view(page)).cards.find((c) => c.id === "phone:3")!;
+  const t = await clickTarget(page, "video", 0.25, 0.6);
   // the target is the drawn screen, inside the bezel
+  const card = (await view(page)).cards.find((c) => c.id === "phone:3")!;
   expect(t.box).toEqual(card.box);
-  await page.mouse.click(t.box.x + 0.25 * t.box.w, t.box.y + 0.6 * t.box.h);
   await expect.poll(async () => (await taps()).length).toBe(1);
   const [first] = await taps();
   expect([first!.phone, first!.session]).toEqual(["phone-3", session]);
-  expect(first!.x).toBeCloseTo(0.25, 2);
-  expect(first!.y).toBeCloseTo(0.6 * t.yScale, 2);
+  // within a pixel of the point aimed at
+  expect(Math.abs(t.fx - 0.25) * t.box.w).toBeLessThanOrEqual(0.5);
+  expect(first!.x).toBeCloseTo(t.fx, 3);
+  expect(first!.y).toBeCloseTo(t.fy * t.yScale, 3);
   // the bezel: inside the body, outside the screen
   const b = card.bezel!;
   await page.mouse.click(b.x + card.pad.left / 2, b.y + b.h / 2);
@@ -366,23 +394,34 @@ for (const screen of SCREENS)
   expect(await taps()).toHaveLength(1);
   await expect(page.getByTestId("phone-notice")).toHaveCount(0);
   // where Robot Park draws its Info tab: the right half of the bar along the screen's bottom
-  await page.mouse.click(t.box.x + 0.75 * t.box.w, t.box.y + 0.95 * t.box.h);
+  const bar = await clickTarget(page, "video", 0.75, 0.95);
   await expect.poll(async () => (await taps()).length).toBe(2);
   const info = (await taps())[1]!;
-  expect(info.x).toBeCloseTo(0.75, 2);
-  expect(info.y).toBeCloseTo(0.95 * t.yScale, 2);
+  expect(info.x).toBeCloseTo(bar.fx, 3);
+  expect(info.y).toBeCloseTo(bar.fy * bar.yScale, 3);
   // the page drops a click sooner than 210 ms after the last tap it sent
+  await page.waitForTimeout(300);
+  // a smaller window fits the phone again: a click lands on the fraction of the screen as drawn now
+  const size = page.viewportSize()!;
+  await page.setViewportSize({ width: size.width - 40, height: size.height - 120 });
+  await expect.poll(async () => (await tapTarget(page, "video"))?.box).not.toEqual(bar.box);
+  const refit = await clickTarget(page, "video", 0.25, 0.9);
+  expect(refit.box).not.toEqual(bar.box);
+  await expect.poll(async () => (await taps()).length).toBe(3);
+  const after = (await taps())[2]!;
+  expect(after.x).toBeCloseTo(refit.fx, 3);
+  expect(after.y).toBeCloseTo(refit.fy * refit.yScale, 3);
+  await page.setViewportSize(size);
   await page.waitForTimeout(300);
   // the GPU mirror beside the video takes taps the same way
   await page.getByTestId("phone-view-both").click();
   await expect(page.getByTestId("phone-tap-mirror")).toBeVisible();
-  const m = (await tapTarget(page, "mirror"))!;
+  const m = await clickTarget(page, "mirror", 0.75, 0.1);
   expect(m.box).toEqual((await view(page)).mirror!.box);
-  await page.mouse.click(m.box.x + 0.75 * m.box.w, m.box.y + 0.1 * m.box.h);
-  await expect.poll(async () => (await taps()).length).toBe(3);
-  const second = (await taps())[2]!;
-  expect(second.x).toBeCloseTo(0.75, 2);
-  expect(second.y).toBeCloseTo(0.1 * m.yScale, 2);
+  await expect.poll(async () => (await taps()).length).toBe(4);
+  const second = (await taps())[3]!;
+  expect(second.x).toBeCloseTo(m.fx, 3);
+  expect(second.y).toBeCloseTo(m.fy * m.yScale, 3);
   await expect(page.getByTestId("phone-notice")).toHaveCount(0);
   await page.getByTestId("phone-give-back").click();
   await expect(page.getByTestId("phone-tap-video")).toHaveCount(0);
