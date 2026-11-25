@@ -735,17 +735,20 @@ test-all: show-notes check-disk setup-fcvm _test-all
 # --confine's CI gate (src/confine.rs): the rootless VM tests that cover each restore path
 # and device, with every VMM confined (FCVM_CONFINE=required) and its syscall allowlist
 # enforcing. An unlisted syscall kills the VMM, so the test that hit it fails. Needs a kernel
-# with Landlock ABI 9 or later; below it every confined start is refused.
-CONFINE_TEST_FILTER ?= -E 'test(=test_confine_rootless_vm) | test(=test_sanity_rootless) | test(=test_exec_rootless) | test(/^test_hugepage_/) | (test(/^test_pmem_/) & !test(/sudo/)) | test(/^test_fuse_snapshot_matrix_/) | test(/snapshot_clone/) | test(=test_clone_while_baseline_running_rootless)'
+# with Landlock ABI 9 or later; below it every confined start is refused. It runs the default
+# feature set (integration-fast and integration-slow): the snapshot clone and FUSE snapshot
+# matrix tests are integration-slow. Hugepage tests are privileged-tests, and a root start is
+# not confined yet, so they are not here.
+CONFINE_TEST_FILTER ?= -E 'test(=test_confine_rootless_vm) | test(=test_sanity_rootless) | test(=test_exec_rootless) | (test(/^test_pmem_/) & !test(/sudo/)) | test(/^test_fuse_snapshot_matrix_/) | test(/snapshot_clone/) | test(=test_clone_while_baseline_running_rootless)'
 test-confine: show-notes check-disk setup-fcvm
-	FCVM_CONFINE=required FCVM_CONFINE_SECCOMP=enforce $(MAKE) --no-print-directory _test-fast FILTER="$(CONFINE_TEST_FILTER)"
+	FCVM_CONFINE=required FCVM_CONFINE_SECCOMP=enforce $(MAKE) --no-print-directory _test-all FILTER="$(CONFINE_TEST_FILTER)"
 
 # Discovery tool for the policy, not a gate: the same tests in log mode, failing on any
 # syscall the policy does not list. Needs auditd: without it the kernel prints the
 # type=1326 records to the kernel log through printk_ratelimit, so a run can drop records
 # and a clean result would mean nothing; the script refuses to run without it.
 test-confine-audit: show-notes check-disk setup-fcvm
-	./scripts/confine-seccomp-audit.sh $(MAKE) --no-print-directory _test-fast FILTER="$(CONFINE_TEST_FILTER)"
+	./scripts/confine-seccomp-audit.sh $(MAKE) --no-print-directory _test-all FILTER="$(CONFINE_TEST_FILTER)"
 test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages setup-cloud-hypervisor _test-root
 test: test-root
 
