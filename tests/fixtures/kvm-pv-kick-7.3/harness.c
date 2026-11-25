@@ -15,8 +15,11 @@
  *   kick    a runnable vCPU with a kick pending takes a page-ready
  *           completion, with and without the guest's async page fault
  *           interface: the kick must still be pending.
- *   wake    a vCPU halted for an async page fault takes its completion: it
- *           must be runnable, with no kick invented.
+ *   wake    the function's own statements: entered with the vCPU marked
+ *           halted for an async page fault it leaves it runnable, and it
+ *           invents no kick. (7.3.3 calls it only for a running vCPU, whose
+ *           mp_state is already RUNNABLE, so this pins the function and not
+ *           a state the hang passes through.)
  *   helper  kvm_set_mp_state() itself still clears the kick on a move to
  *           runnable, which its other callers rely on, and leaves it alone
  *           on a move to halted.

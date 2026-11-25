@@ -111,7 +111,7 @@ HLT must then not block. Since Linux 6.15 (e9cb61055fee) `kvm_set_mp_state()` cl
 `pv_unhalted` on every move to runnable, and `kvm_arch_async_page_present()` goes through it
 for a vCPU that is already runnable, so a page-ready completion in that window erased the
 kick: the HLT blocked, only an NMI could wake the vCPU, and every CPU that sent it an IPI and
-waited spun for ever. On an oversubscribed x86_64 host 1 to 3 in 100 two-vCPU guests restored
+waited spun for ever. On an oversubscribed x86_64 host 15 of 900 two-vCPU guests restored
 through userfaultfd hung that way; the trace of each showed the kick hypercall, its
 `kvm_apic_accept_irq`, a `kvm_async_pf_ready` for the kicked vCPU 40 to 104 us later and then
 its HLT with no wakeup. Guest `no-kvmapf` does not avoid it: without the guest interface KVM

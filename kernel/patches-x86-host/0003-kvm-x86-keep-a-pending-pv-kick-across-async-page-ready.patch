@@ -26,7 +26,7 @@ ever: the guest reports soft lockups and stops.
 
 Seen on a 7.3.3 host with 6.18.60 guests restored from a snapshot through
 userfaultfd (many async page faults right after the restore) while the
-host is oversubscribed: 1 to 3 in 100 two-vCPU guests. A trace of one:
+host is oversubscribed: 15 of 900 two-vCPU guests. A trace of one:
 
   vcpu0 kvm_hypercall       nr 0x5 a0 0x0 a1 0x1      (KVM_HC_KICK_CPU)
   vcpu0 kvm_apic_accept_irq apicid 1 vec 0 (Res3|edge)
@@ -35,8 +35,7 @@ host is oversubscribed: 1 to 3 in 100 two-vCPU guests. A trace of one:
   (no kvm_vcpu_wakeup for vcpu1 until the guest's watchdog sends an NMI)
 
 Set the state directly, as the function did before the helper existed, so
-the kick survives. The other callers of kvm_set_mp_state() are moves out
-of a halted state or state loads, where clearing the kick is intended.
+the kick survives. No other caller of kvm_set_mp_state() is changed.
 
 Fixes: e9cb61055fee ("KVM: x86: Clear pv_unhalted on all transitions to KVM_MP_STATE_RUNNABLE")
 ---
