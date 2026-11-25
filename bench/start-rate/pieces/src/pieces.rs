@@ -658,6 +658,7 @@ fn vmm_request() -> fcvm::confine::Request<'static> {
         network: fcvm::confine::Network::Rootless,
         firecracker_args: None,
         unsupported: Some("the start-rate pieces harness measures unconfined VMMs"),
+        kernel_profile: None,
     }
 }
 
@@ -669,7 +670,7 @@ fn vmm_decision() -> Result<fcvm::confine::Decision> {
 
 #[cfg(test)]
 mod confine_tests {
-    use fcvm::confine::{decide, Host, Mode};
+    use fcvm::confine::{decide, Host, Mode, SeccompMode};
 
     fn host(mode: Mode) -> Host {
         Host {
@@ -680,6 +681,9 @@ mod confine_tests {
             firecracker_args: None,
             core_pattern: Some("core".to_string()),
             core_hard_limit: u64::MAX,
+            seccomp: SeccompMode::Enforce,
+            firecracker_commit: None,
+            allow_seccomp_log: true,
         }
     }
 

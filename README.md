@@ -569,6 +569,8 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
 | `FCVM_FIRECRACKER_LOG_LEVEL` | `Info` | Level of Firecracker's own per-VM `firecracker.log`: `Error`, `Warning`, `Info` or `Debug`. `Debug` adds one line per vsock packet, which is gigabytes an hour under FUSE-over-vsock volumes. Teardown copies the log's last 16 MiB to `/tmp/fcvm-firecracker-<vm_id>.log` |
 | `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` | `3600` | How long a cached firecracker-fork resolution stays valid before a launch re-queries the remote; `0` forces a query every launch |
+| `FCVM_CONFINE` | config | `required` confines every VMM this host starts (see [Confining the VMM](#confining-the-vmm---confine)); it can tighten the config's `[confine] mode`, never loosen it |
+| `FCVM_CONFINE_SECCOMP` | `enforce` | `log` allows a confined VMM the syscalls its allowlist does not list and has the kernel record each one, to check a workload before enforcing. It restricts nothing, so `fcvm ls` shows the layer as `seccomp-log`, every such start warns, and a host whose config has `[confine] mode = "required"` refuses it unless the config also has `allow_seccomp_log = true` |
 | `RUST_LOG` | `warn` | Logging level (`info`, `debug` for verbose) |
 
 **Firecracker fork resolution.** When a kernel profile builds firecracker from a
@@ -579,6 +581,89 @@ cached in `assets_dir/firecracker/<profile>.resolved.json` and reused for
 that file, so rebuilding the fork takes effect for launches immediately rather
 than after the TTL. `<binary> --version` probes are cached the same way, keyed by
 the binary's path + mtime + size, so a rebuilt binary is always re-checked.
+
+### Confining the VMM (`--confine`)
+
+`--confine` on `podman run` or `snapshot run` (or, for every start on a host,
+`[confine] mode = "required"` in the config or `FCVM_CONFINE=required`) runs the VM's
+Firecracker with two layers:
+
+- **Process:** no capabilities and none regained by its exec, `no_new_privs`, no core dumps.
+- **Syscalls:** an allowlist per Firecracker thread
+  (`resources/seccomp/firecracker-confined-<arch>.json`): Firecracker's own shipped filter
+  for the pinned commit, less io_uring, plus the calls glibc makes where musl makes others
+  and `fstatfs`, which that Firecracker calls and its filter omits. It has no process
+  creation, exec, ptrace, mount, bpf, unshare or setns. The VMM runs with
+  `MALLOC_ARENA_MAX=1`, so that glibc grows the heap with `brk`, which the allowlist has,
+  and not a thread's own arena with `mprotect`, which two of its three classes lack; and
+  with `TZ=<UTC>0`, so that glibc reads no time zone file at the first log line, which the
+  API and vCPU threads could not do. Firecracker's own log is therefore stamped in UTC.
+
+A start that cannot be confined is refused, never run unconfined. Confinement needs
+rootless networking, the Firecracker backend, the default build of Firecracker, and a
+kernel with Landlock ABI 9 or later. A kernel profile that pins its own Firecracker is
+refused. `fcvm setup` compiles the allowlist beside each Firecracker it builds from the
+commit the allowlist is derived from, and records the compiled file's SHA-256 beside it
+(`<filter>.sha256`). A confined start opens the filter without following a symbolic link
+and refuses one that is not a regular file owned by the user (or root, or the owner of
+the Firecracker binary), that other users can write, or whose bytes are not the recorded
+ones. It checks before anything is created, so a host that was upgraded and not set up
+again is told to run `fcvm setup` with nothing started; `fcvm setup` rebuilds a filter
+that does not match its record. The launch checks again and hands the VMM the bytes it
+checked, in a sealed memory file. Another binary (`--firecracker-bin`, or the one an
+older snapshot recorded) has no recorded filter and is refused the same way. Once
+Firecracker has built the VM, fcvm reads every thread of the VMM from `/proc` and
+requires each to run under a seccomp filter; otherwise it kills the VMM and fails the
+start naming the threads, because Firecracker accepts a filter file that installs
+nothing. A restore is checked before its guest resumes; a boot within 5 s of its guest's
+start. `fcvm ls` shows the layers a VM runs with.
+
+**What the two layers do not stop.** The record and the filter belong to the same user
+as fcvm, so the digest catches a damaged, truncated or half-replaced filter and not a
+process that already runs as that user. A confined VMM is such a process, and the
+allowlist still lets it open and write any file its uid can (`openat`, `write`), connect
+to any Unix socket its uid can reach (`socket`, `connect`), and signal any process of its
+uid, fcvm included (`tgkill`, `tkill`). A compromised confined VMM can therefore replace
+the filter, its record or the Firecracker binary for later starts, or stop the fcvm that
+watches it. Closing that needs the file and socket layer (Landlock: the paths the VMM may
+read and write, the Unix sockets it may reach, signals scoped to itself), which fcvm does
+not apply yet. Until it does, confinement narrows what a compromised VMM can ask the
+kernel for; it is not a boundary between the VMM and the rest of the user's files.
+
+**A syscall outside the allowlist kills the VMM, and the guest with it.** fcvm logs at ERROR
+which Firecracker thread made which syscall. One case is known where the thread hangs
+instead: Firecracker's handler for the trap writes a log line, and a syscall trapped while
+that thread was already writing one (glibc reading the time zone file for the first line)
+left the API thread stopped, the guest running and nothing reported. `TZ=<UTC>0` removes
+that call; a trap in the same place from another cause would do the same. The allowlist covers what fcvm's test suites
+ask of Firecracker; a workload that takes Firecracker down a path they do not can hit a
+syscall it does not list. Check a workload first with `FCVM_CONFINE_SECCOMP=log`: a syscall
+outside the allowlist is then allowed and the kernel records it as an audit record of type
+`SECCOMP` that names the thread (`comm=`, in hex when the name holds a space, as a vCPU
+thread's `fc_vcpu 0` does) and the syscall number (`syscall=`):
+
+```bash
+FCVM_CONFINE_SECCOMP=log fcvm podman run --confine --name check my-image
+sudo grep -h 'type=SECCOMP' /var/log/audit/audit.log* | grep 'exe="[^"]*firecracker'
+```
+
+(The kernel writes `exe=` as hex when the path holds a space, which this pattern misses;
+`scripts/confine-seccomp-audit.sh` decodes those.) Log mode restricts nothing:
+every start in it warns, `fcvm ls` lists the layer as `seccomp-log` and not `seccomp`, and
+a host whose config sets `[confine] mode = "required"` refuses it unless the config also
+sets `allow_seccomp_log = true`. Where only `FCVM_CONFINE=required` in the environment
+requires confinement, log mode is accepted, since whoever sets that variable can leave it
+unset.
+
+Without auditd the records go to the kernel log, rate-limited, so a run can lose some.
+auditd rotates its log (by default it keeps five files of 8 MB), so a syscall made in a
+loop can push earlier records out of all of them: read every file, and raise
+`max_log_file` in `/etc/audit/auditd.conf` if they filled. No record over a representative
+run means enforce mode would not have stopped it.
+
+A syscall made through another architecture's entry (on x86_64, `int 0x80`) is not trapped:
+libseccomp's default for it, which Firecracker's compiler does not change, kills the
+calling thread and leaves the process. That is the same under Firecracker's own filters.
 
 ### A VM's own cgroup
 

@@ -1544,6 +1544,7 @@ mod tests {
                         landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
                         layers: vec![crate::confine::Layer::Process],
                         core_limit: 1,
+                        seccomp: None,
                     })),
                 )
             },

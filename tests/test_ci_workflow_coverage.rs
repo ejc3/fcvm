@@ -393,15 +393,15 @@ fn fleet_web_changes_run_the_fleet_web_job() {
         "a ci.yml-only change does not run `fleet-web`, so a broken fleet-web job merges green"
     );
     // Every fail-open branch opens the web gate too: each `emit true` that is not
-    // the classifier's own verdict opens all four gates.
+    // the classifier's own verdict opens every gate.
     for line in text
         .lines()
         .map(str::trim)
         .filter(|l| l.starts_with("emit true "))
     {
         assert!(
-            line == "emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""
-                || line.ends_with(" true true true true"),
+            line == "emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\" \"$confine\""
+                || line.ends_with(" true true true true true"),
             "a fail-open branch of `changes` leaves a gate closed: {line}"
         );
     }
@@ -2883,7 +2883,7 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
         );
         // `emit` writes each output from its positional argument. A declared
         // output the function does not write is the empty string to every consumer.
-        let position = ["run", "reason", "code", "bench", "fleet", "web"]
+        let position = ["run", "reason", "code", "bench", "fleet", "web", "confine"]
             .iter()
             .position(|k| *k == name)
             .unwrap_or_else(|| panic!("`changes` declares `{name}`, which `emit` does not write"))
@@ -2900,8 +2900,9 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
     // exposed that. The fail-open branches are pinned in
     // fleet_web_changes_run_the_fleet_web_job.
     assert!(
-        scripts.contains("emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""),
-        "the classifier's own verdict is not emitted from $code, $bench, $fleet and $web"
+        scripts
+            .contains("emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\" \"$confine\""),
+        "the classifier's own verdict is not emitted from $code, $bench, $fleet, $web and $confine"
     );
 
     // And the reverse: nothing may gate on an output `changes` does not declare.
@@ -3244,6 +3245,17 @@ fn run_matrix_plan(
     pr_tree_matches: bool,
     pr_jobs: &[&str],
 ) -> BTreeMap<String, String> {
+    run_matrix_plan_for(event, pr_tree_matches, pr_jobs, false)
+}
+
+/// [`run_matrix_plan`], saying whether the `changes` job found the pull request touching
+/// the VMM's confinement (`needs.changes.outputs.confine`).
+fn run_matrix_plan_for(
+    event: &str,
+    pr_tree_matches: bool,
+    pr_jobs: &[&str],
+    touches_confinement: bool,
+) -> BTreeMap<String, String> {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let ci = parse_workflow("ci.yml");
     let run = workflow_job(&ci, "skip-check")
@@ -3302,6 +3314,10 @@ exit 1
         .env("PATH", path)
         .env("EVENT", event)
         .env("REPO", "o/r")
+        .env(
+            "CONFINE",
+            if touches_confinement { "true" } else { "false" },
+        )
         .env("GH_TOKEN", "unused")
         .env("GITHUB_OUTPUT", &out_file)
         .env(
@@ -3422,6 +3438,44 @@ fn a_pull_request_runs_every_arm64_job_and_one_x64_job() {
         arm64, every_arm64,
         "a pull request must still run every arm64 job"
     );
+}
+
+/// A pull request that touches the VMM's confinement also runs Host-x64.
+///
+/// Host-x64's `test-confine` step is the only place the x86_64 seccomp policy runs under
+/// real confinement. Without it, a change to that policy first met an x86_64 kernel on
+/// main. The `changes` job says whether the pull request touches confinement, and the plan
+/// reads it as `needs.changes.outputs.confine`.
+#[test]
+fn a_pull_request_that_touches_confinement_also_runs_host_x64() {
+    let jobs = planned_jobs(&run_matrix_plan_for("pull_request", false, &[], true));
+    let x64: BTreeSet<String> = jobs.iter().filter(|j| j.contains("x64")).cloned().collect();
+    assert_eq!(
+        x64,
+        job_set(&["Host-x64", "Host-Root-x64-SnapshotEnabled"]),
+        "a pull request that touches confinement must run the x64 Host job"
+    );
+    let ci = std::fs::read_to_string(workflow_path("ci.yml")).expect("read ci.yml");
+    assert!(
+        ci.contains("CONFINE: ${{ needs.changes.outputs.confine }}")
+            && ci.contains("confine: ${{ steps.detect.outputs.confine }}"),
+        "the plan no longer reads the changes job's confine output"
+    );
+    let scope = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-pr-scope.sh"),
+    )
+    .expect("read ci-pr-scope.sh");
+    for path in [
+        "resources/seccomp/*",
+        "src/confine.rs",
+        "src/firecracker/vm.rs",
+        "scripts/confine-*",
+    ] {
+        assert!(
+            scope.contains(path),
+            "ci-pr-scope.sh no longer counts {path} as a confinement path"
+        );
+    }
 }
 
 /// Main runs whatever its PR run of the same tree did not.
@@ -4191,4 +4245,164 @@ fn host_jobs_install_from_cached_apt_archives_and_save_on_a_miss() {
             );
         }
     }
+}
+
+/// The Lean model of the vCPU wake-up path (`verify/`) is checked by a workflow of its own,
+/// `verify.yml`, whose one job runs `lake build`: every proof, every recorded break and the
+/// axiom check. It is not in `Summary`, so these are the ways it could stop checking while
+/// still rendering nothing red:
+///
+/// - a `branches:` filter on `pull_request` matches the BASE branch and skips every stacked
+///   pull request (the #752 shape this file opens with);
+/// - a `paths:` list that leaves out `verify/**` never starts it;
+/// - a `paths:` filter on the `push` to main lets main go unchecked after a merge that the
+///   pull request's own run did not cover;
+/// - `continue-on-error`, an `if:` or an `|| true` on the build step turns a broken proof
+///   into a pass.
+#[test]
+fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
+    let wf = parse_workflow("verify.yml");
+    let on = triggers(&wf);
+
+    let pull_request = on
+        .get("pull_request")
+        .and_then(Value::as_mapping)
+        .expect("verify.yml has no `pull_request:` mapping");
+    for key in ["branches", "branches-ignore", "paths-ignore"] {
+        assert!(
+            !pull_request.contains_key(Value::from(key)),
+            "verify.yml restricts `pull_request` with `{key}:`; a base-branch filter skips \
+             every stacked pull request, and an ignore list cannot be kept complete"
+        );
+    }
+    let paths: Vec<&str> = pull_request
+        .get(Value::from("paths"))
+        .and_then(Value::as_sequence)
+        .expect("verify.yml `pull_request` has no `paths:` list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for needed in ["verify/**", ".github/workflows/verify.yml"] {
+        assert!(
+            paths.contains(&needed),
+            "verify.yml `pull_request.paths` is {paths:?}; without `{needed}` a change there \
+             starts no check"
+        );
+    }
+
+    let push = on
+        .get("push")
+        .and_then(Value::as_mapping)
+        .expect("verify.yml has no `push:` mapping, so main is never checked");
+    let branches: Vec<&str> = push
+        .get(Value::from("branches"))
+        .and_then(Value::as_sequence)
+        .expect("verify.yml `push` has no `branches:` list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        branches.contains(&"main"),
+        "verify.yml `push.branches` is {branches:?}: main is not checked"
+    );
+    for key in ["paths", "paths-ignore"] {
+        assert!(
+            !push.contains_key(Value::from(key)),
+            "verify.yml filters the push to main with `{key}:`"
+        );
+    }
+
+    let job = workflow_job(&wf, "lean");
+    for key in ["if", "continue-on-error"] {
+        assert!(
+            job.get(key).is_none(),
+            "verify.yml's `lean` job has `{key}:`, so it can pass or vanish without building"
+        );
+    }
+    let runs_on = job
+        .get("runs-on")
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_default();
+    assert!(
+        !runs_on.contains("self-hosted"),
+        "the `lean` job must stay on a hosted runner: it needs no KVM, and the self-hosted \
+         fleet is the VM matrix's ({runs_on})"
+    );
+    let minutes = job
+        .get("timeout-minutes")
+        .and_then(Value::as_u64)
+        .expect("the `lean` job has no `timeout-minutes`; GitHub's default is six hours");
+    assert!(
+        minutes <= 15,
+        "the `lean` job's cap is {minutes} minutes, over 15"
+    );
+
+    let steps = job
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("the `lean` job has no steps");
+    let builds: Vec<&Value> = steps
+        .iter()
+        .filter(|s| {
+            s.get("run")
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.lines().any(|l| l.trim() == "lake build"))
+        })
+        .collect();
+    assert_eq!(
+        builds.len(),
+        1,
+        "the `lean` job must have exactly one step that runs `lake build` on a line of its own"
+    );
+    let build = builds[0];
+    assert_eq!(
+        build.get("working-directory").and_then(Value::as_str),
+        Some("verify"),
+        "`lake build` must run in verify/"
+    );
+    for key in ["if", "continue-on-error"] {
+        assert!(
+            build.get(key).is_none(),
+            "the `lake build` step has `{key}:`, so a broken proof would not fail the job"
+        );
+    }
+    let script = build.get("run").and_then(Value::as_str).unwrap();
+    assert!(
+        script.contains("set -euo pipefail") && !script.contains("|| true"),
+        "the `lake build` step must fail when any of its commands fails: {script:?}"
+    );
+
+    // The toolchain is the one verify/lean-toolchain pins, read from the file, and its cache
+    // is keyed on that file: a toolchain bump cannot be served the old compiler.
+    let install = steps
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("elan toolchain install") || r.contains("elan\" toolchain install"))
+        .expect("no step of the `lean` job installs the toolchain");
+    assert!(
+        install.contains("$(cat verify/lean-toolchain)"),
+        "the toolchain install must read verify/lean-toolchain: {install:?}"
+    );
+    let toolchain_caches = steps
+        .iter()
+        .filter(|s| {
+            s.get("with")
+                .and_then(|w| w.get("path"))
+                .and_then(Value::as_str)
+                == Some("~/.elan")
+        })
+        .filter_map(|s| {
+            s.get("with")
+                .and_then(|w| w.get("key"))
+                .and_then(Value::as_str)
+        })
+        .filter(|k| !k.contains("cache-primary-key"))
+        .collect::<Vec<_>>();
+    assert!(
+        !toolchain_caches.is_empty()
+            && toolchain_caches
+                .iter()
+                .all(|k| k.contains("hashFiles('verify/lean-toolchain')")),
+        "the ~/.elan cache must be keyed on verify/lean-toolchain: {toolchain_caches:?}"
+    );
 }
