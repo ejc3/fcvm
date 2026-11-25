@@ -246,6 +246,42 @@ on the present, and the `default` profile keeps the clock running through a paus
 `test_source_clock_matches_the_host_after_snapshot_create` measures it;
 `every_reopen_after_a_pause_sets_the_sources_clock` pins the host side.
 
+### A clone is snapshotted only after its restore is acknowledged
+
+A restored clone resumes behind the gate, with its container frozen and the source's
+sockets in it, and its guest opens ingress only after it has retired those sockets and run
+the restore hook. The snapshot one-shots do not know whose gate they are handling. Run in a
+clone that has not got there, `--resume-snapshot-network` (or the reopen after a failed
+prepare) removes both halves of the gate and the manifest and thaws the container, and the
+prepare freezes a container a restore hook is running in. On main at 1df89a80e a `snapshot
+create` of a clone held before the boundary exited 0 in 0.2 s; after it a client outside got
+HTTP 200 from a clone `snapshot run` had not reported, with the source's connection still
+established in it, and the clone's restore then failed on the missing manifest (#2138).
+
+So `fcvm snapshot create` refuses a VM whose state says it was restored (`process_type:
+clone`) and not published (`lifecycle_ready: false`), before anything reaches its guest or
+its VMM (`ensure_restore_published`, `src/commands/common.rs`). `snapshot run` writes
+`lifecycle_ready` after the guest's acknowledgement and never for a restore that failed or
+was interrupted. It is written once per VM, from false to true, and every restore has a VM
+id of its own, so the check needs no lock against the restore: a state that reads true stays
+true, and the create reads it under the per-VM snapshot lock after it has tied the state to
+the process it snapshots. `--stop` refuses before it arms the guard that stops the VM, so a
+refused clone is left running. A caller that learns a clone is up from the clone's own ports
+(the potato ring) is a moment ahead of that write and passes `--await-restore SECONDS`,
+which waits for it. The owner's own snapshots (a startup snapshot, `podman prepare`) run in
+its task after the acknowledgement and are not checked.
+
+`a_snapshot_of_a_clone_is_refused_until_its_restore_is_acknowledged`
+(`tests/test_snapshot_clone.rs`) holds a clone at `restore.pre_gate_verify`, in its restore
+hook and after a failed restore, and requires the refusal and an unchanged guest each time.
+The state in which main opened the gate is one step before that hold, with the boundary lock
+free, and fc-agent has no failpoint there; it was reproduced by hand.
+`a_snapshot_is_refused_until_the_restore_is_acknowledged`,
+`snapshot_create_refuses_an_unpublished_restore_before_it_reaches_the_vm`,
+`a_clone_is_published_only_after_its_restore_is_acknowledged` and
+`lifecycle_readiness_is_never_taken_back` pin the decision, where it sits and what it rests
+on.
+
 ## A FLEET MODE IS UP ONLY WHEN A VIEWER GETS ITS PIXELS
 
 A fleet mode (wall, phones, Windows, Minecraft, potato) counts as working only when the

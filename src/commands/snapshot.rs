@@ -1496,6 +1496,14 @@ async fn cmd_snapshot_create_and_stop(args: SnapshotCreateArgs) -> Result<()> {
             || crate::utils::process_start_time(pid) == vm_state.pid_start_time,
         "PID {pid} is no longer the VM's fcvm process"
     );
+    // A clone whose restore is not acknowledged is refused here, before the guard: nothing
+    // has touched it, so it is left running and not stopped.
+    let vm_state = super::common::await_restore_published(
+        &state_manager,
+        vm_state,
+        Duration::from_secs(args.await_restore),
+    )
+    .await?;
     // From here the VM may be paused, so it is stopped on every way out, a panic included
     // (a print to a closed stdout panics while the source is still paused).
     let guard = StopOnDrop {
@@ -1562,6 +1570,15 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             vm_state.vm_id
         );
     }
+    // A clone whose restore is not acknowledged is refused here, before any lock is waited
+    // for, or waited for when --await-restore says so. Checked again below on the state the
+    // create acts on.
+    let vm_state = super::common::await_restore_published(
+        &state_manager,
+        vm_state,
+        Duration::from_secs(args.await_restore),
+    )
+    .await?;
 
     // Fail fast: the disk-only capture path (freeze -> reflink -> unfreeze, no
     // memory dump) is dispatched below when args.disk_only is set.
@@ -1712,6 +1729,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             .await
             .context("re-reading VM state under lock")?;
         super::common::validate_snapshot_vm_identity(&vm_state, &fresh_state)?;
+        // The state of the process this create is about to snapshot: nothing below
+        // reaches its guest or its VMM unless its restore, if it had one, was acknowledged.
+        super::common::ensure_restore_published(&fresh_state)?;
         if let Some(name) = fresh_state.config.snapshot_name.as_deref() {
             validate_snapshot_name(name).context("invalid parent snapshot name in VM state")?;
         }
@@ -8560,6 +8580,90 @@ mod tests {
         assert_eq!(runtime.firecracker_args, Some("--enable-nv2".to_string()));
     }
 
+    /// `snapshot create` decides whether a restored VM may be snapshotted on the state it
+    /// re-reads under the per-VM snapshot lock, once that state is tied to the process it
+    /// is about to snapshot, and before anything that reaches the VM's guest or its VMM
+    /// (issue 2138). It also refuses before it waits for any lock, and `--stop` refuses
+    /// before it arms the guard that stops the VM, so a refused clone is left running.
+    ///
+    /// RED BEFORE THE FIX: `snapshot create` made no such check.
+    #[test]
+    fn snapshot_create_refuses_an_unpublished_restore_before_it_reaches_the_vm() {
+        let source = include_str!("snapshot.rs");
+        let function = |name: &str| {
+            let body = &source[source.find(name).unwrap_or_else(|| panic!("no {name}"))..];
+            &body[..body.find("\n}\n").expect("the function ends")]
+        };
+        let create = function("async fn cmd_snapshot_create(");
+        let at = |what: &str| {
+            create
+                .find(what)
+                .unwrap_or_else(|| panic!("cmd_snapshot_create has no {what}"))
+        };
+        let early = at("await_restore_published(");
+        assert!(
+            early < at("acquire_snapshot_create_generation_locks("),
+            "the refusal waits for the snapshot's generation locks"
+        );
+        let checked = at("ensure_restore_published(&fresh_state)");
+        assert!(
+            at("acquire_vm_snapshot_lock(") < at("validate_snapshot_vm_identity(")
+                && at("validate_snapshot_vm_identity(") < checked,
+            "the restore is not checked on the state of the locked, identified VM"
+        );
+        for reaches_the_vm in [
+            "create_disk_only_snapshot_core(",
+            "capture_remote_inode_tables(",
+            "record_diff_parent(",
+            "FirecrackerClient::new(",
+            "create_snapshot_core(",
+            "create_snapshot_ch(",
+        ] {
+            assert!(
+                checked < at(reaches_the_vm),
+                "{reaches_the_vm} comes before the restore is checked"
+            );
+        }
+
+        let stop = function("async fn cmd_snapshot_create_and_stop(");
+        let refused = stop
+            .find("await_restore_published(")
+            .expect("--stop does not check the restore");
+        let armed = stop.find("StopOnDrop {").expect("--stop arms no guard");
+        assert!(
+            refused < armed,
+            "--stop arms the guard that stops the VM before it checks the restore"
+        );
+    }
+
+    /// What `ensure_restore_published` rests on: `snapshot run` publishes a clone's
+    /// lifecycle only after it has waited for the guest's acknowledgement of this restore.
+    #[test]
+    fn a_clone_is_published_only_after_its_restore_is_acknowledged() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source
+            .find("async fn cmd_snapshot_run_inner(")
+            .expect("no cmd_snapshot_run_inner")..];
+        let body = &body[..body
+            .find("\nasync fn restored_prepare(")
+            .expect("restored_prepare no longer follows cmd_snapshot_run_inner")];
+        let waited = body
+            .find("= wait_for_restore_completion(")
+            .expect("snapshot run does not wait for the restore's acknowledgement");
+        let publications: Vec<usize> = body
+            .match_indices("lifecycle_gate.publish(")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(
+            !publications.is_empty(),
+            "snapshot run publishes no lifecycle"
+        );
+        assert!(
+            publications.iter().all(|at| *at > waited),
+            "snapshot run publishes a clone before it has waited for its acknowledgement"
+        );
+    }
+
     /// A disk-only `snapshot create` reads the VM's balloon from Firecracker once it
     /// holds the per-VM snapshot lock. A memory snapshot of the same VM holds that
     /// lock for as long as Firecracker writes the memory file, so a create waits for
@@ -8961,6 +9065,7 @@ mod tests {
             gpu_warm: false,
             stop: false,
             expect_vm_id: None,
+            await_restore: 0,
             memory_dir: None,
         };
         let mut state = VmState::new("vm-raw".to_string(), "win.raw".to_string(), 2, 4096);

@@ -49,6 +49,11 @@ const FIRST_WAKE_MS: f64 = 1500.0;
 /// The lead is computed over the wakes of this long. The latest wake is kept beyond it, so
 /// a ring that paused starts from its last measurement.
 const WAKE_WINDOW: Duration = Duration::from_secs(30);
+/// How long a player's `snapshot create` waits for the player's own restore to be recorded
+/// as acknowledged (`--await-restore`). A player is ready when it answers on its ball port,
+/// which is a moment before its `snapshot run` has recorded the acknowledgement, and a
+/// create that arrives in between is refused without the wait.
+const RESTORE_PUBLICATION_WAIT_SECS: u64 = 10;
 /// How long an fcvm the agent stops has to exit after SIGTERM before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(30);
 /// How long an fcvm that exited is given for its last lines to be read into its failure.
@@ -97,6 +102,8 @@ impl PotatoCfg {
             "--tag".into(),
             Self::tag(n),
             "--stop".into(),
+            "--await-restore".into(),
+            RESTORE_PUBLICATION_WAIT_SECS.to_string(),
         ];
         if let Some(dir) = memory_dir {
             args.push("--memory-dir".into());
@@ -1147,6 +1154,8 @@ impl Ops for FcvmOps {
                             "--tag".into(),
                             GOLD.into(),
                             "--stop".into(),
+                            "--await-restore".into(),
+                            RESTORE_PUBLICATION_WAIT_SECS.to_string(),
                         ],
                         cfg.cgroup.as_deref(),
                     )
@@ -1255,7 +1264,9 @@ impl Ops for FcvmOps {
                 _ => {}
             }
             let created = create.elapsed();
-            // --stop has stopped the VM's fcvm (also on failure); reap it
+            // --stop has stopped the VM's fcvm (also on failure); reap it. A create that was
+            // refused because the player's restore was never recorded as acknowledged left
+            // the VM running, and it is stopped below once the reap's deadline has passed.
             let reap = Instant::now();
             if tokio::time::timeout(REAP_DEADLINE, vm.exited())
                 .await
@@ -2702,13 +2713,25 @@ mod tests {
                 "--tag",
                 "potato-3",
                 "--stop",
+                "--await-restore",
+                "10",
                 "--memory-dir",
                 "/dev/shm/fcvm-potato",
             ]
         );
         assert_eq!(
             PotatoCfg::sleep_args(3, 4242, None),
-            ["snapshot", "create", "--pid", "4242", "--tag", "potato-3", "--stop"]
+            [
+                "snapshot",
+                "create",
+                "--pid",
+                "4242",
+                "--tag",
+                "potato-3",
+                "--stop",
+                "--await-restore",
+                "10",
+            ]
         );
     }
 

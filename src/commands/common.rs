@@ -5576,6 +5576,107 @@ pub async fn acquire_snapshot_create_generation_locks(
     Ok(SnapshotCreateGenerationLocks { _files: files })
 }
 
+/// Refuse a snapshot of a restored VM that its owner has not published.
+///
+/// A VM restored from a memory snapshot resumes behind the network gate its snapshot was
+/// taken behind, with its container frozen and its source's sockets still in it. Its guest
+/// retires those sockets, runs the restore hook, opens the gate and only then acknowledges
+/// the restore. A snapshot's guest one-shots know none of that: run in a guest that has not
+/// got there, the resume one-shot (or a failed prepare's rollback) opens the gate with the
+/// source's sockets alive, the container thawed and no hook run, and the image is of a
+/// restore part way through (issue 2138).
+///
+/// The process that owns the VM (`snapshot run`, or `podman run` on a cache hit) writes
+/// `lifecycle_ready` after the guest's acknowledgement, and never for a restore that
+/// failed or was interrupted, so a restored VM without it is refused before anything
+/// reaches its guest or its VMM. A VM that was booted has no inherited gate and is not
+/// checked.
+///
+/// No lock is held against the owner, and none is needed. `lifecycle_ready` is written
+/// once per VM, from false to true, under the state lock (`publish_lifecycle_ready`), and
+/// every restore runs under a VM id of its own, so a state that reads true cannot go back
+/// to restoring. The create checks the state it re-reads under the per-VM snapshot lock,
+/// after [`validate_snapshot_vm_identity`] has tied that state to the process it is about
+/// to snapshot. A check that reads false while the acknowledgement lands refuses a VM that
+/// is ready a moment later, which the caller retries.
+pub(crate) fn ensure_restore_published(state: &crate::state::VmState) -> Result<()> {
+    let restored = state.config.process_type == Some(crate::state::ProcessType::Clone);
+    if !restored || state.lifecycle_ready {
+        return Ok(());
+    }
+    let name = state.name.as_deref().unwrap_or(&state.vm_id);
+    let owner = match state.pid {
+        Some(pid) => format!("fcvm process {pid}"),
+        None => "no fcvm process".to_string(),
+    };
+    let source = match state.config.snapshot_name.as_deref() {
+        Some(snapshot) => format!("snapshot '{snapshot}'"),
+        None => "a snapshot".to_string(),
+    };
+    let listing = match state.pid {
+        Some(pid) => format!("fcvm ls --json --pid {pid}"),
+        None => "fcvm ls --json".to_string(),
+    };
+    anyhow::bail!(
+        "cannot snapshot VM '{name}' ({owner}): it was restored from {source} and its \
+         restore has not been acknowledged, so its guest is still behind the snapshot's \
+         network gate. A snapshot now would open that gate before the source's connections \
+         are retired. Wait until `fcvm snapshot run` reports the clone, or until \
+         `{listing}` shows \"lifecycle_ready\": true. A restore that failed is never \
+         acknowledged; its VM is being stopped."
+    )
+}
+
+/// How often `snapshot create --await-restore` re-reads the state of a clone it waits for.
+const RESTORE_PUBLICATION_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// [`ensure_restore_published`] for the VM `snapshot create` selected, waiting up to `wait`
+/// (`--await-restore`) for an unpublished clone's owner to publish it. Returns the state as
+/// last read, which is the published one after a wait.
+///
+/// The wait ends with the refusal as soon as there is nothing left to wait for: the owner
+/// recorded the restore as failed, the owner is gone, or the state is gone or names
+/// another process.
+pub(crate) async fn await_restore_published(
+    state_manager: &StateManager,
+    selected: VmState,
+    wait: std::time::Duration,
+) -> Result<VmState> {
+    let started = std::time::Instant::now();
+    let mut current = selected;
+    loop {
+        let refusal = match ensure_restore_published(&current) {
+            Ok(()) => return Ok(current),
+            Err(refusal) => refusal,
+        };
+        if matches!(current.status, VmStatus::Failed) {
+            return Err(refusal.context("the VM's restore failed"));
+        }
+        if !crate::state::owner_is_live(&current) {
+            return Err(refusal.context("the VM's fcvm process has exited"));
+        }
+        if started.elapsed() >= wait {
+            return Err(if wait.is_zero() {
+                refusal
+            } else {
+                refusal.context(format!(
+                    "no acknowledgement of the VM's restore within the {} s of --await-restore",
+                    wait.as_secs()
+                ))
+            });
+        }
+        tokio::time::sleep(RESTORE_PUBLICATION_POLL).await;
+        let reread = match state_manager.load_state(&current.vm_id).await {
+            Ok(reread) => reread,
+            Err(_) => return Err(refusal.context("the VM's state is gone")),
+        };
+        if (reread.pid, reread.pid_start_time) != (current.pid, current.pid_start_time) {
+            return Err(refusal.context("the VM's state now names another fcvm process"));
+        }
+        current = reread;
+    }
+}
+
 /// Fail closed if the state selected before snapshot locking no longer identifies the same
 /// live fcvm process after the locks are held.
 ///
@@ -8701,6 +8802,284 @@ mod tests {
         let mut reused = current.clone();
         reused.pid_start_time = Some(start + 1);
         assert!(validate_snapshot_vm_identity(&reused, &reused).is_err());
+    }
+
+    /// The state `snapshot run` leaves on disk for a clone of `base` before the guest has
+    /// acknowledged its restore.
+    fn restoring_clone(vm_id: &str) -> VmState {
+        let mut state = make_vm_state(vm_id, Some("vm-source"));
+        state.name = Some(format!("{vm_id}-name"));
+        state.pid = Some(4242);
+        state.status = crate::state::VmStatus::Running;
+        state.config.snapshot_name = Some("base".to_string());
+        state.config.process_type = Some(crate::state::ProcessType::Clone);
+        state
+    }
+
+    /// `snapshot create` refuses a VM that was restored from a snapshot until the process
+    /// that owns it has published it, and takes a VM that was booted as it always did
+    /// (issue 2138). Each state is one an owner leaves on disk. `snapshot run` saves a
+    /// clone's state before it resumes the guest and publishes it after the guest's
+    /// acknowledgement. A restore that failed is marked failed and never published, and a
+    /// prepare's restore is never published either.
+    ///
+    /// RED BEFORE THE FIX: nothing read the restore's state. With the check admitting every
+    /// state, as `snapshot create` did, the restoring, failed and prepare cases are admitted.
+    #[test]
+    fn a_snapshot_is_refused_until_the_restore_is_acknowledged() {
+        let restoring = restoring_clone("vm-clone");
+        let refusal = ensure_restore_published(&restoring)
+            .expect_err("a clone whose restore is not acknowledged was admitted")
+            .to_string();
+        for part in [
+            "VM 'vm-clone-name'",
+            "fcvm process 4242",
+            "restored from snapshot 'base'",
+            "has not been acknowledged",
+            "fcvm ls --json --pid 4242",
+        ] {
+            assert!(refusal.contains(part), "no {part:?} in: {refusal}");
+        }
+
+        // A restore that failed, as `snapshot run` records it before it tears the VM down.
+        let mut failed = restoring.clone();
+        failed.status = crate::state::VmStatus::Failed;
+        failed.health_status = crate::state::HealthStatus::Unhealthy;
+        assert!(
+            ensure_restore_published(&failed).is_err(),
+            "a clone whose restore failed was admitted"
+        );
+
+        // A clone served by a memory server is a restore like one from the snapshot's files.
+        let mut served = restoring.clone();
+        served.config.serve_pid = Some(77);
+        assert!(ensure_restore_published(&served).is_err());
+
+        // A state with neither a name nor a process still says which VM and how to look.
+        let mut anonymous = restoring.clone();
+        anonymous.name = None;
+        anonymous.pid = None;
+        anonymous.config.snapshot_name = None;
+        let refusal = ensure_restore_published(&anonymous)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("VM 'vm-clone'") && refusal.contains("`fcvm ls --json`"),
+            "{refusal}"
+        );
+
+        let mut acknowledged = restoring.clone();
+        acknowledged.lifecycle_ready = true;
+        ensure_restore_published(&acknowledged)
+            .expect("a clone whose restore was acknowledged was refused");
+
+        // A VM that was booted, during its setup and after: unchanged.
+        let mut booted = make_vm_state("vm-booted", None);
+        assert_eq!(
+            booted.config.process_type,
+            Some(crate::state::ProcessType::Vm)
+        );
+        ensure_restore_published(&booted).expect("a booted VM in setup was refused");
+        booted.lifecycle_ready = true;
+        ensure_restore_published(&booted).expect("a booted VM was refused");
+    }
+
+    /// The acknowledgement that admits a snapshot is the owner's one locked write of
+    /// `lifecycle_ready`: a create that reads the clone's state before it refuses, and one
+    /// that reads it after is admitted.
+    #[tokio::test]
+    async fn the_owners_publication_is_what_admits_a_snapshot_of_a_clone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+
+        let pid = std::process::id();
+        let mut clone = restoring_clone("vm-admit");
+        clone.pid = Some(pid);
+        clone.pid_start_time = crate::utils::process_start_time(pid);
+        manager.save_state(&clone).await.unwrap();
+
+        let on_disk = manager.load_state_by_pid(pid).await.unwrap();
+        assert!(ensure_restore_published(&on_disk).is_err());
+
+        publish_lifecycle_ready(&manager, &mut clone).await.unwrap();
+        let on_disk = manager.load_state_by_pid(pid).await.unwrap();
+        validate_snapshot_vm_identity(&clone, &on_disk).unwrap();
+        ensure_restore_published(&on_disk).unwrap();
+    }
+
+    /// `--await-restore` waits for the owner's publication and no longer: it returns the
+    /// published state once the owner has written it, and gives the refusal at the deadline,
+    /// or at once when the restore is recorded as failed, the owner has exited or the state
+    /// is gone. Without the flag an unpublished clone is refused at once.
+    #[tokio::test]
+    async fn awaiting_a_restore_ends_at_its_publication_its_failure_or_the_deadline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manager = crate::state::StateManager::new(tmp.path().to_path_buf());
+        manager.init().await.unwrap();
+        let pid = std::process::id();
+        let start = crate::utils::process_start_time(pid);
+        let unpublished = |vm_id: &str| {
+            let mut clone = restoring_clone(vm_id);
+            clone.pid = Some(pid);
+            clone.pid_start_time = start;
+            clone
+        };
+        let long = std::time::Duration::from_secs(60);
+        let ended_early = |started: std::time::Instant| {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the wait ran to its deadline"
+            );
+        };
+
+        // No wait: refused at once, with the plain refusal.
+        let clone = unpublished("vm-await-none");
+        manager.save_state(&clone).await.unwrap();
+        let refusal = await_restore_published(&manager, clone, std::time::Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert!(
+            refusal.to_string().starts_with("cannot snapshot VM"),
+            "{refusal:#}"
+        );
+
+        // Published while the create waits: the published state comes back.
+        let mut clone = unpublished("vm-await-published");
+        manager.save_state(&clone).await.unwrap();
+        let started = std::time::Instant::now();
+        let waited = await_restore_published(&manager, clone.clone(), long);
+        let published = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            publish_lifecycle_ready(&manager, &mut clone).await.unwrap();
+        };
+        let (admitted, ()) = tokio::join!(waited, published);
+        assert!(admitted.unwrap().lifecycle_ready);
+        ended_early(started);
+
+        // Recorded as failed while the create waits.
+        let clone = unpublished("vm-await-failed");
+        manager.save_state(&clone).await.unwrap();
+        let started = std::time::Instant::now();
+        let waited = await_restore_published(&manager, clone, long);
+        let failed = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            manager
+                .update_state("vm-await-failed", |state| {
+                    state.status = crate::state::VmStatus::Failed
+                })
+                .await
+                .unwrap();
+        };
+        let (refused, ()) = tokio::join!(waited, failed);
+        let refusal = format!("{:#}", refused.unwrap_err());
+        assert!(refusal.contains("restore failed"), "{refusal}");
+        ended_early(started);
+
+        // The state removed while the create waits, as the owner's teardown does.
+        let clone = unpublished("vm-await-gone");
+        manager.save_state(&clone).await.unwrap();
+        let started = std::time::Instant::now();
+        let waited = await_restore_published(&manager, clone, long);
+        let removed = async {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            manager.delete_state("vm-await-gone").await.unwrap();
+        };
+        let (refused, ()) = tokio::join!(waited, removed);
+        let refusal = format!("{:#}", refused.unwrap_err());
+        assert!(refusal.contains("state is gone"), "{refusal}");
+        ended_early(started);
+
+        // An owner that has exited: nothing will ever publish.
+        let mut orphan = restoring_clone("vm-await-orphan");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        orphan.pid = Some(child.id());
+        child.wait().unwrap();
+        let started = std::time::Instant::now();
+        let refusal = format!(
+            "{:#}",
+            await_restore_published(&manager, orphan, long)
+                .await
+                .unwrap_err()
+        );
+        assert!(refusal.contains("has exited"), "{refusal}");
+        ended_early(started);
+
+        // Never published: refused at the deadline, which the refusal names.
+        let clone = unpublished("vm-await-deadline");
+        manager.save_state(&clone).await.unwrap();
+        let started = std::time::Instant::now();
+        let refusal = format!(
+            "{:#}",
+            await_restore_published(&manager, clone, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+        assert!(
+            refusal.contains("within the 1 s of --await-restore")
+                && refusal.contains("cannot snapshot VM"),
+            "{refusal}"
+        );
+
+        // A booted VM is never waited for.
+        let mut booted = make_vm_state("vm-await-booted", None);
+        booted.pid = Some(pid);
+        booted.pid_start_time = start;
+        let started = std::time::Instant::now();
+        await_restore_published(&manager, booted, long)
+            .await
+            .unwrap();
+        ended_early(started);
+    }
+
+    /// Why `snapshot create` needs no lock against a restore: a state that reads published
+    /// never goes back to restoring. `lifecycle_ready` starts false in `VmState::new` and
+    /// nothing else in the tree writes false to it, so its one write is the owner's
+    /// publication.
+    #[test]
+    fn lifecycle_readiness_is_never_taken_back() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root];
+        let mut initial = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                // Unit tests build states by hand; what ships is the code before the
+                // file's first test module, without its comments.
+                let tests = source
+                    .match_indices("#[cfg(test)]")
+                    .map(|(at, attribute)| (at, source[at + attribute.len()..].trim_start()))
+                    .find(|(_, item)| item.starts_with("mod ") || item.starts_with("pub mod "))
+                    .map_or(source.len(), |(at, _)| at);
+                let squeezed: String = source[..tests]
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .flat_map(str::split_whitespace)
+                    .collect();
+                assert!(
+                    !squeezed.contains("lifecycle_ready=false"),
+                    "{} takes lifecycle readiness back",
+                    path.display()
+                );
+                if squeezed.contains("lifecycle_ready:false") {
+                    initial.push(path);
+                }
+            }
+        }
+        assert_eq!(
+            initial,
+            [Path::new(env!("CARGO_MANIFEST_DIR")).join("src/state/types.rs")],
+            "only VmState::new may start a state unpublished"
+        );
     }
 
     #[tokio::test]

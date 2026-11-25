@@ -1721,10 +1721,24 @@ pub struct SnapshotCreateArgs {
     /// is never resumed, and its fcvm process is sent SIGTERM (SIGKILL after 30 s); the
     /// command returns once that process has exited. A VM put to sleep this way does nothing
     /// after its snapshot, so nothing it does is lost when it is restored. The VM is stopped
-    /// also when the snapshot fails, since a failed snapshot can leave it paused. Firecracker
-    /// VMs only.
+    /// also when the snapshot fails, since a failed snapshot can leave it paused. A clone
+    /// refused because its restore is not acknowledged (see `--await-restore`) was not
+    /// touched and is left running. Firecracker VMs only.
     #[arg(long, conflicts_with_all = ["disk_only", "gpu_warm"])]
     pub stop: bool,
+
+    /// How long to wait, in seconds, for the restore of a VM that was restored from a
+    /// snapshot to be acknowledged, before refusing to snapshot it. The default refuses at
+    /// once.
+    ///
+    /// A restored VM stays behind its snapshot's network gate until its guest has retired
+    /// the source's connections and run the restore hook, and a snapshot taken before that
+    /// would open the gate, so it is refused. `snapshot run` records the acknowledgement a
+    /// moment after the guest opens its ports, so a caller that learns a clone is up from
+    /// the clone itself (a port that answers) gives a wait here. The wait ends early when
+    /// the restore fails or the VM's fcvm exits. A VM that was booted is never waited for.
+    #[arg(long, value_name = "SECONDS", default_value_t = 0)]
+    pub await_restore: u64,
 
     /// The VM `--stop` pinned (internal): the create refuses any other, so a VM that took the
     /// selector's name or PID after the pin is never snapshotted and left paused.
