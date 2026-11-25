@@ -47,27 +47,65 @@ class Summary(unittest.TestCase):
 
 
 class RateWithAlive(unittest.TestCase):
+    @staticmethod
+    def rows(healthy_at, exits=None):
+        exits = exits or {}
+        return [{"healthy_at_ms": h, "exit_at_ms": exits.get(i)} for i, h in enumerate(healthy_at)]
+
     def test_counts_from_the_floor_to_the_last_healthy(self):
         # 1000 healthy by 2 s, then 500 more over the next 2 s.
         hs = [2.0 * i for i in range(1, 1001)] + [2000 + 4.0 * i for i in range(1, 501)]
-        r = startrate.rate_with_alive(hs)
+        r = startrate.rate_with_alive(self.rows(hs))
         self.assertEqual((r["window_s"], r["healthy_in_window"], r["rate_per_s"]), (2.0, 500, 250.0))
+        self.assertEqual(r["min_alive_in_window"], 1000)
 
     def test_no_rate_under_the_floor_or_in_a_short_window(self):
-        r = startrate.rate_with_alive([float(i) for i in range(1000)])
+        r = startrate.rate_with_alive(self.rows([float(i) for i in range(999)]))
         self.assertIsNone(r["rate_per_s"])
-        self.assertIn("no clone turned healthy with 1000 up", r["why"])
-        r = startrate.rate_with_alive([float(i) for i in range(1000)] + [1500.0])
+        self.assertIn("at most 999 clones were alive at once, under 1000", r["why"])
+        r = startrate.rate_with_alive(self.rows([float(i) for i in range(1000)] + [1500.0]))
         self.assertEqual((r["rate_per_s"], r["healthy_in_window"], r["window_s"]), (None, 1, 0.501))
         self.assertIn("under 1.0 s", r["why"])
+        self.assertIn("no clone turned healthy", startrate.rate_with_alive([])["why"])
 
-    def test_a_summary_carries_it(self):
+    def test_a_clone_that_exits_before_the_floor_is_not_alive(self):
+        # RED BEFORE THE FIX: 1000 healthy counted as 1000 alive whatever had exited.
+        # Clone 998 exits at 500 ms, so the 1000th healthy clone makes 999 alive and the
+        # 1001st makes 1000: the window starts there.
+        hs = [float(i) for i in range(1000)] + [3000.0, 4000.0, 5000.0]
+        r = startrate.rate_with_alive(self.rows(hs, {998: 500.0}))
+        self.assertEqual((r["window_s"], r["healthy_in_window"], r["rate_per_s"]), (2.0, 2, 1.0))
+        # With nothing after it, the 1000th healthy clone's predecessor having exited leaves no rate.
+        r = startrate.rate_with_alive(self.rows([float(i) for i in range(1000)], {998: 500.0}))
+        self.assertIsNone(r["rate_per_s"])
+        self.assertIn("at most 999 clones were alive at once", r["why"])
+
+    def test_no_rate_when_the_alive_count_falls_inside_the_window(self):
+        hs = [float(i) for i in range(1000)] + [3000.0]
+        r = startrate.rate_with_alive(self.rows(hs, {5: 2000.0}))
+        self.assertIsNone(r["rate_per_s"])
+        self.assertEqual(r["min_alive_in_window"], 999)
+        self.assertIn("the alive count fell to 999, under 1000, inside the window", r["why"])
+        # An exit after the last clone is healthy (the run's own teardown) is outside the window.
+        r = startrate.rate_with_alive(self.rows(hs, {i: 9000.0 for i in range(1001)}))
+        self.assertEqual((r["rate_per_s"], r["min_alive_in_window"]), (0.5, 1000))
+
+    def test_a_summary_carries_it_and_names_the_mode(self):
         with tempfile.TemporaryDirectory() as t:
             d = Path(t)
             Summary().write_run(d, [float(i) for i in range(1, 2002)])
             s = startrate.summarize(d)
             self.assertEqual(s["rate_with_alive"]["rate_per_s"], 1000.0)
             self.assertIsNone(s["pacing"])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                startrate.print_summary(s)
+            self.assertIn("with 1000+ alive (closed loop): 1001 healthy in 1.001 s = 1000.0/s, at least 1000 alive throughout", out.getvalue())
+            s["pacing"] = startrate.pacing_summary([{"spawn_at_ms": 0.0, "due_at_ms": 0.0}], 800.0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                startrate.print_summary(s)
+            self.assertIn("with 1000+ alive (paced at 800.0/s):", out.getvalue())
 
 
 class SteppingClock:
@@ -430,6 +468,9 @@ class FakeFcvm(FakeBase):
         for r in rows:
             self.assertAlmostEqual(r["due_at_ms"] - first, r["i"] * 50.0, places=3)
             self.assertGreaterEqual(r["spawn_at_ms"], r["due_at_ms"])
+            # Each clone's exit is stamped when its fcvm closes its output, here at the run's teardown.
+            self.assertIsNotNone(r["exit_at_ms"], "a clone the run stopped has no exit time")
+            self.assertGreaterEqual(r["exit_at_ms"], r["healthy_at_ms"])
         s = json.loads((out / "summary.json").read_text())
         self.assertEqual((s["healthy"], s["pacing"]["issued"], s["pacing"]["not_issued"]), (6, 6, 0))
         self.assertEqual(s["pacing"]["offered_rate_per_s"], 20.0)

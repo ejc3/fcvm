@@ -294,7 +294,7 @@ class HostSampler(threading.Thread):
 
 
 class Clone:
-    __slots__ = ("i", "name", "proc", "log", "t_spawn", "spawn_ns", "due_ns", "marks", "t_healthy", "exit", "buf", "error", "done")
+    __slots__ = ("i", "name", "proc", "log", "t_spawn", "spawn_ns", "due_ns", "marks", "t_healthy", "exit", "exit_ns", "buf", "error", "done")
 
     def __init__(self, i, name):
         self.i, self.name = i, name
@@ -306,6 +306,7 @@ class Clone:
         self.marks = {}
         self.t_healthy = None
         self.exit = None
+        self.exit_ns = None
         self.buf = b""
         self.error = None
         self.done = False
@@ -586,6 +587,8 @@ def cmd_run(a):
                         on_line(c, c.buf, t)
                         c.buf = b""
                     c.log.flush()
+                    # The clone's fcvm closed its output: it has exited, healthy before or not.
+                    c.exit_ns = t
                     if not c.done:
                         rc = c.proc.wait()
                         c.exit = rc
@@ -723,6 +726,7 @@ def cmd_run(a):
                     "healthy_at_ms": (c.t_healthy - t0) / 1e6 if c.t_healthy else None,
                     "spawn_to_healthy_ms": (c.t_healthy - c.spawn_ns) / 1e6 if c.t_healthy else None,
                     "marks_ms": c.marks, "error": c.error, "exit": c.exit,
+                    "exit_at_ms": (c.exit_ns - t0) / 1e6 if c.exit_ns is not None else None,
                 }) + "\n")
         (out / "phases.json").write_text(json.dumps({
             "t0_mono_ns": t0, "all_done_mono_ns": t_all, "hold_end_mono_ns": t_hold_end,
@@ -1556,21 +1560,51 @@ ALIVE_MIN_WINDOW_S = 1.0
 PACED_LATE_MS = 5.0
 
 
-def rate_with_alive(hs, floor=ALIVE_FLOOR, min_window_s=ALIVE_MIN_WINDOW_S):
-    """Clones reaching healthy per second from the moment `floor` of them are healthy to the last.
+def rate_with_alive(rows, floor=ALIVE_FLOOR, min_window_s=ALIVE_MIN_WINDOW_S):
+    """Clones reaching healthy per second while at least `floor` are alive.
 
-    `hs` is every healthy time in ms, sorted. A run keeps every clone up, so `floor` healthy is
-    `floor` alive. No rate when the run does not reach the floor or the window is too short.
+    A clone is alive from the moment it is healthy until its fcvm exits (`exit_at_ms`; the
+    run stops every clone only after the window). The window runs from the moment `floor`
+    are alive to the last clone turning healthy. No rate when the run never has `floor`
+    alive, when the alive count falls under it inside the window, or when the window is
+    shorter than `min_window_s`.
     """
-    out = {"alive_floor": floor, "min_window_s": min_window_s, "window_s": None, "healthy_in_window": None, "rate_per_s": None}
-    if len(hs) <= floor:
-        return {**out, "why": f"{len(hs)} healthy: no clone turned healthy with {floor} up"}
-    window_s = (hs[-1] - hs[floor - 1]) / 1000
-    n = len(hs) - floor
-    out.update(window_s=round(window_s, 3), healthy_in_window=n)
+    out = {"alive_floor": floor, "min_window_s": min_window_s, "window_s": None, "healthy_in_window": None,
+           "min_alive_in_window": None, "rate_per_s": None}
+    ok = [r for r in rows if r.get("healthy_at_ms") is not None]
+    if not ok:
+        return {**out, "why": "no clone turned healthy"}
+    # An exit sorts before a start at the same instant, so a tie never overstates the count.
+    events = sorted(
+        [(r["healthy_at_ms"], 1) for r in ok]
+        + [(r["exit_at_ms"], -1) for r in ok if r.get("exit_at_ms") is not None],
+        key=lambda e: (e[0], e[1]),
+    )
+    last = max(r["healthy_at_ms"] for r in ok)
+    alive = peak = 0
+    start = None
+    lowest = None
+    healthy_in = 0
+    for t, d in events:
+        if start is not None and t > last:
+            break
+        alive += d
+        peak = max(peak, alive)
+        if start is None:
+            if alive >= floor:
+                start, lowest = t, alive
+        else:
+            lowest = min(lowest, alive)
+            healthy_in += d > 0
+    if start is None:
+        return {**out, "why": f"at most {peak} clones were alive at once, under {floor}"}
+    window_s = (last - start) / 1000
+    out.update(window_s=round(window_s, 3), healthy_in_window=healthy_in, min_alive_in_window=lowest)
+    if lowest < floor:
+        return {**out, "why": f"the alive count fell to {lowest}, under {floor}, inside the window"}
     if window_s < min_window_s:
-        return {**out, "why": f"the window with {floor} up is {window_s:.3f} s, under {min_window_s} s"}
-    return {**out, "rate_per_s": round(n / window_s, 1)}
+        return {**out, "why": f"the window with {floor} alive is {window_s:.3f} s, under {min_window_s} s"}
+    return {**out, "rate_per_s": round(healthy_in / window_s, 1)}
 
 
 def pacing_summary(rows, rate):
@@ -1641,7 +1675,7 @@ def summarize(out, verify=None, teardown_s=None, t0_wall=None):
         "overall_rate_per_s": round(len(ok) / span_s, 1) if span_s else None,
         "best_1s_window": best_window(1000),
         "best_5s_window_rate": round(best_window(5000) / 5, 1),
-        "rate_with_alive": rate_with_alive(hs),
+        "rate_with_alive": rate_with_alive(rows),
         "pacing": pacing_summary(rows, (host.get("config") or {}).get("rate_per_s")),
         "spawn_to_healthy_ms": {"p50": pct(lat, 0.5), "p90": pct(lat, 0.9), "p99": pct(lat, 0.99), "max": pct(lat, 1)},
         "popen_ms": {"p50": pct([r["popen_ms"] for r in rows if r["popen_ms"]], 0.5),
@@ -1666,11 +1700,13 @@ def print_summary(s):
     print(f"   healthy {s['healthy']}/{s['launched']} failed {s['failed']} in {s['span_s']} s: "
           f"overall {s['overall_rate_per_s']}/s, best 1 s window {s['best_1s_window']}, best 5 s {s['best_5s_window_rate']}/s")
     ra = s["rate_with_alive"]
-    if ra["rate_per_s"] is not None:
-        print(f"   with {ra['alive_floor']}+ up: {ra['healthy_in_window']} healthy in {ra['window_s']} s = {ra['rate_per_s']}/s")
-    else:
-        print(f"   with {ra['alive_floor']}+ up: no rate ({ra['why']})")
     pc = s["pacing"]
+    mode = f"paced at {pc['offered_rate_per_s']}/s" if pc else "closed loop"
+    if ra["rate_per_s"] is not None:
+        print(f"   with {ra['alive_floor']}+ alive ({mode}): {ra['healthy_in_window']} healthy in {ra['window_s']} s = "
+              f"{ra['rate_per_s']}/s, at least {ra['min_alive_in_window']} alive throughout")
+    else:
+        print(f"   with {ra['alive_floor']}+ alive ({mode}): no rate ({ra['why']})")
     if pc:
         print(f"   paced: offered {pc['offered_rate_per_s']}/s, issued {pc['issued']} at {pc['issued_rate_per_s']}/s, "
               f"{pc['late_starts']} late by over {pc['late_threshold_ms']} ms (p50 {pc['late_ms']['p50']} p99 {pc['late_ms']['p99']} "

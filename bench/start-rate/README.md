@@ -66,8 +66,10 @@ the rate offered, the rate issued, and how many starts were late by more than on
 (5 ms at least) and by how much. Every start is issued inside the measured window, by the
 same `fcvm snapshot run` as the closed loop's; nothing is prepared for a clone before its
 start. Both modes report `rate_with_alive`: clones reaching healthy per second from the
-moment 1000 are healthy to the last one, when that window is at least 1 s (a run of 1000
-clones has no such window).
+moment 1000 are alive (healthy, and their fcvm not exited) to the last one turning healthy.
+There is no rate, and the summary says why, when the run never has 1000 alive (a run of
+1000 clones), when the alive count falls under 1000 inside the window, or when the window
+is under 1 s. `min_alive_in_window` is beside the rate.
 
 `run` measures a ramp: every clone stays up, so nothing is torn down while clones start and
 no namespace is used twice. `churn` measures a rate a host can hold: each clone runs
