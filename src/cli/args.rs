@@ -521,9 +521,29 @@ pub struct FleetCoordArgs {
     )]
     pub host_subnets: Vec<crate::fleet::coord::hosts::Regional>,
 
+    /// A launch template of pages mode's host (`<region>:<name>`, repeatable, one region).
+    /// With any, the coordinator runs one such CPU host while the fleet is awake, as it runs
+    /// the GPU hosts: spot first, on demand when spot is refused for capacity (at most one),
+    /// none while the fleet sleeps. Its instances are tagged `Purpose=fcvm-fleet-renders`.
+    #[arg(
+        long = "renders-template",
+        env = "FLEET_RENDERS_TEMPLATES",
+        value_delimiter = ','
+    )]
+    pub renders_templates: Vec<crate::fleet::coord::hosts::Regional>,
+
+    /// A subnet pages mode's host may launch in (`<region>:<subnet id>`, repeatable); the
+    /// region of the --renders-template needs at least one
+    #[arg(
+        long = "renders-subnet",
+        env = "FLEET_RENDERS_SUBNETS",
+        value_delimiter = ','
+    )]
+    pub renders_subnets: Vec<crate::fleet::coord::hosts::Regional>,
+
     /// Sleep with no active viewer (no tiles, every VM stopped) and wake for the next one,
     /// on hosts the coordinator does not launch (a fixed host, a test box). Implied by any
-    /// --host-template.
+    /// --host-template or --renders-template.
     #[arg(long)]
     pub sleep_when_idle: bool,
 
@@ -565,11 +585,11 @@ pub struct FleetCoordArgs {
     pub min_wake_remaining: u64,
 
     /// The most the fleet may spend in one UTC day, in USD. The coordinator meters what the
-    /// fleet's GPU hosts and EC2 tiles cost (spot at the spot price, on demand at the
-    /// on-demand rate) and, at this less 15 minutes of the current burn, sleeps the fleet
-    /// until 00:00 UTC: no wake or claim wakes it. Needs a fleet that sleeps (--host-template
-    /// or --sleep-when-idle) and instances to meter (--host-template or --ec2 aws). Off
-    /// without it.
+    /// fleet's GPU hosts, pages mode's host and EC2 tiles cost (spot at the spot price, on
+    /// demand at the on-demand rate) and, at this less 15 minutes of the current burn, sleeps
+    /// the fleet until 00:00 UTC: no wake or claim wakes it. Needs a fleet that sleeps
+    /// (--host-template, --renders-template or --sleep-when-idle) and instances to meter
+    /// (--host-template, --renders-template or --ec2 aws). Off without it.
     #[arg(long, env = "FLEET_DAILY_SPEND_USD")]
     pub daily_spend_usd: Option<f64>,
 
@@ -1009,6 +1029,19 @@ pub struct FleetAgentArgs {
     /// fcvm's snapshot directory, where the gold snapshot and the forks are made
     #[arg(long, default_value = "/mnt/fcvm-btrfs/snapshots")]
     pub minecraft_snapshot_dir: std::path::PathBuf,
+
+    /// Pages mode: run pages mode's host module (`fcvm fleet renders-bench`'s) while the
+    /// coordinator orders it to (docs/fleet/ARCHITECTURE.md, "Pages mode"). The agent must run
+    /// in a subgroup of a delegated systemd unit, as renders-bench must.
+    #[arg(long, requires = "renders_args")]
+    pub renders: bool,
+
+    /// Pages mode: one of the module's options, as `fcvm fleet renders-bench` takes it
+    /// (`--renders-arg=--corpus=/srv/corpus`). Repeatable. `--levels`, `--seconds`,
+    /// `--overlay-text` and `--overlay-transform` are the benchmark's and are refused: under
+    /// the agent the coordinator's orders say when to render and what overlay to serve.
+    #[arg(long = "renders-arg", allow_hyphen_values = true, requires = "renders")]
+    pub renders_args: Vec<String>,
 }
 
 /// `fcvm fleet phone-web-proxy`: the phones' web proxy on its own (a warm phone's bake and
@@ -1022,8 +1055,9 @@ pub struct FleetPhoneWebProxyArgs {
 
 /// `fcvm fleet renders-bench`: pages mode's host module ("One VM per page") on its own. It
 /// must run in a subgroup of a delegated systemd unit (`Delegate=yes` with
-/// `DelegateSubgroup=`), because each side runs in a cpuset of its own.
-#[derive(Args, Debug)]
+/// `DelegateSubgroup=`), because each side runs in a cpuset of its own. The fleet agent runs
+/// the same module with these options (`fcvm fleet agent --renders --renders-arg ...`).
+#[derive(Args, Debug, Clone)]
 pub struct FleetRendersBenchArgs {
     /// Where the records go: renders.jsonl, samples.jsonl, report.json, summary.json, logs
     #[arg(long)]
@@ -1128,7 +1162,11 @@ pub struct FleetRendersBenchArgs {
     /// Values for the Setup lists that the module cannot read itself (`side.name=value`)
     #[arg(long = "setup")]
     pub setup: Vec<String>,
-    /// Wait at this stage until the module is ended (the teardown check's)
+    /// Wait at this stage until the module is ended: the host checks' option
+    /// (renders_teardown_check.py, renders_agent_check.py). Under the agent, an order to stop
+    /// or the end of the connection ends a module held at a stage of its start (`cgroups` to
+    /// `workers`); one held at `start`, `running` or `stopping` is ended only with the agent's
+    /// process, whose end lets the reaper remove everything
     #[arg(long, hide = true)]
     pub hold_at: Option<String>,
 }

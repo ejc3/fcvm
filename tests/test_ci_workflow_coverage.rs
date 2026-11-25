@@ -570,6 +570,454 @@ fn gating_jobs_live_in_the_pull_request_workflow() {
     }
 }
 
+/// The step every self-hosted job that starts VMs runs before anything but its checkout and
+/// the disk preflight: scripts/check-runner-kernel.py with no argument, or with
+/// `--current-only`, which accepts fewer kernels. Its other arguments replace the kernel
+/// release, the machine and the clock, so a step that passed one would not check the runner.
+const RUNNER_KERNEL_CHECK: &str = "./scripts/check-runner-kernel.py";
+
+/// Jobs on our runners that do not run the check, and why. Every other job that is not on
+/// one of GitHub's runners (GITHUB_HOSTED) has to run it.
+const NO_RUNNER_KERNEL_CHECK: &[(&str, &str, &str)] = &[
+    // These three build the guest kernels a runner image needs before it can be built
+    // (build-runner-ami.yml starts when they finish). They have to run on the image the
+    // new one replaces, however old, and they start no VM.
+    ("kernels.yml", "build-default-kernel", "builds a kernel"),
+    ("kernels.yml", "build-nested-kernel", "builds a kernel"),
+    ("kernels.yml", "build-btrfs-kernel", "builds a kernel"),
+    // The runner is these jobs' IPv6 vantage point on the fleet's public endpoints.
+    ("fleet-prod-smoke.yml", "ipv6", "starts no VM"),
+    ("fleet-viewer-smoke.yml", "ipv6", "starts no VM"),
+    // Checks the runner's registration; it has no checkout to run a script from.
+    ("runner-acceptance.yml", "accept", "starts no VM"),
+];
+
+/// The `runs-on` labels of GitHub's own runners that the workflows use. A job on any of
+/// them never needs the check. Anything else is taken to run on a runner of ours: a label
+/// list, an expression, or a label that is not here yet (which then costs one line here).
+const GITHUB_HOSTED: &[&str] = &["ubuntu-latest", "ubuntu-24.04", "ubuntu-24.04-arm"];
+
+enum Runner {
+    /// One of GITHUB_HOSTED.
+    GitHub,
+    /// No `runs-on`: the job calls a workflow file of this repository, whose own jobs are
+    /// read where that file is read.
+    Caller(String),
+    /// Everything else.
+    Ours,
+}
+
+fn runner_of(job: &Value) -> Result<Runner, String> {
+    match job.get("runs-on") {
+        Some(Value::String(label)) if GITHUB_HOSTED.contains(&label.as_str()) => Ok(Runner::GitHub),
+        Some(_) => Ok(Runner::Ours),
+        None => job
+            .get("uses")
+            .and_then(Value::as_str)
+            .and_then(|uses| uses.strip_prefix("./.github/workflows/"))
+            .map(|file| Runner::Caller(file.to_string()))
+            .ok_or_else(|| "it has no runs-on and calls no workflow of this repository".into()),
+    }
+}
+
+/// What is wrong with the runner kernel check of a job on a runner of ours, if anything.
+/// `workflow_shell` is the workflow's own `defaults.run.shell`.
+fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> Option<String> {
+    if job.get("continue-on-error").is_some() {
+        return Some("the job sets continue-on-error".into());
+    }
+    // The step has to run on the runner itself, under the runner's default shell: in a job
+    // container the script's interpreter and git are the image's, and a default shell is
+    // one more thing between the step and its exit status.
+    if job.get("container").is_some() {
+        return Some("the job runs its steps in a container".into());
+    }
+    let job_shell = job
+        .get("defaults")
+        .and_then(|defaults| defaults.get("run"))
+        .and_then(|run| run.get("shell"));
+    if job_shell.or(workflow_shell).is_some() {
+        return Some("a default shell is set for the job's steps".into());
+    }
+    let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
+        return Some("it has no steps to read".into());
+    };
+    let run_of = |step: &Value| {
+        step.get("run")
+            .and_then(Value::as_str)
+            .map(|run| run.trim().to_string())
+    };
+    let Some(checkout) = steps.iter().position(|step| {
+        step.get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+    }) else {
+        return Some("it has no checkout to run the check from".into());
+    };
+    let Some(check) = steps
+        .iter()
+        .position(|step| run_of(step).is_some_and(|run| run.contains("check-runner-kernel")))
+    else {
+        return Some("it does not run the runner kernel check".into());
+    };
+    let step = &steps[check];
+    let run = run_of(step).unwrap();
+    if run != RUNNER_KERNEL_CHECK && run != format!("{RUNNER_KERNEL_CHECK} --current-only") {
+        return Some(format!("the check step runs `{run}`"));
+    }
+    if step.get("working-directory").and_then(Value::as_str) != Some("fcvm") {
+        return Some("the check step does not run in the checkout".into());
+    }
+    let extra: Vec<String> = step
+        .as_mapping()
+        .unwrap()
+        .keys()
+        .filter_map(Value::as_str)
+        .filter(|key| !matches!(*key, "name" | "run" | "working-directory"))
+        .map(str::to_string)
+        .collect();
+    if !extra.is_empty() {
+        return Some(format!("the check step sets {}", extra.join(", ")));
+    }
+    if check < checkout {
+        return Some("the check runs before the checkout".into());
+    }
+    let between = &steps[checkout + 1..check];
+    if let Some(other) = between
+        .iter()
+        .find(|step| run_of(step).as_deref() != Some("./scripts/runner-disk-preflight.sh"))
+    {
+        return Some(format!(
+            "a step other than the disk preflight runs before the check: {other:?}"
+        ));
+    }
+    // A step whose `if` has a status function runs after a failed check too. One that runs
+    // make then has to name the outcome of a step that cannot run after a failed check
+    // itself: a later step with an id and no status function in an `if` of its own.
+    let after_a_failure = |step: &Value| {
+        let condition = step.get("if").map(|v| format!("{v:?}")).unwrap_or_default();
+        ["always()", "failure()", "cancelled()"]
+            .iter()
+            .any(|status| condition.contains(status))
+            .then_some(condition)
+    };
+    for step in &steps[check + 1..] {
+        let Some(condition) = after_a_failure(step) else {
+            continue;
+        };
+        let runs_make =
+            run_of(step).is_some_and(|run| run.split_whitespace().any(|word| word == "make"));
+        if !runs_make {
+            continue;
+        }
+        let gated = steps[check + 1..].iter().any(|earlier| {
+            after_a_failure(earlier).is_none()
+                && earlier.get("id").and_then(Value::as_str).is_some_and(|id| {
+                    condition.contains(&format!("steps.{id}.outcome == 'success'"))
+                })
+        });
+        if !gated {
+            return Some(format!(
+                "the step `{}` can run make after the check failed",
+                step.get("name").and_then(Value::as_str).unwrap_or("?")
+            ));
+        }
+    }
+    None
+}
+
+/// A runner that did not boot the image build-runner-ami.yml publishes, or booted one older
+/// than the last host kernel change, fails tests in ways nothing in the job attributes to its
+/// kernel: on a stock 6.14 kernel nine tests lost their namespace holder at its 5 s deadline
+/// (#1563), and on the x86_64 host build without patch 0003 restored clones hung with a guest
+/// soft lockup about once in several lanes (#2125). Every job on a runner of ours therefore runs
+/// scripts/check-runner-kernel.py first, or is listed above with the reason it does not.
+#[test]
+fn every_self_hosted_job_checks_the_runner_kernel() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut checked = BTreeSet::new();
+    let mut exempt = BTreeSet::new();
+    let mut findings = Vec::new();
+    let mut files = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        // GitHub reads both extensions.
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        files += 1;
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+        let workflow = parse_workflow(&file);
+        let workflow_shell = workflow
+            .get("defaults")
+            .and_then(|defaults| defaults.get("run"))
+            .and_then(|run| run.get("shell"));
+        let jobs = workflow
+            .get("jobs")
+            .and_then(Value::as_mapping)
+            .unwrap_or_else(|| panic!("{file} has no jobs"));
+        for (name, job) in jobs {
+            let name = name.as_str().unwrap();
+            let runner = match runner_of(job) {
+                Ok(runner) => runner,
+                Err(finding) => {
+                    findings.push(format!("{file}/{name}: {finding}"));
+                    continue;
+                }
+            };
+            match runner {
+                Runner::GitHub => continue,
+                Runner::Caller(called) => {
+                    if !dir.join(&called).is_file() {
+                        findings.push(format!(
+                            "{file}/{name}: it calls {called}, which is not here"
+                        ));
+                    }
+                    continue;
+                }
+                Runner::Ours => {}
+            }
+            if NO_RUNNER_KERNEL_CHECK
+                .iter()
+                .any(|(f, j, _)| *f == file && *j == name)
+            {
+                exempt.insert(format!("{file}/{name}"));
+                continue;
+            }
+            match runner_kernel_check_finding(job, workflow_shell) {
+                Some(finding) => findings.push(format!("{file}/{name}: {finding}")),
+                None => {
+                    checked.insert(format!("{file}/{name}"));
+                }
+            }
+        }
+    }
+    assert!(files >= 10, "read only {files} workflow files in {dir:?}");
+    assert!(findings.is_empty(), "{findings:#?}");
+    let listed: BTreeSet<String> = NO_RUNNER_KERNEL_CHECK
+        .iter()
+        .map(|(file, job, _)| format!("{file}/{job}"))
+        .collect();
+    assert_eq!(
+        exempt, listed,
+        "an exemption names a job that is not on a runner of ours any more"
+    );
+    assert_eq!(
+        checked.into_iter().collect::<Vec<_>>(),
+        [
+            "ci.yml/container",
+            "ci.yml/host",
+            "ci.yml/host-root",
+            "teardown-evidence.yml/evidence",
+            "weekly.yml/bench-vm",
+            "weekly.yml/fuzz",
+        ]
+    );
+
+    // A benchmark's numbers come from the build the checkout gives, never the one before it.
+    let weekly = parse_workflow("weekly.yml");
+    let bench_runs: Vec<&str> = workflow_job(&weekly, "bench-vm")["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|run| run.contains("check-runner-kernel"))
+        .collect();
+    assert_eq!(
+        bench_runs,
+        ["./scripts/check-runner-kernel.py --current-only"]
+    );
+
+    // The script's own tests run in the job every pull request that runs CI gets.
+    let ci = parse_workflow("ci.yml");
+    assert!(
+        workflow_job(&ci, "actionlint")["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .any(
+                |step| step.get("run").and_then(Value::as_str).map(str::trim)
+                    == Some("make test-runner-kernel")
+                    && step.get("if").is_none()
+                    && step.get("continue-on-error").is_none()
+            )
+            && workflow_job(&ci, "actionlint")
+                .get("continue-on-error")
+                .is_none(),
+        "ci.yml's actionlint job must run `make test-runner-kernel`, and fail when it fails"
+    );
+}
+
+/// The pin above has to fail for a job that skips the check, weakens it, or runs it late.
+#[test]
+fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
+    let finding = |job: &str| {
+        let job: Value = serde_norway::from_str(job).unwrap();
+        assert!(
+            matches!(runner_of(&job), Ok(Runner::Ours)),
+            "the fixture must be a job on a runner of ours: {job:?}"
+        );
+        runner_kernel_check_finding(&job, None)
+    };
+    let job = |runs_on: &str, steps: &str| {
+        format!(
+            "runs-on: {runs_on}\nsteps:\n  - run: sudo chown -R $USER fcvm\n  \
+             - uses: actions/checkout@0000000000000000000000000000000000000000\n    \
+             with:\n      path: fcvm\n{steps}"
+        )
+    };
+    let labels = "[self-hosted, Linux, ARM64]";
+    let check = "  - name: Runner kernel check\n    working-directory: fcvm\n    \
+                 run: ./scripts/check-runner-kernel.py\n";
+    let preflight = "  - working-directory: fcvm\n    run: ./scripts/runner-disk-preflight.sh\n";
+    let build = "  - run: make build\n";
+
+    // The shapes the workflows use, each with the runs-on forms they use, and forms that do
+    // not say `self-hosted`: an expression, a label of ours, and a GitHub label in a list.
+    for runs_on in [
+        labels,
+        "[self-hosted, Linux, '${{ matrix.arch }}']",
+        "${{ fromJSON(format('[\"self-hosted\",\"Linux\",\"{0}\"]', matrix.arch)) }}",
+        "${{ matrix.runner }}",
+        "${{ fromJSON(needs.plan.outputs.labels) }}",
+        "metal-arm64",
+        "[ubuntu-latest]",
+    ] {
+        assert_eq!(finding(&job(runs_on, &format!("{check}{build}"))), None);
+        assert_eq!(
+            finding(&job(runs_on, &format!("{preflight}{check}{build}"))),
+            None
+        );
+        assert_eq!(
+            finding(&job(runs_on, build)).as_deref(),
+            Some("it does not run the runner kernel check")
+        );
+    }
+    let strict = check.replace("kernel.py\n", "kernel.py --current-only\n");
+    assert_eq!(finding(&job(labels, &strict)), None);
+
+    let wrong = |steps: String, wanted: &str| {
+        let found = finding(&job(labels, &steps)).unwrap_or_else(|| panic!("no finding: {steps}"));
+        assert!(found.contains(wanted), "{found}");
+    };
+    wrong(format!("{build}{check}"), "runs before the check");
+    wrong(
+        format!("  - uses: ./fcvm/.github/actions/checkout-deps\n{check}"),
+        "runs before the check",
+    );
+    wrong(
+        check.replace(
+            "kernel.py\n",
+            "kernel.py --release 7.3.3-fcvm-0123456789ab\n",
+        ),
+        "the check step runs",
+    );
+    wrong(
+        check.replace("kernel.py\n", "kernel.py || true\n"),
+        "the check step runs",
+    );
+    wrong(
+        format!("{check}    if: matrix.arch == 'arm64'\n"),
+        "the check step sets if",
+    );
+    wrong(
+        format!("{check}    continue-on-error: true\n"),
+        "the check step sets continue-on-error",
+    );
+    wrong(
+        format!("{check}    env:\n      PATH: /nowhere\n"),
+        "the check step sets env",
+    );
+    wrong(
+        check.replace("    working-directory: fcvm\n", ""),
+        "does not run in the checkout",
+    );
+    assert_eq!(
+        finding(&format!("{}continue-on-error: true\n", job(labels, check))).as_deref(),
+        Some("the job sets continue-on-error")
+    );
+    assert_eq!(
+        finding(&format!("runs-on: {labels}\nsteps:\n{check}")).as_deref(),
+        Some("it has no checkout to run the check from")
+    );
+    assert_eq!(
+        finding(&format!("runs-on: {labels}\n")).as_deref(),
+        Some("it has no steps to read")
+    );
+    assert_eq!(
+        finding(&format!("{}container: ubuntu:24.04\n", job(labels, check))).as_deref(),
+        Some("the job runs its steps in a container")
+    );
+    assert_eq!(
+        finding(&format!(
+            "{}defaults:\n  run:\n    shell: sh\n",
+            job(labels, check)
+        ))
+        .as_deref(),
+        Some("a default shell is set for the job's steps")
+    );
+    let checked: Value = serde_norway::from_str(&job(labels, check)).unwrap();
+    assert_eq!(
+        runner_kernel_check_finding(&checked, Some(&Value::String("sh".into()))).as_deref(),
+        Some("a default shell is set for the job's steps")
+    );
+
+    // Steps after the check that run when an earlier step failed.
+    let later = |steps: &str| finding(&job(labels, &format!("{check}{steps}")));
+    let setup = "  - id: setup\n    run: make setup-fcvm\n";
+    assert_eq!(
+        later("  - if: always()\n    run: ./scripts/ci-stray-vm-guard.sh post\n"),
+        None
+    );
+    assert_eq!(
+        later(&format!(
+            "{setup}  - if: ${{{{ !cancelled() && steps.setup.outcome == 'success' }}}}\n    \
+             run: make fuzz-gym\n"
+        )),
+        None
+    );
+    for ungated in [
+        "  - name: gym\n    if: always()\n    run: FCVM_GYM_SAMPLES=16 make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: failure()\n    run: |\n      cd fcvm\n      make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: ${{ !cancelled() }}\n    run: make fuzz-gym\n".to_string(),
+        // the outcome of a step that does not exist, and of one that runs after a failure too
+        "  - name: gym\n    if: always() && steps.setup.outcome == 'success'\n    run: make fuzz-gym\n"
+            .to_string(),
+        "  - id: setup\n    if: always()\n    run: ./prepare.sh\n  - name: gym\n    \
+         if: always() && steps.setup.outcome == 'success'\n    run: make fuzz-gym\n"
+            .to_string(),
+    ] {
+        assert_eq!(
+            later(&ungated).as_deref(),
+            Some("the step `gym` can run make after the check failed"),
+            "{ungated}"
+        );
+    }
+
+    // Which jobs the rule is applied to at all.
+    let runner = |job: &str| runner_of(&serde_norway::from_str::<Value>(job).unwrap());
+    for label in GITHUB_HOSTED {
+        assert!(matches!(
+            runner(&format!("runs-on: {label}\n")),
+            Ok(Runner::GitHub)
+        ));
+    }
+    assert!(matches!(
+        runner("uses: ./.github/workflows/fleet-viewer-smoke.yml\n"),
+        Ok(Runner::Caller(file)) if file == "fleet-viewer-smoke.yml"
+    ));
+    for unreadable in [
+        "steps: []\n",
+        "uses: example-owner/example-repo/.github/workflows/build.yml@main\n",
+    ] {
+        assert!(runner(unreadable).is_err(), "{unreadable}");
+    }
+}
+
 /// Every self-hosted job that checks out must first repair workspace ownership.
 ///
 /// Self-hosted runners keep their workspace between jobs. fcvm's privileged

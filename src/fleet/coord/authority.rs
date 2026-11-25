@@ -155,10 +155,10 @@ impl Zone {
     }
 }
 
-/// The subzone's records for a state: every slot's and tile's published launch and every
+/// The subzone's records for a state: every slot's and tile's published launch, every
 /// aggregator's published names (a host's `agg-<host>-<token>`, the EC2 half's
-/// `agg-ec2-<token>`), `<label>` with its IPv6 address and `<label>-v4` with its IPv4
-/// address.
+/// `agg-ec2-<token>`) and pages mode's host's (`renders-<host>-<token>`), `<label>` with its
+/// IPv6 address and `<label>-v4` with its IPv4 address.
 pub fn zone_of(state: &State, apex: &str) -> Zone {
     let mut z = Zone {
         serial: state.version as u32,
@@ -178,7 +178,13 @@ pub fn zone_of(state: &State, apex: &str) -> Zone {
         .hosts
         .values()
         .filter_map(|h| h.aggregate_published.as_ref())
-        .chain(f.ec2_aggregate_published.as_ref());
+        .chain(f.ec2_aggregate_published.as_ref())
+        .chain(
+            f.renders
+                .hosts
+                .values()
+                .filter_map(|h| h.published.as_ref()),
+        );
     for p in launches.chain(aggregators) {
         let label = p.label.to_ascii_lowercase();
         if let Some(v6) = p.ipv6.as_deref().and_then(|a| a.parse().ok()) {
@@ -1075,6 +1081,64 @@ impl Authority {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pages mode's host's frame socket is a fact of the DNS task, `renders-<host>`, with
+    /// the addresses its hello gave; once its names are published the subzone answers them,
+    /// AAAA for the label and A for its `-v4` name.
+    #[test]
+    fn the_zone_answers_the_renders_hosts_names() {
+        let hello: fleet_core::Event = serde_json::from_value(serde_json::json!({
+            "type": "agent", "at": 1000, "host": "i-0123456789abcdef0",
+            "msg": {"type": "hello", "host": "i-0123456789abcdef0", "arch": "aarch64",
+                "capacity": 0, "gpus": [], "renders": {"cpus": 40, "pages": [],
+                "ipv6": "2001:db8:7:7::5", "ipv4": "198.51.100.5", "v4_port": 8443}}
+        }))
+        .unwrap();
+        let config = fleet_core::Config {
+            names_published: true,
+            ..fleet_core::Config::default()
+        };
+        let state = fleet_core::apply(State::new(config, 0), &hello);
+        let apex = "tiles.fcvm.example";
+        let fact = super::super::dns::facts(&state)
+            .into_iter()
+            .find(|f| f.id == "renders-i-0123456789abcdef0")
+            .expect("the renders host is a fact");
+        assert!(super::super::dns::needs_names(apex, &fact));
+        assert_eq!(fact.v4_port, Some(8443));
+        let names = super::super::dns::names(
+            apex,
+            "renders-i-0123456789abcdef0-abcdefgh",
+            fact.generation,
+            fact.ipv6.as_deref(),
+            fact.ipv4.as_deref(),
+            fact.v4_port,
+        );
+        let state = fleet_core::apply(
+            state,
+            &fleet_core::Event::Published {
+                at: 2000,
+                slot: fact.id.clone(),
+                names,
+            },
+        );
+        let z = zone_of(&state, apex);
+        let label = "renders-i-0123456789abcdef0-abcdefgh";
+        assert_eq!(
+            z.aaaa.get(&format!("{label}.{apex}")),
+            Some(&vec!["2001:db8:7:7::5".parse::<Ipv6Addr>().unwrap()])
+        );
+        assert_eq!(
+            z.a.get(&format!("{label}-v4.{apex}")),
+            Some(&vec!["198.51.100.5".parse::<Ipv4Addr>().unwrap()])
+        );
+        // Published for exactly these addresses: no new names are needed.
+        let fact = super::super::dns::facts(&state)
+            .into_iter()
+            .find(|f| f.id == "renders-i-0123456789abcdef0")
+            .unwrap();
+        assert!(!super::super::dns::needs_names(apex, &fact));
+    }
 
     /// Logs written while `f` runs on this thread (and by tasks a current-thread runtime runs
     /// on it).
