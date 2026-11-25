@@ -188,7 +188,7 @@ const SECCOMP_POLICY: &str = include_str!("../resources/seccomp/firecracker-conf
 /// from (resources/seccomp/confined-changes.json); `[firecracker] commit` in
 /// rootfs-config.toml must be this commit. A VMM built from another commit is not confined:
 /// its syscalls were never checked against the policy.
-pub const CONFINED_FIRECRACKER_COMMIT: &str = "3e203733cb9115d1cbdd6857d59703541b85ddf6";
+pub const CONFINED_FIRECRACKER_COMMIT: &str = "2a33289b55b7f611959891dd5295438a416f386e";
 
 /// The environment a confined VMM starts with, on top of fcvm's own.
 ///
