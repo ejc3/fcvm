@@ -798,7 +798,7 @@ GPU is attached at restore), so KVM inside a phone VM has to survive a snapshot.
 executes VMXON when kvm_intel loads (`kvm.enable_virt_at_load`), and Firecracker did not save
 KVM's nested state, so a restored guest believed it was in VMX operation and KVM did not:
 the guest's next VMX instruction faulted. The fork's change (ejc3/firecracker#23, merged
-into `agent/vfio-uffd-populate`, the gpu profile's amd64 branch) saves
+into `agent/vfio-uffd-populate`, which the gpu and phone profiles' amd64 pin is built on) saves
 `KVM_GET_NESTED_STATE` in the vCPU state, header included (kvm-ioctls reports a header-only
 state as none, but the header holds
 `vmxon_pa`), and restores it after `SET_SREGS` and `IA32_FEATURE_CONTROL` and before

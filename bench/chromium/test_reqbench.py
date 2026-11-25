@@ -1543,11 +1543,19 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                 return real_wait_state_owned(*call_args, **call_kwargs)
 
             reqbench.wait_state_owned = mark_owner_wait
+            answers = []
+
+            def told(record):
+                answers.append((dict(record), list(owner_wait_calls)))
+                # A callback that fails is the caller's fault, not the request's.
+                raise RuntimeError("the caller's callback failed")
+
             args = argparse.Namespace(
                 fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
                 snapshot_tag="", serve_pid=1, rust_log="off",
                 timeout=5.0, teardown_timeout=5.0, cdp_port=port,
                 state_dir=state_dir, data_root=d, ws_url="", run_id="test-run",
+                on_answer=told,
             )
             try:
                 rec = reqbench.run_cdp_request(args, 0, fast=True)
@@ -1558,6 +1566,19 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                 server.close()
 
             self.assertTrue(rec["ok"])
+            # A caller that starts its next request while this clone is torn
+            # down is told once, when the answer is in hand: the request's time
+            # is set, and neither the owner wait nor the teardown has begun.
+            self.assertEqual(len(answers), 1)
+            answered, owner_waits_before = answers[0]
+            self.assertTrue(answered["ok"])
+            self.assertEqual(answered["blocking_ms"], rec["blocking_ms"])
+            self.assertNotIn("teardown", answered)
+            self.assertEqual(owner_waits_before, [])
+            # The callback raised: the request is still the answered one, with its owner
+            # wait and teardown done, and the record says what the callback did.
+            self.assertIn("the caller's callback failed", rec["on_answer_error"])
+            self.assertNotIn("error", rec)
             # reqscale's request function (_make_request_fn) times each corpus
             # scale request from these three monotonic stamps, and refuses a
             # successful record without artifact_ns; run_cdp_request set none
@@ -2995,6 +3016,47 @@ class CdpDriveHostHeader(unittest.TestCase):
         out = cdpdrive.drive(ns)  # must NOT raise AttributeError
         self.assertIs(out["ok"], False)
         self.assertEqual(out["stage"], "resolve", f"never reached resolve: {out}")
+
+
+    def test_a_malformed_viewport_is_refused_before_a_clone_is_started(self):
+        """The caller's error costs no clone: the request raises before fcvm is spawned."""
+        import reqbench
+
+        with tempfile.TemporaryDirectory() as d:
+            started = os.path.join(d, "started")
+            stub = os.path.join(d, "fcvm")
+            with open(stub, "w") as f:
+                f.write(f"#!/bin/sh\n: > {started}\nsleep 30\n")
+            os.chmod(stub, 0o755)
+            args = argparse.Namespace(
+                fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+                snapshot_tag="", serve_pid=1, rust_log="off", timeout=2.0,
+                teardown_timeout=2.0, cdp_port=1, state_dir=d, data_root=d, ws_url="",
+                run_id="bad-viewport", viewport="1280X720",
+            )
+            with self.assertRaises(ValueError):
+                reqbench.run_cdp_request(args, 0, fast=True)
+            self.assertFalse(os.path.exists(started), "a clone was started")
+
+    def test_a_clones_driver_gets_the_callers_viewport_and_none_by_default(self):
+        """reqbench's arms set no viewport, so their wire sequence is unchanged;
+        a caller that sets one (two engines compared at one size) has it reach
+        cdpdrive."""
+        import cdpdrive
+        import reqbench
+
+        seen = []
+
+        def record(ns):
+            seen.append(ns.viewport)
+            return {"ok": True}
+
+        base = dict(url="http://x/", format="jpeg", quality=80, ws_url="")
+        with _subreaper_mock.patch.object(cdpdrive, "drive", record):
+            for extra in ({}, {"viewport": "1280x720"}):
+                reqbench._drive_clone(argparse.Namespace(**base, **extra), 0, "screenshot",
+                                      "127.0.0.1:1", time.monotonic() + 5, 1, {})
+        self.assertEqual(seen, ["", "1280x720"])
 
 
 class CdpDriveResolveThrottling(unittest.TestCase):
