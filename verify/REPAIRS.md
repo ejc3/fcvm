@@ -4,8 +4,9 @@
 (REPAIR 1) and the Firecracker fork with the restore kick of #2131 (REPAIR 2). `Proofs.lean` proves
 every property of `Properties.lean` for it. Writing the proof, and running the search on the
 combinations in between, turned up two things the two fixes did not say about each other, and one
-rule the VMM has to keep. Nothing here changes a kernel patch, the fork or fcvm: those changes
-belong to #2130 and #2131, and this file is what the model says about them.
+rule the VMM has to keep (3, the one hypothesis the proof could not drop). Nothing here changes a
+kernel patch, the fork or fcvm: those changes belong to #2130 and #2131, and this file is what the
+model says about them.
 
 ## 1. A completion leaves the kick alone (#2130, host kernel, merged)
 
@@ -29,7 +30,7 @@ alone (the patch is merged): "The other callers were checked with a model of the
 where the vCPU is not waiting for a kick. The patch is also what makes the restore kick of #2131
 hold (#2132)."
 
-## 2. The restore gives every runnable vCPU a kick (#2131, Firecracker fork)
+## 2. The restore gives every runnable vCPU a kick (#2131, Firecracker fork; for the owner of that fix)
 
 **The change.** After every vCPU's state and the VM's state are restored, `KVM_SIGNAL_MSI` with the
 remote-read delivery mode to each vCPU that was saved RUNNABLE.
@@ -63,7 +64,7 @@ address with the enable and interrupt-delivery bits, written with `KVM_SET_MSRS`
 Expected: the vCPU runs past its HLT on a kernel with REPAIR 1 and on v6.14, and blocks on v6.15
 and later without it. On an unpatched host that is the reproduction of #2132.
 
-## 3. The VMM never writes `mp_state` to a live VM (found by the proof)
+## 3. The VMM never writes `mp_state` to a live VM (found by the proof; for the owner of the #2131 fix)
 
 **What the proof found.** The design's theorems would not close for a VMM that reads `mp_state` of
 a paused VM and writes it back. The state that blocks the proof is a runnable vCPU at its HLT in
@@ -71,29 +72,49 @@ a paused VM and writes it back. The state that blocks the proof is a runnable vC
 later, with or without REPAIR 1 (`breaks_writeBack`). So the theorems carry the hypothesis
 `Sound.noSet`, and the configuration that drops it is the last row of the table in BREAKS.md.
 
-**Why it matters.** It is true of Firecracker today, where `KVM_SET_MP_STATE` is issued only on the
-vCPUs of a VM being built from a snapshot. It is not written down anywhere, and a later change that
-restores state in place (a snapshot loaded into the running VM, a register write-back after a
-debugger stop) would bring the hang back with every test of today still passing.
+**Why it matters.** It is true of the fork today: `KVM_SET_MP_STATE` is issued in one place,
+`KvmVcpu::restore_state` (src/vmm/src/arch/x86_64/vcpu.rs:709-711 at 3e203733cb91), and that
+function is called only on the new vCPUs of `build_microvm_from_snapshot`
+(src/vmm/src/builder.rs:475-480). It is written down nowhere, and nothing enforces it. A later
+change that restores state in place (a snapshot loaded into the running VM, a register write-back
+after a debugger stop, a "reset vCPU" API) would bring the hang back with every test of today
+still passing.
 
-**Proposed wording** for the comment above `set_mp_state` in the fork's `restore_state`:
-"`KVM_SET_MP_STATE` to RUNNABLE clears a pending paravirtual kick on Linux v6.15 and later. It is
-safe here because the vCPU is new and `kick_runnable_vcpus` runs after it. Never call it on a vCPU
-of a VM that has run without giving that vCPU a kick afterwards."
+**The repair, in the Firecracker fork** (three parts, smallest first):
 
-## 4. Hosts fcvm does not build the kernel for (not a change to the model)
+1. *A comment at the call.* Proposed wording, above `set_mp_state` in `restore_state`:
+   "`KVM_SET_MP_STATE` to RUNNABLE clears a pending paravirtual kick (`pv_unhalted`) on Linux v6.15
+   and later. It is safe here because this vCPU is new and has never run, and
+   `kick_runnable_vcpus` runs after it. Never call it on a vCPU that has run without giving that
+   vCPU a kick afterwards: a waiter in the guest's `kvm_wait()` would halt with its wake-up gone
+   (fcvm `verify/REPAIRS.md`, 3)."
+2. *A debug assertion that the vCPU has never run.* `KvmVcpu` gets a `has_run: bool` (or the
+   existing run-state of its `Vcpu`), set on the first `KVM_RUN`, and `restore_state` starts with
+   `debug_assert!(!self.has_run, "restore_state on a vCPU that has run: KVM_SET_MP_STATE would
+   clear a pending paravirtual kick")`.
+3. *A test that fails if a second writer appears.* A source-level test in the fork, in the style
+   of fcvm's own order pins: `set_mp_state(` occurs once in `src/vmm/src` outside test modules, in
+   `restore_state`; `restore_state` on a `KvmVcpu` is called from `build_microvm_from_snapshot`
+   and nowhere else outside tests; and in `restore_kvm_state` the kick follows the last
+   `restore_state`. With the assertion of part 2, a unit test that runs a vCPU once and then calls
+   `restore_state` must panic in a debug build.
+
+Part 1 belongs in the same change as the restore kick. Parts 2 and 3 are what keep the model's
+hypothesis true after the next refactor.
+
+## 4. Hosts fcvm does not build the kernel for
 
 On a host at v6.15 or later without REPAIR 1, findings 1 and 3 are both open and nothing in the VMM
-closes them: the completion that clears the kick runs inside KVM. Two things would:
+closes them: the completion that clears the kick runs inside KVM.
 
-- **Upstream.** Linux master has the code of v7.3.3 here. The #2130 patch, with its reproduction,
-  is the change to send.
-- **The guest.** A guest booted with `nopvspin` has no `kvm_wait()`, so no kick to lose (#2130's
-  measurements: 0 of 200 restores stuck with it, against 15 of 900 without). fcvm chooses the guest's
-  command line, so it could add `nopvspin` when the host kernel is v6.15 or later and is not one
-  fcvm built, at the cost of spinning where a waiter would have halted. This is not modelled (a
-  lock that only spins has no HLT, and the model's lock paths would simply not reach one), and the
-  cost on an oversubscribed host is not measured.
+**The remedy is the upstream fix.** Linux master has the code of v7.3.3 here. The #2130 patch, with
+its reproduction and the trace of #2132, is the change to send, and until a host carries it (from
+upstream, a stable backport, or fcvm's own kernel build) that host has both hangs.
+
+No guest-side workaround is proposed. Booting guests with `nopvspin` removes `kvm_wait()` and with
+it the kick, but the owner has declined guest-side workarounds for this defect, it gives up halting
+waiters under oversubscription (the case PV spinlocks exist for), and its cost there is not
+measured. It is not modelled either.
 
 ## What was not repaired
 

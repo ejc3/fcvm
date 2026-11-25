@@ -30,7 +30,7 @@ Measured on an arm64 dev box (Neoverse, one build at a time), toolchain already 
 
 | Command | Wall time | Peak memory |
 |---|---|---|
-| `lake build` from cold | 1 min 25 s | 0.8 GB |
+| `lake build` from cold | 1 min 26 s | 1.6 GB |
 | `lake exe breaks` (70 searches, 150.7 million states in all) | 9 min 43 s | 1.8 GB |
 | `harness/run.sh` after `lake build` | 2 s | 0.1 GB |
 
@@ -45,7 +45,7 @@ Measured on an arm64 dev box (Neoverse, one build at a time), toolchain already 
 | `WakeVerify/Breaks.lean` | Each run the search found, replayed and checked by the kernel (`by decide`) |
 | `WakeVerify/Lemmas.lean` | `KeepsKick` (what the proofs need of a kernel), the invariant `PInv`, and that every step keeps it |
 | `WakeVerify/Proofs.lean` | `Sound`, `reachable_inv`, the `sound_*` and `design_*` theorems, which kernels are sound |
-| `WakeVerify/Axioms.lean` | Fails the build if a theorem rests on more than `propext`, `Quot.sound`, `Classical.choice` |
+| `WakeVerify/Axioms.lean` | Fails the build if any theorem under `Wake` rests on more than `propext`, `Quot.sound`, `Classical.choice` (a sweep over every theorem), and pins the axioms of the cited ones |
 | `Search.lean` | `lake exe breaks`: breadth-first search, kinds of break, shortest runs, the audit |
 | `HostOps.lean`, `harness/` | `lake exe hostops` and the C harness: the kernel's own functions against the rule books |
 
@@ -81,6 +81,16 @@ the restore kick, are in `BREAKS.md`.
   restores.
 - Every run in `Breaks.lean`: replayed step by step, the property evaluated, by `decide`.
 
+**The hypothesis every `design_*` theorem carries: the VMM never writes `mp_state` to a live VM.**
+`KVM_SET_MP_STATE` with RUNNABLE clears a pending kick on v6.15 and later, with or without the
+#2130 patch, so a VMM that reads `mp_state` of a VM that has run and writes it back can erase a
+wake-up (`breaks_writeBack`, on the designed system). The proof would not close without assuming
+this never happens (`Sound.noSet`, `C.userSetMp = false`). It is true of the pinned Firecracker
+fork, which issues `KVM_SET_MP_STATE` once, in `KvmVcpu::restore_state`
+(src/vmm/src/arch/x86_64/vcpu.rs:709-711), called only on the new vCPUs of
+`build_microvm_from_snapshot` (src/vmm/src/builder.rs:475-480). Nothing in the fork enforces it:
+`REPAIRS.md`, 3 is the repair that would.
+
 **Checked exhaustively, not proved**: that the rule books of today have no break other than those
 listed (the search visits every reachable state of each finite model; the search program is
 compiled Lean and is not itself verified), and the audit below.
@@ -105,6 +115,7 @@ proves it can fail by running v7.3.3's functions against the patched rule book.
 
 | Assumption | Why it is safe |
 |---|---|
+| The VMM never writes `mp_state` to a live VM (`Sound.noSet`) | Not safe to drop: see above. True of the pinned fork by reading its one call site; unenforced there |
 | Each KVM function is one atomic step | Each one reads the kick at most once before it may clear it, and the only write from another thread is the kick setting it. Every interleaving equals one of the two orders of atomic steps |
 | `kvm_vcpu_block`'s sleep and wake protocol (rcuwait, `kvm_vcpu_kick`) is correct | A blocked vCPU is modelled as running again exactly when `kvm_arch_vcpu_runnable` is true. A lost host-side wake of the vCPU thread is a different defect, not followed here |
 | Interrupt injection is correct: a pending, unmasked interrupt reaches a guest that runs | `KVM_REQ_EVENT`, the interrupt window and posted interrupts are not modelled. Every writer in the model raises `KVM_REQ_EVENT` in the source (lapic.c:1454, 3347; x86.c:9086) |
@@ -219,35 +230,29 @@ hang:
 - **A pending interrupt is the vGIC's state**, which `kvm_arch_vcpu_runnable` reads (arm.c:849-859)
   and Firecracker saves and restores through the vGIC device.
 
-## CI (proposed, not added here)
+## CI
 
-`lake build` from cold takes 1 min 25 s on the dev box, plus the toolchain download on a fresh
-runner, which is over the two minutes this pull request was allowed for a new CI check. The job to
-add when that is accepted:
+`.github/workflows/verify.yml`, job `lean` (check name "Lean"): `cd verify && lake build` on a
+hosted runner, on every pull request that changes `verify/**` (no base-branch filter, so stacked
+pull requests are checked) and on every push to main. elan comes from a checksum-pinned release
+file, the toolchain is the one `lean-toolchain` names, both are cached with the build directory,
+and the job is capped at 15 minutes. It is a workflow of its own and is not part of `Summary`.
+`tests/test_ci_workflow_coverage.rs` (`the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main`)
+pins its triggers and its build step.
 
-```yaml
-  lean:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install elan
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh |
-            sh -s -- -y --default-toolchain none
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - uses: actions/cache@v4
-        with:
-          path: verify/.lake
-          key: lake-${{ hashFiles('verify/lean-toolchain', 'verify/lakefile.toml', 'verify/**/*.lean') }}
-      - run: cd verify && lake build
-```
+What fails it, each observed locally by breaking the model one way in a copy of this directory and
+running `lake build` (exit status 1 each time, and 0 for the unchanged copy):
 
-on `pull_request` and `push` to main with `paths: ['verify/**']`, in a workflow of its own so that
-`ci.yml` keeps running for every pull request (`tests/test_ci_workflow_coverage.rs`). A broken
-proof, an axiom beyond Lean's own, or a recorded run that no longer breaks its property fails it.
-The search (`make verify-search`) and the harness (`make verify-harness`, which needs the network)
-stay manual or nightly.
+| Broken | How | `lake build` |
+|---|---|---|
+| a proof | `V733Patched.present` made to clear the kick (REPAIR 1 undone) | fails in `Proofs.lean` (`v733Patched_keepsKick`: unsolved goal `present_keeps`) and in `Breaks.lean` (`design_survives`) |
+| an axiom beyond the allowed ones | `breaks_kickFirst` proved with `native_decide` | fails in `Axioms.lean`: "theorems resting on more than Lean's own axioms: Wake.breaks_kickFirst depends on [..native_decide.ax_1_1]" |
+| a `sorry` | the proof of `sound_noHang` replaced by `sorry` | fails in `Proofs.lean`: "declaration uses `sorry`", an error because warnings are (`lakefile.toml`) |
+| a recorded break | the last step of `Run.pageReady` removed | fails in `Breaks.lean`: "`decide` proved that the proposition ... is false" |
+
+The search (`make verify-search`, ten minutes) and the harness (`make verify-harness`, which
+fetches kernel source) are not in CI: run them by hand after a change to `Spec.lean`,
+`Today.lean` or `Design.lean`.
 
 ## Conventions
 

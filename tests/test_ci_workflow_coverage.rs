@@ -3272,3 +3272,163 @@ fn host_jobs_install_from_cached_apt_archives_and_save_on_a_miss() {
         }
     }
 }
+
+/// The Lean model of the vCPU wake-up path (`verify/`) is checked by a workflow of its own,
+/// `verify.yml`, whose one job runs `lake build`: every proof, every recorded break and the
+/// axiom check. It is not in `Summary`, so these are the ways it could stop checking while
+/// still rendering nothing red:
+///
+/// - a `branches:` filter on `pull_request` matches the BASE branch and skips every stacked
+///   pull request (the #752 shape this file opens with);
+/// - a `paths:` list that leaves out `verify/**` never starts it;
+/// - a `paths:` filter on the `push` to main lets main go unchecked after a merge that the
+///   pull request's own run did not cover;
+/// - `continue-on-error`, an `if:` or an `|| true` on the build step turns a broken proof
+///   into a pass.
+#[test]
+fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
+    let wf = parse_workflow("verify.yml");
+    let on = triggers(&wf);
+
+    let pull_request = on
+        .get("pull_request")
+        .and_then(Value::as_mapping)
+        .expect("verify.yml has no `pull_request:` mapping");
+    for key in ["branches", "branches-ignore", "paths-ignore"] {
+        assert!(
+            !pull_request.contains_key(Value::from(key)),
+            "verify.yml restricts `pull_request` with `{key}:`; a base-branch filter skips \
+             every stacked pull request, and an ignore list cannot be kept complete"
+        );
+    }
+    let paths: Vec<&str> = pull_request
+        .get(Value::from("paths"))
+        .and_then(Value::as_sequence)
+        .expect("verify.yml `pull_request` has no `paths:` list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for needed in ["verify/**", ".github/workflows/verify.yml"] {
+        assert!(
+            paths.contains(&needed),
+            "verify.yml `pull_request.paths` is {paths:?}; without `{needed}` a change there \
+             starts no check"
+        );
+    }
+
+    let push = on
+        .get("push")
+        .and_then(Value::as_mapping)
+        .expect("verify.yml has no `push:` mapping, so main is never checked");
+    let branches: Vec<&str> = push
+        .get(Value::from("branches"))
+        .and_then(Value::as_sequence)
+        .expect("verify.yml `push` has no `branches:` list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        branches.contains(&"main"),
+        "verify.yml `push.branches` is {branches:?}: main is not checked"
+    );
+    for key in ["paths", "paths-ignore"] {
+        assert!(
+            !push.contains_key(Value::from(key)),
+            "verify.yml filters the push to main with `{key}:`"
+        );
+    }
+
+    let job = workflow_job(&wf, "lean");
+    for key in ["if", "continue-on-error"] {
+        assert!(
+            job.get(key).is_none(),
+            "verify.yml's `lean` job has `{key}:`, so it can pass or vanish without building"
+        );
+    }
+    let runs_on = job
+        .get("runs-on")
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_default();
+    assert!(
+        !runs_on.contains("self-hosted"),
+        "the `lean` job must stay on a hosted runner: it needs no KVM, and the self-hosted \
+         fleet is the VM matrix's ({runs_on})"
+    );
+    let minutes = job
+        .get("timeout-minutes")
+        .and_then(Value::as_u64)
+        .expect("the `lean` job has no `timeout-minutes`; GitHub's default is six hours");
+    assert!(
+        minutes <= 15,
+        "the `lean` job's cap is {minutes} minutes, over 15"
+    );
+
+    let steps = job
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("the `lean` job has no steps");
+    let builds: Vec<&Value> = steps
+        .iter()
+        .filter(|s| {
+            s.get("run")
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.lines().any(|l| l.trim() == "lake build"))
+        })
+        .collect();
+    assert_eq!(
+        builds.len(),
+        1,
+        "the `lean` job must have exactly one step that runs `lake build` on a line of its own"
+    );
+    let build = builds[0];
+    assert_eq!(
+        build.get("working-directory").and_then(Value::as_str),
+        Some("verify"),
+        "`lake build` must run in verify/"
+    );
+    for key in ["if", "continue-on-error"] {
+        assert!(
+            build.get(key).is_none(),
+            "the `lake build` step has `{key}:`, so a broken proof would not fail the job"
+        );
+    }
+    let script = build.get("run").and_then(Value::as_str).unwrap();
+    assert!(
+        script.contains("set -euo pipefail") && !script.contains("|| true"),
+        "the `lake build` step must fail when any of its commands fails: {script:?}"
+    );
+
+    // The toolchain is the one verify/lean-toolchain pins, read from the file, and its cache
+    // is keyed on that file: a toolchain bump cannot be served the old compiler.
+    let install = steps
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("elan toolchain install") || r.contains("elan\" toolchain install"))
+        .expect("no step of the `lean` job installs the toolchain");
+    assert!(
+        install.contains("$(cat verify/lean-toolchain)"),
+        "the toolchain install must read verify/lean-toolchain: {install:?}"
+    );
+    let toolchain_caches = steps
+        .iter()
+        .filter(|s| {
+            s.get("with")
+                .and_then(|w| w.get("path"))
+                .and_then(Value::as_str)
+                == Some("~/.elan")
+        })
+        .filter_map(|s| {
+            s.get("with")
+                .and_then(|w| w.get("key"))
+                .and_then(Value::as_str)
+        })
+        .filter(|k| !k.contains("cache-primary-key"))
+        .collect::<Vec<_>>();
+    assert!(
+        !toolchain_caches.is_empty()
+            && toolchain_caches
+                .iter()
+                .all(|k| k.contains("hashFiles('verify/lean-toolchain')")),
+        "the ~/.elan cache must be keyed on verify/lean-toolchain: {toolchain_caches:?}"
+    );
+}

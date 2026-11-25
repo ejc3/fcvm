@@ -1,6 +1,10 @@
 name = "WakeVerify"
 defaultTargets = ["WakeVerify", "breaks", "hostops"]
 
+# A warning fails the build: `sorry` is a warning, and so is a `#guard_msgs` that Lean could
+# only partly check.
+leanOptions = { warningAsError = true }
+
 [[lean_lib]]
 name = "WakeVerify"
 

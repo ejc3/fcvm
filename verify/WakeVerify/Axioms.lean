@@ -1,13 +1,41 @@
+import Lean
 import WakeVerify.Proofs
 import WakeVerify.Breaks
 
 /-!
 # What each theorem rests on
 
-`lake build` fails if a theorem about the repaired system, or a recorded break, comes to depend on
-anything beyond Lean's own axioms (`propext`, `Classical.choice`, `Quot.sound`): no `sorry`, no
-added axiom, no `native_decide` (which would add `Lean.ofReduceBool`).
+`lake build` fails if any theorem of the model comes to depend on anything beyond Lean's own
+axioms (`propext`, `Classical.choice`, `Quot.sound`): no `sorry` (`sorryAx`), no added axiom, no
+`native_decide` (which adds an axiom of its own for what the compiled code returned).
+
+Two checks. The sweep below visits every theorem in the `Wake` namespace, so a theorem added later
+is covered without being listed. The `#guard_msgs` lines after it pin the exact axioms of the
+theorems the documents cite, so the build also fails when one of those is renamed or removed.
 -/
+
+open Lean Elab Command in
+/-- Fails if a theorem under `Wake` depends on an axiom outside the allowed three, or if it finds
+too few theorems, or not the ones it must (a sweep that inspects nothing must not pass). -/
+elab "#check_wake_axioms" : command => do
+  let env ← getEnv
+  let allowed : List Name := [``propext, ``Quot.sound, ``Classical.choice]
+  let theorems := env.constants.fold (init := #[]) fun acc name info =>
+    match info with
+    | .thmInfo _ => if (`Wake).isPrefixOf name then acc.push name else acc
+    | _ => acc
+  let mut bad : Array String := #[]
+  for name in theorems do
+    let axioms ← collectAxioms name
+    let extra := axioms.toList.filter (!allowed.contains ·)
+    if !extra.isEmpty then bad := bad.push s!"{name} depends on {extra}"
+  if theorems.size < 100 || !theorems.contains `Wake.design_noLostKick
+      || !theorems.contains `Wake.breaks_pageReady then
+    throwError "the axiom sweep found {theorems.size} theorems under Wake and not the ones it must"
+  if !bad.isEmpty then
+    throwError "theorems resting on more than Lean's own axioms:\n{"\n".intercalate bad.toList}"
+
+#check_wake_axioms
 
 open Wake
 
