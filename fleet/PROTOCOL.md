@@ -1474,7 +1474,7 @@ The snapshot's `state.minecraft` is absent with no servers, else:
 {"server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
  "image_aspect": 2.0, "claim_secs": 120,
  "borrow": {"cap": 2, "lent": 1, "next_return_at": 1761134525000},
- "last_reset_all": {"clicked_at": 1761134400000, "by": "viewer:v-3", "servers": 4},
+ "last_reset_all": {"clicked_at": 1761134400000, "by": "viewer:v-3", "servers": 4, "back": 4, "took_ms": 6120},
  "last_fork": {"from": "mc-1", "to": "mc-2", "clicked_at": 1761134410000, "by": "viewer:v-5",
                "first_chunk_at": 1761134412300, "snapshot_ms": 640, "restore_ms": 1100, "total_ms": 2300},
  "tiles": [{"id": "mc:1", "slot": "mc-1", "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5}, "phase": "running",
@@ -1510,7 +1510,11 @@ of, null for a launch from the gold snapshot; it is cleared by the server's next
 `first_chunk_at` the copy's first chunk (kept as `first_frame_at` is), `snapshot_ms` the
 source's `fcvm snapshot create`, `restore_ms` the copy's `fcvm snapshot run` until its view
 answered, `total_ms` the click to the copy's first chunk. `last_reset_all` is the last committed
-`minecraft_reset` of every server, with how many it reset.
+`minecraft_reset` of every server, with how many it reset, and the coordinator's count of it:
+`back`, how many of those servers are back on the launch the reset began (a server reset again
+before that is never counted, nor one the reset did not touch), and once one is, `took_ms`, the
+click to the first chunk of the last of them. Both are absent from a record written before the
+coordinator counted.
 
 Intents:
 
@@ -1568,6 +1572,65 @@ leaves or the coordinator restarts is reset when its host reports it again, and 
 that reset until its fresh launch reports running, as a sandbox does. There is no drive intent:
 keys go from the page to the tile.
 
+#### Many servers: the field and the status rows
+
+A snapshot that listed every server of a large fleet as a tile would be large and would be sent
+again at every restore: measured with `make fleet-snapshot-size`, 512 servers on one host made
+a snapshot of 271,732 bytes (525 a server). So:
+
+- **`tiles` lists at most 16 servers** (`fleet_core::minecraft::TILES_LISTED`) once the fleet
+  runs more: the first 16 by number and every lent one (its holder's page needs its borrow), laid
+  out in an image of their own (`rect`, `image_aspect`), with their ids unchanged (`mc:<k>`, k
+  the server's place among all of them). A fleet of 16 or fewer is listed whole, as before.
+- **`field`** (absent with 16 servers or fewer) names every server:
+
+  ```json
+  "field": {"servers": 512,
+            "hosts": [{"key": "3f9a0c2b7d1e", "servers": [1, 2, 3, "..."],
+                       "frames": {"prefix": "wss://mc-", "suffix": ".mc.example.test/view",
+                                  "names": ["1-abcdefgh", null, "3-zyxwvuts", "..."]},
+                       "frames_v4": {"prefix": "...", "suffix": "...", "names": ["..."]}}]}
+  ```
+
+  A host's `servers` are its servers' numbers (`mc-<n>`) in the order of its status rows.
+  `frames` is each one's view URL (`frame_url`): `prefix + name + suffix`, null for a server with
+  none now; `frames_v4` the same for `frame_url_v4`, absent when no server has one. `key` is a
+  hash of the host's name, never the name. The field holds no state of any server, so a restore
+  changes it only when the server's URL changes. With it, the 512-server snapshot is 15,810
+  bytes.
+- **Status rows** carry the servers' state, outside the snapshot. A page that shows Minecraft
+  mode says so in its `visibility` message (`"minecraft": true`; absent or false for every other
+  page), and is then sent, for each host, about once a second:
+
+  ```json
+  {"type": "minecraft_status", "host": "3f9a0c2b7d1e", "received_at": 1761134400310,
+   "t": 1761134400000, "rows": "<base64>", "cpus": 192, "busy": 98.7,
+   "mem_total_mib": 385024, "mem_used_mib": 20480}
+  ```
+
+  `rows` is 8 bytes for each of the host's servers, in the order of `field.hosts[].servers`:
+  the phase (0 not reported, 1 restoring, 2 forking, 3 running, 4 failed), ticks per second
+  times ten (255: none), players (255: none), a zero, then two little-endian 16-bit numbers:
+  seconds since this launch's first chunk, and the launch's milliseconds to that chunk (65535:
+  none; a larger value is 65534). "None" is what the host did not read, and a page draws
+  nothing for it, never a zero. `t` is the host's clock. `cpus`, `busy` (CPUs busy over the last
+  second) and the memory figures (`MemTotal`, and `MemTotal` less `MemAvailable`) are the whole
+  host's, whatever else it runs; each is absent when the host could not read it. A page whose
+  rows are not 8 bytes for each server of the host in its snapshot ignores them. The messages
+  are no part of the state: they move no version, nothing stores them, and a page that asks
+  later gets each host's latest at its next report. A page from before them sends no
+  `minecraft` and is sent none (it would refuse a message type it does not know).
+
+  Rows are a reading, and an old reading is none. `received_at` is the coordinator's clock when
+  the report reached it; rows older than 5 s (`STATUS_EXPIRE_MS`, five missed reports) are
+  sent to no page, and a page that holds them shows their servers as not reported, never as
+  they last were. A host whose last server is unassigned sends one report with every row not
+  reported and then none. The coordinator takes a report only from the host's current
+  connection and only when `rows` is base64 of whole rows for no more servers than the host's
+  hello said it runs; anything else is dropped. It takes them no closer together than 500 ms
+  (an agent sends one a second): of those that come sooner it keeps the latest and takes it
+  when the 500 ms end, so a host's last report is not lost.
+
 #### Agent messages (Minecraft mode)
 
 - Hello: `minecraft` (the servers the host runs, 0 or absent for none) and `minecraft_server`
@@ -1581,6 +1644,14 @@ keys go from the page to the tile.
 - Slot report: as a sandbox's, with the `mc-<n>` id, `phase` one of the above, `frame_url` the
   view socket, `timings` with `restore_ms`, `first_chunk_ms`, `total_ms` and for a fork
   `snapshot_ms`, and `first_chunk_at` (Unix ms, host clock) with `running`.
+- Status rows: about once a second, a health report whose `id` is `minecraft` and whose
+  `minecraft` field is the status message above without its `type` and `host`
+  (`{"type": "health", "id": "minecraft", "fps": 0, "minecraft": {"t", "rows", "cpus", "busy",
+  "mem_total_mib", "mem_used_mib"}}`). The agent asks each running server's `/health` (64 at a
+  time, 400 ms each; one that does not answer has no tick rate in that row) and reads
+  `/proc/stat` and `/proc/meminfo`. It rides in a health report because the coordinator closes
+  an agent's connection on a message it cannot parse: a coordinator from before the field reads
+  it as a health report for a slot it does not have, and drops it.
 
 ## Agent
 
@@ -3773,13 +3844,25 @@ rules (`SCENE_TOKEN_FILE` is not used; `TLS_CERT_FILE` and its `scene_token`, re
   - `{"type": "map", "seq": 41, "region": {"x0", "z0", "w", "h"}, "cells": "<base64>"}`: every
     column, row by row (z then x), two bytes each: its top block's material (an index into
     `materials`) and its height (`y + 64`, held to 0..255). Sent on connect, when the region
-    changes, and to a socket that fell behind.
+    changes, and to a socket that fell behind. Optional `"ground": "<base64>"`, in the same
+    layout and of the same length (the page refuses another length): for each column the highest
+    block that is not leaves, a plant or water. The page reads it only under those three; without
+    it the page guesses the forest floor and the lake's bed from the columns beside them.
   - `{"type": "delta", "seq": 42, "cells": [[index, material, height], ...]}`: the columns that
-    changed, at most every 200 ms.
+    changed, at most every 200 ms. Optional `"ground": [[index, material, height], ...]`, the
+    ground that changed, read only by a page that holds a `map.ground`.
   - `{"type": "status", "t": <unix ms>, "tps": 19.98 | null, "players": [{"name", "x", "y",
     "z", "yaw", "bot", "driven"}], "drive": {"seq": 12, "moved_at": <unix ms>} | null}`, ten a
     second. `drive` is the last drive message whose effect the tile saw (the driven bot moved
-    or turned), on the tile's clock.
+    or turned), on the tile's clock. Optional `"day_time": 0..23999`, the game's tick of the day
+    (0 sunrise, 6000 noon, 12000 sunset, 18000 midnight), for the world's sky; without it the
+    page lights every world at mid-morning.
+
+  `ground` and `day_time` are optional: without them the page guesses the forest floor and the
+  lake's bed and lights every world at mid-morning. The tile sends `ground` in every `map`, and
+  in a `delta` when the ground changed. No tile sends `day_time`: Pumpkin 3ea7d281's time
+  packets carried no day clock that moved (none in 150 s on five servers, 2026-11-24), so every
+  world keeps the one sky. The page's mock sends both from every other server.
   - `{"type": "drive_ack", "seq": 12, "ok": true, "at": <unix ms>}` or `{"ok": false,
     "reason": "..."}`, for each drive message.
 

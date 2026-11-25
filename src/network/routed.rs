@@ -1177,10 +1177,13 @@ impl NetworkManager for RoutedNetwork {
         .await;
 
         // Detect default interface early — used for sysctl checks AND proxy NDP below.
-        let default_iface = detect_default_ipv6_interface()
-            .await
-            .unwrap_or_else(|| "eth0".to_string());
+        let detected_iface = detect_default_ipv6_interface().await;
+        let default_iface = detected_iface.clone().unwrap_or_else(|| "eth0".to_string());
         self.default_iface = Some(default_iface.clone());
+        if self.ipv6_prefix.is_some() {
+            // The detected uplink only: a rule for a guessed name answers nothing.
+            hold_hairpin_rule(lease_dir, network, prefix_len, detected_iface.as_deref()).await;
+        }
 
         // Verify host routing is set up correctly. These sysctls are the user's
         // responsibility (host sysctl configuration), not fcvm's — but warn
@@ -1761,6 +1764,208 @@ async fn detect_ipv6_dns(selected: Option<String>) -> Option<String> {
     None
 }
 
+/// The built-in chain the hairpin rule is in.
+const HAIRPIN_CHAIN: &str = "FORWARD";
+
+/// Seconds `ip6tables` waits for the xtables lock (`-w`), where the binary takes one.
+const HAIRPIN_XTABLES_WAIT_SECS: &str = "2";
+
+/// How long one `ip6tables` call for the hairpin rule may take before it is killed.
+const HAIRPIN_COMMAND_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The host's rule for a VM prefix given with `--ipv6-prefix`: a packet for the prefix that
+/// came in on the uplink and would be forwarded back out of it is answered with an ICMPv6
+/// address-unreachable.
+///
+/// Such a prefix is routed to the host by the network. A packet for one of its addresses
+/// that no VM holds (a VM that is still starting, or stopped, or a client's stray
+/// connection) matches only the default route, leaves by the uplink and comes straight
+/// back, until its hop limit runs out: 9,560 of 10,291 packets captured for one address in
+/// 64 s were one SYN going out and in again (#2109). The rule answers it the first time it
+/// comes back.
+///
+/// It matches that packet and nothing else. What the host itself sends is not forwarded, so
+/// the host still reaches every address of the prefix by its routes; a VM's traffic comes in
+/// on its veth; and traffic for a VM goes out on its veth. So a prefix shared with other
+/// hosts on the link keeps working, and a prefix given by mistake loses nothing. The rule
+/// reads the packet's devices and destination only: no connection tracking.
+fn hairpin_rule(uplink: &str, prefix: &str) -> [String; 10] {
+    [
+        "-i",
+        uplink,
+        "-o",
+        uplink,
+        "-d",
+        prefix,
+        "-j",
+        "REJECT",
+        "--reject-with",
+        "icmp6-addr-unreachable",
+    ]
+    .map(str::to_string)
+}
+
+/// Run `<program> -w <secs> <action> FORWARD <the hairpin rule>`, killed after `bound`.
+/// `Ok(true)` is exit status 0 and `Ok(false)` exit status 1, which is how `-C` says the
+/// rule is absent. Anything else is the reason nothing is known: the program did not run,
+/// did not finish in time, or failed another way (status 4: the xtables lock stayed held).
+async fn hairpin_rule_command(
+    program: &std::ffi::OsStr,
+    bound: std::time::Duration,
+    action: &str,
+    uplink: &str,
+    prefix: &str,
+) -> std::result::Result<bool, String> {
+    let mut command = crate::utils::helper_command(program);
+    command
+        .args(["-w", HAIRPIN_XTABLES_WAIT_SECS, action, HAIRPIN_CHAIN])
+        .args(hairpin_rule(uplink, prefix))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(bound, command.output()).await {
+        Err(_) => Err(format!("no answer within {bound:?}")),
+        Ok(Err(error)) => Err(error.to_string()),
+        Ok(Ok(output)) => match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(format!(
+                "{}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+        },
+    }
+}
+
+/// The record that a prefix's hairpin rule has been added since boot: a file in the lease
+/// directory holding, one per line, the uplinks the rule was added for. Its name does not
+/// end in `.lock`, so the sweep of abandoned leases leaves it.
+fn hairpin_record(dir: &std::path::Path, network: u128, len: u8) -> std::path::PathBuf {
+    dir.join(format!(
+        "hairpin-{}-{len}.rule",
+        std::net::Ipv6Addr::from(network)
+    ))
+}
+
+/// Add the prefix's hairpin rule (`hairpin_rule`) for `uplink`, unless the record says it
+/// was added since boot.
+///
+/// The rule is host configuration fcvm adds once per prefix per boot, like the sysctls it
+/// sets, and never removes: it rejects only uplink-to-uplink forwards for a prefix this
+/// host was told to serve, so one left in place after the prefix's last VM costs nothing,
+/// where every way of removing a rule VMs share is a way to remove it under one of them.
+/// The record lives in `/run/fcvm/routed-ipv6`, on tmpfs, so a reboot clears it with the
+/// kernel's ruleset.
+///
+/// The record is what lets every later launch skip the `ip6tables` process: a launch that
+/// finds its uplink in it reads one file and takes no lock. It is a hint, not a check. A
+/// ruleset reload (`nft flush ruleset`, a firewalld restart, an `ip6tables-restore`)
+/// removes the rule and leaves the record, and the host is then where it was before the
+/// rule existed until the next boot, or until the record is removed and the next routed
+/// launch adds the rule again: `rm /run/fcvm/routed-ipv6/hairpin-*.rule`.
+///
+/// A launch that does not find its uplink adds the rule while it holds the record's own
+/// lock, never the lease table's. A second launch that finds the lock held goes on without
+/// waiting: the first is adding the rule, and no launch needs it in order to start. Each
+/// `ip6tables` call is bounded (`HAIRPIN_COMMAND_BOUND`), and a failure writes no record,
+/// so the next launch tries again. An uplink that differs from the recorded ones (the
+/// default route moved, or the host has two) gets a rule of its own beside theirs. No
+/// rule is added for a device that does not exist, or when no uplink was detected.
+async fn hold_hairpin_rule(dir: &std::path::Path, network: u128, len: u8, uplink: Option<&str>) {
+    hold_hairpin_rule_with(
+        std::ffi::OsStr::new("ip6tables"),
+        HAIRPIN_COMMAND_BOUND,
+        dir,
+        network,
+        len,
+        uplink,
+    )
+    .await
+}
+
+/// [`hold_hairpin_rule`] with the program to run and the bound on each run of it.
+async fn hold_hairpin_rule_with(
+    program: &std::ffi::OsStr,
+    bound: std::time::Duration,
+    dir: &std::path::Path,
+    network: u128,
+    len: u8,
+    uplink: Option<&str>,
+) {
+    use nix::fcntl::{Flock, FlockArg};
+    use std::io::Write;
+
+    let prefix = format!("{}/{len}", std::net::Ipv6Addr::from(network));
+    let Some(uplink) = uplink else {
+        warn!(%prefix, "no default IPv6 interface was found, so the prefix's hairpin rule was not added");
+        return;
+    };
+    let record = hairpin_record(dir, network, len);
+    let recorded = || {
+        std::fs::read_to_string(&record).is_ok_and(|text| text.lines().any(|line| line == uplink))
+    };
+    if recorded() {
+        return;
+    }
+    // By index, not `/sys/class/net`: sysfs lists the devices of the namespace it was
+    // mounted in, and the rule goes into this thread's.
+    if nix::net::if_::if_nametoindex(uplink).is_err() {
+        warn!(%prefix, %uplink, "the default IPv6 interface does not exist, so the prefix's hairpin rule was not added");
+        return;
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&record)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            warn!(path = %record.display(), %error, "opening the record of the prefix's hairpin rule; the rule was not added");
+            return;
+        }
+    };
+    let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        // Another launch is adding the rule.
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => return,
+        Err((_, error)) => {
+            warn!(path = %record.display(), %error, "locking the record of the prefix's hairpin rule; the rule was not added");
+            return;
+        }
+    };
+    // The launch that held the lock a moment ago may have added it.
+    if recorded() {
+        return;
+    }
+    // A rule with no record: a launch killed between the two, or an operator's own.
+    let present = match hairpin_rule_command(program, bound, "-C", uplink, &prefix).await {
+        Ok(present) => present,
+        Err(reason) => {
+            warn!(%prefix, %uplink, %reason, "checking for the prefix's hairpin rule failed; the next routed launch tries again");
+            return;
+        }
+    };
+    if !present {
+        match hairpin_rule_command(program, bound, "-I", uplink, &prefix).await {
+            Ok(true) => {
+                info!(%prefix, %uplink, "the host answers a packet for the prefix that would go back out of the uplink")
+            }
+            Ok(false) => {
+                warn!(%prefix, %uplink, "adding the prefix's hairpin rule failed; the next routed launch tries again");
+                return;
+            }
+            Err(reason) => {
+                warn!(%prefix, %uplink, %reason, "adding the prefix's hairpin rule failed; the next routed launch tries again");
+                return;
+            }
+        }
+    }
+    let mut file: &std::fs::File = &lock;
+    if let Err(error) = writeln!(file, "{uplink}") {
+        warn!(path = %record.display(), %error, "recording the prefix's hairpin rule; the next routed launch checks for it again");
+    }
+}
+
 /// Detect the default IPv6 outgoing interface
 pub(crate) async fn detect_default_ipv6_interface() -> Option<String> {
     let output = tokio::process::Command::new("ip")
@@ -2317,6 +2522,572 @@ mod tests {
             "the host's own address was not found as a route"
         );
         assert!(host_route_for("2001:db8:ffff::77").await.unwrap().is_none());
+    }
+
+    /// The rule is added where `setup` finds the uplink, with the uplink it found and not
+    /// the name it falls back to. Nothing removes the rule: `cleanup` drops the lease as it
+    /// always did, and the rule's code runs no `-D` and never takes the lease table.
+    #[test]
+    fn the_hairpin_rule_is_added_with_the_detected_uplink_and_never_removed() {
+        let source = include_str!("routed.rs");
+        let setup = &source[source.find("    async fn setup(&mut self)").unwrap()..];
+        let detected = setup
+            .find("let detected_iface = detect_default_ipv6_interface().await;")
+            .unwrap();
+        let held = setup
+            .find("hold_hairpin_rule(lease_dir, network, prefix_len, detected_iface.as_deref())")
+            .unwrap();
+        assert!(detected < held);
+        let cleanup = &source[source.find("    async fn cleanup(&mut self)").unwrap()..];
+        let cleanup = &cleanup[..cleanup.find("\n    fn take_port_listeners").unwrap()];
+        assert_eq!(cleanup.matches("self.address_lease.take();").count(), 2);
+        let rule = &source[source.find("const HAIRPIN_CHAIN").unwrap()..];
+        let rule = &rule[..rule
+            .find("/// Detect the default IPv6 outgoing interface")
+            .unwrap()];
+        assert!(
+            !rule.contains("\"-D\""),
+            "the hairpin rule is removed somewhere"
+        );
+        assert!(!rule.contains("lock_lease_table("));
+    }
+
+    /// The rule reads devices and a destination, and nothing that attaches connection
+    /// tracking or looks at a route.
+    #[test]
+    fn the_hairpin_rule_matches_only_uplink_to_uplink_for_the_prefix() {
+        assert_eq!(
+            hairpin_rule("up0", "2001:db8:2109::/64").join(" "),
+            "-i up0 -o up0 -d 2001:db8:2109::/64 -j REJECT --reject-with icmp6-addr-unreachable"
+        );
+    }
+
+    /// A stand-in for `ip6tables`: a shell script with `body`. Its third argument is the
+    /// action (`-w 2 -C FORWARD ...`).
+    fn stand_in(dir: &std::path::Path, name: &str, body: &str) -> std::ffi::OsString {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.into_os_string()
+    }
+
+    const QUICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The first launch of a prefix checks for the rule, adds it when it is missing and
+    /// records the uplink. A launch that finds its uplink recorded runs nothing. A failed
+    /// add records nothing, so the next launch tries again.
+    #[tokio::test]
+    async fn a_launch_that_finds_its_uplink_recorded_runs_no_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let actions = || std::fs::read_to_string(&ran).unwrap_or_default();
+        let logged = format!("echo \"$3\" >> {}", ran.display());
+        let (vms, len) = prefix("2001:db8:2109::/64");
+        let record = hairpin_record(dir.path(), vms, len);
+
+        // the add fails: nothing is recorded, and the next launch runs both again
+        let failing = stand_in(dir.path(), "failing", &format!("{logged}; exit 1"));
+        for _launch in 0..2 {
+            hold_hairpin_rule_with(&failing, QUICK, dir.path(), vms, len, Some("lo")).await;
+        }
+        assert_eq!(actions(), "-C\n-I\n-C\n-I\n");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "");
+
+        // the rule is missing and the add works
+        std::fs::remove_file(&ran).unwrap();
+        let adding = stand_in(
+            dir.path(),
+            "adding",
+            &format!("{logged}; [ \"$3\" = -C ] && exit 1; exit 0"),
+        );
+        hold_hairpin_rule_with(&adding, QUICK, dir.path(), vms, len, Some("lo")).await;
+        assert_eq!(actions(), "-C\n-I\n");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "lo\n");
+        for _launch in 0..3 {
+            hold_hairpin_rule_with(&adding, QUICK, dir.path(), vms, len, Some("lo")).await;
+        }
+        assert_eq!(
+            actions(),
+            "-C\n-I\n",
+            "a launch with its uplink recorded ran ip6tables"
+        );
+
+        // a rule already there (a launch killed before it recorded it, or an operator's)
+        // is recorded and not added twice
+        let (other, len) = prefix("2001:db8:2110::/64");
+        std::fs::remove_file(&ran).unwrap();
+        let present = stand_in(dir.path(), "present", &format!("{logged}; exit 0"));
+        hold_hairpin_rule_with(&present, QUICK, dir.path(), other, len, Some("lo")).await;
+        assert_eq!(actions(), "-C\n");
+        assert_eq!(
+            std::fs::read_to_string(hairpin_record(dir.path(), other, len)).unwrap(),
+            "lo\n"
+        );
+        // the sweep every lease runs leaves the records
+        let lease = leased(
+            lease_address(dir.path(), "2001:db8:2109::5".parse().unwrap(), "vm-test").unwrap(),
+        )
+        .unwrap();
+        assert!(record.exists());
+        drop(lease);
+    }
+
+    /// No rule for a device that does not exist, and none when no uplink was detected:
+    /// `ip6tables` is not run and nothing is recorded.
+    #[tokio::test]
+    async fn no_rule_is_added_for_a_missing_device_or_an_undetected_uplink() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let program = stand_in(
+            dir.path(),
+            "logging",
+            &format!("echo \"$3\" >> {}; exit 0", ran.display()),
+        );
+        let (vms, len) = prefix("2001:db8:2109::/64");
+        hold_hairpin_rule_with(&program, QUICK, dir.path(), vms, len, Some("nosuch0")).await;
+        hold_hairpin_rule_with(&program, QUICK, dir.path(), vms, len, None).await;
+        assert!(
+            !ran.exists(),
+            "ip6tables ran for an uplink that is not there"
+        );
+        assert!(!hairpin_record(dir.path(), vms, len).exists());
+    }
+
+    /// An `ip6tables` that does not return (the xtables lock held by something else, or
+    /// anything else) holds up nothing but the one launch that runs it, and that one for
+    /// the bound: a second launch of the prefix takes its lease and goes on at once, on the
+    /// same runtime thread, and the first is back after one bound with nothing recorded.
+    ///
+    /// RED WITH THE LEASE TABLE LOCKED ACROSS THE CALL: the second launch's lease waits.
+    /// RED WITHOUT THE BOUND: the first launch is back when the program is.
+    #[tokio::test]
+    async fn a_stuck_ip6tables_holds_up_no_lease_and_no_second_launch() {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+        let dir = tempfile::tempdir().unwrap();
+        let stuck = stand_in(dir.path(), "stuck", "exec sleep 20");
+        let (vms, len) = prefix("2001:db8:2109::/64");
+        let started = std::time::Instant::now();
+        let first = {
+            let (stuck, dir) = (stuck.clone(), dir.path().to_path_buf());
+            tokio::spawn(async move {
+                hold_hairpin_rule_with(&stuck, BOUND, &dir, vms, len, Some("lo")).await
+            })
+        };
+        // the first launch is inside its `ip6tables -C`
+        tokio::time::sleep(BOUND / 5).await;
+        let attempt = {
+            let dir = dir.path().to_path_buf();
+            tokio::time::timeout(
+                BOUND / 5,
+                tokio::task::spawn_blocking(move || {
+                    lease_address(&dir, "2001:db8:2109::6".parse().unwrap(), "vm-second")
+                }),
+            )
+            .await
+            .expect("the second launch's lease waited for the first launch's ip6tables")
+            .unwrap()
+            .unwrap()
+        };
+        let lease = leased(attempt).unwrap();
+        // The second launch's own look at the rule: it never waits, so the first, on the
+        // same runtime thread, has not moved.
+        hold_hairpin_rule_with(&stuck, BOUND, dir.path(), vms, len, Some("lo")).await;
+        assert!(
+            !first.is_finished(),
+            "the second launch waited for the first"
+        );
+        first.await.unwrap();
+        let took = started.elapsed();
+        assert!(
+            took >= BOUND && took < BOUND * 4,
+            "the first launch was back after {took:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hairpin_record(dir.path(), vms, len)).unwrap(),
+            ""
+        );
+        drop(lease);
+    }
+
+    /// A network of namespaces for the hairpin rule's tests: a router `r`, two hosts `h1`
+    /// and `h2` each on a link of its own to the router, and a VM behind each host.
+    ///
+    /// ```text
+    ///   v1 (2001:db8:d::7) -- h1 (2001:db8:a1::1) -- r -- (2001:db8:a2::1) h2 -- v2 (2001:db8:b::22)
+    /// ```
+    ///
+    /// The router routes `2001:db8:d::/64` to h1 (a prefix delegated to one host), holds
+    /// `2001:db8:b::/64` on-link towards h2, which answers neighbour solicitations for v2
+    /// there (a prefix shared on the link, with proxy NDP), and holds `2001:db8:c::9`
+    /// itself. Each host's default route is the router, and its uplink is `uplink`.
+    ///
+    /// The namespaces have no names. Each is one a thread of the test made for itself and
+    /// is held by a descriptor here, and every device is made inside one of them, so
+    /// nothing is in the host's namespace and everything goes with the test process,
+    /// however it ends.
+    #[cfg(feature = "privileged-tests")]
+    struct Lan(std::collections::HashMap<&'static str, std::sync::Arc<std::fs::File>>);
+
+    #[cfg(feature = "privileged-tests")]
+    impl Lan {
+        fn build() -> Lan {
+            let mut namespaces = std::collections::HashMap::new();
+            for name in ["r", "h1", "h2", "v1", "v2"] {
+                let namespace = std::thread::spawn(|| {
+                    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+                    std::fs::File::open("/proc/thread-self/ns/net").unwrap()
+                })
+                .join()
+                .unwrap();
+                namespaces.insert(name, std::sync::Arc::new(namespace));
+            }
+            let lan = Lan(namespaces);
+            for name in ["r", "h1", "h2", "v1", "v2"] {
+                lan.ip(name, &["link", "set", "dev", "lo", "up"]);
+            }
+            // (one end, its namespace, its addresses, the other end, its namespace, its addresses)
+            let links: [(&str, &str, &[&str], &str, &str, &[&str]); 4] = [
+                (
+                    "r1",
+                    "r",
+                    &["2001:db8:a1::ff/64"],
+                    "uplink",
+                    "h1",
+                    &["2001:db8:a1::1/64"],
+                ),
+                (
+                    "r2",
+                    "r",
+                    &["2001:db8:a2::ff/64"],
+                    "uplink",
+                    "h2",
+                    &["2001:db8:a2::1/64"],
+                ),
+                (
+                    "vm",
+                    "h1",
+                    &["fd00:1::1/64"],
+                    "eth0",
+                    "v1",
+                    &["fd00:1::2/64", "2001:db8:d::7/128"],
+                ),
+                (
+                    "vm",
+                    "h2",
+                    &["fd00:2::1/64"],
+                    "eth0",
+                    "v2",
+                    &["fd00:2::2/64", "2001:db8:b::22/128"],
+                ),
+            ];
+            for (a, a_ns, a_addrs, b, b_ns, b_addrs) in links {
+                // made in the first namespace, its other end moved to the second
+                lan.ip(
+                    a_ns,
+                    &["link", "add", a, "type", "veth", "peer", "name", "hp-peer"],
+                );
+                let there = lan.path(b_ns);
+                lan.ip(
+                    a_ns,
+                    &["link", "set", "dev", "hp-peer", "netns", &there, "name", b],
+                );
+                for (ns, device, addrs) in [(a_ns, a, a_addrs), (b_ns, b, b_addrs)] {
+                    lan.ip(ns, &["link", "set", "dev", device, "up"]);
+                    for addr in addrs {
+                        lan.ip(ns, &["-6", "addr", "add", addr, "dev", device, "nodad"]);
+                    }
+                }
+            }
+            for host in ["r", "h1", "h2"] {
+                lan.sysctl(host, "net/ipv6/conf/all/forwarding", "1");
+            }
+            let route =
+                |ns, args: &[&str]| lan.ip(ns, &[&["-6", "route", "add"][..], args].concat());
+            route(
+                "h1",
+                &["default", "via", "2001:db8:a1::ff", "dev", "uplink"],
+            );
+            route(
+                "h2",
+                &["default", "via", "2001:db8:a2::ff", "dev", "uplink"],
+            );
+            route("v1", &["default", "via", "fd00:1::1", "dev", "eth0"]);
+            route("v2", &["default", "via", "fd00:2::1", "dev", "eth0"]);
+            // a VM's /128 on each host, as routed mode adds it
+            route("h1", &["2001:db8:d::7/128", "dev", "vm"]);
+            route("h2", &["2001:db8:b::22/128", "dev", "vm"]);
+            // the delegated prefix, the shared one with h2 answering for its VM, the router's own
+            route(
+                "r",
+                &["2001:db8:d::/64", "via", "2001:db8:a1::1", "dev", "r1"],
+            );
+            route("r", &["2001:db8:b::/64", "dev", "r2"]);
+            lan.sysctl("h2", "net/ipv6/conf/uplink/proxy_ndp", "1");
+            lan.sysctl("h2", "net/ipv6/neigh/uplink/proxy_delay", "0");
+            lan.ip(
+                "h2",
+                &[
+                    "-6",
+                    "neigh",
+                    "add",
+                    "proxy",
+                    "2001:db8:b::22",
+                    "dev",
+                    "uplink",
+                ],
+            );
+            lan.ip(
+                "r",
+                &[
+                    "-6",
+                    "addr",
+                    "add",
+                    "2001:db8:c::9/128",
+                    "dev",
+                    "lo",
+                    "nodad",
+                ],
+            );
+            lan
+        }
+
+        /// A path another process can open namespace `name` by.
+        fn path(&self, name: &str) -> String {
+            use std::os::fd::AsRawFd;
+            format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                self.0[name].as_raw_fd()
+            )
+        }
+
+        /// Run `work` on a thread of its own inside namespace `name`. What it starts and
+        /// the sockets it opens are in that namespace.
+        fn within<T: Send + 'static>(
+            &self,
+            name: &str,
+            work: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
+            let namespace = self.0[name].clone();
+            std::thread::spawn(move || {
+                nix::sched::setns(&*namespace, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+                work()
+            })
+            .join()
+            .unwrap()
+        }
+
+        /// Run a program inside namespace `name` and return what it printed.
+        fn run(&self, name: &str, program: &'static str, args: &[&str]) -> String {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            self.within(name, move || {
+                let out = std::process::Command::new(program)
+                    .args(&args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{program} {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                String::from_utf8_lossy(&out.stdout).to_string()
+            })
+        }
+
+        fn ip(&self, name: &str, args: &[&str]) -> String {
+            self.run(name, "ip", args)
+        }
+
+        fn sysctl(&self, name: &str, key: &'static str, value: &'static str) {
+            self.within(name, move || {
+                std::fs::write(format!("/proc/sys/{key}"), value).unwrap()
+            })
+        }
+
+        /// A listener on port 9000 of every address of namespace `name`, which accepts and
+        /// drops connections for as long as the test runs.
+        fn listen(&self, name: &str) {
+            let listener = self.within(name, || std::net::TcpListener::bind("[::]:9000").unwrap());
+            std::thread::spawn(move || for _connection in listener.incoming() {});
+        }
+
+        /// One connection from namespace `from` to port 9000 of `address`.
+        fn connect(&self, from: &str, address: &'static str) -> std::io::Result<()> {
+            self.within(from, move || {
+                let to = std::net::SocketAddr::new(address.parse().unwrap(), 9000);
+                std::net::TcpStream::connect_timeout(&to, std::time::Duration::from_secs(5))
+                    .map(drop)
+            })
+        }
+
+        /// Packets `device` of namespace `name` has received.
+        fn received(&self, name: &str, device: &str) -> u64 {
+            let stats = self.ip(name, &["-j", "-s", "link", "show", "dev", device]);
+            let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+            stats[0]["stats64"]["rx"]["packets"].as_u64().unwrap()
+        }
+
+        /// What a routed launch in namespace `name` does about the rule for `cidr`, with
+        /// `uplink` the default interface it found.
+        fn launch(&self, name: &str, dir: &std::path::Path, cidr: &str, uplink: &'static str) {
+            let (network, len) = prefix(cidr);
+            let dir = dir.to_path_buf();
+            self.within(name, move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(hold_hairpin_rule(&dir, network, len, Some(uplink)))
+            })
+        }
+
+        /// The hairpin rules in namespace `name`, as `ip6tables -S` prints them.
+        fn hairpin_rules(&self, name: &str) -> Vec<String> {
+            self.run(name, "ip6tables", &["-w", "-S", "FORWARD"])
+                .lines()
+                .filter(|rule| rule.contains("icmp6-addr-unreachable"))
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// #2109: a packet for an address of a prefix routed to the host, which no VM holds,
+    /// went out of the uplink and came back until its hop limit ran out. With the rule the
+    /// host answers it the first time it comes back, whether the network or the host itself
+    /// sent it, and a VM's own address is reached as before. Later launches add no second
+    /// rule, a launch with another uplink adds one for it beside the first, and passing
+    /// traffic attaches no connection tracking.
+    ///
+    /// A connect in this network sends two SYNs. The answer to the first comes back inside
+    /// the connect call, the namespaces being on one machine, and the kernel only notes an
+    /// error that arrives while the caller holds the socket; the answer to the retransmitted
+    /// one ends the connect. With the rule each SYN is on the host's uplink once.
+    ///
+    /// RED WITHOUT THE RULE: 64 to 66 packets on the host's uplink for one connect.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn a_packet_for_an_address_no_vm_holds_is_answered_the_first_time_it_comes_back() {
+        const DELEGATED: &str = "2001:db8:d::/64";
+        let lan = Lan::build();
+        let records = tempfile::tempdir().unwrap();
+        lan.listen("v1");
+        let circled = |from: &str| {
+            let before = lan.received("h1", "uplink");
+            let refused = lan
+                .connect(from, "2001:db8:d::5")
+                .expect_err("nobody holds it");
+            (
+                lan.received("h1", "uplink") - before,
+                refused.raw_os_error(),
+            )
+        };
+        // the premise: without the rule the packet circles between h1 and the router
+        let (packets, _) = circled("r");
+        assert!(
+            packets > 20,
+            "the network does not loop here: {packets} packets"
+        );
+
+        lan.launch("h1", records.path(), DELEGATED, "uplink");
+        for from in ["r", "h1"] {
+            let (packets, error) = circled(from);
+            assert!(
+                packets <= 4,
+                "a connect from {from} to an address no VM holds put {packets} packets on the \
+                 host's uplink"
+            );
+            assert_eq!(error, Some(libc::EHOSTUNREACH), "from {from}");
+        }
+        // as `ip6tables -S` prints it, which puts the destination first
+        const RULE: &str = "-A FORWARD -d 2001:db8:d::/64 -i uplink -o uplink -j REJECT \
+                            --reject-with icmp6-addr-unreachable";
+        assert_eq!(lan.hairpin_rules("h1"), [RULE]);
+        // a VM's address: from the network, and from the host
+        lan.connect("r", "2001:db8:d::7")
+            .expect("the VM, from the network");
+        lan.connect("h1", "2001:db8:d::7")
+            .expect("the VM, from its host");
+
+        // later launches add nothing
+        let record = hairpin_record(records.path(), prefix(DELEGATED).0, 64);
+        lan.launch("h1", records.path(), DELEGATED, "uplink");
+        assert_eq!(lan.hairpin_rules("h1"), [RULE]);
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "uplink\n");
+        // a launch killed after adding the rule and before recording it: the next one
+        // finds the rule and adds no second
+        std::fs::remove_file(&record).unwrap();
+        lan.launch("h1", records.path(), DELEGATED, "uplink");
+        assert_eq!(lan.hairpin_rules("h1"), [RULE]);
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "uplink\n");
+        // the default route on another device: a rule for it beside the first, which stays
+        lan.launch("h1", records.path(), DELEGATED, "vm");
+        assert_eq!(
+            lan.hairpin_rules("h1"),
+            [
+                "-A FORWARD -d 2001:db8:d::/64 -i vm -o vm -j REJECT --reject-with \
+                 icmp6-addr-unreachable",
+                RULE
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), "uplink\nvm\n");
+        lan.connect("r", "2001:db8:d::7")
+            .expect("the VM, with both rules");
+
+        // nothing above made the host track connections
+        let tracked = lan.within("h1", || {
+            std::fs::read_to_string("/proc/sys/net/netfilter/nf_conntrack_count")
+                .unwrap_or_else(|_| "0".to_string())
+        });
+        assert_eq!(tracked.trim(), "0", "the rule attached connection tracking");
+    }
+
+    /// Two hosts share a prefix on their link, each answering neighbour solicitations for
+    /// its own VMs, and their own addresses are outside it. Each runs a VM of the prefix,
+    /// so each holds the rule. A host still reaches the other host's VM: what a host sends
+    /// is not forwarded, so the rule does not see it.
+    ///
+    /// RED WITH AN UNREACHABLE ROUTE FOR THE PREFIX (what this rule replaced): h1 has no
+    /// route to h2's VM but that one.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn hosts_sharing_a_prefix_still_reach_each_others_vms() {
+        const SHARED: &str = "2001:db8:b::/64";
+        let lan = Lan::build();
+        let records = tempfile::tempdir().unwrap();
+        lan.listen("v2");
+        lan.connect("h1", "2001:db8:b::22")
+            .expect("the test's premise");
+        // each host's records are its own
+        for host in ["h1", "h2"] {
+            let records = records.path().join(host);
+            std::fs::create_dir_all(&records).unwrap();
+            lan.launch(host, &records, SHARED, "uplink");
+            assert_eq!(lan.hairpin_rules(host).len(), 1);
+        }
+        lan.connect("h1", "2001:db8:b::22")
+            .expect("h1 reaches h2's VM in the prefix they share");
+        lan.connect("v1", "2001:db8:b::22")
+            .expect("h1's VM reaches h2's VM in the prefix they share");
+    }
+
+    /// A prefix given by mistake, one the network does not route to this host, stays
+    /// reachable from the host and from its VMs.
+    ///
+    /// RED WITH AN UNREACHABLE ROUTE FOR THE PREFIX: the host has no route to it left.
+    #[cfg(feature = "privileged-tests")]
+    #[test]
+    fn a_prefix_given_by_mistake_stays_reachable() {
+        const MISTAKEN: &str = "2001:db8:c::/64";
+        let lan = Lan::build();
+        let records = tempfile::tempdir().unwrap();
+        lan.listen("r");
+        lan.launch("h1", records.path(), MISTAKEN, "uplink");
+        assert_eq!(lan.hairpin_rules("h1").len(), 1);
+        lan.connect("h1", "2001:db8:c::9")
+            .expect("the host reaches the prefix it was wrongly given");
+        lan.connect("v1", "2001:db8:c::9")
+            .expect("a VM reaches the prefix its host was wrongly given");
     }
 
     // --- parse_ipv6_prefix tests ---

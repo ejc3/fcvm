@@ -818,6 +818,12 @@ mod tests {
             "rootless_storage_args: fc-mock gives its podman an XDG_RUNTIME_DIR of its own \
              (apply_user_ns_env), and that is where a rootless default runroot lives",
         ),
+        (
+            "fc-agent/src/snapshot_network.rs",
+            3,
+            "not podman: crun's own flag of that name, its state directory, in the restore \
+             hook's `crun state` and `crun exec` and the two tests of their arguments",
+        ),
     ];
 
     /// Occurrences of the podman graphroot flag in the code part of `line`. Comments

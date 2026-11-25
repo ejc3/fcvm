@@ -29,6 +29,12 @@ export interface MockPotatoOptions {
   slowWakeMs: number;
   slowWakeChance: number;
   seed?: number;
+  /**
+   * The CPU allotment K (the agent's `--potato-cpus`): a machine not asleep holds one, and a wake
+   * waits for a free CPU. Unset: no allotment, the page's old coordinator behaviour. A test sets it
+   * through `reset({ cpus })`.
+   */
+  cpus?: number;
 }
 
 const SIZES = [2, 4, 8, 16, 32, 64, 96];
@@ -58,6 +64,10 @@ interface Player {
   wake_stages: Record<string, number>;
   timer: NodeJS.Timeout | null;
   wakeTimer: NodeJS.Timeout | null;
+  /** Asked to wake and waiting for a free CPU since this time. */
+  waitSince: number | null;
+  /** How long its latest wake waited for a CPU. */
+  cpuWaitMs: number | null;
 }
 
 interface Drop {
@@ -76,12 +86,27 @@ interface Drop {
   sleep_stages: Record<string, number>;
   wake_stages: Record<string, number>;
   detail: string;
+  cause?: string | null;
+  cause_ms?: number | null;
+  cpu_wait_ms?: number | null;
+  pace?: number | null;
+}
+
+interface Lap {
+  cpus_busy?: number | null;
+  lap: number;
+  pace: number;
+  hold_ms: number;
+  cpus_peak: number;
 }
 
 interface Rung {
   size: number;
   record_hold_ms: number | null;
   record_at: number | null;
+  record_pace: number | null;
+  record_pace_at: number | null;
+  record_prev_pace: number | null;
   broke: Drop | null;
   rounds: number;
 }
@@ -102,6 +127,14 @@ interface Round {
   waiting: { to: number; seq: number; until: number; timer: NodeJS.Timeout } | null;
   kickoff: boolean;
   timer: NodeJS.Timeout | null;
+  /** When each catch happened, by seq, for the measured pace. */
+  catchAt: number[];
+  laps: Lap[];
+  pace: number | null;
+  bestPace: number | null;
+  /** The most machines not asleep at any instant since the last lap completed, and in the lap before. */
+  peak: number;
+  lastPeak: number | null;
 }
 
 interface Record_ {
@@ -142,14 +175,40 @@ export class MockPotato {
   private lastRestart = new Map<string, number>();
   /** Tests: the next wake takes this long, whatever the draw. */
   private forcedWakeMs: number | null = null;
+  /** The CPU allotment, or null for none. */
+  private cpus: number | null;
+  /** Wakes waiting for a free CPU, oldest first. */
+  private cpuQueue: number[] = [];
 
   constructor(opts: MockPotatoOptions, host: PotatoHost) {
     this.opts = opts;
     this.host = host;
     this.rand = rng(opts.seed ?? 4096);
-    this.ladder = (opts.sizes ?? SIZES).map((size) => ({ size, record_hold_ms: null, record_at: null, broke: null, rounds: 0 }));
+    this.cpus = opts.cpus ?? null;
+    this.ladder = this.rungs().map((size) => ({ size, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 }));
     // the host says hello: the first round starts a second later, as the coordinator's tick starts it
     this.scheduleStart(1000);
+  }
+
+  /** The ring sizes: the old ladder, or with an allotment 2K doubling below the players, then the players. */
+  private rungs(): number[] {
+    if (this.cpus === null) return this.opts.sizes ?? SIZES;
+    const out: number[] = [];
+    for (let n = 2 * this.cpus; n < this.opts.players; n *= 2) out.push(n);
+    out.push(this.opts.players);
+    return out;
+  }
+
+  /** Machines not asleep: awake, waking, or going to sleep. */
+  private held(): number {
+    let k = 0;
+    for (const p of this.players.values()) if (p.phase !== "asleep" || p.sleepingSince !== null) k += 1;
+    return k;
+  }
+
+  private noteHeld(): void {
+    const r = this.round;
+    if (r) r.peak = Math.max(r.peak, this.held());
   }
 
   // ---- the snapshot ------------------------------------------------------------------
@@ -166,7 +225,8 @@ export class MockPotato {
     const seq = r?.seq ?? 0;
     const hold = r ? this.holdAt(r, seq) : 0;
     return {
-      ladder: this.ladder.map((g) => ({ ...g, broke: g.broke && { ...g.broke } })),
+      // the coordinator no longer sends the old hold records (PROTOCOL.md): only the pace record
+      ladder: this.ladder.map(({ record_hold_ms: _h, record_at: _a, ...g }) => ({ ...g, broke: g.broke && { ...g.broke } })),
       size: r?.size ?? this.ladder[this.rung]?.size ?? null,
       round: r && {
         id: r.id,
@@ -185,6 +245,11 @@ export class MockPotato {
         last_catch_at: r.last_catch_at,
         flight: r.flight && { ...r.flight },
         best_lap_hold_ms: r.best_lap_hold_ms,
+        pace: r.pace,
+        best_pace: r.bestPace,
+        laps: r.laps.slice(-60).map((l) => ({ ...l, cpus_peak: this.cpus === null ? null : l.cpus_peak, cpus_busy: this.cpus === null ? null : (l.cpus_busy ?? null) })),
+        // an agent that reports no allotment: the counts are null, never zero
+        ...(this.cpus === null ? { cpus_in_use: null, cpus_peak: null, asleep: null, lead: null, slowest_wake_ms: null, cpus_busy: null, cpu_slots: null } : this.cpuFields(r)),
       },
       players: [...this.players.entries()]
         .sort(([a], [b]) => a - b)
@@ -197,13 +262,36 @@ export class MockPotato {
           since: p.sleepingSince ?? p.since,
           last_sleep_ms: p.last_sleep_ms,
           last_wake_ms: p.last_wake_ms,
+          cpu_wait_ms: this.cpus === null ? null : p.cpuWaitMs,
+          ready_margin_ms: null,
         })),
       records: { fastest_cycle_ms: this.records.fastest_cycle_ms && { ...this.records.fastest_cycle_ms }, longest_round: this.records.longest_round && { ...this.records.longest_round } },
       last_drop: this.lastDrop && { ...this.lastDrop },
       next_round_at: this.nextRoundAt,
       colours: COLOURS,
       capacity: this.opts.players,
+      cpus: this.cpus,
+      confined: this.cpus === null ? null : true,
       host: "mock-host-1",
+    };
+  }
+
+  /** What the agent reports with each catch (POTATO-FIELDS): the CPU counts, the lead and the slowest wake. */
+  private cpuFields(r: Round) {
+    const ring = r.ring.map((n) => [n, this.players.get(n)!] as const);
+    const slot = (n: number, p: Player) => (p.sleepingSince !== null ? "saving" : p.phase === "waking" ? "waking" : n === r.holder ? "ball" : "ready");
+    const held = ring.filter(([, p]) => p.phase !== "asleep" || p.sleepingSince !== null);
+    const order = ["ball", "ready", "waking", "saving"];
+    const slots = held.map(([n, p]) => ({ player: n, phase: slot(n, p) })).sort((a, b) => order.indexOf(a.phase) - order.indexOf(b.phase));
+    const hold = Math.max(1, this.holdAt(r, r.seq ?? 0));
+    return {
+      cpus_in_use: slots.length,
+      cpus_peak: r.lastPeak,
+      asleep: ring.length - held.length,
+      lead: Math.max(1, Math.ceil(this.leadMs() / hold)),
+      slowest_wake_ms: this.recentWakes.length === 0 ? null : Math.max(...this.recentWakes),
+      cpus_busy: Math.round(Math.min(this.cpus ?? 0, slots.length * 0.7) * 10) / 10,
+      cpu_slots: slots,
     };
   }
 
@@ -247,7 +335,22 @@ export class MockPotato {
           wake_stages: {},
           timer: null,
           wakeTimer: null,
+          waitSince: null,
+          cpuWaitMs: null,
         });
+      }
+    }
+    if (this.cpus !== null) {
+      // the agent has every machine of the ring saved before a round starts, so at most K are ever not asleep
+      for (const p of this.players.values()) {
+        if (p.timer) clearTimeout(p.timer);
+        if (p.wakeTimer) clearTimeout(p.wakeTimer);
+        p.timer = null;
+        p.wakeTimer = null;
+        p.phase = "asleep";
+        p.sleepingSince = null;
+        p.since = now;
+        p.waitSince = null;
       }
     }
     this.roundCount += 1;
@@ -266,6 +369,12 @@ export class MockPotato {
       waiting: null,
       kickoff: true,
       timer: null,
+      catchAt: [],
+      laps: [],
+      pace: null,
+      bestPace: null,
+      peak: 0,
+      lastPeak: null,
     };
     this.nextRoundAt = null;
     this.host.markDirty();
@@ -301,6 +410,8 @@ export class MockPotato {
       const h = this.holdAt(r, seq - 1);
       if (r.best_lap_hold_ms === null || h < r.best_lap_hold_ms) r.best_lap_hold_ms = h;
     }
+    r.catchAt[seq] = now;
+    if ((seq + 1) % n === 0) this.lapDone(r, seq);
     r.seq = seq;
     r.holder = player;
     r.last_catch_at = now;
@@ -310,6 +421,30 @@ export class MockPotato {
     const hold = this.holdAt(r, seq);
     r.timer = this.host.later(hold, () => this.threw(r, player, seq + 1));
     this.planWakes(r);
+  }
+
+  /** A lap's pace from the catch times: its catches over the time from the catch before its first to its last. */
+  private lapDone(r: Round, seq: number): void {
+    const n = r.ring.length;
+    const lap = Math.floor(seq / n);
+    const first = lap * n;
+    const from = lap === 0 ? r.catchAt[0]! : r.catchAt[first - 1]!;
+    const catches = lap === 0 ? n - 1 : n;
+    const span = r.catchAt[seq]! - from;
+    if (span <= 0) return;
+    const pace = Math.round((catches / (span / 1000)) * 100) / 100;
+    const peak = Math.max(r.peak, this.held());
+    r.pace = pace;
+    r.lastPeak = peak;
+    r.peak = this.held();
+    r.laps.push({ lap, pace, hold_ms: this.holdAt(r, seq), cpus_peak: peak });
+    if (r.bestPace === null || pace > r.bestPace) r.bestPace = pace;
+    const rung = this.ladder.find((g) => g.size === r.size);
+    if (rung && this.cpus !== null && (rung.record_pace === null || pace > rung.record_pace)) {
+      rung.record_prev_pace = rung.record_pace;
+      rung.record_pace = pace;
+      rung.record_pace_at = this.host.now();
+    }
   }
 
   private threw(r: Round, from: number, seq: number): void {
@@ -367,6 +502,7 @@ export class MockPotato {
       sleep_stages: { ...(q?.sleep_stages ?? {}) },
       wake_stages: { ...(q?.wake_stages ?? {}) },
       detail: d.detail,
+      ...(this.cpus === null ? { cause: null, cause_ms: null, cpu_wait_ms: null, pace: r.pace } : this.causeOf(d, q, now, r)),
     };
     this.endRound(r);
     const rung = this.ladder.find((g) => g.size === r.size);
@@ -387,6 +523,13 @@ export class MockPotato {
     this.scheduleStart(this.opts.restartAfterMs);
   }
 
+  /** What the agent measured about the catcher that was not ready. */
+  private causeOf(d: { stage: string; stage_ms: number }, q: Player | null, now: number, r: Round) {
+    const cause = q === null ? null : q.waitSince !== null ? "cpu_wait" : d.stage === "sleeping" ? "saving" : d.stage === "waking" ? "waking" : null;
+    const cause_ms = cause === "cpu_wait" ? Math.round(now - q!.waitSince!) : cause === "saving" ? d.stage_ms : null;
+    return { cause, cause_ms, cpu_wait_ms: cause === "cpu_wait" ? cause_ms : null, pace: r.pace };
+  }
+
   private endRound(r: Round): void {
     if (r.timer) clearTimeout(r.timer);
     if (r.waiting) clearTimeout(r.waiting.timer);
@@ -398,6 +541,7 @@ export class MockPotato {
       if (p.wakeTimer) clearTimeout(p.wakeTimer);
       p.wakeTimer = null;
     }
+    this.cpuQueue = [];
   }
 
   // ---- sleep and wake ----------------------------------------------------------------
@@ -410,6 +554,7 @@ export class MockPotato {
     const p = this.players.get(n)!;
     if (p.phase !== "awake" || p.sleepingSince !== null) return;
     p.sleepingSince = this.host.now();
+    this.noteHeld();
     const ms = this.jitter(this.opts.sleepMs);
     p.timer = this.host.later(ms, () => {
       p.timer = null;
@@ -420,6 +565,7 @@ export class MockPotato {
       const part = (f: number) => Math.round(ms * f * 10) / 10;
       p.sleep_stages = { prepare_ms: part(0.07), pause_ms: part(0.002), save_ms: part(0.29), disk_ms: part(0.33), stop_ms: part(0.31) };
       this.host.markDirty();
+      this.drainCpuQueue();
       const r = this.round;
       // a round waiting to serve its first ball to this player wakes it now
       if (r && r.kickoff && r.ring[0] === n) this.wake(n);
@@ -453,12 +599,32 @@ export class MockPotato {
     }
   }
 
+  /** Start the waits that a freed CPU lets begin. */
+  private drainCpuQueue(): void {
+    while (this.cpus !== null && this.cpuQueue.length > 0 && this.held() < this.cpus) {
+      const n = this.cpuQueue.shift()!;
+      this.wake(n);
+    }
+  }
+
   private wake(n: number): void {
     const p = this.players.get(n)!;
     if (p.phase !== "asleep") return;
     const start = this.host.now();
+    // the agent never starts a wake while K machines hold a CPU: it waits, and records how long
+    if (this.cpus !== null && this.held() >= this.cpus) {
+      if (p.waitSince === null) {
+        p.waitSince = start;
+        this.cpuQueue.push(n);
+        this.host.markDirty();
+      }
+      return;
+    }
+    p.cpuWaitMs = p.waitSince === null ? null : Math.round(start - p.waitSince);
+    p.waitSince = null;
     p.phase = "waking";
     p.since = start;
+    this.noteHeld();
     this.host.markDirty();
     let ms = this.rand() < this.opts.slowWakeChance ? this.jitter(this.opts.slowWakeMs) : this.jitter(this.opts.wakeMs);
     if (this.forcedWakeMs !== null) {
@@ -484,8 +650,12 @@ export class MockPotato {
       const d = this.lastDrop;
       if (d && d.player === n && d.listening_after_ms === null && d.at <= now && (r === null || r.id !== d.round)) {
         d.listening_after_ms = now - d.at;
+        if (d.cause === "waking") d.cause_ms = Math.round(d.listening_after_ms);
         const rung = this.ladder.find((g) => g.broke?.round === d.round);
-        if (rung?.broke) rung.broke.listening_after_ms = d.listening_after_ms;
+        if (rung?.broke) {
+          rung.broke.listening_after_ms = d.listening_after_ms;
+          if (d.cause === "waking") rung.broke.cause_ms = d.cause_ms;
+        }
       }
       this.host.markDirty();
       if (!r) return;
@@ -536,14 +706,18 @@ export class MockPotato {
    * Tests: start over at a size (the ladder's records and the rate limits cleared), the next
    * round `nextInMs` from now, and optionally make the next wake take `slowWakeMs`.
    */
-  reset(over: { size?: number; next_in_ms?: number; slow_wake_ms?: number }): void {
+  reset(over: { size?: number; next_in_ms?: number; slow_wake_ms?: number; cpus?: number | null; players?: number }): void {
     if (this.round) this.endRound(this.round);
     for (const p of this.players.values()) {
       if (p.timer) clearTimeout(p.timer);
       if (p.wakeTimer) clearTimeout(p.wakeTimer);
     }
     this.players.clear();
-    this.ladder = this.ladder.map((g) => ({ size: g.size, record_hold_ms: null, record_at: null, broke: null, rounds: 0 }));
+    this.cpuQueue = [];
+    if (over.players !== undefined) this.opts.players = over.players;
+    if (over.cpus !== undefined) this.cpus = over.cpus === null || over.cpus <= 0 ? null : over.cpus;
+    this.ladder = (over.cpus === undefined && over.players === undefined ? this.ladder.map((g) => g.size) : this.rungs()).map((size) => ({ size, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 }));
+    if (over.cpus !== undefined || over.players !== undefined) this.rung = 0;
     this.records = { fastest_cycle_ms: null, longest_round: null };
     this.lastDrop = null;
     this.recentWakes = [];

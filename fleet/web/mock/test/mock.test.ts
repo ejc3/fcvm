@@ -4,6 +4,8 @@ import { innerRect, parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, 
 import { MockCoordinator } from "../coordinator.ts";
 import { MockWindows } from "../windows.ts";
 import { MATERIALS } from "../../core/minecraft.ts";
+import { fieldCells } from "../../core/minecraft-field.ts";
+import { parseMinecraftField, parseServerMsg, type MinecraftStatusMsg } from "../../core/protocol.ts";
 import { gridIn, mockLayout } from "../layout.ts";
 import { MockRenderers } from "../renderer.ts";
 import { FFMPEG } from "../encoder.ts";
@@ -1487,6 +1489,36 @@ describe("mock minecraft", () => {
     a.ws.close();
   });
 
+  it("a server that sends its ground keeps it with its world: a block a bot placed is the ground of its column, in the delta and in a later map", async () => {
+    await settle();
+    const a = await live();
+    const first = { admit: await token(a) };
+    // mc-2 sends the optional fields (every other server does)
+    const v = await view(tile("mc-2").frame_url, first);
+    const map = await v.next((m) => m["type"] === "map");
+    expect(typeof map["ground"]).toBe("string");
+    const d = (await v.next((m) => m["type"] === "delta" && (m["cells"] as number[][]).some((c) => c[1]! >= 32), 8000)) as { cells: number[][]; ground: number[][] };
+    // the delta carries the ground of the columns that changed: under a block of wool, the wool
+    const built = d.cells.find((c) => c[1]! >= 32)!;
+    expect(d.ground.find((g) => g[0] === built[0])).toEqual(built);
+    v.ws.close();
+    // a page that connects afterwards gets that ground in its map, not the snapshot's
+    const again = await view(tile("mc-2").frame_url, first);
+    const later = await again.next((m) => m["type"] === "map");
+    const ground = Buffer.from(later["ground"] as string, "base64");
+    const cells = Buffer.from(later["cells"] as string, "base64");
+    const i = built[0]!;
+    expect([ground[i * 2], ground[i * 2 + 1]]).toEqual([cells[i * 2], cells[i * 2 + 1]]);
+    expect(cells[i * 2]).toBeGreaterThanOrEqual(32);
+    again.ws.close();
+    // a server that does not send its ground sends none in its deltas either
+    const plain = await view(tile("mc-1").frame_url, first);
+    const pd = await plain.next((m) => m["type"] === "delta", 8000);
+    expect("ground" in pd).toBe(false);
+    plain.ws.close();
+    a.ws.close();
+  });
+
   it("resets one server: restoring, then running with a new launch timed from the click, and its sockets close", async () => {
     await settle();
     const a = await live();
@@ -1507,9 +1539,15 @@ describe("mock minecraft", () => {
     expect(await send(b, "minecraft_reset", {})).toMatchObject({ outcome: "refused", reason: "args must name a slot or say all" });
     expect(await send(b, "minecraft_reset", { slot: "mc-9" })).toMatchObject({ outcome: "refused", reason: 'no server "mc-9"' });
     expect(await send(b, "minecraft_reset", { all: true })).toMatchObject({ outcome: "committed" });
-    expect(mcNow().last_reset_all).toMatchObject({ servers: 3 });
+    // the coordinator counts the reset's own servers back: none yet
+    expect(mcNow().last_reset_all).toEqual({ clicked_at: expect.any(Number), by: expect.stringMatching(/^viewer:/), servers: 3, back: 0 });
     expect(mcNow().tiles.map((t) => t.last_relaunch.by)).toEqual(["reset_all", "reset_all", "reset_all"]);
     expect(await send(b, "minecraft_reset", { all: true })).toMatchObject({ outcome: "refused", reason: "one reset all per 10 s per client" });
+    // all three, and the time from the click to the last of them
+    await until(() => mcNow().tiles.every((t) => t.phase === "running"), 8000);
+    const all = mcNow().last_reset_all as unknown as { clicked_at: number; back: number; took_ms: number };
+    expect(all.back).toBe(3);
+    expect(all.took_ms).toBe(Math.max(...mcNow().tiles.map((t) => t.last_relaunch.first_frame_at!)) - all.clicked_at);
     a.ws.close();
     b.ws.close();
   });
@@ -1626,6 +1664,72 @@ describe("mock minecraft", () => {
     const acks = await Promise.all(Array.from({ length: 34 }, () => drive(va)));
     expect(acks.filter((x) => !x.ok).map((x) => x.reason)).toContain("at most 30 drive messages a second");
     for (const x of [va.ws, vb.ws, a.ws, b.ws]) x.close();
+  });
+
+  it("a large fleet is a field and status rows, in the coordinator's shapes, and the page reads them", async () => {
+    const r = new MockRenderers({ port: 0, publicHost: "localhost", fps: FPS, threads: 1, maxHeight: 360, epochUnixMs: coord.patternScene().epoch_unix_ms, scene: () => big.patternScene() });
+    await r.listen();
+    const big: MockCoordinator = new MockCoordinator({
+      port: 0, fcvmGpus: 2, ec2Gpus: 1, gpusPerHost: 1, fcvmRelaunchMs: 400, ec2RelaunchMs: 900,
+      raceEverySecs: 0, firstRaceSecs: 0, cooldownSecs: 1, capacityWaitProb: 0, capacityWaitMs: [0, 0],
+      borrowCap: 1, claimSecs: 1, holdSecs: 600, travelSecs: 0.5, turnstileSitekey: null,
+      sleepAfterSecs: 0, wakeMs: 800, mediaDir: MEDIA,
+      refusedWords: ["forbidden"], checkMs: 20, epochUnixMs: coord.patternScene().epoch_unix_ms, renderers: r,
+      minecraft: { count: 40, perHost: 20, cap: 2, claimSecs: 2, cooldownSecs: 1, restoreMs: 300, forkSnapshotMs: 100, port: 0, publicHost: "localhost" },
+    });
+    await big.listen();
+    try {
+      const mc = (big.fleetState() as unknown as { minecraft: { tiles: { id: string }[]; field: { servers: number; hosts: Record<string, unknown>[] } } }).minecraft;
+      // 16 tiles listed, every server named: the keys a coordinator sent for 256 servers (2026-11-24)
+      expect(mc.tiles.map((t) => t.id)).toEqual(Array.from({ length: 16 }, (_, k) => `mc:${k + 1}`));
+      expect(mc.field.servers).toBe(40);
+      expect(mc.field.hosts.map((h) => Object.keys(h).sort())).toEqual([["frames", "frames_v4", "key", "servers"], ["frames", "frames_v4", "key", "servers"]]);
+      expect(Object.keys(mc.field.hosts[0]!["frames"] as object).sort()).toEqual(["names", "prefix", "suffix"]);
+      const msgs = (big as unknown as { minecraft: { statusMessages(): Record<string, unknown>[] } }).minecraft.statusMessages();
+      expect(msgs.map((m) => Object.keys(m).sort())).toEqual(Array(2).fill(["busy", "cpus", "host", "mem_total_mib", "mem_used_mib", "received_at", "rows", "t", "type"]));
+      // the page's own parser and field read them: 40 cells, each running with its numbers
+      const field = parseMinecraftField(mc.field);
+      const statuses = Object.fromEntries(msgs.map((m) => [m["host"] as string, { ...(parseServerMsg(JSON.stringify(m)) as MinecraftStatusMsg), at: 0 }]));
+      const cells = fieldCells(field!, statuses, 0);
+      expect(cells.map((c) => c.n)).toEqual(Array.from({ length: 40 }, (_, k) => k + 1));
+      expect(cells.every((c) => c.phase === "running" && c.tps !== null && c.players === 3 && c.ageS !== null && c.launchMs !== null && c.frame !== null && c.seenAt !== null)).toBe(true);
+      expect(cells[20]!.frame).toMatch(/^ws:\/\/localhost:\d+\/mc-21\/view$/);
+    } finally {
+      await big.close();
+      await r.close();
+    }
+  });
+
+  it("the hang fault leaves a handshake unanswered while it is on, and lifting it resets the ones it held", async () => {
+    const url = new URL(tile("mc-2").frame_url);
+    // A handshake as a browser sends it, over a plain socket: what comes back, and whether the server ended it.
+    const handshake = () => {
+      const sock = net.connect(Number(url.port), "127.0.0.1");
+      const got = { data: "", closed: false };
+      sock.on("data", (d) => (got.data += d.toString()));
+      sock.on("close", () => (got.closed = true));
+      sock.on("error", () => {});
+      sock.on("connect", () =>
+        sock.write(`GET ${url.pathname} HTTP/1.1\r\nHost: ${url.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`),
+      );
+      return { sock, got };
+    };
+    await admin("/mock/fault", { minecraft_hang: true });
+    const held = handshake();
+    try {
+      // held: connected, never answered, not ended
+      await new Promise((r) => setTimeout(r, 300));
+      expect(held.got).toEqual({ data: "", closed: false });
+    } finally {
+      await admin("/mock/fault", { minecraft_hang: false });
+    }
+    // Lifted: the held one is ended at once, so it cannot keep a browser's next handshake to this
+    // address and port unsent (Chromium sends them one at a time), and a new one is answered.
+    await until(() => held.got.closed, 1000);
+    expect(held.got.data).toBe("");
+    const fresh = handshake();
+    await until(() => fresh.got.data.startsWith("HTTP/1.1 101 "), 1000);
+    fresh.sock.destroy();
   });
 });
 

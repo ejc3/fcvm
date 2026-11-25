@@ -72,7 +72,8 @@ x86-only patch today.
 
 The host kernels (`make install-host-kernel`) apply the `patches_dir` of their
 own `host_kernel` table, minus the `.vm.patch` files, both on 7.3.3:
-`kernel/patches-x86-host` on x86_64, which links the 7.3 fuse patches, and
+`kernel/patches-x86-host` on x86_64, which links the 7.3 fuse patches and holds the KVM
+patch below, and
 `kernel/patches-arm64-host` on arm64, which links the patches it shares with the
 7.3.3 nested guest from `kernel/patches-arm64` and holds the host-only KVM patches
 below. Each host also sets the Kconfig lines of its `config_fragment` on top of the
@@ -92,6 +93,34 @@ waited up to 1.86 s; without the barrier no hold passed 50 ms and the longest
 creation took 180 ms (#1563). fcvm carried the commit as a patch until the pin
 reached 6.18.60. `every_host_kernel_pins_a_release_without_the_bridge_rcu_barrier`
 fails if a host kernel pins an earlier release.
+`scripts/check-bridge-teardown-kernel.sh` applies the same rule to a `uname -r` release.
+Both runner images (`scripts/build-ami.sh`, arm64 and x64) install the host kernel of their
+architecture and run that check on the release GRUB will boot (`scripts/grub-boot-kernel.sh`).
+The image is then created as a candidate no launcher selects, one bare-metal instance boots
+from it and runs the check on its running kernel, and only an image that passes is tagged
+`Purpose=github-runner`. The x64 runners ran a stock
+6.14 kernel before the x64 image existed: on 2026-11-24 one of them stalled every network
+operation for 6.6 s and 5.9 s while namespaces died, and nine tests lost their namespace
+holder at its 5 s readiness deadline.
+
+`kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch`
+keeps a paravirtual spinlock kick that KVM erased (#2125). A PV spinlock waiter checks the
+lock and then executes HLT, with interrupts off when the lock is taken from interrupt
+context; a kick (`KVM_HC_KICK_CPU`) that arrives between the two sets `pv_unhalted`, and the
+HLT must then not block. Since Linux 6.15 (e9cb61055fee) `kvm_set_mp_state()` clears
+`pv_unhalted` on every move to runnable, and `kvm_arch_async_page_present()` goes through it
+for a vCPU that is already runnable, so a page-ready completion in that window erased the
+kick: the HLT blocked, only an NMI could wake the vCPU, and every CPU that sent it an IPI and
+waited spun for ever. On an oversubscribed x86_64 host 15 of 900 two-vCPU guests restored
+through userfaultfd hung that way; the trace of each showed the kick hypercall, its
+`kvm_apic_accept_irq`, a `kvm_async_pf_ready` for the kicked vCPU 40 to 104 us later and then
+its HLT with no wakeup. Guest `no-kvmapf` does not avoid it: without the guest interface KVM
+halts the vCPU artificially and completes through the same function. The patch sets the run
+state directly in that one function, as 6.14 did. Upstream has the same code today (7.4-rc4);
+there is no upstream commit to take. arm64 KVM has no async page faults, so the arm64 host
+does not carry it. `a_page_ready_completion_keeps_a_pending_pv_kick`
+(tests/test_kernel_patch_invariants.rs) runs the release's two functions in a C harness and
+fails without the patch.
 
 `kernel/patches-arm64-host/vgic-v3-keep-hcr-on-quiet-exits.patch` gives back most of what
 6.19's vgic rework added to every KVM exit (#659). Since Linux 6.19 (the vgic-lr-overflow

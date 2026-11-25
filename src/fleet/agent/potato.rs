@@ -318,42 +318,86 @@ fn ms(d: Duration) -> f64 {
 /// One message to a player's ball port and its one-line answer.
 async fn ask(addr: Ipv6Addr, msg: &Inbound, deadline: Duration) -> Result<String> {
     tokio::time::timeout(deadline, async {
-        let mut c = TcpStream::connect((addr, BALL_PORT)).await?;
-        c.set_nodelay(true)?;
-        let mut line = serde_json::to_string(msg)?;
-        line.push('\n');
-        c.write_all(line.as_bytes()).await?;
-        let mut answer = String::new();
-        BufReader::new(c).read_line(&mut answer).await?;
-        anyhow::Ok(answer)
+        let c = TcpStream::connect((addr, BALL_PORT)).await?;
+        exchange(c, msg).await
     })
     .await
     .with_context(|| format!("[{addr}]:{BALL_PORT} did not answer in {deadline:?}"))?
 }
 
-/// Probe a player's ball port every 2 ms until it answers, up to `deadline`.
+/// `msg` over a connection to a player's ball port, and the player's one-line answer.
+async fn exchange(mut c: TcpStream, msg: &Inbound) -> Result<String> {
+    c.set_nodelay(true)?;
+    let mut line = serde_json::to_string(msg)?;
+    line.push('\n');
+    c.write_all(line.as_bytes()).await?;
+    let mut answer = String::new();
+    BufReader::new(c).read_line(&mut answer).await?;
+    Ok(answer)
+}
+
+/// One probe of a player's ball port: its connect within the budget's connect timeout, and
+/// once connected (the player listens) its answer within the budget's answer timeout.
+async fn probe(
+    addr: Ipv6Addr,
+    budget: super::probe::Budget,
+    connected: super::probe::Connected,
+) -> Result<String> {
+    let c = tokio::time::timeout(budget.connect, TcpStream::connect((addr, BALL_PORT)))
+        .await
+        .with_context(|| {
+            format!(
+                "[{addr}]:{BALL_PORT} did not accept a connection in {:?}",
+                budget.connect
+            )
+        })??;
+    connected.mark();
+    tokio::time::timeout(budget.answer, exchange(c, &Inbound::Probe))
+        .await
+        .with_context(|| format!("[{addr}]:{BALL_PORT} did not answer in {:?}", budget.answer))?
+}
+
+/// How a player's ball port is probed (see [`super::probe`]): every 10 ms with 25 ms for a
+/// connect in the first second, which is 3 sockets and 100 SYNs at a player that does not
+/// answer a SYN, then one attempt at a time. A probe that connected has the 250 ms an attempt
+/// had before for its answer.
+const LISTEN_PACE: super::probe::Pace = super::probe::Pace {
+    every: Duration::from_millis(10),
+    fast_connect: Duration::from_millis(25),
+    answer: Duration::from_millis(250),
+};
+
+/// Probe a player's ball port until it answers, up to `deadline`. A probe sent before the port
+/// accepts is lost and its connect ends only at its timeout; the next does not wait for it in
+/// the first second of the wait.
 async fn until_listening(addr: Ipv6Addr, deadline: Duration) -> Result<Instant> {
-    let end = Instant::now() + deadline;
+    let mut probes = super::probe::Probes::new(LISTEN_PACE, |budget, connected| {
+        probe(addr, budget, connected)
+    });
+    let end = tokio::time::sleep(deadline);
+    tokio::pin!(end);
+    // Answers are read in the order their probes were sent, so this is the newest.
     let mut last = String::new();
-    while Instant::now() < end {
-        match ask(addr, &Inbound::Probe, Duration::from_millis(250)).await {
-            Ok(a)
-                if matches!(
-                    serde_json::from_str::<Report>(a.trim()),
-                    Ok(Report::Probe { .. })
-                ) =>
-            {
-                return Ok(Instant::now())
-            }
-            Ok(a) => last = a,
-            Err(e) => last = format!("{e:#}"),
+    loop {
+        tokio::select! {
+            answer = probes.next() => match answer {
+                Ok(a)
+                    if matches!(
+                        serde_json::from_str::<Report>(a.trim()),
+                        Ok(Report::Probe { .. })
+                    ) =>
+                {
+                    return Ok(Instant::now())
+                }
+                Ok(a) => last = a,
+                Err(e) => last = format!("{e:#}"),
+            },
+            _ = &mut end => bail!(
+                "[{addr}]:{BALL_PORT} never answered a probe: {}",
+                last.trim()
+            ),
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    bail!(
-        "[{addr}]:{BALL_PORT} never answered a probe: {}",
-        last.trim()
-    )
 }
 
 /// Run `fcvm <args>` to its end with fcvm's info log, and return what it printed.

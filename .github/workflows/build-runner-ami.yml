@@ -7,9 +7,26 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Cancel in-progress runs when a new run is triggered
+# The newest image build wins: a newer run cancels an older one, which carries older
+# content, and the approval prompt always belongs to the newest commit. That holds only
+# among runs that build. Every finished Build Kernels run starts a run of this workflow,
+# including one whose only job is then skipped, and on 2026-11-24 such a run cancelled a
+# build 44 minutes in and left its builder running. A run whose job will be skipped gets a
+# group of its own, so it can neither cancel a build in flight nor displace a waiting one.
+# The condition is the build-ami job's `if:`, word for word: the workflow test fails when
+# the two differ.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: >-
+    ${{
+      (github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion != 'cancelled' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository)))
+      && format('{0}-{1}', github.workflow, github.ref)
+      || format('{0}-skipped-{1}', github.workflow, github.run_id)
+    }}
   cancel-in-progress: true
 
 env:
@@ -17,14 +34,15 @@ env:
 
 jobs:
   build-ami:
-    name: Build Runner AMI
+    name: Build Runner AMI (${{ matrix.arch }})
     # Publishing affects every future runner. The environment requires owner
     # approval and permits main only; ordinary collaborator CI stays ungated.
-    # The image takes one release, the arm64 nested kernel (scripts/build-ami.sh
-    # runs `fcvm setup --kernel-profile nested ... --install-host-kernel`), so
-    # it waits for that release (the first step), not for every leg of Build
-    # Kernels to succeed: one failed x86_64 leg, or one dropped request in the
-    # run's release check, used to skip the image (#957).
+    # Each image takes one release, the nested kernel of its architecture
+    # (scripts/build-ami.sh runs `fcvm setup --kernel-profile nested ...
+    # --install-host-kernel`), so it waits for that release (the first step),
+    # not for every leg of Build Kernels to succeed: one failed x86_64 leg, or
+    # one dropped request in the run's release check, used to skip the arm64
+    # image (#957).
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'workflow_dispatch' ||
@@ -34,6 +52,14 @@ jobs:
         github.event.workflow_run.head_repository.full_name == github.repository))
     environment: runner-ami-publish
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            config_arch: arm64
+          - arch: x64
+            config_arch: amd64
     permissions:
       id-token: write
       contents: read
@@ -45,7 +71,7 @@ jobs:
           persist-credentials: false
 
       - name: Check that the kernel the image downloads is published
-        run: python3 scripts/verify-kernel-releases.py --leg nested arm64
+        run: python3 scripts/verify-kernel-releases.py --leg nested ${{ matrix.config_arch }}
 
       - name: Check CI security contracts without AWS credentials
         run: make test-ci-security
@@ -58,21 +84,27 @@ jobs:
 
       - name: Build AMI
         id: build
+        env:
+          AMI_ARCH: ${{ matrix.arch }}
         run: |
           chmod +x scripts/build-ami.sh
           scripts/build-ami.sh
 
       - name: Summary
+        env:
+          BOOT_KERNEL: ${{ steps.build.outputs.boot_kernel }}
+          BOOT_TEST_TYPE: ${{ steps.build.outputs.boot_test_type }}
         run: |
           if [ "${{ steps.build.outputs.cached }}" = "true" ]; then
-            echo "## Runner AMI (Cached)" >> $GITHUB_STEP_SUMMARY
+            echo "## Runner AMI ${{ matrix.arch }} (Cached)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**AMI ID:** \`${{ steps.build.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
           else
-            echo "## Runner AMI Built" >> $GITHUB_STEP_SUMMARY
+            echo "## Runner AMI ${{ matrix.arch }} Built" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "**AMI ID:** \`${{ steps.build.outputs.ami_id }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "**Kernel:** \`${{ steps.build.outputs.kernel_version }}-nested\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Kernel:** \`${{ steps.build.outputs.kernel_version }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**Boot test:** the image booted \`$BOOT_KERNEL\` on \`$BOOT_TEST_TYPE\` before it was published" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "No terraform change is needed. The image carries Purpose=github-runner; the AMI replicator copies it to the runner regions and the autoscaler launches runners from the newest copy." >> $GITHUB_STEP_SUMMARY
           fi

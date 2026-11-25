@@ -3181,6 +3181,8 @@ pub async fn load_vm_state(
 
 /// Parameters for snapshot restore, grouping the many read-only inputs.
 pub struct RestoreParams<'a> {
+    /// From the restore's [`crate::confine::resolve`]; the VMM is spawned under it.
+    pub decision: crate::confine::Decision,
     pub vm_id: &'a str,
     pub vm_name: &'a str,
     pub data_dir: &'a Path,
@@ -3762,14 +3764,12 @@ async fn prepare_clone_substrate(
     vm_state: &mut VmState,
     // What the snapshot load overrides, so needs no redirect.
     overrides: LoadOverrides,
+    decision: &crate::confine::Decision,
 ) -> Result<CloneSubstrate> {
     let vm_dir = data_dir.join("disks");
     let mut holder_child: Option<tokio::process::Child> = None;
     let mut holder_pid_for_post_start: Option<u32> = None;
-    let mut namespace = crate::utils::NamespaceParams {
-        vm_id: vm_id.to_string(),
-        ..Default::default()
-    };
+    let mut namespace = crate::utils::NamespaceParams::new(vm_id, decision.clone());
 
     // rootfs_path is set by either the bridged, rootless, or routed branch.
     let rootfs_path: PathBuf;
@@ -4056,6 +4056,7 @@ pub async fn restore_from_snapshot(
     vm_state: &mut VmState,
 ) -> Result<RestoredVmm<FirecrackerBackend>> {
     let RestoreParams {
+        decision,
         vm_id,
         vm_name,
         data_dir,
@@ -4132,6 +4133,7 @@ pub async fn restore_from_snapshot(
         data_dir,
         vm_state,
         load_overrides,
+        &decision,
     )
     .await?;
     failpoint::hit_async("restore.post_clone_disk").await;
@@ -4152,6 +4154,7 @@ pub async fn restore_from_snapshot(
         vm_id.to_string(),
         socket_path.to_path_buf(),
         Some(fc_log_path),
+        decision.clone(),
     );
     vm_manager.set_vm_name(vm_name.to_string());
     // Apply the substrate's namespace/mount isolation to the Firecracker VmManager (the
@@ -4167,6 +4170,13 @@ pub async fn restore_from_snapshot(
         vm_manager.set_net_namespace_path(p.clone());
     }
     vm_manager.set_keep_fds(ns.keep_fds.clone());
+    // A confined clone never runs in a pooled namespace (`clone_may_pool`), so this TAP is
+    // its own.
+    vm_manager.set_tap_owner(
+        decision
+            .confinement()
+            .map(|_| network.tap_device().to_string()),
+    );
     if let Some(redirects) = &ns.mount_redirects {
         vm_manager.set_mount_redirects(redirects.clone());
     }
@@ -4649,10 +4659,15 @@ pub async fn restore_from_snapshot_ch(
     state_manager: &StateManager,
     vm_state: &mut VmState,
 ) -> Result<RestoredVmm<crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend>> {
+    anyhow::ensure!(
+        params.decision.confinement().is_none(),
+        "confinement supports the Firecracker backend only"
+    );
     use crate::hypervisor::cloud_hypervisor::CloudHypervisorBackend;
     use crate::hypervisor::{Hypervisor, ProcessSpec};
 
     let RestoreParams {
+        decision,
         vm_id,
         vm_name,
         data_dir,
@@ -4718,6 +4733,7 @@ pub async fn restore_from_snapshot_ch(
         data_dir,
         vm_state,
         LoadOverrides::None,
+        &decision,
     )
     .await?;
 
@@ -4769,8 +4785,12 @@ pub async fn restore_from_snapshot_ch(
         }
     };
     let log_path = data_dir.join("firecracker.log");
-    let mut backend =
-        CloudHypervisorBackend::new(vm_id.to_string(), socket_path.to_path_buf(), Some(log_path));
+    let mut backend = CloudHypervisorBackend::new(
+        vm_id.to_string(),
+        socket_path.to_path_buf(),
+        Some(log_path),
+        decision.clone(),
+    );
 
     // Restore paused, then resume after network post-start (mirrors the FC load/resume split).
     let restore_args = format!(
@@ -4788,6 +4808,7 @@ pub async fn restore_from_snapshot_ch(
         net_namespace_path: substrate.namespace.net_namespace_path.clone(),
         mount_redirects: substrate.namespace.mount_redirects.clone(),
         keep_fds: substrate.namespace.keep_fds.clone(),
+        tap_owner: None,
     };
     if let Err(error) = backend
         .spawn(&spec)
@@ -4835,8 +4856,10 @@ pub async fn restore_from_snapshot_ch(
                 .health_port
                 .context("a raw VM's state names no health port")?;
             *slot = Some(
-                crate::commands::vm::NsHelper::start(user_ns, net_ns, vm_id, data_dir, rdp_port)
-                    .await?,
+                crate::commands::vm::NsHelper::start(
+                    user_ns, net_ns, vm_id, data_dir, rdp_port, &decision,
+                )
+                .await?,
             );
         }
 
