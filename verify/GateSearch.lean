@@ -262,7 +262,7 @@ structure Run where
 def allRuns : List Run := Gate.runs.map (fun (n, w, c) => { name := n, what := w, cfg := c })
 
 def books : List Rules :=
-  [Today.main, Today.flags, Today.cookieA, Today.cookieB, Today.cookieBOneLook, Design.rules]
+  [Today.ctstate, Today.flags, Today.cookieA, Today.cookieB, Today.cookieBOneLook, Design.rules]
 
 /-- Print one run: its steps in words, the state it ends in, the run as a Lean term, and the
 same run under the design. -/
@@ -338,7 +338,7 @@ def printTrace (R : Rules) (r : Run) (f : Found) (check : String) (i : Nat) : IO
 /-- Runs written by hand: a break the search reports only through a shorter run of another
 kind, written out so that it is recorded as itself. `Breaks.lean` checks each. -/
 def handRuns : List (String × Rules × String × String × List Label) := [
-  ("reusedTuple", Today.main, "nat", "P3 smuggledLate",
+  ("reusedTuple", Today.ctstate, "nat", "P3 smuggledLate",
     [.pkt .a .plain .syn, .pkt .a .plain .ack,
      .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .restore,
      .agent, .agent, .agent, .agent, .agent, .agent, .agent, .pkt .a .plain .syn]),

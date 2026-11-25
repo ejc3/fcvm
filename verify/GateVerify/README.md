@@ -48,6 +48,22 @@ already installed. Peak memory is the largest single process:
 CI runs the first and the third (as `summary`, compared with `search.expected`) in the one job,
 under its 15 minute cap (`../../.github/workflows/verify.yml`).
 
+## The rule books
+
+A rule book is one fixed commit, named for what the boundary does there. None is named for a
+branch, because `main` moves from one to the next as the fixes land.
+
+| Rule book | Commit | What it is | `main` |
+|---|---|---|---|
+| `ctstate` | 4adc1dee6 | the gate's TCP rule is `--ctstate NEW`; the manifest leaves out by address; no list | until #2113 landed |
+| `flags` | a1e5fc687 | #2113: the TCP rule reads the packet's flags | since #2113 landed (a0ef91072) |
+| `cookieA` | a80e1ad34 | #2124 at its first commit: SYN cookies refused, the restore's own list | never |
+| `cookieB` | 27add63dd | #2124 at its head: the mirror rule, a second dump, the write-back after the gate | once #2124 lands |
+| `design` | none | `cookieB` with the repairs of `REPAIRS.md` | not yet |
+
+The drift check in CI names the rule book of the tree it runs in (below, "The model against the
+code").
+
 ## The files
 
 | File | What it holds |
@@ -141,7 +157,7 @@ reached, and P1 and P5 are about every run and not only the ones that end by the
 
 ## Results
 
-| | `main` 4adc1dee6 | `flags` a1e5fc687 (#2113) | `cookieA` a80e1ad34 | `cookieB` 27add63dd (#2124) | Design |
+| | `ctstate` 4adc1dee6 | `flags` a1e5fc687 (#2113) | `cookieA` a80e1ad34 | `cookieB` 27add63dd (#2124) | Design |
 |---|---|---|---|---|---|
 | P1 `sourceDisturbed` | broken | broken | broken | broken | **proved**, with one exemption: a source reported failed |
 | P2 `generationBroken` | broken | broken | broken | broken | **proved** for the connections `step` makes (`Limits.lean`) |
@@ -160,7 +176,7 @@ configurations searched to the end, which CI does on every run and compares with
 `search.expected`, and the two `all-` configurations as far as `BREAKS.md`, "Everything at
 once", says. 17 of the 20 have the boot plan over MMDS (Firecracker) and 3 over vsock (Cloud
 Hypervisor); the breaks the vsock ones add are `containerMidBoundary` and `agentDiesVsock`. Most of what
-breaks `main` and #2113 beyond the known issues breaks the head of #2124 too, because it is in
+breaks `ctstate` and #2113 beyond the known issues breaks the head of #2124 too, because it is in
 code #2124 does not touch: the one-shots, the watchdog, what a dead fc-agent leaves.
 
 ## What is proved, what is searched, what is assumed
@@ -214,7 +230,7 @@ invariants, `Classical.choice`), for every value of `Cfg` and every state reacha
   (`REPAIRS.md`, the last table). The fourth, the manifest leaving a socket out by its mirror
   image and not by its address (`manAddr`), is redundant in the design: its restore's own list
   retires whatever the manifest leaves out, so no proof and no search tells the two rules
-  apart. It matters where there is no list, on `main` and #2113 (`loopbackClient`).
+  apart. It matters where there is no list, on `ctstate` and #2113 (`loopbackClient`).
 
 **P2 is proved for the connections `step` can make.** `design_fixedGeneration` says no
 retirement destroys, by cookie or by a reset, what the test above names. `design_retiresOnly`
@@ -309,14 +325,15 @@ Each abstraction, and whether it can hide a break:
 | Assumption | Conservative? |
 |---|---|
 | A dump of one family is one instant; the list is two instants (IPv4, then IPv6) and a second look is a third | **Not conservative.** The kernel walks the hash table a bucket at a time (net/ipv4/tcp_diag.c:479-520), so a dump can also miss one of two sockets of the same family. The connections inside the guest in the model have their ends in different families, which gives the same split |
-| Connection tracking is modelled for the inbound TCP tuples and two UDP flows only | **Not conservative** for the tracker's table as a whole: a tracker the gate attaches also tracks loopback and outbound flows, and on `main` a segment of a source's outbound connection can be reset the same way an inbound one is. No property reads those entries |
-| A tracked entry is `new`, `est`, `closed` (a FIN seen) or `reset` (the guest's side reset it). One-sided closes (FIN_WAIT, CLOSE_WAIT, LAST_ACK) are folded into `closed`, and a `new` entry is both a SYN sent and a connection picked up in the middle | **Not conservative** for `main`: the one-sided states also let a SYN through as not NEW (`sIG`, nf_conntrack_proto_tcp.c:138), and a FIN on a `new` entry made by a SYN is invalid, not NEW. It hides runs of the #2106 kind on `main` only |
-| An entry never expires | Conservative for the design; for `main` it makes `reusedTuple` possible at any distance, where the kernel gives it 10 s (6.18.60) |
+| Connection tracking is modelled for the inbound TCP tuples and two UDP flows only | **Not conservative** for the tracker's table as a whole: a tracker the gate attaches also tracks loopback and outbound flows, and on `ctstate` a segment of a source's outbound connection can be reset the same way an inbound one is. No property reads those entries |
+| A tracked entry is `new`, `est`, `closed` (a FIN seen) or `reset` (the guest's side reset it). One-sided closes (FIN_WAIT, CLOSE_WAIT, LAST_ACK) are folded into `closed`, and a `new` entry is both a SYN sent and a connection picked up in the middle | **Not conservative** for `ctstate`: the one-sided states also let a SYN through as not NEW (`sIG`, nf_conntrack_proto_tcp.c:138), and a FIN on a `new` entry made by a SYN is invalid, not NEW. It hides runs of the #2106 kind on `ctstate` only |
+| An entry never expires | Conservative for the design; for `ctstate` it makes `reusedTuple` possible at any distance, where the kernel gives it 10 s (6.18.60) |
 | A SYN cookie a client holds stays valid | Conservative: the real one expires (2 minutes of guest run time), which removes runs |
 | The accept queue has room | Conservative for the sockets a client can make: a full one refuses the socket. **Not conservative** for P2: see the next row |
 | A connection inside the guest gets both its sockets in one step and loses both in one step | **Not conservative** for P2. One end can be alone in the kernel, and the proof of P2 uses that none is (`Limits.lean`, `loneEndRetired`) |
 | TIME-WAIT sockets are not modelled; a close removes the socket | The faithfulness review: this neither hides nor invents a break. The cookie is copied to the TIME-WAIT socket, `tcp_abort` removes it silently, and the gate rejects the SYN that would reuse its tuple |
 | The egress proxy's two sockets are destroyed independently | Not checked. A reset from one reaches the other through the nat mapping; both are retired together in every recorded run |
+| A client of a `/loopback` port does not choose its source port to make its socket a mirror image (its own, or another such client's) | **Not conservative** for P3: #2152. Such a client's connection is kept by the mirror rule at 27add63dd and in the design. The model's kinds cannot express a chosen port (`Limits.lean`) |
 | A packet with a loopback source cannot arrive on eth0 | Kernel: the source check refuses a local source address without `accept_local` (net/ipv4/fib_frontend.c:382-389), also with `route_localnet` on |
 | A connect to the guest's own address that is not loopback is refused by the closed egress half | Read from the chain (`gate_chain_rules`: OUTPUT returns for a loopback destination only), as the PR says of itself. Not run. If it were let through, it would be another connection inside the guest made behind the gate, which the model has two kinds of |
 | The gate's removal is one transaction for both families; its installation is one step a family | As the code: `remove_halves` is one nf_tables batch, `close` is `install_family` twice |
@@ -416,20 +433,20 @@ src/commands/common.rs; the unit file in src/setup/rootfs.rs.
 of events that fc-agent's own model tests pin (`ModelGate`, `ModelBarrier`, `ModelDiag`,
 `ModelHook`: the `vec![...]` literals of event names) and compares them with each rule book's
 restore order. It prints the rule books the source pins and fails unless the one named is among
-them. CI names `main`, the rule book of this tree, so a tree that goes to an order the model
+them. CI names `ctstate`, the rule book of this tree, so a tree that goes to an order the model
 does not have fails, and so does one that goes back to an earlier order once the name has been
 moved on. A pull request that changes that file starts the job.
 
 | Source at | Rule books it pins |
 |---|---|
-| `main` 4adc1dee6, a1e5fc687 | `main`, `flags` |
+| 4adc1dee6, a1e5fc687 | `ctstate`, `flags` |
 | a80e1ad34 | `cookieA` |
 | 27add63dd | `cookieB`, `design` |
 | 27add63dd with the second `cookie-dump` deleted from the one test that pins two | `cookieA`: naming `cookieB` exits 1 |
-| `main` with `gate-udp-ingress` and `rx-barrier` swapped in one test | none: exit 1 |
+| 4adc1dee6 with `gate-udp-ingress` and `rx-barrier` swapped in one test | none: exit 1 |
 
-The pull request that lands #2113 or #2124 moves the name in `verify.yml` and in the Makefile's
-`GATE_BOOK`.
+A change to the boundary's order moves the name in `verify.yml` and in the Makefile's
+`GATE_BOOK` with it, or the job fails.
 
 What the check cannot see:
 

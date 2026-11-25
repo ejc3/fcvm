@@ -1919,6 +1919,6 @@ verify-gate-search: verify-lake
 	cd verify && "$(VERIFY_LAKE)" exe gate-breaks $(GATE_ARGS)
 
 # The rule book of this tree's fc-agent (verify/GateVerify/Today.lean).
-GATE_BOOK ?= main
+GATE_BOOK ?= ctstate
 verify-gate-drift: verify-lake
 	cd verify && "$(VERIFY_LAKE)" exe gate-seq check ../fc-agent/src/snapshot_network.rs $(GATE_BOOK)

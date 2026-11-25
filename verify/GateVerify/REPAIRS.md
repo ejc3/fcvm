@@ -17,10 +17,13 @@ Each repair is carried by a proof: with its field put back, `lake build GateVeri
 fails (the table at the end). Of the four rules the design inherits from #2113 and #2124, three
 are carried the same way and one is redundant in the design.
 
-None of this is implemented. The fixes #2113 and #2124 already make are not repeated here: the
-flag rule (`tcpByCt := false`), the restore's own list with the mirror image deciding and a
-second dump, `tcp_syncookies` refused from the restore's first step and written back after the
-gate is removed.
+None of this is in this pull request. Fixes are in flight for most of it: #2151 for repair 2
+(the host's side), and a pull request stacked on #2124 by its author for repairs 3, 4, 6 and 8
+and for #2152, built to the two rulings recorded under repairs 3 and 8 (`BREAKS.md`, "Fixes in
+flight"). The fixes #2113 and #2124 already make are not repeated here: the flag rule
+(`tcpByCt := false`), the restore's own list with the mirror image deciding and a second dump,
+`tcp_syncookies` refused from the restore's first step and written back after the gate is
+removed.
 
 ## 1. Withdrawn: a record of the restore under /run
 
@@ -251,7 +254,7 @@ put back). With it the manifest leaves out every socket whose peer address is lo
 `/loopback` port's client among them; without it, only a socket whose mirror image is in the
 dump. Either way the design's restore takes its own list by the mirror rule and retires what
 the manifest left out, so no property tells the two manifests apart. The manifest's rule is
-what matters where there is no list: on `main` and #2113 (`loopbackClient`).
+what matters where there is no list: on `ctstate` and #2113 (`loopbackClient`).
 
 ## What the design does not repair
 
@@ -262,5 +265,11 @@ what matters where there is no list: on `main` and #2113 (`loopbackClient`).
   By design, as in #2124: the socket is the source's own and the clone's list retires it.
 - **One end of a connection inside the guest left alone by the kernel** (`Limits.lean`): an
   accepted cost of the mirror rule.
+- **A `/loopback` client that picks its source port (#2152).** The mirror rule keeps its
+  connection, at 27add63dd and in the design. The model cannot express a chosen source port, so
+  it neither finds the break nor proves its absence (`Limits.lean`). Its fix, a source port
+  range reserved for the `/loopback` rewrite with a loopback peer in that range counted as
+  outside the guest, is in flight; it would be a ninth field of the rule book and a new kind of
+  socket.
 - **What a restarted fc-agent writes before its plan loop** (resolv.conf, the boot command
   line's IPv6 address): not in the model.

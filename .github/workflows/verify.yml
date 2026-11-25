@@ -93,9 +93,9 @@ jobs:
           # every file of both models is imported by its axiom sweep
           ./check-imports.sh
           lake build
-          # The rule book of this tree's fc-agent. Change it in the pull request that changes
-          # the boundary's order (`flags`, `cookieB` and `design` are the ones in flight).
-          lake exe gate-seq check ../fc-agent/src/snapshot_network.rs main
+          # The rule book of this tree's fc-agent (verify/GateVerify/README.md, "The rule
+          # books"). Change it in the pull request that changes the boundary's order.
+          lake exe gate-seq check ../fc-agent/src/snapshot_network.rs ctstate
           # The exhaustive search of the default configurations, every rule book, against the
           # result the documents quote: state counts, which properties break, and how soon.
           lake exe gate-breaks summary | diff GateVerify/search.expected -

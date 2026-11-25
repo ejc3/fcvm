@@ -1,6 +1,6 @@
 
 ## routed: no nat rules, so the guest tracks nothing unless a rule asks; two clients
-main: 14141 states; P1 sourceDisturbed@5 P3 staleAtPublication@37 P3 smuggledLate@20
+ctstate: 14141 states; P1 sourceDisturbed@5 P3 staleAtPublication@37 P3 smuggledLate@20
 flags: 4225 states;
 cookieA: 4681 states;
 cookieB: 5081 states;
@@ -8,7 +8,7 @@ cookieB-one-dump: 4821 states;
 design: 5081 states;
 
 ## routed-stale: no nat rules, and the tracker holds an ESTABLISHED entry for A's tuple
-main: 2737 states; P1 sourceDisturbed@20 P3 staleAtPublication@22 P3 smuggledLate@18
+ctstate: 2737 states; P1 sourceDisturbed@20 P3 staleAtPublication@22 P3 smuggledLate@18
 flags: 985 states;
 cookieA: 1074 states;
 cookieB: 1140 states;
@@ -16,7 +16,7 @@ cookieB-one-dump: 1106 states;
 design: 1140 states;
 
 ## nat: IPv4 nat rules at boot (a /loopback port's): IPv4 always tracked; two clients
-main: 8815 states; P1 sourceDisturbed@6 P3 staleAtPublication@37 P3 smuggledLate@19
+ctstate: 8815 states; P1 sourceDisturbed@6 P3 staleAtPublication@37 P3 smuggledLate@19
 flags: 3982 states;
 cookieA: 4451 states;
 cookieB: 4822 states;
@@ -24,7 +24,7 @@ cookieB-one-dump: 4565 states;
 design: 4822 states;
 
 ## cookie: a listener in SYN-queue overflow answers with cookies (#2123)
-main: 4743 states; P1 sourceDisturbed@5 P3 staleAtPublication@35 P3 smuggledLate@20
+ctstate: 4743 states; P1 sourceDisturbed@5 P3 staleAtPublication@35 P3 smuggledLate@20
 flags: 2128 states; P3 staleAtPublication@23 P3 smuggledLate@19
 cookieA: 2013 states; P3 smuggledLate@26
 cookieB: 2533 states;
@@ -32,7 +32,7 @@ cookieB-one-dump: 2459 states;
 design: 2533 states;
 
 ## loopback-port: a port published with /loopback, and SYN cookies
-main: 40125 states; P3 staleAtPublication@22 P3 smuggledLate@19
+ctstate: 40125 states; P3 staleAtPublication@22 P3 smuggledLate@19
 flags: 25255 states; P3 staleAtPublication@22 P3 smuggledLate@19
 cookieA: 28496 states; P3 staleAtPublication@26 P3 smuggledLate@26
 cookieB: 35303 states;
@@ -40,7 +40,7 @@ cookieB-one-dump: 33538 states;
 design: 35303 states;
 
 ## pairs: connections inside the guest, made while a list is taken
-main: 28833 states; P1 sourceDisturbed@5 P3 staleAtPublication@37 P3 smuggledLate@20
+ctstate: 28833 states; P1 sourceDisturbed@5 P3 staleAtPublication@37 P3 smuggledLate@20
 flags: 11374 states;
 cookieA: 13162 states; P2 generationBroken@21
 cookieB: 15539 states;
@@ -48,7 +48,7 @@ cookieB-one-dump: 15209 states; P2 generationBroken@21
 design: 15539 states;
 
 ## proxy: the egress proxy, and a process outside the container that connects out
-main: 3942 states; P3 staleAtPublication@22 P3 smuggledLate@19
+ctstate: 3942 states; P3 staleAtPublication@22 P3 smuggledLate@19
 flags: 3814 states; P3 staleAtPublication@22
 cookieA: 4289 states; P2 generationBroken@21
 cookieB: 4670 states; P2 generationBroken@22
@@ -56,7 +56,7 @@ cookieB-one-dump: 4314 states; P2 generationBroken@21
 design: 3857 states;
 
 ## egress: no proxy; the container and another process connect out
-main: 27275 states; P1 sourceDisturbed@5 P3 staleAtPublication@37 P3 smuggledLate@20
+ctstate: 27275 states; P1 sourceDisturbed@5 P3 staleAtPublication@37 P3 smuggledLate@20
 flags: 10776 states;
 cookieA: 12147 states;
 cookieB: 13034 states;
@@ -64,7 +64,7 @@ cookieB-one-dump: 12428 states;
 design: 13034 states;
 
 ## fails: any step of the restore or of a one-shot can fail; SYN cookies
-main: 9566 states; P1 sourceDisturbed@5 P3 staleAtPublication@27 P3 smuggledLate@20 P6 stuck@11
+ctstate: 9566 states; P1 sourceDisturbed@5 P3 staleAtPublication@27 P3 smuggledLate@20 P6 stuck@11
 flags: 2832 states; P1 sourceDisturbed@11 P3 staleAtPublication@23 P3 smuggledLate@19 P6 stuck@11
 cookieA: 3964 states; P1 sourceDisturbed@11 P3 smuggledLate@26 P5 lastingChange@25 P5 capturedChange@34 P6 stuck@11
 cookieB: 4574 states; P1 sourceDisturbed@11 P5 lastingChange@26 P5 capturedChange@35 P6 stuck@11
@@ -72,7 +72,7 @@ cookieB-one-dump: 4500 states; P1 sourceDisturbed@11 P5 lastingChange@25 P5 capt
 design: 4412 states;
 
 ## kills: fc-agent or a one-shot can be killed at any step; a process connects out
-main: 102930 states; P1 sourceDisturbed@4 P3 staleAtPublication@30 P3 smuggledLate@20 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@4
+ctstate: 102930 states; P1 sourceDisturbed@4 P3 staleAtPublication@30 P3 smuggledLate@20 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@4
 flags: 21733 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@4
 cookieA: 22624 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@4
 cookieB: 23159 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@4
@@ -80,7 +80,7 @@ cookieB-one-dump: 22780 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 
 design: 10419 states;
 
 ## host: the host's snapshot create can die, and a step of it can fail
-main: 2508 states; P1 sourceDisturbed@5 P6 stuck@9
+ctstate: 2508 states; P1 sourceDisturbed@5 P6 stuck@9
 flags: 831 states; P1 sourceDisturbed@11 P6 stuck@9
 cookieA: 1274 states; P1 sourceDisturbed@11 P5 lastingChange@25 P5 capturedChange@34 P6 stuck@9
 cookieB: 1289 states; P1 sourceDisturbed@11 P5 lastingChange@26 P5 capturedChange@35 P6 stuck@9
@@ -88,7 +88,7 @@ cookieB-one-dump: 1277 states; P1 sourceDisturbed@11 P5 lastingChange@25 P5 capt
 design: 1209 states;
 
 ## slow: a boundary that outlives the payload freeze's deadline; the container connects out
-main: 8121 states; P1 sourceDisturbed@5 P3 staleAtPublication@37 P3 smuggledLate@20 P4 workloadBehindEgress@11
+ctstate: 8121 states; P1 sourceDisturbed@5 P3 staleAtPublication@37 P3 smuggledLate@20 P4 workloadBehindEgress@11
 flags: 3352 states; P4 workloadBehindEgress@11
 cookieA: 3714 states; P4 workloadBehindEgress@11
 cookieB: 3921 states; P4 workloadBehindEgress@11
@@ -96,7 +96,7 @@ cookieB-one-dump: 3766 states; P4 workloadBehindEgress@11
 design: 2159 states;
 
 ## udp: UDP, the guest tracking all the time; the host gates client datagrams
-main: 2269 states; -- replyDatagram@14
+ctstate: 2269 states; -- replyDatagram@14
 flags: 1551 states; -- replyDatagram@14
 cookieA: 1753 states; -- replyDatagram@15
 cookieB: 1851 states; -- replyDatagram@15
@@ -104,7 +104,7 @@ cookieB-one-dump: 1779 states; -- replyDatagram@15
 design: 1851 states; -- replyDatagram@15
 
 ## udp-reach: UDP, and nothing on the host side keeps a datagram from a clone
-main: 3589 states; P1 sourceDisturbed@5 U1 clientDatagram@11 -- replyDatagram@11
+ctstate: 3589 states; P1 sourceDisturbed@5 U1 clientDatagram@11 -- replyDatagram@11
 flags: 1175 states; U1 clientDatagram@11 -- replyDatagram@11
 cookieA: 1274 states; U1 clientDatagram@11 -- replyDatagram@11
 cookieB: 1358 states; U1 clientDatagram@11 -- replyDatagram@11
@@ -112,7 +112,7 @@ cookieB-one-dump: 1322 states; U1 clientDatagram@11 -- replyDatagram@11
 design: 1358 states; U1 clientDatagram@11 -- replyDatagram@11
 
 ## early: the host is asked for a snapshot of a clone that has not published
-main: 3370 states; P1 sourceDisturbed@5 P2 generationBroken@38 P3 staleAtPublication@22 P4 workloadBehindEgress@23 P5 capturedChange@22
+ctstate: 3370 states; P1 sourceDisturbed@5 P2 generationBroken@38 P3 staleAtPublication@22 P4 workloadBehindEgress@23 P5 capturedChange@22
 flags: 1312 states; P2 generationBroken@38 P3 staleAtPublication@22 P4 workloadBehindEgress@23 P5 capturedChange@22
 cookieA: 1473 states; P2 generationBroken@41 P3 staleAtPublication@22 P4 workloadBehindEgress@24 P5 capturedChange@20
 cookieB: 1623 states; P2 generationBroken@42 P3 staleAtPublication@22 P4 workloadBehindEgress@24 P5 capturedChange@20
@@ -120,7 +120,7 @@ cookieB-one-dump: 1539 states; P2 generationBroken@41 P3 staleAtPublication@22 P
 design: 411 states;
 
 ## early-fails: the same, and a step can fail
-main: 8510 states; P1 sourceDisturbed@5 P2 generationBroken@29 P3 staleAtPublication@13 P4 workloadBehindEgress@13 P5 capturedChange@22 P6 stuck@11
+ctstate: 8510 states; P1 sourceDisturbed@5 P2 generationBroken@29 P3 staleAtPublication@13 P4 workloadBehindEgress@13 P5 capturedChange@22 P6 stuck@11
 flags: 2774 states; P1 sourceDisturbed@11 P2 generationBroken@29 P3 staleAtPublication@13 P4 workloadBehindEgress@13 P5 capturedChange@22 P6 stuck@11
 cookieA: 3824 states; P1 sourceDisturbed@11 P2 generationBroken@23 P3 staleAtPublication@13 P4 workloadBehindEgress@14 P5 lastingChange@25 P5 capturedChange@20 P6 stuck@11
 cookieB: 3597 states; P1 sourceDisturbed@11 P2 generationBroken@24 P3 staleAtPublication@13 P4 workloadBehindEgress@14 P5 lastingChange@26 P5 capturedChange@20 P6 stuck@11
@@ -128,7 +128,7 @@ cookieB-one-dump: 3492 states; P1 sourceDisturbed@11 P2 generationBroken@23 P3 s
 design: 722 states;
 
 ## two-gen: two restores, kills and failures: a snapshot of a published clone
-main: 24756 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@15 P6 stuck@4
+ctstate: 24756 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@15 P6 stuck@4
 flags: 8908 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@15 P6 stuck@4
 cookieA: 14630 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 lastingChange@25 P5 capturedChange@15 P6 stuck@4
 cookieB: 14782 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 lastingChange@26 P5 capturedChange@15 P6 stuck@4
@@ -136,7 +136,7 @@ cookieB-one-dump: 14597 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 
 design: 6719 states;
 
 ## kills-vsock: kills, with the boot plan over vsock (Cloud Hypervisor)
-main: 124776 states; P1 sourceDisturbed@4 P3 staleAtPublication@30 P3 smuggledLate@20 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@6
+ctstate: 124776 states; P1 sourceDisturbed@4 P3 staleAtPublication@30 P3 smuggledLate@20 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@6
 flags: 24317 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@6
 cookieA: 25426 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@6
 cookieB: 26060 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@16 P6 stuck@6
@@ -144,7 +144,7 @@ cookieB-one-dump: 25582 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 
 design: 10719 states;
 
 ## kills-vsock-all: over vsock: kills, failures, a dying host, slow boundaries
-main: 376152 states; P1 sourceDisturbed@4 P3 staleAtPublication@29 P3 smuggledLate@20 P4 workloadBehindEgress@11 P5 capturedChange@15 P6 stuck@4
+ctstate: 376152 states; P1 sourceDisturbed@4 P3 staleAtPublication@29 P3 smuggledLate@20 P4 workloadBehindEgress@11 P5 capturedChange@15 P6 stuck@4
 flags: 78067 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@11 P5 capturedChange@15 P6 stuck@4
 cookieA: 112040 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@11 P5 lastingChange@25 P5 capturedChange@15 P6 stuck@4
 cookieB: 112801 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@11 P5 lastingChange@26 P5 capturedChange@15 P6 stuck@4
@@ -152,7 +152,7 @@ cookieB-one-dump: 112144 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@11
 design: 57473 states;
 
 ## two-gen-vsock: over vsock: two restores, kills and failures
-main: 27423 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@15 P6 stuck@4
+ctstate: 27423 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@15 P6 stuck@4
 flags: 9281 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 capturedChange@15 P6 stuck@4
 cookieA: 15037 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 lastingChange@25 P5 capturedChange@15 P6 stuck@4
 cookieB: 15201 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@13 P5 lastingChange@26 P5 capturedChange@15 P6 stuck@4

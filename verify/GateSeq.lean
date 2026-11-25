@@ -51,7 +51,7 @@ def events : RStep → List (String × Bool)
   | .ingress => [("gate-open", false)]
   | _ => []
 
-def books : List Rules := [Today.main, Today.flags, Today.cookieA, Today.cookieB, Design.rules]
+def books : List Rules := [Today.ctstate, Today.flags, Today.cookieA, Today.cookieB, Design.rules]
 
 def restoreSeq (R : Rules) : List (String × Bool) := R.restore.flatMap events
 

@@ -29,31 +29,31 @@ namespace Gate
 
 /-! ## Known breaks -/
 
-/-- **The second fault of #2106.** On `main`, a guest that tracks nothing: closing the gate attaches
-the tracker, a segment of a connection that was already open is the first it sees of it, so it is
-NEW, and the gate answers a live client of the source with a reset (5 steps). -/
+/-- **The second fault of #2106.** On `ctstate`, a guest that tracks nothing: closing the gate
+attaches the tracker, a segment of a connection that was already open is the first it sees of it,
+so it is NEW, and the gate answers a live client of the source with a reset (5 steps). -/
 def Run.liveReset : List Label :=
   [.pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .snap,
    .pkt .a .plain .ack]
 
 theorem breaks_liveReset :
-    after (replay Today.main Runs.routed Run.liveReset (init Runs.routed))
+    after (replay Today.ctstate Runs.routed Run.liveReset (init Runs.routed))
       sourceDisturbed := by decide
 
 theorem design_keeps_liveReset :
     (replay Design.rules Runs.routed Run.liveReset (init Runs.routed)).map
       sourceDisturbed = some false := by decide
 
-/-- **#2106.** On `main`, a SYN on a tuple the guest still tracks as ESTABLISHED is not NEW: it passes
-the source's closed gate after the dump, the request socket is in the image and in no manifest,
-and the clone publishes with it (22 steps). -/
+/-- **#2106.** On `ctstate`, a SYN on a tuple the guest still tracks as ESTABLISHED is not NEW: it
+passes the source's closed gate after the dump, the request socket is in the image and in no
+manifest, and the clone publishes with it (22 steps). -/
 def Run.staleTuple : List Label :=
   [.snap, .snap, .snap, .snap, .snap, .snap, .pkt .a .plain .syn,
    .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
    .agent, .agent, .agent]
 
 theorem breaks_staleTuple :
-    after (replay Today.main Runs.routedStale Run.staleTuple (init Runs.routedStale))
+    after (replay Today.ctstate Runs.routedStale Run.staleTuple (init Runs.routedStale))
       staleAtPublication := by decide
 
 /-- The same run with the design's restore: the same steps in its own order. -/
@@ -72,7 +72,7 @@ def Run.staleTupleLate : List Label :=
    .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .pkt .a .plain .syn]
 
 theorem breaks_staleTupleLate :
-    after (replay Today.main Runs.routedStale Run.staleTupleLate (init Runs.routedStale))
+    after (replay Today.ctstate Runs.routedStale Run.staleTupleLate (init Runs.routedStale))
       smuggledLate := by decide
 
 /-- The same run with the design's restore: the same steps in its own order. -/
@@ -97,7 +97,7 @@ def Run.staleTupleGrown : List Label :=
    .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
 
 theorem breaks_staleTupleGrown :
-    after (replay Today.main Runs.routed Run.staleTupleGrown (init Runs.routed))
+    after (replay Today.ctstate Runs.routed Run.staleTupleGrown (init Runs.routed))
       staleAtPublication := by decide
 
 /-- The same run with the design's restore: it refuses the last step. -/
@@ -118,7 +118,7 @@ def Run.halfOpenRetransmit : List Label :=
    .agent, .pkt .a .plain .syn]
 
 theorem breaks_halfOpenRetransmit :
-    after (replay Today.main Runs.nat Run.halfOpenRetransmit (init Runs.nat))
+    after (replay Today.ctstate Runs.nat Run.halfOpenRetransmit (init Runs.nat))
       smuggledLate := by decide
 
 /-- The same run with the design's restore: the same steps in its own order. -/
@@ -139,7 +139,7 @@ theorem flags_keeps_halfOpenRetransmit :
 /-- And with an established connection: the clone's retirement resets it from the guest's side, which
 leaves the tracked entry closed by a reset that was not the client's. A client that connects again
 from the same address and port within the entry's timeout (10 s in Linux 6.18.60) sends a SYN the
-tracker does not recycle: not NEW, it passes the clone's closed gate. `main` only. Written by
+tracker does not recycle: not NEW, it passes the clone's closed gate. `ctstate` only. Written by
 hand: the search reports the shorter `halfOpenRetransmit` (20 steps). -/
 def Run.reusedTuple : List Label :=
   [.pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .snap,
@@ -147,7 +147,7 @@ def Run.reusedTuple : List Label :=
    .agent, .agent, .agent, .pkt .a .plain .syn]
 
 theorem breaks_reusedTuple :
-    after (replay Today.main Runs.nat Run.reusedTuple (init Runs.nat))
+    after (replay Today.ctstate Runs.nat Run.reusedTuple (init Runs.nat))
       smuggledLate := by decide
 
 /-- The same run with the design's restore: the same steps in its own order. -/
@@ -210,7 +210,7 @@ theorem design_keeps_cookieAckClone :
 
 /-- **The `/loopback` port.** A connection from a client of a port published with `/loopback` records
 a loopback peer, so the manifest leaves it out as a connection inside the guest, and every clone
-publishes with it. The same on `main` (22 steps). -/
+publishes with it. The same on `ctstate` (22 steps). -/
 def Run.loopbackClient : List Label :=
   [.pkt .a .lb .syn, .snap, .snap, .snap, .snap, .snap,
    .snap, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
@@ -359,7 +359,7 @@ theorem design_refuses_proxyConnect :
     replay Design.rules Runs.proxy Run.proxyConnectDesign (init Runs.proxy) = none
     ∧ (replay Design.rules Runs.proxy (Run.proxyConnectDesign.take 10) (init Runs.proxy)).isSome = true := by decide
 
-/-- The same connect on the source, where `main` and #2113 have no list: made behind the source's
+/-- The same connect on the source, where `ctstate` and #2113 have no list: made behind the source's
 closed egress half after the dump, its two sockets are in the image and in no manifest, and the
 clone publishes holding them. (The relay behind the proxy is vsock and the restore resets it by
 other means, which the model does not hold; the two TCP sockets are what the test reads.) (22

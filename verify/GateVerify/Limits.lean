@@ -5,7 +5,7 @@ import GateVerify.Configs
 /-!
 # Connections inside the guest: what the retirement does to them, and where the model stops
 
-Three cases, each a run the kernel replays, and a fourth the model cannot express.
+Three cases, each a run the kernel replays, and two more the model cannot express.
 
 **A connection with one end on the guest's own address** (a client bound to the guest's
 address, a loopback listener: `selfC`, `selfS`). The server end records a peer that is not
@@ -67,11 +67,32 @@ global IPv6 address to a `::1` listener. The manifest names the server end alone
 first case. The clone destroys it, and its reset is addressed to the snapshot's address, which
 the guest no longer has: the reset does not come back on `lo`, and the client end stays, alone,
 for as long as its owner keeps it. So for a routed clone "one end destroyed and the other left"
-IS a state the kernel leaves. The same on `main`. Found by the delta review of this model, by
+IS a state the kernel leaves, under every rule book here. Found by the delta review of this model, by
 source, not run; low, since the connection is one the snapshot named for retirement and the
 end that stays is dead. The model has no address move and its connections inside the guest are
 IPv4, so no theorem here is about it, and `mixedPairGoes` is about a guest that keeps its
 addresses.
+
+**A `/loopback` client that picks its source port: a stated limit, not in the model (#2152).**
+The mirror rule keeps a socket whose peer is loopback and whose mirror image is in the list.
+For a `/loopback` port the guest rewrites the client's source address to 127.0.0.1 and keeps
+its source port (fc-agent/src/network.rs, `--to-source 127.0.0.1` with no port range), so the
+client chooses the peer port the server's socket records. A client that connects to guest port
+P from source port P makes a socket that is its own mirror image; with two such ports, a
+connection to each from the other's number makes two sockets that are each other's. The mirror
+rule takes them for a connection inside the guest: the manifest leaves them out, the restore's
+list keeps them, and the clone publishes holding a connection of the source's from a client
+outside. A break of P3 at 27add63dd and so in the design, found by the head review of #2124, by
+reading, not run.
+
+The model cannot make it. A socket's kind fixes its tuple, and `inb c lb` has no mirror image
+(`Kind.mirror`): a client's source port is not something a run can choose. So
+`design_noStaleAtPublication` is a theorem about clients that do not choose their source port
+to match, and `outside_mirror` (`Socks.lean`: a connection that leaves the guest has no mirror
+image), on which that proof rests, is exactly what #2152 shows to be false of the code. Making
+it a kind needs the repair with it (a source port range reserved for the rewrite, and a
+loopback peer in that range counted as outside the guest), which is being built on #2124's
+branch; the model gets both when that lands.
 -/
 
 namespace Gate

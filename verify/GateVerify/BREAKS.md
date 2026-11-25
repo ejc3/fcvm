@@ -6,8 +6,11 @@ three are written by hand (`handRuns` in `GateSearch.lean`), where the search re
 only through a shorter run of another kind. Steps are counted from a running guest that no
 boundary holds and that booted without the snapshot cache.
 
-Rule books: `main` is 4adc1dee6, `flags` is #2113 at a1e5fc687, `cookieA` is #2124 at its first
-commit a80e1ad34, `cookieB` is #2124 at its head 27add63dd.
+Rule books are fixed commits, named for what the boundary does at each and not for a branch:
+`ctstate` is 4adc1dee6, where the gate's TCP rule is `--ctstate NEW` (what `main` was before
+#2113); `flags` is #2113 at a1e5fc687; `cookieA` is #2124 at its first commit a80e1ad34;
+`cookieB` is #2124 at its head. `README.md`, "The rule books", says which one `main` matches
+now.
 
 Nothing here was run in a VM. Each run is a run of the model, whose rules are read from the
 source at those commits and from Linux v6.18.60; "by source" below means exactly that.
@@ -41,7 +44,7 @@ vsock). CI runs that search and compares its result with `search.expected`. A na
 recorded run of that kind. The two `all-` configurations, which turn everything on at once,
 are in the last section.
 
-| | `main` | `flags` | `cookieA` | `cookieB` | design |
+| | `ctstate` | `flags` | `cookieA` | `cookieB` | design |
 |---|---|---|---|---|---|
 | P1 `sourceDisturbed` | `liveReset`, `agentDiesSource`, `barrierKill`, `reopenFails` | `agentDiesSource`, `barrierKill`, `reopenFails` | the same | the same | proved |
 | P2 `generationBroken` | after an early snapshot | the same | `twoDumps`, `proxyConnectA`, and that | `proxyConnect`, and that | proved, for the connections the model makes (`Limits.lean`) |
@@ -63,7 +66,7 @@ are about one run each. The column above is the general theorems of `Proofs.lean
 
 ### `liveReset`: the gate resets a live connection of the source (#2106, second fault)
 
-`main`. P1. Run `routed`, 5 steps. High. Fixed by #2113.
+`ctstate`. P1. Run `routed`, 5 steps. High. Fixed by #2113.
 
 ```
 client A connects to the source (SYN, ACK)
@@ -80,7 +83,7 @@ segment passes. Under `flags` and later the rule reads the packet's flags.
 
 ### `staleTuple`, `staleTupleLate`, `staleTupleGrown`: a SYN on a tracked tuple passes (#2106)
 
-`main`. P3. Run `routed-stale`, 22 and 18 steps; run `routed`, 37 steps. High. Fixed by #2113.
+`ctstate`. P3. Run `routed-stale`, 22 and 18 steps; run `routed`, 37 steps. High. Fixed by #2113.
 
 ```
 (the tracker holds an ESTABLISHED entry for client A's tuple, and no socket)
@@ -116,7 +119,7 @@ run (`strayAck`): the ACK is picked up as an entry, the guest answers with a res
 entry was taken to stay and to let a later SYN through. It does not stay: the reset is that
 entry's only reply, and the tracker deletes an unreplied entry on a reset
 (nf_conntrack_proto_tcp.c:1344-1352). The run is withdrawn, and with the rule corrected
-`staleTupleGrown` is the shortest run the search finds on `main` here.
+`staleTupleGrown` is the shortest run the search finds on `ctstate` here.
 
 Where: every family the guest tracks only while a rule asks. That is both families in routed
 mode with no nat rule, and IPv6 in a guest whose nat rules are IPv4 only: a `/loopback` port's
@@ -129,7 +132,7 @@ which the model does not hold.
 
 ### `halfOpenRetransmit`, `reusedTuple`: the same in a guest that always tracks (new, on #2106)
 
-`main`. P3 `smuggledLate`. Run `nat`, 19 and 20 steps. Medium. Fixed by #2113
+`ctstate`. P3 `smuggledLate`. Run `nat`, 19 and 20 steps. Medium. Fixed by #2113
 (`flags_keeps_halfOpenRetransmit`, `flags_keeps_reusedTuple`). The first is reported as a
 comment on #2106.
 
@@ -182,7 +185,7 @@ needs a listener in SYN-queue overflow (or `tcp_syncookies=2`) at the snapshot.
 
 ### `loopbackClient`, `loopbackClientA`: a `/loopback` port's client looks like the guest itself
 
-`main`, `flags`, `cookieA`. P3. Run `loopback-port`, 22 and 26 steps. High for such ports.
+`ctstate`, `flags`, `cookieA`. P3. Run `loopback-port`, 22 and 26 steps. High for such ports.
 Fixed at 27add63dd (the review of a80e1ad34, P2).
 
 ```
@@ -253,7 +256,7 @@ restore that begins between a prepare's exit and the pause.
 ### `proxyConnectA`, `proxyConnect`, `proxyStale`: a connect behind the closed egress half
 
 `cookieA`, `cookieB`: P2, run `proxy`, 21 and 22 steps. Low. Documented at 27add63dd.
-`main`, `flags`: P3, run `proxy`, 22 steps. Low.
+`ctstate`, `flags`: P3, run `proxy`, 22 steps. Low.
 
 ```
 a clone is restored
@@ -265,7 +268,7 @@ open_egress; SOCK_DESTROY                       => both retired
 Where: rootless only (the proxy), and only for a process the boundary does not freeze: a system
 daemon, an `fcvm exec --vm` command.
 
-`proxyStale` is the same connect on the source, between its dump and its pause, under `main`
+`proxyStale` is the same connect on the source, between its dump and its pause, under `ctstate`
 and `flags`, which take no list: the two sockets are in the image and in no manifest, and the
 clone publishes holding them. It is P3 only by this model's wider reading of "a connection that
 leaves the guest": the relay behind the proxy is vsock, the restore resets it by other means,
@@ -278,7 +281,7 @@ All four. P6. Run `host`, 9 steps. Known, open; #1941 is its fix.
 
 ## New breaks, in #2124 at its head
 
-All are in code #2124 does not change and so are in `main` and #2113 as well, except where
+All are in code #2124 does not change and so are in `ctstate` and #2113 as well, except where
 `tcp_syncookies` is named.
 
 ### `earlySnapshot`, `earlySnapshotFails`: a snapshot of a clone that has not published (#2138)
@@ -449,6 +452,37 @@ user's next `snapshot create` as a step of the system. It no longer does (`Prope
 clone published with a warning; a later snapshot of it captures the 0. The design fails the
 restore instead (`REPAIRS.md`, 7).
 
+## Known, and not in the model
+
+### A `/loopback` client that picks its source port (#2152)
+
+`cookieB`, and so the design. P3. Found by the head review of #2124, by reading, not run.
+
+A client that connects to a `/loopback` port P from source port P makes a server socket whose
+own end and peer are both 127.0.0.1:P, which is its own mirror image; two such ports and two
+clients make a pair. The mirror rule takes them for a connection inside the guest and every
+clone keeps them. The model cannot make this run: a kind fixes its tuple, and no run chooses a
+client's source port. `design_noStaleAtPublication` is therefore about clients that do not
+(`Limits.lean`; `README.md`, "Assumed"). The fix (a reserved source port range for the rewrite)
+is in flight with the others.
+
+## Fixes in flight
+
+None of the repairs in `REPAIRS.md` is in this pull request. As of this writing:
+
+| Break | Issue | Fix |
+|---|---|---|
+| `earlySnapshot`, `earlySnapshotFails`, `earlySnapshotCaptures`, `failedCloneSnapshot` | #2138 | #2151: on the host, `snapshot create` refuses a clone whose restore is not acknowledged (repair 2) |
+| `watchdogThaw` | #2140 | a pull request stacked on #2124 by its author, built to the two rulings of `REPAIRS.md`, 3 and 8 |
+| `barrierKill`, `barrierKillCaptured` | #2141 | the same |
+| `reopenFails`, `reopenFailsStuck` | #2142 | the same |
+| `agentDies`, `agentDiesSource`, `agentDiesVsock`, `containerMidBoundary` | #2149 | the same |
+| a `/loopback` client that picks its source port | #2152 | the same |
+| `hostDies` | #1936 | #1941 |
+
+The rule book of each fix is not written yet: when one lands, its commit gets a rule book in
+`Today.lean` and the search says which of these runs it closes.
+
 ## UDP (#2112)
 
 The clone's UDP rule is `-m conntrack --ctdir ORIGINAL -j REJECT`, in from the restore's
@@ -482,7 +516,7 @@ them.
 
 | | `all-routed` | `all-proxy` |
 |---|---|---|
-| `main` | capped at 10,000,000 states | 2,914,335 states, complete |
+| `ctstate` | capped at 10,000,000 states | 2,914,335 states, complete |
 | `flags` | 7,214,191 states, complete | 2,516,499, complete |
 | `cookieA` | capped | 5,098,605, complete |
 | `cookieB` | capped | 4,984,357, complete |

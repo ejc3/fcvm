@@ -1,14 +1,16 @@
 import GateVerify.Spec
 
 /-!
-# The code as it is: four rule books
+# The code as it is and as it was: four rule books
 
 Each is one commit of ejc3/fcvm, and each field cites the lines that make it so. `sn.rs` is
-fc-agent/src/snapshot_network.rs.
+fc-agent/src/snapshot_network.rs. A rule book is a fixed commit and is named for what the
+boundary does there, not for a branch: `main` has moved through three of them
+(`verify/GateVerify/README.md`, "The rule books").
 
 | rule book | commit | what it is |
 |---|---|---|
-| `Today.main` | 4adc1dee6 | `origin/main` |
+| `Today.ctstate` | 4adc1dee6 | `main` before #2113: the gate's TCP rule is `--ctstate NEW` |
 | `Today.flags` | a1e5fc687 | PR #2113, `gate-syn-flags` |
 | `Today.cookieA` | a80e1ad34 | PR #2124, its first commit, the one that was reviewed |
 | `Today.cookieB` | 27add63dd | PR #2124, its head |
@@ -68,8 +70,8 @@ namespace Today
   `destroy` (2264), `store.remove()` (2291); then, in `handle_clone_restore`,
   `payload_freeze::thaw` (fc-agent/src/restore.rs:792) and `publish` (restore.rs:814), which is
   the hook (sn.rs:2369) and `reopen_with` (sn.rs:2374). -/
-def main : Rules where
-  name := "main"
+def ctstate : Rules where
+  name := "ctstate"
   tcpByCt := true
   manAddr := true
   list := .none
@@ -85,21 +87,21 @@ def main : Rules where
   guard := false
   rcuUndo := false
 
-/-- PR #2113, a1e5fc687. One change against `main`:
+/-- PR #2113, a1e5fc687. One change against `ctstate`:
 
 - `tcpByCt := false`: the TCP rule is `TCP_NEW_FLOW_REJECT`, `-p tcp -m tcp --tcp-flags SYN,ACK
   SYN -j REJECT --reject-with tcp-reset` (sn.rs:990-1002, used at sn.rs:942).
 
 The manifest (sn.rs:2142-2153, `is_preserved` at sn.rs:117-124) and the restore's order
 (sn.rs:2209-2380: 2255, 2269, 2275, 2285, 2310, 2315, 2331, 2358; restore.rs:795, 818;
-sn.rs:2436, 2441) are `main`'s. -/
+sn.rs:2436, 2441) are `ctstate`'s. -/
 def flags : Rules where
   name := "flags"
   tcpByCt := false
   manAddr := true
   list := .none
   look := false
-  restore := main.restore
+  restore := ctstate.restore
   natGate := false
   wdMidBoundary := true
   snapUnpublished := true
