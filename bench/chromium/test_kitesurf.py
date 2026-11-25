@@ -442,6 +442,28 @@ class ReplayInjection(unittest.TestCase):
             head, body = self.get(s.http, "site.test", "/?utm=x")
             self.assertEqual(body, b"<html><body>page<b>MARK</b></body></html>")
 
+    def test_a_document_two_captures_share_still_carries_them(self):
+        """Two captures of one page: the reply serves the first capture's body, and
+        that body is the page's main document, so it carries the bytes."""
+        root = tempfile.mkdtemp()
+        for name, text in (("a_root", b"<html><body>first</body></html>"),
+                           ("b_root", b"<html><body>second</body></html>")):
+            site = os.path.join(root, name)
+            os.mkdir(site)
+            with open(os.path.join(site, "0"), "wb") as handle:
+                handle.write(text)
+            with open(os.path.join(site, "index.json"), "w") as handle:
+                json.dump({"url": "https://x.test/", "resources": {
+                    "https://x.test/": {"file": "0", "status": 200, "mime": "text/html"}}},
+                    handle)
+        path = os.path.join(root, "inject.html")
+        with open(path, "wb") as handle:
+            handle.write(b"<b>MARK</b>")
+        with ReplayServer("--root", root, "--inject-file", path) as s:
+            head, body = self.get(s.http, "x.test", "/")
+            self.assertEqual(body, b"<html><body>first<b>MARK</b></body></html>")
+            self.assertIn("x-replay-injected", head)
+
     def test_a_document_without_a_body_end_gets_them_at_its_end(self):
         import corpus_serve
         self.assertEqual(corpus_serve.inject(b"<p>a", b"X"), b"<p>aX")
