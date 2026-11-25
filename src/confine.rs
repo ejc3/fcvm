@@ -750,18 +750,19 @@ pub fn filter_bytes_digest(bytes: &[u8]) -> String {
 /// The largest filter or record [`read_store_file`] reads. A compiled policy is about 3 KiB.
 const FILTER_READ_LIMIT: u64 = 1 << 20;
 
-/// The bytes of a store file a confined launch depends on, opened once and without following
-/// a symbolic link: a regular file that others cannot write, owned by this user, by root, or
-/// by `binary_owner`, the owner of the Firecracker binary the file is for. That owner
-/// already decides what the VMM runs (under `sudo fcvm` the store belongs to the user who
-/// ran `fcvm setup`), so accepting its filter gives it nothing it lacks.
+/// The bytes of a store file a confined launch depends on, opened once, without following a
+/// symbolic link and without waiting (a FIFO under the name would otherwise hold the start
+/// until something wrote to it): a regular file that others cannot write, owned by this
+/// user, by root, or by `binary_owner`, the owner of the Firecracker binary the file is for.
+/// That owner already decides what the VMM runs (under `sudo fcvm` the store belongs to the
+/// user who ran `fcvm setup`), so accepting its filter gives it nothing it lacks.
 fn read_store_file(path: &std::path::Path, binary_owner: u32) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context as _;
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("opening {} (a symbolic link is refused)", path.display()))?;
     let meta = file
@@ -2522,6 +2523,24 @@ mod tests {
             verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err()
         );
         assert!(linked.contains("a symbolic link is refused"), "{linked}");
+
+        // A FIFO under the filter's name is refused at once; the open does not wait for a
+        // writer.
+        let (_dir, firecracker) = store_with_filter(None, Some(&digest));
+        let path = filter_path(&firecracker, SeccompMode::Enforce);
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo with a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        // On its own thread, so that an open that does wait fails this test, not hangs it.
+        let (answer, answered) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let refused = verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err();
+            let _ = answer.send(format!("{refused:#}"));
+        });
+        let fifo = answered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("opening a FIFO under the filter's name waited for a writer");
+        assert!(fifo.contains("is not a regular file"), "{fifo}");
 
         // A filter every user can write.
         let (_dir, firecracker) = store_with_filter(Some(good), Some(&digest));
