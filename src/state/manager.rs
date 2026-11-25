@@ -300,9 +300,24 @@ impl Published {
         serde_json::from_slice(&std::fs::read(path).ok()?).ok()
     }
 
-    /// Carry the flags into `state` when it is the state of the same process.
+    /// What `state` says of itself, to carry over a write of it.
+    fn of(state: &VmState) -> Self {
+        Self {
+            pid: state.pid,
+            pid_start_time: state.pid_start_time,
+            lifecycle_ready: state.lifecycle_ready,
+            restore_acknowledged: state.restore_acknowledged,
+        }
+    }
+
+    /// Carry the flags into `state` when it is the state of the same process: the same
+    /// PID with the same start time, both recorded. A state without a start time names no
+    /// process that can be told from a later one with its PID, and inherits nothing.
     fn keep(&self, state: &mut VmState) {
-        if (self.pid, self.pid_start_time) == (state.pid, state.pid_start_time) {
+        let same_process = self.pid.is_some()
+            && self.pid_start_time.is_some()
+            && (self.pid, self.pid_start_time) == (state.pid, state.pid_start_time);
+        if same_process {
             state.lifecycle_ready |= self.lifecycle_ready;
             state.restore_acknowledged |= self.restore_acknowledged;
         }
@@ -1440,10 +1455,12 @@ impl StateManager {
                 serde_json::from_str(&state_json).context("parsing VM state for update")?;
 
             // Apply caller's modification. An acknowledged restore stays acknowledged
-            // whatever the closure does: `snapshot create` relies on it never going back.
-            let acknowledged = state.restore_acknowledged;
+            // whatever the closure does, unless it made the state another process's:
+            // `snapshot create` relies on it never going back.
+            let mut before = Published::of(&state);
+            before.lifecycle_ready = false;
             mutate(&mut state);
-            state.restore_acknowledged |= acknowledged;
+            before.keep(&mut state);
             state.last_updated = jiff::Timestamp::now();
 
             // Write to temp file

@@ -271,6 +271,12 @@ pub async fn sweep_fork_snapshots(dir: &Path) {
 /// fork asked for in between is refused without the wait.
 const RESTORE_ACKNOWLEDGEMENT_WAIT_SECS: u64 = 10;
 
+/// Why a server that asked for a copy of `slot` restores the gold snapshot when `slot` has
+/// no running server on this host.
+fn source_not_running(slot: &str) -> String {
+    format!("{slot} does not run on this host")
+}
+
 /// `fcvm snapshot create` of a running server; `stop` for the gold VM only.
 pub fn snapshot_argv(pid: u32, tag: &str, stop: bool) -> Vec<String> {
     let mut a = s(&[
@@ -1070,17 +1076,21 @@ impl Server {
     /// no copy of this generation failed yet and that server runs here, else the gold
     /// snapshot.
     ///
-    /// `failed_copy` is why this generation's copy failed, when it did: the server then
-    /// restores from the gold snapshot, and its reports say so with that reason, so a tile
-    /// that shows the gold world where a copy was asked for says why in its state.
+    /// `no_copy` is why this generation gets no copy any more, when an earlier attempt
+    /// settled that (the copy failed, or its source did not run here): the server then
+    /// restores from the gold snapshot. Every gold restore that stands in for a copy says
+    /// so in its reports, with the reason, so a tile that shows the gold world where a copy
+    /// was asked for says why in its state. `copying` is set when this attempt is a copy,
+    /// so the caller can tell a failed copy from a failed gold restore.
     async fn relaunch(
         &self,
         live: &mut Option<Live>,
         gold: &str,
         want: &Desired,
-        failed_copy: Option<&str>,
+        no_copy: Option<&str>,
+        copying: &mut bool,
     ) -> std::result::Result<Live, String> {
-        let fork_ok = failed_copy.is_none();
+        let fork_ok = no_copy.is_none();
         let generation = want.generation;
         let t0 = Instant::now();
         let mut timings = BTreeMap::new();
@@ -1096,11 +1106,15 @@ impl Server {
                     .copied()
                     .map(|(pid, place)| (f.clone(), pid, place))
             });
-        // What the reports of a gold restore that stands in for a failed copy carry.
-        let instead_of_copy = match (&want.fork, failed_copy) {
-            (Some(f), Some(why)) => Some(format!(
-                "restored from the gold snapshot, not copied from {}: {why}",
-                f.slot
+        *copying = source.is_some();
+        // What the reports of a gold restore that stands in for a copy carry.
+        let instead_of_copy = match &want.fork {
+            Some(f) if source.is_none() && f.index != self.index => Some(format!(
+                "restored from the gold snapshot, not copied from {}: {}",
+                f.slot,
+                no_copy
+                    .map(str::to_string)
+                    .unwrap_or_else(|| source_not_running(&f.slot))
             )),
             _ => None,
         };
@@ -1261,6 +1275,7 @@ async fn supervise(
     ctx.board.lock().unwrap().remove(&ctx.index);
     let mut live: Option<Live> = None;
     // The generation whose fork failed once: its next attempt restores the gold snapshot.
+    // With why it gets no copy.
     let mut fork_failed: Option<(u64, String)> = None;
     let mut backoff = ctx.agent.backoff_min;
     let mut retry_after: Option<Duration> = None;
@@ -1300,13 +1315,14 @@ async fn supervise(
                 }
             }
             let want = desired.borrow_and_update().clone();
-            let failed_copy = fork_failed
+            let no_copy = fork_failed
                 .as_ref()
                 .filter(|(generation, _)| *generation == want.generation)
                 .map(|(_, why)| why.as_str());
-            let copy_failed_before = failed_copy.is_some();
+            let settled_before = no_copy.is_some();
+            let mut copying = false;
             let r = tokio::select! {
-                r = ctx.relaunch(&mut live, &tag, &want, failed_copy) => Some(r),
+                r = ctx.relaunch(&mut live, &tag, &want, no_copy, &mut copying) => Some(r),
                 _ = removed(&mut desired) => None,
             };
             match r {
@@ -1314,9 +1330,16 @@ async fn supervise(
                 Some(Ok(l)) => live = Some(l),
                 Some(Err(e)) => {
                     tracing::warn!(target: "fcvm::fleet::minecraft", server = %ctx.id, generation = want.generation, error = %e, "relaunch failed");
-                    // The reason kept is the copy's, not that of a gold restore after it.
-                    if want.fork.is_some() && !copy_failed_before {
-                        fork_failed = Some((want.generation, e.clone()));
+                    // One failed attempt settles that this generation gets no copy. The
+                    // reason kept is why there is no copy: the copy's own failure, or that
+                    // its source did not run here. A gold restore's failure is neither.
+                    if let (Some(f), false) = (&want.fork, settled_before) {
+                        let why = if copying {
+                            e.clone()
+                        } else {
+                            source_not_running(&f.slot)
+                        };
+                        fork_failed = Some((want.generation, why));
                     }
                     let delay = backoff;
                     backoff = (backoff * 2).min(ctx.agent.backoff_max);

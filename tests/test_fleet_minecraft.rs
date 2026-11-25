@@ -565,7 +565,14 @@ async fn a_fork_whose_source_does_not_run_here_restores_the_gold_snapshot() {
     f.mc.assign(&[assign("mc-2", 1, 1, None, None)]);
     f.report("mc-2", "running", 1).await;
     f.mc.assign(&[assign("mc-2", 1, 2, Some(("mc-1", 0)), None)]);
-    f.report("mc-2", "running", 2).await;
+    let r = f.report("mc-2", "running", 2).await;
+    // The tile shows the gold world where a copy was asked for, and its state says why.
+    assert_eq!(
+        r.error.as_deref(),
+        Some(
+            "restored from the gold snapshot, not copied from mc-1: mc-1 does not run on this host"
+        )
+    );
     let ev = f.events();
     let gold = mc_cfg(&f.snaps).gold_tag();
     assert!(
@@ -788,6 +795,45 @@ async fn a_fork_asked_for_during_its_sources_restore_waits_and_then_copies() {
     );
     assert!(r.timings.contains_key("snapshot_ms"), "{:?}", r.timings);
     assert_eq!(r.error, None, "a copy says nothing of the gold snapshot");
+    f.mc.stop().await;
+}
+
+/// A gold restore that fails is not reported as the failure of a copy. Here the fork's source
+/// does not run on this host, so the server restores from the gold snapshot, and that restore
+/// fails once: the next one still says there is no copy because the source does not run here,
+/// and does not give the gold restore's error as the copy's.
+///
+/// RED BEFORE THE FIX: any failed relaunch of a server that asked for a fork was stored as
+/// the fork's failure, and the next report read "not copied from mc-1: fcvm exited ...".
+#[tokio::test]
+async fn a_failed_gold_restore_is_not_reported_as_the_copys_failure() {
+    let mut f = fake_with(&[("FAKE_FAIL_ONCE", "mc-2")], |_| {}).await;
+    f.mc.assign(&[assign("mc-2", 1, 1, Some(("mc-1", 0)), None)]);
+    let end = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut failed = None;
+    let r = loop {
+        let m = tokio::time::timeout_at(end, f.rx.recv())
+            .await
+            .expect("no report")
+            .unwrap();
+        if let AgentMsg::Slot(r) = m {
+            if r.id == "mc-2" && r.phase == "failed" {
+                failed = r.error.clone();
+            }
+            if r.id == "mc-2" && r.phase == "running" && r.generation == 1 {
+                break r;
+            }
+        }
+    };
+    let failed = failed.expect("the gold restore that was to fail once did not");
+    assert!(failed.contains("fcvm exited"), "{failed}");
+    assert_eq!(
+        r.error.as_deref(),
+        Some(
+            "restored from the gold snapshot, not copied from mc-1: mc-1 does not run on this host"
+        ),
+        "the gold restore's failure was: {failed}"
+    );
     f.mc.stop().await;
 }
 

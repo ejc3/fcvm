@@ -1631,8 +1631,12 @@ restore hook and opened the gate. A snapshot taken before that would open the ga
 way through, so `snapshot create` refuses such a VM, `--stop` included, and leaves it as it was. The test is the VM's
 state: `process_type` is `clone` and `restore_acknowledged` is not set. `snapshot run` records the acknowledgement on
 the state and then prints its restored record, so once the record is printed a create is taken; `fcvm ls --json --pid
-<PID>` shows `"restore_acknowledged": true`. A restore that failed is never acknowledged, and its state says `failed`
-until the VM's teardown removes it. A caller that learns a clone is up from the clone's own ports can be a few
+<PID>` shows `"restore_acknowledged": true`. Taken is not yet run: `snapshot run` still has its own checks of the clone
+to do (the guest's output connection, the port check) and holds the VM's snapshot lock until it has published
+`lifecycle_ready`, so a create asked for in that stretch (7 ms measured) waits for it and does not pause the guest
+under those checks; it gives up after 60 s if the clone is never published. A clone whose state says `failed` is
+refused, whether its restore failed before the acknowledgement or after it; the state says so until the VM's teardown
+removes it. A caller that learns a clone is up from the clone's own ports can be a few
 milliseconds ahead of the record; `--await-restore <SECONDS>` waits for it, and ends early when the restore fails,
 the VM's fcvm exits or its state is removed. A VM that was booted is not checked.
 

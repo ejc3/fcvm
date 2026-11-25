@@ -16,6 +16,7 @@
 #                       waits up to S seconds for the acknowledgement
 #   FAKE_SNAPSHOT_SECS  a snapshot create takes this long, then logs snapshot_done
 #   FAKE_FAIL_FORK      a VM restored from a mc-fork-* snapshot exits with status 3
+#   FAKE_FAIL_ONCE      the VM of this name exits with status 3 the first time it is started
 #   FAKE_STALL_FORK     a VM restored from a mc-fork-* snapshot holds that snapshot's generation
 #                       lock shared, as fcvm snapshot run does while it restores, and never comes up
 #
@@ -89,6 +90,12 @@ if [ -n "${FAKE_STALL_FORK:-}" ] && [ "${tag#mc-fork-}" != "$tag" ]; then
     while true; do sleep 1 & wait $!; done
 fi
 sleep "${FAKE_UP_SECS:-0.1}" & wait $!
+# FAKE_FAIL_ONCE: the named VM's first start fails, whatever it was restored from.
+if [ "${FAKE_FAIL_ONCE:-}" = "$name" ] && [ ! -e "$dir/failed-once-$name" ]; then
+    touch "$dir/failed-once-$name"
+    echo "died $name $$ ${tag:--} $(date +%s%N)" >> "$log"
+    exit 3
+fi
 # FAKE_FAIL_FORK: a restore of a fork's snapshot exits at once, as a copy that cannot run.
 if [ -n "${FAKE_FAIL_FORK:-}" ] && [ "${tag#mc-fork-}" != "$tag" ]; then
     echo "died $name $$ $tag $(date +%s%N)" >> "$log"

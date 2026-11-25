@@ -1725,7 +1725,13 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         // lineage. The selector may now resolve to a replacement VM, or a snapshot that won
         // the VM lock first may have advanced snapshot_name while we acquired generation
         // locks. Neither stale observation is safe to use.
-        let vm_lock = super::common::acquire_vm_snapshot_lock(&vm_disk_path).await?;
+        let vm_lock = super::common::acquire_vm_snapshot_lock_for_create(
+            &vm_disk_path,
+            &state_manager,
+            &vm_state.vm_id,
+            super::common::RESTORE_PUBLICATION_LIMIT,
+        )
+        .await?;
         let fresh_state = load_snapshot_create_target(&state_manager, &args)
             .await
             .context("re-reading VM state under lock")?;
@@ -4553,14 +4559,37 @@ async fn cmd_snapshot_run_inner(
         other => other,
     };
     // The restore is acknowledged: recorded on the VM's state before the restored record
-    // below is printed, so a caller that has read the record may snapshot the clone at
-    // once (`common::ensure_restore_acknowledged`). A prepare's disposable VM is not
-    // recorded, so no other command snapshots it.
+    // below is printed, so a caller that has read the record may ask for a snapshot of the
+    // clone at once (`common::ensure_restore_acknowledged`). A prepare's disposable VM is
+    // not recorded, so no other command snapshots it.
+    //
+    // This process still has the output handshake and the port check to do, and a snapshot
+    // pauses the guest: a pause under the port check fails the check and tears down the VM
+    // being saved. So the per-VM snapshot lock is taken before the acknowledgement is
+    // recorded and held until the lifecycle is published or the restore has failed
+    // (`publication_lock`), and a create asked for in between waits on it. It is a file
+    // lock on an open file of this process, so every way out of this function gives it
+    // back, a panic and a kill included. Lock order: this lock, then the state lock inside
+    // each state write; no snapshot generation lock is held or taken while it is held.
+    let mut publication_lock: Option<std::fs::File> = None;
     let restore_completion_result = match restore_completion_result {
         Ok(RestoreAck::Acked { guest_phases }) if args.prepare.is_none() => {
-            match super::common::publish_restore_acknowledged(&state_manager, &mut vm_state).await {
-                Ok(()) => Ok(RestoreAck::Acked { guest_phases }),
-                Err(error) => Err(error),
+            let vm_disk = data_dir.join("disks/rootfs.raw");
+            let locked = tokio::select! {
+                lock = super::common::acquire_vm_snapshot_lock(&vm_disk) => lock.map(Some),
+                _ = cancel.cancelled() => Ok(None),
+            };
+            match locked {
+                Ok(Some(lock)) => {
+                    publication_lock = Some(lock);
+                    super::common::publish_restore_acknowledged(&state_manager, &mut vm_state)
+                        .await
+                        .map(|()| RestoreAck::Acked { guest_phases })
+                }
+                Ok(None) => Ok(RestoreAck::Interrupted),
+                Err(error) => {
+                    Err(error.context("taking the VM's snapshot lock for its publication"))
+                }
             }
         }
         other => other,
@@ -4569,6 +4598,7 @@ async fn cmd_snapshot_run_inner(
     // powered off, a failed hook) says so in the state for as long as the teardown leaves it.
     if restore_completion_result.is_err() {
         super::common::record_restore_failed(&state_manager, &vm_id).await;
+        drop(publication_lock.take());
     }
 
     // For routed mode clones: fc-agent reconfigures eth0 with the new vm_ipv6 via MMDS.
@@ -4640,6 +4670,10 @@ async fn cmd_snapshot_run_inner(
         gate.settle();
     }
 
+    // Test-only hold between the restored record and this process's own checks of the
+    // clone (the output handshake, the port check), with the publication lock held.
+    failpoint::hit_async("restore.acked_pre_verify").await;
+
     // Handle --exec: run command in container then cleanup and exit
     if let Some(exec_cmd) = &args.exec {
         info!("executing command in clone: {}", exec_cmd);
@@ -4663,6 +4697,8 @@ async fn cmd_snapshot_run_inner(
                 }
             }
         };
+        // Published, or not going to be: a snapshot of the clone no longer waits.
+        drop(publication_lock.take());
         let exec_result: Result<i32> = match ready_result {
             Err(error) => Err(error),
             Ok(()) => tokio::select! {
@@ -4971,6 +5007,11 @@ async fn cmd_snapshot_run_inner(
     if verify_result.is_err() {
         super::common::record_restore_failed(&state_manager, &vm_id).await;
     }
+    // A restore that will not be published gives the publication lock back here, after
+    // the state says why, so a create that was waiting reads `failed` and is refused.
+    if killed_in_handshake || verify_result.is_err() {
+        drop(publication_lock.take());
+    }
 
     // Set when the VMM exited on its own: the container exit code the guest reported, or
     // None when it reported none. Left None when fcvm stopped the VM (a signal, a memory
@@ -5070,6 +5111,12 @@ async fn cmd_snapshot_run_inner(
                 Err(error) => lifecycle_ready_result = Err(error),
             }
         }
+        // Published, or failed before it could be: either way a snapshot of the clone no
+        // longer waits. A clone that lost its memory server says so first.
+        if clone_failure.is_some() {
+            super::common::record_restore_failed(&state_manager, &vm_id).await;
+        }
+        drop(publication_lock.take());
 
         if let (Some(prepare), None) = (args.prepare.as_ref(), clone_failure.as_ref()) {
             let restored = restored_prepare(
@@ -8630,7 +8677,7 @@ mod tests {
         );
         let checked = at("ensure_restore_acknowledged(&fresh_state)");
         assert!(
-            at("acquire_vm_snapshot_lock(") < at("validate_snapshot_vm_identity(")
+            at("acquire_vm_snapshot_lock_for_create(") < at("validate_snapshot_vm_identity(")
                 && at("validate_snapshot_vm_identity(") < checked,
             "the restore is not checked on the state of the locked, identified VM"
         );
@@ -8700,7 +8747,7 @@ mod tests {
              restore that is not a prepare's"
         );
         assert!(
-            body[recorded..printed].contains("Err(error) => Err(error),"),
+            body[recorded..printed].contains(".map(|()| RestoreAck::Acked { guest_phases })"),
             "a failure to record the acknowledgement does not fail the restore"
         );
         let publications: Vec<usize> = body
@@ -8710,6 +8757,110 @@ mod tests {
         assert!(
             !publications.is_empty() && publications.iter().all(|at| *at > recorded),
             "lifecycle readiness is published before the acknowledgement is recorded"
+        );
+    }
+
+    /// The owner of a restored clone holds the per-VM snapshot lock from before it records
+    /// the acknowledgement until it has published the lifecycle or recorded that the
+    /// restore failed, so a `snapshot create` asked for when the restored record appears
+    /// waits and cannot pause the guest under the owner's output handshake and port check
+    /// (a pause longer than the port check's 5 s failed the check and tore down the VM
+    /// being saved). The lock is given back before the owner's own snapshots, which take
+    /// it themselves, and before the supervise loop; a restore that failed says so in the
+    /// state before it gives the lock back.
+    ///
+    /// RED BEFORE THE FIX: the owner took no lock.
+    #[test]
+    fn the_owner_holds_the_snapshot_lock_from_the_acknowledgement_to_publication() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source
+            .find("async fn cmd_snapshot_run_inner(")
+            .expect("no cmd_snapshot_run_inner")..];
+        let body = &body[..body
+            .find("\nasync fn restored_prepare(")
+            .expect("restored_prepare no longer follows cmd_snapshot_run_inner")];
+        // The code without its comments and its whitespace.
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect();
+        let at = |what: &str| {
+            code.find(what)
+                .unwrap_or_else(|| panic!("cmd_snapshot_run_inner has no {what}"))
+        };
+        const RELEASE: &str = "drop(publication_lock.take());";
+        const FAILED: &str = "super::common::record_restore_failed(&state_manager,&vm_id).await;";
+        let publications: Vec<usize> = code
+            .match_indices("lifecycle_gate.publish(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            publications.len(),
+            2,
+            "a publication site was added or removed"
+        );
+        let (exec_publication, publication) = (publications[0], publications[1]);
+
+        // Taken before the acknowledgement is recorded, and held across the test hold, the
+        // output handshake and the port check, to the publication.
+        let steps = [
+            at("super::common::acquire_vm_snapshot_lock(&vm_disk)"),
+            at("publish_restore_acknowledged(&state_manager,&mutvm_state)"),
+            at("failpoint::hit_async(\"restore.acked_pre_verify\")"),
+            at("wait_for_restored_output("),
+            at("network.verify_port_forwarding()"),
+            publication,
+        ];
+        assert!(
+            steps.windows(2).all(|pair| pair[0] < pair[1]),
+            "the lock, the acknowledgement, the checks and the publication are out of order: \
+             {steps:?}"
+        );
+
+        // The four places it is given back, and no other.
+        let not_acknowledged = at(&format!(
+            "ifrestore_completion_result.is_err(){{{FAILED}{RELEASE}}}"
+        ));
+        let after_exec_publication = exec_publication
+            + code[exec_publication..]
+                .find(RELEASE)
+                .expect("the --exec path never gives the lock back");
+        let not_verified = at(&format!(
+            "ifverify_result.is_err(){{{FAILED}}}ifkilled_in_handshake||verify_result.is_err(){{{RELEASE}}}"
+        ));
+        let after_publication = at(&format!("ifclone_failure.is_some(){{{FAILED}}}{RELEASE}"));
+        assert_eq!(
+            code.matches(RELEASE).count(),
+            4,
+            "the publication lock is given back somewhere this test does not know"
+        );
+        assert!(
+            steps[1] < not_acknowledged && not_acknowledged < steps[2],
+            "a restore that is not acknowledged does not give the lock back at once"
+        );
+        assert!(
+            after_exec_publication < at("letexec_result:Result<i32>="),
+            "the --exec path runs its command with the lock held"
+        );
+        assert!(
+            steps[4] < not_verified && not_verified < publication,
+            "a restore whose port check failed keeps the lock, or gives it back early"
+        );
+        assert!(
+            publication < after_publication
+                && after_publication < at("letrestored=restored_prepare(")
+                && after_publication < at("whileargs.prepare.is_none()"),
+            "the lock is still held when the owner snapshots or supervises the clone"
+        );
+
+        // The create takes the same lock, with the bound for an owner that never publishes.
+        let create = &source[source.find("async fn cmd_snapshot_create(").unwrap()..];
+        let create = &create[..create.find("\n}\n").unwrap()];
+        assert!(
+            create.contains("acquire_vm_snapshot_lock_for_create(")
+                && create.contains("super::common::RESTORE_PUBLICATION_LIMIT"),
+            "snapshot create does not wait for the owner's publication with a bound"
         );
     }
 
@@ -8730,7 +8881,7 @@ mod tests {
             .expect("ensure_not_disk_only no longer follows cmd_snapshot_create");
         let body = &source[start..start + end];
         let locked = body
-            .find("acquire_vm_snapshot_lock(")
+            .find("acquire_vm_snapshot_lock_for_create(")
             .expect("snapshot create takes no per-VM snapshot lock");
         let read = body
             .find("snapshot_config.metadata.record_balloon(")

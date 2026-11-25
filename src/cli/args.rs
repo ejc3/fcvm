@@ -1735,7 +1735,9 @@ pub struct SnapshotCreateArgs {
     /// it does after it has retired the snapshot's connections, run the restore hook and
     /// opened its network gate. `snapshot run` records the acknowledgement on the VM's
     /// state (`restore_acknowledged` in `fcvm ls --json`) and then prints its restored
-    /// record, so a caller that has read the record needs no wait. A caller that learns a
+    /// record, so a caller that has read the record needs no wait: its create is taken, and
+    /// runs once `snapshot run` has finished its own checks of the clone, which takes
+    /// milliseconds and is given up on after 60 s. A caller that learns a
     /// clone is up from the clone itself (a port that answers) can be a few milliseconds
     /// ahead of the record and gives a wait here. The wait ends early when the restore
     /// fails, the VM's fcvm exits or its state is removed. A VM that was booted is never
