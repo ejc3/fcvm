@@ -3018,6 +3018,26 @@ class CdpDriveHostHeader(unittest.TestCase):
         self.assertEqual(out["stage"], "resolve", f"never reached resolve: {out}")
 
 
+    def test_a_malformed_viewport_is_refused_before_a_clone_is_started(self):
+        """The caller's error costs no clone: the request raises before fcvm is spawned."""
+        import reqbench
+
+        with tempfile.TemporaryDirectory() as d:
+            started = os.path.join(d, "started")
+            stub = os.path.join(d, "fcvm")
+            with open(stub, "w") as f:
+                f.write(f"#!/bin/sh\n: > {started}\nsleep 30\n")
+            os.chmod(stub, 0o755)
+            args = argparse.Namespace(
+                fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+                snapshot_tag="", serve_pid=1, rust_log="off", timeout=2.0,
+                teardown_timeout=2.0, cdp_port=1, state_dir=d, data_root=d, ws_url="",
+                run_id="bad-viewport", viewport="1280X720",
+            )
+            with self.assertRaises(ValueError):
+                reqbench.run_cdp_request(args, 0, fast=True)
+            self.assertFalse(os.path.exists(started), "a clone was started")
+
     def test_a_clones_driver_gets_the_callers_viewport_and_none_by_default(self):
         """reqbench's arms set no viewport, so their wire sequence is unchanged;
         a caller that sets one (two engines compared at one size) has it reach
