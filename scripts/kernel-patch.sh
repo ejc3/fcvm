@@ -87,7 +87,7 @@ get_kernel_version() {
         in_section && /^[[:space:]]*kernel_version[[:space:]]*=/ {
             value = $0
             sub(/^[^=]*=[[:space:]]*"/, "", value)
-            sub(/"[[:space:]]*$/, "", value)
+            sub(/".*$/, "", value)
             print value
             exit
         }
@@ -119,7 +119,7 @@ get_patches_dir() {
         in_section && /^[[:space:]]*patches_dir[[:space:]]*=/ {
             value = $0
             sub(/^[^=]*=[[:space:]]*"/, "", value)
-            sub(/"[[:space:]]*$/, "", value)
+            sub(/".*$/, "", value)
             print value
             found = 1
             exit

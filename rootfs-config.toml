@@ -76,9 +76,9 @@ archives = [
 # that is pending for a runnable vCPU in a flag no ioctl reads, so the snapshot does not
 # hold it, and without the kick a vCPU restored just before the HLT of its lock wait halts
 # with interrupts off for good (#2131). KVM from 6.15 on clears the kick again on the
-# vCPU's first entry (#2132) unless it carries the x86_64 host kernel's patch 0003
-# (kernel/README.md), which today only [kernel_profiles.nested.amd64.host_kernel] does: no
-# distribution kernel, and none of the guest kernels below that run KVM themselves. The
+# vCPU's first entry (#2132) unless it carries the patch that keeps it
+# (kernel/README.md): every x86_64 kernel below that builds KVM does, the host kernel and
+# the guest kernels that run KVM themselves, and no distribution kernel does. The
 # gpu, phone and nested amd64 profiles pin the same fix on their own branches, and
 # every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore fails when one of these
 # pins moves to a commit that is not listed as carrying it.
@@ -444,10 +444,13 @@ kernel_repo = "ejc3/fcvm"
 published = false
 build_inputs = [
     "kernel/phone-x86.conf",
-    "kernel/patches-gpu-7.3/*.patch",
+    "kernel/patches-phone-7.3/*.patch",
 ]
 kernel_config = "kernel/phone-x86.conf"
-patches_dir = "kernel/patches-gpu-7.3"
+# The gpu profile's patches (links to them) and, because this guest runs KVM, the x86_64
+# host kernel's patch that keeps a pending paravirtual kick across an async page-ready
+# completion (kernel/README.md, #2132).
+patches_dir = "kernel/patches-phone-7.3"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 # The fork's VFIO branch with the nested state in snapshots (ejc3/firecracker#23) and the
 # Prefilled memory backend (ejc3/firecracker#24) merged, plus the paravirtual kick a
@@ -545,7 +548,7 @@ description = "Nested virtualization support for running VMs inside VMs (x86_64)
 guest_kvm = true
 kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "12a11e36fba7"
+kernel_sha = "6544a8efc8d3"
 
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [
@@ -556,7 +559,9 @@ build_inputs = [
 
 # Build paths (relative to repo root)
 kernel_config = "kernel/nested-x86.conf"
-patches_dir = "kernel/patches-x86"  # FUSE remap_file_range patch for reflink support
+# The FUSE and virtio patches, and patch 0008 for the KVM this guest runs: it keeps a pending
+# paravirtual kick across an async page-ready completion (kernel/README.md, #2132).
+patches_dir = "kernel/patches-x86"
 
 # Base config for VM kernel (Firecracker's microvm config)
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
@@ -642,7 +647,9 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # --- mountinfo scaling experiment -------------------------------------------
 # Two identical 6.16.1 guest kernels that differ only by a patch to
 # caching get_dominating_id()'s ring scan per peer group, so the pair can be A/B'd for
-# the cost of generating /proc/self/mountinfo in a slave mount namespace.
+# the cost of generating /proc/self/mountinfo in a slave mount namespace. Both run KVM,
+# so both carry the patch that keeps a pending paravirtual kick across an async page-ready
+# completion (kernel/README.md, #2132).
 # 6.16.1 is chosen because that is where the behaviour was first measured.
 
 [kernel_profiles.mountinfo-base.amd64]
@@ -655,13 +662,14 @@ kernel_repo = "ejc3/fcvm"
 published = false
 build_inputs = [
     "kernel/mountinfo.conf",
+    "kernel/patches-mountinfo-base/*.patch",
 ]
 kernel_config = "kernel/mountinfo.conf"
-# Empty means apply no patches. The repo's default FUSE patches target a newer
-# kernel and do not apply to 6.16.1, and this comparison only times reads of
-# /proc/self/mountinfo, so the pair carries none and differs by exactly the
-# patch under test.
-patches_dir = ""
+# Holds one patch, a link to the KVM patch the fix profile also applies. The repo's
+# default FUSE patches target a newer kernel and do not apply to 6.16.1, and this
+# comparison only times reads of /proc/self/mountinfo, so the pair carries none of them
+# and differs by exactly the patch under test.
+patches_dir = "kernel/patches-mountinfo-base"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
 [kernel_profiles.mountinfo-fix.amd64]
@@ -677,7 +685,7 @@ build_inputs = [
     "kernel/patches-mountinfo/*.patch",
 ]
 kernel_config = "kernel/mountinfo.conf"
-# Holds exactly one patch, the one under test. The control applies none, so the
-# pair differs by that patch alone.
+# Holds the patch under test and the KVM patch the control applies too, so the pair
+# differs by the patch under test alone.
 patches_dir = "kernel/patches-mountinfo"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"

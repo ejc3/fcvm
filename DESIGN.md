@@ -606,18 +606,22 @@ slot. Otherwise, on such a kernel, the kick reaches the HLT only when KVM carrie
 `0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch` (#2125,
 kernel/README.md). A kernel on 6.14 or earlier keeps the kick as it is.
 
-Which kernels carry that patch today:
+Which kernels carry that patch:
 
 | KVM that runs the restored guest | carries the patch |
 |---|---|
 | fcvm's x86_64 host kernel (`[kernel_profiles.nested.amd64.host_kernel]`, `kernel/patches-x86-host`), on the x64 runners and the fleet's GPU hosts once their images are rebuilt from a main that has it | yes |
+| KVM inside an fcvm guest, for a VM restored inside that guest: `nested.amd64` (6.18.60), `phone.amd64` (7.3.3) and the `mountinfo` pair (6.16.1), each with a port of the patch in its own patch set | yes |
 | a distribution's or any other kernel from 6.15 on that fcvm did not build | no |
-| KVM inside an fcvm guest, for a VM restored inside that guest: `nested.amd64` (6.18.60), `phone.amd64` (7.3.3) and the `mountinfo` pair (6.16.1) | no |
 
-Where the patch is missing, the kick is given and then cleared, #2131 stays as it was, and
-the same kernel loses the guest's own kicks to #2125. Measured on Linux 7.0.0 with a vCPU
-set up as Linux sets one up: with the distribution's KVM the restored vCPU was still halted
-after 10 s, and with the same KVM rebuilt with that one change it ran on.
+`every_x86_kernel_that_builds_kvm_carries_the_pv_kick_patch`
+(`tests/test_kernel_patch_invariants.rs`) takes the first two rows from rootfs-config.toml:
+it fails when an x86_64 host kernel, or a guest kernel whose config builds KVM, is on 6.15 or
+later and its patch set lacks the patch. Under a kernel of the last row the kick is given and
+then cleared, #2131 stays as it was, and the same kernel loses the guest's own kicks to
+#2125 until the patch is upstream. Measured on Linux 7.0.0 with a vCPU set up as Linux sets
+one up: with the distribution's KVM the restored vCPU was still halted after 10 s, and with
+the same KVM rebuilt with that one change it ran on.
 
 A snapshot restores on the Firecracker binary that took it while that file exists, so a
 snapshot taken before this build restores without the kick until it is taken again, or is
