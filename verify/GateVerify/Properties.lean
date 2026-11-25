@@ -17,19 +17,23 @@ namespace Gate
 /-- **P1, source undisturbed.** An established connection of a guest being snapshotted was reset
 by the gate; or no boundary is in progress (`snapshot create` returned, with or without an
 error, on a guest that is a source or a published clone) and the guest still has a half of the
-gate, the manifest, or `rcu_expedited` on. -/
+gate, the manifest, `rcu_expedited` on, or a living container left frozen. -/
 def sourceDisturbed (s : State) : Bool :=
   s.rst || (s.pw && s.sp == .idle && (s.rp == .none || s.rp == .done)
-              && (s.gated || s.man.isSome || s.rcu))
+              && (s.gated || s.man.isSome || s.rcu || (s.frozen && s.up)))
 
-/-- **P2, fixed generation.** A restore destroyed a socket that a process of the clone opened, or
-one end of a connection inside the guest that the manifest does not name and whose other end is
-alive: something that is neither the snapshot's nor made from outside behind the closed gate. -/
+/-- **P2, fixed generation.** A retirement destroyed, by cookie or by the reset a destroyed
+socket sends its other end inside the guest, something that is neither the snapshot's nor made
+from outside behind the closed gate: a socket a process of the clone opened; a socket a packet
+made with the gate open; an end of a loopback connection inside the guest that had both its
+ends; or an end of any connection inside the guest that had both its ends and that the
+manifest does not name. (`doStep`, `.retire`, has the test.) -/
 def generationBroken (s : State) : Bool := s.bad
 
 /-- **P3, no stale or smuggled socket at publication.** Ingress is open in some family on a
-guest that was restored, and it holds a TCP socket whose other end is outside the guest and that
-was in the image or made behind the closed gate. -/
+guest that was restored, and it holds a TCP socket of a connection that leaves the guest
+(directly or through the egress proxy) and that was in the image or made behind the closed
+gate. -/
 def staleAtPublication (s : State) : Bool :=
   s.pw && s.rp != .none && (!s.in4 || !s.in6)
     && s.socks.any (fun x => x.kind.outside && (x.gen == .stale || x.gen == .smuggled))
@@ -48,33 +52,45 @@ def hookMisplaced (s : State) : Bool := s.hk
 either the container runs or the restore has already retired sockets. A process that connects
 is answered with the gate's reset. -/
 def workloadBehindEgress (s : State) : Bool :=
-  s.pw && (s.out4 || s.out6) && (s.cut || !s.frozen)
+  s.pw && (s.out4 || s.out6) && (s.cut || s.ctrRuns)
     && (match s.rp with
         | .at _ => true
         | _ => false)
 
 /-- **P5, no lasting change to the clone.** A published clone that no snapshot holds has
-something the restore changed and did not put back: `tcp_syncookies`, the UDP rule, the
-restore's record. (A half of the gate and `rcu_expedited` are P1's, for a source and a published
-clone alike.) -/
+something the restore changed and did not put back: `tcp_syncookies`, the UDP rule. (A half of
+the gate and `rcu_expedited` are P1's, for a source and a published clone alike.) The test
+reads a clone whose restore is over; that every restore is over within a bounded number of
+steps, so that a change is never left by a restore that does not end, is P6 (`Ends.lean`). -/
 def lastingChange (C : Cfg) (s : State) : Bool :=
-  s.pw && s.rp == .done && s.sp == .idle && (s.sc != C.sc0 || s.udp || s.jr)
+  s.pw && s.rp == .done && s.sp == .idle && (s.sc != C.sc0 || s.udp)
 
 /-- P5: a memory image was taken while a setting was changed. -/
 def capturedChange (s : State) : Bool := s.cap
 
-/-- The steps of the system itself that move a boundary on: not the environment's, and not a
-failure or a kill. -/
-def progressLabels : List Label := [.snap, .guard, .agent, .restart, .off, .timeout]
+/-- A step of the system itself: a step of a `snapshot create` that has begun, the guard's, a
+restore's, either of them failing, systemd's restart of the agent, a failed clone's power-off
+and the host's timeout. Not the environment's (packets, processes, kills, a dying host), and
+not the user's next `snapshot create` or `snapshot run`. -/
+def own (l : Label) (s : State) : Bool :=
+  match l with
+  | .snap => s.sp != .idle
+  | .guard | .snapFail | .agent | .agentFail | .restart | .off | .timeout => true
+  | _ => false
+
+/-- The steps that move a boundary on: the system's own, the failures left out. -/
+def moves : List Label := [.snap, .guard, .agent, .restart, .off, .timeout]
 
 /-- **P6, never left closed.** A half of the gate is installed, or the guest is paused, and no
-step of the system is enabled: nothing will open it and nothing will report it. -/
+step that moves a boundary on is enabled: nothing will open it and nothing will report it. The
+user's next `snapshot create` is not such a step. -/
 def stuck (R : Rules) (C : Cfg) (s : State) : Bool :=
   s.pw && (s.gated || s.sp == .paused)
-    && !(progressLabels.any (fun l => (step R C l s).isSome))
+    && !(moves.any (fun l => own l s && (step R C l s).isSome))
 
 /-- **U1, no client datagram before publication.** A datagram on a flow a client began reached a
-clone that had not published. -/
+clone that had not published. Before the clone's UDP rule is in, what keeps one out is the
+host's (`Cfg.udpReach`), which the model assumes and does not hold. -/
 def clientDatagram (s : State) : Bool := s.udpIn
 
 /-- Not a property: a datagram on a flow the guest itself began reached a clone that had not

@@ -20,9 +20,10 @@ def routed : Cfg :=
 def routedStale : Cfg :=
   { staleCt := true, maxId := 3 }
 
-/-- Nat rules at boot (a published port), so the guest always tracks. -/
+/-- IPv4 nat rules at boot (a `/loopback` port's), so the guest always tracks IPv4 and tracks
+IPv6 only while a rule asks; two clients. -/
 def nat : Cfg :=
-  { nat := true, maxId := 3 }
+  { nat := true, cliB := true, maxId := 3 }
 
 /-- A listener in SYN-queue overflow answers with cookies (#2123). -/
 def cookie : Cfg :=
@@ -38,7 +39,7 @@ def pairs : Cfg :=
 
 /-- The egress proxy, and a process outside the container that connects out. -/
 def proxy : Cfg :=
-  { nat := true, proxy := true, dmnOut := true, maxId := 5 }
+  { nat := true, nat6 := true, proxy := true, dmnOut := true, maxId := 5 }
 
 /-- No proxy; the container and another process connect out. -/
 def egress : Cfg :=
@@ -48,14 +49,10 @@ def egress : Cfg :=
 def fails : Cfg :=
   { fails := true, flood := true, maxId := 3 }
 
-/-- fc-agent or a one-shot can be killed at any step; a process connects out. -/
+/-- fc-agent or a one-shot can be killed at any step, in a source and in a clone; a process
+connects out. The boot plan is over MMDS (Firecracker). -/
 def kills : Cfg :=
-  { kills := true, killDone := true, dmnOut := true, maxId := 3 }
-
-/-- The same with the boot plan over vsock (Cloud Hypervisor): a restarted agent starts behind a
-closed egress half too. -/
-def killsVsock : Cfg :=
-  { kills := true, killDone := true, dmnOut := true, mmds := false, maxId := 3 }
+  { kills := true, dmnOut := true, maxId := 3 }
 
 /-- The host's snapshot create can die, and a step of it can fail. -/
 def host : Cfg :=
@@ -91,12 +88,12 @@ def twoGen : Cfg :=
     early snapshots, cookies, pairs, outbound connects. -/
 def allRouted : Cfg :=
   { cliB := true, flood := true, loops := true, dmnOut := true, ctrOut := true, fails := true,
-    kills := true, killDone := true, hostDies := true, slow := true, earlySnap := true, maxId := 3 }
+    kills := true, hostDies := true, slow := true, earlySnap := true, maxId := 3 }
 
 /-- Everything at once with the egress proxy and a /loopback port. -/
 def allProxy : Cfg :=
-  { nat := true, proxy := true, lb := true, flood := true, selfs := true, dmnOut := true,
-    ctrOut := true, fails := true, kills := true, killDone := true, hostDies := true,
+  { nat := true, nat6 := true, proxy := true, lb := true, flood := true, selfs := true,
+    dmnOut := true, ctrOut := true, fails := true, kills := true, hostDies := true,
     slow := true, earlySnap := true, maxId := 3 }
 
 end Runs
@@ -106,7 +103,8 @@ def runs : List (String × String × Cfg) := [
   ("routed", "no nat rules, so the guest tracks nothing unless a rule asks; two clients",
     Runs.routed),
   ("routed-stale", "no nat rules, and the tracker holds an ESTABLISHED entry for A's tuple", Runs.routedStale),
-  ("nat", "nat rules at boot (a published port), so the guest always tracks", Runs.nat),
+  ("nat", "IPv4 nat rules at boot (a /loopback port's): IPv4 always tracked; two clients",
+    Runs.nat),
   ("cookie", "a listener in SYN-queue overflow answers with cookies (#2123)", Runs.cookie),
   ("loopback-port", "a port published with /loopback, and SYN cookies", Runs.loopbackPort),
   ("pairs", "connections inside the guest, made while a list is taken", Runs.pairs),
@@ -114,7 +112,6 @@ def runs : List (String × String × Cfg) := [
   ("egress", "no proxy; the container and another process connect out", Runs.egress),
   ("fails", "any step of the restore or of a one-shot can fail; SYN cookies", Runs.fails),
   ("kills", "fc-agent or a one-shot can be killed at any step; a process connects out", Runs.kills),
-  ("kills-vsock", "the same with the boot plan over vsock (Cloud Hypervisor)", Runs.killsVsock),
   ("host", "the host's snapshot create can die, and a step of it can fail", Runs.host),
   ("slow", "a boundary that outlives the payload freeze's deadline; the container connects out",
     Runs.slow),

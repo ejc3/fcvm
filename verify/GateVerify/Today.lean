@@ -31,8 +31,16 @@ What all four share, cited at 27add63dd (the same code is in the other three, at
   (`udp_ingress_rule_args`, `-m conntrack --ctdir ORIGINAL`).
 - The egress proxy's redirect is in nat OUTPUT and nothing of the gate is (`natGate := false`;
   fc-agent/src/proxy.rs:763-822).
-- A restarted fc-agent starts its restore watcher with no handled epoch
-  (fc-agent/src/mmds.rs:267) and so runs `handle_clone_restore` again (`rerun := true`).
+- Both one-shots are exec'd through the long-running fc-agent (src/commands/common.rs:6021).
+  When that agent has died, systemd has killed the unit's cgroup with it (the container, and a
+  one-shot in progress) and starts a new one (`Restart=on-failure`, `Delegate=yes`, no
+  `KillMode`, src/setup/rootfs.rs:1610-1626). The new process loops on its boot plan before it
+  starts the exec server or the restore watcher (fc-agent/src/agent.rs:74-86, 215). A guest
+  restored from a memory image is served no plan, so its agent never comes back and the
+  restore is never run a second time; a cold-booted guest's comes back unless the fetch is
+  over MMDS behind the closed egress half (`Spec.restart`). Read from the source; not run.
+- A write of `tcp_syncookies` back that fails is tried three times and then the restore goes on
+  with a warning (`restore_syn_cookies`; `backFails := false`).
 - The receive barrier turns `/sys/kernel/rcu_expedited` on and off around its grace period
   (sn.rs:486-529), and nothing else ever writes it back (`rcuUndo := false`).
 - The payload-freeze watchdog thaws any freeze it has seen 60 times, a second apart, whatever
@@ -67,8 +75,9 @@ def main : Rules where
   natGate := false
   wdMidBoundary := true
   snapUnpublished := true
-  rerun := true
   reopenRetry := false
+  backFails := false
+  startWaits := false
   guard := false
   rcuUndo := false
 
@@ -90,8 +99,9 @@ def flags : Rules where
   natGate := false
   wdMidBoundary := true
   snapUnpublished := true
-  rerun := true
   reopenRetry := false
+  backFails := false
+  startWaits := false
   guard := false
   rcuUndo := false
 
@@ -118,8 +128,9 @@ def cookieA : Rules where
   natGate := false
   wdMidBoundary := true
   snapUnpublished := true
-  rerun := true
   reopenRetry := false
+  backFails := false
+  startWaits := false
   guard := false
   rcuUndo := false
 
@@ -148,8 +159,9 @@ def cookieB : Rules where
   natGate := false
   wdMidBoundary := true
   snapUnpublished := true
-  rerun := true
   reopenRetry := false
+  backFails := false
+  startWaits := false
   guard := false
   rcuUndo := false
 

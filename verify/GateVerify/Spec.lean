@@ -78,10 +78,16 @@ inductive Kind where
   | selfS
   deriving DecidableEq, Repr, Hashable, Inhabited
 
-/-- The socket's other end is outside the guest. The egress proxy's two sockets are each other's
-peer inside the guest (the relay behind the proxy is vsock, not TCP). -/
+/-- The connection leaves the guest: the socket's other end is outside it, or the socket is one
+of the egress proxy's two, which are each other's peer and carry a connection to a server
+outside through the relay behind the proxy (vsock, not TCP). -/
 def Kind.outside : Kind → Bool
-  | .inb _ _ | .outb _ => true
+  | .inb _ _ | .outb _ | .proxC _ | .proxS _ => true
+  | _ => false
+
+/-- An end of a loopback connection inside the guest: both addresses loopback. -/
+def Kind.loop : Kind → Bool
+  | .loopC | .loopS => true
   | _ => false
 
 /-- The socket records a loopback address as its peer: what `is_preserved` reads. -/
@@ -159,8 +165,15 @@ inductive CtSt where
   | new
   /-- a reply seen and no close: SYN_RECV or ESTABLISHED, `IP_CT_ESTABLISHED` -/
   | est
-  /-- closed both ways or reset: TIME_WAIT or CLOSE. A SYN recycles it (ct_tcp.c:1036-1067) -/
+  /-- closed with a FIN seen (TIME_WAIT, or CLOSE after one). A SYN recycles it: the entry is
+  deleted and the packet looked up again (ct_tcp.c:1036-1067, `IP_CT_TCP_FLAG_CLOSE_INIT`) -/
   | closed
+  /-- the last packet was a reset from the guest's side and no FIN was seen: CLOSE, or still
+  ESTABLISHED when the reset's sequence did not match exactly (ct_tcp.c:1211-1261). A client's
+  SYN does not recycle it, because the reset was not from the SYN's direction
+  (ct_tcp.c:1051-1054): the SYN is ignored and passes on the old entry, which has seen a reply
+  and so is not NEW. The entry lasts `nf_conntrack_tcp_timeout_close`, 10 s by default -/
+  | reset
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 /-- A segment from a client. -/
@@ -177,8 +190,6 @@ inductive Seg where
 
 /-- One step of a restore, in the order a rule book runs them (`Rules.restore`). -/
 inductive RStep where
-  /-- (design) record under /run what the restore is about to change -/
-  | journal
   /-- `FirewallGate::refuse_syn_cookies`: write 0 to `net.ipv4.tcp_syncookies` -/
   | cookiesOff
   /-- `is_closed`, and `close` when the inherited gate does not verify -/
@@ -211,8 +222,6 @@ inductive RStep where
   | ingress
   /-- `restore_syn_cookies` -/
   | cookiesBack
-  /-- (design) the record under /run is removed -/
-  | unjournal
   deriving DecidableEq, Repr, Hashable, Inhabited
 
 /-- How a restore decides which listed sockets it retires beside the manifest's. -/
@@ -246,10 +255,17 @@ structure Rules where
   wdMidBoundary : Bool
   /-- `snapshot create` is admitted on a clone that has not published -/
   snapUnpublished : Bool
-  /-- an fc-agent that is restarted runs the restore again from its first step -/
-  rerun : Bool
-  /-- a reopen of the source that fails is tried again -/
+  /-- a reopen of the source that fails, or that no agent answers, is tried again, `retryMax`
+  times, and then the host ends the guest; otherwise `snapshot create` returns its error and
+  nothing tries again -/
   reopenRetry : Bool
+  /-- a write of `tcp_syncookies` back that fails `retryMax` times fails the restore; otherwise
+  the restore goes on with a warning -/
+  backFails : Bool
+  /-- an fc-agent that starts while the gate's egress half is installed waits for it to go
+  before it fetches a boot plan or starts a container; otherwise it does both whenever a plan
+  is served to it, which over vsock is also behind the closed gate -/
+  startWaits : Bool
   /-- what a dead `snapshot create` left is undone by a guard -/
   guard : Bool
   /-- the reopen also writes `rcu_expedited` back when a barrier of this boundary left it on -/
@@ -258,9 +274,14 @@ structure Rules where
 /-- What exists around the guest, and which moves a search allows. The proofs hold for every
 value; the search fixes one per run. -/
 structure Cfg where
-  /-- nat rules are installed at boot (a published port's DNAT, or the egress proxy), so the
-  guest tracks connections all the time -/
+  /-- IPv4 nat rules are installed at boot (a `/loopback` port's DNAT and SNAT, or the egress
+  proxy's redirect), so the guest tracks IPv4 connections all the time. Tracking is per family
+  (`nf_ct_netns_get` takes the rule's family, xt_conntrack.c:266-280, and
+  nf_conntrack_proto.c:441-470 counts `users4` and `users6` apart) -/
   nat : Bool := false
+  /-- IPv6 nat rules too: the egress proxy's ip6tables redirect (proxy.rs
+  `setup_ip6tables_redirect`). A `/loopback` port's rules are iptables only (network.rs) -/
+  nat6 : Bool := false
   /-- the egress proxy: nat OUTPUT redirects outbound TCP to a loopback port (proxy.rs) -/
   proxy : Bool := false
   /-- a port is published with `/loopback` -/
@@ -268,7 +289,8 @@ structure Cfg where
   /-- `net.ipv4.tcp_syncookies` at boot is not 0 -/
   sc0 : Bool := true
   /-- fc-agent reads its boot plan over MMDS, a TCP connection on eth0 (Firecracker; Cloud
-  Hypervisor's is over vsock): an agent that starts behind a closed egress half cannot -/
+  Hypervisor's is over vsock): an agent that starts behind a closed egress half is answered
+  with the gate's reset and tries again for ever (agent.rs:74-86) -/
   mmds : Bool := true
   /-- the guest's tracker holds an ESTABLISHED entry for client `a`'s tuple and no socket: a
   guest that has been through a boundary before (#2106) -/
@@ -293,10 +315,8 @@ structure Cfg where
   udp : Bool := false
   /-- a step of the agent or of a one-shot can fail -/
   fails : Bool := false
-  /-- the agent or a one-shot can be killed -/
+  /-- the agent or a one-shot can be killed, at any step, in a source and in a clone -/
   kills : Bool := false
-  /-- also once the clone has published -/
-  killDone : Bool := false
   /-- the host's `snapshot create` can die -/
   hostDies : Bool := false
   /-- a boundary can be held past the payload freeze's deadline (60 s of guest run time) -/
@@ -363,9 +383,11 @@ structure State where
   /-- the tracker holds a UDP flow a client began, and one the guest began -/
   ctUin : Bool := false
   ctUout : Bool := false
-  /-- the tracker's hooks are still attached after the last rule that used it was removed: the
-  rule's destruction, and with it `nf_ct_netns_put` (xt_conntrack.c:279), runs after the commit -/
-  lag : Bool := false
+  /-- the tracker's hooks of a family are still attached after the last rule that used it was
+  removed: the rule's destruction, and with it `nf_ct_netns_put` (xt_conntrack.c:279), runs
+  after the commit -/
+  lag4 : Bool := false
+  lag6 : Bool := false
   /-- client `a` holds a SYN cookie of `plain`, of `lb`; client `b` of `plain` -/
   ckA : Bool := false
   ckL : Bool := false
@@ -384,16 +406,28 @@ structure State where
   -- Files under /run, which is guest memory.
   /-- the manifest: the cookies a restore retires -/
   man : Option (List Nat) := none
-  /-- (design) the restore's record, and the `tcp_syncookies` value it holds -/
-  jr : Bool := false
-  jrSc : Bool := true
   /-- the container's cgroup is frozen -/
   frozen : Bool := false
+  /-- the container is alive. systemd kills the unit's cgroup, the container in it, when
+  fc-agent dies (`Restart=on-failure`, `Delegate=yes`, no `KillMode`, src/setup/rootfs.rs;
+  payload_freeze.rs:69 puts the container's cgroup inside the unit's) -/
+  up : Bool := true
   -- Processes.
   sp : SP := .idle
   rp : RP := .none
-  /-- the long-running fc-agent is alive -/
+  /-- the long-running fc-agent is alive and serves exec -/
   ag : Bool := true
+  /-- the host serves this guest a boot plan: true from a cold boot, false once the guest is
+  restored from a memory image. A restore replaces the MMDS store with a `latest` object that
+  has no `container-plan` (src/commands/common.rs:4456-4487), and the Cloud Hypervisor restore
+  document has none (src/commands/snapshot.rs:4309-4361) -/
+  plan : Bool := true
+  /-- the image this guest was restored from was taken inside a restore: the agent's task goes
+  on with that restore, and its watcher then begins one for the new epoch -/
+  again : Bool := false
+  /-- failed tries of the step being tried again: the reopen, or the write of `tcp_syncookies`
+  back -/
+  tries : Nat := 0
   /-- the host's `snapshot create` is alive -/
   host : Bool := true
   /-- the VM is powered on -/
@@ -473,10 +507,18 @@ def State.unpublished (s : State) : Bool :=
 /-- Any half of the gate is installed in any family. -/
 def State.gated (s : State) : Bool := s.in4 || s.in6 || s.out4 || s.out6
 
-/-- Connection tracking sees packets: its hooks are attached while a rule uses it
-(`nf_ct_netns_get`, xt_conntrack.c:270), and a little longer (`lag`). -/
-def tracked (R : Rules) (C : Cfg) (s : State) : Bool :=
-  C.nat || s.lag || s.udp || (R.tcpByCt && s.gated)
+/-- Connection tracking sees a family's packets: its hooks for that family are attached while a
+rule of that family uses it (`nf_ct_netns_get`, xt_conntrack.c:270), and a little longer
+(`lag4`, `lag6`). The clone's UDP rule is in both families' INPUT chains. -/
+def tracked (R : Rules) (C : Cfg) (s : State) : Fam → Bool
+  | .v4 => C.nat || s.lag4 || s.udp || (R.tcpByCt && (s.in4 || s.out4))
+  | .v6 => C.nat6 || s.lag6 || s.udp || (R.tcpByCt && (s.in6 || s.out6))
+
+/-- How many times a step that is tried again is tried before it is given up. -/
+def retryMax : Nat := 3
+
+/-- The container's processes run. -/
+def State.ctrRuns (s : State) : Bool := s.up && !s.frozen
 
 def State.has (s : State) (k : Kind) : Bool := s.socks.any (·.kind == k)
 
@@ -527,27 +569,35 @@ def lookIds (lst : List Nat) (seen now : List Sock) : List Nat :=
 /-- The tracker's entry once the packet is through, and whether `--ctstate NEW` matches it.
 
 - no entry and a SYN: a new entry, NEW (`tcp_new`, ct_tcp.c:876-905);
+- no entry and a FIN: invalid, no entry, not NEW (the `fin` row from `sNO` is `sIV`,
+  ct_tcp.c:169);
 - no entry and anything else: picked up as a connection already open, with `tcp_loose` at its
   default of 1, still NEW because no reply has been seen (ct_tcp.c:907-925, 1638;
   ct_core.c:1879-1883);
 - an entry that has seen a reply and no close: a SYN is ignored and the entry stands, so the
   packet is ESTABLISHED (the `sIG` cells of the `syn` row, ct_tcp.c:138, and
   `TCP_CONNTRACK_IGNORE`, ct_tcp.c:1069-1125);
-- a closed entry and a SYN: the entry is deleted and the packet looked up again, NEW
-  (ct_tcp.c:1036-1067). -/
+- an entry closed with a FIN seen, and a SYN: the entry is deleted and the packet looked up
+  again, NEW (ct_tcp.c:1036-1067);
+- an entry the guest's side reset, and a SYN: not recycled, ignored, and not NEW
+  (ct_tcp.c:1051-1054, then the fall through to `TCP_CONNTRACK_IGNORE`). -/
 def ctIn (seg : Seg) (cur : Option CtSt) : Option CtSt × Bool :=
   let syn := seg == .syn || seg == .synFull
   match cur with
-  | none => (some .new, true)
+  | none => if seg == .fin then (none, false) else (some .new, true)
   | some .new => (some .new, true)
   | some .est => (if seg == .fin then some .closed else some .est, false)
   | some .closed => if syn then (some .new, true) else (some .closed, false)
+  | some .reset => (some .reset, false)
 
 /-- The tracker's entry for the tuple once the guest has answered the segment: a reply makes it
-ESTABLISHED, a reset or a close closes it. Nothing changes when the guest does not track. -/
+ESTABLISHED, a FIN closes it, and the guest's reset (no socket for the segment) leaves it reset.
+A FIN with no entry was invalid and nothing is tracked. Nothing changes when the guest does not
+track. -/
 def answered (tr : Bool) (c : Cli) (p : Port) (seg : Seg) (reset : Bool) (s : State) : State :=
   if !tr then s
-  else if reset || seg == .fin then s.ctSet c p (some .closed)
+  else if seg == .fin then (if (s.ctGet c p).isNone then s else s.ctSet c p (some .closed))
+  else if reset then s.ctSet c p (some .reset)
   else s.ctSet c p (some .est)
 
 def State.noteRst (s : State) (b : Bool) : State := { s with rst := s.rst || b }
@@ -567,21 +617,21 @@ def State.gateIn (s : State) : Fam → Bool
 a segment the tracker calls NEW (`Rules.tcpByCt`), or else a SYN. -/
 def rejects (R : Rules) (C : Cfg) (c : Cli) (p : Port) (seg : Seg) (s : State) : Bool :=
   s.gateIn c.fam
-    && (if R.tcpByCt then (tracked R C s && (ctIn seg (s.ctGet c p)).2)
+    && (if R.tcpByCt then (tracked R C s c.fam && (ctIn seg (s.ctGet c p)).2)
         else (seg == .syn || seg == .synFull))
 
 /-- The state after a rejected segment. A closed entry that a SYN recycled is gone and the new
 one is never confirmed. The record: an established connection of a guest being snapshotted was
 answered with a reset. -/
 def rejected (R : Rules) (C : Cfg) (c : Cli) (p : Port) (seg : Seg) (s : State) : State :=
-  (if tracked R C s && (seg == .syn || seg == .synFull) && s.ctGet c p == some .closed
+  (if tracked R C s c.fam && (seg == .syn || seg == .synFull) && s.ctGet c p == some .closed
     then s.ctSet c p none else s).noteRst
     (!(seg == .syn || seg == .synFull) && s.sp != .idle
       && s.socks.any (fun x => x.kind == .inb c p && x.st == .est))
 
 /-- A SYN that was let in and dropped by a full SYN queue: the tracker has its entry, unanswered. -/
 def unanswered (R : Rules) (C : Cfg) (c : Cli) (p : Port) (seg : Seg) (s : State) : State :=
-  if tracked R C s then s.ctSet c p (ctIn seg (s.ctGet c p)).1 else s
+  if tracked R C s c.fam then s.ctSet c p (ctIn seg (s.ctGet c p)).1 else s
 
 /-- A clone that has not published, with its ingress half still in for this family: a packet
 from outside that makes a socket got past the closed gate. -/
@@ -618,7 +668,7 @@ def pkt (R : Rules) (C : Cfg) (c : Cli) (p : Port) (seg : Seg) (s : State) : Opt
   else if seg == .synFull && !C.flood then none
   else if rejects R C c p seg s then some (rejected R C c p seg s)
   else
-    let tr := tracked R C s
+    let tr := tracked R C s c.fam
     match seg, s.find (.inb c p) with
     | .syn, none =>
       if s.next < C.maxId then
@@ -651,7 +701,7 @@ def udpC (R : Rules) (C : Cfg) (s : State) : Option State :=
   if !s.running || !C.udp then none
   else if s.unpublished && (s.in4 || s.in6) && !C.udpReach then none
   else if s.udp then none
-  else some { s with ctUin := s.ctUin || tracked R C s,
+  else some { s with ctUin := s.ctUin || tracked R C s .v4,
                      udpIn := s.udpIn || (s.unpublished && (s.in4 || s.in6)) }
 
 /-- A datagram from the address and port the guest itself sent to, to the port it sent from.
@@ -667,12 +717,12 @@ def udpR (C : Cfg) (s : State) : Option State :=
 /-- A process of the guest sends a datagram. OUTPUT gates no UDP but NTP. -/
 def udpS (R : Rules) (C : Cfg) (s : State) : Option State :=
   if !s.running || !C.udp then none
-  else some { s with ctUout := s.ctUout || tracked R C s }
+  else some { s with ctUout := s.ctUout || tracked R C s .v4 }
 
 /-! ## The guest's own processes -/
 
 def procRuns (s : State) : Who → Bool
-  | .ctr => !s.frozen
+  | .ctr => s.ctrRuns
   | .dmn => true
 
 /-- Process `w` connects to a server outside the guest.
@@ -736,12 +786,18 @@ def State.closeGate (s : State) (v4 v6 : Bool) : State :=
 rules kept attached stays attached a little longer. -/
 def openGate (R : Rules) (C : Cfg) (s : State) : State :=
   { s with in4 := false, in6 := false, out4 := false, out6 := false, udp := false,
-           lag := s.lag || (!C.nat && (s.udp || (R.tcpByCt && s.gated))) }
+           lag4 := s.lag4 || (!C.nat && (s.udp || (R.tcpByCt && (s.in4 || s.out4)))),
+           lag6 := s.lag6 || (!C.nat6 && (s.udp || (R.tcpByCt && (s.in6 || s.out6)))) }
+
+/-- A powered-off guest: nothing of it is left but the records. -/
+def State.dead (s : State) : State :=
+  { pw := false, gens := s.gens, rst := s.rst, bad := s.bad, late := s.late, eg := s.eg,
+    hk := s.hk, cap := s.cap, udpIn := s.udpIn, udpLate := s.udpLate }
 
 /-! ## `snapshot create` -/
 
 /-- The boundary lock (`/run/fcvm/snapshot-network.lock`) is held by the restoring agent: from
-its first step until it publishes or exits. -/
+its first step until it publishes or exits. A dead agent holds nothing. -/
 def lockRestore (s : State) : Bool :=
   s.ag && (match s.rp with
     | .at n => 0 < n
@@ -753,13 +809,28 @@ def lockOneShot (s : State) : Bool :=
   | .closed4 | .closed | .barIn | .bar | .dump4 | .dump6 | .opened => true
   | _ => false
 
+/-- The reopen: the resume one-shot opens the gate (and, with `Rules.rcuUndo`, writes
+`rcu_expedited` back). -/
+def reopened (R : Rules) (C : Cfg) (s : State) : State :=
+  { openGate R C s with sp := .opened, rcu := s.rcu && !R.rcuUndo, tries := 0 }
+
+/-- The reopen cannot be delivered: no fc-agent answers the host's exec. With
+`Rules.reopenRetry` the host (or the guard) tries again; otherwise `snapshot create` returns its
+error, and what the prepare left stays. -/
+def unreached (R : Rules) (s : State) : State :=
+  if R.reopenRetry then { s with tries := s.tries + 1 } else { s with sp := .idle }
+
 /-- The next step of `snapshot create`, when it succeeds. `byGuard` is the guard doing a dead
 host's part.
 
 Host (common.rs `create_snapshot_core`): start the prepare one-shot, pause, resume, start the
 resume one-shot; after a prepare that failed, the resume one-shot alone. In the guest
 (`prepare_with`, `resume_source_network`): freeze, close, barrier, dump, save; open, remove the
-manifest, thaw. -/
+manifest, thaw.
+
+Both one-shots, and the guard's, are exec'd through the long-running fc-agent's exec server
+(common.rs:6021), so each step in the guest needs the agent alive. The pause and the resume are
+the VMM's and need nothing in the guest. -/
 def snap (R : Rules) (C : Cfg) (byGuard : Bool) (s : State) : Option State :=
   if !s.pw then none
   else
@@ -767,60 +838,74 @@ def snap (R : Rules) (C : Cfg) (byGuard : Bool) (s : State) : Option State :=
     match s.sp with
     | .idle =>
       -- the host starts a snapshot of a guest it holds no snapshot of
-      if byGuard || !s.host then none
+      if byGuard || !s.host || !s.ag then none
       else if s.unpublished && !(R.snapUnpublished && C.earlySnap) then none
-      else if s.jr then none
-      else some { s with sp := .frozen, frozen := true }
+      else some { s with sp := .frozen, frozen := true, tries := 0 }
     | .frozen =>
-      if byGuard || lockRestore s then none
+      if byGuard || !s.ag || lockRestore s then none
       else some { s.closeGate true false with sp := .closed4 }
-    | .closed4 => if byGuard then none else some { s.closeGate false true with sp := .closed }
-    | .closed => if byGuard then none else some { s with sp := .barIn, rcu := true, rcuOwn := !s.rcu }
+    | .closed4 =>
+      if byGuard || !s.ag then none else some { s.closeGate false true with sp := .closed }
+    | .closed =>
+      if byGuard || !s.ag then none
+      else some { s with sp := .barIn, rcu := true, rcuOwn := !s.rcu }
     | .barIn =>
-      if byGuard then none
+      if byGuard || !s.ag then none
       else some { s with sp := .bar, rcu := s.rcu && !s.rcuOwn, rcuOwn := false }
     | .bar =>
-      if byGuard then none
+      if byGuard || !s.ag then none
       else some { s with sp := .dump4, seen := s.socks.filter (·.kind.fam == .v4) }
     | .dump4 =>
-      if byGuard then none
+      if byGuard || !s.ag then none
       else some { s with sp := .dump6, seen := s.seen ++ s.socks.filter (·.kind.fam == .v6) }
     | .dump6 =>
-      if byGuard then none
+      if byGuard || !s.ag then none
       else some { s with sp := .saved, man := some (manifestIds R s.seen s.socks), seen := [] }
     | .saved =>
       if byGuard then
         -- nobody is left to pause: the guard undoes the prepare
-        if hostStep && !lockRestore s then
-          some { openGate R C s with sp := .opened, rcu := s.rcu && !R.rcuUndo }
-        else none
+        if !hostStep || lockRestore s then none
+        else if R.reopenRetry && retryMax ≤ s.tries then some s.dead
+        else if s.ag then some (reopened R C s)
+        else some (unreached R s)
       else if s.host then
-        some { s with sp := .paused, cap := s.cap || s.sc != C.sc0 || s.rcu }
+        some { s with sp := .paused, tries := 0, cap := s.cap || s.sc != C.sc0 || s.rcu }
       else none
-    | .paused => if hostStep then some { s with sp := .resumed } else none
+    | .paused => if hostStep then some { s with sp := .resumed, tries := 0 } else none
     | .resumed | .aborted =>
-      if hostStep && !lockRestore s then
-        some { openGate R C s with sp := .opened, rcu := s.rcu && !R.rcuUndo }
-      else none
+      if !hostStep || lockRestore s then none
+      -- the host ends a guest it could not reopen
+      else if R.reopenRetry && retryMax ≤ s.tries then some s.dead
+      else if s.ag then some (reopened R C s)
+      else some (unreached R s)
     | .opened =>
-      if byGuard then none
-      else some { s with sp := .idle, man := none, frozen := false, host := true }
+      if s.ag then
+        -- the resume one-shot goes on: it removes the manifest and thaws
+        if byGuard then none
+        else some { s with sp := .idle, man := none, frozen := false, host := true, tries := 0 }
+      -- the one-shot died with the agent, after it had opened the gate
+      else if !hostStep then none
+      else if R.reopenRetry && retryMax ≤ s.tries then some s.dead
+      else some (unreached R s)
 
 /-- A step of `snapshot create` fails.
 
 A prepare step: the one-shot rolls back (`rollback_preparation` opens the gate, the barrier's
 guard writes the switch back, main.rs thaws) and exits non-zero. The reopen: with
-`Rules.reopenRetry` it is tried again; otherwise the one-shot goes on to remove the manifest and
-thaw, exits non-zero, and nothing opens the gate. -/
+`Rules.reopenRetry` it is tried again, `retryMax` times; otherwise the one-shot goes on to
+remove the manifest and thaw, exits non-zero, and nothing opens the gate. -/
 def snapFail (R : Rules) (C : Cfg) (s : State) : Option State :=
-  if !s.pw || !C.fails then none
+  if !s.pw || !C.fails || !s.ag then none
   else match s.sp with
     | .frozen | .closed4 | .closed | .barIn | .bar | .dump4 | .dump6 =>
       if s.sp == .frozen && lockRestore s then none
       else some { openGate R C s with sp := .aborted, rcu := s.rcu && !s.rcuOwn, rcuOwn := false,
-                                      frozen := false, seen := [] }
+                                      frozen := false, seen := [], tries := 0 }
     | .resumed | .aborted =>
-      if !s.host || lockRestore s || R.reopenRetry then none
+      if !(s.host || R.guard) || lockRestore s then none
+      else if R.reopenRetry then
+        if s.tries < retryMax then some { s with tries := s.tries + 1 } else none
+      else if !s.host then none
       else some { s with sp := .idle, man := none, frozen := false }
     | _ => none
 
@@ -830,15 +915,22 @@ def snapKill (C : Cfg) (s : State) : Option State :=
   if !s.pw || !C.kills then none
   else match s.sp with
     | .closed4 | .closed | .barIn | .bar | .dump4 | .dump6 =>
-      some { s with sp := .aborted, seen := [], rcuOwn := false }
+      some { s with sp := .aborted, seen := [], rcuOwn := false, tries := 0 }
     | _ => none
 
 /-! ## The restore -/
 
+/-- The sockets a retirement's resets reach. `SOCK_DESTROY` is `tcp_abort`, which sends a reset
+for an established socket (tcp.c:5058-5110). When the other end is in the guest the reset goes
+out through OUTPUT, which refuses only a SYN and NTP, and comes in on `lo`, which the gate's
+INPUT chain returns for (`gate_chain_rules`: `-i lo -j RETURN`), so the other end is reset and
+freed too. `gone` are the sockets destroyed by cookie. -/
+def resetBy (gone : List Sock) (y : Sock) : Bool :=
+  gone.any (fun x => x.st == .est && x.kind.mirror == some y.kind)
+
 /-- A restore step, when it succeeds. -/
 def doStep (R : Rules) (C : Cfg) (r : RStep) (s : State) : State :=
   match r with
-  | .journal => { s with jr := true, jrSc := s.sc }
   | .cookiesOff => { s with saved := if s.sc then some true else s.saved, sc := false }
   -- The inherited gate verifies only as exactly the gate's rules, hooked first, in both
   -- families; anything else (a half that is gone, a UDP rule an earlier run of the restore
@@ -859,26 +951,25 @@ def doStep (R : Rules) (C : Cfg) (r : RStep) (s : State) : State :=
     let ids := s.man.getD [] ++ s.lst
     let gone := s.socks.filter (fun x => ids.contains x.id)
     let left := s.socks.filter (fun x => !ids.contains x.id)
-    -- a destroyed established socket sends a reset, which closes its tracked entry
+    -- a destroyed established socket sends a reset, which leaves its tracked entry reset
     -- (`tcp_abort`, tcp.c:5058-5110); a destroyed request socket sends nothing
     let closes (c : Cli) (p : Port) : Bool :=
-      tracked R C s && gone.any (fun x => x.kind == .inb c p && x.st == .est)
-    { s with socks := left, cut := true, lst := [],
+      tracked R C s c.fam && gone.any (fun x => x.kind == .inb c p && x.st == .est)
+    { s with socks := left.filter (fun y => !resetBy gone y), cut := true, lst := [],
              eg := s.eg || s.out4 || s.out6,
-             bad := s.bad || gone.any (fun x =>
-               x.gen == .own || x.gen == .fresh
-                 || (!(s.man.getD []).contains x.id && hasMirror left x)),
-             ctA := if closes .a .plain then some .closed else s.ctA,
-             ctL := if closes .a .lb then some .closed else s.ctL,
-             ctB := if closes .b .plain then some .closed else s.ctB }
+             bad := s.bad
+               || gone.any (fun x => x.gen == .own || x.gen == .fresh
+                    || (hasMirror s.socks x
+                        && (x.kind.loop || !(s.man.getD []).contains x.id)))
+               || left.any (fun y => resetBy gone y && (y.gen == .own || y.gen == .fresh)),
+             ctA := if closes .a .plain then some .reset else s.ctA,
+             ctL := if closes .a .lb then some .reset else s.ctL,
+             ctB := if closes .b .plain then some .reset else s.ctB }
   | .disarm => { s with man := none }
   | .thaw => { s with frozen := false }
   | .hook => { s with hk := s.hk || s.out4 || s.out6 || !s.in4 || !s.in6 }
   | .ingress => openGate R C s
-  | .cookiesBack =>
-    if R.restore.contains .journal then { s with sc := s.jrSc, saved := none }
-    else { s with sc := (s.saved.getD s.sc), saved := none }
-  | .unjournal => { s with jr := false }
+  | .cookiesBack => { s with sc := (s.saved.getD s.sc), saved := none, tries := 0 }
 
 /-- The agent's next step. -/
 def nextStep (R : Rules) (s : State) : Option RStep :=
@@ -890,67 +981,76 @@ def nextStep (R : Rules) (s : State) : Option RStep :=
 lock. -/
 def agentRuns (s : State) : Bool := s.running && s.ag && !lockOneShot s
 
+/-- The restore's next step is done. After the last one the clone has published and
+acknowledged; unless the image was taken inside a restore (`again`), in which case that was
+the old epoch's restore and the watcher now begins the new one. -/
 def advance (R : Rules) (s : State) : State :=
   match s.rp with
   | .at n => if n + 1 < R.restore.length then { s with rp := .at (n + 1) }
+             else if s.again then { s with rp := .at 0, again := false }
              else { s with rp := .done, waiting := false }
   | _ => s
 
-/-- The agent's next restore step succeeds. `load` with no manifest is the one step that cannot. -/
+/-- The agent's next restore step succeeds. `load` with no manifest cannot, and with
+`Rules.backFails` neither can a write-back that has failed `retryMax` times: the restore
+fails. -/
 def agent (R : Rules) (C : Cfg) (s : State) : Option State :=
   if !agentRuns s then none
   else match nextStep R s with
     | none => none
     | some r =>
-      if r == .load && s.man.isNone then some { s with rp := .failed, saved := none }
+      if (r == .load && s.man.isNone)
+          || (r == .cookiesBack && R.backFails && retryMax ≤ s.tries) then
+        some { s with rp := .failed, saved := none }
       else some (advance R (doStep R C r s))
 
 /-- The agent's next restore step fails: the restore fails closed and the agent goes to
-`shutdown_vm`. The write of `tcp_syncookies` back is the exception: after three tries the
-restore goes on with a warning (`restore_syn_cookies`); with the design's record it is tried
-until it lands, which is no step. -/
+`shutdown_vm`. The write of `tcp_syncookies` back is the exception (`restore_syn_cookies`):
+it is tried three times and then the restore goes on with a warning, the setting left at 0.
+With `Rules.backFails` each failed try is a step, and after `retryMax` of them the restore
+fails (`agent`). -/
 def agentFail (R : Rules) (C : Cfg) (s : State) : Option State :=
   if !agentRuns s || !C.fails then none
   else match nextStep R s with
     | none => none
     | some .cookiesBack =>
-      if R.restore.contains .journal then none
+      if R.backFails then
+        if s.tries < retryMax then some { s with tries := s.tries + 1 } else none
       else some (advance R { s with saved := none })
-    | some .unjournal => none
     | some _ =>
       some { s with rp := .failed, saved := none, seen := [], lst := [],
                     rcu := s.rcu && !s.rcuOwn, rcuOwn := false }
 
-/-- fc-agent is killed (an OOM kill, a crash). What it held in memory is gone, and so is its
-lock. -/
+/-- fc-agent is killed (an OOM kill, a crash), in a source or in a clone. What it held in
+memory is gone, and so is its lock. systemd kills the rest of the unit's cgroup with it: the
+container, and a one-shot in progress, which leaves what it had done (`snapKill`). A resume
+one-shot that had opened the gate has not removed the manifest. -/
 def kill (C : Cfg) (s : State) : Option State :=
-  if !s.pw || !s.ag || !C.kills then none
-  else match s.rp with
-    | .at _ => some { s with ag := false, saved := none, seen := [], lst := [], rcuOwn := false }
-    | .done => if C.killDone then some { s with ag := false } else none
-    | _ => none
-
-/-- systemd starts fc-agent again (`Restart=on-failure`, src/setup/rootfs.rs). Its restore
-watcher starts with no handled epoch, reads the restore document and runs the restore from its
-first step (mmds.rs `watch_restore_epoch`), unless the rule book says otherwise. Before the
-watcher, the agent reads its boot plan (agent.rs `run`, `bootplan::fetch_plan`): over MMDS that
-is a connect the closed egress half answers with a reset, and the agent tries again for ever. -/
-def restart (R : Rules) (C : Cfg) (s : State) : Option State :=
-  if !s.pw || s.ag then none
-  else if R.rerun then
-    if C.mmds && s.out4 then none
-    else match s.rp with
-      | .at _ | .done => some { s with ag := true, rp := .at 0 }
-      | _ => some { s with ag := true }
+  if !s.running || !s.ag || !C.kills then none
   else
-    match s.rp with
-    | .at _ => some { s with ag := true, rp := if s.jr then .failed else .at 0 }
-    | _ => some { s with ag := true }
+    let sp := match s.sp with
+      | .frozen | .closed4 | .closed | .barIn | .bar | .dump4 | .dump6 => .aborted
+      | x => x
+    some { s with ag := false, up := false, sp := sp, saved := none, seen := [], lst := [],
+                  rcuOwn := false }
 
-/-- A powered-off guest: nothing of it is left but the records. -/
-def State.dead (s : State) : State :=
-  { pw := false, gens := s.gens, rst := s.rst, bad := s.bad, late := s.late, eg := s.eg,
-    hk := s.hk, cap := s.cap, udpIn := s.udpIn, udpLate := s.udpLate }
+/-- systemd starts fc-agent again (`Restart=on-failure`, src/setup/rootfs.rs). The new process
+fetches its boot plan before anything else that matters here, in a loop with no end
+(agent.rs:74-86), and only then starts the exec server and the restore watcher (agent.rs:215).
+
+- A guest restored from a memory image is served no plan (`State.plan`): the loop never ends,
+  the restore is never run again, and exec never comes back.
+- A cold-booted guest is served its plan again, unless the fetch is over MMDS and the gate's
+  egress half is closed (or the rule book has the agent wait for the gate,
+  `Rules.startWaits`). Then the agent runs its boot path: a new container, exec again. Over
+  vsock that is also behind a closed gate: a container that runs while a boundary holds it for
+  frozen, and that the memory image then holds running.
+
+Before the loop the new process writes /etc/resolv.conf and adds the boot command line's IPv6
+address (agent.rs:66-67), which the model does not hold. -/
+def restart (R : Rules) (C : Cfg) (s : State) : Option State :=
+  if !s.running || s.ag || !s.plan || ((C.mmds || R.startWaits) && s.out4) then none
+  else some { s with ag := true, up := true, frozen := false }
 
 /-- The failed restore's `shutdown_vm(1)` lands. -/
 def off (s : State) : Option State :=
@@ -968,23 +1068,30 @@ def inPrepare (s : State) : Bool :=
   | _ => false
 
 /-- The payload-freeze watchdog thaws a container whose freeze outlived its deadline
-(payload_freeze.rs). -/
+(payload_freeze.rs). It is a thread of the long-running agent and dies with it. -/
 def watchdog (R : Rules) (C : Cfg) (s : State) : Option State :=
-  if !s.running || !s.frozen || !C.slow then none
+  if !s.running || !s.frozen || !s.ag || !C.slow then none
   else if !R.wdMidBoundary && (s.unpublished || inPrepare s) then none
   else some { s with frozen := false }
 
 /-- A clone is restored from the memory image and resumed. Everything the guest held is in it;
-every socket in it is now the source's. Its agent reads a new restore epoch and begins a
-restore, unless the image is of a clone whose restore had failed: that agent had left its
-restore for `shutdown_vm`, and the clone resumes there. -/
+every socket in it is now the source's, and no boot plan is served to it.
+
+Its agent is as the image has it. An agent that was idle reads a new restore epoch and begins
+a restore. One whose restore had failed had left it for `shutdown_vm`, and the clone resumes
+there. One that was inside a restore (an image of a clone that had not published) goes on with
+that restore from the step it was at, its memory with it, and the watcher begins the new
+epoch's restore when that one is over (`again`). -/
 def restore (C : Cfg) (s : State) : Option State :=
   if s.pw && s.sp == .paused && s.gens < C.maxGens then
-    some { s with sp := .idle, rp := if s.rp == .failed then .failed else .at 0,
-                  ag := true, host := true, waiting := true,
-                  socks := s.socks.map (fun x => { x with gen := .stale }),
-                  saved := none, seen := [], lst := [], rcuOwn := false, cut := false,
-                  gens := s.gens + 1 }
+    let t : State :=
+      { s with sp := .idle, host := true, waiting := true, plan := false, tries := 0,
+               socks := s.socks.map (fun x => { x with gen := .stale }),
+               cut := false, gens := s.gens + 1 }
+    match s.rp with
+    | .at _ => some { t with again := true }
+    | .failed => some t
+    | _ => some { t with rp := .at 0, saved := none, seen := [], lst := [], rcuOwn := false }
   else none
 
 /-! ## One step -/
@@ -1017,7 +1124,8 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
   | .udpC => udpC R C s
   | .udpR => udpR C s
   | .udpS => udpS R C s
-  | .detach => if s.pw && s.lag then some { s with lag := false } else none
+  | .detach =>
+    if s.pw && (s.lag4 || s.lag6) then some { s with lag4 := false, lag6 := false } else none
   | .conn w => conn R C w s
   | .shut w => shut w s
   | .pair b => pair C b s
@@ -1037,7 +1145,8 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
   | .timeout => timeout s
   | .watchdog => watchdog R C s
 
-/-- A running guest that no boundary holds: the rules its boot installs, nothing else. -/
+/-- A cold-booted, running guest that no boundary holds: the rules its boot installs, nothing
+else. -/
 def init (C : Cfg) : State :=
   { sc := C.sc0, ctA := if C.staleCt then some .est else none }
 

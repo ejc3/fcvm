@@ -6,20 +6,26 @@ import GateVerify.Configs
 /-!
 # The rules as they are, broken: each run the search found, checked by the kernel
 
+Written by `../gen-breaks.py` from the trace output; edit that, not this file.
+
 Copied exactly from `lake exe gate-breaks traces`: for each kind of break, the shortest run from
 `init` after which a property is broken, under the rule book and the configuration it was found
-in. `by decide` replays the run and evaluates the property in the kernel, so each is a checked
-fact about the model: a run that stops being possible, or stops breaking its property, fails the
-build. `verify/BREAKS.md` has each in words, with its steps.
+in, and a few runs written by hand where the search reports a break only through a shorter run
+of another kind (`handRuns` in `GateSearch.lean`). `by decide` replays the run and evaluates the
+property in the kernel, so each is a checked fact about the model: a run that stops being
+possible, or stops breaking its property, fails the build. `BREAKS.md` has each in words.
 
-Each is followed by the same run under `Design.rules`: there the run is not possible, or the
-property holds at its end (`design_keeps_`). The two UDP runs are the exception: the design does
-not change them (`design_too_`).
+Each is followed by what the design does with the same run, aligned to the design's own restore
+order: where the run has the agent do a restore step, the design's agent does its steps up to
+and including that one (`printRun` in `GateSearch.lean`). Either the design refuses a step of
+it (`design_refuses_`: the aligned run is not possible, and the refused step is its last), or
+the run is possible and the property holds at its end (`design_keeps_`). These say what the
+design does with one run. That the design keeps a property on every run is `Proofs.lean`. The
+two UDP runs are the exception: the design does not change them (`design_too_`).
 -/
 
 namespace Gate
 
-set_option maxRecDepth 100000
 
 /-! ## Known breaks -/
 
@@ -35,8 +41,8 @@ theorem breaks_liveReset :
       sourceDisturbed := by decide
 
 theorem design_keeps_liveReset :
-    ¬ after (replay Design.rules Runs.routed Run.liveReset (init Runs.routed))
-      sourceDisturbed := by decide
+    (replay Design.rules Runs.routed Run.liveReset (init Runs.routed)).map
+      sourceDisturbed = some false := by decide
 
 /-- **#2106.** On `main`, a SYN on a tuple the guest still tracks as ESTABLISHED is not NEW: it passes
 the source's closed gate after the dump, the request socket is in the image and in no manifest,
@@ -50,9 +56,15 @@ theorem breaks_staleTuple :
     after (replay Today.main Runs.routedStale Run.staleTuple (init Runs.routedStale))
       staleAtPublication := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.staleTupleDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap,
+   .pkt .a .plain .syn, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
+
 theorem design_keeps_staleTuple :
-    ¬ after (replay Design.rules Runs.routedStale Run.staleTuple (init Runs.routedStale))
-      staleAtPublication := by decide
+    (replay Design.rules Runs.routedStale Run.staleTupleDesign (init Runs.routedStale)).map
+      staleAtPublication = some false := by decide
 
 /-- #2106 on the clone: the same SYN passes the clone's closed gate after its retirement (18 steps). -/
 def Run.staleTupleLate : List Label :=
@@ -63,27 +75,67 @@ theorem breaks_staleTupleLate :
     after (replay Today.main Runs.routedStale Run.staleTupleLate (init Runs.routedStale))
       smuggledLate := by decide
 
-theorem design_keeps_staleTupleLate :
-    ¬ after (replay Design.rules Runs.routedStale Run.staleTupleLate (init Runs.routedStale))
-      smuggledLate := by decide
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.staleTupleLateDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .pkt .a .plain .syn]
 
-/-- #2106 with nothing assumed: where the stale entry comes from. The gate's own rule attaches the
-tracker during one snapshot, a client's handshake is tracked, the tracker is detached before the
-client closes, and the next snapshot's clone publishes with that client's new connection (37
+theorem design_keeps_staleTupleLate :
+    (replay Design.rules Runs.routedStale Run.staleTupleLateDesign (init Runs.routedStale)).map
+      smuggledLate = some false := by decide
+
+/-- #2106 with nothing assumed, by the issue's own route: where the stale entry comes from. The gate's
+rule attaches IPv4 tracking during one snapshot and it stays attached a little after the gate is
+removed; a client's handshake is tracked then; the tracker is detached before the client closes,
+so the close is not seen; and the next snapshot's clone publishes with that client's new
+connection. Written by hand: the search reports a shorter run of another kind (`strayAck`) (38
 steps). -/
 def Run.staleTupleGrown : List Label :=
-  [.snap, .snap, .pkt .b .plain .syn, .snap, .snap, .snap,
-   .snap, .snap, .snap, .snap, .snap, .snap, .detach, .pkt .b .plain .fin, .snap, .snap, .snap,
-   .snap, .snap, .snap, .snap, .snap, .pkt .b .plain .syn, .snap, .snap, .restore, .agent, .agent,
-   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .detach,
+   .pkt .a .plain .fin, .snap, .snap, .snap, .snap, .snap, .snap, .pkt .a .plain .syn, .snap, .snap,
+   .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent]
 
 theorem breaks_staleTupleGrown :
     after (replay Today.main Runs.routed Run.staleTupleGrown (init Runs.routed))
       staleAtPublication := by decide
 
-theorem design_keeps_staleTupleGrown :
-    ¬ after (replay Design.rules Runs.routed Run.staleTupleGrown (init Runs.routed))
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.staleTupleGrownDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .detach]
+
+theorem design_refuses_staleTupleGrown :
+    replay Design.rules Runs.routed Run.staleTupleGrownDesign (init Runs.routed) = none
+    ∧ (replay Design.rules Runs.routed (Run.staleTupleGrownDesign.take 14) (init Runs.routed)).isSome = true := by decide
+
+/-- The same hole reached without a connection: an ACK for no socket arrives while the tracker is
+attached, the guest answers with a reset, and the entry that leaves is one a later SYN from that
+client does not recycle (the reset was not from the SYN's direction,
+nf_conntrack_proto_tcp.c:1051-1054). The SYN is not NEW and passes the next snapshot's closed gate
+(35 steps). -/
+def Run.strayAck : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .pkt .a .plain .ack, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .pkt .a .plain .syn, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent]
+
+theorem breaks_strayAck :
+    after (replay Today.main Runs.routed Run.strayAck (init Runs.routed))
       staleAtPublication := by decide
+
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.strayAckDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .pkt .a .plain .ack, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .pkt .a .plain .syn, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
+
+theorem design_keeps_strayAck :
+    (replay Design.rules Runs.routed Run.strayAckDesign (init Runs.routed)).map
+      staleAtPublication = some false := by decide
 
 /-- A variant of #2106 in a guest that always tracks. A request socket in the manifest is retired
 without a reset (`tcp_abort`, tcp.c:5062-5069), so its tracked entry stays; the client's SYN, sent
@@ -97,13 +149,48 @@ theorem breaks_halfOpenRetransmit :
     after (replay Today.main Runs.nat Run.halfOpenRetransmit (init Runs.nat))
       smuggledLate := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.halfOpenRetransmitDesign : List Label :=
+  [.pkt .a .plain .syn, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .pkt .a .plain .syn]
+
 theorem design_keeps_halfOpenRetransmit :
-    ¬ after (replay Design.rules Runs.nat Run.halfOpenRetransmit (init Runs.nat))
-      smuggledLate := by decide
+    (replay Design.rules Runs.nat Run.halfOpenRetransmitDesign (init Runs.nat)).map
+      smuggledLate = some false := by decide
 
 /-- #2113's flag rule refuses that SYN like any other. -/
 theorem flags_keeps_halfOpenRetransmit :
     ¬ after (replay Today.flags Runs.nat Run.halfOpenRetransmit (init Runs.nat)) smuggledLate := by
+  decide
+
+/-- And with an established connection: the clone's retirement resets it from the guest's side, which
+leaves the tracked entry closed by a reset that was not the client's. A client that connects again
+from the same address and port within the entry's timeout (10 s in Linux 6.18.60) sends a SYN the
+tracker does not recycle: not NEW, it passes the clone's closed gate. `main` only. Written by
+hand: the search reports the shorter `halfOpenRetransmit` (20 steps). -/
+def Run.reusedTuple : List Label :=
+  [.pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .pkt .a .plain .syn]
+
+theorem breaks_reusedTuple :
+    after (replay Today.main Runs.nat Run.reusedTuple (init Runs.nat))
+      smuggledLate := by decide
+
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.reusedTupleDesign : List Label :=
+  [.pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .pkt .a .plain .syn]
+
+theorem design_keeps_reusedTuple :
+    (replay Design.rules Runs.nat Run.reusedTupleDesign (init Runs.nat)).map
+      smuggledLate = some false := by decide
+
+/-- #2113's flag rule refuses that SYN too. -/
+theorem flags_keeps_reusedTuple :
+    ¬ after (replay Today.flags Runs.nat Run.reusedTuple (init Runs.nat)) smuggledLate := by
   decide
 
 /-- **#2123.** With the flag rule, the ACK that completes a SYN-cookie handshake passes the source's
@@ -118,9 +205,15 @@ theorem breaks_cookieAck :
     after (replay Today.flags Runs.cookie Run.cookieAck (init Runs.cookie))
       staleAtPublication := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.cookieAckDesign : List Label :=
+  [.pkt .a .plain .synFull, .snap, .snap, .snap, .snap,
+   .snap, .snap, .pkt .a .plain .ack, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
+
 theorem design_keeps_cookieAck :
-    ¬ after (replay Design.rules Runs.cookie Run.cookieAck (init Runs.cookie))
-      staleAtPublication := by decide
+    (replay Design.rules Runs.cookie Run.cookieAckDesign (init Runs.cookie)).map
+      staleAtPublication = some false := by decide
 
 /-- #2123 on the clone: a cookie's ACK makes a socket after the retirement, before publication (19
 steps). -/
@@ -133,9 +226,15 @@ theorem breaks_cookieAckClone :
     after (replay Today.flags Runs.cookie Run.cookieAckClone (init Runs.cookie))
       smuggledLate := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.cookieAckCloneDesign : List Label :=
+  [.pkt .a .plain .synFull, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .pkt .a .plain .ack]
+
 theorem design_keeps_cookieAckClone :
-    ¬ after (replay Design.rules Runs.cookie Run.cookieAckClone (init Runs.cookie))
-      smuggledLate := by decide
+    (replay Design.rules Runs.cookie Run.cookieAckCloneDesign (init Runs.cookie)).map
+      smuggledLate = some false := by decide
 
 /-- **The `/loopback` port.** A connection from a client of a port published with `/loopback` records
 a loopback peer, so the manifest leaves it out as a connection inside the guest, and every clone
@@ -149,9 +248,15 @@ theorem breaks_loopbackClient :
     after (replay Today.flags Runs.loopbackPort Run.loopbackClient (init Runs.loopbackPort))
       staleAtPublication := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.loopbackClientDesign : List Label :=
+  [.pkt .a .lb .syn, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
+
 theorem design_keeps_loopbackClient :
-    ¬ after (replay Design.rules Runs.loopbackPort Run.loopbackClient (init Runs.loopbackPort))
-      staleAtPublication := by decide
+    (replay Design.rules Runs.loopbackPort Run.loopbackClientDesign (init Runs.loopbackPort)).map
+      staleAtPublication = some false := by decide
 
 /-- The review of a80e1ad34, P2: its own list skips a loopback peer the same way, so such a socket,
 made by a cookie or not, is published (26 steps). -/
@@ -164,9 +269,15 @@ theorem breaks_loopbackClientA :
     after (replay Today.cookieA Runs.loopbackPort Run.loopbackClientA (init Runs.loopbackPort))
       staleAtPublication := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.loopbackClientADesign : List Label :=
+  [.pkt .a .lb .syn, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
+
 theorem design_keeps_loopbackClientA :
-    ¬ after (replay Design.rules Runs.loopbackPort Run.loopbackClientA (init Runs.loopbackPort))
-      staleAtPublication := by decide
+    (replay Design.rules Runs.loopbackPort Run.loopbackClientADesign (init Runs.loopbackPort)).map
+      staleAtPublication = some false := by decide
 
 /-- The review of a80e1ad34, the list is two dumps: a connection made inside the guest between the
 IPv4 dump and the IPv6 dump has one end listed, and the restore retires it. It needs a connection
@@ -181,24 +292,36 @@ theorem breaks_twoDumps :
     after (replay Today.cookieA Runs.pairs Run.twoDumps (init Runs.pairs))
       generationBroken := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.twoDumpsDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .pair true, .agent,
+   .agent, .agent, .agent]
+
 theorem design_keeps_twoDumps :
-    ¬ after (replay Design.rules Runs.pairs Run.twoDumps (init Runs.pairs))
-      generationBroken := by decide
+    (replay Design.rules Runs.pairs Run.twoDumpsDesign (init Runs.pairs)).map
+      generationBroken = some false := by decide
 
 /-- What 27add63dd's second dump is for: without it, and with the mirror image deciding, any
 connection made inside the guest between the two dumps loses an end (21 steps). -/
 def Run.oneDump : List Label :=
-  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .pair false, .agent, .agent,
+  [.snap, .snap, .snap, .snap, .snap, .snap, .pair false, .snap,
+   .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
    .agent]
 
 theorem breaks_oneDump :
     after (replay Today.cookieBOneLook Runs.pairs Run.oneDump (init Runs.pairs))
       generationBroken := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.oneDumpDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .pair false,
+   .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent]
+
 theorem design_keeps_oneDump :
-    ¬ after (replay Design.rules Runs.pairs Run.oneDump (init Runs.pairs))
-      generationBroken := by decide
+    (replay Design.rules Runs.pairs Run.oneDumpDesign (init Runs.pairs)).map
+      generationBroken = some false := by decide
 
 /-- The review of a80e1ad34, publication's order: `tcp_syncookies` is written back before the ingress
 half is removed, so a cookie's ACK in between makes a socket in a clone that has not published
@@ -212,9 +335,16 @@ theorem breaks_cookiesBackFirst :
     after (replay Today.cookieA Runs.cookie Run.cookiesBackFirst (init Runs.cookie))
       smuggledLate := by decide
 
+/-- The same run with the design's restore: the same steps in its own order. -/
+def Run.cookiesBackFirstDesign : List Label :=
+  [.pkt .a .plain .synFull, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .pkt .a .plain .ack]
+
 theorem design_keeps_cookiesBackFirst :
-    ¬ after (replay Design.rules Runs.cookie Run.cookiesBackFirst (init Runs.cookie))
-      smuggledLate := by decide
+    (replay Design.rules Runs.cookie Run.cookiesBackFirstDesign (init Runs.cookie)).map
+      smuggledLate = some false := by decide
 
 /-- The review of a80e1ad34, the egress proxy: nat OUTPUT redirects a connect before the gate's OUTPUT
 chain sees it, so a process outside the frozen container connects out behind the closed egress
@@ -228,9 +358,14 @@ theorem breaks_proxyConnectA :
     after (replay Today.cookieA Runs.proxy Run.proxyConnectA (init Runs.proxy))
       generationBroken := by decide
 
-theorem design_keeps_proxyConnectA :
-    ¬ after (replay Design.rules Runs.proxy Run.proxyConnectA (init Runs.proxy))
-      generationBroken := by decide
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.proxyConnectADesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .restore, .conn .dmn]
+
+theorem design_refuses_proxyConnectA :
+    replay Design.rules Runs.proxy Run.proxyConnectADesign (init Runs.proxy) = none
+    ∧ (replay Design.rules Runs.proxy (Run.proxyConnectADesign.take 10) (init Runs.proxy)).isSome = true := by decide
 
 /-- The same at 27add63dd, which documents it: both sockets are retired and the process connects again
 (22 steps). -/
@@ -243,9 +378,36 @@ theorem breaks_proxyConnect :
     after (replay Today.cookieB Runs.proxy Run.proxyConnect (init Runs.proxy))
       generationBroken := by decide
 
-theorem design_keeps_proxyConnect :
-    ¬ after (replay Design.rules Runs.proxy Run.proxyConnect (init Runs.proxy))
-      generationBroken := by decide
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.proxyConnectDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .restore, .conn .dmn]
+
+theorem design_refuses_proxyConnect :
+    replay Design.rules Runs.proxy Run.proxyConnectDesign (init Runs.proxy) = none
+    ∧ (replay Design.rules Runs.proxy (Run.proxyConnectDesign.take 10) (init Runs.proxy)).isSome = true := by decide
+
+/-- The same connect on the source, where `main` and #2113 have no list: made behind the source's
+closed egress half after the dump, its two sockets are in the image and in no manifest, and the
+clone publishes holding them. (The relay behind the proxy is vsock and the restore resets it by
+other means, which the model does not hold; the two TCP sockets are what the test reads.) (22
+steps). -/
+def Run.proxyStale : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .conn .dmn, .snap,
+   .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent]
+
+theorem breaks_proxyStale :
+    after (replay Today.flags Runs.proxy Run.proxyStale (init Runs.proxy))
+      staleAtPublication := by decide
+
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.proxyStaleDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .conn .dmn]
+
+theorem design_refuses_proxyStale :
+    replay Design.rules Runs.proxy Run.proxyStaleDesign (init Runs.proxy) = none
+    ∧ (replay Design.rules Runs.proxy (Run.proxyStaleDesign.take 6) (init Runs.proxy)).isSome = true := by decide
 
 /-- **#1936.** The host's `snapshot create` dies after the prepare: nothing opens the source's gate (9
 steps). -/
@@ -258,8 +420,8 @@ theorem breaks_hostDies :
       (stuck Today.cookieB Runs.host) := by decide
 
 theorem design_keeps_hostDies :
-    ¬ after (replay Design.rules Runs.host Run.hostDies (init Runs.host))
-      (stuck Design.rules Runs.host) := by decide
+    (replay Design.rules Runs.host Run.hostDies (init Runs.host)).map
+      (stuck Design.rules Runs.host) = some false := by decide
 
 /-! ## Breaks the search found in PR #2124 at its head -/
 
@@ -275,9 +437,14 @@ theorem breaks_earlySnapshot :
     after (replay Today.cookieB Runs.early Run.earlySnapshot (init Runs.early))
       staleAtPublication := by decide
 
-theorem design_keeps_earlySnapshot :
-    ¬ after (replay Design.rules Runs.early Run.earlySnapshot (init Runs.early))
-      staleAtPublication := by decide
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.earlySnapshotDesign : List Label :=
+  [.pkt .a .plain .syn, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .restore, .snap]
+
+theorem design_refuses_earlySnapshot :
+    replay Design.rules Runs.early Run.earlySnapshotDesign (init Runs.early) = none
+    ∧ (replay Design.rules Runs.early (Run.earlySnapshotDesign.take 11) (init Runs.early)).isSome = true := by decide
 
 /-- The same with a prepare that fails: its rollback opens the gate (13 steps). -/
 def Run.earlySnapshotFails : List Label :=
@@ -288,9 +455,14 @@ theorem breaks_earlySnapshotFails :
     after (replay Today.cookieB Runs.earlyFails Run.earlySnapshotFails (init Runs.earlyFails))
       staleAtPublication := by decide
 
-theorem design_keeps_earlySnapshotFails :
-    ¬ after (replay Design.rules Runs.earlyFails Run.earlySnapshotFails (init Runs.earlyFails))
-      staleAtPublication := by decide
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.earlySnapshotFailsDesign : List Label :=
+  [.pkt .a .plain .syn, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .restore, .snap]
+
+theorem design_refuses_earlySnapshotFails :
+    replay Design.rules Runs.earlyFails Run.earlySnapshotFailsDesign (init Runs.earlyFails) = none
+    ∧ (replay Design.rules Runs.earlyFails (Run.earlySnapshotFailsDesign.take 11) (init Runs.earlyFails)).isSome = true := by decide
 
 /-- A snapshot of a clone whose restore begins between the prepare and the pause: the image holds
 `tcp_syncookies` at 0 (20 steps). -/
@@ -302,9 +474,14 @@ theorem breaks_earlySnapshotCaptures :
     after (replay Today.cookieB Runs.early Run.earlySnapshotCaptures (init Runs.early))
       capturedChange := by decide
 
-theorem design_keeps_earlySnapshotCaptures :
-    ¬ after (replay Design.rules Runs.early Run.earlySnapshotCaptures (init Runs.early))
-      capturedChange := by decide
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.earlySnapshotCapturesDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .restore, .snap]
+
+theorem design_refuses_earlySnapshotCaptures :
+    replay Design.rules Runs.early Run.earlySnapshotCapturesDesign (init Runs.early) = none
+    ∧ (replay Design.rules Runs.early (Run.earlySnapshotCapturesDesign.take 10) (init Runs.early)).isSome = true := by decide
 
 /-- **Can a snapshot capture `tcp_syncookies` at 0?** Yes. A restore that fails after
 `refuse_syn_cookies` leaves the 0 and goes to `shutdown_vm`; a `snapshot create` asked of the
@@ -319,9 +496,14 @@ theorem breaks_failedCloneSnapshot :
     after (replay Today.cookieB Runs.earlyFails Run.failedCloneSnapshot (init Runs.earlyFails))
       capturedChange := by decide
 
-theorem design_keeps_failedCloneSnapshot :
-    ¬ after (replay Design.rules Runs.earlyFails Run.failedCloneSnapshot (init Runs.earlyFails))
-      capturedChange := by decide
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.failedCloneSnapshotDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .restore, .agent, .agentFail, .snap]
+
+theorem design_refuses_failedCloneSnapshot :
+    replay Design.rules Runs.earlyFails Run.failedCloneSnapshotDesign (init Runs.earlyFails) = none
+    ∧ (replay Design.rules Runs.earlyFails (Run.failedCloneSnapshotDesign.take 12) (init Runs.earlyFails)).isSome = true := by decide
 
 /-- The clone of that image: it is restored, and the only step its agent has left is the
 power-off. -/
@@ -333,58 +515,37 @@ theorem failedCloneSnapshotEnds :
         (Run.failedCloneSnapshot ++ [.restore, .agent]) (init Runs.earlyFails)) = none := by
   decide
 
-/-- fc-agent is killed during the retirement (after `refuse_syn_cookies`, with egress open, before the
-manifest is removed) and systemd restarts it. The second run of the restore reads 0, has nothing
-to write back, and the clone is published without SYN cookies for good; every snapshot of it
-carries the 0 (38 steps). -/
-def Run.restartCookies : List Label :=
-  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
-   .kill, .restart, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
-   .agent, .agent, .agent, .agent, .agent, .agent]
+/-- fc-agent dies between the prepare and the reopen. The one-shots are exec'd through it, so the
+host's resume one-shot cannot run, `snapshot create` returns its error, and the source keeps what
+the prepare had installed. On Firecracker the restarted agent fetches its boot plan over MMDS,
+behind the closed egress half, and never gets it: the source stays gated for good (4 steps). -/
+def Run.agentDies : List Label :=
+  [.snap, .snap, .kill, .snap]
 
-theorem breaks_restartCookies :
-    after (replay Today.cookieB Runs.kills Run.restartCookies (init Runs.kills))
-      (lastingChange Runs.kills) := by decide
+theorem breaks_agentDies :
+    after (replay Today.cookieB Runs.kills Run.agentDies (init Runs.kills))
+      (stuck Today.cookieB Runs.kills) := by decide
 
-theorem design_keeps_restartCookies :
-    ¬ after (replay Design.rules Runs.kills Run.restartCookies (init Runs.kills))
-      (lastingChange Runs.kills) := by decide
+theorem design_keeps_agentDies :
+    (replay Design.rules Runs.kills Run.agentDies (init Runs.kills)).map
+      (stuck Design.rules Runs.kills) = some false := by decide
 
-/-- fc-agent is killed after the retirement. The second run of the restore finds the egress half gone
-and closes it again: the daemons whose connections were just retired reconnect into a reset (25
+/-- The same run read as P1: `snapshot create` is over and the source has a half of the gate (4
 steps). -/
-def Run.restartEgress : List Label :=
-  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
-   .agent, .kill, .restart, .agent, .agent]
+def Run.agentDiesSource : List Label :=
+  [.snap, .snap, .kill, .snap]
 
-theorem breaks_restartEgress :
-    after (replay Today.cookieB Runs.kills Run.restartEgress (init Runs.kills))
-      workloadBehindEgress := by decide
+theorem breaks_agentDiesSource :
+    after (replay Today.cookieB Runs.kills Run.agentDiesSource (init Runs.kills))
+      sourceDisturbed := by decide
 
-theorem design_keeps_restartEgress :
-    ¬ after (replay Design.rules Runs.kills Run.restartEgress (init Runs.kills))
-      workloadBehindEgress := by decide
-
-/-- fc-agent is killed after egress opened and a process connected out. The second run's list is taken
-with that connection in it and retires it (34 steps). -/
-def Run.restartRetires : List Label :=
-  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
-   .conn .dmn, .kill, .restart, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
-   .agent, .agent, .agent]
-
-theorem breaks_restartRetires :
-    after (replay Today.cookieB Runs.kills Run.restartRetires (init Runs.kills))
-      generationBroken := by decide
-
-theorem design_keeps_restartRetires :
-    ¬ after (replay Design.rules Runs.kills Run.restartRetires (init Runs.kills))
-      generationBroken := by decide
+theorem design_keeps_agentDiesSource :
+    (replay Design.rules Runs.kills Run.agentDiesSource (init Runs.kills)).map
+      sourceDisturbed = some false := by decide
 
 /-- The prepare one-shot is killed inside the receive barrier: `/sys/kernel/rcu_expedited` stays 1 on
-the source after the snapshot has failed and the gate is open again (7 steps). -/
+the source after the snapshot has failed and the gate is open again. Written by hand: in this
+configuration the search reports the shorter `agentDiesSource` (7 steps). -/
 def Run.barrierKill : List Label :=
   [.snap, .snap, .snap, .snap, .snapKill, .snap, .snap]
 
@@ -393,8 +554,22 @@ theorem breaks_barrierKill :
       sourceDisturbed := by decide
 
 theorem design_keeps_barrierKill :
-    ¬ after (replay Design.rules Runs.kills Run.barrierKill (init Runs.kills))
-      sourceDisturbed := by decide
+    (replay Design.rules Runs.kills Run.barrierKill (init Runs.kills)).map
+      sourceDisturbed = some false := by decide
+
+/-- And every later snapshot of that guest captures the 1: the next barrier finds the switch on and
+leaves it on (16 steps). -/
+def Run.barrierKillCaptured : List Label :=
+  [.snap, .snap, .snap, .snap, .snapKill, .snap, .snap,
+   .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap]
+
+theorem breaks_barrierKillCaptured :
+    after (replay Today.cookieB Runs.kills Run.barrierKillCaptured (init Runs.kills))
+      capturedChange := by decide
+
+theorem design_keeps_barrierKillCaptured :
+    (replay Design.rules Runs.kills Run.barrierKillCaptured (init Runs.kills)).map
+      capturedChange = some false := by decide
 
 /-- A boundary held past the payload freeze's deadline: the watchdog thaws the container while both
 halves of the clone's gate are closed (11 steps). -/
@@ -406,9 +581,9 @@ theorem breaks_watchdogThaw :
     after (replay Today.cookieB Runs.slow Run.watchdogThaw (init Runs.slow))
       workloadBehindEgress := by decide
 
-theorem design_keeps_watchdogThaw :
-    ¬ after (replay Design.rules Runs.slow Run.watchdogThaw (init Runs.slow))
-      workloadBehindEgress := by decide
+theorem design_refuses_watchdogThaw :
+    replay Design.rules Runs.slow Run.watchdogThaw (init Runs.slow) = none
+    ∧ (replay Design.rules Runs.slow (Run.watchdogThaw.take 10) (init Runs.slow)).isSome = true := by decide
 
 /-- The resume one-shot fails to open the gate. It removes the manifest, thaws, exits non-zero, and
 nothing tries again: the source stays gated (11 steps). -/
@@ -421,8 +596,22 @@ theorem breaks_reopenFails :
       sourceDisturbed := by decide
 
 theorem design_keeps_reopenFails :
-    ¬ after (replay Design.rules Runs.fails Run.reopenFails (init Runs.fails))
-      sourceDisturbed := by decide
+    (replay Design.rules Runs.fails Run.reopenFails (init Runs.fails)).map
+      sourceDisturbed = some false := by decide
+
+/-- The same run read as P6: the gate is closed and no step of the system is left that would open it
+(11 steps). -/
+def Run.reopenFailsStuck : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snapFail]
+
+theorem breaks_reopenFailsStuck :
+    after (replay Today.cookieB Runs.fails Run.reopenFailsStuck (init Runs.fails))
+      (stuck Today.cookieB Runs.fails) := by decide
+
+theorem design_keeps_reopenFailsStuck :
+    (replay Design.rules Runs.fails Run.reopenFailsStuck (init Runs.fails)).map
+      (stuck Design.rules Runs.fails) = some false := by decide
 
 /-- The write of `tcp_syncookies` back fails three times: the clone is published without SYN cookies,
 with a warning (documented in the PR) (26 steps). -/
@@ -436,8 +625,8 @@ theorem breaks_writeBackFails :
       (lastingChange Runs.fails) := by decide
 
 theorem design_keeps_writeBackFails :
-    ¬ after (replay Design.rules Runs.fails Run.writeBackFails (init Runs.fails))
-      (lastingChange Runs.fails) := by decide
+    (replay Design.rules Runs.fails Run.writeBackFails (init Runs.fails)).map
+      (lastingChange Runs.fails) = some false := by decide
 
 /-! ## UDP -/
 
@@ -452,13 +641,9 @@ theorem breaks_replyDatagram :
     after (replay Today.cookieB Runs.udp Run.replyDatagram (init Runs.udp))
       replyDatagram := by decide
 
-/-- The design does not change this. Its restore has one more step before the UDP rule. -/
-def Run.replyDatagramDesign : List Label :=
-  [.udpS, .snap, .snap, .snap, .snap, .snap, .snap,
-   .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .udpR]
-
+/-- The design does not change this. -/
 theorem design_too_replyDatagram :
-    after (replay Design.rules Runs.udp Run.replyDatagramDesign (init Runs.udp))
+    after (replay Design.rules Runs.udp Run.replyDatagram (init Runs.udp))
       replyDatagram := by decide
 
 /-- Without the host's gate, a client's datagram reaches a clone between its resume and its UDP rule

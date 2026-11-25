@@ -63,7 +63,6 @@ def whoName : Who → String
   | .dmn => "a process outside the container"
 
 def stepName : RStep → String
-  | .journal => "writes the restore's record under /run"
   | .cookiesOff => "refuse_syn_cookies: writes 0 to tcp_syncookies"
   | .verify => "verifies the inherited gate (is_closed), closing it if it does not verify"
   | .udp => "gate_udp_ingress: adds the UDP rule"
@@ -80,10 +79,15 @@ def stepName : RStep → String
   | .hook => "runs the restore hook"
   | .ingress => "open: removes the rest of the gate (ingress opens)"
   | .cookiesBack => "restore_syn_cookies: writes tcp_syncookies back"
-  | .unjournal => "removes the restore's record"
 
-def snapName (s : State) (byGuard : Bool) : String :=
+def snapName (R : Rules) (s : State) (byGuard : Bool) : String :=
   let who := if byGuard then "the guard" else "the host"
+  let reopen (what : String) : String :=
+    if R.reopenRetry && retryMax ≤ s.tries then
+      s!"{who} ends the guest it could not reopen"
+    else if s.ag then s!"{what}: the gate is opened"
+    else if R.reopenRetry then s!"{what}: no fc-agent answers the exec; it will try again"
+    else s!"{what}: no fc-agent answers the exec; snapshot create returns its error"
   match s.sp with
   | .idle => "the host starts snapshot create: the prepare one-shot freezes the container"
   | .frozen => "prepare: close, IPv4 chains and hooks"
@@ -93,11 +97,11 @@ def snapName (s : State) (byGuard : Bool) : String :=
   | .bar => "prepare: dumps the IPv4 sockets"
   | .dump4 => "prepare: dumps the IPv6 sockets"
   | .dump6 => "prepare: saves the manifest and exits 0"
-  | .saved => if byGuard then "the guard runs the resume one-shot: the gate is opened"
+  | .saved => if byGuard then reopen "the guard runs the resume one-shot"
               else "the host pauses the VM: the memory image is this state"
   | .paused => s!"{who} resumes the VM (the run stays with the source)"
-  | .resumed => s!"{who} runs the resume one-shot: the gate is opened"
-  | .aborted => s!"{who} runs the resume one-shot after the failed prepare: the gate is opened"
+  | .resumed => reopen s!"{who} runs the resume one-shot"
+  | .aborted => reopen s!"{who} runs the resume one-shot after the failed prepare"
   | .opened => "resume one-shot: removes the manifest, thaws the container, exits"
 
 def describe (R : Rules) (l : Label) (s : State) : String :=
@@ -118,24 +122,30 @@ def describe (R : Rules) (l : Label) (s : State) : String :=
   | .pair b => if b then "a process connects to a loopback listener from the guest's own address"
                else "a process opens a loopback connection inside the guest"
   | .unpair _ => "that connection inside the guest is closed"
-  | .snap => snapName s false
-  | .guard => snapName s true
+  | .snap => snapName R s false
+  | .guard => snapName R s true
   | .snapFail => match s.sp with
-    | .resumed | .aborted => "the resume one-shot fails to open the gate; it removes the manifest, thaws and exits non-zero"
+    | .resumed | .aborted =>
+      if R.reopenRetry then "the resume one-shot fails to open the gate; it will be tried again"
+      else "the resume one-shot fails to open the gate; it removes the manifest, thaws and exits non-zero"
     | _ => "the prepare step fails: the one-shot rolls back (gate opened, thaw) and exits non-zero"
   | .snapKill => "the prepare one-shot is killed"
   | .hostDie => "the host's snapshot create dies"
   | .restore => "a clone is restored from the image and resumed (the run follows the clone)"
   | .agent => match nextStep R s with
     | some r => if r == .load && s.man.isNone then "restore: store.load() finds no manifest: the restore fails closed"
+                else if r == .cookiesBack && R.backFails && retryMax ≤ s.tries then
+                  "restore: the write of tcp_syncookies has failed three times: the restore fails"
                 else s!"restore: {stepName r}"
     | none => "restore"
   | .agentFail => match nextStep R s with
-    | some .cookiesBack => "restore: the write of tcp_syncookies fails three times; the restore goes on with a warning"
+    | some .cookiesBack =>
+      if R.backFails then "restore: the write of tcp_syncookies fails; it is tried again"
+      else "restore: the write of tcp_syncookies fails three times; the restore goes on with a warning"
     | some r => s!"restore: FAILS at the step that {stepName r}; the restore fails closed"
     | none => "restore fails"
-  | .kill => "fc-agent is killed"
-  | .restart => "systemd restarts fc-agent"
+  | .kill => "fc-agent is killed; systemd kills the container and any one-shot with it"
+  | .restart => "systemd restarts fc-agent: it fetches its boot plan and runs its boot path"
   | .off => "shutdown_vm(1): the clone powers off"
   | .timeout => "the host gives up waiting for the restore and ends the VM"
   | .watchdog => "the payload-freeze watchdog thaws the container"
@@ -156,8 +166,9 @@ def showState (s : State) : String :=
     ++ (match s.man with
         | some m => s!" manifest={m}"
         | none => "")
-    ++ (if s.lst.isEmpty then "" else s!" list={s.lst}") ++ b "record" s.jr
-    ++ sp ++ rp ++ b "agent-dead" (!s.ag) ++ b "host-dead" (!s.host)
+    ++ (if s.lst.isEmpty then "" else s!" list={s.lst}")
+    ++ sp ++ rp ++ b "agent-dead" (!s.ag) ++ b "container-dead" (!s.up) ++ b "host-dead" (!s.host)
+    ++ (if s.tries == 0 then "" else s!" tries={s.tries}") ++ b "old-epoch" s.again
     ++ s!" socks={s.socks.map showSock}"
     ++ (match s.ctA with
         | some c => " ct(A)=" ++ (strip (reprStr c)).replace "CtSt." ""
@@ -168,7 +179,8 @@ def showState (s : State) : String :=
     ++ (match s.ctB with
         | some c => " ct(B)=" ++ (strip (reprStr c)).replace "CtSt." ""
         | none => "")
-    ++ b "ct(udp-in)" s.ctUin ++ b "ct(udp-out)" s.ctUout ++ b "tracker-lag" s.lag
+    ++ b "ct(udp-in)" s.ctUin ++ b "ct(udp-out)" s.ctUout ++ b "tracker-lag4" s.lag4
+    ++ b "tracker-lag6" s.lag6
 
 /-! ## The properties, by name -/
 
@@ -247,25 +259,104 @@ def allRuns : List Run := Gate.runs.map (fun (n, w, c) => { name := n, what := w
 def books : List Rules :=
   [Today.main, Today.flags, Today.cookieA, Today.cookieB, Today.cookieBOneLook, Design.rules]
 
-def printTrace (R : Rules) (r : Run) (f : Found) (check : String) (i : Nat) : IO Unit := do
-  let path := pathTo f i
-  IO.println s!"\n### {R.name} / {r.name}: {check} ({path.length} steps)"
+/-- Print one run: its steps in words, the state it ends in, the run as a Lean term, and the
+same run under the design. -/
+def printRun (R : Rules) (r : Run) (title : String) (check : String) (labels : List Label) :
+    IO Unit := do
+  IO.println s!"\n### {title}: {check} ({labels.length} steps)"
+  let mut st := init r.cfg
   let mut n := 1
-  for (p, li) in path do
-    let l := allLabels[li]!
-    IO.println s!"  {n}. {describe R l f.states[p]!}"
-    n := n + 1
-  IO.println s!"  => {showState f.states[i]!}"
-  let terms := path.map (fun (_, li) => labelTerm allLabels[li]!)
-  IO.println s!"  [{", ".intercalate terms}]"
+  let mut possible := true
+  for l in labels do
+    if possible then
+      IO.println s!"  {n}. {describe R l st}"
+      n := n + 1
+      match step R r.cfg l st with
+      | some t => st := t
+      | none => possible := false
+  let holds := match (checks R r.cfg).find? (·.1 == check) with
+    | some (_, f) => f st
+    | none => false
+  if !possible then IO.println "  NOT POSSIBLE under this rule book"
+  else if !holds then IO.println "  NOT BROKEN at its end under this rule book"
+  IO.println s!"  => {showState st}"
+  IO.println s!"  [{", ".intercalate (labels.map labelTerm)}]"
+  -- The same run under the design. Where the run has the agent do a restore step, the design
+  -- does its own steps up to and including that one, so the two restores are at the same
+  -- place whatever their orders. Then: is the run possible, and does the test hold at its end.
+  let mut so := init r.cfg
+  let mut sd := init r.cfg
+  let mut out : List Label := []
+  let mut refused := false
+  for l in labels do
+    if refused then break
+    let todo : List Label :=
+      if l == .agent then
+        match nextStep R so with
+        | some rs =>
+          if Design.rules.restore.contains rs then
+            -- how many design steps until `rs` has run
+            match sd.rp with
+            | .at n =>
+              match Design.rules.restore.findIdx? (· == rs) with
+              | some i => if n ≤ i then List.replicate (i - n + 1) Label.agent else []
+              | none => []
+            -- the design's restore is over: it has done this step already
+            | .done => []
+            | _ => [Label.agent]
+          else []
+        | none => [l]
+      else [l]
+    match step R r.cfg l so with
+    | some t => so := t
+    | none => pure ()
+    for d in todo do
+      if !refused then
+        out := out ++ [d]
+        match step Design.rules r.cfg d sd with
+        | some t => sd := t
+        | none => refused := true
+  let test := (checks Design.rules r.cfg).find? (·.1 == check)
+  let broken := match test with
+    | some (_, f) => f sd
+    | none => false
+  IO.println s!"  design-run: [{", ".intercalate (out.map labelTerm)}]"
+  if refused then
+    IO.println s!"  design: refuses step {out.length}"
+  else
+    IO.println s!"  design: runs, {if broken then "broken" else "holds"}"
+
+
+def printTrace (R : Rules) (r : Run) (f : Found) (check : String) (i : Nat) : IO Unit :=
+  printRun R r s!"{R.name} / {r.name}" check ((pathTo f i).map (fun (_, li) => allLabels[li]!))
+
+/-- Runs written by hand: a break the search reports only through a shorter run of another
+kind, written out so that it is recorded as itself. `Breaks.lean` checks each. -/
+def handRuns : List (String × Rules × String × String × List Label) := [
+  ("staleTupleGrown", Today.main, "routed", "P3 staleAtPublication",
+    [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+     .pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .detach, .pkt .a .plain .fin,
+     .snap, .snap, .snap, .snap, .snap, .snap, .pkt .a .plain .syn, .snap, .snap, .snap,
+     .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+     .agent]),
+  ("reusedTuple", Today.main, "nat", "P3 smuggledLate",
+    [.pkt .a .plain .syn, .pkt .a .plain .ack,
+     .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .restore,
+     .agent, .agent, .agent, .agent, .agent, .agent, .agent, .pkt .a .plain .syn]),
+  ("barrierKill", Today.cookieB, "kills", "P1 sourceDisturbed",
+    [.snap, .snap, .snap, .snap, .snapKill, .snap, .snap]),
+  ("failedCloneSnapshot", Today.cookieB, "early-fails", "P5 capturedChange",
+    [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .restore, .agent,
+     .agentFail, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap])]
 
 def main (args : List String) : IO Unit := do
   let traces := args.contains "traces"
-  let named := args.filter (· != "traces")
+  let limits := args.filterMap (fun a => if a.startsWith "limit=" then (a.drop 6).toNat? else none)
+  let named := args.filter (fun a => a != "traces" && !a.startsWith "limit=")
   let bookNames := books.map (·.name)
   let onlyBooks := named.filter (bookNames.contains ·)
   let only := named.filter (!bookNames.contains ·)
-  let limit := 20000000
+  let limit := limits.head?.getD 20000000
   for r in allRuns do
     -- the two `all-` runs are large: they run when named
     if (only.isEmpty && !r.name.startsWith "all-") || only.contains r.name then
@@ -287,3 +378,8 @@ def main (args : List String) : IO Unit := do
             match f.first[ci]! with
             | some i => printTrace R r f cs[ci]!.1 i
             | none => pure ()
+  if traces && named.isEmpty then
+    for (name, R, run, check, labels) in handRuns do
+      match allRuns.find? (·.name == run) with
+      | some r => printRun R r s!"HAND {name} / {R.name} / {r.name}" check labels
+      | none => pure ()

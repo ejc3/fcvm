@@ -5,8 +5,9 @@ import GateVerify.Properties
 # The invariant of the design: what holds in every reachable state
 
 Two parts. `Scal` is about the settings, the rules and the phases: for each place a snapshot or a
-restore can be, what the gate, `tcp_syncookies`, `rcu_expedited`, the freeze, the manifest and the
-restore's record are there. `Socks` (below) is about the sockets and the lists of cookies.
+restore can be, what the gate, `tcp_syncookies`, `rcu_expedited`, the freeze, the manifest and
+the agent are there. `Flags` is about the records a step leaves when it breaks a property. The
+sockets and the lists of cookies are in `Socks.lean` and `Gens.lean`.
 
 Each is shown to hold at `init` and to be kept by every step of `Design.rules`, whatever the
 configuration. `Proofs.lean` reads the properties off them.
@@ -21,38 +22,61 @@ set_option linter.unusedVariables false
 
 /-- A guest no restore is running on: a source, or a published clone. -/
 def SrcOk (C : Cfg) (s : State) : Prop :=
-  s.sc = C.sc0 ∧ s.jr = false ∧ s.udp = false
+  s.sc = C.sc0 ∧ s.udp = false ∧ s.again = false
   ∧ (s.rcu = true → (s.sp = .barIn ∧ s.rcuOwn = true) ∨ s.sp = .aborted)
   ∧ (s.sp = .closed4 → s.in4 = true ∧ s.out4 = true)
   ∧ (s.sp = .closed ∨ s.sp = .barIn ∨ s.sp = .bar ∨ s.sp = .dump4 ∨ s.sp = .dump6
       ∨ s.sp = .saved ∨ s.sp = .paused ∨ s.sp = .resumed →
         s.in4 = true ∧ s.in6 = true ∧ s.out4 = true ∧ s.out6 = true)
   ∧ (inPrepare s = true ∨ s.sp = .paused → s.frozen = true)
+  ∧ (s.sp = .frozen ∨ s.sp = .closed4 ∨ s.sp = .closed ∨ s.sp = .barIn ∨ s.sp = .bar
+      ∨ s.sp = .dump4 ∨ s.sp = .dump6 → s.ag = true)
   ∧ (s.sp = .idle ∨ s.sp = .opened →
         s.in4 = false ∧ s.in6 = false ∧ s.out4 = false ∧ s.out6 = false)
-  ∧ (s.sp = .idle → s.man = none)
-  ∧ (s.rp = .done → s.cut = true)
+  ∧ (s.sp = .idle → s.man = none ∧ (s.frozen = false ∨ s.up = false))
+  ∧ (s.rp = .done → s.cut = true ∧ s.plan = false)
 
 /-- A clone whose agent has completed `n` steps of the design's restore. -/
 def CloneOk (C : Cfg) (n : Nat) (s : State) : Prop :=
-  n < 18 ∧ s.sp = .idle ∧ s.waiting = true
-  ∧ (n ≤ 15 → s.in4 = true ∧ s.in6 = true)
-  ∧ (16 ≤ n → s.in4 = false ∧ s.in6 = false ∧ s.udp = false)
-  ∧ (n ≤ 10 → s.out4 = true ∧ s.out6 = true)
-  ∧ (11 ≤ n → s.out4 = false ∧ s.out6 = false)
-  ∧ (n ≤ 13 → s.frozen = true)
-  ∧ (n ≤ 11 → s.cut = false) ∧ (12 ≤ n → s.cut = true)
-  ∧ (n = 0 → s.jr = false) ∧ (1 ≤ n → s.jr = true ∧ s.jrSc = C.sc0)
-  ∧ (n ≤ 1 ∨ n = 17 → s.sc = C.sc0) ∧ (2 ≤ n → n ≤ 16 → s.sc = false)
-  ∧ (s.rcu = true → n = 5) ∧ (n = 5 → s.ag = true → s.rcuOwn = true)
-  ∧ (13 ≤ n → s.man = none)
+  n < 16 ∧ s.sp = .idle ∧ s.waiting = true ∧ s.plan = false ∧ s.again = false
+  ∧ (n ≤ 14 → s.in4 = true ∧ s.in6 = true)
+  ∧ (15 ≤ n → s.in4 = false ∧ s.in6 = false ∧ s.udp = false)
+  ∧ (n ≤ 9 → s.out4 = true ∧ s.out6 = true)
+  ∧ (10 ≤ n → s.out4 = false ∧ s.out6 = false)
+  ∧ (n ≤ 12 → s.frozen = true) ∧ (13 ≤ n → s.frozen = false)
+  ∧ (n ≤ 10 → s.cut = false) ∧ (11 ≤ n → s.cut = true)
+  ∧ (n = 0 → s.sc = C.sc0 ∧ s.saved = none) ∧ (1 ≤ n → s.sc = false)
+  ∧ (1 ≤ n → s.ag = true → s.saved = if C.sc0 then some true else none)
+  ∧ (3 ≤ n → n ≤ 14 → s.udp = true)
+  ∧ (s.rcu = true → n = 4) ∧ (n = 4 → s.ag = true → s.rcuOwn = true)
+  ∧ (12 ≤ n → s.man = none)
 
-/-- A clone whose restore failed: closed as it was, on its way to the power-off. -/
+/-- A clone whose restore failed: on its way to the power-off. Closed as it was, unless it
+failed at the write of `tcp_syncookies` back, after its ingress had opened. -/
 def FailedOk (s : State) : Prop :=
-  s.sp = .idle ∧ s.waiting = true
+  s.sp = .idle ∧ s.waiting = true ∧ s.plan = false ∧ s.again = false
   ∧ (s.cut = false → s.in4 = true ∧ s.in6 = true)
   ∧ (s.cut = true → s.in4 = true ∨ s.in6 = true → s.sc = false)
   ∧ (s.in4 = s.in6)
+
+namespace CloneOk
+
+variable {C : Cfg} {n : Nat} {s : State}
+
+theorem lt (h : CloneOk C n s) : n < 16 := h.1
+theorem idle (h : CloneOk C n s) : s.sp = .idle := h.2.1
+theorem waits (h : CloneOk C n s) : s.waiting = true := h.2.2.1
+theorem noPlan (h : CloneOk C n s) : s.plan = false := h.2.2.2.1
+theorem once (h : CloneOk C n s) : s.again = false := h.2.2.2.2.1
+theorem inn (h : CloneOk C n s) (hn : n ≤ 14) : s.in4 = true ∧ s.in6 = true := h.2.2.2.2.2.1 hn
+theorem out (h : CloneOk C n s) (hn : n ≤ 9) : s.out4 = true ∧ s.out6 = true :=
+  h.2.2.2.2.2.2.2.1 hn
+theorem scOff (h : CloneOk C n s) (hn : 1 ≤ n) : s.sc = false :=
+  h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 hn
+theorem udpIn (h : CloneOk C n s) (h3 : 3 ≤ n) (h14 : n ≤ 14) : s.udp = true :=
+  h.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.2.1 h3 h14
+
+end CloneOk
 
 def Scal (C : Cfg) (s : State) : Prop :=
   s.pw = true →
@@ -68,14 +92,15 @@ theorem scal_init (C : Cfg) : Scal C (init C) := by
 
 /-- The fields `Scal` reads. A step that leaves them alone keeps `Scal`. -/
 def State.scal (s : State) :=
-  (s.pw, s.rp, s.sp, s.sc, s.jr, s.jrSc, s.udp, s.rcu, s.rcuOwn, s.in4, s.in6, s.out4, s.out6,
-   s.frozen, s.man, s.cut, s.waiting, s.ag)
+  (s.pw, s.rp, s.sp, s.sc, s.udp, s.rcu, s.rcuOwn, s.in4, s.in6, s.out4, s.out6,
+   s.frozen, s.man, s.cut, s.waiting, s.ag, s.plan, s.again, s.saved, s.up, s.tries)
 
 theorem scal_congr {C : Cfg} {s t : State} (h : t.scal = s.scal) (hi : Scal C s) : Scal C t := by
   simp only [State.scal, Prod.mk.injEq] at h
-  obtain ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18⟩ := h
+  obtain ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19,
+    h20, -⟩ := h
   unfold Scal SrcOk CloneOk FailedOk inPrepare at *
-  rw [h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18]
+  rw [h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20]
   exact hi
 
 @[simp] theorem ctSet_scal (s : State) (c : Cli) (p : Port) (v : Option CtSt) :
@@ -109,9 +134,8 @@ theorem scal_congr {C : Cfg} {s t : State} (h : t.scal = s.scal) (hi : Scal C s)
 @[simp] theorem answered_scal (tr : Bool) (c : Cli) (p : Port) (seg : Seg) (r : Bool) (s : State) :
     (answered tr c p seg r s).scal = s.scal := by
   unfold answered
-  split
-  · rfl
-  · split <;> simp
+  repeat' split
+  all_goals first | rfl | simp
 
 /-- Closes `f s = some t → t.scal = s.scal` for a step `f` that is unfolded in the goal. -/
 macro "scal_same" : tactic => `(tactic| (
@@ -159,11 +183,13 @@ theorem unpair_scal {b : Bool} {s t : State} : unpair b s = some t → t.scal = 
 
 /-! ### The system's own steps -/
 
-@[simp] theorem design_journal : Design.rules.restore.contains .journal = true := by decide
+@[simp] theorem getD_sc0 (b : Bool) :
+    (if b = true then some true else none).getD false = b := by
+  cases b <;> rfl
 
-theorem lt18 {n : Nat} (h : n < 18) :
+theorem lt16 {n : Nat} (h : n < 16) :
     n = 0 ∨ n = 1 ∨ n = 2 ∨ n = 3 ∨ n = 4 ∨ n = 5 ∨ n = 6 ∨ n = 7 ∨ n = 8 ∨ n = 9 ∨ n = 10
-      ∨ n = 11 ∨ n = 12 ∨ n = 13 ∨ n = 14 ∨ n = 15 ∨ n = 16 ∨ n = 17 := by
+      ∨ n = 11 ∨ n = 12 ∨ n = 13 ∨ n = 14 ∨ n = 15 := by
   omega
 
 set_option hygiene false in
@@ -182,11 +208,12 @@ macro "open_step" : tactic => `(tactic| (
 /-- What `close_scal` unfolds. -/
 macro "scal_simp" : tactic => `(tactic|
   simp_all [SrcOk, CloneOk, FailedOk, inPrepare, openGate, State.closeGate, State.unpublished,
-    lockRestore, Design.rules, State.gated, State.running, State.dead])
+    lockRestore, Design.rules, Today.cookieB, State.gated, State.running, State.dead, reopened,
+    unreached, retryMax])
 
 set_option hygiene false in
 /-- Closes `Scal C t` from `hi : Scal C s` once `t` is spelled out. For a clone in its restore
-it goes through the eighteen places the restore can be when it must. -/
+it goes through the sixteen places the restore can be when it must. -/
 macro "close_scal" : tactic => `(tactic| (
   unfold Scal at hi ⊢
   intro hpw
@@ -195,9 +222,9 @@ macro "close_scal" : tactic => `(tactic| (
   | «at» n =>
     first
       | (scal_simp; done)
-      | (have hn : n < 18 := by simp_all [CloneOk]
-         rcases lt18 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
-           | h0 | h0 | h0 | h0 <;> subst h0 <;> (try simp only [hr, RP.at.injEq] at *)
+      | (have hn : n < 16 := by simp_all [CloneOk]
+         rcases lt16 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
+           | h0 | h0 <;> subst h0 <;> (try simp only [hr, RP.at.injEq] at *)
            <;> (try subst_vars) <;> scal_simp)
   | _ => scal_simp))
 
@@ -269,10 +296,10 @@ theorem agent_scal {C : Cfg} {s t : State} :
   cases hr : s.rp with
   | «at» n =>
     simp only [hr] at hi
-    have hn : n < 18 := hi.1
-    rcases lt18 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
-      | h0 | h0 | h0 | h0 <;> subst h0 <;>
-      simp [agent, nextStep, hr, Design.rules, doStep, advance, agentRuns] at h <;>
+    have hn : n < 16 := hi.1
+    rcases lt16 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
+      | h0 | h0 <;> subst h0 <;>
+      simp [agent, nextStep, hr, Design.rules, Today.cookieB, doStep, advance, agentRuns] at h <;>
       first
         | (obtain ⟨_, rfl⟩ := h; scal_simp; done)
         | (obtain ⟨_, h⟩ := h; split at h <;> (try simp at h) <;> (try subst h) <;> scal_simp)
@@ -295,11 +322,11 @@ theorem agentFail_scal {C : Cfg} {s t : State} :
   cases hr : s.rp with
   | «at» n =>
     simp only [hr] at hi
-    have hn : n < 18 := hi.1
-    rcases lt18 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
-      | h0 | h0 | h0 | h0 <;> subst h0 <;>
-      simp [agentFail, nextStep, hr, Design.rules, agentRuns] at h <;>
-      (obtain ⟨_, rfl⟩ := h; scal_simp)
+    have hn : n < 16 := hi.1
+    rcases lt16 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
+      | h0 | h0 <;> subst h0 <;>
+      simp [agentFail, nextStep, hr, Design.rules, Today.cookieB, agentRuns] at h <;>
+      (first | (obtain ⟨_, _, rfl⟩ := h) | (obtain ⟨_, rfl⟩ := h)) <;> scal_simp
   | _ => simp [agentFail, nextStep, hr] at h
 
 /-- Every step of the design keeps `Scal`. -/
@@ -348,19 +375,17 @@ theorem reachable_scal {C : Cfg} {s : State} (hr : Reachable Design.rules C s) :
 
 /-! ## The records a step leaves -/
 
-/-- No step has left a record of a break. The client datagram needs the host's gate
-(`Cfg.udpReach = false`). -/
+/-- No step has left a record of a break. -/
 def Flags (C : Cfg) (s : State) : Prop :=
   s.rst = false ∧ s.eg = false ∧ s.hk = false ∧ s.cap = false ∧ s.late = false
-  ∧ (C.udpReach = false → s.udpIn = false)
 
-def State.fl (s : State) := (s.rst, s.eg, s.hk, s.cap, s.late, s.udpIn)
+def State.fl (s : State) := (s.rst, s.eg, s.hk, s.cap, s.late)
 
 theorem flags_congr {C : Cfg} {s t : State} (h : t.fl = s.fl) (hi : Flags C s) : Flags C t := by
   simp only [State.fl, Prod.mk.injEq] at h
-  obtain ⟨h1, h2, h3, h4, h5, h6⟩ := h
+  obtain ⟨h1, h2, h3, h4, h5⟩ := h
   unfold Flags at *
-  rw [h1, h2, h3, h4, h5, h6]
+  rw [h1, h2, h3, h4, h5]
   exact hi
 
 @[simp] theorem ctSet_fl (s : State) (c : Cli) (p : Port) (v : Option CtSt) :
@@ -377,9 +402,8 @@ theorem flags_congr {C : Cfg} {s t : State} (h : t.fl = s.fl) (hi : Flags C s) :
 @[simp] theorem answered_fl (tr : Bool) (c : Cli) (p : Port) (seg : Seg) (r : Bool) (s : State) :
     (answered tr c p seg r s).fl = s.fl := by
   unfold answered
-  split
-  · rfl
-  · split <;> simp
+  repeat' split
+  all_goals first | rfl | simp
 
 @[simp] theorem unanswered_fl (R : Rules) (C : Cfg) (c : Cli) (p : Port) (seg : Seg)
     (s : State) : (unanswered R C c p seg s).fl = s.fl := by
@@ -413,9 +437,9 @@ theorem shut_cut_sc {C : Cfg} {s : State} {f : Fam} (hi : Scal C s) (hpw : s.pw 
   cases hr : s.rp with
   | «at» n =>
     simp only [hr] at hi
-    have hn : n < 18 := hi.1
-    rcases lt18 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
-      | h0 | h0 | h0 | h0 <;> subst h0 <;> cases f <;> simp_all [CloneOk, State.gateIn]
+    have hn : n < 16 := hi.1
+    rcases lt16 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
+      | h0 | h0 <;> subst h0 <;> cases f <;> simp_all [CloneOk, State.gateIn]
   | failed => cases f <;> simp_all [FailedOk, State.gateIn]
   | none => simp_all
   | done => simp_all
@@ -447,21 +471,13 @@ theorem pkt_flags {C : Cfg} {c : Cli} {p : Port} {seg : Seg} {s t : State}
       simp [this] at hsc
     simp [noteLate_fl _ _ this]
 
-theorem udpC_flags {C : Cfg} {s t : State} :
-    udpC Design.rules C s = some t → Flags C s → Flags C t := by
+theorem udpC_fl {R : Rules} {C : Cfg} {s t : State} : udpC R C s = some t → t.fl = s.fl := by
   unfold udpC
   repeat' split
-  all_goals (intro h hi)
-  all_goals (try contradiction)
-  simp only [Option.some.injEq] at h
-  subst h
-  rename_i hreach _
-  obtain ⟨h1, h2, h3, h4, h5, h6⟩ := hi
-  refine ⟨h1, h2, h3, h4, h5, ?_⟩
-  intro hu
-  have h6 := h6 hu
-  cases hun : s.unpublished <;> cases h4' : s.in4 <;> cases h6' : s.in6 <;>
-    simp_all
+  all_goals (intro h)
+  all_goals first
+    | contradiction
+    | (simp only [Option.some.injEq] at h; subst h; rfl)
 
 set_option hygiene false in
 /-- Closes `Flags C t` from `hi : Scal C s` and `hf : Flags C s` once `t` is spelled out. -/
@@ -472,7 +488,8 @@ macro "close_flags" : tactic => `(tactic| (
     | (have hi := hi (by simp_all)
        cases hr : s.rp <;>
          simp_all [Flags, SrcOk, CloneOk, FailedOk, inPrepare, openGate, State.closeGate,
-           State.unpublished, lockRestore, Design.rules, State.gated, State.running, State.dead])))
+           State.unpublished, lockRestore, Design.rules, Today.cookieB, State.gated,
+           State.running, State.dead, reopened, unreached, retryMax])))
 
 set_option hygiene false in
 /-- `open_step` with the records' invariant as a third hypothesis. -/
@@ -548,10 +565,10 @@ theorem agent_flags {C : Cfg} {s t : State} :
   cases hr : s.rp with
   | «at» n =>
     simp only [hr] at hi
-    have hn : n < 18 := hi.1
-    rcases lt18 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
-      | h0 | h0 | h0 | h0 <;> subst h0 <;>
-      simp [agent, nextStep, hr, Design.rules, doStep, advance, agentRuns] at h <;>
+    have hn : n < 16 := hi.1
+    rcases lt16 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
+      | h0 | h0 <;> subst h0 <;>
+      simp [agent, nextStep, hr, Design.rules, Today.cookieB, doStep, advance, agentRuns] at h <;>
       first
         | (obtain ⟨_, rfl⟩ := h; simp_all [Flags, CloneOk, openGate, State.closeGate]; done)
         | (obtain ⟨_, h⟩ := h; split at h <;> (try simp at h) <;> (try subst h) <;>
@@ -561,28 +578,20 @@ theorem agent_flags {C : Cfg} {s t : State} :
 theorem advance_fl (R : Rules) (s : State) : (advance R s).fl = s.fl := by
   unfold advance
   split
-  · split <;> rfl
+  · split
+    · rfl
+    · split <;> rfl
   · rfl
 
-theorem agentFail_flags {C : Cfg} {s t : State} :
-    agentFail Design.rules C s = some t → Flags C s → Flags C t := by
-  intro h hf
-  cases hr : s.rp with
-  | «at» n =>
-    unfold agentFail at h
-    split at h
-    · contradiction
-    · split at h
-      · contradiction
-      · split at h
-        · contradiction
-        · simp only [Option.some.injEq] at h; subst h
-          exact flags_congr (by rw [advance_fl]; rfl) hf
-      · contradiction
-      · simp only [Option.some.injEq] at h; subst h; simpa [Flags] using hf
-  | _ =>
-    unfold agentFail nextStep at h
-    simp [hr] at h
+theorem agentFail_fl {R : Rules} {C : Cfg} {s t : State} :
+    agentFail R C s = some t → t.fl = s.fl := by
+  unfold agentFail
+  repeat' split
+  all_goals (intro h)
+  all_goals first
+    | contradiction
+    | (simp only [Option.some.injEq] at h; subst h; rfl)
+    | (simp only [Option.some.injEq] at h; subst h; rw [advance_fl]; rfl)
 
 /-- The environment's other steps leave the records alone. -/
 macro "fl_same" : tactic => `(tactic| (
@@ -623,7 +632,7 @@ theorem step_flags {C : Cfg} {l : Label} {s t : State}
     (h : step Design.rules C l s = some t) (hi : Scal C s) (hf : Flags C s) : Flags C t := by
   cases l with
   | pkt c p seg => exact flags_congr (pkt_flags hi h) hf
-  | udpC => exact udpC_flags h hf
+  | udpC => exact flags_congr (udpC_fl h) hf
   | udpR => exact flags_congr (udpR_fl h) hf
   | udpS => exact flags_congr (udpS_fl h) hf
   | detach =>
@@ -650,7 +659,7 @@ theorem step_flags {C : Cfg} {l : Label} {s t : State}
   | guard => exact snap_flags h hi hf
   | restore => exact restore_flags h hi hf
   | agent => exact agent_flags h hi hf
-  | agentFail => exact agentFail_flags h hf
+  | agentFail => exact flags_congr (agentFail_fl h) hf
   | kill => exact kill_flags h hi hf
   | restart => exact restart_flags h hi hf
   | off => exact off_flags h hi hf

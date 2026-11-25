@@ -4,14 +4,19 @@ import GateVerify.Socks
 # The invariant over the generations: a retirement destroys nothing it must not
 
 `Sk` (`Socks.lean`) shows a retirement destroys everything it must. `Gn` shows it destroys
-nothing else: every cookie the manifest names is a socket from the image, every cookie the
-restore's own list names is a socket that is not a process's own and has no mirror image left,
-and a connection inside the guest that a process of the clone opened keeps both its ends. So the
-record `bad` is never set.
+nothing else, by cookie or by the reset a destroyed socket sends its other end inside the
+guest: every cookie the manifest names is a socket from the image, and never an end of a
+loopback connection that has both its ends; every cookie the restore's own list names is a
+socket that is not a process's own and has no mirror image left; and a connection inside the
+guest that a process of the clone opened keeps both its ends. So the record `bad` is never set.
 
 `Evo2` adds to `Evo` what a step of the environment or of a process can do to connections
-inside the guest: a new socket is nobody's mirror image unless both ends are new, a socket that
-goes takes its mirror image with it, and a process connects out only with egress open.
+inside the guest: a new socket is of a kind no socket has, and is nobody's mirror image unless
+both ends are new; a socket that goes takes its mirror image with it; and a process connects
+out only with egress open.
+
+The second of those is where the model is narrower than the kernel, which can hold one end of
+such a connection alone (`Limits.lean`).
 -/
 
 namespace Gate
@@ -26,23 +31,34 @@ theorem hasMirror_iff {l : List Sock} {x : Sock} :
   | none => simp
   | some k => simp [List.any_eq_true, beq_iff_eq]
 
+theorem mirror_symm {k k' : Kind} (h : k.mirror = some k') : k'.mirror = some k := by
+  cases k <;> simp [Kind.mirror] at h <;> subst h <;> rfl
+
+theorem loop_peerLo {k : Kind} (h : k.loop = true) : k.peerLo = true := by
+  cases k <;> simp_all [Kind.loop, Kind.peerLo]
+
 structure Gn (s : State) : Prop where
   /-- every cookie in the list and in the manifest has been handed out -/
   g1 : ∀ i ∈ s.lst, i < s.next
   g2 : ∀ i ∈ s.man.getD [], i < s.next
   /-- in a clone, a socket the manifest names is from the image -/
   gM : ∀ n, s.rp = .at n → ∀ x ∈ s.socks, x.id ∈ s.man.getD [] → x.gen = .stale
+  /-- the manifest names no end of a loopback connection that has both its ends: what its
+  second look is for -/
+  gML : ∀ x ∈ s.socks, x.id ∈ s.man.getD [] → x.kind.loop = true → hasMirror s.socks x = false
   /-- while a clone's ingress is closed, no packet from outside has made a socket it may keep -/
-  gF : ∀ n, s.rp = .at n → n ≤ 15 → ∀ x ∈ s.socks, x.gen ≠ .fresh
+  gF : ∀ n, s.rp = .at n → n ≤ 14 → ∀ x ∈ s.socks, x.gen ≠ .fresh
   /-- while a clone's egress is closed, a process has opened only connections inside the guest -/
-  gO : ∀ n, s.rp = .at n → n ≤ 10 → ∀ x ∈ s.socks, x.gen = .own → x.kind.mirror ≠ none
+  gO : ∀ n, s.rp = .at n → n ≤ 9 → ∀ x ∈ s.socks, x.gen = .own → x.kind.mirror ≠ none
   /-- a connection inside the guest that a process opened has both its ends -/
   gP : ∀ x ∈ s.socks, x.gen = .own → ∀ k, x.kind.mirror = some k →
     ∃ y ∈ s.socks, y.kind = k ∧ y.gen = .own
+  /-- one kind, one origin: no two sockets of a kind differ in how they came to be -/
+  gU : ∀ x ∈ s.socks, ∀ y ∈ s.socks, x.kind = y.kind → x.gen = y.gen
   /-- after the IPv6 dump: every cookie in the list is a seen socket's -/
-  gLS : s.rp = .at 9 → s.ag = true → ∀ i ∈ s.lst, ∃ y ∈ s.seen, y.id = i
+  gLS : s.rp = .at 8 → s.ag = true → ∀ i ∈ s.lst, ∃ y ∈ s.seen, y.id = i
   /-- after the second look: a listed socket is not a process's own, and has no mirror image -/
-  gL : ∀ n, s.rp = .at n → 10 ≤ n → n ≤ 11 → s.ag = true → ∀ x ∈ s.socks, x.id ∈ s.lst →
+  gL : ∀ n, s.rp = .at n → 9 ≤ n → n ≤ 10 → s.ag = true → ∀ x ∈ s.socks, x.id ∈ s.lst →
     x.gen ≠ .own ∧ x.gen ≠ .fresh ∧ hasMirror s.socks x = false
   /-- no retirement has destroyed a socket it must not -/
   gB : s.bad = false
@@ -50,6 +66,10 @@ structure Gn (s : State) : Prop where
 /-- What a step of the environment or of a process does to connections inside the guest. `S` are
 the sockets before, `T` after, `next` the next cookie before, `out4` the egress half before. -/
 structure Evo2 (S T : List Sock) (next : Nat) (out4 : Bool) : Prop where
+  /-- a new socket is of a kind no old socket has, and two new ones of a kind came to be the
+  same way -/
+  nk : ∀ z ∈ T, next ≤ z.id → ∀ x ∈ S, x.kind ≠ z.kind
+  nn : ∀ z ∈ T, ∀ z' ∈ T, next ≤ z.id → next ≤ z'.id → z.kind = z'.kind → z.gen = z'.gen
   /-- a new socket is not the mirror image of an old one -/
   nm : ∀ z ∈ T, next ≤ z.id → ∀ x ∈ S, x.kind.mirror ≠ some z.kind
   /-- an old socket stays, or its kind is gone and so is every socket whose mirror image it was -/
@@ -65,10 +85,24 @@ theorem gn_evo {C : Cfg} {s t : State} (hs : Scal C s) (hpw : s.pw = true) (he :
     (he2 : Evo2 s.socks t.socks s.next s.out4) (hb : t.bad = s.bad) (hsc : t.scal = s.scal)
     (hg : Gn s) : Gn t := by
   simp only [State.scal, Prod.mk.injEq] at hsc
-  obtain ⟨-, hrp, -, -, -, -, -, -, -, -, -, -, -, -, -, -, -, hag⟩ := hsc
+  obtain ⟨-, hrp, -, -, -, -, -, -, -, -, -, -, -, -, -, hag, -⟩ := hsc
   have hi := hs hpw
   have hnext := he.next_le
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  -- a socket of `t` that is the mirror image of an old one's is old too
+  have hmir : ∀ x ∈ t.socks, ∀ x0 ∈ s.socks, x0.kind = x.kind → hasMirror s.socks x0 = false →
+      hasMirror t.socks x = false := by
+    intro x hx x0 hx0 h2 c
+    cases hm : hasMirror t.socks x with
+    | false => rfl
+    | true =>
+      exfalso
+      obtain ⟨k, hk, z, hz, hzk⟩ := hasMirror_iff.mp hm
+      rcases he.old z hz with ⟨z0, hz0, -, f2, -⟩ | ⟨f1, -, -⟩
+      · have : hasMirror s.socks x0 = true :=
+          hasMirror_iff.mpr ⟨k, by rw [h2]; exact hk, z0, hz0, by rw [f2]; exact hzk⟩
+        rw [c] at this; cases this
+      · exact he2.nm z hz f1 x0 hx0 (by rw [h2, hk, hzk])
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro i hi'; rw [he.lst] at hi'; have := hg.g1 i hi'; omega
   · intro i hi'; rw [he.man] at hi'; have := hg.g2 i hi'; omega
   · intro n hn x hx hm
@@ -76,23 +110,28 @@ theorem gn_evo {C : Cfg} {s t : State} (hs : Scal C s) (hpw : s.pw = true) (he :
     rcases he.old x hx with ⟨x0, hx0, h1, -, h3⟩ | ⟨h1, -, -⟩
     · rw [← h3]; exact hg.gM n hn x0 hx0 (by rw [h1]; exact hm)
     · have := hg.g2 x.id hm; omega
-  · intro n hn h15 x hx
+  · intro x hx hm hl
+    rw [he.man] at hm
+    rcases he.old x hx with ⟨x0, hx0, h1, h2, -⟩ | ⟨h1, -, -⟩
+    · exact hmir x hx x0 hx0 h2 (hg.gML x0 hx0 (by rw [h1]; exact hm) (by rw [h2]; exact hl))
+    · have := hg.g2 x.id hm; omega
+  · intro n hn h14 x hx
     rw [hrp] at hn
     rcases he.old x hx with ⟨x0, hx0, -, -, h3⟩ | ⟨-, -, h3⟩
-    · rw [← h3]; exact hg.gF n hn h15 x0 hx0
+    · rw [← h3]; exact hg.gF n hn h14 x0 hx0
     · rcases h3 with h3 | ⟨h3, -⟩
       · rw [h3]; simp
-      · simp only [hn, CloneOk] at hi
-        have hin : s.in4 = true ∧ s.in6 = true := hi.2.2.2.1 h15
+      · simp only [hn] at hi
+        have hin : s.in4 = true ∧ s.in6 = true := hi.inn h14
         have : s.shutTo x.kind.fam = true := by
           cases hf : x.kind.fam <;> simp [State.shutTo, State.unpublished, hn, State.gateIn, hin]
         rw [h3]; simp [genIn, this]
-  · intro n hn h10 x hx hown
+  · intro n hn h9 x hx hown
     rw [hrp] at hn
     rcases he.old x hx with ⟨x0, hx0, -, h2, h3⟩ | ⟨h1, -, -⟩
-    · rw [← h2]; exact hg.gO n hn h10 x0 hx0 (by rw [h3]; exact hown)
-    · simp only [hn, CloneOk] at hi
-      have hout : s.out4 = true ∧ s.out6 = true := hi.2.2.2.2.2.1 h10
+    · rw [← h2]; exact hg.gO n hn h9 x0 hx0 (by rw [h3]; exact hown)
+    · simp only [hn] at hi
+      have hout : s.out4 = true ∧ s.out6 = true := hi.out h9
       rcases he2.no x hx h1 hown with h | h
       · exact h
       · rw [hout.1] at h; cases h
@@ -103,24 +142,22 @@ theorem gn_evo {C : Cfg} {s t : State} (hs : Scal C s) (hpw : s.pw = true) (he :
       · exact ⟨y', hy', by rw [e2]; exact hyk, by rw [e3]; exact hyo⟩
       · exact absurd (by rw [hk, hyk]) (hgone x hx).2
     · exact he2.np x hx h1 hown k hk
-  · intro h9 ha i hi'
-    rw [hrp] at h9; rw [hag] at ha; rw [he.lst] at hi'; rw [he.seen]
-    exact hg.gLS h9 ha i hi'
-  · intro n hn h10 h11 ha x hx hl
+  · intro x hx y hy hxy
+    rcases he.old x hx with ⟨x0, hx0, -, a2, a3⟩ | ⟨a1, -, -⟩
+    · rcases he.old y hy with ⟨y0, hy0, -, b2, b3⟩ | ⟨b1, -, -⟩
+      · rw [← a3, ← b3]; exact hg.gU x0 hx0 y0 hy0 (by rw [a2, b2]; exact hxy)
+      · exact absurd (by rw [a2]; exact hxy) (he2.nk y hy b1 x0 hx0)
+    · rcases he.old y hy with ⟨y0, hy0, -, b2, -⟩ | ⟨b1, -, -⟩
+      · exact absurd (by rw [b2]; exact hxy.symm) (he2.nk x hx a1 y0 hy0)
+      · exact he2.nn x hx y hy a1 b1 hxy
+  · intro h8 ha i hi'
+    rw [hrp] at h8; rw [hag] at ha; rw [he.lst] at hi'; rw [he.seen]
+    exact hg.gLS h8 ha i hi'
+  · intro n hn h9 h10 ha x hx hl
     rw [hrp] at hn; rw [hag] at ha; rw [he.lst] at hl
     rcases he.old x hx with ⟨x0, hx0, h1, h2, h3⟩ | ⟨h1, -, -⟩
-    · obtain ⟨a, b, c⟩ := hg.gL n hn h10 h11 ha x0 hx0 (by rw [h1]; exact hl)
-      refine ⟨by rw [← h3]; exact a, by rw [← h3]; exact b, ?_⟩
-      cases hm : hasMirror t.socks x with
-      | false => rfl
-      | true =>
-        exfalso
-        obtain ⟨k, hk, z, hz, hzk⟩ := hasMirror_iff.mp hm
-        rcases he.old z hz with ⟨z0, hz0, -, f2, -⟩ | ⟨f1, -, -⟩
-        · have : hasMirror s.socks x0 = true :=
-            hasMirror_iff.mpr ⟨k, by rw [h2]; exact hk, z0, hz0, by rw [f2]; exact hzk⟩
-          rw [c] at this; cases this
-        · exact he2.nm z hz f1 x0 hx0 (by rw [h2, hk, hzk])
+    · obtain ⟨a, b, c⟩ := hg.gL n hn h9 h10 ha x0 hx0 (by rw [h1]; exact hl)
+      exact ⟨by rw [← h3]; exact a, by rw [← h3]; exact b, hmir x hx x0 hx0 h2 c⟩
     · have := hg.g1 x.id hl; omega
   · rw [hb]; exact hg.gB
 
@@ -128,7 +165,9 @@ theorem gn_evo {C : Cfg} {s t : State} (hs : Scal C s) (hpw : s.pw = true) (he :
 
 theorem e2_same {S : List Sock} {next : Nat} {o : Bool} (hj : ∀ x ∈ S, x.id < next) :
     Evo2 S S next o := by
-  refine ⟨?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro z hz hn; have := hj z hz; omega
+  · intro z hz z' _ hn; have := hj z hz; omega
   · intro z hz hn; have := hj z hz; omega
   · intro x hx; exact Or.inl ⟨x, hx, rfl, rfl, rfl⟩
   · intro z hz hn; have := hj z hz; omega
@@ -144,7 +183,15 @@ theorem e2_upgrade {S : List Sock} {next : Nat} {o : Bool} (k : Kind)
     intro x; split <;> rfl
   have hgen : ∀ x : Sock, (if x.kind == k then { x with st := St.est } else x).gen = x.gen := by
     intro x; split <;> rfl
-  refine ⟨?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro z hz hn
+    simp only [List.mem_map] at hz
+    obtain ⟨x, hx, rfl⟩ := hz
+    have := hj x hx; rw [hid] at hn; omega
+  · intro z hz z' _ hn
+    simp only [List.mem_map] at hz
+    obtain ⟨x, hx, rfl⟩ := hz
+    have := hj x hx; rw [hid] at hn; omega
   · intro z hz hn
     simp only [List.mem_map] at hz
     obtain ⟨x, hx, rfl⟩ := hz
@@ -165,7 +212,9 @@ theorem e2_sub {S T : List Sock} {next : Nat} {o : Bool} (ks : List Kind)
     (hT : ∀ y, y ∈ T ↔ y ∈ S ∧ y.kind ∉ ks)
     (hcl : ∀ k ∈ ks, ∀ k' : Kind, k'.mirror = some k → k' ∈ ks)
     (hj : ∀ x ∈ S, x.id < next) : Evo2 S T next o := by
-  refine ⟨?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro z hz hn; have := hj z ((hT z).mp hz).1; omega
+  · intro z hz z' _ hn; have := hj z ((hT z).mp hz).1; omega
   · intro z hz hn; have := hj z ((hT z).mp hz).1; omega
   · intro x hx
     by_cases hk : x.kind ∈ ks
@@ -181,10 +230,21 @@ theorem e2_sub {S T : List Sock} {next : Nat} {o : Bool} (ks : List Kind)
 
 /-- One new socket: made by a packet, or a process's own with egress open. -/
 theorem e2_add1 {S : List Sock} {next : Nat} {o : Bool} (x : Sock) (hid : x.id = next)
+    (hnk : ∀ y ∈ S, y.kind ≠ x.kind)
     (hnm : ∀ y ∈ S, y.kind.mirror ≠ some x.kind)
     (hg : x.gen ≠ .own ∨ (x.kind.mirror = none ∧ o = false))
     (hj : ∀ y ∈ S, y.id < next) : Evo2 S (ins x S) next o := by
-  refine ⟨?_, ?_, ?_, ?_⟩
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro z hz hn
+    rcases mem_ins.mp hz with rfl | hz
+    · exact hnk
+    · have := hj z hz; omega
+  · intro z hz z' hz' hn hn' _
+    rcases mem_ins.mp hz with rfl | hz
+    · rcases mem_ins.mp hz' with rfl | hz'
+      · rfl
+      · have := hj z' hz'; omega
+    · have := hj z hz; omega
   · intro z hz hn
     rcases mem_ins.mp hz with rfl | hz
     · exact hnm
@@ -207,6 +267,7 @@ theorem e2_add1 {S : List Sock} {next : Nat} {o : Bool} (x : Sock) (hid : x.id =
 sockets of a connect through the proxy with egress open. -/
 theorem e2_add2 {S : List Sock} {next : Nat} {o : Bool} (x1 x2 : Sock) (hid1 : x1.id = next)
     (hid2 : x2.id = next + 1)
+    (hnk : ∀ y ∈ S, y.kind ≠ x1.kind ∧ y.kind ≠ x2.kind)
     (hnm : ∀ y ∈ S, y.kind.mirror ≠ some x1.kind ∧ y.kind.mirror ≠ some x2.kind)
     (hown : x1.gen = .own ∧ x2.gen = .own)
     (hp : (x1.kind.mirror = some x2.kind ∧ x2.kind.mirror = some x1.kind)
@@ -214,7 +275,20 @@ theorem e2_add2 {S : List Sock} {next : Nat} {o : Bool} (x1 x2 : Sock) (hid1 : x
     (hj : ∀ y ∈ S, y.id < next) : Evo2 S (ins x2 (ins x1 S)) next o := by
   have hmem : ∀ z, z ∈ ins x2 (ins x1 S) ↔ z = x2 ∨ z = x1 ∨ z ∈ S := by
     intro z; rw [mem_ins, mem_ins]
-  refine ⟨?_, ?_, ?_, ?_⟩
+  have hnew : ∀ z ∈ ins x2 (ins x1 S), next ≤ z.id → z.gen = .own := by
+    intro z hz hn
+    rcases (hmem z).mp hz with rfl | rfl | hz
+    · exact hown.2
+    · exact hown.1
+    · have := hj z hz; omega
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro z hz hn y hy
+    rcases (hmem z).mp hz with rfl | rfl | hz
+    · exact (hnk y hy).2
+    · exact (hnk y hy).1
+    · have := hj z hz; omega
+  · intro z hz z' hz' hn hn' _
+    rw [hnew z hz hn, hnew z' hz' hn']
   · intro z hz hn y hy
     rcases (hmem z).mp hz with rfl | rfl | hz
     · exact (hnm y hy).2
@@ -271,9 +345,8 @@ theorem e2_add2 {S : List Sock} {next : Nat} {o : Bool} (x1 x2 : Sock) (hid1 : x
 @[simp] theorem answered_socks (tr : Bool) (c : Cli) (p : Port) (seg : Seg) (r : Bool)
     (s : State) : (answered tr c p seg r s).socks = s.socks := by
   unfold answered
-  split
-  · rfl
-  · split <;> simp
+  repeat' split
+  all_goals first | rfl | simp
 
 @[simp] theorem unanswered_socks (R : Rules) (C : Cfg) (c : Cli) (p : Port) (seg : Seg)
     (s : State) : (unanswered R C c p seg s).socks = s.socks := by
@@ -306,9 +379,8 @@ theorem e2_add2 {S : List Sock} {next : Nat} {o : Bool} (x1 x2 : Sock) (hid1 : x
 @[simp] theorem answered_bad (tr : Bool) (c : Cli) (p : Port) (seg : Seg) (r : Bool)
     (s : State) : (answered tr c p seg r s).bad = s.bad := by
   unfold answered
-  split
-  · rfl
-  · split <;> simp
+  repeat' split
+  all_goals first | rfl | simp
 
 @[simp] theorem unanswered_bad (R : Rules) (C : Cfg) (c : Cli) (p : Port) (seg : Seg)
     (s : State) : (unanswered R C c p seg s).bad = s.bad := by
@@ -326,6 +398,11 @@ theorem mirror_ne_inb (k : Kind) (c : Cli) (p : Port) : k.mirror ≠ some (.inb 
 theorem genIn_ne_own (s : State) (f : Fam) : genIn s f ≠ .own := by
   unfold genIn; split <;> simp
 
+theorem find_none {s : State} {k : Kind} (h : s.find k = none) : ∀ y ∈ s.socks, y.kind ≠ k := by
+  intro y hy e
+  simp only [State.find, List.find?_eq_none] at h
+  exact h y hy (by simp [e])
+
 theorem pkt_evo2 {C : Cfg} {c : Cli} {p : Port} {seg : Seg} {s t : State} :
     pkt Design.rules C c p seg s = some t → (∀ x ∈ s.socks, x.id < s.next) →
       Evo2 s.socks t.socks s.next s.out4 ∧ t.bad = s.bad := by
@@ -340,7 +417,8 @@ theorem pkt_evo2 {C : Cfg} {c : Cli} {p : Port} {seg : Seg} {s t : State} :
   all_goals first
     | exact e2_same hj
     | exact e2_upgrade _ hj
-    | (exact e2_add1 _ rfl (fun y _ => mirror_ne_inb _ _ _) (Or.inl (genIn_ne_own _ _)) hj)
+    | (exact e2_add1 _ rfl (find_none (by assumption)) (fun y _ => mirror_ne_inb _ _ _)
+        (Or.inl (genIn_ne_own _ _)) hj)
     | (refine e2_sub [.inb c p] ?_ ?_ hj
        · intro y; simp [List.mem_filter]
        · intro k hk k' hm
@@ -414,13 +492,17 @@ theorem conn_evo2 {C : Cfg} {w : Who} {s t : State} :
   all_goals (simp only [Option.some.injEq] at h; subst h)
   all_goals (refine ⟨?_, rfl⟩)
   · -- through the proxy
-    rename_i hp _
+    rename_i hp hhas
     have hout : s.out4 = false := by simp [Design.rules] at hp; exact hp.2
-    exact e2_add2 _ _ rfl rfl (fun y _ => ⟨mirror_ne_proxC _ _, mirror_ne_proxS _ _⟩) ⟨rfl, rfl⟩
+    have hc : s.has (.proxC w) = false := by cases hh : s.has (.proxC w) <;> simp_all
+    have hs : s.has (.proxS w) = false := by cases hh : s.has (.proxS w) <;> simp_all
+    exact e2_add2 _ _ rfl rfl (fun y hy => ⟨has_false hc y hy, has_false hs y hy⟩)
+      (fun y _ => ⟨mirror_ne_proxC _ _, mirror_ne_proxS _ _⟩) ⟨rfl, rfl⟩
       (Or.inr ⟨rfl, rfl, hout⟩) hj
-  · rename_i hout _
+  · rename_i hout hhas
     have hout : s.out4 = false := by simpa using hout
-    exact e2_add1 _ rfl (fun y _ => mirror_ne_outb _ _) (Or.inr ⟨rfl, hout⟩) hj
+    have hc : s.has (.outb w) = false := by cases hh : s.has (.outb w) <;> simp_all
+    exact e2_add1 _ rfl (has_false hc) (fun y _ => mirror_ne_outb _ _) (Or.inr ⟨rfl, hout⟩) hj
 
 theorem shut_evo2 {w : Who} {s t : State} :
     shut w s = some t → (∀ x ∈ s.socks, x.id < s.next) →
@@ -457,7 +539,8 @@ theorem pair_evo2 {C : Cfg} {b : Bool} {s t : State} :
     cases hh : s.has (pairC b) <;> simp_all
   have hs : s.has (pairS b) = false := by
     cases hh : s.has (pairS b) <;> simp_all
-  refine ⟨e2_add2 _ _ rfl rfl ?_ ⟨rfl, rfl⟩ (Or.inl ⟨pairC_mirror b, pairS_mirror b⟩) hj, rfl⟩
+  refine ⟨e2_add2 _ _ rfl rfl (fun y hy => ⟨has_false hc y hy, has_false hs y hy⟩) ?_ ⟨rfl, rfl⟩
+    (Or.inl ⟨pairC_mirror b, pairS_mirror b⟩) hj, rfl⟩
   intro y hy
   exact ⟨fun e => has_false hs y hy (mirror_pairC e), fun e => has_false hc y hy (mirror_pairS e)⟩
 
@@ -484,47 +567,6 @@ theorem unpair_evo2 {b : Bool} {s t : State} :
 
 /-! ## The system's own steps -/
 
-/-- A step that leaves the sockets and the record alone, and either leaves the restore where it
-was or moves it somewhere the phase-bound clauses follow from where it was. -/
-theorem gn_sys {s t : State} (hg : Gn s) (h1 : t.socks = s.socks) (h2 : t.next = s.next)
-    (hb : t.bad = s.bad)
-    (hlst : ∀ i ∈ t.lst, i ∈ s.lst)
-    (hman : ∀ i ∈ t.man.getD [], i < s.next)
-    (hM : ∀ n, t.rp = .at n → ∃ m, s.rp = .at m ∧ ∀ i ∈ t.man.getD [], i ∈ s.man.getD [])
-    (hF : ∀ n, t.rp = .at n → n ≤ 15 → ∃ m, s.rp = .at m ∧ m ≤ 15)
-    (hO : ∀ n, t.rp = .at n → n ≤ 10 → ∃ m, s.rp = .at m ∧ m ≤ 10)
-    (hLS : t.rp = .at 9 → t.ag = true →
-      s.rp = .at 9 ∧ s.ag = true ∧ t.lst = s.lst ∧ t.seen = s.seen)
-    (hL : ∀ n, t.rp = .at n → 10 ≤ n → n ≤ 11 → t.ag = true →
-      ∃ m, s.rp = .at m ∧ 10 ≤ m ∧ m ≤ 11 ∧ s.ag = true ∧ t.lst = s.lst) : Gn t := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-  · intro i hi; rw [h2]; exact hg.g1 i (hlst i hi)
-  · intro i hi; rw [h2]; exact hman i hi
-  · intro n hn x hx hm
-    obtain ⟨m, e1, e2⟩ := hM n hn
-    rw [h1] at hx
-    exact hg.gM m e1 x hx (e2 _ hm)
-  · intro n hn h15 x hx
-    obtain ⟨m, e1, e2⟩ := hF n hn h15
-    rw [h1] at hx
-    exact hg.gF m e1 e2 x hx
-  · intro n hn h10 x hx
-    obtain ⟨m, e1, e2⟩ := hO n hn h10
-    rw [h1] at hx
-    exact hg.gO m e1 e2 x hx
-  · intro x hx hown k hk
-    rw [h1] at hx ⊢
-    exact hg.gP x hx hown k hk
-  · intro h9 ha i hi
-    obtain ⟨e1, e2, e3, e4⟩ := hLS h9 ha
-    rw [e3] at hi; rw [e4]
-    exact hg.gLS e1 e2 i hi
-  · intro n hn h10 h11 ha x hx hl
-    obtain ⟨m, e1, e2, e3, e4, e5⟩ := hL n hn h10 h11 ha
-    rw [h1] at hx ⊢; rw [e5] at hl
-    exact hg.gL m e1 e2 e3 e4 x hx hl
-  · rw [hb]; exact hg.gB
-
 theorem hasMirror_kind {l : List Sock} {x y : Sock} (h : x.kind = y.kind) :
     hasMirror l x = hasMirror l y := by
   unfold hasMirror; rw [h]
@@ -537,6 +579,55 @@ theorem hasMirror_sub {l l' : List Sock} {x : Sock} (hs : ∀ y ∈ l', y ∈ l)
     obtain ⟨k, hk, y, hy, hyk⟩ := hasMirror_iff.mp hm
     have : hasMirror l x = true := hasMirror_iff.mpr ⟨k, hk, y, hs y hy, hyk⟩
     rw [h] at this; cases this
+
+/-- A step that leaves the sockets and the record alone, and either leaves the restore where it
+was or moves it somewhere the phase-bound clauses follow from where it was. -/
+theorem gn_sys {s t : State} (hg : Gn s) (h1 : t.socks = s.socks) (h2 : t.next = s.next)
+    (hb : t.bad = s.bad)
+    (hlst : ∀ i ∈ t.lst, i ∈ s.lst)
+    (hman : ∀ i ∈ t.man.getD [], i < s.next)
+    (hML : ∀ x ∈ s.socks, x.id ∈ t.man.getD [] → x.kind.loop = true →
+      hasMirror s.socks x = false)
+    (hM : ∀ n, t.rp = .at n → ∃ m, s.rp = .at m ∧ ∀ i ∈ t.man.getD [], i ∈ s.man.getD [])
+    (hF : ∀ n, t.rp = .at n → n ≤ 14 → ∃ m, s.rp = .at m ∧ m ≤ 14)
+    (hO : ∀ n, t.rp = .at n → n ≤ 9 → ∃ m, s.rp = .at m ∧ m ≤ 9)
+    (hLS : t.rp = .at 8 → t.ag = true →
+      s.rp = .at 8 ∧ s.ag = true ∧ t.lst = s.lst ∧ t.seen = s.seen)
+    (hL : ∀ n, t.rp = .at n → 9 ≤ n → n ≤ 10 → t.ag = true →
+      ∃ m, s.rp = .at m ∧ 9 ≤ m ∧ m ≤ 10 ∧ s.ag = true ∧ t.lst = s.lst) : Gn t := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro i hi; rw [h2]; exact hg.g1 i (hlst i hi)
+  · intro i hi; rw [h2]; exact hman i hi
+  · intro n hn x hx hm
+    obtain ⟨m, e1, e2⟩ := hM n hn
+    rw [h1] at hx
+    exact hg.gM m e1 x hx (e2 _ hm)
+  · intro x hx hm hl
+    rw [h1] at hx ⊢
+    exact hML x hx hm hl
+  · intro n hn h14 x hx
+    obtain ⟨m, e1, e2⟩ := hF n hn h14
+    rw [h1] at hx
+    exact hg.gF m e1 e2 x hx
+  · intro n hn h9 x hx
+    obtain ⟨m, e1, e2⟩ := hO n hn h9
+    rw [h1] at hx
+    exact hg.gO m e1 e2 x hx
+  · intro x hx hown k hk
+    rw [h1] at hx ⊢
+    exact hg.gP x hx hown k hk
+  · intro x hx y hy
+    rw [h1] at hx hy
+    exact hg.gU x hx y hy
+  · intro h8 ha i hi
+    obtain ⟨e1, e2, e3, e4⟩ := hLS h8 ha
+    rw [e3] at hi; rw [e4]
+    exact hg.gLS e1 e2 i hi
+  · intro n hn h9 h10 ha x hx hl
+    obtain ⟨m, e1, e2, e3, e4, e5⟩ := hL n hn h9 h10 ha
+    rw [h1] at hx ⊢; rw [e5] at hl
+    exact hg.gL m e1 e2 e3 e4 x hx hl
+  · rw [hb]; exact hg.gB
 
 theorem listIds_seen {man : List Nat} {seen : List Sock} :
     ∀ i ∈ listIds Design.rules man seen, ∃ y ∈ seen, y.id = i := by
@@ -552,44 +643,85 @@ theorem manifestIds_lt {R : Rules} {seen now : List Sock} {n : Nat}
   obtain ⟨y, ⟨hy, -⟩, rfl⟩ := hi
   exact h y hy
 
-/-- A clone is restored: every socket is now the source's. -/
-theorem restore_gn {C : Cfg} {s t : State} : restore C s = some t → Gn s → Gn t := by
+/-- The manifest's second look: with it, a socket the manifest names is no end of a loopback
+connection that has both its ends now. -/
+theorem manifest_loop {s : State} (hk : Sk s) :
+    ∀ x ∈ s.socks, x.id ∈ manifestIds Design.rules s.seen s.socks → x.kind.loop = true →
+      hasMirror s.socks x = false := by
+  intro x hx hm hl
+  simp only [manifestIds, Design.rules, List.mem_map, List.mem_filter] at hm
+  obtain ⟨y, ⟨hy, hst⟩, hid⟩ := hm
+  have hkind : y.kind = x.kind := hk.u y hy x hx hid
+  have hpl : y.kind.peerLo = true := loop_peerLo (by rw [hkind]; exact hl)
+  simp [hpl] at hst
+  rw [← hasMirror_kind hkind]
+  exact hst.2
+
+/-- A clone is restored: every socket is now the source's. In the design the image is never of
+a clone inside its restore. -/
+theorem restore_gn {C : Cfg} {s t : State} : restore C s = some t → Scal C s → Gn s → Gn t := by
   unfold restore
   split
-  · intro h hg
-    simp only [Option.some.injEq] at h
-    subst h
-    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-    · intro i hi; simp at hi
-    · exact hg.g2
-    · intro n _ x hx _
-      simp only [List.mem_map] at hx
-      obtain ⟨x0, -, rfl⟩ := hx
-      rfl
-    · intro n _ _ x hx
-      simp only [List.mem_map] at hx
-      obtain ⟨x0, -, rfl⟩ := hx
-      simp
-    · intro n _ _ x hx hown
-      simp only [List.mem_map] at hx
-      obtain ⟨x0, -, rfl⟩ := hx
-      simp at hown
-    · intro x hx hown
-      simp only [List.mem_map] at hx
-      obtain ⟨x0, -, rfl⟩ := hx
-      simp at hown
-    · intro _ _ i hi; simp at hi
-    · intro n _ _ _ _ x _ hl; simp at hl
-    · exact hg.gB
+  · rename_i hc
+    intro h hi hg
+    have hpw : s.pw = true := by simp at hc; exact hc.1.1
+    have hsp : s.sp = .paused := by simp at hc; exact hc.1.2
+    have hi := hi hpw
+    cases hr : s.rp with
+    | «at» n => simp only [hr] at hi; rw [hi.idle] at hsp; cases hsp
+    | failed => simp only [hr] at hi; rw [hi.1] at hsp; cases hsp
+    | _ =>
+      simp only [hr, Option.some.injEq] at h
+      subst h
+      have hmap : ∀ x : Sock,
+          hasMirror (s.socks.map (fun x => { x with gen := Gen.stale })) x
+            = hasMirror s.socks x := by
+        intro x
+        simp only [hasMirror]
+        split
+        · simp [List.any_map, Function.comp_def]
+        · rfl
+      refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+      · intro i hi; simp at hi
+      · exact hg.g2
+      · intro n _ x hx _
+        simp only [List.mem_map] at hx
+        obtain ⟨x0, -, rfl⟩ := hx
+        rfl
+      · intro x hx hm hl
+        simp only [List.mem_map] at hx
+        obtain ⟨x0, hx0, rfl⟩ := hx
+        rw [hmap]
+        exact hg.gML x0 hx0 hm hl
+      · intro n _ _ x hx
+        simp only [List.mem_map] at hx
+        obtain ⟨x0, -, rfl⟩ := hx
+        simp
+      · intro n _ _ x hx hown
+        simp only [List.mem_map] at hx
+        obtain ⟨x0, -, rfl⟩ := hx
+        simp at hown
+      · intro x hx hown
+        simp only [List.mem_map] at hx
+        obtain ⟨x0, -, rfl⟩ := hx
+        simp at hown
+      · intro x hx y hy _
+        simp only [List.mem_map] at hx hy
+        obtain ⟨x0, -, rfl⟩ := hx
+        obtain ⟨y0, -, rfl⟩ := hy
+        rfl
+      · intro _ _ i hi; simp at hi
+      · intro n _ _ _ _ x _ hl; simp at hl
+      · exact hg.gB
   · intro h; contradiction
 
 /-- The IPv6 dump: the list's cookies are seen sockets'. -/
-theorem gn_dump6 {s t : State} (hk : Sk s) (hg : Gn s) (hs : s.rp = .at 8)
+theorem gn_dump6 {s t : State} (hk : Sk s) (hg : Gn s) (hs : s.rp = .at 7)
     (h1 : t.socks = s.socks) (h2 : t.next = s.next) (hb : t.bad = s.bad)
     (hseen : t.seen = s.seen ++ s.socks.filter (·.kind.fam == .v6))
     (hlst : t.lst = listIds Design.rules (s.man.getD []) t.seen) (hman : t.man = s.man)
-    (hrp : t.rp = .at 9) : Gn t := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    (hrp : t.rp = .at 8) : Gn t := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro i hi
     rw [hlst] at hi
     obtain ⟨y, hy, rfl⟩ := listIds_seen i hi
@@ -601,7 +733,48 @@ theorem gn_dump6 {s t : State} (hk : Sk s) (hg : Gn s) (hs : s.rp = .at 8)
   · intro i hi; rw [hman] at hi; rw [h2]; exact hg.g2 i hi
   · intro n _ x hx hm
     rw [h1] at hx; rw [hman] at hm
+    exact hg.gM 7 hs x hx hm
+  · intro x hx hm hl
+    rw [h1] at hx ⊢; rw [hman] at hm
+    exact hg.gML x hx hm hl
+  · intro n _ _ x hx
+    rw [h1] at hx
+    exact hg.gF 7 hs (by omega) x hx
+  · intro n _ _ x hx
+    rw [h1] at hx
+    exact hg.gO 7 hs (by omega) x hx
+  · intro x hx hown k hkk
+    rw [h1] at hx ⊢
+    exact hg.gP x hx hown k hkk
+  · intro x hx y hy
+    rw [h1] at hx hy
+    exact hg.gU x hx y hy
+  · intro _ _ i hi
+    rw [hlst] at hi
+    exact listIds_seen i hi
+  · intro n hn h9 _
+    rw [hrp] at hn; cases hn; omega
+  · rw [hb]; exact hg.gB
+
+/-- The second look: what stays on the list is no process's own socket and has no mirror image. -/
+theorem gn_look {s t : State} (hk : Sk s) (hg : Gn s) (hs : s.rp = .at 8) (hag : s.ag = true)
+    (h1 : t.socks = s.socks) (h2 : t.next = s.next) (hb : t.bad = s.bad)
+    (hlst : t.lst = lookIds s.lst s.seen s.socks) (hman : t.man = s.man)
+    (hrp : t.rp = .at 9) : Gn t := by
+  have hsub : ∀ i ∈ t.lst, i ∈ s.lst := by
+    intro i hi
+    rw [hlst] at hi
+    simp only [lookIds, List.mem_filter] at hi
+    exact hi.1
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro i hi; rw [h2]; exact hg.g1 i (hsub i hi)
+  · intro i hi; rw [hman] at hi; rw [h2]; exact hg.g2 i hi
+  · intro n _ x hx hm
+    rw [h1] at hx; rw [hman] at hm
     exact hg.gM 8 hs x hx hm
+  · intro x hx hm hl
+    rw [h1] at hx ⊢; rw [hman] at hm
+    exact hg.gML x hx hm hl
   · intro n _ _ x hx
     rw [h1] at hx
     exact hg.gF 8 hs (by omega) x hx
@@ -611,39 +784,10 @@ theorem gn_dump6 {s t : State} (hk : Sk s) (hg : Gn s) (hs : s.rp = .at 8)
   · intro x hx hown k hkk
     rw [h1] at hx ⊢
     exact hg.gP x hx hown k hkk
-  · intro _ _ i hi
-    rw [hlst] at hi
-    exact listIds_seen i hi
-  · intro n hn h10 _
-    rw [hrp] at hn; cases hn; omega
-  · rw [hb]; exact hg.gB
-
-/-- The second look: what stays on the list is no process's own socket and has no mirror image. -/
-theorem gn_look {s t : State} (hk : Sk s) (hg : Gn s) (hs : s.rp = .at 9) (hag : s.ag = true)
-    (h1 : t.socks = s.socks) (h2 : t.next = s.next) (hb : t.bad = s.bad)
-    (hlst : t.lst = lookIds s.lst s.seen s.socks) (hman : t.man = s.man)
-    (hrp : t.rp = .at 10) : Gn t := by
-  have hsub : ∀ i ∈ t.lst, i ∈ s.lst := by
-    intro i hi
-    rw [hlst] at hi
-    simp only [lookIds, List.mem_filter] at hi
-    exact hi.1
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-  · intro i hi; rw [h2]; exact hg.g1 i (hsub i hi)
-  · intro i hi; rw [hman] at hi; rw [h2]; exact hg.g2 i hi
-  · intro n _ x hx hm
-    rw [h1] at hx; rw [hman] at hm
-    exact hg.gM 9 hs x hx hm
-  · intro n _ _ x hx
-    rw [h1] at hx
-    exact hg.gF 9 hs (by omega) x hx
-  · intro n _ _ x hx
-    rw [h1] at hx
-    exact hg.gO 9 hs (by omega) x hx
-  · intro x hx hown k hkk
-    rw [h1] at hx ⊢
-    exact hg.gP x hx hown k hkk
-  · intro h9; rw [hrp] at h9; cases h9
+  · intro x hx y hy
+    rw [h1] at hx hy
+    exact hg.gU x hx y hy
+  · intro h8; rw [hrp] at h8; cases h8
   · intro n _ _ _ _ x hx hl
     rw [h1] at hx ⊢
     rw [hlst] at hl
@@ -656,9 +800,9 @@ theorem gn_look {s t : State} (hk : Sk s) (hg : Gn s) (hs : s.rp = .at 9) (hag :
       have := hno y hy
       simp only [hid, beq_self_eq_true, Bool.true_and, Bool.not_eq_true] at this
       rw [← hasMirror_kind hkind]; exact this
-    refine ⟨?_, hg.gF 9 hs (by omega) x hx, hmir⟩
+    refine ⟨?_, hg.gF 8 hs (by omega) x hx, hmir⟩
     intro hown
-    have hm := hg.gO 9 hs (by omega) x hx hown
+    have hm := hg.gO 8 hs (by omega) x hx hown
     cases hk' : x.kind.mirror with
     | none => exact hm hk'
     | some k =>
@@ -667,68 +811,140 @@ theorem gn_look {s t : State} (hk : Sk s) (hg : Gn s) (hs : s.rp = .at 9) (hag :
       rw [hmir] at this; cases this
   · rw [hb]; exact hg.gB
 
-/-- The retirement: what it destroys is from the image or was made behind the closed gate, and
-no connection a process opened inside the guest loses an end. The record stays clear. -/
-theorem gn_retire {s t : State} (hg : Gn s) (hs : s.rp = .at 11) (hag : s.ag = true)
-    (h1 : t.socks = s.socks.filter (fun x => !(s.man.getD [] ++ s.lst).contains x.id))
+/-- What a retirement names, in a clone at its retirement step: no process's own socket, none a
+packet made with the gate open, and none with a mirror image unless the manifest names it and
+it is no end of a loopback connection. -/
+theorem named_ok {s : State} (hg : Gn s) (hs : s.rp = .at 10) (hag : s.ag = true) :
+    ∀ x ∈ s.socks, x.id ∈ s.man.getD [] ∨ x.id ∈ s.lst →
+      x.gen ≠ .own ∧ x.gen ≠ .fresh
+      ∧ (hasMirror s.socks x = true → x.id ∈ s.man.getD [] ∧ x.kind.loop = false) := by
+  intro x hx hin
+  by_cases hm : x.id ∈ s.man.getD []
+  · have hst := hg.gM 10 hs x hx hm
+    refine ⟨by rw [hst]; simp, by rw [hst]; simp, ?_⟩
+    intro hmir
+    refine ⟨hm, ?_⟩
+    cases hl : x.kind.loop with
+    | false => rfl
+    | true => have := hg.gML x hx hm hl; rw [hmir] at this; cases this
+  · have hl : x.id ∈ s.lst := by
+      rcases hin with h | h
+      · exact absurd h hm
+      · exact h
+    obtain ⟨a, b, c⟩ := hg.gL 10 hs (by omega) (by omega) hag x hx hl
+    refine ⟨a, b, ?_⟩
+    intro hmir
+    rw [c] at hmir; cases hmir
+
+/-- A socket a process of the clone opened is not reset by a retirement either: the socket
+that would reset it is of its mirror image's kind, and that one is the process's own too. -/
+theorem own_not_reset {s : State} (hg : Gn s) (gone : List Sock)
+    (hgone : ∀ x ∈ gone, x ∈ s.socks ∧ x.gen ≠ .own) :
+    ∀ y ∈ s.socks, y.gen = .own → resetBy gone y = false := by
+  intro y hy hown
+  cases hr : resetBy gone y with
+  | false => rfl
+  | true =>
+    exfalso
+    simp only [resetBy, List.any_eq_true, Bool.and_eq_true, beq_iff_eq] at hr
+    obtain ⟨x, hx, -, hmx⟩ := hr
+    obtain ⟨hxs, hxo⟩ := hgone x hx
+    obtain ⟨z, hz, hzk, hzo⟩ := hg.gP y hy hown x.kind (mirror_symm hmx)
+    exact hxo (by rw [hg.gU x hxs z hz hzk.symm]; exact hzo)
+
+/-- The retirement: what it destroys, by cookie or by a reset, is from the image or was made
+behind the closed gate, and no loopback connection that has both its ends loses one. The record
+stays clear. -/
+theorem gn_retire {s t : State} (hg : Gn s) (hs : s.rp = .at 10) (hag : s.ag = true)
+    (h1 : t.socks = (s.socks.filter (fun x => !(s.man.getD [] ++ s.lst).contains x.id)).filter
+      (fun y => !resetBy (s.socks.filter (fun x => (s.man.getD [] ++ s.lst).contains x.id)) y))
     (h2 : t.next = s.next)
-    (hb : t.bad = (s.bad || (s.socks.filter (fun x => (s.man.getD [] ++ s.lst).contains x.id)).any
-      (fun x => x.gen == .own || x.gen == .fresh
-        || (!(s.man.getD []).contains x.id
-            && hasMirror (s.socks.filter (fun x => !(s.man.getD [] ++ s.lst).contains x.id)) x))))
-    (hlst : t.lst = []) (hman : t.man = s.man) (hrp : t.rp = .at 12) : Gn t := by
+    (hb : t.bad = (s.bad
+      || (s.socks.filter (fun x => (s.man.getD [] ++ s.lst).contains x.id)).any
+        (fun x => x.gen == .own || x.gen == .fresh
+          || (hasMirror s.socks x && (x.kind.loop || !(s.man.getD []).contains x.id)))
+      || (s.socks.filter (fun x => !(s.man.getD [] ++ s.lst).contains x.id)).any
+        (fun y => resetBy (s.socks.filter (fun x => (s.man.getD [] ++ s.lst).contains x.id)) y
+          && (y.gen == .own || y.gen == .fresh))))
+    (hlst : t.lst = []) (hman : t.man = s.man) (hrp : t.rp = .at 11) : Gn t := by
+  have hnamed := named_ok hg hs hag
+  have hgone : ∀ x ∈ s.socks.filter (fun x => (s.man.getD [] ++ s.lst).contains x.id),
+      x ∈ s.socks ∧ (x.id ∈ s.man.getD [] ∨ x.id ∈ s.lst) := by
+    intro x hx
+    rw [List.mem_filter] at hx
+    exact ⟨hx.1, by simpa using hx.2⟩
+  have hreset := own_not_reset hg _ (fun x hx => ⟨(hgone x hx).1,
+    (hnamed x (hgone x hx).1 (hgone x hx).2).1⟩)
   have hsub : ∀ x ∈ t.socks, x ∈ s.socks := by
-    intro x hx; rw [h1, List.mem_filter] at hx; exact hx.1
-  -- a socket the retirement names is not a process's own
-  have hnamed : ∀ x ∈ s.socks, x.id ∈ s.man.getD [] ∨ x.id ∈ s.lst → x.gen ≠ .own := by
-    intro x hx hin
-    rcases hin with hm | hl
-    · rw [hg.gM 11 hs x hx hm]; simp
-    · exact (hg.gL 11 hs (by omega) (by omega) hag x hx hl).1
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    intro x hx; rw [h1, List.mem_filter, List.mem_filter] at hx; exact hx.1.1
+  -- a socket a process of the clone opened stays
+  have hstay : ∀ y ∈ s.socks, y.gen = .own → y ∈ t.socks := by
+    intro y hy hown
+    rw [h1, List.mem_filter, List.mem_filter]
+    refine ⟨⟨hy, ?_⟩, by rw [hreset y hy hown]; rfl⟩
+    simp only [Bool.not_eq_true', List.contains_eq_mem, List.mem_append, decide_eq_false_iff_not]
+    intro hin
+    exact (hnamed y hy hin).1 hown
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro i hi; rw [hlst] at hi; simp at hi
   · intro i hi; rw [hman] at hi; rw [h2]; exact hg.g2 i hi
   · intro n _ x hx hm
     rw [hman] at hm
-    exact hg.gM 11 hs x (hsub x hx) hm
+    exact hg.gM 10 hs x (hsub x hx) hm
+  · intro x hx hm hl
+    rw [hman] at hm
+    exact hasMirror_sub hsub (hg.gML x (hsub x hx) hm hl)
   · intro n _ _ x hx
-    exact hg.gF 11 hs (by omega) x (hsub x hx)
-  · intro n hn h10
+    exact hg.gF 10 hs (by omega) x (hsub x hx)
+  · intro n hn h9
     rw [hrp] at hn; cases hn; omega
   · intro x hx hown k hkk
     obtain ⟨y, hy, hyk, hyo⟩ := hg.gP x (hsub x hx) hown k hkk
-    refine ⟨y, ?_, hyk, hyo⟩
-    rw [h1, List.mem_filter]
-    refine ⟨hy, ?_⟩
-    simp only [Bool.not_eq_true', List.contains_eq_mem, List.mem_append, decide_eq_false_iff_not]
-    intro hin
-    exact hnamed y hy hin hyo
-  · intro h9; rw [hrp] at h9; cases h9
-  · intro n hn h10 h11
+    exact ⟨y, hstay y hy hyo, hyk, hyo⟩
+  · intro x hx y hy
+    exact hg.gU x (hsub x hx) y (hsub y hy)
+  · intro h8; rw [hrp] at h8; cases h8
+  · intro n hn h9 h10
     rw [hrp] at hn; cases hn; omega
-  · rw [hb, hg.gB, Bool.false_or, List.any_eq_false]
-    intro x hx
-    rw [List.mem_filter] at hx
-    obtain ⟨hx, hc⟩ := hx
-    simp only [List.contains_eq_mem, List.mem_append, decide_eq_true_eq] at hc
-    have e1 : (x.gen == Gen.own) = false := by simpa using hnamed x hx hc
-    by_cases hm : x.id ∈ s.man.getD []
-    · have e2 : (x.gen == Gen.fresh) = false := by rw [hg.gM 11 hs x hx hm]; rfl
-      simp [e1, e2, hm]
-    · have hl : x.id ∈ s.lst := by
-        rcases hc with h | h
-        · exact absurd h hm
-        · exact h
-      obtain ⟨-, b, c⟩ := hg.gL 11 hs (by omega) (by omega) hag x hx hl
+  · rw [hb, hg.gB, Bool.false_or, Bool.or_eq_false_iff, List.any_eq_false, List.any_eq_false]
+    refine ⟨?_, ?_⟩
+    · intro x hx
+      obtain ⟨hxs, hin⟩ := hgone x hx
+      obtain ⟨a, b, c⟩ := hnamed x hxs hin
+      have e1 : (x.gen == Gen.own) = false := by simpa using a
       have e2 : (x.gen == Gen.fresh) = false := by simpa using b
-      have e3 : hasMirror (s.socks.filter
-          (fun x => !(s.man.getD [] ++ s.lst).contains x.id)) x = false :=
-        hasMirror_sub (fun y hy => (List.mem_filter.mp hy).1) c
-      rw [e1, e2, e3]
-      simp
+      rw [e1, e2]
+      cases hm : hasMirror s.socks x with
+      | false => simp
+      | true =>
+        obtain ⟨c1, c2⟩ := c hm
+        simp [c1, c2]
+    · intro y hy
+      rw [List.mem_filter] at hy
+      cases hr : resetBy (s.socks.filter
+          (fun x => (s.man.getD [] ++ s.lst).contains x.id)) y with
+      | false => simp
+      | true =>
+        have e1 : (y.gen == Gen.own) = false := by
+          cases ho : (y.gen == Gen.own) with
+          | false => rfl
+          | true =>
+            have := hreset y hy.1 (by simpa using ho)
+            rw [hr] at this; cases this
+        have e2 : (y.gen == Gen.fresh) = false := by
+          simpa using hg.gF 10 hs (by omega) y hy.1
+        simp [e1, e2]
 
 theorem gn_dead {s : State} (hg : Gn s) : Gn s.dead := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [State.dead, hg.gB]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [State.dead, hg.gB]
+
+theorem gn_failed {s : State} (hg : Gn s) : Gn { s with rp := .failed, saved := none } := by
+  refine ⟨hg.g1, hg.g2, ?_, hg.gML, ?_, ?_, hg.gP, hg.gU, ?_, ?_, hg.gB⟩
+  · intro n hr; cases hr
+  · intro n hr; cases hr
+  · intro n hr; cases hr
+  · intro hr; cases hr
+  · intro n hr; cases hr
 
 set_option hygiene false in
 /-- A side goal that holds because the state it speaks of cannot be: a restore is under way and
@@ -737,9 +953,9 @@ macro "scal_absurd" : tactic => `(tactic| (
   have hi' := hi (by simp_all [State.running])
   first
     | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-        State.dead]; done)
+        State.dead, reopened, unreached, Design.rules]; done)
     | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-        State.dead]; omega)))
+        State.dead, reopened, unreached, Design.rules]; omega)))
 
 set_option hygiene false in
 macro "open_gn" : tactic => `(tactic| (
@@ -753,39 +969,49 @@ macro "open_gn" : tactic => `(tactic| (
   all_goals (try subst h)))
 
 set_option hygiene false in
-macro "close_gn" : tactic => `(tactic| (
-  refine gn_sys hg rfl rfl rfl ?_ ?_ ?_ ?_ ?_ ?_ ?_
-  · intro i hi0
-    first
-      | exact hi0
-      | (simp at hi0; done)
-  · intro i hi0
-    first
-      | exact hg.g2 i hi0
-      | (simp at hi0; done)
-      | exact manifestIds_lt hk.j2 i (by simpa using hi0)
-  · intro n hr
-    first
-      | exact ⟨n, hr, fun i h0 => h0⟩
-      | scal_absurd
-  · intro n hr hle
-    first
-      | exact ⟨n, hr, hle⟩
-      | scal_absurd
-  · intro n hr hle
-    first
-      | exact ⟨n, hr, hle⟩
-      | scal_absurd
-  · intro hr ha
-    first
-      | exact ⟨hr, ha, rfl, rfl⟩
-      | (simp at ha; done)
-      | scal_absurd
-  · intro n hr h10 h11 ha
-    first
-      | exact ⟨n, hr, h10, h11, ha, rfl⟩
-      | (simp at ha; done)
-      | scal_absurd))
+macro "close_gn" : tactic => `(tactic| first | exact gn_dead hg | (
+  (try unfold reopened unreached)
+  (try split)
+  all_goals (
+    refine gn_sys hg rfl rfl rfl ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
+    · intro i hi0
+      first
+        | exact hi0
+        | (simp at hi0; done)
+    · intro i hi0
+      first
+        | exact hg.g2 i hi0
+        | (simp [openGate] at hi0; done)
+        | (simp [openGate] at hi0; exact hg.g2 i hi0)
+        | exact manifestIds_lt hk.j2 i (by simpa using hi0)
+    · intro x hx hm hl
+      first
+        | exact hg.gML x hx hm hl
+        | (simp [openGate] at hm; done)
+        | (simp [openGate] at hm; exact hg.gML x hx hm hl)
+        | exact manifest_loop hk x hx (by simpa using hm) hl
+    · intro n hr
+      first
+        | exact ⟨n, hr, fun i h0 => h0⟩
+        | scal_absurd
+    · intro n hr hle
+      first
+        | exact ⟨n, hr, hle⟩
+        | scal_absurd
+    · intro n hr hle
+      first
+        | exact ⟨n, hr, hle⟩
+        | scal_absurd
+    · intro hr ha
+      first
+        | exact ⟨hr, ha, rfl, rfl⟩
+        | (simp at ha; done)
+        | scal_absurd
+    · intro n hr h9 h10 ha
+      first
+        | exact ⟨n, hr, h9, h10, ha, rfl⟩
+        | (simp at ha; done)
+        | scal_absurd)))
 
 theorem snap_gn {C : Cfg} {g : Bool} {s t : State} :
     snap Design.rules C g s = some t → Scal C s → Sk s → Gn s → Gn t := by
@@ -826,54 +1052,59 @@ theorem watchdog_gn {C : Cfg} {s t : State} :
 theorem agent_gn {C : Cfg} {s t : State} (h : agent Design.rules C s = some t)
     (hi : Scal C s) (hk : Sk s) (hg : Gn s) : Gn t := by
   have hpw := agent_pw h
-  obtain ⟨n, r, hr, hnr, hag, rfl⟩ := agent_spec h
+  obtain ⟨n, r, hr, hnr, hag, ht⟩ := agent_spec h
+  rcases ht with rfl | rfl
+  · exact gn_failed hg
   have hi' := hi hpw
   simp only [hr] at hi'
-  have hn : n < 18 := hi'.1
-  rcases lt18 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
-    | h0 | h0 | h0 | h0 <;> subst h0 <;> simp [Design.rules] at hnr <;> subst hnr
+  have hn : n < 16 := hi'.lt
+  have hon := hi'.once
+  rcases lt16 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
+    | h0 | h0 <;> subst h0 <;> simp [Design.rules, Today.cookieB] at hnr <;> subst hnr
   all_goals first
     | -- a step that leaves the sockets, the lists and the record alone
-      (refine gn_sys hg ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
-       · simp [advance, doStep, hr, Design.rules, openGate, State.closeGate]
-       · simp [advance, doStep, hr, Design.rules, openGate, State.closeGate]
-       · simp [advance, doStep, hr, Design.rules, openGate, State.closeGate]
+      (refine gn_sys hg ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
+       · simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate, State.closeGate]
+       · simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate, State.closeGate]
+       · simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate, State.closeGate]
        · intro i hi0
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at hi0 <;> exact hi0
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hi0 <;> exact hi0
        · intro i hi0
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at hi0 <;>
-           exact hg.g2 i hi0
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hi0 <;> exact hg.g2 i hi0
+       · intro x hx hm hl
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hm <;> exact hg.gML x hx hm hl
        · intro m hm
          refine ⟨_, hr, ?_⟩
          intro i hi0
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at hi0 <;> exact hi0
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hi0 <;> exact hi0
        · intro m hm hle
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at hm <;>
-           (refine ⟨_, hr, ?_⟩; omega)
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hm <;> (refine ⟨_, hr, ?_⟩; omega)
        · intro m hm hle
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at hm <;>
-           (refine ⟨_, hr, ?_⟩; omega)
-       · intro h9 ha
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at h9
-       · intro m hm h10 h11 ha
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at hm <;>
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hm <;> (refine ⟨_, hr, ?_⟩; omega)
+       · intro h8 ha
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at h8
+       · intro m hm h9 h10 ha
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hm <;>
            first
              | omega
              | (refine ⟨_, hr, ?_, ?_, hag, ?_⟩ <;>
-                 first | omega | simp [advance, doStep, hr, Design.rules])
+                 first | omega | simp [advance, doStep, hr, Design.rules, Today.cookieB])
        done)
     | skip
-  · -- load: with no manifest the restore fails; with one, nothing changes
-    cases hm : s.man.isNone <;>
-      (refine gn_sys hg ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_ <;>
-        simp [advance, doStep, hr, Design.rules, hm]) <;>
-      first
-        | (intro i hi0; exact hg.g2 i hi0)
-        | (intro i hi0; exact hi0)
-        | (intro m hm' h9; omega)
-  · refine gn_dump6 hk hg hr ?_ ?_ ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules]
-  · refine gn_look hk hg hr hag ?_ ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules]
-  · refine gn_retire hg hr hag ?_ ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules]
+  · refine gn_dump6 hk hg hr ?_ ?_ ?_ ?_ ?_ ?_ ?_ <;>
+      simp [advance, doStep, hr, Design.rules, Today.cookieB]
+  · refine gn_look hk hg hr hag ?_ ?_ ?_ ?_ ?_ ?_ <;>
+      simp [advance, doStep, hr, Design.rules, Today.cookieB]
+  · refine gn_retire hg hr hag ?_ ?_ ?_ ?_ ?_ ?_ <;>
+      simp [advance, doStep, hr, Design.rules, Today.cookieB]
 
 theorem agentFail_gn {C : Cfg} {s t : State} :
     agentFail Design.rules C s = some t → Gn s → Gn t := by
@@ -882,10 +1113,19 @@ theorem agentFail_gn {C : Cfg} {s t : State} :
   all_goals (intro h hg)
   all_goals (try contradiction)
   all_goals first
-    | (exfalso; simp_all; done)
+    | (exfalso; simp_all [Design.rules]; done)
     | (simp only [Option.some.injEq] at h
        subst h
-       refine gn_sys hg rfl rfl rfl ?_ hg.g2 ?_ ?_ ?_ ?_ ?_ <;> simp)
+       refine gn_sys hg rfl rfl rfl ?_ hg.g2 hg.gML ?_ ?_ ?_ ?_ ?_
+       · intro i hi0; exact hi0
+       · intro n hr; exact ⟨n, hr, fun i h0 => h0⟩
+       · intro n hr hle; exact ⟨n, hr, hle⟩
+       · intro n hr hle; exact ⟨n, hr, hle⟩
+       · intro hr ha; exact ⟨hr, ha, rfl, rfl⟩
+       · intro n hr h9 h10 ha; exact ⟨n, hr, h9, h10, ha, rfl⟩)
+    | (simp only [Option.some.injEq] at h
+       subst h
+       refine gn_sys hg rfl rfl rfl ?_ hg.g2 hg.gML ?_ ?_ ?_ ?_ ?_ <;> simp)
 
 theorem off_gn {s t : State} : off s = some t → Gn s → Gn t := by
   unfold off
@@ -946,7 +1186,7 @@ theorem step_gn {C : Cfg} {l : Label} {s t : State}
       exact gn_evo hi hpw (evo_same rfl hk.j1) (e2_same hk.j1) rfl rfl hg
     · contradiction
   | guard => exact snap_gn h hi hk hg
-  | restore => exact restore_gn h hg
+  | restore => exact restore_gn h hi hg
   | agent => exact agent_gn h hi hk hg
   | agentFail => exact agentFail_gn h hg
   | kill => exact kill_gn h hi hk hg
@@ -956,7 +1196,7 @@ theorem step_gn {C : Cfg} {l : Label} {s t : State}
   | watchdog => exact watchdog_gn h hi hk hg
 
 theorem gn_init (C : Cfg) : Gn (init C) := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [init]
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [init]
 
 theorem reachable_gn {C : Cfg} {s : State} (hr : Reachable Design.rules C s) : Gn s := by
   induction hr with

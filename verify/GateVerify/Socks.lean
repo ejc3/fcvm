@@ -44,10 +44,10 @@ structure Sk (s : State) : Prop where
   w : ∀ x ∈ s.socks, ∀ y ∈ s.socks, x.id = y.id → x.kind = y.kind
   u : ∀ y ∈ s.seen, ∀ x ∈ s.socks, y.id = x.id → y.kind = x.kind
   /-- after the IPv4 dump: every IPv4 socket that must go has been seen -/
-  k8 : s.rp = .at 8 → s.ag = true → ∀ x ∈ s.socks, x.kind.outside = true → x.kind.fam = .v4 →
+  k8 : s.rp = .at 7 → s.ag = true → ∀ x ∈ s.socks, x.kind.outside = true → x.kind.fam = .v4 →
     badGen x → ∃ y ∈ s.seen, y.id = x.id
   /-- after the IPv6 dump: every socket that must go is in the manifest or the list -/
-  k5 : ∀ n, s.rp = .at n → 9 ≤ n → n ≤ 11 → s.ag = true → ∀ x ∈ s.socks,
+  k5 : ∀ n, s.rp = .at n → 8 ≤ n → n ≤ 10 → s.ag = true → ∀ x ∈ s.socks,
     x.kind.outside = true → badGen x → x.id ∈ s.man.getD [] ∨ x.id ∈ s.lst
   /-- after the retirement: none is left -/
   k3 : s.cut = true → ∀ x ∈ s.socks, x.kind.outside = true → ¬ badGen x
@@ -71,7 +71,7 @@ structure Evo (s t : State) : Prop where
 theorem sk_evo {C : Cfg} {s t : State} (hs : Scal C s) (hpw : s.pw = true) (he : Evo s t)
     (hsc : t.scal = s.scal) (hk : Sk s) : Sk t := by
   simp only [State.scal, Prod.mk.injEq] at hsc
-  obtain ⟨-, hrp, -, -, -, -, -, -, -, -, -, -, -, -, -, hcut, -, hag⟩ := hsc
+  obtain ⟨-, hrp, -, -, -, -, -, -, -, -, -, -, -, hcut, -, hag, -⟩ := hsc
   have hi := hs hpw
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro y hy
@@ -112,9 +112,9 @@ theorem sk_evo {C : Cfg} {s t : State} (hs : Scal C s) (hpw : s.pw = true) (he :
         (by unfold badGen at *; rw [h3]; exact hb)
       rw [← h1]; exact this
     · exfalso
-      simp only [hn, CloneOk] at hi
-      have hin : s.in4 = true ∧ s.in6 = true := hi.2.2.2.1 (by omega)
-      have hsc' : s.sc = false := hi.2.2.2.2.2.2.2.2.2.2.2.2.2.1 (by omega) (by omega)
+      simp only [hn] at hi
+      have hin : s.in4 = true ∧ s.in6 = true := hi.inn (by omega)
+      have hsc' : s.sc = false := hi.scOff (by omega)
       rcases h3 with h3 | ⟨-, h3⟩
       · unfold badGen at hb; rw [h3] at hb; simp at hb
       · cases hfam : x.kind.fam <;> simp_all [State.gateIn]
@@ -150,9 +150,8 @@ def State.sk (s : State) := (s.socks, s.next, s.seen, s.lst, s.man)
 @[simp] theorem answered_sk (tr : Bool) (c : Cli) (p : Port) (seg : Seg) (r : Bool) (s : State) :
     (answered tr c p seg r s).sk = s.sk := by
   unfold answered
-  split
-  · rfl
-  · split <;> simp
+  repeat' split
+  all_goals first | rfl | simp
 
 @[simp] theorem unanswered_sk (R : Rules) (C : Cfg) (c : Cli) (p : Port) (seg : Seg)
     (s : State) : (unanswered R C c p seg s).sk = s.sk := by
@@ -354,9 +353,9 @@ theorem unpair_evo {b : Bool} {s t : State} :
 somewhere `k8` and `k5` say nothing about. -/
 theorem sk_sys {s t : State} (hk : Sk s) (h1 : t.socks = s.socks) (h2 : t.next = s.next)
     (hseen : ∀ y ∈ t.seen, y ∈ s.seen ∨ y ∈ s.socks)
-    (h8 : t.rp = .at 8 → t.ag = true → s.rp = .at 8 ∧ s.ag = true ∧ t.seen = s.seen)
-    (h5 : ∀ n, t.rp = .at n → 9 ≤ n → n ≤ 11 → t.ag = true →
-      ∃ m, s.rp = .at m ∧ 9 ≤ m ∧ m ≤ 11 ∧ s.ag = true ∧ t.man = s.man ∧ t.lst = s.lst)
+    (h8 : t.rp = .at 7 → t.ag = true → s.rp = .at 7 ∧ s.ag = true ∧ t.seen = s.seen)
+    (h5 : ∀ n, t.rp = .at n → 8 ≤ n → n ≤ 10 → t.ag = true →
+      ∃ m, s.rp = .at m ∧ 8 ≤ m ∧ m ≤ 10 ∧ s.ag = true ∧ t.man = s.man ∧ t.lst = s.lst)
     (h3 : t.cut = true → s.cut = true) : Sk t := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro x hx; rw [h1] at hx; rw [h2]; exact hk.j1 x hx
@@ -390,7 +389,7 @@ theorem hasMirror_outside (l : List Sock) {x : Sock} (h : x.kind.outside = true)
 
 /-- The IPv4 dump. -/
 theorem sk_dump4 {s t : State} (hk : Sk s) (h1 : t.socks = s.socks) (h2 : t.next = s.next)
-    (hseen : t.seen = s.socks.filter (·.kind.fam == .v4)) (hrp : t.rp = .at 8)
+    (hseen : t.seen = s.socks.filter (·.kind.fam == .v4)) (hrp : t.rp = .at 7)
     (hcut : t.cut = s.cut) : Sk t := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro x hx; rw [h1] at hx; rw [h2]; exact hk.j1 x hx
@@ -410,11 +409,11 @@ theorem sk_dump4 {s t : State} (hk : Sk s) (h1 : t.socks = s.socks) (h2 : t.next
   · intro hc x hx; rw [h1] at hx; rw [hcut] at hc; exact hk.k3 hc x hx
 
 /-- The IPv6 dump, and the comparison with the manifest. -/
-theorem sk_dump6 {s t : State} (hk : Sk s) (hs : s.rp = .at 8) (hag : s.ag = true)
+theorem sk_dump6 {s t : State} (hk : Sk s) (hs : s.rp = .at 7) (hag : s.ag = true)
     (h1 : t.socks = s.socks) (h2 : t.next = s.next)
     (hseen : t.seen = s.seen ++ s.socks.filter (·.kind.fam == .v6))
     (hlst : t.lst = listIds Design.rules (s.man.getD []) t.seen) (hman : t.man = s.man)
-    (hrp : t.rp = .at 9) (hcut : t.cut = s.cut) : Sk t := by
+    (hrp : t.rp = .at 8) (hcut : t.cut = s.cut) : Sk t := by
   have hmem : ∀ y ∈ t.seen, y ∈ s.seen ∨ y ∈ s.socks := by
     intro y hy
     rw [hseen, List.mem_append, List.mem_filter] at hy
@@ -457,10 +456,10 @@ theorem sk_dump6 {s t : State} (hk : Sk s) (hs : s.rp = .at 8) (hag : s.ag = tru
   · intro hc x hx; rw [h1] at hx; rw [hcut] at hc; exact hk.k3 hc x hx
 
 /-- The second look. -/
-theorem sk_look {s t : State} (hk : Sk s) (hs : s.rp = .at 9) (hag : s.ag = true)
+theorem sk_look {s t : State} (hk : Sk s) (hs : s.rp = .at 8) (hag : s.ag = true)
     (h1 : t.socks = s.socks) (h2 : t.next = s.next) (hseen : t.seen = s.seen)
     (hlst : t.lst = lookIds s.lst s.seen s.socks) (hman : t.man = s.man)
-    (hrp : t.rp = .at 10) (hcut : t.cut = s.cut) : Sk t := by
+    (hrp : t.rp = .at 9) (hcut : t.cut = s.cut) : Sk t := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro x hx; rw [h1] at hx; rw [h2]; exact hk.j1 x hx
   · intro y hy; rw [hseen] at hy; rw [h2]; exact hk.j2 y hy
@@ -469,7 +468,7 @@ theorem sk_look {s t : State} (hk : Sk s) (hs : s.rp = .at 9) (hag : s.ag = true
   · intro hr; rw [hrp] at hr; cases hr
   · intro n _ _ _ _ x hx ho hb
     rw [h1] at hx; rw [hman]
-    rcases hk.k5 9 hs (by omega) (by omega) hag x hx ho hb with h | h
+    rcases hk.k5 8 hs (by omega) (by omega) hag x hx ho hb with h | h
     · exact Or.inl h
     · refine Or.inr ?_
       rw [hlst]
@@ -486,11 +485,10 @@ theorem sk_look {s t : State} (hk : Sk s) (hs : s.rp = .at 9) (hag : s.ag = true
 
 /-- The retirement: what the manifest and the list name is gone, and that is everything that
 had to go. -/
-theorem sk_retire {s t : State} (hk : Sk s) (hs : s.rp = .at 11) (hag : s.ag = true)
-    (h1 : t.socks = s.socks.filter (fun x => !(s.man.getD [] ++ s.lst).contains x.id))
-    (h2 : t.next = s.next) (hseen : t.seen = s.seen) (hrp : t.rp = .at 12) : Sk t := by
-  have hsub : ∀ x ∈ t.socks, x ∈ s.socks := by
-    intro x hx; rw [h1, List.mem_filter] at hx; exact hx.1
+theorem sk_retire {s t : State} (hk : Sk s) (hs : s.rp = .at 10) (hag : s.ag = true)
+    (h1 : ∀ x ∈ t.socks, x ∈ s.socks ∧ ¬ (x.id ∈ s.man.getD [] ∨ x.id ∈ s.lst))
+    (h2 : t.next = s.next) (hseen : t.seen = s.seen) (hrp : t.rp = .at 11) : Sk t := by
+  have hsub : ∀ x ∈ t.socks, x ∈ s.socks := fun x hx => (h1 x hx).1
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro x hx; rw [h2]; exact hk.j1 x (hsub x hx)
   · intro y hy; rw [hseen] at hy; rw [h2]; exact hk.j2 y hy
@@ -500,12 +498,8 @@ theorem sk_retire {s t : State} (hk : Sk s) (hs : s.rp = .at 11) (hag : s.ag = t
   · intro n hn h9 _
     rw [hrp] at hn; cases hn; omega
   · intro _ x hx ho hb
-    rw [h1, List.mem_filter] at hx
-    obtain ⟨hx, hnot⟩ := hx
-    have := hk.k5 11 hs (by omega) (by omega) hag x hx ho hb
-    simp only [Bool.not_eq_true', List.contains_eq_mem, List.mem_append,
-      decide_eq_false_iff_not] at hnot
-    exact hnot this
+    obtain ⟨hx, hnot⟩ := h1 x hx
+    exact hnot (hk.k5 10 hs (by omega) (by omega) hag x hx ho hb)
 
 theorem step_pw {R : Rules} {C : Cfg} {l : Label} {s t : State}
     (h : step R C l s = some t) : s.pw = true := by
@@ -516,6 +510,9 @@ theorem step_pw {R : Rules} {C : Cfg} {l : Label} {s t : State}
         restore, agent, agentFail, kill, restart, off, timeout, watchdog, State.running,
         agentRuns, hp] at h
   · rfl
+
+theorem sk_dead (s : State) : Sk s.dead := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [State.dead]
 
 set_option hygiene false in
 macro "open_sk" : tactic => `(tactic| (
@@ -529,7 +526,7 @@ macro "open_sk" : tactic => `(tactic| (
   all_goals (try subst h)))
 
 set_option hygiene false in
-macro "close_sk" : tactic => `(tactic| (
+macro "close_sk" : tactic => `(tactic| first | exact sk_dead _ | (
   refine sk_sys hk rfl rfl ?_ ?_ ?_ ?_
   · intro y hy
     first
@@ -544,18 +541,18 @@ macro "close_sk" : tactic => `(tactic| (
     have hi' := hi (by simp_all [State.running])
     first
       | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-          State.dead]; done)
+          State.dead, reopened, unreached, Design.rules]; done)
       | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-          State.dead]; omega)
+          State.dead, reopened, unreached, Design.rules]; omega)
   · intro n hr h9 h11 ha
     have hi' := hi (by simp_all [State.running])
     first
       | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-          State.dead]; done)
+          State.dead, reopened, unreached, Design.rules]; done)
       | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-          State.dead]; omega)
+          State.dead, reopened, unreached, Design.rules]; omega)
   · intro hc
-    simp_all [openGate, State.closeGate, State.dead]))
+    simp_all [openGate, State.closeGate, State.dead, reopened, unreached, Design.rules]))
 
 theorem snap_sk {C : Cfg} {g : Bool} {s t : State} :
     snap Design.rules C g s = some t → Scal C s → Sk s → Sk t := by
@@ -592,9 +589,6 @@ theorem watchdog_sk {C : Cfg} {s t : State} :
   open_sk
   all_goals close_sk
 
-theorem sk_dead (s : State) : Sk s.dead := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> simp [State.dead]
-
 theorem off_sk {s t : State} : off s = some t → Sk t := by
   unfold off
   split
@@ -607,34 +601,44 @@ theorem timeout_sk {s t : State} : timeout s = some t → Sk t := by
   · intro h; simp only [Option.some.injEq] at h; subst h; exact sk_dead s
   · intro h; contradiction
 
-/-- A clone is restored: the same sockets, each now the source's, and nothing seen or listed. -/
-theorem restore_sk {C : Cfg} {s t : State} : restore C s = some t → Sk s → Sk t := by
+/-- A clone is restored: the same sockets, each now the source's, and nothing seen or listed.
+In the design the image is never of a clone inside its restore. -/
+theorem restore_sk {C : Cfg} {s t : State} :
+    restore C s = some t → Scal C s → Sk s → Sk t := by
   unfold restore
   split
-  · intro h hk
-    simp only [Option.some.injEq] at h
-    subst h
-    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-    · intro x hx
-      simp only [List.mem_map] at hx
-      obtain ⟨x0, hx0, rfl⟩ := hx
-      exact hk.j1 x0 hx0
-    · intro y hy; simp at hy
-    · intro x hx y hy
-      simp only [List.mem_map] at hx hy
-      obtain ⟨x0, hx0, rfl⟩ := hx
-      obtain ⟨y0, hy0, rfl⟩ := hy
-      exact hk.w x0 hx0 y0 hy0
-    · intro y hy; simp at hy
-    · intro hr; split at hr <;> simp at hr
-    · intro n hr h9; split at hr <;> simp at hr; omega
-    · intro hc; simp at hc
+  · rename_i hc
+    intro h hi hk
+    have hpw : s.pw = true := by simp at hc; exact hc.1.1
+    have hsp : s.sp = .paused := by simp at hc; exact hc.1.2
+    have hi := hi hpw
+    cases hr : s.rp with
+    | «at» n => simp only [hr] at hi; rw [hi.idle] at hsp; cases hsp
+    | failed => simp only [hr] at hi; rw [hi.1] at hsp; cases hsp
+    | _ =>
+      simp only [hr, Option.some.injEq] at h
+      subst h
+      refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+      · intro x hx
+        simp only [List.mem_map] at hx
+        obtain ⟨x0, hx0, rfl⟩ := hx
+        exact hk.j1 x0 hx0
+      · intro y hy; simp at hy
+      · intro x hx y hy
+        simp only [List.mem_map] at hx hy
+        obtain ⟨x0, hx0, rfl⟩ := hx
+        obtain ⟨y0, hy0, rfl⟩ := hy
+        exact hk.w x0 hx0 y0 hy0
+      · intro y hy; simp at hy
+      · intro hr'; simp at hr'
+      · intro n hr' h9; simp at hr'; omega
+      · intro hc'; simp at hc'
   · intro h; contradiction
 
+/-- A step of the agent: the restore fails, or its next step is done. -/
 theorem agent_spec {R : Rules} {C : Cfg} {s t : State} (h : agent R C s = some t) :
     ∃ n r, s.rp = .at n ∧ R.restore[n]? = some r ∧ s.ag = true
-      ∧ t = (if (r == .load && s.man.isNone) = true then { s with rp := .failed, saved := none }
-             else advance R (doStep R C r s)) := by
+      ∧ (t = { s with rp := .failed, saved := none } ∨ t = advance R (doStep R C r s)) := by
   unfold agent at h
   split at h
   · contradiction
@@ -647,48 +651,60 @@ theorem agent_spec {R : Rules} {C : Cfg} {s t : State} (h : agent R C s = some t
       · contradiction
       · rename_i r hnr
         refine ⟨n, r, rfl, hnr, hag, ?_⟩
-        split at h <;> simp_all
+        split at h
+        · exact Or.inl (Option.some.inj h).symm
+        · exact Or.inr (Option.some.inj h).symm
     | _ => simp [nextStep, hr] at h
+
+/-- A restore that fails keeps what the sockets' invariant says. -/
+theorem sk_failed {s : State} (hk : Sk s) : Sk { s with rp := .failed, saved := none } := by
+  refine ⟨hk.j1, hk.j2, hk.w, hk.u, ?_, ?_, hk.k3⟩
+  · intro hr; cases hr
+  · intro n hr; cases hr
 
 theorem agent_sk {C : Cfg} {s t : State} (h : agent Design.rules C s = some t)
     (hi : Scal C s) (hk : Sk s) : Sk t := by
   have hpw := agent_pw h
-  obtain ⟨n, r, hr, hnr, hag, rfl⟩ := agent_spec h
+  obtain ⟨n, r, hr, hnr, hag, ht⟩ := agent_spec h
+  rcases ht with rfl | rfl
+  · exact sk_failed hk
   have hi' := hi hpw
   simp only [hr] at hi'
-  have hn : n < 18 := hi'.1
-  rcases lt18 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
-    | h0 | h0 | h0 | h0 <;> subst h0 <;> simp [Design.rules] at hnr <;> subst hnr
+  have hn : n < 16 := hi'.lt
+  have hon := hi'.once
+  rcases lt16 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
+    | h0 | h0 <;> subst h0 <;> simp [Design.rules, Today.cookieB] at hnr <;> subst hnr
   all_goals first
     | -- a step that leaves the sockets, the dump and the lists alone
       (refine sk_sys hk ?_ ?_ ?_ ?_ ?_ ?_
-       · simp [advance, doStep, hr, Design.rules, openGate, State.closeGate]
-       · simp [advance, doStep, hr, Design.rules, openGate, State.closeGate]
+       · simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate, State.closeGate]
+       · simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate, State.closeGate]
        · intro y hy
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at hy <;>
-           exact Or.inl hy
-       · simp [advance, doStep, hr, Design.rules, openGate, State.closeGate]
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hy <;> exact Or.inl hy
+       · simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate, State.closeGate]
        · intro m hm h9 h11
-         simp [advance, doStep, hr, Design.rules, openGate, State.closeGate] at hm <;> omega
-       · simp [advance, doStep, hr, Design.rules, openGate, State.closeGate]
+         simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate,
+           State.closeGate] at hm <;> omega
+       · simp [advance, doStep, hr, hon, Design.rules, Today.cookieB, openGate, State.closeGate]
        done)
     | skip
-  · -- load: with no manifest the restore fails; with one, nothing changes
-    cases hm : s.man.isNone <;>
-      (refine sk_sys hk ?_ ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules, hm]) <;>
-      first
-        | (intro y hy; exact Or.inl hy)
-        | (intro m hm' h9 h11; omega)
-  · refine sk_dump4 hk ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules]
-  · refine sk_dump6 hk hr hag ?_ ?_ ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules]
-  · refine sk_look hk hr hag ?_ ?_ ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules]
+  · refine sk_dump4 hk ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules, Today.cookieB]
+  · refine sk_dump6 hk hr hag ?_ ?_ ?_ ?_ ?_ ?_ ?_ <;>
+      simp [advance, doStep, hr, Design.rules, Today.cookieB]
+  · refine sk_look hk hr hag ?_ ?_ ?_ ?_ ?_ ?_ ?_ <;>
+      simp [advance, doStep, hr, Design.rules, Today.cookieB]
   · -- egress: the list stands, the dump is dropped
-    (refine sk_sys hk ?_ ?_ ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules]) <;>
+    (refine sk_sys hk ?_ ?_ ?_ ?_ ?_ ?_ <;>
+        simp [advance, doStep, hr, Design.rules, Today.cookieB]) <;>
       first
         | (intro y hy; exact Or.inl hy)
-        | (intro m hm h9 h11; exact ⟨10, rfl, by omega, by omega, hag⟩)
-        | exact ⟨10, rfl, by omega, by omega, hag⟩
-  · refine sk_retire hk hr hag ?_ ?_ ?_ ?_ <;> simp [advance, doStep, hr, Design.rules]
+        | (intro m hm h9 h11; exact ⟨9, rfl, by omega, by omega, hag⟩)
+        | exact ⟨9, rfl, by omega, by omega, hag⟩
+  · refine sk_retire hk hr hag ?_ ?_ ?_ ?_ <;>
+      simp [advance, doStep, hr, Design.rules, Today.cookieB]
+    intros
+    simp_all
 
 theorem agentFail_sk {C : Cfg} {s t : State} :
     agentFail Design.rules C s = some t → Sk s → Sk t := by
@@ -697,7 +713,17 @@ theorem agentFail_sk {C : Cfg} {s t : State} :
   all_goals (intro h hk)
   all_goals (try contradiction)
   all_goals first
-    | (exfalso; simp_all; done)
+    | (exfalso; simp_all [Design.rules]; done)
+    | (simp only [Option.some.injEq] at h
+       subst h
+       exact sk_failed hk)
+    | (simp only [Option.some.injEq] at h
+       subst h
+       refine sk_sys hk rfl rfl ?_ ?_ ?_ ?_
+       · intro y hy; exact Or.inl hy
+       · intro h1 h2; exact ⟨h1, h2, rfl⟩
+       · intro n h1 h2 h3 h4; exact ⟨n, h1, h2, h3, h4, rfl, rfl⟩
+       · intro hc; exact hc)
     | (simp only [Option.some.injEq] at h
        subst h
        refine sk_sys hk rfl rfl ?_ ?_ ?_ ?_ <;> simp)
@@ -733,7 +759,7 @@ theorem step_sk {C : Cfg} {l : Label} {s t : State}
       exact sk_evo hi hpw (evo_same rfl hk.j1) rfl hk
     · contradiction
   | guard => exact snap_sk h hi hk
-  | restore => exact restore_sk h hk
+  | restore => exact restore_sk h hi hk
   | agent => exact agent_sk h hi hk
   | agentFail => exact agentFail_sk h hk
   | kill => exact kill_sk h hi hk
