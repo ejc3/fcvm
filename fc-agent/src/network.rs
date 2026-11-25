@@ -1910,9 +1910,21 @@ pub fn publish_as_loopback_client(ports: &[String]) {
     }
 }
 
+/// The source ports a `/loopback` port's clients are given, and nobody else: above the
+/// guest's ephemeral range (`ip_local_port_range`, 32768 to 60999), so no connection the
+/// guest makes to itself has one unless a process binds it on purpose.
+///
+/// The snapshot boundary reads the port to tell such a client from a connection inside
+/// the guest (`snapshot_network::sockets_leaving_the_guest`). Both are a socket with a
+/// 127.0.0.1 peer, and with the client's own port kept a client could make its socket
+/// look like the second: from source port P to guest port P it is its own mirror image
+/// (#2152). At most 4,536 clients of one `/loopback` port are connected at a time.
+pub const LOOPBACK_CLIENT_PORTS: std::ops::RangeInclusive<u16> = 61000..=65535;
+
 /// `iptables -w -t nat <op> INPUT -i eth0 -p tcp -d 127.0.0.1 --dport P -j SNAT
-/// --to-source 127.0.0.1`: the connections `loopback_dnat_args` rewrote, arriving from
-/// the host side, take loopback as their source as well.
+/// --to-source 127.0.0.1:61000-65535`: the connections `loopback_dnat_args` rewrote,
+/// arriving from the host side, take loopback as their source as well, from a port in
+/// `LOOPBACK_CLIENT_PORTS`.
 fn loopback_client_snat_args(op: &str, port: u16) -> Vec<String> {
     [
         "-w",
@@ -1931,11 +1943,12 @@ fn loopback_client_snat_args(op: &str, port: u16) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .chain([port.to_string()])
-    .chain(
-        ["-j", "SNAT", "--to-source", "127.0.0.1"]
-            .iter()
-            .map(|s| s.to_string()),
-    )
+    .chain(["-j", "SNAT", "--to-source"].iter().map(|s| s.to_string()))
+    .chain([format!(
+        "127.0.0.1:{}-{}",
+        LOOPBACK_CLIENT_PORTS.start(),
+        LOOPBACK_CLIENT_PORTS.end()
+    )])
     .collect()
 }
 
@@ -2255,13 +2268,16 @@ mod loopback_publish_tests {
     }
 
     /// A loopback-client port's SNAT matches only the DNAT'd connections from eth0, and
-    /// rewrites their source to loopback (#1034).
+    /// rewrites their source to loopback (#1034), from a port of the range reserved for
+    /// them (#2152), which is above the ports the guest gives its own connections.
     #[test]
     fn loopback_client_snat_rewrites_the_source_of_dnatd_connections_from_eth0() {
         assert_eq!(
             loopback_client_snat_args("-A", 8097).join(" "),
-            "-w -t nat -A INPUT -i eth0 -p tcp -d 127.0.0.1 --dport 8097 -j SNAT --to-source 127.0.0.1"
+            "-w -t nat -A INPUT -i eth0 -p tcp -d 127.0.0.1 --dport 8097 -j SNAT --to-source 127.0.0.1:61000-65535"
         );
+        // The kernel's default ephemeral range ends at 60999.
+        assert!(*LOOPBACK_CLIENT_PORTS.start() > 60999);
     }
 
     /// Containment is the difference between "published ports reach loopback" and

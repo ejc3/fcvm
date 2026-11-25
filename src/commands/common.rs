@@ -6037,17 +6037,234 @@ async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &s
 /// the pause (the arm64 `default` profile: 0 ms behind after the same pause) is left
 /// alone.
 async fn resume_paused_source(vsock_socket: &Path, vm_id: &str) -> Result<()> {
-    let host_time = crate::utils::host_clock_now().as_nanos().to_string();
-    let output = run_fc_agent_command(
-        vsock_socket,
-        vm_id,
-        &["--resume-snapshot-network", "--host-time-ns", &host_time],
-    )
-    .await?;
-    // The one-shot's own report, including the size of the clock step, reaches no
-    // console: it is this exec's stderr.
-    debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
-    Ok(())
+    reopen_source_network(vsock_socket, vm_id, true).await
+}
+
+/// Reopen the source's network after a prepare that failed, whose failure does not prove
+/// it did not run. No pause preceded it, so the guest's clock is left alone.
+async fn reopen_source_after_failed_prepare(vsock_socket: &Path, vm_id: &str) -> Result<()> {
+    reopen_source_network(vsock_socket, vm_id, false).await
+}
+
+/// The exit status of a boundary one-shot that the guest refused because a restore is
+/// under way in it (`REFUSED_EXIT` in fc-agent's main.rs). Running it again changes
+/// nothing, and the guest's gate is its restore's, not this snapshot's to open.
+const ONE_SHOT_REFUSED_EXIT: i32 = 3;
+
+/// How long a snapshot create keeps asking its source to reopen, and how long it waits
+/// between two tries.
+///
+/// The guest opens the gate a prepare closed only when its host asks: a guest cannot
+/// tell a resumed source from a clone that has not been told of its restore, and the
+/// host can. So a source whose resume one-shot failed is asked again. Each ask is an
+/// exec whose connect is tried for about 54 s (`commands::exec`), so an ask that finds no
+/// exec server takes that long. The case the bound is for: fc-agent dies between the
+/// prepare and the resume, systemd starts it again (`Restart=on-failure`,
+/// `RestartSec=1`), and the new agent serves this one command before its boot plan. In
+/// the VM test the new agent was up about a second after the kill and the first ask
+/// landed. The bound also covers a stop that waits systemd's 90 s stop timeout for a
+/// frozen container that ignores SIGTERM, which was read from systemd and not observed.
+const SOURCE_REOPEN_BOUND: std::time::Duration = std::time::Duration::from_secs(150);
+const SOURCE_REOPEN_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why a source's network was not reopened.
+#[derive(Debug)]
+enum ReopenFailure {
+    /// The guest refused: a restore is under way in it, and its gate is that restore's.
+    Refused(anyhow::Error),
+    /// The bound passed with the gate still closed.
+    LeftGated(anyhow::Error),
+}
+
+impl ReopenFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            ReopenFailure::Refused(error) | ReopenFailure::LeftGated(error) => error,
+        }
+    }
+}
+
+/// What one try at reopening a source's network came to.
+#[derive(Debug)]
+enum ReopenTry {
+    Open,
+    /// The guest refused: a restore is under way in it.
+    Refused(anyhow::Error),
+    /// The one-shot failed, or could not be run at all.
+    Failed(anyhow::Error),
+}
+
+/// Run the guest's resume one-shot until it has opened the gate or `SOURCE_REOPEN_BOUND`
+/// has passed (#2142). `pause_preceded` sends the host's clock with each try, taken at
+/// that try.
+///
+/// A source that is still gated when the bound has passed is left running: its
+/// established connections go on working behind the gate, and ending it would end them.
+/// It is reported failed instead. The create fails with the VM's id, the VM's state
+/// records `network_gate_closed`, and the next `snapshot create` of it is refused until
+/// the gate is open ([`refuse_a_source_left_gated`]).
+async fn reopen_source_network(
+    vsock_socket: &Path,
+    vm_id: &str,
+    pause_preceded: bool,
+) -> Result<()> {
+    let reopened =
+        ask_source_to_reopen(vsock_socket, vm_id, pause_preceded, SOURCE_REOPEN_BOUND).await;
+    if let Err(ReopenFailure::LeftGated(_)) = &reopened {
+        record_source_gate(vm_id, true).await;
+    }
+    reopened.map_err(ReopenFailure::into_error)
+}
+
+/// Write `network_gate_closed` on the VM's state. Best-effort: the create's own error
+/// already names the VM, and a VM being torn down has no state to write.
+async fn record_source_gate(vm_id: &str, closed: bool) {
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    match state_manager
+        .update_state(vm_id, |state| state.network_gate_closed = closed)
+        .await
+    {
+        Ok(_) => {}
+        Err(error) => warn!(
+            vm_id,
+            closed,
+            error = %format!("{error:#}"),
+            "could not record the source's gate on its state"
+        ),
+    }
+}
+
+/// Refuse a snapshot of a VM whose gate an earlier create left closed, unless the gate
+/// can be opened now. The guest is asked once: the reopen is the same one-shot, it does
+/// nothing to an open gate, and an operator or a restarted agent may have made it
+/// possible since. A source that opens is recorded open and snapshotted as any other.
+async fn refuse_a_source_left_gated(vsock_socket: &Path, vm_id: &str) -> Result<()> {
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let gated = state_manager
+        .load_state(vm_id)
+        .await
+        .is_ok_and(|state| state.network_gate_closed);
+    if !gated {
+        return Ok(());
+    }
+    match ask_source_to_reopen(vsock_socket, vm_id, false, std::time::Duration::ZERO).await {
+        Ok(()) => {
+            info!(
+                vm_id,
+                "the gate an earlier snapshot create left closed is open"
+            );
+            record_source_gate(vm_id, false).await;
+            Ok(())
+        }
+        Err(failure) => Err(failure.into_error().context(format!(
+            "snapshot create of VM {vm_id} is refused: an earlier snapshot create left its \
+             network gate closed, and it still cannot be opened"
+        ))),
+    }
+}
+
+async fn ask_source_to_reopen(
+    vsock_socket: &Path,
+    vm_id: &str,
+    pause_preceded: bool,
+    bound: std::time::Duration,
+) -> std::result::Result<(), ReopenFailure> {
+    reopen_until_open(vm_id, bound, SOURCE_REOPEN_PAUSE, || async {
+        let host_time = crate::utils::host_clock_now().as_nanos().to_string();
+        let mut args = vec!["--resume-snapshot-network"];
+        if pause_preceded {
+            args.extend(["--host-time-ns", &host_time]);
+        }
+        match run_fc_agent_command_any_exit(vsock_socket, vm_id, &args).await {
+            Ok(output) if output.exit_code == 0 => {
+                // The one-shot's own report, including the size of the clock step,
+                // reaches no console: it is this exec's stderr.
+                debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
+                ReopenTry::Open
+            }
+            Ok(output) => {
+                let error = anyhow::anyhow!(
+                    "`fc-agent --resume-snapshot-network` failed in guest {vm_id} with exit \
+                     code {}: stdout={:?}, stderr={:?}",
+                    output.exit_code,
+                    output.stdout,
+                    output.stderr
+                );
+                if output.exit_code == ONE_SHOT_REFUSED_EXIT {
+                    ReopenTry::Refused(error)
+                } else {
+                    ReopenTry::Failed(error)
+                }
+            }
+            Err(error) => ReopenTry::Failed(error),
+        }
+    })
+    .await
+}
+
+/// The loop of [`reopen_source_network`], with the try as a parameter.
+///
+/// A source that is still gated when the bound has passed is reported as that, by name:
+/// it refuses every new TCP connection in both directions until a resume lands, and
+/// nothing else in the system says so.
+async fn reopen_until_open<F, Fut>(
+    vm_id: &str,
+    bound: std::time::Duration,
+    pause: std::time::Duration,
+    mut reopen: F,
+) -> std::result::Result<(), ReopenFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ReopenTry>,
+{
+    let started = std::time::Instant::now();
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        let error = match reopen().await {
+            ReopenTry::Open => {
+                if tries > 1 {
+                    warn!(
+                        vm_id,
+                        tries,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "the source's network reopened after failed tries"
+                    );
+                }
+                return Ok(());
+            }
+            ReopenTry::Refused(error) => {
+                return Err(ReopenFailure::Refused(error.context(format!(
+                    "guest {vm_id} refused to reopen its network: a restore is under way in \
+                     it, and its gate is that restore's"
+                ))));
+            }
+            ReopenTry::Failed(error) => error,
+        };
+        if started.elapsed() + pause > bound {
+            error!(
+                vm_id,
+                tries,
+                error = %format!("{error:#}"),
+                "CRITICAL: the source VM is left with its network gate closed"
+            );
+            return Err(ReopenFailure::LeftGated(error.context(format!(
+                "source VM {vm_id} is LEFT WITH ITS NETWORK GATE CLOSED: {tries} tries over \
+                 {:.0?} did not reopen it. It is left running and keeps the connections it \
+                 has, and refuses every new TCP connection, in and out, until \
+                 `{FC_AGENT_PATH} --resume-snapshot-network` succeeds in it (`fcvm exec \
+                 --vm`, or the next `snapshot create`, which is refused until then)",
+                started.elapsed()
+            ))));
+        }
+        warn!(
+            vm_id,
+            tries,
+            error = %format!("{error:#}"),
+            "reopening the source's network failed; trying again"
+        );
+        tokio::time::sleep(pause).await;
+    }
 }
 
 /// The guest's free page reporting parameter, which holds the order its balloon reports at.
@@ -6105,8 +6322,8 @@ pub(crate) async fn run_fc_agent_one_shot(
         .map(|_| ())
 }
 
-/// Run `fc-agent <args>` in the guest over the exec channel and fail unless it exits 0.
-async fn run_fc_agent_command(
+/// Run `fc-agent <args>` in the guest over the exec channel, whatever it exits with.
+async fn run_fc_agent_command_any_exit(
     vsock_socket: &Path,
     vm_id: &str,
     args: &[&str],
@@ -6118,9 +6335,19 @@ async fn run_fc_agent_command(
         .map(str::to_string)
         .collect();
     let shown = command.join(" ");
-    let output = run_exec_in_vm_captured(vsock_socket, &command, false, vm_id)
+    run_exec_in_vm_captured(vsock_socket, &command, false, vm_id)
         .await
-        .with_context(|| format!("running `{shown}` in guest {vm_id}"))?;
+        .with_context(|| format!("running `{shown}` in guest {vm_id}"))
+}
+
+/// Run `fc-agent <args>` in the guest over the exec channel and fail unless it exits 0.
+async fn run_fc_agent_command(
+    vsock_socket: &Path,
+    vm_id: &str,
+    args: &[&str],
+) -> Result<crate::commands::exec::ExecOutput> {
+    let shown = format!("{FC_AGENT_PATH} {}", args.join(" "));
+    let output = run_fc_agent_command_any_exit(vsock_socket, vm_id, args).await?;
     anyhow::ensure!(
         output.exit_code == 0,
         "`{shown}` failed in guest {vm_id} with exit code {}: \
@@ -6562,6 +6789,7 @@ pub async fn create_snapshot_core(
     // failpoint: widen the window before preparation — never sleep after the
     // gate closes and before the pause.
     failpoint::hit_async("snapshot.pre_pause").await;
+    refuse_a_source_left_gated(vsock_socket_path, &snapshot_config.vm_id).await?;
     info!(snapshot = %snapshot_config.name, "preparing guest network and pausing VM for snapshot");
     let boundary_started = std::time::Instant::now();
     let mut boundary = SnapshotBoundaryTimes::default();
@@ -6580,13 +6808,10 @@ pub async fn create_snapshot_core(
         // invoked yet.
         let operation_error =
             error.context("preparing guest network boundary for Firecracker snapshot");
-        let guest_network_resume_result = run_snapshot_network_command(
-            vsock_socket_path,
-            &snapshot_config.vm_id,
-            "--resume-snapshot-network",
-        )
-        .await
-        .context("reopening guest network after Firecracker preparation failure");
+        let guest_network_resume_result =
+            reopen_source_after_failed_prepare(vsock_socket_path, &snapshot_config.vm_id)
+                .await
+                .context("reopening guest network after Firecracker preparation failure");
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(operation_error),
@@ -6817,6 +7042,9 @@ pub async fn create_snapshot_core(
     // the socket-generation boundary its restored clones consume.
     let guest_network_resume_result = match source_disposition {
         SnapshotSourceDisposition::Resume => {
+            // failpoint: the source runs again, behind its closed gate, and has not been
+            // asked to reopen. A test kills the guest's agent here.
+            failpoint::hit_async("snapshot.post_resume_pre_reopen").await;
             resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
                 .await
                 .context("reopening guest network after Firecracker snapshot")
@@ -7107,6 +7335,7 @@ impl<'a> ChSnapshotGuest<'a> {
     async fn prepare(&self, vm_id: &str) -> Result<()> {
         match self {
             ChSnapshotGuest::FcAgent { vsock_socket_path } => {
+                refuse_a_source_left_gated(vsock_socket_path, vm_id).await?;
                 run_snapshot_network_command(vsock_socket_path, vm_id, "--prepare-snapshot-network")
                     .await
             }
@@ -7119,8 +7348,7 @@ impl<'a> ChSnapshotGuest<'a> {
     async fn reopen_after_failed_prepare(&self, vm_id: &str) -> Result<()> {
         match self {
             ChSnapshotGuest::FcAgent { vsock_socket_path } => {
-                run_snapshot_network_command(vsock_socket_path, vm_id, "--resume-snapshot-network")
-                    .await
+                reopen_source_after_failed_prepare(vsock_socket_path, vm_id).await
             }
             ChSnapshotGuest::Raw => Ok(()),
         }
@@ -9639,6 +9867,128 @@ mod tests {
         );
     }
 
+    /// A source whose reopen fails is asked again until its gate is open, and one that is
+    /// still gated when the bound has passed is reported by name with what it now refuses
+    /// (#2142). A guest that refuses because a restore is under way in it is not asked
+    /// again: its gate is that restore's.
+    ///
+    /// RED BEFORE THE FIX: the resume one-shot ran once, and a source whose reopen failed
+    /// stayed gated with an error that said only that the one-shot had failed.
+    #[tokio::test]
+    async fn a_source_is_asked_to_reopen_until_its_gate_is_open_or_the_bound_has_passed() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let pause = std::time::Duration::from_millis(5);
+
+        // the exec server comes back, or the gate's removal lands, on the third try
+        let tries = AtomicU32::new(0);
+        reopen_until_open(
+            "vm-source",
+            std::time::Duration::from_secs(30),
+            pause,
+            || async {
+                match tries.fetch_add(1, Ordering::SeqCst) {
+                    0 | 1 => ReopenTry::Failed(anyhow::anyhow!("exec: connection refused")),
+                    _ => ReopenTry::Open,
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        // never: bounded, and loud
+        let tries = AtomicU32::new(0);
+        let started = std::time::Instant::now();
+        let error = reopen_until_open(
+            "vm-source",
+            std::time::Duration::from_millis(60),
+            pause,
+            || async {
+                tries.fetch_add(1, Ordering::SeqCst);
+                ReopenTry::Failed(anyhow::anyhow!("nf_tables commit refused"))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ReopenFailure::LeftGated(_)), "{error:?}");
+        let error = format!("{:#}", error.into_error());
+        assert!(
+            tries.load(Ordering::SeqCst) > 2,
+            "tried once and gave up: {error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(
+            error.contains("source VM vm-source is LEFT WITH ITS NETWORK GATE CLOSED")
+                && error.contains("--resume-snapshot-network")
+                && error.contains("nf_tables commit refused"),
+            "{error}"
+        );
+
+        // refused: once
+        let tries = AtomicU32::new(0);
+        let error = reopen_until_open(
+            "vm-clone",
+            std::time::Duration::from_secs(30),
+            pause,
+            || async {
+                tries.fetch_add(1, Ordering::SeqCst);
+                ReopenTry::Refused(anyhow::anyhow!("exit code 3"))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+        assert!(matches!(error, ReopenFailure::Refused(_)), "{error:?}");
+        assert!(format!("{:#}", error.into_error()).contains("a restore is under way"));
+
+        // A bound of zero is one ask, which is what a later create gives a gated source.
+        let tries = AtomicU32::new(0);
+        reopen_until_open("vm-source", std::time::Duration::ZERO, pause, || async {
+            tries.fetch_add(1, Ordering::SeqCst);
+            ReopenTry::Failed(anyhow::anyhow!("still closed"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+
+        // A source left gated is recorded on its state and refused its next create, and
+        // neither creator ends it.
+        let source = include_str!("common.rs");
+        let reopen = body_of(source, "async fn reopen_source_network(");
+        assert!(reopen.contains("if let Err(ReopenFailure::LeftGated(_)) = &reopened {"));
+        assert!(reopen.contains("record_source_gate(vm_id, true).await;"));
+        let refuse = body_of(source, "async fn refuse_a_source_left_gated(");
+        assert!(refuse.contains(".is_ok_and(|state| state.network_gate_closed);"));
+        assert!(refuse.contains("record_source_gate(vm_id, false).await;"));
+        let core = body_of(source, "pub async fn create_snapshot_core(");
+        assert!(
+            core.find("refuse_a_source_left_gated(").unwrap()
+                < core.find("\"--prepare-snapshot-network\"").unwrap()
+        );
+        let guest = body_of(source, "impl<'a> ChSnapshotGuest<'a> {");
+        assert!(
+            guest.find("refuse_a_source_left_gated(").unwrap()
+                < guest.find("\"--prepare-snapshot-network\"").unwrap()
+        );
+        // The state's field: absent while false, kept when true.
+        let mut state = crate::state::VmState::new("vm-source".into(), "alpine".into(), 1, 128);
+        assert!(!serde_json::to_string(&state)
+            .unwrap()
+            .contains("network_gate_closed"));
+        state.network_gate_closed = true;
+        let saved = serde_json::to_string(&state).unwrap();
+        let loaded: crate::state::VmState = serde_json::from_str(&saved).unwrap();
+        assert!(loaded.network_gate_closed);
+
+        // The status the guest refuses with is the one the host reads.
+        let agent = include_str!("../../fc-agent/src/main.rs");
+        assert!(agent.contains(&format!(
+            "const REFUSED_EXIT: i32 = {ONE_SHOT_REFUSED_EXIT};"
+        )));
+        // The bound covers systemd's 90 s stop timeout as well.
+        assert!(SOURCE_REOPEN_BOUND > std::time::Duration::from_secs(90 + 30));
+    }
+
     /// Every reopen of the source's network after a pause has been invoked sets the
     /// source's clock to the host's (`resume_paused_source`), on both backends. Where
     /// the VMM freezes the guest's clock during the pause (the arm64 `nested` profile),
@@ -9655,7 +10005,7 @@ mod tests {
             (
                 "create_snapshot_core",
                 "state: \"Paused\".to_string()",
-                "\"--resume-snapshot-network\"",
+                "reopen_source_after_failed_prepare(",
                 "resume_paused_source(",
             ),
             (
@@ -9676,7 +10026,7 @@ mod tests {
                 "{name}: the reopen after a failed prepare changed"
             );
             assert!(
-                !after.contains("\"--resume-snapshot-network\"")
+                !after.contains("reopen_source_after_failed_prepare(")
                     && !after.contains(".reopen_after_failed_prepare("),
                 "{name} reopens the source after its pause without setting its clock"
             );
@@ -9695,9 +10045,23 @@ mod tests {
             let end = guest[start..].find("\n    }").unwrap();
             &guest[start..start + end]
         };
-        assert!(step("reopen_after_failed_prepare").contains("\"--resume-snapshot-network\""));
+        assert!(step("reopen_after_failed_prepare")
+            .contains("reopen_source_after_failed_prepare(vsock_socket_path"));
         assert!(step("resume").contains("resume_paused_source(vsock_socket_path"));
-        assert!(!step("resume").contains("\"--resume-snapshot-network\""));
+        assert!(!step("resume").contains("reopen_source_after_failed_prepare("));
+        // Both go through the one loop, and only the reopen after a pause sends the clock.
+        assert!(body_of(source, "async fn resume_paused_source(")
+            .contains("reopen_source_network(vsock_socket, vm_id, true)"));
+        assert!(
+            body_of(source, "async fn reopen_source_after_failed_prepare(")
+                .contains("reopen_source_network(vsock_socket, vm_id, false)")
+        );
+        assert!(body_of(source, "async fn reopen_source_network(").contains(
+            "ask_source_to_reopen(vsock_socket, vm_id, pause_preceded, SOURCE_REOPEN_BOUND)"
+        ));
+        let reopen = body_of(source, "async fn ask_source_to_reopen(");
+        assert!(reopen.contains("if pause_preceded {"));
+        assert!(reopen.contains("args.extend([\"--host-time-ns\", &host_time]);"));
     }
 
     /// A memory snapshot's balloon record is read from the VMM inside

@@ -392,6 +392,34 @@ fn read_request_and_handshake(conn: OwnedFd, timeout: Duration) -> Option<(ExecR
     }
 }
 
+/// While set, the server runs one command and refuses every other: the source's resume
+/// one-shot. An fc-agent that starts while a snapshot's boundary is owed opens its exec
+/// server before anything else of its boot (`agent::run`), because the host's resume is
+/// the only thing that may open the gate and it arrives over exec. Nothing else may run
+/// that early: the health monitor's `podman inspect` would run against storage setup
+/// that this boot has not finished.
+static RESUME_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Serve nothing but the source's resume one-shot, from now until [`serve_everything`].
+pub fn serve_only_the_boundary_resume() {
+    RESUME_ONLY.store(true, Ordering::Release);
+}
+
+/// The boot is far enough along for any command.
+pub fn serve_everything() {
+    RESUME_ONLY.store(false, Ordering::Release);
+}
+
+/// Whether `request` is the host's `fc-agent --resume-snapshot-network`, run in the guest.
+fn is_the_boundary_resume(request: &ExecRequest) -> bool {
+    !request.in_container
+        && request
+            .command
+            .first()
+            .is_some_and(|program| program.ends_with("/fc-agent"))
+        && request.command.get(1).map(String::as_str) == Some("--resume-snapshot-network")
+}
+
 async fn handle_connection(client_fd: OwnedFd) {
     // Read the request line and run the ACK/GO handshake in spawn_blocking
     // (blocking byte-by-byte I/O, bounded by HANDSHAKE_TIMEOUT). The task owns
@@ -406,6 +434,15 @@ async fn handle_connection(client_fd: OwnedFd) {
         Ok(None) => return, // closed, timed out, or invalid (conn already dropped)
         Err(_) => return,   // task panicked or was cancelled (conn dropped with it)
     };
+
+    if RESUME_ONLY.load(Ordering::Acquire) && !is_the_boundary_resume(&request) {
+        eprintln!(
+            "[fc-agent] exec refused: only the snapshot boundary's resume runs before this \
+             boot has its plan ({:?})",
+            request.command.first()
+        );
+        return;
+    }
 
     crate::tty::run_session(conn, session_spec(&request)).await;
 }
@@ -491,6 +528,36 @@ mod tests {
             in_container,
             ..Default::default()
         }
+    }
+
+    /// What an exec server that was opened early for an owed snapshot boundary runs: the
+    /// host's resume one-shot in the guest, and nothing else.
+    #[test]
+    fn only_the_boundary_resume_is_the_boundary_resume() {
+        let resume = ["/usr/local/bin/fc-agent", "--resume-snapshot-network"];
+        assert!(is_the_boundary_resume(&request(&resume, false)));
+        assert!(is_the_boundary_resume(&request(
+            &[resume[0], resume[1], "--host-time-ns", "1"],
+            false
+        )));
+        assert!(!is_the_boundary_resume(&request(&resume, true)));
+        assert!(!is_the_boundary_resume(&request(
+            &[resume[0], "--prepare-snapshot-network"],
+            false
+        )));
+        assert!(!is_the_boundary_resume(&request(
+            &["podman", "inspect"],
+            false
+        )));
+        assert!(!is_the_boundary_resume(&request(
+            &["sh", "-c", "fc-agent --resume-snapshot-network"],
+            false
+        )));
+        assert!(!is_the_boundary_resume(&request(&[], false)));
+        // What the host sends is that command.
+        let host = include_str!("../../src/commands/common.rs");
+        assert!(host.contains("const FC_AGENT_PATH: &str = \"/usr/local/bin/fc-agent\";"));
+        assert!(host.contains("\"--resume-snapshot-network\""));
     }
 
     /// The part of a container exec's argv that follows `podman exec`.

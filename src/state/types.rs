@@ -68,6 +68,13 @@ pub struct VmState {
     /// to 0 so state files written before this field existed still load.
     #[serde(default)]
     pub vsock_epoch: u64,
+    /// A snapshot create closed this VM's network gate and could not open it again: the
+    /// guest refuses every new TCP connection, in and out, and keeps the ones it has.
+    /// Set when the create gives up (`commands::common::reopen_source_network`); a later
+    /// `snapshot create` asks the guest once more and is refused while the gate stays
+    /// closed. Absent from a state file while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_gate_closed: bool,
     pub created_at: jiff::Timestamp,
     pub last_updated: jiff::Timestamp,
     pub config: VmConfig,
@@ -439,6 +446,7 @@ impl VmState {
             netpool: None,
             confinement: None,
             vsock_epoch: 0,
+            network_gate_closed: false,
             created_at: now,
             last_updated: now,
             config: VmConfig {

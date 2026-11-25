@@ -237,9 +237,13 @@ namespace, and each acts on the agent's own. That is where every listener of
 the workload is: the container runs with `--network=host`. A namespace a
 privileged workload makes for itself is outside all three, as it was outside
 the gate before (its traffic is forwarded, and the gate hooks INPUT and
-OUTPUT). A snapshot of a clone cannot capture the 0: the prepare takes the
-boundary lock, which the restore holds until publication, and a clone whose
-restore or publication failed keeps the 0 and is powered off by the agent.
+OUTPUT). What keeps the 0 out of a snapshot of a clone: the restore holds the
+boundary lock from its first step to publication, and a snapshot's prepare is
+refused from the restore's dispatch until its publication (`restore-under-way`,
+below). A restore that fails keeps the 0, drops the lock and leaves the mark,
+so the prepare stays refused until the agent's power-off lands. What can still
+capture it is a create whose prepare ran before the restore was dispatched and
+whose pause lands in the middle of it, which the host refuses (#2138).
 
 A socket the clone opens after that list is in neither list and is never
 retired, whatever tuple it reuses. `ModelDiag` fails if a socket made after the
@@ -248,6 +252,78 @@ list is retired, or if the list is taken while cookies are still accepted;
 `a_syn_cookie_handshake_does_not_reach_a_restored_clone` and
 `a_loopback_ports_client_connection_does_not_outlive_a_restore`
 (`tests/test_snapshot_gate_tcp.rs`) hold these in a routed VM.
+
+### A closed gate is somebody's: a source's boundary is owed until its host's resume opens it
+
+**A source's gate is closed only while a snapshot create is in flight on the host, and
+every exit from that opens it.** The prepare closes the gate and freezes the container;
+the resume one-shot undoes both. Three things used to break that, each a way to leave a
+source refusing new TCP for good or a clone open before its restore (#2142, #2140, #2138,
+and the model's F2):
+
+- a resume whose gate removal failed removed the manifest and thawed the container
+  anyway, and nothing tried again;
+- an fc-agent that died between the prepare and the resume took the exec server with it,
+  so no resume could run, and on Firecracker its successor waited for ever for a boot
+  plan that comes through the closed egress half;
+- the one-shots and the freeze watchdog acted on a restoring clone as on a source.
+
+**A `/loopback` port's client is outside the guest whatever the list holds**
+(#2152). The rewrite gives it a source port of a reserved range
+(`network::LOOPBACK_CLIENT_PORTS`, 61000 to 65535, above the guest's ephemeral
+ports), and a 127.0.0.1 peer at a port of that range never stays. With the
+client's own port kept, a client from source port P to guest port P was its own
+mirror image.
+
+**The guest never opens an owed gate by itself.** A clone whose restore has not been
+dispatched is, byte for byte, its source after the resume, so a rule in the guest that
+opens a source's gate also opens that clone's. Only the host knows which a guest is, and
+it says "a source, and its snapshot is over" by running `--resume-snapshot-network`. The
+guest's part is that the request can always be served and that a served request either
+opens the gate or leaves the boundary owed.
+
+Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
+`fc-agent/src/snapshot_network.rs`); they are in guest memory, so in the image:
+
+| mark | written | removed | while it is there |
+|---|---|---|---|
+| `snapshot-boundary-owed` | by the prepare, under the boundary lock, before the freeze and the gate | by the resume that opened the gate; by a restore when it is dispatched | a resume that fails leaves it, the manifest and the freeze; an fc-agent that starts and finds it opens exec at once, for the resume one-shot alone (`exec::serve_only_the_boundary_resume`) |
+| `restore-under-way` | when a restore's epoch is dispatched, before anything else of the restore | at publication, before the acknowledgement | both one-shots refuse with exit 3 and change nothing; the freeze watchdog does not count its looks |
+
+- **The host asks until the gate is open** (`reopen_source_network`,
+  `src/commands/common.rs`): every 2 s for up to 150 s. Each ask is itself an exec whose
+  connect is tried for about 54 s, and an agent that died is back about a second later
+  (`RestartSec=1`), so the first ask usually lands; the bound also covers systemd's 90 s
+  stop timeout. A guest that refuses with exit 3 is not asked again.
+- **A source still gated then is left running and reported failed.** It is not ended:
+  the connections it has go on working behind the gate. The create fails with
+  `source VM <id> is LEFT WITH ITS NETWORK GATE CLOSED`, the VM's state records
+  `network_gate_closed`, and the next `snapshot create` of it asks once more and is
+  refused while the gate stays closed (`refuse_a_source_left_gated`).
+- **An agent that starts in the middle of a boundary serves exec first and starts no
+  container.** It opens exec before its boot plan, for the resume alone, and holds the
+  container's start until no mark is left
+  (`hold_the_container_start_through_a_boundary`). On Cloud Hypervisor the plan comes over
+  vsock, outside the gate, and the restarted agent used to start the container while the
+  prepare believed the guest frozen; an image taken then resumed every clone with a
+  container running behind its closed gate.
+- **The watchdog's deadline is for a boundary nobody is working on.** A look while the
+  boundary lock is held or a restore is under way is not counted
+  (`snapshot_network::boundary_in_progress`), so a restore or a prepare that takes over a
+  minute keeps its container frozen. A source whose host died, or whose gate cannot be
+  opened, is still thawed after 60 looks.
+- **`rcu_expedited` is put back after a kill** (#2141). The barrier records the switch's
+  value in `/run/fcvm/rcu-expedited-before` before it turns it on; the next barrier, the
+  next resume and the next start of the agent put it back from the record. The resume
+  does it before it tries the gate and whatever comes of that, so a reopen that never
+  lands does not leave the switch on for the next snapshot to capture.
+- Not covered: the host's `snapshot create` dying as well (#1936, #1941), and a stray
+  one-shot on a clone before its restore is dispatched, which only the host can refuse
+  (#2138's host half).
+
+`a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and_the_resume` and
+`a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs_deadline`
+(`tests/test_snapshot_gate_tcp.rs`) hold these in a VM.
 
 ### On restore, the gate's egress half opens before the stale sockets are retired
 
@@ -259,9 +335,12 @@ system configs. With the restore hook inside that window (4 to 35 s, where the
 window had been about 0.1 s) a www clone served 500s for as long as it lived
 (2026-10-14, `Sitevar FBLOGGER_CONFIG could not be loaded from Configerator` on
 every request, with a no-op hook as well as the real one). So the OUTPUT half
-of the gate is removed as soon as the receive barrier has drained, before the
-first socket is retired (a socket opened from then on is not in the manifest,
-so the cookie-bound retirement never touches it), the restore remounts NFS and
+of the gate is removed before the first socket is retired. Three steps come
+between the receive barrier and that: a routed clone's move to its own IPv6
+address, the load of the manifest, and the restore's own list of the guest's
+sockets. A socket opened after that list is in neither list, so the
+cookie-bound retirement never touches it; one opened before it with no mirror
+image in the list is retired as unlisted. Then the restore remounts NFS and
 waits for the exec server and the egress proxy, the hook runs last, and the
 INPUT half is removed after it: publication. `ModelDiag` fails if a socket is
 retired with egress closed, `ModelHook` if the hook runs with egress closed or
