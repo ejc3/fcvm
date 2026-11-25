@@ -356,7 +356,18 @@ ip-192-0-2-42 login: [   26.214015] cloud-init[1469]: Fetched 38.5 MB in 5s (823
             harness.write_text(script + 'SCRIPT_DIR=' + shlex.quote(str(Path(__file__).resolve().parent)) + r'''
 sleep() { :; }
 git() { printf '%040d\n' 0; }
+# One required tool reads as missing: `command -v` fails for it, as it does when it is not on PATH.
+if [ -n "${AMI_TEST_MISSING_TOOL:-}" ]; then
+  command() {
+    if [ "$1" = -v ] && [ "$2" = "$AMI_TEST_MISSING_TOOL" ]; then return 1; fi
+    builtin command "$@"
+  }
+fi
 compute_pinned_hash() { echo test-build-hash; }
+compute_pinned_host_kernel() {
+  [ -z "${AMI_TEST_NO_EXPECTED_KERNEL:-}" ] || return 1
+  echo "${AMI_TEST_EXPECTED_KERNEL:-7.3.3-fcvm-0123456789ab}"
+}
 check_existing_ami() { echo None; }
 verify_source_commit_fetchable() { return "${AMI_TEST_UNFETCHABLE:-0}"; }
 get_base_ami() { echo ami-00000000000000000; }
@@ -483,6 +494,97 @@ main
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertFalse(any(call[1] == "create-image" for call in calls))
                 self.assertNotIn("ami_id", self.outputs(result))
+
+    def test_only_the_host_kernel_the_commit_builds_becomes_an_image(self):
+        # The release rule above passes any fcvm build from 7.2 on. The image has to boot the
+        # one build the pinned commit's host kernel inputs give: scripts/check-runner-kernel.py
+        # fails every CI job on a runner that boots another.
+        other = "7.3.3-fcvm-ba9876543210"
+        for arch in ["arm64", "x64"]:
+            with self.subTest(arch=arch):
+                # the builder installed, and the candidate would boot, another fcvm build
+                result, calls = self.run_build(AMI_ARCH=arch, AMI_TEST_BUILDER_KERNEL=other,
+                                               AMI_TEST_KERNEL=other)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"the builder installed {other}, and this commit builds "
+                              "7.3.3-fcvm-0123456789ab", result.stderr)
+                self.assertFalse(any(call[1] == "create-image" for call in calls))
+                self.assertNotIn("ami_id", self.outputs(result))
+                # the same build, when it is the one the commit gives, is published
+                result, calls = self.run_build(AMI_ARCH=arch, AMI_TEST_BUILDER_KERNEL=other,
+                                               AMI_TEST_KERNEL=other, AMI_TEST_EXPECTED_KERNEL=other)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.outputs(result)["boot_kernel"], other)
+        # A commit whose expected release cannot be computed builds nothing.
+        result, calls = self.run_build(AMI_TEST_NO_EXPECTED_KERNEL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot compute the host kernel this commit builds", result.stderr)
+        self.assertFalse(any(call[1] in {"run-instances", "create-image", "create-tags"} for call in calls))
+
+    def test_the_expected_host_kernel_is_computed_from_the_pinned_commit(self):
+        root = Path(__file__).resolve().parent.parent
+        script = Path(__file__).with_name("build-ami.sh").read_text()
+        function = script[script.index("\ncompute_pinned_host_kernel() {"):]
+        function = function[:function.index("\n}\n") + 3]
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              text=True, capture_output=True)
+        if head.returncode != 0:
+            self.skipTest("not a git checkout")
+        dirty = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain", "--", "rootfs-config.toml", "kernel",
+             "scripts/check-runner-kernel.py"], text=True, capture_output=True, check=True).stdout
+
+        def compute(commit, machine, path=None):
+            # The options build-ami.sh sets for itself: with pipefail a `git archive` that
+            # fails is a failure of the function even when tar accepted what it had sent.
+            return subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + function + '\ncompute_pinned_host_kernel "$1" "$2"',
+                 "bash", str(root), commit],
+                text=True, capture_output=True,
+                env={**os.environ, "KERNEL_MACHINE": machine, **({"PATH": path} if path else {})})
+
+        for machine in ["aarch64", "x86_64"]:
+            with self.subTest(machine=machine):
+                result = compute(head.stdout.strip(), machine)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertRegex(result.stdout, r"\A[0-9]+\.[0-9]+\.[0-9]+-fcvm-[0-9a-f]{12}\n\Z")
+                if not dirty:
+                    checkout = subprocess.run(
+                        [sys.executable, str(root / "scripts/check-runner-kernel.py"), "--print-expected",
+                         "--machine", machine], text=True, capture_output=True, check=True).stdout
+                    self.assertEqual(result.stdout, checkout)
+        # A commit that is not there, and a machine with no host kernel, print nothing.
+        for commit, machine in [("0" * 40, "x86_64"), (head.stdout.strip(), "riscv64")]:
+            result = compute(commit, machine)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+        # So does a `git archive` that sends a whole archive and then fails.
+        self.assertTrue(script.startswith("#!/bin/bash\n") and "\nset -euo pipefail\n" in script[:400])
+        with tempfile.TemporaryDirectory(prefix="ami-git-") as temporary:
+            real = shutil.which("git")
+            fake = Path(temporary) / "git"
+            fake.write_text(f'#!/bin/bash\n{real} "$@"\nstatus=$?\n'
+                            'for a in "$@"; do [ "$a" = archive ] && exit 1; done\nexit $status\n')
+            fake.chmod(0o755)
+            result = compute(head.stdout.strip(), "x86_64", path=f"{temporary}:{os.environ['PATH']}")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertEqual(result.stdout, "")
+
+    def test_a_missing_tool_stops_the_build_before_anything_is_read_or_launched(self):
+        for tool in ["aws", "jq", "git", "python3"]:
+            with self.subTest(tool=tool):
+                result, calls = self.run_build(AMI_TEST_MISSING_TOOL=tool)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"required tool '{tool}' is missing", result.stderr)
+                self.assertEqual(calls, [])
+
+    def test_the_builder_checks_the_kernel_it_installed_against_its_checkout(self):
+        build = self.user_data()
+        steps = ["--install-host-kernel\n", "\nBOOT_KERNEL=$(./scripts/grub-boot-kernel.sh)\n",
+                 '\n./scripts/check-runner-kernel.py --current-only --release "$BOOT_KERNEL"\n',
+                 '\naws ec2 create-tags --resources $INSTANCE_ID --tags "Key=KernelVersion,Value=$BOOT_KERNEL" --region us-west-1\n']
+        positions = [build.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions))
 
     def test_candidates_of_earlier_runs_are_retired_before_anything_is_built(self):
         stale = ["ami-0aaaaaaaaaaaaaaa1", "ami-0bbbbbbbbbbbbbbb2"]
