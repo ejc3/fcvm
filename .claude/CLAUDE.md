@@ -823,10 +823,10 @@ stacked on (`scripts/ci-pr-scope.sh`), when that other PR is not a draft and its
 this one's. A draft tests nothing, so a ready PR under a draft runs the matrix itself, and so
 does one whose child's draft state cannot be read. Their run ends in a check named
 **`Summary (deferred)`**, never `Summary`, so it can never be read as a pass. Push the stack as
-drafts and mark it ready from the tip down: the tip runs, and each lower layer then finds a
-ready PR above it and defers. Marked ready from the bottom up, each layer can find a draft
-above it when its run starts and run the whole matrix, one run per layer on the self-hosted
-fleet, and nothing cancels them. The top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
+drafts and mark every layer ready back to back. A layer whose run starts while the PR above it
+is still a draft runs the matrix itself and nothing cancels that run, so flips spaced apart
+from the bottom up can cost one run per layer on the self-hosted fleet; from the tip down they
+cannot. The top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
 `main`, not only the top PR's files, so a docs-only top cannot skip the matrix for code changed
 lower down.
 

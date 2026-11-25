@@ -264,7 +264,7 @@ gh pr checks <N>
 
 CI runs only on the top of a stack (see AGENTS.md "CI runs on the top of a stack"). Drafts, and
 lower PRs under a ready PR whose head contains theirs, get `Summary (deferred)`. A ready PR
-under a draft runs, so mark a stack ready from the tip down, or every layer runs the matrix. A lower PR is tested when its head carries `Summary` success
+under a draft runs, so mark a stack's layers ready back to back (see AGENTS.md for the order). A lower PR is tested when its head carries `Summary` success
 or the `Stack CI` status that the top's passing run posts; bisect a failing top with
 `gh workflow run ci.yml --ref <layer-branch>`.
 
