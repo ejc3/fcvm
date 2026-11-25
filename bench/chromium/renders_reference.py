@@ -70,6 +70,10 @@ def reference(summary, path, digest):
     held = regimes.get("held")
     if not held or set(held["sides"]) != set(SIDES):
         raise Refused("the summary has no `held` regime with both sides")
+    levels = held["fixedLevels"]
+    if not (isinstance(levels, list) and len(levels) == 2 and all(type(n) is int and n > 0 for n in levels)
+            and all(held["sides"][side]["inFlight"] == level for side, level in zip(SIDES, levels))):
+        raise Refused(f"the `held` regime is not a run held at fixed levels on both sides: {levels!r}")
     for side in SIDES:
         row = held["sides"][side]
         if row["failed"] is None or not row["rendersPerS"] or row["pageMeanMs"] is None:

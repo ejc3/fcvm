@@ -18,7 +18,7 @@ SUMMARY = {
     "kitesurf_commit": "b" * 40, "instance_type": "m8gd.metal-24xl", "boot": "0" * 16,
     "regimes": [
         {"label": "held", "run": "c-held", "ended": "2026-01-02T03:04:05Z", "window": {"seconds": 300.0},
-         "fixed_levels": [15, 38], "sides": {"fcvm": SIDE, "kitesurf": dict(SIDE, renders_per_s=31.6)},
+         "fixed_levels": [15, 38], "sides": {"fcvm": SIDE, "kitesurf": dict(SIDE, renders_per_s=31.6, in_flight_median=38)},
          "files": {"summary.json": {"sha256": "c" * 64, "size": 1}}},
         {"label": "alone-fcvm", "run": "c-alone", "ended": "2026-01-02T04:00:00Z", "window": {"seconds": 240.0},
          "fixed_levels": [15, 0], "sides": {"fcvm": SIDE, "kitesurf": {"renders": 0, "failed": 0}}, "files": {}},
@@ -99,6 +99,16 @@ class Reference(unittest.TestCase):
             os.rmdir(os.path.join(tmp, "renders-test", "c-alone"))
             with self.assertRaises(renders_reference.Refused):
                 renders_reference.generate(summary)
+
+    def test_the_held_regime_is_a_run_held_at_fixed_levels(self):
+        """A search run labelled `held` is not the page's table: the regime must say the level each side
+        was held at, and each side's renders in flight must have been that level."""
+        for levels in (None, [15, 0], [0, 38], [15], "15,38", [15, 38, 1], [True, 38]):
+            with self.subTest(levels=levels):
+                self.assertIn("held at fixed levels",
+                              self.refused(lambda s, v=levels: s["regimes"][0].update(fixed_levels=v)))
+        self.assertIn("held at fixed levels", self.refused(
+            lambda s: s["regimes"][0]["sides"]["kitesurf"].update(in_flight_median=37)))
 
     def test_the_reference_is_text_a_typescript_file_can_hold(self):
         text = renders_reference.generate()

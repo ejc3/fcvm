@@ -2492,7 +2492,9 @@ rebuilt from this tree; the committed one is byte for byte what that gives.
 `bench/chromium/renders_reference.py` writes `fleet/web/core/renders-reference.gen.ts` from the
 one summary in the tree: the campaign, its date, instance type, kernel and commits, and each
 regime's figures by label. The regime labelled `held` is the table the page will show: both sides
-held at the limits the module's own search ended on. No figure is typed;
+held at the limits the module's own search ended on. The generator takes a `held` regime only
+from a run held at fixed levels on both sides, each side's renders in flight at its level; a
+search run under that label gives no file. No figure is typed;
 `test_renders_reference.py` fails when the file is not what the summary gives. A `WITHDRAWN`
 marker in the campaign's directory, or in the directory of a run the summary cites, withdraws the
 file: the generator and its check stop there, holding the directories' shared locks as
