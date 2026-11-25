@@ -65,9 +65,11 @@ const FAILURES_BEFORE_A_WAIT: u32 = 3;
 const WAIT_AFTER_FAILURES: Duration = Duration::from_secs(1);
 
 /// Whether a kernel release has the bridge teardown fix, without which a clone's teardown
-/// stalls for seconds under load and no figure from the host is published: the
-/// repository's own kernels (`-fcvm`), 6.18.60 and later of 6.18, 7.2 and later, and
-/// Ubuntu's `7.0.0-1017-aws` and later.
+/// stalls for seconds under load and the module does not run: the repository's own kernels
+/// (`-fcvm`), 6.18.60 and later of 6.18, 7.2 and later, and Ubuntu's `7.0.0-1017-aws` and
+/// later. This is the floor for running at all, not the rule for what may be shown: a
+/// recorded figure comes only from a campaign on the repository's own host kernel
+/// (`bench/chromium/renders_campaign.py` and `renders_reference.py` take no other).
 pub fn kernel_has_bridge_fix(release: &str) -> bool {
     if release.contains("-fcvm") {
         return true;
@@ -1348,6 +1350,10 @@ pub fn hello(args: &FleetRendersBenchArgs, facts: &HostFacts) -> Result<RendersH
         cpus: cpus[0].len() as u32,
         confined,
         build,
+        // The frame socket's public addresses, once the agent serves frames.
+        ipv6: None,
+        ipv4: None,
+        v4_port: None,
     })
 }
 

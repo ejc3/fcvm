@@ -575,7 +575,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   through `fleet/coord/stage-smoke.py --agents`): a release host absent from it never
   registered since `since`.
 - `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
-  hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
+  hosts (`--host-template`) or pages mode's host (`--renders-template`), or with
+  `--sleep-when-idle` on hosts it does not launch (a
   fixed host, a test box); without either it stays `awake`. After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), or
   after `--sleep-without-new-viewer` seconds (default 3600, 0 never; also
@@ -734,6 +735,7 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
                  [--awake-hosts 1] [--host-spread none|az] [--host-on-demand-max 8] [--idle-scale-down 600]
+                 [--renders-template <region>:<template>... --renders-subnet <region>:<subnet id>...]
                  [--sleep-without-new-viewer 3600] [--min-wake-remaining 600]
                  [--history-idle 60]
                  [--daily-spend-usd <usd> [--spend-rates <instance type>=<usd per hour>,...]]
@@ -767,15 +769,17 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
 
 - `--daily-spend-usd` (also `FLEET_DAILY_SPEND_USD`) is the most the fleet may spend in one
   UTC day, in USD (`fleet.spend` above); off without it. It needs a fleet that sleeps
-  (`--host-template` or `--sleep-when-idle`) and instances to meter (`--host-template` or
-  `--ec2 aws`). Every 30 s the meter lists the instances tagged `Fleet=<--fleet-name>` and
-  `Purpose` `fcvm-fleet-host` or `fcvm-fleet-tile` in every host and tile region
+  (`--host-template`, `--renders-template` or `--sleep-when-idle`) and instances to meter
+  (`--host-template`, `--renders-template` or `--ec2 aws`). Every 30 s the meter lists the
+  instances tagged `Fleet=<--fleet-name>` and `Purpose` `fcvm-fleet-host`, `fcvm-fleet-tile`
+  or `fcvm-fleet-renders` in every host, renders and tile region
   (`DescribeInstances`, pending to shutting-down) and prices each: spot at the current spot
   price of its type in its zone (`DescribeSpotPriceHistory`, `Linux/UNIX`, read again after
   30 minutes), on demand at the on-demand rate of its type. `--spend-rates` (also
   `FLEET_SPEND_RATES`) sets on-demand rates, `<instance type>=<USD per hour>` comma
   separated, over the built-in us-east-1 list prices of `g4dn.metal` (7.824), `g4dn.xlarge`
-  (0.526), `g5g.metal` (2.744) and `g5g.xlarge` (0.42). The meter errs high where it cannot
+  (0.526), `g5g.metal` (2.744), `g5g.xlarge` (0.42) and `c8gd.metal-24xl` (4.70304, pages
+  mode's host). The meter errs high where it cannot
   know: a spot instance without a spot price is charged its on-demand rate, an instance
   type without a rate the highest rate known, and a region it cannot list keeps its last
   listed instances; each marks the `spend` component degraded (`degraded`).
@@ -1035,6 +1039,22 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   host launch`, the line the coordinator's degraded alarm matches; it still asks again
   10 s later, and stays degraded through the polls in between until an attempt is refused
   for something else or the region holds its awake hosts.
+- `--renders-template` and `--renders-subnet` (also `FLEET_RENDERS_TEMPLATES` and
+  `FLEET_RENDERS_SUBNETS`, comma separated, the same `<region>:<name>` form) are pages mode's
+  host's launch templates and subnets, in one region (templates in two regions stop the
+  coordinator at start). Without them nothing of this paragraph applies. With them the
+  coordinator runs a second host group as it runs the GPU hosts, over the same power state:
+  one host while the fleet is awake, launched in the same wake as the GPU hosts, spot first
+  and on demand in the same pass when spot is refused for capacity (at most one on-demand
+  host of this group, counted apart from `--host-on-demand-max`), none while it sleeps. Its
+  instances are tagged `Purpose=fcvm-fleet-renders`, `Fleet=<--fleet-name>` and
+  `Market=spot|on-demand`, and found by those tags, so a restarted coordinator keeps the host
+  it finds. With its one host, a spot interruption notice launches nothing: the replacement
+  is launched when EC2 takes the instance. A failed call or a quota refusal marks the
+  coordinator degraded as for the GPU hosts, under the component `scale-renders`, and logs
+  `EC2 refused a renders host launch`. The host is no GPU host: it has no slot, takes no part
+  in a wake's record (`fleet.power.hosts`) or the hosts the fcvm side waits for, and its agent
+  passes the check below as an instance of this group, with a hello that fits it.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication, so the coordinator refuses to start when the address
@@ -1671,9 +1691,17 @@ host to the page on the host's frame socket; the coordinator carries the summary
 | `cpus`, `confined` | the pinned CPUs of each side, and whether each side runs in a cpuset of exactly that many |
 | `build` | what runs, by name, for the `Setup` lists (absent when empty) |
 | `report`, `report_at` | the host's last report as it sent it (below), and when the coordinator received it; absent before the first |
+| `draining` | true once the host reported a spot interruption notice; absent otherwise |
+| `frame_url`, `frame_url_v4` | the host's frame socket and its IPv4-only name: with the coordinator's subzone, the names it published for the addresses the hello gave (`renders-<host>-<token>`, below; absent until published), otherwise the report's |
 | `overlay` | `{"text"?, "transform"?, "chromium_only", "until", "seq"}`: what viewers put on every page; absent with none |
 | `transforms` | `{"both": [...], "chromium_only": [...]}`: the names a viewer may pick from |
 | `max_overlay_chars`, `change_interval_s` | the text's limit, and the least seconds between two changes from one viewer |
+
+The host is no host of the wall's: it is not in `fleet.hosts` (the hosts the phones, Windows
+and Minecraft pages count), it has no slot and no entry in `fleet.power.hosts`, and its spot
+interruption notice and its loss change only this section (`draining`, then no `renders`),
+never `failures` (no `host_reclaimed`) or the wall's tiling. A host that said hello as a wall
+host and then with `renders` on the same name leaves the wall.
 
 While `overlay.chromium_only` is true the transform is in the `fcvm` side's pages only, the two
 sides render different work, and a page compares nothing across them.
@@ -1725,16 +1753,21 @@ coordinator's is adopted, so the next relaunch goes past it. The coordinator ser
 admits only the agents' service token there. With `--agent-access-aud`, the coordinator also
 verifies that token itself (`Cf-Access-Jwt-Assertion`: the team's RS256 signature, issuer,
 one of those audiences, expiry, and a service token rather than a person) and answers `403`
-without it. With host templates (`--host-template`), the host a dialed agent's hello names
-must be one of this fleet's GPU hosts: an EC2 instance, pending or running, tagged
-`Purpose=fcvm-fleet-host` and `Fleet=<--fleet-name>` in a host region, and the connection
+without it. With host templates (`--host-template` or `--renders-template`), the host a dialed
+agent's hello names must be one of this fleet's hosts: an EC2 instance, pending or running,
+tagged `Fleet=<--fleet-name>` and `Purpose=fcvm-fleet-host` in a host region or
+`Purpose=fcvm-fleet-renders` in the renders region, and the connection
 must come from that instance: its public IPv4 address, one of its IPv6 addresses, or an
 address in one of its delegated IPv6 prefixes (the source is `CF-Connecting-IP` with
 `--trust-cf-connecting-ip`, which a coordinator behind Cloudflare needs for this, else the
 peer address). Instance ids appear in snapshots, so the name alone proves nothing. Any other
 name (another fleet's instance, a terminated one, no instance), a connection from elsewhere,
 or a listing that fails, closes the connection before the hello is applied, and the agent
-dials again. Both refusals are
+dials again. So does a hello that does not fit the class of the instance: an agent on a
+`fcvm-fleet-renders` instance must carry `renders` and no GPU, phone, Windows sandbox,
+Minecraft server or potato player, and an agent on a `fcvm-fleet-host` instance must not carry
+`renders`; the refusal names the instance's class and what the hello said. Without host
+templates nothing is checked and the hello alone says what a host runs. Both refusals are
 logged at warn with `marker=fleet-agent-refused`. Agents started with `--agent-cmd` are not
 checked.
 
@@ -1827,15 +1860,15 @@ side that is present carries `search` (with `in_flight` and `phase`),
 `renders_per_s`, `cpus_busy`, `done`, `failed` and `since`; a tile carries `page`, `side`,
 `state`, `renders_per_s`, `done` and `failed`. A host says it runs
 the mode with `renders` in its hello (`{"pages": [{"id", "url"}], "cpus", "confined"?,
-"build"?}`), and sends this message on a connection only after it has received a `renders`
-order on that connection: a coordinator built before the mode sends none, and would close the
-connection on this message. The agent (`fcvm fleet agent --renders`) sends the module's
-summary while the module's loop runs (every fifth tick of its one-second loop, so 5 s or a
-little more apart), and otherwise its own every 5 s, with nothing in flight and every tile
-`waiting`: while the order is `run: false`, while the module starts, while it sweeps after
-its loop has ended, and, with `withheld` set to the error, after a module failed. A failed
-module is started again after 60 s while the order is `run: true`, and at once on any new
-order that says `run: true`. An agent started again right after it was killed reports
+"build"?, "ipv6"?, "ipv4"?, "v4_port"?}`), and sends this message on a connection only after it
+has received a `renders` order on that connection: a coordinator built before the mode sends
+none, and would close the connection on this message. The agent (`fcvm fleet agent --renders`)
+sends the module's summary while the module's loop runs (every fifth tick of its one-second
+loop, so 5 s or a little more apart), and otherwise its own every 5 s, with nothing in flight
+and every tile `waiting`: while the order is `run: false`, while the module starts, while it
+sweeps after its loop has ended, and, with `withheld` set to the error, after a module failed.
+A failed module is started again after 60 s while the order is `run: true`, and at once on any
+new order that says `run: true`. An agent started again right after it was killed reports
 `withheld` (the run directory's lock is held) until the killed module's reaper has finished
 its sweep, and starts the module at the next retry.
 
@@ -1843,6 +1876,13 @@ its sweep, and starts the module at the next retry.
 and `kitesurf_commit` (the agent's `--setup fcvm.commit=` and `--setup kitesurf.commit=`
 module options), `bundle_sha256` (the engine bundle's `index.js`), `viewport`, `vcpus` and
 `page_size` (the snapshot's once it is made), and `recycle_mib`.
+
+`ipv6` and `ipv4` are the public addresses of the host's frame socket (port 443 on IPv6,
+`v4_port` on IPv4, 443 when absent); the agent sends none until it serves frames. With its
+subzone the coordinator names them as it names a host's aggregator: `renders-<host>-<token>`
+AAAA the IPv6 address and `renders-<host>-<token>-v4` A the IPv4 address, a label minted once
+for those addresses and never answered before it is minted; `state.renders.frame_url` and
+`frame_url_v4` are then those names.
 
 - `sides`, by `fcvm` and `kitesurf`. `search` is the side's search for its limit: `in_flight`
   now; `phase` `starting` (no baseline at one in flight yet), `adding` or `holding`;

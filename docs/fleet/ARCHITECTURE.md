@@ -224,6 +224,24 @@ fleet, which terminates every host.
 ECS is used for the coordinator only. The GPU hosts stay plain EC2: the ECS GPU AMIs bind
 the NVIDIA driver on the host, and these hosts must leave every GPU to vfio-pci.
 
+Pages mode's host (below) is a second host group of the same launcher, not a second
+launcher. With `FLEET_RENDERS_TEMPLATES` and `FLEET_RENDERS_SUBNETS` (one region) the
+coordinator runs one more `hosts::run` over the same power state, whose driver lists, launches
+and terminates only instances tagged `Purpose=fcvm-fleet-renders`: one host while the fleet is
+awake, launched in the same wake as the GPU hosts (spot first, on demand in the same pass when
+spot is refused for capacity, at most one on demand, apart from the GPU hosts' cap), none
+while it sleeps, adopted by its tags after a restart. With one host, a spot notice waits for
+EC2 to take the instance. A quota refusal marks the component `scale-renders` degraded. It is
+not a GPU host: no slot, no place in the wall's tiling or the potato ring, no phone, sandbox
+or server, no entry in a wake's record, none of the hosts the fcvm side waits for, and not one
+of the hosts the other modes' pages count. Its spot notice and its loss change pages mode's
+state only, never the wall's reclaimed-host failure. The instance's class decides what its
+agent's hello may say: an agent on a renders instance must say it runs the mode and offer
+nothing of the wall's, and one on a GPU instance must not say it runs the mode, or it is
+refused before the hello is applied. The
+spend meter lists its instances with the rest and charges them under the same daily ceiling;
+c8gd.metal-24xl, its type, has a built-in on-demand rate (4.70304 USD/h).
+
 ### EC2 tiles (the comparison)
 
 An EC2 tile is one spot instance with one GPU: g4dn.xlarge (x86, one T4) or g5g.xlarge
@@ -2377,11 +2395,14 @@ Measured above, and each a later PR of this stack, to be measured on the ring:
 "One VM per page" (`?mode=pages`): a renders host renders a fixed set of replayed web pages on
 two sides at once, a new microVM running unmodified Chromium for every render and Kitesurf
 engines on workerd, each side on its own equal set of pinned CPUs. The protocol, the
-coordinator's state and the `/live` view are in `fleet/PROTOCOL.md`, "Pages mode". This section
-is the host's half. The fleet agent runs the module with `--renders` (below), and
-`fcvm fleet renders-bench` (`make fleet-renders-bench`) runs the same module without a
-coordinator or viewers, through the same function (`renders::session`), so the benchmark's
-reference figures and the live wall's come from one piece of code.
+coordinator's state and the `/live` view are in `fleet/PROTOCOL.md`, "Pages mode". The
+coordinator launches and terminates the host as a host group of its own ("Hosts and
+capacity" above) and names its frame socket `renders-<host>-<token>` in its subzone, from
+the addresses the host's hello gives. This section is the host's half. The fleet agent runs the
+module with `--renders` (below), and `fcvm fleet renders-bench` (`make fleet-renders-bench`)
+runs the same module without a coordinator or viewers, through the same function
+(`renders::session`), so the benchmark's reference figures and the live wall's come from one
+piece of code.
 
 ### The host module
 

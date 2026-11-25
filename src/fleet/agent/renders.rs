@@ -237,6 +237,9 @@ mod tests {
             cpus: 40,
             confined: true,
             build: Default::default(),
+            ipv6: None,
+            ipv4: None,
+            v4_port: None,
         }
     }
 

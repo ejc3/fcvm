@@ -521,9 +521,29 @@ pub struct FleetCoordArgs {
     )]
     pub host_subnets: Vec<crate::fleet::coord::hosts::Regional>,
 
+    /// A launch template of pages mode's host (`<region>:<name>`, repeatable, one region).
+    /// With any, the coordinator runs one such CPU host while the fleet is awake, as it runs
+    /// the GPU hosts: spot first, on demand when spot is refused for capacity (at most one),
+    /// none while the fleet sleeps. Its instances are tagged `Purpose=fcvm-fleet-renders`.
+    #[arg(
+        long = "renders-template",
+        env = "FLEET_RENDERS_TEMPLATES",
+        value_delimiter = ','
+    )]
+    pub renders_templates: Vec<crate::fleet::coord::hosts::Regional>,
+
+    /// A subnet pages mode's host may launch in (`<region>:<subnet id>`, repeatable); the
+    /// region of the --renders-template needs at least one
+    #[arg(
+        long = "renders-subnet",
+        env = "FLEET_RENDERS_SUBNETS",
+        value_delimiter = ','
+    )]
+    pub renders_subnets: Vec<crate::fleet::coord::hosts::Regional>,
+
     /// Sleep with no active viewer (no tiles, every VM stopped) and wake for the next one,
     /// on hosts the coordinator does not launch (a fixed host, a test box). Implied by any
-    /// --host-template.
+    /// --host-template or --renders-template.
     #[arg(long)]
     pub sleep_when_idle: bool,
 
@@ -565,11 +585,11 @@ pub struct FleetCoordArgs {
     pub min_wake_remaining: u64,
 
     /// The most the fleet may spend in one UTC day, in USD. The coordinator meters what the
-    /// fleet's GPU hosts and EC2 tiles cost (spot at the spot price, on demand at the
-    /// on-demand rate) and, at this less 15 minutes of the current burn, sleeps the fleet
-    /// until 00:00 UTC: no wake or claim wakes it. Needs a fleet that sleeps (--host-template
-    /// or --sleep-when-idle) and instances to meter (--host-template or --ec2 aws). Off
-    /// without it.
+    /// fleet's GPU hosts, pages mode's host and EC2 tiles cost (spot at the spot price, on
+    /// demand at the on-demand rate) and, at this less 15 minutes of the current burn, sleeps
+    /// the fleet until 00:00 UTC: no wake or claim wakes it. Needs a fleet that sleeps
+    /// (--host-template, --renders-template or --sleep-when-idle) and instances to meter
+    /// (--host-template, --renders-template or --ec2 aws). Off without it.
     #[arg(long, env = "FLEET_DAILY_SPEND_USD")]
     pub daily_spend_usd: Option<f64>,
 
