@@ -22,7 +22,7 @@ class HostRecord(unittest.TestCase):
 
     def test_the_record_is_one_the_campaign_tool_takes(self):
         text = self.text()
-        self.assertIn("root=PARTUUID=elided ro console=ttyS0 kvm-arm.mode=nested\n", text)
+        self.assertIn("\ncmdline: kvm-arm.mode=nested\n", text)
         self.assertNotIn("0b1c2d3e", text)
         self.assertNotIn("made-up-boot-id", text)
         self.assertIn("arguments: MAX_FCVM=40 MAX_ENGINES=48\n", text)
@@ -36,18 +36,35 @@ class HostRecord(unittest.TestCase):
                           "MAX_FCVM=40 MAX_ENGINES=48"))
         self.assertRegex(record["boot"], r"^[0-9a-f]{16}$")
 
-    def test_every_partition_and_filesystem_id_is_elided(self):
-        for cmdline in ("root=UUID=0b1c2d3e-0000-4000-8000-000000000000 ro",
-                        "root=PARTUUID=x resume=UUID=y", "root=LABEL=cloudimg-rootfs rd.luks.uuid=UUID=z"):
-            with self.subTest(cmdline=cmdline):
-                line = self.text(cmdline=cmdline).splitlines()[1]
-                self.assertNotRegex(line, r"UUID=(?!elided)")
+    def test_only_the_named_kernel_parameters_are_kept(self):
+        """The record keeps the parameters that change what is measured, from a list, and nothing else of
+        the command line: a root device, an address, a host name or an id never reaches it, however spelled."""
+        hostile = ("BOOT_IMAGE=/vmlinuz root=/dev/disk/by-uuid/0b1c2d3e-0000-4000-8000-000000000000 "
+                   "root=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_" + "vol" + "0123456789abcdef0-part1 "
+                   "nfsroot=10.1.2.3:/export ip=10.1.2.4::10.1.2.1:255.255.255.0:build-host-7:eth0:off "
+                   "systemd.hostname=build-host-7 rd.luks.uuid=luks-0b1c2d3e root=uuid=0b1c2d3e resume=UUID=y "
+                   "console=ttyS0 kvm-arm.mode=nested numa=off arm64.nv2 hugepagesz=2M hugepages=34000 "
+                   "isolcpus=80-95 mitigations=off numa=10.1.2.3 kvm-arm.mode=build-host-7/x")
+        line = self.text(cmdline=hostile).splitlines()[1]
+        self.assertEqual(line, "cmdline: kvm-arm.mode=nested numa=off arm64.nv2 hugepagesz=2M hugepages=34000 "
+                               "isolcpus=80-95 mitigations=off")
+        self.assertEqual(self.text(cmdline="quiet splash\n").splitlines()[1], "cmdline: (none of the recorded parameters)")
+
+    def test_an_arguments_value_that_is_a_path_keeps_its_last_name_only(self):
+        text = self.text(arguments="MAX_FCVM=0 LEVELS=0,38 DIST=/home/someone/kitesurf/dist-opt KITESURF=/srv/k/ TAG=golden")
+        self.assertIn("arguments: MAX_FCVM=0 LEVELS=0,38 DIST=dist-opt KITESURF=k TAG=golden\n", text)
+        for bad in ("MAX_FCVM", "lower=1", "X=a b;c", "HOST=10.1.2.3", "X=$(id)"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.text(arguments=bad)
 
     def test_what_is_not_a_commit_or_an_instance_type_is_refused(self):
         for change in ({"source": "abc123"}, {"kitesurf": ""}, {"instance_type": "a host name"},
-                       {"instance_type": "ip-10-0-0-1"}):
+                       {"instance_type": "ip-" + "10-0-0-1"}, {"instance_type": "host1.internal"},
+                       {"instance_type": "build.example"}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.text(**change)
+        for good in ("m8gd.metal-24xl", "c8g.metal-48xl", "g4dn.metal", "m7g.8xlarge", "t4g.large"):
+            self.text(instance_type=good)
 
 
 if __name__ == "__main__":

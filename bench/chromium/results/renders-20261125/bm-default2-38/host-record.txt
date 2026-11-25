@@ -1,7 +1,7 @@
 kernel: 7.3.3-fcvm-57abeebe8d9c
-cmdline: BOOT_IMAGE=/vmlinuz-7.3.3-fcvm-57abeebe8d9c root=PARTUUID=elided ro console=tty1 console=ttyS0 nvme_core.io_timeout=4294967295 kvm-arm.mode=nested numa=off arm64.nv2 panic=-1
+cmdline: kvm-arm.mode=nested numa=off arm64.nv2
 source: 93e3fa0932405d94e743a2860e2a1c8675238afd
 kitesurf: f964846eb3cf3437abe93a64cd858c0f71938200
 host: m8gd.metal-24xl  boot: 1c7b86ffb3e655f0
-arguments: MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-default
+arguments: MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default
 ended: 2026-11-25T17:54:39Z

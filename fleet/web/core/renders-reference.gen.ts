@@ -991,5 +991,5 @@ export const RENDERS_REFERENCE = {
   },
   "sourceRevision": "93e3fa0932405d94e743a2860e2a1c8675238afd",
   "summary": "bench/chromium/results/renders-20261125-summary.json",
-  "summarySha256": "453315ff2b0163efd76417bce84d0f140dec8cf737daeca5d8bb871592a139ba"
+  "summarySha256": "0714e103ff17c8acf2785568b8eb8d5670f3171955b4463d8f5f9b3ecb87edec"
 } as const;

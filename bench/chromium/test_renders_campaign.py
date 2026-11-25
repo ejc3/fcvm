@@ -16,7 +16,7 @@ KITESURF = "b" * 40
 
 def write_run(root, run, *, kernel=KERNEL, summary_kernel=None, source=SOURCE, kitesurf=KITESURF,
               instance="m8gd.metal-24xl", boot="0123456789abcdef", left=None, levels=((3, 5), (4, 6)),
-              record=None, cmdline="quiet root=PARTUUID=elided"):
+              record=None, cmdline="kvm-arm.mode=nested numa=off"):
     """A run of 20 samples a second apart: each side at its first level, then its second
     from the tenth sample; one render a side a second, 100 ms and 200 ms."""
     out = os.path.join(root, run)
@@ -128,18 +128,26 @@ class Summary(unittest.TestCase):
                     json.dump(left, handle)
                 self.assertIn("does not say nothing was left", self.refused([("one", f"q{i}", 0.0, 0.0)]))
 
-    def test_a_host_record_must_say_each_thing_once_and_hold_no_partition_id(self):
-        good = (f"kernel: {KERNEL}\ncmdline: quiet root=PARTUUID=elided\nsource: {SOURCE}\nkitesurf: {KITESURF}\n"
+    def test_a_host_record_says_each_thing_once_and_only_what_it_may(self):
+        good = (f"kernel: {KERNEL}\ncmdline: kvm-arm.mode=nested arm64.nv2\nsource: {SOURCE}\nkitesurf: {KITESURF}\n"
                 "host: m8gd.metal-24xl  boot: 0123456789abcdef\narguments: MAX_FCVM=40\nended: 2026-01-01T00:00:00Z\n")
         write_run(self.root, "good", record=good)
         renders_campaign.summarize(self.root, "c", [("one", "good", 0.0, 0.0)])
+        write_run(self.root, "none", record=good.replace("kvm-arm.mode=nested arm64.nv2", "(none of the recorded parameters)"))
+        renders_campaign.summarize(self.root, "c", [("one", "none", 0.0, 0.0)])
         for name, record, text in (
             ("twice", good.replace(f"kernel: {KERNEL}\n", f"kernel: 7.0.0-1018-aws\nkernel: {KERNEL}\n"), "says `kernel` twice"),
             ("noend", good.replace("ended: 2026-01-01T00:00:00Z\n", ""), "no `ended`"),
             ("noargs", good.replace("arguments: MAX_FCVM=40\n", ""), "no `arguments`"),
             ("badend", good.replace("2026-01-01T00:00:00Z", "yesterday"), "`ended`"),
-            ("uuid", good.replace("PARTUUID=elided", "PARTUUID=4a97390b-26c9-47aa-b101-000000000000"), "partition"),
-            ("uuid2", good.replace("root=PARTUUID=elided", "root=UUID=0b1c2d3e-0000-4000-8000-000000000000"), "partition"),
+            ("uuid", good.replace("arm64.nv2", "root=PARTUUID=4a97390b-26c9-47aa-b101-000000000000"), "command line"),
+            ("elided", good.replace("arm64.nv2", "root=PARTUUID=elided"), "command line"),
+            ("byid", good.replace("arm64.nv2", "root=/dev/disk/by-id/nvme-vol0123456789abcdef0"), "command line"),
+            ("name", good.replace("arm64.nv2", "systemd.hostname=build-host-7"), "command line"),
+            ("value", good.replace("kvm-arm.mode=nested", "kvm-arm.mode=10.1.2.3"), "command line"),
+            ("path", good.replace("MAX_FCVM=40", "DIST=/home/someone/dist"), "`arguments`"),
+            ("addr", good.replace("MAX_FCVM=40", "HOST=10.1.2.3"), "`arguments`"),
+            ("type", good.replace("m8gd.metal-24xl", "host1.internal"), "instance type"),
             ("nohost", good.replace("host: m8gd.metal-24xl  boot: 0123456789abcdef\n", "host: m8gd.metal-24xl\n"), "no `host: TYPE  boot: HASH`"),
             ("commit", good.replace(SOURCE, "abc123"), "is not a commit"),
         ):

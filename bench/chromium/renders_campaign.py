@@ -5,9 +5,10 @@
 
 DIR holds one directory per run of `make fleet-renders-bench` (renders.jsonl, samples.jsonl,
 summary.json, teardown.json) with a `host-record.txt` beside them, written when the run
-ended (renders_host_record.py): lines `kernel:`, `cmdline:`, `source:` (the fcvm commit),
-`kitesurf:` (its commit), `host:` (the instance type, then `boot:` and a hash of the boot
-id), `arguments:`, `ended:`, each once.
+ended (renders_host_record.py): lines `kernel:`, `cmdline:` (the kernel parameters that
+writer keeps, and no other), `source:` (the fcvm commit), `kitesurf:` (its commit), `host:`
+(the instance type, then `boot:` and a hash of the boot id), `arguments:`, `ended:`, each
+once.
 
 A regime is a run scored over a window (renders_analyze.py: from `skip` seconds after the
 first sample, or the `last` seconds). The summary carries, per regime, each side's figures,
@@ -16,9 +17,9 @@ files, so a figure can be traced to its record.
 
 Nothing is written unless every run agrees on the kernel, the fcvm commit, Kitesurf's commit,
 the instance type and the boot, the kernel is fcvm's own host kernel, each run's summary
-names that kernel, and each run's teardown says it left nothing. A host record that holds a
-partition id, a run that is not a directory of DIR, or a window without samples is refused
-the same way.
+names that kernel, and each run's teardown says it left nothing. A host record that holds
+anything its writer would not write, a run that is not a directory of DIR, or a window
+without samples is refused the same way.
 """
 
 import argparse
@@ -30,13 +31,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import renders_analyze  # noqa: E402
+import renders_host_record  # noqa: E402
 
 FCVM_KERNEL = re.compile(r"^\d+\.\d+\.\d+-fcvm-[0-9a-f]{12}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 ENDED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-# A partition or filesystem id on the recorded kernel command line: a value of the host, which the
-# record's writer replaces with `elided`.
-PARTITION_ID = re.compile(r"UUID=(?!elided\b)")
 HOST_FIELDS = ("kernel", "cmdline", "source", "kitesurf", "host", "arguments", "ended")
 RECORD_FILES = ("renders.jsonl", "samples.jsonl", "summary.json", "teardown.json", "host-record.txt")
 SAME = ("kernel", "source", "kitesurf", "instance_type", "boot")
@@ -67,8 +66,16 @@ def host_record(path):
     found = re.fullmatch(r"(\S+)\s+boot:\s+([0-9a-f]{16})", fields["host"])
     if not found:
         raise Refused(f"{path}: no `host: TYPE  boot: HASH` line")
-    if PARTITION_ID.search(fields["cmdline"]):
-        raise Refused(f"{path}: the kernel command line holds a partition id; the record's writer elides it")
+    # Only what the record's writer writes: listed kernel parameters, plain arguments, an instance type.
+    if fields["cmdline"] != renders_host_record.kept_parameters(fields["cmdline"]):
+        raise Refused(f"{path}: the kernel command line holds more than the recorded parameters")
+    try:
+        if fields["arguments"] != " ".join(renders_host_record.argument(t) for t in fields["arguments"].split()):
+            raise ValueError("a path")
+    except ValueError:
+        raise Refused(f"{path}: `arguments` holds more than NAME=value with plain values") from None
+    if not renders_host_record.INSTANCE_TYPE.fullmatch(found.group(1)):
+        raise Refused(f"{path}: {found.group(1)!r} is not an instance type")
     if not ENDED.fullmatch(fields["ended"]):
         raise Refused(f"{path}: `ended` is {fields['ended']!r}, not a UTC time to the second")
     record = {"kernel": fields["kernel"], "source": fields["source"],

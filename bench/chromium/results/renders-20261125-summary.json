@@ -13,8 +13,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "2bad1d7bc980b2beb79c9f704aa5bd51190e014f21ec1df86804ea9f220d03ba",
-     "size": 457
+     "sha256": "660ae235d127168476168617daf2f2cab7cf7f2eb745d74bd56714067603426a",
+     "size": 321
     },
     "renders.jsonl": {
      "sha256": "bfa4b1f2c4082eed1730b19776046eea8f01b73e7a565f186496f81424abcb9e",
@@ -204,8 +204,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "04e23b2969f1dc05316c1c67eef1c50412e46d909314bdfdd0b0a5240bf38639",
-     "size": 457
+     "sha256": "00bd3eb33c78b42e4720059b84a40502ccd356162657a9cabdc0689bf326c4f8",
+     "size": 321
     },
     "renders.jsonl": {
      "sha256": "9ce4e39ea38f1139e8866a0577714624f9324f590e9380ca26869fb5f98864c6",
@@ -395,8 +395,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "5cc55d4c261ed7d0afc575370dab6ba052a6c125a77646f7b772a0aaab8f9a31",
-     "size": 445
+     "sha256": "df3a9f06e682e5934df0422ad747e27436aaec42bf1ba73e297b4e843dcf7bc0",
+     "size": 309
     },
     "renders.jsonl": {
      "sha256": "416a3bfbdfecc50f33d6708d4370f0d8434e4e2a9abcad650c8b5a643feecbbc",
@@ -875,8 +875,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "42ba18c1c97549a651c6217a5a957e9ea232718a1cb89671980abf5cce51b8c1",
-     "size": 445
+     "sha256": "b551a43a82dfe2692807c5511449435a9d67efaabfd5f9a8cda37b0e121a47df",
+     "size": 309
     },
     "renders.jsonl": {
      "sha256": "7d1b6b643bf6a6b34c926c8e47b57300c1d151c6632fbababeacc16892694bdc",
@@ -1323,8 +1323,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "907b46f357bf5c4ea91c5def48783d86c4d96455545e5bbdbb352f9fd4fc053b",
-     "size": 445
+     "sha256": "2a9cbf4ee3a71d54abac2cbe9b8279d68507f81bae54c5da96fd7d80a9f2d622",
+     "size": 309
     },
     "renders.jsonl": {
      "sha256": "4c1eb59ef42df4aa83099af95713e303a3b709e3906be85084839b634e5c42fa",
@@ -1771,8 +1771,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "ca4ad42629d9a73965e124c5bd7afc160470a739674e502311ffa87d0579a01f",
-     "size": 455
+     "sha256": "21f8743175593721960cbab187f66b8b0789dca4585eea72b922acd005b9fa57",
+     "size": 319
     },
     "renders.jsonl": {
      "sha256": "8bba3b08cee9ea906607812569e7e9e5f2ea1c7bb1d6203c463c21107b239e55",
@@ -1936,8 +1936,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "a1e60fc31efe4ccd3ad7c5a17a963ec7b2b1a3068ba0ff28a3608eb75dc693a1",
-     "size": 455
+     "sha256": "d1132c30c11e07ea7c76784e78a00eff27a570a765082b56dd8dec94d4c8f5aa",
+     "size": 319
     },
     "renders.jsonl": {
      "sha256": "a15435d8e9ffb9cb20aed3e4832454e22ab0e48eca2a8f841fcacb070e176dff",
@@ -2099,8 +2099,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "9b58b138285e5c7a36a265e445f6e46992ae8967ca628ddfa8cfdb10e30616e0",
-     "size": 453
+     "sha256": "fc8b45fb823745a24285485f02bd163c0ad34eac27a64df09f419374d1b10c28",
+     "size": 317
     },
     "renders.jsonl": {
      "sha256": "cf1a51cb9d8a2b4bc655259bef53d6951eff4e2afd8147f19ce2b295c6e02b4a",
@@ -2264,8 +2264,8 @@
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "02e3f0b9899da67acc2fdfbedd5977a0ed79ecf1460af90dff375b87d39ba618",
-     "size": 453
+     "sha256": "b0ecbeac1d80e89673551008dc91c63e0369685d3a76e026328931ce0334de83",
+     "size": 317
     },
     "renders.jsonl": {
      "sha256": "a9e008372b6ab449ec28d481458c1cfbe0615033d69b3b25e4bed661a5eb5ce1",
@@ -2421,14 +2421,14 @@
    }
   },
   {
-   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-default",
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default",
    "ended": "2026-11-25T17:36:35Z",
    "engine_recycles": 0,
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "06b79422b0e11a8e3615ff9e754e063322cdf8471079cbeddfc76c91e317e2aa",
-     "size": 510
+     "sha256": "467dc830facb26ba29633afc553aaabeb3e5464828fbca2de608091af99bcd8b",
+     "size": 349
     },
     "renders.jsonl": {
      "sha256": "028a211da8569f2e243f507d20e539949429f3332f4660c124107a89d8da8122",
@@ -2584,14 +2584,14 @@
    }
   },
   {
-   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-default",
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default",
    "ended": "2026-11-25T17:39:12Z",
    "engine_recycles": 0,
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "e76c1a0e3e74cf6624d83d78d30be1d473511eee836d69409becdf14246c098c",
-     "size": 512
+     "sha256": "e3dd759cb13102a7a0a74692cf702be0ca44611a7164360c6b9fef91f0ba7161",
+     "size": 351
     },
     "renders.jsonl": {
      "sha256": "51985b420231b2c6cf16860bf0f403a9cb0607362b5f09e033454943ce17b77b",
@@ -2747,14 +2747,14 @@
    }
   },
   {
-   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-opt",
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-opt",
    "ended": "2026-11-25T17:41:45Z",
    "engine_recycles": 0,
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "f76a84172968a0455eacc8ba71e722737894c563596f746e44a698ab57a05fc0",
-     "size": 506
+     "sha256": "0e700e27f00a6fd02614a16703b88984ffac486ff28052a6287edcc3356d0c86",
+     "size": 345
     },
     "renders.jsonl": {
      "sha256": "0d44612aef7c6b974219b6dca61b7ba52d7b11194c90e165c02c22f64601395f",
@@ -2910,14 +2910,14 @@
    }
   },
   {
-   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-opt",
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-opt",
    "ended": "2026-11-25T17:44:21Z",
    "engine_recycles": 0,
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "ee4ae67dd6aa53e8e0cde45ced4b42b9f0affaeb07faddffda7e619accb5cc32",
-     "size": 508
+     "sha256": "e02f601220d107c0f7ed91412602ce21e2acb3b07f5eb999e2718ffbad69423a",
+     "size": 347
     },
     "renders.jsonl": {
      "sha256": "660e864f61d1c5304f4222aae75ab8bfbc09dbbeda4b318d6db4a1cfbc301f16",
@@ -3073,14 +3073,14 @@
    }
   },
   {
-   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-opt",
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-opt",
    "ended": "2026-11-25T17:46:54Z",
    "engine_recycles": 0,
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "5401efe7e8c3d4220685ea4f633a8fb735798c30b13f20f0e1b358b5dee6b73d",
-     "size": 506
+     "sha256": "4f96908bf3dffc74642667fc6292019ea387797f81c780206d5f82e12c0861cf",
+     "size": 345
     },
     "renders.jsonl": {
      "sha256": "da05f1e9dff72d2ec21a2a89a9f4df64464ec03622d3c54796179f498d501f1c",
@@ -3236,14 +3236,14 @@
    }
   },
   {
-   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-opt",
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-opt",
    "ended": "2026-11-25T17:49:30Z",
    "engine_recycles": 0,
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "b4689ef44d83d55acdd1d5530e4801993aa7d527a5b74f7ee3aec1c6a28da62b",
-     "size": 508
+     "sha256": "8410e0e9bf88f9f42eeaeb657c7e59186d1f4f78019caa5c49def075c89410ca",
+     "size": 347
     },
     "renders.jsonl": {
      "sha256": "50d1a2f97f993490cafb2f62f84fc9f556e9233e539cba99fab728659e668212",
@@ -3399,14 +3399,14 @@
    }
   },
   {
-   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-default",
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default",
    "ended": "2026-11-25T17:52:03Z",
    "engine_recycles": 0,
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "75d50f95605645970457da7e1750b8fb133e8bbda9cc653b477e743202c83c3d",
-     "size": 510
+     "sha256": "7d38587c05fd9d88ee9c6eede80846c84734cfcaa620649d6eabf666a96dccfc",
+     "size": 349
     },
     "renders.jsonl": {
      "sha256": "443fde04c55e6fd9058bee0aefd04146182c51ad86f6136312f2d0bb3da5efd2",
@@ -3562,14 +3562,14 @@
    }
   },
   {
-   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=/mnt/fcvm-btrfs/kitesurf/dist-default",
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default",
    "ended": "2026-11-25T17:54:39Z",
    "engine_recycles": 0,
    "engine_restarts": 0,
    "files": {
     "host-record.txt": {
-     "sha256": "8a4cc4c988e5fe645afb22113edbfb9c10362a021c3ce57cb0fe21e407a1780d",
-     "size": 512
+     "sha256": "2b0e852d352b2b4144cd5ffb3c006004c4e3066d86b9947067b92f91ae0af29b",
+     "size": 351
     },
     "renders.jsonl": {
      "sha256": "a064d1c19dc82ec8d83302bd73e0dc9365cf9d6f12bd6c9ca3a6b8bd13e25600",

@@ -2469,14 +2469,15 @@ directory, 2 MiB pages. Every count must be zero.
 The recorded figures for the page come from one campaign: every regime on one boot of one host,
 on fcvm's own host kernel, at one fcvm commit and one Kitesurf commit, each regime a run of
 `make fleet-renders-bench`. When a run has ended, `bench/chromium/renders_host_record.py` writes
-`host-record.txt` beside its records: the kernel release and command line, the fcvm commit,
-Kitesurf's commit, the instance type, a hash of the boot id, the run's arguments and the time. It
-names no instance, address or host, and a partition id on the command line is written as
-`elided`. `bench/chromium/renders_campaign.py` writes the campaign's summary,
-`bench/chromium/results/renders-<id>-summary.json`, from the runs' records. It writes nothing
-when two runs differ in kernel, fcvm commit, Kitesurf commit, instance type or boot, when the
-kernel is not fcvm's own, when a run's summary names another kernel, when a host record holds a
-partition id or says a thing twice, or when a run's teardown does not say it left nothing. Per regime the summary holds each side's figures over a stated window
+`host-record.txt` beside its records: the kernel release, the kernel parameters that change what
+is measured (from a list in that file; the rest of the command line is dropped), the fcvm
+commit, Kitesurf's commit, the instance type, a hash of the boot id, the run's arguments (a
+path's last name only) and the time. `bench/chromium/renders_campaign.py` writes the campaign's
+summary, `bench/chromium/results/renders-<id>-summary.json`, from the runs' records. It writes
+nothing when two runs differ in kernel, fcvm commit, Kitesurf commit, instance type or boot,
+when the kernel is not fcvm's own, when a run's summary names another kernel, when a host record
+says a thing twice or holds anything its writer would not write, or when a run's teardown does
+not say it left nothing. Per regime the summary holds each side's figures over a stated window
 (`renders_analyze.py`), the levels the search moved through, and the sha256 and size of the run's
 files.
 
