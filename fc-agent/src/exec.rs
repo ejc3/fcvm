@@ -414,7 +414,7 @@ pub fn serve_everything() {
 fn refusal_frame() -> Vec<u8> {
     exec_proto::Message::Error(
         "fc-agent is restarting in the middle of a snapshot of this VM and runs nothing but \
-         that snapshot's resume until its boot has its plan; try again"
+         that snapshot's resume until its boot has set up container storage; try again"
             .to_string(),
     )
     .encode()
@@ -448,7 +448,7 @@ async fn handle_connection(client_fd: OwnedFd) {
     if RESUME_ONLY.load(Ordering::Acquire) && !is_the_boundary_resume(&request) {
         eprintln!(
             "[fc-agent] exec refused: only the snapshot boundary's resume runs before this \
-             boot has its plan ({:?})",
+             boot has set up container storage ({:?})",
             request.command.first()
         );
         // The client is past its handshake and reads frames: tell it why, or `fcvm exec`

@@ -6036,15 +6036,38 @@ async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &s
 /// (`bootplan::advance_system_clock`), so a source whose clock kept running through
 /// the pause (the arm64 `default` profile: 0 ms behind after the same pause) is left
 /// alone.
+///
+/// **A source whose agent died in the boundary fails the create.** The resume is then
+/// answered by the agent systemd started next, which says so in its report. The death may
+/// have come before the pause, and the image then holds a dead or starting agent and a
+/// killed container: on Firecracker a clone of it waits for a boot plan behind its closed
+/// gate until the host ends it. The host cannot tell when the agent died, so every such
+/// create fails, after the gate is open again, and its caller discards the image.
 async fn resume_paused_source(vsock_socket: &Path, vm_id: &str) -> Result<()> {
-    reopen_source_network(vsock_socket, vm_id, true).await
+    if reopen_source_network(vsock_socket, vm_id, true).await? {
+        bail!(
+            "snapshot create of VM {vm_id} failed and its image is discarded: the VM's guest \
+             agent died during the snapshot and its successor answered the resume, so the \
+             image may hold a dead agent and a killed container. The VM's network gate is \
+             open again"
+        );
+    }
+    Ok(())
 }
 
 /// Reopen the source's network after a prepare that failed, whose failure does not prove
 /// it did not run. No pause preceded it, so the guest's clock is left alone.
 async fn reopen_source_after_failed_prepare(vsock_socket: &Path, vm_id: &str) -> Result<()> {
-    reopen_source_network(vsock_socket, vm_id, false).await
+    reopen_source_network(vsock_socket, vm_id, false)
+        .await
+        .map(|_agent_restarted| ())
 }
+
+/// What the guest's resume one-shot writes on its stderr when the agent that served the
+/// prepare died before the resume (`AGENT_RESTARTED_REPORT` in fc-agent's
+/// snapshot_network.rs, which holds the two equal).
+const SOURCE_AGENT_RESTARTED_REPORT: &str =
+    "the agent that served this snapshot's prepare died before its resume";
 
 /// The exit status of a boundary one-shot that the guest refused because a restore is
 /// under way in it (`REFUSED_EXIT` in fc-agent's main.rs). Running it again changes
@@ -6095,6 +6118,9 @@ impl ReopenFailure {
 #[derive(Debug)]
 enum ReopenTry {
     Open,
+    /// Open, and the one-shot reported that the agent which served the prepare died
+    /// before this resume (`SOURCE_AGENT_RESTARTED_REPORT`).
+    OpenAfterAgentRestart,
     /// The guest refused: a restore is under way in it.
     Refused(anyhow::Error),
     /// The one-shot failed, or could not be run at all.
@@ -6111,15 +6137,18 @@ enum ReopenTry {
 /// records `network_gate_closed`, and the next `snapshot create` of it is refused until
 /// the gate is open ([`refuse_a_source_left_gated`]).
 ///
-/// The state is written at the first try that fails and cleared by the try that opens
-/// the gate, not when the loop gives up: a create that is interrupted while it is still
-/// asking (Ctrl-C; nothing here handles a signal) leaves the source gated, and the
-/// record is what makes the next create ask again before it prepares.
+/// The state is written before the first ask and cleared by the try that opens the gate:
+/// a create that is interrupted while it is asking (Ctrl-C; nothing here handles a
+/// signal), at its first try as at any later one, leaves the source gated, and the record
+/// is what makes the next create ask again before it prepares. A reopen that needs no
+/// second try writes the record and clears it, and leaves the state as it found it.
+///
+/// `Ok(true)`: open, and the agent that served the prepare died before the resume.
 async fn reopen_source_network(
     vsock_socket: &Path,
     vm_id: &str,
     pause_preceded: bool,
-) -> Result<()> {
+) -> Result<bool> {
     ask_source_to_reopen(
         vsock_socket,
         vm_id,
@@ -6169,7 +6198,7 @@ async fn refuse_a_source_left_gated(vsock_socket: &Path, vm_id: &str) -> Result<
         return Ok(());
     }
     match ask_source_to_reopen(vsock_socket, vm_id, false, SOURCE_REOPEN_ONE_ASK, 1, true).await {
-        Ok(()) => {
+        Ok(_agent_restarted) => {
             info!(
                 vm_id,
                 "the gate an earlier snapshot create left closed is open"
@@ -6192,7 +6221,7 @@ async fn ask_source_to_reopen(
     bound: std::time::Duration,
     max_tries: u32,
     gated: bool,
-) -> std::result::Result<(), ReopenFailure> {
+) -> std::result::Result<bool, ReopenFailure> {
     reopen_until_open(
         vm_id,
         bound,
@@ -6210,7 +6239,11 @@ async fn ask_source_to_reopen(
                     // The one-shot's own report, including the size of the clock step,
                     // reaches no console: it is this exec's stderr.
                     debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
-                    ReopenTry::Open
+                    if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {
+                        ReopenTry::OpenAfterAgentRestart
+                    } else {
+                        ReopenTry::Open
+                    }
                 }
                 Ok(output) => {
                     let error = anyhow::anyhow!(
@@ -6239,9 +6272,11 @@ async fn ask_source_to_reopen(
 ///
 /// - Each try is given what is left of `bound` and cut off there, so the loop is over
 ///   within `bound` of its start. A try is not started for less than `least_try`.
-/// - `record(true)` runs at the first try that fails, unless `gated` says the state
-///   already holds it, and `record(false)` when a try opens a gate that was recorded
-///   closed.
+/// - `record(true)` runs before the first try, unless `gated` says the state already
+///   holds it, and `record(false)` when a try opens the gate. A guest that refuses (a
+///   restore is under way in it, and the gate is the restore's) has the record this call
+///   wrote taken back.
+/// - `Ok(true)` is a gate opened by a resume that reported the agent's restart.
 /// - A source that is still gated at the end is reported as that, by name: it refuses
 ///   every new TCP connection in both directions until a resume lands, and nothing else
 ///   in the system says so.
@@ -6253,7 +6288,7 @@ async fn reopen_until_open<F, Fut, R, RFut>(
     mut gated: bool,
     mut reopen: F,
     record: R,
-) -> std::result::Result<(), ReopenFailure>
+) -> std::result::Result<bool, ReopenFailure>
 where
     F: FnMut(std::time::Duration) -> Fut,
     Fut: std::future::Future<Output = ReopenTry>,
@@ -6262,6 +6297,11 @@ where
 {
     let started = std::time::Instant::now();
     let mut tries = 0u32;
+    let recorded_here = !gated;
+    if recorded_here {
+        gated = true;
+        record(true).await;
+    }
     loop {
         tries += 1;
         let limit = bound.saturating_sub(started.elapsed());
@@ -6273,7 +6313,7 @@ where
             )),
         };
         let error = match tried {
-            ReopenTry::Open => {
+            ReopenTry::Open | ReopenTry::OpenAfterAgentRestart => {
                 if gated {
                     record(false).await;
                 }
@@ -6285,9 +6325,12 @@ where
                         "the source's network reopened after failed tries"
                     );
                 }
-                return Ok(());
+                return Ok(matches!(tried, ReopenTry::OpenAfterAgentRestart));
             }
             ReopenTry::Refused(error) => {
+                if recorded_here {
+                    record(false).await;
+                }
                 return Err(ReopenFailure::Refused(error.context(format!(
                     "guest {vm_id} refused to reopen its network: a restore is under way in \
                      it, and its gate is that restore's"
@@ -6295,10 +6338,6 @@ where
             }
             ReopenTry::Failed(error) => error,
         };
-        if !gated {
-            gated = true;
-            record(true).await;
-        }
         if tries >= max_tries || started.elapsed() + pause + least_try > bound {
             error!(
                 vm_id,
@@ -9982,13 +10021,11 @@ mod tests {
             u32::MAX,
             false,
             |_| async {
+                // the state holds the closed gate from before the first ask, so a create
+                // interrupted in any try leaves the record
+                assert_eq!(*recorded.lock().unwrap(), vec![true]);
                 match tries.fetch_add(1, Ordering::SeqCst) {
-                    0 => ReopenTry::Failed(anyhow::anyhow!("exec: connection refused")),
-                    1 => {
-                        // the state holds the closed gate while the create is still asking
-                        assert_eq!(*recorded.lock().unwrap(), vec![true]);
-                        ReopenTry::Failed(anyhow::anyhow!("exec: connection refused"))
-                    }
+                    0 | 1 => ReopenTry::Failed(anyhow::anyhow!("exec: connection refused")),
                     _ => ReopenTry::Open,
                 }
             },
@@ -10003,19 +10040,39 @@ mod tests {
             "recorded once, and cleared by the open"
         );
 
-        // a first try that opens the gate writes nothing
-        reopen_until_open(
+        // a first try that opens the gate leaves the state as it found it
+        let restarted = reopen_until_open(
             "vm-source",
             Duration::from_secs(30),
             spacing,
             u32::MAX,
             false,
-            |_| async { ReopenTry::Open },
+            |_| async {
+                assert_eq!(*recorded.lock().unwrap(), vec![true]);
+                ReopenTry::Open
+            },
             record,
         )
         .await
         .unwrap();
-        assert_eq!(take(), Vec::<bool>::new());
+        assert!(!restarted);
+        assert_eq!(take(), vec![true, false]);
+
+        // open, by a resume that an agent started in the boundary answered: the gate is
+        // recorded open, and the caller is told
+        let restarted = reopen_until_open(
+            "vm-source",
+            Duration::from_secs(30),
+            spacing,
+            u32::MAX,
+            false,
+            |_| async { ReopenTry::OpenAfterAgentRestart },
+            record,
+        )
+        .await
+        .unwrap();
+        assert!(restarted);
+        assert_eq!(take(), vec![true, false]);
 
         // never: bounded, and loud
         let tries = AtomicU32::new(0);
@@ -10107,7 +10164,11 @@ mod tests {
         assert_eq!(tries.load(Ordering::SeqCst), 1);
         assert!(matches!(error, ReopenFailure::Refused(_)), "{error:?}");
         assert!(format!("{:#}", error.into_error()).contains("a restore is under way"));
-        assert_eq!(take(), Vec::<bool>::new());
+        assert_eq!(
+            take(),
+            vec![true, false],
+            "the gate of a restoring clone is not this create's to record"
+        );
 
         // What a later create gives a source recorded gated: one ask. Still closed, the
         // record stays as it is; open, it is cleared.
@@ -10148,8 +10209,16 @@ mod tests {
         let refuse = body_of(source, "async fn refuse_a_source_left_gated(");
         assert!(refuse.contains(".is_ok_and(|state| state.network_gate_closed);"));
         assert!(refuse.contains("SOURCE_REOPEN_ONE_ASK, 1, true)"));
-        assert!(body_of(source, "async fn ask_source_to_reopen(")
-            .contains("|closed| record_source_gate(vm_id, closed),"));
+        let ask = body_of(source, "async fn ask_source_to_reopen(");
+        assert!(ask.contains("|closed| record_source_gate(vm_id, closed),"));
+        // A create whose source's agent died in the boundary fails once the gate is
+        // open, and both creators discard the image on that error.
+        assert!(ask.contains(
+            "if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {\n                        ReopenTry::OpenAfterAgentRestart"
+        ));
+        let resume = body_of(source, "async fn resume_paused_source(");
+        assert!(resume.contains("if reopen_source_network(vsock_socket, vm_id, true).await? {"));
+        assert!(resume.contains("failed and its image is discarded"));
         // The refusal is each creator's first step: before the global permit and the
         // staging directory, and outside the prepare, whose failure runs the whole reopen
         // loop as its recovery.

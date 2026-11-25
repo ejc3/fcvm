@@ -824,7 +824,7 @@ const GATE_CHAINS: &str =
     "{ /usr/sbin/iptables -w -S; /usr/sbin/ip6tables -w -S; } | grep FCVM_SNAPSHOT || true";
 
 /// A source whose agent dies between a snapshot's prepare and its resume is reopened
-/// all the same.
+/// all the same, and the snapshot is not published.
 ///
 /// The prepare closes the source's gate and freezes its container, and the resume
 /// one-shot that undoes both arrives over the agent's exec server. With the agent dead
@@ -838,6 +838,11 @@ const GATE_CHAINS: &str =
 /// systemd starts the next agent about a second after the kill (`RestartSec=1`), which is
 /// inside the 54 s the host's exec keeps trying to connect, so the first ask lands.
 ///
+/// The create then fails and leaves no image. The new agent wrote into the `owed` mark
+/// that it started in a boundary, the resume reports that, and the host fails the create
+/// on the report: an agent that died before the pause is in the image, with the container
+/// systemd killed, and the host cannot tell that death from this one, after the pause.
+///
 /// What says the gate is open is read on the host, from two logs:
 ///
 /// - the resume one-shot's own report, which the host logs when the one-shot succeeds;
@@ -850,7 +855,9 @@ const GATE_CHAINS: &str =
 /// agent with no snapshot in sight (#2158). An exec sent then is a race with the
 /// poweroff, which this test lost in 3 runs of 6 while it sent one.
 ///
-/// RED BEFORE THE FIX: `snapshot create` fails after its one ask and the gate stays.
+/// RED BEFORE THE FIX: the guest never reports its gate open (`snapshot create` fails
+/// after its one ask and the gate stays). Before the create failed on the report: it
+/// succeeded and published the image.
 #[tokio::test]
 async fn a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and_the_resume(
 ) -> Result<()> {
@@ -925,16 +932,28 @@ async fn a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and
             .await
             .context("snapshot create did not end within 240 s")??;
         let logged = std::fs::read_to_string(&create_log).unwrap_or_default();
-        anyhow::ensure!(
-            status.success(),
-            "snapshot create failed after the source's agent died between its prepare and \
-             its resume ({status}):\n{logged}"
-        );
         // The guest's own account of the resume, as the host logged it.
         anyhow::ensure!(
             logged.contains("source VM snapshot network reopened: gate=open"),
-            "snapshot create succeeded without the guest reporting its gate open:\n{logged}"
+            "the guest did not report its gate open ({status}):\n{logged}"
         );
+        // The create fails, on the resume's report that a new agent answered it, and
+        // leaves no image: the host cannot tell this death from one before the pause.
+        anyhow::ensure!(
+            !status.success()
+                && logged.contains("failed and its image is discarded")
+                && logged.contains("guest agent died during the snapshot"),
+            "snapshot create did not fail on a source whose agent died in the boundary \
+             ({status}):\n{logged}"
+        );
+        let snapshots = fcvm::paths::snapshot_dir();
+        for left in [snapshot_name.clone(), format!("{snapshot_name}.creating")] {
+            anyhow::ensure!(
+                !snapshots.join(&left).exists(),
+                "the failed create left {left} in {}",
+                snapshots.display()
+            );
+        }
         // The resume was served by an agent that started behind the closed gate, and
         // that agent then reached MMDS: a connection out of the guest.
         const OWED: &str =

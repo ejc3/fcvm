@@ -376,7 +376,7 @@ pub(crate) struct Watch {
 /// resume holds the boundary lock for a fraction of it. Past the cap every look counts,
 /// so a one-shot that hangs while it holds the lock keeps a container frozen for
 /// `UNCOUNTED_LOOKS_CAP + DEADLINE_LOOKS` looks at most, not for good.
-const UNCOUNTED_LOOKS_CAP: u32 = 900;
+pub(crate) const UNCOUNTED_LOOKS_CAP: u32 = 900;
 
 /// One watchdog look: count it against the recorded freeze, and thaw that freeze once
 /// [`DEADLINE_LOOKS`] looks have found it.

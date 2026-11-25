@@ -302,11 +302,13 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
   long. An agent that died is back about a second later (`RestartSec=1`), so the first
   ask usually lands; the bound also covers systemd's 90 s stop timeout. A guest that
   refuses with exit 3 is not asked again.
-- **A source still gated then is left running and reported failed.** It is not ended:
-  the connections it has go on working behind the gate. The create fails with
+- **A source still gated then is left running and reported failed.** The host does not
+  end it: the connections it has go on working behind the gate. (A source whose agent
+  died is another matter today: see #2158 below.) The create fails with
   `source VM <id> is LEFT WITH ITS NETWORK GATE CLOSED`. The VM's state records
-  `network_gate_closed` from the first try that fails, so a create interrupted while it
-  asks leaves the record too, and the try that opens the gate clears it. The next
+  `network_gate_closed` before the first ask, so a create interrupted while it asks, in
+  its first try as in any later one, leaves the record, and the try that opens the gate
+  clears it. A reopen that needs one try leaves the state as it found it. The next
   `snapshot create` of that VM asks once more, as its first step, and is refused while
   the gate stays closed (`refuse_a_source_left_gated`).
 - **An agent that starts in the middle of a boundary serves exec first and starts no
@@ -318,13 +320,27 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
   the prepare believed the guest frozen.
 - **The agent's death still ends the VM** (#2158). systemd kills the container with the
   agent, the next agent's `podman start` of it fails with 125, and the VM powers off
-  about a second after its boot plan arrives, with or without a snapshot in sight. For a
-  death in the middle of a boundary this section buys a gate that is reopened, a
-  `snapshot create` that succeeds and leaves a good snapshot, and no source left running
-  behind a closed gate. It does not keep the source.
+  about a second after its boot plan arrives, with or without a snapshot in sight. On
+  Cloud Hypervisor the plan comes at once, so the same happens when the hold on the
+  container's start ends. For a death in the middle of a boundary this section buys a
+  gate that is reopened and no source left running behind a closed gate. It does not
+  keep the source; #2158 is to change that.
+- **A create whose source's agent died in the boundary fails and discards its image.**
+  The agent that starts with the boundary owed writes that into the `owed` mark
+  (`note_the_agent_restarted_in_a_boundary`), the resume reports it on its stderr, and
+  the host fails the create on the report once the gate is open
+  (`resume_paused_source`). An agent that died between the prepare's reply and the pause
+  is in the image, dead or starting, with the container systemd killed; on Firecracker a
+  clone of that image would wait for a boot plan behind its closed gate until the host
+  ended it, and the image can be a cached startup snapshot. The host cannot tell that
+  death from one after the pause, so both fail.
 - **The hold gives up after 300 looks, one a second, that find the gate closed and
   nobody at work on the boundary, and the agent then goes on to its container start
-  behind the closed gate.** That is twice the host's 150 s, so no create is in flight any more: it has
+  behind the closed gate.** A look that finds someone holding the boundary lock is not
+  counted and starts the count again, so a count begun under one create cannot run out
+  inside a later one's boundary; at most 900 looks go uncounted, as for the watchdog, so
+  a one-shot hung under the lock cannot hold the start for good. 300 looks is twice the
+  host's 150 s, so no create is in flight any more: it has
   failed and recorded the source gated, or its host is gone, and nothing believes the
   guest frozen. A create that comes later freezes the container like any running one.
   The freeze watchdog thaws a frozen container in the same state for the same reason.

@@ -117,6 +117,7 @@ pub async fn run() -> Result<()> {
             "[fc-agent] WARNING: a snapshot's boundary is owed its resume and the agent that \
              served it is gone; serving the host's resume before the boot plan"
         );
+        crate::snapshot_network::note_the_agent_restarted_in_a_boundary();
         exec::serve_only_the_boundary_resume();
         start_exec_server(
             &exec_rebind,

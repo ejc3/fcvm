@@ -302,6 +302,23 @@ impl BoundaryMarks {
         std::fs::write(path, b"").with_context(|| format!("writing {}", path.display()))
     }
 
+    /// Write into an `owed` mark that the agent which served its prepare is gone. Only
+    /// into a mark that is there: this never makes one.
+    fn note_agent_restarted(&self) -> Result<()> {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.owed)
+            .and_then(|mut mark| mark.write_all(AGENT_RESTARTED_NOTE.as_bytes()))
+            .with_context(|| format!("writing {}", self.owed.display()))
+    }
+
+    /// Whether the agent restarted while this boundary was owed.
+    fn agent_restarted(&self) -> bool {
+        std::fs::read_to_string(&self.owed).is_ok_and(|mark| mark.trim() == AGENT_RESTARTED_NOTE)
+    }
+
     fn clear(path: &Path) -> Result<()> {
         match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -317,6 +334,25 @@ impl BoundaryMarks {
     /// A source whose gate a prepare closed and no resume has opened.
     fn source_owed(&self) -> bool {
         self.owed.exists() && !self.restore_under_way()
+    }
+}
+
+/// What an agent that starts with a source's boundary owed writes into the `owed` mark.
+const AGENT_RESTARTED_NOTE: &str = "agent-restarted";
+
+/// What the resume one-shot reports, on the stderr the host reads, when the agent that
+/// served the prepare died before the resume: the image the host has just taken may hold
+/// a dead or starting agent and a killed container, and the host discards it
+/// (`SOURCE_AGENT_RESTARTED_REPORT` in `src/commands/common.rs`; the two are held equal by
+/// `the_host_reads_the_restarted_agents_report_as_the_guest_writes_it`).
+pub(crate) const AGENT_RESTARTED_REPORT: &str =
+    "the agent that served this snapshot's prepare died before its resume";
+
+/// An agent that starts and finds a source's boundary owed says so in the mark, for the
+/// resume that comes.
+pub fn note_the_agent_restarted_in_a_boundary() {
+    if let Err(error) = BoundaryMarks::system().note_agent_restarted() {
+        eprintln!("[fc-agent] WARNING: {error:#}; the host will not learn that the agent restarted in the middle of its snapshot");
     }
 }
 
@@ -383,9 +419,14 @@ enum HoldEnd {
 ///   ever on a mark with nothing behind it.
 ///
 /// **When the hold gives up, and why the container then starts.** A look that finds the
-/// gate closed while someone holds the boundary lock is not counted: a prepare or a
-/// resume is at work. `HOLD_ABANDONED_LOOKS` counted looks mean no snapshot create is in
-/// flight any more: the host asks a source to reopen for 150 s and then fails the create
+/// gate closed while someone holds the boundary lock is not counted, and starts the count
+/// again: a prepare or a resume is at work, and the looks counted before it belong to a
+/// boundary that has moved on (without that, a count begun under one snapshot create
+/// could run out between a later one's prepare and its pause). At most
+/// `payload_freeze::UNCOUNTED_LOOKS_CAP` looks go uncounted, as for the freeze watchdog,
+/// so a one-shot hung under the lock cannot hold the start for good.
+/// `HOLD_ABANDONED_LOOKS` counted looks in a row mean no snapshot create is in flight any
+/// more: the host asks a source to reopen for 150 s and then fails the create
 /// and records the source gated, or the host is gone. From there nothing believes the
 /// guest frozen, so the container starts behind the closed gate, with a warning, as the
 /// freeze watchdog thaws one there after its own deadline. A create that comes later
@@ -422,20 +463,35 @@ where
     Fut: std::future::Future<Output = Result<bool>>,
 {
     let mut announced = false;
+    let mut unreadable = false;
     let mut counted = 0u32;
+    let mut uncounted = 0u32;
     loop {
         let held = if marks.restore_under_way() {
             true
         } else if marks.owed.exists() {
-            // A gate that cannot be read is taken for closed.
+            // A gate that cannot be read is taken for closed. Said once, not every look.
             let closed = gate_is_installed().await.unwrap_or_else(|error| {
-                eprintln!("[fc-agent] WARNING: {error:#}; taking the snapshot gate for closed");
+                if !unreadable {
+                    unreadable = true;
+                    eprintln!(
+                        "[fc-agent] WARNING: {error:#}; taking the snapshot gate for closed \
+                         while it cannot be read"
+                    );
+                }
                 true
             });
-            if closed && !matches!(try_boundary_lock_at(lock), BoundaryLock::Held) {
-                counted += 1;
-                if counted >= HOLD_ABANDONED_LOOKS {
-                    return HoldEnd::Abandoned;
+            if closed {
+                let at_work = matches!(try_boundary_lock_at(lock), BoundaryLock::Held)
+                    && uncounted < crate::payload_freeze::UNCOUNTED_LOOKS_CAP;
+                if at_work {
+                    uncounted += 1;
+                    counted = 0;
+                } else {
+                    counted += 1;
+                    if counted >= HOLD_ABANDONED_LOOKS {
+                        return HoldEnd::Abandoned;
+                    }
                 }
             }
             closed
@@ -3318,6 +3374,8 @@ async fn resume_source_network_with<G: FirewallGate, S: ManifestStore>(
             eprintln!("[fc-agent] WARNING: {error:#}; chronyd stays offline until set online");
         }
     }
+    // Read before the mark goes.
+    let agent_restarted = marks.agent_restarted();
     let resumed = retire_source_boundary(reopened, store, marks);
     if resumed.result.is_err() {
         return resumed;
@@ -3326,6 +3384,9 @@ async fn resume_source_network_with<G: FirewallGate, S: ManifestStore>(
         "[fc-agent] source VM snapshot network reopened: gate=open \
          (link never taken down)"
     );
+    if agent_restarted {
+        eprintln!("[fc-agent] {AGENT_RESTARTED_REPORT}");
+    }
     // A poll the gate rejected would leave chronyd waiting its whole interval.
     // Awaited: a task spawned here dies with this one-shot's runtime when it returns.
     chrony_burst().await;
@@ -9350,7 +9411,8 @@ mod tests {
     ///   gate is gone (a failed prepare's rollback opened it and the host died, or a
     ///   resume was killed between the gate and the mark) holds nothing.
     /// - With the gate closed, a look while someone holds the boundary lock is not
-    ///   counted; `HOLD_ABANDONED_LOOKS` counted looks end the hold as abandoned.
+    ///   counted and starts the count again; `HOLD_ABANDONED_LOOKS` counted looks in a
+    ///   row end the hold as abandoned. At most `UNCOUNTED_LOOKS_CAP` looks go uncounted.
     ///
     /// RED BEFORE THE FIX: nothing in the agent's start looked at the boundary. Then: a
     /// stale `owed` mark with the gate open, and a closed gate nobody would ever open,
@@ -9388,17 +9450,24 @@ mod tests {
             HoldEnd::Over
         );
 
-        // a prepare's gate, a boundary someone is working on: held, and not counted
+        // a prepare's gate, a boundary someone is working on: held, and not counted. The
+        // gate opens at a look past the count that would have abandoned it.
         gate_closed.store(true, Ordering::SeqCst);
         let working = acquire_boundary_lock_at(&lock).unwrap();
         looks.store(0, Ordering::SeqCst);
-        tokio::time::timeout(within(3_000), hold())
-            .await
-            .expect_err("the hold gave up on a boundary someone is working on");
-        assert!(
-            looks.load(Ordering::SeqCst) > HOLD_ABANDONED_LOOKS,
-            "the test did not look often enough to tell"
+        let end = hold_the_container_start_with(
+            &marks,
+            &lock,
+            || async { Ok(looks.fetch_add(1, Ordering::SeqCst) < HOLD_ABANDONED_LOOKS + 100) },
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(
+            end,
+            HoldEnd::Over,
+            "the hold gave up on a boundary someone is working on"
         );
+        assert_eq!(looks.load(Ordering::SeqCst), HOLD_ABANDONED_LOOKS + 101);
         drop(working);
         // ... until the resume opens the gate
         let opened = async {
@@ -9418,6 +9487,57 @@ mod tests {
             HoldEnd::Abandoned
         );
         assert_eq!(looks.load(Ordering::SeqCst), HOLD_ABANDONED_LOOKS);
+
+        // Someone works on the boundary at the look before the count would run out (a
+        // later snapshot create's prepare): the count starts again, so the hold is not
+        // abandoned inside that create's boundary.
+        let cap = crate::payload_freeze::UNCOUNTED_LOOKS_CAP;
+        let working: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+        looks.store(0, Ordering::SeqCst);
+        let end = hold_the_container_start_with(
+            &marks,
+            &lock,
+            || async {
+                let look = looks.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut working = working.lock().unwrap();
+                if look == HOLD_ABANDONED_LOOKS {
+                    *working = Some(acquire_boundary_lock_at(&lock).unwrap());
+                } else {
+                    *working = None;
+                }
+                Ok(true)
+            },
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert_eq!(end, HoldEnd::Abandoned);
+        assert_eq!(
+            looks.load(Ordering::SeqCst),
+            2 * HOLD_ABANDONED_LOOKS,
+            "the looks counted before someone worked on the boundary still counted"
+        );
+
+        // A one-shot hung under the lock: its looks go uncounted up to the cap, then
+        // count, so the hold ends.
+        let hung = acquire_boundary_lock_at(&lock).unwrap();
+        looks.store(0, Ordering::SeqCst);
+        let end = tokio::time::timeout(
+            within(60_000),
+            hold_the_container_start_with(
+                &marks,
+                &lock,
+                || async {
+                    looks.fetch_add(1, Ordering::SeqCst);
+                    Ok(true)
+                },
+                std::time::Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("a lock held for ever held the container's start for ever");
+        assert_eq!(end, HoldEnd::Abandoned);
+        assert_eq!(looks.load(Ordering::SeqCst), cap + HOLD_ABANDONED_LOOKS);
+        drop(hung);
 
         // the image's clone: the restore takes the boundary, and the start waits for its
         // publication whatever the gate
@@ -9442,6 +9562,65 @@ mod tests {
             "const SOURCE_REOPEN_BOUND: std::time::Duration = std::time::Duration::from_secs(150);"
         ));
         assert!(u64::from(HOLD_ABANDONED_LOOKS) * HOLD_LOOK.as_secs() >= 2 * 150);
+    }
+
+    /// An agent that starts with a source's boundary owed writes that into the mark, and
+    /// the resume that opens the gate reports it on the stderr the host reads: the image
+    /// the host took may hold a dead agent and a killed container, and only the guest
+    /// knows. The note never makes a mark, and goes with it.
+    ///
+    /// RED BEFORE THE FIX: a snapshot whose source's agent died in the boundary was
+    /// published like any other.
+    #[tokio::test]
+    async fn an_agent_that_restarts_in_a_boundary_says_so_and_the_resume_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = marks_in(dir.path());
+        assert!(marks.note_agent_restarted().is_err());
+        assert!(!marks.owed.exists(), "the note made a mark");
+        assert!(!marks.agent_restarted());
+
+        BoundaryMarks::mark(&marks.owed).unwrap();
+        assert!(!marks.agent_restarted());
+        marks.note_agent_restarted().unwrap();
+        assert!(marks.agent_restarted());
+        assert!(marks.source_owed());
+        BoundaryMarks::clear(&marks.owed).unwrap();
+        assert!(!marks.agent_restarted());
+
+        // The agent notes it where it opens exec for the resume alone, and the resume
+        // reads the note before it retires the mark.
+        let agent = include_str!("agent.rs").replace(char::is_whitespace, "");
+        let noted = agent
+            .find("crate::snapshot_network::note_the_agent_restarted_in_a_boundary();")
+            .expect("the agent notes its restart");
+        assert!(
+            noted
+                < agent
+                    .find("exec::serve_only_the_boundary_resume();")
+                    .unwrap()
+        );
+        let source = include_str!("snapshot_network.rs");
+        let resume = &source[source.find("async fn resume_source_network_with<").unwrap()..];
+        let resume = &resume[..resume.find("\nasync fn reopen_owed_gate<").unwrap()];
+        let read = resume.find("marks.agent_restarted()").unwrap();
+        let retired = resume
+            .find("retire_source_boundary(reopened, store, marks)")
+            .unwrap();
+        let reported = resume
+            .find("eprintln!(\"[fc-agent] {AGENT_RESTARTED_REPORT}\")")
+            .unwrap();
+        assert!(read < retired && retired < reported);
+    }
+
+    /// The host fails a snapshot create on the restarted agent's report, which it finds
+    /// by its text.
+    #[test]
+    fn the_host_reads_the_restarted_agents_report_as_the_guest_writes_it() {
+        let host = include_str!("../../src/commands/common.rs").replace(char::is_whitespace, "");
+        let expected =
+            format!("const SOURCE_AGENT_RESTARTED_REPORT: &str = \"{AGENT_RESTARTED_REPORT}\";")
+                .replace(char::is_whitespace, "");
+        assert!(host.contains(&expected));
     }
 
     /// Any part of the gate, in either family, is a gate that is installed; a read that
