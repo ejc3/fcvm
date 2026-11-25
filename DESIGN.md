@@ -1567,6 +1567,7 @@ One async session per connection:
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm balloon` | Print a VM's balloon target and size; with MIB, set the target first |
 | `fcvm ls` | List running VMs |
+| `fcvm paths` | Print the state and data directories this binary uses |
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Spawn clone from memory server |
@@ -2046,6 +2047,25 @@ my-nginx       12345   running   healthy   bridged   nginx:alpine
 clone-1        12350   running   healthy   rootless  (clone)
 ```
 
+#### `fcvm paths`
+
+**Purpose**: Name the directories this binary keeps VM state and data in, for tools
+outside fcvm that read state files (the benchmark harnesses under `bench/`).
+
+**Usage**:
+```bash
+fcvm paths [--json]
+```
+
+With `--json` it prints one JSON object on one line, for example
+`{"state_dir":"/mnt/fcvm-btrfs/state","data_dir":"/mnt/fcvm-btrfs"}`; without, one
+`name<TAB>path` line per directory. Each value is what `paths::state_dir()` and
+`paths::data_dir()` return for this config and `FCVM_DATA_DIR`, so a tool that asks
+follows the binary wherever it keeps its state. Fields are added, never renamed or
+removed. It reads no VM state and creates nothing. A tool asks with the binary and
+environment its VMs run with: `sudo` without `-E` drops FCVM_DATA_DIR, and the answer
+under it is then the configured directory, as it is for the VMs.
+
 #### `fcvm balloon`
 
 **Purpose**: Read or set the balloon target of a running VM.
@@ -2183,6 +2203,7 @@ fcvm/
 │   │   ├── common.rs       # Shared utilities
 │   │   ├── exec.rs         # fcvm exec
 │   │   ├── ls.rs           # fcvm ls
+│   │   ├── paths.rs        # fcvm paths
 │   │   ├── podman.rs       # fcvm podman run
 │   │   ├── setup.rs        # fcvm setup
 │   │   ├── snapshot.rs     # fcvm snapshot {create,serve,run} + UFFD server
