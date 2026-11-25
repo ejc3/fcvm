@@ -143,6 +143,15 @@ fn hugepages(meminfo: &str) -> (u64, u64) {
     )
 }
 
+/// Whether one more clone may start. A clone reserves `clone_pages` when its VMM maps its
+/// memory, a moment after it is started, so what the kernel reports free lags the clones
+/// just started. The pool must therefore hold the memory server's copy, every clone in
+/// flight or in teardown (`busy`) and this one by count, and the kernel must also report
+/// room for one.
+fn pool_has_room(total: u64, room: u64, clone_pages: u64, busy: u64) -> bool {
+    (busy + 2) * clone_pages <= total && room >= clone_pages
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
@@ -462,6 +471,10 @@ enum Event {
         index: usize,
         result: Result<(Child, f64)>,
     },
+    Probe {
+        side: usize,
+        ms: Option<f64>,
+    },
 }
 
 /// What the workers of a side are started with.
@@ -573,7 +586,9 @@ struct Module {
     harness: CpuCgroup,
     /// The harness's CPU pressure counter over the last ticks: when (ms), usec.
     harness_pressure: std::collections::VecDeque<(u64, u64)>,
-    replay_addrs: [SocketAddr; 2],
+    /// Each side's replay's time to answer one request, as a client sees it; none when it
+    /// did not answer in time. Taken by a task of its own, so a slow replay delays no
+    /// decision.
     replay_ms: [Option<f64>; 2],
     out: PathBuf,
 }
@@ -596,7 +611,13 @@ impl Module {
         if side == FCVM {
             if self.clone_pages > 0 {
                 let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-                if hugepages(&meminfo).1 < self.clone_pages {
+                let (total, room) = hugepages(&meminfo);
+                let busy = self.sides[side]
+                    .workers
+                    .iter()
+                    .filter(|w| w.job.is_some())
+                    .count() as u64;
+                if !pool_has_room(total, room, self.clone_pages, busy) {
                     self.sides[side].pool_waits += 1;
                     return None;
                 }
@@ -762,6 +783,7 @@ impl Module {
             Event::Line { side, index, line } => self.line(side, index, &line).await,
             Event::Gone { side, index } => self.gone(side, index).await,
             Event::Engine { index, result } => self.engine(index, result).await,
+            Event::Probe { side, ms } => self.replay_ms[side] = ms,
         }
     }
 
@@ -873,16 +895,6 @@ impl Module {
             while self.harness_pressure.len() > 31 {
                 self.harness_pressure.pop_front();
             }
-        }
-        for side in 0..2 {
-            self.replay_ms[side] = http_get(
-                self.replay_addrs[side],
-                "example.com",
-                "/",
-                Duration::from_millis(800),
-            )
-            .await
-            .map(|(_, ms)| ms);
         }
         sample["engines_up"] = json!(up);
         sample["recycles"] = json!(self.recycles);
@@ -1464,13 +1476,26 @@ async fn run(
         samples: std::io::BufWriter::new(std::fs::File::create(args.out.join("samples.jsonl"))?),
         harness,
         harness_pressure: Default::default(),
-        replay_addrs: [
-            SocketAddr::from((addrs[0], args.replay_http_port)),
-            SocketAddr::from((addrs[1], args.replay_http_port)),
-        ],
         replay_ms: [None; 2],
         out: args.out.clone(),
     };
+
+    // One request a second to each side's replay, timed from this side of the socket.
+    for (side, addr) in addrs.iter().enumerate() {
+        let addr = SocketAddr::from((*addr, args.replay_http_port));
+        let tx = module.tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let ms = http_get(addr, "example.com", "/", Duration::from_millis(800))
+                    .await
+                    .map(|(_, ms)| ms);
+                if tx.send(Event::Probe { side, ms }).is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -1648,6 +1673,21 @@ mod tests {
         // never while a start is under way
         assert!(!engine_needs_a_start(true, true, true, 9, true));
         assert!(!engine_needs_a_start(false, true, true, 9, true));
+    }
+
+    /// 512 pages a clone: the memory server's copy, the clones busy and one more must fit
+    /// by count, whatever the kernel says is free just now.
+    #[test]
+    fn a_clone_starts_only_while_the_pool_holds_every_reservation() {
+        // 14,000 pages: the server and 26 clones, so a 26th may start beside 25 busy
+        assert!(pool_has_room(14_000, 14_000, 512, 0));
+        assert!(pool_has_room(14_000, 1_000, 512, 25));
+        assert!(!pool_has_room(14_000, 14_000, 512, 26));
+        // room by count, but the kernel reports less than one clone free
+        assert!(!pool_has_room(14_000, 511, 512, 3));
+        // the smallest pool the module starts with: the server, one in flight, one in teardown
+        assert!(pool_has_room(1_536, 1_024, 512, 1));
+        assert!(!pool_has_room(1_536, 1_024, 512, 2));
     }
 
     #[test]
