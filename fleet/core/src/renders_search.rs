@@ -114,6 +114,18 @@ pub struct LimitSearch {
     return_to: Option<u32>,
 }
 
+/// A render time for a set of renders of several pages: the mean over the pages of each
+/// page's median, which is the time to render one of each page divided by the pages. Pages
+/// with no render are left out; none with no render at all.
+///
+/// Not the median over all the renders. The pages differ by an order of magnitude, the
+/// median over all of them falls between two groups of pages, and one render more of a
+/// fast or of a slow page moves it from one group to the other.
+pub fn page_mean_ms<'a>(by_page: impl IntoIterator<Item = &'a [f64]>) -> Option<f64> {
+    let medians: Vec<f64> = by_page.into_iter().filter_map(median).collect();
+    (!medians.is_empty()).then(|| medians.iter().sum::<f64>() / medians.len() as f64)
+}
+
 fn median(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -238,7 +250,7 @@ impl LimitSearch {
             ratio,
             pressure,
             renders_per_s: all.len() as f64 * 1000.0 / dwell_ms as f64,
-            render_ms: median(&all),
+            render_ms: page_mean_ms(self.at_level.iter().map(Vec::as_slice)),
         }
     }
 

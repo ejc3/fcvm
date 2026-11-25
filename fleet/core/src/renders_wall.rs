@@ -10,7 +10,7 @@
 use crate::renders::{
     RendersOrder, RendersPage, RendersReport, SideReport, TileReport, SIDE_FCVM, SIDE_KITESURF,
 };
-use crate::renders_search::{Pair, Render, SearchParams};
+use crate::renders_search::{page_mean_ms, Pair, Render, SearchParams};
 use std::collections::{BTreeMap, VecDeque};
 
 /// The sides in the order the wall indexes them.
@@ -112,21 +112,15 @@ impl Meter {
 
     fn report(&self, now: u64, search: crate::renders::Search) -> SideReport {
         let from = now.saturating_sub(self.window_ms);
-        let mut times: Vec<f64> = self
-            .recent
-            .iter()
-            .filter(|r| r.0 >= from)
-            .map(|r| r.2)
-            .collect();
-        let n = times.len();
-        times.sort_by(|a, b| a.total_cmp(b));
-        let render_ms = (n > 0).then(|| {
-            if n % 2 == 1 {
-                times[n / 2]
-            } else {
-                (times[n / 2 - 1] + times[n / 2]) / 2.0
+        let mut by_page: Vec<Vec<f64>> = vec![Vec::new(); self.tiles.len()];
+        let mut n = 0usize;
+        for (_, page, ms) in self.recent.iter().filter(|r| r.0 >= from) {
+            n += 1;
+            if let Some(times) = by_page.get_mut(*page) {
+                times.push(*ms);
             }
-        });
+        }
+        let render_ms = page_mean_ms(by_page.iter().map(Vec::as_slice));
         // The window a rate is over is no longer than the side has been counting.
         let window = self.window_ms.min(now.saturating_sub(self.since)).max(1);
         let (cpus_busy, cpu_ms_per_render) = match (self.cpu.front(), self.cpu.back()) {
@@ -432,6 +426,51 @@ mod tests {
         );
     }
 
+    /// The side's render time is the mean over the pages of each page's median, the time to
+    /// render one of each page divided by the pages. The median over all renders falls
+    /// between two groups of pages (seven near 300 ms, seven near 700 ms in the recorded
+    /// runs) and moves by hundreds of ms with one render: on a host it read 436, 629 and
+    /// 732 ms at 36, 37 and 38 in flight while the mean moved by a few percent.
+    #[test]
+    fn a_sides_render_time_does_not_move_with_one_render_of_another_page() {
+        let pages: Vec<RendersPage> = (0..4)
+            .map(|i| RendersPage {
+                id: format!("p{i}"),
+                url: format!("https://p{i}.test/"),
+            })
+            .collect();
+        let time = |extra: usize| {
+            let mut w = Wall::new(pages.clone(), SearchParams::default(), 20_000, 0);
+            w.order(
+                &RendersOrder {
+                    run: true,
+                    overlay: None,
+                },
+                0,
+            );
+            let mut at = 0;
+            // five rounds of the four pages: two at 300 ms, two at 700 ms
+            for _ in 0..5 {
+                for page in 0..4 {
+                    at += 100;
+                    let ms = if page < 2 { 300.0 } else { 700.0 };
+                    w.render(&ok(0, page, at, ms, 1));
+                }
+            }
+            // and one render more, of a fast page or of a slow one
+            w.render(&ok(
+                0,
+                extra,
+                at + 100,
+                if extra < 2 { 300.0 } else { 700.0 },
+                1,
+            ));
+            w.report(10_000, None, None).sides[SIDE_FCVM].render_ms
+        };
+        assert_eq!(time(0), Some(500.0));
+        assert_eq!(time(3), Some(500.0));
+    }
+
     #[test]
     fn rates_times_and_cpu_come_from_completed_renders_in_the_window() {
         let mut w = running(0);
@@ -447,7 +486,8 @@ mod tests {
         let r = w.report(20_000, Some("wss://h/frames".into()), None);
         let s = &r.sides[SIDE_FCVM];
         assert_eq!(s.renders_per_s, 2.0);
-        assert_eq!(s.render_ms, Some(200.0));
+        // one of each page: 200 and 1,000 ms
+        assert_eq!(s.render_ms, Some(600.0));
         assert!((s.cpus_busy - 1.3).abs() < 1e-9);
         assert_eq!(s.cpu_ms_per_render, Some(650.0));
         assert_eq!((s.done, s.failed), (40, 0));
