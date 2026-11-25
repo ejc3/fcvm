@@ -1079,15 +1079,26 @@ async fn starting_and_stopping_a_vm_truncates_no_lock_file() {
             manager.delete_state(id).await.unwrap();
         }
     };
-    // The first start creates the sweep's lock file; the second opens it again.
-    start_and_stop("vm-first").await;
+    // The first start makes every directory a start of this vm_id, name and process
+    // uses. The second makes the VM's lock file anew (the first's delete removed it) and
+    // opens it again for each later save and for the delete: those opens are what a
+    // truncating open would show up in.
+    start_and_stop("vm-repeat").await;
     let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
-    // Every directory the first start made: the second uses the same ones (one name,
-    // one process) apart from its own state's bucket.
-    for dir in dirs_under(temp_dir.path()) {
+    let dirs = dirs_under(temp_dir.path());
+    let lock_dir = manager
+        .lock_file("vm-repeat")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert!(
+        dirs.contains(&lock_dir),
+        "the VM's lock file is in no watched directory"
+    );
+    for dir in dirs {
         inotify.add_watch(&dir, AddWatchFlags::IN_MODIFY).unwrap();
     }
-    start_and_stop("vm-second").await;
+    start_and_stop("vm-repeat").await;
     let mut truncated = Vec::new();
     loop {
         match inotify.read_events() {
