@@ -2,9 +2,9 @@
 
 Every run here is recorded in `Breaks.lean` under the name given and checked by the kernel on
 every build, under the rule book it breaks. Most were found by `lake exe gate-breaks traces`;
-four are written by hand (`handRuns` in `GateSearch.lean`), where the search reports a break
-only through a shorter run of another kind. Steps are counted from a cold-booted, running guest
-that no boundary holds.
+three are written by hand (`handRuns` in `GateSearch.lean`), where the search reports a break
+only through a shorter run of another kind. Steps are counted from a running guest that no
+boundary holds and that booted without the snapshot cache.
 
 Rule books: `main` is 4adc1dee6, `flags` is #2113 at a1e5fc687, `cookieA` is #2124 at its first
 commit a80e1ad34, `cookieB` is #2124 at its head 27add63dd.
@@ -17,6 +17,17 @@ proxy on, so the guest tracks both families all the time), routed (no proxy; the
 family only while a rule of that family asks), a port published with `/loopback` (IPv4 nat
 rules, so IPv4 is tracked all the time and IPv6 is not).
 
+Two things decide which runs a real guest can take, and neither is a step of the model:
+
+- **Whether the guest was restored.** A guest restored from a memory image is served no boot
+  plan, so an fc-agent that dies in it never comes back. Most guests are restored guests: a
+  `podman run` that hits the snapshot cache goes through the restore path. "Booted without the
+  cache" below means a guest whose agent can be served its plan again.
+- **Firecracker or Cloud Hypervisor.** On Firecracker the boot plan is fetched over MMDS, a TCP
+  connection the gate's egress half refuses. On Cloud Hypervisor it is over vsock, which the
+  gate (iptables rules) does not see. Every configuration here is Firecracker's but the three
+  named `vsock`.
+
 Severity: **high** is a client reaching a clone it must not, or a source's live connection
 reset, in a configuration people run, with nothing unusual needed. **medium** needs a failure,
 a kill or unusual timing, or a narrower configuration. **low** changes a setting or a
@@ -24,21 +35,23 @@ connection inside the guest and no client's.
 
 ## The table
 
-`holds` is the search finding no reachable state that breaks the property in the 17
-configurations of `Configs.lean` that run by default. A name is a recorded run of that kind.
-The two `all-` configurations, which turn everything on at once, are in the last section.
+`holds` is the search finding no reachable state that breaks the property in the 20
+configurations of `Configs.lean` that run by default (17 with the boot plan over MMDS, 3 over
+vsock). CI runs that search and compares its result with `search.expected`. A name is a
+recorded run of that kind. The two `all-` configurations, which turn everything on at once,
+are in the last section.
 
 | | `main` | `flags` | `cookieA` | `cookieB` | design |
 |---|---|---|---|---|---|
 | P1 `sourceDisturbed` | `liveReset`, `agentDiesSource`, `barrierKill`, `reopenFails` | `agentDiesSource`, `barrierKill`, `reopenFails` | the same | the same | proved |
 | P2 `generationBroken` | after an early snapshot | the same | `twoDumps`, `proxyConnectA`, and that | `proxyConnect`, and that | proved, for the connections the model makes (`Limits.lean`) |
-| P3 `staleAtPublication` | `staleTuple`, `staleTupleGrown`, `strayAck`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `cookieAck`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `loopbackClientA`, `earlySnapshot` | `earlySnapshot`, `earlySnapshotFails` | proved |
+| P3 `staleAtPublication` | `staleTuple`, `staleTupleGrown`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `cookieAck`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `loopbackClientA`, `earlySnapshot` | `earlySnapshot`, `earlySnapshotFails` | proved |
 | P3 `smuggledLate` | `staleTupleLate`, `halfOpenRetransmit`, `reusedTuple` | `cookieAckClone` | `cookiesBackFirst` | holds | proved |
 | P4 `retiredBehindEgress`, `hookMisplaced` | holds | holds | holds | holds | proved |
-| P4 `workloadBehindEgress` | `watchdogThaw`, after an early snapshot | the same | the same | the same | proved |
+| P4 `workloadBehindEgress` | `watchdogThaw`, after an early snapshot, and over vsock `containerMidBoundary` | the same | the same | the same | proved |
 | P5 `lastingChange` | holds | holds | `writeBackFails` | the same | proved |
 | P5 `capturedChange` | `barrierKillCaptured`, after an early snapshot | the same | and `failedCloneSnapshot`, `earlySnapshotCaptures`, after `writeBackFails` | the same | proved |
-| P6 `stuck` | `agentDies`, `hostDies`, `reopenFailsStuck` | the same | the same | the same | proved |
+| P6 `stuck` | `agentDies`, `agentDiesVsock`, `hostDies`, `reopenFailsStuck` | the same | the same | the same | proved |
 | U1 `clientDatagram` | `clientDatagram` without the host's gate | the same | the same | the same | the same: assumed, not proved |
 
 What the design does with each recorded run is in `Breaks.lean` beside it: `design_refuses_`
@@ -65,10 +78,9 @@ sees of a connection that was already open is picked up as NEW (`tcp_loose`), an
 answers it with a reset. Where the family is always tracked, the entry has seen a reply and the
 segment passes. Under `flags` and later the rule reads the packet's flags.
 
-### `staleTuple`, `staleTupleLate`, `staleTupleGrown`, `strayAck`: a SYN on a tracked tuple passes (#2106)
+### `staleTuple`, `staleTupleLate`, `staleTupleGrown`: a SYN on a tracked tuple passes (#2106)
 
-`main`. P3. Run `routed-stale`, 22 and 18 steps; run `routed`, 38 and 35 steps. High. Fixed by
-#2113.
+`main`. P3. Run `routed-stale`, 22 and 18 steps; run `routed`, 37 steps. High. Fixed by #2113.
 
 ```
 (the tracker holds an ESTABLISHED entry for client A's tuple, and no socket)
@@ -99,10 +111,12 @@ An earlier version of this model recorded a run in which an IPv6 handshake was t
 only the IPv4 half of the gate was in. That cannot happen: an iptables rule attaches IPv4 hooks
 only. The run above replaces it.
 
-`strayAck` is the shortest run the search finds, and it needs no connection: an ACK for no
-socket arrives while the tracker is attached, the guest answers with a reset, and the entry
-that leaves is closed by a reset from the guest's side. A SYN from that client does not recycle
-it (`reusedTuple` below has the kernel rule), so it is not NEW.
+An ACK for no socket does not do the same. The second version of this model recorded such a
+run (`strayAck`): the ACK is picked up as an entry, the guest answers with a reset, and the
+entry was taken to stay and to let a later SYN through. It does not stay: the reset is that
+entry's only reply, and the tracker deletes an unreplied entry on a reset
+(nf_conntrack_proto_tcp.c:1344-1352). The run is withdrawn, and with the rule corrected
+`staleTupleGrown` is the shortest run the search finds on `main` here.
 
 Where: every family the guest tracks only while a rule asks. That is both families in routed
 mode with no nat rule, and IPv6 in a guest whose nat rules are IPv4 only: a `/loopback` port's
@@ -300,10 +314,10 @@ memory is in the image, so its task goes on with the old restore from the step i
 the watcher then begins the new epoch's (`State.again`). Today's rule books only: the design
 never has an unpublished clone in a snapshot.
 
-### `agentDies`, `agentDiesSource`: fc-agent dies between the prepare and the reopen (#2149)
+### `agentDies`, `agentDiesSource`, `agentDiesVsock`: fc-agent dies between the prepare and the reopen (#2149)
 
-All four. P6 and P1. Run `kills`, 4 steps. Medium: it needs fc-agent to die (an OOM kill, a
-crash) inside a `snapshot create`.
+All four. P6 and P1. Run `kills`, 4 steps; run `kills-vsock`, 6 steps. Medium: it needs
+fc-agent to die (an OOM kill, a crash) inside a `snapshot create`. By source, not run in a VM.
 
 ```
 snapshot create: the prepare one-shot freezes the container; close, IPv4 chains and hooks
@@ -313,16 +327,53 @@ the host runs the resume one-shot: no fc-agent answers the exec
 ```
 
 Both one-shots are exec'd through the long-running agent's exec server
-(src/commands/common.rs:6021), so with the agent dead the reopen cannot be delivered, and the
-host tries once. What happens next depends on the guest. A guest restored from a memory image
-is served no boot plan, so its restarted agent loops for ever before it starts an exec server.
-A cold-booted guest on Firecracker fetches its plan over MMDS, a TCP connection the closed
-egress half answers with a reset, and loops the same way: gated for good. A cold-booted guest
-on Cloud Hypervisor gets its plan over vsock and comes back, behind a gate nobody is going to
-open, and starts a new container there. This is the reopen that cannot be attempted; #2142 is
-the reopen that is attempted and fails. By source, not run in a VM.
+(src/commands/common.rs:6021). With the agent dead the reopen cannot be delivered. The host
+makes one exec, which tries its connect 41 times over about 54 s (src/commands/exec.rs,
+`MAX_EXEC_CONNECT_ATTEMPTS`), and then `snapshot create` returns its error. The unit restarts
+the agent after `RestartSec=1`, once the old cgroup is gone, which a frozen container that does
+not die on SIGTERM can hold up for systemd's stop timeout (90 s by default, by reading, not
+observed). What the new agent can do decides the outcome:
 
+- **A restored guest** (most guests) is served no boot plan. The new agent loops for ever
+  before it starts an exec server. Gated for good.
+- **A guest that booted without the cache, on Firecracker**, fetches its plan over MMDS, which
+  the closed egress half answers with a reset. It loops the same way. Gated for good. (If the
+  agent died before the prepare closed the IPv4 half, the fetch gets through and this guest
+  takes the next leg.)
+- **A guest that booted without the cache, on Cloud Hypervisor**, gets its plan over vsock
+  behind the closed gate and starts its exec server. If that is inside the host's 54 s, the
+  exec connects, the resume one-shot runs and the gate opens: nothing is broken. If the restart
+  takes longer (the 90 s stop), the host has given up, and the guest runs on with an agent, a
+  new container and a closed gate that nothing is going to open (`agentDiesVsock`).
+
+This is the reopen that cannot be attempted; #2142 is the reopen that is attempted and fails.
 The same holds for a kill at any later step of the create up to the reopen.
+
+### `containerMidBoundary`: a container started inside a prepare, and captured running
+
+All four. P4. Run `kills-vsock`, 13 steps. Low: Cloud Hypervisor only, a guest that booted
+without the cache only, and a narrow window. By source, not run in a VM.
+
+```
+snapshot create: prepare (freeze, close, barrier, dump, save); the one-shot exits 0
+fc-agent is killed; systemd kills the container with it
+systemd restarts fc-agent: it gets its boot plan over vsock and serves exec again
+the host pauses the VM: the image holds the new agent, its container not yet started
+a clone is restored from the image
+the clone's agent starts the container           => it runs behind the closed egress half
+```
+
+Nothing in `agent::run` reads the gate, and a provisioned guest's restarted agent starts the
+existing container (`existing_container_id`). The host notices nothing: the prepare's exec and
+the pause are adjacent calls (src/commands/common.rs:7225-7247 for Cloud Hypervisor), so the
+agent must die after the prepare's reply and be back, through `RestartSec=1` at the least,
+before the next call the host makes. With the container started in the source before the pause
+instead, the image holds it running and every clone resumes it behind its closed gate. A second
+boot path that fails a mount shuts the VM down instead of coming back.
+
+The first version of this document said this was found only by a proof and had no recorded
+run. That was for want of a Cloud Hypervisor configuration in the search; the three `vsock`
+configurations find it on every one of today's rule books.
 
 ### What a killed fc-agent leaves in a clone (the first version's #2139, corrected)
 
@@ -339,7 +390,8 @@ cgroup, the container in it, before the restart. So in every rule book:
   `snapshot run` gives up waiting and ends it (15 minutes). No property is broken
   (`orphanWaits` in `Ends.lean` is the run under the design);
 - an agent killed in a published clone leaves a guest with no exec, no container and no
-  boundary held.
+  boundary held. Since most guests are restored guests, this is what an fc-agent crash does to
+  most running VMs.
 
 Not in the model: before its plan loop the new process writes /etc/resolv.conf from the boot
 command line and adds the command line's IPv6 address (agent.rs:66-67,
@@ -412,8 +464,8 @@ second step (third, with cookies) until publication.
   can arrive at all is the host side's matter and is not in the model.
 - **What it does not open**: a datagram on a flow a client began is in the original direction
   of its entry, stale or new, and is rejected once the rule is in. `design_udpRuleHolds` is
-  that as a theorem: a client's datagram reaches an unpublished clone of the design only
-  before the rule is in, or in a clone whose restore has failed.
+  that as a theorem: a client's datagram reaches a clone of the design that still has an
+  ingress half only before the rule is in, or in a clone whose restore has failed.
 - **Before the rule is in** nothing in the guest stops a datagram, a client's or a reply
   (`clientDatagram`, run `udp-reach`, 11 steps; #1114), in any rule book, the design included.
   The host does: its filter on the clone's TAP for published ports, and a routed clone's
@@ -425,23 +477,24 @@ second step (third, with cookies) until publication.
 
 `all-routed` and `all-proxy` turn on failures, kills, a dying host, slow boundaries, early
 snapshots, cookies, connections inside the guest and outbound connects together, with two
-socket cookies. They run only when named.
+socket cookies and the boot plan over MMDS. They run only when named, and CI does not run
+them.
 
 | | `all-routed` | `all-proxy` |
 |---|---|---|
-| `main` | capped at 10,000,000 states | 3,368,263 states, complete |
-| `flags` | 7,912,884 states, complete | 2,270,043, complete |
-| `cookieA` | capped | 4,248,922, complete |
-| `cookieB` | capped | 4,211,351, complete |
-| `cookieB` without its second dump | capped | 3,985,273, complete |
-| design | 1,929,111 states, complete, no break | 418,029, complete, no break |
+| `main` | capped at 10,000,000 states | 2,914,335 states, complete |
+| `flags` | 7,214,191 states, complete | 2,516,499, complete |
+| `cookieA` | capped | 5,098,605, complete |
+| `cookieB` | capped | 4,984,357, complete |
+| `cookieB` without its second dump | capped | 4,741,741, complete |
+| design | 1,971,774 states, complete, no break | 521,538, complete, no break |
 
-One run each, on a shared dev box: 7 min 30 s and 2.5 GB for today's five rule books, 15 s and
-0.5 GB for the design. A capped search has looked at the first ten million states in
-breadth-first order and says nothing of the rest.
+One run each, on a shared dev box: 7 min 50 s and 2.5 GB for today's five rule books, 15 s and 0.5 GB for
+the design. A capped search has looked at the first ten million states in breadth-first order
+and says nothing of the rest.
 
 In both configurations each of today's rule books breaks only properties it breaks in the
-table above: none breaks one the table calls `holds`. In particular `cookieB` has no `smuggledLate` in `all-proxy` (complete)
-and none in the first ten million states of `all-routed`. The first version of this model had
-one, at 32 steps: it went through an fc-agent restarted into a second restore, which cannot
-happen.
+table above: none breaks one the table calls `holds`. In particular `cookieB` has no
+`smuggledLate` in `all-proxy` (complete) and none in the first ten million states of
+`all-routed`. The first version of this model had one, at 32 steps: it went through an fc-agent
+restarted into a second restore, which cannot happen.

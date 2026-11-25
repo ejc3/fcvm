@@ -50,7 +50,8 @@ def fails : Cfg :=
   { fails := true, flood := true, maxId := 3 }
 
 /-- fc-agent or a one-shot can be killed at any step, in a source and in a clone; a process
-connects out. The boot plan is over MMDS (Firecracker). -/
+connects out. The boot plan is over MMDS (Firecracker), as in every configuration but the three
+`vsock` ones. -/
 def kills : Cfg :=
   { kills := true, dmnOut := true, maxId := 3 }
 
@@ -96,6 +97,20 @@ def allProxy : Cfg :=
     dmnOut := true, ctrOut := true, fails := true, kills := true, hostDies := true,
     slow := true, earlySnap := true, maxId := 3 }
 
+/-- The same kills with the boot plan over vsock (Cloud Hypervisor): a restarted agent of a
+guest that booted without the cache is served its plan behind a closed gate. -/
+def killsVsock : Cfg :=
+  { kills := true, dmnOut := true, mmds := false, maxId := 3 }
+
+/-- Over vsock: kills, failures, a dying host, slow boundaries, outbound connects. -/
+def killsVsockAll : Cfg :=
+  { kills := true, fails := true, hostDies := true, slow := true, ctrOut := true, dmnOut := true,
+    mmds := false, maxId := 3 }
+
+/-- Over vsock: two restores, kills and failures. -/
+def twoGenVsock : Cfg :=
+  { maxGens := 2, kills := true, fails := true, mmds := false, maxId := 2 }
+
 end Runs
 
 /-- The runs of `lake exe gate-breaks`: a name, what it is for, the configuration. -/
@@ -120,6 +135,10 @@ def runs : List (String × String × Cfg) := [
   ("early", "the host is asked for a snapshot of a clone that has not published", Runs.early),
   ("early-fails", "the same, and a step can fail", Runs.earlyFails),
   ("two-gen", "two restores, kills and failures: a snapshot of a published clone", Runs.twoGen),
+  ("kills-vsock", "kills, with the boot plan over vsock (Cloud Hypervisor)", Runs.killsVsock),
+  ("kills-vsock-all", "over vsock: kills, failures, a dying host, slow boundaries",
+    Runs.killsVsockAll),
+  ("two-gen-vsock", "over vsock: two restores, kills and failures", Runs.twoGenVsock),
   ("all-routed", "everything at once, no nat rules", Runs.allRouted),
   ("all-proxy", "everything at once, the egress proxy and a /loopback port", Runs.allProxy)]
 

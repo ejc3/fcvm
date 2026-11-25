@@ -17,13 +17,15 @@ and #2124, to find the ones no review had drawn yet.
 
 Nothing in it was run in a VM. The rules are read from the source at the commits named and from
 Linux v6.18.60. Two independent reviews of its first version (207b5bc59) found it wrong about
-what a restarted fc-agent does and blind to an fc-agent that dies in a source; this version has
-their corrections, and `BREAKS.md` says which recorded breaks changed.
+what a restarted fc-agent does and blind to an fc-agent that dies in a source, and a review of
+the corrections found one more recorded run that could not happen and no Cloud Hypervisor
+configuration in the search. This version has all three reviews' corrections, and `BREAKS.md`
+says which recorded breaks changed.
 
 ## Build
 
 ```sh
-make verify              # check-imports.sh, then cd verify && lake build: both models
+make verify              # check-imports.sh, lake build (both models), the search against search.expected
 make verify-gate-search  # lake exe gate-breaks: the exhaustive search, every rule book
 make verify-gate-drift   # lake exe gate-seq check: the model's order against the Rust source
 ```
@@ -32,18 +34,19 @@ make verify-gate-drift   # lake exe gate-seq check: the model's order against th
 term, and as the same run under the design. A run's name or a rule book's name in `GATE_ARGS`
 limits the search to it; `limit=N` caps a search at N states.
 
-Measured on a shared arm64 dev box (96 cores, load average 4 to 25, one run each), toolchain
+Measured on a shared arm64 dev box (96 cores, load average 5 to 27, one run each), toolchain
 already installed. Peak memory is the largest single process:
 
 | Command | Wall time | Peak memory |
 |---|---|---|
-| `lake build` from cold, both models | 1 min 27 s | 1.5 GB |
-| `lake build GateVerify gate-breaks gate-seq` from cold, this model alone | 37 s | 1.5 GB |
-| `lake exe gate-breaks` (17 runs, 6 rule books, 1,146,457 states in all) | 4.3 s | 98 MB |
-| `lake exe gate-breaks design all-routed all-proxy` (2,347,140 states) | 15 s | 0.5 GB |
-| `lake exe gate-breaks limit=10000000 all-routed all-proxy` for today's five rule books | 7 min 30 s | 2.5 GB |
+| `lake build` from cold, both models | 1 min 32 s | 1.5 GB |
+| `lake build GateVerify gate-breaks gate-seq` from cold, this model alone | 58 s | 1.5 GB |
+| `lake exe gate-breaks` (20 runs, 6 rule books, 2,084,655 states in all) | 8.2 s | 101 MB |
+| `lake exe gate-breaks design all-routed all-proxy` (2,493,312 states) | 15 s | 0.5 GB |
+| `lake exe gate-breaks limit=10000000 all-routed all-proxy` for today's five rule books | 7 min 50 s | 2.5 GB |
 
-CI builds both models in the one job, under its 15 minute cap (`../../.github/workflows/verify.yml`).
+CI runs the first and the third (as `summary`, compared with `search.expected`) in the one job,
+under its 15 minute cap (`../../.github/workflows/verify.yml`).
 
 ## The files
 
@@ -52,6 +55,7 @@ CI builds both models in the one job, under its 15 minute cap (`../../.github/wo
 | `Spec.lean` | `State` (one guest: its sockets, tracked connections, rules, settings, files under /run, processes), the kernel's handling of a segment and of a datagram, the guest's own processes, `snapshot create` and the restore one step at a time with each step able to fail or its process to be killed, `step`, `replay`, `Reachable`. `Rules` is a rule book's type; `Cfg` is what exists around the guest and which moves a search allows |
 | `Today.lean` | `Today.main`, `Today.flags`, `Today.cookieA`, `Today.cookieB`: four commits, each field cited. `Today.cookieBOneLook`: the head of #2124 without its second dump |
 | `Design.lean` | `Design.rules`: the head of #2124 with seven repairs |
+| `search.expected` | What `lake exe gate-breaks summary` prints: every default configuration and rule book, its state count, the properties it breaks and at how many steps. CI compares the search with it |
 | `Properties.lean` | The properties, as tests on a state |
 | `Configs.lean` | The configurations the search runs, by name |
 | `Breaks.lean` | Each recorded run, replayed and checked by the kernel (`by decide`), and what the design does with the same run. Generated from `lake exe gate-breaks traces` |
@@ -62,7 +66,7 @@ CI builds both models in the one job, under its 15 minute cap (`../../.github/wo
 | `Limits.lean` | Connections inside the guest: the reset that takes the other end, the manifest's second look, and one end left alone by the kernel, which the model does not make |
 | `Proofs.lean` | The `design_*` theorems |
 | `Axioms.lean` | Fails the build if anything a module of the library declares rests on more than `propext`, `Quot.sound`, `Classical.choice`; pins the axioms of the cited theorems |
-| `../check-imports.sh` | Fails if a file of either model is not imported by its `Axioms.lean`. Outside lake, because lake does not elaborate `Axioms.lean` again when a file it does not import is added |
+| `../check-imports.sh` | Fails if a file of either model is not imported by its `Axioms.lean`, if the sweep is not that file's last command, or if an executable's module declares a theorem or an axiom. Outside lake, because lake does not elaborate `Axioms.lean` again when a file it does not import is added |
 | `../GateSearch.lean` | `lake exe gate-breaks`: breadth-first search, shortest runs |
 | `../GateSeq.lean` | `lake exe gate-seq`: the rule books' restore order against the order fc-agent's tests pin |
 
@@ -73,14 +77,20 @@ half opens as soon as the stale sockets are gone") and the issues.
 
 1. **Source undisturbed.** `snapshot create` reads its source. While it runs, no established
    connection of the source is reset. When it is over, with or without an error, the source has
-   no half of the gate, no manifest, no setting changed, and its container thawed.
+   no half of the gate, no manifest, no setting changed, and its container thawed. One
+   exception, and only in the design: a source whose gate could not be reopened after a bounded
+   number of tries is left running as the boundary left it, and the host says so (the create
+   fails naming the VM, and the VM's state is failed and still gated). It is not ended to make
+   the sentence above true of it: ending a source is the largest disturbance there is.
 2. **Fixed generation.** A restore destroys the snapshot's sockets, by their kernel cookie and
    never by their four-tuple, and what a packet from outside made behind the closed gate. It
    never destroys a socket a process of the clone opened, nor a loopback connection inside the
    guest that has both its ends. (Destroying one end of a connection inside the guest resets
-   the other: `SOCK_DESTROY` sends a reset and the gate lets it through on `lo`. So "one end
-   destroyed and the other left" is not a state the kernel leaves, and the requirement is
-   about whole connections.)
+   the other: `SOCK_DESTROY` sends a reset and the gate lets it through on `lo`. So in a guest
+   that still has the address the reset goes to, "one end destroyed and the other left" is not
+   a state the kernel leaves, and the requirement is about whole connections. A routed clone
+   has given up the snapshot's IPv6 address by then, and there it is: `Limits.lean`, "A routed
+   clone".)
 3. **Nothing stale or smuggled at publication.** When a clone's ingress opens, the clone holds
    no TCP socket of a connection that leaves the guest, directly or through the egress proxy,
    that was in the image or was made behind the closed gate, by any route: a manifest that
@@ -93,9 +103,10 @@ half opens as soon as the stale sockets are gone") and the issues.
 5. **No lasting change to the clone.** Whatever the restore changes (`tcp_syncookies`, a rule)
    is as it was at boot once the clone is published, on every way out, and no snapshot captures
    a changed value.
-6. **Never left closed.** No single failure leaves a gate closed for good: while a gate is
-   closed, something of the system can still act, to open it or to end the guest and report
-   it, and it does so within a bounded number of steps.
+6. **Never left closed.** No single failure leaves a gate closed with nobody told: while a gate
+   is closed, something of the system can still act, to open it, to end a clone that did not
+   publish, or to report a source that could not be reopened, and it does so within a bounded
+   number of steps.
 
 And for UDP, which the gate handles with one conntrack rule (#2112): no datagram on a flow a
 client began reaches a clone before it has published (U1).
@@ -107,7 +118,7 @@ state passes the test.
 
 | | Test | What it reads |
 |---|---|---|
-| P1 | `sourceDisturbed` | the record `rst` (the gate reset an established connection of a guest being snapshotted); or no boundary in progress and a half of the gate, the manifest, `rcu_expedited`, or a living container left frozen |
+| P1 | `sourceDisturbed` | the record `rst` (the gate reset an established connection of a guest being snapshotted); or no boundary in progress, the host has not reported the guest as failed and still gated, and it has a half of the gate, the manifest, `rcu_expedited`, or a living container left frozen |
 | P2 | `generationBroken` | the record `bad`: a retirement destroyed, by cookie or by the reset a destroyed socket sends its other end, a socket a process of the clone opened or one a packet made with the gate open; or it destroyed an end of a loopback connection that had both ends; or an end of any connection inside the guest that had both ends and that the manifest does not name |
 | P3 | `staleAtPublication` | a guest that was restored, ingress open in some family, and a socket of a connection that leaves the guest (`inb`, `outb`, and the proxy's two) that is `stale` (in the image) or `smuggled` (made by a packet from outside behind a clone's closed ingress half) |
 | P3 | `smuggledLate` | the record `late`: such a socket was made after the clone's retirement |
@@ -116,23 +127,23 @@ state passes the test.
 | P4 | `workloadBehindEgress` | a restore in progress, egress closed in some family, and the container running or sockets already retired |
 | P5 | `lastingChange` | a published clone no snapshot holds, with `tcp_syncookies` not as at boot, or the UDP rule |
 | P5 | `capturedChange` | the record `cap`: the VMM paused the guest with `tcp_syncookies` or `rcu_expedited` changed |
-| P6 | `stuck` | a half of the gate in, or the guest paused, and no step that moves a boundary on enabled (`moves`: the snapshot's next step once begun, the guard's, the restore's, the agent's restart, a failed clone's power-off, the host's timeout). The user's next `snapshot create` is not such a step |
+| P6 | `stuck` | a half of the gate in, or the guest paused, the host has not reported the guest as failed, and no step that moves a boundary on is enabled (`moves`: the snapshot's next step once begun, the guard's, the restore's, the agent's restart, its container's start, a failed clone's power-off, the host's timeout). The user's next `snapshot create` is not such a step |
 | U1 | `clientDatagram` | the record `udpIn` |
 
 `replyDatagram` is not a property. It records a datagram on a flow the guest began reaching an
 unpublished clone, which the UDP rule passes by design.
 
 P1 and P5 read a guest whose boundary is over. A reopen or a write-back that is tried again and
-never lands would never be read by them. In the design each is tried `retryMax` times and then
-the guest is ended (`REPAIRS.md`, 3 and 7), each failed try is a step of the model, and
-`design_bounded` bounds the steps: so "the boundary is over" is reached, and P1 and P5 are
-about every run and not only the ones that end by themselves.
+never lands would never be read by them. In the design each is tried `retryMax` times; then a
+source is reported failed and a clone's restore fails (`REPAIRS.md`, 3 and 7). Each failed try
+is a step of the model and `design_bounded` bounds the steps: so "the boundary is over" is
+reached, and P1 and P5 are about every run and not only the ones that end by themselves.
 
 ## Results
 
 | | `main` 4adc1dee6 | `flags` a1e5fc687 (#2113) | `cookieA` a80e1ad34 | `cookieB` 27add63dd (#2124) | Design |
 |---|---|---|---|---|---|
-| P1 `sourceDisturbed` | broken | broken | broken | broken | **proved** |
+| P1 `sourceDisturbed` | broken | broken | broken | broken | **proved**, with one exemption: a source reported failed |
 | P2 `generationBroken` | broken | broken | broken | broken | **proved** for the connections `step` makes (`Limits.lean`) |
 | P3 `staleAtPublication` | broken | broken | broken | broken (by an early snapshot, in every run found) | **proved** |
 | P3 `smuggledLate` | broken | broken | broken | searched: holds, one configuration capped | **proved** |
@@ -144,10 +155,11 @@ about every run and not only the ones that end by themselves.
 | P6 `stuck` | broken | broken | broken | broken | **proved**, and that every boundary ends (`Ends.lean`) |
 | U1 `clientDatagram` | assumed: the host's gate | the same | the same | the same | assumed; the guest's part **proved** (`design_udpRuleHolds`) |
 
-"broken" is a run in `Breaks.lean` (`BREAKS.md` has which). "searched: holds" is the 17 default
-configurations searched to the end, and the two `all-` configurations as far as `BREAKS.md`,
-"Everything at once", says: `all-proxy` to the end for every rule book, `all-routed` to the end
-for `flags` and the design and capped at ten million states for the others. Most of what
+"broken" is a run in `Breaks.lean` (`BREAKS.md` has which). "searched: holds" is the 20 default
+configurations searched to the end, which CI does on every run and compares with
+`search.expected`, and the two `all-` configurations as far as `BREAKS.md`, "Everything at
+once", says. 17 of the 20 have the boot plan over MMDS (Firecracker) and 3 over vsock (Cloud
+Hypervisor); the breaks the vsock ones add are `containerMidBoundary` and `agentDiesVsock`. Most of what
 breaks `main` and #2113 beyond the known issues breaks the head of #2124 too, because it is in
 code #2124 does not touch: the one-shots, the watchdog, what a dead fc-agent leaves.
 
@@ -158,10 +170,13 @@ can build. Unbounded: the number of socket cookies handed out, of restores, of s
 after another, of packets, kills and failures. Bounded by the model's shape, in the proofs as
 in the search:
 
-- fourteen kinds of socket, at most one socket of a kind at a time: two clients (one IPv4, one
-  IPv6), two ports (one plain, one `/loopback`), one request or established socket a client and
-  port, one outbound connection a process for two processes (direct or through the proxy), one
-  loopback connection inside the guest and one from the guest's own address;
+- fourteen kinds of socket, of which thirteen occur (the IPv6 client never reaches the
+  `/loopback` port, whose rules are IPv4), at most one socket of a kind at a time: two clients
+  (one IPv4, one IPv6), two ports (one plain, one `/loopback`), one request or established
+  socket a client and port, one outbound connection a process for two processes (direct or
+  through the proxy, IPv4 only), one loopback connection inside the guest and one from the
+  guest's own address (an IPv4 client end and an IPv6 server end each);
+- no address changes: a routed clone's move to its own IPv6 address is not in it;
 - three tracked TCP tuples and two UDP flows;
 - one `snapshot create` of a guest at a time, and one guest followed (at a pause the run stays
   with the source or moves to one clone).
@@ -179,7 +194,8 @@ invariants, `Classical.choice`), for every value of `Cfg` and every state reacha
   `design_egressBeforeRetirement`, `design_hookPlaced`, `design_workloadEgress` (P4),
   `design_noLastingChange`, `design_noCapturedChange` (P5), `design_neverStuck`,
   `design_bounded`, `design_ends`, `design_restore_ends`, `design_settles` (P6), and
-  `design_udpRuleHolds` (the guest's part of U1).
+  `design_udpRuleHolds` (the guest's part of U1). `design_sourceUndisturbed` exempts exactly a
+  source the host has reported as failed and still gated.
 - The proofs are four inductive invariants over the same `step` the search runs: `Scal`
   (`reachable_scal`: for each place a snapshot or a restore can be, what the gate,
   `tcp_syncookies`, `rcu_expedited`, the freeze, the manifest and the agent are there), `Flags`
@@ -193,8 +209,12 @@ invariants, `Classical.choice`), for every value of `Cfg` and every state reacha
   opened has both its ends).
 - Every run in `Breaks.lean` and in `Limits.lean`: replayed step by step and the test
   evaluated, by `decide`.
-- Each repair, and each rule the design inherits from #2113 and #2124, is carried by a proof:
-  with the field put back the proofs do not build (`REPAIRS.md`, the last table).
+- Each of the seven repairs is carried by a proof, and so are three of the four rules the
+  design inherits from #2113 and #2124: with the field put back the proofs do not build
+  (`REPAIRS.md`, the last table). The fourth, the manifest leaving a socket out by its mirror
+  image and not by its address (`manAddr`), is redundant in the design: its restore's own list
+  retires whatever the manifest leaves out, so no proof and no search tells the two rules
+  apart. It matters where there is no list, on `main` and #2113 (`loopbackClient`).
 
 **P2 is proved for the connections `step` can make.** `design_fixedGeneration` says no
 retirement destroys, by cookie or by a reset, what the test above names. `design_retiresOnly`
@@ -206,7 +226,10 @@ destroys exactly the generation it should. `Limits.lean` has the three cases aro
 - a connection with one end on the guest's own address is named by one end and goes whole,
   because the reset takes the other (`mixedPairGoes`). A model without the reset shows the clone
   publishing with one end alone; the first version of this model did, and the proofs review
-  found that run. It is an artefact of leaving the reset out;
+  found that run. In a guest that keeps its addresses it is an artefact of leaving the reset
+  out. In a routed clone, which has moved off the snapshot's IPv6 address before the
+  retirement, the reset has nowhere to go and the other end does stay: a stated limit, by
+  source, not in the model (`Limits.lean`, "A routed clone");
 - the manifest's second look is what keeps a loopback connection made between the source's two
   dumps (`manifestOneLook`), and `Gn.gML` is its obligation in the proof;
 - one end left alone by the kernel with nothing destroyed (the other end closed and its
@@ -234,46 +257,50 @@ review rebuilt it and reproduced the first version's counts exactly.
 
 ### P6: every boundary ends
 
-`design_neverStuck` is progress: while a gate is closed, a step that moves the boundary on is
-enabled. It is not freedom from livelock. `Ends.lean` adds that, for the system's own steps.
+`design_neverStuck` is progress: while a gate is closed and the host has not reported the guest
+failed, a step that moves the boundary on is enabled. It is not freedom from livelock.
+`Ends.lean` adds that, for the system's own steps.
 
-`measure` reads a number off a state, at most 22 in a reachable one: the steps a `snapshot
+`measure` reads a number off a state, at most 23 in a reachable one: the steps a `snapshot
 create` has left (at most 20, its reopen's tries among them), the steps a restore has left (at
-most 20: its 16 steps, its write-back's tries, a failure's power-off), 1 for the restart of a
-dead agent in a guest that is served a boot plan, and 1 while the host waits for a clone's
-acknowledgement.
+most 20: its 16 steps, its write-back's tries, a failure's power-off), 2 for a dead agent in a
+guest that is served a boot plan (its restart, and its container's start), and 1 while the host
+waits for a clone's acknowledgement.
 
 - `own_decreases`: every step of the system makes the measure smaller, in every reachable
   state. The system's steps are the steps of a `snapshot create` that has begun, the guard's,
-  the restore's, a failed try of either, systemd's restart of the agent, a failed clone's
-  power-off, and the host's timeout.
+  the restore's, a failed try of either, systemd's restart of the agent, the restarted agent's
+  start of the container, a failed clone's power-off, and the host's timeout.
 - `step_account`, `calm_keeps`: a step of the environment that begins nothing leaves the
   measure where it was or lower (packets, datagrams, processes connecting and closing, the
-  watchdog, a dying host, a killed one-shot, a killed agent in a clone). Three moves raise it:
-  the user's next `snapshot create` (by 20), a clone restored from the image (to at most 21),
-  and fc-agent killed in a guest that is served a boot plan (by 1).
+  watchdog, a dying host, a killed one-shot, a killed agent in a guest that is served no boot
+  plan). Three moves raise it: the user's next `snapshot create` (by 20), a clone restored from
+  the image (to at most 22), and fc-agent killed in a guest that is served a boot plan (by 2).
 - `design_bounded`: so in any run from a reachable state, the steps of the system number at
-  most the measure at its start, plus 1 for each such kill, 20 for each `snapshot create` begun
-  and 21 for each clone restored. With none of the three, at most 22 (`design_ends`).
-- `design_restore_ends`: one restore of a clone is over within 21 steps of the system,
-  whatever is killed in it. A guest restored from a memory image is served no boot plan, so its
-  agent never comes back and no restore runs twice (`clone_never_restarts`); a kill in a clone
-  adds nothing to the bound.
+  most the measure at its start, plus 2 for each such kill, 20 for each `snapshot create` begun
+  and 22 for each clone restored. With none of the three, at most 23 (`design_ends`).
+- `design_restore_ends`: one restore of a clone is over within 22 steps of the system,
+  whatever is killed in it, with no hypothesis about kills: a guest restored from a memory
+  image is served no boot plan (`clone_never_restarts`, `noPlan_kills`), so a kill in it adds
+  nothing to the bound. It still supposes that no `snapshot create` begins and no further
+  clone is restored in that run.
 - `design_settles`: a reachable state in which no step moves a boundary on, the host's timeout
-  not counted, is settled (powered off, or running with no snapshot and no restore under way
-  and no half of the gate installed), or it is a clone that has not published and whose
-  fc-agent is dead, for which the host's timeout is enabled. So the timeout is the way out for
-  that clone and for nothing else.
-- `kill_restart_repeats`: the kills the bound counts cannot be left out of it. In a cold-booted
-  guest that no boundary holds, fc-agent can be killed and restarted any number of times, each
-  restart a step of the system. Those restarts are recoveries (the agent comes back and starts
-  a new container); none of them runs a restore.
+  not counted, is settled (powered off; or running with no snapshot and no restore under way,
+  and either no half of the gate installed or the host having reported the guest as failed and
+  still gated), or it is a clone that has not published and whose fc-agent is dead, for which
+  the host's timeout is enabled. So the timeout is the way out for that clone and for nothing
+  else, and a gated guest at rest is one the host has named.
+- `kill_restart_repeats`: the kills the bound counts cannot be left out of it. In a guest that
+  is served a boot plan and that no boundary holds, fc-agent can be killed and come back any
+  number of times, two steps of the system each time. Those are recoveries; none of them runs
+  a restore.
 
 What these do not say: that a step which stays enabled is taken. That the guest's scheduler
 runs the agent, that systemd restarts it, and that the host's `snapshot create` runs on, is
 assumed. The bound counts steps of the model, not time: one step of the restore can wait on
 the kernel (the receive barrier, a `SOCK_DESTROY` acknowledgement) for as long as the code's
-own budgets allow, and the host's timeout is 15 minutes.
+own budgets allow, one try of a reopen is an exec that waits about 54 s for an agent, and the
+host's timeout is 15 minutes.
 
 ### Assumed
 
@@ -284,7 +311,7 @@ Each abstraction, and whether it can hide a break:
 | A dump of one family is one instant; the list is two instants (IPv4, then IPv6) and a second look is a third | **Not conservative.** The kernel walks the hash table a bucket at a time (net/ipv4/tcp_diag.c:479-520), so a dump can also miss one of two sockets of the same family. The connections inside the guest in the model have their ends in different families, which gives the same split |
 | Connection tracking is modelled for the inbound TCP tuples and two UDP flows only | **Not conservative** for the tracker's table as a whole: a tracker the gate attaches also tracks loopback and outbound flows, and on `main` a segment of a source's outbound connection can be reset the same way an inbound one is. No property reads those entries |
 | A tracked entry is `new`, `est`, `closed` (a FIN seen) or `reset` (the guest's side reset it). One-sided closes (FIN_WAIT, CLOSE_WAIT, LAST_ACK) are folded into `closed`, and a `new` entry is both a SYN sent and a connection picked up in the middle | **Not conservative** for `main`: the one-sided states also let a SYN through as not NEW (`sIG`, nf_conntrack_proto_tcp.c:138), and a FIN on a `new` entry made by a SYN is invalid, not NEW. It hides runs of the #2106 kind on `main` only |
-| An entry never expires | Conservative for the design; for `main` it makes `reusedTuple` and `strayAck` possible at any distance, where the kernel gives them 10 s (6.18.60) |
+| An entry never expires | Conservative for the design; for `main` it makes `reusedTuple` possible at any distance, where the kernel gives it 10 s (6.18.60) |
 | A SYN cookie a client holds stays valid | Conservative: the real one expires (2 minutes of guest run time), which removes runs |
 | The accept queue has room | Conservative for the sockets a client can make: a full one refuses the socket. **Not conservative** for P2: see the next row |
 | A connection inside the guest gets both its sockets in one step and loses both in one step | **Not conservative** for P2. One end can be alone in the kernel, and the proof of P2 uses that none is (`Limits.lean`, `loneEndRetired`) |
@@ -297,15 +324,16 @@ Each abstraction, and whether it can hide a break:
 | The restore's steps that touch no network state are left out (clock, NFS remount, exec and proxy waits, GPUs) | They run between the retirement and the thaw and change nothing the properties read |
 | The host's `snapshot run` ends a clone that does not acknowledge (`timeout`) | src/commands/snapshot.rs, 15 minutes. `design_settles` says exactly which states rest on it |
 | systemd kills the unit's cgroup, the container and any one-shot, when fc-agent dies | From the unit file (no `KillMode`, `Delegate=yes`) and systemd's documented default. Not observed. The model keeps the dead container's sockets, which only adds sockets |
-| A guest restored from a memory image is served no boot plan; a cold-booted one is, over MMDS only with the egress half open | Read from src/commands/common.rs, snapshot.rs, fc-agent/src/agent.rs and bootplan.rs. Not run. Firecracker's answer for the missing key and whether the fork persists its MMDS store were not checked |
+| A guest restored from a memory image is served no boot plan; one that booted without the snapshot cache is, over MMDS only with the egress half open and over vsock always | Read from src/commands/common.rs, snapshot.rs, podman/vm_config.rs, fc-agent/src/agent.rs and bootplan.rs. Not run. Firecracker's answer for the missing key and whether the fork persists its MMDS store were not checked |
+| Timing is order only: the unit's `RestartSec=1`, the stop timeout of a frozen container (up to 90 s), the exec's 54 s of connect retries, the two adjacent host calls of prepare and pause | **Not conservative as a guide to likelihood.** The model allows every order of restart, exec and pause. Which order a real guest takes is decided by those times, and `BREAKS.md` states them for `agentDies` and `containerMidBoundary` |
 | One `sp` counter a guest: a reopen cannot overtake a prepare that has not taken the boundary lock | **Not conservative.** The open finding on #1941 is that it can; the model cannot express it |
 
 ## The things least sure to be faithful
 
 1. **What a dead and restarted fc-agent leaves.** The first version had it run the restore
    again; the faithfulness review showed it cannot. This version has the agent never come back
-   in a restored guest, and come back in a cold-booted one unless MMDS is behind the closed
-   egress half. All of it is read from the source and from systemd's documentation; nobody has
+   in a restored guest, and come back in one that booted without the snapshot cache unless MMDS
+   is behind the closed egress half, with its exec server first and its container after. All of it is read from the source and from systemd's documentation; nobody has
    killed an fc-agent in a guest and watched. What the new process does before its plan loop
    (resolv.conf, the boot command line's IPv6 address) and what a returning agent's boot path
    does to a guest a boundary still holds are not in the model.
@@ -338,13 +366,14 @@ published clone is a source for the next generation.
 - **The manifest**, the restore's own list (two dumps and a second look).
 - **The retirement**: destruction by cookie, and the reset an established socket sends its
   other end inside the guest.
-- **Processes**: the container (frozen across the boundary, killed with the agent), a process
-  outside it, the long-running agent and whether a boot plan is served to it, the one-shots
-  (exec'd through the agent), the host's `snapshot create`, the payload-freeze watchdog.
+- **Processes**: the container (frozen across the boundary, killed with the agent, started
+  again by a restarted one), a process outside it, the long-running agent and whether a boot
+  plan is served to it, the one-shots (exec'd through the agent), the host's `snapshot create`
+  and what it has recorded of the guest, the payload-freeze watchdog.
 - **Failure and kill** as transitions: any step of the agent or of a one-shot fails
   (`agentFail`, `snapFail`); the agent is killed between any two steps, in a source or in a
-  clone (`kill`), or a one-shot alone (`snapKill`); systemd restarts the agent (`restart`);
-  the host dies (`hostDie`). In the design a reopen and a write-back are tried again, each
+  clone (`kill`), or a one-shot alone (`snapKill`); systemd restarts the agent (`restart`) and
+  the restarted agent starts the container (`boot`); the host dies (`hostDie`). In the design a reopen and a write-back are tried again, each
   failed try a step.
 
 ### The kernel's rules and their source (Linux v6.18.60)
@@ -355,6 +384,7 @@ published clone is a source for the next generation.
 | `ctIn`: a new tuple is NEW; a segment that is not a SYN is picked up, still NEW | net/netfilter/nf_conntrack_proto_tcp.c:876-925 (`tcp_new`), 1638 (`tcp_loose = 1`); nf_conntrack_core.c:1868-1885 |
 | `ctIn`: a SYN on an entry that has seen a reply is ignored and the entry stands | nf_conntrack_proto_tcp.c:138 (`sIG`), 1069-1125 |
 | `ctIn`: a FIN with no entry is invalid: no entry, not NEW | nf_conntrack_proto_tcp.c:169 (the `fin` row from `sNO`) |
+| `answered`: the guest's reset deletes an entry that had seen no reply, and leaves one closed with a FIN as it was | nf_conntrack_proto_tcp.c:1344-1352; nf_conntrack_core.c:2047-2049 (`IPS_SEEN_REPLY` is set after the handler returns) |
 | `ctIn`: a SYN on an entry closed with a FIN seen deletes it and starts a new one; on one the guest's side reset, it is ignored and is not NEW | nf_conntrack_proto_tcp.c:1036-1069 (recycled only with `IP_CT_TCP_FLAG_CLOSE_INIT` or a last reset from the SYN's own direction), 1211-1261 |
 | `--ctstate NEW`, `--ctdir ORIGINAL` | net/netfilter/xt_conntrack.c:167-197 |
 | `tracked`: a family's hooks attached while a rule of that family uses the tracker | xt_conntrack.c:266-280; net/netfilter/nf_conntrack_proto.c:441-470 (`users4`, `users6`), 585-627 |
@@ -442,8 +472,10 @@ closed with the egress half). The second is the abstraction `Limits.lean` is abo
   finding) cannot be expressed.
 - **Routes, neighbours, addresses.** No step of any rule book here takes a link down or writes
   one of those tables (`prepare_with` and `restore_boundary_with` have no such call), so they are
-  not in the state. A routed clone's move to its own address is left out with them, and so is
-  the address a restarted fc-agent adds from the boot command line.
+  not in the state. A routed clone's move to its own address is left out with them, which is
+  why the reset of a retired socket always arrives in the model and does not always in a
+  routed clone (`Limits.lean`), and so is the address a restarted fc-agent adds from the boot
+  command line.
 - **ICMP and protocols other than TCP and UDP**, which the gate does not handle.
 - **A workload's own network namespace or NAT rules.**
 - **The relay behind the egress proxy** (vsock), which the restore resets by other means.

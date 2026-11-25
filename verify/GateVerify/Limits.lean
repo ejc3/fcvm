@@ -5,7 +5,7 @@ import GateVerify.Configs
 /-!
 # Connections inside the guest: what the retirement does to them, and where the model stops
 
-Three cases, each a run the kernel replays.
+Three cases, each a run the kernel replays, and a fourth the model cannot express.
 
 **A connection with one end on the guest's own address** (a client bound to the guest's
 address, a loopback listener: `selfC`, `selfS`). The server end records a peer that is not
@@ -18,6 +18,10 @@ and freed too. The whole connection goes, which is what snapshot_network.rs says
 connection over an address a restore can take from the guest. No end is left alone, and
 nothing of the clone's own is destroyed (`mixedPairGoes`). A model without the reset shows the
 clone publishing with the client end alone; that end is an artefact of leaving the reset out.
+
+This holds for a guest that still has the address the reset is sent to. The model's kinds are
+IPv4 and it has no address move, so that is every guest in it. It is NOT every real guest: see
+"A routed clone" below.
 
 **The manifest's second look.** A loopback connection made between the source's IPv4 dump and
 its IPv6 dump has one end in the dump. Without the second look the manifest names that end, the
@@ -54,6 +58,20 @@ process of the clone opened inside the guest has its mirror image.
   and P2 as written allows it (`loneEndInImage`). snapshot_network.rs says so of
   `manifest_sockets`: "one whose owner now reads an error where it would have read
   end-of-file".
+
+**A routed clone: a stated limit, not in the model.** A routed restore moves the guest from the
+snapshot's global IPv6 address to the clone's own (`network::reconfigure_ipv6`), and it does so
+before egress opens and so before the retirement (`before_egress` in `restore_boundary_with`,
+snapshot_network.rs:2522 at 27add63dd). Take a connection inside the guest from the snapshot's
+global IPv6 address to a `::1` listener. The manifest names the server end alone, as in the
+first case. The clone destroys it, and its reset is addressed to the snapshot's address, which
+the guest no longer has: the reset does not come back on `lo`, and the client end stays, alone,
+for as long as its owner keeps it. So for a routed clone "one end destroyed and the other left"
+IS a state the kernel leaves. The same on `main`. Found by the delta review of this model, by
+source, not run; low, since the connection is one the snapshot named for retirement and the
+end that stays is dead. The model has no address move and its connections inside the guest are
+IPv4, so no theorem here is about it, and `mixedPairGoes` is about a guest that keeps its
+addresses.
 -/
 
 namespace Gate

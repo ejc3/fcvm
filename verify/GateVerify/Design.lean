@@ -10,12 +10,12 @@ it stands for and the wording proposed:
 | field | repair | against |
 |---|---|---|
 | `snapUnpublished := false` | 2: `snapshot create` refuses a clone that has not published | the resume one-shot publishing an unrestored clone |
-| `guard := true`, `reopenRetry := true` | 3: a source's reopen is owed until it lands, tried `retryMax` times, and then the host ends the guest it could not reopen | a dead or failed `snapshot create`, and an fc-agent that died before the reopen |
-| `rcuUndo := true` | 4: the reopen writes `rcu_expedited` back | a prepare killed inside the barrier |
+| `guard := true`, `reopenRetry := true` | 3: a source's reopen is owed until it lands, tried `retryMax` times; then the create fails, the source is left running and the host records it as failed and still gated and refuses further creates of it | a dead or failed `snapshot create`, and an fc-agent that died before the reopen |
+| `rcuUndo := true` | 4: the resume one-shot writes `rcu_expedited` back, whether or not its reopen lands | a prepare killed inside the barrier |
 | `natGate := true` | 5: the proxy's redirect closes with the egress half | a connect behind the closed egress half |
 | `wdMidBoundary := false` | 6: the freeze watchdog leaves a freeze alone while its boundary is in progress | a workload thawed behind the closed gate |
 | `backFails := true` | 7: a write of `tcp_syncookies` back that keeps failing fails the restore | a clone published for good without SYN cookies |
-| `startWaits := true` | 8: an fc-agent that starts behind a closed egress half waits for it to open | a container started, over vsock, while a boundary holds the guest, and captured running |
+| `startWaits := true` | 8: a restarted fc-agent serves exec at once and holds the container's start while a boundary is in progress | a container started, over vsock, while a prepare holds the guest, and captured running |
 
 Repair 1 of the first version of this model (a record of the restore under /run, for an
 fc-agent that is restarted inside a restore) is withdrawn: a restarted agent never runs a

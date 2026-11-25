@@ -16,7 +16,10 @@ A state in which a step has left a record of a break (`rst`, `bad`, `late`, `eg`
 `udpIn`, `udpLate`) is not searched further: the record never clears, so everything past it
 would be reported as that break again.
 
-`lake exe gate-breaks` prints the table. `lake exe gate-breaks traces` also prints each shortest
+`lake exe gate-breaks` prints the table. `lake exe gate-breaks summary` prints it without the
+timings: CI compares that with `GateVerify/search.expected`, so a change that moves a state
+count, breaks a property a rule book kept, or shortens or lengthens a shortest run fails until
+the expected file is changed with it. `lake exe gate-breaks traces` also prints each shortest
 run, step by step and as a Lean term for `GateVerify/Breaks.lean`. A run's name or a rule book's
 name as an argument limits the search to it; the two `all-` runs are searched only when named.
 -/
@@ -33,7 +36,7 @@ def allLabels : Array Label := #[
   .conn .ctr, .conn .dmn, .shut .ctr, .shut .dmn,
   .pair false, .pair true, .unpair false, .unpair true,
   .snap, .snapFail, .snapKill, .hostDie, .guard, .restore,
-  .agent, .agentFail, .kill, .restart, .off, .timeout, .watchdog]
+  .agent, .agentFail, .kill, .restart, .boot, .off, .timeout, .watchdog]
 
 def strip (s : String) : String :=
   ((s.replace "Gate." "").replace "Label." "").replace "RStep." ""
@@ -84,7 +87,7 @@ def snapName (R : Rules) (s : State) (byGuard : Bool) : String :=
   let who := if byGuard then "the guard" else "the host"
   let reopen (what : String) : String :=
     if R.reopenRetry && retryMax ≤ s.tries then
-      s!"{who} ends the guest it could not reopen"
+      s!"{who} gives up: snapshot create fails, the guest is recorded as failed and still gated"
     else if s.ag then s!"{what}: the gate is opened"
     else if R.reopenRetry then s!"{what}: no fc-agent answers the exec; it will try again"
     else s!"{what}: no fc-agent answers the exec; snapshot create returns its error"
@@ -145,7 +148,8 @@ def describe (R : Rules) (l : Label) (s : State) : String :=
     | some r => s!"restore: FAILS at the step that {stepName r}; the restore fails closed"
     | none => "restore fails"
   | .kill => "fc-agent is killed; systemd kills the container and any one-shot with it"
-  | .restart => "systemd restarts fc-agent: it fetches its boot plan and runs its boot path"
+  | .restart => "systemd restarts fc-agent: it fetches its boot plan and serves exec again"
+  | .boot => "the restarted fc-agent starts the container"
   | .off => "shutdown_vm(1): the clone powers off"
   | .timeout => "the host gives up waiting for the restore and ends the VM"
   | .watchdog => "the payload-freeze watchdog thaws the container"
@@ -168,6 +172,7 @@ def showState (s : State) : String :=
         | none => "")
     ++ (if s.lst.isEmpty then "" else s!" list={s.lst}")
     ++ sp ++ rp ++ b "agent-dead" (!s.ag) ++ b "container-dead" (!s.up) ++ b "host-dead" (!s.host)
+    ++ b "reported-failed" s.reported
     ++ (if s.tries == 0 then "" else s!" tries={s.tries}") ++ b "old-epoch" s.again
     ++ s!" socks={s.socks.map showSock}"
     ++ (match s.ctA with
@@ -333,12 +338,6 @@ def printTrace (R : Rules) (r : Run) (f : Found) (check : String) (i : Nat) : IO
 /-- Runs written by hand: a break the search reports only through a shorter run of another
 kind, written out so that it is recorded as itself. `Breaks.lean` checks each. -/
 def handRuns : List (String × Rules × String × String × List Label) := [
-  ("staleTupleGrown", Today.main, "routed", "P3 staleAtPublication",
-    [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-     .pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .detach, .pkt .a .plain .fin,
-     .snap, .snap, .snap, .snap, .snap, .snap, .pkt .a .plain .syn, .snap, .snap, .snap,
-     .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
-     .agent]),
   ("reusedTuple", Today.main, "nat", "P3 smuggledLate",
     [.pkt .a .plain .syn, .pkt .a .plain .ack,
      .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .restore,
@@ -351,8 +350,11 @@ def handRuns : List (String × Rules × String × String × List Label) := [
 
 def main (args : List String) : IO Unit := do
   let traces := args.contains "traces"
+  -- `summary`: one line a rule book and run, with no timing, for CI to compare with
+  -- `GateVerify/search.expected`
+  let summary := args.contains "summary"
   let limits := args.filterMap (fun a => if a.startsWith "limit=" then (a.drop 6).toNat? else none)
-  let named := args.filter (fun a => a != "traces" && !a.startsWith "limit=")
+  let named := args.filter (fun a => a != "traces" && a != "summary" && !a.startsWith "limit=")
   let bookNames := books.map (·.name)
   let onlyBooks := named.filter (bookNames.contains ·)
   let only := named.filter (!bookNames.contains ·)
@@ -366,7 +368,8 @@ def main (args : List String) : IO Unit := do
         let f := explore R r.cfg limit
         let t1 ← IO.monoMsNow
         let cs := checks R r.cfg
-        let mut line := s!"{R.name}: {f.states.size} states{if f.complete then "" else " (LIMIT REACHED)"}, {t1 - t0} ms;"
+        let timing := if summary then "" else s!", {t1 - t0} ms"
+        let mut line := s!"{R.name}: {f.states.size} states{if f.complete then "" else " (LIMIT REACHED)"}{timing};"
         for ci in [0:cs.size] do
           match f.first[ci]! with
           | some i => line := line ++ s!" {cs[ci]!.1}@{(pathTo f i).length}"

@@ -20,10 +20,12 @@ set_option linter.unusedVariables false
 
 /-! ## Settings, rules and phases -/
 
-/-- A guest no restore is running on: a source, or a published clone. -/
+/-- A guest no restore is running on: a source, or a published clone. What it says of a guest
+with no boundary in progress it says of one the host has not reported as failed and still gated
+(`State.reported`); a reported one keeps what its boundary left. -/
 def SrcOk (C : Cfg) (s : State) : Prop :=
   s.sc = C.sc0 ∧ s.udp = false ∧ s.again = false
-  ∧ (s.rcu = true → (s.sp = .barIn ∧ s.rcuOwn = true) ∨ s.sp = .aborted)
+  ∧ (s.rcu = true → (s.sp = .barIn ∧ s.rcuOwn = true) ∨ s.sp = .aborted ∨ s.sp = .idle)
   ∧ (s.sp = .closed4 → s.in4 = true ∧ s.out4 = true)
   ∧ (s.sp = .closed ∨ s.sp = .barIn ∨ s.sp = .bar ∨ s.sp = .dump4 ∨ s.sp = .dump6
       ∨ s.sp = .saved ∨ s.sp = .paused ∨ s.sp = .resumed →
@@ -31,9 +33,11 @@ def SrcOk (C : Cfg) (s : State) : Prop :=
   ∧ (inPrepare s = true ∨ s.sp = .paused → s.frozen = true)
   ∧ (s.sp = .frozen ∨ s.sp = .closed4 ∨ s.sp = .closed ∨ s.sp = .barIn ∨ s.sp = .bar
       ∨ s.sp = .dump4 ∨ s.sp = .dump6 → s.ag = true)
-  ∧ (s.sp = .idle ∨ s.sp = .opened →
-        s.in4 = false ∧ s.in6 = false ∧ s.out4 = false ∧ s.out6 = false)
-  ∧ (s.sp = .idle → s.man = none ∧ (s.frozen = false ∨ s.up = false))
+  ∧ (s.sp = .opened → s.in4 = false ∧ s.in6 = false ∧ s.out4 = false ∧ s.out6 = false)
+  ∧ (s.sp = .idle → s.reported = false →
+        s.in4 = false ∧ s.in6 = false ∧ s.out4 = false ∧ s.out6 = false
+        ∧ s.man = none ∧ s.rcu = false ∧ (s.frozen = false ∨ s.up = false))
+  ∧ (s.reported = true → s.sp = .idle)
   ∧ (s.rp = .done → s.cut = true ∧ s.plan = false)
 
 /-- A clone whose agent has completed `n` steps of the design's restore. -/
@@ -49,7 +53,7 @@ def CloneOk (C : Cfg) (n : Nat) (s : State) : Prop :=
   ∧ (1 ≤ n → s.ag = true → s.saved = if C.sc0 then some true else none)
   ∧ (3 ≤ n → n ≤ 14 → s.udp = true)
   ∧ (s.rcu = true → n = 4) ∧ (n = 4 → s.ag = true → s.rcuOwn = true)
-  ∧ (12 ≤ n → s.man = none)
+  ∧ (12 ≤ n → s.man = none) ∧ s.reported = false
 
 /-- A clone whose restore failed: on its way to the power-off. Closed as it was, unless it
 failed at the write of `tcp_syncookies` back, after its ingress had opened. -/
@@ -57,7 +61,7 @@ def FailedOk (s : State) : Prop :=
   s.sp = .idle ∧ s.waiting = true ∧ s.plan = false ∧ s.again = false
   ∧ (s.cut = false → s.in4 = true ∧ s.in6 = true)
   ∧ (s.cut = true → s.in4 = true ∨ s.in6 = true → s.sc = false)
-  ∧ (s.in4 = s.in6)
+  ∧ (s.in4 = s.in6) ∧ s.reported = false
 
 namespace CloneOk
 
@@ -93,14 +97,16 @@ theorem scal_init (C : Cfg) : Scal C (init C) := by
 /-- The fields `Scal` reads. A step that leaves them alone keeps `Scal`. -/
 def State.scal (s : State) :=
   (s.pw, s.rp, s.sp, s.sc, s.udp, s.rcu, s.rcuOwn, s.in4, s.in6, s.out4, s.out6,
-   s.frozen, s.man, s.cut, s.waiting, s.ag, s.plan, s.again, s.saved, s.up, s.tries)
+   s.frozen, s.man, s.cut, s.waiting, s.ag, s.plan, s.again, s.saved, s.up, s.tries,
+   s.reported)
 
 theorem scal_congr {C : Cfg} {s t : State} (h : t.scal = s.scal) (hi : Scal C s) : Scal C t := by
   simp only [State.scal, Prod.mk.injEq] at h
   obtain ⟨h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19,
-    h20, -⟩ := h
+    h20, -, h22⟩ := h
   unfold Scal SrcOk CloneOk FailedOk inPrepare at *
-  rw [h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20]
+  rw [h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, h16, h17, h18, h19, h20,
+    h22]
   exact hi
 
 @[simp] theorem ctSet_scal (s : State) (c : Cli) (p : Port) (v : Option CtSt) :
@@ -209,7 +215,7 @@ macro "open_step" : tactic => `(tactic| (
 macro "scal_simp" : tactic => `(tactic|
   simp_all [SrcOk, CloneOk, FailedOk, inPrepare, openGate, State.closeGate, State.unpublished,
     lockRestore, Design.rules, Today.cookieB, State.gated, State.running, State.dead, reopened,
-    unreached, retryMax])
+    unreached, gaveUp, retryMax])
 
 set_option hygiene false in
 /-- Closes `Scal C t` from `hi : Scal C s` once `t` is spelled out. For a clone in its restore
@@ -258,8 +264,14 @@ theorem kill_scal {C : Cfg} {s t : State} : kill C s = some t → Scal C s → S
   all_goals close_scal
 
 theorem restart_scal {s t : State} {C : Cfg} :
-    restart Design.rules C s = some t → Scal C s → Scal C t := by
+    restart C s = some t → Scal C s → Scal C t := by
   unfold restart
+  open_step
+  all_goals close_scal
+
+theorem boot_scal {s t : State} {C : Cfg} :
+    boot Design.rules s = some t → Scal C s → Scal C t := by
+  unfold boot
   open_step
   all_goals close_scal
 
@@ -364,6 +376,7 @@ theorem step_scal {C : Cfg} {l : Label} {s t : State}
   | agentFail => exact agentFail_scal h hi
   | kill => exact kill_scal h hi
   | restart => exact restart_scal h hi
+  | boot => exact boot_scal h hi
   | off => exact off_scal h hi
   | timeout => exact timeout_scal h hi
   | watchdog => exact watchdog_scal h hi
@@ -489,7 +502,7 @@ macro "close_flags" : tactic => `(tactic| (
        cases hr : s.rp <;>
          simp_all [Flags, SrcOk, CloneOk, FailedOk, inPrepare, openGate, State.closeGate,
            State.unpublished, lockRestore, Design.rules, Today.cookieB, State.gated,
-           State.running, State.dead, reopened, unreached, retryMax])))
+           State.running, State.dead, reopened, unreached, gaveUp, retryMax])))
 
 set_option hygiene false in
 /-- `open_step` with the records' invariant as a third hypothesis. -/
@@ -534,8 +547,14 @@ theorem kill_flags {C : Cfg} {s t : State} :
   all_goals close_flags
 
 theorem restart_flags {C : Cfg} {s t : State} :
-    restart Design.rules C s = some t → Scal C s → Flags C s → Flags C t := by
+    restart C s = some t → Scal C s → Flags C s → Flags C t := by
   unfold restart
+  open_step3
+  all_goals close_flags
+
+theorem boot_flags {C : Cfg} {s t : State} :
+    boot Design.rules s = some t → Scal C s → Flags C s → Flags C t := by
+  unfold boot
   open_step3
   all_goals close_flags
 
@@ -662,6 +681,7 @@ theorem step_flags {C : Cfg} {l : Label} {s t : State}
   | agentFail => exact flags_congr (agentFail_fl h) hf
   | kill => exact kill_flags h hi hf
   | restart => exact restart_flags h hi hf
+  | boot => exact boot_flags h hi hf
   | off => exact off_flags h hi hf
   | timeout => exact timeout_flags h hi hf
   | watchdog => exact watchdog_flags h hi hf

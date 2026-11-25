@@ -256,19 +256,23 @@ structure Rules where
   /-- `snapshot create` is admitted on a clone that has not published -/
   snapUnpublished : Bool
   /-- a reopen of the source that fails, or that no agent answers, is tried again, `retryMax`
-  times, and then the host ends the guest; otherwise `snapshot create` returns its error and
-  nothing tries again -/
+  times; then `snapshot create` fails and the host records the guest as failed and still gated
+  (`State.reported`), and refuses further creates of it. Each try also writes `rcu_expedited`
+  back when it can (`Rules.rcuUndo`), whether or not the gate opens. Otherwise `snapshot create`
+  returns its error after one exec and nothing tries again or records anything -/
   reopenRetry : Bool
   /-- a write of `tcp_syncookies` back that fails `retryMax` times fails the restore; otherwise
   the restore goes on with a warning -/
   backFails : Bool
-  /-- an fc-agent that starts while the gate's egress half is installed waits for it to go
-  before it fetches a boot plan or starts a container; otherwise it does both whenever a plan
-  is served to it, which over vsock is also behind the closed gate -/
+  /-- a restarted fc-agent serves exec at once and holds the start of the container while a
+  boundary is in progress (a `snapshot create` under way, or a half of the gate installed);
+  otherwise it starts the container as soon as its boot path gets there, which over vsock is
+  also behind a closed gate and inside a prepare -/
   startWaits : Bool
   /-- what a dead `snapshot create` left is undone by a guard -/
   guard : Bool
-  /-- the reopen also writes `rcu_expedited` back when a barrier of this boundary left it on -/
+  /-- the resume one-shot writes `rcu_expedited` back when a barrier of this boundary left it
+  on -/
   rcuUndo : Bool
 
 /-- What exists around the guest, and which moves a search allows. The proofs hold for every
@@ -430,6 +434,12 @@ structure State where
   tries : Nat := 0
   /-- the host's `snapshot create` is alive -/
   host : Bool := true
+  /-- the host has recorded this guest as failed and still gated: a `snapshot create` could not
+  reopen it. The guest runs on; the create failed naming it, and no further create is admitted.
+  The host records what it knows: when fc-agent died after the resume one-shot had opened the
+  gate and before it had removed the manifest and thawed, the gate is in fact open, and the
+  host, whose exec failed, cannot tell -/
+  reported : Bool := false
   /-- the VM is powered on -/
   pw : Bool := true
   /-- the host's `snapshot run` still waits for the restore's acknowledgement -/
@@ -591,13 +601,23 @@ def ctIn (seg : Seg) (cur : Option CtSt) : Option CtSt × Bool :=
   | some .reset => (some .reset, false)
 
 /-- The tracker's entry for the tuple once the guest has answered the segment: a reply makes it
-ESTABLISHED, a FIN closes it, and the guest's reset (no socket for the segment) leaves it reset.
-A FIN with no entry was invalid and nothing is tracked. Nothing changes when the guest does not
-track. -/
+ESTABLISHED and a FIN closes it. A FIN with no entry was invalid and nothing is tracked. The
+guest's reset (no socket for the segment) depends on what the entry was:
+
+- an entry that had seen a reply is left reset;
+- one that had not (no entry, so the segment was picked up, or `new`) is deleted: the reset is
+  its only reply, and the tracker kills an unreplied entry on a reset (ct_tcp.c:1344-1352);
+- one already closed with a FIN seen stays as it is, and a SYN still recycles it.
+
+Nothing changes when the guest does not track. -/
 def answered (tr : Bool) (c : Cli) (p : Port) (seg : Seg) (reset : Bool) (s : State) : State :=
   if !tr then s
   else if seg == .fin then (if (s.ctGet c p).isNone then s else s.ctSet c p (some .closed))
-  else if reset then s.ctSet c p (some .reset)
+  else if reset then
+    match s.ctGet c p with
+    | some .est | some .reset => s.ctSet c p (some .reset)
+    | some .closed => s
+    | _ => s.ctSet c p none
   else s.ctSet c p (some .est)
 
 def State.noteRst (s : State) (b : Bool) : State := { s with rst := s.rst || b }
@@ -814,11 +834,16 @@ def lockOneShot (s : State) : Bool :=
 def reopened (R : Rules) (C : Cfg) (s : State) : State :=
   { openGate R C s with sp := .opened, rcu := s.rcu && !R.rcuUndo, tries := 0 }
 
-/-- The reopen cannot be delivered: no fc-agent answers the host's exec. With
+/-- The reopen cannot be delivered: no fc-agent answers the host's exec, which tries its
+connect 41 times over about 54 s (src/commands/exec.rs, `MAX_EXEC_CONNECT_ATTEMPTS`). With
 `Rules.reopenRetry` the host (or the guard) tries again; otherwise `snapshot create` returns its
 error, and what the prepare left stays. -/
 def unreached (R : Rules) (s : State) : State :=
   if R.reopenRetry then { s with tries := s.tries + 1 } else { s with sp := .idle }
+
+/-- The tries are spent: `snapshot create` fails, the guest runs on with what the boundary left,
+and the host records it as failed and still gated. -/
+def gaveUp (s : State) : State := { s with sp := .idle, reported := true, tries := 0 }
 
 /-- The next step of `snapshot create`, when it succeeds. `byGuard` is the guard doing a dead
 host's part.
@@ -838,7 +863,7 @@ def snap (R : Rules) (C : Cfg) (byGuard : Bool) (s : State) : Option State :=
     match s.sp with
     | .idle =>
       -- the host starts a snapshot of a guest it holds no snapshot of
-      if byGuard || !s.host || !s.ag then none
+      if byGuard || !s.host || !s.ag || s.reported then none
       else if s.unpublished && !(R.snapUnpublished && C.earlySnap) then none
       else some { s with sp := .frozen, frozen := true, tries := 0 }
     | .frozen =>
@@ -865,7 +890,7 @@ def snap (R : Rules) (C : Cfg) (byGuard : Bool) (s : State) : Option State :=
       if byGuard then
         -- nobody is left to pause: the guard undoes the prepare
         if !hostStep || lockRestore s then none
-        else if R.reopenRetry && retryMax ≤ s.tries then some s.dead
+        else if R.reopenRetry && retryMax ≤ s.tries then some (gaveUp s)
         else if s.ag then some (reopened R C s)
         else some (unreached R s)
       else if s.host then
@@ -874,8 +899,8 @@ def snap (R : Rules) (C : Cfg) (byGuard : Bool) (s : State) : Option State :=
     | .paused => if hostStep then some { s with sp := .resumed, tries := 0 } else none
     | .resumed | .aborted =>
       if !hostStep || lockRestore s then none
-      -- the host ends a guest it could not reopen
-      else if R.reopenRetry && retryMax ≤ s.tries then some s.dead
+      -- the host gives a guest up that it could not reopen
+      else if R.reopenRetry && retryMax ≤ s.tries then some (gaveUp s)
       else if s.ag then some (reopened R C s)
       else some (unreached R s)
     | .opened =>
@@ -885,7 +910,7 @@ def snap (R : Rules) (C : Cfg) (byGuard : Bool) (s : State) : Option State :=
         else some { s with sp := .idle, man := none, frozen := false, host := true, tries := 0 }
       -- the one-shot died with the agent, after it had opened the gate
       else if !hostStep then none
-      else if R.reopenRetry && retryMax ≤ s.tries then some s.dead
+      else if R.reopenRetry && retryMax ≤ s.tries then some (gaveUp s)
       else some (unreached R s)
 
 /-- A step of `snapshot create` fails.
@@ -904,7 +929,10 @@ def snapFail (R : Rules) (C : Cfg) (s : State) : Option State :=
     | .resumed | .aborted =>
       if !(s.host || R.guard) || lockRestore s then none
       else if R.reopenRetry then
-        if s.tries < retryMax then some { s with tries := s.tries + 1 } else none
+        -- the one-shot ran and its reopen failed; it still writes `rcu_expedited` back
+        if s.tries < retryMax then
+          some { s with tries := s.tries + 1, rcu := s.rcu && !R.rcuUndo }
+        else none
       else if !s.host then none
       else some { s with sp := .idle, man := none, frozen := false }
     | _ => none
@@ -1034,23 +1062,34 @@ def kill (C : Cfg) (s : State) : Option State :=
     some { s with ag := false, up := false, sp := sp, saved := none, seen := [], lst := [],
                   rcuOwn := false }
 
-/-- systemd starts fc-agent again (`Restart=on-failure`, src/setup/rootfs.rs). The new process
-fetches its boot plan before anything else that matters here, in a loop with no end
-(agent.rs:74-86), and only then starts the exec server and the restore watcher (agent.rs:215).
+/-- systemd starts fc-agent again (`Restart=on-failure`, `RestartSec=1`, src/setup/rootfs.rs),
+once the old unit's cgroup is gone, which a frozen container that does not die on SIGTERM can
+hold up for the stop timeout (90 s by systemd's default). The new process fetches its boot plan
+before anything else that matters here, in a loop with no end (agent.rs:74-86), and only then
+starts the restore watcher (agent.rs:215) and the exec server.
 
 - A guest restored from a memory image is served no plan (`State.plan`): the loop never ends,
-  the restore is never run again, and exec never comes back.
-- A cold-booted guest is served its plan again, unless the fetch is over MMDS and the gate's
-  egress half is closed (or the rule book has the agent wait for the gate,
-  `Rules.startWaits`). Then the agent runs its boot path: a new container, exec again. Over
-  vsock that is also behind a closed gate: a container that runs while a boundary holds it for
-  frozen, and that the memory image then holds running.
+  the restore is never run again, and exec never comes back. Most guests are restored guests:
+  a `podman run` that hits the snapshot cache goes through the restore path.
+- A guest that booted without the cache is served its plan again, unless the fetch is over
+  MMDS and the gate's egress half is closed. Over vsock (Cloud Hypervisor) it is served behind
+  a closed gate too: the gate is iptables rules and vsock is outside them.
+
+This step is the agent back with its exec server. The container is `boot`.
 
 Before the loop the new process writes /etc/resolv.conf and adds the boot command line's IPv6
 address (agent.rs:66-67), which the model does not hold. -/
-def restart (R : Rules) (C : Cfg) (s : State) : Option State :=
-  if !s.running || s.ag || !s.plan || ((C.mmds || R.startWaits) && s.out4) then none
-  else some { s with ag := true, up := true, frozen := false }
+def restart (C : Cfg) (s : State) : Option State :=
+  if !s.running || s.ag || !s.plan || (C.mmds && s.out4) then none
+  else some { s with ag := true }
+
+/-- The restarted agent's boot path reaches the container and starts it (a provisioned guest's
+existing container, `existing_container_id`). With `Rules.startWaits` it holds that while a
+boundary is in progress: a `snapshot create` under way, or a half of the gate installed. -/
+def boot (R : Rules) (s : State) : Option State :=
+  if !s.running || !s.ag || s.up then none
+  else if R.startWaits && (s.sp != .idle || s.gated) then none
+  else some { s with up := true, frozen := false }
 
 /-- The failed restore's `shutdown_vm(1)` lands. -/
 def off (s : State) : Option State :=
@@ -1112,8 +1151,9 @@ inductive Label where
   | guard
   /-- a clone is restored from the image and followed -/
   | restore
-  /-- the restore: its next step, that step failing, the agent killed, restarted -/
-  | agent | agentFail | kill | restart
+  /-- the restore: its next step, that step failing, the agent killed, restarted, and the
+  restarted agent's container started -/
+  | agent | agentFail | kill | restart | boot
   | off | timeout | watchdog
   deriving DecidableEq, Repr, Hashable, Inhabited
 
@@ -1140,13 +1180,14 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
   | .agent => agent R C s
   | .agentFail => agentFail R C s
   | .kill => kill C s
-  | .restart => restart R C s
+  | .restart => restart C s
+  | .boot => boot R s
   | .off => off s
   | .timeout => timeout s
   | .watchdog => watchdog R C s
 
-/-- A cold-booted, running guest that no boundary holds: the rules its boot installs, nothing
-else. -/
+/-- A running guest that booted without the snapshot cache and that no boundary holds: the
+rules its boot installs, nothing else. -/
 def init (C : Cfg) : State :=
   { sc := C.sc0, ctA := if C.staleCt then some .est else none }
 

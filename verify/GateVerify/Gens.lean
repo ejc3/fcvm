@@ -653,9 +653,9 @@ theorem manifest_loop {s : State} (hk : Sk s) :
   obtain ⟨y, ⟨hy, hst⟩, hid⟩ := hm
   have hkind : y.kind = x.kind := hk.u y hy x hx hid
   have hpl : y.kind.peerLo = true := loop_peerLo (by rw [hkind]; exact hl)
-  simp [hpl] at hst
   rw [← hasMirror_kind hkind]
-  exact hst.2
+  -- not left out, with a loopback peer: no mirror image in the dump and none at the second look
+  simp [hpl] at hst <;> exact hst.2
 
 /-- A clone is restored: every socket is now the source's. In the design the image is never of
 a clone inside its restore. -/
@@ -953,9 +953,9 @@ macro "scal_absurd" : tactic => `(tactic| (
   have hi' := hi (by simp_all [State.running])
   first
     | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-        State.dead, reopened, unreached, Design.rules]; done)
+        State.dead, reopened, unreached, gaveUp, Design.rules]; done)
     | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-        State.dead, reopened, unreached, Design.rules]; omega)))
+        State.dead, reopened, unreached, gaveUp, Design.rules]; omega)))
 
 set_option hygiene false in
 macro "open_gn" : tactic => `(tactic| (
@@ -970,7 +970,7 @@ macro "open_gn" : tactic => `(tactic| (
 
 set_option hygiene false in
 macro "close_gn" : tactic => `(tactic| first | exact gn_dead hg | (
-  (try unfold reopened unreached)
+  (try unfold reopened unreached gaveUp)
   (try split)
   all_goals (
     refine gn_sys hg rfl rfl rfl ?_ ?_ ?_ ?_ ?_ ?_ ?_ ?_
@@ -1038,8 +1038,14 @@ theorem kill_gn {C : Cfg} {s t : State} :
   all_goals close_gn
 
 theorem restart_gn {C : Cfg} {s t : State} :
-    restart Design.rules C s = some t → Scal C s → Sk s → Gn s → Gn t := by
+    restart C s = some t → Scal C s → Sk s → Gn s → Gn t := by
   unfold restart
+  open_gn
+  all_goals close_gn
+
+theorem boot_gn {C : Cfg} {s t : State} :
+    boot Design.rules s = some t → Scal C s → Sk s → Gn s → Gn t := by
+  unfold boot
   open_gn
   all_goals close_gn
 
@@ -1191,6 +1197,7 @@ theorem step_gn {C : Cfg} {l : Label} {s t : State}
   | agentFail => exact agentFail_gn h hg
   | kill => exact kill_gn h hi hk hg
   | restart => exact restart_gn h hi hk hg
+  | boot => exact boot_gn h hi hk hg
   | off => exact off_gn h hg
   | timeout => exact timeout_gn h hg
   | watchdog => exact watchdog_gn h hi hk hg

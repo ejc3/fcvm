@@ -507,7 +507,7 @@ theorem step_pw {R : Rules} {C : Cfg} {l : Label} {s t : State}
   · exfalso
     cases l <;>
       simp [step, pkt, udpC, udpR, udpS, conn, shut, pair, unpair, snap, snapFail, snapKill,
-        restore, agent, agentFail, kill, restart, off, timeout, watchdog, State.running,
+        restore, agent, agentFail, kill, restart, boot, off, timeout, watchdog, State.running,
         agentRuns, hp] at h
   · rfl
 
@@ -541,18 +541,18 @@ macro "close_sk" : tactic => `(tactic| first | exact sk_dead _ | (
     have hi' := hi (by simp_all [State.running])
     first
       | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-          State.dead, reopened, unreached, Design.rules]; done)
+          State.dead, reopened, unreached, gaveUp, Design.rules]; done)
       | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-          State.dead, reopened, unreached, Design.rules]; omega)
+          State.dead, reopened, unreached, gaveUp, Design.rules]; omega)
   · intro n hr h9 h11 ha
     have hi' := hi (by simp_all [State.running])
     first
       | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-          State.dead, reopened, unreached, Design.rules]; done)
+          State.dead, reopened, unreached, gaveUp, Design.rules]; done)
       | (simp_all [CloneOk, FailedOk, SrcOk, State.unpublished, openGate, State.closeGate,
-          State.dead, reopened, unreached, Design.rules]; omega)
+          State.dead, reopened, unreached, gaveUp, Design.rules]; omega)
   · intro hc
-    simp_all [openGate, State.closeGate, State.dead, reopened, unreached, Design.rules]))
+    simp_all [openGate, State.closeGate, State.dead, reopened, unreached, gaveUp, Design.rules]))
 
 theorem snap_sk {C : Cfg} {g : Bool} {s t : State} :
     snap Design.rules C g s = some t → Scal C s → Sk s → Sk t := by
@@ -578,8 +578,14 @@ theorem kill_sk {C : Cfg} {s t : State} : kill C s = some t → Scal C s → Sk 
   all_goals close_sk
 
 theorem restart_sk {C : Cfg} {s t : State} :
-    restart Design.rules C s = some t → Scal C s → Sk s → Sk t := by
+    restart C s = some t → Scal C s → Sk s → Sk t := by
   unfold restart
+  open_sk
+  all_goals close_sk
+
+theorem boot_sk {C : Cfg} {s t : State} :
+    boot Design.rules s = some t → Scal C s → Sk s → Sk t := by
+  unfold boot
   open_sk
   all_goals close_sk
 
@@ -764,6 +770,7 @@ theorem step_sk {C : Cfg} {l : Label} {s t : State}
   | agentFail => exact agentFail_sk h hk
   | kill => exact kill_sk h hi hk
   | restart => exact restart_sk h hi hk
+  | boot => exact boot_sk h hi hk
   | off => exact off_sk h
   | timeout => exact timeout_sk h
   | watchdog => exact watchdog_sk h hi hk

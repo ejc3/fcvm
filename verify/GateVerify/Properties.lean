@@ -17,9 +17,11 @@ namespace Gate
 /-- **P1, source undisturbed.** An established connection of a guest being snapshotted was reset
 by the gate; or no boundary is in progress (`snapshot create` returned, with or without an
 error, on a guest that is a source or a published clone) and the guest still has a half of the
-gate, the manifest, `rcu_expedited` on, or a living container left frozen. -/
+gate, the manifest, `rcu_expedited` on, or a living container left frozen. The one exemption
+is a guest the host has reported as failed and still gated (`State.reported`): its
+`snapshot create` could not reopen it after its tries, said so, and left it running. -/
 def sourceDisturbed (s : State) : Bool :=
-  s.rst || (s.pw && s.sp == .idle && (s.rp == .none || s.rp == .done)
+  s.rst || (s.pw && s.sp == .idle && (s.rp == .none || s.rp == .done) && !s.reported
               && (s.gated || s.man.isSome || s.rcu || (s.frozen && s.up)))
 
 /-- **P2, fixed generation.** A retirement destroyed, by cookie or by the reset a destroyed
@@ -69,23 +71,24 @@ def lastingChange (C : Cfg) (s : State) : Bool :=
 def capturedChange (s : State) : Bool := s.cap
 
 /-- A step of the system itself: a step of a `snapshot create` that has begun, the guard's, a
-restore's, either of them failing, systemd's restart of the agent, a failed clone's power-off
-and the host's timeout. Not the environment's (packets, processes, kills, a dying host), and
+restore's, either of them failing, systemd's restart of the agent, the restarted agent's start
+of the container, a failed clone's power-off and the host's timeout. Not the environment's (packets, processes, kills, a dying host), and
 not the user's next `snapshot create` or `snapshot run`. -/
 def own (l : Label) (s : State) : Bool :=
   match l with
   | .snap => s.sp != .idle
-  | .guard | .snapFail | .agent | .agentFail | .restart | .off | .timeout => true
+  | .guard | .snapFail | .agent | .agentFail | .restart | .boot | .off | .timeout => true
   | _ => false
 
 /-- The steps that move a boundary on: the system's own, the failures left out. -/
-def moves : List Label := [.snap, .guard, .agent, .restart, .off, .timeout]
+def moves : List Label := [.snap, .guard, .agent, .restart, .boot, .off, .timeout]
 
-/-- **P6, never left closed.** A half of the gate is installed, or the guest is paused, and no
-step that moves a boundary on is enabled: nothing will open it and nothing will report it. The
-user's next `snapshot create` is not such a step. -/
+/-- **P6, never left closed.** A half of the gate is installed, or the guest is paused, no step
+that moves a boundary on is enabled, and the host has not reported the guest failed: nothing
+will open it and nothing has said so. The user's next `snapshot create` is not such a step. A
+guest reported as failed and still gated is an end: the create failed naming it. -/
 def stuck (R : Rules) (C : Cfg) (s : State) : Bool :=
-  s.pw && (s.gated || s.sp == .paused)
+  s.pw && (s.gated || s.sp == .paused) && !s.reported
     && !(moves.any (fun l => own l s && (step R C l s).isSome))
 
 /-- **U1, no client datagram before publication.** A datagram on a flow a client began reached a

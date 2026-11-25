@@ -89,14 +89,12 @@ theorem design_keeps_staleTupleLate :
 rule attaches IPv4 tracking during one snapshot and it stays attached a little after the gate is
 removed; a client's handshake is tracked then; the tracker is detached before the client closes,
 so the close is not seen; and the next snapshot's clone publishes with that client's new
-connection. Written by hand: the search reports a shorter run of another kind (`strayAck`) (38
-steps). -/
+connection (37 steps). -/
 def Run.staleTupleGrown : List Label :=
   [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .snap, .snap, .snap, .pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .detach,
-   .pkt .a .plain .fin, .snap, .snap, .snap, .snap, .snap, .snap, .pkt .a .plain .syn, .snap, .snap,
-   .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
-   .agent]
+   .snap, .snap, .snap, .pkt .a .plain .syn, .detach, .pkt .a .plain .fin, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap, .pkt .a .plain .syn, .snap, .snap, .snap, .restore, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
 
 theorem breaks_staleTupleGrown :
     after (replay Today.main Runs.routed Run.staleTupleGrown (init Runs.routed))
@@ -105,37 +103,11 @@ theorem breaks_staleTupleGrown :
 /-- The same run with the design's restore: it refuses the last step. -/
 def Run.staleTupleGrownDesign : List Label :=
   [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .snap, .snap, .snap, .snap, .pkt .a .plain .syn, .pkt .a .plain .ack, .snap, .detach]
+   .snap, .snap, .snap, .snap, .pkt .a .plain .syn, .detach]
 
 theorem design_refuses_staleTupleGrown :
     replay Design.rules Runs.routed Run.staleTupleGrownDesign (init Runs.routed) = none
-    ∧ (replay Design.rules Runs.routed (Run.staleTupleGrownDesign.take 14) (init Runs.routed)).isSome = true := by decide
-
-/-- The same hole reached without a connection: an ACK for no socket arrives while the tracker is
-attached, the guest answers with a reset, and the entry that leaves is one a later SYN from that
-client does not recycle (the reset was not from the SYN's direction,
-nf_conntrack_proto_tcp.c:1051-1054). The SYN is not NEW and passes the next snapshot's closed gate
-(35 steps). -/
-def Run.strayAck : List Label :=
-  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .snap, .snap, .pkt .a .plain .ack, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .pkt .a .plain .syn, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent,
-   .agent, .agent, .agent, .agent, .agent, .agent]
-
-theorem breaks_strayAck :
-    after (replay Today.main Runs.routed Run.strayAck (init Runs.routed))
-      staleAtPublication := by decide
-
-/-- The same run with the design's restore: the same steps in its own order. -/
-def Run.strayAckDesign : List Label :=
-  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .snap, .snap, .snap, .pkt .a .plain .ack, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .pkt .a .plain .syn, .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent,
-   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent]
-
-theorem design_keeps_strayAck :
-    (replay Design.rules Runs.routed Run.strayAckDesign (init Runs.routed)).map
-      staleAtPublication = some false := by decide
+    ∧ (replay Design.rules Runs.routed (Run.staleTupleGrownDesign.take 12) (init Runs.routed)).isSome = true := by decide
 
 /-- A variant of #2106 in a guest that always tracks. A request socket in the manifest is retired
 without a reset (`tcp_abort`, tcp.c:5062-5069), so its tracked entry stays; the client's SYN, sent
@@ -542,6 +514,38 @@ theorem breaks_agentDiesSource :
 theorem design_keeps_agentDiesSource :
     (replay Design.rules Runs.kills Run.agentDiesSource (init Runs.kills)).map
       sourceDisturbed = some false := by decide
+
+/-- The same over vsock (Cloud Hypervisor), where a guest that booted without the snapshot cache is
+served its boot plan behind the closed gate: the agent comes back with its exec server and starts
+the container, after the host's exec has given up, and nothing asks for the reopen. (If it is back
+inside the exec's 54 s of connect retries, the reopen lands and nothing is broken.) (6 steps). -/
+def Run.agentDiesVsock : List Label :=
+  [.snap, .snap, .kill, .snap, .restart, .boot]
+
+theorem breaks_agentDiesVsock :
+    after (replay Today.cookieB Runs.killsVsock Run.agentDiesVsock (init Runs.killsVsock))
+      (stuck Today.cookieB Runs.killsVsock) := by decide
+
+theorem design_refuses_agentDiesVsock :
+    replay Design.rules Runs.killsVsock Run.agentDiesVsock (init Runs.killsVsock) = none
+    ∧ (replay Design.rules Runs.killsVsock (Run.agentDiesVsock.take 5) (init Runs.killsVsock)).isSome = true := by decide
+
+/-- Over vsock again: fc-agent dies after the prepare one-shot has replied and is back before the
+host's pause, which is the next call the host makes. The image holds the new agent with its
+container not yet started, and the clone's agent starts it during the restore, behind the closed
+egress half. It needs the unit's restart (`RestartSec=1`, and up to the 90 s stop timeout if the
+frozen container does not die on SIGTERM) to fit between two adjacent host calls (13 steps). -/
+def Run.containerMidBoundary : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .kill, .restart, .snap, .restore, .boot]
+
+theorem breaks_containerMidBoundary :
+    after (replay Today.cookieB Runs.killsVsock Run.containerMidBoundary (init Runs.killsVsock))
+      workloadBehindEgress := by decide
+
+theorem design_refuses_containerMidBoundary :
+    replay Design.rules Runs.killsVsock Run.containerMidBoundary (init Runs.killsVsock) = none
+    ∧ (replay Design.rules Runs.killsVsock (Run.containerMidBoundary.take 12) (init Runs.killsVsock)).isSome = true := by decide
 
 /-- The prepare one-shot is killed inside the receive barrier: `/sys/kernel/rcu_expedited` stays 1 on
 the source after the snapshot has failed and the gate is open again. Written by hand: in this

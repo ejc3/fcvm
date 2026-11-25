@@ -30,10 +30,11 @@ set_option linter.unusedVariables false
 variable {C : Cfg} {s : State}
 
 /-- **P1.** No established connection of a guest being snapshotted is reset, and once no boundary
-is in progress the guest has no half of the gate, no manifest, `rcu_expedited` as it was, and
-its container thawed. That every boundary is over within a bounded number of steps, with the
-source running ungated or ended by the host that could not reopen it, is `design_bounded` and
-`design_settles`. -/
+is in progress a guest the host has not reported as failed has no half of the gate, no
+manifest, `rcu_expedited` as it was, and its container thawed. The exemption is exactly a
+source whose `snapshot create` could not reopen it after its tries: it runs on, gated, and the
+create failed naming it. That every boundary is over within a bounded number of steps, with the
+source running ungated or reported, is `design_bounded` and `design_settles`. -/
 theorem design_sourceUndisturbed (hr : Reachable Design.rules C s) : sourceDisturbed s = false := by
   have hi := reachable_scal hr
   have hf := reachable_flags hr
@@ -43,7 +44,7 @@ theorem design_sourceUndisturbed (hr : Reachable Design.rules C s) : sourceDistu
   · have hi := hi hpw
     cases hrp : s.rp <;> cases hsp : s.sp <;>
       simp_all [SrcOk, State.gated, hf.1, inPrepare] <;>
-      (intro hfr; simp_all)
+      (intro hfr; simp_all) <;> (intro hfz; simp_all)
 
 /-- **P2.** No retirement destroys a socket a process of the clone opened, a socket a packet made
 with the gate open, or an end of a connection inside the guest whose other end stays. -/
@@ -163,10 +164,12 @@ theorem design_noCapturedChange (hr : Reachable Design.rules C s) : capturedChan
   (reachable_flags hr).2.2.2.1
 
 /-- **P6.** While a half of the gate is installed or the guest is paused, a step that moves the
-boundary on is enabled: the snapshot's next step, the guard's, the restore's, the restart of a
-cold-booted guest's agent, a failed clone's power-off, or the host's timeout. The timeout is
-the one left only for a clone whose fc-agent has died (`design_settles`). The user's next
-`snapshot create` is not counted. This is progress; the end is `design_bounded`. -/
+boundary on is enabled: the snapshot's next step, the guard's, the restore's, the restart of
+an agent that is served a boot plan, its container's start, a failed clone's power-off, or the
+host's timeout; unless the host has reported the guest as failed and still gated, which is an
+end. The timeout is the one left only for a clone whose fc-agent has died (`design_settles`).
+The user's next `snapshot create` is not counted. This is progress; the end is
+`design_bounded`. -/
 theorem design_neverStuck (hr : Reachable Design.rules C s) : stuck Design.rules C s = false := by
   cases hst : stuck Design.rules C s with
   | false => rfl
@@ -174,28 +177,29 @@ theorem design_neverStuck (hr : Reachable Design.rules C s) : stuck Design.rules
     exfalso
     simp only [stuck, moves, Bool.and_eq_true, Bool.not_eq_true', List.any_eq_false,
       List.mem_cons, List.mem_nil_iff, or_false, Bool.not_eq_true] at hst
-    obtain ⟨⟨hpw, hg⟩, hno⟩ := hst
+    obtain ⟨⟨⟨hpw, hg⟩, hrep⟩, hno⟩ := hst
     have hrest : atRest Design.rules C s = true := by
       simp only [atRest, movesInGuest, Bool.not_eq_true', List.any_eq_false, List.mem_cons,
         List.mem_nil_iff, or_false, Bool.not_eq_true]
       intro l hl
-      have := hno l (by rcases hl with h | h | h | h | h <;> simp [h])
+      have := hno l (by rcases hl with h | h | h | h | h | h <;> simp [h])
       cases ho : own l s <;> cases hs : (step Design.rules C l s).isSome <;> simp_all
     rcases design_settles hr hrest with h | h
-    · simp [settled, hpw] at h
+    · simp [settled, hpw, hrep] at h
       obtain ⟨⟨h1, -⟩, h3⟩ := h
       simp [h1, h3] at hg
     · simp only [orphaned, Bool.and_eq_true] at h
       have := hno .timeout (by simp)
       simp [own, step, h.2] at this
 
-/-- **U1, the guest's part.** A client's datagram reaches a clone that has not published only
-before the restore's UDP rule is in (its first three steps), or in a clone whose restore has
-failed and that is on its way to the power-off. Before the rule, what keeps a datagram out is
-the host's gate on the clone's TAP and, for a routed clone, its address: assumed
-(`Cfg.udpReach`), not proved. -/
+/-- **U1, the guest's part.** A client's datagram reaches a clone that has not published and
+still has an ingress half only before the restore's UDP rule is in (its first three steps), or
+in a clone whose restore has failed and that is on its way to the power-off. Before the rule,
+what keeps a datagram out is the host's gate on the clone's TAP and, for a routed clone, its
+address: assumed (`Cfg.udpReach`), not proved. -/
 theorem design_udpRuleHolds {t : State} (hr : Reachable Design.rules C s)
-    (h : udpC Design.rules C s = some t) (hnew : t.udpIn = true) (hold : s.udpIn = false) :
+    (h : udpC Design.rules C s = some t) (hun : s.unpublished = true)
+    (hin : (s.in4 || s.in6) = true) :
     s.rp = .failed ∨ ∃ n, s.rp = .at n ∧ n ≤ 2 := by
   have hi := reachable_scal hr
   unfold udpC at h
@@ -206,13 +210,9 @@ theorem design_udpRuleHolds {t : State} (hr : Reachable Design.rules C s)
     · split at h
       · contradiction
       · rename_i hrun _ hudp
-        simp only [Option.some.injEq] at h
-        subst h
         have hpw : s.pw = true := by
           cases hp : s.pw <;> simp_all [State.running]
         have hi := hi hpw
-        simp only [hold, Bool.false_or, Bool.and_eq_true, Bool.or_eq_true] at hnew
-        obtain ⟨hun, hin⟩ := hnew
         cases hrp : s.rp with
         | none => simp [State.unpublished, hrp] at hun
         | done => simp [State.unpublished, hrp] at hun
@@ -231,8 +231,6 @@ theorem design_udpRuleHolds {t : State} (hr : Reachable Design.rules C s)
               rw [hu] at this; cases this
             | inr h15 =>
               have := hi.2.2.2.2.2.2.1 h15
-              rcases hin with h | h
-              · rw [this.1] at h; cases h
-              · rw [this.2.1] at h; cases h
+              simp [this.1, this.2.1] at hin
 
 end Gate

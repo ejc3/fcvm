@@ -37,8 +37,12 @@ What all four share, cited at 27add63dd (the same code is in the other three, at
   `KillMode`, src/setup/rootfs.rs:1610-1626). The new process loops on its boot plan before it
   starts the exec server or the restore watcher (fc-agent/src/agent.rs:74-86, 215). A guest
   restored from a memory image is served no plan, so its agent never comes back and the
-  restore is never run a second time; a cold-booted guest's comes back unless the fetch is
-  over MMDS behind the closed egress half (`Spec.restart`). Read from the source; not run.
+  restore is never run a second time; the agent of a guest that booted without the snapshot
+  cache comes back unless the fetch is over MMDS behind the closed egress half
+  (`Spec.restart`), and then starts the container again (`Spec.boot`). When no agent answers,
+  the host's one exec of the resume one-shot gives up after its 41 connect attempts, about
+  54 s (src/commands/exec.rs), and `snapshot create` returns its error. Read from the source;
+  not run.
 - A write of `tcp_syncookies` back that fails is tried three times and then the restore goes on
   with a warning (`restore_syn_cookies`; `backFails := false`).
 - The receive barrier turns `/sys/kernel/rcu_expedited` on and off around its grace period

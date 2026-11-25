@@ -7,13 +7,15 @@ documents.
 
 With all of them the search finds no break of P1 to P6 in any configuration (`lake exe
 gate-breaks design`, and the two `all-` runs), and P1 to P6 are proved (`Proofs.lean`,
-`Ends.lean`), P2 for the connections the model makes (`Limits.lean`). U1 is not among them:
+`Ends.lean`), P2 for the connections the model makes (`Limits.lean`) and P1 with one
+exemption, a source reported failed (repair 3). U1 is not among them:
 `lake exe gate-breaks design udp-reach` reports `clientDatagram` for the design as for every
 rule book, and what keeps a client's datagram from a clone before its UDP rule is the host's,
 assumed.
 
 Each repair is carried by a proof: with its field put back, `lake build GateVerify.Proofs`
-fails (the table at the end).
+fails (the table at the end). Of the four rules the design inherits from #2113 and #2124, three
+are carried the same way and one is redundant in the design.
 
 None of this is implemented. The fixes #2113 and #2124 already make are not repeated here: the
 flag rule (`tcpByCt := false`), the restore's own list with the mirror image deciding and a
@@ -58,7 +60,7 @@ Proposed wording, for the doc of `resume_source_network`:
 > The reopen is the undo of one prepare. It opens the gate that prepare closed and no other: a
 > clone that has not published has a closed gate that is not a snapshot's to open.
 
-## 3. A source's reopen is owed until it lands, and a guest that cannot be reopened is ended (#1936, #2142, #2149)
+## 3. A source's reopen is owed until it lands; one that cannot be reopened is left running and reported failed (#1936, #2142, #2149)
 
 Model: `guard := true`, `reopenRetry := true`.
 
@@ -68,46 +70,65 @@ Change:
 - A reopen that fails: `resume_source_network` leaves the manifest in place when `reopen_with`
   fails (it is the one marker that the boundary is still closed), and the host tries the
   reopen again before `snapshot create` returns, as the guard does after it.
-- A reopen that cannot be delivered because no fc-agent answers the exec is a failed try like
-  any other.
+- A reopen that cannot be delivered because no fc-agent answers the exec (after the exec's own
+  41 connect attempts over about 54 s) is a failed try like any other.
 - After a bounded number of tries (three in the model, `retryMax`) the host, or the guard,
-  ends the guest, as `snapshot run` ends a clone that does not acknowledge its restore. A
-  guest whose fc-agent is dead and cannot come back has no container and no exec; leaving it
-  running behind a closed gate helps nobody.
+  gives up. The source is NOT ended: a snapshot does not disturb its source, and ending it is
+  the largest disturbance there is. Its established connections still work behind the gate.
+  `snapshot create` fails naming the VM, the VM's state on the host says it is failed and
+  still gated (`State.reported`), and the host refuses further creates of it.
 - The container stays frozen while a reopen is owed, and is thawed by the resume one-shot that
   lands (the model's `opened` to `idle`).
+- The report is what the host knows. If fc-agent dies after the resume one-shot has opened the
+  gate and before it has removed the manifest and thawed, the host's exec fails all the same,
+  and the guest is reported though its gate is open.
 
-The last two are choices, and the second is the owner's: the alternative to ending the guest
-is a source left gated and reported, which requirement 1 does not allow.
+What this asks of the properties, and the model does each:
 
-Answers: `hostDies`, `reopenFails`, `reopenFailsStuck`, `agentDies`, `agentDiesSource`.
+- **P1's test exempts exactly a guest reported failed and still gated.** Requirement 1 says so.
+  For every other guest with no boundary in progress the gate, the manifest, `rcu_expedited`
+  and the freeze are as before the snapshot (`design_sourceUndisturbed`).
+- **P6 counts the report as an end.** A gated guest the host has reported is not stuck: the
+  create failed and said which VM (`stuck`, `settled`).
+- **P5 needs two things** that the ending of the guest used to give for free. The resume
+  one-shot writes `rcu_expedited` back whether or not its reopen lands (repair 4), and the
+  host refuses further creates of a reported guest, so no image is taken of one whose switch
+  could not be written back because no agent answered (`design_noCapturedChange`).
 
-What the model shows: `design_sourceUndisturbed` (no boundary in progress and a half of the
-gate still in is unreachable), `design_neverStuck`, and `design_bounded` with
-`design_settles`: a `snapshot create` that has begun is over within 20 steps of the system,
-with the source running ungated or ended. `sourceEnded` in `Ends.lean` is the run where the
-agent dies during the prepare on Firecracker: three tries, then the guest is ended.
+Answers: `hostDies`, `reopenFails`, `reopenFailsStuck`, `agentDies`, `agentDiesSource`,
+`agentDiesVsock`.
+
+What the model shows: `design_sourceUndisturbed`, `design_neverStuck`, and `design_bounded`
+with `design_settles`: a `snapshot create` that has begun is over within 20 steps of the
+system, with the source running ungated or reported. `sourceReported` in `Ends.lean` is the run
+where the agent dies during the prepare on Firecracker: three tries, then the guest is recorded
+as failed, is not stuck, and refuses the next create. `sourceRecovers` is the same on Cloud
+Hypervisor: the restarted agent answers the exec and the gate opens.
 
 Proposed wording, for the comment in `resume_source_network`:
 
 > A reopen that fails leaves the boundary owed. The manifest stays, so the guest still says a
-> boundary is closed, and whoever asked for the reopen asks again. A guest that cannot be
-> reopened is ended: it is not left closed.
+> boundary is closed, and whoever asked for the reopen asks again. A source that cannot be
+> reopened is left running and reported failed: it is not ended, and it is not snapshotted
+> again.
 
-## 4. The reopen writes `rcu_expedited` back (#2141)
+## 4. The resume one-shot writes `rcu_expedited` back, whether or not its reopen lands (#2141)
 
 Model: `rcuUndo := true`.
 
 Change: `ExpeditedGracePeriods::begin` writes a file under `/run/fcvm/` before it writes 1 to
 the switch and removes it after writing the switch back. `resume_source_network` writes 0 to
-the switch and removes the file when it finds one. On a clone nothing needs it: a restore
-killed inside its barrier leaves a clone that never publishes and that the host ends.
+the switch and removes the file when it finds one, before it tries the reopen and not as part
+of it: a reopen that fails must not leave the switch on with it. On a clone nothing needs it:
+a restore killed inside its barrier leaves a clone that never publishes and that the host ends.
 
 Answers: `barrierKill`, `barrierKillCaptured`.
 
 What the model shows: with it, `rcu_expedited` on outside a barrier in progress or an aborted
-prepare is unreachable in a source (`SrcOk`), which is part of `design_sourceUndisturbed` and
-of `design_noCapturedChange`.
+prepare is unreachable in a source the host has not reported failed (`SrcOk`), which is part of
+`design_sourceUndisturbed` and of `design_noCapturedChange`. The one case left is a source
+whose agent died inside the barrier and never answered a reopen: the switch stays on, the
+source is reported failed (repair 3), and no image is taken of it.
 
 ## 5. The proxy's redirect closes with the egress half
 
@@ -178,49 +199,59 @@ Answers: `writeBackFails`, and the snapshot that captures the 0 after it.
 What the model shows: `design_noLastingChange`: a published clone has `tcp_syncookies` as it
 was at boot.
 
-## 8. An fc-agent that starts behind a closed egress half waits for it to open
+## 8. A restarted fc-agent serves exec at once and holds the container's start while a boundary is in progress
 
-Model: `startWaits := true`.
+Model: `startWaits := true`. `restart` is the agent back with its exec server; `boot` is its
+container started.
 
-Found by the proof, not by a recorded run: the invariant "a guest in a snapshot's prepare has
-its container frozen" does not hold without it. A cold-booted guest's restarted agent is
-served its boot plan again. Over MMDS the closed egress half already stops it. Over vsock
-(Cloud Hypervisor) nothing does: the new agent runs its boot path behind the closed gate and
-starts a new container while the prepare holds the guest for frozen, and if the host then
-pauses, the image holds a running container, which every clone resumes behind its closed gate.
+Change: the restarted agent's boot path brings the exec server up as today, and before it
+starts the container it waits while a boundary is in progress: a `snapshot create` under way
+(the prepare's freeze, the boundary lock, the manifest) or a half of the gate installed.
 
-Change: in `agent::run`, before the boot plan loop, wait while the gate's OUTPUT chain is
-hooked. With repair 3 the host has by then tried the reopen and ended the guest it could not
-reach.
+Answers: `containerMidBoundary` (`BREAKS.md`): Cloud Hypervisor, a guest that booted without
+the snapshot cache, an fc-agent that dies after the prepare's reply and is back before the
+host's pause. On Firecracker the closed egress half already stops the new agent at its boot
+plan.
 
-Answers: no recorded run. It needs fc-agent to die between a prepare's exit and the pause, and
-to be back with a container before the pause, on Cloud Hypervisor.
+Why exec first: the gate is opened only by a reopen exec'd through the agent. An agent that
+waited for the gate before serving exec would wait for ever, and every source whose agent died
+behind a closed egress half would be lost, where today a Cloud Hypervisor source recovers when
+the agent is back inside the host's 54 s exec wait. Holding only the container keeps that
+recovery (`sourceRecovers`) and still keeps a container from starting inside a prepare.
 
-What the model shows: with `startWaits := false` the build fails at `restart_scal`
-(`Lemmas.lean`).
+What the model shows: with `startWaits := false` the build fails at `boot_scal`
+(`Lemmas.lean`): "a guest in a snapshot's prepare has its container frozen" does not hold, and
+`design_workloadEgress` rests on it through the image a clone is restored from.
 
 ## What carries each repair
 
 `lake build GateVerify.Proofs` with one field of `Design.rules` put back (`Proofs` does not
 import the recorded runs, so these are the proofs failing, not a replayed run):
 
-| Field put back | The build fails at |
+| Field put back | The build |
 |---|---|
-| 2: `snapUnpublished := true` | `snap_scal` (`Lemmas.lean`) |
-| 3: `reopenRetry := false` | `snap_scal` |
-| 3: `guard := false` | `settle_src` (`Ends.lean`) |
-| 4: `rcuUndo := false` | `snap_scal` |
-| 5: `natGate := false` | `conn_evo2` (`Gens.lean`) |
-| 6: `wdMidBoundary := true` | `watchdog_scal` (`Lemmas.lean`) |
-| 7: `backFails := false` | `agentFail_scal` (`Lemmas.lean`) |
-| 8: `startWaits := false` | `restart_scal` (`Lemmas.lean`) |
-| inherited from #2113: `tcpByCt := true` | `rejected_fl` (`Lemmas.lean`) |
-| inherited from #2124: `look := false` | `manifest_loop` (`Gens.lean`) |
-| inherited from #2124: `manAddr := true` | `manifest_loop` |
-| inherited from #2124: `list := .addr` | `sk_dump6` (`Socks.lean`) |
+| 2: `snapUnpublished := true` | fails at `snap_scal` (`Lemmas.lean`) |
+| 3: `reopenRetry := false` | fails at `snap_scal` |
+| 3: `guard := false` | fails at `settle_src` (`Ends.lean`) |
+| 4: `rcuUndo := false` | fails at `snap_scal` |
+| 5: `natGate := false` | fails at `conn_evo2` (`Gens.lean`) |
+| 6: `wdMidBoundary := true` | fails at `watchdog_scal` (`Lemmas.lean`) |
+| 7: `backFails := false` | fails at `agentFail_scal` (`Lemmas.lean`) |
+| 8: `startWaits := false` | fails at `boot_scal` (`Lemmas.lean`) |
+| inherited from #2113: `tcpByCt := true` | fails at `rejected_fl` (`Lemmas.lean`) |
+| inherited from #2124: `look := false` | fails at `manifest_loop` (`Gens.lean`) |
+| inherited from #2124: `list := .addr` | fails at `sk_dump6` (`Socks.lean`) |
+| inherited from #2124: `manAddr := true` | **passes** |
 
-Run on a copy of this directory, one field at a time; every one exits 1 and the unchanged copy
-exits 0.
+Run on a copy of this directory, one field at a time: eleven exit 1, `manAddr` and the unchanged
+copy exit 0.
+
+`manAddr` is redundant in the design, and the search agrees (it finds nothing with the field
+put back). With it the manifest leaves out every socket whose peer address is loopback, a
+`/loopback` port's client among them; without it, only a socket whose mirror image is in the
+dump. Either way the design's restore takes its own list by the mirror rule and retires what
+the manifest left out, so no property tells the two manifests apart. The manifest's rule is
+what matters where there is no list: on `main` and #2113 (`loopbackClient`).
 
 ## What the design does not repair
 
