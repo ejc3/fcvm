@@ -3781,6 +3781,43 @@ mkdir -p \"$BUILD_DIR/linux-x\"\n\
         );
     }
 
+    /// scripts/check-runner-kernel.py fails a CI job whose runner does not run the host kernel
+    /// the checkout builds, and computes that kernel's release itself. It has to be the release
+    /// `install_host_kernel` gives the kernel it builds into the runner image, on both
+    /// architectures: with another, every job would fail on a correct runner.
+    #[test]
+    fn the_runner_kernel_check_names_the_host_kernel_setup_installs() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let plan: crate::setup::rootfs::Plan =
+            toml::from_str(crate::setup::rootfs::EMBEDDED_CONFIG).unwrap();
+        for (config_arch, machine) in [("amd64", "x86_64"), ("arm64", "aarch64")] {
+            let host = plan.kernel_profiles["nested"][config_arch]
+                .host_kernel
+                .clone()
+                .expect("host_kernel");
+            let installed = format!(
+                "{}-fcvm-{}",
+                host.kernel_version,
+                compute_host_kernel_sha(&host, repo).unwrap()
+            );
+            let output = std::process::Command::new("python3")
+                .arg(repo.join("scripts/check-runner-kernel.py"))
+                .args(["--print-expected", "--machine", machine])
+                .output()
+                .expect("run check-runner-kernel.py");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                installed,
+                "{config_arch}"
+            );
+        }
+    }
+
     /// `make install-host-kernel` points the build at the scratch disk through
     /// FCVM_HOST_KERNEL_BUILD_DIR; the build script and the search for its debs
     /// must use that one directory.

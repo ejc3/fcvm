@@ -273,6 +273,8 @@ jobs:
         run: make test-runner-acceptance
       - name: Test the pull request scope and stack coverage
         run: make test-ci-scope
+      - name: Test the runner kernel check
+        run: make test-runner-kernel
       - name: Test cached release downloads
         run: bash scripts/test-cached-download.sh
       - name: Test workflow trust conditions and AMI build arguments
@@ -743,10 +745,11 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
-      # Fail on a runner whose kernel lacks the bridge teardown fix (#1563), naming the kernel.
+      # Fail on a runner whose kernel is not a host kernel this checkout or main builds: a
+      # stock kernel, or an image older than the last host kernel change (#1563, #2125).
       - name: Runner kernel check
         working-directory: fcvm
-        run: ./scripts/check-bridge-teardown-kernel.sh
+        run: ./scripts/check-runner-kernel.py
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
@@ -1089,10 +1092,11 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
-      # Fail on a runner whose kernel lacks the bridge teardown fix (#1563), naming the kernel.
+      # Fail on a runner whose kernel is not a host kernel this checkout or main builds: a
+      # stock kernel, or an image older than the last host kernel change (#1563, #2125).
       - name: Runner kernel check
         working-directory: fcvm
-        run: ./scripts/check-bridge-teardown-kernel.sh
+        run: ./scripts/check-runner-kernel.py
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
@@ -1455,10 +1459,11 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
-      # Fail on a runner whose kernel lacks the bridge teardown fix (#1563), naming the kernel.
+      # Fail on a runner whose kernel is not a host kernel this checkout or main builds: a
+      # stock kernel, or an image older than the last host kernel change (#1563, #2125).
       - name: Runner kernel check
         working-directory: fcvm
-        run: ./scripts/check-bridge-teardown-kernel.sh
+        run: ./scripts/check-runner-kernel.py
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and

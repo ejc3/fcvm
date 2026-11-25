@@ -48,6 +48,11 @@ test-runner-acceptance:
 test-ci-scope:
 	python3 scripts/test-ci-stack-scope.py
 
+# scripts/check-runner-kernel.py against fixture repositories. Needs git and Python 3.11.
+.PHONY: test-runner-kernel
+test-runner-kernel:
+	python3 -B scripts/test-check-runner-kernel.py
+
 .PHONY: test-ci-security test-ci-workflow-security test-ami-security
 test-ci-security: test-ci-workflow-security test-ami-security
 test-ci-workflow-security:
