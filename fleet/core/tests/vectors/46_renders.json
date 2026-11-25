@@ -527,14 +527,7 @@
       "scrub_failures": 0,
       "scrubs": 0
     },
-    "failures": [
-      {
-        "host": "h1",
-        "kind": "host_reclaimed",
-        "retiling": true,
-        "since": 190000
-      }
-    ],
+    "failures": [],
     "fleet": {
       "agents": {
         "hosts": [
