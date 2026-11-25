@@ -596,18 +596,29 @@ main
                                    text=True, capture_output=True, check=True).stdout
         check = user_data[user_data.index("nic_order_ok() {"):user_data.index("\nSTATUS=boot-failed\n")]
         loader = "systemd-modules-load.service"
-        # machine, the resolved After, systemctl show's status, whether the loader is active
-        cases = [("aarch64", f"systemd-remount-fs.service {loader} system.slice", 0, 0, True),
-                 ("aarch64", "systemd-remount-fs.service system.slice", 0, 0, False),
-                 ("aarch64", f"not-{loader} system.slice", 0, 0, False),
-                 ("aarch64", "", 0, 0, False),
-                 ("aarch64", loader, 1, 0, False),
+        # the loader's file is named where the function reads it
+        self.assertIn("\nNIC_MODULES_LOAD=/etc/modules-load.d/fcvm-runner-nic.conf\n", user_data.split("nic_order_ok() {")[0])
+        # machine, the resolved After, systemctl show's status, whether the loader is active,
+        # the loader's file (None: absent)
+        cases = [("aarch64", f"systemd-remount-fs.service {loader} system.slice", 0, 0, "ena\n", True),
+                 ("aarch64", "systemd-remount-fs.service system.slice", 0, 0, "ena\n", False),
+                 ("aarch64", f"not-{loader} system.slice", 0, 0, "ena\n", False),
+                 ("aarch64", "", 0, 0, "ena\n", False),
+                 ("aarch64", loader, 1, 0, "ena\n", False),
                  # ordered after a loader that failed or never ran: the module was not loaded there
-                 ("aarch64", loader, 0, 3, False),
-                 ("x86_64", "systemd-remount-fs.service system.slice", 0, 3, True)]
-        for machine, after, status, inactive, want in cases:
-            with self.subTest(machine=machine, after=after, status=status, inactive=inactive), \
+                 ("aarch64", loader, 0, 3, "ena\n", False),
+                 # an active loader that was not told to load the driver
+                 ("aarch64", loader, 0, 0, None, False),
+                 ("aarch64", loader, 0, 0, "enax\n", False),
+                 # a long After with the loader first: the answer does not depend on a reader
+                 # that stops at the first match while the list is still being written
+                 ("aarch64", loader + " example.service" * 20000, 0, 0, "ena\n", True),
+                 ("x86_64", "systemd-remount-fs.service system.slice", 0, 3, None, True)]
+        for machine, after, status, inactive, conf, want in cases:
+            with self.subTest(machine=machine, after=after[:80], status=status, inactive=inactive, conf=conf), \
                     tempfile.TemporaryDirectory() as tmp:
+                if conf is not None:
+                    Path(tmp, "nic.conf").write_text(conf)
                 for name, body in (("uname", f'[ "$*" = -m ] && echo {machine}'),
                                    ("systemctl", f'[ "$*" = "is-active --quiet {loader}" ] && exit {inactive}\n'
                                                  f'[ "$*" = "show cloud-init-local.service -p After --value" ] || exit 9\n'
@@ -615,7 +626,7 @@ main
                     tool = Path(tmp, name)
                     tool.write_text("#!/bin/bash\n" + body + "\n")
                     tool.chmod(0o755)
-                ran = subprocess.run(["bash", "-c", "set -uo pipefail\n" + check + "\nnic_order_ok"],
+                ran = subprocess.run(["bash", "-c", f"set -uo pipefail\nNIC_MODULES_LOAD={tmp}/nic.conf\n" + check + "\nnic_order_ok"],
                                      env={"PATH": f"{tmp}:/usr/bin:/bin"}, text=True, capture_output=True)
                 self.assertEqual(ran.returncode == 0, want, ran.stderr)
 

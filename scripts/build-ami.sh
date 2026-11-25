@@ -611,14 +611,21 @@ INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.2
 unset TOKEN
 set -x
 # On arm64 the image orders cloud-init-local after the loader of the NIC's driver (#2174).
-# The loader must have run without a failure this boot, and the order systemd resolved must
-# name it; an order that cannot be read fails.
+# The loader must have been told to load it and have run without a failure this boot, and
+# the order systemd resolved must name the loader; an order that cannot be read fails. The
+# list is matched in the shell: a reader that stops at the first match can end the writer
+# with SIGPIPE, which pipefail reports as a failure.
+NIC_MODULES_LOAD=/etc/modules-load.d/fcvm-runner-nic.conf
 nic_order_ok() {
   local after
   [ "$(uname -m)" = aarch64 ] || return 0
+  grep -qx ena "$NIC_MODULES_LOAD" || return 1
   systemctl is-active --quiet systemd-modules-load.service || return 1
   after=$(systemctl show cloud-init-local.service -p After --value) || return 1
-  printf '%s\n' $after | grep -qx systemd-modules-load.service
+  case " $after " in
+    *" systemd-modules-load.service "*) return 0 ;;
+  esac
+  return 1
 }
 STATUS=boot-failed
 if /usr/local/sbin/check-bridge-teardown-kernel.sh && nic_order_ok; then
