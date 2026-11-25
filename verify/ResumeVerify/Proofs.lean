@@ -1,4 +1,6 @@
 import ResumeVerify.Lemmas
+import ResumeVerify.Today
+import ResumeVerify.Design
 
 set_option linter.unusedSimpArgs false
 
@@ -167,12 +169,132 @@ theorem reachable_inv {R : Rules} {C : Cfg} {s : State} (hR : Sound R) (h : Reac
 section
 variable {R : Rules} {C : Cfg} {s : State}
 
+/-- R1: no cross-call is owed to a CPU whose SGI is neither pending nor active. -/
 theorem sound_noLostIpi (hR : Sound R) (h : Reachable R C s) : lostIpi s = false := by
   have i := (reachable_inv hR h).m
   simp [lostIpi, anyVcpu, i.v0.call, i.v1.call]
   intro _
   constructor <;> (intro h1 h2; simp_all)
 
+/-- R1: the device never waits with its interrupt neither pending nor active. -/
+theorem sound_noLostDeviceIrq (hR : Sound R) (h : Reachable R C s) : lostDeviceIrq C s = false := by
+  have i := (reachable_inv hR h).m
+  have h1 := i.platch
+  have h2 := i.pline
+  cases hd : s.vm.dev <;> cases hl : C.spiLevel <;> cases ha : s.vm.spi.act <;>
+    simp_all [lostDeviceIrq, pend]
+
+/-- R1 and R4: the counter is the one the guest should read whenever it runs, so an armed
+timer fires when it should. -/
+theorem sound_clockRight (hR : Sound R) (h : Reachable R C s) : clockOff s = false := by
+  have i := reachable_inv hR h
+  cases hp : s.ph <;> simp [clockOff, running, hp]
+  exact i.run hp
+
+theorem sound_timerCanFire (hR : Sound R) (h : Reachable R C s) : timerCannotFire s = false := by
+  have i := reachable_inv hR h
+  cases hp : s.ph <;> simp [timerCannotFire, running, hp]
+  intro _
+  rw [i.run hp]
+  decide
+
+/-- R2: no interrupt is active on a CPU that is not in its handler. -/
+theorem sound_noStuckActive (hR : Sound R) (h : Reachable R C s) : stuckActive s = false := by
+  have i := (reachable_inv hR h).m
+  simp [stuckActive, anyVcpu, i.v0.tact, i.v0.sact, i.v1.tact, i.v1.sact, i.pact]
+
+/-- R2: no active priority is left on a CPU that is in no handler. -/
+theorem sound_noStuckPriority (hR : Sound R) (h : Reachable R C s) : stuckPriority s = false := by
+  have i := (reachable_inv hR h).m
+  simp [stuckPriority, anyVcpu, i.v0.ap, i.v1.ap]
+
+/-- R2: no enable the guest set is lost. -/
+theorem sound_noLostEnable (hR : Sound R) (h : Reachable R C s) : lostEnable s = false := by
+  have i := (reachable_inv hR h).m
+  simp [lostEnable, anyVcpu, i.gic, i.pen, i.v0.ten, i.v0.sen, i.v0.pmr, i.v0.grp, i.v1.ten, i.v1.sen,
+    i.v1.pmr, i.v1.grp]
+
+/-- R2: no SGI is pending that nobody sent, and no latch sits on the timer interrupt. -/
+theorem sound_noStrayPending (hR : Sound R) (h : Reachable R C s) : strayPending s = false := by
+  have i := (reachable_inv hR h).m
+  simp [strayPending, anyVcpu, i.v0.call, i.v0.tl, i.v1.call, i.v1.tl]
+  intro _
+  constructor <;> (intro h1; simp_all)
+
+theorem bool3 (g p A B S : Bool) (h : (g && p && (A || B || S)) = true) :
+    ((g && p && true && !false && A) || (g && p && true && !false && B)
+      || (g && p && true && !false && S)) = true := by
+  cases g <;> cases p <;> cases A <;> cases B <;> cases S <;> simp_all
+
+/-- On a CPU with no active priority and its group on, what KVM counts as pending is
+signalled. -/
+theorem idle_signalled (C : Cfg) (m : VM) (v : Vid) (hap : (m.get v).ap = false)
+    (hgrp : (m.get v).grp = true) (hk : kvmPending C m v = true) :
+    (deliverable C m v .tmr || deliverable C m v .sgi || deliverable C m v .spi) = true := by
+  cases v <;> simp only [VM.get_false, VM.get_true] at hap hgrp <;>
+    simp only [kvmPending, deliverable, VM.get_false, VM.get_true, hap, hgrp] at hk ⊢ <;>
+    exact bool3 _ _ _ _ _ hk
+
+/-- R3: no vCPU is idle, runnable for KVM, and beyond every interrupt: an idle CPU has no
+active priority and its group is on, so what KVM counts as pending is signalled. -/
+theorem sound_noSpin (hR : Sound R) (h : Reachable R C s) : spins C s = false := by
+  have i := (reachable_inv hR h).m
+  cases hsp : spins C s
+  · rfl
+  · exfalso
+    simp only [spins, anyVcpu, Bool.and_eq_true, Bool.or_eq_true, Bool.not_eq_true', beq_iff_eq] at hsp
+    rcases hsp with ⟨_, hsp | hsp⟩
+    · obtain ⟨⟨⟨⟨⟨⟨_, _⟩, hg⟩, hk⟩, h1⟩, h2⟩, h3⟩ := hsp
+      have hd := idle_signalled C s.vm false (by simp [VM.get, i.v0.ap, hg]) (by simp [VM.get, i.v0.grp]) hk
+      simp [h1, h2, h3] at hd
+    · obtain ⟨⟨⟨⟨⟨⟨_, _⟩, hg⟩, hk⟩, h1⟩, h2⟩, h3⟩ := hsp
+      have hd := idle_signalled C s.vm true (by simp [VM.get, i.v1.ap, hg]) (by simp [VM.get, i.v1.grp]) hk
+      simp [h1, h2, h3] at hd
+
+/-- R5: a resume in place never finds a vCPU changed. -/
+theorem sound_sourceUndisturbed (hR : Sound R) (h : Reachable R C s) : sourceDisturbed s = false :=
+  (reachable_inv hR h).calm
+
+/-- R6: a CPU the guest has on is not stopped, and one it has off is. -/
+theorem sound_powerRight (hR : Sound R) (h : Reachable R C s) : powerWrong s = false := by
+  have i := (reachable_inv hR h).m
+  simp [powerWrong, anyVcpu, i.v0.mp, i.v1.mp]
+
+/-- Every requirement, in every reachable state. -/
+theorem sound_healthy (hR : Sound R) (h : Reachable R C s) : healthy C s = true := by
+  simp [healthy, checks, sound_noLostIpi hR h, sound_noLostDeviceIrq hR h, sound_timerCanFire hR h,
+    sound_noStuckActive hR h, sound_noStuckPriority hR h, sound_noLostEnable hR h,
+    sound_noStrayPending hR h, sound_noSpin hR h, sound_clockRight hR h,
+    sound_sourceUndisturbed hR h, sound_powerRight hR h]
+
 end
+
+/-! ## The two designs are sound -/
+
+theorem Design.cloudHypervisor_sound : Sound Design.cloudHypervisor :=
+  ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+
+theorem Design.firecracker_sound : Sound Design.firecracker :=
+  ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+
+theorem design_cloudHypervisor {C : Cfg} {s : State} (h : Reachable Design.cloudHypervisor C s) :
+    healthy C s = true := sound_healthy Design.cloudHypervisor_sound h
+
+theorem design_firecracker {C : Cfg} {s : State} (h : Reachable Design.firecracker C s) :
+    healthy C s = true := sound_healthy Design.firecracker_sound h
+
+/-! ## Today's rule books are not sound, and which requirement of `Sound` each fails -/
+
+theorem cloudHypervisor_reads_vcpu0 : Today.cloudHypervisor.slotsFromRestore = true := rfl
+theorem cloudHypervisor_no_freeze : Today.cloudHypervisor.freeze = false := rfl
+theorem forkDefault_no_freeze : Today.forkDefault.freeze = false := rfl
+theorem forkBefore630_no_freeze : Today.forkBefore630.freeze = false := rfl
+theorem forkNested_counter_of_save : Today.forkNested.cntAtPause = false := rfl
+theorem forkNested_load_not_frozen : Today.forkNested.freezeLoaded = false := rfl
+
+theorem cloudHypervisor_not_sound : ¬ Sound Today.cloudHypervisor := fun h => nomatch h.ownSlots
+theorem forkDefault_not_sound : ¬ Sound Today.forkDefault := fun h => nomatch h.freeze
+theorem forkBefore630_not_sound : ¬ Sound Today.forkBefore630 := fun h => nomatch h.freeze
+theorem forkNested_not_sound : ¬ Sound Today.forkNested := fun h => nomatch h.cntAtPause
 
 end Resume

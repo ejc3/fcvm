@@ -1,6 +1,4 @@
 import ResumeVerify.Spec
-import ResumeVerify.Today
-import ResumeVerify.Design
 import ResumeVerify.Properties
 
 set_option linter.unusedSimpArgs false

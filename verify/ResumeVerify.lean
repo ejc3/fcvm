@@ -3,3 +3,8 @@ import ResumeVerify.Today
 import ResumeVerify.Design
 import ResumeVerify.Properties
 import ResumeVerify.Configs
+import ResumeVerify.Breaks
+import ResumeVerify.Invariant
+import ResumeVerify.Lemmas
+import ResumeVerify.Proofs
+import ResumeVerify.Axioms
