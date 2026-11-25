@@ -222,9 +222,12 @@ prices every instance the fleet runs, the replacement included, and a budget tri
 fleet, which terminates every host. Because the ceiling is computed from the rates, a host
 group launches only types the rate table prices (built in, and `--spend-rates`): a template
 whose type has no rate gets no CreateFleet, and the group's component (`scale`,
-`scale-renders`) is degraded with the template and the type until a rate is given. An instance
-of such a type already running is metered at the highest rate known. EC2 tiles are launched
-from their templates without reading the type, and are not checked.
+`scale-renders`) is degraded with the template and the type until a rate is given. One such
+template holds its region's whole request, its priced templates included; the group's other
+regions launch. The rule holds with or without `--daily-spend-usd`. An instance of such a type
+already running is metered at the highest rate known. EC2 tiles are launched from their
+templates without reading the type, and are not checked (#2169); nothing is checked when the
+coordinator starts, because the types are read from the templates at the first launch.
 
 ECS is used for the coordinator only. The GPU hosts stay plain EC2: the ECS GPU AMIs bind
 the NVIDIA driver on the host, and these hosts must leave every GPU to vfio-pci.

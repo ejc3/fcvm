@@ -1171,6 +1171,11 @@ impl AwsHosts {
         self
     }
 
+    /// Whether this driver may launch `instance_type`: its table has a rate for it.
+    pub fn prices(&self, instance_type: &str) -> bool {
+        self.rates.contains_key(instance_type)
+    }
+
     /// The regions with host templates, in name order.
     pub fn regions(&self) -> Vec<String> {
         self.templates.keys().cloned().collect()

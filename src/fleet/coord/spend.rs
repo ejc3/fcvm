@@ -194,8 +194,11 @@ pub fn on_demand_rates(args: &[String]) -> Result<BTreeMap<String, f64>> {
         .map(|(t, r)| (t.to_string(), *r))
         .collect();
     for a in args {
+        // A list written with spaces (`a=1, b=2`) names the same types: a key kept with its
+        // space would price nothing, and a host group launches no type without a rate.
         let (t, r) = a
             .split_once('=')
+            .map(|(t, r)| (t.trim(), r.trim()))
             .filter(|(t, _)| !t.is_empty())
             .with_context(|| {
                 format!("--spend-rates {a:?} is not <instance type>=<USD per hour>")
@@ -1092,6 +1095,10 @@ mod tests {
         assert_eq!(r["c8gd.metal-24xl"], 4.70304);
         let r = on_demand_rates(&["c8gd.metal-24xl=5.1".into()]).unwrap();
         assert_eq!(r["c8gd.metal-24xl"], 5.1);
+        // a list written with spaces names the same types
+        let r = on_demand_rates(&[" x9z.metal = 3.5 ".into()]).unwrap();
+        assert_eq!(r.get("x9z.metal"), Some(&3.5), "{r:?}");
+        assert!(on_demand_rates(&[" =3.5".into()]).is_err());
         // An on-demand renders host is a host in the burn, at that rate.
         let listed = BTreeMap::from([(
             "us-east-2".to_string(),
