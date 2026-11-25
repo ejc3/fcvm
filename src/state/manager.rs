@@ -409,6 +409,56 @@ pub(crate) fn remove_if_exists(path: &Path) -> std::io::Result<()> {
 
 use crate::utils::process_start_time;
 
+/// What a state file says its process has published: the two flags that only ever go from
+/// false to true, and the process they were written for.
+///
+/// `snapshot create` admits a restored VM on `restore_acknowledged` (or, for a state from
+/// before that field, `lifecycle_ready`) without holding a lock against the VM's owner. It
+/// can do that only because a state that reads true never reads false again, so
+/// [`StateManager::save_state`] carries both flags over from the file it replaces when
+/// that file is the same process's.
+#[derive(serde::Deserialize)]
+struct Published {
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    pid_start_time: Option<u64>,
+    #[serde(default)]
+    lifecycle_ready: bool,
+    #[serde(default)]
+    restore_acknowledged: bool,
+}
+
+impl Published {
+    /// The flags of the state file at `path`; None when there is none or it does not parse.
+    fn read(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    /// What `state` says of itself, to carry over a write of it.
+    fn of(state: &VmState) -> Self {
+        Self {
+            pid: state.pid,
+            pid_start_time: state.pid_start_time,
+            lifecycle_ready: state.lifecycle_ready,
+            restore_acknowledged: state.restore_acknowledged,
+        }
+    }
+
+    /// Carry the flags into `state` when it is the state of the same process: the same
+    /// PID with the same start time, both recorded. A state without a start time names no
+    /// process that can be told from a later one with its PID, and inherits nothing.
+    fn keep(&self, state: &mut VmState) {
+        let same_process = self.pid.is_some()
+            && self.pid_start_time.is_some()
+            && (self.pid, self.pid_start_time) == (state.pid, state.pid_start_time);
+        if same_process {
+            state.lifecycle_ready |= self.lifecycle_ready;
+            state.restore_acknowledged |= self.restore_acknowledged;
+        }
+    }
+}
+
 /// Check whether the process recorded in a state file is still the same
 /// process that wrote it. Returns false when the state records a start time
 /// and the process currently at that PID has a different one (PID reuse by an
@@ -554,10 +604,19 @@ fn old_names_lock_wait() -> std::time::Duration {
 /// message. `None` when it names none (or the holder is outside this PID namespace).
 fn flock_holder(path: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
-    let inode = std::fs::metadata(path).ok()?.ino().to_string();
+    let inode = std::fs::metadata(path).ok()?.ino();
+    flock_holder_in(&std::fs::read_to_string("/proc/locks").ok()?, inode)
+}
+
+/// The one PID that `locks`, the text of /proc/locks, names as holding a flock on an inode
+/// numbered `inode`. /proc/locks gives the superblock's device, which on btrfs is not the
+/// device stat reports for a file in a subvolume, so only the inode number is compared. Two
+/// files on different filesystems can share it, so when the flocks on that number are held
+/// by more than one process, none is named.
+fn flock_holder_in(locks: &str, inode: u64) -> Option<u32> {
+    let inode = inode.to_string();
     // "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF"
-    std::fs::read_to_string("/proc/locks")
-        .ok()?
+    let mut holders = locks
         .lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
@@ -565,7 +624,9 @@ fn flock_holder(path: &Path) -> Option<u32> {
                 && fields.get(5)?.rsplit(':').next() == Some(inode.as_str());
             held.then(|| fields.get(4)?.parse::<u32>().ok()).flatten()
         })
-        .find(|pid| *pid > 0)
+        .filter(|pid| *pid > 0);
+    let first = holders.next()?;
+    holders.all(|pid| pid == first).then_some(first)
 }
 
 /// Write the `layout` marker of `state_dir`: under a name of its own, world-readable
@@ -612,6 +673,48 @@ struct LayoutScan {
 impl LayoutScan {
     fn has_old_entries(&self) -> bool {
         !(self.old_states.is_empty() && self.old_files.is_empty() && self.old_dirs.is_empty())
+    }
+}
+
+struct WatchFd(nix::sys::inotify::Inotify);
+
+impl std::os::fd::AsRawFd for WatchFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsFd;
+        self.0.as_fd().as_raw_fd()
+    }
+}
+
+/// A watch on one VM's state file ([`StateManager::watch_state`]).
+pub struct StateWatch {
+    inotify: tokio::io::unix::AsyncFd<WatchFd>,
+    file: std::ffi::OsString,
+}
+
+impl StateWatch {
+    /// Resolves once the state file has been replaced or removed since the watch began or
+    /// since this last resolved. A watch that fails never resolves; its caller's own
+    /// timer is the fallback.
+    pub async fn changed(&mut self) {
+        use nix::sys::inotify::AddWatchFlags;
+        loop {
+            let Ok(mut ready) = self.inotify.readable().await else {
+                return std::future::pending().await;
+            };
+            match ready.get_inner().0.read_events() {
+                Ok(events) => {
+                    // An overflowed queue dropped events, this file's perhaps among them.
+                    if events.iter().any(|event| {
+                        event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW)
+                            || event.name.as_deref() == Some(self.file.as_os_str())
+                    }) {
+                        return;
+                    }
+                }
+                Err(nix::errno::Errno::EAGAIN) => ready.clear_ready(),
+                Err(_) => return std::future::pending().await,
+            }
+        }
     }
 }
 
@@ -1043,6 +1146,11 @@ impl StateManager {
             // Record the start time of the process at `pid` so later lookups
             // can detect PID reuse by an unrelated process (see pid_identity_matches).
             state.pid_start_time = state.pid.and_then(process_start_time);
+            // What this process has published stays published: a save from a copy made
+            // before the publication must not take it back (`Published`).
+            if let Some(published) = Published::read(&state_file) {
+                published.keep(&mut state);
+            }
 
             let state_json = serde_json::to_string_pretty(&state)?;
 
@@ -1439,9 +1547,9 @@ impl StateManager {
     }
 
     /// Sweep the state directory (`cleanup_stale_state`) at most once a `SWEEP_EVERY` per
-    /// state directory, from the one launch that wins `sweep.lock`, after its claim has
-    /// released the name lock. A claim no longer scans every state, so this is what removes the states
-    /// SIGKILLed VMs leave and the index entries that outlive them; until it runs they
+    /// state directory, from the one launch that wins `sweep.lock`, after its claim. A
+    /// claim scans no other VM's state, so this is what removes the states SIGKILLed VMs
+    /// leave and the index entries that outlive them; until it runs they
     /// hold nothing (a dead owner is not live, and a stale index entry names a state that
     /// is gone). Best effort: a sweep that cannot take its lock leaves it to the next.
     async fn maybe_sweep(&self) {
@@ -1590,6 +1698,30 @@ impl StateManager {
             self.release_name(state);
         }
         Ok(())
+    }
+
+    /// Remove the state files of processes that no longer exist, now. For a caller that
+    /// has just killed a set of VMs and must leave nothing of them behind.
+    /// Takes the sweep's lock, waiting up to 30 s for a launch's own sweep to finish, so two
+    /// sweeps never scan at once.
+    pub async fn sweep_stale(&self) {
+        let Ok(mut file) = open_lock_file(&self.state_dir.join("sweep.lock")) else {
+            return;
+        };
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let _guard = loop {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(guard) => break guard,
+                Err((returned, _)) => {
+                    if std::time::Instant::now() >= until {
+                        return;
+                    }
+                    file = returned;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+        self.cleanup_stale_state().await;
     }
 
     /// Clean up stale state files from processes that no longer exist.
@@ -2166,8 +2298,13 @@ impl StateManager {
             let mut state: VmState =
                 serde_json::from_str(&state_json).context("parsing VM state for update")?;
 
-            // Apply caller's modification
+            // Apply caller's modification. An acknowledged restore stays acknowledged
+            // whatever the closure does, unless it made the state another process's:
+            // `snapshot create` relies on it never going back.
+            let mut before = Published::of(&state);
+            before.lifecycle_ready = false;
             mutate(&mut state);
+            before.keep(&mut state);
             state.last_updated = jiff::Timestamp::now();
 
             // Write to temp file
@@ -2238,6 +2375,36 @@ impl StateManager {
             .map_err(|(_, err)| err)
             .context("releasing lock after reading VM state")?;
         result
+    }
+
+    /// Watch one VM's state file for its next replacement or removal.
+    ///
+    /// Every write of a state is a rename onto `<vm_id>.json` (an exchange with its
+    /// temporary file where the filesystem has one, which raises the same event under that
+    /// name) and its removal an unlink, so a waiter that holds a watch from before it read
+    /// the state misses no change. The watch is on the VM's bucket, the one directory its
+    /// state file is ever in, made when missing so that a watch can begin before the VM's
+    /// first state is written.
+    pub fn watch_state(&self, vm_id: &str) -> Result<StateWatch> {
+        use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let bucket = self.bucket_dir(VMS_DIR, &bucket_of(vm_id))?;
+        let inotify = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC)
+            .context("creating an inotify instance for the state directory")?;
+        inotify
+            .add_watch(
+                &bucket,
+                AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_DELETE,
+            )
+            .with_context(|| format!("watching {}", bucket.display()))?;
+        // SAFETY: `WatchFd` owns the inotify descriptor and returns that same open
+        // descriptor from every `as_raw_fd` for as long as the `AsyncFd` holds it.
+        let inotify = unsafe { tokio::io::unix::AsyncFd::register(WatchFd(inotify)) }
+            .map_err(std::io::Error::from)
+            .context("registering the state watch")?;
+        Ok(StateWatch {
+            inotify,
+            file: format!("{vm_id}.json").into(),
+        })
     }
 
     /// Update health status atomically by holding lock across read-modify-write.
@@ -3522,6 +3689,25 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o644, "the marker's mode follows the umask");
+    }
+
+    /// A flock's holder is named from /proc/locks only when one process holds every flock
+    /// on an inode of that number: a file on another filesystem can have the same number,
+    /// and naming its holder would tell the operator to end the wrong process.
+    #[test]
+    fn a_lock_holder_is_named_only_when_one_process_holds_that_inode() {
+        let one = "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF\n\
+                   2: POSIX  ADVISORY  WRITE 99 fd:01:5678 0 EOF\n\
+                   3: FLOCK  ADVISORY  WRITE 77 fd:01:56789 0 EOF\n";
+        assert_eq!(flock_holder_in(one, 5678), Some(1234));
+        assert_eq!(flock_holder_in(one, 1), None);
+        let two = "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF\n\
+                   2: FLOCK  ADVISORY  WRITE 4321 00:2c:5678 0 EOF\n";
+        assert_eq!(
+            flock_holder_in(two, 5678),
+            None,
+            "a holder was named although two processes hold flocks on inodes numbered 5678"
+        );
     }
 
     /// The marker's temporary is synced before the rename that publishes it and the

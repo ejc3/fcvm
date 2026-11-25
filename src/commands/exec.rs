@@ -452,11 +452,24 @@ fn read_vsock_epoch(state_file: &Path) -> Option<u64> {
 pub(crate) struct EpochGuardedReader {
     stream: UnixStream,
     guard: SnapshotOrphanGuard,
+    /// When the session is given up on, for a caller that set one (`ending_by`).
+    deadline: Option<std::time::Instant>,
 }
 
 impl EpochGuardedReader {
     pub(crate) fn new(stream: UnixStream, guard: SnapshotOrphanGuard) -> Self {
-        Self { stream, guard }
+        Self {
+            stream,
+            guard,
+            deadline: None,
+        }
+    }
+
+    /// Fail a read that is still waiting at `deadline`. Checked on the socket's polling
+    /// clock, so it is late by at most `EXEC_EPOCH_POLL_INTERVAL`.
+    pub(crate) fn ending_by(mut self, deadline: Option<std::time::Instant>) -> Self {
+        self.deadline = deadline;
+        self
     }
 }
 
@@ -469,6 +482,16 @@ impl Read for EpochGuardedReader {
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
                     self.guard.check().map_err(std::io::Error::other)?;
+                    if self
+                        .deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the guest took the command and did not finish it in the time \
+                             its caller allowed",
+                        ));
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 other => return other,
@@ -956,6 +979,19 @@ pub async fn run_exec_in_vm_captured(
     in_container: bool,
     vm_id: &str,
 ) -> Result<ExecOutput> {
+    run_exec_in_vm_captured_within(vsock_socket, command, in_container, vm_id, None).await
+}
+
+/// [`run_exec_in_vm_captured`] with a limit on the session once the guest has taken the
+/// command: a read still waiting `answer_within` after the handshake fails the exec. The
+/// connect and its retries come before it and are not counted.
+pub async fn run_exec_in_vm_captured_within(
+    vsock_socket: &Path,
+    command: &[String],
+    in_container: bool,
+    vm_id: &str,
+    answer_within: Option<std::time::Duration>,
+) -> Result<ExecOutput> {
     debug!(
         socket = %vsock_socket.display(),
         command = ?command,
@@ -979,9 +1015,10 @@ pub async fn run_exec_in_vm_captured(
 
         // Connect, send the request, and complete the ACK/GO handshake
         let (stream, guard) = connect_and_start_exec(&vsock_socket, &request, &vm_id)?;
+        let deadline = answer_within.map(|limit| std::time::Instant::now() + limit);
 
         // Capture the streams instead of printing them
-        let reader = BufReader::new(EpochGuardedReader::new(stream, guard));
+        let reader = BufReader::new(EpochGuardedReader::new(stream, guard).ending_by(deadline));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit_code = read_exec_frames(

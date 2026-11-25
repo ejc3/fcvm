@@ -48,6 +48,12 @@ test-runner-acceptance:
 test-ci-scope:
 	python3 scripts/test-ci-stack-scope.py
 
+# scripts/check-runner-kernel.py against fixture repositories. Needs git 2.29 and Python 3.11.4
+# (tomllib, tarfile's extraction filter, fetch --no-write-fetch-head) or later.
+.PHONY: test-runner-kernel
+test-runner-kernel:
+	python3 -B scripts/test-check-runner-kernel.py
+
 .PHONY: test-ci-security test-ci-workflow-security test-ami-security
 test-ci-security: test-ci-workflow-security test-ami-security
 test-ci-workflow-security:
@@ -615,6 +621,36 @@ build-fleet-coordinator: cargo-target-link dep-provenance
 test-fleet-coordinator: private SHELL := $(TARGET_LEASE_SHELL)
 test-fleet-coordinator: cargo-target-link dep-provenance
 	CARGO_TARGET_DIR=target $(CARGO) test --locked --release --no-default-features -p fcvm --test test_fleet_coord
+
+# Pages mode's host module on its own, as a systemd unit started with sudo
+# (bench/chromium/renders_bench.sh lists the knobs; command-line variables reach it):
+#   make fleet-renders-bench OUT=dir KITESURF=dir [TAG=] [LEVELS=F,K] [SECONDS_RUN=]
+# It runs target/release/fcvm as built and has no build dependency: a figure is taken from
+# the binary the snapshot was made with.
+.PHONY: fleet-renders-bench
+fleet-renders-bench:
+	@test -n "$(OUT)" || { echo "fleet-renders-bench needs OUT=DIR" >&2; exit 2; }
+	bench/chromium/renders_bench.sh run
+
+# End a pages-mode module at each stage (SIGKILL, and SIGTERM while it renders) and count
+# what is left: processes, cgroups, namespaces, clones, sockets, ports, the run directory.
+# Needs what fleet-renders-bench needs, on a host that is otherwise idle.
+#   make test-fleet-renders-teardown OUT=dir KITESURF=dir [STAGES=a,b:TERM]
+.PHONY: test-fleet-renders-teardown
+test-fleet-renders-teardown:
+	@test -n "$(OUT)" || { echo "test-fleet-renders-teardown needs OUT=DIR" >&2; exit 2; }
+	bench/chromium/renders_bench.sh teardown-check $(STAGES)
+
+# The same module under `fcvm fleet agent --renders`, with the coordinator's side played by
+# bench/chromium/renders_agent_check.py over the agent's --stdio: the hello, renders on both
+# sides, an overlay order, a stop while rendering and while held at HOLD_STAGES (the agent
+# stays up and renders again), and SIGKILL of the agent at each of STAGES (SIGTERM at
+# running:TERM). Every census count must be zero. No build dependency, as above.
+#   make test-fleet-renders-agent OUT=dir KITESURF=dir [STAGES=a,b:TERM] [HOLD_STAGES=a,b] [CASES=running,held,kill]
+.PHONY: test-fleet-renders-agent
+test-fleet-renders-agent:
+	@test -n "$(OUT)" || { echo "test-fleet-renders-agent needs OUT=DIR" >&2; exit 2; }
+	bench/chromium/renders_bench.sh agent-check $(STAGES)
 
 # The directed camera's program with no votes, as JSON (fleet/core/examples/program.rs):
 # make fleet-program SEED=1 SECS=600 OUT=program.json
@@ -1731,6 +1767,7 @@ bench-clone-latency: build setup-default
 # Start rate: snapshot clones reaching healthy per second (bench/start-rate/README.md).
 #   make bench-start-rate-prep OUT=/mnt/fcvm-btrfs/sr/prep-rootless NETWORK=rootless UFFD=1
 #   make bench-start-rate-run PREP=/mnt/fcvm-btrfs/sr/prep-rootless/prep.json OUT=... COUNT=1000 CONCURRENCY=128
+#   RATE=500 paces the starts at 500 a second (CONCURRENCY then only caps how many are starting at once)
 #   make bench-start-rate-teardown PREP=...
 # NETWORK=bridged|routed run fcvm under sudo. run and teardown have no build dependency:
 # a rebuild between prep and run would measure clones of a snapshot another binary made.
@@ -1746,7 +1783,7 @@ bench-start-rate-prep: build setup-default
 bench-start-rate-run:
 	@test -n "$(PREP)" -a -n "$(OUT)" -a -n "$(COUNT)" -a -n "$(CONCURRENCY)" || { echo "PREP= OUT= COUNT= CONCURRENCY= are required"; exit 2; }
 	$$(jq -e .sudo $(PREP) >/dev/null && echo sudo -E) $(START_RATE) run --fcvm $(START_RATE_FCVM) --prep $(PREP) --out $(OUT) --count $(COUNT) \
-		--concurrency $(CONCURRENCY) --launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180) --hold $(or $(HOLD),0)
+		--concurrency $(CONCURRENCY) --launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180) --hold $(or $(HOLD),0) $(if $(RATE),--rate $(RATE))
 
 # Keeps ALIVE clones up, each for LIFETIME, in a namespace pool that is already running
 # (`fcvm netpool serve`), and measures the rate of starts and stops that takes: the loop is

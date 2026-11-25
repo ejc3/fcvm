@@ -68,8 +68,9 @@ jobs:
   # (docs, the assistant tooling, the claude workflows) still runs `actionlint`
   # and still publishes `Summary`; it just skips the VM matrix, which cannot say
   # anything about those files. Gating per-job rather than per-workflow is what
-  # keeps `Summary` present on every PR. A draft, or a PR with another stacked
-  # on it, runs none of them (not even `actionlint`) and reports `Summary (deferred)`.
+  # keeps `Summary` present on every PR. A draft, or a PR with another PR that is
+  # not a draft stacked on it, runs none of them (not even `actionlint`) and reports
+  # `Summary (deferred)`.
   changes:
     name: Changes
     runs-on: ubuntu-latest
@@ -84,8 +85,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # A draft, and a PR with another open PR stacked on it, run nothing; the top
-      # of a stack classifies the whole stack's diff. See scripts/ci-pr-scope.sh.
+      # A draft, and a PR with another open PR that is not a draft stacked on it,
+      # run nothing; the top of a stack classifies the whole stack's diff. See
+      # scripts/ci-pr-scope.sh.
       - name: Detect what this event needs to run
         id: detect
         env:
@@ -271,6 +273,8 @@ jobs:
         run: make test-runner-acceptance
       - name: Test the pull request scope and stack coverage
         run: make test-ci-scope
+      - name: Test the runner kernel check
+        run: make test-runner-kernel
       - name: Test cached release downloads
         run: bash scripts/test-cached-download.sh
       - name: Test workflow trust conditions and AMI build arguments
@@ -741,6 +745,11 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
+      # Fail on a runner whose kernel is not a host kernel this checkout or main builds: a
+      # stock kernel, or an image older than the last host kernel change (#1563, #2125).
+      - name: Runner kernel check
+        working-directory: fcvm
+        run: ./scripts/check-runner-kernel.py
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
@@ -1083,6 +1092,11 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
+      # Fail on a runner whose kernel is not a host kernel this checkout or main builds: a
+      # stock kernel, or an image older than the last host kernel change (#1563, #2125).
+      - name: Runner kernel check
+        working-directory: fcvm
+        run: ./scripts/check-runner-kernel.py
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
@@ -1445,6 +1459,11 @@ jobs:
       - name: Disk preflight
         working-directory: fcvm
         run: ./scripts/runner-disk-preflight.sh
+      # Fail on a runner whose kernel is not a host kernel this checkout or main builds: a
+      # stock kernel, or an image older than the last host kernel change (#1563, #2125).
+      - name: Runner kernel check
+        working-directory: fcvm
+        run: ./scripts/check-runner-kernel.py
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
@@ -1562,7 +1581,8 @@ jobs:
           retention-days: 14
 
   # Final summary job - runs after all test jobs
-  # A run that tested nothing (a draft, or a PR with another stacked on it) is
+  # A run that tested nothing (a draft, or a PR with another PR that is not a
+  # draft stacked on it) is
   # named "Summary (deferred)", so a reader or a tool looking for a passing
   # Summary on that commit finds none.
   summary:

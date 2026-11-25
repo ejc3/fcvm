@@ -24,10 +24,12 @@ async fn test_state_persistence() {
         pid: Some(12345),
         pid_start_time: None,
         lifecycle_ready: false,
+        restore_acknowledged: false,
         holder_pid: None,
         netpool: None,
         confinement: None,
         vsock_epoch: 0,
+        network_gate_closed: false,
         created_at: now,
         last_updated: now,
         config: VmConfig {
@@ -147,10 +149,12 @@ async fn test_list_vms() {
             pid: Some(10000 + i),
             pid_start_time: None,
             lifecycle_ready: false,
+            restore_acknowledged: false,
             holder_pid: None,
             netpool: None,
             confinement: None,
             vsock_epoch: 0,
+            network_gate_closed: false,
             created_at: now,
             last_updated: now,
             config: VmConfig {
@@ -240,10 +244,12 @@ async fn test_load_state_by_name_duplicate_detection() {
             pid: Some(pid),
             pid_start_time: None,
             lifecycle_ready: false,
+            restore_acknowledged: false,
             holder_pid: None,
             netpool: None,
             confinement: None,
             vsock_epoch: 0,
+            network_gate_closed: false,
             created_at: now,
             last_updated: now,
             config: VmConfig {
@@ -328,10 +334,12 @@ async fn test_load_state_by_name_duplicate_detection() {
         pid: Some(6000),
         pid_start_time: None,
         lifecycle_ready: false,
+        restore_acknowledged: false,
         holder_pid: None,
         netpool: None,
         confinement: None,
         vsock_epoch: 0,
+        network_gate_closed: false,
         created_at: now,
         last_updated: now,
         config: VmConfig {
@@ -484,10 +492,12 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
         pid: Some(pid),
         pid_start_time: None,
         lifecycle_ready: false,
+        restore_acknowledged: false,
         holder_pid: None,
         netpool: None,
         confinement: None,
         vsock_epoch: 0,
+        network_gate_closed: false,
         created_at: Timestamp::now(),
         last_updated: Timestamp::now(),
         config: VmConfig {
@@ -1069,15 +1079,26 @@ async fn starting_and_stopping_a_vm_truncates_no_lock_file() {
             manager.delete_state(id).await.unwrap();
         }
     };
-    // The first start creates the sweep's lock file; the second opens it again.
-    start_and_stop("vm-first").await;
+    // The first start makes every directory a start of this vm_id, name and process
+    // uses. The second makes the VM's lock file anew (the first's delete removed it) and
+    // opens it again for each later save and for the delete: those opens are what a
+    // truncating open would show up in.
+    start_and_stop("vm-repeat").await;
     let inotify = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
-    // Every directory the first start made: the second uses the same ones (one name,
-    // one process) apart from its own state's bucket.
-    for dir in dirs_under(temp_dir.path()) {
+    let dirs = dirs_under(temp_dir.path());
+    let lock_dir = manager
+        .lock_file("vm-repeat")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    assert!(
+        dirs.contains(&lock_dir),
+        "the VM's lock file is in no watched directory"
+    );
+    for dir in dirs {
         inotify.add_watch(&dir, AddWatchFlags::IN_MODIFY).unwrap();
     }
-    start_and_stop("vm-second").await;
+    start_and_stop("vm-repeat").await;
     let mut truncated = Vec::new();
     loop {
         match inotify.read_events() {
@@ -1451,27 +1472,38 @@ async fn readers_never_see_a_state_being_written() {
     vm.name = Some("busy".to_string());
     manager.claim_name(&mut vm).await.unwrap();
 
+    // Each side does a fixed number of operations while the other runs: the reader reads
+    // until it has read `ROUNDS` times and the writer has written `ROUNDS` times, and the
+    // writer writes until the reader is done. The deadline only catches a stall.
+    const ROUNDS: u32 = 50;
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let writer = {
-        let (dir, stop) = (dir.clone(), stop.clone());
+        let (dir, stop, writes) = (dir.clone(), stop.clone(), writes.clone());
         tokio::spawn(async move {
             let manager = StateManager::new(dir);
-            let mut writes = 0u32;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let written = writes.load(std::sync::atomic::Ordering::Relaxed);
                 manager
-                    .update_state("vm-busy", |state| state.exit_code = Some(writes as i32))
+                    .update_state("vm-busy", |state| state.exit_code = Some(written as i32))
                     .await
                     .unwrap()
                     .expect("the state is there");
-                writes += 1;
+                writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            writes
         })
     };
     let me = std::process::id();
     let mut reads = 0;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-    while std::time::Instant::now() < deadline {
+    let stalled = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while (reads < ROUNDS || writes.load(std::sync::atomic::Ordering::Relaxed) < ROUNDS)
+        && !writer.is_finished()
+    {
+        assert!(
+            std::time::Instant::now() < stalled,
+            "stalled after {reads} reads and {} writes",
+            writes.load(std::sync::atomic::Ordering::Relaxed)
+        );
         let reader = StateManager::new(dir.clone());
         let listed = reader.list_vms().await.unwrap();
         assert_eq!(listed.len(), 1, "the VM vanished from a listing");
@@ -1487,10 +1519,7 @@ async fn readers_never_see_a_state_being_written() {
         reads += 1;
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let writes = writer.await.unwrap();
-    assert!(
-        writes > 20 && reads > 20,
-        "only {writes} writes and {reads} reads raced: the test checked little"
-    );
+    // A writer that failed ended the loop early; its panic is reported here.
+    writer.await.unwrap();
     manager.delete_state("vm-busy").await.unwrap();
 }

@@ -267,7 +267,10 @@ class Player:
         assert self.phase in ("awake", "sleeping"), self.phase
         self.phase = "sleeping"
         t0 = now()
-        args = [(env or ENV).get("FCVM_BIN", FCVM), "snapshot", "create", "--pid", str(self.proc.pid), "--tag", self.tag]
+        # A player is awake when it answers, a moment before its `snapshot run` has recorded the
+        # restore's acknowledgement; a create in between is refused unless it waits.
+        args = [(env or ENV).get("FCVM_BIN", FCVM), "snapshot", "create", "--pid", str(self.proc.pid), "--tag", self.tag,
+                "--await-restore", "10"]
         if STOP:
             args.append("--stop")
         p = await asyncio.create_subprocess_exec(

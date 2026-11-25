@@ -502,6 +502,10 @@ pub struct View {
     /// host has run players.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub potato: Option<crate::potato::PotatoView>,
+    /// Pages mode (`?mode=pages`): the renders host's last report and the overlay. Absent
+    /// while no host runs the mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renders: Option<crate::renders::RendersView>,
 }
 
 impl PhonesView {
@@ -902,6 +906,14 @@ pub fn view(state: &State) -> View {
         windows: windows_view(state),
         minecraft: minecraft_view(state),
         potato: state.fleet.potato.view(&state.config.potato),
+        renders: state
+            .fleet
+            .renders
+            .view(&state.config.renders)
+            .map(|mut v| {
+                (v.frame_url, v.frame_url_v4) = renders_urls(state, &v.host);
+                v
+            }),
     }
 }
 
@@ -1660,6 +1672,34 @@ pub fn host_aggregate_urls(state: &State, h: &Host) -> (Option<String>, Option<S
                 h.aggregate_ipv6.as_deref(),
                 h.aggregate_ipv4.as_deref(),
                 h.aggregate_v4_port,
+            ) =>
+        {
+            (p.frame_url.clone(), p.frame_url_v4.clone())
+        }
+        _ => (None, None),
+    }
+}
+
+/// Pages mode's host's frame URLs (IPv6, IPv4), as for a host aggregator: with published
+/// names, those of the addresses its hello gave, once published; otherwise the URLs of its
+/// last report.
+pub fn renders_urls(state: &State, host: &str) -> (Option<String>, Option<String>) {
+    let Some(h) = state.fleet.renders.hosts.get(host) else {
+        return (None, None);
+    };
+    if !state.config.names_published {
+        let r = h.report.as_ref();
+        return (
+            r.and_then(|r| r.frame_url.clone()),
+            r.and_then(|r| r.frame_url_v4.clone()),
+        );
+    }
+    match &h.published {
+        Some(p)
+            if p.names(
+                h.hello.ipv6.as_deref(),
+                h.hello.ipv4.as_deref(),
+                h.hello.v4_port,
             ) =>
         {
             (p.frame_url.clone(), p.frame_url_v4.clone())

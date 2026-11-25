@@ -563,6 +563,10 @@ pub async fn handle_clone_restore(
         *carried_listeners.lock().unwrap() = Some(carried);
         Ok(())
     };
+    // failpoint: the restore is under way and has not taken the boundary lock. The exec
+    // server was asked to re-register at the top, so a test can ask things of a clone
+    // held here: what a snapshot create finds when it arrives before the boundary.
+    failpoint::hit_async("restore.pre_boundary").await;
     let restored = crate::snapshot_network::restore_snapshot_network(move_to_clone_address)
         .await
         .context("restore phase tcp-cleanup")?;
@@ -1322,6 +1326,7 @@ mod tests {
             reassert_ms: 0.0,
             barrier_ms: 20.0,
             destroy_ms: 600.0,
+            listing_ms: 0.0,
             egress_open_ms: 30.0,
             hook_ms: 0.0,
             reopen_ms: 0.0,
