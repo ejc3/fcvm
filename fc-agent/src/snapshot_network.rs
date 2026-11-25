@@ -3940,6 +3940,51 @@ mod tests {
         assert_eq!(dumps.taken, 2);
     }
 
+    /// A loopback socket with no mirror image is named and retired whatever its state,
+    /// also where it is one end of a connection inside the guest that the kernel left
+    /// alone. That happens two ways. The other end closed and its TIME-WAIT socket
+    /// expired, which leaves the survivor in CLOSE-WAIT. Or a SYN to a loopback listener
+    /// whose accept queue is full was dropped, which leaves the client alone in SYN-SENT.
+    /// A process of the clone that holds such an end made after the resume reads a reset
+    /// where its peer was already gone, or has one connect fail that would have sent its
+    /// SYN again.
+    ///
+    /// The state cannot excuse the socket. A `/loopback` port's client that has sent its
+    /// FIN leaves the server's socket in CLOSE-WAIT with a 127.0.0.1 peer and no mirror
+    /// image, and the server can still send to that client on the host. The two are the
+    /// same record in a dump, so a rule that kept the first would keep the second.
+    ///
+    /// This pins what the code does, so that changing it is a decision.
+    #[test]
+    fn a_lone_loopback_end_is_named_and_retired_whatever_its_state() {
+        const TCP_SYN_SENT: u8 = 2;
+        const TCP_CLOSE_WAIT: u8 = 8;
+        let empty = SnapshotNetworkManifest {
+            version: MANIFEST_VERSION,
+            routes: Vec::new(),
+            sockets: Vec::new(),
+        };
+        for state in [TCP_CLOSE_WAIT, TCP_SYN_SENT] {
+            let [client, server] = connection(1, 2, "127.0.0.1", "127.0.0.1");
+            let survivor = TcpSocketIdentity { state, ..server };
+            let connecting = TcpSocketIdentity { state, ..client };
+            let from_the_host = TcpSocketIdentity {
+                state,
+                ..loopback_client_port_socket(3)
+            };
+            for lone in [survivor, connecting, from_the_host] {
+                // the snapshot's manifest names it, after a second look for its other end
+                let mut dumps = Dumps::of(&[&[lone]]);
+                assert_eq!(manifest_sockets(&mut dumps).unwrap(), vec![lone]);
+                assert_eq!(dumps.taken, 2);
+                // and a restore whose manifest does not name it retires it
+                let mut dumps = Dumps::of(&[&[lone]]);
+                assert_eq!(unlisted_sockets(&mut dumps, &empty).unwrap(), vec![lone]);
+                assert_eq!(dumps.taken, 2);
+            }
+        }
+    }
+
     #[derive(Default)]
     struct MemoryStore(Mutex<Option<SnapshotNetworkManifest>>);
 
