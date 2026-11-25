@@ -67,7 +67,7 @@ What the boundary needs is narrow, and both halves are non-destructive:
 
 | need | mechanism | reversible? |
 |------|-----------|-------------|
-| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: its chains and hooks added, then removed |
+| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables): a TCP SYN without ACK is reset, read off the packet | yes: its chains and hooks added, then removed |
 | packets already in receive processing must drain | one expedited RCU grace period, `membarrier(MEMBARRIER_CMD_GLOBAL)` in fc-agent's own thread | yes: the kernel's `rcu_expedited` switch is on for the grace period, then put back |
 | restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
 | a restored clone's own page faults must not queue behind its workload's | the container's cgroup frozen (`cgroup.freeze`) from the prepare until the source resumes or the clone is about to publish (`fc-agent/src/payload_freeze.rs`) | yes: a thaw undoes it, and the guest agent's watchdog thread thaws it itself once it has found the freeze on 60 looks a second apart (time the guest ran, which a clock does not measure across a pause or a restore), so a resume that never arrives, a killed prepare or a killed fcvm cannot leave it frozen; the record `/run/fcvm-payload-frozen` names the frozen cgroups, written before they are frozen, under one lock |
@@ -135,6 +135,54 @@ touches the link, so there are no routes and no neighbours to reinstate.
 addresses across one snapshot and fails on any difference. The `ModelBarrier`
 and `ModelDiag` invariants in `fc-agent/src/snapshot_network.rs` fail if any
 boundary step takes the link down, on the source or the clone path.
+
+### The gate reads the packet. It does not ask connection tracking.
+
+The gate's TCP rule was `-m conntrack --ctstate NEW` until 2026-11-24 (#2106).
+In a guest with no nat rule (a routed VM without a published port or the egress
+proxy), that rule was the only thing that attached the tracker, and the tracker
+tracks only while a rule needs it: 5 connections made with no such rule left the
+table empty, 5 made with one left 5 entries, 5 more after it was deleted left
+none. Three faults came from it:
+
+- **The snapshot reset the source's connections.** With the tracker attached at
+  the close, the next segment of a connection that was already open was the
+  first the tracker saw of it, which is NEW. An HTTP connection sending a
+  request every 25 ms through `snapshot create` was reset at its 21st.
+- **The gate left state behind.** A connection open when the gate's chains are
+  removed keeps its entry with nobody tracking its FIN: ESTABLISHED, for the
+  5 days an established flow may idle, counted in guest run time, and every
+  later snapshot of that guest carries it. The table holds 8192.
+- **A stale tuple passed the closed gate.** A SYN on a tuple tracked as
+  ESTABLISHED is not NEW, so the listener accepted it and a restored clone
+  answered a client before publication. A fleet potato player answered a probe
+  that way and refused the wake message sent 0.1 ms later: one wake in 13,444
+  and one in 22,352, a round lost each time.
+
+The rule is now `-p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with
+tcp-reset` in both chains and both families (`TCP_NEW_FLOW_REJECT`).
+
+**Rules:**
+
+1. **Nothing the snapshot side installs may use connection tracking.** Attaching
+   the tracker changes what the guest's kernel does with every packet and leaves
+   entries behind.
+2. **What begins a flow is read off the packet where the protocol has such a
+   packet.** The tracker's memory outlives the connections it describes. For
+   TCP that packet is a SYN without ACK, with one exception the rule does not
+   cover: the ACK that completes a handshake the listener answered with a SYN
+   cookie (#2123).
+3. **The restored clone's UDP rule is the exception, and only on the restore
+   side** (`udp_ingress_rule_args`): UDP has no packet that begins a flow. Its
+   doc says what it promises and what it does not.
+
+**Enforcement:** `a_syn_is_refused_whatever_the_tracker_holds_for_its_tuple`,
+`a_segment_of_an_open_connection_passes_untracked` and
+`no_rule_the_snapshot_side_installs_uses_connection_tracking` run a packet model
+over the chains `gate_chain_rules` builds.
+`a_stale_tracked_tuple_does_not_pass_a_restored_clones_closed_gate` and
+`a_snapshot_leaves_the_sources_tracked_connections_as_it_found_them`
+(`tests/test_snapshot_gate_tcp.rs`) hold both in a routed VM.
 
 ### On restore, the gate's egress half opens before the stale sockets are retired
 
