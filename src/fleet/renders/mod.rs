@@ -1128,13 +1128,15 @@ pub async fn bench(args: FleetRendersBenchArgs) -> Result<()> {
     };
     // One module per run directory, and never a directory that is someone else's.
     let lock = reap::RunLock::take(&args.run_dir)?;
-    lock.claim(&args.run_dir)?;
+    lock.usable(&args.run_dir)?;
     // What a module that lost its host left, before anything is made.
     let left = reap::sweep(&target).await;
     anyhow::ensure!(
         left.clean(),
         "an earlier run's processes could not be removed: {left:?}"
     );
+    // The path is this run's from here; the sweep that removes its directory ends that.
+    lock.claim(&args.run_dir)?;
     std::fs::create_dir_all(&args.out)?;
     let logs = args.out.join("logs");
     std::fs::create_dir_all(logs.join("clones"))?;
@@ -1955,6 +1957,24 @@ mod tests {
             .expect("the starts are ended");
         let returned = run.find("let ended = ended?;").unwrap();
         assert!(stop < returned, "ended before an error leaves run()");
+    }
+
+    /// The run directory is claimed after the start's sweep (which ends an earlier run's
+    /// claim with its directory) and before the reaper and anything made in the directory.
+    #[test]
+    fn the_run_directory_is_claimed_between_the_sweep_and_the_reaper() {
+        let source = include_str!("mod.rs");
+        let source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let at = |text: &str| {
+            source
+                .find(text)
+                .unwrap_or_else(|| panic!("{text} is in the module's start"))
+        };
+        let usable = at("lock.usable(&args.run_dir)?;");
+        let swept = at("reap::sweep(&target).await;");
+        let claimed = at("lock.claim(&args.run_dir)?;");
+        let reaper = at("reap::Reaper::start(");
+        assert!(usable < swept && swept < claimed && claimed < reaper);
     }
 
     #[test]

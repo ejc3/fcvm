@@ -151,10 +151,12 @@ fn lock_path(run_dir: &Path) -> anyhow::Result<PathBuf> {
 /// What the lock file holds once the path is the module's.
 const CLAIMED: &str = "pages-mode run directory\n";
 
-/// Whether `run_dir` was claimed as a pages-mode run directory ([`RunLock::claim`]). The
+/// Whether `run_dir` is claimed as a pages-mode run directory ([`RunLock::claim`]). The
 /// record is beside the directory, never in it: nothing a removal does to the directory,
 /// cut short or refused part-way, changes whose it is, and a sweep removes only a claimed
-/// one.
+/// one. Without the record a directory that holds files cannot be told from someone
+/// else's, so a lock file that was removed while its directory held a run's files leaves
+/// a directory a start refuses until a person removes it ([`RunLock::usable`] says so).
 pub fn run_dir_owned(run_dir: &Path) -> bool {
     lock_path(run_dir)
         .ok()
@@ -163,12 +165,23 @@ pub fn run_dir_owned(run_dir: &Path) -> bool {
 }
 
 /// Remove a run directory with everything in it, when the path was claimed; a path nobody
-/// claimed stays as it is. Returns whether the directory is still there.
+/// claimed stays as it is. Once the directory is gone the claim ends with it, so what
+/// someone else later puts at the path is theirs. Returns whether the directory is still
+/// there. The caller holds the path's lock ([`RunLock`]): a module at its start, or its
+/// reaper.
 fn remove_run_dir(run_dir: &Path) -> bool {
+    let gone = |dir: &Path| matches!(std::fs::symlink_metadata(dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
     if run_dir_owned(run_dir) {
         let _ = std::fs::remove_dir_all(run_dir);
+        if gone(run_dir) {
+            // A sweep ended between the two leaves a claimed path with no directory, which
+            // the next start claims again.
+            let _ = lock_path(run_dir)
+                .and_then(|path| Ok(std::fs::OpenOptions::new().write(true).open(path)?))
+                .and_then(|file| Ok(file.set_len(0)?));
+        }
     }
-    run_dir.exists()
+    !gone(run_dir)
 }
 
 /// One module at a time per run directory: an exclusive lock on `<run dir>.lock`, held by
@@ -203,24 +216,45 @@ impl RunLock {
         Ok(RunLock { file, path })
     }
 
-    /// Make `run_dir` the module's, under the lock. A path claimed before stays claimed,
-    /// whatever its directory holds now (what a module that lost its host left). A path
-    /// never claimed is claimed only while its directory is absent or empty: one that holds
-    /// files is someone else's, and is refused and never removed.
-    pub fn claim(&self, run_dir: &Path) -> anyhow::Result<()> {
-        use std::io::Write;
+    /// Whether a module may use `run_dir`, before anything is removed or made. A claimed
+    /// path may be, whatever its directory holds (what a module that lost its host left).
+    /// A path nobody claimed may be only while its directory is absent or empty: one that
+    /// holds files is someone else's as far as anything here can tell, and is refused and
+    /// never removed. A lock file that holds anything but the record, or a record cut
+    /// short while it was written, is someone else's file and is never written over.
+    pub fn usable(&self, run_dir: &Path) -> anyhow::Result<()> {
         if run_dir_owned(run_dir) {
             return Ok(());
         }
+        let held = std::fs::read(&self.path)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", self.path.display()))?;
+        anyhow::ensure!(
+            CLAIMED.as_bytes().starts_with(&held),
+            "{} is not a pages-mode lock file (it holds something else); name a --run-dir whose `.lock` file is free",
+            self.path.display()
+        );
         let free = match std::fs::read_dir(run_dir) {
             Ok(mut entries) => entries.next().is_none(),
             Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         };
         anyhow::ensure!(
             free,
-            "--run-dir {} holds files that are not a pages-mode run's; the module removes its run directory at start and at the end, so name a directory of its own",
-            run_dir.display()
+            "--run-dir {} holds files and {} does not record it as a pages-mode run directory. The module removes its run directory at start and at the end, so name a directory of its own; if an earlier pages-mode run left these, remove the directory by hand",
+            run_dir.display(),
+            self.path.display()
         );
+        Ok(())
+    }
+
+    /// Make `run_dir` this run's, under the lock, after what an earlier run left is gone
+    /// and before anything is made in it. The claim ends when a sweep has removed the
+    /// directory ([`remove_run_dir`]).
+    pub fn claim(&self, run_dir: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        self.usable(run_dir)?;
+        if run_dir_owned(run_dir) {
+            return Ok(());
+        }
         self.file.set_len(0)?;
         (&self.file).write_all(CLAIMED.as_bytes())?;
         self.file.sync_all()?;
@@ -420,7 +454,7 @@ mod tests {
         let lock = RunLock::take(&theirs).unwrap();
         let refused = lock.claim(&theirs).unwrap_err();
         assert!(
-            refused.to_string().contains("not a pages-mode run's"),
+            refused.to_string().contains("does not record it"),
             "{refused}"
         );
         assert!(!run_dir_owned(&theirs));
@@ -471,14 +505,48 @@ mod tests {
         std::fs::write(run.join("logs/engine-0.log"), "x").unwrap();
         assert!(!remove_run_dir(&run));
         assert!(!run.exists());
-        // gone, and still the module's for the next start
-        assert!(run_dir_owned(&run));
+        // The claim ended with the directory: what someone puts at the path afterwards is
+        // theirs, refused at the next start and left where it is.
+        assert!(!run_dir_owned(&run));
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("thesis.tex"), "keep").unwrap();
+        let refused = lock.claim(&run).unwrap_err();
+        assert!(
+            refused.to_string().contains("remove the directory by hand"),
+            "{refused}"
+        );
+        assert!(remove_run_dir(&run));
+        assert!(run.join("thesis.tex").is_file());
 
         let theirs = root.path().join("theirs");
         std::fs::create_dir(&theirs).unwrap();
         std::fs::write(theirs.join("notes.txt"), "keep").unwrap();
         assert!(remove_run_dir(&theirs));
         assert!(theirs.join("notes.txt").is_file());
+    }
+
+    /// A file at the lock's path that holds someone's text is not written over, and a
+    /// record cut short while it was written is finished.
+    #[test]
+    fn a_lock_file_that_holds_something_else_is_left_as_it_is() {
+        let root = tempfile::tempdir().unwrap();
+        let run = root.path().join("build");
+        std::fs::write(root.path().join("build.lock"), "pid 4242\n").unwrap();
+        let lock = RunLock::take(&run).unwrap();
+        let refused = lock.claim(&run).unwrap_err();
+        assert!(refused.to_string().contains("build.lock"), "{refused}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("build.lock")).unwrap(),
+            "pid 4242\n"
+        );
+        assert!(!run_dir_owned(&run));
+
+        let run = root.path().join("run");
+        std::fs::write(root.path().join("run.lock"), &CLAIMED[..9]).unwrap();
+        assert!(!run_dir_owned(&run));
+        let lock = RunLock::take(&run).unwrap();
+        lock.claim(&run).unwrap();
+        assert!(run_dir_owned(&run));
     }
 
     #[test]
