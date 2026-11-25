@@ -11,6 +11,18 @@ exists, and proofs for what is designed.
 It was written after two hangs of restored clones (#2125, #2131), to find every way the same
 wake-up can be lost, not only those two.
 
+## The models in this directory
+
+One Lake package, one `lake build`, one CI job. Each model is a library of its own with its own
+search executable and documents.
+
+| Model | Library, namespace | Search | Documents |
+|---|---|---|---|
+| The guest vCPU wake-up path | `WakeVerify`, `Wake` | `lake exe breaks` | this file, `BREAKS.md`, `REPAIRS.md` |
+| The snapshot and restore network boundary in fc-agent | `GateVerify`, `Gate` | `lake exe gate-breaks` | [`GateVerify/README.md`](GateVerify/README.md), [`GateVerify/BREAKS.md`](GateVerify/BREAKS.md), [`GateVerify/REPAIRS.md`](GateVerify/REPAIRS.md) |
+
+The rest of this file is about the first.
+
 - `BREAKS.md`: every break the search found, per kernel and VMM variant, with its trace, what it
   is in the real system, and a severity.
 - `REPAIRS.md`: what each break needs changed, where, and the wording proposed.

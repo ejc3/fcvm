@@ -1,10 +1,11 @@
 name = "WakeVerify"
-defaultTargets = ["WakeVerify", "breaks", "hostops"]
+defaultTargets = ["WakeVerify", "breaks", "hostops", "GateVerify", "gate-breaks", "gate-seq"]
 
 # A warning fails the build: `sorry` is a warning, and so is a `#guard_msgs` that Lean could
 # only partly check.
 leanOptions = { warningAsError = true }
 
+# The guest vCPU wake-up path (namespace `Wake`).
 [[lean_lib]]
 name = "WakeVerify"
 
@@ -18,3 +19,18 @@ root = "Search"
 [[lean_exe]]
 name = "hostops"
 root = "HostOps"
+
+# The snapshot and restore network boundary (namespace `Gate`).
+[[lean_lib]]
+name = "GateVerify"
+
+# `lake exe gate-breaks`: the exhaustive search of every rule book of the boundary.
+[[lean_exe]]
+name = "gate-breaks"
+root = "GateSearch"
+
+# `lake exe gate-seq`: each rule book's boundary sequence, in the names fc-agent's own model
+# tests log, for gate-drift.sh to compare with the Rust source.
+[[lean_exe]]
+name = "gate-seq"
+root = "GateSeq"

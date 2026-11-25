@@ -1,8 +1,11 @@
 name: Verify
 
-# Checks the Lean model of the vCPU wake-up path (verify/): `lake build` elaborates every
-# proof, replays every recorded break, and runs the axiom check. A broken proof, an axiom
-# beyond Lean's own, a `sorry`, or a recorded run that no longer breaks its property fails it.
+# Checks the Lean models under verify/ (the vCPU wake-up path, and the snapshot and restore
+# network boundary): `lake build` elaborates every proof, replays every recorded break, and
+# runs the axiom checks. A broken proof, an axiom beyond Lean's own, a `sorry`, or a recorded
+# run that no longer breaks its property fails it. `gate-seq check` then compares the boundary
+# model's restore order with the order fc-agent's own tests pin, so a change to the Rust source
+# that the model does not follow fails here too.
 #
 # A workflow of its own, not a job in ci.yml: nothing in ci.yml's matrix builds or reads
 # verify/, and this job needs none of its scope machinery. It renders its own check ("Lean")
@@ -16,6 +19,8 @@ on:
     paths:
       - 'verify/**'
       - '.github/workflows/verify.yml'
+      # the source the boundary model's order is compared with
+      - 'fc-agent/src/snapshot_network.rs'
   push:
     branches: [main]
   workflow_dispatch:
@@ -31,7 +36,8 @@ jobs:
   lean:
     name: Lean
     runs-on: ubuntu-latest
-    # A cold build measured 1 min 24 s on an arm64 dev box, after the toolchain download.
+    # A cold build of both models measured 1 min 25 s on an arm64 dev box, after the toolchain
+    # download.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -85,3 +91,4 @@ jobs:
           export PATH="$HOME/.elan/bin:$PATH"
           lean --version
           lake build
+          lake exe gate-seq check ../fc-agent/src/snapshot_network.rs
