@@ -1006,15 +1006,13 @@ async fn a_killed_pool_leaves_no_process_and_ends_every_lease() {
 
 /// The state of the VM named `name` in `data_dir`, once it has one.
 fn vm_state(data_dir: &std::path::Path, name: &str) -> Option<serde_json::Value> {
-    for entry in std::fs::read_dir(data_dir.join("state")).ok()?.flatten() {
-        if entry.path().extension().is_some_and(|ext| ext == "json") {
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                continue;
-            };
-            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) {
-                if state["name"] == name {
-                    return Some(state);
-                }
+    for path in fcvm::state::StateManager::new(data_dir.join("state")).state_files() {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) {
+            if state["name"] == name {
+                return Some(state);
             }
         }
     }

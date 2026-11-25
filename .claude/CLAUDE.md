@@ -1657,7 +1657,7 @@ The ubuntu user has KVM access (`kvm` group), so `fcvm podman run` works without
 ./target/release/fcvm podman run --name test alpine:latest 2>&1 | tee /tmp/vm.log
 # Defaults to --network rootless
 # Get PID from state and use exec:
-ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs cat | jq -r '.pid'
+./target/release/fcvm ls --json | jq -r '.[-1].pid'
 ./target/release/fcvm exec --pid <PID> -- hostname
 
 # ONLY WHEN NEEDED - Bridged mode (requires sudo)
@@ -1666,7 +1666,7 @@ sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine
 sleep 30
 grep healthy /tmp/vm.log
 # Get PID from state and use exec:
-sudo ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs sudo cat | jq -r '.pid'
+sudo ./target/release/fcvm ls --json | jq -r '.[-1].pid'
 sudo ./target/release/fcvm exec --pid <PID> -- curl -s ifconfig.me
 ```
 
@@ -1713,7 +1713,7 @@ sleep 60  # Wait for VM to boot and run commands
 **Inspecting namespace state for running VM:**
 ```bash
 # Get holder PID from state file
-HOLDER_PID=$(cat /mnt/fcvm-btrfs/state/*.json | jq -r '.holder_pid')
+HOLDER_PID=$(fcvm ls --json | jq -r '.[0].holder_pid')
 # Check namespace network config
 sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip addr
 sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
@@ -2522,35 +2522,75 @@ On serve process exit (SIGTERM/SIGINT):
    state, so its cost does not grow with the number of VMs (with every state read on every
    start, a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). Once a
    minute per state directory (`maybe_sweep`: `sweep.stamp` missing or expired, and
-   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim has released
-   `names.lock`; that launch pays for the scan, and no other start waits for it. The sweep
-   removes the states of dead or replaced processes and the index entries that outlive
-   them. Until it runs a stale state holds nothing: its owner is not live.
+   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim; that launch
+   pays for the scan, and no other start waits for it. The sweep removes the states of dead
+   or replaced processes, and the PID entries, name tokens and claim directories that
+   outlive them. Until it runs a stale state holds nothing: its owner is not live.
 
-**Indexes** (`src/state/manager.rs`), so a start's fast path does not scan:
-- `name/<sha256 of name>.json` records which VM claimed the name last, written by
-  `claim_name()` under `names.lock`. That VM holds the name while its state exists, names
-  it, and its owner is live. A state written without a claim has no entry and holds no name.
-- `pid/<pid>.<vm_id>` (empty) is written by `save_state()` under the VM's state lock;
-  `load_state_by_pid()` reads the states it names and scans everything only on a miss.
-- Lock order: `names.lock` before a VM's `<vm_id>.json.lock`, never the reverse.
-  `delete_state()` removes both entries; the sweep removes any a crash left.
-- Root and the state directory's owner share one state directory (privileged tests run as
-  root beside unprivileged ones), so `name/` and `pid/` made by root are handed to the
-  state directory's owner before they appear (`index_dir`), and `sweep.stamp` is written
-  like a lock file (0666). Nothing is made world-writable.
+**Layout** (`src/state/manager.rs`, layout 2). No directory takes every VM's writes and no
+lock is host-wide: a create or a rename holds its directory's lock exclusively, and with
+every state in one directory under one `names.lock`, clones starting together queued on
+both.
 
-**State file layout**: Individual files per VM, keyed by `vm_id` (UUID):
 ```
 /mnt/fcvm-btrfs/state/
-├── vm-abc123.json      # { vm_id: "vm-abc123", pid: 5000, pid_start_time: 12345, ... }
-├── vm-def456.json      # { vm_id: "vm-def456", pid: 5001, pid_start_time: 67890, ... }
-├── name/<sha256>.json  # { name, vm_id }: the VM that claimed the name last
-├── pid/5000.vm-abc123  # PID index entry
-└── names.lock          # Global lock for name claims
+├── layout                              # "2"
+├── vms/<b>/vm-abc123.json             # { vm_id, pid, pid_start_time, name, ... }
+├── vms/<b>/vm-abc123.json.lock        # per-VM flock; .json.tmp while a write runs
+├── names/<b>/<sha256 of name>/        # a name slot: a directory with one token in it
+│   └── 5000.12345.vm-abc123            # the holder's <pid>.<start time>.<vm_id>
+├── names/<b>/.claim.<pid>.<start>.<vm_id>/   # a claim being built
+├── pids/<b>/5000.vm-abc123            # PID index entry (empty)
+└── sweep.lock, sweep.stamp
 ```
 
-No master state file - `list_vms()` globs all `.json` files.
+- `<b>` is the first hex digit of the SHA-256 of the key (vm_id, name, PID)
+  (`bucket_of`): the same in every process and build. Sixteen buckets: more would cut
+  the wait between starts further, but every listing opens every bucket, and with 256
+  an `fcvm ls` on an empty store spent more than half its time in 281 `openat` calls.
+- **A name is claimed by renaming a directory onto its slot** (`claim_name()`): the claim
+  directory holds the claimer's token, and the kernel replaces a directory only with one
+  that is absent or empty, so of any number of concurrent claims exactly one rename
+  succeeds, with no lock. A slot in use names its holder in the token's file name. A live
+  holder keeps the name; a dead one's state is deleted and its token unlinked by its own
+  name, then the rename is tried again. `delete_state()` unlinks the VM's token and removes
+  the slot if empty. Every step is conditional in the kernel, so it holds through a
+  fuse-pipe mount, where a flock would not
+  (`test_rename_directory_onto_directory_needs_an_empty_target`).
+- `pids/<b>/<pid>.<vm_id>` is written by `save_state()` under the VM's state lock;
+  `load_state_by_pid()` reads the states its bucket names and scans everything only on a
+  miss.
+- The only flock on the start path is the VM's own `<vm_id>.json.lock`.
+- **A state is published by exchange, not by a rename over the old one** (`publish_state`):
+  `RENAME_EXCHANGE` of `<vm_id>.json.tmp` with `<vm_id>.json`, then the old state is
+  unlinked. btrfs starts writing a file's data out inside a rename that replaces another
+  file, with the directory locked, and with many clones starting together each such
+  rename slept in the block layer. An exchange starts no I/O.
+- `list_vms()` opens and reads the buckets and the state files on up to 8 threads.
+- Root and the state directory's owner share one state directory (privileged tests run as
+  root beside unprivileged ones), so a directory root makes (`shared_dir`, a claim
+  directory) is handed to the state directory's owner before it appears, and `sweep.stamp`
+  is written like a lock file (0666). Nothing is made world-writable.
+- **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
+  by every command while a VM of it is running: the error lists each one's name and PID,
+  and they are stopped with the fcvm that started them. A command that only reads decides
+  refuse or proceed and writes nothing (`check_layout_for_read`), so `fcvm ls` needs no
+  write access and removes nothing of an older launch in progress. A launch
+  (`check_layout_for_write`) removes what layout 1 left with no VM running, under layout
+  1's own `names.lock`, held across a second scan and the removal, and writes the marker;
+  the lock file stays, so an older launch and a conversion always exclude each other.
+  The marker's content is read: anything but this layout's number is refused. An older
+  fcvm pointed at a layout 2 store sees no VMs and cannot tell, so do not run two fcvm
+  builds of different layouts on one store.
+- **Liveness is read from the caller's own /proc** (`process_liveness`): a state directory
+  is used from one PID namespace, which holds because each nesting level has its own data
+  directory. Only "no such process" (or a zombie, or another start time) is dead; a /proc
+  read that fails for another reason fails a name claim and removes nothing.
+- **A state file a host crash left empty or cut short** is removed by the sweep when it
+  was written before this boot (`/proc/stat` btime), and warned about once per process
+  otherwise. Nothing on the state path is synced.
+
+No master state file: `list_vms()` reads every bucket of `vms/`.
 
 ## Architecture
 
@@ -3502,7 +3542,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
-├── state/{vm_id}.json            # VM state files
+├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
 ├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy

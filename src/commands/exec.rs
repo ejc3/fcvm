@@ -495,7 +495,7 @@ pub fn connect_and_start_exec(
     vm_id: &str,
 ) -> Result<(UnixStream, SnapshotOrphanGuard)> {
     let request_json = serde_json::to_string(request)?;
-    let state_file = paths::state_dir().join(format!("{}.json", vm_id));
+    let state_file = StateManager::new(paths::state_dir()).state_file(vm_id);
     let mut attempt = 0;
     loop {
         attempt += 1;
