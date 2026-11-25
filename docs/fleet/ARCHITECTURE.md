@@ -2378,10 +2378,10 @@ Measured above, and each a later PR of this stack, to be measured on the ring:
 two sides at once, a new microVM running unmodified Chromium for every render and Kitesurf
 engines on workerd, each side on its own equal set of pinned CPUs. The protocol, the
 coordinator's state and the `/live` view are in `fleet/PROTOCOL.md`, "Pages mode". This section
-is the host's half. No fleet host runs it yet: the module runs on its own as
-`fcvm fleet renders-bench` (`make fleet-renders-bench`), which is the agent's module without a
-coordinator or viewers, so the benchmark's reference figures and the live wall's come from one
-piece of code.
+is the host's half. The fleet agent runs the module with `--renders` (below), and
+`fcvm fleet renders-bench` (`make fleet-renders-bench`) runs the same module without a
+coordinator or viewers, through the same function (`renders::session`), so the benchmark's
+reference figures and the live wall's come from one piece of code.
 
 ### The host module
 
@@ -2463,6 +2463,40 @@ sends SIGKILL to every process left the moment the main process is gone, the rea
 each stage, by SIGKILL and by SIGTERM, and counts what is left: processes, the unit's cgroup,
 network namespaces, clones' state files and directories, sockets, listening ports, the run
 directory, 2 MiB pages. Every count must be zero.
+
+### In the fleet agent
+
+`fcvm fleet agent --renders` takes the module's options as renders-bench takes them, one per
+`--renders-arg` (`--renders-arg=--corpus=/srv/corpus`). The benchmark's own options
+(`--levels`, `--seconds`, `--overlay-text`, `--overlay-transform`) are refused: the
+coordinator's orders say when to render and what to inject, and the search sets the levels.
+The module runs the agent's own binary, and the agent must run in a subgroup of a delegated
+unit, as renders-bench must. Without `--renders` the agent says no `renders` in its hello and
+starts nothing of the mode.
+
+| who | owns | ends it |
+|---|---|---|
+| `serve` | the order (a watch channel) and the mode's task (`agent/renders.rs`) | the end of its connection drops the order's sender, then it waits for the task |
+| the mode's task | one module at a time, as a future it awaits | the order's sender gone, once the module has ended |
+| the module (`renders::session`) | its lock, its reaper, its processes and cgroups | an order to stop, the sender gone, or an error; then the reaper's sweep |
+
+- **An order to run** starts a module: the same sequence as the benchmark's, from the kernel
+  rule and the lock to the reaper and the stages. The module applies each later order itself.
+- **An overlay order** is written to each side's injected file by rename (a Chromium-only
+  transform to the fcvm side's alone), the next reports carry its `seq` as `overlay_seq`, and
+  both searches start again. An order equal to the one the replays serve writes nothing.
+- **An order to stop** ends the module: during its start the start is dropped where it is
+  (every child it started is killed with its handle, and it spawns no task that could run on),
+  during the renders the loop ends; then the reaper sweeps and the agent stays up. The next
+  order to run starts a new module.
+- **The agent killed outright**, by SIGKILL or by SIGTERM (the module registers no signal
+  handler in the agent), closes the reaper's pipe, and the reaper removes everything, as it
+  does for the benchmark. A module started inside the agent's connection is ended when the
+  connection ends (`--stdio`); a dialing agent keeps it across reconnects, as it keeps its VMs.
+- **Reports** go only after the connection's first `renders` order (the dialing agent keeps
+  that rule per connection), at least every 5 s: the module's own while it renders, and one
+  with nothing in flight while it is stopped or starting. A module that fails reports
+  `withheld` with its error, and is started again after 60 s while the order says run.
 
 ## Windows mode
 

@@ -1009,6 +1009,19 @@ pub struct FleetAgentArgs {
     /// fcvm's snapshot directory, where the gold snapshot and the forks are made
     #[arg(long, default_value = "/mnt/fcvm-btrfs/snapshots")]
     pub minecraft_snapshot_dir: std::path::PathBuf,
+
+    /// Pages mode: run pages mode's host module (`fcvm fleet renders-bench`'s) while the
+    /// coordinator orders it to (docs/fleet/ARCHITECTURE.md, "Pages mode"). The agent must run
+    /// in a subgroup of a delegated systemd unit, as renders-bench must.
+    #[arg(long, requires = "renders_args")]
+    pub renders: bool,
+
+    /// Pages mode: one of the module's options, as `fcvm fleet renders-bench` takes it
+    /// (`--renders-arg=--corpus=/srv/corpus`). Repeatable. `--levels`, `--seconds`,
+    /// `--overlay-text` and `--overlay-transform` are the benchmark's and are refused: under
+    /// the agent the coordinator's orders say when to render and what overlay to serve.
+    #[arg(long = "renders-arg", allow_hyphen_values = true, requires = "renders")]
+    pub renders_args: Vec<String>,
 }
 
 /// `fcvm fleet phone-web-proxy`: the phones' web proxy on its own (a warm phone's bake and
@@ -1022,8 +1035,9 @@ pub struct FleetPhoneWebProxyArgs {
 
 /// `fcvm fleet renders-bench`: pages mode's host module ("One VM per page") on its own. It
 /// must run in a subgroup of a delegated systemd unit (`Delegate=yes` with
-/// `DelegateSubgroup=`), because each side runs in a cpuset of its own.
-#[derive(Args, Debug)]
+/// `DelegateSubgroup=`), because each side runs in a cpuset of its own. The fleet agent runs
+/// the same module with these options (`fcvm fleet agent --renders --renders-arg ...`).
+#[derive(Args, Debug, Clone)]
 pub struct FleetRendersBenchArgs {
     /// Where the records go: renders.jsonl, samples.jsonl, report.json, summary.json, logs
     #[arg(long)]

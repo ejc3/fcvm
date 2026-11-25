@@ -1822,13 +1822,23 @@ A `/health` reply carrying `error` (the renderer failed) fails the relaunch at o
  "overlay_seq": 3, "harness": {"cpu_pressure": 0.0, "replay_ms": {"fcvm": 0.4, "kitesurf": 0.5}}}
 ```
 
-Pages mode: the host's summary, every few seconds. At the top level only `at` is required. A
+Pages mode: the host's summary, at least every 5 s. At the top level only `at` is required. A
 side that is present carries `search` (with `in_flight` and `phase`),
 `renders_per_s`, `cpus_busy`, `done`, `failed` and `since`; a tile carries `page`, `side`,
 `state`, `renders_per_s`, `done` and `failed`. A host says it runs
 the mode with `renders` in its hello (`{"pages": [{"id", "url"}], "cpus", "confined"?,
-"build"?}`), and sends this message only after it has received a `renders` order: a
-coordinator built before the mode sends none, and would close the connection on this message.
+"build"?}`), and sends this message on a connection only after it has received a `renders`
+order on that connection: a coordinator built before the mode sends none, and would close the
+connection on this message. The agent (`fcvm fleet agent --renders`) sends the module's
+summary while the module renders, and otherwise one with nothing in flight and every tile
+`waiting`: while the order is `run: false`, while the module starts, and, with `withheld`
+set to the error, after a module failed. A failed module is started again after 60 s while
+the order is `run: true`, and at once on the next `run: true` after a `run: false`.
+
+`build` names, when the host knows them: `instance_type` (on EC2), `kernel`, `fcvm_commit`
+and `kitesurf_commit` (the agent's `--setup fcvm.commit=` and `--setup kitesurf.commit=`
+module options), `bundle_sha256` (the engine bundle's `index.js`), `viewport`, `vcpus` and
+`page_size` (the snapshot's once it is made), and `recycle_mib`.
 
 - `sides`, by `fcvm` and `kitesurf`. `search` is the side's search for its limit: `in_flight`
   now; `phase` `starting` (no baseline at one in flight yet), `adding` or `holding`;
@@ -2125,7 +2135,8 @@ order changes. `run` is false while the fleet is asleep: the host stops every cl
 for none: `text` (plain text; the host escapes it), `transform` (a name; the style behind it is
 the host's), `chromium_only` (the transform goes into the `fcvm` side's pages only), and `seq`,
 which the host's reports repeat as `overlay_seq` once its replays serve it. A render sees the
-old overlay or the new one whole.
+old overlay or the new one whole. An overlay whose content or `seq` differs from the one the
+replays serve starts both sides' searches again; the same order sent again changes nothing.
 
 ### Grid budget
 
