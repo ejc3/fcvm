@@ -49,6 +49,10 @@ def lostEnable (s : State) : Bool :=
     (!s.vm.gicEn || !s.vm.spi.en ||
      anyVcpu s fun _ c => !c.gOff && (!c.tmr.en || !c.sgi.en || !c.pmr || !c.grp))
 
+/-- R2: an interrupt the guest disabled is enabled: here, one of a CPU it took offline. -/
+def strayEnable (s : State) : Bool :=
+  running s && anyVcpu s fun _ c => c.gOff && (c.tmr.en || c.sgi.en)
+
 /-- R2: an SGI is pending that no CPU sent, or a pending latch sits on the level-triggered
 timer interrupt. -/
 def strayPending (s : State) : Bool :=
@@ -77,7 +81,7 @@ def powerWrong (s : State) : Bool :=
 def checks (C : Cfg) : List (String × (State → Bool)) :=
   [("R1 lostIpi", lostIpi), ("R1 lostDeviceIrq", lostDeviceIrq C), ("R1 timerCannotFire", timerCannotFire),
    ("R2 stuckActive", stuckActive), ("R2 stuckPriority", stuckPriority), ("R2 lostEnable", lostEnable),
-   ("R2 strayPending", strayPending), ("R3 spins", spins C), ("R4 clockOff", clockOff),
+   ("R2 strayEnable", strayEnable), ("R2 strayPending", strayPending), ("R3 spins", spins C), ("R4 clockOff", clockOff),
    ("R5 sourceDisturbed", sourceDisturbed), ("R6 powerWrong", powerWrong)]
 
 /-- Every requirement at once. -/

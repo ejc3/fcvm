@@ -53,8 +53,8 @@ structure VOk (c : Vcpu) : Prop where
   sact : c.sgi.act = (c.g == .hdl .sgi)
   ap : c.ap = !(c.g == .run || c.g == .idle)
   call : c.call = (c.sgi.latch || c.sgi.act)
-  ten : c.tmr.en = true
-  sen : c.sgi.en = true
+  ten : c.tmr.en = !c.gOff
+  sen : c.sgi.en = !c.gOff
   pmr : c.pmr = true
   grp : c.grp = true
   tl : c.tmr.latch = false

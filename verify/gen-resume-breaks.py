@@ -10,6 +10,7 @@ import sys
 
 BOOK = {
     "cloud-hypervisor": ("Today.cloudHypervisor", "ch", "Design.cloudHypervisor"),
+    "cloud-hypervisor-repin": ("Today.cloudHypervisorRepin", "repin", "Design.cloudHypervisor"),
     "fork-default": ("Today.forkDefault", "fork", "Design.firecracker"),
     "fork-before-630": ("Today.forkBefore630", "before630", "Design.firecracker"),
     "fork-nested": ("Today.forkNested", "nested", "Design.firecracker"),

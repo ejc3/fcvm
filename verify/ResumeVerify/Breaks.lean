@@ -236,6 +236,25 @@ theorem design_keeps_ch_level_spins :
     (replay Design.cloudHypervisor Cfg.level Run.ch_level_spins (init Cfg.level)).map (healthy Cfg.level) = some true := by
   decide
 
+/-- R1, `cloud-hypervisor-repin` in `level`, 5 steps:
+1. the device raises its interrupt
+2. the VMM pauses the vCPUs
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en] device-waits; counter exact -/
+def Run.repin_level_lostDeviceIrq : List Label :=
+  [.dev, .pause, .save, .restore, .resume]
+
+theorem breaks_repin_level_lostDeviceIrq :
+    (replay Today.cloudHypervisorRepin Cfg.level Run.repin_level_lostDeviceIrq (init Cfg.level)).map (lostDeviceIrq Cfg.level) = some true := by
+  decide
+
+theorem design_keeps_repin_level_lostDeviceIrq :
+    (replay Design.cloudHypervisor Cfg.level Run.repin_level_lostDeviceIrq (init Cfg.level)).map (healthy Cfg.level) = some true := by
+  decide
+
 /-- R1, `fork-default` in `level`, 5 steps:
 1. the device raises its interrupt
 2. the VMM pauses the vCPUs
@@ -295,6 +314,42 @@ theorem breaks_ch_offline_stuckPriority :
 
 theorem design_keeps_ch_offline_stuckPriority :
     (replay Design.cloudHypervisor Cfg.offline Run.ch_offline_stuckPriority (init Cfg.offline)).map (healthy Cfg.offline) = some true := by
+  decide
+
+/-- R2, `cloud-hypervisor` in `offline`, 4 steps:
+1. the VMM pauses the vCPUs
+2. the VMM saves the state
+3. a new VM is restored from the image
+4. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest STOPPED offline tmr[en] sgi[en]; spi[en]; counter exact -/
+def Run.ch_offline_strayEnable : List Label :=
+  [.pause, .save, .restore, .resume]
+
+theorem breaks_ch_offline_strayEnable :
+    (replay Today.cloudHypervisor Cfg.offline Run.ch_offline_strayEnable (init Cfg.offline)).map (strayEnable) = some true := by
+  decide
+
+theorem design_keeps_ch_offline_strayEnable :
+    (replay Design.cloudHypervisor Cfg.offline Run.ch_offline_strayEnable (init Cfg.offline)).map (healthy Cfg.offline) = some true := by
+  decide
+
+/-- R2, `fork-default` in `offline`, 4 steps:
+1. the VMM pauses the vCPUs
+2. the VMM saves the state
+3. a new VM is restored from the image
+4. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest STOPPED offline tmr[DIS] sgi[en]; spi[en]; counter exact -/
+def Run.fork_offline_strayEnable : List Label :=
+  [.pause, .save, .restore, .resume]
+
+theorem breaks_fork_offline_strayEnable :
+    (replay Today.forkDefault Cfg.offline Run.fork_offline_strayEnable (init Cfg.offline)).map (strayEnable) = some true := by
+  decide
+
+theorem design_keeps_fork_offline_strayEnable :
+    (replay Design.firecracker Cfg.offline Run.fork_offline_strayEnable (init Cfg.offline)).map (healthy Cfg.offline) = some true := by
   decide
 
 /-- R1, `cloud-hypervisor` in `dump`, 5 steps:
@@ -414,6 +469,24 @@ theorem breaks_ch_dump_clockOff :
 
 theorem design_keeps_ch_dump_clockOff :
     (replay Design.cloudHypervisor Cfg.dump Run.ch_dump_clockOff (init Cfg.dump)).map (healthy Cfg.dump) = some true := by
+  decide
+
+/-- R4, `cloud-hypervisor-repin` in `dump`, 4 steps:
+1. the VMM pauses the vCPUs
+2. the VMM saves the state
+3. host time passes while the guest does not run
+4. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.repin_dump_clockOff : List Label :=
+  [.pause, .save, .wait, .resume]
+
+theorem breaks_repin_dump_clockOff :
+    (replay Today.cloudHypervisorRepin Cfg.dump Run.repin_dump_clockOff (init Cfg.dump)).map (clockOff) = some true := by
+  decide
+
+theorem design_keeps_repin_dump_clockOff :
+    (replay Design.cloudHypervisor Cfg.dump Run.repin_dump_clockOff (init Cfg.dump)).map (healthy Cfg.dump) = some true := by
   decide
 
 /-- R4, `fork-default` in `dump`, 4 steps:
@@ -550,6 +623,23 @@ theorem breaks_ch_lags_clockOff :
 
 theorem design_keeps_ch_lags_clockOff :
     (replay Design.cloudHypervisor Cfg.lags Run.ch_lags_clockOff (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
+  decide
+
+/-- R4, `cloud-hypervisor-repin` in `lags`, 3 steps:
+1. the VMM pauses the vCPUs
+2. host time passes while the guest does not run
+3. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
+def Run.repin_lags_clockOff : List Label :=
+  [.pause, .wait, .resume]
+
+theorem breaks_repin_lags_clockOff :
+    (replay Today.cloudHypervisorRepin Cfg.lags Run.repin_lags_clockOff (init Cfg.lags)).map (clockOff) = some true := by
+  decide
+
+theorem design_keeps_repin_lags_clockOff :
+    (replay Design.cloudHypervisor Cfg.lags Run.repin_lags_clockOff (init Cfg.lags)).map (healthy Cfg.lags) = some true := by
   decide
 
 /-- R4, `fork-default` in `lags`, 3 steps:

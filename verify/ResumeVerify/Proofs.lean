@@ -214,6 +214,11 @@ theorem sound_noLostEnable (hR : Sound R) (h : Reachable R C s) : lostEnable s =
   simp [lostEnable, anyVcpu, i.gic, i.pen, i.v0.ten, i.v0.sen, i.v0.pmr, i.v0.grp, i.v1.ten, i.v1.sen,
     i.v1.pmr, i.v1.grp]
 
+/-- R2: nothing the guest disabled is enabled. -/
+theorem sound_noStrayEnable (hR : Sound R) (h : Reachable R C s) : strayEnable s = false := by
+  have i := (reachable_inv hR h).m
+  simp [strayEnable, anyVcpu, i.v0.ten, i.v0.sen, i.v1.ten, i.v1.sen]
+
 /-- R2: no SGI is pending that nobody sent, and no latch sits on the timer interrupt. -/
 theorem sound_noStrayPending (hR : Sound R) (h : Reachable R C s) : strayPending s = false := by
   have i := (reachable_inv hR h).m
@@ -264,18 +269,25 @@ theorem sound_powerRight (hR : Sound R) (h : Reachable R C s) : powerWrong s = f
 theorem sound_healthy (hR : Sound R) (h : Reachable R C s) : healthy C s = true := by
   simp [healthy, checks, sound_noLostIpi hR h, sound_noLostDeviceIrq hR h, sound_timerCanFire hR h,
     sound_noStuckActive hR h, sound_noStuckPriority hR h, sound_noLostEnable hR h,
-    sound_noStrayPending hR h, sound_noSpin hR h, sound_clockRight hR h,
+    sound_noStrayEnable hR h, sound_noStrayPending hR h, sound_noSpin hR h, sound_clockRight hR h,
     sound_sourceUndisturbed hR h, sound_powerRight hR h]
 
 end
 
 /-! ## The two designs are sound -/
 
+theorem clearSet_inv (c s : Bool) : clearSet c (!s) s = s := by
+  cases c <;> cases s <;> rfl
+
 theorem Design.cloudHypervisor_sound : Sound Design.cloudHypervisor :=
-  ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, fun C i => by
+    simp [build, Design.cloudHypervisor, apply, clrOf, clearSet_inv, rebuilt, vcpuOf, emptyVM,
+      freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
 theorem Design.firecracker_sound : Sound Design.firecracker :=
-  ⟨rfl, rfl, rfl, rfl, rfl, fun _ _ => rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, fun C i => by
+    simp [build, Design.firecracker, Today.fcOrder, apply, clrOf, clearSet_inv, rebuilt, vcpuOf,
+      emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
 theorem design_cloudHypervisor {C : Cfg} {s : State} (h : Reachable Design.cloudHypervisor C s) :
     healthy C s = true := sound_healthy Design.cloudHypervisor_sound h
@@ -291,6 +303,9 @@ theorem forkDefault_no_freeze : Today.forkDefault.freeze = false := rfl
 theorem forkBefore630_no_freeze : Today.forkBefore630.freeze = false := rfl
 theorem forkNested_counter_of_save : Today.forkNested.cntAtPause = false := rfl
 theorem forkNested_load_not_frozen : Today.forkNested.freezeLoaded = false := rfl
+
+theorem cloudHypervisorRepin_no_freeze : Today.cloudHypervisorRepin.freeze = false := rfl
+theorem cloudHypervisorRepin_not_sound : ¬ Sound Today.cloudHypervisorRepin := fun h => nomatch h.freeze
 
 theorem cloudHypervisor_not_sound : ¬ Sound Today.cloudHypervisor := fun h => nomatch h.ownSlots
 theorem forkDefault_not_sound : ¬ Sound Today.forkDefault := fun h => nomatch h.freeze

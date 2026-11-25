@@ -122,9 +122,32 @@ partial def pathTo (f : Found) (i : Nat) : List Label :=
   go i []
 
 def nvBooks : List Rules := [Today.forkBefore630, Today.forkNested, Design.firecracker]
-def elBooks : List Rules := [Today.cloudHypervisor, Today.forkDefault, Design.cloudHypervisor, Design.firecracker]
+def elBooks : List Rules :=
+  [Today.cloudHypervisor, Today.cloudHypervisorRepin, Today.forkDefault, Design.cloudHypervisor, Design.firecracker]
 
 def booksFor (C : Cfg) : List Rules := if C.nv then nvBooks else elBooks
+
+/-- Each repair of the design put back, one at a time (`lake exe resume-breaks mutants`). -/
+def mutants : List Rules :=
+  let d := Design.cloudHypervisor
+  let f := Design.firecracker
+  [{ d with name := "ch: slots read from vCPU 0 again", slotsFromRestore := true },
+   { d with name := "ch: image holds the counter of the save", cntAtPause := false },
+   { d with name := "ch: resume does not take out the pause", freeze := false },
+   { d with name := "ch: load to resume not taken out", freezeLoaded := false },
+   { d with name := "ch: lines not saved", levelInfo := false },
+   { d with name := "ch: clear-registers written with the saved bits", clearInverted := false },
+   { d with name := "ch: no KVM_ARM_SET_COUNTER_OFFSET on restore", restore := d.restore.filter (· != .offset) },
+   { d with name := "ch: lines not restored", restore := d.restore.filter (· != .level) },
+   { d with name := "ch: counter of the last vCPU not replayed, no offset",
+            restore := d.restore.filter (fun o => o != .offset && o != .cntv true && o != .cntp true) },
+   { f with name := "fc: image holds the counter of the save", cntAtPause := false },
+   { f with name := "fc: resume does not take out the pause", freeze := false },
+   { f with name := "fc: load to resume not taken out", freezeLoaded := false },
+   { f with name := "fc: lines not saved", levelInfo := false },
+   { f with name := "fc: clear-registers written with the saved bits", clearInverted := false },
+   { f with name := "fc: no KVM_ARM_SET_COUNTER_OFFSET on restore", restore := f.restore.filter (· != .offset) },
+   { f with name := "fc: lines not restored", restore := f.restore.filter (· != .level) }]
 
 def printRun (R : Rules) (C : Cfg) (title : String) (labels : List Label) : IO Unit := do
   IO.println s!"\n### {title} ({labels.length} steps)"
@@ -152,6 +175,18 @@ def spinKind (C : Cfg) (s : State) (v : Vid) : String :=
   s!"vCPU {vn v}: " ++ ", ".intercalate w ++ "; " ++ ", ".intercalate p
 
 def main (args : List String) : IO UInt32 := do
+  if args.contains "mutants" then
+    for R in mutants do
+      let mut line := s!"{R.name}:"
+      for (name, _, C) in runs do
+        let f := explore R C 30000000
+        let cs := (checks C).toArray
+        let mut found : List String := []
+        for ci in [0:cs.size] do
+          if f.first[ci]!.isSome then found := found ++ [cs[ci]!.1]
+        if !found.isEmpty then line := line ++ s!" [{name}: {", ".intercalate found}]"
+      IO.println line
+    return 0
   let traces := args.contains "traces"
   let spinsOnly := args.contains "spins"
   let limit := 30000000

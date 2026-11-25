@@ -254,6 +254,9 @@ structure Rules where
   freezeLoaded : Bool
   /-- the save reads `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` -/
   levelInfo : Bool
+  /-- the restore writes the clear-registers (`ICENABLER`, `ICACTIVER`) with the complement of
+  the saved bits, so that what the new VM has set and the image has not is cleared -/
+  clearInverted : Bool
   restore : List Op
   deriving Repr, Inhabited
 
@@ -423,8 +426,16 @@ def emptyVM : VM :=
   { c0 := freshVcpu, c1 := freshVcpu, spi := IrqSt.none, dev := false, gicEn := false,
     ctr := .fresh, offFlag := false, ideal := 0, restored := true }
 
+/-- A clear-register written with `clr`, then its set-register with `set`: a bit that was set
+and is not in `clr` stays (`vgic_uaccess_write_cenable` and `_senable`, vgic-mmio.c:189-228;
+`vgic_mmio_uaccess_write_cactive` and `_sactive`, vgic-mmio.c:593-668). -/
+def clearSet (cur clr set : Bool) : Bool := (cur && !clr) || set
+
+/-- What the restore writes to a clear-register for a saved bit. -/
+def clrOf (R : Rules) (saved : Bool) : Bool := if R.clearInverted then !saved else saved
+
 /-- One request of a restore, by the kernel's rules. -/
-def apply (C : Cfg) (i : Image) (m : VM) : Op → VM
+def apply (R : Rules) (C : Cfg) (i : Image) (m : VM) : Op → VM
   | .create v =>
     -- `kvm_timer_vcpu_init` (arch_timer.c:1105-1122): unless the VM's offset was set by
     -- `KVM_ARM_SET_COUNTER_OFFSET`, a new vCPU resets the VM-wide offsets
@@ -462,19 +473,25 @@ def apply (C : Cfg) (i : Image) (m : VM) : Op → VM
     m.set v { c with stopped := (i.slot v).stopped }
   | .gic => { m with spi := IrqSt.none, gicEn := false }
   | .dist =>
-    -- `GICD_CTLR`, then ICENABLER and ISENABLER (net: the saved bits), ISPENDR (the latch,
-    -- exactly: `vgic_v3_uaccess_write_pending`, vgic-mmio-v3.c:383-394; ICPENDR is ignored,
-    -- vgic-mmio-v3.c:649-652), ICACTIVER and ISACTIVER (net: the saved bits)
+    -- `GICD_CTLR`, then ICENABLER and ISENABLER, ISPENDR (the latch, exactly:
+    -- `vgic_v3_uaccess_write_pending`, vgic-mmio-v3.c:383-394; ICPENDR is ignored,
+    -- vgic-mmio-v3.c:649-652), ICACTIVER and ISACTIVER
     { m with gicEn := i.gicEn, dev := i.dev, ideal := i.ideal,
-             spi := { m.spi with en := i.spi.en, latch := i.spi.latch, act := i.spi.act } }
+             spi := { m.spi with en := clearSet m.spi.en (clrOf R i.spi.en) i.spi.en,
+                                 latch := i.spi.latch,
+                                 act := clearSet m.spi.act (clrOf R i.spi.act) i.spi.act } }
   | .redist v =>
     let c := m.get v
     let s := i.slot v
     -- a user write of the active bit of a mapped interrupt is dropped
     -- (`vgic_hw_irq_change_active`, vgic-mmio.c:537-545)
-    m.set v { c with tmr := { c.tmr with en := s.tmr.en, latch := s.tmr.latch,
-                                         act := if c.hw then c.tmr.act else s.tmr.act },
-                     sgi := { c.sgi with en := s.sgi.en, latch := s.sgi.latch, act := s.sgi.act } }
+    m.set v { c with tmr := { c.tmr with en := clearSet c.tmr.en (clrOf R s.tmr.en) s.tmr.en,
+                                         latch := s.tmr.latch,
+                                         act := if c.hw then c.tmr.act
+                                                else clearSet c.tmr.act (clrOf R s.tmr.act) s.tmr.act },
+                     sgi := { c.sgi with en := clearSet c.sgi.en (clrOf R s.sgi.en) s.sgi.en,
+                                         latch := s.sgi.latch,
+                                         act := clearSet c.sgi.act (clrOf R s.sgi.act) s.sgi.act } }
   | .icc v =>
     -- `vgic_v3_cpu_sysregs_uaccess` (vgic-sys-reg-v3.c): PMR, IGRPEN1, AP1R0 as given
     let c := m.get v
@@ -488,7 +505,7 @@ def apply (C : Cfg) (i : Image) (m : VM) : Op → VM
              c0 := { c0 with tmr := { c0.tmr with line := i.s0.tmr.line } },
              c1 := { c1 with tmr := { c1.tmr with line := i.s1.tmr.line } } }
 
-def build (R : Rules) (C : Cfg) (i : Image) : VM := R.restore.foldl (apply C i) emptyVM
+def build (R : Rules) (C : Cfg) (i : Image) : VM := R.restore.foldl (apply R C i) emptyVM
 
 /-- A vCPU thread enters `KVM_RUN`: the first time maps the timer interrupt
 (`kvm_timer_enable`), and every load recomputes the timer's level from its registers
@@ -573,11 +590,12 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
                       restores := s.restores + 1, vm := build R C i }
 
 /-- A guest that has booted: both CPUs running, the interrupts it uses enabled, the priority
-mask open, nothing pending. -/
+mask open, nothing pending. A CPU the guest took offline has its timer interrupt and its SGI
+disabled (observed on a Linux guest: #2155, comment 7174817511). -/
 def bootVcpu (off : Bool) : Vcpu :=
   { g := .run, call := false, gOff := off, thr := .guest, stopped := off,
     pmr := true, grp := true, ap := false,
-    tmr := { IrqSt.none with en := true }, sgi := { IrqSt.none with en := true },
+    tmr := { IrqSt.none with en := !off }, sgi := { IrqSt.none with en := !off },
     tEn := false, cv := 0, l2 := false, hw := true }
 
 def init (C : Cfg) : State :=
