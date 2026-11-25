@@ -945,9 +945,16 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
 }
 
 /// The gate's TCP rule in both chains and both families: a SYN without ACK is
-/// answered with a reset. That segment is what begins a TCP connection in
+/// answered with a reset. That segment is what asks for a new TCP connection in
 /// either direction, so the rule reads the packet and asks connection tracking
 /// nothing.
+///
+/// One connection it does not cover begins without that segment reaching the
+/// closed gate (#2123): a listener whose SYN queue is full answers a SYN with a
+/// cookie and keeps no request socket (`tcp_syncookies`), so the client's bare
+/// ACK creates the established socket by itself. A cookie sent before the gate
+/// closed is completed by an ACK that passes this rule, and the socket it
+/// creates is in no manifest.
 ///
 /// It used to be `-m conntrack --ctstate NEW`, which has two faults (#2106):
 ///
@@ -974,8 +981,12 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
 /// the reset `restore_boundary_with` describes, which is why that half opens
 /// before the stale sockets are retired. The match is SYN set and ACK clear
 /// whatever else is set, so a SYN that also carries FIN or RST, which a
-/// listener drops anyway, is refused too. A first fragment too short to hold
-/// the flags is dropped by the `tcp` match itself.
+/// listener drops anyway, is refused too. A fragment that does not hold the
+/// flags does not match and passes the gate: with the nf_tables backend the
+/// rule is a read of the TCP header, and a read that fails is a non-match. The
+/// stack is what drops a first fragment too short for them: IPv4 reaches INPUT
+/// reassembled, and IPv6 reassembly refuses a first fragment without the whole
+/// TCP header.
 const TCP_NEW_FLOW_REJECT: [&str; 11] = [
     "-p",
     "tcp",

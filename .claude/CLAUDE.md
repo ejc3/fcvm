@@ -156,8 +156,8 @@ none. Three faults came from it:
 - **A stale tuple passed the closed gate.** A SYN on a tuple tracked as
   ESTABLISHED is not NEW, so the listener accepted it and a restored clone
   answered a client before publication. A fleet potato player answered a probe
-  that way and refused the wake message 59 us later: one wake in 13,444 and one
-  in 22,352, a round lost each time.
+  that way and refused the wake message sent 0.1 ms later: one wake in 13,444
+  and one in 22,352, a round lost each time.
 
 The rule is now `-p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with
 tcp-reset` in both chains and both families (`TCP_NEW_FLOW_REJECT`).
@@ -168,7 +168,10 @@ tcp-reset` in both chains and both families (`TCP_NEW_FLOW_REJECT`).
    the tracker changes what the guest's kernel does with every packet and leaves
    entries behind.
 2. **What begins a flow is read off the packet where the protocol has such a
-   packet.** The tracker's memory outlives the connections it describes.
+   packet.** The tracker's memory outlives the connections it describes. For
+   TCP that packet is a SYN without ACK, with one exception the rule does not
+   cover: the ACK that completes a handshake the listener answered with a SYN
+   cookie (#2123).
 3. **The restored clone's UDP rule is the exception, and only on the restore
    side** (`udp_ingress_rule_args`): UDP has no packet that begins a flow. Its
    doc says what it promises and what it does not.
