@@ -360,11 +360,26 @@ pub fn chromium_only(name: &str) -> Option<bool> {
     }
 }
 
-/// An overlay's text as it is kept: whitespace collapsed, no control characters, 1 to
-/// [`MAX_OVERLAY_CHARS`] characters. Plain text: the host escapes it into the page.
+/// Whether `c` is an invisible format character an overlay's text may not hold: the
+/// characters that change the direction of the text around them, zero-width spaces and
+/// marks, and the tag characters. The zero-width joiner and non-joiner are not among them:
+/// emoji sequences and several scripts are written with them.
+fn invisible_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
+}
+
+/// An overlay's text as it is kept: runs of spaces collapsed, 1 to [`MAX_OVERLAY_CHARS`]
+/// characters, no control characters (a tab or a newline is one) and no invisible format
+/// characters. Plain text: the host escapes it into the page.
 pub fn normalise_overlay(text: &str) -> Result<String, String> {
     if text.chars().any(|c| c.is_control()) {
         return Err("text holds control characters".into());
+    }
+    if text.chars().any(invisible_format) {
+        return Err("text holds invisible format characters".into());
     }
     let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let n = t.chars().count();
@@ -458,9 +473,10 @@ impl Renders {
         if let Some(reason) = self.refusal(client, at, cfg) {
             return Err(reason);
         }
-        let (mut text, mut transform) = self
-            .overlay
-            .as_ref()
+        // An overlay past its end is gone, whether or not a tick has removed it yet.
+        let ended = self.overlay.as_ref().is_some_and(|o| at >= o.until);
+        let current = self.overlay.as_ref().filter(|_| !ended);
+        let (mut text, mut transform) = current
             .map(|o| (o.text.clone(), o.transform.clone()))
             .unwrap_or_default();
         let done = match change {
@@ -476,7 +492,7 @@ impl Renders {
                 "transform"
             }
             Change::Clear => {
-                if self.overlay.is_none() {
+                if current.is_none() {
                     return Err("nothing is set".into());
                 }
                 text = None;
@@ -484,7 +500,9 @@ impl Renders {
                 "clear"
             }
         };
-        self.overlay_seq += 1;
+        // The end of the one before and this change are two changes, as they are when a
+        // tick comes between them.
+        self.overlay_seq += 1 + u64::from(ended);
         self.overlay = (text.is_some() || transform.is_some()).then(|| Overlay {
             text,
             transform,
@@ -576,6 +594,115 @@ mod tests {
         let mut r = Renders::default();
         r.agent_hello("h1", Some(&host()));
         r
+    }
+
+    /// An overlay past its end is gone, whether or not a tick has removed it yet: a change
+    /// that arrives in between starts from nothing and does not bring the old text back.
+    #[test]
+    fn a_change_after_an_overlays_end_does_not_bring_its_text_back() {
+        let cfg = RendersConfig::default();
+        let mut r = with_host();
+        r.change("v1", "c1", &Change::Text("hello".into()), 1_000, &cfg)
+            .unwrap();
+        let until = r.overlay.as_ref().unwrap().until;
+        assert_eq!(until, 121_000);
+        // no tick since; a transform half a second after the end
+        r.change(
+            "v2",
+            "c2",
+            &Change::Transform("mirror".into()),
+            until + 500,
+            &cfg,
+        )
+        .unwrap();
+        let o = r.overlay.clone().unwrap();
+        assert_eq!((o.text, o.transform.as_deref()), (None, Some("mirror")));
+        // the end and the new overlay are two changes: a host tells them apart by number
+        assert_eq!(o.seq, 3);
+        // and a clear of an overlay that has ended is a clear of nothing
+        let mut r = with_host();
+        r.change("v1", "c1", &Change::Text("hello".into()), 1_000, &cfg)
+            .unwrap();
+        assert_eq!(
+            r.change("v2", "c2", &Change::Clear, 121_500, &cfg),
+            Err("nothing is set".into())
+        );
+        r.tick(121_500);
+        assert_eq!((r.overlay.clone(), r.overlay_seq), (None, 2));
+    }
+
+    /// Characters that change the direction of the text around them, and other invisible
+    /// format characters, are refused: the text is drawn into every page. A joiner between
+    /// emoji is kept.
+    #[test]
+    fn an_overlay_text_holds_no_invisible_format_characters() {
+        for bad in [
+            "abc\u{202E}def",
+            "\u{2066}abc",
+            "a\u{200F}b",
+            "a\u{200B}b",
+            "\u{FEFF}abc",
+            "a\u{061C}b",
+            "a\u{2060}b",
+            "a\u{E0041}b",
+        ] {
+            assert_eq!(
+                normalise_overlay(bad),
+                Err("text holds invisible format characters".into()),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            normalise_overlay("ok \u{1F468}\u{200D}\u{1F469} ok").as_deref(),
+            Ok("ok \u{1F468}\u{200D}\u{1F469} ok")
+        );
+        // a tab or a newline is a control character and is refused, not collapsed
+        assert!(normalise_overlay("a\tb").is_err());
+        assert_eq!(normalise_overlay("  a   b  ").as_deref(), Ok("a b"));
+    }
+
+    /// PROTOCOL.md's list of what a report must carry is what the types need: the smallest
+    /// report it describes parses, and one without any of the named fields does not.
+    #[test]
+    fn a_report_needs_the_documented_fields_and_no_others() {
+        let side = serde_json::json!({
+            "search": {"in_flight": 1, "phase": "starting"},
+            "renders_per_s": 0.0, "cpus_busy": 0.0, "done": 0, "failed": 0, "since": 0,
+        });
+        let tile = serde_json::json!({
+            "page": "example", "side": "fcvm", "state": "waiting",
+            "renders_per_s": 0.0, "done": 0, "failed": 0,
+        });
+        let report = |side: &serde_json::Value, tile: &serde_json::Value| {
+            serde_json::from_value::<RendersReport>(
+                serde_json::json!({"at": 1, "sides": {"fcvm": side}, "tiles": [tile]}),
+            )
+        };
+        assert!(serde_json::from_value::<RendersReport>(serde_json::json!({"at": 1})).is_ok());
+        assert!(serde_json::from_value::<RendersReport>(serde_json::json!({})).is_err());
+        assert!(report(&side, &tile).is_ok());
+        for key in [
+            "search",
+            "renders_per_s",
+            "cpus_busy",
+            "done",
+            "failed",
+            "since",
+        ] {
+            let mut without = side.clone();
+            without.as_object_mut().unwrap().remove(key);
+            assert!(report(&without, &tile).is_err(), "a side without {key}");
+        }
+        for key in ["in_flight", "phase"] {
+            let mut without = side.clone();
+            without["search"].as_object_mut().unwrap().remove(key);
+            assert!(report(&without, &tile).is_err(), "a search without {key}");
+        }
+        for key in ["page", "side", "state", "renders_per_s", "done", "failed"] {
+            let mut without = tile.clone();
+            without.as_object_mut().unwrap().remove(key);
+            assert!(report(&side, &without).is_err(), "a tile without {key}");
+        }
     }
 
     #[test]

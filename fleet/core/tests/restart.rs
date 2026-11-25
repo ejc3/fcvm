@@ -744,6 +744,74 @@ fn a_pages_overlay_survives_a_restart_and_still_ends_on_time() {
     assert_eq!(s.fleet.renders.order(true).overlay, None);
 }
 
+/// The recent-actions list, which every viewer sees, shows of a pages intent only what the
+/// coordinator parsed and committed: a refused transform's name is free text nobody checked,
+/// and so is any other key a viewer puts beside `text` or `name`.
+#[test]
+fn a_pages_action_shows_only_what_was_parsed_and_committed() {
+    let intent = |at: u64, client: &str, id: &str, name: &str, args: serde_json::Value| {
+        ev(
+            json!({"at": at, "type": "intent", "viewer": "v1", "client": client, "id": id,
+            "name": name, "args": args, "check": {"verdict": "allow", "reason": ""}}),
+        )
+    };
+    let s = run(
+        State::new(config(), 0),
+        vec![
+            pages_hello(1_000),
+            intent(
+                2_000,
+                "198.51.100.20",
+                "t-1",
+                "renders_transform",
+                json!({"name": "so nasty"}),
+            ),
+            intent(
+                3_000,
+                "198.51.100.21",
+                "o-1",
+                "renders_overlay",
+                json!({"text": "  hello   there ", "note": "so nasty"}),
+            ),
+            intent(
+                20_000,
+                "198.51.100.22",
+                "t-2",
+                "renders_transform",
+                json!({"name": "mirror", "note": "so nasty"}),
+            ),
+            intent(
+                40_000,
+                "198.51.100.23",
+                "c-1",
+                "renders_clear",
+                json!({"note": "so nasty"}),
+            ),
+        ],
+    );
+    assert_eq!(s.receipts["t-1"].outcome, Outcome::Refused);
+    for id in ["o-1", "t-2", "c-1"] {
+        assert_eq!(s.receipts[id].outcome, Outcome::Committed, "{id}");
+    }
+    let v = serde_json::to_value(fleet_core::view(&s)).unwrap();
+    assert!(!v.to_string().contains("nasty"), "{v}");
+    let shown: Vec<_> = v["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["id"].as_str().unwrap().to_string(), a["args"].clone()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("t-1".to_string(), json!({})),
+            ("o-1".to_string(), json!({"text": "hello there"})),
+            ("t-2".to_string(), json!({"name": "mirror"})),
+            ("c-1".to_string(), json!({})),
+        ]
+    );
+}
+
 /// A text the check refused is in no viewer's snapshot: not as the overlay, and not in the
 /// recent-actions list, which every viewer sees.
 #[test]

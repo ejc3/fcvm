@@ -1680,15 +1680,29 @@ sides render different work, and a page compares nothing across them.
 
 | intent | args | effect |
 |--------|------|--------|
-| `renders_overlay` | `{"text": "hello"}` | the text on every page: 1 to 40 characters after collapsing whitespace, no control characters, plain text (the host escapes it into the page); checked alone by the text check as a `word` is, and its receipt carries the `check` |
+| `renders_overlay` | `{"text": "hello"}` | the text on every page: 1 to 40 characters after collapsing runs of spaces, plain text (the host escapes it into the page). Refused with a control character (a tab or a newline is one) or an invisible format character (those that change the text's direction, zero-width spaces and marks, tag characters; a joiner between emoji is kept). Checked alone by the text check as a `word` is, and its receipt carries the `check` |
 | `renders_transform` | `{"name": "mirror"}` | one of `transforms`; any other name is refused |
 | `renders_clear` | `{}` | the text and the transform go; refused with nothing set |
 
 A change is refused with no host of the mode, within 30 s of the same client's last change, and
 within 10 s of anyone's (every change starts both sides' searches again). A change keeps the
-other part of the overlay and sets `until` to two minutes on; at `until` the overlay goes. Each
-change, an expiry included, takes the next `seq`. The overlay is in the stored state before its
-receipt is sent, and a restarted coordinator keeps it, its `until` and its `seq`.
+other part of the overlay and sets `until` to two minutes on, so an overlay goes two minutes
+after its last change, whoever made it. From `until` on the overlay is gone: a change that
+arrives before the coordinator's next tick starts from nothing. Each change, an expiry
+included, takes the next `seq`. The overlay is in the stored state before its receipt is sent,
+and a restarted coordinator keeps it, its `until` and its `seq`.
+
+The order a change gives the host is sent when the change is applied, which can be before the
+state holding it is stored, as with every other order. A coordinator that dies in between comes
+back without the change and can give its `seq` to another one. A host's connection ends with
+the coordinator, and the order at the start of the next one replaces whatever the host served,
+so a host or a page compares an overlay by its content and its `seq` within one connection,
+never by a `seq` kept across connections.
+
+In the recent-actions list a pages intent shows what was parsed and committed and nothing else:
+a committed `renders_overlay` its text as kept, a committed `renders_transform` its `name`, and
+`{}` for a `renders_clear` and for any of the three that was refused. Its args as sent can hold
+text nobody checked.
 
 ## Agent
 
@@ -1807,7 +1821,10 @@ A `/health` reply carrying `error` (the renderer failed) fails the relaunch at o
  "overlay_seq": 3, "harness": {"cpu_pressure": 0.0, "replay_ms": {"fcvm": 0.4, "kitesurf": 0.5}}}
 ```
 
-Pages mode: the host's summary, every few seconds. Only `at` is required. A host says it runs
+Pages mode: the host's summary, every few seconds. At the top level only `at` is required. A
+side that is present carries `search` (with `in_flight` and `phase`),
+`renders_per_s`, `cpus_busy`, `done`, `failed` and `since`; a tile carries `page`, `side`,
+`state`, `renders_per_s`, `done` and `failed`. A host says it runs
 the mode with `renders` in its hello (`{"pages": [{"id", "url"}], "cpus", "confined"?,
 "build"?}`), and sends this message only after it has received a `renders` order: a
 coordinator built before the mode sends none, and would close the connection on this message.

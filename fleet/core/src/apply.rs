@@ -238,8 +238,16 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 secret: secret.as_deref(),
                 at,
             };
-            let result = Intent::parse(name, args)
-                .and_then(|intent| intent_effect(state, &ctx, &intent, check.as_ref()));
+            let parsed = Intent::parse(name, args);
+            // What a pages intent shows of itself once committed: the parsed value, never
+            // the args as sent.
+            let pages_args = match &parsed {
+                Ok(Intent::RendersOverlay { text }) => Some(serde_json::json!({"text": text})),
+                Ok(Intent::RendersTransform { name }) => Some(serde_json::json!({"name": name})),
+                _ => None,
+            };
+            let result =
+                parsed.and_then(|intent| intent_effect(state, &ctx, &intent, check.as_ref()));
             let (outcome, reason, summary) = match result {
                 Ok(summary) => (Outcome::Committed, None, summary),
                 // The reason reaches the public actions feed and the viewer's receipt.
@@ -248,14 +256,22 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     (Outcome::Refused, Some(reason.clone()), reason)
                 }
             };
-            // A refused word's text, and a refused pages overlay's, is never shown: its args
-            // are left out and the summary is the reason only. Args that are not an object (refused, `args must be an
+            // A refused word's text is never shown: its args are left out and the summary is
+            // the reason only. Args that are not an object (refused, `args must be an
             // object`) are shown as `{}` too: an intent's args are an object on the wire, and
             // a page keeps nothing else.
             // A claim's and a resume's args are the claim's token, which only its viewer may
             // hold.
-            let shown_args = if ((name == "word" || name == "renders_overlay")
-                && outcome == Outcome::Refused)
+            // A pages intent (`renders_*`) shows what was parsed and committed and nothing
+            // else: a refused one shows `{}`, whatever it was refused for, and a committed
+            // one its text as kept or its transform's name. Its args as sent can hold text
+            // nobody checked (a transform's name that is none, a key beside `text`).
+            let shown_args = if name.starts_with("renders_") {
+                match outcome {
+                    Outcome::Committed => pages_args.unwrap_or_else(|| serde_json::json!({})),
+                    _ => serde_json::json!({}),
+                }
+            } else if (name == "word" && outcome == Outcome::Refused)
                 || name == "resume_claim"
                 || name == "claim_gpu"
                 || !args.is_object()

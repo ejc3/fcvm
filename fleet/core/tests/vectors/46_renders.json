@@ -407,7 +407,7 @@
     "actions": [
       {
         "args": {
-          "text": "  hello   there "
+          "text": "hello there"
         },
         "at": 3000,
         "id": "t1",
@@ -417,9 +417,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "name": "mirror"
-        },
+        "args": {},
         "at": 4000,
         "id": "t2",
         "name": "renders_transform",
@@ -428,9 +426,7 @@
         "viewer": "v1"
       },
       {
-        "args": {
-          "name": "invert"
-        },
+        "args": {},
         "at": 5000,
         "id": "t3",
         "name": "renders_transform",
@@ -468,9 +464,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "name": "spin"
-        },
+        "args": {},
         "at": 50000,
         "id": "t7",
         "name": "renders_transform",
@@ -508,9 +502,7 @@
         "viewer": "v3"
       },
       {
-        "args": {
-          "name": "flip"
-        },
+        "args": {},
         "at": 200000,
         "id": "t11",
         "name": "renders_transform",

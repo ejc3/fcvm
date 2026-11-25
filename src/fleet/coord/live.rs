@@ -1160,9 +1160,10 @@ async fn tell_claim(
     }
 }
 
-/// A `word` intent, or pages mode's `renders_overlay` (`name`): its first receipt if the id is known; otherwise the pre-checks, then
-/// the text check of the whole sky, then the event with the verdict. Returns the receipt
-/// to send, or `None` when another task already holds this id (that task sends it).
+/// A `word` intent, or pages mode's `renders_overlay` (`name`): its first receipt if the id
+/// is known; otherwise the pre-checks, then the text check (a word with the whole sky, an
+/// overlay alone), then the event with the verdict. Returns the receipt to send, or `None`
+/// when another task already holds this id (that task sends it).
 async fn word(
     app: &App,
     viewer: &str,
@@ -1201,8 +1202,13 @@ async fn word(
         if busy {
             Some(TextCheck {
                 verdict: "error".into(),
-                reason: "another word from this viewer is being checked".into(),
-                sky: app.handle.sky().await,
+                reason: "another text from this viewer is being checked".into(),
+                // An overlay is checked alone; the sky is a word's context.
+                sky: if overlay {
+                    Vec::new()
+                } else {
+                    app.handle.sky().await
+                },
             })
         } else {
             let text = args
