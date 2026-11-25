@@ -1536,9 +1536,9 @@ impl StateManager {
     }
 
     /// Sweep the state directory (`cleanup_stale_state`) at most once a `SWEEP_EVERY` per
-    /// state directory, from the one launch that wins `sweep.lock`, after its claim has
-    /// released the name lock. A claim no longer scans every state, so this is what removes the states
-    /// SIGKILLed VMs leave and the index entries that outlive them; until it runs they
+    /// state directory, from the one launch that wins `sweep.lock`, after its claim. A
+    /// claim scans no other VM's state, so this is what removes the states SIGKILLed VMs
+    /// leave and the index entries that outlive them; until it runs they
     /// hold nothing (a dead owner is not live, and a stale index entry names a state that
     /// is gone). Best effort: a sweep that cannot take its lock leaves it to the next.
     async fn maybe_sweep(&self) {
@@ -2368,18 +2368,23 @@ impl StateManager {
 
     /// Watch one VM's state file for its next replacement or removal.
     ///
-    /// Every write of a state is a rename onto `<vm_id>.json` and its removal an unlink, so
-    /// a waiter that holds a watch from before it read the state misses no change.
+    /// Every write of a state is a rename onto `<vm_id>.json` (an exchange with its
+    /// temporary file where the filesystem has one, which raises the same event under that
+    /// name) and its removal an unlink, so a waiter that holds a watch from before it read
+    /// the state misses no change. The watch is on the VM's bucket, the one directory its
+    /// state file is ever in, made when missing so that a watch can begin before the VM's
+    /// first state is written.
     pub fn watch_state(&self, vm_id: &str) -> Result<StateWatch> {
         use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+        let bucket = self.bucket_dir(VMS_DIR, &bucket_of(vm_id))?;
         let inotify = Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC)
             .context("creating an inotify instance for the state directory")?;
         inotify
             .add_watch(
-                &self.state_dir,
+                &bucket,
                 AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_DELETE,
             )
-            .with_context(|| format!("watching {}", self.state_dir.display()))?;
+            .with_context(|| format!("watching {}", bucket.display()))?;
         // SAFETY: `WatchFd` owns the inotify descriptor and returns that same open
         // descriptor from every `as_raw_fd` for as long as the `AsyncFd` holds it.
         let inotify = unsafe { tokio::io::unix::AsyncFd::register(WatchFd(inotify)) }
