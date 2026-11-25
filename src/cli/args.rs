@@ -595,7 +595,8 @@ pub struct FleetCoordArgs {
 
     /// On-demand rates the spend meter uses, `<instance type>=<USD per hour>`, comma
     /// separated, over its built-in rates for the fleet's instance types (us-east-1 list
-    /// prices). Spot instances are priced at their current spot price.
+    /// prices). Spot instances are priced at their current spot price. A host group launches
+    /// only types this table prices.
     #[arg(long, env = "FLEET_SPEND_RATES", value_delimiter = ',')]
     pub spend_rates: Vec<String>,
 

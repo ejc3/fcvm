@@ -1442,6 +1442,8 @@ pub const RENDERS_ON_DEMAND_MAX: u32 = 1;
 /// region). Each lists and launches only its own class's instances.
 pub fn host_groups(args: &FleetCoordArgs) -> Result<Vec<hosts::HostConfig>> {
     let mut groups = Vec::new();
+    // Each group launches only types this table prices (hosts::unpriced_launch).
+    let rates = spend::on_demand_rates(&args.spend_rates)?;
     if args.host_templates.is_empty() {
         anyhow::ensure!(
             args.host_subnets.is_empty(),
@@ -1452,7 +1454,8 @@ pub fn host_groups(args: &FleetCoordArgs) -> Result<Vec<hosts::HostConfig>> {
             &args.host_templates,
             &args.host_subnets,
             args.fleet_name.clone(),
-        )?;
+        )?
+        .priced_by(rates.clone());
         groups.push(hosts::HostConfig {
             class: hosts::HostClass::Gpu,
             regions: driver.regions(),
@@ -1479,7 +1482,8 @@ pub fn host_groups(args: &FleetCoordArgs) -> Result<Vec<hosts::HostConfig>> {
             &args.renders_subnets,
             args.fleet_name.clone(),
             hosts::HostClass::Renders,
-        )?;
+        )?
+        .priced_by(rates);
         let regions = driver.regions();
         anyhow::ensure!(
             regions.len() == 1,
