@@ -1908,16 +1908,44 @@ impl StateManager {
 
     /// The path of every state file there is now, in every bucket. For tests and tools
     /// that inspect the store without loading it; `list_vms` is the listing to act on.
+    ///
+    /// An error when `vms/` or one of its buckets cannot be listed: a caller that checks the
+    /// store for what a VM left must not pass because it could not look. A store with no
+    /// `vms/` has no state files. The sweeps pass over such a bucket instead
+    /// (`bucket_entries`), since they run again.
     #[doc(hidden)]
-    pub fn state_files(&self) -> Vec<PathBuf> {
-        self.bucket_entries(VMS_DIR)
-            .into_iter()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
+    pub fn state_files(&self) -> Result<Vec<PathBuf>> {
+        let vms = self.state_dir.join(VMS_DIR);
+        let buckets = match std::fs::read_dir(&vms) {
+            Ok(buckets) => buckets,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).with_context(|| format!("listing {}", vms.display())),
+        };
+        let mut files = Vec::new();
+        for bucket in buckets {
+            let bucket = bucket.with_context(|| format!("listing {}", vms.display()))?;
+            if !bucket.file_name().to_str().is_some_and(is_bucket) {
+                continue;
+            }
+            let path = bucket.path();
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("listing {}", path.display()))
+                }
+            };
+            for entry in entries {
+                let entry = entry.with_context(|| format!("listing {}", path.display()))?;
+                if entry
+                    .path()
+                    .extension()
                     .is_some_and(|extension| extension == "json")
-            })
-            .collect()
+                {
+                    files.push(entry.path());
+                }
+            }
+        }
+        Ok(files)
     }
 
     /// The entries of every bucket of `kind`. A bucket that cannot be read is passed over:
@@ -3123,6 +3151,51 @@ mod tests {
                 "deleting the last holder left its slot"
             );
         }
+    }
+
+    /// The listing of state files fails when it cannot look, so a test that checks the store
+    /// for what a VM left cannot pass on a bucket it could not read. A store with no `vms/`,
+    /// or an empty one, lists nothing and is no error.
+    #[test]
+    fn listing_state_files_fails_when_a_bucket_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        assert!(
+            manager.state_files().unwrap().is_empty(),
+            "a store with no vms/"
+        );
+        std::fs::create_dir(dir.path().join(VMS_DIR)).unwrap();
+        assert!(manager.state_files().unwrap().is_empty(), "an empty vms/");
+        write_state_file(dir.path(), &named_state("vm-listed", "listed"));
+        assert_eq!(
+            manager.state_files().unwrap(),
+            vec![manager.state_file("vm-listed")]
+        );
+
+        let bucket = manager.vm_bucket("vm-listed");
+        let unreadable = if nix::unistd::geteuid().is_root() {
+            // Root lists a directory whatever its mode, so the bucket is replaced by a file
+            // of its name, which cannot be listed.
+            std::fs::remove_dir_all(&bucket).unwrap();
+            std::fs::write(&bucket, b"").unwrap();
+            "a bucket that is a file (run as root)"
+        } else {
+            std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o000)).unwrap();
+            "a bucket of mode 000 (run as a user other than root)"
+        };
+        let listed = manager.state_files();
+        if bucket.is_dir() {
+            // So the temporary directory can be removed.
+            std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let Err(error) = listed else {
+            panic!("listed a store with {unreadable} without an error");
+        };
+        assert!(
+            format!("{error:#}").contains(&bucket.display().to_string()),
+            "the error does not name the bucket: {error:#}"
+        );
     }
 
     /// Wakes the thread that polls a future by hand (`poll_then_drop`).
