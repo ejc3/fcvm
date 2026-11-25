@@ -487,6 +487,153 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
     Ok(())
 }
 
+/// Each vCPU's GICR_ISENABLER0 and GICR_PENDBASER in a Cloud Hypervisor snapshot's `rdist`
+/// array (hypervisor/src/kvm/aarch64/gic/redist_regs.rs in the fork): every vCPU's 7 words
+/// of redistributor registers first, of which GICR_PENDBASER is the fifth and sixth, then
+/// every vCPU's 17 words of SGI and PPI registers, of which GICR_ISENABLER0 is the third.
+#[cfg(target_arch = "aarch64")]
+fn saved_enables_and_pending_tables(state_json: &std::path::Path) -> Result<Vec<(u32, u64)>> {
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(state_json)?)?;
+    let gic = doc["snapshots"]["device-manager"]["snapshots"]["gic-v3-its"]["snapshot_data"]
+        ["state"]
+        .as_str()
+        .context("the snapshot's state file has no vGIC state")?;
+    let gic: serde_json::Value = serde_json::from_str(gic)?;
+    let rdist: Vec<u32> = serde_json::from_value(gic["Kvm"]["rdist"].clone())
+        .context("the vGIC state has no rdist array")?;
+    anyhow::ensure!(
+        !rdist.is_empty() && rdist.len() % 24 == 0,
+        "rdist has {} words, not 24 per vCPU",
+        rdist.len()
+    );
+    let vcpus = rdist.len() / 24;
+    Ok((0..vcpus)
+        .map(|v| {
+            let pendbaser = u64::from(rdist[v * 7 + 4]) | u64::from(rdist[v * 7 + 5]) << 32;
+            (rdist[vcpus * 7 + v * 17 + 2], pendbaser)
+        })
+        .collect())
+}
+
+/// #2155: a Cloud Hypervisor snapshot of a VM that was booted (not restored) saved vCPU 0's
+/// redistributor and CPU interface registers once per vCPU, because the identities that
+/// address each vCPU's registers were set on the restore path only. A clone then ran every
+/// vCPU on vCPU 0's interrupt state. When vCPU 0 was inside an interrupt handler at the
+/// pause, the clone's CPU 1 inherited an active priority that nothing ended: it took no
+/// interrupt again, and the restore never completed.
+///
+/// No race is needed to see the save: guest CPU 1 is taken offline, which disables its timer
+/// interrupt (PPI 27), so the two vCPUs' enable registers differ for certain. The snapshot
+/// has to hold each vCPU's own, and a clone of it has to bring CPU 1 back with a working
+/// timer.
+#[cfg(target_arch = "aarch64")]
+#[tokio::test]
+async fn test_cloud_hypervisor_snapshot_saves_each_vcpus_own_gic_state() -> Result<()> {
+    use std::time::Duration;
+
+    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
+        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+        return Ok(());
+    }
+    const TIMER_PPI: u32 = 1 << 27;
+    let (vm_name, clone_name, tag, _) = common::unique_names("ch-gic");
+
+    // Cold boot: only a VM that was never restored had the defect.
+    let (_child, pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            "--cpu",
+            "2",
+            common::TEST_IMAGE,
+        ],
+        &[("FCVM_NO_SNAPSHOT", "1")],
+    )
+    .await?;
+    let result = async {
+        common::poll_health_by_pid(pid, 240).await?;
+        let online = common::exec_in_vm(
+            pid,
+            &["echo 0 > /sys/devices/system/cpu/cpu1/online; cat /sys/devices/system/cpu/online"],
+        )
+        .await?;
+        anyhow::ensure!(
+            online.trim() == "0",
+            "guest CPU 1 did not go offline: {online}"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            common::create_snapshot_by_pid(pid, &tag),
+        )
+        .await
+        .context("snapshot create timed out")??;
+        let saved = saved_enables_and_pending_tables(
+            &fcvm::paths::snapshot_dir()
+                .join(&tag)
+                .join("ch")
+                .join("state.json"),
+        )?;
+        println!("saved (GICR_ISENABLER0, GICR_PENDBASER) per vCPU: {saved:x?}");
+        anyhow::ensure!(saved.len() == 2, "expected two vCPUs, found {saved:x?}");
+        let enables = [saved[0].0, saved[1].0];
+        anyhow::ensure!(
+            enables[0] & TIMER_PPI != 0,
+            "vCPU 0's saved GICR_ISENABLER0 {:#x} has no timer interrupt",
+            enables[0]
+        );
+        anyhow::ensure!(
+            enables[1] & TIMER_PPI == 0,
+            "guest CPU 1 is offline, and the snapshot says its timer interrupt is enabled: \
+             vCPU 1's saved GICR_ISENABLER0 {:#x} is vCPU 0's ({:#x})",
+            enables[1],
+            enables[0]
+        );
+        // What a restore refuses a snapshot for (ch_snapshot_repeats_one_vcpus_gic_state):
+        // the guest gives each redistributor a pending table of its own.
+        anyhow::ensure!(
+            saved[0].1 != 0 && saved[0].1 != saved[1].1,
+            "the snapshot holds one LPI pending table for both vCPUs: {saved:x?}"
+        );
+
+        // The clone: CPU 1 comes back and takes timer interrupts.
+        let (_clone, clone_pid) =
+            common::spawn_fcvm(&["snapshot", "run", "--snapshot", &tag, "--name", &clone_name])
+                .await?;
+        let clone = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            let ticks = common::exec_in_vm(
+                clone_pid,
+                &["echo 1 > /sys/devices/system/cpu/cpu1/online; \
+                   t() { awk '/arch_timer/ {print $3; exit}' /proc/interrupts; }; \
+                   a=$(t); sleep 2; b=$(t); echo $(nproc) $((b - a))"],
+            )
+            .await?;
+            let fields: Vec<u64> = ticks
+                .split_whitespace()
+                .filter_map(|field| field.parse().ok())
+                .collect();
+            anyhow::ensure!(
+                fields.len() == 2 && fields[0] == 2 && fields[1] > 0,
+                "the clone's CPU 1 did not come back with a timer (cpus, timer interrupts on \
+                 CPU 1 in 2 s): {ticks}"
+            );
+            Ok(())
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        clone
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&tag));
+    result
+}
+
 /// #806: `podman run --hypervisor cloud-hypervisor` uses the snapshot cache like a
 /// Firecracker run. The first run of a command takes the pre-start snapshot; the second,
 /// the same command, restores it and runs the container. A unique echo token makes the key

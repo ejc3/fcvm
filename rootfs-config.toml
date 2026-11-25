@@ -112,9 +112,17 @@ commit = "2a33289b55b7f611959891dd5295438a416f386e"
 # release yet. Required for CH snapshot/restore on SVE-capable hosts (Graviton3+).
 # The branch also carries memory_restore_mode=map (ejc3/cloud-hypervisor#1), which fcvm's
 # Cloud Hypervisor restores use: the snapshot's memory file mapped instead of copied.
+# fcvm-v52-gic-identities is fcvm-v52-sve-fix plus nine upstream commits, cherry-picked
+# with -x. Six are the arm64 vGIC fixes (#2155): a snapshot of a booted (never restored) VM
+# saved vCPU 0's redistributor and CPU interface registers for every vCPU, so a clone could
+# come up with a CPU that takes no interrupt (18366e1b7 with its prerequisite efa34d789 and
+# its test c31cf494e, eccd176e2); the ICC registers were read through a u32 (2018dd4b0, in
+# upstream v55.0 and not in the v53.1 and v54.1 point releases); and a restore left enabled
+# what the guest had disabled (1ede69b5b). Three are restore fixes that apply unchanged:
+# 4c6bb7951, 69d4c0a82, 499ff5405.
 [cloud_hypervisor]
 repo = "ejc3/cloud-hypervisor"
-branch = "fcvm-v52-sve-fix"
+branch = "fcvm-v52-gic-identities"
 
 # Rootfs Modification Plan
 #

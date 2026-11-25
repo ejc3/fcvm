@@ -3720,6 +3720,79 @@ fn assert_ch_config_disks_covered(
     Ok(())
 }
 
+/// The vGIC state a Cloud Hypervisor snapshot's `state.json` holds: the string the
+/// `gic-v3-its` device saved, parsed. `None` for a state file without one (x86_64).
+fn ch_snapshot_vgic_state(state: &serde_json::Value) -> Option<serde_json::Value> {
+    let saved = state
+        .pointer("/snapshots/device-manager/snapshots/gic-v3-its/snapshot_data/state")?
+        .as_str()?;
+    serde_json::from_str(saved).ok()
+}
+
+/// Whether a saved vGIC state has one LPI pending table for every vCPU, which is the mark
+/// of #2155 in a snapshot.
+///
+/// Cloud Hypervisor builds before the `fcvm-v52-gic-identities` pin read the redistributor
+/// and CPU interface registers of vCPU 0 once per vCPU when they saved a VM they had booted.
+/// A guest that enables LPIs gives every redistributor a pending table of its own
+/// (GICR_PENDBASER), so one table address under every vCPU is state that was copied. With
+/// one vCPU there is nothing to copy. A layout this does not read is not marked.
+fn ch_vgic_state_has_one_pending_table(vgic: &serde_json::Value) -> bool {
+    // Per vCPU: GICR_STATUSR, GICR_WAKER, GICR_PROPBASER (2 words), GICR_PENDBASER (2 words),
+    // GICR_CTLR, for every vCPU, and then 17 words of SGI and PPI registers for every vCPU.
+    const RD_WORDS: usize = 7;
+    const SGI_WORDS: usize = 17;
+    const PENDBASER: usize = 4;
+    const CTLR: usize = 6;
+    const ENABLE_LPIS: u64 = 1;
+    let Some(rdist) = vgic
+        .pointer("/Kvm/rdist")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|words| {
+            words
+                .iter()
+                .map(serde_json::Value::as_u64)
+                .collect::<Option<Vec<u64>>>()
+        })
+    else {
+        return false;
+    };
+    let vcpus = rdist.len() / (RD_WORDS + SGI_WORDS);
+    if vcpus < 2 || rdist.len() != vcpus * (RD_WORDS + SGI_WORDS) {
+        return false;
+    }
+    let table = |vcpu: usize| {
+        let regs = &rdist[vcpu * RD_WORDS..(vcpu + 1) * RD_WORDS];
+        (regs[CTLR] & ENABLE_LPIS != 0).then(|| (regs[PENDBASER], regs[PENDBASER + 1]))
+    };
+    match table(0) {
+        Some(first) if first != (0, 0) => (1..vcpus).all(|vcpu| table(vcpu) == Some(first)),
+        _ => false,
+    }
+}
+
+/// Why a Cloud Hypervisor snapshot is not restored on account of #2155, if it is not.
+///
+/// Refused: a snapshot with the mark above, taken from a VM that had been booted. Its
+/// vCPUs all hold vCPU 0's interrupt state, a clone's other vCPUs can come back with an
+/// interrupt in service that nothing ends, and nothing in the file says what their state
+/// was.
+///
+/// Not refused: a snapshot of a VM that had itself been restored (`source_was_restored`).
+/// Those builds set the redistributor identities on the restore path, so they saved a
+/// restored VM vCPU by vCPU. Such a snapshot can carry the mark, because a VM restored
+/// from a marked snapshot keeps the copied table address, but what it holds is that VM's
+/// own state.
+fn ch_snapshot_gic_refusal(vgic: &serde_json::Value, source_was_restored: bool) -> Option<String> {
+    (!source_was_restored && ch_vgic_state_has_one_pending_table(vgic)).then(|| {
+        "it holds vCPU 0's interrupt controller state for every vCPU (fcvm issue 2155): the \
+         Cloud Hypervisor build that took it saved a booted VM that way, and a clone can \
+         come back with a CPU that takes no interrupt. Boot the VM and take the snapshot \
+         again with this build"
+            .to_string()
+    })
+}
+
 /// Refuse a Cloud Hypervisor restore whose snapshot config does not name the exact
 /// vsock socket recorded in fcvm's snapshot metadata.
 ///
@@ -4774,6 +4847,26 @@ pub async fn restore_from_snapshot_ch(
         &restore_config.source_vsock_socket_path,
         vm_state.config.guest,
     )?;
+    // #2155: a snapshot whose vCPUs all hold vCPU 0's interrupt controller state gives a
+    // clone that can lose a CPU for good. Refused before the substrate's side effects, like
+    // the checks above. `snapshot_vm_id` differs from the lineage's first VM exactly when the
+    // snapshot was taken from a restored VM.
+    if let Ok(state) = tokio::fs::read(ch_dir.join("state.json")).await {
+        let source_was_restored = restore_config
+            .snapshot_vm_id
+            .as_deref()
+            .is_some_and(|vm| vm != restore_config.original_vm_id);
+        if let Some(reason) = serde_json::from_slice::<serde_json::Value>(&state)
+            .ok()
+            .and_then(|state| ch_snapshot_vgic_state(&state))
+            .and_then(|vgic| ch_snapshot_gic_refusal(&vgic, source_was_restored))
+        {
+            bail!(
+                "Cloud Hypervisor snapshot {} is not restored: {reason}",
+                snapshot_dir.display()
+            );
+        }
+    }
 
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
     let mut substrate = prepare_clone_substrate(
@@ -10671,6 +10764,88 @@ mod tests {
         );
         assert_eq!(std::fs::read(clone.join("state.json")).unwrap(), b"{}");
         assert!(!clone.join("config.json").exists());
+    }
+
+    /// The vGIC state of four snapshots of one guest image, recorded on an arm64 host
+    /// (tests/fixtures/ch-vgic-state): by the build before the `fcvm-v52-gic-identities`
+    /// pin, of a booted two-vCPU VM, of a VM restored from that snapshot, and of a booted
+    /// one-vCPU VM; and by the pin's build, of a booted two-vCPU VM.
+    #[test]
+    fn only_a_ch_snapshot_that_repeats_vcpu0s_gic_state_is_refused() {
+        let recorded = |file: &str| -> serde_json::Value {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/ch-vgic-state")
+                .join(file);
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+        let pending_tables = |vgic: &serde_json::Value| -> Vec<u64> {
+            let rdist = vgic["Kvm"]["rdist"].as_array().unwrap();
+            (0..rdist.len() / 24)
+                .map(|vcpu| rdist[vcpu * 7 + 4].as_u64().unwrap())
+                .collect()
+        };
+
+        // The defect: a booted two-vCPU VM saved by the old build. Refused, and the message
+        // names the cause and what to do.
+        let old_booted = recorded("old-build-booted-2-vcpus.json");
+        assert_eq!(pending_tables(&old_booted), [0x4189_0780, 0x4189_0780]);
+        let reason = ch_snapshot_gic_refusal(&old_booted, false).expect("refused");
+        assert!(reason.contains("vCPU 0's interrupt controller state for every vCPU"));
+        assert!(reason.contains("take the snapshot again"), "{reason}");
+
+        // The same guest saved by the pin's build: each vCPU has its own table.
+        let new_booted = recorded("new-build-booted-2-vcpus.json");
+        assert_eq!(pending_tables(&new_booted), [0x4189_0780, 0x418a_0780]);
+        assert_eq!(ch_snapshot_gic_refusal(&new_booted, false), None);
+        assert_eq!(ch_snapshot_gic_refusal(&new_booted, true), None);
+
+        // A VM restored from the defective snapshot, saved by the old build: vCPU by vCPU
+        // (guest CPU 1 was offline, and the two enable registers differ), with the table
+        // address the restore copied. It is that VM's own state, and it is restored.
+        let old_restored = recorded("old-build-restored-2-vcpus.json");
+        assert_eq!(pending_tables(&old_restored), [0x4189_0780, 0x4189_0780]);
+        let enables = |vcpu: usize| old_restored["Kvm"]["rdist"][2 * 7 + vcpu * 17 + 2].as_u64();
+        assert_eq!((enables(0), enables(1)), (Some(0x0880_ffff), Some(0xff00)));
+        assert!(ch_vgic_state_has_one_pending_table(&old_restored));
+        assert_eq!(ch_snapshot_gic_refusal(&old_restored, true), None);
+
+        // One vCPU has one table by definition.
+        let one = recorded("old-build-booted-1-vcpu.json");
+        assert_eq!(pending_tables(&one).len(), 1);
+        assert_eq!(ch_snapshot_gic_refusal(&one, false), None);
+
+        // LPIs off, no pending table, or a layout that is not the one read here: not marked.
+        let edited = |edit: &dyn Fn(&mut Vec<serde_json::Value>)| {
+            let mut vgic = old_booted.clone();
+            edit(vgic["Kvm"]["rdist"].as_array_mut().unwrap());
+            vgic
+        };
+        let lpis_off = edited(&|rdist| {
+            rdist[6] = 6.into();
+            rdist[13] = 6.into();
+        });
+        assert_eq!(ch_snapshot_gic_refusal(&lpis_off, false), None);
+        let no_table = edited(&|rdist| {
+            rdist[4] = 0.into();
+            rdist[11] = 0.into();
+        });
+        assert_eq!(ch_snapshot_gic_refusal(&no_table, false), None);
+        let short = edited(&|rdist| {
+            rdist.pop();
+        });
+        assert_eq!(ch_snapshot_gic_refusal(&short, false), None);
+
+        // Where the state sits in state.json, and a state file without a vGIC (x86_64).
+        let state_json = serde_json::json!({ "snapshots": { "device-manager": { "snapshots": {
+            "gic-v3-its": { "snapshot_data": { "state": old_booted.to_string() } } } } } });
+        assert_eq!(
+            ch_snapshot_vgic_state(&state_json),
+            Some(old_booted.clone())
+        );
+        assert_eq!(
+            ch_snapshot_vgic_state(&serde_json::json!({ "snapshots": {} })),
+            None
+        );
     }
 
     /// Every Cloud Hypervisor restore maps the memory file; `copy` read the whole guest
