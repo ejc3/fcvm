@@ -17,6 +17,10 @@
 #
 # The kernel source is fetched, not kept in this repository.
 #
+# Exit status: 0 every kernel agrees and the self-test found its differences, 1 a kernel
+# disagrees with its rule book, 2 BLOCKED: a step could not be carried out. harness/test-run.sh
+# tests the last of these.
+#
 # usage: harness/run.sh            from verify/, or through `make verify-harness`
 set -euo pipefail
 
@@ -102,16 +106,32 @@ build_one() {
     -DCUT="\"$out/cut.c\"" -I"$here" -o "$out/harness" "$here/harness.c"
 }
 
-# Run one variant's functions against one rule book's expectations.
+blocked() {
+  echo "BLOCKED: $*" >&2
+  exit 2
+}
+
+# Run one variant's functions against one rule book's expectations. Returns 0 when they agree and
+# 1 when they differ, with the differences on stdout. Both callers use it as a condition, where
+# `set -e` does not apply, so every step is checked here: a step that could not be carried out
+# ends the run as BLOCKED (exit 2) and is never taken for agreement or for a difference.
 compare() {
-  local variant=$1 book=$2 out="$build/$1"
-  (cd "$verify" && lake exe hostops "$book") > "$out/expect-$book.txt"
-  [ -s "$out/expect-$book.txt" ] || { echo "BLOCKED: no operations for $book" >&2; exit 2; }
-  sed 's/ | .*//' "$out/expect-$book.txt" > "$out/ops-$book.txt"
-  sed 's/.* | //' "$out/expect-$book.txt" > "$out/want-$book.txt"
-  "$out/harness" < "$out/ops-$book.txt" > "$out/got-$book.txt"
-  diff <(paste -d'|' "$out/ops-$book.txt" "$out/want-$book.txt") \
-       <(paste -d'|' "$out/ops-$book.txt" "$out/got-$book.txt")
+  local variant=$1 book=$2 out="$build/$1" rc=0
+  (cd "$verify" && lake exe hostops "$book") > "$out/expect-$book.txt" ||
+    blocked "lake exe hostops $book failed"
+  [ -s "$out/expect-$book.txt" ] || blocked "no operations for $book"
+  sed 's/ | .*//' "$out/expect-$book.txt" > "$out/ops-$book.txt" || blocked "sed failed for $book"
+  sed 's/.* | //' "$out/expect-$book.txt" > "$out/want-$book.txt" || blocked "sed failed for $book"
+  "$out/harness" < "$out/ops-$book.txt" > "$out/got-$book.txt" ||
+    blocked "the $variant functions failed on the operations of $book"
+  paste -d'|' "$out/ops-$book.txt" "$out/want-$book.txt" > "$out/want-lines-$book.txt" ||
+    blocked "paste failed for $book"
+  paste -d'|' "$out/ops-$book.txt" "$out/got-$book.txt" > "$out/got-lines-$book.txt" ||
+    blocked "paste failed for $book"
+  diff "$out/want-lines-$book.txt" "$out/got-lines-$book.txt" || rc=$?
+  # diff: 0 no difference, 1 differences, 2 or more it could not compare
+  [ "$rc" -le 1 ] || blocked "diff failed (status $rc) comparing $variant with the rule book $book"
+  return "$rc"
 }
 
 status=0
@@ -127,11 +147,17 @@ for variant in v6.14 v7.3.3 v7.3.3-patched; do
 done
 
 # The comparison must be able to fail: the unpatched functions against the patched rule book
-# differ exactly where #2125 is.
-if compare v7.3.3 v7.3.3-patched > "$build/v7.3.3/self-test.txt"; then
+# differ exactly where #2125 is. Only a completed comparison that found differences passes.
+self=0
+compare v7.3.3 v7.3.3-patched > "$build/v7.3.3/self-test.txt" || self=$?
+differing=$(grep -c '^<' "$build/v7.3.3/self-test.txt" || true)
+if [ "$self" = 0 ]; then
   echo "BLOCKED: the harness cannot tell v7.3.3 from v7.3.3 with the #2130 patch" >&2
   status=2
+elif [ "$self" != 1 ] || [ "$differing" -lt 1 ]; then
+  echo "BLOCKED: the self-test did not complete (status $self, $differing differing operations)" >&2
+  status=2
 else
-  echo "self-test: v7.3.3's functions against the patched rule book differ in $(grep -c '^<' "$build/v7.3.3/self-test.txt") operations, as they must"
+  echo "self-test: v7.3.3's functions against the patched rule book differ in $differing operations, as they must"
 fi
 exit $status

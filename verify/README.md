@@ -242,6 +242,10 @@ occupied; then every recorded run of `Breaks.lean` whose rule book has that kern
 The output must equal what `Today.lean` and `Design.lean` compute: 2,867, 4,804 and 2,951
 operations agree for v6.14, v7.3.3 and v7.3.3 with the patch. The harness proves it can fail by
 running v7.3.3's functions against the patched rule book: 55 operations differ, as they must.
+A step that cannot be carried out (the operations not generated in full, the functions crashing,
+`diff` unable to compare) ends the run as BLOCKED with exit status 2, for a kernel's own
+comparison and for the self-test alike; `harness/test-run.sh` injects each failure and checks
+that.
 
 **What it does not run.**
 

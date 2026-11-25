@@ -242,15 +242,18 @@ and `kvm-intel.ko` rebuilt from the same source with the one change of the #2130
 passed. That is steps 13 to 16 above. #2132 is closed for every kernel fcvm builds; a stock
 kernel from v6.15 on still clears the restore kick.
 
-Checked on the kernel's own functions by `make verify-harness`, step by step: `kvm_pv_enable_async_pf` queues the
+Checked on the kernel's own functions by `make verify-harness`, step by step, from the call the
+MSR write makes to the halt: `kvm_pv_enable_async_pf` (cut from v7.3.3 msrs.c) queues the
 completion through `kvm_async_pf_wakeup_all`; the kick sets `pv_unhalted`;
 `kvm_check_async_pf_completion` finds the slot free
 (`kvm_arch_can_dequeue_async_page_present`) and runs `kvm_arch_async_page_present`, after which
 `pv_unhalted` is clear; `__kvm_emulate_halt` then halts the vCPU and `vcpu_block` sleeps. With the
-patch applied the same sequence leaves the vCPU running. Read from the source and not run in the
-harness: that Firecracker's `KVM_SET_MSRS` reaches `kvm_pv_enable_async_pf` before the kick, and
-that `vcpu_enter_guest` handles `KVM_REQ_APF_READY` before the first guest instruction (v7.3.3
-x86.c:8216-8217). Fix: land the patch and the kick together, and see REPAIRS.md, 2 and 4.
+patch applied the same sequence leaves the vCPU running. Two links of the chain are read from the
+source and not run in the harness: that Firecracker's `KVM_SET_MSRS` of `MSR_KVM_ASYNC_PF_EN`
+reaches `kvm_pv_enable_async_pf` (the ioctl's dispatch is not cut) and does so before the kick,
+and that `vcpu_enter_guest` handles `KVM_REQ_APF_READY` before the first guest instruction (v7.3.3
+x86.c:8216-8217). Both are run on real KVM by #2135's test above. Fixed where the patch and the
+kick are both present (REPAIRS.md, 2 and 4).
 
 ### 4. Writing `mp_state` back on a live VM clears a pending kick
 
