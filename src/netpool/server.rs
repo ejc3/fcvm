@@ -871,11 +871,27 @@ mod tests {
         own.build_namespace(holder_pid)
             .await
             .expect("building the links");
-        let own_fingerprint = netns_agent::client(holder_pid)
-            .unwrap()
-            .fingerprint("tap-own")
-            .await
-            .expect("fingerprinting the clone's own namespace");
+        // A bridge is created with a carrier and loses it once it has ports and none of
+        // them forwards, which the kernel works out through its link watch some time after
+        // the ports are added (0.1 to 2.1 s in six builds on an idle host). The clone's own
+        // namespace has no attached TAP yet, so its bridge settles without one: read it
+        // then, not during the time it still shows the carrier it was created with.
+        let own_agent = netns_agent::client(holder_pid).unwrap();
+        let settle_by = tokio::time::Instant::now() + Duration::from_secs(20);
+        let own_fingerprint = loop {
+            let now = own_agent
+                .fingerprint("tap-own")
+                .await
+                .expect("fingerprinting the clone's own namespace");
+            if !bridge_has_carrier(&now) {
+                break now;
+            }
+            assert!(
+                tokio::time::Instant::now() < settle_by,
+                "the clone's own bridge kept a carrier with no attached port:\n{now}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
 
         assert!(
             pooled.built_as.contains("link tap-pool "),
@@ -893,9 +909,12 @@ mod tests {
             pooled.built_as
         );
         // The one difference: the pooled TAP is attached from its build on, by its holder,
-        // and has a carrier; a clone's own is attached when its VMM starts.
+        // and has a carrier; a clone's own is attached when its VMM starts. Each bridge
+        // follows its ports: the pooled one has a carrier, the clone's own has none.
         assert!(tap_flags(&pooled.built_as, proto::TAP) & CARRIER == CARRIER);
         assert!(tap_flags(&own_fingerprint, "tap-own") & CARRIER == 0);
+        assert!(bridge_has_carrier(&pooled.built_as), "{}", pooled.built_as);
+        assert!(!bridge_has_carrier(&own_fingerprint), "{own_fingerprint}");
         assert_eq!(
             comparable(&pooled.built_as, proto::TAP),
             comparable(&own_fingerprint, "tap-own"),
@@ -911,19 +930,33 @@ mod tests {
     /// IFF_LOWER_UP: the flag of a link with a carrier that a fingerprint keeps.
     const CARRIER: u32 = 0x1_0000;
 
+    /// The flags on a fingerprint's `link` line, when it is one.
+    fn link_flags(line: &str) -> Option<u32> {
+        let flags = line.strip_prefix("link ")?.split("flags=0x").nth(1)?;
+        u32::from_str_radix(flags.split_whitespace().next()?, 16).ok()
+    }
+
+    /// Whether a fingerprint's bridge shows a carrier.
+    fn bridge_has_carrier(fingerprint: &str) -> bool {
+        let bridge = fingerprint
+            .lines()
+            .find(|line| line.ends_with("kind=bridge"))
+            .unwrap_or_else(|| panic!("no bridge: {fingerprint}"));
+        link_flags(bridge).unwrap() & CARRIER != 0
+    }
+
     /// The flags on the fingerprint's line for the link `tap`.
     fn tap_flags(fingerprint: &str, tap: &str) -> u32 {
-        let line = fingerprint
+        fingerprint
             .lines()
             .find(|line| line.starts_with(&format!("link {tap} ")))
-            .unwrap_or_else(|| panic!("no link {tap}: {fingerprint}"));
-        let flags = line.split("flags=0x").nth(1).unwrap();
-        u32::from_str_radix(flags.split_whitespace().next().unwrap(), 16).unwrap()
+            .and_then(link_flags)
+            .unwrap_or_else(|| panic!("no link {tap}: {fingerprint}"))
     }
 
     /// A fingerprint with what differs between any two namespaces taken out: the VMM's
-    /// TAP's name, the MAC the kernel drew for each TAP, and whether the VMM's TAP has a
-    /// carrier yet.
+    /// TAP's name, the MAC the kernel drew for each TAP, whether the VMM's TAP has a
+    /// carrier yet, and with it the bridge's, which follows its ports'.
     fn comparable(fingerprint: &str, tap: &str) -> String {
         let flags = tap_flags(fingerprint, tap);
         let mut text = fingerprint
@@ -931,7 +964,21 @@ mod tests {
                 &format!("link {tap} flags={flags:#x} "),
                 &format!("link {tap} flags={:#x} ", flags & !CARRIER),
             )
-            .replace(tap, "TAP");
+            .replace(tap, "TAP")
+            .lines()
+            .map(|line| match link_flags(line) {
+                Some(flags) if line.ends_with("kind=bridge") => line.replacen(
+                    &format!("flags={flags:#x} "),
+                    &format!("flags={:#x} ", flags & !CARRIER),
+                    1,
+                ),
+                _ => line.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if fingerprint.ends_with('\n') {
+            text.push('\n');
+        }
         let drawn: Vec<(String, String)> = text
             .lines()
             .filter(|line| line.starts_with("link ") && line.ends_with("kind=tun"))
