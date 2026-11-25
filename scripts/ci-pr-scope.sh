@@ -4,7 +4,7 @@
 # Writes run, reason, code, bench, fleet and web to $GITHUB_OUTPUT.
 #
 # A pull request runs nothing while it is a draft, or while another open PR
-# from this repository is stacked on it (based on its branch): CI runs once, on
+# from this repository that is not a draft is stacked on it (based on its branch): CI runs once, on
 # the top of the stack, whose head holds every lower PR's commits. The top's run
 # classifies the whole stack's diff against the default branch, not only its own
 # files, so a docs-only top PR cannot skip the matrix for code changed lower down.
@@ -63,14 +63,21 @@ fi
 # Open PRs from this repository based on this PR's branch whose head contains this
 # PR's head: their runs test this commit. A child that does not contain it yet (a fix
 # pushed here before the child was rebased) defers nothing, or the commit would go
-# untested. A failed lookup counts as no child, so this PR runs.
+# untested. Nor does a draft child: a draft runs nothing (above), so deferring to one
+# left this PR with every job skipped and a green `Summary (deferred)`. A child whose
+# draft state is not the literal `false` counts as a draft. A failed lookup counts as
+# no child, so this PR runs.
 if [ "$stackable" = false ]; then
   echo "head branch is in $HEAD_REPO, not $REPO: not part of a stack here"
 elif children=$("$GH" api --paginate "repos/$REPO/pulls?state=open&base=$HEAD_REF&per_page=100" \
-    --jq ".[] | select(.head.repo.full_name == \"$REPO\") | \"\(.number) \(.head.sha)\""); then
+    --jq ".[] | select(.head.repo.full_name == \"$REPO\") | \"\(.number) \(.head.sha) \(.draft)\""); then
   covering=""
-  while read -r number sha; do
+  while read -r number sha child_draft; do
     [[ "$number" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    if [ "$child_draft" != "false" ]; then
+      echo "#$number is stacked here but is a draft, which runs no CI"
+      continue
+    fi
     status=$("$GH" api "repos/$REPO/compare/$HEAD_SHA...$sha" --jq '.status' 2>/dev/null) || status=""
     if [ "$status" = "ahead" ] || [ "$status" = "identical" ]; then
       covering="$covering${covering:+ }$number"

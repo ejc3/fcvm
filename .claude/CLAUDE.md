@@ -67,7 +67,7 @@ What the boundary needs is narrow, and both halves are non-destructive:
 
 | need | mechanism | reversible? |
 |------|-----------|-------------|
-| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables) | yes: its chains and hooks added, then removed |
+| no NEW socket may appear while the cookie dump runs | directional NEW-flow REJECT gate (iptables/ip6tables): a TCP SYN without ACK is reset, read off the packet | yes: its chains and hooks added, then removed |
 | packets already in receive processing must drain | one expedited RCU grace period, `membarrier(MEMBARRIER_CMD_GLOBAL)` in fc-agent's own thread | yes: the kernel's `rcu_expedited` switch is on for the grace period, then put back |
 | restore must destroy exactly the snapshot-time sockets | dump kernel socket **cookies** into a manifest | read-only |
 | a restored clone's own page faults must not queue behind its workload's | the container's cgroup frozen (`cgroup.freeze`) from the prepare until the source resumes or the clone is about to publish (`fc-agent/src/payload_freeze.rs`) | yes: a thaw undoes it, and the guest agent's watchdog thread thaws it itself once it has found the freeze on 60 looks a second apart (time the guest ran, which a clock does not measure across a pause or a restore), so a resume that never arrives, a killed prepare or a killed fcvm cannot leave it frozen; the record `/run/fcvm-payload-frozen` names the frozen cgroups, written before they are frozen, under one lock |
@@ -135,6 +135,119 @@ touches the link, so there are no routes and no neighbours to reinstate.
 addresses across one snapshot and fails on any difference. The `ModelBarrier`
 and `ModelDiag` invariants in `fc-agent/src/snapshot_network.rs` fail if any
 boundary step takes the link down, on the source or the clone path.
+
+### The gate reads the packet. It does not ask connection tracking.
+
+The gate's TCP rule was `-m conntrack --ctstate NEW` until 2026-11-24 (#2106).
+In a guest with no nat rule (a routed VM without a published port or the egress
+proxy), that rule was the only thing that attached the tracker, and the tracker
+tracks only while a rule needs it: 5 connections made with no such rule left the
+table empty, 5 made with one left 5 entries, 5 more after it was deleted left
+none. Three faults came from it:
+
+- **The snapshot reset the source's connections.** With the tracker attached at
+  the close, the next segment of a connection that was already open was the
+  first the tracker saw of it, which is NEW. An HTTP connection sending a
+  request every 25 ms through `snapshot create` was reset at its 21st.
+- **The gate left state behind.** A connection open when the gate's chains are
+  removed keeps its entry with nobody tracking its FIN: ESTABLISHED, for the
+  5 days an established flow may idle, counted in guest run time, and every
+  later snapshot of that guest carries it. The table holds 8192.
+- **A stale tuple passed the closed gate.** A SYN on a tuple tracked as
+  ESTABLISHED is not NEW, so the listener accepted it and a restored clone
+  answered a client before publication. A fleet potato player answered a probe
+  that way and refused the wake message sent 0.1 ms later: one wake in 13,444
+  and one in 22,352, a round lost each time.
+
+The rule is now `-p tcp -m tcp --tcp-flags SYN,ACK SYN -j REJECT --reject-with
+tcp-reset` in both chains and both families (`TCP_NEW_FLOW_REJECT`).
+
+**Rules:**
+
+1. **Nothing the snapshot side installs may use connection tracking.** Attaching
+   the tracker changes what the guest's kernel does with every packet and leaves
+   entries behind.
+2. **What begins a flow is read off the packet where the protocol has such a
+   packet.** The tracker's memory outlives the connections it describes. For
+   TCP that packet is a SYN without ACK, with one exception the rule passes:
+   the ACK that completes a handshake the listener answered with a SYN cookie
+   (#2123). The restore covers it, below.
+3. **The restored clone's UDP rule is the exception, and only on the restore
+   side** (`udp_ingress_rule_args`): UDP has no packet that begins a flow. Its
+   doc says what it promises and what it does not.
+
+**Enforcement:** `a_syn_is_refused_whatever_the_tracker_holds_for_its_tuple`,
+`a_segment_of_an_open_connection_passes_untracked` and
+`no_rule_the_snapshot_side_installs_uses_connection_tracking` run a packet model
+over the chains `gate_chain_rules` builds.
+`a_stale_tracked_tuple_does_not_pass_a_restored_clones_closed_gate` and
+`a_snapshot_leaves_the_sources_tracked_connections_as_it_found_them`
+(`tests/test_snapshot_gate_tcp.rs`) hold both in a routed VM.
+
+### A SYN cookie's socket is the restore's to retire, not the gate's to refuse
+
+A listener whose SYN queue is full answers a SYN with a cookie and keeps
+nothing, so the client's bare ACK is the whole handshake to it, and the flag
+rule passes a bare ACK (#2123). The old `--ctstate NEW` rule reset that ACK
+unless the tracker held the tuple, by the fault that made it reset every other
+segment the tracker had not seen. Measured in a guest whose listener answers
+with cookies, the ACK held back until the clone is restored and its gate still
+closed: reset under the old rule, and under the flag rule an established socket
+in the published clone that no manifest names.
+
+On the source such a socket is the source's own, like any connection it
+accepts, and the snapshot does not touch `tcp_syncookies`: a snapshot does not
+reconfigure its source. On the clone the restore closes it in two steps
+(`restore_boundary_with`):
+
+1. **Its first step writes 0 to `net.ipv4.tcp_syncookies`**
+   (`FirewallGate::refuse_syn_cookies`), and a cookie's ACK is answered with a
+   reset from then on, as the gate answers a SYN. Publication writes back the
+   value read at the restore's start once the ingress half is gone, so a
+   publication that fails leaves the clone unpublished and still taking no
+   cookie. If the write fails three times the clone stays published without
+   SYN cookies, with a warning that names the value.
+2. **It lists the guest's TCP sockets itself**, with both halves of the gate
+   closed and receive processing drained, and retires what the manifest does
+   not name with what it does (`unlisted_sockets`).
+
+**A loopback peer does not say "inside the guest".** A client of a port
+published with `/loopback` is rewritten to 127.0.0.1 on the way in, and the
+manifest, which went by the address, left every such connection of the source
+established in every clone. A connection inside the guest has two sockets in
+the list, each the other's mirror image (`sockets_leaving_the_guest`), a
+dual-stack server's IPv4 client included. The manifest leaves a socket out when
+its peer is loopback and its mirror image is in the list (`manifest_sockets`);
+the restore keeps a socket the manifest does not name when its mirror image is
+in the list. A connection inside the guest over an address that is not loopback
+is in the manifest, as it always was: a routed clone moves to its own IPv6
+address, and the connection would be left with no route between its ends. No
+dump is one instant, so a socket that may stay and has no mirror image is
+looked for in one more dump before it is given up.
+
+Not every socket in the restore's list predates the restore. With the egress
+proxy, nat OUTPUT redirects an outbound connect to the proxy's loopback port
+before the gate's OUTPUT rule sees it, so a process that runs during the
+restore can connect behind the closed egress half. Its two sockets are not
+mirror images. One made before the list is retired with the rest and the
+process connects again; one made after it is in neither list and stays.
+
+The gate's chains, the socket list and the setting are each per network
+namespace, and each acts on the agent's own. That is where every listener of
+the workload is: the container runs with `--network=host`. A namespace a
+privileged workload makes for itself is outside all three, as it was outside
+the gate before (its traffic is forwarded, and the gate hooks INPUT and
+OUTPUT). A snapshot of a clone cannot capture the 0: the prepare takes the
+boundary lock, which the restore holds until publication, and a clone whose
+restore or publication failed keeps the 0 and is powered off by the agent.
+
+A socket the clone opens after that list is in neither list and is never
+retired, whatever tuple it reuses. `ModelDiag` fails if a socket made after the
+list is retired, or if the list is taken while cookies are still accepted;
+`ModelHook` if the hook runs while they are.
+`a_syn_cookie_handshake_does_not_reach_a_restored_clone` and
+`a_loopback_ports_client_connection_does_not_outlive_a_restore`
+(`tests/test_snapshot_gate_tcp.rs`) hold these in a routed VM.
 
 ### On restore, the gate's egress half opens before the stale sockets are retired
 
@@ -819,9 +932,14 @@ Enforcement: `tests/test_ci_workflow_coverage.rs` fails if `ci.yml` reintroduces
 ### CI runs on the top of a stack, not on every layer
 
 A draft PR runs no tests, and neither does a PR that another open PR from this repository is
-stacked on (`scripts/ci-pr-scope.sh`). Their run ends in a check named **`Summary (deferred)`**,
-never `Summary`, so it can never be read as a pass. Push the stack as drafts, mark it ready, and
-the top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
+stacked on (`scripts/ci-pr-scope.sh`), when that other PR is not a draft and its head contains
+this one's. A draft tests nothing, so a ready PR under a draft runs the matrix itself, and so
+does one whose child's draft state cannot be read. Their run ends in a check named
+**`Summary (deferred)`**, never `Summary`, so it can never be read as a pass. Push the stack as
+drafts and mark every layer ready back to back. A layer whose run starts while the PR above it
+is still a draft runs the matrix itself and nothing cancels that run, so flips spaced apart
+from the bottom up can cost one run per layer on the self-hosted fleet; from the tip down they
+cannot. The top PR's run tests every layer: its `changes` job classifies the whole stack's diff against
 `main`, not only the top PR's files, so a docs-only top cannot skip the matrix for code changed
 lower down.
 

@@ -1738,6 +1738,7 @@ bench-clone-latency: build setup-default
 # Start rate: snapshot clones reaching healthy per second (bench/start-rate/README.md).
 #   make bench-start-rate-prep OUT=/mnt/fcvm-btrfs/sr/prep-rootless NETWORK=rootless UFFD=1
 #   make bench-start-rate-run PREP=/mnt/fcvm-btrfs/sr/prep-rootless/prep.json OUT=... COUNT=1000 CONCURRENCY=128
+#   RATE=500 paces the starts at 500 a second (CONCURRENCY then only caps how many are starting at once)
 #   make bench-start-rate-teardown PREP=...
 # NETWORK=bridged|routed run fcvm under sudo. run and teardown have no build dependency:
 # a rebuild between prep and run would measure clones of a snapshot another binary made.
@@ -1753,7 +1754,7 @@ bench-start-rate-prep: build setup-default
 bench-start-rate-run:
 	@test -n "$(PREP)" -a -n "$(OUT)" -a -n "$(COUNT)" -a -n "$(CONCURRENCY)" || { echo "PREP= OUT= COUNT= CONCURRENCY= are required"; exit 2; }
 	$$(jq -e .sudo $(PREP) >/dev/null && echo sudo -E) $(START_RATE) run --fcvm $(START_RATE_FCVM) --prep $(PREP) --out $(OUT) --count $(COUNT) \
-		--concurrency $(CONCURRENCY) --launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180) --hold $(or $(HOLD),0)
+		--concurrency $(CONCURRENCY) --launchers $(or $(LAUNCHERS),4) --timeout $(or $(TIMEOUT),180) --hold $(or $(HOLD),0) $(if $(RATE),--rate $(RATE))
 
 # Keeps ALIVE clones up, each for LIFETIME, in a namespace pool that is already running
 # (`fcvm netpool serve`), and measures the rate of starts and stops that takes: the loop is

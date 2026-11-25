@@ -294,7 +294,7 @@ class HostSampler(threading.Thread):
 
 
 class Clone:
-    __slots__ = ("i", "name", "proc", "log", "t_spawn", "spawn_ns", "marks", "t_healthy", "exit", "buf", "error", "done")
+    __slots__ = ("i", "name", "proc", "log", "t_spawn", "spawn_ns", "due_ns", "marks", "t_healthy", "exit", "exit_ns", "buf", "error", "done")
 
     def __init__(self, i, name):
         self.i, self.name = i, name
@@ -302,9 +302,11 @@ class Clone:
         self.log = None
         self.t_spawn = None
         self.spawn_ns = None
+        self.due_ns = None
         self.marks = {}
         self.t_healthy = None
         self.exit = None
+        self.exit_ns = None
         self.buf = b""
         self.error = None
         self.done = False
@@ -426,6 +428,21 @@ def claim_dir(path):
     return p
 
 
+def start_due_ns(t_first_ns, i, rate):
+    """When paced start i is due: the first start's time plus i / rate seconds."""
+    return t_first_ns + int(i * 1e9 / rate)
+
+
+def positive_rate(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number")
+    if not value > 0 or value != value or value == float("inf"):
+        raise argparse.ArgumentTypeError(f"{text!r}: a rate is starts per second, above 0")
+    return value
+
+
 class Progress:
     """Run-wide completion state. Every read-modify-write of it happens under one lock.
 
@@ -433,10 +450,17 @@ class Progress:
     events for it are ignored, so pending never goes negative and no clone counts twice.
     """
 
-    def __init__(self, count, concurrency):
+    def __init__(self, count, concurrency, rate=None, clock=None):
         self.cv = threading.Condition()
         self.count = count
         self.concurrency = concurrency
+        # Paced starts: clone i is due at the first claim plus i / rate, on the monotonic clock.
+        # The schedule is absolute, so a start the in-flight cap holds back does not move the
+        # ones after it; it is issued when a slot frees, late, and its lateness is recorded.
+        self.rate = rate
+        self.clock = clock or now_ns
+        self.t_first = None
+        self.due_ns = {}
         self.pending = 0  # spawned (or being spawned), not yet healthy and not failed
         self.healthy_n = 0
         self.failed_n = 0
@@ -462,14 +486,25 @@ class Progress:
     def claim(self):
         """A launcher's next clone index once a slot is free, or None when the run is over or stopped."""
         with self.cv:
-            while self.pending >= self.concurrency and not self.stopping:
-                self.cv.wait(0.5)
-            if self.stopping or self.next_i >= self.count:
-                return None
-            i = self.next_i
-            self.next_i += 1
-            self.pending += 1
-            return i
+            while True:
+                if self.stopping or self.next_i >= self.count:
+                    return None
+                if self.pending >= self.concurrency:
+                    self.cv.wait(0.5)
+                    continue
+                if self.rate:
+                    if self.t_first is None:
+                        self.t_first = self.clock()
+                    due = start_due_ns(self.t_first, self.next_i, self.rate)
+                    wait_ns = due - self.clock()
+                    if wait_ns > 0:
+                        self.cv.wait(min(wait_ns / 1e9, 0.5))
+                        continue
+                    self.due_ns[self.next_i] = due
+                i = self.next_i
+                self.next_i += 1
+                self.pending += 1
+                return i
 
     def stop(self):
         with self.cv:
@@ -492,6 +527,7 @@ def cmd_run(a):
         "network": prep["network"], "cpu": prep["cpu"], "mem_mib": prep["mem_mib"], "image": prep["image"],
         "snapshot": prep["snapshot"], "clone_timeout_s": a.timeout, "rust_log": a.rust_log,
         "launchers": a.launchers, "pidstat_interval": a.pidstat_interval, "hold_s": a.hold,
+        "rate_per_s": a.rate,
     }
     (out / "host.json").write_text(json.dumps({**facts, "config": cfg}, indent=2) + "\n")
     print(json.dumps(cfg))
@@ -514,7 +550,7 @@ def cmd_run(a):
     sel = selectors.DefaultSelector()
     sel_lock = threading.Lock()
     clones = [Clone(i, f"{run_id}-c{i:05d}") for i in range(a.count)]
-    progress = Progress(a.count, a.concurrency)
+    progress = Progress(a.count, a.concurrency, rate=a.rate)
     t0 = now_ns()
     t0_wall = wall()
 
@@ -551,6 +587,8 @@ def cmd_run(a):
                         on_line(c, c.buf, t)
                         c.buf = b""
                     c.log.flush()
+                    # The clone's fcvm closed its output: it has exited, healthy before or not.
+                    c.exit_ns = t
                     if not c.done:
                         rc = c.proc.wait()
                         c.exit = rc
@@ -568,6 +606,7 @@ def cmd_run(a):
                 return
             c = clones[i]
             c.spawn_ns = now_ns()
+            c.due_ns = progress.due_ns.get(i)
             r = w = None
             try:
                 c.log = open(out / "clones" / f"{c.name}.log", "w")
@@ -682,10 +721,12 @@ def cmd_run(a):
                 fh.write(json.dumps({
                     "i": c.i, "name": c.name,
                     "spawn_at_ms": (c.spawn_ns - t0) / 1e6 if c.spawn_ns else None,
+                    "due_at_ms": (c.due_ns - t0) / 1e6 if c.due_ns is not None else None,
                     "popen_ms": c.t_spawn,
                     "healthy_at_ms": (c.t_healthy - t0) / 1e6 if c.t_healthy else None,
                     "spawn_to_healthy_ms": (c.t_healthy - c.spawn_ns) / 1e6 if c.t_healthy else None,
                     "marks_ms": c.marks, "error": c.error, "exit": c.exit,
+                    "exit_at_ms": (c.exit_ns - t0) / 1e6 if c.exit_ns is not None else None,
                 }) + "\n")
         (out / "phases.json").write_text(json.dumps({
             "t0_mono_ns": t0, "all_done_mono_ns": t_all, "hold_end_mono_ns": t_hold_end,
@@ -1510,6 +1551,82 @@ def mark(marks, key):
     return marks.get(key)
 
 
+# The goal's rate: clones reaching healthy per second while at least this many are up, over
+# a window at least this long.
+ALIVE_FLOOR = 1000
+ALIVE_MIN_WINDOW_S = 1.0
+# A paced start is late when it is issued more than one interval, and at least this long,
+# after it was due.
+PACED_LATE_MS = 5.0
+
+
+def rate_with_alive(rows, floor=ALIVE_FLOOR, min_window_s=ALIVE_MIN_WINDOW_S):
+    """Clones reaching healthy per second while at least `floor` are alive.
+
+    A clone is alive from the moment it is healthy until its fcvm exits (`exit_at_ms`; the
+    run stops every clone only after the window). The window runs from the moment `floor`
+    are alive to the last clone turning healthy. No rate when the run never has `floor`
+    alive, when the alive count falls under it inside the window, or when the window is
+    shorter than `min_window_s`.
+    """
+    out = {"alive_floor": floor, "min_window_s": min_window_s, "window_s": None, "healthy_in_window": None,
+           "min_alive_in_window": None, "rate_per_s": None}
+    ok = [r for r in rows if r.get("healthy_at_ms") is not None]
+    if not ok:
+        return {**out, "why": "no clone turned healthy"}
+    # An exit sorts before a start at the same instant, so a tie never overstates the count.
+    events = sorted(
+        [(r["healthy_at_ms"], 1) for r in ok]
+        + [(r["exit_at_ms"], -1) for r in ok if r.get("exit_at_ms") is not None],
+        key=lambda e: (e[0], e[1]),
+    )
+    last = max(r["healthy_at_ms"] for r in ok)
+    alive = peak = 0
+    start = None
+    lowest = None
+    healthy_in = 0
+    for t, d in events:
+        if start is not None and t > last:
+            break
+        alive += d
+        peak = max(peak, alive)
+        if start is None:
+            if alive >= floor:
+                start, lowest = t, alive
+        else:
+            lowest = min(lowest, alive)
+            healthy_in += d > 0
+    if start is None:
+        return {**out, "why": f"at most {peak} clones were alive at once, under {floor}"}
+    window_s = (last - start) / 1000
+    out.update(window_s=round(window_s, 3), healthy_in_window=healthy_in, min_alive_in_window=lowest)
+    if lowest < floor:
+        return {**out, "why": f"the alive count fell to {lowest}, under {floor}, inside the window"}
+    if window_s < min_window_s:
+        return {**out, "why": f"the window with {floor} alive is {window_s:.3f} s, under {min_window_s} s"}
+    return {**out, "rate_per_s": round(healthy_in / window_s, 1)}
+
+
+def pacing_summary(rows, rate):
+    """What a paced run offered and issued. None for a closed-loop run."""
+    if not rate:
+        return None
+    spawned = [r for r in rows if r["spawn_at_ms"] is not None]
+    late = sorted(r["spawn_at_ms"] - r["due_at_ms"] for r in spawned if r.get("due_at_ms") is not None)
+    threshold = max(1000 / rate, PACED_LATE_MS)
+    at = sorted(r["spawn_at_ms"] for r in spawned)
+    span_s = (at[-1] - at[0]) / 1000 if len(at) > 1 else 0
+    return {
+        "offered_rate_per_s": rate,
+        "issued": len(spawned),
+        "not_issued": len(rows) - len(spawned),
+        "issued_rate_per_s": round((len(at) - 1) / span_s, 1) if span_s > 0 else None,
+        "late_threshold_ms": round(threshold, 3),
+        "late_starts": sum(1 for v in late if v > threshold),
+        "late_ms": {"p50": pct(late, 0.5), "p99": pct(late, 0.99), "max": pct(late, 1)},
+    }
+
+
 def summarize(out, verify=None, teardown_s=None, t0_wall=None):
     out = Path(out)
     rows = [json.loads(ln) for ln in (out / "samples.jsonl").read_text().splitlines() if ln.strip()]
@@ -1558,6 +1675,8 @@ def summarize(out, verify=None, teardown_s=None, t0_wall=None):
         "overall_rate_per_s": round(len(ok) / span_s, 1) if span_s else None,
         "best_1s_window": best_window(1000),
         "best_5s_window_rate": round(best_window(5000) / 5, 1),
+        "rate_with_alive": rate_with_alive(rows),
+        "pacing": pacing_summary(rows, (host.get("config") or {}).get("rate_per_s")),
         "spawn_to_healthy_ms": {"p50": pct(lat, 0.5), "p90": pct(lat, 0.9), "p99": pct(lat, 0.99), "max": pct(lat, 1)},
         "popen_ms": {"p50": pct([r["popen_ms"] for r in rows if r["popen_ms"]], 0.5),
                      "p99": pct([r["popen_ms"] for r in rows if r["popen_ms"]], 0.99)},
@@ -1580,6 +1699,18 @@ def print_summary(s):
     print(f"== {c.get('backend')}/{c.get('network')} N={c.get('count')} C={c.get('concurrency')} on {s['instance_type']}")
     print(f"   healthy {s['healthy']}/{s['launched']} failed {s['failed']} in {s['span_s']} s: "
           f"overall {s['overall_rate_per_s']}/s, best 1 s window {s['best_1s_window']}, best 5 s {s['best_5s_window_rate']}/s")
+    ra = s["rate_with_alive"]
+    pc = s["pacing"]
+    mode = f"paced at {pc['offered_rate_per_s']}/s" if pc else "closed loop"
+    if ra["rate_per_s"] is not None:
+        print(f"   with {ra['alive_floor']}+ alive ({mode}): {ra['healthy_in_window']} healthy in {ra['window_s']} s = "
+              f"{ra['rate_per_s']}/s, at least {ra['min_alive_in_window']} alive throughout")
+    else:
+        print(f"   with {ra['alive_floor']}+ alive ({mode}): no rate ({ra['why']})")
+    if pc:
+        print(f"   paced: offered {pc['offered_rate_per_s']}/s, issued {pc['issued']} at {pc['issued_rate_per_s']}/s, "
+              f"{pc['late_starts']} late by over {pc['late_threshold_ms']} ms (p50 {pc['late_ms']['p50']} p99 {pc['late_ms']['p99']} "
+              f"max {pc['late_ms']['max']} ms), {pc['not_issued']} not issued")
     lat = s["spawn_to_healthy_ms"]
     print(f"   spawn->healthy p50 {lat['p50']} p90 {lat['p90']} p99 {lat['p99']} max {lat['max']} ms; popen p50 {s['popen_ms']['p50']} ms")
     print(f"   peak load1 {s['peak_load1']} procs_running {s['peak_procs_running']} min MemAvailable {s['min_mem_avail_mib']} MiB")
@@ -1626,7 +1757,12 @@ def build_parser():
     r.add_argument("--prep", required=True)
     r.add_argument("--out", required=True)
     r.add_argument("--count", type=int, required=True)
-    r.add_argument("--concurrency", type=positive_int, required=True)
+    r.add_argument("--concurrency", type=positive_int, required=True,
+                   help="clones starting at once, at most; without --rate the next starts as soon as one is healthy")
+    r.add_argument("--rate", type=positive_rate, default=None,
+                   help="paced starts: issue this many a second on a fixed schedule (clone i at i / RATE after the "
+                        "first), still at most --concurrency starting at once; a start the cap holds back is issued "
+                        "late and counted")
     r.add_argument("--launchers", type=positive_int, default=4)
     r.add_argument("--timeout", type=float, default=180)
     r.add_argument("--rust-log", default="fcvm=info,health-monitor=info")

@@ -15,6 +15,9 @@ pub struct Config {
     /// Potato mode's game (docs/fleet/ARCHITECTURE.md, "Potato mode").
     #[serde(default)]
     pub potato: crate::potato::PotatoConfig,
+    /// Pages mode's overlay limits.
+    #[serde(default)]
+    pub renders: crate::renders::RendersConfig,
     /// Width / height of the whole image (both halves).
     pub image_aspect: f64,
     /// Width / height the tiling aims for.
@@ -255,6 +258,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             potato: Default::default(),
+            renders: Default::default(),
             max_tiles: 100,
             image_aspect: 16.0 / 9.0,
             tile_aspect: 16.0 / 9.0,
@@ -858,6 +862,9 @@ pub struct Fleet {
     /// Potato mode's game.
     #[serde(default)]
     pub potato: crate::potato::Potato,
+    /// Pages mode: its hosts' reports and the overlay viewers set.
+    #[serde(default)]
+    pub renders: crate::renders::Renders,
     /// The GPU hosts the launcher keeps, by instance id (`Event::HostsExpected`); `None`
     /// when it cannot say, or the coordinator launches none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -995,6 +1002,7 @@ impl State {
                 last_minecraft_fork: None,
                 minecraft_to_reset: BTreeMap::new(),
                 potato: Default::default(),
+                renders: Default::default(),
                 expected_hosts: None,
                 registrations: Registrations {
                     since: now_ms,
@@ -1022,6 +1030,8 @@ impl State {
         let f = &mut self.fleet;
         // the ladder and the records stay; the round and the players went with the agent
         f.potato.resumed();
+        // the overlay stays and ends at its time; the hosts went with their connections
+        f.renders.resumed();
         // Registrations it had not stored are lost, and agents reconnect only once it is back.
         f.registrations = Registrations {
             since: now_ms,

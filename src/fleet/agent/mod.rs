@@ -642,6 +642,8 @@ where
             .unwrap_or_default(),
         minecraft: agent.minecraft.as_ref().map_or(0, |m| m.count),
         minecraft_server: agent.minecraft.as_ref().and_then(|m| m.server.clone()),
+        // Pages mode's module is not in this agent yet.
+        renders: None,
     })
     .ok();
     let (potato_tx, potato_rx) = watch::channel(None);
@@ -745,6 +747,9 @@ where
             }
             // The dialing connection keeps the replay (dial.rs); nothing to do here.
             CoordMsg::QuarantineStored { .. } => {}
+            // Pages mode's module is not in this agent yet: it says no `renders` in its
+            // hello, so a coordinator sends it none of these.
+            CoordMsg::Renders { .. } => {}
             CoordMsg::Potato { round } => {
                 potato_tx.send_replace(round);
             }
