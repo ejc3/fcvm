@@ -45,7 +45,7 @@ def reference(summary, path, digest):
     """The page's reference as a plain value. Raises Refused."""
     if summary.get("schema") != 1:
         raise Refused(f"summary schema {summary.get('schema')!r}")
-    if not FCVM_KERNEL.match(summary.get("kernel") or ""):
+    if not FCVM_KERNEL.fullmatch(summary.get("kernel") or ""):
         raise Refused(f"kernel {summary.get('kernel')!r} is not fcvm's host kernel")
     regimes = {}
     for row in summary.get("regimes") or []:
@@ -67,8 +67,14 @@ def reference(summary, path, digest):
     if not held or set(held["sides"]) != set(SIDES):
         raise Refused("the summary has no `held` regime with both sides")
     for side in SIDES:
-        if held["sides"][side]["failed"] is None or held["sides"][side]["rendersPerS"] is None:
+        row = held["sides"][side]
+        if row["failed"] is None or not row["rendersPerS"] or row["pageMeanMs"] is None:
             raise Refused(f"the `held` regime has no figures for {side}")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", held["ended"] or ""):
+        raise Refused(f"the `held` regime's `ended` is {held['ended']!r}")
+    for key in ("campaign", "instance_type", "source_revision", "kitesurf_commit"):
+        if not isinstance(summary.get(key), str) or not summary[key]:
+            raise Refused(f"the summary has no `{key}`")
     return {
         "campaign": summary["campaign"], "date": (held["ended"] or "")[:10],
         "instanceType": summary["instance_type"], "kernel": summary["kernel"],

@@ -2466,14 +2466,17 @@ directory, 2 MiB pages. Every count must be zero.
 
 ### The recorded campaign
 
-The page's recorded figures come from one campaign: every regime on one boot of one host, on
-fcvm's own host kernel, at one fcvm commit and one Kitesurf commit, each regime a run of
-`make fleet-renders-bench`. `bench/chromium/renders_campaign.py` writes the campaign's summary,
-`bench/chromium/results/renders-<id>-summary.json`, from the runs' records and a `host-record.txt`
-written beside each when it ended (kernel, fcvm commit, Kitesurf commit, instance type, a hash of
-the boot id, the run's arguments). It writes nothing when two runs differ in any of those, when
-the kernel is not fcvm's own, when a run's summary names another kernel, or when a run's teardown
-left something. Per regime the summary holds each side's figures over a stated window
+The recorded figures for the page come from one campaign: every regime on one boot of one host,
+on fcvm's own host kernel, at one fcvm commit and one Kitesurf commit, each regime a run of
+`make fleet-renders-bench`. When a run has ended, `bench/chromium/renders_host_record.py` writes
+`host-record.txt` beside its records: the kernel release and command line, the fcvm commit,
+Kitesurf's commit, the instance type, a hash of the boot id, the run's arguments and the time. It
+names no instance, address or host, and a partition id on the command line is written as
+`elided`. `bench/chromium/renders_campaign.py` writes the campaign's summary,
+`bench/chromium/results/renders-<id>-summary.json`, from the runs' records. It writes nothing
+when two runs differ in kernel, fcvm commit, Kitesurf commit, instance type or boot, when the
+kernel is not fcvm's own, when a run's summary names another kernel, when a host record holds a
+partition id or says a thing twice, or when a run's teardown does not say it left nothing. Per regime the summary holds each side's figures over a stated window
 (`renders_analyze.py`), the levels the search moved through, and the sha256 and size of the run's
 files.
 
@@ -2484,21 +2487,23 @@ ejc3/fcvm-bench-records at the same path, listed in `results/records-renders-<id
 
 `bench/chromium/renders_reference.py` writes `fleet/web/core/renders-reference.gen.ts` from the
 one summary in the tree: the campaign, its date, instance type, kernel and commits, and each
-regime's figures by label. The regime labelled `held` is the page's table: both sides held at the
-limits the module's own search ended on. No figure is typed; `test_renders_reference.py` fails
-when the file is not what the summary gives.
+regime's figures by label. The regime labelled `held` is the table the page will show: both sides
+held at the limits the module's own search ended on. No figure is typed;
+`test_renders_reference.py` fails when the file is not what the summary gives. Nothing in
+`fleet/web` reads the file yet.
 
 The campaign in the tree, `renders-20261125`, has these regimes:
 
 | label | what ran |
 |---|---|
 | `search`, `search-2`, `search-3` | both sides, the search live, three starts (30, 20 and 20 minutes); scored over the last five minutes |
-| `held`, `held-2` | both sides held at the limits the first search ended on, five scored minutes, taken after the first search and again at the end of the boot |
+| `held`, `held-2` | both sides held at the limits the first search ended on, five scored minutes, taken after the first search and again after the last regime that runs both sides |
 | `alone-fcvm`, `alone-kitesurf` | one side at its limit while the other half is idle |
 | `one-fcvm`, `one-kitesurf` | one render at a time |
 | `bundle-default-*`, `bundle-opt-*` | Kitesurf alone on its production bundle built in Bazel's default mode and with `-c opt`, at one render in flight and at its limit, each twice |
 
-Beside them: `teardown-check.json` (the stage kills on that boot), `transforms.json` (the mean
+Beside them: `teardown-check.json` (the stage kills, taken in the same session; the file names
+no kernel or commit), `transforms.json` (the mean
 pixel difference of Kitesurf's screenshots with each transform against its plain ones: which
 transforms it draws at that commit) and `kitesurf-bundles.txt` (the two bundles' digests).
 

@@ -15,7 +15,8 @@ KITESURF = "b" * 40
 
 
 def write_run(root, run, *, kernel=KERNEL, summary_kernel=None, source=SOURCE, kitesurf=KITESURF,
-              instance="m8gd.metal-24xl", boot="0123456789abcdef", left=None, levels=((3, 5), (4, 6))):
+              instance="m8gd.metal-24xl", boot="0123456789abcdef", left=None, levels=((3, 5), (4, 6)),
+              record=None, cmdline="quiet root=PARTUUID=elided"):
     """A run of 20 samples a second apart: each side at its first level, then its second
     from the tenth sample; one render a side a second, 100 ms and 200 ms."""
     out = os.path.join(root, run)
@@ -45,8 +46,9 @@ def write_run(root, run, *, kernel=KERNEL, summary_kernel=None, source=SOURCE, k
     with open(os.path.join(out, "teardown.json"), "w") as handle:
         json.dump(left or {"cgroups_left": [], "resources_left": 0, "run_dir_left": False}, handle)
     with open(os.path.join(out, "host-record.txt"), "w") as handle:
-        handle.write(f"kernel: {kernel}\ncmdline: quiet\nsource: {source}\nkitesurf: {kitesurf}\n"
-                     f"host: {instance}  boot: {boot}\narguments: MAX_FCVM=40\nended: 2026-01-01T00:00:00Z\n")
+        handle.write(record if record is not None else (
+            f"kernel: {kernel}\ncmdline: {cmdline}\nsource: {source}\nkitesurf: {kitesurf}\n"
+            f"host: {instance}  boot: {boot}\narguments: MAX_FCVM=40\nended: 2026-01-01T00:00:00Z\n"))
     return out
 
 
@@ -69,7 +71,7 @@ class Summary(unittest.TestCase):
         self.assertEqual(search["sides"]["kitesurf"]["level_changes"], [[0, 4], [10, 6]])
         self.assertEqual((fcvm["limit"], fcvm["setup"]), (5, {"vcpus": "4"}))
         self.assertEqual((fcvm["failed"], fcvm["renders"]), (0, 20))
-        # 2 CPU-seconds a second over the window: two CPUs busy, 2,000 ms of CPU a render
+        # 2 CPU-seconds a second over the 19 s window: two CPUs busy, 38 s of CPU over 20 renders
         self.assertEqual((fcvm["cores_busy"], fcvm["cpu_ms_per_render"]), (2.0, 1900.0))
         self.assertEqual(held["window"], {"seconds": 14.0, "skip_s": 5.0, "last_s": 0.0})
         self.assertEqual(sorted(search["files"]), sorted(renders_campaign.RECORD_FILES))
@@ -113,6 +115,52 @@ class Summary(unittest.TestCase):
             with self.subTest(left=left):
                 write_run(self.root, f"t{i}", left=left)
                 self.assertIn("the teardown left something", self.refused([("one", f"t{i}", 0.0, 0.0)]))
+
+    def test_a_teardown_that_does_not_say_nothing_was_left_is_refused(self):
+        """Absent keys are not "nothing left": the reaper's result must say so."""
+        for i, left in enumerate(({}, {"cgroups_left": None, "resources_left": 0, "run_dir_left": False},
+                                  {"error": "the reaper died"}, [],
+                                  {"cgroups_left": [], "resources_left": "0", "run_dir_left": False},
+                                  {"cgroups_left": [], "resources_left": 0})):
+            with self.subTest(left=left):
+                out = write_run(self.root, f"q{i}")
+                with open(os.path.join(out, "teardown.json"), "w") as handle:
+                    json.dump(left, handle)
+                self.assertIn("does not say nothing was left", self.refused([("one", f"q{i}", 0.0, 0.0)]))
+
+    def test_a_host_record_must_say_each_thing_once_and_hold_no_partition_id(self):
+        good = (f"kernel: {KERNEL}\ncmdline: quiet root=PARTUUID=elided\nsource: {SOURCE}\nkitesurf: {KITESURF}\n"
+                "host: m8gd.metal-24xl  boot: 0123456789abcdef\narguments: MAX_FCVM=40\nended: 2026-01-01T00:00:00Z\n")
+        write_run(self.root, "good", record=good)
+        renders_campaign.summarize(self.root, "c", [("one", "good", 0.0, 0.0)])
+        for name, record, text in (
+            ("twice", good.replace(f"kernel: {KERNEL}\n", f"kernel: 7.0.0-1018-aws\nkernel: {KERNEL}\n"), "says `kernel` twice"),
+            ("noend", good.replace("ended: 2026-01-01T00:00:00Z\n", ""), "no `ended`"),
+            ("noargs", good.replace("arguments: MAX_FCVM=40\n", ""), "no `arguments`"),
+            ("badend", good.replace("2026-01-01T00:00:00Z", "yesterday"), "`ended`"),
+            ("uuid", good.replace("PARTUUID=elided", "PARTUUID=4a97390b-26c9-47aa-b101-000000000000"), "partition"),
+            ("uuid2", good.replace("root=PARTUUID=elided", "root=UUID=0b1c2d3e-0000-4000-8000-000000000000"), "partition"),
+            ("nohost", good.replace("host: m8gd.metal-24xl  boot: 0123456789abcdef\n", "host: m8gd.metal-24xl\n"), "no `host: TYPE  boot: HASH`"),
+            ("commit", good.replace(SOURCE, "abc123"), "is not a commit"),
+        ):
+            with self.subTest(name=name):
+                write_run(self.root, name, record=record)
+                self.assertIn(text, self.refused([("one", name, 0.0, 0.0)]))
+
+    def test_a_run_is_a_directory_of_the_campaign_and_a_window_holds_samples(self):
+        write_run(self.root, "a")
+        for run, text in ((os.path.join(self.root, "a"), "names a directory of the campaign"),
+                          ("./a", "names a directory of the campaign"), ("a/", "names a directory of the campaign"),
+                          ("..", "names a directory of the campaign"), ("absent", "absent")):
+            with self.subTest(run=run):
+                self.assertIn(text, self.refused([("one", run, 0.0, 0.0)]))
+        self.assertIn("fewer than two samples", self.refused([("one", "a", 100.0, 0.0)]))
+        self.assertIn("window", self.refused([("one", "a", -1.0, 0.0)]))
+        os.remove(os.path.join(self.root, "a", "teardown.json"))
+        self.assertIn("teardown.json", self.refused([("one", "a", 0.0, 0.0)]))
+        out = os.path.join(self.root, "summary.json")
+        self.assertEqual(renders_campaign.main([self.root, "--name", "c", "--regime", "one=a", "--out", out]), 2)
+        self.assertFalse(os.path.exists(out))
 
     def test_no_regime_or_a_label_twice_is_refused(self):
         write_run(self.root, "a")

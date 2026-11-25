@@ -5,8 +5,9 @@
 
 DIR holds one directory per run of `make fleet-renders-bench` (renders.jsonl, samples.jsonl,
 summary.json, teardown.json) with a `host-record.txt` beside them, written when the run
-ended: lines `kernel:`, `source:` (the fcvm commit), `kitesurf:` (its commit), `host:` (the
-instance type, then `boot:` and a hash of the boot id), `arguments:`, `ended:`.
+ended (renders_host_record.py): lines `kernel:`, `cmdline:`, `source:` (the fcvm commit),
+`kitesurf:` (its commit), `host:` (the instance type, then `boot:` and a hash of the boot
+id), `arguments:`, `ended:`, each once.
 
 A regime is a run scored over a window (renders_analyze.py: from `skip` seconds after the
 first sample, or the `last` seconds). The summary carries, per regime, each side's figures,
@@ -15,7 +16,9 @@ files, so a figure can be traced to its record.
 
 Nothing is written unless every run agrees on the kernel, the fcvm commit, Kitesurf's commit,
 the instance type and the boot, the kernel is fcvm's own host kernel, each run's summary
-names that kernel, and each run's teardown left nothing.
+names that kernel, and each run's teardown says it left nothing. A host record that holds a
+partition id, a run that is not a directory of DIR, or a window without samples is refused
+the same way.
 """
 
 import argparse
@@ -30,6 +33,11 @@ import renders_analyze  # noqa: E402
 
 FCVM_KERNEL = re.compile(r"^\d+\.\d+\.\d+-fcvm-[0-9a-f]{12}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
+ENDED = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+# A partition or filesystem id on the recorded kernel command line: a value of the host, which the
+# record's writer replaces with `elided`.
+PARTITION_ID = re.compile(r"UUID=(?!elided\b)")
+HOST_FIELDS = ("kernel", "cmdline", "source", "kitesurf", "host", "arguments", "ended")
 RECORD_FILES = ("renders.jsonl", "samples.jsonl", "summary.json", "teardown.json", "host-record.txt")
 SAME = ("kernel", "source", "kitesurf", "instance_type", "boot")
 
@@ -40,25 +48,49 @@ class Refused(Exception):
 
 def host_record(path):
     fields = {}
-    with open(path) as handle:
-        for line in handle:
-            key, sep, value = line.partition(":")
-            if sep:
-                fields[key.strip()] = value.strip()
-    host = fields.get("host", "")
-    found = re.fullmatch(r"(\S+)\s+boot:\s+([0-9a-f]{16})", host)
+    try:
+        with open(path) as handle:
+            lines = handle.read().splitlines()
+    except OSError as error:
+        raise Refused(f"{path}: {error.strerror}") from None
+    for line in lines:
+        key, sep, value = line.partition(":")
+        key = key.strip()
+        if not sep or key not in HOST_FIELDS:
+            continue
+        if key in fields:
+            raise Refused(f"{path}: says `{key}` twice")
+        fields[key] = value.strip()
+    for key in HOST_FIELDS:
+        if key not in fields:
+            raise Refused(f"{path}: no `{key}` line" if key != "host" else f"{path}: no `host: TYPE  boot: HASH` line")
+    found = re.fullmatch(r"(\S+)\s+boot:\s+([0-9a-f]{16})", fields["host"])
     if not found:
         raise Refused(f"{path}: no `host: TYPE  boot: HASH` line")
-    record = {"kernel": fields.get("kernel", ""), "source": fields.get("source", ""),
-              "kitesurf": fields.get("kitesurf", ""), "instance_type": found.group(1),
-              "boot": found.group(2), "arguments": fields.get("arguments", ""),
-              "ended": fields.get("ended", "")}
-    if not FCVM_KERNEL.match(record["kernel"]):
+    if PARTITION_ID.search(fields["cmdline"]):
+        raise Refused(f"{path}: the kernel command line holds a partition id; the record's writer elides it")
+    if not ENDED.fullmatch(fields["ended"]):
+        raise Refused(f"{path}: `ended` is {fields['ended']!r}, not a UTC time to the second")
+    record = {"kernel": fields["kernel"], "source": fields["source"],
+              "kitesurf": fields["kitesurf"], "instance_type": found.group(1),
+              "boot": found.group(2), "arguments": fields["arguments"],
+              "ended": fields["ended"]}
+    if not FCVM_KERNEL.fullmatch(record["kernel"]):
         raise Refused(f"{path}: kernel {record['kernel']!r} is not fcvm's host kernel")
     for key in ("source", "kitesurf"):
-        if not COMMIT.match(record[key]):
+        if not COMMIT.fullmatch(record[key]):
             raise Refused(f"{path}: {key} {record[key]!r} is not a commit")
     return record
+
+
+def read_json(path):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except OSError as error:
+        raise Refused(f"{path}: {error.strerror}") from None
+    except ValueError as error:
+        raise Refused(f"{path}: not JSON ({error})") from None
 
 
 def level_changes(samples, side):
@@ -82,19 +114,34 @@ def file_record(path):
 
 
 def regime(directory, label, run, skip_s, last_s):
+    if run in ("", ".", "..") or os.path.basename(run) != run:
+        raise Refused(f"{run!r}: a run names a directory of the campaign, not a path")
+    if skip_s < 0 or last_s < 0:
+        raise Refused(f"{run}: a window's seconds are not negative")
     out = os.path.join(directory, run)
+    if not os.path.isdir(out):
+        raise Refused(f"{run}: absent from {directory}")
     host = host_record(os.path.join(out, "host-record.txt"))
-    with open(os.path.join(out, "summary.json")) as handle:
-        summary = json.load(handle)
-    with open(os.path.join(out, "teardown.json")) as handle:
-        teardown = json.load(handle)
+    summary = read_json(os.path.join(out, "summary.json"))
+    teardown = read_json(os.path.join(out, "teardown.json"))
+    if not isinstance(summary, dict):
+        raise Refused(f"{run}: summary.json is not an object")
     module = summary.get("module") or {}
     if module.get("kernel") != host["kernel"]:
         raise Refused(f"{run}: summary.json names kernel {module.get('kernel')!r}, the host record {host['kernel']!r}")
-    if teardown.get("cgroups_left") or teardown.get("resources_left") or teardown.get("run_dir_left"):
-        raise Refused(f"{run}: the teardown left something: {json.dumps(teardown, sort_keys=True)[:200]}")
-    figures = renders_analyze.analyze(out, skip_s, last_s)
-    samples = renders_analyze.rows(os.path.join(out, "samples.jsonl"))
+    said = json.dumps(teardown, sort_keys=True)[:200]
+    if not isinstance(teardown, dict) or type(teardown.get("cgroups_left")) is not list \
+            or type(teardown.get("resources_left")) is not int or type(teardown.get("run_dir_left")) is not bool:
+        raise Refused(f"{run}: teardown.json does not say nothing was left: {said}")
+    if teardown["cgroups_left"] or teardown["resources_left"] or teardown["run_dir_left"]:
+        raise Refused(f"{run}: the teardown left something: {said}")
+    try:
+        figures = renders_analyze.analyze(out, skip_s, last_s)
+        samples = renders_analyze.rows(os.path.join(out, "samples.jsonl"))
+    except SystemExit as stopped:  # renders_analyze's own refusals: an empty window
+        raise Refused(str(stopped)) from None
+    except OSError as error:
+        raise Refused(f"{run}: {error.filename}: {error.strerror}") from None
     sides = {}
     for side, values in figures["sides"].items():
         search = ((summary.get("sides") or {}).get(side) or {}).get("search") or {}
