@@ -1,4 +1,5 @@
 import GateVerify.Lemmas
+import GateVerify.Socks
 
 /-!
 # The design keeps its properties, in every reachable state
@@ -9,13 +10,14 @@ snapshots asked early) and every state reachable from `init C` under `Design.rul
 any length.
 
 No `sorry`, and no axiom beyond Lean's own (`Axioms.lean` checks it on every build). The proofs
-are inductive invariants (`Scal` and `Flags` in `Lemmas.lean`) over the same `step` the search
-runs, not the search.
+are inductive invariants (`Scal` and `Flags` in `Lemmas.lean`, `Sk` in `Socks.lean`) over the
+same `step` the search runs, not the search.
 
-What is NOT proved here, and is only searched (`verify/README.md`): P2 (`generationBroken`) and
-the first half of P3 (`staleAtPublication`). Both are about which sockets a retirement destroys
-and leaves, and need an invariant over the socket list and the lists of cookies that this file
-does not have.
+What is NOT proved here, and is only searched (`verify/GateVerify/README.md`): P2
+(`generationBroken`). It says a retirement destroys no socket a process of the clone opened and
+no end of a live connection inside the guest, and needs more about the sockets than `Sk` holds:
+which cookies the manifest and the list can name, and that connections inside the guest keep
+both ends.
 -/
 
 namespace Gate
@@ -36,6 +38,45 @@ theorem design_sourceUndisturbed (hr : Reachable Design.rules C s) : sourceDistu
   · have hi := hi hpw
     cases hrp : s.rp <;> cases hsp : s.sp <;>
       simp_all [SrcOk, State.gated, hf.1, inPrepare]
+
+/-- **P3, first half.** Once a restored guest's ingress is open in either family, it holds no
+socket with its other end outside the guest that was in the image or made behind the closed
+gate. -/
+theorem design_noStaleAtPublication (hr : Reachable Design.rules C s) :
+    staleAtPublication s = false := by
+  have hi := reachable_scal hr
+  have hk := reachable_sk hr
+  unfold staleAtPublication
+  cases hpw : s.pw
+  · simp
+  · have hi := hi hpw
+    -- with ingress open, the retirement is behind
+    have key : s.cut = true →
+        (s.socks.any fun x => x.kind.outside && (x.gen == .stale || x.gen == .smuggled)) = false := by
+      intro hc
+      rw [List.any_eq_false]
+      intro x hx hbad
+      simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hbad
+      exact hk.k3 hc x hx hbad.1 hbad.2
+    cases hrp : s.rp with
+    | none => simp
+    | done =>
+      have hc : s.cut = true := by simp_all [SrcOk]
+      simp [key hc]
+    | failed =>
+      cases hc : s.cut
+      · have : s.in4 = true ∧ s.in6 = true := by simp_all [FailedOk]
+        simp [this.1, this.2]
+      · simp [key hc]
+    | «at» n =>
+      simp only [hrp] at hi
+      cases hc : s.cut
+      · have hn : n < 18 := hi.1
+        have : s.in4 = true ∧ s.in6 = true := by
+          rcases lt18 hn with h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0 | h0
+            | h0 | h0 | h0 | h0 | h0 <;> subst h0 <;> simp_all [CloneOk]
+        simp [this.1, this.2]
+      · simp [key hc]
 
 /-- **P3, second half.** No packet from outside makes a socket in a clone between its retirement
 and its publication. -/

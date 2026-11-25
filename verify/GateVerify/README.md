@@ -26,13 +26,13 @@ make verify-gate-drift   # lake exe gate-seq check: the model's order against th
 `make verify-gate-search GATE_ARGS=traces` prints each shortest run, step by step and as a Lean
 term. A run's name or a rule book's name in `GATE_ARGS` limits the search to it.
 
-Measured on a shared arm64 dev box (load average 4 of many cores, one run each), toolchain
+Measured on a shared arm64 dev box (load average 4 to 10 of many cores, one run each), toolchain
 already installed:
 
 | Command | Wall time | Peak memory |
 |---|---|---|
-| `lake build` from cold, both models | 1 min 25 s | 1.6 GB |
-| `lake build GateVerify gate-breaks gate-seq` from cold, this model alone | 15 s | 1.6 GB |
+| `lake build` from cold, both models | 1 min 27 s | 1.6 GB |
+| `lake build GateVerify gate-breaks gate-seq` from cold, this model alone | 18 s | 1.6 GB |
 | `lake exe gate-breaks` (18 runs, 6 rule books, 1.62 million states in all) | 5.0 s | 68 MB |
 | `lake exe gate-breaks design all-routed all-proxy` (696,354 states) | 4.2 s | 138 MB |
 
@@ -47,6 +47,7 @@ already installed:
 | `Configs.lean` | The configurations the search runs, by name |
 | `Breaks.lean` | Each run the search found, replayed and checked by the kernel (`by decide`), and the same run under the design |
 | `Lemmas.lean` | The invariants `Scal` (settings, rules and phases) and `Flags` (the records steps leave), and that every step of the design keeps them |
+| `Socks.lean` | The invariant `Sk` over the sockets, the dump and the lists of cookies; `Evo`, what a step of the environment can do to the socket list; and that every step of the design keeps `Sk` |
 | `Proofs.lean` | The `design_*` theorems |
 | `Axioms.lean` | Fails the build if any theorem under `Gate` rests on more than `propext`, `Quot.sound`, `Classical.choice`, and pins the axioms of the cited ones |
 | `../GateSearch.lean` | `lake exe gate-breaks`: breadth-first search, shortest runs |
@@ -110,7 +111,7 @@ unpublished clone, which the UDP rule passes by design.
 |---|---|---|---|---|---|
 | P1 `sourceDisturbed` | broken | broken | broken | broken | **proved** |
 | P2 `generationBroken` | broken | broken | broken | broken | searched: holds |
-| P3 `staleAtPublication` | broken | broken | broken | broken (early snapshot only) | searched: holds |
+| P3 `staleAtPublication` | broken | broken | broken | broken (early snapshot only) | **proved** |
 | P3 `smuggledLate` | broken | broken | broken | searched: holds | **proved** |
 | P4 `retiredBehindEgress` | searched: holds | searched: holds | searched: holds | searched: holds | **proved** |
 | P4 `hookMisplaced` | searched: holds | searched: holds | searched: holds | searched: holds | **proved** |
@@ -126,18 +127,23 @@ is in code #2124 does not touch: the one-shots, the watchdog, the agent's restar
 
 ## What is proved, what is searched, what is assumed
 
-**Proved** (Lean's kernel, no `sorry`, axioms `propext` and `Quot.sound` only), for every
-configuration `C` and every state reachable from `init C` under `Design.rules`, by runs of any
-length:
+**Proved** (Lean's kernel, no `sorry`, axioms `propext`, `Quot.sound` and, for the socket
+invariant, `Classical.choice`), for every configuration `C` and every state reachable from
+`init C` under `Design.rules`, by runs of any length:
 
-- `design_sourceUndisturbed` (P1), `design_noSmuggledLate` (the second half of P3),
-  `design_egressBeforeRetirement`, `design_hookPlaced`, `design_workloadEgress` (P4),
+- `design_sourceUndisturbed` (P1), `design_noStaleAtPublication` and `design_noSmuggledLate`
+  (P3), `design_egressBeforeRetirement`, `design_hookPlaced`, `design_workloadEgress` (P4),
   `design_noLastingChange`, `design_noCapturedChange` (P5), `design_neverStuck` (P6), and
   `design_noClientDatagram` (U1), which carries the hypothesis `C.udpReach = false`.
-- The proofs are two inductive invariants over the same `step` the search runs: `Scal`
+- The proofs are three inductive invariants over the same `step` the search runs: `Scal`
   (`reachable_scal`: for each place a snapshot or a restore can be, what the gate,
-  `tcp_syncookies`, `rcu_expedited`, the freeze, the manifest and the record are there) and
-  `Flags` (`reachable_flags`: no step has left a record of a break).
+  `tcp_syncookies`, `rcu_expedited`, the freeze, the manifest and the record are there),
+  `Flags` (`reachable_flags`: no step has left a record of a break) and `Sk` (`reachable_sk`:
+  after the IPv4 dump every IPv4 socket that must go has been seen; after the IPv6 dump every
+  socket that must go has its cookie in the manifest or the list; after the retirement none is
+  left; and no packet makes another in between).
+- `design_neverStuck` is progress, not termination: a step of the system is always enabled
+  while a gate is closed. That the steps end is not proved.
 - "Every configuration" is every value of `Cfg`: with and without nat rules, the proxy, a
   `/loopback` port, cookies, failures of any step, kills of the agent and of a one-shot at any
   step, a dying host, boundaries held past the freeze deadline, snapshots asked of a clone
@@ -145,13 +151,13 @@ length:
 - Every run in `Breaks.lean`: replayed step by step and the test evaluated, by `decide`, under
   the rule book it breaks and under the design.
 
-**Not proved: P2 (`generationBroken`) and the first half of P3 (`staleAtPublication`) for the
-design.** Both say which sockets a retirement destroys and which it leaves, and need an
-invariant over the socket list and the lists of cookies. That invariant is written out in
-"The invariant P2 and P3 still need" below and is not in `Lemmas.lean`. For these two the only
-evidence is the search. This is unfinished work, not a proof that failed on a state.
+**Not proved: P2 (`generationBroken`) for the design.** It says a retirement destroys no socket
+a process of the clone opened and no end of a live connection inside the guest. `Sk` shows the
+retirement destroys everything it must; it does not show that it destroys nothing else. What
+that needs is written out in "The invariant P2 still needs" below. For P2 the only evidence is
+the search. This is unfinished work, not a proof that failed on a state.
 
-**Searched exhaustively, not proved**: that the design has no break of P2 or P3 in the bounded
+**Searched exhaustively, not proved**: that the design has no break of P2 in the bounded
 configurations (18 runs, and the two `all-` runs that turn everything on at once: 568,336 and
 128,018 states), and that the rule books of today have no break other than those listed. The
 bounds are 2 to 5 socket cookies and one or two restores. The search program is compiled Lean
@@ -177,7 +183,7 @@ model takes both as given; neither is in it.
 | A SYN cookie a client holds stays valid | Conservative: the real one expires (2 minutes of guest run time), which removes runs |
 | The accept queue has room | Conservative: a full one refuses the socket |
 | TIME-WAIT sockets are not modelled; a close removes the socket | **Not conservative** for the manifest's TIME-WAIT handling (it names them, and the second look skips them). A reused tuple is modelled through a process that closes and reconnects |
-| A packet with a loopback source cannot arrive on eth0 | Kernel: `fib_validate_source` refuses a local source address without `accept_local` (net/ipv4/fib_frontend.c), also with `route_localnet` on |
+| A packet with a loopback source cannot arrive on eth0 | Kernel: the source check refuses a local source address without `accept_local` (net/ipv4/fib_frontend.c:382-389), also with `route_localnet` on |
 | A connect to the guest's own address that is not loopback is refused by the closed egress half | Read from the chain (`gate_chain_rules`: OUTPUT returns for a loopback destination only), as the PR says of itself. Not run. If it were let through, it would be another connection inside the guest made behind the gate, which the model has two kinds of |
 | The gate's removal is one transaction for both families; its installation is one step a family | As the code: `remove_halves` is one nf_tables batch, `close` is `install_family` twice |
 | A step of the agent is atomic | A kill lands between steps. Inside one step the code makes several writes only in `close` (chains, then two hooks) |
@@ -273,26 +279,23 @@ be the CI line. The events do not show the steps the Rust models do not log (the
 manifest's removal, `tcp_syncookies` written back): the order of those is in `Today.lean` by
 citation only, and `cookieA` and `cookieB` differ in exactly such a step.
 
-## The invariant P2 and P3 still need
+## The invariant P2 still needs
 
-For a clone whose restore has completed `n` steps of the design's 18:
+`Sk` (`Socks.lean`) has the cookies below `next`, one kind a cookie, and where the sockets that
+must go are. For a clone whose restore has completed `n` steps of the design's 18, P2 needs
+besides:
 
-- every cookie in the manifest, in the list and of a seen socket is below `next`, and two
-  sockets with one cookie have one kind;
+- every cookie in the manifest and in the list is below `next`;
 - a socket whose cookie the manifest names is `stale`; while ingress is closed none is `fresh`;
   while egress is closed the only `own` sockets are ends of connections inside the guest, and
   each such end has its mirror image, also `own`;
-- after the IPv4 dump, every IPv4 socket with its other end outside is among the seen; after the
-  IPv6 dump, every `stale` or `smuggled` socket with its other end outside has its cookie in the
-  manifest or the list (no such socket is made in between: the gate refuses a SYN and the
-  listener a cookie);
 - after the second look, a socket whose cookie is in the list is not `own` and has no mirror
   image among the sockets (and none can appear: a connection inside the guest is made only when
-  neither of its kinds exists);
-- after the retirement, no socket with its other end outside is `stale` or `smuggled`.
+  neither of its kinds exists).
 
-The first three steps of each (`ins`, `filter`, `map` over the socket list) are what
-`Lemmas.lean` does not yet have.
+`Evo` would have to say three more things of a step: that a socket which goes takes its mirror
+image with it, that a new socket is nobody's mirror image unless both ends are new, and that a
+process connects out only with egress open.
 
 ## What is not modelled
 

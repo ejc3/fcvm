@@ -6,8 +6,8 @@ answers (`BREAKS.md`), what the model shows of it, and wording proposed for the 
 documents.
 
 With all six the search finds no break in any configuration (`lake exe gate-breaks design`,
-and the two `all-` runs), and P1, the second half of P3, P4, P5, P6 and U1 are proved
-(`Proofs.lean`). P2 and the first half of P3 are searched and not proved (`README.md`).
+and the two `all-` runs), and P1, P3, P4, P5, P6 and U1 are proved (`Proofs.lean`). P2 is
+searched and not proved (`README.md`).
 
 None of this is implemented. The fixes #2113 and #2124 already make are not repeated here: the
 flag rule (`tcpByCt := false`), the restore's own list with the mirror image deciding and a
@@ -61,7 +61,7 @@ Answers: `earlySnapshot`, `earlySnapshotFails`, `earlySnapshotCaptures`,
 `failedCloneSnapshot`.
 
 What the model shows: an unpublished clone of the design is never in a snapshot
-(`CloneOk`: `sp = idle`), on which the proofs of P3's second half, P4 and P5 rest.
+(`CloneOk`: `sp = idle`), on which the proofs of P3, P4 and P5 rest.
 
 Proposed wording, for the doc of `resume_source_network`:
 

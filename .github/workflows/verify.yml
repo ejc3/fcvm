@@ -36,7 +36,7 @@ jobs:
   lean:
     name: Lean
     runs-on: ubuntu-latest
-    # A cold build of both models measured 1 min 25 s on an arm64 dev box, after the toolchain
+    # A cold build of both models measured 1 min 27 s on an arm64 dev box, after the toolchain
     # download.
     timeout-minutes: 15
     steps:

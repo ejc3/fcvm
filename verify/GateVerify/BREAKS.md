@@ -26,7 +26,7 @@ configurations of `Configs.lean`. A name is the first recorded run of that kind.
 |---|---|---|---|---|---|
 | P1 `sourceDisturbed` | `liveReset`, `barrierKill`, `reopenFails` | `barrierKill`, `reopenFails` | the same | the same | proved |
 | P2 `generationBroken` | early snapshot, restart | the same | `twoDumps`, `proxyConnectA`, and those | `proxyConnect`, `restartRetires`, early snapshot | holds |
-| P3 `staleAtPublication` | `staleTuple`, `staleTupleGrown`, `loopbackClient`, `earlySnapshot` | `cookieAck`, `loopbackClient`, `earlySnapshot` | `loopbackClientA`, `earlySnapshot` | `earlySnapshot`, `earlySnapshotFails` | holds |
+| P3 `staleAtPublication` | `staleTuple`, `staleTupleGrown`, `loopbackClient`, `earlySnapshot` | `cookieAck`, `loopbackClient`, `earlySnapshot` | `loopbackClientA`, `earlySnapshot` | `earlySnapshot`, `earlySnapshotFails` | proved |
 | P3 `smuggledLate` | `staleTupleLate`, `halfOpenRetransmit` | `cookieAckClone` | `cookiesBackFirst` | holds | proved |
 | P4 `retiredBehindEgress`, `hookMisplaced` | holds | holds | holds | holds | proved |
 | P4 `workloadBehindEgress` | `watchdogThaw`, `restartEgress`, early snapshot | the same | the same | the same | proved |

@@ -30,7 +30,8 @@ elab "#check_gate_axioms" : command => do
     let axioms ← collectAxioms name
     let extra := axioms.toList.filter (!allowed.contains ·)
     if !extra.isEmpty then bad := bad.push s!"{name} depends on {extra}"
-  if theorems.size < 100 || !theorems.contains `Gate.design_neverStuck
+  if theorems.size < 150 || !theorems.contains `Gate.design_neverStuck
+      || !theorems.contains `Gate.design_noStaleAtPublication
       || !theorems.contains `Gate.reachable_scal || !theorems.contains `Gate.breaks_cookieAck then
     throwError "the axiom sweep found {theorems.size} theorems under Gate and not the ones it must"
   if !bad.isEmpty then
@@ -42,6 +43,10 @@ open Gate
 
 /-- info: 'Gate.design_sourceUndisturbed' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in #print axioms design_sourceUndisturbed
+/-- info: 'Gate.design_noStaleAtPublication' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms design_noStaleAtPublication
+/-- info: 'Gate.reachable_sk' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in #print axioms reachable_sk
 /-- info: 'Gate.design_noSmuggledLate' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in #print axioms design_noSmuggledLate
 /-- info: 'Gate.design_egressBeforeRetirement' depends on axioms: [propext, Quot.sound] -/

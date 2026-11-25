@@ -5,5 +5,6 @@ import GateVerify.Properties
 import GateVerify.Configs
 import GateVerify.Breaks
 import GateVerify.Lemmas
+import GateVerify.Socks
 import GateVerify.Proofs
 import GateVerify.Axioms
