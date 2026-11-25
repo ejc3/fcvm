@@ -164,7 +164,10 @@ def forkDefault : Rules := { forkBefore630 with name := "fork-default", onResume
 0baf5b0b and 865fcab0: `KVM_ARM_SET_COUNTER_OFFSET` at boot, before the register replay of a
 restore from vCPU 0's saved `CNTPCT_EL0` (src/vmm/src/builder.rs:520-535), and on `resume_vm`
 moved by the time since `pause_vm` (src/vmm/src/lib.rs:478-524). A restored VM starts with
-`paused_at_counter: None`, so the time between its load and its resume is not taken out. -/
+`paused_at_counter: None`, so the time between its load and its resume is not taken out.
+This is the path on which the ioctl succeeds. A failed ioctl at a restore, or an image with no
+`CNTPCT_EL0`, is logged and leaves the restore as `forkBefore630` does it (builder.rs:520-548);
+a failed ioctl at a resume is an error and the VM stays paused. -/
 def forkNested : Rules :=
   { name := "fork-nested",
     slotsFromRestore := false, cntAtPause := false, freeze := true, freezeLoaded := false,

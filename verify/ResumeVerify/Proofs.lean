@@ -331,6 +331,22 @@ theorem Design.firecracker_sound : Sound Design.firecracker :=
     simp [build, Design.firecracker, Today.fcOrder, apply, clrOf, clearSet_inv, rebuilt, vcpuOf,
       emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
+/-- `KVM_ARM_SET_COUNTER_OFFSET` may also come last in a restore: it overwrites whatever the
+register replay left in the VM's offsets. (It may not be combined with a counter write after
+it: once the ioctl has been used, the kernel ignores those.) -/
+def Design.cloudHypervisorOffsetLast : Rules :=
+  { Design.cloudHypervisor with
+    name := "design-cloud-hypervisor-offset-last",
+    restore := (Design.cloudHypervisor.restore.filter (· != .offset)) ++ [.offset] }
+
+theorem Design.cloudHypervisorOffsetLast_sound : Sound Design.cloudHypervisorOffsetLast :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, quiet_nil, quiet_kick, fun C i => by
+    cases hnv : C.nv <;> cases h0 : i.s0.l2 <;> cases h1 : i.s1.l2 <;> cases hc0 : i.s0.cnt <;>
+      cases hc1 : i.s1.cnt <;>
+      simp [build, Design.cloudHypervisorOffsetLast, Design.cloudHypervisor, apply, clrOf,
+        clearSet_inv, rebuilt, vcpuOf, emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none,
+        hnv, h0, h1, hc0, hc1]⟩
+
 theorem design_cloudHypervisor {C : Cfg} {s : State} (h : Reachable Design.cloudHypervisor C s) :
     healthy C s = true := sound_healthy Design.cloudHypervisor_sound h
 
