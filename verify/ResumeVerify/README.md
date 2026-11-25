@@ -67,15 +67,10 @@ make verify-resume-search RESUME_ARGS=spins     # every kind of state with #2155
 make verify-resume-search RESUME_ARGS=mutants   # each repair of the design put back
 ```
 
-Measured on an arm64 dev box that other work shares (load average 6 to 10 on 64 cores),
-toolchain installed:
-
-| Command | Wall time |
-|---|---|
-| `lake build ResumeVerify` from cold | 1 min 35 s (the guest-step lemma is 80 s of it) |
-| `lake exe resume-breaks` (8 configurations, 1,011,711 states) | 3 s |
-| `lake exe resume-breaks mutants` | 7 s |
-| CI, job `Lean`, all three models, cold | 3 min 19 s (run 45705082234) |
+Measured by CI on a hosted runner (job `Lean`, which builds all three models from cold and runs
+both searches): 3 min 19 s (run 45705082234). The search is 1,011,711 states over eight
+configurations and takes seconds; the guest-step lemma (`guest_ok`) is most of this library's
+build time.
 
 ## The files
 
