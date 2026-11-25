@@ -654,6 +654,7 @@ where
 #[derive(Debug)]
 pub struct RestoreUnderWay(&'static str);
 
+#[cfg(test)]
 impl RestoreUnderWay {
     /// The refusal of `what` (a one-shot) in a guest whose restore is under way.
     pub fn of(what: &'static str) -> Self {
