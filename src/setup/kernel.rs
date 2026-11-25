@@ -3038,7 +3038,14 @@ async fn checkout_cloud_hypervisor_source(url: &str, commit: &str, build_dir: &P
         .to_str()
         .context("the cloud-hypervisor build directory is not UTF-8")?;
     git_as_invoker(
-        &["clone", "-q", "--filter=blob:none", "--no-checkout", url, dir],
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            url,
+            dir,
+        ],
         &format!("clone {url}"),
     )
     .await?;
@@ -3050,7 +3057,15 @@ async fn checkout_cloud_hypervisor_source(url: &str, commit: &str, build_dir: &P
         .context("looking for the cloud-hypervisor commit in the clone")?;
     if !have.success() {
         git_as_invoker(
-            &["-C", dir, "fetch", "-q", "--filter=blob:none", "origin", commit],
+            &[
+                "-C",
+                dir,
+                "fetch",
+                "-q",
+                "--filter=blob:none",
+                "origin",
+                commit,
+            ],
             &format!("fetch cloud-hypervisor commit {commit} from {url}"),
         )
         .await?;
@@ -3161,7 +3176,13 @@ pub async fn ensure_cloud_hypervisor(
     // recorded, so the length is fixed: two builds of one commit print the same.
     let mut build_cmd = Command::new(&cargo);
     build_cmd
-        .args(["build", "--release", "--locked", "--bin", "cloud-hypervisor"])
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--bin",
+            "cloud-hypervisor",
+        ])
         .env("RUSTUP_TOOLCHAIN", &toolchain)
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.abbrev")
@@ -3329,10 +3350,12 @@ mod tests {
         assert_eq!(pin.repo, "cloud-hypervisor/cloud-hypervisor");
         validate_full_git_commit(&pin.commit, "the embedded cloud-hypervisor commit").unwrap();
         // A branch in place of the commit does not parse.
-        assert!(toml::from_str::<crate::setup::rootfs::CloudHypervisorConfig>(
-            "repo = \"cloud-hypervisor/cloud-hypervisor\"\nbranch = \"main\"\n"
-        )
-        .is_err());
+        assert!(
+            toml::from_str::<crate::setup::rootfs::CloudHypervisorConfig>(
+                "repo = \"cloud-hypervisor/cloud-hypervisor\"\nbranch = \"main\"\n"
+            )
+            .is_err()
+        );
 
         let toolchain = pinned_rust_toolchain().unwrap();
         assert!(
@@ -3344,7 +3367,10 @@ mod tests {
             .find("pub async fn ensure_cloud_hypervisor(")
             .expect("ensure_cloud_hypervisor is gone")..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        assert!(body.contains("\"--locked\""), "the build does not pass --locked");
+        assert!(
+            body.contains("\"--locked\""),
+            "the build does not pass --locked"
+        );
         assert!(
             body.contains(".env(\"RUSTUP_TOOLCHAIN\", &toolchain)"),
             "the build does not name its toolchain"

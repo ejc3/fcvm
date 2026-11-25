@@ -623,9 +623,10 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn add_network_interface(&mut self, iface: &NetIfaceSpec) -> Result<()> {
-        self.pending
-            .net
-            .push(NetConfig::new(iface.host_dev_name.clone(), iface.guest_mac.clone()));
+        self.pending.net.push(NetConfig::new(
+            iface.host_dev_name.clone(),
+            iface.guest_mac.clone(),
+        ));
         Ok(())
     }
 

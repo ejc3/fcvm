@@ -10790,8 +10790,14 @@ mod tests {
         let unrecorded = ensure_ch_snapshot_written_by(None, running, bin)
             .unwrap_err()
             .to_string();
-        assert!(unrecorded.contains("records no Cloud Hypervisor build"), "{unrecorded}");
-        assert!(unrecorded.contains("Create the snapshot again"), "{unrecorded}");
+        assert!(
+            unrecorded.contains("records no Cloud Hypervisor build"),
+            "{unrecorded}"
+        );
+        assert!(
+            unrecorded.contains("Create the snapshot again"),
+            "{unrecorded}"
+        );
 
         let source = include_str!("common.rs");
         assert_in_order(

@@ -766,7 +766,14 @@ async fn ch_baseline(vm_name: &str) -> Result<(tokio::process::Child, u32)> {
 /// `fcvm snapshot create --pid <pid> --tag <tag>`, failing with its stderr.
 async fn ch_snapshot(pid: u32, tag: &str) -> Result<()> {
     let out = tokio::process::Command::new(common::find_fcvm_binary()?)
-        .args(["snapshot", "create", "--pid", &pid.to_string(), "--tag", tag])
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            tag,
+        ])
         .output()
         .await
         .context("running snapshot create")?;
@@ -827,7 +834,14 @@ async fn test_cloud_hypervisor_clone_keeps_the_snapshots_clock() -> Result<()> {
 
     let restore_started = Instant::now();
     let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--snapshot", &snap, "--name", &clone_name],
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snap,
+            "--name",
+            &clone_name,
+        ],
         &clone_name,
     )
     .await
@@ -912,7 +926,14 @@ async fn test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot(
     ch_snapshot(baseline_pid, &parent_snap).await?;
 
     let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--snapshot", &parent_snap, "--name", &clone_name],
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &parent_snap,
+            "--name",
+            &clone_name,
+        ],
         &clone_name,
     )
     .await?;
@@ -939,14 +960,25 @@ async fn test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot(
     );
 
     let (mut grandchild, grandchild_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "run", "--snapshot", &child_snap, "--name", &grandchild_name],
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &child_snap,
+            "--name",
+            &grandchild_name,
+        ],
         &grandchild_name,
     )
     .await?;
     common::poll_health_by_pid(grandchild_pid, 300)
         .await
         .context("a clone of the child snapshot should become healthy without the parent")?;
-    assert_eq!(from_source.len(), 64, "no checksum from the source: {from_source:?}");
+    assert_eq!(
+        from_source.len(),
+        64,
+        "no checksum from the source: {from_source:?}"
+    );
     assert_eq!(
         common::exec_in_vm(grandchild_pid, &[&sum("from-source")])
             .await?
