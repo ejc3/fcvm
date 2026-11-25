@@ -2029,7 +2029,8 @@ still on subvolumes, four wakes and four sleeps at once (`potatobench.py burst`)
 disk step took 17 ms p50 and 192 ms p99 as a reflink against 193 ms and 1.8 s as a subvolume
 snapshot, and fcvm now reflinks a clone's disk of at most 4096 extents while fewer than 8
 reflinks of that snapshot's disk are in flight (the fleet relaunches 8 tiles of one snapshot at
-once); a deeper queue takes subvolume snapshots, which do not wait on the source inode's lock.
+once); a deeper queue takes subvolume snapshots, which do not wait on the source inode's lock,
+and while any clone of that snapshot is taking one, the next takes one too.
 
 A soak of the coordinator and one host shaped like staging (96 players, two phones, the
 ladder from 2 to 96, 2026-11-07) put a number on the host's side. Sleeps finished at up to

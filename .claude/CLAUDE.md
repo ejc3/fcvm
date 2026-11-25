@@ -2748,7 +2748,14 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   reflink, so reflinks of one snapshot run one at a time, 4.6 ms each for an 871-extent disk, about 240 per second
   at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
   relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
-  share no lock. On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
+  share no lock. A slot that frees while clones of the snapshot are taking subvolume snapshots is not taken: each such
+  clone holds a shared `flock` on `subvolume-snapshot.lock` beside the slots for its snapshot and 100 ms after it
+  (`SUBVOLUME_SNAPSHOT_LINGER`: the snapshots that share a commit end together, and the clones that arrive next must
+  still find a mark), and a clone that finds it held (`subvolume_snapshot_in_flight`) takes the subvolume snapshot too. A reflink joins a
+  transaction for every extent and waits out each commit that starts meanwhile, and the commits carry what the
+  reflinks dirtied: in 1000 whole clones at 128 at a time (c8gd.metal-24xl, 7.0.0-1018-aws, btrfs on NVMe, an
+  864-extent disk) the 212 that reflinked took 107 ms at the median in the disk step and the 788 that snapshotted
+  59 ms, against 24 ms with every clone snapshotting. On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
   none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
   against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
   subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes
