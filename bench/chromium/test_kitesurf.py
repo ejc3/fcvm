@@ -265,6 +265,42 @@ class ReplayPool(unittest.TestCase):
                         leaves.append(tls.getpeercert(binary_form=True))
             self.assertEqual(leaves[0], leaves[1])
 
+    def test_processes_started_together_on_an_empty_cert_dir_serve_one_leaf(self):
+        """The lock: both processes find the directory empty, and only one of
+        them makes the certificate. Without it each serves a leaf of its own."""
+        import threading
+        d = tempfile.mkdtemp()
+        servers = [ReplayServer("--tls-cert-dir", d) for _ in range(2)]
+        starts = [threading.Thread(target=s.__enter__) for s in servers]
+        for t in starts:
+            t.start()
+        for t in starts:
+            t.join()
+        try:
+            leaves = [ssl.get_server_certificate(("127.0.0.1", s.tls)) for s in servers]
+        finally:
+            for s in servers:
+                s.__exit__(None, None, None)
+        self.assertEqual(leaves[0], leaves[1])
+
+    def test_a_cert_dir_made_for_other_hosts_or_long_ago_is_refused(self):
+        """A leaf lasts two days and names the hosts it was made for. A directory
+        kept from another corpus or another day would be served to clients that
+        refuse it, so the process says so at start instead."""
+        import corpus_serve
+        from pathlib import Path
+        d = Path(tempfile.mkdtemp())
+        first = corpus_serve.shared_certificate(d, ["a.test"])
+        self.assertEqual(corpus_serve.shared_certificate(d, ["a.test"]), first)
+        with self.assertRaises(SystemExit) as refused:
+            corpus_serve.shared_certificate(d, ["a.test", "b.test"])
+        self.assertIn("other hosts", str(refused.exception))
+        old = time.time() - 2 * 86400
+        os.utime(d / "replay.crt", (old, old))
+        with self.assertRaises(SystemExit) as refused:
+            corpus_serve.shared_certificate(d, ["a.test"])
+        self.assertIn("a day", str(refused.exception))
+
     def test_processes_with_their_own_ca_do_not_verify_under_each_others(self):
         """What --tls-cert-dir is for: two processes each making a CA
         (--tls-ca-out) present chains a client holding one CA refuses."""
@@ -341,7 +377,7 @@ class ReplayInjection(unittest.TestCase):
             head, body = self.get(s.http, "example.com")
             at = captured.lower().rfind(b"</body>")
             self.assertEqual(body, captured[:at] + extra + captured[at:])
-            self.assertIn(f"content-length: {len(body)}", head)
+            self.assertIn(f"content-length: {len(body)}\r\n", head + "\r\n")
             self.assertIn("x-replay-injected: " + hashlib.sha256(extra).hexdigest(), head)
             # replaced by rename: the next request has the new bytes, whole
             with open(path + ".tmp", "wb") as handle:
@@ -375,6 +411,36 @@ class ReplayInjection(unittest.TestCase):
             self.assertIn(" 200 ", head.split("\r\n")[0] + " ")
             self.assertNotIn(b"MARK", body)
             self.assertNotIn("x-replay-injected", head)
+
+    def test_a_subresource_at_the_documents_own_path_is_left_alone(self):
+        """The bytes go into the reply that IS the page's main document. A
+        subresource with the document's host and path and a query of its own is
+        another captured body; the document asked for with a query that was not
+        captured is still the document."""
+        root = tempfile.mkdtemp()
+        site = os.path.join(root, "site.test_root")
+        os.mkdir(site)
+        with open(os.path.join(site, "0"), "wb") as handle:
+            handle.write(b"<html><body>page</body></html>")
+        with open(os.path.join(site, "1"), "wb") as handle:
+            handle.write(b'{"ajax": true}')
+        with open(os.path.join(site, "index.json"), "w") as handle:
+            json.dump({"url": "https://site.test/", "resources": {
+                "https://site.test/": {"file": "0", "status": 200, "mime": "text/html"},
+                "https://site.test/?ajax=1": {"file": "1", "status": 200,
+                                              "mime": "application/json"},
+            }}, handle)
+        path = os.path.join(root, "inject.html")
+        with open(path, "wb") as handle:
+            handle.write(b"<b>MARK</b>")
+        with ReplayServer("--root", root, "--inject-file", path) as s:
+            head, body = self.get(s.http, "site.test", "/")
+            self.assertEqual(body, b"<html><body>page<b>MARK</b></body></html>")
+            head, body = self.get(s.http, "site.test", "/?ajax=1")
+            self.assertEqual(body, b'{"ajax": true}')
+            self.assertNotIn("x-replay-injected", head)
+            head, body = self.get(s.http, "site.test", "/?utm=x")
+            self.assertEqual(body, b"<html><body>page<b>MARK</b></body></html>")
 
     def test_a_document_without_a_body_end_gets_them_at_its_end(self):
         import corpus_serve

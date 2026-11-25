@@ -4,7 +4,8 @@
 Serves the ORIGINAL urls: the replay Chromium runs with
 --host-resolver-rules="MAP * 127.0.0.1", so every host resolves here; this
 server picks the response by (Host header, path?query) from the capture
-indexes and replays status + mime + body byte-identically. HTTP on --port and
+indexes and replays status + mime + body byte-identically (--inject-file adds
+its bytes to each page's main document and to nothing else). HTTP on --port and
 HTTPS on --tls-port with a self-signed cert (the bench Chromium bakes in
 --ignore-certificate-errors).
 
@@ -91,10 +92,10 @@ def load_indexes(root: Path):
 
 
 def main_documents(root: Path):
-    """The key of each capture's main document: its page's own URL, after the
-    captured redirects that lead from it (en.wikipedia.org/ answers with a
-    redirect to /wiki/Main_Page, which is the document)."""
-    keys = set()
+    """Each capture's main document, by key, with its body's file: its page's
+    own URL, after the captured redirects that lead from it (en.wikipedia.org/
+    answers with a redirect to /wiki/Main_Page, which is the document)."""
+    keys = {}
     for idx in sorted(root.glob("*/index.json")):
         data = json.loads(idx.read_text())
         url, seen = data.get("url"), set()
@@ -104,7 +105,7 @@ def main_documents(root: Path):
             url = urllib.parse.urljoin(url, redirects[url].get("location", ""))
         if url in data.get("resources", {}):
             u = urllib.parse.urlparse(url)
-            keys.add((u.netloc, u.path, u.query))
+            keys[(u.netloc, u.path, u.query)] = idx.parent / data["resources"][url]["file"]
     return keys
 
 
@@ -374,11 +375,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     inject_file = None
     main_docs = frozenset()
 
-    def _injection(self, host, u):
-        if self.inject_file is None:
-            return b""
-        if (host, u.path, u.query) not in self.main_docs \
-                and not any(k[0] == host and k[1] == u.path for k in self.main_docs):
+    def _injection(self, body_file):
+        # By the body the reply was resolved to, not by the request: the
+        # document asked for with a query nobody captured is still the document,
+        # and a subresource at the document's own path is not.
+        if self.inject_file is None or body_file not in self.main_docs:
             return b""
         try:
             return Path(self.inject_file).read_bytes()
@@ -604,7 +605,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         path, status, mime = entry
         data = path.read_bytes()
-        extra = self._injection(host, u)
+        extra = self._injection(path)
         if extra:
             data = inject(data, extra)
         # Replay the RECORDED status: coercing errors to 200 changed browser
@@ -994,17 +995,36 @@ def shared_certificate(cert_dir: Path, hosts):
     chain per connection. The leaf's key stays in the directory for as long as
     the processes may start, so the directory is the caller's to make private
     and to remove. Returns (leaf, key, CA certificate).
+
+    A directory is for one run of one corpus. The leaf names the hosts it was
+    made for and lasts two days, and a process that loaded one for other hosts,
+    or an old one, would serve a certificate its clients refuse while it said
+    it was replaying. So a directory whose leaf was made for other hosts, or
+    more than a day ago, is refused at start.
     """
     cert_dir.mkdir(parents=True, exist_ok=True)
     crt, key, ca = cert_dir / "replay.crt", cert_dir / "replay.key", cert_dir / "ca.pem"
+    made_for = cert_dir / "hosts.json"
+    wanted = sorted(set(hosts))
     with open(cert_dir / ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not (crt.exists() and key.exists() and ca.exists()):
+        if not (crt.exists() and key.exists() and ca.exists() and made_for.exists()):
             with tempfile.TemporaryDirectory(prefix="mk-", dir=cert_dir) as tmp:
                 made_crt, made_key = ca_signed(Path(tmp), hosts, Path(tmp) / "ca.pem")
+                (Path(tmp) / "hosts.json").write_text(json.dumps(wanted))
+                # The list last: a directory without it is made again, whole.
+                made_for.unlink(missing_ok=True)
                 os.replace(Path(tmp) / "ca.pem", ca)
                 os.replace(made_key, key)
                 os.replace(made_crt, crt)
+                os.replace(Path(tmp) / "hosts.json", made_for)
+        else:
+            if json.loads(made_for.read_text()) != wanted:
+                raise SystemExit(f"--tls-cert-dir {cert_dir} holds a certificate made for other hosts "
+                                 "than this corpus's; give each run a new directory")
+            if time.time() - crt.stat().st_mtime > 86400:
+                raise SystemExit(f"--tls-cert-dir {cert_dir} holds a certificate made more than a day "
+                                 "ago (it lasts two); give each run a new directory")
     return crt, key, ca
 
 
@@ -1194,7 +1214,7 @@ def main():
     Handler.exact, Handler.noquery, Handler.redirects = load_indexes(Path(args.root))
     if args.inject_file:
         Handler.inject_file = args.inject_file
-        Handler.main_docs = frozenset(main_documents(Path(args.root)))
+        Handler.main_docs = frozenset(main_documents(Path(args.root)).values())
     if args.tls_cert_dir and args.tls_ca_out:
         ap.error("--tls-cert-dir keeps its CA at DIR/ca.pem; --tls-ca-out is for one process")
     if args.reuse_port:
