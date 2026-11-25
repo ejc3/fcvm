@@ -5,7 +5,7 @@
 # security group admits TCP 443 only): everything goes through SSM Run Command, and files
 # reach them through presigned S3 URLs, since Ubuntu's images carry no AWS CLI.
 #
-#   build-ami.sh launch host|tile           launch a builder, print its instance id
+#   build-ami.sh launch host|tile|renders   launch a builder, print its instance id
 #   build-ami.sh push   <id>                copy fleet/ami to /opt/fleet-ami on the builder
 #   build-ami.sh env    <id> K=V...         write /var/lib/fleet-ami/env (read by the phases)
 #   build-ami.sh start  <id> <script> <phase>   run a phase detached (logs in /var/log/fleet-ami)
@@ -32,7 +32,7 @@ now() { date +%s; }
 # shellcheck source=../tools/g-admission.sh
 . "$HERE/../tools/g-admission.sh"
 
-ubuntu_ami() { A ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text; }
+ubuntu_ami() { A ssm get-parameter --name "/aws/service/canonical/ubuntu/server/24.04/stable/current/${1:-amd64}/hvm/ebs-gp3/ami-id" --query Parameter.Value --output text; }
 subnet() {
   [ -n "${SUBNET:-}" ] && { echo "$SUBNET"; return; }
   A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${AZ_SUFFIX:-a}" --query 'Subnets[0].SubnetId' --output text
@@ -104,9 +104,13 @@ case "$1" in
 launch)
   kind=$2
   case "$kind" in
-    host) type=${TYPE:-g4dn.metal}; profile=fcvm-fleet-host; size=96 ;;
-    tile) type=${TYPE:-g4dn.xlarge}; profile=fcvm-fleet-tile; size=32 ;;
-    *) echo "launch host|tile" >&2; exit 2 ;;
+    host) type=${TYPE:-g4dn.metal}; profile=fcvm-fleet-host; size=96; arch=amd64 ;;
+    tile) type=${TYPE:-g4dn.xlarge}; profile=fcvm-fleet-tile; size=32; arch=amd64 ;;
+    # Pages mode's host (fleet/ami/renders): the type it runs on, arm64, with the GPU host's
+    # instance profile (store parts from the asset bucket). The root holds the checkout and the
+    # packed store; its Kitesurf tree is the size no build has recorded yet, so it has room.
+    renders) type=${TYPE:-m8gd.metal-24xl}; profile=fcvm-fleet-host; size=128; arch=arm64 ;;
+    *) echo "launch host|tile|renders" >&2; exit 2 ;;
   esac
   # A host builder gets an IPv6 prefix, as a fleet host does: build.sh's root warm-up
   # (warm-root.sh) launches a routed VM at an address in it.
@@ -114,9 +118,14 @@ launch)
   [ "$kind" = host ] && net="$net,Ipv6PrefixCount=1"
   vcpus=$(A ec2 describe-instance-types --instance-types "$type" --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text)
   [[ "$vcpus" =~ ^[0-9]+$ ]] || { say "no vCPU count for $type"; exit 1; }
-  ami=${BASE_AMI:-$(ubuntu_ami)}
+  ami=${BASE_AMI:-$(ubuntu_ami "$arch")}
   [[ "$ami" == ami-* ]] || { say "no base AMI"; exit 1; }
   image_in_region "$ami" || exit 1
+  # A renders builder is a Standard instance: the wall's G reserve and its ledger do not count it.
+  if [ "$kind" = renders ]; then
+    admit_lock() { :; }; admit_held() { :; }; admit_unlock() { :; }; admit_abandon() { :; }
+    room_for() { :; }; ledger_add() { :; }
+  fi
   # shellcheck disable=SC2034  # read by g-admission.sh
   owner=ami-build-$kind GA_WHAT="$type builder"
   admit_lock || { say "no admission: the lock in s3://$BUCKET/$ADMIT_LOCK could not be taken"; exit 1; }
@@ -207,7 +216,8 @@ image)
   [[ "$guard_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid guard digest" >&2; exit 1; }
   unit_hashes=""
   for unit_file in "$HERE/host/fcvm-fleet-agent.service" "$HERE/host/fcvm-fleet-store.service" \
-                   "$HERE/tile/fcvm-fleet-renderer.service" "$HERE/tile/fcvm-fleet-nginx.service"; do
+                   "$HERE/tile/fcvm-fleet-renderer.service" "$HERE/tile/fcvm-fleet-nginx.service" \
+                   "$HERE/renders/fcvm-fleet-renders-agent.service"; do
     unit_sha=$(sha256sum "$unit_file"); unit_sha=${unit_sha%% *}
     [[ "$unit_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "invalid unit digest" >&2; exit 1; }
     unit_hashes+=" ${unit_file##*/}=$unit_sha"
@@ -253,7 +263,8 @@ guard = Path('/usr/local/sbin/cve-2026-98432-mitigation')
 service = 'cve-2026-98432-mitigation.service'
 sources = dict(value.split('=', 1) for value in sys.argv[2:])
 need(set(sources) == {'fcvm-fleet-agent.service', 'fcvm-fleet-store.service',
-                      'fcvm-fleet-renderer.service', 'fcvm-fleet-nginx.service'}
+                      'fcvm-fleet-renderer.service', 'fcvm-fleet-nginx.service',
+                      'fcvm-fleet-renders-agent.service'}
      and all(re.fullmatch('[0-9a-f]{64}', value) for value in sources.values()), 'recipe unit digests are missing')
 need(guard.is_file() and not guard.is_symlink(), 'installed guard is missing or unsafe')
 implementation = guard.read_bytes()
@@ -290,14 +301,18 @@ settings = configuration(service, hashlib.sha256(units[0].encode()).hexdigest())
 command = r'\{ path=' + re.escape(str(guard)) + r' ; argv\[\]=' + re.escape(str(guard))
 need(re.fullmatch(command + r' --load ; ignore_errors=no ; [^{}]* \}', settings.get('ExecStart', '')),
      'guard boot command differs')
-selected = ()
-for units in (('fcvm-fleet-agent.service', 'fcvm-fleet-store.service'),
-              ('fcvm-fleet-renderer.service', 'fcvm-fleet-nginx.service')):
-    states = [output(['systemctl', 'show', unit, '--property=LoadState', '--value']).strip() for unit in units]
-    if 'loaded' in states:
-        need(all(state == 'loaded' for state in states) and not selected, 'incomplete or ambiguous fleet services')
-        selected = units
-need(selected, 'no fleet services installed')
+# The image is exactly one family: the GPU host, the EC2 tile, or the renders host (which shares
+# the GPU host's store unit). Any other set of loaded units is incomplete or ambiguous.
+families = (('fcvm-fleet-agent.service', 'fcvm-fleet-store.service'),
+            ('fcvm-fleet-renderer.service', 'fcvm-fleet-nginx.service'),
+            ('fcvm-fleet-renders-agent.service', 'fcvm-fleet-store.service'))
+names = sorted({unit for family in families for unit in family})
+loaded = {unit for unit in names
+          if output(['systemctl', 'show', unit, '--property=LoadState', '--value']).strip() == 'loaded'}
+need(loaded, 'no fleet services installed')
+matching = [family for family in families if set(family) == loaded]
+need(len(matching) == 1, 'incomplete or ambiguous fleet services')
+selected = matching[0]
 for unit in selected:
     settings = configuration(unit, sources[unit], allow_guard_dropin=True)
     need(all(service in settings.get(key, '').split() for key in ('Requires', 'After')),

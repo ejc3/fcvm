@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Proofs run only on the four broker-owned image builders/validators.
+"""Proofs run only on the broker-owned image builders/validators (the pair's four, the renders
+track's two).
 
 Secrets stay in RAM or private runtime files. Standard output is a small proof;
 commands and secret-bearing exception text are never returned to CodeBuild.
@@ -9,6 +10,7 @@ import contextlib
 import datetime
 import hashlib
 import hmac
+import importlib.util
 import io
 import ipaddress
 import json
@@ -34,6 +36,16 @@ TLS = Path("/run/fcvm-fleet/tls")
 GUARD = "cve-2026-98432-mitigation.service"
 DIAGNOSTIC_LOG = Path("/var/log/fleet-image-phase.log")
 DIAGNOSTIC_LIMIT = 1024 * 1024
+# The build phases of each kind, for the private diagnostics archive.
+PHASES = {"host": {"prep", "build", "bake"}, "tile": {"prep", "image", "trace", "bake"},
+          "renders": {"prep", "build", "bake"}}
+# The units each kind's image starts for the fleet, with the recipe file each must be byte for
+# byte (build-ami.sh's guard proof). The renders host shares the GPU host's store unit.
+GUARDED_UNITS = {"fcvm-fleet-agent.service": "host", "fcvm-fleet-store.service": "host",
+                 "fcvm-fleet-renderer.service": "tile", "fcvm-fleet-nginx.service": "tile",
+                 "fcvm-fleet-renders-agent.service": "renders"}
+RENDERS_RECORD = Path("/etc/fcvm-fleet/renders-build.json")
+RENDERS_CONF = Path("/etc/fcvm-fleet/renders.conf")
 
 
 def need(value, message):
@@ -55,9 +67,8 @@ def guard():
     proof = source.split("# BEGIN IMAGE GUARD PROOF\n", 1)[1].split("# END IMAGE GUARD PROOF", 1)[0]
     implementation = AMI / "common/cve-2026-98432-mitigation.py"
     argv = ["-", hashlib.sha256(implementation.read_bytes()).hexdigest()]
-    for kind, names in (("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
-                        ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))):
-        argv.extend(name + "=" + hashlib.sha256((AMI / kind / name).read_bytes()).hexdigest() for name in names)
+    argv.extend(name + "=" + hashlib.sha256((AMI / kind / name).read_bytes()).hexdigest()
+                for name, kind in GUARDED_UNITS.items())
     previous = sys.argv
     try:
         sys.argv = argv
@@ -137,8 +148,7 @@ def upload(client, bucket, key, path):
 
 
 def export_diagnostics(bucket, prefix, region, kind, phase):
-    need(kind in {"host", "tile"} and phase in ({"prep", "build", "bake"} if kind == "host"
-         else {"prep", "image", "trace", "bake"}), "invalid diagnostics phase")
+    need(phase in PHASES.get(kind, ()), "invalid diagnostics phase")
     client = bucket_client(bucket, prefix, region)
     descriptor = os.open(DIAGNOSTIC_LOG, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -232,11 +242,11 @@ def sanitized():
 
 
 def seal(kind):
-    need(kind in {"host", "tile"}, "invalid factory kind")
+    need(kind in {"host", "tile", "renders"}, "invalid factory kind")
     clean_identity()
     sanitized()
     guard()
-    if kind == "host":
+    if kind in ("host", "renders"):
         store_parts()
     command(["cloud-init", "clean", "--logs", "--seed"])
     Path("/etc/machine-id").write_text("")
@@ -346,9 +356,10 @@ def tls_proof(port, document):
 
 
 def ordering(kind):
-    names = ("fcvm-fleet-store.service",) if kind == "host" else (
+    names = ("fcvm-fleet-store.service",) if kind in ("host", "renders") else (
         "fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service")
-    ready = ("fcvm-fleet-vfio.service", *names) if kind == "host" else names
+    ready = (("fcvm-fleet-vfio.service", *names) if kind == "host"
+             else ("fcvm-fleet-hugepages.service", *names) if kind == "renders" else names)
     deadline = time.monotonic() + 1800
     while True:
         remaining = deadline - time.monotonic()
@@ -648,10 +659,113 @@ def verify(kind, expected_image, build_arn, test_arn, region, *proofs):
             "build_cert_sha256": cert_hash(old["cert"]), "test_cert_sha256": cert_hash(new["cert"])}
 
 
+# A renders validator's failure as the record keeps it: host-check.py's fixed sentences and the
+# agent check's case names, never a URL or a token. Anything else is dropped.
+RENDERS_TEXT = re.compile(r"[A-Za-z0-9 :./,()'_+-]{1,160}")
+RENDERS_FAILURES_MAX = 40
+
+
+def plain(items):
+    return [item for item in items if isinstance(item, str) and RENDERS_TEXT.fullmatch(item)
+            and "//" not in item][:RENDERS_FAILURES_MAX]
+
+
+def renders_conf():
+    """host-check.py, and the image's renders.conf as host-check.py reads it."""
+    spec = importlib.util.spec_from_file_location("renders_host_check", AMI / "renders/host-check.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, module.read_conf(RENDERS_CONF.read_text())
+
+
+def renders_record():
+    """What the renders build made (host-check.py record), for the factory's manifest."""
+    record = json.loads(RENDERS_RECORD.read_text())
+    module, conf = renders_conf()
+    need(isinstance(record, dict) and set(record) == set(module.RECORD_FIELDS), "the renders build record is malformed")
+    need(all(re.fullmatch(r"[0-9a-f]{40}", record[k]) for k in ("fcvm_commit", "kitesurf_commit"))
+         and re.fullmatch(r"[0-9a-f]{64}", record["bundle_sha256"])
+         and module.RELEASE.fullmatch(record["kernel_release"])
+         and record["boot_params"] == conf["RENDERS_BOOT_PARAMS"]
+         and record["hugepages"] == int(conf["RENDERS_HUGEPAGES"]), "the renders build record is malformed")
+    return record
+
+
+def renders_host_proof():
+    """host-check.py's problems on this boot (empty when it passed)."""
+    done = subprocess.run(["python3", str(AMI / "renders/host-check.py"), "host"], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=3600)
+    try:
+        result = json.loads(done.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return ["the renders host check wrote no result"]
+    problems = result.get("problems") if isinstance(result, dict) else None
+    if done.returncode == 0 and result.get("ok") is True and problems == []:
+        return []
+    return problems if isinstance(problems, list) and problems else ["the renders host check failed without a problem"]
+
+
+def agent_check_failures(path):
+    """The failing cases of `make test-fleet-renders-agent`'s record (renders_agent_check.py)."""
+    try:
+        record = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return ["the agent check wrote no record"]
+    failed = record.get("failed") if isinstance(record, dict) else None
+    if not isinstance(failed, list) or type(record.get("cases")) is not int:
+        return ["the agent check's record is malformed"]
+    if record["cases"] == 0:
+        return ["the agent check ran no case"]
+    return [str(case) for case in failed]
+
+
+def renders_agent_proof():
+    """Pages mode on this image, under its agent, with the coordinator played by the host check
+    (make test-fleet-renders-agent: hello, renders on both sides, an overlay, stops while
+    rendering and while held, SIGKILL at every stage, each with nothing left). Run as the build
+    user, the agent's user, from the image's own checkout, every case. Returns the failing cases."""
+    _, conf = renders_conf()
+    user, uid = conf["RENDERS_USER"], conf["RENDERS_UID"]
+    with tempfile.TemporaryDirectory(dir="/mnt/fcvm-btrfs") as out:
+        os.chown(out, int(uid), int(uid))
+        check = out + "/check"
+        # The check's own log names the run's paths and processes; it stays on the validator.
+        subprocess.run(["runuser", "-u", conf["RENDERS_USER"], "--", "env", "HOME=/home/" + user,
+                        "XDG_RUNTIME_DIR=/run/user/" + uid, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                        "make", "-C", conf["RENDERS_SRC"], "test-fleet-renders-agent", "OUT=" + check,
+                        "FCVM=/usr/local/bin/fcvm", "TAG=" + conf["RENDERS_SNAPSHOT_TAG"],
+                        "KITESURF=" + conf["RENDERS_KITESURF"], "DIST=" + conf["RENDERS_DIST"],
+                        "MAX_FCVM=" + conf["RENDERS_CHECK_MAX_FCVM"], "MAX_ENGINES=" + conf["RENDERS_CHECK_MAX_ENGINES"]],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5400)
+        return agent_check_failures(check + ".agent-check.json")
+
+
+# Proofs a renders validator runs only when asked (the cold boot). The frame server's viewer
+# acceptance is added here, and in pipeline.py RENDERS_COLD_PROOFS, once it exists.
+RENDERS_PROOFS = ("renders-agent",)
+
+
+def verify_renders(*proofs):
+    """A renders image's validation boot: the security proofs every image carries, its units up in
+    order, the fleet's launch path, the flavor's own check (host-check.py: the -fcvm kernel the
+    build installed with the reference's boot line, the pool, /dev/kvm, the units, the pieces),
+    and, when asked, the agent check."""
+    need(set(proofs) <= set(RENDERS_PROOFS), "unknown validator proof")
+    sanitized()
+    guard()
+    ordering("renders")
+    launch_path_proof()
+    problems = plain(renders_host_proof())
+    agent = plain(renders_agent_proof()) if "renders-agent" in proofs else None
+    return {**boot(), "guard": True, "sanitized": True, "launch_path": True,
+            "renders_host": problems == [], **({"renders_host_problems": problems} if problems else {}),
+            "renders_agent": agent == [], **({"renders_agent_failures": agent} if agent else {})}
+
+
 def main():
     actions = {"boot": boot, "renderer": renderer, "export-renderer": export_renderer,
         "export-store": export_store, "export-diagnostics": export_diagnostics, "tile-tls": tile_tls, "tile-ready": tile_ready,
-        "seal": seal, "verify": verify}
+        "seal": seal, "verify": verify, "verify-renders": verify_renders, "renders-record": renders_record}
     try:
         need(len(sys.argv) >= 2 and sys.argv[1] in actions, "unknown image operation")
         result = actions[sys.argv[1]](*sys.argv[2:])

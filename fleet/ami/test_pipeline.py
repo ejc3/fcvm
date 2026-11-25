@@ -38,6 +38,9 @@ pipeline = module("pipeline")
 guest = module("pipeline_guest")
 SOURCE = "1" * 40
 IMAGE = "sha256:" + "2" * 64
+RENDERS_RECORD = {"fcvm_commit": SOURCE, "kitesurf_commit": "9" * 40, "bundle_sha256": "a" * 64,
+    "kernel_release": "7.3.3-fcvm-0123456789ab", "boot_params": "kvm-arm.mode=nested numa=off arm64.nv2",
+    "hugepages": 34000}
 CONFIG = {"build_id": "fleet-images:example", "source_commit": SOURCE, "capability": "c" * 64,
     "broker_arn": "arn:aws:lambda:us-west-1:111111111111:function:example:build",
     "bucket": "example-images", "final_store_bucket": "example-runtime", "final_store_region": "us-east-2",
@@ -64,6 +67,7 @@ class Broker:
         self.midwait_change = None
         self.slow_final_cleanup = False
         self.final_cleanup_had_manifest = []
+        self.track = "pair"
 
     def invoke(self, **arguments):
         request = json.loads(arguments["Payload"])
@@ -92,7 +96,7 @@ class Broker:
             elif action == "seal":
                 assert slot.endswith("-build") and self.slots[slot]["state"] == "stopped"
                 kind = slot.split("-")[0]
-                image = "ami-" + ("a" if kind == "host" else "b") * 17
+                image = "ami-" + {"host": "a", "tile": "b", "renders": "c"}[kind] * 17
                 self.candidates[kind] = image
                 self.slots[slot]["image_state"] = "available"
                 reply = {"image_id": image, "state": "available"}
@@ -146,6 +150,10 @@ class Worker:
         self.invalidated = 0
         self.tls = {}
         self.artifact_fault = None
+        self.renders_asks = []
+        self.renders_kernel = RENDERS_RECORD["kernel_release"]
+        self.renders_record = dict(RENDERS_RECORD)
+        self.secret_writes = 0
 
     def invalidate(self):
         self.invalidated += 1
@@ -161,7 +169,11 @@ class Worker:
         key = arguments["Key"]
         assert key.startswith("runs/" + hashlib.sha256(CONFIG["build_id"].encode()).hexdigest() + "/")
         assert key not in self.objects
-        if key.endswith("manifest.json"):
+        if key.endswith("manifest.json") and self.broker.track == "renders":
+            assert set(self.broker.slots) == set(pipeline.RENDERS_SLOTS)
+            assert self.broker.slots["renders-build"]["state"] == "terminated"
+            assert sum("pipeline_guest.py verify-renders" in item["Parameters"]["commands"][0] for item in self.commands) == 3
+        elif key.endswith("manifest.json"):
             assert set(self.broker.slots) == set(pipeline.SLOTS)
             assert all(self.broker.slots[kind + "-build"]["state"] == "terminated" for kind in ("host", "tile"))
             assert sum("pipeline_guest.py verify " in item["Parameters"]["commands"][0] for item in self.commands) == 6
@@ -189,6 +201,7 @@ class Worker:
             "CopyObjectResult": {"ChecksumSHA256": "wrong" if self.artifact_fault == "bad-checksum" else checksum}}
 
     def put_secret_value(self, **arguments):
+        self.secret_writes += 1
         assert not self.broker.slots, "initialize isolated canaries before any paid launch"
         variant = "build" if arguments["SecretId"] == CONFIG["tls_build_arn"] else "test"
         assert arguments["SecretId"] == CONFIG["tls_" + variant + "_arn"]
@@ -242,6 +255,17 @@ class Worker:
                     value.update(self.tls)
                     if self.bad_proof:
                         value[self.bad_proof] = False
+                elif action == "verify-renders":
+                    cold = "renders-agent" in args[3:]
+                    self.renders_asks.append(cold)
+                    value = {"boot_id": identity, "guard": True, "sanitized": True, "launch_path": True,
+                        "kernel_release": self.renders_kernel, "renders_host": True, "renders_agent": cold}
+                    if self.bad_proof in value:
+                        value[self.bad_proof] = False
+                        value[self.bad_proof + "_problems" if self.bad_proof == "renders_host" else "renders_agent_failures"] = \
+                            ["held:engines", "kill:running"]
+                elif action == "renders-record":
+                    value = dict(self.renders_record)
                 else:
                     value = {"ok": True}
             command_id = "00000000-0000-4000-8000-" + f"{len(self.commands):012d}"
@@ -1751,6 +1775,501 @@ class LaunchPathTests(unittest.TestCase):
         body = source.split("def verify(kind, expected_image", 1)[1].split("\ndef ", 1)[0]
         self.assertLess(body.index("ordering(kind)"), body.index("launch_path_proof()"))
         self.assertIn('"launch_path": True', body)
+
+
+RENDERS = HERE / "renders"
+
+
+def renders_phases():
+    source = (RENDERS / "build.sh").read_text()
+    return source, dict(re.findall(r"\n(\w+)\)\n(.*?)\n  ;;", source, re.S))
+
+
+def host_check():
+    spec = importlib.util.spec_from_file_location("renders_host_check", RENDERS / "host-check.py")
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+def unit_settings(path):
+    """KEY -> [values] of a unit file's settings, comments left out."""
+    found = {}
+    for line in Path(path).read_text().splitlines():
+        if "=" in line and not line.lstrip().startswith(("#", "[")):
+            key, value = line.split("=", 1)
+            found.setdefault(key.strip(), []).append(value.strip())
+    return found
+
+
+class RendersTrackTests(unittest.TestCase):
+    """The renders image is a track of its own: its own build, broker slots, lease and manifest.
+    It shares nothing with the host/tile pair, so a failure of either cannot publish or hold the
+    other."""
+
+    def setUp(self):
+        self.broker = Broker()
+        self.broker.track = "renders"
+        self.worker = Worker(self.broker)
+        self.now = 100
+        self.driver = pipeline.Pipeline(self.broker, self.worker, {**CONFIG, "track": "renders"},
+            root=HERE.parents[1], clock=lambda: self.now, sleep=self.advance)
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def run_driver(self):
+        with patch.object(pipeline, "input_digest", return_value=("6" * 64, b"immutable archive")):
+            return self.driver.run()
+
+    def commands(self, slot):
+        identifier = self.broker.slots[slot]["instance_id"]
+        return [entry["Parameters"]["commands"][0] for entry in self.worker.commands if entry["InstanceIds"] == [identifier]]
+
+    def test_the_renders_track_builds_validates_and_records_one_image(self):
+        result = self.run_driver()
+        self.assertEqual(set(self.broker.slots), {"renders-build", "renders-verify"})
+        self.assertEqual(sum(call["action"] == "launch" for call in self.broker.calls), 2)
+        self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
+        self.assertEqual(result["track"], "renders")
+        self.assertEqual(set(result["images"]), {"renders"})
+        image = result["images"]["renders"]
+        self.assertEqual(image["image_id"], "ami-" + "c" * 17)
+        self.assertEqual(image["architecture"], "arm64")
+        self.assertEqual(image["build"], RENDERS_RECORD)
+        self.assertEqual(len(set(image["validation"]["boot_ids"])), 3)
+        self.assertTrue(image["validation"]["renders_agent"])
+        # its store goes to a prefix of its own, which its bake names in store.env
+        self.assertEqual(result["store"]["destination"]["prefix"], "factory/" + "3" * 64 + "/renders/store/")
+        self.assertEqual(len(result["store"]["objects"]), 19)
+        env = next(text for text in self.commands("renders-build") if "cat > /var/lib/fleet-ami/env" in text)
+        self.assertIn("export STORE_S3_PREFIX=factory/" + "3" * 64 + "/renders/store/", env)
+        self.assertIn("export FCVM_COMMIT=" + SOURCE, env)
+        # no renderer and no certificate: the track writes no TLS canary and exports no renderer
+        self.assertNotIn("FLEET_TLS_SECRET", env)
+        self.assertEqual(self.worker.secret_writes, 0)
+        self.assertNotIn("tls", result)
+        self.assertFalse(any("export-renderer" in text for text in self.commands("renders-build")))
+        phases = [text for text in self.commands("renders-build") if "/renders/build.sh" in text]
+        self.assertEqual([re.search(r"build\.sh (\w+)", text).group(1) for text in phases], ["prep", "build", "bake"])
+        upgrade = next(i for i, text in enumerate(self.commands("renders-build")) if "--with-new-pkgs upgrade" in text)
+        prep = next(i for i, text in enumerate(self.commands("renders-build")) if "/renders/build.sh prep" in text)
+        self.assertLess(upgrade, prep)
+
+    def test_the_agent_check_runs_on_the_cold_boot_only(self):
+        self.run_driver()
+        self.assertEqual(self.worker.renders_asks, [True, False, False])
+
+    def test_a_failed_renders_proof_publishes_nothing_and_says_why(self):
+        for proof, words in (("guard", "security"), ("sanitized", "security"), ("launch_path", "launch-path"),
+                             ("renders_host", "held:engines"), ("renders_agent", "kill:running")):
+            with self.subTest(proof=proof):
+                self.setUp()
+                self.worker.bad_proof = proof
+                with self.assertRaisesRegex(RuntimeError, words):
+                    self.run_driver()
+                self.assertFalse(any(name.endswith("manifest.json") for name in self.worker.objects))
+                self.assertTrue(all(value["state"] == "terminated" for value in self.broker.slots.values()))
+
+    def test_the_validated_image_boots_the_kernel_its_build_installed(self):
+        self.worker.renders_kernel = "7.3.3-fcvm-ba9876543210"
+        with self.assertRaisesRegex(RuntimeError, "kernel"):
+            self.run_driver()
+        self.assertFalse(any(name.endswith("manifest.json") for name in self.worker.objects))
+
+    def test_the_build_record_must_name_the_built_commit_and_the_reference_boot_line(self):
+        for field, value in (("fcvm_commit", "f" * 40), ("kitesurf_commit", "main"), ("bundle_sha256", ""),
+                             ("kernel_release", "7.3.3-generic"), ("boot_params", "kvm-arm.mode=nested"),
+                             ("hugepages", 1)):
+            with self.subTest(field=field):
+                self.setUp()
+                self.worker.renders_record[field] = value
+                with self.assertRaises(RuntimeError):
+                    self.run_driver()
+                self.assertFalse(self.broker.candidates, "an image was sealed from a build with a wrong record")
+
+    def test_a_renders_build_refuses_the_pairs_slots_and_the_pair_refuses_its(self):
+        with self.assertRaisesRegex(RuntimeError, "slot"):
+            self.driver.call("launch", "host-build")
+        pair = pipeline.Pipeline(self.broker, self.worker, CONFIG, root=HERE.parents[1],
+                                 clock=lambda: self.now, sleep=self.advance)
+        for slot in pipeline.RENDERS_SLOTS:
+            with self.subTest(slot=slot), self.assertRaisesRegex(RuntimeError, "slot"):
+                pair.call("launch", slot)
+
+    def test_the_pair_is_the_default_track_and_an_unknown_track_is_refused(self):
+        self.assertEqual(pipeline.Pipeline(self.broker, self.worker, CONFIG).track, "pair")
+        self.assertEqual(pipeline.TRACKS, {"pair": pipeline.SLOTS, "renders": pipeline.RENDERS_SLOTS})
+        with self.assertRaisesRegex(RuntimeError, "track"):
+            pipeline.Pipeline(self.broker, self.worker, {**CONFIG, "track": "everything"})
+        # The pair's CodeBuild project sets nothing new: without FLEET_AMI_TRACK it builds the pair.
+        source = (HERE / "pipeline.py").read_text().split("\ndef main():", 1)[1]
+        self.assertIn('config["track"] = os.environ.get("FLEET_AMI_TRACK", "pair")', source)
+
+
+class RendersRecipeTests(unittest.TestCase):
+    def test_the_boot_line_is_the_nested_arm64_profiles_and_the_references(self):
+        import tomllib
+        conf = host_check().read_conf((RENDERS / "renders.conf").read_text())
+        profile = tomllib.loads((HERE.parents[1] / "rootfs-config.toml").read_text())["kernel_profiles"]["nested"]["arm64"]
+        # make install-host-kernel writes the profile's boot_args to GRUB; the check expects these
+        self.assertEqual(conf["RENDERS_BOOT_PARAMS"], profile["boot_args"])
+        self.assertEqual(conf["RENDERS_BOOT_PARAMS"].split(), ["kvm-arm.mode=nested", "numa=off", "arm64.nv2"])
+        self.assertEqual(conf["RENDERS_HUGEPAGES"], "34000")
+
+    def test_prep_installs_fcvms_host_kernel_and_records_grubs_default(self):
+        _, phases = renders_phases()
+        prep = phases["prep"]
+        self.assertIn('as_user "cd $SRC && make install-host-kernel"', prep)
+        self.assertLess(prep.index("store_settled"), prep.index("make install-host-kernel"))
+        self.assertLess(prep.index('as_user "cd $SRC && make setup-btrfs"'), prep.index("make install-host-kernel"))
+        record = prep.index("/etc/fcvm-fleet/renders-kernel")
+        self.assertLess(prep.index("make install-host-kernel"), record)
+        self.assertIn("with Linux", prep[record - 300:record])
+
+    def test_the_build_runs_only_on_the_built_kernel_and_the_reference_boot_line(self):
+        _, phases = renders_phases()
+        build = phases["build"]
+        boot = build.index('python3 "$HERE/host-check.py" boot')
+        self.assertLess(boot, build.index('as_user "cd $SRC && make build"'))
+        self.assertLess(boot, build.index("store_settled"))
+
+    def test_kitesurf_is_built_at_its_pin_in_a_named_unit_beside_fcvms_build(self):
+        source, phases = renders_phases()
+        build = phases["build"]
+        start = build.index("bg_start fleet-ami-kitesurf")
+        self.assertLess(build.index("git checkout -q -f --detach $FCVM_COMMIT"), start)
+        self.assertLess(start, build.index('as_user "cd $SRC && make build"'))
+        unit = build[start:build.index("\n", build.index("\n", start) + 1)]
+        self.assertIn("kitesurf-dist.sh", unit)
+        wait = build.index('bg_wait fleet-ami-kitesurf "$L/kitesurf.log"')
+        self.assertLess(wait, build.index('as_user "cd $SRC && make test-fleet-renders-agent'))
+        # the commit is kitesurf_pins.sh's at FCVM_COMMIT: the recipe never sets it
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("KITESURF_REV", code)
+        self.assertNotIn("kitesurf_pins.sh", code)
+        self.assertIn('BG_UNITS="fleet-ami-kitesurf"', source)
+        dist = (RENDERS / "kitesurf-dist.sh").read_text()
+        self.assertIn('bash "$SRC/bench/chromium/kitesurf_build.sh"', dist)
+        prepare = dist.index("wpt-engine.mjs prepare")
+        bundle = dist.index("build //packages/engine:dist")
+        self.assertLess(dist.index("kitesurf_build.sh"), prepare)
+        self.assertLess(prepare, bundle)
+        # Bazel's default mode, served from its own output directory (its assets are beside it)
+        self.assertNotIn("-c opt", dist)
+        self.assertNotIn("--compilation_mode", dist)
+        self.assertIn('ln -s "$(readlink -f "$out")" "$DIST"', dist)
+        self.assertIn("kitesurf_seal.py\" write", dist)
+
+    def test_the_build_writes_the_agents_environment_and_runs_the_agent_check(self):
+        _, phases = renders_phases()
+        build = phases["build"]
+        env = build.index('python3 "$HERE/host-check.py" agent-env > /etc/fcvm-fleet/renders.env')
+        record = build.index('python3 "$HERE/host-check.py" record')
+        check = build.index('as_user "cd $SRC && make test-fleet-renders-agent')
+        self.assertLess(build.index('bg_wait fleet-ami-kitesurf'), record)
+        self.assertLess(record, env)
+        self.assertLess(env, check)
+        line = build[build.rindex("\n", 0, check):build.index("\n", check)]
+        for word in ("CASES=running", "FCVM=/usr/local/bin/fcvm", "TAG=$RENDERS_SNAPSHOT_TAG",
+                     "KITESURF=$RENDERS_KITESURF", "DIST=$RENDERS_DIST",
+                     "MAX_FCVM=$RENDERS_CHECK_MAX_FCVM", "MAX_ENGINES=$RENDERS_CHECK_MAX_ENGINES"):
+            self.assertIn(word, line)
+        self.assertLess(check, build.index('python3 "$HERE/host-check.py" host'))
+
+    def test_the_bake_packs_the_store_without_kitesurfs_build_only_state_and_checks_the_host(self):
+        _, phases = renders_phases()
+        bake = phases["bake"]
+        pack = bake.index('python3 "$HERE/../host/store-pack.py"')
+        call = bake[pack:bake.index("\n", bake.index("--exclude=./windows/src" if "windows" in bake else "kitesurf/bazelisk", pack))]
+        for excluded in ("./vm-disks", "./state", "./cache", "./cargo-target*", "./renders",
+                         "./kitesurf/downloads", "./kitesurf/npm-cache", "./kitesurf/pnpm-store",
+                         "./kitesurf/cache", "./kitesurf/bazelisk"):
+            self.assertIn("--exclude='" + excluded + "'" if "*" in excluded else "--exclude=" + excluded, call)
+        for kept in ("./snapshots", "./kitesurf/bazel-root", "./kitesurf/src", "./image-cache"):
+            self.assertNotIn("--exclude=" + kept, call)
+        self.assertLess(pack, bake.index('python3 "$HERE/host-check.py" host'))
+        self.assertLess(bake.index('python3 "$HERE/host-check.py" host'), bake.index("\n  root_has_room"))
+        self.assertIn('STORE_S3_PREFIX=%s', bake)
+
+    def test_the_recipe_reuses_the_gpu_hosts_store_unit_and_scripts(self):
+        _, phases = renders_phases()
+        for name in ("store.sh", "s3-cat.py", "store-pack.py", "fcvm-fleet-store.service"):
+            self.assertFalse((RENDERS / name).exists(), name + " must be the host recipe's, not a copy")
+        for phase in ("prep", "bake"):
+            with self.subTest(phase=phase):
+                self.assertIn('"$HERE/../host/store.sh" "$HERE/../host/s3-cat.py"', phases[phase])
+                self.assertIn('"$HERE/../host/fcvm-fleet-store.service"', phases[phase])
+        enable = [line for line in phases["prep"].splitlines() if line.strip().startswith("systemctl enable ")]
+        self.assertEqual(len(enable), 1)
+        for unit in ("fcvm-fleet-hugepages.service", "fcvm-fleet-store.service", "fcvm-fleet-renders-agent.service"):
+            self.assertIn(unit, enable[0])
+
+    def test_the_agents_unit_is_the_benchs_unit(self):
+        unit = unit_settings(RENDERS / "fcvm-fleet-renders-agent.service")
+        bench = (HERE.parents[1] / "bench/chromium/renders_bench.sh").read_text()
+        props = re.search(r"\nunit_props\(\) \{\n(.*?)\n\}\n", bench, re.S).group(1)
+        for key, value in re.findall(r"-p ([A-Za-z]+)=([^ \"\\]+)", props):
+            if key == "User":
+                continue  # the caller there; the build user here
+            with self.subTest(key=key):
+                self.assertEqual(unit.get(key), [value])
+        conf = host_check().read_conf((RENDERS / "renders.conf").read_text())
+        self.assertEqual(unit["User"], [conf["RENDERS_USER"]])
+        # the default KillMode: with mixed, systemd kills the module's reaper with the agent
+        self.assertNotIn("KillMode", unit)
+        self.assertIn("XDG_RUNTIME_DIR=/run/user/" + conf["RENDERS_UID"], " ".join(unit["Environment"]))
+        self.assertIn("HOME=/home/" + conf["RENDERS_USER"], " ".join(unit["Environment"]))
+        self.assertEqual(unit["EnvironmentFile"], ["/etc/fcvm-fleet/agent.env", "/etc/fcvm-fleet/renders.env"])
+        self.assertEqual(unit["ExecStart"],
+                         ["/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS $RENDERS_AGENT_ARGS $RENDERS_FRAME_ARGS"])
+        self.assertEqual(unit["ConditionPathExists"], ["/etc/fcvm-fleet/agent.env"])
+        for key in ("Requires", "After"):
+            words = " ".join(unit[key]).split()
+            for name in ("cve-2026-98432-mitigation.service", "fcvm-fleet-hugepages.service", "fcvm-fleet-store.service"):
+                self.assertIn(name, words, key)
+        self.assertIn("user@" + conf["RENDERS_UID"] + ".service", " ".join(unit["After"]).split())
+
+    def test_the_pool_is_reserved_early_in_boot_and_before_the_store(self):
+        unit = unit_settings(RENDERS / "fcvm-fleet-hugepages.service")
+        self.assertEqual(unit["DefaultDependencies"], ["no"])
+        before = " ".join(unit["Before"]).split()
+        self.assertIn("sysinit.target", before)
+        self.assertIn("fcvm-fleet-store.service", before)
+        self.assertNotIn("After", unit)
+        self.assertEqual(unit["ExecStart"], ["/usr/local/lib/fcvm-fleet/hugepages.sh"])
+        self.assertEqual(unit["WantedBy"], ["sysinit.target"])
+        self.assertEqual(unit["Type"], ["oneshot"])
+        self.assertEqual(unit["RemainAfterExit"], ["yes"])
+
+    def run_pool(self, granted):
+        """hugepages.sh against a stand-in for the kernel that grants at most `granted` pages."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conf").write_text('RENDERS_HUGEPAGES=34000\n')
+            (root / "nr").write_text("0\n")
+            program = ("HUGEPAGES_LIB=1\n. " + shlex.quote(str(RENDERS / "hugepages.sh")) + "\n"
+                       "pool_ask() { local n=$1; [ \"$n\" -le " + str(granted) + " ] || n=" + str(granted) + "; echo \"$n\" > \"$POOL\"; }\n"
+                       "compact() { echo compacted >> " + shlex.quote(str(root / "compacted")) + "; }\n"
+                       "main\n")
+            result = subprocess.run(["bash", "-c", program], capture_output=True, text=True, timeout=30,
+                env={"PATH": "/usr/bin:/bin", "RENDERS_CONF": str(root / "conf"), "POOL": str(root / "nr"),
+                     "POOL_TRIES": "3"})
+            compacted = (root / "compacted").read_text().count("compacted") if (root / "compacted").exists() else 0
+            return result, compacted
+
+    def test_the_pool_fails_its_unit_when_the_kernel_gives_fewer_pages(self):
+        result, compacted = self.run_pool(34000)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(compacted, 0)
+        result, compacted = self.run_pool(33999)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("33999 of 34000", result.stdout + result.stderr)
+        self.assertEqual(compacted, 2, "it compacts memory and asks again before it gives up")
+
+    def test_the_agent_can_bind_the_replays_ports_and_use_userfaultfd(self):
+        # The module's replays listen on 80, 443 and 53 of loopback and its clones use
+        # userfaultfd; the agent runs as the build user, as the recorded campaign's module did.
+        _, phases = renders_phases()
+        conf = re.search(r"cat > /etc/sysctl\.d/99-fcvm\.conf <<'X'\n(.*?)\nX\n", phases["prep"], re.S).group(1)
+        keys = dict(line.split("=", 1) for line in conf.splitlines() if "=" in line and not line.startswith("#"))
+        self.assertEqual(keys["net.ipv4.ip_unprivileged_port_start"], "0")
+        self.assertEqual(keys["vm.unprivileged_userfaultfd"], "1")
+        self.assertEqual(keys["kernel.unprivileged_userns_clone"], "1")
+        self.assertEqual(keys["kernel.apparmor_restrict_unprivileged_userns"], "0")
+        self.assertIn("sysctl -e -p /etc/sysctl.d/99-fcvm.conf", phases["prep"])
+        self.assertIn('usermod -aG kvm "$U"', phases["prep"])
+
+
+class RendersHostCheckTests(unittest.TestCase):
+    PARAMS = "kvm-arm.mode=nested numa=off arm64.nv2"
+    RELEASE = "7.3.3-fcvm-0123456789ab"
+    LINE = "BOOT_IMAGE=/vmlinuz-7.3.3-fcvm-0123456789ab root=PARTUUID=00000000-01 ro console=tty1 console=ttyS0 " \
+           "nvme_core.io_timeout=4294967295 kvm-arm.mode=nested numa=off arm64.nv2"
+
+    def setUp(self):
+        self.check = host_check()
+
+    def test_the_reference_boot_line_passes(self):
+        self.assertEqual(self.check.boot_problems(self.RELEASE, self.RELEASE, self.LINE, self.PARAMS), [])
+
+    def test_a_boot_line_that_differs_from_the_reference_fails(self):
+        for line in (self.LINE.replace(" numa=off", ""), self.LINE.replace("numa=off", "numa=on"),
+                     self.LINE + " numa=on", self.LINE.replace(" arm64.nv2", ""),
+                     self.LINE.replace("kvm-arm.mode=nested", "kvm-arm.mode=nvhe"),
+                     self.LINE + " hugepages=34000", self.LINE + " mitigations=off",
+                     self.LINE + " transparent_hugepage=never"):
+            with self.subTest(line=line[-40:]):
+                self.assertTrue(self.check.boot_problems(self.RELEASE, self.RELEASE, line, self.PARAMS))
+
+    def test_a_kernel_that_is_not_the_built_one_fails(self):
+        for release, expected in (("7.0.0-1009-aws", "7.0.0-1009-aws"), (self.RELEASE, "7.3.3-fcvm-ba9876543210"),
+                                  (self.RELEASE, "")):
+            with self.subTest(release=release, expected=expected):
+                self.assertTrue(self.check.boot_problems(release, expected, self.LINE, self.PARAMS))
+
+    def test_the_pool_is_exactly_the_reservation(self):
+        self.assertEqual(self.check.pool_problems("34000\n", 34000), [])
+        for text in ("33999\n", "68000\n", "", "lots"):
+            with self.subTest(text=text):
+                self.assertTrue(self.check.pool_problems(text, 34000))
+
+    def test_the_conf_parser_takes_only_its_own_format(self):
+        conf = self.check.read_conf('# a comment\n\nA=1\nB="two words"\n')
+        self.assertEqual(conf, {"A": "1", "B": "two words"})
+        for text in ("A = 1\n", "export A=1\n", "A=$(id)\n", 'A="unterminated\n', "A=1\nA=2\n", "a=1\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.check.read_conf(text)
+
+    def conf(self):
+        return self.check.read_conf((RENDERS / "renders.conf").read_text())
+
+    def test_the_agent_arguments_are_the_modules_options_from_the_conf(self):
+        conf = self.conf()
+        urls = "https://example.com/,https://example.org/"
+        words = self.check.agent_args(conf, RENDERS_RECORD, urls)
+        self.assertEqual(words[:5], ["--renders", "--image", "unused", "--base-port", "1"])
+        self.assertIn("--host-from-imds", words)
+        module = [w.split("=", 1)[1] for w in words if w.startswith("--renders-arg=")]
+        expected = {
+            "--cpus-fcvm": conf["RENDERS_CPUS_FCVM"], "--cpus-engines": conf["RENDERS_CPUS_ENGINES"],
+            "--cpus-harness": conf["RENDERS_CPUS_HARNESS"], "--max-fcvm": conf["RENDERS_MAX_FCVM"],
+            "--max-engines": conf["RENDERS_MAX_ENGINES"], "--snapshot-tag": conf["RENDERS_SNAPSHOT_TAG"],
+            "--kitesurf": conf["RENDERS_KITESURF"], "--kitesurf-dist": conf["RENDERS_DIST"],
+            "--bench": conf["RENDERS_SRC"] + "/bench/chromium", "--corpus": conf["RENDERS_SRC"] + "/bench/chromium/corpus-live",
+            "--urls": urls, "--out": conf["RENDERS_OUT"], "--run-dir": conf["RENDERS_RUN_DIR"],
+            "--status-file": conf["RENDERS_OUT"] + ".status.json"}
+        given = dict(option.split("=", 1) for option in module if not option.startswith("--setup="))
+        self.assertEqual(given, expected)
+        self.assertEqual(sorted(option for option in module if option.startswith("--setup=")),
+                         ["--setup=fcvm.commit=" + SOURCE, "--setup=kitesurf.commit=" + "9" * 40])
+        self.assertEqual(expected["--cpus-fcvm"], "0-39")
+        self.assertEqual(expected["--cpus-engines"], "40-79")
+        self.assertEqual(expected["--cpus-harness"], "80-95")
+        self.assertEqual((expected["--max-fcvm"], expected["--max-engines"]), ("40", "48"))
+        # systemd splits $RENDERS_AGENT_ARGS at whitespace; the benchmark's own options are refused
+        # by the agent, so none is given
+        self.assertTrue(all(not re.search(r"\s", w) for w in words))
+        for refused in ("--levels", "--seconds", "--overlay-text", "--overlay-transform"):
+            self.assertFalse(any(w.startswith("--renders-arg=" + refused) for w in words))
+
+    def test_the_agent_environment_leaves_a_place_for_the_frame_servers_options(self):
+        text = self.check.agent_env(self.conf(), RENDERS_RECORD, "https://example.com/")
+        lines = [line for line in text.splitlines() if line and not line.startswith("#")]
+        self.assertEqual([line.split("=", 1)[0] for line in lines], ["RENDERS_AGENT_ARGS", "RENDERS_FRAME_ARGS"])
+        self.assertEqual(lines[1], "RENDERS_FRAME_ARGS=")
+        self.assertTrue(lines[0].startswith('RENDERS_AGENT_ARGS="--renders ') and lines[0].endswith('"'))
+
+    def test_the_page_list_is_the_campaigns(self):
+        urls = self.check.campaign_urls(HERE.parents[1] / "bench/chromium/corpus_campaign.sh")
+        bench = (HERE.parents[1] / "bench/chromium/renders_bench.sh").read_text()
+        self.assertIn("corpus_campaign.sh", bench)
+        self.assertTrue(urls.startswith("https://") and "," in urls and " " not in urls)
+
+    def test_the_build_record_names_what_the_build_made(self):
+        record = self.check.build_record(fcvm_commit=SOURCE, kitesurf_commit="9" * 40, index_js=b"bundle",
+            release=self.RELEASE, conf=self.conf())
+        self.assertEqual(record, {"fcvm_commit": SOURCE, "kitesurf_commit": "9" * 40,
+            "bundle_sha256": hashlib.sha256(b"bundle").hexdigest(), "kernel_release": self.RELEASE,
+            "boot_params": self.PARAMS, "hugepages": 34000})
+        with self.assertRaises(ValueError):
+            self.check.build_record(fcvm_commit="main", kitesurf_commit="9" * 40, index_js=b"x",
+                                    release=self.RELEASE, conf=self.conf())
+
+
+class RendersGuestTests(unittest.TestCase):
+    def test_renders_verification_runs_the_agent_check_only_when_asked(self):
+        asked = []
+        with patch.multiple(guest, sanitized=lambda: True, guard=lambda: True, ordering=lambda kind: asked.append(kind),
+                            launch_path_proof=lambda: True, renders_host_proof=lambda: [],
+                            renders_agent_proof=lambda: asked.append("agent") or []):
+            cold = guest.verify_renders("renders-agent")
+            warm = guest.verify_renders()
+        self.assertEqual(asked, ["renders", "agent", "renders"])
+        for result in (cold, warm):
+            self.assertTrue(result["guard"] and result["sanitized"] and result["launch_path"] and result["renders_host"])
+            self.assertEqual(result["kernel_release"], os.uname().release)
+        self.assertTrue(cold["renders_agent"])
+        self.assertFalse(warm["renders_agent"])
+        with self.assertRaisesRegex(RuntimeError, "unknown validator proof"):
+            guest.verify_renders("viewer-path")
+
+    def test_renders_failures_reach_the_record_as_short_plain_strings(self):
+        with patch.multiple(guest, sanitized=lambda: True, guard=lambda: True, ordering=lambda kind: None,
+                            launch_path_proof=lambda: True,
+                            renders_host_proof=lambda: ["the pool holds 0 of 34000 2 MiB pages", "x" * 500],
+                            renders_agent_proof=lambda: ["kill:running", "https://example.invalid/?token=secret"]):
+            result = guest.verify_renders("renders-agent")
+        self.assertFalse(result["renders_host"])
+        self.assertEqual(result["renders_host_problems"], ["the pool holds 0 of 34000 2 MiB pages"])
+        self.assertFalse(result["renders_agent"])
+        self.assertEqual(result["renders_agent_failures"], ["kill:running"])
+
+    def test_the_agent_checks_failing_cases_are_read_from_its_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "check.agent-check.json"
+            self.assertEqual(guest.agent_check_failures(path), ["the agent check wrote no record"])
+            path.write_text(json.dumps({"rows": [{"case": "running:hello", "ok": True}], "cases": 1, "failed": []}))
+            self.assertEqual(guest.agent_check_failures(path), [])
+            path.write_text(json.dumps({"rows": [], "cases": 2, "failed": ["held:engines", "kill:running"]}))
+            self.assertEqual(guest.agent_check_failures(path), ["held:engines", "kill:running"])
+            path.write_text(json.dumps({"rows": [], "cases": 0, "failed": []}))
+            self.assertEqual(guest.agent_check_failures(path), ["the agent check ran no case"])
+
+    def test_the_agent_check_runs_as_the_build_user_through_make(self):
+        source = (HERE / "pipeline_guest.py").read_text()
+        body = source.split("def renders_agent_proof():", 1)[1].split("\ndef ", 1)[0]
+        self.assertIn('"runuser", "-u", conf["RENDERS_USER"]', body)
+        self.assertIn('"make", "-C", conf["RENDERS_SRC"], "test-fleet-renders-agent"', body)
+        self.assertIn('"FCVM=/usr/local/bin/fcvm"', body)
+        self.assertNotIn("CASES=", body, "the validation runs every case")
+
+    def test_renders_ordering_waits_for_the_pool_and_the_store(self):
+        reads = []
+        def command(args, timeout=120):
+            if "--property=ActiveState" in args:
+                reads.append(args)
+                return "\n".join("active" for _ in args[2:-2])
+            if "--property=ActiveEnterTimestampMonotonic" in args:
+                return "10"
+            if args[:2] == ["systemctl", "is-active"]:
+                return "active"
+            return "20"
+        with patch.object(guest, "command", side_effect=command):
+            guest.ordering("renders")
+        self.assertIn("fcvm-fleet-hugepages.service", reads[0])
+        self.assertIn("fcvm-fleet-store.service", reads[0])
+        self.assertNotIn("fcvm-fleet-renders-agent.service", reads[0], "a validator runs no agent")
+
+    def test_renders_diagnostics_and_seal(self):
+        prefix = "builders/arn:aws:ec2:us-west-2:111111111111:instance/i-" + "a" * 17 + "/"
+        for phase in ("prep", "build", "bake"):
+            with self.subTest(phase=phase), patch.object(guest, "bucket_client") as client, \
+                    patch.object(guest.os, "open", side_effect=OSError("no log in this test")):
+                with self.assertRaises(OSError):
+                    guest.export_diagnostics("example-images", prefix, "us-west-2", "renders", phase)
+                client.assert_called_once()
+        with patch.object(guest, "bucket_client") as client, self.assertRaises(RuntimeError):
+            guest.export_diagnostics("example-images", prefix, "us-west-2", "renders", "image")
+        client.assert_not_called()
+        steps = []
+        with patch.multiple(guest, clean_identity=lambda: steps.append("clean"), sanitized=lambda: steps.append("sanitized"),
+                            guard=lambda: steps.append("guard"), store_parts=lambda: steps.append("store"),
+                            command=lambda args, timeout=120: steps.append(args[0])), \
+                patch.object(guest.Path, "write_text", lambda self, text: steps.append("machine-id")):
+            guest.seal("renders")
+        self.assertEqual(steps[:4], ["clean", "sanitized", "guard", "store"])
+
+    def test_the_build_record_is_read_and_checked_on_the_builder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "renders-build.json"
+            path.write_text(json.dumps(RENDERS_RECORD))
+            with patch.object(guest, "RENDERS_RECORD", path), patch.object(guest, "RENDERS_CONF", RENDERS / "renders.conf"):
+                self.assertEqual(guest.renders_record(), RENDERS_RECORD)
+                path.write_text(json.dumps({**RENDERS_RECORD, "extra": "field"}))
+                with self.assertRaises(RuntimeError):
+                    guest.renders_record()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

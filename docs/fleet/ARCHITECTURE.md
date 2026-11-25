@@ -2544,6 +2544,38 @@ starts nothing of the mode.
   once it has been untouched for twice the render timeout and a minute). The benchmark keeps
   its whole record: a run's record is its evidence.
 
+### The renders host image
+
+The host boots from an arm64 image of its own, built and validated by the image factory
+(`fleet/ami/renders`, `fleet/ami/README.md`, "The renders track") on the type it runs on,
+m8gd.metal-24xl. The image makes a host the configuration the recorded figures were measured on:
+
+- fcvm's arm64 host kernel (`make install-host-kernel`), booted with
+  `kvm-arm.mode=nested numa=off arm64.nv2`. The three are `RENDERS_BOOT_PARAMS` in
+  `fleet/ami/renders/renders.conf`, which a test holds equal to the nested arm64 profile's
+  `boot_args`; the build and every validation boot fail on another kernel, on a missing one of the
+  three, or on another value of a parameter the campaign's host record keeps.
+- 34,000 pages of 2 MiB (`RENDERS_HUGEPAGES`) reserved through sysfs by
+  `fcvm-fleet-hugepages.service` in the first transaction of the boot, before the store's restore.
+  A short pool fails the unit and the agent, which requires it, does not start.
+- The store on the instance-store NVMe, restored at every boot as a GPU host's is: the default
+  kernel and rootfs, the bench image's export, the module's snapshot (made at build by the module
+  itself, so a host's first module does not take the two minutes `fcvm podman prepare` takes), and
+  Kitesurf at `bench/chromium/kitesurf_pins.sh`'s commit with its production bundle in Bazel's
+  default mode, served from Bazel's output directory.
+- `fcvm-fleet-renders-agent.service`: `fcvm fleet agent --renders` as the build user, with
+  `renders_bench.sh`'s unit properties (`Delegate=yes`, `DelegateSubgroup=agent`, the default
+  `KillMode`, `LimitNOFILE=1048576`, `TasksMax=infinity`). The host's boot writes the fleet's
+  arguments to `/etc/fcvm-fleet/agent.env`; the module's (CPU sets 0-39, 40-79 and 80-95, at most
+  40 and 48 renders in flight, the corpus, the snapshot tag, Kitesurf, and `--setup fcvm.commit=`
+  and `--setup kitesurf.commit=` so the hello's build map names both) are in
+  `/etc/fcvm-fleet/renders.env`, written at build from `renders.conf`. `RENDERS_FRAME_ARGS` in that
+  file is where the frame server's options go.
+
+The image publishes only after `make test-fleet-renders-agent` has passed every case on its cold
+boot. It is a track of its own: it shares no renderer with the GPU host and tile pair, so neither
+track's failure holds or publishes the other.
+
 ## Windows mode
 
 `?mode=windows` shows disposable Windows desktops, each a Cloud Hypervisor VM restored from a

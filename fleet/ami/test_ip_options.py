@@ -24,7 +24,8 @@ INSTALL_CALL = 'bash "$HERE/../common/install-ip-options.sh"'
 class GuardContractTests(unittest.TestCase):
     def test_public_units_require_successful_guard_before_start(self):
         for relative in ("host/fcvm-fleet-agent.service", "host/fcvm-fleet-store.service",
-                         "tile/fcvm-fleet-renderer.service", "tile/fcvm-fleet-nginx.service"):
+                         "tile/fcvm-fleet-renderer.service", "tile/fcvm-fleet-nginx.service",
+                         "renders/fcvm-fleet-renders-agent.service"):
             with self.subTest(unit=relative):
                 unit = (AMI / relative).read_text().split("[Unit]\n", 1)[1].split("[Service]", 1)[0]
                 for key in ("Requires", "After"):
@@ -42,6 +43,10 @@ class GuardContractTests(unittest.TestCase):
         body = re.search(r"(?ms)^install_units\(\) \{\n(.*?)^\}", (AMI / "tile/build.sh").read_text())[1]
         self.assertIn(INSTALL_CALL, body)
         self.assertLess(body.index(INSTALL_CALL), body.index("systemctl enable"))
+        renders = (AMI / "renders/build.sh").read_text()
+        prep = renders.split("\nprep)\n", 1)[1].split("\nbuild)\n", 1)[0]
+        self.assertLess(prep.index(INSTALL_CALL), prep.index("systemctl enable"))
+        self.assertIn(INSTALL_CALL, renders.split("\nbake)\n", 1)[1])
 
     def test_bundled_helper_is_the_reviewed_implementation(self):
         self.assertEqual(hashlib.sha256((AMI / "common/cve-2026-98432-mitigation.py").read_bytes()).hexdigest(), HELPER_SHA)
@@ -159,7 +164,8 @@ else: sys.exit(91)
         self.assertLess(proof, create)
         command = json.loads(calls[proof][calls[proof].index("--parameters") + 1])["commands"][0]
         for kind, names in (("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
-                            ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))):
+                            ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service")),
+                            ("renders", ("fcvm-fleet-renders-agent.service",))):
             for name in names:
                 self.assertIn(name + "=" + hashlib.sha256((AMI / kind / name).read_bytes()).hexdigest(), command)
         tags = calls[create][calls[create].index("--tag-specifications") + 1:]
@@ -359,7 +365,8 @@ else: sys.exit(91)
             unit.write_text(unit_text)
             consumers = {name: AMI / kind / name for kind, names in (
                 ("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
-                ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))) for name in names}
+                ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service")),
+                ("renders", ("fcvm-fleet-renders-agent.service",))) for name in names}
             files = {"/etc/systemd/system/" + GUARD: unit}
             for name, source in consumers.items():
                 fragment = Path(temporary) / name
@@ -378,6 +385,10 @@ else: sys.exit(91)
                     dropins[name] = canonical
             loaded = ({"fcvm-fleet-agent.service", "fcvm-fleet-store.service"} if family == "host" else
                       {"fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"} if family == "tile" else
+                      {"fcvm-fleet-renders-agent.service", "fcvm-fleet-store.service"} if family == "renders" else
+                      {"fcvm-fleet-agent.service", "fcvm-fleet-store.service", "fcvm-fleet-renders-agent.service"}
+                      if family == "host+renders" else
+                      {"fcvm-fleet-renders-agent.service"} if family == "renders-partial" else
                       {"fcvm-fleet-agent.service"})
 
             def output(args, **kwargs):
@@ -444,11 +455,14 @@ else: sys.exit(91)
         return calls
 
     def test_remote_verifier_accepts_only_complete_guarded_host_or_tile(self):
-        for family in ("host", "tile"):
+        for family in ("host", "tile", "renders"):
             with self.subTest(family=family):
                 self.assertTrue(self.remote_proof(family=family))
-        with self.assertRaises(SystemExit):
-            self.remote_proof(family="partial")
+        # The renders image shares the store unit with the GPU host: a renders agent without the
+        # store, or both agents at once, is no image of either.
+        for family in ("partial", "renders-partial", "host+renders"):
+            with self.subTest(family=family), self.assertRaises(SystemExit):
+                self.remote_proof(family=family)
 
     def test_remote_verifier_rejects_wrong_hash_failed_check_or_disabled_unit(self):
         for options in ({"corrupt": True}, {"healthy": False}, {"enabled": False}):
@@ -473,7 +487,8 @@ else: sys.exit(91)
 
     def test_remote_verifier_rejects_consumer_commands_or_untrusted_configuration(self):
         for family, names in (("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
-                              ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))):
+                              ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service")),
+                              ("renders", ("fcvm-fleet-renders-agent.service", "fcvm-fleet-store.service"))):
             for name in names:
                 for change in ("command-dropin", "unknown-dropin", "fragment", "pending-reload"):
                     with self.subTest(unit=name, change=change), self.assertRaises(SystemExit):
@@ -481,7 +496,8 @@ else: sys.exit(91)
 
     def test_remote_verifier_accepts_only_the_exact_known_guard_dependency_dropin(self):
         for family, names in (("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
-                              ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))):
+                              ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service")),
+                              ("renders", ("fcvm-fleet-renders-agent.service", "fcvm-fleet-store.service"))):
             for name in names:
                 with self.subTest(unit=name):
                     self.assertTrue(self.remote_proof(family=family, consumer_change=(name, "guard-only")))
