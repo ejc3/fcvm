@@ -95,7 +95,8 @@ jobs:
       - name: Create test log directory
         id: test-logs
         run: |
-          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
           sudo rm -rf /tmp/fcvm-teardown-evidence
       - name: Clean test data
         working-directory: fcvm

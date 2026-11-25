@@ -137,7 +137,9 @@ jobs:
           podman system migrate || true
       - name: Create test log directory
         id: test-logs
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true

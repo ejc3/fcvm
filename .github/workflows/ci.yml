@@ -938,7 +938,8 @@ jobs:
       - name: Create test log directory
         id: test-logs
         run: |
-          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
           # Teardown's VMM log copies from an earlier job on this runner are not this job's.
           sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
           # Record disk I/O for the rest of the job in 10 s samples. The suite's real
@@ -1262,7 +1263,8 @@ jobs:
       - name: Create test log directory
         id: test-logs
         run: |
-          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
           # Teardown's VMM log copies from an earlier job on this runner are not this job's.
           sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
           # Record disk I/O for the rest of the job in 10 s samples. The suite's real
@@ -1524,7 +1526,8 @@ jobs:
       - name: Create test log directory
         id: test-logs
         run: |
-          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
           # Teardown's VMM log copies from an earlier job on this runner are not this job's.
           sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
           # Record disk I/O for the rest of the job in 10 s samples. The suite's real
