@@ -360,32 +360,47 @@ pub fn chromium_only(name: &str) -> Option<bool> {
     }
 }
 
-/// Whether `c` is an invisible format character an overlay's text may not hold: the
-/// characters that change the direction of the text around them, zero-width spaces and
-/// marks, and the tag characters. The zero-width joiner and non-joiner are not among them:
-/// emoji sequences and several scripts are written with them.
-fn invisible_format(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'
-        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}'
-        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}')
+/// Whether `c` changes the direction of the text around it: the embeddings, the overrides
+/// and the isolates. The direction marks (U+200E, U+200F, U+061C) do not: keyboards insert
+/// them in ordinary Hebrew and Arabic text.
+fn direction_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Whether `c` draws nothing on its own: a space, a zero-width or other format character,
+/// a filler, the blank braille pattern, a variation selector, a tag. A text needs one
+/// character that is none of these; it may hold these beside it (a word-break hint in
+/// Thai, a joiner or a tag in an emoji).
+fn draws_nothing(c: char) -> bool {
+    c.is_whitespace()
+        || matches!(c,
+            '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}'
+            | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}'
+            | '\u{2060}'..='\u{2064}' | '\u{206A}'..='\u{206F}' | '\u{2800}' | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E0FFF}')
 }
 
 /// An overlay's text as it is kept: runs of spaces collapsed, 1 to [`MAX_OVERLAY_CHARS`]
-/// characters, no control characters (a tab or a newline is one) and no invisible format
-/// characters. Plain text: the host escapes it into the page.
+/// characters. Refused: a control character (a tab or a newline is one), a character that
+/// changes the direction of the text around it, and a text that shows nothing. Plain text:
+/// the host escapes it into the page.
 pub fn normalise_overlay(text: &str) -> Result<String, String> {
     if text.chars().any(|c| c.is_control()) {
         return Err("text holds control characters".into());
     }
-    if text.chars().any(invisible_format) {
-        return Err("text holds invisible format characters".into());
+    if text.chars().any(direction_control) {
+        return Err("text holds direction controls".into());
+    }
+    if text.chars().all(draws_nothing) {
+        return Err(if text.trim().is_empty() {
+            "text is empty".into()
+        } else {
+            "text shows nothing".into()
+        });
     }
     let t = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let n = t.chars().count();
-    if n == 0 {
-        return Err("text is empty".into());
-    }
     if n > MAX_OVERLAY_CHARS {
         return Err(format!(
             "text is {n} characters; the limit is {MAX_OVERLAY_CHARS}"
@@ -631,31 +646,50 @@ mod tests {
         assert_eq!((r.overlay.clone(), r.overlay_seq), (None, 2));
     }
 
-    /// Characters that change the direction of the text around them, and other invisible
-    /// format characters, are refused: the text is drawn into every page. A joiner between
-    /// emoji is kept.
+    /// A text may not turn the text around it: the direction embeddings, overrides and
+    /// isolates are refused. It must show something: a text of characters that draw nothing
+    /// is empty. Characters ordinary texts need are kept, among them the word-break hint in
+    /// Thai, the direction marks Hebrew and Arabic keyboards insert, the tags of a flag
+    /// emoji and the joiner between emoji.
     #[test]
-    fn an_overlay_text_holds_no_invisible_format_characters() {
+    fn an_overlay_text_turns_nothing_and_shows_something() {
         for bad in [
             "abc\u{202E}def",
             "\u{2066}abc",
-            "a\u{200F}b",
-            "a\u{200B}b",
-            "\u{FEFF}abc",
-            "a\u{061C}b",
-            "a\u{2060}b",
-            "a\u{E0041}b",
+            "a\u{202A}b\u{202C}",
+            "a\u{2069}",
         ] {
             assert_eq!(
                 normalise_overlay(bad),
-                Err("text holds invisible format characters".into()),
+                Err("text holds direction controls".into()),
                 "{bad:?}"
             );
         }
-        assert_eq!(
-            normalise_overlay("ok \u{1F468}\u{200D}\u{1F469} ok").as_deref(),
-            Ok("ok \u{1F468}\u{200D}\u{1F469} ok")
-        );
+        for blank in [
+            "\u{3164}",
+            "\u{200B}\u{200B}",
+            "\u{2800} \u{FEFF}",
+            "\u{115F}\u{1160}\u{FFA0}",
+            "\u{034F}\u{00AD}",
+            "\u{200E} \u{200F}",
+        ] {
+            assert_eq!(
+                normalise_overlay(blank),
+                Err("text shows nothing".into()),
+                "{blank:?}"
+            );
+        }
+        for kept in [
+            "\u{0E2A}\u{0E27}\u{0E31}\u{200B}\u{0E2A}\u{0E14}\u{0E35}",
+            "\u{05E9}\u{05DC}\u{05D5}\u{05DD}\u{200F} ok",
+            "go \u{1F3F4}\u{E0067}\u{E0062}\u{E0073}\u{E0063}\u{E0074}\u{E007F}",
+            "ok \u{1F468}\u{200D}\u{1F469} ok",
+            "\u{2764}\u{FE0F}",
+        ] {
+            assert_eq!(normalise_overlay(kept).as_deref(), Ok(kept), "{kept:?}");
+        }
+        assert_eq!(normalise_overlay("   "), Err("text is empty".into()));
+        assert_eq!(normalise_overlay(""), Err("text is empty".into()));
         // a tab or a newline is a control character and is refused, not collapsed
         assert!(normalise_overlay("a\tb").is_err());
         assert_eq!(normalise_overlay("  a   b  ").as_deref(), Ok("a b"));

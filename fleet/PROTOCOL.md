@@ -1680,16 +1680,17 @@ sides render different work, and a page compares nothing across them.
 
 | intent | args | effect |
 |--------|------|--------|
-| `renders_overlay` | `{"text": "hello"}` | the text on every page: 1 to 40 characters after collapsing runs of spaces, plain text (the host escapes it into the page). Refused with a control character (a tab or a newline is one) or an invisible format character (those that change the text's direction, zero-width spaces and marks, tag characters; a joiner between emoji is kept). Checked alone by the text check as a `word` is, and its receipt carries the `check` |
+| `renders_overlay` | `{"text": "hello"}` | the text on every page: 1 to 40 characters after collapsing runs of spaces, plain text (the host escapes it into the page). Refused with a control character (a tab or a newline is one), with a character that changes the direction of the text around it (the embeddings, overrides and isolates, U+202A to U+202E and U+2066 to U+2069), and when it shows nothing (only spaces, zero-width characters, fillers and the like). Checked alone by the text check as a `word` is, and its receipt carries the `check` |
 | `renders_transform` | `{"name": "mirror"}` | one of `transforms`; any other name is refused |
 | `renders_clear` | `{}` | the text and the transform go; refused with nothing set |
 
 A change is refused with no host of the mode, within 30 s of the same client's last change, and
 within 10 s of anyone's (every change starts both sides' searches again). A change keeps the
 other part of the overlay and sets `until` to two minutes on, so an overlay goes two minutes
-after its last change, whoever made it. From `until` on the overlay is gone: a change that
-arrives before the coordinator's next tick starts from nothing. Each change, an expiry
-included, takes the next `seq`. The overlay is in the stored state before its receipt is sent,
+after its last change, whoever made it. A change that arrives after `until` starts from
+nothing. The overlay leaves `/live` and the hosts' order at the coordinator's next tick, up to
+a second after `until`, so a page treats an overlay whose `until` has passed as gone. Each
+change, an expiry included, takes the next `seq`. The overlay is in the stored state before its receipt is sent,
 and a restarted coordinator keeps it, its `until` and its `seq`.
 
 The order a change gives the host is sent when the change is applied, which can be before the
