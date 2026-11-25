@@ -84,7 +84,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      # A draft, and a PR with another open PR stacked on it, run nothing; the top
+      # A draft, and a PR with another open PR that is not a draft stacked on it, run nothing; the top
       # of a stack classifies the whole stack's diff. See scripts/ci-pr-scope.sh.
       - name: Detect what this event needs to run
         id: detect
