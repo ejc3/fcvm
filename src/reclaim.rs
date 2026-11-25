@@ -1420,8 +1420,30 @@ fn write_stamp(dir: &OwnerDir, now: u64) -> Result<()> {
 /// tests of what a launch does with a fresh stamp and with an old one.
 #[doc(hidden)]
 pub fn set_sweep_stamp(path: &Path, ago: std::time::Duration) -> Result<()> {
-    let ago = u64::try_from(ago.as_nanos()).unwrap_or(u64::MAX);
-    write_stamp(&OwnerDir::open(path)?, boottime_ns().saturating_sub(ago))
+    let dir = OwnerDir::open(path)?;
+    let now = boottime_ns();
+    match u64::try_from(ago.as_nanos())
+        .ok()
+        .and_then(|ago| now.checked_sub(ago))
+    {
+        Some(began) => write_stamp(&dir, began),
+        // Longer ago than this boot is old: a sweep of the boot before, which the count
+        // since this boot cannot name.
+        None => {
+            use std::io::Write;
+            let mut stamp = dir
+                .open_file(
+                    SWEEP_STAMP,
+                    nix::fcntl::OFlag::O_CREAT
+                        | nix::fcntl::OFlag::O_WRONLY
+                        | nix::fcntl::OFlag::O_TRUNC,
+                )
+                .with_context(|| format!("opening {}", dir.display(SWEEP_STAMP)))?;
+            stamp
+                .write_all(stamp_text("the-boot-before", now).as_bytes())
+                .with_context(|| format!("writing {}", dir.display(SWEEP_STAMP)))
+        }
+    }
 }
 
 /// Try the sweep lock of `dir` without waiting.
@@ -2223,13 +2245,12 @@ mod tests {
             staging.join("memory.bin").exists(),
             "a pass removed the staging directory a live create holds the tag lock for"
         );
-        let names = files_in(&dir);
-        let name = names
+        let files = record_files(&dir);
+        let path = files
             .iter()
-            .find(|name| name.ends_with(".json"))
-            .unwrap_or_else(|| panic!("the record did not stay: {names:?}"));
-        let record: Record =
-            serde_json::from_slice(&std::fs::read(dir.join(name)).unwrap()).unwrap();
+            .find(|path| path.extension().is_some_and(|e| e == "json"))
+            .unwrap_or_else(|| panic!("the record did not stay: {files:?}"));
+        let record: Record = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(record.resources, [resource]);
         drop(live_create);
     }
@@ -2785,16 +2806,39 @@ mod tests {
             Reclaimed::default()
         );
         assert!(second.exists() && record_path(&dir, "vm-second").exists());
-        set_sweep_stamp(&dir, hour - std::time::Duration::from_secs(60)).unwrap();
+
+        // The interval has passed: due. The stamp is a few milliseconds old at most, so the
+        // interval is a nanosecond: an hour ago may be before this host booted.
+        assert_eq!(
+            reclaim_abandoned_if_due_in(&dir, std::time::Duration::from_nanos(1))
+                .await
+                .owners,
+            1
+        );
+        assert!(!second.exists());
+
+        // A sweep longer ago than the host has been up is one of the boot before: due.
+        let before_boot = abandon("vm-before-boot");
+        set_sweep_stamp(&dir, std::time::Duration::from_secs(40 * 365 * 86_400)).unwrap();
+        assert!(std::fs::read_to_string(&stamp)
+            .unwrap()
+            .starts_with("the-boot-before "));
+        assert_eq!(reclaim_abandoned_if_due_in(&dir, hour).await.owners, 1);
+        assert!(!before_boot.exists());
+        // One that began this instant is this boot's and fresh.
+        set_sweep_stamp(&dir, std::time::Duration::ZERO).unwrap();
+        let kept = abandon("vm-kept");
         assert_eq!(
             reclaim_abandoned_if_due_in(&dir, hour).await,
             Reclaimed::default()
         );
-
-        // The interval has passed: due.
-        set_sweep_stamp(&dir, hour).unwrap();
-        assert_eq!(reclaim_abandoned_if_due_in(&dir, hour).await.owners, 1);
-        assert!(!second.exists());
+        assert!(kept.exists());
+        assert_eq!(
+            reclaim_abandoned_if_due_in(&dir, std::time::Duration::from_nanos(1))
+                .await
+                .owners,
+            1
+        );
 
         // Another boot's stamp, one later than now, and one that does not parse: due.
         for (id, text) in [

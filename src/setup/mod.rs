@@ -589,7 +589,7 @@ mod store_ownership_tests {
         );
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
         assert_eq!(
-            std::fs::read_dir(&owners).unwrap().count(),
+            crate::reclaim::record_files(&owners).len(),
             0,
             "records were left"
         );
