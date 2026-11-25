@@ -101,8 +101,8 @@ pub(crate) struct Env<'a> {
     /// Whether the boundary that made the freeze is being worked on right now
     /// (`snapshot_network::boundary_in_progress`). The watchdog asks before each look.
     pub(crate) boundary_in_progress: &'a dyn Fn() -> bool,
-    /// Whether a source's boundary is owed its resume
-    /// (`snapshot_network::source_boundary_is_owed`).
+    /// Whether a source's boundary is owed its resume with its gate still installed
+    /// (`snapshot_network::source_gate_is_owed`).
     pub(crate) source_owed: &'a dyn Fn() -> bool,
 }
 
@@ -114,7 +114,7 @@ impl Env<'static> {
             lock: Path::new(FROZEN_LOCK),
             froze: &|_| {},
             boundary_in_progress: &crate::snapshot_network::boundary_in_progress,
-            source_owed: &crate::snapshot_network::source_boundary_is_owed,
+            source_owed: &crate::snapshot_network::source_gate_is_owed,
         }
     }
 }
@@ -377,7 +377,8 @@ pub(crate) struct Watch {
     asked: u32,
 }
 
-/// How many looks at one freeze go uncounted while a source's boundary is owed: the
+/// How many looks at one freeze go uncounted while a source's boundary is owed and its
+/// gate is still installed (`snapshot_network::source_gate_is_owed`): the
 /// host's whole bound on asking for the resume (`SOURCE_REOPEN_BOUND`, 150 s, at one look
 /// a second). Between two of the host's tries nobody holds the boundary lock, so those
 /// looks used to count, and the thaw could land about 90 s into the 150: a container

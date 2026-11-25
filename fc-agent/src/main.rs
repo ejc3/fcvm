@@ -86,9 +86,43 @@ fn event_prefix(level: &tracing::Level) -> &'static str {
 }
 
 /// The exit status of a boundary one-shot that was refused because a restore is under
-/// way in the guest. The host reads it (`ONE_SHOT_REFUSED_EXIT` in
-/// src/commands/common.rs) and does not try again.
+/// way in the guest: the gate is the restore's. The host reads it
+/// (`ONE_SHOT_REFUSED_EXIT` in src/commands/common.rs) and does not try again.
 const REFUSED_EXIT: i32 = 3;
+
+/// The exit status of a resume that was refused because its token is not the one of the
+/// boundary owed in this guest (#2159). The gate may be this source's own, and closed:
+/// the host keeps its record of it (`ONE_SHOT_STALE_EXIT` in src/commands/common.rs).
+const STALE_RESUME_EXIT: i32 = 5;
+
+/// The status a boundary one-shot that failed exits with.
+fn failed_one_shot_exit(error: &anyhow::Error) -> i32 {
+    if error
+        .downcast_ref::<snapshot_network::RestoreUnderWay>()
+        .is_some()
+    {
+        REFUSED_EXIT
+    } else if error
+        .downcast_ref::<snapshot_network::StaleResume>()
+        .is_some()
+    {
+        STALE_RESUME_EXIT
+    } else {
+        1
+    }
+}
+
+/// The status of a resume that opened the gate: 0, or `OPEN_UNCLEAN_EXIT` when the
+/// manifest or the mark could not be removed afterwards. None when the gate is not open.
+fn open_gate_exit(resumed: &snapshot_network::SourceResume) -> Option<i32> {
+    resumed.gate_open.then(|| {
+        if resumed.result.is_ok() {
+            0
+        } else {
+            OPEN_UNCLEAN_EXIT
+        }
+    })
+}
 
 /// The exit status of a resume that opened the gate and then could not retire the
 /// manifest or the `owed` mark. The gate is open and the source is back in service; the
@@ -154,13 +188,15 @@ async fn main() {
                     // frozen for the resume that does.
                     if resumed.gate_open {
                         payload_freeze::thaw();
-                        if let Err(error) = &resumed.result {
-                            eprintln!(
-                                "[fc-agent] the gate is open, and the boundary's manifest or \
-                                 mark could not be removed: {error:#}"
-                            );
-                            std::process::exit(OPEN_UNCLEAN_EXIT);
-                        }
+                    }
+                    if let (Some(OPEN_UNCLEAN_EXIT), Err(error)) =
+                        (open_gate_exit(&resumed), &resumed.result)
+                    {
+                        eprintln!(
+                            "[fc-agent] the gate is open, and the boundary's manifest or mark \
+                             could not be removed: {error:#}"
+                        );
+                        std::process::exit(OPEN_UNCLEAN_EXIT);
                     }
                     resumed.result
                 }
@@ -172,13 +208,7 @@ async fn main() {
         if let Err(error) = result {
             eprintln!("[fc-agent] snapshot network boundary failed: {error:#}");
             // The host does not run a refused one-shot again.
-            let refused = error
-                .downcast_ref::<snapshot_network::RestoreUnderWay>()
-                .is_some()
-                || error
-                    .downcast_ref::<snapshot_network::StaleResume>()
-                    .is_some();
-            std::process::exit(if refused { REFUSED_EXIT } else { 1 });
+            std::process::exit(failed_one_shot_exit(&error));
         }
         return;
     }
@@ -312,9 +342,8 @@ mod tests {
             "the prepare is not handed the freeze, or does not thaw exactly when it is told to"
         );
         assert!(
-            squeezed.contains(
-                "ifresumed.gate_open{payload_freeze::thaw();ifletErr(error)=&resumed.result{"
-            ) && squeezed.contains("std::process::exit(OPEN_UNCLEAN_EXIT);}}resumed.result"),
+            squeezed.contains("ifresumed.gate_open{payload_freeze::thaw();}iflet(Some(OPEN_UNCLEAN_EXIT),Err(error))=(open_gate_exit(&resumed),&resumed.result){")
+                && squeezed.contains("std::process::exit(OPEN_UNCLEAN_EXIT);}resumed.result"),
             "the source resume does not thaw exactly when the gate is open"
         );
         // Inside the prepare: refused before the freeze, and frozen before the gate.
@@ -359,20 +388,46 @@ mod tests {
     /// status the host reads as "do not ask again" (`reopen_source_network`).
     #[test]
     fn a_refused_one_shot_exits_with_the_status_the_host_reads() {
-        let host = include_str!("../../src/commands/common.rs");
-        assert!(host.contains(&format!(
-            "const ONE_SHOT_REFUSED_EXIT: i32 = {};",
+        use super::snapshot_network::{RestoreUnderWay, SourceResume, StaleResume};
+        // What each way out of a one-shot exits with, from the errors themselves.
+        let restore: anyhow::Error = RestoreUnderWay::of("a source's resume").into();
+        assert_eq!(super::failed_one_shot_exit(&restore), super::REFUSED_EXIT);
+        assert_eq!(
+            super::failed_one_shot_exit(&restore.context("reopening")),
             super::REFUSED_EXIT
-        )));
-        let main = include_str!("main.rs");
-        assert!(main.contains("std::process::exit(if refused { REFUSED_EXIT } else { 1 });"));
-        // A resume that opened the gate and could not clean up says so with a status of
-        // its own, which the host reads as an open gate.
-        assert!(host.contains(&format!(
-            "const ONE_SHOT_OPEN_UNCLEAN_EXIT: i32 = {};",
-            super::OPEN_UNCLEAN_EXIT
-        )));
-        assert_ne!(super::OPEN_UNCLEAN_EXIT, super::REFUSED_EXIT);
+        );
+        let stale: anyhow::Error = StaleResume.into();
+        assert_eq!(
+            super::failed_one_shot_exit(&stale),
+            super::STALE_RESUME_EXIT
+        );
+        assert_eq!(
+            super::failed_one_shot_exit(&anyhow::anyhow!("nf_tables")),
+            1
+        );
+        let resumed = |gate_open, result| SourceResume { gate_open, result };
+        assert_eq!(super::open_gate_exit(&resumed(true, Ok(()))), Some(0));
+        assert_eq!(
+            super::open_gate_exit(&resumed(true, Err(anyhow::anyhow!("manifest")))),
+            Some(super::OPEN_UNCLEAN_EXIT)
+        );
+        assert_eq!(super::open_gate_exit(&resumed(false, Err(stale))), None);
+        // Three statuses besides 0 and 1, all different, each the one the host reads.
+        let statuses = [
+            ("ONE_SHOT_REFUSED_EXIT", super::REFUSED_EXIT),
+            ("ONE_SHOT_OPEN_UNCLEAN_EXIT", super::OPEN_UNCLEAN_EXIT),
+            ("ONE_SHOT_STALE_EXIT", super::STALE_RESUME_EXIT),
+        ];
+        let host = include_str!("../../src/commands/common.rs");
+        for (name, status) in statuses {
+            assert!(
+                host.contains(&format!("const {name}: i32 = {status};")),
+                "{name}"
+            );
+            assert!(status > 1);
+        }
+        assert!(statuses[0].1 != statuses[1].1 && statuses[1].1 != statuses[2].1);
+        assert_ne!(statuses[0].1, statuses[2].1);
     }
 
     use super::fatal_error_line;
