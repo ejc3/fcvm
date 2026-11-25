@@ -1,0 +1,112 @@
+#!/bin/bash
+# Differential test of the model's kernel rules against the kernel's own functions.
+#
+# Fetches the pinned files of Linux v6.14 and v7.3.3 (checked against SHA256SUMS), cuts the
+# functions the model has rules for out of them verbatim (cut.py), compiles them with stubs for
+# everything they call (stubs.h, harness.c), and feeds them the operations `lake exe hostops`
+# prints: every rule on every input, then every recorded run of WakeVerify/Breaks.lean. Any
+# difference between what the kernel's functions do and what the model expects fails.
+#
+# The kernel source is fetched, not kept in this repository.
+#
+# usage: harness/run.sh            from verify/, or through `make verify-harness`
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+verify=$(dirname "$here")
+repo=$(dirname "$verify")
+build="$here/build"
+base=https://raw.githubusercontent.com/gregkh/linux
+patch_file="$repo/kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch"
+
+for tool in curl sha256sum python3 cc lake diff patch; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
+done
+
+mkdir -p "$build/src"
+while read -r sum path; do
+  tag=${path%%/*}
+  file=${path#*/}
+  dest="$build/src/$path"
+  if ! { [ -f "$dest" ] && echo "$sum  $dest" | sha256sum --check --status; }; then
+    mkdir -p "$(dirname "$dest")"
+    curl -fsSL "$base/$tag/$file" -o "$dest"
+    echo "$sum  $dest" | sha256sum --check --status ||
+      { echo "BLOCKED: $path does not match its pinned checksum" >&2; exit 2; }
+  fi
+done < "$here/SHA256SUMS"
+
+# v7.3.3 with the #2130 patch: the repository's own patch file when it is there, and otherwise
+# the patch's one changed statement, replaced in place.
+rm -rf "$build/src/v7.3.3-patched"
+cp -r "$build/src/v7.3.3" "$build/src/v7.3.3-patched"
+if [ -f "$patch_file" ]; then
+  patch -s -p1 -d "$build/src/v7.3.3-patched" < "$patch_file"
+  echo "v7.3.3-patched: applied $(basename "$patch_file")"
+else
+  python3 - "$build/src/v7.3.3-patched/arch/x86/kvm/x86.c" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+head, sep, tail = text.partition("\nvoid kvm_arch_async_page_present(")
+old = "\tkvm_set_mp_state(vcpu, KVM_MP_STATE_RUNNABLE);\n}\n"
+new = "\tvcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;\n}\n"
+if not sep or old not in tail:
+    sys.exit("BLOCKED: kvm_arch_async_page_present does not end as the #2130 patch expects")
+open(path, "w").write(head + sep + tail.replace(old, new, 1))
+PY
+  echo "v7.3.3-patched: the #2130 patch file is not in this tree; its one statement was replaced in place"
+fi
+
+x86_functions="kvm_vcpu_running kvm_vcpu_has_events kvm_arch_vcpu_runnable vcpu_block
+  __kvm_emulate_halt kvm_arch_vcpu_ioctl_get_mpstate kvm_arch_vcpu_ioctl_set_mpstate
+  kvm_arch_async_page_present"
+
+build_one() {
+  local variant=$1 src="$build/src/$1/arch/x86/kvm" out="$build/$1"
+  mkdir -p "$out"
+  {
+    if [ -f "$src/x86.h" ] && grep -q '^static inline void kvm_set_mp_state' "$src/x86.h"; then
+      python3 "$here/cut.py" "$src/x86.h" kvm_set_mp_state
+    fi
+    # shellcheck disable=SC2086
+    python3 "$here/cut.py" "$src/x86.c" $x86_functions
+    python3 "$here/cut.py" "$src/lapic.c" __apic_accept_irq
+  } > "$out/cut.c"
+  cc -std=gnu11 -O1 -Wall -Werror -Wno-unused-function -Wno-unused-value \
+    -DCUT="\"$out/cut.c\"" -I"$here" -o "$out/harness" "$here/harness.c"
+}
+
+# Run one variant's functions against one rule book's expectations.
+compare() {
+  local variant=$1 book=$2 out="$build/$1"
+  (cd "$verify" && lake exe hostops "$book") > "$out/expect-$book.txt"
+  [ -s "$out/expect-$book.txt" ] || { echo "BLOCKED: no operations for $book" >&2; exit 2; }
+  sed 's/ | .*//' "$out/expect-$book.txt" > "$out/ops-$book.txt"
+  sed 's/.* | //' "$out/expect-$book.txt" > "$out/want-$book.txt"
+  "$out/harness" < "$out/ops-$book.txt" > "$out/got-$book.txt"
+  diff <(paste -d'|' "$out/ops-$book.txt" "$out/want-$book.txt") \
+       <(paste -d'|' "$out/ops-$book.txt" "$out/got-$book.txt")
+}
+
+status=0
+for variant in v6.14 v7.3.3 v7.3.3-patched; do
+  build_one "$variant"
+  if compare "$variant" "$variant" > "$build/$variant/diff.txt"; then
+    echo "$variant: $(wc -l < "$build/$variant/ops-$variant.txt") operations, the kernel's functions agree with the model"
+  else
+    echo "$variant: the kernel's functions DISAGREE with the model:" >&2
+    head -20 "$build/$variant/diff.txt" >&2
+    status=1
+  fi
+done
+
+# The comparison must be able to fail: the unpatched functions against the patched rule book
+# differ exactly where #2125 is.
+if compare v7.3.3 v7.3.3-patched > "$build/v7.3.3/self-test.txt"; then
+  echo "BLOCKED: the harness cannot tell v7.3.3 from v7.3.3 with the #2130 patch" >&2
+  status=2
+else
+  echo "self-test: v7.3.3's functions against the patched rule book differ in $(grep -c '^<' "$build/v7.3.3/self-test.txt") operations, as they must"
+fi
+exit $status

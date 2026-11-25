@@ -1,0 +1,16 @@
+name = "WakeVerify"
+defaultTargets = ["WakeVerify", "breaks", "hostops"]
+
+[[lean_lib]]
+name = "WakeVerify"
+
+# `lake exe breaks`: the exhaustive search of every rule book for lost wake-ups.
+[[lean_exe]]
+name = "breaks"
+root = "Search"
+
+# `lake exe hostops <kernel>`: the model's kernel rules as operations and expected states, for
+# the C harness that drives the kernel's own functions (harness/run.sh).
+[[lean_exe]]
+name = "hostops"
+root = "HostOps"
