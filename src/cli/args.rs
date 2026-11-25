@@ -199,6 +199,12 @@ pub enum FleetCommand {
     PhoneWebProxy(FleetPhoneWebProxyArgs),
     /// Run a Lambda tile: the lane image's Lambda runtime, the renderer and its tunnel
     LambdaTile(Box<FleetLambdaTileArgs>),
+    /// Run pages mode's host module without a coordinator or viewers, and record what it
+    /// measures
+    RendersBench(Box<FleetRendersBenchArgs>),
+    /// Wait for a pages-mode module to go, then remove everything it made
+    #[command(hide = true)]
+    RendersReap(FleetRendersReapArgs),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1012,6 +1018,124 @@ pub struct FleetPhoneWebProxyArgs {
     /// Address to listen on; phones reach it through `--forward-localhost`
     #[arg(long, default_value = "127.0.0.1:3128")]
     pub listen: std::net::SocketAddr,
+}
+
+/// `fcvm fleet renders-bench`: pages mode's host module ("One VM per page") on its own. It
+/// must run in a subgroup of a delegated systemd unit (`Delegate=yes` with
+/// `DelegateSubgroup=`), because each side runs in a cpuset of its own.
+#[derive(Args, Debug)]
+pub struct FleetRendersBenchArgs {
+    /// Where the records go: renders.jsonl, samples.jsonl, report.json, summary.json, logs
+    #[arg(long)]
+    pub out: std::path::PathBuf,
+    /// Scratch for the run (certificates, name files, injected bytes); removed at the end
+    #[arg(long)]
+    pub run_dir: std::path::PathBuf,
+    /// A file the module writes its stage to, by rename, as it starts and stops
+    #[arg(long)]
+    pub status_file: Option<std::path::PathBuf>,
+    /// The repository's bench/chromium (the replay, the drivers, the worker)
+    #[arg(long)]
+    pub bench: std::path::PathBuf,
+    /// The captured pages the replays serve
+    #[arg(long)]
+    pub corpus: std::path::PathBuf,
+    /// The pages to render, in the wall's order (comma separated)
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub urls: Vec<String>,
+    /// The snapshot every clone is restored from
+    #[arg(long)]
+    pub snapshot_tag: String,
+    /// A shell command that makes the snapshot when it is absent (the benchmark's golden)
+    #[arg(long)]
+    pub golden_cmd: Option<String>,
+    /// How the memory server fills clone memory
+    #[arg(long, default_value = "minor")]
+    pub uffd_mode: String,
+    /// A Kitesurf build: `src` (the repository) and `tools/node-*/bin`
+    #[arg(long)]
+    pub kitesurf: Option<std::path::PathBuf>,
+    /// The engine bundle to serve (default: `<kitesurf>/dist`)
+    #[arg(long)]
+    pub kitesurf_dist: Option<std::path::PathBuf>,
+    /// Host CPUs of the fcvm side, the engines and the harness
+    #[arg(long, default_value = "0-39")]
+    pub cpus_fcvm: String,
+    #[arg(long, default_value = "40-79")]
+    pub cpus_engines: String,
+    #[arg(long, default_value = "80-95")]
+    pub cpus_harness: String,
+    /// The most clones in flight, and the most engines (one engine per render in flight);
+    /// 0 leaves a side out
+    #[arg(long, default_value_t = 40)]
+    pub max_fcvm: u32,
+    #[arg(long, default_value_t = 48)]
+    pub max_engines: u32,
+    /// Hold these renders in flight (fcvm,engines) and run no search
+    #[arg(long, value_delimiter = ',', num_args = 2)]
+    pub levels: Option<Vec<u32>>,
+    /// Start an engine again, between renders, once its anonymous memory passes this; 0
+    /// never does
+    #[arg(long, default_value_t = 4096)]
+    pub recycle_mib: u64,
+    /// Replay processes behind each side's address
+    #[arg(long, default_value_t = 4)]
+    pub replay_procs: u32,
+    /// The replays' addresses and ports. The fcvm side's also answers DNS for the clones.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub replay_addr_fcvm: std::net::Ipv4Addr,
+    #[arg(long, default_value = "127.0.0.3")]
+    pub replay_addr_engines: std::net::Ipv4Addr,
+    #[arg(long, default_value_t = 80)]
+    pub replay_http_port: u16,
+    #[arg(long, default_value_t = 443)]
+    pub replay_tls_port: u16,
+    #[arg(long, default_value_t = 53)]
+    pub replay_dns_port: u16,
+    /// The first engine's port on 127.0.0.1; engine N listens on this plus N
+    #[arg(long, default_value_t = 28800)]
+    pub engine_port_base: u16,
+    /// The CSS viewport both renderers are given
+    #[arg(long, default_value = "1280x720")]
+    pub viewport: String,
+    /// The longest one render may take, in seconds
+    #[arg(long, default_value_t = 30)]
+    pub timeout_s: u32,
+    /// The trailing window of the wall's figures, in seconds
+    #[arg(long, default_value_t = 30)]
+    pub window_s: u32,
+    /// Stop after this many seconds of rendering; 0 runs until a signal
+    #[arg(long, default_value_t = 0)]
+    pub seconds: u64,
+    /// A text and a transform put into every page, as a visitor's would be
+    #[arg(long)]
+    pub overlay_text: Option<String>,
+    #[arg(long)]
+    pub overlay_transform: Option<String>,
+    /// Values for the Setup lists that the module cannot read itself (`side.name=value`)
+    #[arg(long = "setup")]
+    pub setup: Vec<String>,
+    /// Wait at this stage until the module is ended (the teardown check's)
+    #[arg(long, hide = true)]
+    pub hold_at: Option<String>,
+}
+
+/// `fcvm fleet renders-reap`: started by the module, which holds the other end of
+/// `--watch-fd`
+#[derive(Args, Debug)]
+pub struct FleetRendersReapArgs {
+    #[arg(long)]
+    pub watch_fd: i32,
+    #[arg(long = "cgroup")]
+    pub cgroup: Vec<std::path::PathBuf>,
+    #[arg(long)]
+    pub run_dir: std::path::PathBuf,
+    #[arg(long)]
+    pub snapshot_tag: String,
+    #[arg(long, default_value_t = 20000)]
+    pub deadline_ms: u64,
+    #[arg(long)]
+    pub report: Option<std::path::PathBuf>,
 }
 
 /// `fcvm fleet lambda-tile`: a Lambda tile's runtime (fleet/PROTOCOL.md, "Lambda tile").

@@ -2372,6 +2372,68 @@ Measured above, and each a later PR of this stack, to be measured on the ring:
    handled only after a catch; the viewer cap set by measuring the wake with 0, 10, 100 and
    1000 viewers reconnecting at once.
 
+## Pages mode
+
+"One VM per page" (`?mode=pages`): a renders host renders a fixed set of replayed web pages on
+two sides at once, a new microVM running unmodified Chromium for every render and Kitesurf
+engines on workerd, each side on its own equal set of pinned CPUs. The protocol, the
+coordinator's state and the `/live` view are in `fleet/PROTOCOL.md`, "Pages mode". This section
+is the host's half. No fleet host runs it yet: the module runs on its own as
+`fcvm fleet renders-bench` (`make fleet-renders-bench`), which is the agent's module without a
+coordinator or viewers, so the benchmark's reference figures and the live wall's come from one
+piece of code.
+
+### The host module
+
+`src/fleet/renders`. The figures and the decision how many renders each side runs in flight are
+`fleet_core::renders_wall::Wall` and `fleet_core::renders_search` (pure functions of completed
+renders and cgroup counters). The module starts and ends the processes and moves lines between
+them.
+
+| cgroup under the unit | CPUs (defaults, 96-CPU host) | holds |
+|---|---|---|
+| `renders-fcvm` | 0 to 39 | the memory server (`fcvm snapshot serve`) and every clone. One pool: nothing below it is pinned or limited |
+| `renders-engines` | 40 to 79 | the Kitesurf engines, one child cgroup each, for its memory. One engine per render in flight: a workerd process runs its isolates on one thread |
+| `renders-harness` | 80 to 95 | `replay-fcvm` and `replay-engines` (each side's replay processes behind one address) and `drivers` (the workers that drive the renders) |
+
+The cgroups are made with `src/fleet/cpuset.rs`, which the potato ring's cgroup uses too: the
+process runs in a subgroup of a delegated unit, a cgroup's `cpuset.cpus` is written and read back
+from `cpuset.cpus.effective`, a process joins before it executes, and `cgroup.kill` ends what
+is left.
+
+- **A render in flight** is one whose answer is not in hand. A clone's teardown follows its
+  answer and is outside the render's time, so the fcvm side starts its next clone while the last
+  is torn down (it has more workers than its most renders in flight).
+- **2 MiB pages.** A clone reserves its memory when it starts. The side starts one only while the
+  pool has room for it, and counts the times it waited (`pool_waits`); a pool too small is never
+  a failed render.
+- **An engine is started again** between renders once its anonymous memory passes
+  `--recycle-mib`: every process in its cgroup is ended and a new engine takes its port.
+- **Three failed renders in a row** on a side make it start nothing for a second.
+- **The kernel rule.** The module refuses to run on a kernel without the bridge teardown fix
+  (`kernel_has_bridge_fix`).
+
+### Start and end
+
+Stages, written to `--status-file` as each completes: `start` (the reaper is running),
+`cgroups`, `golden` (only while the snapshot's command runs), `replays`, `serve`, `engines`,
+`workers` (every worker said it is ready), `running`, `stopping`, `stopped`.
+
+Nothing the module starts is trusted to end itself. Before anything else it starts a reaper
+(`fcvm fleet renders-reap`) that holds the read end of a pipe. When the module is gone, however
+it went, the reaper kills the three cgroups, waits until they are empty, removes them, runs
+fcvm's own sweeps for what killed clones leave (owner records, state files), removes the memory
+server's socket and the run directory, and writes what it found to `teardown.json`. The same
+sweep runs when a module starts.
+
+The unit must keep systemd's default `KillMode=control-group`. With `KillMode=mixed` systemd
+sends SIGKILL to every process left the moment the main process is gone, the reaper included.
+
+`make test-fleet-renders-teardown` (`bench/chromium/renders_teardown_check.py`) ends a module at
+each stage, by SIGKILL and by SIGTERM, and counts what is left: processes, the unit's cgroup,
+network namespaces, clones' state files and directories, sockets, listening ports, the run
+directory, 2 MiB pages. Every count must be zero.
+
 ## Windows mode
 
 `?mode=windows` shows disposable Windows desktops, each a Cloud Hypervisor VM restored from a
