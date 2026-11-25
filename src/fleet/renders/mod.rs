@@ -398,8 +398,38 @@ struct Engine {
     join: Join,
     child: Option<Child>,
     up: bool,
+    /// Being ended and started again: for its memory (a recycle) or because it died or its
+    /// renders kept failing (`restarting`).
     recycling: bool,
+    restarting: bool,
+    /// Renders that failed on it in a row.
+    failed_in_a_row: u32,
+    /// When to try again after a start that failed.
+    retry_at: Option<Instant>,
 }
+
+/// Whether an engine is started again now: its process exited, its renders failed
+/// [`FAILURES_BEFORE_A_WAIT`] times in a row, or an earlier start failed and its retry is
+/// due. Never while a start is under way.
+fn engine_needs_a_start(
+    up: bool,
+    starting: bool,
+    exited: bool,
+    failed_in_a_row: u32,
+    retry_due: bool,
+) -> bool {
+    if starting {
+        return false;
+    }
+    if up {
+        exited || failed_in_a_row >= FAILURES_BEFORE_A_WAIT
+    } else {
+        retry_due
+    }
+}
+
+/// How long after a failed start an engine is tried again.
+const ENGINE_RETRY: Duration = Duration::from_secs(5);
 
 /// A job a worker carries.
 struct Job {
@@ -532,6 +562,8 @@ struct Module {
     recycle_bytes: u64,
     recycles: u64,
     recycle_ms: Vec<f64>,
+    /// Engines started again because they died or kept failing.
+    restarts: u64,
     /// 2 MiB pages a clone reserves; 0 when the snapshot is not on huge pages.
     clone_pages: u64,
     fixed: Option<[u32; 2]>,
@@ -708,6 +740,11 @@ impl Module {
                 return;
             }
             let ok = row["ok"] == json!(true);
+            if side == KITE && row["answered"] != json!(true) {
+                if let Some(e) = self.engines.get_mut(index) {
+                    e.failed_in_a_row = if ok { 0 } else { e.failed_in_a_row + 1 };
+                }
+            }
             let ms = row["ms"].as_f64().unwrap_or(0.0);
             let error = row["error"].as_str().map(str::to_string);
             self.answer(side, index, ok, ms, error);
@@ -758,15 +795,23 @@ impl Module {
     async fn engine(&mut self, index: usize, result: Result<(Child, f64)>) {
         let e = &mut self.engines[index];
         e.recycling = false;
+        let restarting = std::mem::take(&mut e.restarting);
         match result {
             Ok((child, ms)) => {
                 e.child = Some(child);
                 e.up = true;
-                self.recycles += 1;
-                self.recycle_ms.push(ms);
+                e.failed_in_a_row = 0;
+                e.retry_at = None;
+                if restarting {
+                    self.restarts += 1;
+                } else {
+                    self.recycles += 1;
+                    self.recycle_ms.push(ms);
+                }
             }
             Err(error) => {
                 tracing::error!(target: "renders", index, "engine not started again: {error:#}");
+                e.retry_at = Some(Instant::now() + ENGINE_RETRY);
             }
         }
         self.dispatch(KITE).await;
@@ -794,6 +839,21 @@ impl Module {
                 "busy_workers": s.workers.iter().filter(|w| w.job.is_some()).count(),
                 "pool_waits": s.pool_waits, "respawns": s.respawns,
             });
+        }
+        // An engine that died, or whose renders keep failing, is started again.
+        for index in 0..self.engines.len() {
+            let e = &mut self.engines[index];
+            let exited = e
+                .child
+                .as_mut()
+                .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+            let retry_due = e.retry_at.is_some_and(|t| t <= Instant::now());
+            if engine_needs_a_start(e.up, e.recycling, exited, e.failed_in_a_row, retry_due) {
+                tracing::warn!(target: "renders", index, exited, failed = e.failed_in_a_row, "starting an engine again");
+                e.restarting = true;
+                e.retry_at = None;
+                self.recycle(index);
+            }
         }
         let up = self.engines.iter().filter(|e| e.up).count() as u32;
         if !self.engines.is_empty() {
@@ -826,6 +886,7 @@ impl Module {
         }
         sample["engines_up"] = json!(up);
         sample["recycles"] = json!(self.recycles);
+        sample["restarts"] = json!(self.restarts);
         sample["hugepages"] = json!({"total": pool, "room": room});
         sample["harness"] = json!({
             "pressure_usec": self.harness.pressure_usec(),
@@ -863,6 +924,7 @@ impl Module {
         doc["module"] = json!({
             "fixed_levels": self.fixed,
             "recycles": self.recycles,
+            "engine_restarts": self.restarts,
             "recycle_ms_median": sorted.get(sorted.len() / 2),
             "pool_waits": self.sides[FCVM].pool_waits,
             "respawns": {SIDES[0]: self.sides[0].respawns, SIDES[1]: self.sides[1].respawns},
@@ -1255,6 +1317,9 @@ async fn run(
                     child: None,
                     up: false,
                     recycling: false,
+                    restarting: false,
+                    failed_in_a_row: 0,
+                    retry_at: None,
                 });
             }
             while let Some(done) = batch.join_next().await {
@@ -1391,6 +1456,7 @@ async fn run(
         recycle_bytes: args.recycle_mib * 1024 * 1024,
         recycles: 0,
         recycle_ms: Vec::new(),
+        restarts: 0,
         clone_pages,
         fixed,
         tx,
@@ -1566,6 +1632,22 @@ mod tests {
         assert_eq!(body.trim(), "kitesurf: OK");
         assert!(ms < 1500.0, "{ms} ms");
         server.abort();
+    }
+
+    #[test]
+    fn an_engine_is_started_again_when_it_died_or_keeps_failing() {
+        // up and well
+        assert!(!engine_needs_a_start(true, false, false, 0, false));
+        assert!(!engine_needs_a_start(true, false, false, 2, false));
+        // its process exited, or three renders in a row failed on it
+        assert!(engine_needs_a_start(true, false, true, 0, false));
+        assert!(engine_needs_a_start(true, false, false, 3, false));
+        // down after a failed start: only when its retry is due
+        assert!(!engine_needs_a_start(false, false, true, 9, false));
+        assert!(engine_needs_a_start(false, false, false, 0, true));
+        // never while a start is under way
+        assert!(!engine_needs_a_start(true, true, true, 9, true));
+        assert!(!engine_needs_a_start(false, true, true, 9, true));
     }
 
     #[test]
