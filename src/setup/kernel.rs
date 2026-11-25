@@ -3363,11 +3363,14 @@ mod tests {
     /// repository, the commit, the architecture and the libc.
     #[test]
     fn a_cloud_hypervisor_build_is_named_for_its_repo_commit_arch_and_libc() {
-        let name = |repo, commit, arch, libc| cloud_hypervisor_file_name(repo, commit, arch, libc);
+        let name = cloud_hypervisor_file_name;
         let (a, b) = ("a".repeat(40), "b".repeat(40));
         let base = name("o/r", &a, "aarch64", "libc-2.39");
         assert_eq!(base, name("o/r", &a, "aarch64", "libc-2.39"));
-        assert!(base.starts_with("cloud-hypervisor-") && base.ends_with(".bin"), "{base}");
+        assert!(
+            base.starts_with("cloud-hypervisor-") && base.ends_with(".bin"),
+            "{base}"
+        );
         for other in [
             name("o/fork", &a, "aarch64", "libc-2.39"),
             name("o/r", &b, "aarch64", "libc-2.39"),
