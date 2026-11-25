@@ -144,13 +144,12 @@ def build_record(*, fcvm_commit, kitesurf_commit, index_js, release, conf):
             "boot_params": conf["RENDERS_BOOT_PARAMS"], "hugepages": int(conf["RENDERS_HUGEPAGES"])}
 
 
-def pinned_kitesurf(src):
-    """KITESURF_REV of the checkout's bench/chromium/kitesurf_pins.sh."""
-    for line in Path(src, "bench/chromium/kitesurf_pins.sh").read_text().splitlines():
-        match = re.fullmatch(r"KITESURF_REV=([0-9a-f]{40})", line.strip())
-        if match:
-            return match.group(1)
-    raise ValueError("kitesurf_pins.sh pins no commit")
+def kitesurf_rev(conf):
+    """The Kitesurf commit the image builds and runs: renders.conf's, the recorded campaign's."""
+    rev = conf.get("RENDERS_KITESURF_REV", "")
+    if not COMMIT.fullmatch(rev):
+        raise ValueError("renders.conf's RENDERS_KITESURF_REV is not a full commit id")
+    return rev
 
 
 def run(args, **kwargs):
@@ -202,11 +201,11 @@ def check_host(conf):
     if git_head(src) != record["fcvm_commit"]:
         problems.append("the checkout is not the commit the build record names")
     try:
-        pinned = pinned_kitesurf(src)
-    except (OSError, ValueError):
+        pinned = kitesurf_rev(conf)
+    except ValueError:
         pinned = ""
     if record["kitesurf_commit"] != pinned or git_head(Path(kitesurf, "src")) != pinned:
-        problems.append("Kitesurf is not at the commit kitesurf_pins.sh pins")
+        problems.append("Kitesurf is not at renders.conf's RENDERS_KITESURF_REV")
     try:
         bundle = hashlib.sha256(Path(dist, "index.js").read_bytes()).hexdigest()
     except OSError:
@@ -243,10 +242,10 @@ def main(argv):
     conf = read_conf(CONF.read_text() if CONF.is_file() else (HERE / "renders.conf").read_text())
     if mode == "record":
         src = conf["RENDERS_SRC"]
-        record = build_record(fcvm_commit=git_head(src), kitesurf_commit=pinned_kitesurf(src),
+        record = build_record(fcvm_commit=git_head(src), kitesurf_commit=kitesurf_rev(conf),
             index_js=Path(conf["RENDERS_DIST"], "index.js").read_bytes(), release=os.uname().release, conf=conf)
         if git_head(Path(conf["RENDERS_KITESURF"], "src")) != record["kitesurf_commit"]:
-            raise SystemExit("Kitesurf's checkout is not at the commit kitesurf_pins.sh pins")
+            raise SystemExit("Kitesurf's checkout is not at renders.conf's RENDERS_KITESURF_REV")
         RECORD.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
         print(json.dumps(record, sort_keys=True))
         return 0

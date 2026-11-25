@@ -7,8 +7,8 @@
 #                    agent), and fcvm's host kernel at $FCVM_COMMIT as GRUB's default with the
 #                    reference's boot line; the caller reboots the instance afterwards
 #   build.sh build   on that kernel only: fcvm at $FCVM_COMMIT (make build, make setup-default),
-#                    the bench image, Kitesurf at kitesurf_pins.sh's commit and its production
-#                    bundle, the agent's environment, and one run of the agent check, which
+#                    the bench image, Kitesurf at renders.conf's RENDERS_KITESURF_REV (the
+#                    recorded campaign's commit) and its production bundle, the agent's environment, and one run of the agent check, which
 #                    makes the module's snapshot
 #   build.sh bake    packs the store into /var/lib/fcvm-fleet/store/ (host/store-pack.py), checks
 #                    the host and cleans up for imaging
@@ -175,11 +175,11 @@ build)
   # Snapshots restored from a base image's store were made by its fcvm: start the cache empty, so
   # the agent check below makes the module's snapshot with this build's.
   rm -rf /mnt/fcvm-btrfs/snapshots/*
-  # Kitesurf (kitesurf_build.sh at kitesurf_pins.sh's commit, then the production bundle) depends on
+  # Kitesurf (kitesurf_build.sh at RENDERS_KITESURF_REV, then the production bundle) depends on
   # nothing else this phase builds: it runs beside fcvm's build, as the build user, on the store.
   install -d -o "$U" -g "$U" /mnt/fcvm-btrfs/kitesurf
   bg_start fleet-ami-kitesurf "$L/kitesurf.log" -- sudo -u "$U" -H env PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    bash "$HERE/kitesurf-dist.sh" "$SRC" "$RENDERS_KITESURF" "$RENDERS_DIST"
+    bash "$HERE/kitesurf-dist.sh" "$SRC" "$RENDERS_KITESURF" "$RENDERS_DIST" "$RENDERS_KITESURF_REV"
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-default"
   # The module's snapshot is made from this image (`fcvm podman prepare` of localhost/chromium-bench-req).

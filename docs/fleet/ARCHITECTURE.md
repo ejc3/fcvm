@@ -2612,8 +2612,11 @@ m8gd.metal-24xl. The image makes a host the configuration the recorded figures w
 - The store on the instance-store NVMe, restored at every boot as a GPU host's is: the default
   kernel and rootfs, the bench image's export, the module's snapshot (made at build by the module
   itself, so a host's first module does not take the two minutes `fcvm podman prepare` takes), and
-  Kitesurf at `bench/chromium/kitesurf_pins.sh`'s commit with its production bundle in Bazel's
-  default mode, served from Bazel's output directory.
+  Kitesurf at the recorded campaign's commit (`RENDERS_KITESURF_REV` in `renders.conf`, held equal
+  to the summary's `kitesurf_commit`) with its production bundle in Bazel's default mode, served
+  from Bazel's output directory. `bench/chromium/kitesurf_pins.sh` stays the other benchmark arm's
+  pin; the image builds from a copy of it with that commit, and its toolchain (node, pnpm,
+  Bazelisk) is the file's, the combination the campaign's host built.
 - `fcvm-fleet-renders-agent.service`: `fcvm fleet agent --renders` as the build user, with
   `renders_bench.sh`'s unit properties (`Delegate=yes`, `DelegateSubgroup=agent`, the default
   `KillMode`, `LimitNOFILE=1048576`, `TasksMax=infinity`). The host's boot writes the fleet's
@@ -2622,6 +2625,12 @@ m8gd.metal-24xl. The image makes a host the configuration the recorded figures w
   and `--setup kitesurf.commit=` so the hello's build map names both) are in
   `/etc/fcvm-fleet/renders.env`, written at build from `renders.conf`. `RENDERS_FRAME_ARGS` in that
   file is where the frame server's options go.
+
+The image runs the reference's Kitesurf commit and boot line, and the image's other settings that
+the campaign's summary and host records carry (the most renders in flight per side, the pool, the
+instance type, the host kernel's version) are read from them by `fleet/ami/test_pipeline.py`. When
+either the Kitesurf commit or the boot line changes, the reference is measured again: a new
+campaign, whose summary the test then reads.
 
 The image publishes only after `make test-fleet-renders-agent` has passed every case on its cold
 boot. It is a track of its own: it shares no renderer with the GPU host and tile pair, so neither

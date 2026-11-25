@@ -1942,15 +1942,18 @@ class RendersRecipeTests(unittest.TestCase):
         self.assertLess(start, build.index('as_user "cd $SRC && make build"'))
         unit = build[start:build.index("\n", build.index("\n", start) + 1)]
         self.assertIn("kitesurf-dist.sh", unit)
+        # the flavor's own pin, renders.conf's, not the other benchmark arm's kitesurf_pins.sh
+        self.assertIn('"$RENDERS_KITESURF_REV"', unit)
         wait = build.index('bg_wait fleet-ami-kitesurf "$L/kitesurf.log"')
         self.assertLess(wait, build.index('as_user "cd $SRC && make test-fleet-renders-agent'))
-        # the commit is kitesurf_pins.sh's at FCVM_COMMIT: the recipe never sets it
         code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
-        self.assertNotIn("KITESURF_REV", code)
         self.assertNotIn("kitesurf_pins.sh", code)
         self.assertIn('BG_UNITS="fleet-ami-kitesurf"', source)
         dist = (RENDERS / "kitesurf-dist.sh").read_text()
-        self.assertIn('bash "$SRC/bench/chromium/kitesurf_build.sh"', dist)
+        # the repository's build script runs from a copy whose pins name the flavor's commit
+        self.assertIn('bash "$TOOLS/kitesurf_build.sh"', dist)
+        self.assertNotIn('bash "$SRC/bench/chromium/kitesurf_build.sh"', dist)
+        self.assertIn('--rev "$REV"', dist)
         prepare = dist.index("wpt-engine.mjs prepare")
         bundle = dist.index("build //packages/engine:dist")
         self.assertLess(dist.index("kitesurf_build.sh"), prepare)
@@ -1960,6 +1963,75 @@ class RendersRecipeTests(unittest.TestCase):
         self.assertNotIn("--compilation_mode", dist)
         self.assertIn('ln -s "$(readlink -f "$out")" "$DIST"', dist)
         self.assertIn("kitesurf_seal.py\" write", dist)
+
+    def run_tools(self, rev):
+        """kitesurf-dist.sh's tools(): copies of the build, pins and seal scripts with the pins'
+        commit replaced, in a scratch directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src/bench/chromium"
+            src.mkdir(parents=True)
+            for name in ("kitesurf_build.sh", "kitesurf_pins.sh", "kitesurf_seal.py"):
+                (src / name).write_bytes((HERE.parents[1] / "bench/chromium" / name).read_bytes())
+            program = ("KITESURF_DIST_LIB=1\n. " + shlex.quote(str(RENDERS / "kitesurf-dist.sh")) + "\n"
+                       "tools " + shlex.quote(str(Path(tmp) / "src")) + " " + shlex.quote(rev) + " "
+                       + shlex.quote(str(Path(tmp) / "tools")) + "\n")
+            done = subprocess.run(["bash", "-c", program], capture_output=True, text=True, timeout=30,
+                                  env={"PATH": "/usr/bin:/bin"})
+            copies = {p.name: p.read_text() for p in (Path(tmp) / "tools").glob("*")} if done.returncode == 0 else {}
+            original = (src / "kitesurf_pins.sh").read_text()
+            return done, copies, original
+
+    def test_kitesurf_is_built_from_copies_whose_pins_name_the_flavors_commit(self):
+        rev = "0123456789abcdef0123456789abcdef01234567"
+        done, copies, original = self.run_tools(rev)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(set(copies), {"kitesurf_build.sh", "kitesurf_pins.sh", "kitesurf_seal.py"})
+        pins = copies["kitesurf_pins.sh"].splitlines()
+        self.assertEqual([line for line in pins if line.startswith("KITESURF_REV=")], ["KITESURF_REV=" + rev])
+        # everything else in the pins (node, pnpm, Bazelisk) is the repository's, and the
+        # repository's own file is left as it was
+        self.assertEqual([line for line in pins if not line.startswith("KITESURF_REV=")],
+                         [line for line in original.splitlines() if not line.startswith("KITESURF_REV=")])
+        self.assertEqual(original, (HERE.parents[1] / "bench/chromium/kitesurf_pins.sh").read_text())
+        for bad in ("main", rev[:12], rev + "0"):
+            with self.subTest(rev=bad):
+                self.assertNotEqual(self.run_tools(bad)[0].returncode, 0)
+
+    def test_the_flavor_runs_the_recorded_campaigns_configuration(self):
+        # The page's reference figures and a live host come from one configuration: the image's
+        # settings that the campaign's summary and host records carry are read from them here,
+        # never typed. The levels, the viewport, the clones' vCPUs, memory and page size and the
+        # engines' recycle threshold are the module's (its defaults, or the search's), not the
+        # image's, and are not compared.
+        summaries = sorted((HERE.parents[1] / "bench/chromium/results").glob("renders-*-summary.json"))
+        self.assertEqual(len(summaries), 1, summaries)
+        summary = json.loads(summaries[0].read_text())
+        conf = host_check().read_conf((RENDERS / "renders.conf").read_text())
+        self.assertEqual(conf["RENDERS_KITESURF_REV"], summary["kitesurf_commit"])
+        held = next(r for r in summary["regimes"] if r["label"] == "held")
+        fcvm, engines = held["sides"]["fcvm"]["setup"], held["sides"]["kitesurf"]["setup"]
+        self.assertEqual(conf["RENDERS_MAX_FCVM"], fcvm["max_in_flight"])
+        self.assertEqual(conf["RENDERS_MAX_ENGINES"], engines["engines"])
+        self.assertEqual(conf["RENDERS_HUGEPAGES"], fcvm["pool_pages"])
+        arguments = dict(word.split("=", 1) for word in held["arguments"].split())
+        self.assertEqual((arguments["MAX_FCVM"], arguments["MAX_ENGINES"]),
+                         (conf["RENDERS_MAX_FCVM"], conf["RENDERS_MAX_ENGINES"]))
+        launch = re.search(r"\n    renders\) type=\$\{TYPE:-([^}]+)\}", (HERE / "build-ami.sh").read_text()).group(1)
+        self.assertEqual(launch, summary["instance_type"])
+        # every run's host record names the boot line the image boots with
+        records = sorted((summaries[0].parent / summary["campaign"]).glob("*/host-record.txt"))
+        self.assertTrue(records)
+        for record in records:
+            lines = dict(line.split(": ", 1) for line in record.read_text().splitlines())
+            with self.subTest(run=record.parent.name):
+                self.assertEqual(lines["cmdline"], conf["RENDERS_BOOT_PARAMS"])
+                self.assertEqual(lines["kitesurf"], conf["RENDERS_KITESURF_REV"])
+        # the host kernel's version; its hash is the patches' and config fragment's at the
+        # commit the image builds
+        import tomllib
+        host_kernel = tomllib.loads((HERE.parents[1] / "rootfs-config.toml").read_text())[
+            "kernel_profiles"]["nested"]["arm64"]["host_kernel"]
+        self.assertEqual(summary["kernel"].split("-fcvm-")[0], host_kernel["kernel_version"])
 
     def test_the_build_writes_the_agents_environment_and_runs_the_agent_check(self):
         _, phases = renders_phases()
@@ -2113,6 +2185,15 @@ class RendersHostCheckTests(unittest.TestCase):
         for text in ("33999\n", "68000\n", "", "lots"):
             with self.subTest(text=text):
                 self.assertTrue(self.check.pool_problems(text, 34000))
+
+    def test_kitesurfs_commit_is_renders_confs_and_a_full_commit(self):
+        conf = self.conf()
+        self.assertEqual(self.check.kitesurf_rev(conf), conf["RENDERS_KITESURF_REV"])
+        for bad in ("", "main", "f964846e", "F" * 40):
+            with self.subTest(rev=bad), self.assertRaises(ValueError):
+                self.check.kitesurf_rev({**conf, "RENDERS_KITESURF_REV": bad})
+        # the check reads the flavor's pin, never the other benchmark arm's pins file
+        self.assertNotIn("kitesurf_pins.sh", (RENDERS / "host-check.py").read_text())
 
     def test_the_conf_parser_takes_only_its_own_format(self):
         conf = self.check.read_conf('# a comment\n\nA=1\nB="two words"\n')
