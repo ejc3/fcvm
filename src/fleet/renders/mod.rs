@@ -6,7 +6,7 @@
 //! |---|---|
 //! | `renders-fcvm` | the memory server and every clone (`fcvm snapshot run`, Firecracker, pasta, the namespace holder). One pool: nothing below it is pinned or limited |
 //! | `renders-engines` | the Kitesurf engines, one child cgroup each (`e<n>`), for its memory |
-//! | `renders-harness` | `replay-fcvm` and `replay-engines` (each side's replay processes) and `drivers` (the workers that drive the renders, and the VM the snapshot is made from) |
+//! | `renders-harness` | `replay-fcvm` and `replay-engines` (each side's replay processes) and `drivers` (the workers that drive the renders, and the VM the snapshot is made from). One pool like the sides: the three are cgroups of their own for their counters, on the whole harness set unless `--replay-cpus` confines the replays |
 //!
 //! The pure half is `fleet_core::renders_wall::Wall`: it is fed every completed render and
 //! each side's cgroup counters and answers how many renders each side runs in flight, and
@@ -944,6 +944,13 @@ impl Module {
         let mut report = self.wall.report(now_ms(), None, None);
         report.harness = Some(self.harness_health());
         let mut doc = serde_json::to_value(&report).unwrap_or(Value::Null);
+        // Held levels (`--levels`) run no search: the report says what is held.
+        if let Some(fixed) = self.fixed {
+            for (side, level) in fixed.iter().enumerate() {
+                doc["sides"][SIDES[side]]["search"] =
+                    json!({"in_flight": level, "phase": "holding"});
+            }
+        }
         let mut sorted = self.recycle_ms.clone();
         sorted.sort_by(|a, b| a.total_cmp(b));
         doc["module"] = json!({
@@ -1367,7 +1374,11 @@ async fn run(
             format!("{:.0}", start_ms[start_ms.len() / 2]),
         );
         kite_setup.insert("recycle_mib".into(), args.recycle_mib.to_string());
-        kite_setup.insert("bundle".into(), dist.display().to_string());
+        // The bundle by its content, not by where this host keeps it.
+        let index = std::fs::read(dist.join("index.js"))
+            .with_context(|| format!("reading {}/index.js", dist.display()))?;
+        kite_setup.insert("bundle_sha256".into(), sha256_hex(&index));
+        tracing::info!(target: "renders", bundle = %dist.display(), "the engines' bundle");
         engine_spec = Some(spec);
     }
     status.set("engines").await;

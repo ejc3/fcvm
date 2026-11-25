@@ -2394,13 +2394,18 @@ them.
 |---|---|---|
 | `renders-fcvm` | 0 to 39 | the memory server (`fcvm snapshot serve`) and every clone. One pool: nothing below it is pinned or limited |
 | `renders-engines` | 40 to 79 | the Kitesurf engines, one child cgroup each, for its memory. One engine per render in flight: a workerd process runs its isolates on one thread |
-| `renders-harness` | 80 to 95 | `replay-fcvm` and `replay-engines` (each side's replay processes behind one address) and `drivers` (the workers that drive the renders) |
+| `renders-harness` | 80 to 95 | `replay-fcvm` and `replay-engines` (each side's replay processes behind one address) and `drivers` (the workers that drive the renders). One pool: the three are cgroups of their own for their counters and share the 16 CPUs |
 
 The cgroups are made with `src/fleet/cpuset.rs`, which the potato ring's cgroup uses too: the
 process runs in a subgroup of a delegated unit, a cgroup's `cpuset.cpus` is written and read back
 from `cpuset.cpus.effective`, a process joins before it executes, and `cgroup.kill` ends what
 is left.
 
+- **The harness is one pool too.** With each replay confined to four of the harness CPUs
+  (`--replay-cpus 4`), the engines' replay read a CPU pressure of 0.14 at 1.3 CPUs busy with 36
+  Kitesurf renders in flight, and a probe request's 90th percentile was 1.2 and 1.9 ms. Sharing
+  the 16 CPUs it read 0.002, and 0.74 and 0.85 ms (working data from one host boot, two runs
+  each way). The page shows nothing of the harness; the samples carry each part's counters.
 - **A render in flight** is one whose answer is not in hand. A clone's teardown follows its
   answer and is outside the render's time, so the fcvm side starts its next clone while the last
   is torn down (it has more workers than its most renders in flight).

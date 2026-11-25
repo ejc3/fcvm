@@ -1088,9 +1088,10 @@ pub struct FleetRendersBenchArgs {
     /// Replay processes behind each side's address
     #[arg(long, default_value_t = 4)]
     pub replay_procs: u32,
-    /// Harness CPUs each side's replay runs on, the rest being the drivers'; 0 splits
-    /// nothing and the replays and drivers share the whole harness set
-    #[arg(long, default_value_t = 4)]
+    /// Harness CPUs each side's replay is confined to, the rest being the drivers'. 0 (the
+    /// default) confines nothing below the harness set: the replays and the drivers share
+    /// it, as each side shares its own
+    #[arg(long, default_value_t = 0)]
     pub replay_cpus: u32,
     /// The replays' addresses and ports. The fcvm side's also answers DNS for the clones.
     #[arg(long, default_value = "127.0.0.1")]
