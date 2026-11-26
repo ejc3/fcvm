@@ -547,6 +547,22 @@ def jobs_of(gh, run, cache):
     return jobs
 
 
+def executions(jobs):
+    """A run's jobs with GitHub's copies taken out. When one job of a run is run again,
+    every other job is listed again under the new attempt, with a new id and the old
+    conclusion, start and end. Those records are not executions: nothing ran and no runner
+    was held. A job is a copy when an earlier attempt lists the same name with the same
+    start; the earliest record is kept."""
+    kept, seen = [], set()
+    for job in sorted(jobs, key=lambda job: (job.get('run_attempt') or 0)):
+        key = (job['name'], job.get('started_at'))
+        if job.get('started_at') and key in seen:
+            continue
+        seen.add(key)
+        kept.append(job)
+    return kept
+
+
 def first_attempt(jobs, names):
     """Each named job's conclusion in the run's first attempt."""
     return {j['name']: j['conclusion'] for j in jobs if j['name'] in names and j['run_attempt'] == 1}
@@ -563,6 +579,7 @@ def summarise(runs, jobs_by_run):
         jobs = jobs_by_run.get(run['id'])
         if jobs is None:
             continue
+        jobs = executions(jobs)
         for job in jobs:
             kind = runner_class(job['labels'])
             minutes = job_minutes(job)
@@ -875,7 +892,7 @@ def failed_lane_jobs(runs, jobs_by_run):
     lane in the same run said (True passed, False failed again, None not run again)."""
     out = []
     for run in runs:
-        jobs = jobs_by_run.get(run['id']) or []
+        jobs = executions(jobs_by_run.get(run['id']) or [])
         for job in jobs:
             if job['name'] not in LANES or job['conclusion'] not in ('failure', 'timed_out'):
                 continue
