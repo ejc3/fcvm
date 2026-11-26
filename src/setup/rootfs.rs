@@ -54,7 +54,7 @@ pub struct Plan {
     /// Used when no kernel profile overrides it.
     #[serde(default)]
     pub firecracker: Option<FirecrackerConfig>,
-    /// Cloud Hypervisor build configuration (repo + branch to build from), #632.
+    /// Cloud Hypervisor build configuration (repo + commit to build from), #632.
     /// Optional VMM backend (`--hypervisor cloud-hypervisor`); built on demand via
     /// `fcvm setup --cloud-hypervisor`, content-addressed like firecracker.
     #[serde(default)]
@@ -104,19 +104,17 @@ pub struct FirecrackerConfig {
 
 /// Cloud Hypervisor build configuration (#632).
 ///
-/// When set, `fcvm setup --cloud-hypervisor` builds Cloud Hypervisor from the
-/// specified repo/branch (content-addressed, like firecracker) and
-/// `find_cloud_hypervisor()` uses it. CH is an optional backend, so it is built on
-/// demand rather than on every `fcvm setup`. Pinned to a fork branch carrying the
-/// aarch64 SVE register save/restore fix (upstream PR #8268), which landed after the
-/// v52.0 release and is not in any tagged release yet.
+/// When set, `fcvm setup --cloud-hypervisor` builds Cloud Hypervisor from this
+/// commit of this repository and `find_cloud_hypervisor()` runs that build and
+/// no other. It is an optional backend, so it is built on demand rather than on
+/// every `fcvm setup`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct CloudHypervisorConfig {
-    /// GitHub repo (e.g., "ejc3/cloud-hypervisor")
+    /// GitHub repo (e.g., "cloud-hypervisor/cloud-hypervisor")
     pub repo: String,
-    /// Branch to build from (default: "main")
-    #[serde(default = "default_branch")]
-    pub branch: String,
+    /// Exact full commit to build, fetched by its hash. Required, so the build
+    /// is always one known commit and launch resolves it without the network.
+    pub commit: String,
 }
 
 fn default_branch() -> String {

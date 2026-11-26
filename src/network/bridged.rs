@@ -25,6 +25,10 @@ fn derive_host_ip(subnet_id: u16, is_clone: bool) -> String {
     }
 }
 
+/// How many candidate subnets a launch tries before it sweeps what killed VMs left and
+/// tries them once more, and then before it gives up.
+const SUBNET_ATTEMPTS: u32 = 100;
+
 /// Check if an IP address is already assigned to a veth interface
 async fn is_ip_in_use_on_veth(ip: &str) -> bool {
     let output = match tokio::process::Command::new("ip")
@@ -460,7 +464,9 @@ impl NetworkManager for BridgedNetwork {
         // without spending an attempt, since one host network can cover many /30s.
         let host_addresses = host_addresses().await;
         let subnet_id = {
+            let first_candidate = subnet_id;
             let mut attempts = 0u32;
+            let mut swept = false;
             loop {
                 subnet_id =
                     match first_subnet_off_the_host(subnet_id, self.is_clone, &host_addresses) {
@@ -528,7 +534,23 @@ impl NetworkManager for BridgedNetwork {
                     }
                 }
                 attempts += 1;
-                if attempts >= 100 {
+                if attempts >= SUBNET_ATTEMPTS && !swept {
+                    // A launch sweeps only when a sweep is due (crate::reclaim), so the
+                    // veths of VMs killed since the last one may be what holds these
+                    // subnets. Sweep now and go over the candidates once more. No undo
+                    // takes the subnet lock this launch holds.
+                    swept = true;
+                    let reclaimed = crate::reclaim::reclaim_abandoned_on_contention().await;
+                    warn!(
+                        owners = reclaimed.owners,
+                        resources = reclaimed.resources,
+                        "no free subnet in {SUBNET_ATTEMPTS} candidates; swept what killed VMs left and trying them again"
+                    );
+                    attempts = 0;
+                    subnet_id = first_candidate;
+                    continue;
+                }
+                if attempts >= SUBNET_ATTEMPTS {
                     let _ = self.cleanup().await;
                     anyhow::bail!(
                         "subnet allocation failed: no free subnet found after {} attempts",
@@ -854,7 +876,7 @@ impl NetworkManager for BridgedNetwork {
         // Step 3: Delete FORWARD rule and veth pair. With the veth gone its address, and
         // the rules and routes that name it, can be another VM's, so this VM's records of
         // them go first (crate::reclaim). If they cannot be dropped, the objects stay,
-        // still recorded, and the next launch removes them. A kill from here on leaks
+        // still recorded, and the next sweep removes them. A kill from here on leaks
         // what is left.
         // The veth's FORWARD rule is named by the veth, which keeps the name this VM's
         // until it is deleted below.
@@ -866,7 +888,7 @@ impl NetworkManager for BridgedNetwork {
         }
 
         // A rule or route that could not be removed keeps its record, and with it the
-        // veth and namespace that keep its address this VM's, for the next launch.
+        // veth and namespace that keep its address this VM's, for the next sweep.
         let forgotten = if !errors.is_empty() {
             Err(anyhow::anyhow!("rules or routes of this VM remain"))
         } else {
@@ -882,7 +904,7 @@ impl NetworkManager for BridgedNetwork {
         let network_kept = forgotten.is_err();
         if let Err(e) = forgotten {
             errors.push(format!(
-                "dropping network records, so the veth and namespace stay for the next launch: {e:#}"
+                "dropping network records, so the veth and namespace stay for the next sweep: {e:#}"
             ));
         } else {
             if let Some(ref host_veth) = self.host_veth {
@@ -897,7 +919,7 @@ impl NetworkManager for BridgedNetwork {
                 matches!(r, crate::reclaim::Resource::Netns { .. })
             }) {
                 Err(e) => errors.push(format!(
-                    "dropping the namespace record, so it stays for the next launch: {e:#}"
+                    "dropping the namespace record, so it stays for the next sweep: {e:#}"
                 )),
                 Ok(()) => {
                     if let Some(ref namespace_id) = self.namespace_id {
@@ -911,8 +933,8 @@ impl NetworkManager for BridgedNetwork {
         }
 
         // Step 5: Remove global NAT rules if no other bridged VMs are running. A failure
-        // leaves the record, so the next launch tries again. While this VM's own veth
-        // stays for the next launch, the shared rules stay recorded with it: the reclaim
+        // leaves the record, so the next sweep tries again. While this VM's own veth
+        // stays for the next sweep, the shared rules stay recorded with it: the reclaim
         // removes them after the veth (it recorded them first).
         if !network_kept {
             match portmap::cleanup_global_nat_if_unused().await {
@@ -970,6 +992,42 @@ impl NetworkManager for BridgedNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Before it gives up for want of a free subnet, a launch sweeps what killed VMs left
+    /// and goes over its candidates once more: since launches sweep only when a sweep is
+    /// due (`crate::reclaim`), the veths of VMs killed in the last interval can hold them.
+    ///
+    /// Pinned on the source. A run of it needs 100 consecutive subnets held by a dead
+    /// owner's veths, starting at the subnet a hash of the new VM's random id picks, so it
+    /// would have to fill all 16,384. What the sweep does when called this way is tested
+    /// in `reclaim::tests::a_refused_launch_sweeps_at_once_and_waits_only_so_long`.
+    #[test]
+    fn subnet_selection_sweeps_once_before_it_gives_up() {
+        let source = include_str!("bridged.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap()];
+        let guard = code
+            .find("if attempts >= SUBNET_ATTEMPTS && !swept {")
+            .expect("the first exhaustion is not the end");
+        let sweep = code
+            .find("crate::reclaim::reclaim_abandoned_on_contention().await")
+            .expect("the sweep");
+        let give_up = code
+            .find("subnet allocation failed: no free subnet found")
+            .unwrap();
+        assert!(guard < sweep && sweep < give_up);
+        assert_eq!(code.matches("reclaim_abandoned_on_contention").count(), 1);
+        let retry = &code[guard..give_up];
+        for step in [
+            "swept = true;",
+            "attempts = 0;",
+            "subnet_id = first_candidate;",
+            "continue;",
+        ] {
+            assert!(retry.contains(step), "the retry has no {step:?}");
+        }
+        // The second exhaustion ends the launch.
+        assert!(retry.contains("if attempts >= SUBNET_ATTEMPTS {"));
+    }
 
     /// One host network covers many /30s, and they are skipped without spending the
     /// allocation's attempts: a host on 172.30.0.0/23 gets the first /30 after it.
