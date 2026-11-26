@@ -1593,7 +1593,7 @@ jobs:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      # A status function in the `if:` is what lets this job report on a run whose tests failed —
+      # A status function in the `if:` is what lets this job report on a run whose tests failed,
       # and it is also why Summary's own result says nothing about theirs unless
       # it looks. Without this step Summary reported success over genuinely failed
       # gating jobs in 8 of the last 40 runs (Lint, Container-*, Host-Root-*), so
