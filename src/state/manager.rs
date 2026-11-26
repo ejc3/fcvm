@@ -2643,6 +2643,70 @@ mod tests {
         );
     }
 
+    /// Whether `error` has a missing file at its root, as a caller that reads "no state" from
+    /// `load_state` looks for it (`commands::common::owed_boundary_token`).
+    fn not_found_at_root(error: &anyhow::Error) -> bool {
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    /// `load_state` of a VM that has no state fails with `io::ErrorKind::NotFound` at the
+    /// root of its error, and with nothing else there when the store cannot be read: a
+    /// caller tells "this VM has no state" from "the state could not be read" by that alone.
+    #[tokio::test]
+    async fn a_missing_state_is_not_found_at_the_root_and_a_refused_store_is_not() {
+        // No state directory at all, an empty store, and a store with another VM in the
+        // missing VM's bucket: no state.
+        let dir = tempfile::tempdir().unwrap();
+        let nowhere = StateManager::new(dir.path().join("never-made"));
+        assert!(not_found_at_root(
+            &nowhere.load_state("vm-absent").await.unwrap_err()
+        ));
+        let manager = StateManager::new(dir.path().to_path_buf());
+        manager.init().await.unwrap();
+        assert!(not_found_at_root(
+            &manager.load_state("vm-absent").await.unwrap_err()
+        ));
+        let neighbour = (0..)
+            .map(|n| format!("vm-neighbour-{n}"))
+            .find(|id| bucket_of(id) == bucket_of("vm-absent"))
+            .unwrap();
+        manager
+            .save_state(&named_state(&neighbour, "neighbour"))
+            .await
+            .unwrap();
+        assert!(manager.vm_bucket("vm-absent").is_dir());
+        assert!(not_found_at_root(
+            &manager.load_state("vm-absent").await.unwrap_err()
+        ));
+
+        // A state that is there and does not parse: an error, not "no state".
+        std::fs::create_dir_all(manager.vm_bucket("vm-damaged")).unwrap();
+        std::fs::write(manager.state_file("vm-damaged"), "{ not a state").unwrap();
+        assert!(!not_found_at_root(
+            &manager.load_state("vm-damaged").await.unwrap_err()
+        ));
+
+        // A store this build refuses (another layout's marker), and one whose marker cannot
+        // be read: an error for every VM, missing or not.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join(LAYOUT_FILE), "3\n").unwrap();
+        let refused = StateManager::new(other.path().to_path_buf())
+            .load_state("vm-absent")
+            .await
+            .unwrap_err();
+        assert!(!not_found_at_root(&refused), "{refused:#}");
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir(unreadable.path().join(LAYOUT_FILE)).unwrap();
+        let refused = StateManager::new(unreadable.path().to_path_buf())
+            .load_state("vm-absent")
+            .await
+            .unwrap_err();
+        assert!(!not_found_at_root(&refused), "{refused:#}");
+    }
+
     fn named_state(vm_id: &str, name: &str) -> VmState {
         let mut state = VmState::new(vm_id.to_string(), "alpine:latest".to_string(), 1, 512);
         state.name = Some(name.to_string());
