@@ -681,6 +681,11 @@ the two it fixed three defects in arm64 snapshot and restore that fcvm hit on th
 - **The config section is `repo` and `commit`.** A config written by an older fcvm has
   `branch` and no `commit` there and does not parse; `make build` and
   `fcvm setup --generate-config --force` write the current one.
+- **A source resumed in place keeps the host's time.** `snapshot create` without `--stop`
+  pauses the VM, saves it and resumes it. On x86_64 the fork set the guest's clock back to
+  its value at the pause, so the guest fell behind by every pause; upstream sets it with
+  the wall time that passed. On arm64 the counter runs through the pause on both (#2173).
+  Measured in docs/fleet/windows-sandboxes.md, "The fork against upstream".
 - **A snapshot of a clone** is written by cloning the extents of the memory file the clone
   maps (FICLONERANGE) and then writing the pages the clone changed. The result holds every
   page: `test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot` deletes the

@@ -538,90 +538,118 @@ clone touched.
 
 The design's choice follows: map, with the memory file linked, is stack PR 5.
 
-### The fork against upstream, 2026-11-25
+### The fork against upstream, 2026-11-26
 
-`fleet/windows/measure-restore.sh` on one g4dn.metal (the fleet's host image, host kernel
-7.3.3-fcvm-00cf0c326801, nothing else running), one boot, the image the fleet ran that day
-(`e7f6277b7af3`, installed 2026-11-15), 2 vCPUs and 4 GiB. Each build made its own gold
-snapshot the agent's way (cold boot, two logons through the bridge with the desktop idle
-after each, `snapshot create --stop`) and restored 1, 4 and 8 clones at once through fcvm's
-raw-VM mode. The old build is the fleet's of that day: fcvm `faa66800` with the fork
-(`v52.0-49-ga354afd77`, `memory_restore_mode=map`). The new one is this document's:
-upstream at `4969a51a3` (it prints `v55.0-117-g4969a51a`), `copyonwrite` and
+`fleet/windows/measure-restore.sh` and the profiles below on one g4dn.metal (the fleet's host
+image, host kernel 7.3.3-fcvm-2a778d7a8b2d, nothing else running), one boot, the image the
+fleet ran that day (`e7f6277b7af3`, installed 2026-11-15), 2 vCPUs and 4 GiB. Each build
+made its own gold snapshot the agent's way (cold boot, two logons through the bridge with
+the desktop idle after each, `snapshot create --stop`) and restored 1, 4 and 8 clones at
+once through fcvm's raw-VM mode. The old build is the host image's: fcvm `de6f591d` with the
+fork (`v52.0-49-ga354afd77`, `memory_restore_mode=map`). The new one is upstream at
+`4969a51a3` (it prints `v55.0-117-g4969a51a3d3f`) with `copyonwrite` and
 `clock_restore_mode=preserve`.
 
 "To healthy" is from launching `fcvm snapshot run` until `fcvm ls` reports the clone
 healthy (the guest agent has set the clock and Remote Desktop answers an X.224 request).
 Memory is `/proc/<cloud-hypervisor>/smaps_rollup` 20 s later with no client connected, so
-it is not comparable with the table above, where a client showed the desktop. CPU is the
-VMMs' use from 20 to 25 s after healthy, per clone, in cores; a clone is still settling
-then, and the profile below follows it further. "Desktop" is the bridge's logon to the
-restored session until the desktop has stood still for 5 s.
+it is not comparable with the tables above, where a client showed the desktop. CPU is the
+VMMs' use from 20 to 25 s after healthy, per clone, in cores. "Desktop" is the bridge's
+logon to the restored session until the desktop has stood still for 5 s.
 
 | N at once | | fork, `map` | upstream, `copyonwrite` |
 |---|---|---|---|
-| 1 | to healthy | 0.92 s | 0.66 s |
-| 4 | to healthy | 0.88 to 0.96 s | 0.63 to 0.65 s |
-| 8 | to healthy | 0.91 to 1.05 s | 0.60 to 0.81 s |
-| 1 | resident | 1,668 MiB | 1,632 MiB |
-| 4 | PSS | 588 to 590 MiB | 554 to 556 MiB |
-| 8 | PSS | 411 to 418 MiB | 373 to 376 MiB |
-| 4, 8 | private dirty | 225 to 235 MiB | 191 to 195 MiB |
-| 1, 4, 8 | CPU per clone, 20 to 25 s after healthy | 0.54 to 0.61 | 0.13 to 0.15 |
-| 1, 4, 8 | desktop | 7.4 to 7.6 s | 7.4 to 8.0 s |
+| 1 | to healthy | 0.85 s | 0.67 s |
+| 4 | to healthy | 0.87 to 0.89 s | 0.64 to 0.66 s |
+| 8 | to healthy | 0.81 to 1.01 s | 0.62 to 0.75 s |
+| 1 | resident | 1,610 MiB | 1,671 MiB |
+| 4 | PSS | 566 to 567 MiB | 590 to 594 MiB |
+| 8 | PSS | 394 to 398 MiB | 412 to 420 MiB |
+| 4, 8 | private dirty | 214 to 221 MiB | 227 to 239 MiB |
+| 1, 4, 8 | CPU per clone, 20 to 25 s after healthy | 0.58 to 0.60 | 0.12 to 0.14 |
+| 1, 4, 8 | desktop | 7.3 to 7.6 s | 7.3 to 7.8 s |
 
-Every clone of both builds mapped the memory file. The one clone restored seconds after the
-snapshot was written counted all its resident memory as private dirty (1,662 and 1,626 MiB);
-a single clone of the same snapshot 100 s later counted 200 MiB (the clock table's run), so
-the private dirty row leaves the first one out. The cold boot to
-healthy took 18.2 s on the fork and 18.1 s on upstream, and the first logon 42.2 s and 19.7 s
-(one run each).
+Every clone of both builds mapped the memory file. Memory differs by 4 to 5 percent between
+the two gold snapshots; one gold was made per build, so this run does not separate the
+build's effect on memory from the gold's. The one clone restored seconds after its snapshot
+was written counted all its resident memory as private dirty (1,604 and 1,664 MiB), and one
+restored 12 minutes later counted 240 MiB, so the private dirty row leaves the first one
+out. Making the gold: cold boot to healthy 17.6 s on both, first logon to a settled desktop
+42.8 s on the fork and 20.0 s on upstream, second logon 7.1 s on both, `snapshot create
+--stop` 2.25 s and 1.84 s (one run each).
 
 Where the CPU goes. All of it is in the two vCPU threads on both builds. One clone of each
-build's gold snapshot (40 minutes old by then), its vCPU threads' CPU and their KVM exits
-(the `kvm_exit` and `kvm_msr` tracepoints) over windows after healthy:
+gold snapshot, the snapshots 4 to 14 minutes old, its vCPU threads' CPU over windows after
+healthy, first with nothing attached and then again with the `kvm_exit` and `kvm_msr`
+tracepoints counted:
 
-| window after healthy | fork: cores | exits/s | of them reads of MSR 0x40000020 | upstream: cores | exits/s | of them reads of MSR 0x40000020 |
-|---|---|---|---|---|---|---|
-| 0 to 10 s | 0.37 | 40,800 | 26,100 | 0.33 | 17,800 | 0 |
-| 10 to 25 s | 0.31 | 32,200 | 22,700 | 0.13 | 6,500 | 0 |
-| 25 to 35 s | 0.17 | 22,800 | 16,900 | 0.12 | 4,500 | 0 |
-| 65 to 75 s | 0.15 | 19,600 | 15,900 | not recorded | | |
+| window after healthy | fork: cores | fork: cores, traced | exits/s | reads of MSR 0x40000020 /s | upstream: cores | upstream: cores, traced | exits/s | reads of MSR 0x40000020 /s |
+|---|---|---|---|---|---|---|---|---|
+| 0 to 10 s | 0.36 | 0.38 | 41,200 | 26,100 | 0.37 | 0.33 | 18,400 | 0 |
+| 10 to 20 s | 0.18 | 0.20 | 22,200 | 16,400 | 0.17 | 0.16 | 7,400 | 0 |
+| 20 to 25 s | 0.58 | 0.61 | 50,900 | 33,700 | 0.18 | 0.16 | 6,300 | 0 |
+| 25 to 35 s | 0.17 | 0.19 | 22,200 | 16,600 | 0.13 | 0.14 | 4,700 | 0 |
+| 65 to 75 s | 0.17 | 0.19 | 20,200 | 16,400 | 0.15 | 0.15 | 5,600 | 0 |
+| 120 to 130 s | 0.16 | 0.18 | 19,100 | 15,800 | 0.12 | 0.15 | 4,700 | 0 |
 
 0x40000020 is `HV_X64_MSR_TIME_REF_COUNT`: on the fork Windows takes a VM exit for every
-clock read. The fork advertised Hyper-V CPUID leaf 0x40000003 with EAX=0x20e, without the
-two privileges Microsoft's interface marks mandatory (the hypercall MSRs and the VP index);
-Windows then abandons its enlightened setup and never enables the reference TSC page.
-Upstream sets them since v53.0 (`ce9416a9c`; the gold snapshot of the upstream build holds
-EAX=0xa7f), and Windows reads the clock from the page with no exit. Windows decides this
-when it boots, and the snapshot holds both the guest's memory and the CPUID, so a gold
-snapshot made on the fork keeps the exits whatever VMM restores it. The fork's CPU at 10 to
-25 s read 0.31 here and 0.54 to 0.61 in the table above, in clones of a gold snapshot
-seconds old; the two runs were not otherwise the same and the difference is not explained.
+clock read, 16,000 a second at rest. The fork advertised Hyper-V CPUID leaf 0x40000003 with
+EAX=0x20e, without the two privileges Microsoft's interface marks mandatory (the hypercall
+MSRs and the VP index); Windows then abandons its enlightened setup and never enables the
+reference TSC page. Upstream sets them since v53.0 (`ce9416a9c`; the upstream build's gold
+snapshot holds EAX=0xa7f), and Windows reads the clock from the page with no exit. At rest
+that is 0.16 to 0.19 of a core per clone against 0.12 to 0.15. Whatever Windows runs 20 to
+25 s after a restore (the fork's VMM shows disk I/O there) costs 0.6 of a core on the fork
+and does not show on upstream: that window is the table's CPU row.
 
-The clock, on the upstream build, with clones of one gold snapshot 102 to 284 s old,
+Windows decides this when it boots, and the snapshot holds both the guest's memory and the
+CPUID. The fork's gold snapshot restored by upstream's VMM (through a wrapper under the old
+fcvm, which does not check the build) profiles as on the fork: 0.38, 0.24, 0.60, 0.21, 0.19
+and 0.18 cores over the six windows, 19,100 to 51,400 exits a second. A host gets the
+upstream figures only from a gold snapshot booted on the upstream build, which is one reason
+a gold snapshot is keyed by its build.
+
+The clock, on the upstream build, with clones of one gold snapshot 13 to 15 minutes old,
 `preserve` (what fcvm passes) against Cloud Hypervisor's default `advance`, which adds the
 snapshot's age to the guest's clock at the restore:
 
 | | `preserve` | `advance` | `preserve`, after it |
 |---|---|---|---|
-| to healthy, 1 clone | 0.66 s | 1.94 s | 0.72 s |
-| to healthy, 4 at once | 0.72 to 0.81 s | 2.14 to 2.30 s | 0.71 to 0.79 s |
-| PSS, 4 at once | 559 to 560 MiB | 753 to 759 MiB | 568 to 569 MiB |
-| private dirty | 197 to 200 MiB | 405 to 423 MiB | 206 to 209 MiB |
-| CPU per idle clone | 0.14 to 0.16 | 0.14 to 0.17 | 0.14 to 0.16 |
-| desktop | 7.7 s | 7.4 to 7.5 s | 7.7 to 7.8 s |
+| to healthy, 1 clone | 0.59 s | 3.16 s | 0.66 s |
+| to healthy, 4 at once | 0.65 to 0.74 s | 3.50 to 3.85 s | 0.65 to 0.74 s |
+| PSS, 4 at once | 607 to 608 MiB | 913 to 933 MiB | 624 to 627 MiB |
+| private dirty | 240 to 247 MiB | 586 to 604 MiB | 261 to 265 MiB |
+| CPU per clone, 20 to 25 s after healthy | 0.14 | 0.11 to 0.12 | 0.13 to 0.15 |
+| desktop | 7.5 to 7.6 s | 7.1 to 7.4 s | 7.6 s |
 
-With `advance` Windows spends 1.3 to 1.5 s longer before its agent has the clock set and
-Remote Desktop answers, and writes about 200 MiB more per clone, for a snapshot four minutes
-old. The desktop is the same either way once the bridge reaches it. The wall clock is right
-in both, because the guest agent sets it from the namespace's clock line and a clone is not
-healthy until it has.
+With `advance` Windows spends 2.6 to 3.1 s longer before its agent has the clock set and
+Remote Desktop answers, and writes about 340 MiB more per clone, for a snapshot a quarter of
+an hour old. The desktop is the same either way once the bridge reaches it. The wall clock
+is right in both, because the guest agent sets it from the namespace's clock line and a
+clone is not healthy until it has.
+
+A source snapshotted in place (`fcvm snapshot create` without `--stop`, which pauses the VM,
+saves it and resumes it; the fleet's gold flow uses `--stop`, and nothing in the fleet takes
+this path). One clone of each gold, snapshotted twice 10 s apart, the guest's clock read
+from the two state files:
+
+| | fork | upstream |
+|---|---|---|
+| pause to resume, first snapshot | 1.16 s | 0.27 s |
+| host time between the two pauses | 11.19 s | 10.30 s |
+| guest clock between the two pauses | 10.03 s | 10.30 s |
+| the source 3 s after the second resume | unhealthy | healthy |
+
+The fork saved the guest's clock at the pause and set it back at the resume, so the guest
+lost the length of every pause. Upstream sets it with the wall time that passed, and the
+guest keeps the host's time. A raw VM is healthy only while its clock is within 1 s of the
+host's; the fork's source was 2.3 s behind after two snapshots (the health monitor's own
+reason was not read). The pause is shorter on upstream because a snapshot of a VM restored
+with `copyonwrite` clones the extents of the memory file it maps and writes only the pages
+the VM changed.
 
 The fork's gold snapshot under the upstream build: fcvm refuses it ("this snapshot records
-no Cloud Hypervisor build ... Create the snapshot again"). Upstream's VMM itself does
-restore it (run through a wrapper under the old fcvm, which has no such check): healthy in
-1.04 s, mapped, and at 0.61 of a core 20 to 25 s after healthy, the fork's figure and not
-upstream's (the snapshot carries the fork's CPUID and a guest booted under it).
-A restore whose VMM was made to copy (`memory_restore_mode=copy` through a wrapper) fails in
-fcvm with "restored without mapping".
+no Cloud Hypervisor build ... Create the snapshot again"). Upstream's VMM itself restores
+it (the wrapper run above), with the fork's behaviour. A restore whose VMM was made to copy
+(`memory_restore_mode=copy` through a wrapper) fails in fcvm with "restored without
+mapping": measured on this host type the day before, with the same builds.
