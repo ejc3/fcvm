@@ -354,9 +354,10 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
   boundary lock is held or a restore is under way is not counted
   (`snapshot_network::boundary_in_progress`), so a restore or a prepare that takes over a
   minute keeps its container frozen. While a source's boundary is owed and its gate is
-  still installed (`snapshot_network::source_gate_is_owed`), 150 more looks are not
-  counted (`payload_freeze::SOURCE_REOPEN_LOOKS`, the host's whole bound on asking
-  for the resume): nobody holds the lock between two of the host's tries, and those looks
+  still installed (`snapshot_network::source_gate_is_owed`; asked before the freeze lock
+  is taken, each listing given two seconds for the xtables lock and killed after five),
+  150 more looks are not counted (`payload_freeze::SOURCE_REOPEN_LOOKS`, the host's whole
+  bound on asking for the resume): nobody holds the lock between two of the host's tries, and those looks
   used to count, so the thaw could land with the create still in flight. Looks, not the
   mark's age: the guest takes none while its VM is paused. A source whose host died, or
   whose gate cannot be opened, is still thawed, 60 counted looks after those. At most 900 looks at one freeze go
@@ -370,7 +371,7 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
   the gate and the pause would save an image with the gate open and no manifest. So every
   create's boundary has a token: `run_snapshot_network_command` writes it on the VM's
   state (`boundary_token`) and sends it to the prepare, which puts it into the `owed`
-  mark; every resume reads it from the state once, before its first try, and sends it;
+  mark; every resume reads it from the state at each try (`resume_args`) and sends it;
   the guest runs a resume only when its token is the mark's
   (`BoundaryMarks::resume_is_for_the_owed_boundary`), and refuses any other with exit 5.
   Exit 3 is the restore's refusal alone. On 5 the host asks no more, keeps the record and
@@ -380,12 +381,20 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
   state keeps the token while the gate is recorded closed, for the later create's one
   ask, and loses it when the gate is reported open. A state that is there and cannot be
   read is a failed try, and one that cannot be written fails the create before its
-  prepare is sent: neither is "no token". The token orders resumes. It is not a secret:
+  prepare is sent (`PrepareNotSent`), with no reopen asked of a guest that was sent
+  nothing: neither is "no token". The token orders resumes. It is not a secret:
   the one-shot runs as root in the guest, and whatever can run it can read the mark.
-  Both failures begin with the commands to run by hand (`with_the_resume_by_hand`): the
-  resume with the state's token, or, when the guest refused that as stale, a read of
-  `/run/fcvm/snapshot-boundary-owed` and the resume with the token found there. The
-  mark is written whole or not at all (staged and renamed). A resume that opens the gate
+  Both failures begin with the command to run by hand (`with_the_resume_by_hand`): the
+  resume with the state's token, or, when the guest refused that as stale, the resume
+  with the mark's token, which the refusal itself reports on its stderr
+  (`owed-boundary-token=`). An operator cannot read the mark with `cat` from a guest whose
+  restarted agent serves the resume alone. The mark is written whole or not at all:
+  staged under a name of the writer's own, renamed over, the staged file removed when
+  either fails. The restarted agent's note is a read and a write of the mark, so it takes
+  the boundary lock (`note_agent_restart_under_the_lock`) and looks at the mark again
+  under it; with the default kill mode no one-shot of the dead agent is alive to hold
+  that lock, and with `KillMode=process` (#2158) one can be, for which the note waits up
+  to ten seconds. A resume that opens the gate
   and cannot remove the manifest or the mark after three tries exits 4, which the host
   reads as an open gate (`reopen_try_of`), and still does what follows an open gate (the
   output reconnect). The resume's second look for a restore, right before it touches the

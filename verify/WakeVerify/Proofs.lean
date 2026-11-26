@@ -20,7 +20,9 @@ here. The search's audit (`Search.lean`) checks that part on the finite model.
 They are about a VM whose whole history ran under the rule book. A VM that hung on an unpatched
 host and is then restored on a repaired one starts from a state `Reachable` does not contain.
 
-No `sorry`, and no axiom beyond Lean's own (`Axioms.lean` checks every theorem on every build).
+No `sorry`, and no axiom beyond Lean's own: the sweep in `Axioms.lean` checks every theorem
+whenever that file is elaborated, which `check-sweep.sh` does on every run of `make verify` and
+of the CI job (`lake build` alone does it only when something `Axioms.lean` imports changed).
 -/
 
 namespace Wake
@@ -337,6 +339,10 @@ theorem allLabels_complete : ∀ l : Label, l ∈ allLabels := by
   | pause => decide
   | resume => decide
   | clone => decide
+
+/-- The search stores an edge of its graph as `target * 64 + label` (`Graph.succ` in
+`Search.lean`), which is one-to-one only while there are at most 64 labels. -/
+theorem allLabels_fit_edge_encoding : allLabels.length ≤ 64 := by decide
 
 /-- The end of a possible run is a reachable state, so the theorems above apply to it. -/
 theorem replay_reachable {R : Rules} {C : Cfg} : ∀ (ls : List Label) (s t : State),
