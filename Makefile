@@ -541,9 +541,9 @@ clean-test-data: build
 	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
 	sudo rm -rf $(ROOT_DATA_DIR)/vm-disks/* $(CONTAINER_DATA_DIR)/vm-disks/*
 	@echo "==> Cleaning state files..."
-	sudo rm -rf /mnt/fcvm-btrfs/state/*.json /mnt/fcvm-btrfs/state/*.lock
-	sudo rm -rf $(ROOT_DATA_DIR)/state/*.json $(ROOT_DATA_DIR)/state/*.lock
-	sudo rm -rf $(CONTAINER_DATA_DIR)/state/*.json $(CONTAINER_DATA_DIR)/state/*.lock
+	sudo rm -rf /mnt/fcvm-btrfs/state/vms /mnt/fcvm-btrfs/state/names /mnt/fcvm-btrfs/state/pids /mnt/fcvm-btrfs/state/*.lock
+	sudo rm -rf $(ROOT_DATA_DIR)/state/vms $(ROOT_DATA_DIR)/state/names $(ROOT_DATA_DIR)/state/pids $(ROOT_DATA_DIR)/state/*.lock
+	sudo rm -rf $(CONTAINER_DATA_DIR)/state/vms $(CONTAINER_DATA_DIR)/state/names $(CONTAINER_DATA_DIR)/state/pids $(CONTAINER_DATA_DIR)/state/*.lock
 	@echo "==> Removing root owner records that root does not own..."
 	@# A reclaim/0 owned by another uid was written by a rootless container's root (host uid
 	@# 1000), and every root fcvm on this host refuses it. Root's own records stay for reclaim.

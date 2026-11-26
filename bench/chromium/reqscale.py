@@ -3026,6 +3026,7 @@ class UffdServe:
         ]
 
     def start(self) -> int:
+        reqbench.refuse_unconverted_state_layout(self.args.state_dir)
         watch = reqbench.DirWatch(self.args.state_dir)
         try:
             baseline = {

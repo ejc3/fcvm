@@ -1004,8 +1004,14 @@ async fn a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and
 #[tokio::test]
 async fn a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs_deadline(
 ) -> Result<()> {
-    const FREEZE: &str =
-        "cat /sys/fs/cgroup/system.slice/fc-agent.service/libpod-payload-*/cgroup.freeze";
+    // The request (`cgroup.freeze`) and what the kernel reports of it (`frozen` in
+    // `cgroup.events`): a request alone would read 1 for a cgroup that never froze.
+    const FREEZE: &str = "cd /sys/fs/cgroup/system.slice/fc-agent.service/libpod-payload-*/ && \
+                          cat cgroup.freeze && grep '^frozen ' cgroup.events";
+    const FROZEN: &str = "1\nfrozen 1";
+    const RUNNING: &str = "0\nfrozen 0";
+    // What the host refuses a restoring clone with (`snapshot create`, #2151).
+    const NOT_ACKNOWLEDGED: &str = "its restore has not been acknowledged";
     let (golden_name, clone_name, snapshot_name, _) = common::unique_names("heldrestore");
     let (mut golden_child, golden_pid, _golden_log) = common::spawn_fcvm_with_env_and_log_path(
         &[
@@ -1033,7 +1039,7 @@ async fn a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs
         common::poll_health_by_pid(golden_pid, 180).await?;
         let running = common::exec_in_vm(golden_pid, &[FREEZE]).await?;
         anyhow::ensure!(
-            running.trim() == "0",
+            running.trim() == RUNNING,
             "the source's container cgroup is not where the test reads it: {running:?}"
         );
         common::create_snapshot_by_pid(golden_pid, &snapshot_name).await
@@ -1093,12 +1099,30 @@ async fn a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs
         }
         let refused = String::from_utf8_lossy(&create.stderr);
         anyhow::ensure!(
-            refused.contains("restore"),
+            refused.contains(NOT_ACKNOWLEDGED),
             "snapshot create of a restoring clone failed for another reason: {refused}"
         );
+        // The guest's own refusal, which the host's stands in front of: each one-shot,
+        // run in the held clone, exits with the refused status and names the restore. The
+        // exec server is up in the hold; neither one-shot waits for the restore's lock.
+        for one_shot in ["--prepare-snapshot-network", "--resume-snapshot-network"] {
+            let ran = tokio::time::timeout(
+                Duration::from_secs(20),
+                common::exec_in_vm(
+                    clone_pid,
+                    &[&format!("/usr/local/bin/fc-agent {one_shot} 2>&1; echo exit=$?")],
+                ),
+            )
+            .await
+            .with_context(|| format!("{one_shot} waited in a restoring clone"))??;
+            anyhow::ensure!(
+                ran.contains("exit=3") && ran.contains("a restore is under way in this guest"),
+                "{one_shot} was not refused for the restore: {ran}"
+            );
+        }
         let frozen = common::exec_in_vm(clone_pid, &[FREEZE]).await?;
         anyhow::ensure!(
-            frozen.trim() == "1",
+            frozen.trim() == FROZEN,
             "the refused snapshot thawed the restoring clone's container: {frozen:?}"
         );
         let gate = common::exec_in_vm(clone_pid, &[GATE_CHAINS]).await?;
@@ -1118,7 +1142,7 @@ async fn a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs
             "the hold ended before the watchdog's deadline, so nothing was tested"
         );
         anyhow::ensure!(
-            frozen.trim() == "1",
+            frozen.trim() == FROZEN,
             "the container was thawed behind the closed gate, {:?} into its restore: {frozen:?}",
             held.elapsed()
         );
@@ -1127,7 +1151,7 @@ async fn a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs
         common::poll_health_by_pid(clone_pid, 180).await?;
         let thawed = common::exec_in_vm(clone_pid, &[FREEZE]).await?;
         anyhow::ensure!(
-            thawed.trim() == "0",
+            thawed.trim() == RUNNING,
             "the published clone's container is frozen: {thawed:?}"
         );
         let marks = common::exec_in_vm(
