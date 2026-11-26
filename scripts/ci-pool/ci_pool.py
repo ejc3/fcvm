@@ -917,7 +917,10 @@ def waited_minutes(job):
         return None
     if not job.get('created_at') or not job.get('started_at'):
         return None
-    return max(0.0, (instant(job['started_at']) - instant(job['created_at'])).total_seconds()) / 60
+    waited = (instant(job['started_at']) - instant(job['created_at'])).total_seconds() / 60
+    # The API gives some jobs a creation time after their start. That is no wait of zero:
+    # it is a wait that was not recorded.
+    return waited if waited >= 0 else None
 
 
 def usd(kind, minutes):

@@ -588,6 +588,8 @@ class Cost(unittest.TestCase):
         self.assertIsNone(ci_pool.waited_minutes(self.job('Host-arm64', 'success', 30, self.ARM)))
         self.assertIsNone(ci_pool.waited_minutes(dict(job, conclusion='skipped')))
         self.assertIsNone(ci_pool.waited_minutes(dict(job, runner_name=False)))
+        self.assertIsNone(ci_pool.waited_minutes(dict(job, created_at='2026-01-01T00:05:00+00:00')),
+                          'a job created after it started was counted as having waited zero minutes')
         account = ci_pool.summarise([self.a_run(1)], {1: [job, dict(job, created_at='2025-12-31T23:30:00+00:00'),
                                                           dict(self.job('Lint', 'success', 3, ['ubuntu-latest']),
                                                                created_at='2025-12-31T23:59:58+00:00')]})
