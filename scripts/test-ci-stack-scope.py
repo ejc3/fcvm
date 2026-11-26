@@ -235,6 +235,21 @@ class PrScope(Harness):
                               ('src/confine.rs', 'true'),
                               ('src/firecracker/vm.rs', 'true'),
                               ('src/hypervisor/firecracker.rs', 'true'),
+                              # The pre_exec and keep_fds, the preflight and the restore's
+                              # thread check, setup's compile and digest, the assertion
+                              # every gate test makes, and the gate's filter and count.
+                              ('src/utils.rs', 'true'),
+                              ('src/commands/common.rs', 'true'),
+                              ('src/setup/kernel.rs', 'true'),
+                              ('tests/common/mod.rs', 'true'),
+                              ('Makefile', 'true'),
+                              # The Firecracker pin and [confine], their parser, and the
+                              # two commands that call the preflight.
+                              ('rootfs-config.toml', 'true'),
+                              ('src/setup/rootfs.rs', 'true'),
+                              ('src/commands/snapshot.rs', 'true'),
+                              ('src/commands/podman/mod.rs', 'true'),
+                              ('src/setup/pasta.rs', 'false'),
                               ('scripts/confine-gate.sh', 'true'),
                               ('tests/test_confine.rs', 'true'),
                               ('src/main.rs', 'false'),

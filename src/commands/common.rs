@@ -1636,9 +1636,10 @@ fn merge_with(
 /// For a confined start, as soon as its Firecracker binary is known and before anything is
 /// created: the binary has the seccomp filter `fcvm setup` compiled for it, unchanged
 /// ([`crate::confine::Decision::require_filter`]). A host that was upgraded and not set up
-/// again is refused here with nothing started. A binary that cannot be found here fails the
-/// start where it is looked up, with that error; the launch makes this check again on the
-/// binary it runs, and hands the VMM the bytes it checked.
+/// again is refused here with nothing started, and so is a start whose Firecracker binary
+/// cannot be found: no start builds one (`fcvm setup` does), so there is nothing to wait
+/// for. The launch makes this check again on the binary it runs, and hands the VMM the bytes
+/// it checked.
 pub fn require_confined_filter(
     decision: &crate::confine::Decision,
     runtime_config: &RuntimeConfig,
@@ -1646,15 +1647,22 @@ pub fn require_confined_filter(
     if decision.confinement().is_none() {
         return Ok(());
     }
+    let unfound = |why: String| {
+        anyhow::anyhow!(
+            "this start must be confined and cannot be; nothing was started:\n  seccomp: \
+             {why}, so its confined seccomp filter cannot be checked. Run `fcvm setup`"
+        )
+    };
     let firecracker = match runtime_config.firecracker_bin.clone() {
         Some(path) => path,
-        None => match find_firecracker(runtime_config) {
-            Ok(path) => path,
-            Err(_) => return Ok(()),
-        },
+        None => find_firecracker(runtime_config)
+            .map_err(|error| unfound(format!("no Firecracker binary was found ({error:#})")))?,
     };
     if !firecracker.exists() {
-        return Ok(());
+        return Err(unfound(format!(
+            "the Firecracker binary {} does not exist",
+            firecracker.display()
+        )));
     }
     decision.require_filter(&firecracker)
 }
@@ -8384,6 +8392,36 @@ mod tests {
             .await;
         crate::companion::forget(holder_pid);
         crate::network::netns_agent::forget(holder_pid);
+    }
+
+    /// A confined start whose Firecracker binary cannot be found is refused at the
+    /// preflight, where nothing has been created yet. It used to pass there and fail at the
+    /// launch, after namespaces and disks existed.
+    #[test]
+    fn the_confined_preflight_refuses_a_binary_it_cannot_find() {
+        let confined = crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+            landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+            layers: vec![
+                crate::confine::Layer::Process,
+                crate::confine::Layer::Seccomp,
+            ],
+            core_limit: 1,
+            seccomp: Some(crate::confine::SeccompMode::Enforce),
+        }));
+        let absent = super::RuntimeConfig {
+            firecracker_bin: Some("/nonexistent/firecracker".into()),
+            ..super::RuntimeConfig::default()
+        };
+        let refused = super::require_confined_filter(&confined, &absent)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("nothing was started")
+                && refused.contains("/nonexistent/firecracker does not exist"),
+            "{refused}"
+        );
+        // An unconfined start needs no filter and is not asked for the binary here.
+        super::require_confined_filter(&crate::confine::Decision::for_test(None), &absent).unwrap();
     }
 
     /// `SO_NETNS_COOKIE` of a socket: the identity of the network namespace it was made in.
