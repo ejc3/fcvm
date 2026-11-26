@@ -569,9 +569,15 @@ logon to the restored session until the desktop has stood still for 5 s.
 | 1, 4, 8 | CPU per clone, 20 to 25 s after healthy | 0.58 to 0.60 | 0.12 to 0.14 |
 | 1, 4, 8 | desktop | 7.3 to 7.6 s | 7.3 to 7.8 s |
 
-Every clone of both builds mapped the memory file. Memory differs by 4 to 5 percent between
-the two gold snapshots; one gold was made per build, so this run does not separate the
-build's effect on memory from the gold's. The one clone restored seconds after its snapshot
+Two effects of the build hold: time to healthy (0.62 to 0.75 s against 0.81 to 1.01 s for
+eight at once), and the exits Windows takes to read its clock on the fork, profiled below
+(the CPU row is their burst 20 to 25 s after a restore).
+
+Memory per clone is not an effect of the build. Every clone of both builds mapped the memory
+file, and PSS differs by 4 to 5 percent between the two gold snapshots, upstream's the
+larger. One gold was made per build, and a run of the same script the day before, on the
+same host type with other golds, had the order reversed (373 to 376 MiB at eight on
+upstream against 411 to 418 on the fork). The one clone restored seconds after its snapshot
 was written counted all its resident memory as private dirty (1,604 and 1,664 MiB), and one
 restored 12 minutes later counted 240 MiB, so the private dirty row leaves the first one
 out. Making the gold: cold boot to healthy 17.6 s on both, first logon to a settled desktop
