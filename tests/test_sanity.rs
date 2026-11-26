@@ -502,7 +502,7 @@ fn saved_enables_and_pending_tables(state_json: &std::path::Path) -> Result<Vec<
     let rdist: Vec<u32> = serde_json::from_value(gic["Kvm"]["rdist"].clone())
         .context("the vGIC state has no rdist array")?;
     anyhow::ensure!(
-        !rdist.is_empty() && rdist.len() % 24 == 0,
+        !rdist.is_empty() && rdist.len().is_multiple_of(24),
         "rdist has {} words, not 24 per vCPU",
         rdist.len()
     );
