@@ -332,3 +332,38 @@ fn a_config_that_will_not_load_is_an_error_not_a_panic() {
         "stderr: {stderr}"
     );
 }
+
+/// `fcvm paths --json` prints the directories `fcvm::paths` resolves, as one JSON object: the
+/// data directory FCVM_DATA_DIR names and its state directory (`paths::state_dir`, today
+/// `<data_dir>/state`; this test follows that function if it moves). It reads no VM state
+/// and makes nothing: the data directory is still empty afterwards.
+#[test]
+fn paths_prints_the_directories_the_path_functions_resolve() {
+    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
+    let data = tempfile::tempdir().expect("temporary data directory");
+    let output = Command::new(&fcvm_path)
+        .args(["paths", "--json"])
+        .env("FCVM_DATA_DIR", data.path())
+        .output()
+        .expect("failed to run fcvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "one JSON line, got: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(lines[0]).expect("a JSON object");
+    assert_eq!(
+        value["data_dir"],
+        data.path().to_str().expect("UTF-8 temp path"),
+        "{stdout}"
+    );
+    assert_eq!(
+        value["state_dir"],
+        data.path().join("state").to_str().expect("UTF-8 temp path"),
+        "{stdout}"
+    );
+    let made: Vec<_> = std::fs::read_dir(data.path())
+        .expect("read the data directory")
+        .collect();
+    assert!(made.is_empty(), "fcvm paths created {made:?}");
+}

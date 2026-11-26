@@ -400,7 +400,7 @@ Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace
 - Requires root and a host with a global IPv6 /64 subnet (or `--ipv6-prefix` to specify one explicitly)
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
 - Each VM gets a unique IPv6 derived from the host's /64 prefix, or the address `--ipv6-address` names inside the prefix in use (not its address 0 or 1)
-- A VM leases its address before using it: an exclusive `flock` on `/run/fcvm/routed-ipv6/<address>.lock`, held until its network is torn down and released by the kernel if the process dies. Of two VMs that ask for one address together, exactly one gets it. If the lease is free but the host already has a /128 route for the address, in any routing table, the route belongs to something other than a live fcvm VM (the host itself, a VM that died without cleanup, another program), so a given address is refused and a derived one is re-derived
+- A VM leases its address before using it: an exclusive `flock` on `/run/fcvm/routed-ipv6/<address>.lock`, held until its network is torn down and released by the kernel if the process dies. A killed VM's lease file is removed by a sweep of the directory, which a start runs at most once per 5 s (`src/sweep.rs`); a start holds the directory's `flock` shared while it opens and locks its own file, and the sweep tries the files' locks only under that lock held exclusively. Of two VMs that ask for one address together, exactly one gets it. If the lease is free but the host already has a /128 route for the address, in any routing table, the route belongs to something other than a live fcvm VM (the host itself, a VM that died without cleanup, another program), so a given address is refused and a derived one is re-derived
 - Port forwarding via built-in TCP proxy (`setns` + tokio relay): a mapping listens on its HOSTIP, or on the VM's loopback IP (same allocation as rootless) when it names none
 - Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
 
@@ -1357,7 +1357,7 @@ command runs, and every child (Firecracker, holder, pasta) and every in-process 
 | unprivileged | stays in its own cgroup, one log line |
 | `--no-swap` | `memory.swap.max=0` on the scope before the VMM starts; refused when there is no scope with a memory controller |
 | lifetime | pdeathsig is per process and survives the move: a VM dies with its launcher where the launcher armed it; a foreground fcvm dies with its terminal's SIGHUP; a detached one outlives the session |
-| removal | at exit fcvm moves back to the cgroup it came from and removes the scope; each entry sweeps scopes whose (pid, start time) is gone, and empty `fcvm-<pid>.scope`s of earlier releases, under an `flock` on the parent that covers the empty window between a scope's `mkdir` and its owner's entry. The name is the owner record, not a `reclaim` record, because reclaim records are per data_dir and per user and a cgroup is per kernel |
+| removal | at exit fcvm moves back to the cgroup it came from and removes the scope; a start sweeps the parent when a sweep is due (`src/sweep.rs`: at most once per 5 s and parent, behind a stamp under `<data_dir>/cgroup-sweep/`), removing the scopes whose (pid, start time) is gone and the empty `fcvm-<pid>.scope`s of earlier releases. A start holds the parent's `flock` shared across the empty window between its scope's `mkdir` and its entry, and a sweep removes only under that lock held exclusively, which it waits for at most 100 ms. The name is the owner record, not a `reclaim` record, because reclaim records are per data_dir and per user and a cgroup is per kernel |
 
 ---
 
@@ -1631,6 +1631,7 @@ One async session per connection:
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm balloon` | Print a VM's balloon target and size; with MIB, set the target first |
 | `fcvm ls` | List running VMs |
+| `fcvm paths` | Print the state and data directories this binary uses |
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Spawn clone from memory server |
@@ -2110,6 +2111,25 @@ my-nginx       12345   running   healthy   bridged   nginx:alpine
 clone-1        12350   running   healthy   rootless  (clone)
 ```
 
+#### `fcvm paths`
+
+**Purpose**: Name the directories this binary keeps VM state and data in, for tools
+outside fcvm that read state files (the benchmark harnesses under `bench/`).
+
+**Usage**:
+```bash
+fcvm paths [--json]
+```
+
+With `--json` it prints one JSON object on one line, for example
+`{"state_dir":"/mnt/fcvm-btrfs/state","data_dir":"/mnt/fcvm-btrfs"}`; without, one
+`name<TAB>path` line per directory. Each value is what `paths::state_dir()` and
+`paths::data_dir()` return for this config and `FCVM_DATA_DIR`, so a tool that asks
+follows the binary wherever it keeps its state. Fields are added, never renamed or
+removed. It reads no VM state and creates nothing. A tool asks with the binary and
+environment its VMs run with: `sudo` without `-E` drops FCVM_DATA_DIR, and the answer
+under it is then the configured directory, as it is for the VMs.
+
 #### `fcvm balloon`
 
 **Purpose**: Read or set the balloon target of a running VM.
@@ -2247,6 +2267,7 @@ fcvm/
 │   │   ├── common.rs       # Shared utilities
 │   │   ├── exec.rs         # fcvm exec
 │   │   ├── ls.rs           # fcvm ls
+│   │   ├── paths.rs        # fcvm paths
 │   │   ├── podman.rs       # fcvm podman run
 │   │   ├── setup.rs        # fcvm setup
 │   │   ├── snapshot.rs     # fcvm snapshot {create,serve,run} + UFFD server
@@ -2409,7 +2430,7 @@ Override with `FCVM_BASE_DIR` environment variable.
 │   └── {vm-id}/disks/rootfs.raw
 ├── snapshots/         # Firecracker snapshots
 ├── state/             # VM state JSON files
-│   └── {vm-id}.json
+│   └── vms/<b>/{vm-id}.json
 └── cache/             # Downloaded images and packages
     ├── ubuntu-24.04-arm64-{sha}.img  # Cloud image cache
     └── packages-{sha}/               # Downloaded .deb files
