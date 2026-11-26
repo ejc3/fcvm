@@ -87,6 +87,13 @@ jobs:
       - name: Runner kernel check
         working-directory: fcvm
         run: ./scripts/check-runner-kernel.py
+      # Directly after the kernel check, so a job that fails in any later step still uploads
+      # its own captures, and none of an earlier job's (#2164).
+      - name: Create test log directory
+        id: test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
         run: |
@@ -135,11 +142,6 @@ jobs:
           mkdir -p ~/.config/containers
           printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/fcvm-btrfs/containers/storage"\n' > ~/.config/containers/storage.conf
           podman system migrate || true
-      - name: Create test log directory
-        id: test-logs
-        run: |
-          sudo rm -rf /tmp/fcvm-test-logs
-          mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true

@@ -16,10 +16,14 @@ snapshots it finds nothing, which `v614_sound_without_snapshots` then proves.
 
 | Command | Searches | States visited | Wall time | Peak memory |
 |---|---|---|---|---|
-| `lake exe breaks` | 76 (6 rule books x 12 configurations, 4 restore orders) | 449,763,133 | 7 min 50 s as seven processes side by side (one a rule book, 6.5 to 7.9 min each, and 2 min for the restore orders); 45 min 33 s of CPU in all | 3.3 GB a process |
+| `JOBS=7 ./search-expected.sh full` | 76 (6 rule books x 12 configurations, 4 restore orders) | 449,763,133 | 7 min 53 s as seven processes side by side (one a rule book, and one for the restore orders); about 45 min of CPU in all | 3.3 GB a process |
 
-Run on 2026-11-25 on the tree this file is committed with, on a shared arm64 dev box. One process
-for all 76 searches takes the sum and was not timed. No search hit its state limit. The largest (v7.3.3 with host page faults in the lock, call and
+Run on 2026-11-26 on a shared arm64 dev box. One process for all 76 searches takes the sum and
+was not timed. No search hit its state limit. What every search printed (its states, each kind
+with its count and the length of its shortest run, the audit's numbers) is committed as
+`WakeVerify/search.expected`, and `search-expected.sh` fails on any difference from it, in either
+direction: `quick` (19 searches) in `make verify` and in CI, `full` (all 76) in `make
+verify-search` and the dispatch job. The largest (v7.3.3 with host page faults in the lock, call and
 idle paths) has 8,905,216 states. Each search is followed by the audit (README.md, "Audited"):
 under the design no vCPU is ever unable to run again, in any configuration; under the other rule
 books a search that has such states has between 532 and 32,928 of them, and every dead vCPU has a
@@ -30,7 +34,9 @@ flag of its own there or ahead. Every process exits 0.
 Rule books across, configurations down. **C**: a completion cleared the kick (#2125). **S**: the
 snapshot does not hold the kick (#2131). **W**: the restore's wake-everyone completion cleared the
 restore kick (#2132). **M**: a write-back of `mp_state` cleared the kick (outside the design).
-"none": no reachable state breaks any property, and no vCPU is ever dead.
+"none": no reachable state breaks any property, and the audit finds no vCPU that can never run
+again. The first half is a theorem for the design (below the table); the second is the audit's
+result on the searched configurations, and is not a theorem for any column.
 
 Each letter stands for the hang (`NoLostKick` with interrupts off, at a queue head and at a queue
 node), the missing waker (`HasWaker`), and the stuck cross-CPU call that follows (`NoStuckCall`).
@@ -60,9 +66,11 @@ sleeper is woken by its next interrupt:
 | outside the design: the VMM writes `mp_state` back on a paused VM | S | C M S | none | C M W | M S | M |
 
 Every configuration has devices and a tick (`Cfg.rescue`), and, unless it says otherwise, host
-page faults in ordinary code only. The design's column is also a theorem for every row but the
-last (`design_noLostKick`, `design_hasWaker` and the others in `Proofs.lean`), without the
-searches' bounds.
+page faults in ordinary code only. For the design's column, "no reachable state breaks any
+property" is also a theorem for every row but the last (`design_noLostKick`, `design_hasWaker` and
+the others in `Proofs.lean`), without the searches' bounds. "No vCPU is ever dead" is not: it is
+what the audit found in these twelve searches of the design, and nothing more (README.md,
+"Audited").
 
 Under v7.3.3 as it is (second column) the search also reports the wake-everyone completion
 clearing a kick. That is C, not W: there is no restore kick in that rule book. A VM restored twice
@@ -325,9 +333,11 @@ and judged each by reading. They are transitions of the model, and the search de
 
 ## What each theorem rests on
 
-`Axioms.lean` sweeps everything declared in the library's modules on every build and fails on any axiom beyond
-`propext`, `Quot.sound` and `Classical.choice`. It also prints, and pins, the axioms of the
-theorems about the design:
+`Axioms.lean` sweeps everything declared in the library's modules and fails on any axiom beyond
+`propext`, `Quot.sound` and `Classical.choice`. `lake build` elaborates that file only when
+something it imports changed; `check-sweep.sh` elaborates it on every run of `make verify` and of
+the CI job, and `check-imports.sh` fails when a file of the library is not among its imports. It
+also prints, and pins, the axioms of the theorems about the design:
 
 ```
 design_noLostKick, design_noHang, design_hasWaker, design_noMutualSleep, design_noStuckCall,

@@ -17,25 +17,57 @@
 #
 # The kernel source is fetched, not kept in this repository.
 #
-# Exit status: 0 every kernel agrees and the self-test found its differences, 1 a kernel
-# disagrees with its rule book, 2 BLOCKED: a step could not be carried out. harness/test-run.sh
-# tests the last of these.
+# Exit status: 0 every kernel agrees, compares the number of operations operations.expected
+# gives, and the self-test found its differences; 1 a kernel disagrees with its rule book, or a
+# count differs from operations.expected; 2 BLOCKED: a step could not be carried out (a tool
+# missing, a fetch, the patch, the cut, the compiler, the generation of the operations, the
+# comparison itself). harness/test-run.sh tests each BLOCKED path and the count.
+#
+# The build directory is harness/build, or $HARNESS_BUILD. One run at a time uses it: a second
+# run on the same directory waits for the first.
 #
 # usage: harness/run.sh            from verify/, or through `make verify-harness`
-set -euo pipefail
+set -Eeuo pipefail
+
+blocked() {
+  echo "BLOCKED: $*" >&2
+  exit 2
+}
+# Any command that fails where its failure is not asked about ends the run as BLOCKED, never
+# as a disagreement (exit 1 is a verdict about the kernel's functions).
+trap 'blocked "harness/run.sh line $LINENO failed"' ERR
 
 here=$(cd "$(dirname "$0")" && pwd)
 verify=$(dirname "$here")
 repo=$(dirname "$verify")
-build="$here/build"
+build=${HARNESS_BUILD:-$here/build}
+expected_counts=${HARNESS_EXPECTED:-$here/operations.expected}
 base=https://raw.githubusercontent.com/gregkh/linux
 patch_file="$repo/kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch"
 
-for tool in curl sha256sum python3 cc lake diff patch; do
+for tool in curl sha256sum python3 cc lake diff patch grep sed paste head wc flock awk; do
   command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
 done
+[ -s "$expected_counts" ] || blocked "$expected_counts is missing or empty"
+
+# Every run of Breaks.lean is in `recordedRuns`, the hand-kept list `lake exe hostops` replays:
+# a run left out of it would be recorded and never driven through the kernel's functions.
+missing=$(python3 - "$verify/WakeVerify/Breaks.lean" <<'PY'
+import re, sys
+text = open(sys.argv[1]).read()
+defined = re.findall(r"^def (Run\.\w+) :", text, re.M)
+block = text[text.index("def recordedRuns"):]
+listed = set(re.findall(r"Run\.\w+", block))
+if not defined or not listed:
+    sys.exit("no runs found in Breaks.lean")
+print(" ".join(r for r in defined if r not in listed))
+PY
+)
+[ -z "$missing" ] || blocked "Breaks.lean defines $missing and recordedRuns does not list it"
 
 mkdir -p "$build/src"
+exec 9> "$build/.lock"
+flock 9
 while read -r sum path; do
   tag=${path%%/*}
   file=${path#*/}
@@ -106,11 +138,6 @@ build_one() {
     -DCUT="\"$out/cut.c\"" -I"$here" -o "$out/harness" "$here/harness.c"
 }
 
-blocked() {
-  echo "BLOCKED: $*" >&2
-  exit 2
-}
-
 # Run one variant's functions against one rule book's expectations. Returns 0 when they agree and
 # 1 when they differ, with the differences on stdout. Both callers use it as a condition, where
 # `set -e` does not apply, so every step is checked here: a step that could not be carried out
@@ -134,11 +161,29 @@ compare() {
   return "$rc"
 }
 
+# The number of operations operations.expected gives for a name, or nothing.
+expected_count() {
+  awk -v name="$1" '$1 == name { print $2 }' "$expected_counts"
+}
+# check_count NAME FOUND: the count is a number and is the one the file gives.
+check_count() {
+  local name=$1 found=$2 want
+  want=$(expected_count "$name")
+  case "$want" in '' | *[!0-9]*) blocked "$expected_counts has no count for $name" ;; esac
+  if [ "$found" != "$want" ]; then
+    echo "$name: $found operations, and operations.expected says $want: the documents quote the second (update the file and them together)" >&2
+    status=1
+  fi
+}
+
 status=0
 for variant in v6.14 v7.3.3 v7.3.3-patched; do
   build_one "$variant"
   if compare "$variant" "$variant" > "$build/$variant/diff.txt"; then
-    echo "$variant: $(wc -l < "$build/$variant/ops-$variant.txt") operations, the kernel's functions agree with the model"
+    count=$(wc -l < "$build/$variant/ops-$variant.txt")
+    case "$count" in '' | *[!0-9]*) blocked "the operations of $variant could not be counted" ;; esac
+    echo "$variant: $count operations, the kernel's functions agree with the model"
+    check_count "$variant" "$count"
   else
     echo "$variant: the kernel's functions DISAGREE with the model:" >&2
     head -20 "$build/$variant/diff.txt" >&2
@@ -151,13 +196,14 @@ done
 self=0
 compare v7.3.3 v7.3.3-patched > "$build/v7.3.3/self-test.txt" || self=$?
 differing=$(grep -c '^<' "$build/v7.3.3/self-test.txt" || true)
+case "$differing" in
+  '' | *[!0-9]*) blocked "the self-test's count of differing operations could not be read: '$differing'" ;;
+esac
 if [ "$self" = 0 ]; then
-  echo "BLOCKED: the harness cannot tell v7.3.3 from v7.3.3 with the #2130 patch" >&2
-  status=2
+  blocked "the harness cannot tell v7.3.3 from v7.3.3 with the #2130 patch"
 elif [ "$self" != 1 ] || [ "$differing" -lt 1 ]; then
-  echo "BLOCKED: the self-test did not complete (status $self, $differing differing operations)" >&2
-  status=2
-else
-  echo "self-test: v7.3.3's functions against the patched rule book differ in $differing operations, as they must"
+  blocked "the self-test did not complete (status $self, $differing differing operations)"
 fi
+echo "self-test: v7.3.3's functions against the patched rule book differ in $differing operations, as they must"
+check_count self-test "$differing"
 exit $status
