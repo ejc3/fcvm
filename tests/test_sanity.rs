@@ -26,6 +26,123 @@ async fn test_sanity_routed() -> Result<()> {
     sanity_test_impl("routed").await
 }
 
+/// Each vCPU's enabled SGIs and PPIs as KVM holds them, written out as GICR_ISENABLER0:
+/// the E flag of the first 32 interrupts in debugfs `vgic-state`. Needs root. KVM names a
+/// VM's debugfs directory after the thread that created it and the VM's descriptor.
+#[cfg(all(feature = "privileged-tests", target_arch = "aarch64"))]
+fn kvm_enabled_private_interrupts(fcvm_pid: u32) -> Result<Vec<u32>> {
+    let vmm = common::firecracker_child_of(fcvm_pid).context("fcvm has no Firecracker child")?;
+    let threads: Vec<String> = std::fs::read_dir(format!("/proc/{vmm}/task"))?
+        .filter_map(|task| Some(task.ok()?.file_name().to_string_lossy().into_owned()))
+        .collect();
+    let dir = std::fs::read_dir("/sys/kernel/debug/kvm")
+        .context("reading /sys/kernel/debug/kvm (is debugfs mounted, and is this root?)")?
+        .filter_map(|entry| entry.ok())
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .split_once('-')
+                .is_some_and(|(thread, _)| threads.iter().any(|t| t == thread))
+        })
+        .with_context(|| format!("no KVM debugfs directory for Firecracker {vmm}"))?;
+    let state = std::fs::read_to_string(dir.path().join("vgic-state"))?;
+    let mut enabled: Vec<u32> = Vec::new();
+    for line in state.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            ["VCPU", ..] => enabled.push(0),
+            // TYP ID TGT_ID PLAEHCG ...
+            ["SGI" | "PPI", id, _, flags, ..] if flags.len() == 7 => {
+                if flags.as_bytes()[3] == b'1' {
+                    *enabled
+                        .last_mut()
+                        .context("an interrupt row before the first VCPU header")? |=
+                        1 << id.parse::<u32>()?;
+                }
+            }
+            _ => {}
+        }
+    }
+    anyhow::ensure!(!enabled.is_empty(), "no vCPU in {}", dir.path().display());
+    Ok(enabled)
+}
+
+/// #2172: Firecracker's arm64 restore wrote the saved enable bits to GICR_ICENABLER0 and
+/// then to GICR_ISENABLER0, which leaves `current | saved`. KVM creates a vCPU with its
+/// sixteen SGIs enabled, so every SGI the guest had disabled came back enabled: SGIs 8 to
+/// 15 of an online CPU, and all sixteen of a CPU the guest had taken offline.
+///
+/// The guest takes CPU 1 offline, so the two vCPUs' enables differ and vCPU 1 has none.
+/// KVM's own state of a clone has to equal the source's, vCPU by vCPU.
+#[cfg(all(feature = "privileged-tests", target_arch = "aarch64"))]
+#[tokio::test]
+async fn test_restore_keeps_each_vcpus_enabled_interrupts() -> Result<()> {
+    use std::time::Duration;
+
+    let (vm_name, clone_name, tag, _) = common::unique_names("gic-enables");
+    // Cold boot: the source's state is then what the guest made it, not what an earlier
+    // restore left.
+    let (_child, pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--cpu",
+            "2",
+            common::TEST_IMAGE,
+        ],
+        &[("FCVM_NO_SNAPSHOT", "1")],
+    )
+    .await?;
+    let result = async {
+        common::poll_health_by_pid(pid, 240).await?;
+        let online = common::exec_in_vm(
+            pid,
+            &["echo 0 > /sys/devices/system/cpu/cpu1/online; cat /sys/devices/system/cpu/online"],
+        )
+        .await?;
+        anyhow::ensure!(
+            online.trim() == "0",
+            "guest CPU 1 did not go offline: {online}"
+        );
+        let source = kvm_enabled_private_interrupts(pid)?;
+        anyhow::ensure!(
+            source.len() == 2 && source[0] & (1 << 27) != 0 && source[1] == 0,
+            "the source's vCPU 0 should have its timer interrupt enabled and its offline \
+             vCPU 1 nothing: {source:#010x?}"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            common::create_snapshot_by_pid(pid, &tag),
+        )
+        .await
+        .context("snapshot create timed out")??;
+        let (_clone, clone_pid) =
+            common::spawn_fcvm(&["snapshot", "run", "--snapshot", &tag, "--name", &clone_name])
+                .await?;
+        let clone = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            let restored = kvm_enabled_private_interrupts(clone_pid)?;
+            anyhow::ensure!(
+                restored == source,
+                "the clone's enabled SGIs and PPIs (GICR_ISENABLER0 per vCPU) are \
+                 {restored:#010x?}, and the source's were {source:#010x?}"
+            );
+            Ok(())
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        clone
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&tag));
+    result
+}
+
 async fn sanity_test_impl(network: &str) -> Result<()> {
     use std::time::Duration;
 

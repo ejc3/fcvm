@@ -3566,12 +3566,51 @@ branch = "agent/nv2"
     /// without the kick can halt a vCPU with interrupts off for good (#2131).
     const RESTORE_KICK_COMMITS: [&str; 3] = [
         // [firecracker]: the default, btrfs and mountinfo profiles.
-        "2a33289b55b7f611959891dd5295438a416f386e",
+        "cf5d302d87823789dfdc4df30bfb98c10371cb6f",
         // gpu.amd64 and phone.amd64.
         "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
         // nested.amd64.
         "af888e7aec38fe4727fd75878aaed017a3113028",
     ];
+
+    /// The fork commits whose arm64 snapshot load writes the complement of the saved bits to
+    /// the vGIC's clear-registers (`VgicRegEngine::clears_on_write`, ejc3/firecracker), one
+    /// for each branch an arm64 profile builds. A load that writes the saved bits themselves
+    /// leaves every interrupt enabled that the new VM starts with and the guest had
+    /// disabled: all sixteen SGIs of each vCPU (#2172).
+    const RESTORE_CLEARS_GIC_STATE_COMMITS: [&str; 3] = [
+        // [firecracker]: the default and btrfs profiles.
+        "cf5d302d87823789dfdc4df30bfb98c10371cb6f",
+        // gpu.arm64.
+        "51247b891bceddcdd06169f61d5a64b33f5e0ba5",
+        // nested.arm64.
+        "8750b52190681dbc6fbf633243e1793b1841290d",
+    ];
+
+    /// A pin that moves to a commit without that fix brings #2172 back, and only a test that
+    /// reads KVM's own state as root would say so.
+    #[test]
+    fn every_arm64_firecracker_pin_restores_the_gic_enables_as_saved() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let global = &plan.firecracker.as_ref().unwrap().commit;
+        let mut checked = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            let Some(profile) = arches.get("arm64") else {
+                continue;
+            };
+            // A profile that names no fork of its own runs the [firecracker] build.
+            let commit = profile.firecracker_commit.as_ref().unwrap_or(global);
+            checked += 1;
+            assert!(
+                RESTORE_CLEARS_GIC_STATE_COMMITS.contains(&commit.as_str()),
+                "{name}.arm64 pins Firecracker {commit}, which is not known to restore the \
+                 vGIC's enable bits as saved. Add it to RESTORE_CLEARS_GIC_STATE_COMMITS once \
+                 `git merge-base --is-ancestor <a listed commit of its branch> {commit}` \
+                 succeeds in the fork, or the fix has been cherry-picked onto it"
+            );
+        }
+        assert!(checked > 3, "only {checked} arm64 profiles were checked");
+    }
 
     /// A pin that moves to a commit without the restore kick brings #2131 back with no test
     /// of fcvm's failing: the window is a few guest instructions wide.

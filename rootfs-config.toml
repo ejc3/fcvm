@@ -102,8 +102,8 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-pv-kick-restore"
-commit = "2a33289b55b7f611959891dd5295438a416f386e"
+branch = "agent/uffd-minor-v1.17.0-gic-clear-restore"
+commit = "cf5d302d87823789dfdc4df30bfb98c10371cb6f"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
@@ -358,8 +358,8 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # 6 GiB guest's detach (DESIGN.md "arm64: g5g.metal", #1317). amd64 stays on the
 # previous commit until the change is measured on a g4dn.metal.
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/vfio-keep-dma-on-detach"
-firecracker_commit = "afeb8da92d1d6aaaa4ff009e8df88aafbfc3b1a4"
+firecracker_branch = "agent/vfio-keep-dma-on-detach-gic-clear-restore"
+firecracker_commit = "51247b891bceddcdd06169f61d5a64b33f5e0ba5"
 firecracker_args = "--enable-pci"
 # On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
 # to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
@@ -513,8 +513,8 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # the snapshot but its notification is not, and under EVENT_IDX the guest never
 # notifies again, so the clone never reached the host over vsock (#1207).
 firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "fix/vsock-restore-tx-kick-nv2"
-firecracker_commit = "dbea5779fb3777e5f237e8cc1d0d15e4e1d22448"
+firecracker_branch = "fix/vsock-restore-tx-kick-nv2-gic-clear-restore"
+firecracker_commit = "8750b52190681dbc6fbf633243e1793b1841290d"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM
