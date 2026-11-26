@@ -190,6 +190,7 @@ async fn run(cli: cli::Cli) -> Result<()> {
     // Dispatch to appropriate command handler
     let result = match cli.cmd {
         Commands::Ls(args) => commands::cmd_ls(args).await,
+        Commands::Paths(args) => commands::cmd_paths(args),
         Commands::Podman(args) => commands::cmd_podman(*args).await,
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots(args) => commands::cmd_snapshots(args).await,

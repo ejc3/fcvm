@@ -1366,3 +1366,122 @@ async fn test_prepare_refuses_a_snapshot_that_cannot_fit_before_booting() -> Res
     let _ = common::delete_snapshot(&tag).await;
     Ok(())
 }
+
+/// A VM started with 900 environment variables (32 KB of `KEY=VALUE` text) boots, and its
+/// container holds the last one.
+///
+/// The plan reaches Firecracker as one `PUT /mmds`, and parsing it takes more heap than the
+/// API thread has used before. A glibc build grows that thread's own malloc arena with
+/// mprotect: a body of 22 KB made the API thread call it, and one of 15 KB did not. The
+/// confined policy's api class does not list mprotect (it is the filter of a musl build,
+/// whose heap grows with brk), so that call stopped a confined VMM, until a confined launch
+/// set `MALLOC_ARENA_MAX=1` (`confine::CONFINED_VMM_ENV`). `make test-confine` runs this
+/// with every VMM confined. `--no-snapshot` keeps the start a cold boot, the only start
+/// that sends the whole plan.
+#[tokio::test]
+async fn test_large_boot_plan_rootless() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("large-plan");
+    let variables: Vec<String> = (0..900)
+        .map(|i| format!("FCVM_PLAN_{i:05}=value-{i:05}-xxxxxxxx"))
+        .collect();
+    let mut args = vec![
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--no-snapshot",
+    ];
+    for variable in &variables {
+        args.push("--env");
+        args.push(variable);
+    }
+    args.push(common::TEST_IMAGE);
+    let (mut child, fcvm_pid) = common::spawn_fcvm(&args)
+        .await
+        .context("spawning fcvm podman run with a large boot plan")?;
+    let result = async {
+        common::poll_health_by_pid(fcvm_pid, 300).await?;
+        // The helper runs its words as one `sh -c` script in the container.
+        let out = common::exec_in_container(fcvm_pid, &["echo", "$FCVM_PLAN_00899"]).await?;
+        anyhow::ensure!(
+            out.contains("value-00899-xxxxxxxx"),
+            "the container's last variable: {out}"
+        );
+        Ok(())
+    }
+    .await;
+    common::kill_process(fcvm_pid).await;
+    let _ = child.wait().await;
+    result
+}
+
+/// A VM whose Firecracker logs errors only keeps running after its API thread writes the
+/// first one.
+///
+/// glibc reads the zone file (`/etc/localtime`) at the first log line of a process, with
+/// read and lseek. At the default level that line is written while Firecracker starts. With
+/// `FCVM_FIRECRACKER_LOG_LEVEL=Error` nothing is logged until something fails, so the first
+/// line is written under a seccomp filter, by the thread that has the error. The confined
+/// policy's api class is the filter of a musl build, which maps the file instead, and it
+/// listed no lseek: the API thread's first error line stopped a confined VMM. Here the API
+/// thread answers a request whose body has the wrong type, which it logs at Error.
+/// `make test-confine` runs this with every VMM confined.
+#[tokio::test]
+async fn test_first_firecracker_log_line_from_the_api_thread_rootless() -> Result<()> {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (vm_name, _, _, _) = common::unique_names("first-log");
+    let (mut child, fcvm_pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            common::TEST_IMAGE,
+        ],
+        &[("FCVM_FIRECRACKER_LOG_LEVEL", "Error")],
+    )
+    .await
+    .context("spawning fcvm podman run with Firecracker logging errors only")?;
+    let result = async {
+        common::poll_health_by_pid(fcvm_pid, 300).await?;
+        let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+            .load_state_by_pid(fcvm_pid)
+            .await
+            .with_context(|| format!("loading the state of fcvm process {fcvm_pid}"))?;
+        let socket = fcvm::paths::vm_runtime_dir(&state.vm_id).join("firecracker.sock");
+        let body = r#"{"vcpu_count": "x"}"#;
+        let request = format!(
+            "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: \
+             application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .with_context(|| format!("connecting to {}", socket.display()))?;
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = vec![0u8; 1024];
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut response))
+            .await
+            .context("Firecracker's API did not answer within 10 s")??;
+        let response = String::from_utf8_lossy(&response[..read]);
+        anyhow::ensure!(
+            response.starts_with("HTTP/1.1 400"),
+            "Firecracker's answer to a machine-config of the wrong type: {response:?}"
+        );
+        // The line is written before the answer is sent; the VMM is still there if the
+        // guest still answers.
+        let out = common::exec_in_container(fcvm_pid, &["echo", "still-running"]).await?;
+        anyhow::ensure!(out.contains("still-running"), "exec output: {out}");
+        Ok(())
+    }
+    .await;
+    common::kill_process(fcvm_pid).await;
+    let _ = child.wait().await;
+    result
+}

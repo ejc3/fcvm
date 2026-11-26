@@ -108,13 +108,13 @@ fi
 unset fcvm_log_ok fcvm_log_parts fcvm_log_part
 URL="${URL:-http://127.0.0.1:8000/medium.html}"
 
-STATE_DIR="${STATE_DIR:-/mnt/fcvm-btrfs/state}"
-DATA_ROOT="${DATA_ROOT:-$(dirname "$STATE_DIR")}"
+# The data root. Unset, it is fcvm's own data directory (load_fcvm_paths). The
+# state directory is never derived from it: STATE_DIR is fcvm's answer.
+DATA_ROOT="${DATA_ROOT:-}"
 # fcvm resolves snapshots/ (and the generation lock this harness shares with
-# it) from FCVM_DATA_DIR. reqbench derives DATA_ROOT independently; export
-# the alignment so both processes always lock the SAME files even when the
-# caller overrides the paths.
-export FCVM_DATA_DIR="$DATA_ROOT"
+# it) from FCVM_DATA_DIR. When the caller names a data root, export it so both
+# processes always lock the SAME files.
+[ -z "$DATA_ROOT" ] || export FCVM_DATA_DIR="$DATA_ROOT"
 LOADAVG_FILE="${LOADAVG_FILE:-/proc/loadavg}"
 QUIET_LOADAVG1_LIMIT="2.0"
 QUIET_GUARD_LOADAVG1=""
@@ -187,7 +187,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${REQBENCH_STAGED:-0}" != 1 ]; then
         TAG="$TAG" \
         FCVM_LOG="$FCVM_LOG" \
         URL="$URL" \
-        STATE_DIR="$STATE_DIR" \
         DATA_ROOT="$DATA_ROOT" \
         LOADAVG_FILE="$LOADAVG_FILE" \
         bash "$bundle_dir/reqbench.sh" "$@"
@@ -196,7 +195,34 @@ fi
 mkdir -p "$RESULTS/logs"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
+# fcvm's state and data directories, asked of the binary the clones run ($FCVM,
+# the sealed bundle's copy in a staged run) with their privileges and
+# environment ($SUDO, FCVM_DATA_DIR). Every phase calls it and the first call
+# asks, once per invocation. STATE_DIR is fcvm's answer, never a join of
+# DATA_ROOT, so a binary that keeps its state elsewhere is followed. A
+# DATA_ROOT the caller did not give is fcvm's data directory.
+load_fcvm_paths() {
+    [ -z "${FCVM_PATHS_LOADED:-}" ] || return 0
+    local paths rc=0
+    paths=$($SUDO "$FCVM" paths --json) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "FATAL: '${SUDO:+$SUDO }$FCVM paths --json' exited with status $rc (its stderr is above)"
+        return 2
+    fi
+    STATE_DIR=$(jq -er '.state_dir | select(type == "string" and startswith("/"))' \
+        <<<"$paths") \
+        || { log "FATAL: '${SUDO:+$SUDO }$FCVM paths --json' printed no state_dir: $paths"; return 2; }
+    if [ -z "$DATA_ROOT" ]; then
+        DATA_ROOT=$(jq -er '.data_dir | select(type == "string" and startswith("/"))' \
+            <<<"$paths") \
+            || { log "FATAL: '${SUDO:+$SUDO }$FCVM paths --json' printed no data_dir: $paths"; return 2; }
+        export FCVM_DATA_DIR="$DATA_ROOT"
+    fi
+    FCVM_PATHS_LOADED=1
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    load_fcvm_paths || exit 2
     mkdir -p "$DATA_ROOT/reqbench-locks"
     exec {TAG_LOCK_FD}>"$DATA_ROOT/reqbench-locks/$TAG.lock"
     flock -n "$TAG_LOCK_FD" \
@@ -485,12 +511,15 @@ print(rows[0].get("vm_id") or "" if rows else "")'
 }
 
 assert_vm_artifacts_absent() {
-    local vm_id="$1" left=0 path
+    local vm_id="$1" left=0 path bucket
     [[ "$vm_id" =~ ^vm-[0-9a-f]{32}$ ]] \
         || { log "refusing artifact check for invalid vm_id $vm_id"; return 1; }
+    # State layout 2: vms/<bucket>/<vm_id>.json, bucket = first hex digit of sha256(vm_id).
+    bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1)
     for path in \
-        "$STATE_DIR/$vm_id.json" \
-        "$STATE_DIR/$vm_id.json.lock" \
+        "$STATE_DIR/vms/$bucket/$vm_id.json" \
+        "$STATE_DIR/vms/$bucket/$vm_id.json.lock" \
+        "$STATE_DIR/vms/$bucket/$vm_id.json.tmp" \
         "$DATA_ROOT/vm-disks/$vm_id"; do
         if [ -e "$path" ] || [ -L "$path" ]; then
             log "cleanup left exact artifact $path"
@@ -512,6 +541,7 @@ built_image_id_file() {
 }
 
 cmd_build() {
+    load_fcvm_paths || return 2
     log "building $IMAGE"
     local sealed_source ctx built_id id_file id_tmp iid_tmp
     # Fail-fast pre-check. The bundle sealed this invocation's request code at
@@ -589,6 +619,7 @@ cmd_build() {
 }
 
 cmd_golden() {
+    load_fcvm_paths || return 2
     log "golden: podman prepare --tag $TAG (cold build, snapshot at the image health gate, hugepages=$HUGEPAGES)"
     local name="cb-req-g-$RUNID" lf="$RESULTS/logs/golden.log"
     local image_record image_digest image_id image_cache_key
@@ -1151,6 +1182,7 @@ verify_guest_dns() {
 }
 
 cmd_verify() {
+    load_fcvm_paths || return 2
     # Every hop feeds this counter and the function RETURNS it. Each hop used to
     # be `... || echo "HOP X FAILED"`, which makes the compound command SUCCEED —
     # so cmd_verify exited 0 no matter how many hops failed, and `all` (which
@@ -1538,6 +1570,7 @@ snapshot_memory_mib() {
 }
 
 cmd_run() {
+    load_fcvm_paths || return 2
     # Backend/pool sanity BEFORE the quiet gate: these are configuration
     # errors, not load conditions. A hugepage snapshot cannot be restored
     # file-backed — fcvm silently starts a UFFD server and the record would
@@ -1606,7 +1639,7 @@ cmd_run() {
         --out-dir "$RESULTS" --reps "${REPS:-10}" --warmup "${WARMUP:-2}" \
         --cdp-port "$CDP_PORT" --fcvm "$FCVM" --rust-log "$FCVM_LOG" \
         --image "$IMAGE" --image-id "$image_id" --snapshot-name "$TAG" \
-        --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" \
+        --data-root "$DATA_ROOT" \
         --network-mode "$NETMODE" --cpu "$CPU" --memory-mib "$MEM" \
         --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" \
         --engine "$ENGINE" --resolve-poll-ms "${RESOLVE_POLL_MS:-5}" \
@@ -2069,6 +2102,7 @@ PY
 }
 
 cmd_diag() {
+    load_fcvm_paths || return 2
     # The output directory first, before anything under it is removed: this
     # phase is the only writer of $RESULTS/diag from here to the summary's
     # rename. Refusing (exit 3, as the TAG lock does) rather than queueing
@@ -2226,6 +2260,7 @@ cmd_diag() {
 # The open-loop scale benchmark, from this bundle like every measured phase:
 # reqscale.py refuses a golden created by another bundle, fcvm or revision.
 cmd_scale() {
+    load_fcvm_paths || return 2
     local rc=0
     # reqscale.py hands the run directory it created back to this user itself
     # (hand_back_to_invoker); a directory that already existed is refused.
@@ -2234,7 +2269,7 @@ cmd_scale() {
         REQBENCH_SOURCE_REPO="$REPO" \
         REQBENCH_SOURCE_REVISION="${REQBENCH_SOURCE_REVISION:-}" \
         python3 "$HERE/reqscale.py" --snapshot-tag "$TAG" \
-        --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" "$@" || rc=$?
+        --data-root "$DATA_ROOT" "$@" || rc=$?
     verify_runtime_bundle || rc=1
     return $rc
 }

@@ -566,6 +566,37 @@ async fn a_sigkilled_export_leaves_its_temporary_to_the_next_export() -> Result<
     Ok(())
 }
 
+/// Every fcvm start `test_confine.rs` spawns by hand carries the parent-death signal
+/// (CLAUDE.md, "PROCESS TEARDOWN IS PER-HOP"). A refused confined start launches a VMM
+/// before fcvm kills it, so an fcvm that outlived a test nextest killed would keep that VMM
+/// and its holder. The command is armed in the function that spawns it.
+#[test]
+fn every_hand_spawned_confine_start_dies_with_its_test() {
+    const ARMED: &str = "common::set_test_pdeathsig(&mut ";
+    let source = include_str!("test_confine.rs");
+    let spawn = [".spawn", "()"].concat();
+    let mut checked = 0;
+    for (at, _) in source.match_indices(&spawn) {
+        let line_start = source[..at].rfind('\n').map_or(0, |i| i + 1);
+        // `true` exits at once and starts nothing.
+        if source[line_start..at].contains(r#"Command::new("true")"#) {
+            continue;
+        }
+        let function_start = source[..at].rfind("fn ").unwrap_or(0);
+        assert!(
+            source[function_start..at].contains(ARMED),
+            "test_confine.rs spawns a command at byte {at} without arming the parent-death \
+             signal in the same function:\n{}",
+            &source[function_start..at]
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 1,
+        "test_confine.rs spawns no fcvm start any more: this check reads nothing"
+    );
+}
+
 /// Every `fcvm snapshot export` and `fcvm snapshot import` the tests start by hand carries
 /// the parent-death signal (CLAUDE.md, "PROCESS TEARDOWN IS PER-HOP"): one that outlived a
 /// test nextest killed would keep its snapshot's lock. A command is armed between its

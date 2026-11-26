@@ -1946,7 +1946,11 @@ fn record_loopback_client_ports(record: &std::path::Path, ports: &[u16]) -> std:
         std::fs::create_dir_all(parent)?;
     }
     let lines: String = ports.iter().map(|port| format!("{port}\n")).collect();
-    std::fs::write(record, lines)
+    // Written beside the record and renamed over it: a write that fails leaves the record
+    // that names the rewrites still installed.
+    let staged = record.with_extension("staged");
+    std::fs::write(&staged, lines)?;
+    std::fs::rename(&staged, record)
 }
 
 /// The guest ports published with `/loopback`: none when the agent recorded none.
@@ -2341,6 +2345,17 @@ mod loopback_publish_tests {
         let record = dir.path().join("run").join("ports");
         assert!(read_loopback_client_ports(&record).unwrap().is_empty());
         record_loopback_client_ports(&record, &[8097, 61000]).unwrap();
+        // A write that fails keeps the record of the rewrites still installed: the new
+        // content is staged beside the record and renamed over it. (Written in place, the
+        // record was truncated first.)
+        let staged = record.with_extension("staged");
+        std::fs::create_dir(&staged).unwrap();
+        assert!(record_loopback_client_ports(&record, &[9000]).is_err());
+        assert_eq!(
+            read_loopback_client_ports(&record).unwrap(),
+            [8097, 61000].into_iter().collect()
+        );
+        std::fs::remove_dir(&staged).unwrap();
         assert_eq!(
             read_loopback_client_ports(&record).unwrap(),
             [8097, 61000].into_iter().collect()

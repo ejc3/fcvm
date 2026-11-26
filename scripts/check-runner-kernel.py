@@ -54,12 +54,16 @@ kernel on a box (`make install-host-kernel`) and running the VM lanes there; the
 says so.
 
 The window is measured against commit times with the runner's clock, which is trusted: a
-clock ahead of true time shortens the window and one behind lengthens it.
+clock ahead of true time shortens the window and one behind lengthens it. The walk down
+main's first-parent line stops at the first commit dated before the window, so a commit
+pushed to main with an old date ends it early: builds main gave before that commit are
+not found, and a runner on one of them fails (the check errs towards failing).
 
-The script needs Python 3.11.4 or later (tomllib, and tarfile's extraction filter) and,
-for the fetch, git 2.29 or later (`--no-write-fetch-head`); the runner image has Python
-3.12.3 and git 2.43.0, as GitHub's ubuntu-24.04 does. An older Python, like any error this
-script does not expect, exits 2.
+The script needs Python 3.11 (tomllib). Reading main's history also needs 3.11.4 (tarfile's
+extraction filter) and git 2.29 (`fetch --no-write-fetch-head`): on Python 3.11.0 to
+3.11.3 the first verdict and --print-expected work, and the second and third verdicts
+exit 2. The runner image has Python 3.12.3 and git 2.43.0, as GitHub's ubuntu-24.04 does.
+Any error this script does not expect exits 2.
 
 --release, --machine, --now and --root replace `uname -r`, `uname -m`, the clock and
 the checkout, for the tests (scripts/test-check-runner-kernel.py) and for asking what a
@@ -114,6 +118,8 @@ ROLLOUT_HOURS = 24
 # exit (removing its own lock files) before its process group gets SIGKILL.
 GIT_TIMEOUT = 300
 GIT_KILL_GRACE = 10
+# Lines of a failed git command's stderr kept in the message.
+GIT_ERROR_LINES = 4
 
 # Depths tried, in order, when main's history has to be fetched into a shallow
 # repository. main had 35 first-parent commits in the 24 hours before this was written.
@@ -224,8 +230,11 @@ def git(root, *args, binary=False):
             f"`git {args[0]}` did not finish in {GIT_TIMEOUT} s and was {how}"
         ) from error
     if process.returncode != 0:
-        detail = stderr.decode(errors="replace").strip().splitlines()
-        raise Blocked(f"`git {' '.join(args)}` failed: {detail[-1] if detail else 'no output'}")
+        # The last few lines: git's reason is often the line before its "fatal:" summary.
+        detail = [line for line in stderr.decode(errors="replace").splitlines() if line.strip()]
+        raise Blocked(
+            f"`git {' '.join(args)}` failed: {' | '.join(detail[-GIT_ERROR_LINES:]) or 'no output'}"
+        )
     return stdout if binary else stdout.decode().strip()
 
 
