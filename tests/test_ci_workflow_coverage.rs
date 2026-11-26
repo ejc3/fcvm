@@ -3637,7 +3637,16 @@ fn a_pull_request_that_touches_confinement_also_runs_host_x64() {
         "resources/seccomp/*",
         "src/confine.rs",
         "src/firecracker/vm.rs",
+        "src/utils.rs",
+        "src/commands/common.rs",
+        "src/commands/snapshot.rs",
+        "src/commands/podman/mod.rs",
+        "src/setup/kernel.rs",
+        "src/setup/rootfs.rs",
+        "rootfs-config.toml",
         "scripts/confine-*",
+        "tests/common/mod.rs",
+        "|Makefile)",
     ] {
         assert!(
             scope.contains(path),
