@@ -1619,6 +1619,20 @@ def cause_of(gh, job_id):
     return found or []
 
 
+def states_of(run):
+    """A run's lane states for a pool's diagnosis. While the run has not finished, a lane
+    with no job in its current attempt is OPEN: the attempt may still run it, and until
+    then nothing new may be started for it. Without this, the minute between a dispatch or
+    a rerun being asked for and its jobs being listed looks like nothing was asked."""
+    states = lane_states(run['jobs'])
+    if run.get('status') != 'completed':
+        current = {job['name'] for job in run['jobs'] if job['run_attempt'] == run['run_attempt']}
+        for lane in LANES:
+            if lane not in current:
+                states[lane] = OPEN
+    return states
+
+
 def pool_facts(gh, members):
     """What the runs on the members' heads show: (states_at, causes_at, tries_at, spent,
     required, runs_by_sha). Extra runs spent on this top are counted from the runs
@@ -1629,7 +1643,7 @@ def pool_facts(gh, members):
     for member in members:
         sha = member['sha']
         runs = runs_by_sha[sha] = runs_on(gh, sha)
-        states_at[sha] = merge_lane_states([lane_states(run['jobs']) for run in runs])
+        states_at[sha] = merge_lane_states([states_of(run) for run in runs])
         tries, causes = {}, {}
         for run in runs:
             spent += run['event'] == 'workflow_dispatch'

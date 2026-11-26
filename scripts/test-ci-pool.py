@@ -1853,6 +1853,31 @@ class BisectCommand(PoolOfThree):
             'jobs': [dict(job, id=n) for n, job in enumerate(DEFERRED)]}
         self.assertIn('WAITING', self.bisect('--go')[1])
 
+    def unfinished(self, index, attempt=1):
+        key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[index]}&per_page=100'
+        run = self.fixture[key]['workflow_runs'][-1]
+        run.update(status='in_progress', run_attempt=attempt)
+        return run
+
+    def test_a_probe_that_was_just_dispatched_is_not_dispatched_again(self):
+        # For about a minute after a dispatch the run exists and lists no lane job.
+        self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=2)
+        self.add_run(0, {}, event='workflow_dispatch')
+        self.unfinished(0)
+        code, out, writes = self.bisect('--go')
+        self.assertEqual((code, writes), (0, []), out)
+        self.assertIn('WAITING', out)
+        self.assertIn('1 of 8', out.replace('2 of 8', '1 of 8'))
+
+    def test_a_rerun_that_was_just_asked_for_is_not_asked_for_again(self):
+        # The run is on its second attempt and the lane's new job is not listed yet.
+        every = {lane_name: 'success' for lane_name in ci_pool.LANES}
+        self.add_run(2, dict(every, **{'Host-arm64': 'failure'}))
+        self.unfinished(2, attempt=2)
+        code, out, writes = self.bisect('--go')
+        self.assertEqual((code, writes), (0, []), out)
+        self.assertIn('WAITING: the run on the top has not finished', out)
+
     def test_a_probe_still_running_is_waited_for(self):
         self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=2)
         self.add_run(0, {'Host-arm64': None}, event='workflow_dispatch')
@@ -2034,8 +2059,16 @@ class LandCommand(PoolOfThree):
         self.fixture[key]['workflow_runs'][0]['status'] = 'in_progress'
         code, out, writes = self.land('--go')
         self.assertEqual((code, writes), (2, []), out)
-        self.assertIn('no finished run on the head', out)
+        self.assertIn('the run on the top has not finished', out)
         self.assertTrue(number)
+
+    def test_every_lane_green_in_a_run_whose_other_jobs_are_still_running_does_not_land(self):
+        self.add_run(2, {lane_name: 'success' for lane_name in ci_pool.LANES}, event='workflow_dispatch')
+        key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[2]}&per_page=100'
+        self.fixture[key]['workflow_runs'][0]['status'] = 'in_progress'
+        code, out, writes = self.land('--go')
+        self.assertEqual((code, writes), (2, []), out)
+        self.assertIn('no finished run on the head', out)
 
     def test_a_landing_whose_tree_is_not_the_tested_one_says_so(self):
         self.add_run(2, self.full())
