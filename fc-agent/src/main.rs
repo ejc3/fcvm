@@ -396,7 +396,7 @@ mod tests {
             super::failed_one_shot_exit(&restore.context("reopening")),
             super::REFUSED_EXIT
         );
-        let stale: anyhow::Error = StaleResume.into();
+        let stale: anyhow::Error = StaleResume { owed: None }.into();
         assert_eq!(
             super::failed_one_shot_exit(&stale),
             super::STALE_RESUME_EXIT
