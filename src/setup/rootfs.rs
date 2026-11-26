@@ -3653,7 +3653,7 @@ branch = "agent/nv2"
     /// without the kick can halt a vCPU with interrupts off for good (#2131).
     const RESTORE_KICK_COMMITS: [&str; 3] = [
         // [firecracker]: the default, btrfs and mountinfo profiles.
-        "ec5f7d36ddbc9c6b25dc68a6858ed35cfd7bca82",
+        "df341d66cfef596c957d4ebd0865d6f39b787784",
         // gpu.amd64 and phone.amd64.
         "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
         // nested.amd64.

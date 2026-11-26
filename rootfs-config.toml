@@ -103,6 +103,12 @@ archives = [
 #   tracking (a File or UFFD minor restore) takes the pages the guest wrote from
 #   /proc/self/pagemap, where upstream takes every page of the file that is in
 #   the page cache (mincore);
+# - a Diff written in place over a memory file that already holds the guest's
+#   memory as of the last snapshot writes up to four clean pages lying between
+#   two written runs with them, as one write (each write into a file that
+#   shares its extents with its parent costs about the same whatever its
+#   length: 810 s against 302 s for a 15.7 GB diff of a 128 GiB guest, measured
+#   on the v1.17.0-based branch, #2047);
 # - a balloon inflate on 2 MiB pages zeroes a huge page it covers only in part
 #   when that allocates nothing, and leaves it otherwise: upstream zeroes it
 #   always, which on a clone served from a shared memfd copied a huge page for
@@ -152,7 +158,7 @@ archives = [
 [firecracker]
 repo = "ejc3/firecracker"
 branch = "wip/fcvm-base-2a8d0138"
-commit = "ec5f7d36ddbc9c6b25dc68a6858ed35cfd7bca82"
+commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
