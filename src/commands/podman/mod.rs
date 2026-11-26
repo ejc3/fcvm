@@ -1649,6 +1649,7 @@ async fn prepare_vm_for_lifecycle(
         // A kernel profile's arguments as well as FCVM_FIRECRACKER_ARGS, which Host reads.
         firecracker_args: profile_firecracker_args(&args).as_deref(),
         unsupported: None,
+        kernel_profile: args.kernel_profile.as_deref(),
     })?;
     info!(
         lifecycle = ?lifecycle,
@@ -1766,6 +1767,8 @@ async fn prepare_vm_for_lifecycle(
         },
     )
     .await?;
+    // Still before anything is created: a confined start needs this binary's filter.
+    crate::commands::common::require_confined_filter(&decision, &runtime_config)?;
 
     // Get kernel path
     // Priority: --kernel (explicit) > profile (named or "default")
@@ -4297,6 +4300,7 @@ mod tests {
             landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
             layers: vec![crate::confine::Layer::Process],
             core_limit: 1,
+            seccomp: None,
         }));
         let unconfined = crate::confine::Decision::for_test(None);
         assert!(!super::setup_may_boot_its_vm(true, &confined));
@@ -7614,12 +7618,12 @@ mod tests {
             512,
         );
         state_manager.save_state(&vm_state).await.unwrap();
-        assert!(state_dir.join("vm-test-cleanup.json").exists());
+        assert!(state_manager.state_file("vm-test-cleanup").exists());
 
         cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
 
         assert!(
-            !state_dir.join("vm-test-cleanup.json").exists(),
+            !state_manager.state_file("vm-test-cleanup").exists(),
             "state file should be removed after a failed prepare"
         );
         assert!(

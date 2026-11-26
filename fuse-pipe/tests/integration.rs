@@ -301,6 +301,161 @@ fn test_rename_noreplace_returns_eexist() {
     drop(fuse);
     cleanup(&data_dir, &mount_dir);
 }
+/// A directory renamed onto a directory replaces it only when the target is empty or absent.
+/// fcvm's name claim rests on this (`StateManager::claim_name`): a claim is a directory
+/// holding the claimer's token, renamed onto the name's slot, and the slot of a name in use
+/// holds its holder's token. The state directory is mapped into nested guests through this
+/// filesystem, so the refusal has to come through it unchanged, with both directories as
+/// they were.
+#[test]
+fn test_rename_directory_onto_directory_needs_an_empty_target() {
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
+    let mount = fuse.mount_path();
+
+    let names = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    };
+    let slot = mount.join("slot");
+    fs::create_dir(&slot).expect("mkdir slot");
+    fs::write(slot.join("holder"), "holder").expect("write the holder's token");
+    let claim = mount.join(".claim.second");
+    fs::create_dir(&claim).expect("mkdir claim");
+    fs::write(claim.join("second"), "second").expect("write the claimer's token");
+
+    // Onto a directory with an entry: refused, nothing moved.
+    let refused = fs::rename(&claim, &slot).expect_err("renamed onto a non-empty directory");
+    assert!(
+        matches!(
+            refused.raw_os_error(),
+            Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+        ),
+        "expected ENOTEMPTY, got {refused:?}"
+    );
+    assert_eq!(names(&slot), ["holder"]);
+    assert_eq!(names(&claim), ["second"]);
+    assert_eq!(
+        names(&data_dir.join("slot")),
+        ["holder"],
+        "on the host side"
+    );
+
+    // Onto an empty directory: it is replaced, and holds what the renamed one held.
+    fs::remove_file(slot.join("holder")).expect("unlink the holder's token");
+    fs::rename(&claim, &slot).expect("rename onto an empty directory");
+    assert_eq!(names(&slot), ["second"]);
+    assert!(
+        !claim.exists(),
+        "the renamed directory is still at its old name"
+    );
+    assert_eq!(
+        names(&data_dir.join("slot")),
+        ["second"],
+        "on the host side"
+    );
+    assert_eq!(fs::read_to_string(slot.join("second")).unwrap(), "second");
+
+    // Two claims at once: the one that renames second is refused by the first one's token.
+    let third = mount.join(".claim.third");
+    fs::create_dir(&third).expect("mkdir claim");
+    fs::write(third.join("third"), "third").expect("write the claimer's token");
+    let refused = fs::rename(&third, &slot).expect_err("renamed onto the winner's directory");
+    assert!(
+        matches!(
+            refused.raw_os_error(),
+            Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+        ),
+        "expected ENOTEMPTY, got {refused:?}"
+    );
+
+    // Onto no directory at all, after the holder released the name and removed its slot.
+    fs::remove_file(slot.join("second")).expect("unlink the token");
+    fs::remove_dir(&slot).expect("rmdir the empty slot");
+    fs::rename(&third, &slot).expect("rename onto an absent directory");
+    assert_eq!(names(&slot), ["third"]);
+
+    // An empty slot is removed only while it is empty.
+    let refused = fs::remove_dir(&slot).expect_err("removed a directory with an entry");
+    assert_eq!(refused.raw_os_error(), Some(libc::ENOTEMPTY), "{refused:?}");
+
+    let _ = fs::remove_dir_all(&slot);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
+/// `RENAME_EXCHANGE` swaps two names atomically through the mount. fcvm publishes a VM's
+/// state that way (`publish_state` in src/state/manager.rs): the new file is exchanged with
+/// the published one, and the old one is unlinked from the temporary name.
+#[test]
+fn test_rename_exchange_swaps_two_names() {
+    let (data_dir, mount_dir) = unique_paths("fuse-integ");
+    let fuse = FuseMount::new(&data_dir, &mount_dir, 1);
+    let mount = fuse.mount_path();
+
+    let state = mount.join("vm.json");
+    let temp = mount.join("vm.json.tmp");
+    fs::write(&state, "old state").expect("write state");
+    fs::write(&temp, "new state").expect("write temp");
+    let state_name = std::ffi::CString::new(state.to_str().unwrap()).unwrap();
+    let temp_name = std::ffi::CString::new(temp.to_str().unwrap()).unwrap();
+    // SAFETY: both are NUL-terminated paths that outlive the call.
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp_name.as_ptr(),
+            libc::AT_FDCWD,
+            state_name.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    assert_eq!(
+        ret,
+        0,
+        "renameat2 RENAME_EXCHANGE: {:?}",
+        std::io::Error::last_os_error()
+    );
+    assert_eq!(fs::read_to_string(&state).unwrap(), "new state");
+    assert_eq!(fs::read_to_string(&temp).unwrap(), "old state");
+    assert_eq!(
+        fs::read_to_string(data_dir.join("vm.json")).unwrap(),
+        "new state",
+        "on the host side"
+    );
+    assert_eq!(
+        fs::read_to_string(data_dir.join("vm.json.tmp")).unwrap(),
+        "old state",
+        "on the host side"
+    );
+
+    // With nothing at the second name there is nothing to exchange with.
+    fs::remove_file(&temp).expect("unlink the replaced state");
+    // SAFETY: as above.
+    let ret = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            temp_name.as_ptr(),
+            libc::AT_FDCWD,
+            state_name.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    assert_eq!(ret, -1, "exchanged with a name that does not exist");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ENOENT)
+    );
+    assert_eq!(fs::read_to_string(&state).unwrap(), "new state");
+
+    let _ = fs::remove_file(&state);
+    drop(fuse);
+    cleanup(&data_dir, &mount_dir);
+}
+
 #[test]
 fn test_lseek_supports_negative_offsets() {
     common::increase_ulimit();

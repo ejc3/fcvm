@@ -1,7 +1,9 @@
 # fleet/ami
 
-The fleet's two machine images, built in the fcvm-fleet account in us-west-2 (the factory, and
-`build-ami.sh` by default) and copied to us-east-1, the staging fleet's region, when published,
+The fleet's machine images (the GPU host and the EC2 tile, built and published as a pair, and pages
+mode's arm64 renders host, built and published on a track of its own), built in the fcvm-fleet
+account in us-west-2 (the factory, and `build-ami.sh` by default) and copied to us-east-1, the
+staging fleet's region, when published,
 and `fleet/tools/gpubox.sh`, which leases a GPU host for one agent's work. Every G instance that
 is not the staging fleet's own runs in us-west-2, off staging's quota.
 
@@ -51,6 +53,45 @@ planning; it still owns every other template field. Critical publication retires
 only the old-image Fleet instances, so streams may briefly reconnect. Routine
 publication leaves active machines running and applies on later starts or idle
 recycling. No administration or Next.js machine is restarted by the factory.
+
+### The renders track
+
+Pages mode's host image is a build of its own: `pipeline.py` with `FLEET_AMI_TRACK=renders` (the
+pair's build sets nothing and stays the pair). It has its own broker journal with two slots,
+`renders-build` and `renders-verify` (m8gd.metal-24xl, Ubuntu 24.04 arm64), its own lease, and a
+manifest with `"track": "renders"` and one image, `renders`, whose `build` record names the fcvm
+commit, Kitesurf's commit (`RENDERS_KITESURF_REV` in `renders/renders.conf`: the recorded
+campaign's, which `test_pipeline.py` reads from `bench/chromium/results/renders-*-summary.json`
+together with the pool, the most renders in flight, the instance type, the kernel version and every
+run's boot line), the engine bundle's sha256, the kernel release and the boot line. The image runs
+the reference's Kitesurf commit and boot line; changing either means measuring the reference
+again. It shares no renderer, slot, candidate or
+manifest field with the pair, so neither track's failure publishes or holds the other, and a
+Kitesurf re-pin can publish a renders image without new GPU images. Its store goes to
+`factory/<input>/renders/store/`. The NIC driver (ENA) is a module of the arm64 host kernel,
+whose config is the running Ubuntu kernel's (`=m` there; `kernel/host-arm64.conf` does not pin
+it), and the image boots without an initramfs, as Ubuntu's image and the campaign's host do. `systemd-modules-load.service` loads ENA
+(`/etc/modules-load.d/fcvm-fleet-nic.conf`), which binds the NIC during the load, and a drop-in
+orders `cloud-init-local.service` after it, so the NIC is bound before cloud-init-local looks for
+one. `host-check.py boot` checks both files, that `systemd-modules-load.service` ran, and the
+order systemd resolved, and the launch-path
+proof checks the order the boot took on each of the three validation boots. It publishes to a release pointer of its own; the publisher,
+the pointer and the dispatcher's slots are ejc3/aws's.
+
+Validation: the cold boot, the reboot and the stop/start each run the security proofs every image
+carries, the pool and store units up in order after the guard, the launch path, and
+`renders/host-check.py host` (the running kernel is the `-fcvm` kernel the build installed, the
+boot line holds each of `RENDERS_BOOT_PARAMS` and nothing but them and the base image's
+parameters, `RENDERS_BOOT_BASE_KEYS`, 34,000 pages of 2 MiB reserved, `/dev/kvm`, the units
+enabled, the agent's environment, Kitesurf's sealed tree, the bundle and the snapshot). The cold
+boot also runs `make test-fleet-renders-agent` with every case the check defines, and the agent
+unit's own words: `systemd-analyze verify` on the installed unit, then the check's running case
+(hello, renders on both sides, an overlay, a stop with nothing left) on a transient unit with the
+installed unit's `[Service]` settings and `ExecStart`, the image's `renders.env`, and a validation
+`agent.env` whose only argument is `--stdio`. Each verdict is decided from the proof's raw result
+(exit status, problem or case list); the record carries each failure (a fixed sentence where its
+text cannot be kept) and their count, a pass without its count does not publish, and no manifest
+is written on a failure.
 
 An accepted request is not a published release. Check the request's AWS status and
 the release manifest for validation and promotion results. Infrastructure, the
@@ -106,6 +147,12 @@ fleet/tools/gpubox.sh list              # every gpubox in both regions, owner, l
 |---|---|---|
 | `fcvm-fleet-host-x86_64-<commit>-<date>` (g4dn.metal) | `host/build.sh` prep, build, bake | `fcvm-fleet-vfio.service` binds every NVIDIA function to vfio-pci and fails unless each is passable; `fcvm-fleet-store.service` formats the instance-store NVMe as btrfs at `/mnt/fcvm-btrfs` and restores the store from the asset bucket (`/etc/fcvm-fleet/store.env`), falling back to the AMI's copy (`/var/lib/fcvm-fleet/store/`: the parts `host/store-pack.py` packs at bake, extracted at once); `fcvm-fleet-agent.service` is enabled and runs where the host's boot wrote `/etc/fcvm-fleet/agent.env` (ejc3/aws `fcvm_fleet_host_agent_args`), after the store; the agent dials the coordinator, and serves every place's IPv4 path on 443 of the host (its IPv4 front, routed by TLS server name to each place's own port; fleet/PROTOCOL.md, "The IPv4 front", so a host image built from a commit without it publishes per-place ports instead). `fcvm-fleet-prefetch.service` reads, as soon as `/` is mounted, every root volume file a slot's VM launch reads (`/etc/fcvm-fleet/prefetch.list`, written at build by `host/warm-root.sh`, which launches one VM as root exactly as the agent launches a slot and so also leaves the pre-start snapshot the agent's restores hit). Phones (`?mode=phones`): the build also makes the phone profile, the emulator and system image built from source, Robot Park, the web browser (`scripts/phone/browser.sh`) and the phone image, and `host/warm-phone.sh` takes the warm snapshot of a running phone (`phone-warm`) that every phone of a host is a clone of, after checking one clone streams; it writes the agent's phone arguments to `/etc/fcvm-fleet/phone.env`, which the agent unit adds to the host's own (the host's own `--phones N` turns phones on). Robot Park is built with the AOSP build's tools; nothing of the Android SDK is on a host. Units a host does not use (podman's own, apport, fwupd and others, `host/build.sh` prep) are disabled, and the store unit waits for the network only, not for cloud-init's network stage |
 | `fcvm-fleet-tile-x86_64-<commit>-<date>` (g4dn.xlarge) | `tile/build.sh` prep, image, bake (`units` and bake revise one launched with `BASE_AMI`) | nvidia-persistenced, the certificate from `fcvm-fleet/tls-wildcard`, the renderer on 127.0.0.1:8080 behind nginx on 443 (`fcvm-fleet-nginx.service`); none of them waits for cloud-init's network stage. `fcvm-fleet-prefetch.service` (wanted by `sysinit.target`, ordered after nothing) reads, 256 at a time, the pieces of root volume files that a first boot read (`/etc/fcvm-fleet/prefetch.list`, 2,825 pieces of 2,422 files, 421 MiB, of which 190 MiB are the NVIDIA modules), with the static `prefetch` binary built from `tile/prefetch.c`. The list is written by `tile/build.sh trace` (`tile/resident.py`: the page cache of a tile that served its first frame, mincore per file), run on a tile launched from the image being revised, and `bake` refuses an image without it |
+| `fcvm-factory-<build>-renders` (m8gd.metal-24xl, arm64) | `renders/build.sh` prep, build, bake | `fcvm-fleet-hugepages.service` (before `sysinit.target`, `DefaultDependencies=no`) reserves `RENDERS_HUGEPAGES` 2 MiB pages through sysfs and fails when the kernel gives fewer; `fcvm-fleet-store.service` (the GPU host's unit and `store.sh`) restores the store onto the instance-store NVMe: `make setup-default`'s kernel, rootfs, initrd and Firecracker, the bench image's export, the module's snapshot (`renders-golden`, made at build by the module under the agent check) and Kitesurf (`/mnt/fcvm-btrfs/kitesurf`: its checkout at `RENDERS_KITESURF_REV` with its npm graph, the pinned node, and Bazel's output root, which holds the production bundle that `dist-default` links to); `fcvm-fleet-renders-agent.service` is enabled and runs `fcvm fleet agent $FLEET_AGENT_ARGS $RENDERS_AGENT_ARGS $RENDERS_FRAME_ARGS` as `ubuntu` where the host's boot wrote `/etc/fcvm-fleet/agent.env`, with `renders_bench.sh`'s unit properties. The root carries fcvm's arm64 host kernel (GRUB's default, `kvm-arm.mode=nested numa=off arm64.nv2`), `/usr/local/bin/fcvm`, the checkout at the build's commit (the module's `--bench` and `--corpus`), and `/etc/fcvm-fleet/renders.conf`, `renders.env` and `renders-build.json` |
+
+`renders/renders.conf` holds every value the renders image's build, units and check share: the boot
+line, the pool, the CPU sets (0-39, 40-79, 80-95), the most renders in flight per side (40 and 48),
+the paths and the snapshot tag. `renders/host-check.py agent-env` writes the agent's
+`renders.env` from it; `RENDERS_FRAME_ARGS` there is empty until the frame server exists.
 
 Images are built by the image factory only (owner, 2026-11-21). The hand build below is kept as
 the reference for the `host/build.sh` and `tile/build.sh` phases the factory runs; a dev box's

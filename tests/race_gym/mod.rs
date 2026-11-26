@@ -799,13 +799,14 @@ impl<'a> Run<'a> {
 }
 
 /// Whether a lock (as a lock-wait event names it, masked) belongs to one run: its snapshot's
-/// generation lock or one of its VMs' directories or state files. Concurrent runs share the
-/// rest (state name and loopback locks, the image cache, the setup store).
+/// generation lock or one of its VMs' directories or state files (in a bucket under
+/// `state/vms/`, whose name the mask leaves alone when it has no digit). Concurrent runs
+/// share the rest (the state sweep and loopback locks, the image cache, the setup store).
 pub fn run_owned_lock(lock: &str) -> bool {
     lock.starts_with("snapshots/")
         || lock.starts_with("vm-disks/")
         || lock.starts_with("vm-#/")
-        || (lock.starts_with("state/vm-") && lock.ends_with(".json.lock"))
+        || (lock.starts_with("state/vms/") && lock.ends_with(".json.lock"))
 }
 
 /// Arm `cmd` to be SIGKILLed when the thread that spawns it exits. A gym killed mid-run

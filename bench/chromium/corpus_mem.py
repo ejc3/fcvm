@@ -612,7 +612,29 @@ def spawn_in_cgroup(cg_path, argv, log_path, env=None):
                             stdout=handle, stderr=subprocess.STDOUT, env=env)
 
 
+def refuse_unconverted_state_layout(state_dir):
+    """Raise when ``state_dir`` holds a state layout this harness does not read.
+
+    fcvm marks a state directory with a ``layout`` file from layout 2 on, which keeps
+    each VM's state in a bucket (``vms/<bucket>/<vm_id>.json``) and its PID index entry
+    in ``pids/<bucket>/<pid>.<vm_id>``.  This harness lists ``<vm_id>.json`` in the state
+    directory itself, which is layout 1.  On a marked store that listing is empty, and an
+    empty listing reads as "no VM", so the harness refuses the store instead.
+    """
+    try:
+        with open(os.path.join(state_dir, "layout"), encoding="utf-8") as handle:
+            layout = handle.read().strip()
+    except FileNotFoundError:
+        return
+    raise RuntimeError(
+        f"{state_dir} holds fcvm state layout {layout!r} (states in vms/<bucket>/, "
+        "PID index in pids/<bucket>/); this harness reads the flat layout 1 and has "
+        "not been converted, so it would find no VM there"
+    )
+
+
 def state_files(state_dir):
+    refuse_unconverted_state_layout(state_dir)
     try:
         return [os.path.join(state_dir, f) for f in os.listdir(state_dir) if f.endswith(".json")]
     except OSError as exc:
