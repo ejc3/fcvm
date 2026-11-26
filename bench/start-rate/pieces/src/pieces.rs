@@ -659,6 +659,7 @@ fn vmm_request() -> fcvm::confine::Request<'static> {
         firecracker_args: None,
         unsupported: Some("the start-rate pieces harness measures unconfined VMMs"),
         kernel_profile: None,
+        passthrough_devices: 0,
     }
 }
 
