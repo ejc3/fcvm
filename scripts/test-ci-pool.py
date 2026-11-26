@@ -292,6 +292,12 @@ class Build(Sandbox):
         source = TOOL.read_text()
         pushes = re.findall(r"git\('push'.*?\)", source, re.S)
         self.assertTrue(pushes)
+        # The one lease is on the removal of a queue entry (never a branch): it is removed
+        # only while it still names the commit that went in.
+        leased = [push for push in pushes if 'force' in push]
+        self.assertEqual(len(leased), 1, leased)
+        self.assertIn("f'--force-with-lease={PENDING}{branch}:{sha}'", leased[0])
+        pushes = [push for push in pushes if push not in leased]
         for push in pushes:
             self.assertNotRegex(push, r"force|'-f'|\+")
         self.assertNotRegex(source, r"git\('(rebase|reset)'")
@@ -464,7 +470,7 @@ class Publish(Sandbox):
         members = self.pool()
         prs = self.prs(*members)
         fixture = self.flying(self.remote('c'), self.RUNNING)
-        first = self.commit('b', {'b.txt': 'first\n'}, 'first', push=False)
+        self.commit('b', {'b.txt': 'first\n'}, 'first', push=False)
         self.assertEqual(self.tool('publish', prs=prs, fixture=fixture)[0], 0)
         second = self.commit('b', {'b.txt': 'second\n'}, 'second', push=False)
         code, out, _ = self.tool('publish', prs=prs, fixture=fixture)
@@ -505,6 +511,56 @@ class Publish(Sandbox):
         # One push for the branches, one for the queue entries.
         self.assertEqual((self.dir / 'pushes').read_text().count('push'), 2)
         self.assertIn('nothing is queued', self.tool('flush', '--of', '2', prs=self.prs(*members))[1])
+
+    def test_a_queue_entry_is_removed_only_while_it_names_the_commit_that_went_in(self):
+        # Between a flush's build and its clean-up another publish of the same branch is
+        # queued: it contains the first and more, and must stay queued.
+        self.pool()
+        first = self.commit('b', {'b.txt': 'one\n'}, 'fix one', push=False)
+        self.git('push', '-q', str(self.origin), f'{first}:refs/ci-pool/pending/b')
+        self.git('push', '-q', str(self.origin), f"{self.remote('a')}:refs/ci-pool/pending/a")
+        second = self.commit('b', {'b.txt': 'two\n'}, 'fix two', push=False)
+        self.git('push', '-q', str(self.origin), f'{second}:refs/ci-pool/pending/b')
+        cwd = os.getcwd()
+        os.chdir(self.clone)
+        try:
+            left = ci_pool.drop_queued(str(self.origin), {'a': self.remote('a'), 'b': first})
+        finally:
+            os.chdir(cwd)
+        self.assertEqual((left, self.queued()), ([], {'b': second}))
+
+    def test_a_publish_that_goes_straight_in_takes_what_is_queued_along(self):
+        # c's fix was queued while a run was in flight. The run ended, and a publish of a
+        # goes in at once: it rebuilds c, so c's queued commit must go in with it or it
+        # would no longer contain its branch and no flush could put it in.
+        members = self.pool()
+        prs = self.prs(*members)
+        fix_c = self.commit('c', {'c.txt': 'c fixed\n'}, 'fix c', push=False)
+        self.assertEqual(self.tool('publish', prs=prs, fixture=self.flying(self.remote('c'), self.RUNNING))[0], 0)
+        self.assertEqual(self.queued(), {'c': fix_c})
+        fix_a = self.commit('a', {'a.txt': 'a fixed\n'}, 'fix a', push=False)
+        before = self.remote('a')
+        code, out, _ = self.tool('publish', '--dry-run', prs=prs)
+        self.assertEqual((code, self.remote('a'), self.queued()), (0, before, {'c': fix_c}), out)
+        code, out, _ = self.tool('publish', prs=prs)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.remote('a'), fix_a)
+        self.assertTrue(self.contains('c', fix_a) and self.contains('c', fix_c), out)
+        self.assertEqual(self.queued(), {})
+        self.assertIn('nothing is queued', self.tool('flush', '--of', '2', prs=self.prs(*members))[1])
+
+    def test_a_publish_that_goes_straight_in_must_contain_what_its_branch_has_queued(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        queued = self.commit('b', {'b.txt': 'queued\n'}, 'queued fix', push=False)
+        self.assertEqual(self.tool('publish', prs=prs, fixture=self.flying(self.remote('c'), self.RUNNING))[0], 0)
+        self.git('reset', '-q', '--hard', 'origin/b')
+        self.commit('b', {'other.txt': 'other\n'}, 'another fix', push=False)
+        before = self.remote('b')
+        code, out, calls = self.tool('publish', prs=prs)
+        self.assertEqual(code, 2, out)
+        self.assertIn(f'b already has {queued[:9]} queued, which these commits do not contain', out)
+        self.assertEqual((self.remote('b'), self.queued()), (before, {'b': queued}))
 
     def test_a_flush_that_conflicts_keeps_the_queue(self):
         members = self.pool()
@@ -1597,6 +1653,8 @@ class RedPool(unittest.TestCase):
         states = {6: self.all('pass', SIX), 8: self.all('fail', SIX)}
         states.update(more or {})
         causes = {8: {lane: [BOUNDARY] for lane in SIX}}
+        causes.update({index: {lane: [BOUNDARY] for lane, state in lanes.items() if state == 'fail'}
+                       for index, lanes in (more or {}).items()})
         # boundary-token (index 7) wrote the failing test; state-store-buckets (8) moved the state.
         files = {7: ['src/commands/common.rs', 'src/boundary.rs'], 8: ['src/state/manager.rs', 'src/paths.rs']}
         first = ci_pool.suspects([BOUNDARY], files)
@@ -1715,7 +1773,7 @@ class RedPool(unittest.TestCase):
         for size in (2, 3, 5, 8, 12, 16):
             bound = (size - 1).bit_length()
             for culprit in range(size):
-                step, probes = self.bisect(size, culprit, cap=99)
+                step, probes = self.bisect(size, culprit, cap=99, base={'Host-arm64': 'pass'})
                 self.assertEqual((step['outcome'], step['member']), ('culprit', culprit), (size, culprit, probes))
                 self.assertLessEqual(len(probes), bound, (size, culprit, probes))
 
@@ -1726,16 +1784,40 @@ class RedPool(unittest.TestCase):
         self.assertEqual(step['member'], 3)
         self.assertLessEqual(len(probes), 2 + 4)
 
-    def test_the_bottom_is_named_with_what_is_known_about_the_default_branch(self):
+    def test_the_bottom_is_the_verdict_only_when_the_commit_the_pool_is_based_on_passes(self):
         members, states, causes, tries = self.red(3, 0, probes=(0, 1))
-        unknown = self.diagnose(members, states, causes, tries, spent=3)
-        self.assertEqual((unknown['outcome'], unknown['member']), ('culprit', 0))
-        self.assertIn('may have been there before the pool', unknown['text'])
+        asked = self.diagnose(members, states, causes, tries, spent=3)
+        self.assertEqual(asked['outcome'], 'need-base')
+        self.assertNotIn('member', asked)
         passing = self.diagnose(members, states, causes, tries, spent=3, base={'Host-arm64': 'pass'})
-        self.assertIn('The default branch passes Host-arm64', passing['text'])
+        self.assertEqual((passing['outcome'], passing['member']), ('culprit', 0))
+        self.assertIn('The commit the pool is based on passes Host-arm64', passing['text'])
+        # With no passing prefix there is no verdict: the failure may be older than the pool.
+        for base in ({}, {'Host-x64': 'pass'}, {'Host-arm64': 'open'}, {'Host-arm64': 'pass-on-rerun'}):
+            unknown = self.diagnose(members, states, causes, tries, spent=3, base=base)
+            self.assertEqual(unknown['outcome'], 'not-isolated', base)
+            self.assertIn('may have been there before the pool', unknown['why'])
         failing = self.diagnose(members, states, causes, tries, spent=3, base={'Host-arm64': 'fail'})
         self.assertEqual(failing['outcome'], 'not-isolated')
-        self.assertIn('the default branch fails these lanes too', failing['why'])
+        self.assertIn('the commit the pool is based on fails these lanes too', failing['why'])
+
+    def test_a_failure_whose_cause_was_not_read_is_not_the_same_failure(self):
+        # The probe on the prefix failed and its log could not be fetched. It may be a lost
+        # runner: calling it the same failure would move the verdict down the pool.
+        for nothing in ([], [ci_pool.NO_FAILURE_IN_LOG]):
+            members, states, causes, tries = self.red(3, 1, probes=(0, 1))
+            causes[1] = {'Host-arm64': nothing}
+            step = self.diagnose(members, states, causes, tries, spent=3)
+            self.assertEqual(step['outcome'], 'not-isolated', nothing)
+            self.assertIn(f"why the prefix ending at #{members[1]['number']} fails could not be read", step['why'])
+            # The same when it is the top's own cause that was not read.
+            members, states, causes, tries = self.red(3, 1, probes=(0,))
+            causes[2] = {'Host-arm64': nothing}
+            step = self.diagnose(members, states, causes, tries, spent=2)
+            self.assertEqual(step['outcome'], 'not-isolated', nothing)
+            self.assertIn('failed on the top could not be read', step['why'])
+        members, states, causes, tries = self.red(3, 1, probes=(0, 1))
+        self.assertEqual(self.diagnose(members, states, causes, tries, spent=3)['outcome'], 'culprit')
 
     def test_a_probe_in_flight_is_waited_for_and_not_dispatched_again(self):
         members, states, causes, tries = self.red(8, 5)
@@ -1835,7 +1917,7 @@ class PoolOfThree(Sandbox):
                         f'repos/{REPO}/issues?state=open&per_page=100': []}
         self.members = [pr(11, 'a', 'main', self.SHAS[0]), pr(12, 'b', 'a', self.SHAS[1]), pr(13, 'c', 'b', self.SHAS[2])]
 
-    def add_run(self, index, lanes, event='pull_request', attempt=1, test='fcvm::test_x fails'):
+    def add_run(self, index, lanes, event='pull_request', attempt=1, test='fcvm::test_x fails', concluded='success'):
         """A run on member `index` with {lane: conclusion or [conclusion per attempt]}."""
         self.next_run += 1
         number, jobs = self.next_run, []
@@ -1849,7 +1931,7 @@ class PoolOfThree(Sandbox):
         key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[index]}&per_page=100'
         listed = self.fixture.setdefault(key, {'workflow_runs': []})['workflow_runs']
         listed.append({'id': number, 'path': '.github/workflows/ci.yml', 'event': event, 'status': 'completed',
-                       'run_attempt': attempt, 'html_url': f'https://example.invalid/runs/{number}',
+                       'conclusion': concluded, 'run_attempt': attempt, 'html_url': f'https://example.invalid/runs/{number}',
                        'created_at': '2026-01-01T00:00:00Z'})
         self.fixture[f'repos/{REPO}/actions/runs/{number}/jobs?filter=all&per_page=100'] = {'jobs': jobs}
         return number
@@ -1903,6 +1985,77 @@ class BisectCommand(PoolOfThree):
                          ('failure', 'ci/pool', f'https://example.invalid/runs/{top}'))
         self.assertIn('fails when #13 is added', fields['description'])
         self.assertLessEqual(len(fields['description']), 140)
+
+    def test_a_lane_listed_again_under_a_later_attempt_was_not_run_again(self):
+        # Run 45237585205: rerunning one job listed every other job again under the new
+        # attempt, with the old conclusion and start. A lane that ran once is run again once.
+        top = self.add_run(2, dict(self.green(), **{'Host-arm64': 'failure'}), attempt=3)
+        jobs = self.fixture[f'repos/{REPO}/actions/runs/{top}/jobs?filter=all&per_page=100']['jobs']
+        for job in jobs:
+            job['started_at'] = '2026-01-01T00:00:00Z'
+        jobs += [dict(job, id=job['id'] + 50 * attempt, run_attempt=attempt) for job in list(jobs) for attempt in (2, 3)]
+        code, out, writes = self.bisect('--go')
+        self.assertIn('NEXT: run the failed jobs', out)
+        self.assertEqual([path for _, path, _ in writes], [f'actions/runs/{top}/rerun-failed-jobs'])
+
+    def base(self, lanes=None, tested_head=None, head_tree=None):
+        """The commit of main the pool is based on, and the runs on it or on the head that
+        landed as it."""
+        base, tree = '8' * 40, '7' * 40
+        self.SHAS.append(base)
+        self.fixture[f'repos/{REPO}/compare/main...{self.SHAS[0]}'] = {'merge_base_commit': {'sha': base}}
+        parents = ['6' * 40] + ([tested_head] if tested_head else [])
+        self.fixture[f'repos/{REPO}/git/commits/{base}'] = {'tree': {'sha': tree}, 'parents': [{'sha': p} for p in parents]}
+        if tested_head:
+            self.fixture[f'repos/{REPO}/git/commits/{tested_head}'] = {'tree': {'sha': head_tree or tree}}
+            self.SHAS.append(tested_head)
+        if lanes:
+            self.add_run(len(self.SHAS) - 1, lanes, event='pull_request' if tested_head else 'push')
+
+    def all_fail(self):
+        top = self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=2)
+        self.add_run(0, {'Host-arm64': 'failure'}, event='workflow_dispatch')
+        self.add_run(1, {'Host-arm64': 'failure'}, event='workflow_dispatch')
+        return top
+
+    def test_the_bottom_is_marked_only_when_the_commit_the_pool_is_based_on_passes(self):
+        self.all_fail()
+        self.base({'Host-arm64': 'success'})
+        code, out, writes = self.bisect('--go')
+        self.assertIn('VERDICT: first failing prefix: the failure appears with #11, the bottom of the pool', out)
+        self.assertEqual([(m, p) for m, p, _ in writes], [('POST', f'statuses/{self.SHAS[0]}')])
+
+    def test_the_run_of_the_head_that_landed_as_the_base_counts_for_the_base(self):
+        # Main skips the lanes a landing already proved, so its own commit often has no run.
+        self.all_fail()
+        self.base({'Host-arm64': 'success'}, tested_head='5' * 40)
+        code, out, writes = self.bisect('--go')
+        self.assertIn('the bottom of the pool', out)
+        self.assertEqual(len(writes), 1, writes)
+        # A parent with another tree is a commit that was merged in, not what landed.
+        self.setUp()
+        self.all_fail()
+        self.base({'Host-arm64': 'success'}, tested_head='5' * 40, head_tree='4' * 40)
+        code, out, writes = self.bisect('--go')
+        self.assertEqual((code, writes), (3, []), out)
+
+    def test_with_no_passing_prefix_and_nothing_passing_on_the_base_nobody_is_marked(self):
+        for lanes in (None, {'Host-x64': 'success'}, {'Host-arm64': 'failure'}):
+            self.setUp()
+            self.all_fail()
+            self.base(lanes)
+            code, out, writes = self.bisect('--go')
+            self.assertEqual((code, writes), (3, []), out)
+            self.assertIn('NOT-ISOLATED', out)
+        # Main's tip passing says nothing: the pool is based on an older commit of main.
+        self.setUp()
+        self.all_fail()
+        self.SHAS.append('4' * 40)
+        self.fixture[f'repos/{REPO}/commits/main'] = {'sha': '4' * 40}
+        self.fixture[f'repos/{REPO}/git/commits/{"4" * 40}'] = {'tree': {'sha': '7' * 40}, 'parents': [{'sha': '6' * 40}]}
+        self.add_run(3, {'Host-arm64': 'success'}, event='push')
+        code, out, writes = self.bisect('--go')
+        self.assertEqual((code, writes), (3, []), out)
 
     def test_the_only_status_bisect_posts_is_a_failure(self):
         # A success is a claim that lanes passed: only the run that passed states it (`mark`).
@@ -2189,12 +2342,76 @@ class LandCommand(PoolOfThree):
         self.assertTrue(number)
 
     def test_every_lane_green_in_a_run_whose_other_jobs_are_still_running_does_not_land(self):
-        self.add_run(2, {lane_name: 'success' for lane_name in ci_pool.LANES}, event='workflow_dispatch')
+        number = self.add_run(2, {lane_name: 'success' for lane_name in ci_pool.LANES}, event='workflow_dispatch')
         key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[2]}&per_page=100'
         self.fixture[key]['workflow_runs'][0]['status'] = 'in_progress'
         code, out, writes = self.land('--go')
         self.assertEqual((code, writes), (2, []), out)
-        self.assertIn('no finished run on the head', out)
+        self.assertIn(f'run {number} on the head has not finished', out)
+
+    def test_an_older_finished_run_does_not_stand_in_for_the_one_still_running(self):
+        # The head was a lower member (a deferred run, finished), then its lanes were
+        # dispatched. Every lane is green and Lint has failed, in a run that is not over.
+        self.add_run(2, {job['name']: job['conclusion'] for job in DEFERRED})
+        every = {lane_name: 'success' for lane_name in ci_pool.LANES}
+        number = self.add_run(2, dict(every, Lint='failure', Summary=None), event='workflow_dispatch')
+        key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[2]}&per_page=100'
+        self.fixture[key]['workflow_runs'][-1]['status'] = 'in_progress'
+        code, out, writes = self.land('--go')
+        self.assertEqual((code, writes), (2, []), out)
+        self.assertIn(f'run {number} on the head has not finished', out)
+        # Finished, the run that supplied the lanes is the one whose other jobs are read.
+        self.fixture[key]['workflow_runs'][-1]['status'] = 'completed'
+        jobs = self.fixture[f'repos/{REPO}/actions/runs/{number}/jobs?filter=all&per_page=100']['jobs']
+        next(job for job in jobs if job['name'] == 'Summary')['conclusion'] = 'failure'
+        code, out, writes = self.land('--go')
+        self.assertEqual((code, writes), (2, []), out)
+        self.assertIn('Lint failed', out)
+
+    def test_a_run_still_going_blocks_a_head_that_an_older_run_passed(self):
+        self.add_run(2, self.full())
+        every = {lane_name: 'success' for lane_name in ci_pool.LANES}
+        number = self.add_run(2, dict(every, Lint='failure', Summary=None), event='workflow_dispatch')
+        key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[2]}&per_page=100'
+        self.fixture[key]['workflow_runs'][-1]['status'] = 'in_progress'
+        code, out, writes = self.land('--go')
+        self.assertEqual((code, writes), (2, []), out)
+        self.assertIn(f'run {number} on the head has not finished', out)
+
+    def test_a_run_with_no_summary_is_not_a_verdict(self):
+        # A cancelled run reports no Summary. Lanes that finished before it was cancelled
+        # read green, and nothing says what the jobs that never ran would have shown.
+        cases = {'cancelled, no Summary': (self.green(), 'cancelled'),
+                 'cancelled, with a Summary': (self.full(), 'cancelled'),
+                 'finished, no Summary': (self.green(), 'success'),
+                 'finished, a deferred Summary': (dict(self.green(), **{'Summary (deferred)': 'success'}), 'success')}
+        for name, (jobs, concluded) in cases.items():
+            self.setUp()
+            self.add_run(2, jobs, concluded=concluded)
+            code, out, writes = self.land('--go')
+            self.assertEqual((code, writes), (2, []), f'{name}: {out}')
+            self.assertIn('no finished run on the head', out, name)
+
+    def test_a_superseded_run_beside_the_one_that_passed_does_not_block(self):
+        # GitHub sometimes starts two runs for one push; the second cancels the first.
+        self.add_run(2, {'Changes': 'cancelled', 'Lint': 'cancelled', 'Summary': 'failure',
+                         'Host-${{ matrix.arch }}': 'cancelled'}, concluded='cancelled')
+        self.add_run(2, self.full())
+        code, out, writes = self.land('--go')
+        self.assertEqual(code, 0, out)
+
+    def test_a_refused_merge_puts_every_base_back(self):
+        self.add_run(2, self.full())
+        self.land()
+        self.fixture[f'PUT repos/{REPO}/pulls/13/merge'] = 'FAIL'
+        code, out, calls = self.tool('land', '--of', '13', '--go', prs=self.members, fixture=self.fixture,
+                                     env={'CI_POOL_LOGS': str(self.logs)})
+        writes = self.writes(calls)
+        self.assertEqual(code, 2, out)
+        self.assertIn('nothing landed and every base is as it was', out)
+        self.assertEqual([(m, p, f.get('base')) for m, p, f in writes],
+                         [('PATCH', 'pulls/12', 'main'), ('PATCH', 'pulls/13', 'main'), ('PUT', 'pulls/13/merge', None),
+                          ('PATCH', 'pulls/13', 'b'), ('PATCH', 'pulls/12', 'a')])
 
     def test_a_landing_whose_tree_is_not_the_tested_one_says_so(self):
         self.add_run(2, self.full())
