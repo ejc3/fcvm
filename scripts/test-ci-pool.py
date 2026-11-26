@@ -741,7 +741,7 @@ class CostCommand(Sandbox):
                    self.jobs(3): {'jobs': [self.LANE]}}
         code, out, calls = self.cost(fixture, '--json')
         self.assertEqual((code, json.loads(out.splitlines()[0])['counts']['itemised']), (0, 3), out)
-        (self.dir / 'cache' / '1-1.json').unlink()
+        (self.dir / 'cache' / '1-1-v2.json').unlink()
         code, out, calls = self.cost(fixture, '--json', '--skip-short', '3')
         counts = json.loads(out.splitlines()[0])['counts']
         # Run 3 is short too, but it is a rerun: its first attempt's time is not in its wall time.
@@ -749,6 +749,13 @@ class CostCommand(Sandbox):
         self.assertNotIn(self.jobs(1), [c['path'] for c in calls])
         _, out, _ = self.cost(fixture, '--skip-short', '3')
         self.assertIn('1 runs left out as asked (--skip-short)', out)
+
+    def test_a_job_list_cached_in_an_older_form_is_read_again(self):
+        fixture = {self.window(1): self.listing(1, [1]), self.jobs(1): {'jobs': [self.LANE]}}
+        (self.dir / 'cache').mkdir()
+        (self.dir / 'cache' / '1-1.json').write_text(json.dumps([{'name': 'Host-arm64'}]))
+        _, _, calls = self.cost(fixture)
+        self.assertEqual([c['path'] for c in calls if '/jobs' in c['path']], [self.jobs(1)])
 
     def test_a_request_budget_stops_the_account_and_says_so(self):
         code, out, _ = self.cost({self.window(1): self.listing(2, [1, 2]), self.jobs(1): {'jobs': [self.LANE]},
