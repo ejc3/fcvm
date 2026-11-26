@@ -209,7 +209,7 @@ fn ci_runs_on_pull_requests_regardless_of_base_branch() {
 /// even waits for it.
 ///
 /// Membership in `summary.needs` is necessary but NOT sufficient: `needs` only
-/// makes Summary *wait*, and with `if: always()` Summary then reports its own
+/// makes Summary *wait*, and with `if: !cancelled()` Summary then reports its own
 /// result regardless of theirs. `summary_fails_when_a_gating_job_fails` below
 /// covers the second half.
 /// Skipping draft PRs is only safe if marking one ready re-triggers CI.
@@ -1882,7 +1882,7 @@ fn summary_fails_when_a_gating_job_fails() {
 
     assert!(
         !conds.is_empty(),
-        "ci.yml's `summary` job never inspects `needs.*.result`. With `if: always()` it \
+        "ci.yml's `summary` job never inspects `needs.*.result`. With `if: !cancelled()` it \
          therefore reports success no matter what its gating jobs did — observed in 8 of the \
          last 40 runs, including one where Lint failed. Add a step conditioned on \
          `contains(needs.*.result, 'failure')` that exits non-zero."
