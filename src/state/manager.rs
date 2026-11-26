@@ -2643,6 +2643,70 @@ mod tests {
         );
     }
 
+    /// Whether `error` has a missing file at its root, as a caller that reads "no state" from
+    /// `load_state` looks for it (`commands::common::owed_boundary_token`).
+    fn not_found_at_root(error: &anyhow::Error) -> bool {
+        error
+            .root_cause()
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    /// `load_state` of a VM that has no state fails with `io::ErrorKind::NotFound` at the
+    /// root of its error, and with nothing else there when the store cannot be read: a
+    /// caller tells "this VM has no state" from "the state could not be read" by that alone.
+    #[tokio::test]
+    async fn a_missing_state_is_not_found_at_the_root_and_a_refused_store_is_not() {
+        // No state directory at all, an empty store, and a store with another VM in the
+        // missing VM's bucket: no state.
+        let dir = tempfile::tempdir().unwrap();
+        let nowhere = StateManager::new(dir.path().join("never-made"));
+        assert!(not_found_at_root(
+            &nowhere.load_state("vm-absent").await.unwrap_err()
+        ));
+        let manager = StateManager::new(dir.path().to_path_buf());
+        manager.init().await.unwrap();
+        assert!(not_found_at_root(
+            &manager.load_state("vm-absent").await.unwrap_err()
+        ));
+        let neighbour = (0..)
+            .map(|n| format!("vm-neighbour-{n}"))
+            .find(|id| bucket_of(id) == bucket_of("vm-absent"))
+            .unwrap();
+        manager
+            .save_state(&named_state(&neighbour, "neighbour"))
+            .await
+            .unwrap();
+        assert!(manager.vm_bucket("vm-absent").is_dir());
+        assert!(not_found_at_root(
+            &manager.load_state("vm-absent").await.unwrap_err()
+        ));
+
+        // A state that is there and does not parse: an error, not "no state".
+        std::fs::create_dir_all(manager.vm_bucket("vm-damaged")).unwrap();
+        std::fs::write(manager.state_file("vm-damaged"), "{ not a state").unwrap();
+        assert!(!not_found_at_root(
+            &manager.load_state("vm-damaged").await.unwrap_err()
+        ));
+
+        // A store this build refuses (another layout's marker), and one whose marker cannot
+        // be read: an error for every VM, missing or not.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join(LAYOUT_FILE), "3\n").unwrap();
+        let refused = StateManager::new(other.path().to_path_buf())
+            .load_state("vm-absent")
+            .await
+            .unwrap_err();
+        assert!(!not_found_at_root(&refused), "{refused:#}");
+        let unreadable = tempfile::tempdir().unwrap();
+        std::fs::create_dir(unreadable.path().join(LAYOUT_FILE)).unwrap();
+        let refused = StateManager::new(unreadable.path().to_path_buf())
+            .load_state("vm-absent")
+            .await
+            .unwrap_err();
+        assert!(!not_found_at_root(&refused), "{refused:#}");
+    }
+
     fn named_state(vm_id: &str, name: &str) -> VmState {
         let mut state = VmState::new(vm_id.to_string(), "alpine:latest".to_string(), 1, 512);
         state.name = Some(name.to_string());
@@ -3415,6 +3479,95 @@ mod tests {
     }
 
     /// The names in `dir`, sorted.
+    /// An older build's VM that was killed leaves its state where layout 1 kept it: its
+    /// fcvm ran no teardown. That file is not a running VM. While the process lives the
+    /// store is refused by name and PID; once it is killed (before it is reaped, and
+    /// after), and when another process has taken its PID since, a reader lists nothing
+    /// and removes nothing, and a launch takes the dead VM's name and clears what layout
+    /// 1 left. A store is never refused over a dead VM.
+    #[tokio::test]
+    async fn a_killed_older_vms_state_refuses_nothing_and_a_launch_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut old = named_state("vm-old-killed", "old-web");
+        old.pid = Some(pid);
+        old.pid_start_time = process_start_time(pid);
+        assert!(old.pid_start_time.is_some(), "the child has no start time");
+        let old_state = dir.path().join("vm-old-killed.json");
+        std::fs::write(&old_state, serde_json::to_string(&old).unwrap()).unwrap();
+        std::fs::write(dir.path().join("vm-old-killed.json.lock"), "").unwrap();
+        std::fs::write(dir.path().join("names.lock"), "").unwrap();
+        std::fs::create_dir(dir.path().join("name")).unwrap();
+        std::fs::write(dir.path().join("name").join("abc.json"), "{}").unwrap();
+        let list = || async {
+            // A manager of its own each time: one that has passed the layout check does
+            // not check again.
+            StateManager::new(dir.path().to_path_buf()).list_vms().await
+        };
+
+        let refusal = format!("{:#}", list().await.unwrap_err());
+        assert!(
+            refusal.contains("'old-web'") && refusal.contains(&format!("pid {pid}")),
+            "{refusal}"
+        );
+
+        // SIGKILL. Until its parent waits for it the process is a zombie, which runs
+        // nothing.
+        child.kill().unwrap();
+        let zombie = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !read_proc_stat(pid).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        }) {
+            assert!(
+                std::time::Instant::now() < zombie,
+                "the killed child never became a zombie"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            list().await.unwrap().is_empty(),
+            "a killed VM, not yet reaped"
+        );
+        child.wait().unwrap();
+        assert!(list().await.unwrap().is_empty(), "a killed VM, reaped");
+
+        // The dead VM's PID, taken by another process since: this test's own PID with
+        // another start time.
+        let me = std::process::id();
+        let mut reused = named_state("vm-old-reused", "old-db");
+        reused.pid = Some(me);
+        reused.pid_start_time = process_start_time(me).map(|start| start + 1);
+        std::fs::write(
+            dir.path().join("vm-old-reused.json"),
+            serde_json::to_string(&reused).unwrap(),
+        )
+        .unwrap();
+        let before = top_level(dir.path());
+        assert!(list().await.unwrap().is_empty(), "a dead VM's PID, reused");
+        assert_eq!(top_level(dir.path()), before, "a listing changed the store");
+
+        // A launch takes the dead VM's name, and what layout 1 left is gone.
+        let manager = StateManager::new(dir.path().to_path_buf());
+        let mut new = named_state("vm-new", "old-web");
+        manager.claim_name(&mut new).await.unwrap();
+        assert!(
+            !old_state.exists()
+                && !dir.path().join("vm-old-reused.json").exists()
+                && !dir.path().join("name").exists(),
+            "a launch left files of layout 1: {:?}",
+            top_level(dir.path())
+        );
+        let listed = manager.list_vms().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].vm_id, "vm-new");
+    }
+
     fn top_level(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()

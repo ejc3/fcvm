@@ -6,14 +6,14 @@ set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 2
 fail=0
 no() { echo "FAIL: $*"; fail=1; }
-scripts=(fleet/ami/*.sh fleet/ami/common/*.sh fleet/ami/host/*.sh fleet/ami/tile/*.sh fleet/tools/gpubox.sh fleet/tools/g-admission.sh fleet/tools/issue-cert.sh fleet/tools/viewer-acceptance.sh)
+scripts=(fleet/ami/*.sh fleet/ami/common/*.sh fleet/ami/host/*.sh fleet/ami/tile/*.sh fleet/ami/renders/*.sh fleet/tools/gpubox.sh fleet/tools/g-admission.sh fleet/tools/issue-cert.sh fleet/tools/viewer-acceptance.sh)
 for f in "${scripts[@]}"; do bash -n "$f" || no "bash -n $f"; done
 if command -v shellcheck >/dev/null; then
   shellcheck -S warning "${scripts[@]}" || no "shellcheck -S warning"
 else
   no "shellcheck is not installed"
 fi
-python3 -m py_compile fleet/ami/common/cve-2026-98432-mitigation.py fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py fleet/ami/tile/resident.py || no "py_compile"
+python3 -m py_compile fleet/ami/common/cve-2026-98432-mitigation.py fleet/ami/renders/host-check.py fleet/ami/host/s3-cat.py fleet/ami/host/store-pack.py fleet/ami/tile/fetch-cert.py fleet/ami/tile/resident.py || no "py_compile"
 python3 -B fleet/ami/test_ip_options.py || no "fleet image IP-options guard tests"
 python3 -B fleet/ami/test_pipeline.py || no "fleet image pipeline tests"
 python3 -B fleet/ami/test_request.py || no "fleet image request tests"

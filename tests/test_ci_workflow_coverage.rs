@@ -393,15 +393,15 @@ fn fleet_web_changes_run_the_fleet_web_job() {
         "a ci.yml-only change does not run `fleet-web`, so a broken fleet-web job merges green"
     );
     // Every fail-open branch opens the web gate too: each `emit true` that is not
-    // the classifier's own verdict opens all four gates.
+    // the classifier's own verdict opens every gate.
     for line in text
         .lines()
         .map(str::trim)
         .filter(|l| l.starts_with("emit true "))
     {
         assert!(
-            line == "emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""
-                || line.ends_with(" true true true true"),
+            line == "emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\" \"$confine\""
+                || line.ends_with(" true true true true true"),
             "a fail-open branch of `changes` leaves a gate closed: {line}"
         );
     }
@@ -580,8 +580,10 @@ const RUNNER_KERNEL_CHECK: &str = "./scripts/check-runner-kernel.py";
 /// one of GitHub's runners (GITHUB_HOSTED) has to run it.
 const NO_RUNNER_KERNEL_CHECK: &[(&str, &str, &str)] = &[
     // These three build the guest kernels a runner image needs before it can be built
-    // (build-runner-ami.yml starts when they finish). They have to run on the image the
-    // new one replaces, however old, and they start no VM.
+    // (build-runner-ami.yml starts when they finish), so they have to run on the image the
+    // new one replaces, however old. That ordering is the whole reason: they are not free
+    // of VMs, since `fcvm setup` boots the Layer 2 setup VM in them when the runner has no
+    // rootfs yet.
     ("kernels.yml", "build-default-kernel", "builds a kernel"),
     ("kernels.yml", "build-nested-kernel", "builds a kernel"),
     ("kernels.yml", "build-btrfs-kernel", "builds a kernel"),
@@ -620,8 +622,84 @@ fn runner_of(job: &Value) -> Result<Runner, String> {
     }
 }
 
+/// Whether a step's `if` is one status function and the success of the step `id` and nothing
+/// else: `always() && steps.<id>.outcome == 'success'`, with `failure()` or `!cancelled()`
+/// in place of `always()`, bare or inside `${{ }}`. Any other spelling (an `||`, a negation,
+/// parentheses, a third term) is not read, so it does not count as naming the outcome.
+fn requires_success_of(condition: &str, id: &str) -> bool {
+    let inner = condition.trim();
+    let inner = inner
+        .strip_prefix("${{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .unwrap_or(inner);
+    let words: Vec<&str> = inner.split_whitespace().collect();
+    matches!(
+        words.as_slice(),
+        [status, "&&", outcome, "==", "'success'"]
+            if ["always()", "failure()", "!cancelled()"].contains(status)
+                && *outcome == format!("steps.{id}.outcome")
+    )
+}
+
+/// Whether an `if` calls a status function (`always`, `failure`, `cancelled`, `success`), in
+/// any letter case and with any whitespace before the parenthesis. GitHub's documentation of
+/// expressions says neither whether function names are case sensitive nor whether a space may
+/// stand there, so both are taken as possible: reading too many conditions as running after
+/// a failure only asks for a gate that was not needed.
+fn has_status_function(condition: &str) -> bool {
+    let squeezed: String = condition
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    ["always(", "failure(", "cancelled(", "success("]
+        .iter()
+        .any(|call| squeezed.contains(call))
+}
+
+/// A step's `if`, as written. Empty when it has none or it is not a string.
+fn condition_of(step: &Value) -> &str {
+    step.get("if").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// Whether a step's commands name make, by any path.
+fn runs_make(step: &Value) -> bool {
+    step.get("run").and_then(Value::as_str).is_some_and(|run| {
+        run.split_whitespace()
+            .any(|word| word.rsplit('/').next() == Some("make"))
+    })
+}
+
+/// Steps a checked job may run before its checkout: they repair what an earlier job left in
+/// the workspace. Nothing else has a reason to run before the kernel check. The list is by
+/// name; a listed step that calls an action or runs make is refused all the same.
+const BEFORE_CHECKOUT: &[&str] = &[
+    "Fix workspace permissions (pre-checkout)",
+    "Clean workspace (pre-checkout)",
+];
+
+/// Steps a checked job may run after a failed kernel check without naming the outcome of a
+/// step that did not: they record or clean up the runner's state and start nothing.
+const AFTER_A_FAILURE: &[&str] = &[
+    "Stray microVM guard (post)",
+    "Capture kernel logs",
+    "Capture host load record",
+    "Save disk I/O record",
+    "Save VMM logs",
+    "Upload test logs",
+    "Upload evidence",
+    "Save cargo tools cache",
+];
+
 /// What is wrong with the runner kernel check of a job on a runner of ours, if anything.
 /// `workflow_shell` is the workflow's own `defaults.run.shell`.
+///
+/// This is a lint over the workflow files of this repository, not a model of GitHub's
+/// runner. What it does not see: what a composite action or a script called from a step
+/// does; a step of BEFORE_CHECKOUT or AFTER_A_FAILURE whose commands change to start work
+/// without naming make (the lists are by name); and a job-level `if`. An `if` that names a
+/// step's outcome in any spelling but the one requires_success_of reads does not count.
+/// Anything it cannot read as one of the shapes below is a finding.
 fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> Option<String> {
     if job.get("continue-on-error").is_some() {
         return Some("the job sets continue-on-error".into());
@@ -682,6 +760,37 @@ fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> O
     if check < checkout {
         return Some("the check runs before the checkout".into());
     }
+    if let Some(key) = ["if", "continue-on-error"]
+        .iter()
+        .find(|key| steps[checkout].get(**key).is_some())
+    {
+        return Some(format!("the checkout sets {key}"));
+    }
+    let populated = steps[checkout]
+        .get("with")
+        .and_then(|with| with.get("path"))
+        .and_then(Value::as_str);
+    if populated != Some("fcvm") {
+        return Some("the checkout does not populate fcvm, where the check runs".into());
+    }
+    if let Some(early) = steps[..checkout].iter().find(|step| {
+        !step
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| BEFORE_CHECKOUT.contains(&name))
+    }) {
+        return Some(format!(
+            "a step that is not in BEFORE_CHECKOUT runs before the checkout: {early:?}"
+        ));
+    }
+    if let Some(early) = steps[..checkout]
+        .iter()
+        .find(|step| step.get("uses").is_some() || runs_make(step))
+    {
+        return Some(format!(
+            "a step before the checkout does more than repair the workspace: {early:?}"
+        ));
+    }
     let between = &steps[checkout + 1..check];
     if let Some(other) = between
         .iter()
@@ -691,36 +800,28 @@ fn runner_kernel_check_finding(job: &Value, workflow_shell: Option<&Value>) -> O
             "a step other than the disk preflight runs before the check: {other:?}"
         ));
     }
-    // A step whose `if` has a status function runs after a failed check too. One that runs
-    // make then has to name the outcome of a step that cannot run after a failed check
-    // itself: a later step with an id and no status function in an `if` of its own.
-    let after_a_failure = |step: &Value| {
-        let condition = step.get("if").map(|v| format!("{v:?}")).unwrap_or_default();
-        ["always()", "failure()", "cancelled()"]
-            .iter()
-            .any(|status| condition.contains(status))
-            .then_some(condition)
-    };
+    // A step whose `if` has a status function runs after a failed check too. Its `if` has to
+    // be that function and the outcome of a step that cannot (a later step with an id and no
+    // status function in an `if` of its own), in the one spelling requires_success_of reads,
+    // or the step has to be one of AFTER_A_FAILURE and not run make.
+    let after_a_failure = |step: &Value| has_status_function(condition_of(step));
     for step in &steps[check + 1..] {
-        let Some(condition) = after_a_failure(step) else {
-            continue;
-        };
-        let runs_make =
-            run_of(step).is_some_and(|run| run.split_whitespace().any(|word| word == "make"));
-        if !runs_make {
+        if !after_a_failure(step) {
             continue;
         }
         let gated = steps[check + 1..].iter().any(|earlier| {
-            after_a_failure(earlier).is_none()
-                && earlier.get("id").and_then(Value::as_str).is_some_and(|id| {
-                    condition.contains(&format!("steps.{id}.outcome == 'success'"))
-                })
+            !after_a_failure(earlier)
+                && earlier
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| requires_success_of(condition_of(step), id))
         });
-        if !gated {
-            return Some(format!(
-                "the step `{}` can run make after the check failed",
-                step.get("name").and_then(Value::as_str).unwrap_or("?")
-            ));
+        if gated {
+            continue;
+        }
+        let name = step.get("name").and_then(Value::as_str).unwrap_or("?");
+        if runs_make(step) || !AFTER_A_FAILURE.contains(&name) {
+            return Some(format!("the step `{name}` can run after the check failed"));
         }
     }
     None
@@ -865,7 +966,8 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
     };
     let job = |runs_on: &str, steps: &str| {
         format!(
-            "runs-on: {runs_on}\nsteps:\n  - run: sudo chown -R $USER fcvm\n  \
+            "runs-on: {runs_on}\nsteps:\n  - name: Fix workspace permissions (pre-checkout)\n    \
+             run: sudo chown -R $USER fcvm\n  \
              - uses: actions/checkout@0000000000000000000000000000000000000000\n    \
              with:\n      path: fcvm\n{steps}"
         )
@@ -970,7 +1072,10 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
     let later = |steps: &str| finding(&job(labels, &format!("{check}{steps}")));
     let setup = "  - id: setup\n    run: make setup-fcvm\n";
     assert_eq!(
-        later("  - if: always()\n    run: ./scripts/ci-stray-vm-guard.sh post\n"),
+        later(
+            "  - name: Stray microVM guard (post)\n    if: always()\n    \
+             run: ./scripts/ci-stray-vm-guard.sh post\n"
+        ),
         None
     );
     assert_eq!(
@@ -990,13 +1095,111 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
         "  - id: setup\n    if: always()\n    run: ./prepare.sh\n  - name: gym\n    \
          if: always() && steps.setup.outcome == 'success'\n    run: make fuzz-gym\n"
             .to_string(),
+        "  - id: setup\n    if: ${{ !success() }}\n    run: ./prepare.sh\n  - name: gym\n    \
+         if: always() && steps.setup.outcome == 'success'\n    run: make fuzz-gym\n"
+            .to_string(),
+        // an outcome that an `||` makes optional
+        format!(
+            "{setup}  - name: gym\n    if: always() || steps.setup.outcome == 'success'\n    \
+             run: make fuzz-gym\n"
+        ),
+        // no make: cargo, the binary, a wrapper script, make by its path, a composite action
+        "  - name: gym\n    if: always()\n    run: cargo nextest run --features privileged-tests\n"
+            .to_string(),
+        "  - name: gym\n    if: failure()\n    run: sudo ./target/release/fcvm podman run alpine\n"
+            .to_string(),
+        "  - name: gym\n    if: always()\n    run: ./scripts/run-the-gym.sh\n".to_string(),
+        "  - name: gym\n    if: always()\n    run: /usr/bin/make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: always()\n    uses: ./fcvm/.github/actions/gym\n".to_string(),
+        // a status function in another letter case, or with a space before its parenthesis
+        "  - name: gym\n    if: Always()\n    run: make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: always ()\n    run: make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: ${{ ! Cancelled ( ) }}\n    run: make fuzz-gym\n".to_string(),
+        "  - name: gym\n    if: FAILURE()\n    run: make fuzz-gym\n".to_string(),
+        // the outcome of a step that such a spelling lets run after a failure
+        "  - id: setup\n    if: Always ()\n    run: ./prepare.sh\n  - name: gym\n    \
+         if: always() && steps.setup.outcome == 'success'\n    run: make fuzz-gym\n"
+            .to_string(),
+        // a listed name does not cover a step that runs make, by any path
+        "  - name: Upload test logs\n    if: always()\n    run: make fuzz-gym\n".to_string(),
+        "  - name: Save VMM logs\n    if: always()\n    run: /usr/bin/make test-root\n".to_string(),
+        // spellings of the outcome that are not read: negated, a third term, parentheses
+        format!(
+            "{setup}  - name: gym\n    if: always() && !(steps.setup.outcome == 'success')\n    \
+             run: make fuzz-gym\n"
+        ),
+        format!(
+            "{setup}  - name: gym\n    if: always() && steps.setup.outcome == 'success' && true\n    \
+             run: make fuzz-gym\n"
+        ),
+        format!(
+            "{setup}  - name: gym\n    if: always() && steps.setup.outcome != 'success'\n    \
+             run: make fuzz-gym\n"
+        ),
     ] {
-        assert_eq!(
-            later(&ungated).as_deref(),
-            Some("the step `gym` can run make after the check failed"),
-            "{ungated}"
+        let found = later(&ungated).unwrap_or_else(|| panic!("no finding: {ungated}"));
+        assert!(
+            found.ends_with("` can run after the check failed"),
+            "{found}: {ungated}"
         );
     }
+
+    // Steps before the checkout, and the checkout itself.
+    let early = |before: &str, checkout_extra: &str| {
+        finding(&format!(
+            "runs-on: {labels}\nsteps:\n{before}  \
+             - uses: actions/checkout@0000000000000000000000000000000000000000\n    \
+             with:\n      path: fcvm\n{checkout_extra}{check}"
+        ))
+    };
+    for name in BEFORE_CHECKOUT {
+        assert_eq!(
+            early(&format!("  - name: {name}\n    run: true\n"), ""),
+            None
+        );
+    }
+    assert_eq!(early("", ""), None);
+    for name in BEFORE_CHECKOUT {
+        for body in [
+            "run: make build\n",
+            "run: /usr/bin/make build\n",
+            "uses: ./fcvm/.github/actions/checkout-deps\n",
+        ] {
+            let before = format!("  - name: {name}\n    {body}");
+            let found = early(&before, "").unwrap_or_else(|| panic!("no finding: {before}"));
+            assert!(
+                found.contains("does more than repair the workspace"),
+                "{found}"
+            );
+        }
+    }
+    for elsewhere in ["source", "fcvm/sub"] {
+        let job = format!(
+            "runs-on: {labels}\nsteps:\n  \
+             - uses: actions/checkout@0000000000000000000000000000000000000000\n    \
+             with:\n      path: {elsewhere}\n{check}"
+        );
+        assert_eq!(
+            finding(&job).as_deref(),
+            Some("the checkout does not populate fcvm, where the check runs")
+        );
+    }
+    for before in [
+        "  - run: make build\n",
+        "  - name: Warm the cache\n    run: ./target/release/fcvm setup\n",
+        "  - uses: ./fcvm/.github/actions/checkout-deps\n",
+    ] {
+        let found = early(before, "").unwrap_or_else(|| panic!("no finding: {before}"));
+        assert!(found.contains("is not in BEFORE_CHECKOUT"), "{found}");
+    }
+    assert_eq!(
+        early("", "    continue-on-error: true\n").as_deref(),
+        Some("the checkout sets continue-on-error")
+    );
+    assert_eq!(
+        early("", "    if: always()\n").as_deref(),
+        Some("the checkout sets if")
+    );
 
     // Which jobs the rule is applied to at all.
     let runner = |job: &str| runner_of(&serde_norway::from_str::<Value>(job).unwrap());
@@ -1016,6 +1219,473 @@ fn a_self_hosted_job_without_the_runner_kernel_check_is_a_finding() {
     ] {
         assert!(runner(unreadable).is_err(), "{unreadable}");
     }
+}
+
+/// Actions a job on a runner of ours may use that upload no artifact. An action that is
+/// neither listed here nor `actions/upload-artifact` is a finding: the upload rules below
+/// read one action, and an upload through another would pass them unread.
+const ACTIONS_THAT_UPLOAD_NOTHING: &[&str] = &[
+    "actions/checkout",
+    "actions/cache",
+    "actions/cache/restore",
+    "actions/cache/save",
+    "Swatinem/rust-cache",
+    "./fcvm/.github/actions/checkout-deps",
+];
+
+/// The directories a job on a runner of ours may upload. Both are under `/tmp`, which our
+/// runners keep from job to job, so both come with the reset rules below.
+const UPLOADED_DIRECTORIES: &[&str] = &["/tmp/fcvm-test-logs", "/tmp/fcvm-teardown-evidence"];
+
+/// What is wrong with what a job on a runner of ours uploads, if anything.
+///
+/// This is a lint over what the workflows of this repository write, not a model of GitHub's
+/// runner or of a shell. An upload has one accepted shape: `actions/upload-artifact`, whose
+/// `path` lines are each one of UPLOADED_DIRECTORIES (or an exclusion, `!...`), under an `if`
+/// that requires_success_of reads as requiring the reset step. Anything else (another
+/// action, a glob, an expression, a copy of the logs uploaded from elsewhere) is a finding
+/// until it is given a shape here. Not seen: what a composite action or a `run:` command
+/// uploads.
+fn test_log_upload_finding(job: &Value) -> Option<String> {
+    let steps = job.get("steps").and_then(Value::as_sequence)?;
+    fn run_of(step: &Value) -> &str {
+        step.get("run").and_then(Value::as_str).unwrap_or_default()
+    }
+    fn name_of(step: &Value) -> &str {
+        step.get("name").and_then(Value::as_str).unwrap_or("?")
+    }
+    // A step's commands: comments and blank lines taken out, each line as its words.
+    fn commands(step: &Value) -> Vec<Vec<&str>> {
+        run_of(step)
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or(""))
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            .filter(|words| !words.is_empty())
+            .collect()
+    }
+    // The directories a command removes: `rm -rf` or `sudo rm -rf` of absolute paths, on a
+    // line of its own (`rm -rf A && mkdir A` goes on to the next line when the rm fails, and
+    // the step still succeeds).
+    fn removed<'a>(words: &[&'a str]) -> Vec<&'a str> {
+        let paths = match words {
+            ["sudo", "rm", "-rf", paths @ ..] | ["rm", "-rf", paths @ ..] => paths,
+            _ => return Vec::new(),
+        };
+        if paths.is_empty() || !paths.iter().all(|path| path.starts_with('/')) {
+            return Vec::new();
+        }
+        paths
+            .iter()
+            .copied()
+            .map(|path| path.trim_end_matches('/'))
+            .collect()
+    }
+
+    fn only_makes_directories(words: &[&str]) -> bool {
+        match words {
+            ["mkdir", "-p", paths @ ..] => {
+                !paths.is_empty() && paths.iter().all(|path| path.starts_with('/'))
+            }
+            _ => false,
+        }
+    }
+
+    // Every action the job uses, and what each upload takes.
+    let mut uploads: Vec<(usize, Vec<String>)> = Vec::new();
+    for (at, step) in steps.iter().enumerate() {
+        let Some(uses) = step.get("uses").and_then(Value::as_str) else {
+            continue;
+        };
+        let action = uses.split('@').next().unwrap_or(uses);
+        if ACTIONS_THAT_UPLOAD_NOTHING.contains(&action) {
+            continue;
+        }
+        if action != "actions/upload-artifact" {
+            return Some(format!(
+                "the step `{}` uses {action}, which is neither actions/upload-artifact nor \
+                 one of ACTIONS_THAT_UPLOAD_NOTHING",
+                name_of(step)
+            ));
+        }
+        let Some(paths) = step
+            .get("with")
+            .and_then(|with| with.get("path"))
+            .and_then(Value::as_str)
+        else {
+            return Some(format!(
+                "the step `{}` uploads no path this lint can read",
+                name_of(step)
+            ));
+        };
+        // A line that starts with `!` takes files out of the upload and adds none.
+        let taken: Vec<String> = paths
+            .lines()
+            .map(|line| line.trim().trim_end_matches('/').to_string())
+            .filter(|line| !line.is_empty() && !line.starts_with('!'))
+            .collect();
+        if let Some(path) = taken
+            .iter()
+            .find(|path| !UPLOADED_DIRECTORIES.contains(&path.as_str()))
+        {
+            return Some(format!(
+                "the step `{}` uploads {path}, which is not one of UPLOADED_DIRECTORIES",
+                name_of(step)
+            ));
+        }
+        uploads.push((at, taken));
+    }
+    let first_upload = uploads.first()?.0;
+
+    // The step that empties the log directory for this job.
+    let Some(reset_at) = steps[..first_upload].iter().position(|step| {
+        commands(step)
+            .iter()
+            .any(|words| removed(words).contains(&"/tmp/fcvm-test-logs"))
+    }) else {
+        return Some("no step before the upload removes /tmp/fcvm-test-logs".into());
+    };
+    let reset = &steps[reset_at];
+    // It runs whenever the job got as far as its tests could matter, and its success means
+    // the directories are this job's: no `if`, nothing that turns a failure into a success,
+    // and the runner's default shell, which stops at the first failing line.
+    if reset.get("if").is_some() {
+        return Some(format!("the reset step `{}` has an `if`", name_of(reset)));
+    }
+    if let Some(key) = ["continue-on-error", "shell"]
+        .iter()
+        .find(|key| reset.get(**key).is_some())
+    {
+        return Some(format!("the reset step `{}` sets {key}", name_of(reset)));
+    }
+    let Some(id) = reset.get("id").and_then(Value::as_str) else {
+        return Some(format!("the reset step `{}` has no id", name_of(reset)));
+    };
+    // Directly after the runner kernel check: a job that fails in any later step (the
+    // toolchain, apt, the build) has by then emptied the directories, so what its captures
+    // write there is uploaded, and it is its own.
+    let follows_the_check = reset_at
+        .checked_sub(1)
+        .is_some_and(|before| run_of(&steps[before]).contains("check-runner-kernel"));
+    if !follows_the_check {
+        return Some(format!(
+            "the reset step `{}` does not directly follow the runner kernel check",
+            name_of(reset)
+        ));
+    }
+    for (at, taken) in &uploads {
+        let step = &steps[*at];
+        if !requires_success_of(condition_of(step), id) {
+            return Some(format!(
+                "the step `{}` runs when the reset step `{id}` did not",
+                name_of(step)
+            ));
+        }
+        if let Some(path) = taken.iter().find(|path| {
+            !commands(reset)
+                .iter()
+                .any(|words| removed(words).contains(&path.as_str()))
+        }) {
+            return Some(format!(
+                "the step `{}` uploads {path}, which the reset step `{id}` does not remove",
+                name_of(step)
+            ));
+        }
+    }
+    // Until every uploaded directory is removed the reset step runs nothing but removals and
+    // `mkdir -p`: no command before a removal can change what a failure of it does.
+    let mut left: BTreeSet<&str> = uploads
+        .iter()
+        .flat_map(|(_, taken)| taken.iter().map(String::as_str))
+        .collect();
+    for words in commands(reset) {
+        if left.is_empty() {
+            break;
+        }
+        let gone = removed(&words);
+        if !gone.is_empty() {
+            left.retain(|path| !gone.contains(path));
+        } else if !only_makes_directories(&words) {
+            return Some(format!(
+                "the reset step `{}` runs `{}` before it has removed {}",
+                name_of(reset),
+                words.join(" "),
+                left.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Our runners keep `/tmp` from job to job. A job empties `/tmp/fcvm-test-logs` in a reset
+/// step and uploads the directory in a step that runs after a failure too. While the reset
+/// came after the build setup, a job that failed before it uploaded the previous job's logs
+/// under its own artifact name (#2164); once the upload required the reset, such a job
+/// uploaded nothing, its own kernel log, host load and disk I/O captures included.
+///
+/// So the reset step directly follows the runner kernel check, every upload runs only when it
+/// succeeded, and it removes every directory an upload takes, in `rm -rf` lines that hold
+/// nothing else and come before any other command. A job whose kernel check fails uploads
+/// nothing. A step that writes into the directory after a failed reset leaves files that no
+/// upload takes and the next job's reset removes, so those steps are not held to the rule.
+#[test]
+fn test_log_uploads_require_the_jobs_own_log_reset() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut uploading = BTreeSet::new();
+    let mut findings = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if !matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let file = path.file_name().unwrap().to_string_lossy().to_string();
+        let workflow = parse_workflow(&file);
+        for (name, job) in workflow["jobs"].as_mapping().unwrap() {
+            let name = name.as_str().unwrap();
+            if !matches!(runner_of(job), Ok(Runner::Ours)) {
+                continue;
+            }
+            let uploads = job
+                .get("steps")
+                .and_then(Value::as_sequence)
+                .is_some_and(|steps| {
+                    steps.iter().any(|step| {
+                        format!("{:?}", step.get("with")).contains("/tmp/fcvm-test-logs")
+                    })
+                });
+            if uploads {
+                uploading.insert(format!("{file}/{name}"));
+            }
+            if let Some(finding) = test_log_upload_finding(job) {
+                findings.push(format!("{file}/{name}: {finding}"));
+            }
+        }
+    }
+    assert!(findings.is_empty(), "{findings:#?}");
+    assert_eq!(
+        uploading.into_iter().collect::<Vec<_>>(),
+        [
+            "ci.yml/container",
+            "ci.yml/host",
+            "ci.yml/host-root",
+            "teardown-evidence.yml/evidence",
+            "weekly.yml/fuzz",
+        ]
+    );
+
+    // The rule itself, on fixture jobs.
+    let check = "  - name: check\n    run: ./scripts/check-runner-kernel.py\n";
+    let finding = |steps: &str| {
+        let job: Value = serde_norway::from_str(&format!(
+            "runs-on: [self-hosted, Linux, ARM64]\nsteps:\n{check}{steps}"
+        ))
+        .unwrap();
+        test_log_upload_finding(&job)
+    };
+    let reset = "  - name: reset\n    id: logs\n    run: |\n      sudo rm -rf /tmp/fcvm-test-logs\n      mkdir -p /tmp/fcvm-test-logs\n";
+    let upload = |condition: &str, paths: &str| {
+        format!(
+            "  - name: upload\n    if: {condition}\n    \
+             uses: actions/upload-artifact@0000000000000000000000000000000000000000\n    \
+             with:\n      path: |\n{paths}"
+        )
+    };
+    let logs = "        /tmp/fcvm-test-logs/\n";
+    let gated = "always() && steps.logs.outcome == 'success'";
+    assert_eq!(finding(&format!("{reset}{}", upload(gated, logs))), None);
+    assert_eq!(
+        finding(&format!(
+            "{reset}{}",
+            upload("failure() && steps.logs.outcome == 'success'", logs)
+        )),
+        None
+    );
+    assert_eq!(
+        finding(&format!(
+            "{reset}{}",
+            upload("${{ always() && steps.logs.outcome == 'success' }}", logs)
+        )),
+        None
+    );
+    // an exclusion is not a path the reset has to remove
+    assert_eq!(
+        finding(&format!(
+            "{reset}{}",
+            upload(
+                gated,
+                "        /tmp/fcvm-test-logs/\n        !/tmp/fcvm-test-logs/**/*.tmp\n"
+            )
+        )),
+        None
+    );
+    assert_eq!(finding("  - run: make build\n"), None);
+    let wrong = |steps: String, wanted: &str| {
+        let found = finding(&steps).unwrap_or_else(|| panic!("no finding: {steps}"));
+        assert!(found.contains(wanted), "{found}");
+    };
+    wrong(
+        format!("{reset}{}", upload("always()", logs)),
+        "the step `upload` runs when the reset step `logs` did not",
+    );
+    wrong(
+        format!("{reset}{}", upload("failure()", logs)),
+        "runs when the reset step",
+    );
+    wrong(
+        format!("{}{reset}", upload(gated, logs)),
+        "no step before the upload removes",
+    );
+    wrong(
+        format!(
+            "  - name: reset\n    id: logs\n    run: |\n      # sudo rm -rf /tmp/fcvm-test-logs\n      \
+             mkdir -p /tmp/fcvm-test-logs\n{}",
+            upload(gated, logs)
+        ),
+        "no step before the upload removes",
+    );
+    wrong(
+        format!(
+            "{}{}",
+            reset.replace("    id: logs\n", ""),
+            upload(gated, logs)
+        ),
+        "has no id",
+    );
+    wrong(
+        format!(
+            "{}{}",
+            reset.replace("    id: logs\n", "    id: logs\n    if: always()\n"),
+            upload(gated, logs)
+        ),
+        "has an `if`",
+    );
+    wrong(
+        format!(
+            "{reset}{}",
+            upload(
+                gated,
+                "        /tmp/fcvm-teardown-evidence/\n        /tmp/fcvm-test-logs/\n"
+            )
+        ),
+        "uploads /tmp/fcvm-teardown-evidence, which the reset step `logs` does not remove",
+    );
+    // spellings of the reset's outcome that are not read
+    for condition in [
+        "always() || steps.logs.outcome == 'success'",
+        "always() && !(steps.logs.outcome == 'success')",
+        "always() && steps.logs.outcome != 'success'",
+        "always() && steps.other.outcome == 'success'",
+    ] {
+        wrong(
+            format!("{reset}{}", upload(condition, logs)),
+            "runs when the reset step",
+        );
+    }
+    // a removal that a failure does not stop the step at
+    wrong(
+        format!(
+            "  - name: reset\n    id: logs\n    run: |\n      \
+             sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs\n      \
+             sudo rm -rf /tmp/other\n{}",
+            upload(gated, logs)
+        ),
+        "no step before the upload removes",
+    );
+    // a second upload whose path the lint cannot read
+    wrong(
+        format!(
+            "{reset}{}  - name: more\n    if: always()\n    \
+             uses: actions/upload-artifact@0000000000000000000000000000000000000000\n    \
+             with:\n      path: ${{{{ env.TEST_LOG_DIR }}}}\n",
+            upload(gated, logs)
+        ),
+        "the step `more` uploads ${{ env.TEST_LOG_DIR }}, which is not one of UPLOADED_DIRECTORIES",
+    );
+    // shapes of an upload that are not the accepted one: a glob, a copy of the logs, a path
+    // elsewhere, no path, another action
+    for paths in [
+        "        /tmp/fcvm-test-logs/*.log\n",
+        "        /tmp/fcvm-test-logs/\n        /tmp/copy-of-the-logs/\n",
+        "        target/criterion/\n",
+    ] {
+        wrong(
+            format!("{reset}{}", upload(gated, paths)),
+            "which is not one of UPLOADED_DIRECTORIES",
+        );
+    }
+    wrong(
+        format!(
+            "{reset}  - name: bare\n    if: {gated}\n    \
+             uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
+        ),
+        "the step `bare` uploads no path this lint can read",
+    );
+    wrong(
+        format!(
+            "{reset}{}  - name: other\n    if: always()\n    \
+             uses: example-owner/upload-to-a-bucket@0000000000000000000000000000000000000000\n",
+            upload(gated, logs)
+        ),
+        "the step `other` uses example-owner/upload-to-a-bucket, which is neither",
+    );
+    for action in ACTIONS_THAT_UPLOAD_NOTHING {
+        assert_eq!(
+            finding(&format!(
+                "{reset}  - uses: {action}@0000000000000000000000000000000000000000\n{}",
+                upload(gated, logs)
+            )),
+            None,
+            "{action}"
+        );
+    }
+    // the reset step: directly after the kernel check, under the default shell, and nothing
+    // before its removals
+    wrong(
+        format!("  - run: make build\n{reset}{}", upload(gated, logs)),
+        "the reset step `reset` does not directly follow the runner kernel check",
+    );
+    for (key, value) in [("shell", "sh"), ("continue-on-error", "true")] {
+        wrong(
+            format!(
+                "{}{}",
+                reset.replace(
+                    "    id: logs\n",
+                    &format!("    id: logs\n    {key}: {value}\n")
+                ),
+                upload(gated, logs)
+            ),
+            &format!("the reset step `reset` sets {key}"),
+        );
+    }
+    wrong(
+        format!(
+            "  - name: reset\n    id: logs\n    run: |\n      set +e\n      \
+             sudo rm -rf /tmp/fcvm-test-logs\n      mkdir -p /tmp/fcvm-test-logs\n{}",
+            upload(gated, logs)
+        ),
+        "the reset step `reset` runs `set +e` before it has removed /tmp/fcvm-test-logs",
+    );
+    let both = "        /tmp/fcvm-teardown-evidence/\n        /tmp/fcvm-test-logs/\n";
+    let reset_both = |between: &str| {
+        format!(
+            "  - name: reset\n    id: logs\n    run: |\n      sudo rm -rf /tmp/fcvm-test-logs\n      \
+             mkdir -p /tmp/fcvm-test-logs\n{between}      sudo rm -rf /tmp/fcvm-teardown-evidence\n"
+        )
+    };
+    assert_eq!(
+        finding(&format!("{}{}", reset_both(""), upload(gated, both))),
+        None
+    );
+    wrong(
+        format!(
+            "{}{}",
+            reset_both("      true || exit 0\n"),
+            upload(gated, both)
+        ),
+        "runs `true || exit 0` before it has removed /tmp/fcvm-teardown-evidence",
+    );
 }
 
 /// Every self-hosted job that checks out must first repair workspace ownership.
@@ -2412,7 +3082,7 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
         );
         // `emit` writes each output from its positional argument. A declared
         // output the function does not write is the empty string to every consumer.
-        let position = ["run", "reason", "code", "bench", "fleet", "web"]
+        let position = ["run", "reason", "code", "bench", "fleet", "web", "confine"]
             .iter()
             .position(|k| *k == name)
             .unwrap_or_else(|| panic!("`changes` declares `{name}`, which `emit` does not write"))
@@ -2429,8 +3099,9 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
     // exposed that. The fail-open branches are pinned in
     // fleet_web_changes_run_the_fleet_web_job.
     assert!(
-        scripts.contains("emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\""),
-        "the classifier's own verdict is not emitted from $code, $bench, $fleet and $web"
+        scripts
+            .contains("emit true \"$scope\" \"$code\" \"$bench\" \"$fleet\" \"$web\" \"$confine\""),
+        "the classifier's own verdict is not emitted from $code, $bench, $fleet, $web and $confine"
     );
 
     // And the reverse: nothing may gate on an output `changes` does not declare.
@@ -2773,6 +3444,17 @@ fn run_matrix_plan(
     pr_tree_matches: bool,
     pr_jobs: &[&str],
 ) -> BTreeMap<String, String> {
+    run_matrix_plan_for(event, pr_tree_matches, pr_jobs, false)
+}
+
+/// [`run_matrix_plan`], saying whether the `changes` job found the pull request touching
+/// the VMM's confinement (`needs.changes.outputs.confine`).
+fn run_matrix_plan_for(
+    event: &str,
+    pr_tree_matches: bool,
+    pr_jobs: &[&str],
+    touches_confinement: bool,
+) -> BTreeMap<String, String> {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let ci = parse_workflow("ci.yml");
     let run = workflow_job(&ci, "skip-check")
@@ -2831,6 +3513,10 @@ exit 1
         .env("PATH", path)
         .env("EVENT", event)
         .env("REPO", "o/r")
+        .env(
+            "CONFINE",
+            if touches_confinement { "true" } else { "false" },
+        )
         .env("GH_TOKEN", "unused")
         .env("GITHUB_OUTPUT", &out_file)
         .env(
@@ -2951,6 +3637,53 @@ fn a_pull_request_runs_every_arm64_job_and_one_x64_job() {
         arm64, every_arm64,
         "a pull request must still run every arm64 job"
     );
+}
+
+/// A pull request that touches the VMM's confinement also runs Host-x64.
+///
+/// Host-x64's `test-confine` step is the only place the x86_64 seccomp policy runs under
+/// real confinement. Without it, a change to that policy first met an x86_64 kernel on
+/// main. The `changes` job says whether the pull request touches confinement, and the plan
+/// reads it as `needs.changes.outputs.confine`.
+#[test]
+fn a_pull_request_that_touches_confinement_also_runs_host_x64() {
+    let jobs = planned_jobs(&run_matrix_plan_for("pull_request", false, &[], true));
+    let x64: BTreeSet<String> = jobs.iter().filter(|j| j.contains("x64")).cloned().collect();
+    assert_eq!(
+        x64,
+        job_set(&["Host-x64", "Host-Root-x64-SnapshotEnabled"]),
+        "a pull request that touches confinement must run the x64 Host job"
+    );
+    let ci = std::fs::read_to_string(workflow_path("ci.yml")).expect("read ci.yml");
+    assert!(
+        ci.contains("CONFINE: ${{ needs.changes.outputs.confine }}")
+            && ci.contains("confine: ${{ steps.detect.outputs.confine }}"),
+        "the plan no longer reads the changes job's confine output"
+    );
+    let scope = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-pr-scope.sh"),
+    )
+    .expect("read ci-pr-scope.sh");
+    for path in [
+        "resources/seccomp/*",
+        "src/confine.rs",
+        "src/firecracker/vm.rs",
+        "src/utils.rs",
+        "src/commands/common.rs",
+        "src/commands/snapshot.rs",
+        "src/commands/podman/mod.rs",
+        "src/setup/kernel.rs",
+        "src/setup/rootfs.rs",
+        "rootfs-config.toml",
+        "scripts/confine-*",
+        "tests/common/mod.rs",
+        "|Makefile)",
+    ] {
+        assert!(
+            scope.contains(path),
+            "ci-pr-scope.sh no longer counts {path} as a confinement path"
+        );
+    }
 }
 
 /// Main runs whatever its PR run of the same tree did not.
@@ -3617,10 +4350,11 @@ fn host_jobs_upload_the_vmm_logs_teardown_keeps() {
             clear.contains("-name 'fcvm-firecracker-*.log' -delete"),
             "job {job} uploads VMM logs earlier jobs left: {clear}"
         );
+        // After a failed test step too, and only when this job cleared the directory (#2164).
         let step = &steps[save];
         assert_eq!(
             step.get("if").and_then(Value::as_str),
-            Some("always()"),
+            Some("${{ always() && steps.test-logs.outcome == 'success' }}"),
             "job {job}"
         );
         let run = step.get("run").and_then(Value::as_str).unwrap_or("");
@@ -3719,4 +4453,203 @@ fn host_jobs_install_from_cached_apt_archives_and_save_on_a_miss() {
             );
         }
     }
+}
+
+/// The Lean model of the vCPU wake-up path (`verify/`) is checked by a workflow of its own,
+/// `verify.yml`, whose one job runs `lake build`: every proof, every recorded break and the
+/// axiom check. It is not in `Summary`, so these are the ways it could stop checking while
+/// still rendering nothing red:
+///
+/// - a `branches:` filter on `pull_request` matches the BASE branch and skips every stacked
+///   pull request (the #752 shape this file opens with);
+/// - a `paths:` list that leaves out `verify/**` never starts it;
+/// - a `paths:` filter on the `push` to main lets main go unchecked after a merge that the
+///   pull request's own run did not cover;
+/// - `continue-on-error`, an `if:` or an `|| true` on the build step turns a broken proof
+///   into a pass;
+/// - a build step without `./check-imports.sh` before the build, or without
+///   `./check-sweep.sh`, the two gate tests and the search comparison after it, still builds
+///   every proof and no longer checks what those check: the axiom sweep is not elaborated
+///   again on a restored build directory, and nothing else runs the search or the harness.
+#[test]
+fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
+    let wf = parse_workflow("verify.yml");
+    let on = triggers(&wf);
+
+    let pull_request = on
+        .get("pull_request")
+        .and_then(Value::as_mapping)
+        .expect("verify.yml has no `pull_request:` mapping");
+    for key in ["branches", "branches-ignore", "paths-ignore"] {
+        assert!(
+            !pull_request.contains_key(Value::from(key)),
+            "verify.yml restricts `pull_request` with `{key}:`; a base-branch filter skips \
+             every stacked pull request, and an ignore list cannot be kept complete"
+        );
+    }
+    let paths: Vec<&str> = pull_request
+        .get(Value::from("paths"))
+        .and_then(Value::as_sequence)
+        .expect("verify.yml `pull_request` has no `paths:` list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for needed in ["verify/**", ".github/workflows/verify.yml"] {
+        assert!(
+            paths.contains(&needed),
+            "verify.yml `pull_request.paths` is {paths:?}; without `{needed}` a change there \
+             starts no check"
+        );
+    }
+
+    let push = on
+        .get("push")
+        .and_then(Value::as_mapping)
+        .expect("verify.yml has no `push:` mapping, so main is never checked");
+    let branches: Vec<&str> = push
+        .get(Value::from("branches"))
+        .and_then(Value::as_sequence)
+        .expect("verify.yml `push` has no `branches:` list")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        branches.contains(&"main"),
+        "verify.yml `push.branches` is {branches:?}: main is not checked"
+    );
+    for key in ["paths", "paths-ignore"] {
+        assert!(
+            !push.contains_key(Value::from(key)),
+            "verify.yml filters the push to main with `{key}:`"
+        );
+    }
+
+    let job = workflow_job(&wf, "lean");
+    for key in ["if", "continue-on-error"] {
+        assert!(
+            job.get(key).is_none(),
+            "verify.yml's `lean` job has `{key}:`, so it can pass or vanish without building"
+        );
+    }
+    let runs_on = job
+        .get("runs-on")
+        .map(|v| format!("{v:?}"))
+        .unwrap_or_default();
+    assert!(
+        !runs_on.contains("self-hosted"),
+        "the `lean` job must stay on a hosted runner: it needs no KVM, and the self-hosted \
+         fleet is the VM matrix's ({runs_on})"
+    );
+    let minutes = job
+        .get("timeout-minutes")
+        .and_then(Value::as_u64)
+        .expect("the `lean` job has no `timeout-minutes`; GitHub's default is six hours");
+    assert!(
+        minutes <= 15,
+        "the `lean` job's cap is {minutes} minutes, over 15"
+    );
+
+    let steps = job
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("the `lean` job has no steps");
+    let builds: Vec<&Value> = steps
+        .iter()
+        .filter(|s| {
+            s.get("run")
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.lines().any(|l| l.trim() == "lake build"))
+        })
+        .collect();
+    assert_eq!(
+        builds.len(),
+        1,
+        "the `lean` job must have exactly one step that runs `lake build` on a line of its own"
+    );
+    let build = builds[0];
+    assert_eq!(
+        build.get("working-directory").and_then(Value::as_str),
+        Some("verify"),
+        "`lake build` must run in verify/"
+    );
+    for key in ["if", "continue-on-error"] {
+        assert!(
+            build.get(key).is_none(),
+            "the `lake build` step has `{key}:`, so a broken proof would not fail the job"
+        );
+    }
+    let script = build.get("run").and_then(Value::as_str).unwrap();
+    assert!(
+        script.contains("set -euo pipefail") && !script.contains("|| true"),
+        "the `lake build` step must fail when any of its commands fails: {script:?}"
+    );
+
+    // The same step runs, each on a line of its own, what the model's documents rely on
+    // beside the build:
+    // - the import check before the build, because lake does not elaborate Axioms.lean again
+    //   when a file nothing imports is added, so the axiom sweep inside it does not see one;
+    // - after the build, the sweep elaborated again whatever the build directory holds, the
+    //   tests of the search's and the harness's own gates, and the small searches compared
+    //   with the result the documents quote.
+    let lines: Vec<&str> = script.lines().map(str::trim).collect();
+    let line_of = |what: &str, wanted: &dyn Fn(&str) -> bool| -> usize {
+        lines
+            .iter()
+            .position(|l| wanted(l))
+            .unwrap_or_else(|| panic!("the `lake build` step does not run {what}: {script:?}"))
+    };
+    let imports = line_of("`./check-imports.sh` on a line of its own", &|l| {
+        l == "./check-imports.sh"
+    });
+    let built = line_of("`lake build`", &|l| l == "lake build");
+    assert!(
+        imports < built,
+        "`./check-imports.sh` must run before `lake build`: {script:?}"
+    );
+    for after in [
+        "./check-sweep.sh",
+        "./test-search.sh",
+        "./harness/test-run.sh",
+        "./search-expected.sh quick",
+    ] {
+        let at = line_of(&format!("`{after}` on a line of its own"), &|l| l == after);
+        assert!(
+            built < at,
+            "`{after}` runs what `lake build` makes, so it must come after it: {script:?}"
+        );
+    }
+
+    // The toolchain is the one verify/lean-toolchain pins, read from the file, and its cache
+    // is keyed on that file: a toolchain bump cannot be served the old compiler.
+    let install = steps
+        .iter()
+        .filter_map(|s| s.get("run").and_then(Value::as_str))
+        .find(|r| r.contains("elan toolchain install") || r.contains("elan\" toolchain install"))
+        .expect("no step of the `lean` job installs the toolchain");
+    assert!(
+        install.contains("$(cat verify/lean-toolchain)"),
+        "the toolchain install must read verify/lean-toolchain: {install:?}"
+    );
+    let toolchain_caches = steps
+        .iter()
+        .filter(|s| {
+            s.get("with")
+                .and_then(|w| w.get("path"))
+                .and_then(Value::as_str)
+                == Some("~/.elan")
+        })
+        .filter_map(|s| {
+            s.get("with")
+                .and_then(|w| w.get("key"))
+                .and_then(Value::as_str)
+        })
+        .filter(|k| !k.contains("cache-primary-key"))
+        .collect::<Vec<_>>();
+    assert!(
+        !toolchain_caches.is_empty()
+            && toolchain_caches
+                .iter()
+                .all(|k| k.contains("hashFiles('verify/lean-toolchain')")),
+        "the ~/.elan cache must be keyed on verify/lean-toolchain: {toolchain_caches:?}"
+    );
 }

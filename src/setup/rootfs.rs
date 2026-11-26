@@ -921,6 +921,18 @@ fn config_keeping_confinement(existing: Option<&str>) -> Result<String> {
                         "the existing config's [confine] is not a table, so whether it requires \
                          confinement cannot be told; fix it",
                     )?;
+                    // As when the config is loaded (ConfineConfig refuses unknown keys): a
+                    // misspelled `mode` is not "no mode".
+                    if let Some(unknown) = table
+                        .keys()
+                        .find(|key| !matches!(key.as_str(), "mode" | "allow_seccomp_log"))
+                    {
+                        anyhow::bail!(
+                            "the existing config's [confine] has the key {unknown:?}, which is \
+                             neither \"mode\" nor \"allow_seccomp_log\"; fix it rather than \
+                             have it replaced"
+                        );
+                    }
                     match table.get("mode") {
                         None => false,
                         Some(mode) => match mode.as_str() {
@@ -2975,6 +2987,7 @@ fn layer2_setup_confinement_request() -> crate::confine::Request<'static> {
             "fcvm setup's Layer 2 VM runs unconfined; run fcvm setup with confinement off \
              first (it is a one-time step), then start VMs confined",
         ),
+        kernel_profile: None,
     }
 }
 
@@ -3006,6 +3019,8 @@ mod tests {
             "[confine]\nmode = \"on\"\n",
             "[confine]\nmode = 1\n",
             "confine = \"required\"\n",
+            // A misspelled key read as no mode, and the regenerated config said "off".
+            "[confine]\nmdoe = \"required\"\n",
         ] {
             assert!(
                 super::config_keeping_confinement(Some(bad)).is_err(),
@@ -3014,6 +3029,11 @@ mod tests {
         }
         assert_eq!(
             super::config_keeping_confinement(Some("[confine]\n")).unwrap(),
+            EMBEDDED_CONFIG
+        );
+        assert_eq!(
+            super::config_keeping_confinement(Some("[confine]\nallow_seccomp_log = true\n"))
+                .unwrap(),
             EMBEDDED_CONFIG
         );
     }

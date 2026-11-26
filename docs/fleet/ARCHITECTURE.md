@@ -219,7 +219,15 @@ host's GPUs re-tile coarser over the whole side, and the side gets finer again a
 replacement's GPUs render. One host alone keeps the old behaviour: its places stay dark for
 its replacement, which is what a viewer of a one-host fleet sees anyway. The spend meter
 prices every instance the fleet runs, the replacement included, and a budget trip sleeps the
-fleet, which terminates every host.
+fleet, which terminates every host. Because the ceiling is computed from the rates, a host
+group launches only types the rate table prices (built in, and `--spend-rates`): a template
+whose type has no rate gets no CreateFleet, and the group's component (`scale`,
+`scale-renders`) is degraded with the template and the type until a rate is given. One such
+template holds its region's whole request, its priced templates included; the group's other
+regions launch. The rule holds with or without `--daily-spend-usd`. An instance of such a type
+already running is metered at the highest rate known. EC2 tiles are launched from their
+templates without reading the type, and are not checked (#2169); nothing is checked when the
+coordinator starts, because the types are read from the templates at the first launch.
 
 ECS is used for the coordinator only. The GPU hosts stay plain EC2: the ECS GPU AMIs bind
 the NVIDIA driver on the host, and these hosts must leave every GPU to vfio-pci.
@@ -240,7 +248,7 @@ agent's hello may say: an agent on a renders instance must say it runs the mode 
 nothing of the wall's, and one on a GPU instance must not say it runs the mode, or it is
 refused before the hello is applied. The
 spend meter lists its instances with the rest and charges them under the same daily ceiling;
-c8gd.metal-24xl, its type, has a built-in on-demand rate (4.70304 USD/h).
+m8gd.metal-24xl, its type, has a built-in on-demand rate (5.53536 USD/h).
 
 ### EC2 tiles (the comparison)
 
@@ -2543,6 +2551,110 @@ starts nothing of the mode.
   previous file (`.1`), and only the newest 50 failed clones' logs are kept (a log is counted
   once it has been untouched for twice the render timeout and a minute). The benchmark keeps
   its whole record: a run's record is its evidence.
+
+### The recorded campaign
+
+The recorded figures for the page come from one campaign: every regime on one boot of one host,
+on fcvm's own host kernel, at one fcvm commit and one Kitesurf commit, each regime a run of
+`make fleet-renders-bench`. When a run has ended, `bench/chromium/renders_host_record.py` writes
+`host-record.txt` beside its records: the kernel release, the kernel parameters that change what
+is measured (from a list in that file; the rest of the command line is dropped), the fcvm
+commit, Kitesurf's commit, the instance type, a hash of the boot id, the run's arguments (the
+launcher's variables from a list, each with a value of its shape, a path cut to its last name)
+and the time. The record is those seven lines and no other. `bench/chromium/renders_campaign.py` writes the campaign's
+summary, `bench/chromium/results/renders-<id>-summary.json`, from the runs' records. It writes
+nothing when two runs differ in kernel, fcvm commit, Kitesurf commit, instance type or boot,
+when the kernel is not fcvm's own, when a run's summary names another kernel, when a host record
+says a thing twice or holds anything its writer would not write, when a run or the campaign
+holds a `WITHDRAWN` marker, or when a run's teardown does not say it left nothing. Per regime the summary holds each side's figures over a stated window
+(`renders_analyze.py`), the levels the search moved through, and the sha256 and size of the run's
+files.
+
+Each run's `summary.json`, `teardown.json` and `host-record.txt` stay in the tree under
+`bench/chromium/results/renders-<id>/<run>/`. Its row per render and its samples are in
+ejc3/fcvm-bench-records at the same path, listed in `results/records-renders-<id>.json`
+(`records.py`). `renders_campaign.py` and `renders_analyze.py` read them through that manifest,
+so with a checkout of the records repository named by `FCVM_BENCH_RECORDS` the summary is
+rebuilt from this tree; the committed one is byte for byte what that gives.
+
+`bench/chromium/renders_reference.py` writes `fleet/web/core/renders-reference.gen.ts` from the
+one summary in the tree: the campaign, its date, instance type, kernel and commits, and each
+regime's figures by label. The regime labelled `held` is the table the page will show: both sides
+held at the limits the module's own search ended on. The generator takes a `held` regime only
+from a run held at fixed levels on both sides, each side's renders in flight at its level; a
+search run under that label gives no file. No figure is typed;
+`test_renders_reference.py` fails when the file is not what the summary gives. A `WITHDRAWN`
+marker in the campaign's directory, or in the directory of a run the summary cites, withdraws the
+file: the generator and its check stop there, holding the directories' shared locks as
+`campaign_summary.py` does. Nothing in `fleet/web` reads the file yet.
+
+The campaign in the tree, `renders-20261125`, has these regimes:
+
+| label | what ran |
+|---|---|
+| `search`, `search-2`, `search-3` | both sides, the search live, three starts (30, 20 and 20 minutes); scored over the last five minutes |
+| `held`, `held-2` | both sides held at the limits the first search ended on, five scored minutes, taken after the first search and again after the last regime that runs both sides |
+| `alone-fcvm`, `alone-kitesurf` | one side at its limit while the other half is idle |
+| `one-fcvm`, `one-kitesurf` | one render at a time |
+| `bundle-default-*`, `bundle-opt-*` | Kitesurf alone on its production bundle built in Bazel's default mode and with `-c opt`, at one render in flight and at its limit, each twice |
+
+Beside them: `teardown-check.json` (the stage kills, taken in the same session; the file names
+no kernel or commit), `transforms.json` (the mean
+pixel difference of Kitesurf's screenshots with each transform against its plain ones: which
+transforms it draws at that commit) and `kitesurf-bundles.txt` (the two bundles' digests).
+
+### The renders host image
+
+The host boots from an arm64 image of its own, built and validated by the image factory
+(`fleet/ami/renders`, `fleet/ami/README.md`, "The renders track") on the type it runs on,
+m8gd.metal-24xl. The image makes a host the configuration the recorded figures were measured on:
+
+- fcvm's arm64 host kernel (`make install-host-kernel`), booted with
+  `kvm-arm.mode=nested numa=off arm64.nv2`. The three are `RENDERS_BOOT_PARAMS` in
+  `fleet/ami/renders/renders.conf`, which a test holds equal to the nested arm64 profile's
+  `boot_args`; the build and every validation boot fail on another kernel, on a missing one of the
+  three, or on any parameter other than them and the base image's (`RENDERS_BOOT_BASE_KEYS`: the
+  boot loader's and the cloud image's). A test holds every parameter the campaign's host record
+  keeps to one of the three or refused, so none can be present without being recorded.
+- The NIC driver (ENA) stays a module of the arm64 host kernel, the kernel the reference was
+  measured on: its config is the running Ubuntu kernel's, which has ENA `=m`, and
+  `kernel/host-arm64.conf` does not pin it. The host boots without an initramfs, as Ubuntu's image
+  and the campaign's host do. `systemd-modules-load.service` loads ENA, which binds the NIC during
+  the load, and `cloud-init-local.service` is ordered after it, so the NIC is bound before
+  cloud-init-local looks for one and the host runs its user data. `host-check.py` checks the two
+  files, that `systemd-modules-load.service` ran, and the order systemd resolved, at build and on
+  every validation boot, and the launch-path proof checks the order the boot took on each of the
+  three validation boots.
+- 34,000 pages of 2 MiB (`RENDERS_HUGEPAGES`) reserved through sysfs by
+  `fcvm-fleet-hugepages.service` in the first transaction of the boot, before the store's restore.
+  A short pool fails the unit and the agent, which requires it, does not start.
+- The store on the instance-store NVMe, restored at every boot as a GPU host's is: the default
+  kernel and rootfs, the bench image's export, the module's snapshot (made at build by the module
+  itself, so a host's first module does not take the two minutes `fcvm podman prepare` takes), and
+  Kitesurf at the recorded campaign's commit (`RENDERS_KITESURF_REV` in `renders.conf`, held equal
+  to the summary's `kitesurf_commit`) with its production bundle in Bazel's default mode, served
+  from Bazel's output directory. `bench/chromium/kitesurf_pins.sh` stays the other benchmark arm's
+  pin; the image builds from a copy of it with that commit, and its toolchain (node, pnpm,
+  Bazelisk) is the file's, the combination the campaign's host built.
+- `fcvm-fleet-renders-agent.service`: `fcvm fleet agent --renders` as the build user, with
+  `renders_bench.sh`'s unit properties (`Delegate=yes`, `DelegateSubgroup=agent`, the default
+  `KillMode`, `LimitNOFILE=1048576`, `TasksMax=infinity`). The host's boot writes the fleet's
+  arguments to `/etc/fcvm-fleet/agent.env`; the module's (CPU sets 0-39, 40-79 and 80-95, at most
+  40 and 48 renders in flight, the corpus, the snapshot tag, Kitesurf, and `--setup fcvm.commit=`
+  and `--setup kitesurf.commit=` so the hello's build map names both) are in
+  `/etc/fcvm-fleet/renders.env`, written at build from `renders.conf`. `RENDERS_FRAME_ARGS` in that
+  file is where the frame server's options go.
+
+The image runs the reference's Kitesurf commit and boot line, and the image's other settings that
+the campaign's summary and host records carry (the most renders in flight per side, the pool, the
+instance type, the host kernel's version) are read from them by `fleet/ami/test_pipeline.py`. When
+either the Kitesurf commit or the boot line changes, the reference is measured again: a new
+campaign, whose summary the test then reads.
+
+The image publishes only after `make test-fleet-renders-agent` has passed every case on its cold
+boot, and the check's running case has passed on the agent unit's own words (its settings,
+`ExecStart` and `renders.env`, with `--stdio` standing in for the coordinator's address). It is a track of its own: it shares no renderer with the GPU host and tile pair, so neither
+track's failure holds or publishes the other.
 
 ## Windows mode
 

@@ -1,0 +1,141 @@
+name: Verify
+
+# Checks the Lean model of the vCPU wake-up path (verify/): `lake build` elaborates every
+# proof and replays every recorded break. A broken proof, a `sorry`, or a recorded run that no
+# longer breaks its property fails it. Around the build, the same step runs what the build
+# cannot check about itself (check-imports.sh before it, check-sweep.sh after it: the axiom
+# sweep is run on every job, whatever the restored build directory holds), the tests of the
+# search's and the harness's own gates, and the 19 small searches against search.expected.
+#
+# A workflow of its own, not a job in ci.yml: nothing in ci.yml's matrix builds or reads
+# verify/, and this job needs none of its scope machinery. It renders its own check ("Lean")
+# and is not part of `Summary`.
+#
+# `pull_request` carries no `branches:` filter: that filter matches the BASE branch, so it
+# would skip every stacked pull request. All 76 searches (45 minutes of CPU) are the `search`
+# job, which runs only when this workflow is dispatched by hand.
+on:
+  pull_request:
+    paths:
+      - 'verify/**'
+      - '.github/workflows/verify.yml'
+      # the patch the harness applies to v7.3.3
+      - 'kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lean:
+    name: Lean
+    runs-on: ubuntu-latest
+    # Measured on an arm64 dev box, toolchain installed: a cold build 3 min 37 s, then the
+    # other five steps 2 min 48 s together (the 19 small searches are 2 min of it).
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # elan and the toolchain verify/lean-toolchain pins. Saved as soon as they are
+      # installed, so a failing proof does not cost the next run the download. A pull request
+      # reads the copy main saved and saves none of its own.
+      - name: Restore elan and the Lean toolchain
+        id: elan-cache
+        # A cache service failure must not fail the job: the install below runs on a miss.
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.elan
+          key: elan-4.4.0-0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2-${{ hashFiles('verify/lean-toolchain') }}
+      - name: Install elan (checksum-pinned) and the pinned toolchain
+        if: steps.elan-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ./scripts/cached-download.sh \
+            https://github.com/leanprover/elan/releases/download/v4.4.0/elan-x86_64-unknown-linux-gnu.tar.gz \
+            0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2 "$RUNNER_TEMP/elan.tar.gz" "$RUNNER_TEMP/downloads"
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/elan.tar.gz" elan-init
+          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-toolchain none
+          "$HOME/.elan/bin/elan" toolchain install "$(cat verify/lean-toolchain)"
+      - name: Save elan and the Lean toolchain
+        if: steps.elan-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.elan
+          key: ${{ steps.elan-cache.outputs.cache-primary-key }}
+
+      # Lake rebuilds a module when its source or anything it imports changed, so an older
+      # build directory only saves the modules that did not.
+      - name: Cache the build directory
+        continue-on-error: true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: verify/.lake
+          key: lake-${{ hashFiles('verify/lean-toolchain') }}-${{ hashFiles('verify/lakefile.toml', 'verify/lake-manifest.json', 'verify/**/*.lean') }}
+          restore-keys: |
+            lake-${{ hashFiles('verify/lean-toolchain') }}-
+
+      - name: Check every proof, every recorded break and the axioms
+        working-directory: verify
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.elan/bin:$PATH"
+          lean --version
+          # every file of the model is imported by its axiom sweep, and lakefile.toml builds
+          # every library whole
+          ./check-imports.sh
+          lake build
+          # the axiom sweep, elaborated again whatever the restored build directory holds
+          ./check-sweep.sh
+          # The search program's own gates, and the harness script's. The second fetches the
+          # pinned kernel source and runs the kernel's functions against the rule books.
+          ./test-search.sh
+          ./harness/test-run.sh
+          # the 19 small searches against the result the documents quote, strictly both ways
+          ./search-expected.sh quick
+
+  # All 76 searches against search.expected. Dispatched by hand after a change to the model's
+  # rules or properties: 45 minutes of CPU on an arm64 dev box, 3.3 GB a process.
+  search:
+    name: Lean search (all 76)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Restore elan and the Lean toolchain
+        id: elan-cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.elan
+          key: elan-4.4.0-0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2-${{ hashFiles('verify/lean-toolchain') }}
+      - name: Install elan (checksum-pinned) and the pinned toolchain
+        if: steps.elan-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ./scripts/cached-download.sh \
+            https://github.com/leanprover/elan/releases/download/v4.4.0/elan-x86_64-unknown-linux-gnu.tar.gz \
+            0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2 "$RUNNER_TEMP/elan.tar.gz" "$RUNNER_TEMP/downloads"
+          tar -C "$RUNNER_TEMP" -xzf "$RUNNER_TEMP/elan.tar.gz" elan-init
+          "$RUNNER_TEMP/elan-init" -y --no-modify-path --default-toolchain none
+          "$HOME/.elan/bin/elan" toolchain install "$(cat verify/lean-toolchain)"
+      - name: Run every search and compare it with search.expected
+        working-directory: verify
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.elan/bin:$PATH"
+          lake build breaks
+          # three processes side by side: a hosted runner has 16 GB
+          JOBS=3 ./search-expected.sh full

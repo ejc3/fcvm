@@ -1,0 +1,3730 @@
+{
+ "boot": "1c7b86ffb3e655f0",
+ "campaign": "renders-20261125",
+ "generated_by": "bench/chromium/renders_campaign.py",
+ "instance_type": "m8gd.metal-24xl",
+ "kernel": "7.3.3-fcvm-57abeebe8d9c",
+ "kitesurf_commit": "f964846eb3cf3437abe93a64cd858c0f71938200",
+ "regimes": [
+  {
+   "arguments": "MAX_FCVM=40 MAX_ENGINES=48 LEVELS=15,38 SECONDS_RUN=360",
+   "ended": "2026-11-25T16:24:52Z",
+   "engine_recycles": 19,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "660ae235d127168476168617daf2f2cab7cf7f2eb745d74bd56714067603426a",
+     "size": 321
+    },
+    "renders.jsonl": {
+     "sha256": "bfa4b1f2c4082eed1730b19776046eea8f01b73e7a565f186496f81424abcb9e",
+     "size": 17759063
+    },
+    "samples.jsonl": {
+     "sha256": "47e277f11afa1b2dccf35afcf5aa0e0c9f7a373df9cc2de3308e2fc52375941d",
+     "size": 259089
+    },
+    "summary.json": {
+     "sha256": "aab1be62c68deae6e9626be1f27a1302800c33ceba7739ec4564d30ece185234",
+     "size": 8723
+    },
+    "teardown.json": {
+     "sha256": "85eb09c97bb7d80bf0b48a38c8c6803cc2622f4d0bbdaef678aa78d34164f382",
+     "size": 121
+    }
+   },
+   "fixed_levels": [
+    15,
+    38
+   ],
+   "harness": {
+    "cores_busy": 3.5,
+    "cpu_pressure": 0.02,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.86,
+      "cpu_pressure": 0.004
+     },
+     "replay-engines": {
+      "cores_busy": 1.35,
+      "cpu_pressure": 0.012
+     },
+     "replay-fcvm": {
+      "cores_busy": 1.28,
+      "cpu_pressure": 0.007
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 2.873562,
+     "kitesurf": 9.864279999999999
+    },
+    "replay_ms_median": {
+     "fcvm": 0.62,
+     "kitesurf": 0.7
+    },
+    "replay_ms_p90": {
+     "fcvm": 1.06,
+     "kitesurf": 1.58
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "held",
+   "run": "held-a",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 33.9,
+     "cpu_ms_per_render": 1439.7,
+     "cpu_pressure": 0.13,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 15,
+     "in_flight_range": [
+      15,
+      15
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       15
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 635.9,
+     "median_ms": 388.7,
+     "p90_ms": 1414.9,
+     "page_mean_ms": 634.0,
+     "page_median_ms": {
+      "blog.cloudflare.com": 430.8,
+      "developer.mozilla.org-en-us": 442.8,
+      "developers.cloudflare.com": 509.4,
+      "en.wikipedia.org": 444.9,
+      "example.com": 218.7,
+      "news.ycombinator.com": 266.6,
+      "todomvc.com-examples-angular-dist-browser": 330.9,
+      "todomvc.com-examples-javascript-es6-dist": 298.7,
+      "todomvc.com-examples-preact-dist": 270.1,
+      "todomvc.com-examples-react-dist-index.html": 289.3,
+      "todomvc.com-examples-vue-dist": 279.9,
+      "www.elmundo.es": 2918.4,
+      "www.rtp.pt-noticias": 1404.6,
+      "www.theguardian.com-international": 770.5
+     },
+     "pool_waits": 0,
+     "renders": 7069,
+     "renders_per_s": 23.56,
+     "setup": {
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "max_in_flight": "40",
+      "memory_mib": "1024",
+      "page_size": "2 MiB",
+      "pool_pages": "34000",
+      "uffd_mode": "minor",
+      "vcpus": "4",
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.5,
+     "cpu_ms_per_render": 1248.0,
+     "cpu_pressure": 0.151,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 38,
+     "in_flight_range": [
+      38,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       38
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 1199.6,
+     "median_ms": 755.8,
+     "p90_ms": 2052.3,
+     "page_mean_ms": 1177.6,
+     "page_median_ms": {
+      "blog.cloudflare.com": 875.2,
+      "developer.mozilla.org-en-us": 961.7,
+      "developers.cloudflare.com": 845.4,
+      "en.wikipedia.org": 1309.0,
+      "example.com": 229.7,
+      "news.ycombinator.com": 298.4,
+      "todomvc.com-examples-angular-dist-browser": 448.9,
+      "todomvc.com-examples-javascript-es6-dist": 363.8,
+      "todomvc.com-examples-preact-dist": 360.8,
+      "todomvc.com-examples-react-dist-index.html": 404.7,
+      "todomvc.com-examples-vue-dist": 378.2,
+      "www.elmundo.es": 1338.3,
+      "www.rtp.pt-noticias": 6647.3,
+      "www.theguardian.com-international": 2024.9
+     },
+     "pool_waits": 0,
+     "renders": 9501,
+     "renders_per_s": 31.67,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1023",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "4096",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 300.0,
+    "skip_s": 60.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=40 MAX_ENGINES=48 LEVELS=15,38 SECONDS_RUN=360",
+   "ended": "2026-11-25T17:27:38Z",
+   "engine_recycles": 19,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "00bd3eb33c78b42e4720059b84a40502ccd356162657a9cabdc0689bf326c4f8",
+     "size": 321
+    },
+    "renders.jsonl": {
+     "sha256": "9ce4e39ea38f1139e8866a0577714624f9324f590e9380ca26869fb5f98864c6",
+     "size": 17787107
+    },
+    "samples.jsonl": {
+     "sha256": "8ada97543e17bc5e36a6d457a13ffd78ef9858b84fe52fb2734930f9bbb5be55",
+     "size": 259093
+    },
+    "summary.json": {
+     "sha256": "7e070f78d3c39de0204dbd8b2677d885dfcfa949fe262d18537e3c8a0de8326d",
+     "size": 8733
+    },
+    "teardown.json": {
+     "sha256": "85eb09c97bb7d80bf0b48a38c8c6803cc2622f4d0bbdaef678aa78d34164f382",
+     "size": 121
+    }
+   },
+   "fixed_levels": [
+    15,
+    38
+   ],
+   "harness": {
+    "cores_busy": 3.5,
+    "cpu_pressure": 0.021,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.86,
+      "cpu_pressure": 0.004
+     },
+     "replay-engines": {
+      "cores_busy": 1.36,
+      "cpu_pressure": 0.012
+     },
+     "replay-fcvm": {
+      "cores_busy": 1.29,
+      "cpu_pressure": 0.007
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 5.258386000000001,
+     "kitesurf": 11.654059
+    },
+    "replay_ms_median": {
+     "fcvm": 0.62,
+     "kitesurf": 0.7
+    },
+    "replay_ms_p90": {
+     "fcvm": 1.02,
+     "kitesurf": 1.59
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "held-2",
+   "run": "held-b",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 33.9,
+     "cpu_ms_per_render": 1437.7,
+     "cpu_pressure": 0.13,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 15,
+     "in_flight_range": [
+      15,
+      15
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       15
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 635.7,
+     "median_ms": 388.8,
+     "p90_ms": 1414.5,
+     "page_mean_ms": 634.7,
+     "page_median_ms": {
+      "blog.cloudflare.com": 431.8,
+      "developer.mozilla.org-en-us": 444.3,
+      "developers.cloudflare.com": 510.4,
+      "en.wikipedia.org": 449.4,
+      "example.com": 220.0,
+      "news.ycombinator.com": 267.3,
+      "todomvc.com-examples-angular-dist-browser": 331.5,
+      "todomvc.com-examples-javascript-es6-dist": 301.8,
+      "todomvc.com-examples-preact-dist": 271.9,
+      "todomvc.com-examples-react-dist-index.html": 289.7,
+      "todomvc.com-examples-vue-dist": 280.4,
+      "www.elmundo.es": 2914.0,
+      "www.rtp.pt-noticias": 1405.7,
+      "www.theguardian.com-international": 767.4
+     },
+     "pool_waits": 0,
+     "renders": 7073,
+     "renders_per_s": 23.58,
+     "setup": {
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "max_in_flight": "40",
+      "memory_mib": "1024",
+      "page_size": "2 MiB",
+      "pool_pages": "34000",
+      "uffd_mode": "minor",
+      "vcpus": "4",
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.5,
+     "cpu_ms_per_render": 1244.4,
+     "cpu_pressure": 0.151,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 38,
+     "in_flight_range": [
+      38,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       38
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 1194.6,
+     "median_ms": 757.6,
+     "p90_ms": 2034.0,
+     "page_mean_ms": 1171.8,
+     "page_median_ms": {
+      "blog.cloudflare.com": 875.3,
+      "developer.mozilla.org-en-us": 962.6,
+      "developers.cloudflare.com": 841.0,
+      "en.wikipedia.org": 1304.3,
+      "example.com": 231.5,
+      "news.ycombinator.com": 299.3,
+      "todomvc.com-examples-angular-dist-browser": 444.5,
+      "todomvc.com-examples-javascript-es6-dist": 360.9,
+      "todomvc.com-examples-preact-dist": 359.8,
+      "todomvc.com-examples-react-dist-index.html": 401.0,
+      "todomvc.com-examples-vue-dist": 378.8,
+      "www.elmundo.es": 1331.1,
+      "www.rtp.pt-noticias": 6606.8,
+      "www.theguardian.com-international": 2008.9
+     },
+     "pool_waits": 0,
+     "renders": 9528,
+     "renders_per_s": 31.76,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1023",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "4096",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 300.0,
+    "skip_s": 60.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=40 MAX_ENGINES=48 SECONDS_RUN=1800",
+   "ended": "2026-11-25T16:18:21Z",
+   "engine_recycles": 13,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "df3a9f06e682e5934df0422ad747e27436aaec42bf1ba73e297b4e843dcf7bc0",
+     "size": 309
+    },
+    "renders.jsonl": {
+     "sha256": "416a3bfbdfecc50f33d6708d4370f0d8434e4e2a9abcad650c8b5a643feecbbc",
+     "size": 82040773
+    },
+    "samples.jsonl": {
+     "sha256": "016a41b548f69a13d92544b14be87e4bd1a982596259941539a44bbc24dce2bf",
+     "size": 1301463
+    },
+    "summary.json": {
+     "sha256": "a5870e82a4c4b77a0539dc7474c070f08b45bba1c0145a9125f9d01e187ba65c",
+     "size": 17080
+    },
+    "teardown.json": {
+     "sha256": "85eb09c97bb7d80bf0b48a38c8c6803cc2622f4d0bbdaef678aa78d34164f382",
+     "size": 121
+    }
+   },
+   "fixed_levels": null,
+   "harness": {
+    "cores_busy": 3.5,
+    "cpu_pressure": 0.02,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.86,
+      "cpu_pressure": 0.004
+     },
+     "replay-engines": {
+      "cores_busy": 1.35,
+      "cpu_pressure": 0.012
+     },
+     "replay-fcvm": {
+      "cores_busy": 1.29,
+      "cpu_pressure": 0.007
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 3.5101120000000003,
+     "kitesurf": 7.413318
+    },
+    "replay_ms_median": {
+     "fcvm": 0.61,
+     "kitesurf": 0.7
+    },
+    "replay_ms_p90": {
+     "fcvm": 1.05,
+     "kitesurf": 1.77
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "search",
+   "run": "search-a",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 33.9,
+     "cpu_ms_per_render": 1438.3,
+     "cpu_pressure": 0.131,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 15.0,
+     "in_flight_range": [
+      15,
+      16
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ],
+      [
+       21,
+       2
+      ],
+      [
+       31,
+       3
+      ],
+      [
+       38,
+       4
+      ],
+      [
+       46,
+       5
+      ],
+      [
+       52,
+       6
+      ],
+      [
+       58,
+       7
+      ],
+      [
+       63,
+       8
+      ],
+      [
+       68,
+       9
+      ],
+      [
+       73,
+       10
+      ],
+      [
+       77,
+       11
+      ],
+      [
+       81,
+       12
+      ],
+      [
+       85,
+       13
+      ],
+      [
+       89,
+       14
+      ],
+      [
+       93,
+       15
+      ],
+      [
+       97,
+       16
+      ],
+      [
+       101,
+       17
+      ],
+      [
+       106,
+       16
+      ],
+      [
+       406,
+       15
+      ],
+      [
+       415,
+       1
+      ],
+      [
+       438,
+       15
+      ],
+      [
+       738,
+       16
+      ],
+      [
+       743,
+       15
+      ],
+      [
+       1043,
+       16
+      ],
+      [
+       1048,
+       15
+      ],
+      [
+       1348,
+       16
+      ],
+      [
+       1353,
+       15
+      ],
+      [
+       1653,
+       16
+      ],
+      [
+       1658,
+       15
+      ]
+     ],
+     "limit": 15,
+     "mean_ms": 636.5,
+     "median_ms": 393.0,
+     "p90_ms": 1415.8,
+     "page_mean_ms": 634.8,
+     "page_median_ms": {
+      "blog.cloudflare.com": 433.0,
+      "developer.mozilla.org-en-us": 444.5,
+      "developers.cloudflare.com": 511.4,
+      "en.wikipedia.org": 445.4,
+      "example.com": 221.3,
+      "news.ycombinator.com": 267.2,
+      "todomvc.com-examples-angular-dist-browser": 331.9,
+      "todomvc.com-examples-javascript-es6-dist": 303.2,
+      "todomvc.com-examples-preact-dist": 271.4,
+      "todomvc.com-examples-react-dist-index.html": 291.2,
+      "todomvc.com-examples-vue-dist": 280.6,
+      "www.elmundo.es": 2915.5,
+      "www.rtp.pt-noticias": 1404.8,
+      "www.theguardian.com-international": 766.0
+     },
+     "pool_waits": 0,
+     "renders": 7049,
+     "renders_per_s": 23.57,
+     "setup": {
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "max_in_flight": "40",
+      "memory_mib": "1024",
+      "page_size": "2 MiB",
+      "pool_pages": "34000",
+      "uffd_mode": "minor",
+      "vcpus": "4",
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.5,
+     "cpu_ms_per_render": 1257.8,
+     "cpu_pressure": 0.143,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 38.0,
+     "in_flight_range": [
+      38,
+      39
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ],
+      [
+       49,
+       2
+      ],
+      [
+       73,
+       3
+      ],
+      [
+       92,
+       4
+      ],
+      [
+       108,
+       5
+      ],
+      [
+       122,
+       6
+      ],
+      [
+       137,
+       7
+      ],
+      [
+       147,
+       8
+      ],
+      [
+       158,
+       9
+      ],
+      [
+       169,
+       10
+      ],
+      [
+       180,
+       11
+      ],
+      [
+       191,
+       12
+      ],
+      [
+       201,
+       13
+      ],
+      [
+       211,
+       14
+      ],
+      [
+       222,
+       15
+      ],
+      [
+       231,
+       16
+      ],
+      [
+       241,
+       17
+      ],
+      [
+       250,
+       18
+      ],
+      [
+       259,
+       19
+      ],
+      [
+       268,
+       20
+      ],
+      [
+       277,
+       21
+      ],
+      [
+       286,
+       22
+      ],
+      [
+       294,
+       23
+      ],
+      [
+       302,
+       24
+      ],
+      [
+       310,
+       25
+      ],
+      [
+       318,
+       26
+      ],
+      [
+       326,
+       27
+      ],
+      [
+       334,
+       28
+      ],
+      [
+       342,
+       29
+      ],
+      [
+       350,
+       30
+      ],
+      [
+       358,
+       31
+      ],
+      [
+       366,
+       32
+      ],
+      [
+       374,
+       33
+      ],
+      [
+       382,
+       34
+      ],
+      [
+       390,
+       35
+      ],
+      [
+       398,
+       36
+      ],
+      [
+       406,
+       37
+      ],
+      [
+       414,
+       36
+      ],
+      [
+       439,
+       1
+      ],
+      [
+       489,
+       36
+      ],
+      [
+       789,
+       37
+      ],
+      [
+       1097,
+       38
+      ],
+      [
+       1406,
+       39
+      ],
+      [
+       1414,
+       38
+      ],
+      [
+       1714,
+       39
+      ],
+      [
+       1723,
+       38
+      ]
+     ],
+     "limit": 38,
+     "mean_ms": 1211.8,
+     "median_ms": 743.7,
+     "p90_ms": 2079.5,
+     "page_mean_ms": 1202.9,
+     "page_median_ms": {
+      "blog.cloudflare.com": 891.7,
+      "developer.mozilla.org-en-us": 985.2,
+      "developers.cloudflare.com": 842.5,
+      "en.wikipedia.org": 1312.4,
+      "example.com": 227.5,
+      "news.ycombinator.com": 292.0,
+      "todomvc.com-examples-angular-dist-browser": 455.3,
+      "todomvc.com-examples-javascript-es6-dist": 362.6,
+      "todomvc.com-examples-preact-dist": 367.6,
+      "todomvc.com-examples-react-dist-index.html": 408.5,
+      "todomvc.com-examples-vue-dist": 390.2,
+      "www.elmundo.es": 1365.7,
+      "www.rtp.pt-noticias": 6880.8,
+      "www.theguardian.com-international": 2058.0
+     },
+     "pool_waits": 0,
+     "renders": 9388,
+     "renders_per_s": 31.4,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1024",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "4096",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 300.0,
+    "seconds": 299.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=40 MAX_ENGINES=48 SECONDS_RUN=1200",
+   "ended": "2026-11-25T16:45:01Z",
+   "engine_recycles": 15,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "b551a43a82dfe2692807c5511449435a9d67efaabfd5f9a8cda37b0e121a47df",
+     "size": 309
+    },
+    "renders.jsonl": {
+     "sha256": "7d1b6b643bf6a6b34c926c8e47b57300c1d151c6632fbababeacc16892694bdc",
+     "size": 51464017
+    },
+    "samples.jsonl": {
+     "sha256": "817cfcfa04b54794f8dca93883e587cf408c64acfc75e262a0efbbd954fdaf1b",
+     "size": 863216
+    },
+    "summary.json": {
+     "sha256": "e69c182151a189b147cac32cb07793119f393f6bf631b13943e3a7b0d761df30",
+     "size": 16699
+    },
+    "teardown.json": {
+     "sha256": "85eb09c97bb7d80bf0b48a38c8c6803cc2622f4d0bbdaef678aa78d34164f382",
+     "size": 121
+    }
+   },
+   "fixed_levels": null,
+   "harness": {
+    "cores_busy": 3.5,
+    "cpu_pressure": 0.019,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.86,
+      "cpu_pressure": 0.003
+     },
+     "replay-engines": {
+      "cores_busy": 1.32,
+      "cpu_pressure": 0.011
+     },
+     "replay-fcvm": {
+      "cores_busy": 1.28,
+      "cpu_pressure": 0.006
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 2.448232,
+     "kitesurf": 11.411793999999999
+    },
+    "replay_ms_median": {
+     "fcvm": 0.6,
+     "kitesurf": 0.69
+    },
+    "replay_ms_p90": {
+     "fcvm": 1.05,
+     "kitesurf": 1.32
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "search-2",
+   "run": "search-b",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 33.9,
+     "cpu_ms_per_render": 1435.5,
+     "cpu_pressure": 0.13,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 15,
+     "in_flight_range": [
+      15,
+      16
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ],
+      [
+       21,
+       2
+      ],
+      [
+       32,
+       3
+      ],
+      [
+       41,
+       4
+      ],
+      [
+       48,
+       5
+      ],
+      [
+       54,
+       6
+      ],
+      [
+       59,
+       7
+      ],
+      [
+       64,
+       8
+      ],
+      [
+       69,
+       9
+      ],
+      [
+       74,
+       10
+      ],
+      [
+       78,
+       11
+      ],
+      [
+       82,
+       12
+      ],
+      [
+       86,
+       13
+      ],
+      [
+       90,
+       14
+      ],
+      [
+       95,
+       15
+      ],
+      [
+       99,
+       16
+      ],
+      [
+       103,
+       15
+      ],
+      [
+       403,
+       16
+      ],
+      [
+       408,
+       15
+      ],
+      [
+       416,
+       1
+      ],
+      [
+       440,
+       15
+      ],
+      [
+       741,
+       16
+      ],
+      [
+       746,
+       15
+      ],
+      [
+       1047,
+       16
+      ],
+      [
+       1052,
+       15
+      ]
+     ],
+     "limit": 15,
+     "mean_ms": 636.0,
+     "median_ms": 385.1,
+     "p90_ms": 1414.6,
+     "page_mean_ms": 633.3,
+     "page_median_ms": {
+      "blog.cloudflare.com": 430.4,
+      "developer.mozilla.org-en-us": 442.0,
+      "developers.cloudflare.com": 506.0,
+      "en.wikipedia.org": 446.3,
+      "example.com": 218.8,
+      "news.ycombinator.com": 265.4,
+      "todomvc.com-examples-angular-dist-browser": 331.5,
+      "todomvc.com-examples-javascript-es6-dist": 299.8,
+      "todomvc.com-examples-preact-dist": 269.8,
+      "todomvc.com-examples-react-dist-index.html": 289.3,
+      "todomvc.com-examples-vue-dist": 278.7,
+      "www.elmundo.es": 2916.4,
+      "www.rtp.pt-noticias": 1404.7,
+      "www.theguardian.com-international": 767.3
+     },
+     "pool_waits": 0,
+     "renders": 7085,
+     "renders_per_s": 23.62,
+     "setup": {
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "max_in_flight": "40",
+      "memory_mib": "1024",
+      "page_size": "2 MiB",
+      "pool_pages": "34000",
+      "uffd_mode": "minor",
+      "vcpus": "4",
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.2,
+     "cpu_ms_per_render": 1266.7,
+     "cpu_pressure": 0.125,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 37,
+     "in_flight_range": [
+      37,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ],
+      [
+       46,
+       2
+      ],
+      [
+       70,
+       3
+      ],
+      [
+       88,
+       4
+      ],
+      [
+       106,
+       5
+      ],
+      [
+       122,
+       6
+      ],
+      [
+       135,
+       7
+      ],
+      [
+       147,
+       8
+      ],
+      [
+       158,
+       9
+      ],
+      [
+       169,
+       10
+      ],
+      [
+       179,
+       11
+      ],
+      [
+       190,
+       12
+      ],
+      [
+       200,
+       13
+      ],
+      [
+       210,
+       14
+      ],
+      [
+       220,
+       15
+      ],
+      [
+       229,
+       16
+      ],
+      [
+       238,
+       17
+      ],
+      [
+       247,
+       18
+      ],
+      [
+       256,
+       19
+      ],
+      [
+       265,
+       20
+      ],
+      [
+       273,
+       21
+      ],
+      [
+       281,
+       22
+      ],
+      [
+       289,
+       23
+      ],
+      [
+       297,
+       24
+      ],
+      [
+       306,
+       25
+      ],
+      [
+       315,
+       26
+      ],
+      [
+       323,
+       27
+      ],
+      [
+       332,
+       28
+      ],
+      [
+       341,
+       29
+      ],
+      [
+       349,
+       30
+      ],
+      [
+       357,
+       31
+      ],
+      [
+       365,
+       32
+      ],
+      [
+       373,
+       33
+      ],
+      [
+       381,
+       34
+      ],
+      [
+       389,
+       35
+      ],
+      [
+       398,
+       36
+      ],
+      [
+       407,
+       37
+      ],
+      [
+       415,
+       36
+      ],
+      [
+       441,
+       1
+      ],
+      [
+       493,
+       36
+      ],
+      [
+       793,
+       37
+      ],
+      [
+       1102,
+       38
+      ]
+     ],
+     "limit": 38,
+     "mean_ms": 1205.3,
+     "median_ms": 742.1,
+     "p90_ms": 2063.5,
+     "page_mean_ms": 1191.8,
+     "page_median_ms": {
+      "blog.cloudflare.com": 861.1,
+      "developer.mozilla.org-en-us": 958.4,
+      "developers.cloudflare.com": 818.2,
+      "en.wikipedia.org": 1312.2,
+      "example.com": 221.2,
+      "news.ycombinator.com": 290.1,
+      "todomvc.com-examples-angular-dist-browser": 448.4,
+      "todomvc.com-examples-javascript-es6-dist": 358.8,
+      "todomvc.com-examples-preact-dist": 353.8,
+      "todomvc.com-examples-react-dist-index.html": 399.9,
+      "todomvc.com-examples-vue-dist": 376.7,
+      "www.elmundo.es": 1330.1,
+      "www.rtp.pt-noticias": 6917.6,
+      "www.theguardian.com-international": 2038.3
+     },
+     "pool_waits": 0,
+     "renders": 9290,
+     "renders_per_s": 30.97,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1024",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "4096",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 300.0,
+    "seconds": 300.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=40 MAX_ENGINES=48 SECONDS_RUN=1200",
+   "ended": "2026-11-25T17:05:13Z",
+   "engine_recycles": 12,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "2a9cbf4ee3a71d54abac2cbe9b8279d68507f81bae54c5da96fd7d80a9f2d622",
+     "size": 309
+    },
+    "renders.jsonl": {
+     "sha256": "4c1eb59ef42df4aa83099af95713e303a3b709e3906be85084839b634e5c42fa",
+     "size": 51675006
+    },
+    "samples.jsonl": {
+     "sha256": "fe740a25b43be665d463bbc37a86370d4a5d58fe3dfd56b2702c184fde4d901d",
+     "size": 863079
+    },
+    "summary.json": {
+     "sha256": "ae9da6dd90b9dac8b185b2f9e44ff6faa1de89f1f1e037b0c3f3b4d457bba126",
+     "size": 16986
+    },
+    "teardown.json": {
+     "sha256": "85eb09c97bb7d80bf0b48a38c8c6803cc2622f4d0bbdaef678aa78d34164f382",
+     "size": 121
+    }
+   },
+   "fixed_levels": null,
+   "harness": {
+    "cores_busy": 3.5,
+    "cpu_pressure": 0.02,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.86,
+      "cpu_pressure": 0.003
+     },
+     "replay-engines": {
+      "cores_busy": 1.33,
+      "cpu_pressure": 0.012
+     },
+     "replay-fcvm": {
+      "cores_busy": 1.29,
+      "cpu_pressure": 0.007
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 6.241370000000001,
+     "kitesurf": 11.190604
+    },
+    "replay_ms_median": {
+     "fcvm": 0.62,
+     "kitesurf": 0.69
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.98,
+     "kitesurf": 1.64
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "search-3",
+   "run": "search-c",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 34.0,
+     "cpu_ms_per_render": 1435.2,
+     "cpu_pressure": 0.132,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 15.0,
+     "in_flight_range": [
+      15,
+      16
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ],
+      [
+       21,
+       2
+      ],
+      [
+       32,
+       3
+      ],
+      [
+       41,
+       4
+      ],
+      [
+       48,
+       5
+      ],
+      [
+       54,
+       6
+      ],
+      [
+       59,
+       7
+      ],
+      [
+       64,
+       8
+      ],
+      [
+       69,
+       9
+      ],
+      [
+       74,
+       10
+      ],
+      [
+       78,
+       11
+      ],
+      [
+       83,
+       12
+      ],
+      [
+       87,
+       13
+      ],
+      [
+       91,
+       14
+      ],
+      [
+       95,
+       15
+      ],
+      [
+       99,
+       16
+      ],
+      [
+       103,
+       17
+      ],
+      [
+       108,
+       16
+      ],
+      [
+       408,
+       15
+      ],
+      [
+       416,
+       1
+      ],
+      [
+       440,
+       15
+      ],
+      [
+       740,
+       16
+      ],
+      [
+       745,
+       15
+      ],
+      [
+       1046,
+       16
+      ],
+      [
+       1051,
+       15
+      ]
+     ],
+     "limit": 15,
+     "mean_ms": 634.1,
+     "median_ms": 383.6,
+     "p90_ms": 1416.5,
+     "page_mean_ms": 634.1,
+     "page_median_ms": {
+      "blog.cloudflare.com": 431.2,
+      "developer.mozilla.org-en-us": 442.5,
+      "developers.cloudflare.com": 508.6,
+      "en.wikipedia.org": 450.8,
+      "example.com": 218.3,
+      "news.ycombinator.com": 267.8,
+      "todomvc.com-examples-angular-dist-browser": 330.0,
+      "todomvc.com-examples-javascript-es6-dist": 301.1,
+      "todomvc.com-examples-preact-dist": 269.5,
+      "todomvc.com-examples-react-dist-index.html": 289.9,
+      "todomvc.com-examples-vue-dist": 279.3,
+      "www.elmundo.es": 2914.6,
+      "www.rtp.pt-noticias": 1406.5,
+      "www.theguardian.com-international": 767.1
+     },
+     "pool_waits": 0,
+     "renders": 7079,
+     "renders_per_s": 23.68,
+     "setup": {
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "max_in_flight": "40",
+      "memory_mib": "1024",
+      "page_size": "2 MiB",
+      "pool_pages": "34000",
+      "uffd_mode": "minor",
+      "vcpus": "4",
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.2,
+     "cpu_ms_per_render": 1258.7,
+     "cpu_pressure": 0.124,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 37.0,
+     "in_flight_range": [
+      37,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ],
+      [
+       48,
+       2
+      ],
+      [
+       72,
+       3
+      ],
+      [
+       89,
+       4
+      ],
+      [
+       106,
+       5
+      ],
+      [
+       120,
+       6
+      ],
+      [
+       135,
+       7
+      ],
+      [
+       147,
+       8
+      ],
+      [
+       159,
+       9
+      ],
+      [
+       171,
+       10
+      ],
+      [
+       182,
+       11
+      ],
+      [
+       192,
+       12
+      ],
+      [
+       202,
+       13
+      ],
+      [
+       211,
+       14
+      ],
+      [
+       220,
+       15
+      ],
+      [
+       229,
+       16
+      ],
+      [
+       238,
+       17
+      ],
+      [
+       247,
+       18
+      ],
+      [
+       256,
+       19
+      ],
+      [
+       265,
+       20
+      ],
+      [
+       273,
+       21
+      ],
+      [
+       281,
+       22
+      ],
+      [
+       290,
+       23
+      ],
+      [
+       298,
+       24
+      ],
+      [
+       306,
+       25
+      ],
+      [
+       315,
+       26
+      ],
+      [
+       323,
+       27
+      ],
+      [
+       331,
+       28
+      ],
+      [
+       340,
+       29
+      ],
+      [
+       349,
+       30
+      ],
+      [
+       357,
+       31
+      ],
+      [
+       365,
+       32
+      ],
+      [
+       373,
+       33
+      ],
+      [
+       381,
+       34
+      ],
+      [
+       390,
+       35
+      ],
+      [
+       398,
+       36
+      ],
+      [
+       406,
+       37
+      ],
+      [
+       415,
+       36
+      ],
+      [
+       441,
+       1
+      ],
+      [
+       495,
+       36
+      ],
+      [
+       795,
+       37
+      ],
+      [
+       1104,
+       38
+      ]
+     ],
+     "limit": 38,
+     "mean_ms": 1197.4,
+     "median_ms": 737.5,
+     "p90_ms": 2053.5,
+     "page_mean_ms": 1186.1,
+     "page_median_ms": {
+      "blog.cloudflare.com": 850.4,
+      "developer.mozilla.org-en-us": 960.2,
+      "developers.cloudflare.com": 813.4,
+      "en.wikipedia.org": 1306.2,
+      "example.com": 221.6,
+      "news.ycombinator.com": 286.2,
+      "todomvc.com-examples-angular-dist-browser": 448.7,
+      "todomvc.com-examples-javascript-es6-dist": 360.5,
+      "todomvc.com-examples-preact-dist": 353.3,
+      "todomvc.com-examples-react-dist-index.html": 399.0,
+      "todomvc.com-examples-vue-dist": 376.0,
+      "www.elmundo.es": 1324.9,
+      "www.rtp.pt-noticias": 6878.9,
+      "www.theguardian.com-international": 2025.9
+     },
+     "pool_waits": 0,
+     "renders": 9313,
+     "renders_per_s": 31.15,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1024",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "4096",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 300.0,
+    "seconds": 299.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=40 MAX_ENGINES=0 LEVELS=15,0 SECONDS_RUN=300",
+   "ended": "2026-11-25T17:10:19Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "21f8743175593721960cbab187f66b8b0789dca4585eea72b922acd005b9fa57",
+     "size": 319
+    },
+    "renders.jsonl": {
+     "sha256": "8bba3b08cee9ea906607812569e7e9e5f2ea1c7bb1d6203c463c21107b239e55",
+     "size": 7970162
+    },
+    "samples.jsonl": {
+     "sha256": "36d6ac046c4f2734918dde9f962d50a2dc567fb9527a7bfc2ff09806bd54cd87",
+     "size": 204907
+    },
+    "summary.json": {
+     "sha256": "2c40ee7c171c86f3f8afee3efaf6b9eec876a930887f002c03f00c01667f09cd",
+     "size": 7211
+    },
+    "teardown.json": {
+     "sha256": "15a8cd61ee2924bf59bb46ce1ca2f5fe1c0d141743639e6a99c8265eadfcd688",
+     "size": 121
+    }
+   },
+   "fixed_levels": [
+    15,
+    0
+   ],
+   "harness": {
+    "cores_busy": 2.1,
+    "cpu_pressure": 0.001,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.79,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 0.05,
+      "cpu_pressure": 0.0
+     },
+     "replay-fcvm": {
+      "cores_busy": 1.3,
+      "cpu_pressure": 0.001
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 1.414233,
+     "kitesurf": 0.776664
+    },
+    "replay_ms_median": {
+     "fcvm": 0.51,
+     "kitesurf": 0.52
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.73,
+     "kitesurf": 0.56
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "alone-fcvm",
+   "run": "alone-fcvm",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 35.7,
+     "cpu_ms_per_render": 1336.6,
+     "cpu_pressure": 0.078,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 15,
+     "in_flight_range": [
+      15,
+      15
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       15
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 561.6,
+     "median_ms": 350.6,
+     "p90_ms": 1280.8,
+     "page_mean_ms": 555.3,
+     "page_median_ms": {
+      "blog.cloudflare.com": 386.0,
+      "developer.mozilla.org-en-us": 391.6,
+      "developers.cloudflare.com": 455.7,
+      "en.wikipedia.org": 396.1,
+      "example.com": 187.9,
+      "news.ycombinator.com": 230.8,
+      "todomvc.com-examples-angular-dist-browser": 295.2,
+      "todomvc.com-examples-javascript-es6-dist": 261.5,
+      "todomvc.com-examples-preact-dist": 235.4,
+      "todomvc.com-examples-react-dist-index.html": 254.6,
+      "todomvc.com-examples-vue-dist": 245.0,
+      "www.elmundo.es": 2469.7,
+      "www.rtp.pt-noticias": 1273.4,
+      "www.theguardian.com-international": 691.5
+     },
+     "pool_waits": 0,
+     "renders": 6407,
+     "renders_per_s": 26.7,
+     "setup": {
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "max_in_flight": "40",
+      "memory_mib": "1024",
+      "page_size": "2 MiB",
+      "pool_pages": "34000",
+      "uffd_mode": "minor",
+      "vcpus": "4",
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 240.0,
+    "skip_s": 60.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=300",
+   "ended": "2026-11-25T17:15:26Z",
+   "engine_recycles": 14,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "d1132c30c11e07ea7c76784e78a00eff27a570a765082b56dd8dec94d4c8f5aa",
+     "size": 319
+    },
+    "renders.jsonl": {
+     "sha256": "a15435d8e9ffb9cb20aed3e4832454e22ab0e48eca2a8f841fcacb070e176dff",
+     "size": 8280057
+    },
+    "samples.jsonl": {
+     "sha256": "f226d09d0fc75ec88ee46c8e154c39a14ca4d36f362e909d17c03969e7ae9b0a",
+     "size": 205981
+    },
+    "summary.json": {
+     "sha256": "4daf5eaf3318fd873ffc0b9e0fbb41a516cb3ed8289f4791687885f541bb24cc",
+     "size": 7332
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    38
+   ],
+   "harness": {
+    "cores_busy": 1.4,
+    "cpu_pressure": 0.002,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 1.25,
+      "cpu_pressure": 0.002
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.06,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 1.613408,
+     "kitesurf": 12.588879
+    },
+    "replay_ms_median": {
+     "fcvm": 0.49,
+     "kitesurf": 0.53
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.52,
+     "kitesurf": 1.08
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "alone-kitesurf",
+   "run": "alone-kitesurf",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.8,
+     "cpu_ms_per_render": 1170.2,
+     "cpu_pressure": 0.146,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 38,
+     "in_flight_range": [
+      38,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       38
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 1117.0,
+     "median_ms": 720.5,
+     "p90_ms": 1905.9,
+     "page_mean_ms": 1101.5,
+     "page_median_ms": {
+      "blog.cloudflare.com": 794.8,
+      "developer.mozilla.org-en-us": 878.8,
+      "developers.cloudflare.com": 781.8,
+      "en.wikipedia.org": 1210.2,
+      "example.com": 218.5,
+      "news.ycombinator.com": 279.1,
+      "todomvc.com-examples-angular-dist-browser": 426.9,
+      "todomvc.com-examples-javascript-es6-dist": 347.9,
+      "todomvc.com-examples-preact-dist": 341.4,
+      "todomvc.com-examples-react-dist-index.html": 386.2,
+      "todomvc.com-examples-vue-dist": 362.5,
+      "www.elmundo.es": 1223.3,
+      "www.rtp.pt-noticias": 6287.0,
+      "www.theguardian.com-international": 1882.7
+     },
+     "pool_waits": 0,
+     "renders": 8163,
+     "renders_per_s": 34.01,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1023",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "4096",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 240.0,
+    "skip_s": 60.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=4 MAX_ENGINES=0 LEVELS=1,0 SECONDS_RUN=180",
+   "ended": "2026-11-25T17:18:28Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "fc8b45fb823745a24285485f02bd163c0ad34eac27a64df09f419374d1b10c28",
+     "size": 317
+    },
+    "renders.jsonl": {
+     "sha256": "cf1a51cb9d8a2b4bc655259bef53d6951eff4e2afd8147f19ce2b295c6e02b4a",
+     "size": 384614
+    },
+    "samples.jsonl": {
+     "sha256": "7540f72e8c3a45f3a0a1ca8a1498c20e2719befb84faec05a430aacb2bea244d",
+     "size": 120264
+    },
+    "summary.json": {
+     "sha256": "151a11f861dc5a277863f1c6d70fa3fc5851f200db05322bbf996c35881e87ed",
+     "size": 7412
+    },
+    "teardown.json": {
+     "sha256": "5d4b0c4b67bde1670f414854cd824f437eaf9538330881a4fe1897bcdba81526",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    1,
+    0
+   ],
+   "harness": {
+    "cores_busy": 0.3,
+    "cpu_pressure": 0.0,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 0.05,
+      "cpu_pressure": 0.0
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.13,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 0.82095,
+     "kitesurf": 0.825451
+    },
+    "replay_ms_median": {
+     "fcvm": 0.45,
+     "kitesurf": 0.49
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.5,
+     "kitesurf": 0.52
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "one-fcvm",
+   "run": "one-fcvm",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 2.4,
+     "cpu_ms_per_render": 1097.2,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 1,
+     "in_flight_range": [
+      1,
+      1
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 453.1,
+     "median_ms": 299.0,
+     "p90_ms": 1033.2,
+     "page_mean_ms": 450.0,
+     "page_median_ms": {
+      "blog.cloudflare.com": 317.1,
+      "developer.mozilla.org-en-us": 326.0,
+      "developers.cloudflare.com": 391.5,
+      "en.wikipedia.org": 317.4,
+      "example.com": 157.7,
+      "news.ycombinator.com": 194.3,
+      "todomvc.com-examples-angular-dist-browser": 259.2,
+      "todomvc.com-examples-javascript-es6-dist": 205.5,
+      "todomvc.com-examples-preact-dist": 194.9,
+      "todomvc.com-examples-react-dist-index.html": 221.9,
+      "todomvc.com-examples-vue-dist": 209.0,
+      "www.elmundo.es": 1893.7,
+      "www.rtp.pt-noticias": 1031.7,
+      "www.theguardian.com-international": 580.9
+     },
+     "pool_waits": 0,
+     "renders": 323,
+     "renders_per_s": 2.15,
+     "setup": {
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "max_in_flight": "4",
+      "memory_mib": "1024",
+      "page_size": "2 MiB",
+      "pool_pages": "34000",
+      "uffd_mode": "minor",
+      "vcpus": "4",
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 150.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=4 LEVELS=0,1 SECONDS_RUN=180",
+   "ended": "2026-11-25T17:21:31Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "b0ecbeac1d80e89673551008dc91c63e0369685d3a76e026328931ce0334de83",
+     "size": 317
+    },
+    "renders.jsonl": {
+     "sha256": "a9e008372b6ab449ec28d481458c1cfbe0615033d69b3b25e4bed661a5eb5ce1",
+     "size": 154851
+    },
+    "samples.jsonl": {
+     "sha256": "08fbbf3bc61ec46f4f17be6f8e8f905d5c56833624bc6d2680a9d6ebea876018",
+     "size": 120223
+    },
+    "summary.json": {
+     "sha256": "52c1be586ee0a129ffcf33046af74d85b9051f70e02ec07fd99bc090a5799c1e",
+     "size": 7212
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    1
+   ],
+   "harness": {
+    "cores_busy": 0.1,
+    "cpu_pressure": 0.0,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.0,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.05,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 0.736703,
+     "kitesurf": 0.8023159999999999
+    },
+    "replay_ms_median": {
+     "fcvm": 0.46,
+     "kitesurf": 0.44
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.5,
+     "kitesurf": 0.48
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "one-kitesurf",
+   "run": "one-kitesurf",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0.0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 1.1,
+     "cpu_ms_per_render": 1059.2,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 1.0,
+     "in_flight_range": [
+      1,
+      1
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 970.4,
+     "median_ms": 518.2,
+     "p90_ms": 1636.9,
+     "page_mean_ms": 967.6,
+     "page_median_ms": {
+      "blog.cloudflare.com": 662.3,
+      "developer.mozilla.org-en-us": 720.3,
+      "developers.cloudflare.com": 686.5,
+      "en.wikipedia.org": 1032.8,
+      "example.com": 174.1,
+      "news.ycombinator.com": 227.4,
+      "todomvc.com-examples-angular-dist-browser": 341.5,
+      "todomvc.com-examples-javascript-es6-dist": 292.5,
+      "todomvc.com-examples-preact-dist": 275.0,
+      "todomvc.com-examples-react-dist-index.html": 319.1,
+      "todomvc.com-examples-vue-dist": 290.3,
+      "www.elmundo.es": 1028.2,
+      "www.rtp.pt-noticias": 5861.9,
+      "www.theguardian.com-international": 1634.6
+     },
+     "pool_waits": 0,
+     "renders": 154,
+     "renders_per_s": 1.03,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1029",
+      "engines": "4",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "4096",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 149.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default",
+   "ended": "2026-11-25T17:36:35Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "467dc830facb26ba29633afc553aaabeb3e5464828fbca2de608091af99bcd8b",
+     "size": 349
+    },
+    "renders.jsonl": {
+     "sha256": "028a211da8569f2e243f507d20e539949429f3332f4660c124107a89d8da8122",
+     "size": 125394
+    },
+    "samples.jsonl": {
+     "sha256": "2eefc58ff9a1ad77e65b188483533f486505028fe728d8b01613581f79eaaf82",
+     "size": 99957
+    },
+    "summary.json": {
+     "sha256": "d10265c579b20cd936068c64f67d16acea7bf3e744b4b76d0a12b3e7167fdde9",
+     "size": 7288
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    1
+   ],
+   "harness": {
+    "cores_busy": 0.1,
+    "cpu_pressure": 0.0,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.0,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.05,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 0.742143,
+     "kitesurf": 0.8005319999999999
+    },
+    "replay_ms_median": {
+     "fcvm": 0.47,
+     "kitesurf": 0.45
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.49,
+     "kitesurf": 0.5
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "bundle-default-1",
+   "run": "bm-default-1",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0.0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 1.1,
+     "cpu_ms_per_render": 1107.3,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 1.0,
+     "in_flight_range": [
+      1,
+      1
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 1009.4,
+     "median_ms": 661.5,
+     "p90_ms": 1653.8,
+     "page_mean_ms": 965.4,
+     "page_median_ms": {
+      "blog.cloudflare.com": 670.9,
+      "developer.mozilla.org-en-us": 713.2,
+      "developers.cloudflare.com": 687.3,
+      "en.wikipedia.org": 1028.1,
+      "example.com": 178.1,
+      "news.ycombinator.com": 237.4,
+      "todomvc.com-examples-angular-dist-browser": 354.4,
+      "todomvc.com-examples-javascript-es6-dist": 286.4,
+      "todomvc.com-examples-preact-dist": 281.4,
+      "todomvc.com-examples-react-dist-index.html": 326.9,
+      "todomvc.com-examples-vue-dist": 293.4,
+      "www.elmundo.es": 1041.3,
+      "www.rtp.pt-noticias": 5767.3,
+      "www.theguardian.com-international": 1648.8
+     },
+     "pool_waits": 0,
+     "renders": 118,
+     "renders_per_s": 0.99,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "925",
+      "engines": "1",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "0",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 119.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default",
+   "ended": "2026-11-25T17:39:12Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "e3dd759cb13102a7a0a74692cf702be0ca44611a7164360c6b9fef91f0ba7161",
+     "size": 351
+    },
+    "renders.jsonl": {
+     "sha256": "51985b420231b2c6cf16860bf0f403a9cb0607362b5f09e033454943ce17b77b",
+     "size": 4027447
+    },
+    "samples.jsonl": {
+     "sha256": "da801435ffa624147ae5080a2df2d23071fc7d557f1aca0f690443da4cf72f0a",
+     "size": 102888
+    },
+    "summary.json": {
+     "sha256": "97e2f8575d9b871d8e399cb820ac0b200e8189bf13e032bc7bf5322ecec342ff",
+     "size": 7163
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    38
+   ],
+   "harness": {
+    "cores_busy": 1.4,
+    "cpu_pressure": 0.002,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 1.25,
+      "cpu_pressure": 0.002
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.06,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 0.544268,
+     "kitesurf": 3.4339370000000002
+    },
+    "replay_ms_median": {
+     "fcvm": 0.5,
+     "kitesurf": 0.54
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.52,
+     "kitesurf": 0.95
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "bundle-default-38",
+   "run": "bm-default-38",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.8,
+     "cpu_ms_per_render": 1165.9,
+     "cpu_pressure": 0.14,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 38,
+     "in_flight_range": [
+      38,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       38
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 1114.1,
+     "median_ms": 506.6,
+     "p90_ms": 1886.0,
+     "page_mean_ms": 1099.5,
+     "page_median_ms": {
+      "blog.cloudflare.com": 804.0,
+      "developer.mozilla.org-en-us": 873.2,
+      "developers.cloudflare.com": 789.1,
+      "en.wikipedia.org": 1210.1,
+      "example.com": 220.8,
+      "news.ycombinator.com": 285.3,
+      "todomvc.com-examples-angular-dist-browser": 421.6,
+      "todomvc.com-examples-javascript-es6-dist": 345.7,
+      "todomvc.com-examples-preact-dist": 340.8,
+      "todomvc.com-examples-react-dist-index.html": 384.8,
+      "todomvc.com-examples-vue-dist": 361.6,
+      "www.elmundo.es": 1222.2,
+      "www.rtp.pt-noticias": 6267.1,
+      "www.theguardian.com-international": 1866.5
+     },
+     "pool_waits": 0,
+     "renders": 4095,
+     "renders_per_s": 34.12,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1025",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "0",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 120.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-opt",
+   "ended": "2026-11-25T17:41:45Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "0e700e27f00a6fd02614a16703b88984ffac486ff28052a6287edcc3356d0c86",
+     "size": 345
+    },
+    "renders.jsonl": {
+     "sha256": "0d44612aef7c6b974219b6dca61b7ba52d7b11194c90e165c02c22f64601395f",
+     "size": 132129
+    },
+    "samples.jsonl": {
+     "sha256": "996d0c93eb254d5ab2d15dca387a3acaaff8e10f4d8796eeaaa3eb18c1e9299c",
+     "size": 100210
+    },
+    "summary.json": {
+     "sha256": "d6d1aa14be1f8efc3b55128931e4a5c0a5c594bc78ccc212704101e7780be4c2",
+     "size": 7210
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    1
+   ],
+   "harness": {
+    "cores_busy": 0.1,
+    "cpu_pressure": 0.0,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.0,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.05,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 0.57989,
+     "kitesurf": 0.533988
+    },
+    "replay_ms_median": {
+     "fcvm": 0.48,
+     "kitesurf": 0.45
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.51,
+     "kitesurf": 0.49
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "bundle-opt-1",
+   "run": "bm-opt-1",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 1.1,
+     "cpu_ms_per_render": 1040.0,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 1,
+     "in_flight_range": [
+      1,
+      1
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 945.6,
+     "median_ms": 653.6,
+     "p90_ms": 1638.7,
+     "page_mean_ms": 947.2,
+     "page_median_ms": {
+      "blog.cloudflare.com": 671.6,
+      "developer.mozilla.org-en-us": 730.0,
+      "developers.cloudflare.com": 687.9,
+      "en.wikipedia.org": 1019.4,
+      "example.com": 178.7,
+      "news.ycombinator.com": 235.1,
+      "todomvc.com-examples-angular-dist-browser": 343.0,
+      "todomvc.com-examples-javascript-es6-dist": 287.3,
+      "todomvc.com-examples-preact-dist": 278.5,
+      "todomvc.com-examples-react-dist-index.html": 326.5,
+      "todomvc.com-examples-vue-dist": 293.5,
+      "www.elmundo.es": 1035.7,
+      "www.rtp.pt-noticias": 5538.3,
+      "www.theguardian.com-international": 1635.8
+     },
+     "pool_waits": 0,
+     "renders": 127,
+     "renders_per_s": 1.06,
+     "setup": {
+      "bundle_sha256": "01e56bed7b4b81531e3518611330105ce1521f76d11f23d6075769379912d55a",
+      "engine_start_ms_median": "1026",
+      "engines": "1",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "0",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 120.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-opt",
+   "ended": "2026-11-25T17:44:21Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "e02f601220d107c0f7ed91412602ce21e2acb3b07f5eb999e2718ffbad69423a",
+     "size": 347
+    },
+    "renders.jsonl": {
+     "sha256": "660e864f61d1c5304f4222aae75ab8bfbc09dbbeda4b318d6db4a1cfbc301f16",
+     "size": 4037763
+    },
+    "samples.jsonl": {
+     "sha256": "ab5d36b4f903dacfdb66b6f2fc9bb9f59ab609481f1d2735d643192e0596dbc4",
+     "size": 102969
+    },
+    "summary.json": {
+     "sha256": "115bfaf109fed639b66015698ed94e65f991fa871b43fbfcea88f525ece3f2ea",
+     "size": 7164
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    38
+   ],
+   "harness": {
+    "cores_busy": 1.4,
+    "cpu_pressure": 0.002,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 1.23,
+      "cpu_pressure": 0.002
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.06,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 1.7333669999999999,
+     "kitesurf": 3.4073789999999997
+    },
+    "replay_ms_median": {
+     "fcvm": 0.51,
+     "kitesurf": 0.52
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.53,
+     "kitesurf": 0.74
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "bundle-opt-38",
+   "run": "bm-opt-38",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.8,
+     "cpu_ms_per_render": 1161.4,
+     "cpu_pressure": 0.141,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 38,
+     "in_flight_range": [
+      38,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       38
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 1105.8,
+     "median_ms": 505.8,
+     "p90_ms": 1879.9,
+     "page_mean_ms": 1094.9,
+     "page_median_ms": {
+      "blog.cloudflare.com": 801.3,
+      "developer.mozilla.org-en-us": 871.3,
+      "developers.cloudflare.com": 786.3,
+      "en.wikipedia.org": 1207.4,
+      "example.com": 219.9,
+      "news.ycombinator.com": 284.2,
+      "todomvc.com-examples-angular-dist-browser": 424.3,
+      "todomvc.com-examples-javascript-es6-dist": 345.9,
+      "todomvc.com-examples-preact-dist": 341.3,
+      "todomvc.com-examples-react-dist-index.html": 384.4,
+      "todomvc.com-examples-vue-dist": 361.9,
+      "www.elmundo.es": 1207.0,
+      "www.rtp.pt-noticias": 6223.9,
+      "www.theguardian.com-international": 1869.1
+     },
+     "pool_waits": 0,
+     "renders": 4111,
+     "renders_per_s": 34.26,
+     "setup": {
+      "bundle_sha256": "01e56bed7b4b81531e3518611330105ce1521f76d11f23d6075769379912d55a",
+      "engine_start_ms_median": "1031",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "0",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 120.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-opt",
+   "ended": "2026-11-25T17:46:54Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "4f96908bf3dffc74642667fc6292019ea387797f81c780206d5f82e12c0861cf",
+     "size": 345
+    },
+    "renders.jsonl": {
+     "sha256": "da05f1e9dff72d2ec21a2a89a9f4df64464ec03622d3c54796179f498d501f1c",
+     "size": 125320
+    },
+    "samples.jsonl": {
+     "sha256": "ad979a0514626f739d91585bff4cd2d868b97c33fa5b370eacf3020f67e590a9",
+     "size": 100396
+    },
+    "summary.json": {
+     "sha256": "c90d9e9ae57a61a3b82ac45865acd1910b0977b88b764fe26d318f9a4d5bbc3b",
+     "size": 7319
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    1
+   ],
+   "harness": {
+    "cores_busy": 0.1,
+    "cpu_pressure": 0.0,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.0,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.05,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 0.591802,
+     "kitesurf": 0.620441
+    },
+    "replay_ms_median": {
+     "fcvm": 0.47,
+     "kitesurf": 0.46
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.5,
+     "kitesurf": 0.51
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "bundle-opt-1-b",
+   "run": "bm-opt2-1",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 1.1,
+     "cpu_ms_per_render": 1089.8,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 1,
+     "in_flight_range": [
+      1,
+      1
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 991.1,
+     "median_ms": 668.5,
+     "p90_ms": 1665.9,
+     "page_mean_ms": 964.1,
+     "page_median_ms": {
+      "blog.cloudflare.com": 681.4,
+      "developer.mozilla.org-en-us": 711.2,
+      "developers.cloudflare.com": 692.0,
+      "en.wikipedia.org": 1033.6,
+      "example.com": 179.2,
+      "news.ycombinator.com": 247.0,
+      "todomvc.com-examples-angular-dist-browser": 347.1,
+      "todomvc.com-examples-javascript-es6-dist": 292.1,
+      "todomvc.com-examples-preact-dist": 279.0,
+      "todomvc.com-examples-react-dist-index.html": 323.2,
+      "todomvc.com-examples-vue-dist": 293.6,
+      "www.elmundo.es": 1041.3,
+      "www.rtp.pt-noticias": 5716.2,
+      "www.theguardian.com-international": 1660.9
+     },
+     "pool_waits": 0,
+     "renders": 121,
+     "renders_per_s": 1.01,
+     "setup": {
+      "bundle_sha256": "01e56bed7b4b81531e3518611330105ce1521f76d11f23d6075769379912d55a",
+      "engine_start_ms_median": "1024",
+      "engines": "1",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "0",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 120.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-opt",
+   "ended": "2026-11-25T17:49:30Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "8410e0e9bf88f9f42eeaeb657c7e59186d1f4f78019caa5c49def075c89410ca",
+     "size": 347
+    },
+    "renders.jsonl": {
+     "sha256": "50d1a2f97f993490cafb2f62f84fc9f556e9233e539cba99fab728659e668212",
+     "size": 4013560
+    },
+    "samples.jsonl": {
+     "sha256": "e6f82f004f936a284cd896ece87be2825cc59849c61f4b2d569d4644802192bb",
+     "size": 102922
+    },
+    "summary.json": {
+     "sha256": "a2145ab05f62391869e46d6921f89211cfbffaad0b10fb9b849f7ce613145dbb",
+     "size": 7198
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    38
+   ],
+   "harness": {
+    "cores_busy": 1.4,
+    "cpu_pressure": 0.002,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 1.23,
+      "cpu_pressure": 0.002
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.06,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 1.005959,
+     "kitesurf": 3.156874
+    },
+    "replay_ms_median": {
+     "fcvm": 0.5,
+     "kitesurf": 0.53
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.52,
+     "kitesurf": 0.85
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "bundle-opt-38-b",
+   "run": "bm-opt2-38",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.8,
+     "cpu_ms_per_render": 1169.9,
+     "cpu_pressure": 0.14,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 38,
+     "in_flight_range": [
+      38,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       38
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 1115.0,
+     "median_ms": 516.7,
+     "p90_ms": 1887.2,
+     "page_mean_ms": 1103.3,
+     "page_median_ms": {
+      "blog.cloudflare.com": 801.2,
+      "developer.mozilla.org-en-us": 877.1,
+      "developers.cloudflare.com": 788.2,
+      "en.wikipedia.org": 1207.6,
+      "example.com": 219.5,
+      "news.ycombinator.com": 285.9,
+      "todomvc.com-examples-angular-dist-browser": 424.9,
+      "todomvc.com-examples-javascript-es6-dist": 346.3,
+      "todomvc.com-examples-preact-dist": 342.4,
+      "todomvc.com-examples-react-dist-index.html": 384.6,
+      "todomvc.com-examples-vue-dist": 361.2,
+      "www.elmundo.es": 1225.4,
+      "www.rtp.pt-noticias": 6308.7,
+      "www.theguardian.com-international": 1873.0
+     },
+     "pool_waits": 0,
+     "renders": 4081,
+     "renders_per_s": 34.01,
+     "setup": {
+      "bundle_sha256": "01e56bed7b4b81531e3518611330105ce1521f76d11f23d6075769379912d55a",
+      "engine_start_ms_median": "1120",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "0",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 120.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=1 LEVELS=0,1 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default",
+   "ended": "2026-11-25T17:52:03Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "7d38587c05fd9d88ee9c6eede80846c84734cfcaa620649d6eabf666a96dccfc",
+     "size": 349
+    },
+    "renders.jsonl": {
+     "sha256": "443fde04c55e6fd9058bee0aefd04146182c51ad86f6136312f2d0bb3da5efd2",
+     "size": 123625
+    },
+    "samples.jsonl": {
+     "sha256": "b5633a17022db9343d60b57442c63d1dfa208f856c7739767e3104ebc686407b",
+     "size": 100077
+    },
+    "summary.json": {
+     "sha256": "3918b5a44903e33f53228d96a555a2f8f58ef09fc62c53eca8e57166b5f40836",
+     "size": 7353
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    1
+   ],
+   "harness": {
+    "cores_busy": 0.1,
+    "cpu_pressure": 0.0,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.0,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.05,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 0.6521469999999999,
+     "kitesurf": 0.568612
+    },
+    "replay_ms_median": {
+     "fcvm": 0.47,
+     "kitesurf": 0.45
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.52,
+     "kitesurf": 0.5
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "bundle-default-1-b",
+   "run": "bm-default2-1",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 1.1,
+     "cpu_ms_per_render": 1089.1,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 1,
+     "in_flight_range": [
+      1,
+      1
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       1
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 949.8,
+     "median_ms": 651.5,
+     "p90_ms": 1658.5,
+     "page_mean_ms": 980.4,
+     "page_median_ms": {
+      "blog.cloudflare.com": 676.0,
+      "developer.mozilla.org-en-us": 718.0,
+      "developers.cloudflare.com": 695.0,
+      "en.wikipedia.org": 1043.8,
+      "example.com": 180.1,
+      "news.ycombinator.com": 246.1,
+      "todomvc.com-examples-angular-dist-browser": 347.0,
+      "todomvc.com-examples-javascript-es6-dist": 288.5,
+      "todomvc.com-examples-preact-dist": 284.1,
+      "todomvc.com-examples-react-dist-index.html": 323.9,
+      "todomvc.com-examples-vue-dist": 296.4,
+      "www.elmundo.es": 1046.1,
+      "www.rtp.pt-noticias": 5917.3,
+      "www.theguardian.com-international": 1663.6
+     },
+     "pool_waits": 0,
+     "renders": 121,
+     "renders_per_s": 1.01,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "923",
+      "engines": "1",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "0",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 120.0,
+    "skip_s": 30.0
+   }
+  },
+  {
+   "arguments": "MAX_FCVM=0 MAX_ENGINES=48 LEVELS=0,38 SECONDS_RUN=150 RECYCLE_MIB=0 DIST=dist-default",
+   "ended": "2026-11-25T17:54:39Z",
+   "engine_recycles": 0,
+   "engine_restarts": 0,
+   "files": {
+    "host-record.txt": {
+     "sha256": "2b0e852d352b2b4144cd5ffb3c006004c4e3066d86b9947067b92f91ae0af29b",
+     "size": 351
+    },
+    "renders.jsonl": {
+     "sha256": "a064d1c19dc82ec8d83302bd73e0dc9365cf9d6f12bd6c9ca3a6b8bd13e25600",
+     "size": 4026472
+    },
+    "samples.jsonl": {
+     "sha256": "522ff7c5e18a158872b7c553a2b2e7739c2db461acee30ed13920951fc946182",
+     "size": 102733
+    },
+    "summary.json": {
+     "sha256": "7bca7b689c1e94cd6340681d5ec0b1cf28339d36e91ce4ba230dd08fce18830b",
+     "size": 7175
+    },
+    "teardown.json": {
+     "sha256": "35b55c3ade894e586da4c4d426fa90ac8817583900055cedbedfb42082a377cc",
+     "size": 119
+    }
+   },
+   "fixed_levels": [
+    0,
+    38
+   ],
+   "harness": {
+    "cores_busy": 1.4,
+    "cpu_pressure": 0.002,
+    "parts": {
+     "drivers": {
+      "cores_busy": 0.08,
+      "cpu_pressure": 0.0
+     },
+     "replay-engines": {
+      "cores_busy": 1.24,
+      "cpu_pressure": 0.002
+     },
+     "replay-fcvm": {
+      "cores_busy": 0.06,
+      "cpu_pressure": 0.0
+     }
+    },
+    "replay_ms_max": {
+     "fcvm": 1.36452,
+     "kitesurf": 4.743078000000001
+    },
+    "replay_ms_median": {
+     "fcvm": 0.5,
+     "kitesurf": 0.52
+    },
+    "replay_ms_p90": {
+     "fcvm": 0.53,
+     "kitesurf": 0.96
+    },
+    "replay_unanswered": {
+     "fcvm": 0,
+     "kitesurf": 0
+    }
+   },
+   "label": "bundle-default-38-b",
+   "run": "bm-default2-38",
+   "sides": {
+    "fcvm": {
+     "cores_busy": 0.0,
+     "cpu_ms_per_render": null,
+     "cpu_pressure": 0.0,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [],
+     "in_flight_median": 0,
+     "in_flight_range": [
+      0,
+      0
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ]
+     ],
+     "limit": null,
+     "mean_ms": null,
+     "median_ms": null,
+     "p90_ms": null,
+     "page_mean_ms": null,
+     "page_median_ms": {},
+     "pool_waits": 0,
+     "renders": 0,
+     "renders_per_s": 0.0,
+     "setup": {
+      "viewport": "1280x720"
+     }
+    },
+    "kitesurf": {
+     "cores_busy": 39.8,
+     "cpu_ms_per_render": 1165.9,
+     "cpu_pressure": 0.14,
+     "errors": [],
+     "failed": 0,
+     "image_sizes": [
+      "1280x720"
+     ],
+     "in_flight_median": 38,
+     "in_flight_range": [
+      38,
+      38
+     ],
+     "level_changes": [
+      [
+       0,
+       0
+      ],
+      [
+       1,
+       38
+      ]
+     ],
+     "limit": null,
+     "mean_ms": 1111.5,
+     "median_ms": 497.5,
+     "p90_ms": 1885.7,
+     "page_mean_ms": 1105.1,
+     "page_median_ms": {
+      "blog.cloudflare.com": 798.6,
+      "developer.mozilla.org-en-us": 874.3,
+      "developers.cloudflare.com": 786.3,
+      "en.wikipedia.org": 1213.0,
+      "example.com": 220.1,
+      "news.ycombinator.com": 284.3,
+      "todomvc.com-examples-angular-dist-browser": 423.1,
+      "todomvc.com-examples-javascript-es6-dist": 345.4,
+      "todomvc.com-examples-preact-dist": 342.6,
+      "todomvc.com-examples-react-dist-index.html": 384.6,
+      "todomvc.com-examples-vue-dist": 359.7,
+      "www.elmundo.es": 1216.2,
+      "www.rtp.pt-noticias": 6355.4,
+      "www.theguardian.com-international": 1867.4
+     },
+     "pool_waits": 0,
+     "renders": 4095,
+     "renders_per_s": 34.12,
+     "setup": {
+      "bundle_sha256": "bc99ea0b78358775b4bed3d7a14b5bf81c2b47d6d5399ea2b9055527da348ef9",
+      "engine_start_ms_median": "1025",
+      "engines": "48",
+      "kernel": "7.3.3-fcvm-57abeebe8d9c",
+      "recycle_mib": "0",
+      "viewport": "1280x720"
+     }
+    }
+   },
+   "window": {
+    "last_s": 0.0,
+    "seconds": 120.0,
+    "skip_s": 30.0
+   }
+  }
+ ],
+ "schema": 1,
+ "source_revision": "93e3fa0932405d94e743a2860e2a1c8675238afd"
+}

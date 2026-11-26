@@ -395,6 +395,7 @@ impl Helper {
                         network: fcvm::confine::Network::Rootless,
                         firecracker_args: None,
                         unsupported: None,
+                        kernel_profile: None,
                     })
                     .expect("deciding the stand-in VMM's confinement"),
                 )
