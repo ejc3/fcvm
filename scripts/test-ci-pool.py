@@ -781,25 +781,406 @@ class Tool(Sandbox):
         self.assertRegex(out, r'#9 x: NOT A POOL')
 
 
-class Lanes(unittest.TestCase):
-    def test_the_lanes_are_the_planners(self):
-        # The planner in ci.yml builds the job names from these loops; a lane it gains or
-        # loses must reach LANES, or the account and the verdicts miss it.
-        text = CI.read_text()
-        arches = re.search(r'for arch in ([\w ]+); do', text)[1].split()
-        modes = re.search(r'for mode in ([\w ]+); do', text)[1].split()
-        planned = set()
-        for arch in arches:
-            planned.add(f'Host-{arch}')
-            planned.add(f'Container-{arch}')
-            planned.update(f'Host-Root-{arch}-{mode}' for mode in modes)
-        for template in ('want "Host-$arch"', 'want "Host-Root-$arch-$mode"', 'want "Container-$arch"'):
-            self.assertIn(template, text)
-        self.assertEqual(set(ci_pool.LANES), planned)
+T1, T2 = '1' * 40, '2' * 40
+HEAD, BEFORE, LANDED = 'a' * 40, 'b' * 40, 'c' * 40
+CLEAN = {'status': 'ahead', 'files': ['src/lib.rs', 'docs/x.md']}
 
-    def test_a_pull_requests_lanes_are_the_planners(self):
+
+def lane(name, conclusion, attempt=1):
+    return {'name': name, 'conclusion': conclusion, 'run_attempt': attempt}
+
+
+def a_run(number, jobs, event='pull_request'):
+    return {'id': number, 'event': event, 'jobs': jobs}
+
+
+def passed(names):
+    return [lane(name, 'success') for name in names]
+
+
+SCOPE_SKIPPED = [lane('Changes', 'success'), lane('Skip Check', 'success'), lane('Lint', 'skipped'),
+                 lane('Host-${{ matrix.arch }}', 'skipped'), lane('Host-Root-${{ matrix.arch }}-${{ matrix.mode }}', 'skipped'),
+                 lane('Container-${{ matrix.arch }}', 'skipped'), lane('Summary', 'success')]
+DEFERRED = [lane('Changes', 'success'), lane('Skip Check', 'success'), lane('Lint', 'skipped'),
+            lane('Host-${{ matrix.arch }}', 'skipped'), lane('Host-Root-${{ matrix.arch }}-${{ matrix.mode }}', 'skipped'),
+            lane('Container-${{ matrix.arch }}', 'skipped'), lane('Summary (deferred)', 'success')]
+
+
+class Evidence(unittest.TestCase):
+    def proof(self, jobs, tree=T1, compare=CLEAN, event='pull_request', **kw):
+        return ci_pool.proof_from({'sha': HEAD, 'tree': tree}, [a_run(7, jobs, event)], T1, compare, **kw)
+
+    def test_a_lane_that_succeeded_on_a_commit_with_the_landings_tree_is_proven(self):
+        self.assertEqual(self.proof(passed(['Host-arm64'])), ({'Host-arm64': 7}, None, None))
+
+    def test_a_commit_with_another_tree_proves_nothing(self):
+        lanes, no_lanes, why = self.proof(passed(ci_pool.LANES), tree=T2)
+        self.assertEqual((lanes, no_lanes), ({}, None))
+        self.assertIn('another tree', why)
+
+    def test_a_landing_that_changes_what_defines_the_lanes_proves_nothing(self):
+        # A pull request runs its own workflow, Makefile and scripts: a job named like a
+        # lane in such a run may have tested nothing.
+        for path in ('.github/workflows/ci.yml', '.github/actions/checkout-deps/action.yml', 'Makefile',
+                     '.config/nextest.toml', 'scripts/ci-pr-scope.sh', 'scripts/ci-pool/ci_pool.py',
+                     'scripts/root-test-runner.sh', 'Containerfile', 'Containerfile.nested', 'rust-toolchain.toml',
+                     '.cargo/config.toml'):
+            lanes, no_lanes, why = self.proof(passed(ci_pool.LANES), compare={'status': 'ahead', 'files': ['src/lib.rs', path]})
+            self.assertEqual((lanes, no_lanes), ({}, None), path)
+            self.assertIn(path, why)
+            skipped = self.proof(SCOPE_SKIPPED, compare={'status': 'ahead', 'files': [path]})
+            self.assertEqual(skipped[:2], ({}, None), path)
+        for path in ('src/lib.rs', 'tests/test_sanity.rs', 'docs/scripts/x.md', 'fleet/web/Makefile', 'bench/scripts/a.sh'):
+            self.assertEqual(self.proof(passed(['Host-arm64']), compare={'status': 'ahead', 'files': [path]})[0],
+                             {'Host-arm64': 7}, path)
+
+    def test_a_renamed_file_is_judged_by_both_of_its_names(self):
+        # landing_evidence lists a renamed file under both names: moving a script out of
+        # scripts/ is a change to what defines the lanes.
+        compare = {'status': 'ahead', 'files': ['tools/x.sh', 'scripts/x.sh']}
+        self.assertEqual(self.proof(passed(ci_pool.LANES), compare=compare)[0], {})
+
+    def test_a_comparison_that_may_be_cut_short_or_was_not_read_proves_nothing(self):
+        many = {'status': 'ahead', 'files': [f'src/{n}.rs' for n in range(300)]}
+        self.assertEqual(self.proof(passed(ci_pool.LANES), compare=many)[0], {})
+        self.assertEqual(self.proof(passed(ci_pool.LANES), compare=None)[0], {})
+        nearly = {'status': 'ahead', 'files': [f'src/{n}.rs' for n in range(299)]}
+        self.assertEqual(len(self.proof(passed(ci_pool.LANES), compare=nearly)[0]), len(ci_pool.LANES))
+
+    def test_a_commit_that_does_not_contain_the_default_branch_proves_nothing(self):
+        # A pull request's run tests the merge of its head into its base, which is its
+        # head's tree only when the head already contains the base.
+        for status in ('diverged', 'behind', '', None):
+            lanes, _, why = self.proof(passed(ci_pool.LANES), compare={'status': status, 'files': []})
+            self.assertEqual(lanes, {}, status)
+        self.assertEqual(len(self.proof(passed(ci_pool.LANES), compare={'status': 'identical', 'files': []})[0]), 8)
+
+    def test_only_a_success_proves_a_lane(self):
+        for conclusion in ('failure', 'cancelled', 'skipped', 'timed_out', 'neutral', 'action_required', None):
+            self.assertEqual(self.proof([lane('Host-arm64', conclusion)])[0], {}, conclusion)
+            self.assertEqual(self.proof([lane('Host-arm64', conclusion)], accept_rerun=True)[0], {}, conclusion)
+            if conclusion != 'skipped':
+                self.assertEqual(self.proof([lane('Host-arm64', 'success', 1), lane('Host-arm64', conclusion, 2)],
+                                            accept_rerun=True)[0], {}, conclusion)
+        # A later attempt that skipped the lane says nothing: the earlier success on this tree stands.
+        self.assertEqual(self.proof([lane('Host-arm64', 'success', 1), lane('Host-arm64', 'skipped', 2)])[0], {'Host-arm64': 7})
+
+    def test_a_job_that_is_not_exactly_a_lane_proves_no_lane(self):
+        jobs = passed(['Summary', 'Lint', 'Host-${{ matrix.arch }}', 'Summary (deferred)', 'host-arm64', 'Host-arm64 ',
+                       'Host-arm64 (hosted)', 'Unit-arm64'])
+        self.assertEqual(self.proof(jobs), ({}, None, None))
+
+    def test_the_latest_attempt_decides_whatever_the_earlier_ones_were(self):
+        states = lambda *jobs: ci_pool.lane_states(list(jobs))
+        self.assertEqual(states(lane('Host-arm64', 'success', 1), lane('Host-arm64', 'failure', 2)), {'Host-arm64': 'fail'})
+        self.assertEqual(states(lane('Host-arm64', 'failure', 2), lane('Host-arm64', 'success', 1)), {'Host-arm64': 'fail'})
+        self.assertEqual(states(lane('Host-arm64', 'failure', 1), lane('Host-arm64', 'success', 2)), {'Host-arm64': 'pass-on-rerun'})
+        self.assertEqual(states(lane('Host-arm64', 'cancelled', 1), lane('Host-arm64', 'success', 2)), {'Host-arm64': 'pass-on-rerun'})
+        self.assertEqual(states(lane('Host-arm64', 'success', 1), lane('Host-arm64', 'success', 2)), {'Host-arm64': 'pass'})
+        self.assertEqual(states(lane('Host-arm64', 'failure', 1), lane('Host-arm64', None, 2)), {'Host-arm64': 'open'})
+        self.assertEqual(states(lane('Host-arm64', 'skipped', 1)), {})
+
+    def test_a_lane_that_passed_only_on_a_rerun_is_not_proven_unless_asked(self):
+        jobs = [lane('Host-arm64', 'failure', 1), lane('Host-arm64', 'success', 2), lane('Container-arm64', 'success', 1)]
+        self.assertEqual(self.proof(jobs)[0], {'Container-arm64': 7})
+        self.assertEqual(self.proof(jobs, accept_rerun=True)[0], {'Host-arm64': 7, 'Container-arm64': 7})
+
+    def test_a_lane_counts_whatever_the_rest_of_its_run_did(self):
+        # The live case of 2026-11-25: six lanes passed in a run whose Summary failed for a
+        # GitHub-hosted job. The lanes are evidence; the run's conclusion is not consulted.
+        jobs = passed(l for l in ci_pool.LANES if l not in ('Host-Root-x64-SnapshotDisabled', 'Container-x64'))
+        jobs += [lane('Fleet Web', 'failure'), lane('Summary', 'failure'), lane('Stack coverage', 'skipped')]
+        lanes, no_lanes, _ = self.proof(jobs)
+        self.assertEqual(set(ci_pool.LANES) - set(lanes), {'Host-Root-x64-SnapshotDisabled', 'Container-x64'})
+        self.assertIsNone(no_lanes)
+
+    def test_a_run_that_skipped_the_matrix_by_its_own_scope_says_the_tree_needs_no_lane(self):
+        self.assertEqual(self.proof(SCOPE_SKIPPED), ({}, 7, None))
+
+    def test_a_deferred_or_failed_or_filtered_run_never_says_the_tree_needs_no_lane(self):
+        # A draft's or a lower member's run skips every job under "Summary (deferred)".
+        self.assertEqual(self.proof(DEFERRED), ({}, None, None))
+        failed_summary = [dict(job, conclusion='failure') if job['name'] == 'Summary' else job for job in SCOPE_SKIPPED]
+        self.assertEqual(self.proof(failed_summary)[1], None)
+        failed_scope = [dict(job, conclusion='failure') if job['name'] == 'Changes' else job for job in SCOPE_SKIPPED]
+        self.assertEqual(self.proof(failed_scope)[1], None)
+        rerun = SCOPE_SKIPPED + [lane('Summary', 'failure', 2)]
+        self.assertEqual(self.proof(rerun)[1], None)
+        # A dispatch that named some lanes skips the others: that is its filter, not a scope.
+        for event in ('workflow_dispatch', 'push'):
+            self.assertEqual(self.proof(SCOPE_SKIPPED, event=event)[1], None, event)
+        ran_one = SCOPE_SKIPPED + passed(['Host-arm64'])
+        self.assertEqual(self.proof(ran_one)[1], None)
+
+    def test_a_run_of_an_event_that_is_not_listed_proves_nothing(self):
+        for event in ('schedule', 'workflow_run', 'pull_request_target', 'merge_group', ''):
+            self.assertEqual(self.proof(passed(ci_pool.LANES), event=event), ({}, None, None), event)
+
+    def test_only_exact_lane_names_can_be_asked_for(self):
+        self.assertEqual(ci_pool.validate_lanes(''), ci_pool.LANES)
+        self.assertEqual(ci_pool.validate_lanes(' \n'), ci_pool.LANES)
+        self.assertEqual(ci_pool.validate_lanes('Host-x64, Host-arm64'), ('Host-arm64', 'Host-x64'))
+        for bad in ('host-arm64', 'Host', 'Host-arm64;Host-x64', 'all', 'Host-*', 'Lint', 'Host-arm64 nope'):
+            with self.assertRaises(ci_pool.Blocked, msg=bad):
+                ci_pool.validate_lanes(bad)
+
+
+class Plan(unittest.TestCase):
+    ALL = set(ci_pool.LANES)
+
+    def evidence(self, jobs, tree=T1, compare=CLEAN, event='pull_request'):
+        return [({'sha': HEAD, 'tree': tree}, [a_run(7, jobs, event)], compare)]
+
+    def test_a_pull_request_takes_every_arm64_lane_and_one_x64_lane(self):
+        lanes, _ = ci_pool.plan_lanes('pull_request')
+        self.assertEqual(set(lanes), {l for l in ci_pool.LANES if 'arm64' in l} | {'Host-Root-x64-SnapshotEnabled'})
+        confined, _ = ci_pool.plan_lanes('pull_request', confine=True)
+        self.assertEqual(set(confined), set(lanes) | {'Host-x64'})
+
+    def test_main_runs_what_its_pull_request_left_out(self):
+        pr, _ = ci_pool.plan_lanes('pull_request')
+        main, _ = ci_pool.plan_lanes('push', T1, self.evidence(passed(pr) + passed(['Lint', 'Summary'])))
+        self.assertEqual(set(main), self.ALL - set(pr))
+        self.assertEqual(set(main) | set(pr), self.ALL, 'the two runs together are not the full matrix')
+
+    def test_a_push_takes_every_lane_without_proof_for_exactly_its_tree(self):
+        self.assertEqual(set(ci_pool.plan_lanes('push', T1)[0]), self.ALL)
+        self.assertEqual(set(ci_pool.plan_lanes('push', T1, self.evidence(passed(ci_pool.LANES), tree=T2))[0]), self.ALL)
+        self.assertEqual(ci_pool.plan_lanes('push', T1, self.evidence(passed(ci_pool.LANES)))[0], ())
+        self.assertEqual(ci_pool.plan_lanes('push', T1, self.evidence(SCOPE_SKIPPED))[0], ())
+        self.assertEqual(set(ci_pool.plan_lanes('push', T1, self.evidence(DEFERRED))[0]), self.ALL)
+        edited = {'status': 'ahead', 'files': ['.github/workflows/ci.yml']}
+        self.assertEqual(set(ci_pool.plan_lanes('push', T1, self.evidence(passed(ci_pool.LANES), compare=edited))[0]), self.ALL)
+
+    def test_a_push_runs_again_a_lane_that_passed_only_on_a_rerun(self):
+        jobs = passed(l for l in ci_pool.LANES if l != 'Host-arm64') + [lane('Host-arm64', 'failure', 1), lane('Host-arm64', 'success', 2)]
+        self.assertEqual(ci_pool.plan_lanes('push', T1, self.evidence(jobs))[0], ('Host-arm64',))
+
+    def test_lanes_add_up_across_runs_and_commits_of_one_tree(self):
+        evidence = [({'sha': HEAD, 'tree': T1}, [a_run(7, passed(['Host-arm64'])),
+                                                  a_run(8, passed(['Host-x64']) + [lane('Host-arm64', 'failure')], 'workflow_dispatch')], CLEAN),
+                    ({'sha': 'd' * 40, 'tree': T2}, [a_run(9, passed(['Container-x64']))], CLEAN)]
+        self.assertEqual(self.ALL - set(ci_pool.plan_lanes('push', T1, evidence)[0]), {'Host-arm64', 'Host-x64'})
+
+    def test_evidence_is_never_applied_to_another_event(self):
+        for event in ('workflow_dispatch', 'workflow_run', 'schedule', 'merge_group', ''):
+            self.assertEqual(set(ci_pool.plan_lanes(event, T1, self.evidence(passed(ci_pool.LANES)))[0]), self.ALL, event)
+        self.assertEqual(len(ci_pool.plan_lanes('pull_request', T1, self.evidence(passed(ci_pool.LANES)))[0]), len(ci_pool.PR_LANES))
+
+    def test_a_dispatch_takes_the_lanes_it_names_and_refuses_any_other_name(self):
+        self.assertEqual(ci_pool.plan_lanes('workflow_dispatch', lanes_input='Container-x64 Host-x64')[0],
+                         ('Host-x64', 'Container-x64'))
+        with self.assertRaises(ci_pool.Blocked):
+            ci_pool.plan_lanes('workflow_dispatch', lanes_input='Container-x86')
+        # The input belongs to a dispatch: on any other event it selects nothing.
+        self.assertEqual(len(ci_pool.plan_lanes('pull_request', lanes_input='Host-x64')[0]), len(ci_pool.PR_LANES))
+        self.assertEqual(set(ci_pool.plan_lanes('push', T1, lanes_input='Host-x64')[0]), self.ALL)
+        self.assertEqual(set(ci_pool.plan_lanes('workflow_run', lanes_input='Host-x64')[0]), self.ALL)
+
+    def test_the_matrix_has_a_flag_for_every_list(self):
+        out = ci_pool.matrix_outputs(ci_pool.LANES)
+        self.assertEqual(json.loads(out['host']), {'arch': ['arm64', 'x64']})
+        self.assertEqual(json.loads(out['container']), {'arch': ['arm64', 'x64']})
+        self.assertEqual(json.loads(out['host_root'])['include'],
+                         [{'arch': 'arm64', 'mode': 'SnapshotDisabled', 'fcvm_no_snapshot': '1', 'test_runs': '1'},
+                          {'arch': 'arm64', 'mode': 'SnapshotEnabled', 'fcvm_no_snapshot': '', 'test_runs': '2'},
+                          {'arch': 'x64', 'mode': 'SnapshotDisabled', 'fcvm_no_snapshot': '1', 'test_runs': '1'},
+                          {'arch': 'x64', 'mode': 'SnapshotEnabled', 'fcvm_no_snapshot': '', 'test_runs': '2'}])
+        self.assertEqual((out['host_run'], out['host_root_run'], out['container_run'], out['skip']),
+                         ('true', 'true', 'true', 'false'))
+        none = ci_pool.matrix_outputs(())
+        self.assertEqual((none['host'], none['host_root'], none['container']),
+                         ('{"arch":[]}', '{"include":[]}', '{"arch":[]}'))
+        self.assertEqual((none['host_run'], none['host_root_run'], none['container_run'], none['skip']),
+                         ('false', 'false', 'false', 'true'))
+        one = ci_pool.matrix_outputs(('Host-Root-x64-SnapshotEnabled',))
+        self.assertEqual((one['host_run'], one['host_root_run'], one['container_run'], one['skip']),
+                         ('false', 'true', 'false', 'false'))
+
+
+class PlanCommand(Sandbox):
+    """`plan` as ci.yml's skip-check job runs it, for a commit pushed to the default branch."""
+
+    def answers(self, runs, parents=(BEFORE, HEAD), pulls=(), head_tree=T1, compare=CLEAN, path='.github/workflows/ci.yml',
+                created=None, head=HEAD):
+        created = created or dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        fixture = {f'repos/{REPO}/git/commits/{LANDED}': {'tree': {'sha': T1}, 'parents': [{'sha': p} for p in parents]},
+                   f'repos/{REPO}/commits/{LANDED}/pulls?per_page=100': [
+                       {'head': {'sha': sha, 'repo': {'full_name': repo}}} for sha, repo in pulls],
+                   f'repos/{REPO}/git/commits/{head}': {'tree': {'sha': head_tree}},
+                   f'repos/{REPO}/compare/{BEFORE}...{head}': {
+                       'status': compare['status'], 'files': [{'filename': name} for name in compare['files']]},
+                   f'repos/{REPO}/actions/runs?head_sha={head}&per_page=100': {'workflow_runs': [
+                       {'id': 100 + n, 'path': path, 'event': event, 'created_at': created} for n, (event, _) in enumerate(runs)]}}
+        for n, (_, jobs) in enumerate(runs):
+            fixture[f'repos/{REPO}/actions/runs/{100 + n}/jobs?filter=all&per_page=100'] = {'jobs': jobs}
+        return fixture
+
+    def plan(self, fixture, event='push', **env):
+        out = self.dir / 'github_output'
+        out.write_text('')
+        code, text, calls = self.tool('plan', fixture=fixture, env=dict(EVENT=event, SHA=LANDED, GITHUB_OUTPUT=str(out), **env))
+        outputs = dict(line.split('=', 1) for line in out.read_text().splitlines())
+        planned = set()
+        if outputs:
+            planned |= {f'Host-{a}' for a in json.loads(outputs['host'])['arch']}
+            planned |= {f'Container-{a}' for a in json.loads(outputs['container'])['arch']}
+            planned |= {f"Host-Root-{e['arch']}-{e['mode']}" for e in json.loads(outputs['host_root'])['include']}
+            self.assertEqual(outputs['skip'], str(not planned).lower())
+        return code, text, planned, calls
+
+    ALL = set(ci_pool.LANES)
+
+    def test_main_runs_only_what_the_merged_head_did_not_prove(self):
+        code, text, planned, _ = self.plan(self.answers([('pull_request', passed(ci_pool.PR_LANES))]))
+        self.assertEqual(code, 0, text)
+        self.assertEqual(planned, self.ALL - set(ci_pool.PR_LANES))
+
+    def test_lanes_proven_by_a_dispatch_on_the_merged_head_count_too(self):
+        rest = [l for l in ci_pool.LANES if l not in ci_pool.PR_LANES]
+        fixture = self.answers([('pull_request', passed(ci_pool.PR_LANES)), ('workflow_dispatch', passed(rest))])
+        self.assertEqual(self.plan(fixture)[2], set())
+
+    def test_a_squashed_pull_request_is_found_through_the_commit(self):
+        fixture = self.answers([('pull_request', passed(ci_pool.LANES))], parents=(BEFORE,), pulls=[(HEAD, REPO)])
+        self.assertEqual(self.plan(fixture)[2], set())
+
+    def test_a_forks_pull_request_is_not_evidence(self):
+        fixture = self.answers([('pull_request', passed(ci_pool.LANES))], parents=(BEFORE,), pulls=[(HEAD, 'someone/fork')])
+        code, text, planned, calls = self.plan(fixture)
+        self.assertEqual(planned, self.ALL)
+        self.assertFalse([c for c in calls if 'head_sha=' in c['path']], 'the fork head was looked up')
+
+    def test_a_head_with_another_tree_proves_nothing_and_is_not_looked_at_further(self):
+        # The pull request was behind main when it merged: its runs tested another tree.
+        code, text, planned, calls = self.plan(self.answers([('pull_request', passed(ci_pool.LANES))], head_tree=T2))
+        self.assertEqual(planned, self.ALL)
+        self.assertFalse([c for c in calls if 'head_sha=' in c['path'] or '/compare/' in c['path']])
+
+    def test_a_run_from_a_tree_with_an_edited_workflow_proves_nothing(self):
+        edited = {'status': 'ahead', 'files': ['src/lib.rs', '.github/workflows/ci.yml']}
+        code, text, planned, _ = self.plan(self.answers([('pull_request', passed(ci_pool.LANES))], compare=edited))
+        self.assertEqual(planned, self.ALL)
+        self.assertIn('the landing changes what defines the lanes: .github/workflows/ci.yml', text)
+
+    def test_a_job_named_like_a_lane_in_a_run_of_another_workflow_proves_nothing(self):
+        for path in ('.github/workflows/other.yml', '.github/workflows/ci.yml.bak', 'ci.yml', '.github/workflows/fork/ci.yml',
+                     'dynamic/.github/workflows/ci.yml'):
+            fixture = self.answers([('pull_request', passed(ci_pool.LANES))], path=path)
+            self.assertEqual(self.plan(fixture)[2], self.ALL, path)
+
+    def test_a_renamed_lane_defining_file_is_seen_under_its_old_name(self):
+        fixture = self.answers([('pull_request', passed(ci_pool.LANES))])
+        fixture[f'repos/{REPO}/compare/{BEFORE}...{HEAD}']['files'] = [{'filename': 'tools/x.sh', 'previous_filename': 'scripts/x.sh'}]
+        self.assertEqual(self.plan(fixture)[2], self.ALL)
+
+    def test_a_deferred_run_on_the_merged_head_proves_nothing(self):
+        self.assertEqual(self.plan(self.answers([('pull_request', DEFERRED)]))[2], self.ALL)
+        self.assertEqual(self.plan(self.answers([('pull_request', SCOPE_SKIPPED)]))[2], set())
+
+    def test_every_failed_lookup_runs_the_lanes(self):
+        good = self.answers([('pull_request', passed(ci_pool.LANES))])
+        self.assertEqual(self.plan(good)[2], set())
+        for path in good:
+            if path.endswith('/pulls?per_page=100'):
+                continue  # the merged head is also a parent here: this lookup adds nothing
+            broken = dict(good)
+            broken[path] = 'FAIL'
+            code, text, planned, _ = self.plan(broken)
+            self.assertEqual((code, planned), (0, self.ALL), f'{path} failed and lanes were skipped: {text}')
+        squashed = self.answers([('pull_request', passed(ci_pool.LANES))], parents=(BEFORE,), pulls=[(HEAD, REPO)])
+        self.assertEqual(self.plan(squashed)[2], set())
+        squashed[f'repos/{REPO}/commits/{LANDED}/pulls?per_page=100'] = 'FAIL'
+        self.assertEqual(self.plan(squashed)[2], self.ALL)
+
+    def test_a_push_without_its_commit_runs_the_lanes(self):
+        out = self.dir / 'github_output'
+        out.write_text('')
+        code, text, _ = self.tool('plan', fixture={}, env=dict(EVENT='push', GITHUB_OUTPUT=str(out)))
+        self.assertEqual(code, 0, text)
+        self.assertIn('skip=false', out.read_text())
+
+    def test_old_evidence_is_not_used(self):
+        fixture = self.answers([('pull_request', passed(ci_pool.LANES))], created='2020-01-01T00:00:00Z')
+        self.assertEqual(self.plan(fixture)[2], self.ALL)
+
+    def test_no_other_event_asks_for_evidence(self):
+        for event in ('workflow_dispatch', 'workflow_run'):
+            code, text, planned, calls = self.plan({}, event=event)
+            self.assertEqual((code, planned), (0, self.ALL), text)
+            self.assertEqual(calls, [])
+        code, text, planned, calls = self.plan({}, event='pull_request')
+        self.assertEqual(planned, set(ci_pool.PR_LANES))
+        self.assertEqual(calls, [])
+        _, _, planned, _ = self.plan({}, event='pull_request', CONFINE='true')
+        self.assertEqual(planned, set(ci_pool.PR_LANES) | {'Host-x64'})
+
+    def test_a_dispatch_with_a_bad_lane_fails_the_job_and_plans_nothing(self):
+        code, text, planned, _ = self.plan({}, event='workflow_dispatch', LANES='Host-arm65')
+        self.assertEqual(code, 2, text)
+        self.assertIn('not a lane: Host-arm65', text)
+        self.assertEqual(planned, set())
+        code, _, planned, _ = self.plan({}, event='workflow_dispatch', LANES='Host-x64,Container-x64')
+        self.assertEqual((code, planned), (0, {'Host-x64', 'Container-x64'}))
+
+
+class Wiring(unittest.TestCase):
+    """ci.yml's side of the planner."""
+
+    def test_the_planner_step_runs_the_tool_with_what_it_reads(self):
         text = CI.read_text()
-        self.assertIn('*-arm64 | *-arm64-* | Host-Root-x64-SnapshotEnabled) return 0 ;;', text)
+        block = text.split('\n  skip-check:\n', 1)[1].split('\n  # Runner 0', 1)[0]
+        for line in ('run: python3 scripts/ci-pool/ci_pool.py plan', 'EVENT: ${{ github.event_name }}', 'SHA: ${{ github.sha }}',
+                     'REPO: ${{ github.repository }}', 'CONFINE: ${{ needs.changes.outputs.confine }}',
+                     'LANES: ${{ github.event.inputs.lanes }}', 'GH_TOKEN: ${{ github.token }}', 'id: check'):
+            self.assertIn(line, block)
+        # An input is data: it reaches the planner through the environment, never a script.
+        # Its only other use is in the name of the report job.
+        uses = [line.strip().split(':', 1)[0] for line in text.splitlines() if 'inputs.lanes' in line]
+        self.assertEqual(uses, ['LANES', 'name'])
+
+    def test_every_script_and_local_action_a_lane_runs_is_lane_defining(self):
+        text = CI.read_text()
+        body = text.split('\njobs:\n', 1)[1]
+        blocks = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', body, re.M | re.S))
+        used = set()
+        for name in ('changes', 'skip-check', 'host', 'host-root', 'container'):
+            used |= set(re.findall(r'(?:\./)?(?:fcvm/)?(scripts/[\w./-]+)', blocks[name]))
+            used |= {'.github/' + path for path in re.findall(r'uses: \./(?:fcvm/)?\.github/([\w./-]+)', blocks[name])}
+            used |= set(re.findall(r'(Containerfile[\w.-]*)', blocks[name]))
+        self.assertTrue({'scripts/ci-pr-scope.sh', 'scripts/ci-pool/ci_pool.py', '.github/actions/checkout-deps'} <= used, used)
+        for path in sorted(used) + ['.github/workflows/ci.yml', 'Makefile', '.config/nextest.toml', 'rust-toolchain.toml']:
+            self.assertTrue(ci_pool.lane_defining(path.rstrip('.')), f'{path} is run by a lane and is not lane-defining')
+        self.assertTrue((ROOT / '.config/nextest.toml').exists() and (ROOT / 'rust-toolchain.toml').exists())
+
+    def test_what_the_makefiles_test_recipes_run_is_lane_defining(self):
+        makefile = (ROOT / 'Makefile').read_text()
+        for path in sorted(set(re.findall(r'(?:\./|\$\(MAKEFILE_DIR\))(scripts/[\w./-]+)', makefile))):
+            self.assertTrue(ci_pool.lane_defining(path), path)
+        self.assertFalse(ci_pool.lane_defining('src/main.rs'))
+        self.assertFalse(ci_pool.lane_defining('tests/test_sanity.rs'))
+
+
+class Lanes(unittest.TestCase):
+    def test_the_planned_matrix_expands_to_the_lanes_names(self):
+        # The names the Actions API reports are the job name templates of ci.yml filled in
+        # from the planner's matrix. Evidence is matched by those names, so a renamed job or
+        # a new matrix value must reach LANES.
+        text = CI.read_text()
+        templates = {key: re.search(rf'^  {key}:\n    name: (.*)$', text, re.M)[1] for key in ('host', 'host-root', 'container')}
+        self.assertEqual(templates, {'host': 'Host-${{ matrix.arch }}', 'container': 'Container-${{ matrix.arch }}',
+                                     'host-root': 'Host-Root-${{ matrix.arch }}-${{ matrix.mode }}'})
+        out = ci_pool.matrix_outputs(ci_pool.LANES)
+        names = [f'Host-{arch}' for arch in json.loads(out['host'])['arch']]
+        names += [f"Host-Root-{e['arch']}-{e['mode']}" for e in json.loads(out['host_root'])['include']]
+        names += [f'Container-{arch}' for arch in json.loads(out['container'])['arch']]
+        self.assertEqual(sorted(names), sorted(ci_pool.LANES))
+        for key, output in (('host', 'host'), ('host-root', 'host_root'), ('container', 'container')):
+            block = text.split(f'\n  {key}:\n', 1)[1].split('\n    steps:', 1)[0]
+            self.assertIn(f'matrix: ${{{{ fromJSON(needs.skip-check.outputs.{output}) }}}}', block)
+            self.assertIn(f"needs.skip-check.outputs.{output}_run == 'true'", block)
+
+    def test_a_pull_requests_lanes_are_every_arm64_lane_and_one_x64_lane(self):
         self.assertEqual(set(ci_pool.PR_LANES), {lane for lane in ci_pool.LANES if 'arm64' in lane} | {'Host-Root-x64-SnapshotEnabled'})
 
 

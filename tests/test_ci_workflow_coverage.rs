@@ -3236,26 +3236,18 @@ fn job_set(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|name| name.to_string()).collect()
 }
 
-/// Run skip-check's planning step with fake `gh` and `git` on PATH and return what it
-/// wrote to `$GITHUB_OUTPUT`. The fake `gh` reports one successful PR run, whose commit
-/// has this push's tree when `pr_tree_matches`, with `pr_jobs` as that run's jobs. Any
-/// other `gh` or `git` call fails the step.
-fn run_matrix_plan(
-    event: &str,
-    pr_tree_matches: bool,
-    pr_jobs: &[&str],
-) -> BTreeMap<String, String> {
-    run_matrix_plan_for(event, pr_tree_matches, pr_jobs, false)
+/// Run skip-check's planning step and return what it wrote to `$GITHUB_OUTPUT`. The step
+/// runs `scripts/ci-pool/ci_pool.py plan`. A fake `gh` on PATH fails every call, so a push
+/// finds no evidence. What a push does with evidence (lanes proven for its tree, a run that
+/// skipped the matrix by its scope, a deferred run, a landing that edits the workflow) is
+/// tested where the planner lives: `scripts/test-ci-pool.py`, run by `make test-ci-pool`.
+fn run_matrix_plan(event: &str) -> BTreeMap<String, String> {
+    run_matrix_plan_for(event, false)
 }
 
 /// [`run_matrix_plan`], saying whether the `changes` job found the pull request touching
 /// the VMM's confinement (`needs.changes.outputs.confine`).
-fn run_matrix_plan_for(
-    event: &str,
-    pr_tree_matches: bool,
-    pr_jobs: &[&str],
-    touches_confinement: bool,
-) -> BTreeMap<String, String> {
+fn run_matrix_plan_for(event: &str, touches_confinement: bool) -> BTreeMap<String, String> {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let ci = parse_workflow("ci.yml");
     let run = workflow_job(&ci, "skip-check")
@@ -3275,32 +3267,14 @@ fn run_matrix_plan_for(
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    for (name, body) in [
-        (
-            "gh",
-            r#"#!/bin/bash
-case "$1 $2" in
-  'run list') echo '101 feedface' ;;
-  'api repos/o/r/git/commits/feedface') echo "$FAKE_PR_TREE" ;;
-  'api repos/o/r/actions/runs/101/jobs') printf '%s\n' "$FAKE_PR_JOBS" ;;
-  *) echo "unexpected: gh $*" >&2; exit 1 ;;
-esac
-"#,
-        ),
-        (
-            "git",
-            r#"#!/bin/bash
-if [ "$*" = 'rev-parse HEAD^{tree}' ]; then echo push-tree; exit 0; fi
-echo "unexpected: git $*" >&2
-exit 1
-"#,
-        ),
-    ] {
-        let path = dir.join(name);
-        std::fs::write(&path, body).expect("write fake command");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("make fake command executable");
-    }
+    let gh = dir.join("gh");
+    std::fs::write(
+        &gh,
+        "#!/bin/bash\necho \"no answer for: gh $*\" >&2\nexit 1\n",
+    )
+    .expect("write the fake gh");
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake gh executable");
     let out_file = dir.join("github_output");
     std::fs::write(&out_file, "").expect("seed GITHUB_OUTPUT");
     let path = format!(
@@ -3311,24 +3285,19 @@ exit 1
     let result = std::process::Command::new("bash")
         .arg("-c")
         .arg(&run)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("PATH", path)
+        .env("GH", &gh)
         .env("EVENT", event)
         .env("REPO", "o/r")
+        .env("SHA", "0000000000000000000000000000000000000000")
+        .env("LANES", "")
         .env(
             "CONFINE",
             if touches_confinement { "true" } else { "false" },
         )
         .env("GH_TOKEN", "unused")
         .env("GITHUB_OUTPUT", &out_file)
-        .env(
-            "FAKE_PR_TREE",
-            if pr_tree_matches {
-                "push-tree"
-            } else {
-                "another-tree"
-            },
-        )
-        .env("FAKE_PR_JOBS", pr_jobs.join("\n"))
         .output()
         .expect("run the skip-check planner");
     assert!(
@@ -3418,7 +3387,7 @@ fn planned_jobs(outputs: &BTreeMap<String, String>) -> BTreeSet<String> {
 /// where the x86-specific KVM and vCPU state code lives.
 #[test]
 fn a_pull_request_runs_every_arm64_job_and_one_x64_job() {
-    let jobs = planned_jobs(&run_matrix_plan("pull_request", false, &[]));
+    let jobs = planned_jobs(&run_matrix_plan("pull_request"));
     let x64: BTreeSet<String> = jobs.iter().filter(|j| j.contains("x64")).cloned().collect();
     assert_eq!(
         x64,
@@ -3448,7 +3417,7 @@ fn a_pull_request_runs_every_arm64_job_and_one_x64_job() {
 /// reads it as `needs.changes.outputs.confine`.
 #[test]
 fn a_pull_request_that_touches_confinement_also_runs_host_x64() {
-    let jobs = planned_jobs(&run_matrix_plan_for("pull_request", false, &[], true));
+    let jobs = planned_jobs(&run_matrix_plan_for("pull_request", true));
     let x64: BTreeSet<String> = jobs.iter().filter(|j| j.contains("x64")).cloned().collect();
     assert_eq!(
         x64,
@@ -3478,93 +3447,43 @@ fn a_pull_request_that_touches_confinement_also_runs_host_x64() {
     }
 }
 
-/// Main runs whatever its PR run of the same tree did not.
-///
-/// Together the two runs are the full matrix, so x86 is still fully tested before a
-/// release, and nothing that already passed on the PR runs again on main. Other jobs in
-/// the PR run's list (Lint here) must not change the plan.
+/// Nothing is assumed without evidence: a push whose evidence cannot be read, a manual
+/// dispatch that names no lane and the Build Kernels trigger all run everything.
 #[test]
-fn main_runs_the_x64_jobs_its_pull_request_left_out() {
-    let pr = planned_jobs(&run_matrix_plan("pull_request", false, &[]));
-    let mut reported: Vec<&str> = pr.iter().map(String::as_str).collect();
-    reported.push("Lint");
-    reported.push("Summary");
-    let main = planned_jobs(&run_matrix_plan("push", true, &reported));
-    assert!(
-        pr.is_disjoint(&main),
-        "main re-ran jobs that already passed on the PR: {:?}",
-        pr.intersection(&main).collect::<Vec<_>>()
-    );
-    let both: BTreeSet<String> = pr.union(&main).cloned().collect();
-    assert_eq!(
-        both,
-        job_set(&SELF_HOSTED_JOBS),
-        "the PR run and the main run together must cover the full matrix"
-    );
-}
-
-/// Nothing is assumed without a passing PR run of the same tree: a push whose tree never
-/// passed on a PR, a manual dispatch and the Build Kernels trigger all run everything.
-#[test]
-fn runs_without_a_passing_pull_request_tree_get_the_full_matrix() {
-    assert_eq!(
-        planned_jobs(&run_matrix_plan("push", false, &SELF_HOSTED_JOBS)),
-        job_set(&SELF_HOSTED_JOBS),
-        "a push whose tree never passed on a PR must run the full matrix"
-    );
-    for event in ["workflow_dispatch", "workflow_run"] {
+fn a_push_without_evidence_and_every_other_event_get_the_full_matrix() {
+    for event in ["push", "workflow_dispatch", "workflow_run"] {
         assert_eq!(
-            planned_jobs(&run_matrix_plan(event, false, &[])),
+            planned_jobs(&run_matrix_plan(event)),
             job_set(&SELF_HOSTED_JOBS),
             "{event} must run the full matrix"
         );
     }
 }
 
-/// When the matching PR run already covered everything, main runs nothing: either that
-/// run had the full matrix, or its `changes` job skipped the matrix, which the jobs API
-/// reports under the unexpanded matrix names.
+/// What main skips is decided by `scripts/ci-pool/ci_pool.py plan` from the evidence of
+/// earlier runs, and those rules are tested in `scripts/test-ci-pool.py`. That file must
+/// therefore run in CI, in the job that runs on every pull request that runs CI.
 #[test]
-fn main_skips_the_matrix_when_its_pull_request_needed_nothing_more() {
-    let mut passed: Vec<&str> = SELF_HOSTED_JOBS.to_vec();
-    passed.push("Summary");
+fn the_planners_own_tests_run_on_every_pull_request() {
+    let ci = parse_workflow("ci.yml");
+    let runs_them = workflow_job(&ci, "actionlint")["steps"]
+        .as_sequence()
+        .expect("`actionlint` has no steps")
+        .iter()
+        .any(|step| {
+            step.get("run").and_then(Value::as_str) == Some("make test-ci-pool")
+                && step.get("continue-on-error").is_none()
+                && step.get("if").is_none()
+        });
     assert!(
-        planned_jobs(&run_matrix_plan("push", true, &passed)).is_empty(),
-        "every self-hosted job already passed for this tree, so main must run none"
+        runs_them,
+        "ci.yml's actionlint job must run `make test-ci-pool`, and fail when it fails"
     );
-    let skipped = [
-        "Host-${{ matrix.arch }}",
-        "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
-        "Container-${{ matrix.arch }}",
-        "Lint",
-        "Summary",
-    ];
+    let makefile = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Makefile"))
+        .expect("Makefile");
     assert!(
-        planned_jobs(&run_matrix_plan("push", true, &skipped)).is_empty(),
-        "the PR run skipped the matrix for this tree, so main must skip it too"
-    );
-}
-
-/// A PR run that tested nothing is not evidence for main. A draft's or a lower stack PR's
-/// run skips every job (so the jobs API reports the unexpanded matrix names, the same as
-/// a run whose `changes` job skipped the matrix) and succeeds under a Summary named
-/// "Summary (deferred)". Reusing it would skip every self-hosted job on main.
-#[test]
-fn main_ignores_a_pull_request_run_that_tested_nothing() {
-    let deferred = [
-        "Changes",
-        "Skip Check",
-        "Host-${{ matrix.arch }}",
-        "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
-        "Container-${{ matrix.arch }}",
-        "Lint",
-        "actionlint",
-        "Summary (deferred)",
-    ];
-    assert_eq!(
-        planned_jobs(&run_matrix_plan("push", true, &deferred)),
-        job_set(&SELF_HOSTED_JOBS),
-        "main reused a deferred PR run and skipped self-hosted jobs nothing tested"
+        makefile.contains("test-ci-pool:\n\tpython3 scripts/test-ci-pool.py\n"),
+        "`make test-ci-pool` must run scripts/test-ci-pool.py"
     );
 }
 

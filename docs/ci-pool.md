@@ -67,6 +67,50 @@ status its head carries: the top's passing run posts it on each lower head it co
 its own `Summary (deferred)` says. The tool posts no status: whether a head was tested is
 something only a run can state.
 
+## What main runs after a landing
+
+`ci_pool.py plan` is the `skip-check` job of `ci.yml`: it decides which self-hosted lanes
+a run takes. A pull request takes every arm64 lane and Host-Root-x64-SnapshotEnabled
+(and Host-x64 when it touches the VMM's confinement). A dispatch takes the lanes named
+in its `lanes` input, by exact job name, all of them by default; a name that is not a
+lane fails the job. A push to `main` takes every lane that is not already proven for its
+tree, and anything the planner cannot look up counts as not proven.
+
+A lane is proven for a pushed commit by a job of exactly that lane's name that succeeded
+on its first attempt, in a run of `.github/workflows/ci.yml`, on a commit for which all
+of this holds:
+
+- It is one of the pushed commit's other parents, or the head of a pull request of this
+  repository that GitHub ties to the pushed commit. This is how the evidence is found:
+  by the commit, not by searching recent runs.
+- Its tree is the pushed commit's tree. The tree is read from the commit, never from
+  anything the run reported.
+- It contains `main` as it was before the push. A pull request's run tests the merge of
+  its head into its base, and that merge has the head's tree only when the head already
+  holds the base.
+- Between `main` before the push and that commit, no file that defines the lanes changed:
+  nothing under `.github/`, `scripts/` or `.cargo/`, not the Makefile, a Containerfile,
+  `.config/nextest.toml` or `rust-toolchain.toml`. A pull request's run executes the pull
+  request's own copy of those files, so a change to one of them could produce a job with
+  a lane's name that tested nothing. Such a landing runs every lane on `main`, under the
+  files that landed. A comparison of 300 files or more may be cut short by the API and
+  proves nothing either.
+
+Each lane is judged alone. A lane that passed in a run whose `Summary` failed for another
+job is proven; a lane that passed only when it was run again is not, and runs on `main`.
+The one case where a run speaks for all lanes: a pull request's run that reported
+`Summary` (never `Summary (deferred)`) with every self-hosted job skipped by its own
+scope means the tree needs no lane.
+
+One assumption is not checked, because GitHub does not record it: that the branch a
+pull request was based on did not hold commits its head lacked when the run started. For
+a pull request based on `main` it follows from the third condition. For the top of a
+pool the base is the member below, which `build` and `publish` keep inside the top; a
+member branch pushed by hand, or forced, between a run and the landing breaks it.
+
+In the week of 2026-11-19, 114 first-parent commits on `main` touched code and 31 of
+them touched a lane-defining file (21 under `.github/`, 7 the Makefile, 3 `scripts/`).
+
 ## Cost
 
 `cost` lists the workflow runs created in a date range and every job of each (all

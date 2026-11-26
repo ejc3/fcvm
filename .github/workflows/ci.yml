@@ -11,6 +11,10 @@ on:
           - both
           - host
           - container
+      lanes:
+        description: 'Self-hosted lanes to run, by exact job name, separated by spaces or commas (empty: all)'
+        type: string
+        default: ''
   # No `branches:` filter. That filter matches the PR's BASE branch, and stacked
   # PRs (the documented default in AGENTS.md) are based on the previous PR's
   # branch, not main — so `branches: [main]` skipped every job below for exactly
@@ -430,21 +434,26 @@ jobs:
           bash fleet/phone-app/test-build-apk.sh
           bash fleet/phone-app/test-gradle-dist.sh
 
-  # Plans which self-hosted jobs this run needs.
+  # Plans which self-hosted jobs this run needs (scripts/ci-pool/ci_pool.py plan).
   #
   # A pull_request runs every arm64 job and ONE x64 job, Host-Root-x64-SnapshotEnabled.
   # It runs the privileged suite through a snapshot miss and then a restore, which is
   # where the x86-specific code lives (KVM setup, vCPU state save and restore). The other
-  # three x64 jobs run paths the arm64 jobs already cover on every PR.
+  # three x64 jobs run paths the arm64 jobs already cover on every PR. A change to the
+  # VMM's confinement adds Host-x64.
   #
-  # A push to main runs every job that has NOT already succeeded on a PR run of the same
-  # tree. A fast-forward or rebase merge keeps the PR tip's tree, so main runs exactly
-  # the x64 jobs the PR left out, and x86 still gets its full matrix before a release.
-  # If that PR run skipped the matrix altogether (its `changes` job found nothing the
-  # matrix can check), main skips it too.
+  # A push to main runs every job not already proven for its tree: a job of the same name
+  # that succeeded, on its first attempt, in a run of this workflow on a commit with the
+  # pushed commit's tree. The commits looked at are the pushed commit's other parents and
+  # the heads of the pull requests GitHub ties to it, so the evidence is found whatever
+  # else ran since, and a lane counts even when another job of that run failed. A run
+  # proves nothing when the landing changes a file that defines the lanes (this workflow,
+  # the Makefile, the scripts, the nextest configuration): a pull request runs its own
+  # copy of those. If a pull request's run of that tree skipped the matrix by its own
+  # scope, main skips it too.
   #
-  # Anything else - workflow_dispatch, the Build Kernels workflow_run, a push whose tree
-  # never passed on a PR - runs the full matrix.
+  # A workflow_dispatch runs the lanes named in its `lanes` input, all of them by default.
+  # Anything else, and every lookup that fails, runs the full matrix.
   skip-check:
     name: Skip Check
     needs: [changes]
@@ -466,103 +475,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           CONFINE: ${{ needs.changes.outputs.confine }}
-        run: |
-          set -euo pipefail
-          # Names of the jobs that already passed for this tree on a PR, one per line.
-          PASSED=""
-          if [ "$EVENT" = "push" ]; then
-            TREE_SHA=$(git rev-parse 'HEAD^{tree}')
-            echo "Current tree SHA: $TREE_SHA"
-            # GitHub Actions results are check runs, not commit statuses, so the
-            # legacy status API never reports them. Look for successful runs of
-            # this CI workflow on a PR whose head commit has the same tree SHA.
-            if ! RUNS=$(gh run list --repo "$REPO" --workflow ci.yml --event pull_request \
-                --status success --limit 30 --json databaseId,headSha \
-                --jq '.[] | "\(.databaseId) \(.headSha)"'); then
-              echo "Could not list workflow runs, running the full matrix"
-              RUNS=""
-            fi
-            while read -r run sha; do
-              [ -n "$run" ] || continue
-              if ! COMMIT_TREE=$(gh api "repos/$REPO/git/commits/$sha" --jq '.tree.sha'); then
-                echo "Could not look up commit $sha, ignoring it"
-                continue
-              fi
-              [ "$COMMIT_TREE" = "$TREE_SHA" ] || continue
-              if ! NAMES=$(gh api "repos/$REPO/actions/runs/$run/jobs" --paginate \
-                  --jq '.jobs[] | select(.conclusion == "success" or .conclusion == "skipped") | .name'); then
-                echo "Could not list the jobs of run $run, ignoring it"
-                continue
-              fi
-              # Only a run that tested something counts. A draft's or a lower stack
-              # PR's run skips every job and still succeeds, under a Summary named
-              # "Summary (deferred)"; reusing it would skip the whole matrix here.
-              if ! grep -qxF Summary <<< "$NAMES"; then
-                echo "Run $run tested nothing (no passing Summary), ignoring it"
-                continue
-              fi
-              echo "Tree SHA $TREE_SHA already passed CI on PR commit $sha (run $run)"
-              PASSED="$PASSED"$'\n'"$NAMES"
-            done <<< "$RUNS"
-          fi
-          # A matrix job skipped by its `if:` is reported under its unexpanded name,
-          # with the literal matrix.arch placeholder in it. In a passing PR run that
-          # means `changes` skipped the matrix for this tree.
-          MATRIX_SKIPPED=false
-          if grep -q 'matrix\.arch' <<< "$PASSED"; then
-            MATRIX_SKIPPED=true
-          fi
-          want() {
-            case "$EVENT" in
-              pull_request)
-                case "$1" in
-                  *-arm64 | *-arm64-* | Host-Root-x64-SnapshotEnabled) return 0 ;;
-                  # The x86_64 seccomp policy is exercised under real confinement only by
-                  # Host-x64's test-confine step: a PR that touches confinement runs it.
-                  Host-x64) [ "$CONFINE" = true ] ;;
-                  *) return 1 ;;
-                esac
-                ;;
-              push)
-                [ "$MATRIX_SKIPPED" = false ] && ! grep -qxF -- "$1" <<< "$PASSED"
-                ;;
-              *) return 0 ;;
-            esac
-          }
-          host=""
-          host_root=""
-          container=""
-          planned=""
-          for arch in arm64 x64; do
-            if want "Host-$arch"; then
-              host="$host${host:+,}\"$arch\""
-              planned="$planned Host-$arch"
-            fi
-            for mode in SnapshotDisabled SnapshotEnabled; do
-              want "Host-Root-$arch-$mode" || continue
-              # SnapshotDisabled runs the suite once with FCVM_NO_SNAPSHOT=1.
-              # SnapshotEnabled runs it twice on one runner: a snapshot miss, then a hit.
-              if [ "$mode" = SnapshotDisabled ]; then nosnap=1; runs=1; else nosnap=""; runs=2; fi
-              host_root="$host_root${host_root:+,}{\"arch\":\"$arch\",\"mode\":\"$mode\",\"fcvm_no_snapshot\":\"$nosnap\",\"test_runs\":\"$runs\"}"
-              planned="$planned Host-Root-$arch-$mode"
-            done
-            if want "Container-$arch"; then
-              container="$container${container:+,}\"$arch\""
-              planned="$planned Container-$arch"
-            fi
-          done
-          echo "Self-hosted jobs for this $EVENT:${planned:- none}"
-          # A matrix with no combinations fails the run instead of skipping the job, so
-          # every list comes with a flag the job's `if:` checks first.
-          {
-            echo "host={\"arch\":[$host]}"
-            echo "host_run=$([ -n "$host" ] && echo true || echo false)"
-            echo "host_root={\"include\":[$host_root]}"
-            echo "host_root_run=$([ -n "$host_root" ] && echo true || echo false)"
-            echo "container={\"arch\":[$container]}"
-            echo "container_run=$([ -n "$container" ] && echo true || echo false)"
-            echo "skip=$([ -z "$planned" ] && echo true || echo false)"
-          } >> "$GITHUB_OUTPUT"
+          SHA: ${{ github.sha }}
+          LANES: ${{ github.event.inputs.lanes }}
+        run: python3 scripts/ci-pool/ci_pool.py plan
 
   # Runner 0: Lint (default GitHub runner, no KVM needed)
   # Fast checks: fmt, clippy, audit, deny
@@ -1618,7 +1533,9 @@ jobs:
   # named "Summary (deferred)", so a reader or a tool looking for a passing
   # Summary on that commit finds none.
   summary:
-    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || 'Summary' }}
+    # A dispatch that named some lanes ran only those, so its report is "Summary (some
+    # lanes)": a passing `Summary` on a commit always means every lane its event takes.
+    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
     needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-minecraft, fleet-web, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest

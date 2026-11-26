@@ -407,7 +407,17 @@ class Workflow(unittest.TestCase):
     def test_a_deferred_summary_is_not_named_summary(self):
         block = jobs(CI.read_text())['summary']
         name = re.search(r'^    name:\s*(.*)$', block, re.M)[1]
-        self.assertEqual(name, "${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || 'Summary' }}")
+        self.assertEqual(name, "${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || "
+                               "(github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}")
+        # The name is `Summary` only for a run that deferred nothing and filtered no lane.
+        expression = name.removeprefix('${{').removesuffix('}}').strip()
+        def named(run, lanes):
+            return evaluate(expression, {'needs': {'changes': {'outputs': {'run': run}}},
+                                         'github': {'event': {'inputs': {'lanes': lanes}}}})
+        self.assertEqual(named('true', ''), 'Summary')
+        self.assertEqual(named('true', 'Host-arm64'), 'Summary (some lanes)')
+        self.assertEqual(named('false', ''), 'Summary (deferred)')
+        self.assertEqual(named('false', 'Host-arm64'), 'Summary (deferred)')
 
     def test_the_scope_sees_draft_state_and_the_stack(self):
         block = jobs(CI.read_text())['changes']

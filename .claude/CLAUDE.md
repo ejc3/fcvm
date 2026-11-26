@@ -1183,8 +1183,15 @@ layer pushed on its own starts its run before its child holds the new commit, an
 tests in full.
 
 To bisect a failure on the top, run one layer on its own:
-`gh workflow run ci.yml --ref <layer-branch>` (a dispatch run tests the full matrix). Also run it
+`gh workflow run ci.yml --ref <layer-branch>` (a dispatch run tests the full matrix), or only the
+lanes that failed: `-f lanes='Host-arm64 Container-arm64'`, by exact job name (a name that is not
+a lane fails the run's `Skip Check` job). Also run it
 when the top PR is closed and a lower PR becomes the top, since nothing re-triggers its CI.
+
+Which self-hosted lanes a run takes, and which lanes a push to `main` may skip because an
+earlier run proved them for the same tree, is decided by `scripts/ci-pool/ci_pool.py plan`
+(`docs/ci-pool.md`, "What main runs after a landing"). A landing that changes the workflow, the
+Makefile or a script runs every lane on `main`.
 
 Enforcement: `scripts/test-ci-stack-scope.py` (`make test-ci-scope`, run by the `actionlint`
 job) drives both scripts against a fake `gh` and evaluates every job's `if:` for a deferred run.

@@ -23,6 +23,7 @@ incomplete, 4 a push was refused because a branch moved.
 import argparse
 import datetime as dt
 import fcntl
+import fnmatch
 import json
 import math
 import os
@@ -421,6 +422,230 @@ def cmd_status(args, gh, default_branch):
             else:
                 state, text = member_status(gh, p['sha'])
             note(f"  {position:2d}. #{p['number']:<5d} {p['sha'][:9]} {state:8s} {p['head']}  {text}")
+    return 0
+
+
+# ------------------------------------------------------------------------------ evidence
+
+# A lane is proven for a tree by a job of exactly that name that succeeded in a run of
+# ci.yml on a commit with that tree. A pull request's run executes the pull request's own
+# workflow, Makefile and scripts, so a change to any of them could produce a job with a
+# lane's name that tested nothing. A run therefore proves nothing for a landing that
+# changes one of these paths: the lanes run again on the default branch, under the files
+# that landed. scripts/test-ci-pool.py fails when a lane job of ci.yml runs a script or a
+# local action that no pattern here matches.
+LANE_DEFINING = ('.github/*', 'Makefile', '.config/nextest.toml', 'scripts/*', 'Containerfile*',
+                 'rust-toolchain.toml', '.cargo/*')
+PASS, RERUN_PASS, FAIL, OPEN = 'pass', 'pass-on-rerun', 'fail', 'open'
+MAX_EVIDENCE_AGE_DAYS = 7
+COMPARE_FILE_CAP = 300
+EVIDENCE_EVENTS = ('pull_request', 'workflow_dispatch', 'push')
+
+
+def lane_defining(path):
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in LANE_DEFINING)
+
+
+def latest(jobs, name):
+    """The newest attempt of the job with exactly this name, or None."""
+    tries = [job for job in jobs if job['name'] == name]
+    return max(tries, key=lambda job: job['run_attempt']) if tries else None
+
+
+def lane_states(jobs):
+    """Each lane's state from a run's jobs, every attempt: its latest attempt decides,
+    whatever the earlier ones were. PASS when it succeeded and no earlier attempt of it
+    ended otherwise, RERUN_PASS when it succeeded after one that did, FAIL when it failed
+    or timed out, OPEN when it was cancelled or has not finished. A skipped lane is not
+    evidence and is absent, and so is every job whose name is not exactly a lane's."""
+    states = {}
+    for lane in LANES:
+        tries = sorted((job for job in jobs if job['name'] == lane and job.get('conclusion') != 'skipped'),
+                       key=lambda job: job['run_attempt'])
+        if not tries:
+            continue
+        last = tries[-1].get('conclusion')
+        if last == 'success':
+            states[lane] = PASS if all(job.get('conclusion') == 'success' for job in tries) else RERUN_PASS
+        elif last in ('failure', 'timed_out'):
+            states[lane] = FAIL
+        else:
+            states[lane] = OPEN
+    return states
+
+
+def scope_skipped_the_lanes(jobs):
+    """True when a pull request's run found, by its own scope, that its change needs no
+    lane: it reported `Summary` (never `Summary (deferred)`, which a draft or a lower
+    member reports having tested nothing), the scope job passed, and every self-hosted
+    job was skipped before its matrix expanded."""
+    summary, changes = latest(jobs, 'Summary'), latest(jobs, 'Changes')
+    if not summary or summary.get('conclusion') != 'success' or not changes or changes.get('conclusion') != 'success':
+        return False
+    unexpanded = [job for job in jobs if 'matrix.' in job['name']]
+    return (len(unexpanded) >= 3 and all(job.get('conclusion') == 'skipped' for job in unexpanded)
+            and not any(job['name'] in LANES for job in jobs))
+
+
+def proof_from(commit, runs, landing_tree, compare, accept_rerun=False):
+    """What the runs on one commit prove for a landing: (lanes, no_lanes, why_not).
+
+    commit: {'sha', 'tree'}. runs: [{'id', 'event', 'jobs'}]. compare: the comparison of
+    the default branch before the landing with this commit: {'status', 'files'} or None
+    when it could not be read. Nothing is proven unless all of these hold:
+    - the commit's tree is the landing's tree, so its runs tested what landed;
+    - the commit contains the default branch as it was before the landing, so a pull
+      request's run, which tests the merge of its head into its base, tested that tree;
+    - the comparison lists every changed file, and none is lane-defining."""
+    if commit['tree'] != landing_tree:
+        return {}, None, f"{commit['sha'][:12]} has another tree"
+    if compare is None:
+        return {}, None, f"could not compare {commit['sha'][:12]} with the default branch"
+    if compare['status'] not in ('ahead', 'identical'):
+        return {}, None, f"{commit['sha'][:12]} does not contain the default branch ({compare['status']})"
+    if len(compare['files']) >= COMPARE_FILE_CAP:
+        return {}, None, f"{len(compare['files'])} changed files, more than the comparison lists"
+    changed = sorted(path for path in compare['files'] if lane_defining(path))
+    if changed:
+        return {}, None, f"the landing changes what defines the lanes: {', '.join(changed[:3])}"
+    lanes, no_lanes = {}, None
+    for run in runs:
+        if run['event'] not in EVIDENCE_EVENTS:
+            continue
+        if run['event'] == 'pull_request' and scope_skipped_the_lanes(run['jobs']):
+            no_lanes = run['id']
+        for lane, state in lane_states(run['jobs']).items():
+            if state == PASS or (state == RERUN_PASS and accept_rerun):
+                lanes.setdefault(lane, run['id'])
+    return lanes, no_lanes, None
+
+
+def validate_lanes(text):
+    """The lanes a dispatch asked for. Empty means all. Anything that is not a lane's exact
+    name blocks: a typo must not turn into a run of nothing that reports success."""
+    names = [name for name in re.split(r'[\s,]+', text or '') if name]
+    unknown = [name for name in names if name not in LANES]
+    if unknown:
+        raise Blocked(f"not a lane: {', '.join(unknown)}. The lanes are: {', '.join(LANES)}")
+    return tuple(lane for lane in LANES if lane in names) if names else LANES
+
+
+def landing_evidence(gh, sha, now=None):
+    """(tree, [(commit, runs, compare)]) for a commit pushed to the default branch.
+
+    The commits whose runs can have tested its tree: its other parents (a merge commit
+    has the tree of the branch it merged when that branch contained the default branch)
+    and the heads of the pull requests GitHub ties to it (a squash or a rebase). A lookup
+    that fails drops that commit's evidence and nothing else, which can only leave lanes
+    unproven."""
+    now = now or dt.datetime.now(dt.timezone.utc)
+    landing = gh.one(f'repos/{gh.repo}/git/commits/{sha}', '{tree: .tree.sha, parents: [.parents[].sha]}')
+    if not landing['parents']:
+        return landing['tree'], []
+    before, candidates = landing['parents'][0], list(landing['parents'][1:])
+    try:
+        candidates += gh.call(f'repos/{gh.repo}/commits/{sha}/pulls?per_page=100',
+                              f'.[] | select(.head.repo.full_name == "{gh.repo}") | .head.sha', paginate=True)
+    except Blocked as why:
+        note(f'could not list the pull requests of {sha[:12]}: {why}')
+    out = []
+    for head in dict.fromkeys(candidates):
+        if not re.fullmatch(r'[0-9a-f]{40}', str(head)):
+            continue
+        try:
+            commit = {'sha': head, 'tree': gh.one(f'repos/{gh.repo}/git/commits/{head}', '.tree.sha')}
+            if commit['tree'] != landing['tree']:
+                out.append((commit, [], None))
+                continue
+            compare = gh.one(f'repos/{gh.repo}/compare/{before}...{head}',
+                             '{status, files: [.files[] | .filename, (.previous_filename // empty)]}')
+            runs = []
+            for run in gh.call(f'repos/{gh.repo}/actions/runs?head_sha={head}&per_page=100',
+                               '.workflow_runs[] | select(.path == ".github/workflows/ci.yml") | {id, event, created_at}',
+                               paginate=True):
+                if (now - instant(run['created_at'])).days >= MAX_EVIDENCE_AGE_DAYS:
+                    continue
+                run['jobs'] = gh.call(f"repos/{gh.repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100",
+                                      '.jobs[] | {name, conclusion, run_attempt}', paginate=True)
+                runs.append(run)
+            out.append((commit, runs, compare))
+        except Blocked as why:
+            note(f'no evidence taken from {head[:12]}: {why}')
+    return landing['tree'], out
+
+
+def plan_lanes(event, landing_tree=None, evidence=(), confine=False, lanes_input=''):
+    """(lanes, reasons): the self-hosted lanes this run takes, and why.
+
+    A pull request takes PR_LANES (and Host-x64 for a change to confinement). A push takes
+    every lane not proven for exactly its tree. A dispatch takes the lanes it names, all by default. Evidence is
+    applied to a push and to nothing else."""
+    if event == 'pull_request':
+        return tuple(l for l in LANES if l in PR_LANES or (confine and l == 'Host-x64')), ['a pull request']
+    if event == 'workflow_dispatch':
+        return validate_lanes(lanes_input), ['the lanes this dispatch asked for' if lanes_input.strip() else 'a dispatch']
+    if event != 'push':
+        return LANES, [f'event {event}']
+    have, reasons = {}, []
+    for commit, runs, compare in evidence:
+        lanes, no_lanes, why_not = proof_from(commit, runs, landing_tree, compare)
+        if why_not:
+            reasons.append(f'no proof: {why_not}')
+            continue
+        if no_lanes:
+            return (), [f"run {no_lanes} on {commit['sha'][:12]} found that this tree needs no lane"]
+        for lane, run in lanes.items():
+            have.setdefault(lane, run)
+    if have:
+        reasons.append('already passed for this tree: ' + ', '.join(f'{lane} (run {run})' for lane, run in sorted(have.items())))
+    return tuple(l for l in LANES if l not in have), reasons or ['no run tested this tree']
+
+
+def matrix_outputs(lanes):
+    """The planner's outputs, as the self-hosted jobs of ci.yml read them. A matrix with
+    no combination fails a run instead of skipping the job, so every list has a flag."""
+    host = [l.removeprefix('Host-') for l in lanes if l in ('Host-arm64', 'Host-x64')]
+    container = [l.removeprefix('Container-') for l in lanes if l.startswith('Container-')]
+    host_root = []
+    for lane in lanes:
+        if lane.startswith('Host-Root-'):
+            arch, mode = lane.removeprefix('Host-Root-').split('-')
+            disabled = mode == 'SnapshotDisabled'
+            # SnapshotDisabled runs the suite once with FCVM_NO_SNAPSHOT=1. SnapshotEnabled
+            # runs it twice on one runner: a snapshot miss, then a hit.
+            host_root.append({'arch': arch, 'mode': mode, 'fcvm_no_snapshot': '1' if disabled else '',
+                              'test_runs': '1' if disabled else '2'})
+
+    def compact(value):
+        return json.dumps(value, separators=(',', ':'))
+
+    return {
+        'host': compact({'arch': host}), 'host_run': str(bool(host)).lower(),
+        'host_root': compact({'include': host_root}), 'host_root_run': str(bool(host_root)).lower(),
+        'container': compact({'arch': container}), 'container_run': str(bool(container)).lower(),
+        'skip': str(not lanes).lower(),
+    }
+
+
+def cmd_plan(_args, gh, _default_branch):
+    """ci.yml's `skip-check` job. Reads EVENT, SHA, CONFINE and LANES and writes
+    the matrix to $GITHUB_OUTPUT. Whatever cannot be looked up proves nothing, so the
+    lanes run."""
+    event = os.environ['EVENT']
+    tree, evidence = None, []
+    if event == 'push':
+        try:
+            tree, evidence = landing_evidence(gh, os.environ['SHA'])
+        except (Blocked, KeyError) as why:
+            note(f'no evidence for this push: {why}')
+    lanes, reasons = plan_lanes(event, tree, evidence, os.environ.get('CONFINE') == 'true',
+                                os.environ.get('LANES', ''))
+    for reason in reasons:
+        note(reason)
+    note(f"Self-hosted jobs for this {event or 'event'}: {' '.join(lanes) or 'none'}")
+    with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+        for key, value in matrix_outputs(lanes).items():
+            out.write(f'{key}={value}\n')
     return 0
 
 
@@ -992,6 +1217,7 @@ def main(argv=None):
     publish.add_argument('--lock-wait', type=float, default=900)
 
     sub.add_parser('status', help="pools, members and whether each member's head has been tested")
+    sub.add_parser('plan', help="the self-hosted lanes of this CI run (ci.yml's skip-check job)")
 
     for name, text in (('cost', 'runs, runner-minutes and dollars from the Actions API'),
                        ('failures', 'failed lane attempts by failing test or cause, with their cost')):
@@ -1019,6 +1245,8 @@ def main(argv=None):
         if repo.count('/') != 1:
             raise Blocked(f'cannot tell the repository from {repo!r}: pass --repo owner/name')
         gh = Gh(repo, max_requests=getattr(args, 'max_requests', None))
+        if args.command == 'plan':
+            return cmd_plan(args, gh, None)
         default_branch = os.environ.get('DEFAULT_BRANCH') or gh.one(f'repos/{repo}', '.default_branch')
         return {'build': cmd_build, 'publish': cmd_publish, 'status': cmd_status,
                 'cost': cmd_cost, 'failures': cmd_failures}[args.command](args, gh, default_branch)
