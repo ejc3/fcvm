@@ -288,7 +288,10 @@ def plan_build(members, starts, main, work, sync_main=False):
                 git('merge', '--abort', cwd=work, check=False)
                 git('checkout', '-q', '--detach', main, cwd=work)
                 conflict = (member, prev_name, [f for f in files if f])
-                if any(is_ancestor(start, starts[later['head']], work) for later in members[index + 1:]):
+                # What a later member may already hold is this member's branch as it is now,
+                # not only the commit it starts from here: with a pending commit the two differ.
+                if any(is_ancestor(commit, starts[later['head']], work)
+                       for later in members[index + 1:] for commit in {start, member['sha']}):
                     return included, left_out, conflict
                 left_out.append(conflict)
                 continue
@@ -698,17 +701,26 @@ def scope_skipped_the_lanes(jobs):
             and not any(job['name'] in LANES for job in jobs))
 
 
-def merge_lane_states(per_run):
+def failed_once(jobs):
+    """The lanes with a failed or timed out job in any attempt among these jobs.
+    `lane_states` reports a lane's latest attempt: one that failed and whose next attempt
+    is still running, or was cancelled, reads OPEN or CANCELLED there."""
+    return {job['name'] for job in jobs if job['name'] in LANES and job.get('conclusion') in ('failure', 'timed_out')}
+
+
+def merge_lane_states(per_run, failed=()):
     """One state per lane from every run on a commit. A lane that failed in one run or
     attempt and passed in another did both: RERUN_PASS. Otherwise a failure, then a pass,
     then an unfinished run decide, in that order; a lane that was only ever cancelled is
-    CANCELLED."""
+    CANCELLED. `failed` is the lanes that failed in any attempt of any of the runs
+    (`failed_once`): a pass beside one of those is RERUN_PASS too, also when the attempt
+    after the failure never finished."""
     merged = {}
     for lane in LANES:
         seen = {states[lane] for states in per_run if lane in states}
         if not seen:
             continue
-        if RERUN_PASS in seen or (FAIL in seen and PASS in seen):
+        if RERUN_PASS in seen or (PASS in seen and (FAIL in seen or lane in failed)):
             merged[lane] = RERUN_PASS
         elif FAIL in seen:
             merged[lane] = FAIL
@@ -752,7 +764,8 @@ def proof_from(commit, runs, landing_tree, compare, accept_rerun=False, listed=N
     no_lanes = next((run['id'] for run in counted
                      if run['event'] == 'pull_request' and scope_skipped_the_lanes(run['jobs'])), None)
     per_run = [(run['id'], lane_states(run['jobs'])) for run in counted]
-    merged = merge_lane_states([states for _, states in per_run])
+    merged = merge_lane_states([states for _, states in per_run],
+                               {lane for run in counted for lane in failed_once(run['jobs'])})
     lanes = {}
     for lane, state in merged.items():
         if state == PASS or (state == RERUN_PASS and accept_rerun):
@@ -1111,9 +1124,12 @@ def jobs_of(gh, run, cache):
     jobs = gh.call(f"repos/{gh.repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100", JOB_JQ, paginate=True)
     for job in jobs:
         job['runner_name'] = bool(job.get('runner_name'))
-    tmp = path.with_suffix('.tmp')
-    tmp.write_text(json.dumps(jobs))
-    tmp.replace(path)
+    # A temporary file of this writer's own: two invocations that share a cache and fetch
+    # the same run would otherwise write one file, and the second rename would find it gone.
+    handle, tmp = tempfile.mkstemp(dir=cache, prefix=path.name + '.', suffix='.tmp')
+    with os.fdopen(handle, 'w') as out:
+        out.write(json.dumps(jobs))
+    os.replace(tmp, path)
     return jobs
 
 
@@ -1842,7 +1858,8 @@ def pool_facts(gh, members):
     for member in members:
         sha = member['sha']
         runs = runs_by_sha[sha] = runs_on(gh, sha)
-        states_at[sha] = merge_lane_states([states_of(run) for run in runs])
+        states_at[sha] = merge_lane_states([states_of(run) for run in runs],
+                                           {lane for run in runs for lane in failed_once(run['jobs'])})
         tries, causes = {}, {}
         for run in runs:
             spent += run['event'] == 'workflow_dispatch'
@@ -1882,10 +1899,17 @@ def base_states(gh, bottom, default_branch):
         commit = gh.one(f'repos/{gh.repo}/git/commits/{base}', '{tree: .tree.sha, parents: [.parents[].sha]}')
         shas = [base] + [parent for parent in commit['parents'][1:]
                          if gh.one(f'repos/{gh.repo}/git/commits/{parent}', '.tree.sha') == commit['tree']]
-        return merge_lane_states([states_of(run) for sha in shas for run in runs_on(gh, sha)])
+        runs = [run for sha in shas for run in runs_on(gh, sha)]
+        return merge_lane_states([states_of(run) for run in runs], {lane for run in runs for lane in failed_once(run['jobs'])})
     except Blocked as why:
         note(f'could not read the runs on the commit the pool is based on: {why}')
         return {}
+
+
+def run_that_failed(runs, lanes):
+    """The newest of these runs in which one of the lanes failed, in any attempt, or None.
+    The failure and the pass of a lane that did both can be in different runs."""
+    return next((run for run in sorted(runs, key=lambda run: -run['id']) if failed_once(run['jobs']) & set(lanes)), None)
 
 
 def own_files(gh, members, default_branch, indexes):
@@ -1942,8 +1966,7 @@ def cmd_bisect(args, gh, default_branch):
         note(f"  #{member['number']:<5d} {member['sha'][:9]} {shown}")
     for cause in step.get('causes', []):
         note(f'  failing: {cause}')
-    failing_run = next((run for run in sorted(runs_by_sha[top['sha']], key=lambda run: -run['id'])
-                        if {FAIL, RERUN_PASS} & set(lane_states(run['jobs']).values())), None)
+    failing_run = run_that_failed(runs_by_sha[top['sha']], step.get('lanes') or LANES)
     outcome = step['outcome']
     if outcome in (WAITING, NOT_ISOLATED):
         note(f"{outcome.upper()}: {step['why']}")
@@ -2106,6 +2129,24 @@ def cmd_mark(_args, gh, _default_branch):
 VERDICT_JOBS = ('Summary', 'Summary (some lanes)')
 
 
+# The paths that are part of the VMM's confinement, as scripts/ci-pr-scope.sh lists them
+# (shell patterns, where `*` also matches `/`). A pull request that touches one takes
+# Host-x64, whose test-confine step is the only place the x86_64 policy runs under real
+# confinement. A test fails when this list and the script's differ.
+CONFINE_PATHS = ('resources/seccomp/*', 'src/confine.rs', 'src/firecracker/vm.rs', 'src/hypervisor/firecracker.rs',
+                 'src/utils.rs', 'src/commands/common.rs', 'src/commands/snapshot.rs', 'src/commands/podman/mod.rs',
+                 'src/setup/kernel.rs', 'src/setup/rootfs.rs', 'rootfs-config.toml', 'scripts/confine-*',
+                 'tests/test_confine*.rs', 'tests/common/mod.rs', 'Makefile')
+
+
+def touches_confinement(files):
+    """Whether a change's files include a confinement path. A list that may be cut short,
+    or that names nothing for a change that exists, is taken to include one."""
+    if not files or len(files) >= COMPARE_FILE_CAP:
+        return True
+    return any(fnmatch.fnmatchcase(name, pattern) for name in files for pattern in CONFINE_PATHS)
+
+
 def landing_blockers(members, facts, contains_main, contained, jobs_failed, despite):
     """Why a pool, or its lower part up to and including the last of `members`, may not
     land: a list of reasons, empty when it may. Everything is read from the runs on the
@@ -2177,9 +2218,17 @@ def cmd_land(args, gh, default_branch):
     if above:
         # A lower part lands on a full run of its own head: the lanes a pull request takes.
         required = tuple(lane for lane in LANES if lane in required or lane in PR_LANES)
-    facts = diagnose([top], states_at, causes_at, tries_at, spent, required)
     main_sha = gh.one(f'repos/{gh.repo}/commits/{default_branch}', '.sha')
-    contains_main = gh.one(f"repos/{gh.repo}/compare/{main_sha}...{top['sha']}", '.status') in ('ahead', 'identical')
+    against_main = gh.one(f"repos/{gh.repo}/compare/{main_sha}...{top['sha']}",
+                          '{status, files: [.files[]? | .filename, (.previous_filename // empty)]}')
+    contains_main = against_main['status'] in ('ahead', 'identical')
+    # The lanes a head must show are not only those its own pull request run happened to
+    # list: a lower member's run is deferred and lists none, and a dispatch names its lanes.
+    # What the change needs is read from the change. One that touches the VMM's
+    # confinement needs Host-x64, as its pull request's run would have taken.
+    if required and against_main['status'] != 'identical' and touches_confinement(against_main['files']):
+        required = tuple(lane for lane in LANES if lane in required or lane == 'Host-x64')
+    facts = diagnose([top], states_at, causes_at, tries_at, spent, required)
     contained = {top['number']: True}
     for member in members[:-1]:
         contained[member['number']] = gh.one(f"repos/{gh.repo}/compare/{member['sha']}...{top['sha']}",
@@ -2226,8 +2275,10 @@ def cmd_land(args, gh, default_branch):
         return 0
     rerun_issues = {}
     if facts['outcome'] == PASSED_ON_RERUN:
-        failing = next(run for run in sorted(runs_by_sha[top['sha']], key=lambda run: -run['id'])
-                       if RERUN_PASS in lane_states(run['jobs']).values())
+        failing = run_that_failed(runs_by_sha[top['sha']], facts['lanes'])
+        if failing is None:
+            raise Blocked(f"{', '.join(facts['lanes'])} passed on a rerun, and no run on {top['sha'][:9]} shows the failure: "
+                          'nothing landed')
         text = (f"Failed and then passed on the same commit `{top['sha'][:12]}`, which then landed: "
                 f"{', '.join(facts['lanes'])}. Run: {failing['html_url']}")
         for lane in facts['lanes']:

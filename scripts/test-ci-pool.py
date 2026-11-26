@@ -264,6 +264,24 @@ class Build(Sandbox):
         self.assertEqual((self.remote('a'), self.remote('b'), self.remote('c')), (a, b, c))
         self.assertEqual(self.writes(calls), [])
 
+    def test_a_pending_member_that_conflicts_cannot_be_left_out_while_its_branch_is_inside_a_member_above(self):
+        # c contains b as it is on the remote. b's new commit conflicts with a's new commit.
+        # Leaving b out would rebuild c on a with b's earlier commits still inside it.
+        self.commit('a', {'a.txt': 'a\n'}, 'a')
+        b = self.commit('b', {'b.txt': 'b\n'}, 'b', start='a')
+        c = self.commit('c', {'c.txt': 'c\n'}, 'c', start='b')
+        a = self.remote('a')
+        new_a = self.commit('a', {'shared.txt': 'from a\n'}, 'a touches shared', push=False)
+        new_b = self.commit('b', {'shared.txt': 'from b\n'}, 'b touches shared', push=False)
+        self.git('checkout', '-q', '--detach', 'origin/main')
+        code, out, calls = self.tool('build', '--of', '3', '--pending', f'a={new_a}', '--pending', f'b={new_b}',
+                                     prs=self.prs((1, 'a', 'main'), (2, 'b', 'a'), (3, 'c', 'b')))
+        self.assertEqual(code, 3, out)
+        self.assertIn('CONFLICT merging a into b (#2)', out)
+        self.assertIn('Nothing was pushed', out)
+        self.assertEqual((self.remote('a'), self.remote('b'), self.remote('c')), (a, b, c))
+        self.assertEqual(self.writes(calls), [])
+
     def hook(self, name, body):
         path = self.origin / 'hooks' / name
         path.write_text('#!/bin/sh\n' + body)
@@ -670,6 +688,33 @@ class Cost(unittest.TestCase):
         # A job that has not started is never taken for a copy of another.
         queued = [dict(ran, started_at=None, completed_at=None, conclusion=None, run_attempt=n) for n in (1, 2)]
         self.assertEqual(len(ci_pool.executions(queued)), 2)
+
+    def test_two_invocations_that_fetch_the_same_run_both_publish_their_cache_entry(self):
+        # The second writer fetches, writes and renames between the first writer's write
+        # and its rename. With one temporary file between them the first rename finds it gone.
+        import tempfile
+        from unittest import mock
+        jobs = [dict(self.job('Host-arm64', 'success', 30, self.ARM), runner_name='example-runner')]
+
+        class Answers:
+            repo = REPO
+
+            def call(self, *_args, **_kwargs):
+                return json.loads(json.dumps(jobs))
+        with tempfile.TemporaryDirectory() as directory:
+            cache, run = Path(directory), {'id': 5, 'run_attempt': 1}
+            replace, calls = os.replace, []
+
+            def racing(source, target):
+                calls.append(str(source))
+                if len(calls) == 1:
+                    self.assertEqual(ci_pool.jobs_of(Answers(), run, cache), ci_pool.jobs_of(Answers(), run, cache))
+                return replace(source, target)
+            with mock.patch('os.replace', racing), mock.patch.object(Path, 'replace', lambda source, target: racing(source, target)):
+                first = ci_pool.jobs_of(Answers(), run, cache)
+            self.assertEqual(len(set(calls)), 2, calls)
+            self.assertEqual([path.name for path in cache.iterdir()], [f'5-1-{ci_pool.JOB_CACHE_VERSION}.json'])
+            self.assertEqual(ci_pool.jobs_of(None, run, cache), first)
 
     def test_every_class_of_runner_has_a_price(self):
         for labels in (self.ARM, self.X64, self.ARM + ['on-demand'], self.X64 + ['on-demand'], ['ubuntu-latest']):
@@ -1231,6 +1276,19 @@ class Plan(unittest.TestCase):
             self.assertEqual(self.ALL - set(ci_pool.plan_lanes('push', T1, evidence)[0]), {'Host-x64'}, (first, second))
         both = ci_pool.proof_from({'sha': HEAD, 'tree': T1}, evidence[0][1], T1, CLEAN, accept_rerun=True)[0]
         self.assertEqual(set(both), {'Host-arm64', 'Host-x64'})
+
+    def test_a_failure_whose_next_attempt_was_cancelled_or_is_running_is_still_a_failure(self):
+        # The run's latest attempt of the lane is not a failure, so the run alone reads
+        # cancelled or unfinished. A clean pass in another run must not make the lane proven.
+        for second in ('cancelled', None, 'skipped'):
+            rerun = a_run(7, [lane('Host-arm64', 'failure', 1), lane('Host-arm64', second, 2)] + passed(['Host-x64']))
+            evidence = [({'sha': HEAD, 'tree': T1}, [rerun, a_run(8, passed(['Host-arm64']), 'workflow_dispatch')], CLEAN)]
+            self.assertEqual(self.ALL - set(ci_pool.plan_lanes('push', T1, evidence)[0]), {'Host-x64'}, second)
+        merge = ci_pool.merge_lane_states
+        self.assertEqual(merge([{'Host-arm64': 'cancelled'}, {'Host-arm64': 'pass'}], {'Host-arm64'}), {'Host-arm64': 'pass-on-rerun'})
+        self.assertEqual(merge([{'Host-arm64': 'open'}], {'Host-arm64'}), {'Host-arm64': 'open'})
+        self.assertEqual(ci_pool.failed_once([lane('Host-arm64', 'timed_out'), lane('Lint', 'failure'), lane('Host-x64', 'cancelled')]),
+                         {'Host-arm64'})
 
     def test_a_run_that_did_not_record_the_landed_tree_as_tested_counts_for_nothing(self):
         # The same head run against a base it does not contain tested another tree: the
@@ -2184,6 +2242,27 @@ class BisectCommand(PoolOfThree):
         self.fixture[f'repos/{REPO}/issues/85/comments?per_page=100'].append({'body': writes[0][2]['body']})
         self.assertEqual(self.bisect('--go')[2], [])
 
+    def test_a_failure_and_a_pass_in_separate_runs_are_filed_from_the_run_that_failed(self):
+        failed = self.add_run(2, dict(self.green(), **{'Host-arm64': 'failure'}))
+        self.add_run(2, self.green(), event='workflow_dispatch')
+        self.fixture[f'POST repos/{REPO}/issues'] = {'number': 77}
+        code, out, writes = self.bisect('--go')
+        self.assertEqual(code, 0, out)
+        self.assertIn('PASSED ON RERUN: Host-arm64', out)
+        self.assertEqual([(m, p) for m, p, _ in writes], [('POST', 'issues')])
+        self.assertIn(f'https://example.invalid/runs/{failed}', writes[0][2]['body'])
+
+    def test_a_failure_whose_rerun_never_finished_is_not_forgotten_when_another_run_passes(self):
+        # Attempt 1 failed and attempt 2 was cancelled: that run's latest state is not a
+        # failure. A pass in another run beside it is still a pass after a failure.
+        for second in ('cancelled', None):
+            self.setUp()
+            self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', second]}), attempt=2)
+            self.add_run(2, self.green(), event='workflow_dispatch')
+            code, out, writes = self.bisect()
+            self.assertIn('Host-arm64=pass-on-rerun', out, second)
+            self.assertNotIn('GREEN', out, second)
+
     def test_a_cause_no_issue_owns_gets_a_new_issue_that_owns_it(self):
         self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'success']}), attempt=2)
         self.fixture[f'POST repos/{REPO}/issues'] = {'number': 99}
@@ -2320,11 +2399,13 @@ class LandCommand(PoolOfThree):
     """`land` on the pool of three."""
 
     MAIN = '9' * 40
+    CHANGED = ('src/lib.rs', 'docs/x.md')
 
     def land(self, *args, compares=None):
         self.fixture.setdefault(f'repos/{REPO}/commits/main', {'sha': self.MAIN})
-        self.fixture[f'repos/{REPO}/compare/{self.MAIN}...{self.SHAS[2]}'] = {'status': 'ahead'}
-        self.fixture[f'repos/{REPO}/compare/{self.MAIN}...{self.SHAS[1]}'] = {'status': 'ahead'}
+        for sha in self.SHAS[1:3]:
+            self.fixture.setdefault(f'repos/{REPO}/compare/{self.MAIN}...{sha}',
+                                    {'status': 'ahead', 'files': [{'filename': name} for name in self.CHANGED]})
         for sha in self.SHAS[:2]:
             self.fixture.setdefault(f'repos/{REPO}/compare/{sha}...{self.SHAS[2]}', {'status': 'ahead'})
         self.fixture.setdefault(f'repos/{REPO}/compare/{self.SHAS[0]}...{self.SHAS[1]}', {'status': 'ahead'})
@@ -2410,6 +2491,66 @@ class LandCommand(PoolOfThree):
         self.assertEqual(code, 0, out)
         self.assertEqual([(m, p) for m, p, _ in writes][0], ('POST', 'issues'))
         self.assertIn('- Host-arm64 failed and then passed on this commit: #99', writes[-1][2]['commit_message'])
+
+    def test_a_lane_that_failed_in_one_run_and_passed_in_another_lands_with_its_issue(self):
+        # The failure and the pass are in different runs: no single run shows both.
+        failed = self.add_run(2, self.full({'Host-arm64': 'failure', 'Summary': 'failure'}))
+        self.add_run(2, self.full(), event='workflow_dispatch')
+        self.fixture[f'POST repos/{REPO}/issues'] = {'number': 99}
+        code, out, writes = self.land()
+        self.assertEqual(code, 0, out)
+        code, out, writes = self.land('--go')
+        self.assertEqual(code, 0, out)
+        self.assertEqual([(m, p) for m, p, _ in writes][0], ('POST', 'issues'))
+        self.assertIn(f'https://example.invalid/runs/{failed}', writes[0][2]['body'])
+        self.assertIn('- Host-arm64 failed and then passed on this commit: #99', writes[-1][2]['commit_message'])
+
+    def confine(self, files, sha=None):
+        self.fixture[f'repos/{REPO}/compare/{self.MAIN}...{sha or self.SHAS[2]}'] = {
+            'status': 'ahead', 'files': [{'filename': name} for name in files]}
+
+    def test_a_change_to_confinement_does_not_land_without_host_x64(self):
+        # A lower member's own run is deferred and lists no lane, and a dispatch names its
+        # lanes: the five a pull request takes would land a seccomp change that Host-x64,
+        # the only lane that runs the x86_64 policy under confinement, never saw.
+        for files in (['resources/seccomp/x86_64.json'], ['src/a.rs', 'tests/test_confine_gate.rs'], ['Makefile'],
+                      ['scripts/confine-count.sh'], [], [f'src/{n}.rs' for n in range(300)]):
+            self.setUp()
+            self.add_run(1, {job['name']: job['conclusion'] for job in DEFERRED})
+            self.add_run(1, dict(self.green(), **{'Summary (some lanes)': 'success', 'Lint': 'success'}), event='workflow_dispatch')
+            self.add_run(1, self.full(), event='workflow_dispatch')
+            self.confine(files, self.SHAS[1])
+            code, out, writes = self.land('--go', '--through', '12')
+            self.assertEqual((code, writes), (2, []), f'{files[:2]}: {out}')
+            self.assertIn('has not run Host-x64', out)
+        self.setUp()
+        self.add_run(1, self.full(), event='workflow_dispatch')
+        self.confine(['src/lib.rs', 'resources/seccomp.md'], self.SHAS[1])
+        self.assertEqual(self.land('--go', '--through', '12')[0], 0)
+        # The whole pool, whose top's own run was cancelled before its lanes were listed.
+        self.setUp()
+        self.add_run(2, self.full(), event='workflow_dispatch')
+        self.confine(['src/confine.rs'])
+        code, out, writes = self.land('--go')
+        self.assertEqual((code, writes), (2, []), out)
+        self.assertIn('has not run Host-x64', out)
+        self.setUp()
+        self.add_run(2, self.full({'Host-x64': 'success'}), event='workflow_dispatch')
+        self.confine(['src/confine.rs'])
+        self.assertEqual(self.land('--go')[0], 0)
+
+    def test_a_change_that_needs_no_lane_needs_no_host_x64(self):
+        self.add_run(2, {job['name']: job['conclusion'] for job in SCOPE_SKIPPED})
+        self.confine([])
+        code, out, writes = self.land('--go')
+        self.assertEqual(code, 0, out)
+
+    def test_the_confinement_paths_are_the_scope_scripts(self):
+        script = (ROOT / 'scripts/ci-pr-scope.sh').read_text()
+        arm = re.search(r'^    (\S+)\)\n      confine=true;', script, re.M)[1]
+        self.assertEqual(tuple(arm.split('|')), ci_pool.CONFINE_PATHS)
+        self.assertTrue(ci_pool.touches_confinement(['resources/seccomp/a/b.json']), 'a shell * also matches /')
+        self.assertFalse(ci_pool.touches_confinement(['src/confine.rs.md', 'x/Makefile']))
 
     def test_a_lower_part_lands_on_a_run_of_its_own_head_and_the_member_above_moves_to_main(self):
         self.add_run(2, self.full())

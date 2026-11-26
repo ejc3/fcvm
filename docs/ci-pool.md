@@ -193,6 +193,12 @@ It lands nothing unless, on the head that would land:
   and no run on the head is unfinished: lanes can read green in a run whose other jobs
   have not failed yet. A run that named some lanes with the `lanes` input does not count
   for the others;
+- Host-x64 passed too, when the change against `main` touches the VMM's confinement
+  (the paths `scripts/ci-pr-scope.sh` lists; a test keeps the tool's copy equal to the
+  script's). The lanes a head must show are read from the change, not from the lanes its
+  own run happened to list: a lower member's run is deferred and lists none, and a
+  dispatch names its lanes. A comparison that lists no file, or 300 or more, is taken to
+  touch confinement;
 - a run on the head reached a verdict: it finished, was not cancelled, and reported
   `Summary` (or `Summary (some lanes)`). A deferred run tested nothing, and a cancelled
   run reports no Summary at all, so neither is one;
@@ -232,7 +238,8 @@ tree, and anything the planner cannot look up counts as not proven.
 
 A lane is proven for a pushed commit by a job of exactly that lane's name that succeeded
 on its first attempt, in a run of `.github/workflows/ci.yml`, when the lane never failed
-in any counted run on that commit (a second run that passes does not undo a first that
+in any attempt of any counted run on that commit, whether or not the attempt after the
+failure finished (a second run that passes does not undo a first that
 failed), on a commit for which all of this holds:
 
 - It is one of the pushed commit's other parents, or the head of a pull request of this
