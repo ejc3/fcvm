@@ -2789,6 +2789,162 @@ async fn checkout_firecracker_source(
 /// That is what makes an updated fork take effect for VM launches immediately
 /// rather than after the cache TTL. `fcvm setup` is the sanctioned way to pick
 /// up a new firecracker build.
+/// [`ensure_confined_seccomp`], with a failure logged instead of returned: the filters
+/// serve only `--confine`, whose start refuses to run without them, so a setup that cannot
+/// build them (no network for the source) still sets up everything else.
+async fn ensure_confined_seccomp_or_warn(
+    firecracker: &Path,
+    repo: &str,
+    branch: &str,
+    commit: &str,
+    source: FirecrackerSource,
+) {
+    if let Err(error) = ensure_confined_seccomp(firecracker, repo, branch, commit, source).await {
+        warn!(
+            firecracker = %firecracker.display(),
+            error = %format!("{error:#}"),
+            "the confined seccomp filters were not built; --confine will refuse to start"
+        );
+    }
+}
+
+/// Compile the confined seccomp policy ([`crate::confine::seccomp_policy`]) in every mode
+/// for the Firecracker at `firecracker`, with a `seccompiler-bin` built once from the same
+/// commit. Both are content-addressed beside the binary.
+///
+/// Only for a build of the commit the policy was derived from
+/// ([`crate::confine::policy_is_for`]). A Firecracker of another commit (the GPU, phone and
+/// nested profiles) gets no filter, and a confined launch refuses a binary without one, so
+/// such a build cannot run under a policy its syscalls were never checked against.
+async fn ensure_confined_seccomp(
+    firecracker: &Path,
+    repo: &str,
+    branch: &str,
+    commit: &str,
+    source: FirecrackerSource,
+) -> Result<()> {
+    use crate::confine::{filter_path, seccompiler_path, SeccompMode, SECCOMP_ARCH};
+    if !crate::confine::policy_is_for(commit) {
+        debug!(
+            firecracker = %firecracker.display(),
+            commit,
+            "no confined seccomp filter for a Firecracker of another commit than the policy's"
+        );
+        return Ok(());
+    }
+    // A filter is rebuilt when it is absent and also when it is not the bytes whose digest
+    // was recorded for it: a file that merely exists is not taken as the filter.
+    let missing: Vec<(SeccompMode, PathBuf)> = SeccompMode::ALL
+        .iter()
+        .filter(|mode| crate::confine::verified_filter_bytes(firecracker, **mode).is_err())
+        .map(|mode| (*mode, filter_path(firecracker, *mode)))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let compiler = seccompiler_path(firecracker);
+    let mut lock_path = compiler.clone().into_os_string();
+    lock_path.push(".lock");
+    let flock = super::lock_store_dir(Path::new(&lock_path), "seccompiler build").await?;
+    let result = async {
+        if !compiler.exists() {
+            let cargo = cargo_program()?;
+            let build_dir = firecracker_build_dir(&compiler, uuid::Uuid::new_v4());
+            let url = format!("https://github.com/{repo}");
+            checkout_firecracker_source(&url, branch, commit, source, &build_dir).await?;
+            let mut build = Command::new(&cargo);
+            build
+                .args([
+                    "build",
+                    "--release",
+                    "-p",
+                    "seccompiler",
+                    "--bin",
+                    "seccompiler-bin",
+                ])
+                .current_dir(&build_dir);
+            super::run_build_as_sudo_invoker(&mut build);
+            let status = build.status().await.context("building seccompiler-bin")?;
+            anyhow::ensure!(status.success(), "the seccompiler-bin build failed");
+            let built = ["target/release", "build/cargo_target/release"]
+                .iter()
+                .map(|dir| build_dir.join(dir).join("seccompiler-bin"))
+                .find(|path| path.exists())
+                .context("seccompiler-bin is missing after its build")?;
+            let temp = firecracker_install_temp_path(&compiler, uuid::Uuid::new_v4());
+            tokio::fs::copy(&built, &temp)
+                .await
+                .context("installing seccompiler-bin")?;
+            super::publish_store_entry(&temp, &compiler, "seccompiler-bin").await?;
+            let _ = tokio::fs::remove_dir_all(&build_dir).await;
+        }
+        for (mode, path) in &missing {
+            let nonce = uuid::Uuid::new_v4();
+            let policy = firecracker_install_temp_path(path, nonce).with_extension("json");
+            let temp = firecracker_install_temp_path(path, nonce);
+            let digest_path = crate::confine::filter_digest_path(path);
+            let digest_temp = firecracker_install_temp_path(&digest_path, nonce);
+            tokio::fs::write(&policy, crate::confine::seccomp_policy(*mode))
+                .await
+                .context("writing the confined seccomp policy")?;
+            // Under `sudo fcvm setup` the compiler, a binary in a store its invoker can
+            // write, runs as that invoker and not as root: it is given the policy and an
+            // empty output file it owns, and fcvm reads the result back.
+            let staged = async {
+                tokio::fs::write(&temp, b"")
+                    .await
+                    .context("creating the confined seccomp filter's staging file")?;
+                super::give_store_entry_to_invoker(&temp);
+                let mut compile = Command::new(&compiler);
+                compile
+                    .arg("--input-file")
+                    .arg(&policy)
+                    .args(["--target-arch", SECCOMP_ARCH])
+                    .arg("--output-file")
+                    .arg(&temp);
+                super::run_build_as_sudo_invoker(&mut compile);
+                let status = compile.status().await.context("running seccompiler-bin")?;
+                let compiled = tokio::fs::read(&temp)
+                    .await
+                    .context("reading the compiled seccomp filter")?;
+                anyhow::ensure!(
+                    status.success() && !compiled.is_empty(),
+                    "seccompiler-bin rejected the confined policy"
+                );
+                // The filter, then the record of its digest. A crash between the two leaves
+                // a filter whose record does not match: the launch refuses it and the next
+                // setup rebuilds it.
+                super::publish_store_entry(&temp, path, "confined seccomp filter").await?;
+                tokio::fs::write(
+                    &digest_temp,
+                    format!("{}\n", crate::confine::filter_bytes_digest(&compiled)),
+                )
+                .await
+                .context("writing the confined seccomp filter's digest")?;
+                super::publish_store_entry(
+                    &digest_temp,
+                    &digest_path,
+                    "confined seccomp filter digest",
+                )
+                .await
+            }
+            .await;
+            // Nothing staged outlives a failure.
+            let _ = tokio::fs::remove_file(&policy).await;
+            if staged.is_err() {
+                let _ = tokio::fs::remove_file(&temp).await;
+                let _ = tokio::fs::remove_file(&digest_temp).await;
+            }
+            staged?;
+            info!(path = %path.display(), "confined seccomp filter installed");
+        }
+        Ok(())
+    }
+    .await;
+    flock.unlock().map_err(|(_, err)| err)?;
+    result
+}
+
 pub async fn ensure_profile_firecracker(
     profile: &KernelProfile,
     profile_name: &str,
@@ -2836,6 +2992,12 @@ pub async fn ensure_profile_firecracker(
             if record_resolution {
                 record_firecracker_resolution(profile_name, repo, branch, &commit, &path);
             }
+            let source = if profile.firecracker_commit.is_some() {
+                FirecrackerSource::Pin
+            } else {
+                FirecrackerSource::BranchTip
+            };
+            ensure_confined_seccomp_or_warn(&path, repo, branch, &commit, source).await;
             return Ok(Some(path));
         }
         FirecrackerSetupStep::ReuseCached { path, error } => {
@@ -2845,6 +3007,8 @@ pub async fn ensure_profile_firecracker(
                 path = %path.display(),
                 "could not query remote firecracker commit; keeping the cached binary"
             );
+            // No filter work here: the commit this cached binary was built from is the
+            // thing that could not be read, and the filter is only for the policy's commit.
             return Ok(Some(path));
         }
         FirecrackerSetupStep::Build {
@@ -2871,6 +3035,9 @@ pub async fn ensure_profile_firecracker(
         if record_resolution {
             record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
         }
+        // The other process may not have reached the filters, or may be an fcvm from
+        // before they existed.
+        ensure_confined_seccomp_or_warn(&bin_path, repo, branch, &commit_hash, source).await;
         return Ok(Some(bin_path));
     }
 
@@ -2963,6 +3130,7 @@ pub async fn ensure_profile_firecracker(
     if record_resolution {
         record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
     }
+    ensure_confined_seccomp_or_warn(&bin_path, repo, branch, &commit_hash, source).await;
 
     Ok(Some(bin_path))
 }
@@ -3354,6 +3522,112 @@ async fn update_grub_config_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Firecracker of another commit than the confined policy's gets no filter: nothing
+    /// is built or written beside it, so a confined launch finds no filter and refuses it.
+    /// Setup used to compile the default build's policy beside every profile's Firecracker,
+    /// so `snapshot run --confine --firecracker-bin` could run the nested or a GPU build
+    /// under a policy its syscalls were never checked against. On x86_64 the nested
+    /// build's vCPU threads make an ioctl the policy does not list, which stops the VMM.
+    /// `fcvm setup` records each compiled filter's digest and rebuilds a filter that is
+    /// not the recorded bytes: a file that only exists under the filter's name is not
+    /// skipped. A compile that fails leaves nothing staged behind.
+    #[tokio::test]
+    async fn setup_rebuilds_a_filter_that_is_not_the_recorded_bytes() {
+        use crate::confine::{
+            filter_digest_path, filter_path, seccompiler_path, verified_filter_bytes, SeccompMode,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let firecracker = dir.path().join("firecracker-default-0123456789ab.bin");
+        std::fs::write(&firecracker, b"").unwrap();
+        // A stand-in compiler: its output is its input, so each mode's filter differs.
+        let compiler = seccompiler_path(&firecracker);
+        let write_compiler = |body: &str| {
+            std::fs::write(&compiler, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write_compiler(
+            "while [ $# -gt 0 ]; do case \"$1\" in --input-file) in=\"$2\";; \
+             --output-file) out=\"$2\";; esac; shift; done; cat \"$in\" > \"$out\"",
+        );
+        let setup = || {
+            ensure_confined_seccomp(
+                &firecracker,
+                "example/firecracker",
+                "example-branch",
+                crate::confine::CONFINED_FIRECRACKER_COMMIT,
+                FirecrackerSource::Pin,
+            )
+        };
+        let entries = || {
+            let mut names: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+
+        setup().await.unwrap();
+        let installed = entries();
+        for mode in SeccompMode::ALL {
+            assert_eq!(
+                verified_filter_bytes(&firecracker, mode).unwrap(),
+                crate::confine::seccomp_policy(mode).into_bytes()
+            );
+        }
+
+        // Other bytes under the enforce filter's name; the log filter loses its record.
+        let enforce = filter_path(&firecracker, SeccompMode::Enforce);
+        std::fs::write(&enforce, b"three empty programs").unwrap();
+        std::fs::remove_file(filter_digest_path(&filter_path(
+            &firecracker,
+            SeccompMode::Log,
+        )))
+        .unwrap();
+        setup().await.unwrap();
+        for mode in SeccompMode::ALL {
+            assert_eq!(
+                verified_filter_bytes(&firecracker, mode).unwrap(),
+                crate::confine::seccomp_policy(mode).into_bytes(),
+                "{mode:?} was not rebuilt"
+            );
+        }
+        assert_eq!(entries(), installed);
+
+        // A compiler that fails: an error, and no staging file left.
+        std::fs::write(&enforce, b"three empty programs").unwrap();
+        write_compiler("exit 1");
+        let error = setup().await.unwrap_err().to_string();
+        assert!(error.contains("seccompiler-bin rejected"), "{error}");
+        assert_eq!(entries(), installed);
+    }
+
+    #[tokio::test]
+    async fn a_firecracker_of_another_commit_gets_no_confined_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let firecracker = dir.path().join("firecracker-nested-0123456789ab.bin");
+        std::fs::write(&firecracker, b"").unwrap();
+        ensure_confined_seccomp(
+            &firecracker,
+            "example/firecracker",
+            "example-branch",
+            "0000000000000000000000000000000000000000",
+            FirecrackerSource::Pin,
+        )
+        .await
+        .unwrap();
+        let entries: Vec<std::ffi::OsString> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            [firecracker.file_name().unwrap().to_owned()],
+            "something was written beside a Firecracker of another commit"
+        );
+    }
 
     fn amd64_host_kernel() -> HostKernelConfig {
         let plan: crate::setup::rootfs::Plan =

@@ -237,13 +237,19 @@ namespace, and each acts on the agent's own. That is where every listener of
 the workload is: the container runs with `--network=host`. A namespace a
 privileged workload makes for itself is outside all three, as it was outside
 the gate before (its traffic is forwarded, and the gate hooks INPUT and
-OUTPUT). What keeps the 0 out of a snapshot of a clone: the restore holds the
-boundary lock from its first step to publication, and a snapshot's prepare is
-refused from the restore's dispatch until its publication (`restore-under-way`,
-below). A restore that fails keeps the 0, drops the lock and leaves the mark,
-so the prepare stays refused until the agent's power-off lands. What can still
-capture it is a create whose prepare ran before the restore was dispatched and
-whose pause lands in the middle of it, which the host refuses (#2138).
+OUTPUT). What keeps the 0 out of a snapshot of a clone is two intervals, not
+one. From the restore's dispatch to its publication the guest refuses a
+snapshot's prepare (`restore-under-way`, below). The boundary lock is taken
+later: the restore does its early work first (the exec re-register request, the
+neighbour pin, the `restore.pre_boundary` failpoint) and holds the lock from
+`restore_snapshot_network` to publication, so the lock does not cover the
+pre-boundary work and the mark does. A restore that fails keeps the 0, drops
+the lock and leaves the mark, so the prepare stays refused until the agent's
+power-off lands. The guest cannot refuse a prepare that returned before the
+dispatch. `fcvm` sends none: a restore is dispatched only into a VM that was
+just loaded from an image, and `snapshot create` refuses such a VM, under the
+per-VM snapshot lock, until its restore is acknowledged (#2151). A one-shot run
+by hand in that VM before the dispatch is not covered.
 
 A socket the clone opens after that list is in neither list and is never
 retired, whatever tuple it reuses. `ModelDiag` fails if a socket made after the
@@ -347,11 +353,46 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
 - **The watchdog's deadline is for a boundary nobody is working on.** A look while the
   boundary lock is held or a restore is under way is not counted
   (`snapshot_network::boundary_in_progress`), so a restore or a prepare that takes over a
-  minute keeps its container frozen. A source whose host died, or whose gate cannot be
-  opened, is still thawed after 60 counted looks. At most 900 looks at one freeze go
+  minute keeps its container frozen. While a source's boundary is owed and its gate is
+  still installed (`snapshot_network::source_gate_is_owed`), 150 more looks are not
+  counted (`payload_freeze::SOURCE_REOPEN_LOOKS`, the host's whole bound on asking
+  for the resume): nobody holds the lock between two of the host's tries, and those looks
+  used to count, so the thaw could land with the create still in flight. Looks, not the
+  mark's age: the guest takes none while its VM is paused. A source whose host died, or
+  whose gate cannot be opened, is still thawed, 60 counted looks after those. At most 900 looks at one freeze go
   uncounted (15 minutes, the host's bound on a restore's acknowledgement), so a one-shot
   hung under the lock cannot keep a container frozen for good. A lock that cannot be
   opened is not "held".
+- **A resume acts only on the boundary it was sent for** (#2159). A resume the host gave
+  up on can still be delivered later: its exec runs on a blocking thread that goes on
+  connecting after the try is cut off, and a delivered one-shot can wait in the guest for
+  the boundary lock. Landing between a later create's prepare and its pause, it would open
+  the gate and the pause would save an image with the gate open and no manifest. So every
+  create's boundary has a token: `run_snapshot_network_command` writes it on the VM's
+  state (`boundary_token`) and sends it to the prepare, which puts it into the `owed`
+  mark; every resume reads it from the state once, before its first try, and sends it;
+  the guest runs a resume only when its token is the mark's
+  (`BoundaryMarks::resume_is_for_the_owed_boundary`), and refuses any other with exit 5.
+  Exit 3 is the restore's refusal alone. On 5 the host asks no more, keeps the record and
+  the token, and reports the source as possibly left gated (`ReopenFailure::Stale`): the
+  refusal says nothing of the gate, which can be this source's own and closed (a prepare
+  that failed before it wrote its mark, over the mark of a create whose host died). The
+  state keeps the token while the gate is recorded closed, for the later create's one
+  ask, and loses it when the gate is reported open. A state that is there and cannot be
+  read is a failed try, and one that cannot be written fails the create before its
+  prepare is sent: neither is "no token". The token orders resumes. It is not a secret:
+  the one-shot runs as root in the guest, and whatever can run it can read the mark.
+  Both failures begin with the commands to run by hand (`with_the_resume_by_hand`): the
+  resume with the state's token, or, when the guest refused that as stale, a read of
+  `/run/fcvm/snapshot-boundary-owed` and the resume with the token found there. The
+  mark is written whole or not at all (staged and renamed). A resume that opens the gate
+  and cannot remove the manifest or the mark after three tries exits 4, which the host
+  reads as an open gate (`reopen_try_of`), and still does what follows an open gate (the
+  output reconnect). The resume's second look for a restore, right before it touches the
+  gate, narrows the window in which the two meet and does not close it; no path of fcvm
+  sends a resume to a VM whose restore it has yet to dispatch. A clone inherits its
+  source's mark, token included, until its restore is dispatched and clears it; no path
+  sends a clone its source's token, and a create of the clone carries its own.
 - **`rcu_expedited` is put back after a kill** (#2141). The barrier records the switch's
   value in `/run/fcvm/rcu-expedited-before` before it turns it on; the next barrier, the
   next resume and the next start of the agent put it back from the record. The resume
@@ -1962,18 +2003,18 @@ The ubuntu user has KVM access (`kvm` group), so `fcvm podman run` works without
 # PREFERRED - Rootless mode (no sudo needed, use run_in_background: true)
 ./target/release/fcvm podman run --name test alpine:latest 2>&1 | tee /tmp/vm.log
 # Defaults to --network rootless
-# Get PID from state and use exec:
-ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs cat | jq -r '.pid'
-./target/release/fcvm exec --pid <PID> -- hostname
+# Get the PID of the VM named "test" (jq fails unless exactly one VM has that name):
+PID=$(./target/release/fcvm ls --json | jq -er '[.[] | select(.name == "test")] | if length == 1 then .[0].pid else error("VMs named test: \(length)") end')
+./target/release/fcvm exec --pid "$PID" -- hostname
 
 # ONLY WHEN NEEDED - Bridged mode (requires sudo)
 sudo ./target/release/fcvm podman run --name test --network bridged nginx:alpine 2>&1 | tee /tmp/vm.log
 # Then sleep and check logs:
 sleep 30
 grep healthy /tmp/vm.log
-# Get PID from state and use exec:
-sudo ls -t /mnt/fcvm-btrfs/state/*.json | head -1 | xargs sudo cat | jq -r '.pid'
-sudo ./target/release/fcvm exec --pid <PID> -- curl -s ifconfig.me
+# Get the PID of the VM named "test" (jq fails unless exactly one VM has that name):
+PID=$(sudo ./target/release/fcvm ls --json | jq -er '[.[] | select(.name == "test")] | if length == 1 then .[0].pid else error("VMs named test: \(length)") end')
+sudo ./target/release/fcvm exec --pid "$PID" -- curl -s ifconfig.me
 ```
 
 **Testing egress connectivity:**
@@ -2018,8 +2059,8 @@ sleep 60  # Wait for VM to boot and run commands
 
 **Inspecting namespace state for running VM:**
 ```bash
-# Get holder PID from state file
-HOLDER_PID=$(cat /mnt/fcvm-btrfs/state/*.json | jq -r '.holder_pid')
+# Get the holder PID of the VM named $NAME (jq fails unless exactly one VM has that name)
+HOLDER_PID=$(fcvm ls --json | jq -er --arg name "$NAME" '[.[] | select(.name == $name)] | if length == 1 then .[0].holder_pid else error("VMs named \($name): \(length)") end')
 # Check namespace network config
 sudo nsenter --net=/proc/$HOLDER_PID/ns/net ip addr
 sudo nsenter --net=/proc/$HOLDER_PID/ns/net bridge link  # Show bridge ports
@@ -2828,35 +2869,79 @@ On serve process exit (SIGTERM/SIGINT):
    state, so its cost does not grow with the number of VMs (with every state read on every
    start, a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). Once a
    minute per state directory (`maybe_sweep`: `sweep.stamp` missing or expired, and
-   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim has released
-   `names.lock`; that launch pays for the scan, and no other start waits for it. The sweep
-   removes the states of dead or replaced processes and the index entries that outlive
-   them. Until it runs a stale state holds nothing: its owner is not live.
+   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim; that launch
+   pays for the scan, and no other start waits for it. The sweep removes the states of dead
+   or replaced processes, and the PID entries, name tokens and claim directories that
+   outlive them. Until it runs a stale state holds nothing: its owner is not live.
 
-**Indexes** (`src/state/manager.rs`), so a start's fast path does not scan:
-- `name/<sha256 of name>.json` records which VM claimed the name last, written by
-  `claim_name()` under `names.lock`. That VM holds the name while its state exists, names
-  it, and its owner is live. A state written without a claim has no entry and holds no name.
-- `pid/<pid>.<vm_id>` (empty) is written by `save_state()` under the VM's state lock;
-  `load_state_by_pid()` reads the states it names and scans everything only on a miss.
-- Lock order: `names.lock` before a VM's `<vm_id>.json.lock`, never the reverse.
-  `delete_state()` removes both entries; the sweep removes any a crash left.
-- Root and the state directory's owner share one state directory (privileged tests run as
-  root beside unprivileged ones), so `name/` and `pid/` made by root are handed to the
-  state directory's owner before they appear (`index_dir`), and `sweep.stamp` is written
-  like a lock file (0666). Nothing is made world-writable.
+**Layout** (`src/state/manager.rs`, layout 2). No directory takes every VM's writes and no
+lock is host-wide: a create or a rename holds its directory's lock exclusively, and with
+every state in one directory under one `names.lock`, clones starting together queued on
+both.
 
-**State file layout**: Individual files per VM, keyed by `vm_id` (UUID):
 ```
 /mnt/fcvm-btrfs/state/
-├── vm-abc123.json      # { vm_id: "vm-abc123", pid: 5000, pid_start_time: 12345, ... }
-├── vm-def456.json      # { vm_id: "vm-def456", pid: 5001, pid_start_time: 67890, ... }
-├── name/<sha256>.json  # { name, vm_id }: the VM that claimed the name last
-├── pid/5000.vm-abc123  # PID index entry
-└── names.lock          # Global lock for name claims
+├── layout                              # "2"
+├── vms/<b>/vm-abc123.json             # { vm_id, pid, pid_start_time, name, ... }
+├── vms/<b>/vm-abc123.json.lock        # per-VM flock; .json.tmp while a write runs
+├── names/<b>/<sha256 of name>/        # a name slot: a directory with one token in it
+│   └── 5000.12345.vm-abc123            # the holder's <pid>.<start time>.<vm_id>
+├── names/<b>/.claim.<pid>.<start>.<vm_id>/   # a claim being built
+├── pids/<b>/5000.vm-abc123            # PID index entry (empty)
+└── sweep.lock, sweep.stamp
 ```
 
-No master state file - `list_vms()` globs all `.json` files.
+- `<b>` is the first hex digit of the SHA-256 of the key (vm_id, name, PID)
+  (`bucket_of`): the same in every process and build. Sixteen buckets: more would cut
+  the wait between starts further, but every listing opens every bucket, and with 256
+  an `fcvm ls` on an empty store spent more than half its time in 281 `openat` calls.
+- **A name is claimed by renaming a directory onto its slot** (`claim_name()`): the claim
+  directory holds the claimer's token, and the kernel replaces a directory only with one
+  that is absent or empty, so of any number of concurrent claims exactly one rename
+  succeeds, with no lock. A slot in use names its holder in the token's file name. A live
+  holder keeps the name; a dead one's state is deleted and its token unlinked by its own
+  name, then the rename is tried again. `delete_state()` unlinks the VM's token and removes
+  the slot if empty. Every step is conditional in the kernel, so it holds through a
+  fuse-pipe mount, where a flock would not
+  (`test_rename_directory_onto_directory_needs_an_empty_target`).
+- `pids/<b>/<pid>.<vm_id>` is written by `save_state()` under the VM's state lock;
+  `load_state_by_pid()` reads the states its bucket names and scans everything only on a
+  miss.
+- The only flock on the start path is the VM's own `<vm_id>.json.lock`.
+- **A state is published by exchange, not by a rename over the old one** (`publish_state`):
+  `RENAME_EXCHANGE` of `<vm_id>.json.tmp` with `<vm_id>.json`, then the old state is
+  unlinked. btrfs starts writing a file's data out inside a rename that replaces another
+  file, with the directory locked, and with many clones starting together each such
+  rename slept in the block layer. An exchange starts no I/O.
+- `list_vms()` opens and reads the buckets and the state files on up to 8 threads.
+- Root and the state directory's owner share one state directory (privileged tests run as
+  root beside unprivileged ones), so a directory root makes (`shared_dir`, a claim
+  directory) is handed to the state directory's owner before it appears, and `sweep.stamp`
+  is written like a lock file (0666). Nothing is made world-writable.
+- **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
+  by every command while a VM of it is running: the error lists each one's name and PID,
+  and they are stopped with the fcvm that started them. The layout check of a command
+  that only reads (`check_layout_for_read`) decides refuse or proceed and writes nothing,
+  so `fcvm ls`, which only lists, needs no write access and removes nothing of an older
+  launch in progress. A lookup by PID that misses still runs the sweep
+  (`load_state_by_pid`), which removes stale states. A launch
+  (`check_layout_for_write`) removes what layout 1 left with no VM running, under layout
+  1's own `names.lock`, held across a second scan and the removal, and writes the marker;
+  the lock file stays, so an older launch and a conversion always exclude each other.
+  The marker's content is read: anything but this layout's number is refused. An older
+  fcvm pointed at a layout 2 store sees no VMs and cannot tell, so do not run two fcvm
+  builds of different layouts on one store.
+- **Liveness is read from the caller's own /proc** (`process_liveness`): a state directory
+  is used from one PID namespace, which holds because each nesting level has its own data
+  directory. Only "no such process" (or a zombie, or another start time) is dead; a /proc
+  read that fails for another reason fails a name claim and removes nothing.
+- **A state file a host crash left empty or cut short** is removed by the sweep when it
+  was written before this boot (`/proc/stat` btime), and warned about once per process
+  otherwise. No state file is synced. The one synced file is the layout marker
+  (`write_layout_marker`), written once per store: an empty marker after a host crash
+  would have every command refuse the store.
+
+No master state file: `list_vms()` reads every bucket of `vms/`.
 
 ## Architecture
 
@@ -3802,7 +3887,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
-├── state/{vm_id}.json            # VM state files
+├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
 ├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy
