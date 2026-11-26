@@ -1484,7 +1484,13 @@ mod tests {
     const SECCOMP_ARCHES: [&str; 2] = ["x86_64", "aarch64"];
 
     /// The thread categories the confined policy was audited for: the ones the pinned
-    /// Firecracker installs a filter for, each on the threads of that kind.
+    /// Firecracker installs a filter for, each on the threads of that kind. `blk_worker` is
+    /// listed without an audit, because no VM fcvm starts has such a thread: Firecracker runs
+    /// a drive on worker threads only when the drive sets a queue count
+    /// (`no_drive_asks_for_worker_threads`), and the policy takes from the VMM thread what it
+    /// would need to start one for a drive attached later (confined-changes.json,
+    /// `every_drive_is_attached_before_the_guest_boots`). A drive that asks for worker
+    /// threads needs the audit first.
     const AUDITED_THREAD_CLASSES: [&str; 4] = ["api", "blk_worker", "vcpu", "vmm"];
 
     /// The thread categories of a filter file, sorted.
@@ -1494,11 +1500,44 @@ mod tests {
         classes
     }
 
+    /// No drive fcvm configures sets a queue count (the field this test looks for, spelled so
+    /// that its own text does not hold it). Firecracker runs a drive that sets one on
+    /// worker threads (its `blk_worker` category) and every other drive on the VMM thread, so
+    /// no VM of fcvm's has a thread of that category, and the confined policy for it has
+    /// never run. A drive that starts to ask for worker threads fails here first.
+    #[test]
+    fn no_drive_asks_for_worker_threads() {
+        let field = concat!("num", "_queues");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut read = 0;
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    read += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(
+                        !text.contains(field),
+                        "{} names {field}: a drive with it runs on Firecracker worker threads, \
+                         whose seccomp category the confined policy was never audited for",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(read > 50, "only {read} source files were read");
+    }
+
     /// fcvm attaches every drive and pmem device before the guest boots, and never to a running
-    /// VM. Firecracker starts a block worker thread for a drive while it attaches it: at boot
-    /// and at a snapshot load that is before the VMM thread's filter is installed, and for a
-    /// drive attached later it is under that filter, which then has to allow creating a thread.
-    /// A hot-plug added to fcvm fails here, and not as a confined VM stopped in the field.
+    /// VM. For a drive that runs on worker threads Firecracker starts them while it attaches
+    /// the drive: at boot and at a snapshot load that is before the VMM thread's filter is
+    /// installed, and for a drive attached later it is under that filter. The confined policy
+    /// takes thread creation out of the VMM thread's filter, so a drive attached to a running
+    /// VM must not appear without a decision about it: it fails here, and not as a confined VM
+    /// stopped at run time.
     #[test]
     fn every_drive_is_attached_before_the_guest_boots() {
         // The attach calls, spelled so this test's own text holds none of them.
@@ -1781,9 +1820,12 @@ mod tests {
             ("vmm", "open"),
             ("api", "open"),
             ("vcpu", "open"),
+            ("blk_worker", "open"),
             ("vmm", "stat"),
+            ("blk_worker", "stat"),
             ("vmm", "epoll_wait"),
             ("api", "epoll_wait"),
+            ("blk_worker", "epoll_wait"),
         ];
         // On aarch64 only: none. Its openat and newfstatat are in the x86_64 policy too.
         const AARCH64_ONLY: &[(&str, &str)] = &[];
@@ -1806,8 +1848,10 @@ mod tests {
             ("vcpu", "KVM_GET_MSRS"),
             ("vcpu", "KVM_GET_CPUID2"),
         ];
+        // KVM_SET_DEVICE_ATTR is in both: aarch64 sets the GIC's state with it, and the
+        // x86_64 filter lists it for the KVM VFIO device, whose KVM_CREATE_DEVICE the
+        // changes remove (a removal names a request, not an architecture).
         const AARCH64_ONLY_IOCTLS: &[(&str, &str)] = &[
-            ("vmm", "KVM_SET_DEVICE_ATTR"),
             ("vmm", "KVM_GET_DEVICE_ATTR"),
             ("vcpu", "KVM_GET_ONE_REG"),
             ("vcpu", "KVM_GET_REG_LIST"),

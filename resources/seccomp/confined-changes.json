@@ -24,6 +24,230 @@
                 "val": 32769
             },
             "why": "the fork's rule for MAP_SHARED | MAP_POPULATE is the mapping of an io_uring ring, and the VMM can make no ring without io_uring_setup. No mmap with these flags appears in the traces of this policy's audit and enforce passes on either architecture."
+        },
+        {
+            "syscall": "clone",
+            "why": "the VMM thread starting a block worker thread: Firecracker runs a drive on worker threads only when the drive sets num_queues, which fcvm never sends (no_drive_asks_for_worker_threads), and starts them from the VMM thread only for a drive attached to a running VM, which fcvm never does (every_drive_is_attached_before_the_guest_boots). Without it no thread of the VMM can create a thread or a process."
+        },
+        {
+            "syscall": "seccomp",
+            "why": "the VMM thread starting a block worker thread: Firecracker runs a drive on worker threads only when the drive sets num_queues, which fcvm never sends (no_drive_asks_for_worker_threads), and starts them from the VMM thread only for a drive attached to a running VM, which fcvm never does (every_drive_is_attached_before_the_guest_boots). The new thread installs its own filter with it."
+        },
+        {
+            "syscall": "prctl",
+            "arg": {
+                "index": 0,
+                "val": 15
+            },
+            "why": "the VMM thread starting a block worker thread: Firecracker runs a drive on worker threads only when the drive sets num_queues, which fcvm never sends (no_drive_asks_for_worker_threads), and starts them from the VMM thread only for a drive attached to a running VM, which fcvm never does (every_drive_is_attached_before_the_guest_boots). PR_SET_NAME, the new thread's name."
+        },
+        {
+            "syscall": "prctl",
+            "arg": {
+                "index": 0,
+                "val": 38
+            },
+            "why": "the VMM thread starting a block worker thread: Firecracker runs a drive on worker threads only when the drive sets num_queues, which fcvm never sends (no_drive_asks_for_worker_threads), and starts them from the VMM thread only for a drive attached to a running VM, which fcvm never does (every_drive_is_attached_before_the_guest_boots). PR_SET_NO_NEW_PRIVS, before the new thread's filter."
+        },
+        {
+            "syscall": "mmap",
+            "arg": {
+                "index": 3,
+                "val": 131106
+            },
+            "why": "the VMM thread starting a block worker thread: Firecracker runs a drive on worker threads only when the drive sets num_queues, which fcvm never sends (no_drive_asks_for_worker_threads), and starts them from the VMM thread only for a drive attached to a running VM, which fcvm never does (every_drive_is_attached_before_the_guest_boots). MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, the new thread's stack."
+        },
+        {
+            "syscall": "fcntl",
+            "arg": {
+                "index": 1,
+                "val": 1030
+            },
+            "why": "the VMM thread starting a block worker thread: Firecracker runs a drive on worker threads only when the drive sets num_queues, which fcvm never sends (no_drive_asks_for_worker_threads), and starts them from the VMM thread only for a drive attached to a running VM, which fcvm never does (every_drive_is_attached_before_the_guest_boots). F_DUPFD_CLOEXEC, the worker's copies of the queue eventfds."
+        },
+        {
+            "syscall": "epoll_create1",
+            "why": "the VMM thread starting a block worker thread: Firecracker runs a drive on worker threads only when the drive sets num_queues, which fcvm never sends (no_drive_asks_for_worker_threads), and starts them from the VMM thread only for a drive attached to a running VM, which fcvm never does (every_drive_is_attached_before_the_guest_boots). The worker's event loop."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 3222056672
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). KVM_CREATE_DEVICE for the KVM VFIO device. KVM_SET_DEVICE_ATTR stays on x86_64, because the aarch64 policy needs the same request for the GIC and a removal names a request, not an architecture; without KVM_CREATE_DEVICE the VMM has no device descriptor to use it on."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15204
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_GET_API_VERSION."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15205
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_CHECK_EXTENSION."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15206
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_SET_IOMMU."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15207
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_GROUP_GET_STATUS."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15208
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_GROUP_SET_CONTAINER."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15209
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_GROUP_UNSET_CONTAINER."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15210
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_GROUP_GET_DEVICE_FD."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15211
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_DEVICE_GET_INFO."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15212
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_DEVICE_GET_REGION_INFO."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15213
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_DEVICE_GET_IRQ_INFO."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15214
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_DEVICE_SET_IRQS."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15215
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_DEVICE_RESET."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 15217
+            },
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). VFIO_IOMMU_MAP_DMA."
+        },
+        {
+            "syscall": "pread64",
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). The device's PCI configuration space and BARs, read on the VMM thread at hot-plug and on a vCPU thread at an exit."
+        },
+        {
+            "syscall": "pwrite64",
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: a confined VM runs the [firecracker] build without a passthrough device (the gpu and phone profiles run another build, which confinement refuses). The device's PCI configuration space and BARs, written on the VMM thread at hot-plug and on a vCPU thread at an exit."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 3278417446
+            },
+            "why": "a virtio device attached to a running Nitro Enclave, which fcvm does not start. NE_ADD_DEVICE."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 1074834983
+            },
+            "why": "a virtio device attached to a running Nitro Enclave, which fcvm does not start. NE_SET_VRING_CALL."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 1074834984
+            },
+            "why": "a virtio device attached to a running Nitro Enclave, which fcvm does not start. NE_SET_VRING_KICK."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 1074310699
+            },
+            "why": "a virtio device attached to a running Nitro Enclave, which fcvm does not start. NE_SET_INFO_EVENT_FD."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 1079029292
+            },
+            "why": "a virtio device attached to a running Nitro Enclave, which fcvm does not start. NE_UPDATE_DEVICE_CONFIG."
+        },
+        {
+            "syscall": "mmap",
+            "arg": {
+                "index": 3,
+                "val": 32785
+            },
+            "why": "a virtio device attached to a running Nitro Enclave, which fcvm does not start. MAP_SHARED | MAP_FIXED | MAP_POPULATE over the enclave's memory."
+        },
+        {
+            "syscall": "preadv",
+            "why": "the imago VMDK disk backend and its descriptor paths: fcvm's drives are raw files. Its vectored reads."
+        },
+        {
+            "syscall": "readlink",
+            "why": "the imago VMDK disk backend and its descriptor paths: fcvm's drives are raw files. Canonicalizing a descriptor's path on x86_64; the VFIO hot-plug reads a device's group link with it too."
+        },
+        {
+            "syscall": "readlinkat",
+            "why": "the imago VMDK disk backend and its descriptor paths: fcvm's drives are raw files. Canonicalizing a descriptor's path on aarch64; the VFIO hot-plug reads a device's group link with it too."
         }
     ],
     "add": [
@@ -130,13 +354,12 @@
                 "x86_64"
             ],
             "classes": [
-                "vmm",
                 "api",
                 "vcpu"
             ],
             "rule": {
                 "syscall": "openat",
-                "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists)"
+                "comment": "glibc's open on x86_64 (musl uses open, which the fork's filter lists; in the vmm class the fork's filter lists openat as well)"
             }
         },
         {
