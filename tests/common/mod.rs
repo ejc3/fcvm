@@ -99,6 +99,13 @@ impl TestLogger {
             );
         });
 
+        // The gate scans the logs of its own lane's tests, by this list.
+        if let Err(error) =
+            record_for_the_gate("FCVM_CONFINE_LOG_LIST", &log_path.display().to_string())
+        {
+            panic!("{error:#}");
+        }
+
         let logger = Self {
             test_name: test_name.to_string(),
             log_path,
@@ -1118,7 +1125,10 @@ pub fn firecracker_children(parent: u32) -> Vec<u32> {
 /// confined.
 pub fn vmm_confinement_failures(vmm: u32) -> Vec<String> {
     let mut failures = Vec::new();
-    match fcvm::confine::unfiltered_threads(vmm) {
+    // More filters than this test process has: fcvm, and so its VMM, inherits those.
+    match fcvm::confine::own_seccomp_filters()
+        .and_then(|own| fcvm::confine::unfiltered_threads(vmm, own))
+    {
         Ok(unfiltered) if unfiltered.is_empty() => {}
         Ok(unfiltered) => failures.push(format!(
             "threads under no seccomp filter: {}",
@@ -1190,9 +1200,9 @@ fn current_test_name() -> String {
 /// Under the confinement gate (`FCVM_CONFINE=required`, as `make test-confine` runs the
 /// tests), the VMM of the fcvm process `fcvm_pid` is confined
 /// ([`vmm_confinement_failures`]), or the test fails. Every helper that waits for a VM to
-/// become healthy calls this, so a test in the gate cannot pass on an unconfined VMM. The
-/// test's name is appended to `FCVM_CONFINE_ASSERT_LOG`, which is how
-/// scripts/confine-gate.sh knows the assertion ran in each test it counts.
+/// become healthy calls this, so a test in the gate cannot pass on an unconfined VMM. Each
+/// VMM that passes is recorded in `FCVM_CONFINE_ASSERT_LOG` (test, VMM pid, `healthy`),
+/// which is how scripts/confine-gate.sh knows the assertion ran in each test it counts.
 pub fn assert_vmm_confined_under_the_gate(fcvm_pid: u32) -> anyhow::Result<()> {
     if std::env::var("FCVM_CONFINE").as_deref() != Ok("required") {
         return Ok(());
@@ -1209,35 +1219,167 @@ pub fn assert_vmm_confined_under_the_gate(fcvm_pid: u32) -> anyhow::Result<()> {
             "FCVM_CONFINE=required and the VMM {vmm} of fcvm {fcvm_pid} is not confined: {}",
             failures.join("; ")
         );
+        if let Some(dead) = vmm_api_failure(vmm) {
+            anyhow::bail!("FCVM_CONFINE=required and {dead}");
+        }
+        record_for_the_gate("FCVM_CONFINE_ASSERT_LOG", &format!("{vmm}\thealthy"))?;
     }
-    record_confinement_assertion()
+    Ok(())
 }
 
-/// Append this test's name to `FCVM_CONFINE_ASSERT_LOG`, when the gate set one.
-fn record_confinement_assertion() -> anyhow::Result<()> {
-    if let Some(log) = std::env::var_os("FCVM_CONFINE_ASSERT_LOG") {
-        std::fs::OpenOptions::new()
+/// [`assert_vmm_confined_under_the_gate`] on the blocking pool. The checks read `/proc` and
+/// wait on a socket, and a test's runtime thread must not wait with them: the tests are
+/// current-thread runtimes whose tasks drain the output pipes of every fcvm they started
+/// (a pipe nobody reads stops its writer at the next line it logs).
+pub async fn assert_vmm_confined_off_the_runtime(fcvm_pid: u32) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || assert_vmm_confined_under_the_gate(fcvm_pid))
+        .await
+        .map_err(|e| anyhow::anyhow!("the confinement assertion did not finish: {e}"))?
+}
+
+/// How long a VMM's API has to answer the gate's `GET /`. A healthy one answers in
+/// milliseconds.
+const VMM_API_ANSWER_LIMIT: Duration = Duration::from_secs(10);
+
+/// The API socket the VMM `vmm` was started with (`--api-sock`), from its command line.
+pub fn vmm_api_socket(vmm: u32) -> Option<PathBuf> {
+    let cmdline = std::fs::read(format!("/proc/{vmm}/cmdline")).ok()?;
+    let mut args = cmdline.split(|b| *b == 0);
+    args.find(|arg| *arg == b"--api-sock")?;
+    args.next()
+        .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+}
+
+/// Whether the Firecracker API at `socket` answers `GET /` within `limit`. Firecracker
+/// answers it through its API thread and its main thread, so an answer says both run.
+///
+/// A syscall the policy traps while a Firecracker thread is writing a log line stops that
+/// thread for good: its handler logs, and waits for the logger the thread already holds.
+/// Nothing is written and the process does not exit, so neither fcvm's report nor the
+/// gate's scan of the logs sees it. A VMM in that state does not answer here.
+pub fn vmm_api_answers(socket: &std::path::Path, limit: Duration) -> bool {
+    use std::io::Read;
+    let socket = socket.to_owned();
+    let (answer, answered) = std::sync::mpsc::channel();
+    // On a thread of its own: a connect to a listener that accepts nothing can wait too.
+    std::thread::spawn(move || {
+        let outcome = (|| -> std::io::Result<bool> {
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket)?;
+            stream.set_read_timeout(Some(limit))?;
+            stream.set_write_timeout(Some(limit))?;
+            stream.write_all(
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\n\r\n",
+            )?;
+            let mut status = [0u8; 16];
+            let read = stream.read(&mut status)?;
+            Ok(status[..read].starts_with(b"HTTP/1.1 "))
+        })();
+        let _ = answer.send(outcome.unwrap_or(false));
+    });
+    answered.recv_timeout(limit).unwrap_or(false)
+}
+
+/// Whether process `pid` still runs (it exists and is not a zombie).
+fn process_runs(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| !stat.contains(") Z "))
+}
+
+/// Why the VMM `vmm` counts as hung, or `None`: its API does not answer while the process
+/// keeps running. A VMM that is gone, or goes within two seconds of not answering (it was
+/// exiting), is not hung; a stop by the policy that ends the process is the log scan's.
+pub fn vmm_api_failure(vmm: u32) -> Option<String> {
+    vmm_api_failure_within(vmm, VMM_API_ANSWER_LIMIT)
+}
+
+fn vmm_api_failure_within(vmm: u32, limit: Duration) -> Option<String> {
+    if !process_runs(vmm) {
+        return None;
+    }
+    let Some(socket) = vmm_api_socket(vmm) else {
+        return process_runs(vmm).then(|| format!("the VMM {vmm} has no --api-sock argument"));
+    };
+    if vmm_api_answers(&socket, limit) {
+        return None;
+    }
+    let gone_by = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < gone_by {
+        if !process_runs(vmm) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Some(format!(
+        "the API of the VMM {vmm} ({}) did not answer GET / within {limit:?} and the process \
+         still runs: a Firecracker thread stopped inside its logging hangs like this, and \
+         nothing reports it",
+        socket.display()
+    ))
+}
+
+/// Under the gate, before a test stops the fcvm process `fcvm_pid`: its VMM's API still
+/// answers ([`vmm_api_failure`]). The outcome goes to `FCVM_CONFINE_API_LOG` (`ok` or
+/// `dead`, the test, the reason), and scripts/confine-gate.sh fails the lane on any `dead`
+/// line: this runs in a test's cleanup, where a panic would leave the VM behind.
+fn check_vmm_apis_before_the_stop(fcvm_pid: u32) {
+    if std::env::var("FCVM_CONFINE").as_deref() != Ok("required") {
+        return;
+    }
+    let Some(log) = std::env::var_os("FCVM_CONFINE_API_LOG") else {
+        return;
+    };
+    for vmm in firecracker_children(fcvm_pid) {
+        let line = match vmm_api_failure(vmm) {
+            None => format!("ok\t{}\n", current_test_name()),
+            Some(dead) => {
+                eprintln!("confine gate: {dead}");
+                format!("dead\t{}\t{dead}\n", current_test_name())
+            }
+        };
+        let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log)
-            .and_then(|mut file| file.write_all(format!("{}\n", current_test_name()).as_bytes()))
-            .map_err(|e| anyhow::anyhow!("recording the confinement assertion: {e}"))?;
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+        if let Err(error) = written {
+            eprintln!("confine gate: recording the API check of VMM {vmm}: {error}");
+        }
+    }
+}
+
+/// Append `<this test's name> <TAB> record` to the file the environment variable `list`
+/// names, when scripts/confine-gate.sh set one. One write per line, so lines of tests that
+/// run at the same time do not interleave.
+fn record_for_the_gate(list: &str, record: &str) -> anyhow::Result<()> {
+    if let Some(path) = std::env::var_os(list) {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| {
+                file.write_all(format!("{}\t{record}\n", current_test_name()).as_bytes())
+            })
+            .map_err(|e| anyhow::anyhow!("writing the gate's {list} record: {e}"))?;
     }
     Ok(())
 }
 
 /// Under the gate, inside a health poll: whether a VMM of `fcvm_pid` was seen confined
-/// just now, in which case the assertion is recorded. A test whose VM is meant to fail
+/// just now, in which case that is recorded as `seen`. A test whose VM is meant to fail
 /// before it turns healthy never reaches [`assert_vmm_confined_under_the_gate`]; its VMM
-/// still runs the guest for a while, and this sees it then. Before Firecracker builds the
-/// VM its main thread has no filter yet, so an unconfined reading here is not a failure:
-/// the poll looks again, and a VM that turns healthy is asserted strictly.
+/// still runs the guest for a while, and this sees it then. The gate counts a `seen`
+/// record only for the tests it is told fail their boot. Before Firecracker builds the VM
+/// its main thread has no filter yet, so an unconfined reading here is not a failure: the
+/// poll looks again, and a VM that turns healthy is asserted strictly.
 fn saw_confined_vmm_under_the_gate(fcvm_pid: u32) -> bool {
-    std::env::var("FCVM_CONFINE").as_deref() == Ok("required")
-        && firecracker_children(fcvm_pid)
-            .into_iter()
-            .any(|vmm| vmm_confinement_failures(vmm).is_empty())
-        && record_confinement_assertion().is_ok()
+    if std::env::var("FCVM_CONFINE").as_deref() != Ok("required") {
+        return false;
+    }
+    firecracker_children(fcvm_pid)
+        .into_iter()
+        .find(|vmm| vmm_confinement_failures(*vmm).is_empty())
+        .is_some_and(|vmm| {
+            record_for_the_gate("FCVM_CONFINE_ASSERT_LOG", &format!("{vmm}\tseen")).is_ok()
+        })
 }
 
 pub async fn poll_health(
@@ -1296,7 +1438,7 @@ pub async fn poll_health(
         // Check if VM is healthy using proper enum comparison
         for display in &vms {
             if matches!(display.vm.health_status, fcvm::state::HealthStatus::Healthy) {
-                assert_vmm_confined_under_the_gate(pid)?;
+                assert_vmm_confined_off_the_runtime(pid).await?;
                 return Ok(());
             }
         }
@@ -1315,7 +1457,12 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
         if start.elapsed() > timeout {
             anyhow::bail!("timeout waiting for VM to become healthy");
         }
-        seen_confined = seen_confined || saw_confined_vmm_under_the_gate(pid);
+        if !seen_confined {
+            seen_confined =
+                tokio::task::spawn_blocking(move || saw_confined_vmm_under_the_gate(pid))
+                    .await
+                    .unwrap_or(false);
+        }
 
         // Check if process exited (zombie or gone)
         let is_gone = std::fs::read_to_string(format!("/proc/{}/stat", pid))
@@ -1350,7 +1497,7 @@ pub async fn poll_health_by_pid(pid: u32, timeout_secs: u64) -> anyhow::Result<(
         {
             for d in &vms {
                 if matches!(d.vm.health_status, fcvm::state::HealthStatus::Healthy) {
-                    assert_vmm_confined_under_the_gate(pid)?;
+                    assert_vmm_confined_off_the_runtime(pid).await?;
                     return Ok(());
                 }
             }
@@ -1419,7 +1566,7 @@ pub async fn poll_health_status_by_pid(
                 }
                 if current == expected {
                     if expected == fcvm::state::HealthStatus::Healthy {
-                        assert_vmm_confined_under_the_gate(pid)?;
+                        assert_vmm_confined_off_the_runtime(pid).await?;
                     }
                     return Ok(());
                 }
@@ -1642,6 +1789,9 @@ pub async fn spawn_clone(
 /// before terminating. Without cleanup, network resources accumulate and cause
 /// routing conflicts when the same IPs are reused.
 pub async fn kill_process(pid: u32) {
+    // Off the runtime, like every check here that waits (see
+    // `assert_vmm_confined_off_the_runtime`).
+    let _ = tokio::task::spawn_blocking(move || check_vmm_apis_before_the_stop(pid)).await;
     // First try SIGTERM for graceful shutdown
     let _ = tokio::process::Command::new("kill")
         .arg("-TERM")

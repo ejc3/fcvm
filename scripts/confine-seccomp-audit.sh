@@ -4,7 +4,8 @@
 # thread. A logged record is a syscall the enforcing policy would trap.
 #
 # It fails closed: when auditd is not running (the kernel then printk's records and
-# rate-limits them, so a clean result would mean nothing), when the audit log cannot be read,
+# rate-limits them, so a clean result would mean nothing), when the audit log cannot be read
+# or its lines cannot be counted,
 # when a positive control's record does not appear (one runs before the lane and one after
 # it, which is also the wait for auditd to write the lane's records), when auditd stopped or
 # rotated its log during the
@@ -51,7 +52,19 @@ control() {
   done
   return 1
 }
-start_line=$(sudo wc -l < "$log")
+# The log's line count. The log is read with privilege everywhere: /var/log/audit is root's,
+# and a redirect (`sudo wc -l < "$log"`) is opened by this shell, not by sudo. Where this user
+# cannot read the log that gave an empty count, every later read started at line 1, and an
+# earlier run's control record stood in for this run's.
+log_lines() {
+  local lines
+  lines=$(sudo cat "$log" | wc -l) || fail "cannot read $log to count its lines"
+  case "$lines" in
+    '' | *[!0-9]*) fail "the line count of $log is not a number: '$lines'" ;;
+  esac
+  echo "$lines"
+}
+start_line=$(log_lines) || exit 2
 control fcvm-audit-ctl "$start_line" || fail "the positive control's seccomp record did not reach $log"
 
 # The log file's inode changes when auditd rotates it; `lost` counts the records the kernel
@@ -91,7 +104,7 @@ for l in sys.stdin:
 '
 }
 
-start_line=$(sudo wc -l < "$log")
+start_line=$(log_lines) || exit 2
 start_id=$(log_id)
 start_lost=$(lost)
 [ -n "$start_id" ] && [ -n "$start_lost" ] || fail "cannot read $log's inode or the kernel's lost-record count"
