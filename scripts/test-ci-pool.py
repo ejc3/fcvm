@@ -302,6 +302,10 @@ class Build(Sandbox):
                                      prs=self.prs((1, 'a', 'main'), (2, 'b', 'main'), (3, 'c', 'main')))
         self.assertEqual(code, 0, out)
         self.assertIn('dry run', out)
+        # A dry run names the tree each changed head would have, and the commit can be read back.
+        printed = re.search(r'#3 c \w{9} -> (\w{9}) tree (\w{12})', out)
+        self.assertTrue(printed, out)
+        self.assertTrue(self.git('rev-parse', printed[1] + '^{tree}').startswith(printed[2]))
         self.assertEqual((self.remote('a'), self.remote('b'), self.remote('c')), (a, b, c))
         self.assertEqual(self.writes(calls), [])
 

@@ -359,8 +359,10 @@ def cmd_build(args, gh, default_branch):
         changed = []
         for member, new in included:
             branch = member['head']
+            # The tree is what to compare with another tool's result: two merges of the same
+            # parents are different commits with the same tree.
             note(f"  #{member['number']} {branch} {old[branch][:9]}" +
-                 ('' if new == old[branch] else f' -> {new[:9]}'))
+                 ('' if new == old[branch] else f" -> {new[:9]} tree {git('rev-parse', new + '^{tree}')[:12]}"))
             if new != old[branch]:
                 changed.append((member, new))
         if args.dry_run:
