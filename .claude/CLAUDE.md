@@ -2929,7 +2929,10 @@ both.
   is written like a lock file (0666). Nothing is made world-writable.
 - **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
   by every command while a VM of it is running: the error lists each one's name and PID,
-  and they are stopped with the fcvm that started them. The layout check of a command
+  and they are listed and stopped with the fcvm that started them (this build's `fcvm ls`
+  is refused too, so it shows nothing of them). A VM of it that was killed leaves a state
+  file that is not a running VM (its PID is gone, a zombie, or another process's by start
+  time): a reader lists nothing and a launch removes it. The layout check of a command
   that only reads (`check_layout_for_read`) decides refuse or proceed and writes nothing,
   so `fcvm ls`, which only lists, needs no write access and removes nothing of an older
   launch in progress. A lookup by PID that misses still runs the sweep
@@ -3149,7 +3152,20 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   reflink, so reflinks of one snapshot run one at a time, 4.6 ms each for an 871-extent disk, about 240 per second
   at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
   relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
-  share no lock. On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
+  share no lock. A slot that frees in the middle of a burst is not taken: a
+  clone that takes the subvolume snapshot holds a read lock (`F_OFD_SETLK`) on one byte, drawn at random among 64, of
+  `subvolume-snapshot.lock` beside the slots, for its snapshot and 100 ms after it (`SUBVOLUME_SNAPSHOT_LINGER`: the
+  snapshots that share a commit end together, and the clones that arrive next must still find the burst), and a clone
+  with a free slot takes the subvolume snapshot too while at least 4 of the 64 bytes are held (`SNAPSHOT_BURST`).
+  `subvolume_snapshot_burst` counts the held bytes with `F_OFD_GETLK`, which takes no lock. The kernel answers with
+  the first lock in the way in the order the locks were taken, not the lowest byte, so the count asks both sides of
+  every byte it finds. Clones that drew the same byte count as one: 4 clones hold 4 different bytes in 91 draws of
+  100, and 5 hold at least 4 in 99. A reflink joins a transaction for every
+  extent and waits out each commit that starts meanwhile, and the commits carry what the reflinks dirtied, so the two
+  paths running together slow each other. Fewer held bytes than 4 are a clone or two that found every slot held; the
+  clones after them reflink, as before the mark, which matters where a subvolume snapshot is the slower path (a host
+  writing snapshots at the same time). A burst lasts while about 4 clones arrive per snapshot duration plus 100 ms.
+  On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
   none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
   against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
   subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes
@@ -3897,7 +3913,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
 ├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
-├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
+├── reclaim/{euid}/<b>/{id}.json   # what a live fcvm made on the host, in buckets; a dead one's is reclaimed by the first launch 1 s or more after the last sweep began, or the next setup, snapshot import or export (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy
 └── snapshots/{name}/             # Firecracker snapshots

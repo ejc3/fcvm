@@ -1454,7 +1454,7 @@ impl NetworkManager for RoutedNetwork {
 
             // Remove the IPv6 MASQUERADE rule (only set without --ipv6-prefix) and the
             // proxy NDP entry. One that cannot be removed keeps its record, under this
-            // address's lease, for the next launch.
+            // address's lease, for the next sweep.
             match vm_ipv6.parse() {
                 Ok(address) => {
                     if let crate::reclaim::Undo::Kept(why) =
@@ -1493,7 +1493,7 @@ impl NetworkManager for RoutedNetwork {
         // Delete veth pair (auto-deletes peer, and with it any route through it). Its
         // name, and the address once the lease goes, can be another VM's from here on,
         // so the records go first (crate::reclaim). If they cannot be dropped, the veth
-        // and the namespace stay, still recorded, and the next launch removes them.
+        // and the namespace stay, still recorded, and the next sweep removes them.
         if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
             r.is_network()
                 && !matches!(r, crate::reclaim::Resource::Netns { .. })
@@ -1502,7 +1502,7 @@ impl NetworkManager for RoutedNetwork {
             self.address_lease.take();
             anyhow::bail!(
                 "dropping the records of the routed network, so its veth and namespace stay \
-                 for the next launch: {e:#}"
+                 for the next sweep: {e:#}"
             );
         }
         if let Some(ref host_veth) = self.host_veth {
@@ -1518,7 +1518,7 @@ impl NetworkManager for RoutedNetwork {
             matches!(r, crate::reclaim::Resource::Netns { .. })
         }) {
             anyhow::bail!(
-                "dropping the record of the routed namespace, so it stays for the next launch: \
+                "dropping the record of the routed namespace, so it stays for the next sweep: \
                  {e:#}"
             );
         }

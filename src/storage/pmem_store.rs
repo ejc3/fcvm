@@ -71,7 +71,7 @@
 //! is authoritative only within one kernel, and assets_dir is shared across nesting
 //! levels over fuse-pipe. Ingest holds `.lock` shared from creating its temp until it
 //! removes it, so a collector that takes it exclusively can remove `tmp/*` safely. An
-//! ingest that is killed leaves its temp in `tmp/`, and the next launch removes it
+//! ingest that is killed leaves its temp in `tmp/`, and the next sweep removes it
 //! (`collect_abandoned_temps`); nothing removes entries yet.
 //!
 //! A run opens the store directory and `tmp` once, refusing a symlink or another file in

@@ -1576,7 +1576,7 @@ mod tests {
     /// The reclaim records of snapshot staging directories under the fake's data directory.
     fn staging_records(fake: &Fake) -> Vec<String> {
         let owners = crate::reclaim::owner_dir_in(&fake.host.data_dir).unwrap();
-        names_in(&owners)
+        crate::reclaim::record_file_names(&owners)
             .into_iter()
             .filter(|name| name.contains("snapshot-staging-"))
             .collect()
@@ -2608,7 +2608,7 @@ mod tests {
             }
         }
         let owners = crate::reclaim::owner_dir_in(&fake.host.data_dir).unwrap();
-        for name in names_in(&owners) {
+        for name in crate::reclaim::record_file_names(&owners) {
             if name.contains("store-temp-") {
                 found.push(format!("reclaim/{name}"));
             }

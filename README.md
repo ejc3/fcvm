@@ -518,6 +518,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm balloon` | Print a VM's balloon target and size as one JSON line; with a MIB argument, set the target first |
 | `fcvm ls` | List running VMs (`--json` for JSON) |
+| `fcvm paths` | Print the state and data directories this binary uses (`--json`: one JSON object, `state_dir` and `data_dir`) |
 | `fcvm snapshot create` | Snapshot a running VM (a clone only once its restore is acknowledged; `--await-restore` waits for that) |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Clone from snapshot (`--publish` chooses where its ports listen) |
@@ -771,6 +772,8 @@ fcvm/
 **Tests hang?** Kill test VMs: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
 
 **KVM not available?** Both Firecracker and Cloud Hypervisor require bare-metal KVM or nested virtualization. On AWS, use `.metal` instances.
+
+**"holds N running VM(s) started by an older fcvm"?** A new fcvm keeps VM state in another layout than the build that started those VMs, and refuses every command, `fcvm ls` included, while one of them runs. It changes nothing in the state directory and leaves the VMs running. List and stop them with the fcvm binary that started them (its `ls` shows them; the new one's does not), then run the command again. A VM of the older build that was killed leaves a state file and holds nothing up: the new build does not list it, and its first launch removes what the older layout left.
 
 **Network issues?** Test incrementally inside a VM:
 ```bash
