@@ -30,6 +30,9 @@ import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import state_fixture  # noqa: E402
+
 SH = os.path.join(HERE, "reqbench.sh")
 TAG = "tag-under-test"
 HOSTS = "example.com,blog.cloudflare.com"
@@ -38,8 +41,7 @@ RUN_ID = "0" * 32
 
 # Stands in for fcvm. Every exec is appended to $STUB_EXEC_LOG as
 # "<view> <argv...>" so a test can prove which questions HOP D asked the clone.
-FCVM_STUB = r'''#!/bin/bash
-echo "$*" >> "$STUB_ARGV"
+FCVM_STUB = "#!/bin/bash\n" + state_fixture.SH_FCVM_PATHS + r'''echo "$*" >> "$STUB_ARGV"
 case "$1 $2" in
   "snapshot serve")
       # Simulates the snapshot directory vanishing after the hugepage check
@@ -50,7 +52,8 @@ case "$1 $2" in
       name=""; prev=""
       for a in "$@"; do [ "$prev" = --name ] && name="$a"; prev="$a"; done
       vm_id="vm-$(printf '%s' "$name" | sha256sum | cut -c1-32)"
-      state="$STATE_DIR/$vm_id.json"
+      bucket=$(printf %s "$vm_id" | sha256sum | cut -c1-1); mkdir -p "$FCVM_FAKE_STATE_DIR/vms/$bucket"
+      state="$FCVM_FAKE_STATE_DIR/vms/$bucket/$vm_id.json"
       read -r st < /proc/$$/stat; st=${st##*) }; read -ra f <<< "$st"
       printf '{"vm_id":"%s","name":"%s","pid":%s,"pid_start_time":%s,"config":{"network":{"loopback_ip":"127.0.0.1"}}}\n' \
           "$vm_id" "$name" "$$" "${f[19]}" > "$state"
@@ -59,9 +62,9 @@ case "$1 $2" in
       wait $sl; rm -f "$state"; exit 0 ;;
   "ls --json")
       pid=""; [ "${3:-}" = --pid ] && pid="$4"
-      "$STUB_PYTHON" - "$STATE_DIR" "$pid" <<'PY'
+      "$STUB_PYTHON" - "$FCVM_FAKE_STATE_DIR" "$pid" <<'PY'
 import glob, json, os, sys
-rows = [json.load(open(p)) for p in glob.glob(os.path.join(sys.argv[1], "vm-*.json"))]
+rows = [json.load(open(p)) for p in glob.glob(os.path.join(sys.argv[1], "vms", "*", "vm-*.json"))]
 if sys.argv[2]:
     rows = [r for r in rows if str(r["pid"]) == sys.argv[2]]
 print(json.dumps(rows))
@@ -128,9 +131,8 @@ class VerifyDnsHop(unittest.TestCase):
                  resolv_container="nameserver 10.0.2.2\n", url_status="200",
                  drop_config=False, resolv_rc=0):
         data = os.path.join(d, "data")
-        state_dir = os.path.join(data, "state")
+        state_dir = state_fixture.make_store(os.path.join(data, "state"))
         snap = os.path.join(data, "snapshots", TAG)
-        os.makedirs(state_dir)
         os.makedirs(snap)
         if config:
             network = {"guest_ip": "10.0.2.100"}
@@ -159,7 +161,7 @@ class VerifyDnsHop(unittest.TestCase):
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             TAG=TAG,
-            STATE_DIR=state_dir,
+            FCVM_FAKE_STATE_DIR=state_dir,
             RESULTS=os.path.join(d, "results"),
             RUNID=RUN_ID,
             FCVM=fcvm,
@@ -257,7 +259,7 @@ class VerifyDnsHop(unittest.TestCase):
                     "status": 200, "ok": True,
                     "proxy_env_ignored": ["HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "no_proxy"],
                 })
-            self.assertEqual(os.listdir(state_dir), [])
+            self.assertEqual(state_fixture.leftover(state_dir), [])
 
     def test_the_url_probe_ignores_the_proxy_the_exec_environment_carries(self):
         """fc-agent runs every container exec under the host's saved
@@ -317,7 +319,7 @@ class VerifyDnsHop(unittest.TestCase):
                              {"answer": "93.184.216.34", "ok": False})
             # The hop failed and the ordered teardown still ran: both clone
             # state files are gone, exactly as after a passing verify.
-            self.assertEqual(os.listdir(state_dir), [],
+            self.assertEqual(state_fixture.leftover(state_dir), [],
                              "a failed HOP D skipped the clone teardown")
 
     def test_a_clone_resolving_through_the_baked_resolver_passes(self):
@@ -356,7 +358,7 @@ class VerifyDnsHop(unittest.TestCase):
                     any("urllib" in line and line.endswith(" " + url)
                         for line in execs),
                     f"HOP D never fetched {url} inside the container")
-            self.assertEqual(os.listdir(state_dir), [])
+            self.assertEqual(state_fixture.leftover(state_dir), [])
 
     def test_a_container_view_pointing_elsewhere_fails(self):
         """podman rewrites resolv.conf for the container; the VM's copy
@@ -490,7 +492,7 @@ class VerifyDnsHop(unittest.TestCase):
             self.assertFalse(
                 os.path.exists(os.path.join(env["RESULTS"], "verify-dns.json")),
                 "a blocked hop wrote evidence for checks it never ran")
-            self.assertEqual(os.listdir(state_dir), [],
+            self.assertEqual(state_fixture.leftover(state_dir), [],
                              "a blocked HOP D skipped the clone teardown")
 
 
@@ -570,8 +572,7 @@ class GoldenGuestDns(unittest.TestCase):
             },
         })
         fcvm = os.path.join(d, "fcvm")
-        write_exec(fcvm, f'''#!/bin/bash
-case "$1 $2" in
+        write_exec(fcvm, "#!/bin/bash\n" + state_fixture.SH_FCVM_PATHS + f'''case "$1 $2" in
   "podman prepare")
       mkdir -p "$DATA_ROOT/snapshots/$TAG"
       : > "$DATA_ROOT/snapshots/$TAG.lock"
@@ -601,7 +602,7 @@ exit 1
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             RESULTS=os.path.join(d, "results"),
-            STATE_DIR=os.path.join(d, "state"),
+            FCVM_FAKE_STATE_DIR=os.path.join(d, "state"),
             DATA_ROOT=d,
             ALLOW_BUSY="1",
             RUNID=RUN_ID,

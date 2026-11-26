@@ -618,6 +618,47 @@ evidence. Never report a mode "up", "deployed" or "working" on anything less.
   answered the TLS handshake, and Minecraft published no IPv4 path. The deploy smoke checked
   only the wall's renderers, over IPv4, on ports it hardcoded.
 
+## A START LISTS NO DIRECTORY THAT GROWS WITH THE VMS ALIVE
+
+Six times a start listed a directory that holds an entry for every VM alive, under a lock
+every other start's create in that directory needs: the state directory under the name
+lock, the reclaim owner records, `vm-disks` for a mount view nothing used, the parent
+cgroup of the per-VM scopes (#2178), `/run/netns`, which `ip link show` lists in a bridged
+clone's start (#2194), and the routed IPv6 address leases (#2202). The first four each
+bound the start rate; the last two were found by the test below before anything hit them.
+
+**Rules:**
+
+1. **A start reads what it needs by name.** It never lists a directory that gains an entry
+   per VM, on any filesystem: the store, cgroupfs, the runtime directory, `/proc`.
+2. **Work that has to visit every VM is a sweep**, and every sweep goes through
+   `src/sweep.rs`: once an interval behind a stamp, by the one start that has the turn,
+   never once a start. A table whose entries are made in two steps is held shared by
+   starts and exclusively by the sweep (`sweep::table`). A new sweep is a `Sweep` constant
+   there, listed in `sweep::ALL`, with a caller that runs the matrix
+   (`sweep::testing::caller_matrix!`): do not write another stamp or another lock by hand.
+3. **A new instance is not waived.** One in a directory the test's own starts own (its data
+   directory, its scopes' parent cgroup) goes into `allowances` in the test below with its
+   issue number, and the test fails that entry as soon as its directory stops growing, so
+   the entry leaves with the fix. One in a host-wide directory (`/run/netns`, `/proc`)
+   cannot be allowed, because other tests' VMs change its entries: it is fixed first
+   (#2194 was, found by this test).
+
+**Enforcement:** `tests/test_start_dir_reads.rs` names no directory. It starts a clone under
+`strace -f -y` beside one clone and beside six, sums the entries each `getdents64` returned
+per directory, and fails a directory from which the second start read at least one entry
+more for each clone added. `a_start_lists_no_directory_that_grows_with_the_vms_alive_rootless`,
+`_bridged`, `_routed` and `_unprivileged` are the starts, all traced by root in `make test-root`: an
+unprivileged strace takes the setuid bit from `newuidmap`, so a rootless start traced by its
+own user writes the single-id map, and the test fails a traced start whose id map differs
+from an untraced one's. The test holds off the sweeps it knows by name
+(`FCVM_SWEEP_EVERY_MS`) and sets `*=0`, so a sweep added later runs in every start there
+and fails it until it is named. The `detector` tests in the same file prove that the tracer
+reports a known listing and that the comparison fails on one. The tests need `strace` and
+fail without it. It does not see a directory that gains less than one entry per VM (a hash
+bucket), processes the start did not create (`netpool serve`, `snapshot serve`), or per-VM
+work that is not a listing.
+
 ## MAXIMUM REUSE / CACHEABILITY
 
 **The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,
@@ -1268,11 +1309,13 @@ grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo use
 #    /mnt/fcvm-btrfs when /tmp is on the root disk. iperf3 and nfs-kernel-server
 #    are the nested tests': the network ones start an iperf3 server on the host,
 #    the NFS ones export through the host's NFS server, and without them both
-#    fail in under 2 s with "No such file or directory".
+#    fail in under 2 s with "No such file or directory". strace is
+#    tests/test_start_dir_reads.rs's: it reads a start's directory listings from
+#    strace's log, and its tests fail without it.
 sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
     btrfs-progs bc bison flex libelf-dev libseccomp-dev \
-    debhelper libdw-dev rsync kmod cpio patch iperf3 nfs-kernel-server
+    debhelper libdw-dev rsync kmod cpio patch iperf3 nfs-kernel-server strace
 
 # 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
 #    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable
@@ -2680,13 +2723,39 @@ and oomd killed a session scope holding 138 GB, VM included (#1028).
 2. **A harness that places fcvm in a cgroup of its own sets `FCVM_CGROUP_PARENT=none`**,
    or a root fcvm moves out of it (`bench/chromium/guardexec.py`, `corpus_mem.py`,
    `bench.sh`). `--no-swap` is refused there, and for an unprivileged fcvm.
-3. **Scope identity is (pid, start time)**, and sweep and creation run under an `flock`
-   on the parent. Never remove a scope by pid alone. The name is the scope's owner record
+3. **Scope identity is (pid, start time)**. A start holds the parent's `flock` shared
+   while it makes and enters its scope, and the sweep, which a start runs at most once per
+   5 s and parent (`src/sweep.rs`), removes only under that lock held exclusively. Never
+   remove a scope by pid alone. The name is the scope's owner record
    and the sweep is its reclaim: a `reclaim::Resource` record is per data_dir and per
    user, and a cgroup is per kernel.
 
 `test_each_vm_and_memory_server_has_its_own_cgroup` (`tests/test_vm_cgroup.rs`) pins the
 placement, the charge, `--no-swap` and removal.
+
+### A SWEEP RUNS ONCE AN INTERVAL, AND THERE IS ONE GATE FOR ALL OF THEM
+
+Removing what killed fcvm processes left means visiting every entry of a table: the VM
+states, the owner records, a cgroup parent's scopes, the routed address leases. Each of the
+four once ran in every start under a lock the other starts needed, and each bound the start
+rate (#2077, #2126, #2178, #2202). `src/sweep.rs` is the one mechanism they share.
+
+1. **A start sweeps only when it has the turn** (`sweep::turn_if_due`): no sweep began
+   within the interval, in this boot, and no other process is sweeping. A start without
+   the turn reads one stamp by name. The stamp is `<boot id> <CLOCK_BOOTTIME ns>`, so one
+   kept on a disk never holds off the first sweep of the next boot.
+2. **A table whose entries are made in two steps is held shared by starts and exclusively
+   by the sweep** (`sweep::table`, `sweep::sweep_table`). The sweep asks for the lock only
+   when it found something and waits at most 100 ms; what it found then waits for the
+   next sweep.
+3. **A new sweep is a `Sweep` constant in `sweep.rs`, listed in `sweep::ALL`, with a caller
+   that runs the matrix** (`sweep::testing::caller_matrix!`, and `table_matrix!` for a
+   table). Never write another stamp or another sweep lock by hand:
+   `every_sweep_defined_here_is_listed` fails a sweep that is defined elsewhere or has no
+   matrix caller.
+4. **`FCVM_SWEEP_EVERY_MS` names sweeps** (`state=`, `reclaim=`, `cgroup-scopes=`,
+   `routed-leases=`, and `*` for the rest). A test that must not meet a sweep holds off the
+   ones it knows by name and sets `*=0`, so a sweep added later runs in every start there.
 
 ### Container Build Rules
 
@@ -2884,8 +2953,8 @@ On serve process exit (SIGTERM/SIGINT):
 2. **A periodic sweep, not one per start.** The fast path of a start reads no other VM's
    state, so its cost does not grow with the number of VMs (with every state read on every
    start, a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). Once a
-   minute per state directory (`maybe_sweep`: `sweep.stamp` missing or expired, and
-   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim; that launch
+   minute per state directory (`maybe_sweep`: the turn of `sweep::STATE`, behind
+   `sweep.stamp` and `sweep.lock`), one launch runs `cleanup_stale_state()` after its claim; that launch
    pays for the scan, and no other start waits for it. The sweep removes the states of dead
    or replaced processes, and the PID entries, name tokens and claim directories that
    outlive them. Until it runs a stale state holds nothing: its owner is not live.
@@ -2936,7 +3005,10 @@ both.
   is written like a lock file (0666). Nothing is made world-writable.
 - **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
   by every command while a VM of it is running: the error lists each one's name and PID,
-  and they are stopped with the fcvm that started them. The layout check of a command
+  and they are listed and stopped with the fcvm that started them (this build's `fcvm ls`
+  is refused too, so it shows nothing of them). A VM of it that was killed leaves a state
+  file that is not a running VM (its PID is gone, a zombie, or another process's by start
+  time): a reader lists nothing and a launch removes it. The layout check of a command
   that only reads (`check_layout_for_read`) decides refuse or proceed and writes nothing,
   so `fcvm ls`, which only lists, needs no write access and removes nothing of an older
   launch in progress. A lookup by PID that misses still runs the sweep
@@ -2990,6 +3062,7 @@ tests/
 ├── test_fuse_in_vm_matrix.rs  # In-VM pjdfstest (17 categories, parallel via nextest)
 ├── test_localhost_image.rs    # Local image tests
 ├── test_snapshot_clone.rs     # Snapshot/clone workflow tests
+├── test_start_dir_reads.rs    # A start lists no directory that grows with the VMs alive
 ├── test_egress.rs             # Egress proxy tests (rootless + bridged, fresh + clone)
 ├── test_egress_stress.rs      # Egress proxy IPv4/IPv6 stress tests
 └── test_egress_proxy_bench.rs # 8000-connection concurrent benchmark
@@ -3022,7 +3095,7 @@ fuse-pipe/benches/
 1. **Core Implementation** (2025-11-09)
    - Pluggable `Hypervisor` trait (`src/hypervisor/mod.rs`) selecting the VMM behind the same orchestration, with two backends: **Firecracker (default)** and **Cloud Hypervisor**, chosen via `--hypervisor firecracker|cloud-hypervisor` (#632)
    - Firecracker backend: API client using hyper + hyperlocal (Unix sockets); boot plan via MMDS
-   - Cloud Hypervisor backend: cold boot + container run, snapshot/restore/clone via `--restore` + in-process UFFD; boot plan via vsock (no MMDS)
+   - Cloud Hypervisor backend: cold boot + container run, snapshot/restore/clone via `--restore` with the snapshot's memory file mapped copy-on-write (`memory_restore_mode=copyonwrite`); boot plan via vsock (no MMDS). Built from the upstream commit `[cloud_hypervisor]` pins, with no fork
    - Dual networking modes: bridged (iptables) + rootless (pasta)
    - Storage layer with btrfs CoW disk management
    - VM state persistence
@@ -3156,7 +3229,20 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   reflink, so reflinks of one snapshot run one at a time, 4.6 ms each for an 871-extent disk, about 240 per second
   at any concurrency. With 8 queued the last waits about 8 x 4.6 = 37 ms, under the subvolume median, and the fleet
   relaunches 8 tiles of one snapshot at once, which stay on reflinks; deeper queues take subvolume snapshots, which
-  share no lock. On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
+  share no lock. A slot that frees in the middle of a burst is not taken: a
+  clone that takes the subvolume snapshot holds a read lock (`F_OFD_SETLK`) on one byte, drawn at random among 64, of
+  `subvolume-snapshot.lock` beside the slots, for its snapshot and 100 ms after it (`SUBVOLUME_SNAPSHOT_LINGER`: the
+  snapshots that share a commit end together, and the clones that arrive next must still find the burst), and a clone
+  with a free slot takes the subvolume snapshot too while at least 4 of the 64 bytes are held (`SNAPSHOT_BURST`).
+  `subvolume_snapshot_burst` counts the held bytes with `F_OFD_GETLK`, which takes no lock. The kernel answers with
+  the first lock in the way in the order the locks were taken, not the lowest byte, so the count asks both sides of
+  every byte it finds. Clones that drew the same byte count as one: 4 clones hold 4 different bytes in 91 draws of
+  100, and 5 hold at least 4 in 99. A reflink joins a transaction for every
+  extent and waits out each commit that starts meanwhile, and the commits carry what the reflinks dirtied, so the two
+  paths running together slow each other. Fewer held bytes than 4 are a clone or two that found every slot held; the
+  clones after them reflink, as before the mark, which matters where a subvolume snapshot is the slower path (a host
+  writing snapshots at the same time). A burst lasts while about 4 clones arrive per snapshot duration plus 100 ms.
+  On the disk piece (bench/start-rate/pieces RESULTS.md, c8g.metal-48xl, stock kernel 7.0.0-1013-aws,
   none held), clones per second at C=1, 8, 128 and 512 were 286, 237, 1263 to 1689 and 1641 to 1977 with the slots,
   against 286, 236, 235 and 256 for reflinks only and 128 to 140, 561 to 640, 1287 to 1316 and 1779 to 1943 for
   subvolume snapshots only. The C=8 reflink p50 there was 47 ms, not the 37 ms the arithmetic gives. `rm -rf` removes
@@ -3904,7 +3990,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
 ├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
-├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
+├── reclaim/{euid}/<b>/{id}.json   # what a live fcvm made on the host, in buckets; a dead one's is reclaimed by the first launch 1 s or more after the last sweep began, or the next setup, snapshot import or export (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy
 └── snapshots/{name}/             # Firecracker snapshots

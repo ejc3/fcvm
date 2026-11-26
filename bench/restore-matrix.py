@@ -43,7 +43,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import math
 import json
 import os
@@ -58,6 +57,10 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# The request harness's helpers: fcvm's own state directory (`fcvm paths --json`) and the
+# bucket layout's paths, so this script names neither.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "chromium"))
+import reqbench  # noqa: E402
 DEFAULT_FCVM = REPO / "target" / "release" / "fcvm"
 IMAGE = os.environ.get("MATRIX_IMAGE", "ecr-public.aws.com/nginx/nginx:alpine")
 
@@ -112,13 +115,30 @@ class Harness:
         self.out = Path(args.out) / self.run_id
         self.out.mkdir(parents=True, exist_ok=True)
         self.data_root = Path(args.data_root)
-        self.state_dir = self.data_root / "state"
+        self._state_dir = None
         self.prepared_tags: set = set()
         self.records = []
 
-    def state_bucket(self, vm_id):
-        """The directory fcvm keeps this VM's state and lock in (src/state/manager.rs)."""
-        return self.state_dir / "vms" / hashlib.sha256(vm_id.encode()).hexdigest()[:1]
+    @property
+    def state_dir(self) -> Path:
+        """Where self.fcvm keeps VM state: its own answer, asked once with the environment
+        the serves and clones get (reqbench.fcvm_paths). Never a join of the data root."""
+        if self._state_dir is None:
+            self._state_dir = Path(reqbench.fcvm_state_dir(self.fcvm))
+        return self._state_dir
+
+    def state_files(self, vm_id):
+        """This VM's state, its lock and its temporary file, in the bucket layout."""
+        state = Path(reqbench.vm_state_path(str(self.state_dir), vm_id))
+        return [state, Path(f"{state}.lock"), Path(f"{state}.tmp")]
+
+    def remove_residue(self, vm_id):
+        """What a SIGKILLed clone left: its state files and its runtime directory."""
+        for path in self.state_files(vm_id):
+            path.unlink(missing_ok=True)
+        disk = self.data_root / "vm-disks" / vm_id
+        if disk.exists():
+            subprocess.run(["rm", "-rf", str(disk)], timeout=60, check=False)
 
     # ---- infrastructure -------------------------------------------------
 
@@ -274,8 +294,7 @@ class Harness:
             leftovers = [
                 str(p)
                 for p in (
-                    self.state_bucket(vm_id) / f"{vm_id}.json",
-                    self.state_bucket(vm_id) / f"{vm_id}.json.lock",
+                    *self.state_files(vm_id),
                     self.data_root / "vm-disks" / vm_id,
                 )
                 if p.exists()
@@ -382,16 +401,8 @@ class Harness:
 
         # Sweep the documented crash residue so later cells start clean.
         for _clone, vm_id in victims:
-            if not vm_id:
-                continue
-            for path in (
-                self.state_dir / f"{vm_id}.json",
-                self.state_dir / f"{vm_id}.json.lock",
-            ):
-                path.unlink(missing_ok=True)
-            disk = self.data_root / "vm-disks" / vm_id
-            if disk.exists():
-                subprocess.run(["rm", "-rf", str(disk)], timeout=60, check=False)
+            if vm_id:
+                self.remove_residue(vm_id)
 
     def run_cell(self, cell, tag, serve_pid, rep) -> Result:
         failures = []

@@ -278,32 +278,37 @@ would be a half-open connection in every clone, which Windows holds until it tim
 
 ## Memory
 
-Before stack PR 5 a Cloud Hypervisor restore read the whole memory file into anonymous
-memory (`memory_restore_mode=copy`): every clone paid a read of the full guest size before it
-ran, and held a private copy of every page, including the zeros. Every Cloud Hypervisor
-clone now restores with `map` from a symbolic link to the snapshot's memory file
-(`prepare_ch_restore_files` in `src/commands/common.rs`). The measurement section gives
-both numbers for 1, 4 and 8 clones.
+A Cloud Hypervisor restore that copies (`memory_restore_mode=copy`) reads the whole memory
+file into anonymous memory: every clone pays a read of the full guest size before it runs,
+and holds a private copy of every page, including the zeros. Every Cloud Hypervisor clone
+restores with `memory_restore_mode=copyonwrite` from a symbolic link to the snapshot's memory
+file (`prepare_ch_restore_files` and `ch_restore_args` in `src/commands/common.rs`). The
+measurement section gives both numbers for 1, 4 and 8 clones.
 
-The target is the sharing Firecracker's File backend already gives: map the snapshot's
-memory file `MAP_PRIVATE` over guest RAM, so a restore reads nothing before the guest runs, a
-page is read from the page cache when the guest first touches it, clean pages are shared by
-every clone of the snapshot through the page cache, and a page becomes private to a clone
-only when it writes it. Cloud Hypervisor restores by copying (`copy`) or with its own
-in-process userfaultfd handler (`ondemand`), which copies each page into the VM's own memory
-on its first fault, so it gives laziness but no sharing. The change is a third restore mode
-in our Cloud Hypervisor fork, `memory_restore_mode=map`: after the memory manager has created
-guest RAM, each saved range of the memory file is mapped `MAP_PRIVATE | MAP_FIXED` over the
-RAM that backs it, from its offset in the file. KVM's memory slots already point at those
-host addresses and follow the new mapping through its MMU notifiers. It refuses shared and
-hugetlbfs guest RAM. Page-cache sharing needs every clone to map the same inode, and a
-reflink is a new inode with its own page cache, so each clone's `ch-restore` directory holds a
-symbolic link to the snapshot's memory file (immutable once published) and its own copy of
-the configuration. A hard link would do the same, but the snapshot directory is a btrfs
-subvolume and a link across subvolumes fails with `EXDEV`. Against `copy` on the same host it
-cut the first desktop update at 8 clones from 8.67 to 8.77 s to 2.95 to 3.00 s and the PSS
-of each clone from 4,097 to about 840 MiB (the measurement section). A Cloud Hypervisor
-without `map` fails the restore with an error naming `fcvm setup --cloud-hypervisor`.
+It is the sharing Firecracker's File backend gives: the snapshot's memory file is mapped
+`MAP_PRIVATE` over guest RAM, so a restore reads nothing before the guest runs, a page is
+read from the page cache when the guest first touches it, clean pages are shared by every
+clone of the snapshot through the page cache, and a page becomes private to a clone only
+when it writes it. Cloud Hypervisor's other modes are `copy` and its in-process userfaultfd
+handler (`ondemand`), which copies each page into the VM's own memory on its first fault, so
+it gives laziness but no sharing. The mode was first a patch in a fork fcvm kept
+(`memory_restore_mode=map`, stack PR 5); upstream has had it since v54.0 as `copyonwrite`,
+and fcvm now builds upstream with no patch (DESIGN.md, "Cloud Hypervisor: the build and its
+snapshots"). Upstream's mode falls back to copying when it judges the guest's RAM
+unsuitable (shared or huge pages, hotplug, a passthrough device); a sandbox configures none
+of those, and fcvm fails a restore whose VMM did not map the file. Page-cache sharing needs
+every clone to map the same inode, and a reflink is a new inode with its own page cache, so
+each clone's `ch-restore` directory holds a symbolic link to the snapshot's memory file
+(immutable once published) and its own copy of the configuration. A hard link would do the
+same, but the snapshot directory is a btrfs subvolume and a link across subvolumes fails
+with `EXDEV`. Against `copy` on the same host the fork's mode cut the first desktop update
+at 8 clones from 8.67 to 8.77 s to 2.95 to 3.00 s and the PSS of each clone from 4,097 to
+about 840 MiB (the measurement section).
+
+A clone's clock continues from the snapshot (`clock_restore_mode=preserve`), and the guest
+agent sets the wall clock from the namespace's clock line, as above. A gold snapshot is one
+Cloud Hypervisor build's: its key includes the build, so a host whose build changed makes a
+new one.
 
 fcvm's UFFD memory server (`src/uffd/`, minor mode with working-set replay) would add
 prefetching on top of the same sharing, at the cost of a userfaultfd handshake in the fork.
@@ -434,7 +439,8 @@ done when the screen changed.
    tests that fail first.
 5. Our Cloud Hypervisor fork: `memory_restore_mode=map` (the memory file mapped privately
    over guest RAM), and fcvm restoring Cloud Hypervisor clones with it; lands only if it
-   measures faster than copy mode.
+   measures faster than copy mode. (Landed, and since replaced by upstream's
+   `memory_restore_mode=copyonwrite` on an unpatched build.)
 6. Fleet: the bridge, the agent's Windows slots and gold flow, the coordinator's
    `state.windows` and intents, the page's `?mode=windows`.
 7. ejc3/aws: the host image with the Windows image's inputs and the bridge.
@@ -531,3 +537,125 @@ against 4,097 MiB with copy, and a ninth costs about 0.7 GiB plus whatever pages
 clone touched.
 
 The design's choice follows: map, with the memory file linked, is stack PR 5.
+
+### The fork against upstream, 2026-11-26
+
+`fleet/windows/measure-restore.sh` and the profiles below on one g4dn.metal (the fleet's host
+image, host kernel 7.3.3-fcvm-2a778d7a8b2d, nothing else running), one boot, the image the
+fleet ran that day (`e7f6277b7af3`, installed 2026-11-15), 2 vCPUs and 4 GiB. Each build
+made its own gold snapshot the agent's way (cold boot, two logons through the bridge with
+the desktop idle after each, `snapshot create --stop`) and restored 1, 4 and 8 clones at
+once through fcvm's raw-VM mode. The old build is the host image's: fcvm `de6f591d` with the
+fork (`v52.0-49-ga354afd77`, `memory_restore_mode=map`). The new one is upstream at
+`4969a51a3` (it prints `v55.0-117-g4969a51a3d3f`) with `copyonwrite` and
+`clock_restore_mode=preserve`.
+
+"To healthy" is from launching `fcvm snapshot run` until `fcvm ls` reports the clone
+healthy (the guest agent has set the clock and Remote Desktop answers an X.224 request).
+Memory is `/proc/<cloud-hypervisor>/smaps_rollup` 20 s later with no client connected, so
+it is not comparable with the tables above, where a client showed the desktop. CPU is the
+VMMs' use from 20 to 25 s after healthy, per clone, in cores. "Desktop" is the bridge's
+logon to the restored session until the desktop has stood still for 5 s.
+
+| N at once | | fork, `map` | upstream, `copyonwrite` |
+|---|---|---|---|
+| 1 | to healthy | 0.85 s | 0.67 s |
+| 4 | to healthy | 0.87 to 0.89 s | 0.64 to 0.66 s |
+| 8 | to healthy | 0.81 to 1.01 s | 0.62 to 0.75 s |
+| 1 | resident | 1,610 MiB | 1,671 MiB |
+| 4 | PSS | 566 to 567 MiB | 590 to 594 MiB |
+| 8 | PSS | 394 to 398 MiB | 412 to 420 MiB |
+| 4, 8 | private dirty | 214 to 221 MiB | 227 to 239 MiB |
+| 1, 4, 8 | CPU per clone, 20 to 25 s after healthy | 0.58 to 0.60 | 0.12 to 0.14 |
+| 1, 4, 8 | desktop | 7.3 to 7.6 s | 7.3 to 7.8 s |
+
+Two effects of the build hold: time to healthy (0.62 to 0.75 s against 0.81 to 1.01 s for
+eight at once), and the exits Windows takes to read its clock on the fork, profiled below
+(the CPU row is their burst 20 to 25 s after a restore).
+
+Memory per clone is not an effect of the build. Every clone of both builds mapped the memory
+file, and PSS differs by 4 to 5 percent between the two gold snapshots, upstream's the
+larger. One gold was made per build, and a run of the same script the day before, on the
+same host type with other golds, had the order reversed (373 to 376 MiB at eight on
+upstream against 411 to 418 on the fork). The one clone restored seconds after its snapshot
+was written counted all its resident memory as private dirty (1,604 and 1,664 MiB), and one
+restored 12 minutes later counted 240 MiB, so the private dirty row leaves the first one
+out. Making the gold: cold boot to healthy 17.6 s on both, first logon to a settled desktop
+42.8 s on the fork and 20.0 s on upstream, second logon 7.1 s on both, `snapshot create
+--stop` 2.25 s and 1.84 s (one run each).
+
+Where the CPU goes. All of it is in the two vCPU threads on both builds. One clone of each
+gold snapshot, the snapshots 4 to 14 minutes old, its vCPU threads' CPU over windows after
+healthy, first with nothing attached and then again with the `kvm_exit` and `kvm_msr`
+tracepoints counted:
+
+| window after healthy | fork: cores | fork: cores, traced | exits/s | reads of MSR 0x40000020 /s | upstream: cores | upstream: cores, traced | exits/s | reads of MSR 0x40000020 /s |
+|---|---|---|---|---|---|---|---|---|
+| 0 to 10 s | 0.36 | 0.38 | 41,200 | 26,100 | 0.37 | 0.33 | 18,400 | 0 |
+| 10 to 20 s | 0.18 | 0.20 | 22,200 | 16,400 | 0.17 | 0.16 | 7,400 | 0 |
+| 20 to 25 s | 0.58 | 0.61 | 50,900 | 33,700 | 0.18 | 0.16 | 6,300 | 0 |
+| 25 to 35 s | 0.17 | 0.19 | 22,200 | 16,600 | 0.13 | 0.14 | 4,700 | 0 |
+| 65 to 75 s | 0.17 | 0.19 | 20,200 | 16,400 | 0.15 | 0.15 | 5,600 | 0 |
+| 120 to 130 s | 0.16 | 0.18 | 19,100 | 15,800 | 0.12 | 0.15 | 4,700 | 0 |
+
+0x40000020 is `HV_X64_MSR_TIME_REF_COUNT`: on the fork Windows takes a VM exit for every
+clock read, 16,000 a second at rest. The fork advertised Hyper-V CPUID leaf 0x40000003 with
+EAX=0x20e, without the two privileges Microsoft's interface marks mandatory (the hypercall
+MSRs and the VP index); Windows then abandons its enlightened setup and never enables the
+reference TSC page. Upstream sets them since v53.0 (`ce9416a9c`; the upstream build's gold
+snapshot holds EAX=0xa7f), and Windows reads the clock from the page with no exit. At rest
+that is 0.16 to 0.19 of a core per clone against 0.12 to 0.15. Whatever Windows runs 20 to
+25 s after a restore (the fork's VMM shows disk I/O there) costs 0.6 of a core on the fork
+and does not show on upstream: that window is the table's CPU row.
+
+Windows decides this when it boots, and the snapshot holds both the guest's memory and the
+CPUID. The fork's gold snapshot restored by upstream's VMM (through a wrapper under the old
+fcvm, which does not check the build) profiles as on the fork: 0.38, 0.24, 0.60, 0.21, 0.19
+and 0.18 cores over the six windows, 19,100 to 51,400 exits a second. A host gets the
+upstream figures only from a gold snapshot booted on the upstream build, which is one reason
+a gold snapshot is keyed by its build.
+
+The clock, on the upstream build, with clones of one gold snapshot 13 to 15 minutes old,
+`preserve` (what fcvm passes) against Cloud Hypervisor's default `advance`, which adds the
+snapshot's age to the guest's clock at the restore:
+
+| | `preserve` | `advance` | `preserve`, after it |
+|---|---|---|---|
+| to healthy, 1 clone | 0.59 s | 3.16 s | 0.66 s |
+| to healthy, 4 at once | 0.65 to 0.74 s | 3.50 to 3.85 s | 0.65 to 0.74 s |
+| PSS, 4 at once | 607 to 608 MiB | 913 to 933 MiB | 624 to 627 MiB |
+| private dirty | 240 to 247 MiB | 586 to 604 MiB | 261 to 265 MiB |
+| CPU per clone, 20 to 25 s after healthy | 0.14 | 0.11 to 0.12 | 0.13 to 0.15 |
+| desktop | 7.5 to 7.6 s | 7.1 to 7.4 s | 7.6 s |
+
+With `advance` Windows spends 2.6 to 3.1 s longer before its agent has the clock set and
+Remote Desktop answers, and writes about 340 MiB more per clone, for a snapshot a quarter of
+an hour old. The desktop is the same either way once the bridge reaches it. The wall clock
+is right in both, because the guest agent sets it from the namespace's clock line and a
+clone is not healthy until it has.
+
+A source snapshotted in place (`fcvm snapshot create` without `--stop`, which pauses the VM,
+saves it and resumes it; the fleet's gold flow uses `--stop`, and nothing in the fleet takes
+this path). One clone of each gold, snapshotted twice 10 s apart, the guest's clock read
+from the two state files:
+
+| | fork | upstream |
+|---|---|---|
+| pause to resume, first snapshot | 1.16 s | 0.27 s |
+| host time between the two pauses | 11.19 s | 10.30 s |
+| guest clock between the two pauses | 10.03 s | 10.30 s |
+| the source 3 s after the second resume | unhealthy | healthy |
+
+The fork saved the guest's clock at the pause and set it back at the resume, so the guest
+lost the length of every pause. Upstream sets it with the wall time that passed, and the
+guest keeps the host's time. A raw VM is healthy only while its clock is within 1 s of the
+host's; the fork's source was 2.3 s behind after two snapshots (the health monitor's own
+reason was not read). The pause is shorter on upstream because a snapshot of a VM restored
+with `copyonwrite` clones the extents of the memory file it maps and writes only the pages
+the VM changed.
+
+The fork's gold snapshot under the upstream build: fcvm refuses it ("this snapshot records
+no Cloud Hypervisor build ... Create the snapshot again"). Upstream's VMM itself restores
+it (the wrapper run above), with the fork's behaviour. A restore whose VMM was made to copy
+(`memory_restore_mode=copy` through a wrapper) fails in fcvm with "restored without
+mapping": measured on this host type the day before, with the same builds.
