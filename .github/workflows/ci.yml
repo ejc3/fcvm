@@ -807,7 +807,7 @@ jobs:
         id: apt-prep
         run: |
           # The package list lives here only; later steps read it from the environment.
-          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev"
+          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev strace"
           {
             echo "APT_PACKAGES=$APT_PACKAGES"
             echo "APT_DIR=${{ runner.temp }}/apt-archives"
@@ -1180,7 +1180,7 @@ jobs:
         id: apt-prep
         run: |
           # The package list lives here only; later steps read it from the environment.
-          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev"
+          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev strace"
           {
             echo "APT_PACKAGES=$APT_PACKAGES"
             echo "APT_DIR=${{ runner.temp }}/apt-archives"

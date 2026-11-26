@@ -618,6 +618,47 @@ evidence. Never report a mode "up", "deployed" or "working" on anything less.
   answered the TLS handshake, and Minecraft published no IPv4 path. The deploy smoke checked
   only the wall's renderers, over IPv4, on ports it hardcoded.
 
+## A START LISTS NO DIRECTORY THAT GROWS WITH THE VMS ALIVE
+
+Six times a start listed a directory that holds an entry for every VM alive, under a lock
+every other start's create in that directory needs: the state directory under the name
+lock, the reclaim owner records, `vm-disks` for a mount view nothing used, the parent
+cgroup of the per-VM scopes (#2178), `/run/netns`, which `ip link show` lists in a bridged
+clone's start (#2194), and the routed IPv6 address leases (#2202). The first four each
+bound the start rate; the last two were found by the test below before anything hit them.
+
+**Rules:**
+
+1. **A start reads what it needs by name.** It never lists a directory that gains an entry
+   per VM, on any filesystem: the store, cgroupfs, the runtime directory, `/proc`.
+2. **Work that has to visit every VM is a sweep**, and every sweep goes through
+   `src/sweep.rs`: once an interval behind a stamp, by the one start that has the turn,
+   never once a start. A table whose entries are made in two steps is held shared by
+   starts and exclusively by the sweep (`sweep::table`). A new sweep is a `Sweep` constant
+   there, listed in `sweep::ALL`, with a caller that runs the matrix
+   (`sweep::testing::caller_matrix!`): do not write another stamp or another lock by hand.
+3. **A new instance is not waived.** One in a directory the test's own starts own (its data
+   directory, its scopes' parent cgroup) goes into `allowances` in the test below with its
+   issue number, and the test fails that entry as soon as its directory stops growing, so
+   the entry leaves with the fix. One in a host-wide directory (`/run/netns`, `/proc`)
+   cannot be allowed, because other tests' VMs change its entries: it is fixed first
+   (#2194 was, found by this test).
+
+**Enforcement:** `tests/test_start_dir_reads.rs` names no directory. It starts a clone under
+`strace -f -y` beside one clone and beside six, sums the entries each `getdents64` returned
+per directory, and fails a directory from which the second start read at least one entry
+more for each clone added. `a_start_lists_no_directory_that_grows_with_the_vms_alive_rootless`,
+`_bridged`, `_routed` and `_unprivileged` are the starts, all traced by root in `make test-root`: an
+unprivileged strace takes the setuid bit from `newuidmap`, so a rootless start traced by its
+own user writes the single-id map, and the test fails a traced start whose id map differs
+from an untraced one's. The test holds off the sweeps it knows by name
+(`FCVM_SWEEP_EVERY_MS`) and sets `*=0`, so a sweep added later runs in every start there
+and fails it until it is named. The `detector` tests in the same file prove that the tracer
+reports a known listing and that the comparison fails on one. The tests need `strace` and
+fail without it. It does not see a directory that gains less than one entry per VM (a hash
+bucket), processes the start did not create (`netpool serve`, `snapshot serve`), or per-VM
+work that is not a listing.
+
 ## MAXIMUM REUSE / CACHEABILITY
 
 **The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,
@@ -1261,11 +1302,13 @@ grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo use
 #    /mnt/fcvm-btrfs when /tmp is on the root disk. iperf3 and nfs-kernel-server
 #    are the nested tests': the network ones start an iperf3 server on the host,
 #    the NFS ones export through the host's NFS server, and without them both
-#    fail in under 2 s with "No such file or directory".
+#    fail in under 2 s with "No such file or directory". strace is
+#    tests/test_start_dir_reads.rs's: it reads a start's directory listings from
+#    strace's log, and its tests fail without it.
 sudo apt-get install -y build-essential git jq qemu-utils busybox-static \
     pkg-config libssl-dev clang make podman skopeo uidmap slirp4netns fuse3 passt \
     btrfs-progs bc bison flex libelf-dev libseccomp-dev \
-    debhelper libdw-dev rsync kmod cpio patch iperf3 nfs-kernel-server
+    debhelper libdw-dev rsync kmod cpio patch iperf3 nfs-kernel-server strace
 
 # 3. Fast local storage. Instance-store NVMe is WIPED by a cloud stop/start —
 #    put /mnt/fcvm-btrfs on it (rebuildable cache), keep sources on the durable
@@ -3012,6 +3055,7 @@ tests/
 ├── test_fuse_in_vm_matrix.rs  # In-VM pjdfstest (17 categories, parallel via nextest)
 ├── test_localhost_image.rs    # Local image tests
 ├── test_snapshot_clone.rs     # Snapshot/clone workflow tests
+├── test_start_dir_reads.rs    # A start lists no directory that grows with the VMs alive
 ├── test_egress.rs             # Egress proxy tests (rootless + bridged, fresh + clone)
 ├── test_egress_stress.rs      # Egress proxy IPv4/IPv6 stress tests
 └── test_egress_proxy_bench.rs # 8000-connection concurrent benchmark
