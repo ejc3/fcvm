@@ -1581,7 +1581,7 @@ jobs:
     name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
     needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-minecraft, fleet-web, host, host-root, container]
     # Summary reports on every run but one that was itself cancelled: superseded by a newer
-    # run of the same pull request, or stopped by a person or the unit watcher. Under
+    # run of the same pull request, or stopped by a person. Under
     # `always()` such a run left a failed `Summary` on the head for good. GitHub sometimes
     # starts two runs for one push; the second cancels the first, and on a lower member of
     # a stack the first run's failed `Summary` then stood beside the second's
@@ -1682,68 +1682,6 @@ jobs:
       - name: Analyze CI run
         if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
-
-  # Stops a pull request's run when the unit suite fails on two lanes
-  # (scripts/ci-pool/ci_pool.py unit-watch). A change that breaks a unit test, or whose
-  # tests do not compile, fails `test-unit` and `container-test-unit` about 20 minutes into
-  # each lane that has that step, and the lanes without one go on to their own 34 to 57
-  # minutes. The watcher reads this run's jobs once a minute. When the unit step has failed
-  # on two lanes it puts a `ci/pool` failure on the head and then cancels the run, in that
-  # order and only if the status was written: a cancelled run reports no Summary. One
-  # failed unit step cancels nothing (the step also checks the disk and builds, and the
-  # container one builds an image from a registry, so one lane may be its host), and
-  # neither does a lane that lost its runner or failed any other step.
-  #
-  # It tests nothing and Summary does not wait for it.
-  #
-  # This is the one job with write access to Actions, which cancelling takes, so:
-  # - It runs for a pull request's run only, from this repository's own branch. Not on
-  #   main, whose run is the only one its commit gets, and not on a dispatch, which asked
-  #   for its lanes by name. A pull request from a fork never reaches it.
-  # - It runs no code of the change under test. It checks out the default branch, and of
-  #   that only scripts/ci-pool. While the default branch has no watcher it does nothing.
-  # - It acts on one run, its own: the tool checks that the run it is given is a pull
-  #   request's run of this workflow on the head it is given, on its first attempt,
-  #   before it does anything.
-  # - It decides from the names and conclusions of jobs and steps as the API reports
-  #   them. It reads no log and no artifact, so nothing a test prints can reach it.
-  # - Every value reaches the tool through `env:`, none through the script text.
-  unit-watch:
-    name: Unit watch
-    needs: [changes, skip-check]
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      needs.changes.outputs.code == 'true' &&
-      needs.skip-check.outputs.skip != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    permissions:
-      actions: write
-      contents: read
-      statuses: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          sparse-checkout: scripts/ci-pool
-          persist-credentials: false
-      - name: Watch the unit steps
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          HOST: ${{ needs.skip-check.outputs.host }}
-          CONTAINER: ${{ needs.skip-check.outputs.container }}
-        run: |
-          if ! python3 scripts/ci-pool/ci_pool.py unit-watch --help > /dev/null 2>&1; then
-            echo "::notice::the default branch has no unit watcher yet: nothing is watched"
-            exit 0
-          fi
-          python3 scripts/ci-pool/ci_pool.py unit-watch --minutes 60
 
   # States what this run showed as a `ci/pool` commit status (scripts/ci-pool/ci_pool.py
   # mark). A run that tested nothing (a draft, a lower member of a pool) puts `pending` on

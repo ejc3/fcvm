@@ -1993,7 +1993,7 @@ class BisectCommand(PoolOfThree):
         self.assertEqual(writes, [('POST', f'actions/runs/{run}/rerun-failed-jobs', {})], out)
 
     def test_in_a_run_that_was_stopped_only_the_failed_lanes_job_is_run_again(self):
-        # Not "the run's failed jobs": after the unit watcher stopped a run, that would run
+        # Not "the run's failed jobs": after a run was stopped by hand, that would run
         # every cancelled lane again before it is known whether the failure repeats.
         lanes = dict(self.green(), **{'Host-arm64': 'failure', 'Container-arm64': 'cancelled'})
         run = self.add_run(2, lanes)
@@ -2017,7 +2017,7 @@ class BisectCommand(PoolOfThree):
         self.assertIn('Then Container-arm64', out)
 
     def test_when_what_failed_in_a_stopped_run_has_passed_the_cancelled_lanes_are_run(self):
-        # The watcher stopped the run, the failed lane was run again alone and passed. The
+        # The run was stopped by hand, the failed lane was run again alone and passed. The
         # other lanes never ran: nothing is running and nothing would start them.
         lanes = {lane_name: 'cancelled' for lane_name in ci_pool.PR_LANES}
         lanes['Host-arm64'] = ['failure', 'success']
@@ -2159,9 +2159,7 @@ class BisectCommand(PoolOfThree):
         source = TOOL.read_text()
         body = source.split('def cmd_bisect(', 1)[1].split('\n# ---', 1)[0]
         self.assertEqual(re.findall(r"status_fields\('(\w+)'", body), ['failure'])
-        self.assertEqual(source.count('/statuses/'), 3, 'a status is posted somewhere other than mark, bisect and unit-watch')
-        watcher = source.split('def cmd_unit_watch(', 1)[1].split('\n# ---', 1)[0]
-        self.assertEqual(re.findall(r"status_fields\('(\w+)'", watcher), ['failure'])
+        self.assertEqual(source.count('/statuses/'), 2, 'a status is posted somewhere other than mark and bisect')
         self.assertEqual(source.split('def cmd_mark(', 1)[1].split('\n# ---', 1)[0].count('/statuses/'), 1)
 
     def test_a_failure_that_then_passed_is_filed_under_the_issue_that_owns_its_cause(self):
@@ -2690,220 +2688,6 @@ class Inventory(unittest.TestCase):
     def test_a_hosted_workflow_on_pull_requests_is_not(self):
         self.assertEqual(ci_pool.per_branch_self_hosted(self.HOSTED), [])
         self.assertEqual(self.reasons('  pull_request:\n', '    runs-on: ubuntu-24.04-arm\n'), [])
-
-
-def with_steps(name, conclusion, **steps):
-    return {'name': name, 'conclusion': conclusion, 'steps': [{'name': k.replace('_', '-'), 'conclusion': v} for k, v in steps.items()]}
-
-
-class UnitWatch(Sandbox):
-    """The watcher that stops a pull request's run once the unit step failed on two lanes."""
-
-    PR = ['Host-arm64', 'Container-arm64']
-    HOST_FAILED = with_steps('Host-arm64', 'failure', test_unit='failure')
-    CONTAINER_FAILED = with_steps('Container-arm64', None, container_test_unit='failure')
-
-    def test_the_unit_step_must_fail_on_two_lanes(self):
-        verdict = ci_pool.unit_verdict
-        self.assertEqual(verdict([self.HOST_FAILED, self.CONTAINER_FAILED], self.PR), ('failed', ['Host-arm64', 'Container-arm64']))
-        # One lane's unit step failing may be its host: the step also checks the disk and
-        # builds, and the container one builds an image from a registry.
-        self.assertEqual(verdict([self.HOST_FAILED, with_steps('Container-arm64', None, container_test_unit='success')], self.PR),
-                         ('done', []))
-        self.assertEqual(verdict([self.HOST_FAILED, with_steps('Container-arm64', None, container_test_unit=None)], self.PR),
-                         ('running', []))
-        three = self.PR + ['Host-x64']
-        self.assertEqual(verdict([self.HOST_FAILED, with_steps('Container-arm64', 'success', container_test_unit='success'),
-                                  with_steps('Host-x64', None)], three), ('running', []))
-        self.assertEqual(verdict([self.HOST_FAILED, with_steps('Host-x64', 'failure', test_unit='failure')], three),
-                         ('failed', ['Host-arm64', 'Host-x64']))
-
-    def test_a_failed_unit_step_is_the_only_thing_that_counts_as_failed(self):
-        verdict = ci_pool.unit_verdict
-        # Another step failed, the runner was lost, or the lane was cancelled: not the unit suite.
-        for job in (with_steps('Container-arm64', 'failure', container_test_unit='success', container_test_fast='failure'),
-                    with_steps('Container-arm64', 'failure', Install_dependencies='failure'),
-                    with_steps('Container-arm64', 'failure'), with_steps('Container-arm64', 'cancelled', container_test_unit='cancelled'),
-                    with_steps('Container-arm64', 'failure', test_unit='failure')):
-            self.assertEqual(verdict([self.HOST_FAILED, job], self.PR), ('done', []), job)
-        # A job that is not an expected lane counts for nothing, whatever its steps are called.
-        for job in (with_steps('Host-Root-arm64-SnapshotEnabled', 'failure', test_unit='failure'),
-                    with_steps('Lint', 'failure', test_unit='failure'), with_steps('Host-x64', 'failure', test_unit='failure')):
-            self.assertEqual(verdict([self.HOST_FAILED, job, with_steps('Container-arm64', 'success', container_test_unit='success')],
-                                     self.PR), ('done', []), job)
-
-    def test_a_lane_that_is_not_listed_yet_is_still_to_come(self):
-        # The watcher starts beside the lanes: its first job list can hold none of them, or
-        # only their unexpanded matrix. That is not a run with nothing to watch.
-        verdict = ci_pool.unit_verdict
-        self.assertEqual(verdict([], self.PR), ('running', []))
-        self.assertEqual(verdict([with_steps('Host-${{ matrix.arch }}', None)], self.PR), ('running', []))
-        self.assertEqual(verdict([self.HOST_FAILED], self.PR), ('running', []))
-        past = with_steps('Host-arm64', None, test_unit='success', test_fast=None)
-        self.assertEqual(verdict([past], self.PR), ('done', []))
-        self.assertEqual(verdict([past, with_steps('Container-arm64', None)], self.PR), ('done', []))
-
-    def test_the_lanes_to_watch_come_from_the_plan(self):
-        lanes = ci_pool.unit_lanes
-        self.assertEqual(lanes('{"arch":["arm64"]}', '{"arch":["arm64"]}'), self.PR)
-        self.assertEqual(lanes('{"arch":["arm64","x64"]}', '{"arch":[]}'), ['Host-arm64', 'Host-x64'])
-        for host, container in (('', ''), ('{}', '{"arch":[]}'), ('{"arch":["riscv"]}', '{"arch":[]}'), ('[1]', '{"arch":[]}'),
-                                ('{"arch":["arm64"]}', 'null')):
-            self.assertIsNone(lanes(host, container), (host, container))
-        plan = ci_pool.matrix_outputs(ci_pool.PR_LANES)
-        self.assertEqual(lanes(plan['host'], plan['container']), self.PR)
-
-    RUN = {'path': '.github/workflows/ci.yml', 'head_sha': 'c' * 40, 'event': 'pull_request'}
-
-    def watch(self, jobs, *args, run=None, status=None, **env):
-        fixture = {f'repos/{REPO}/actions/runs/77/jobs?per_page=100': jobs if jobs == 'FAIL' else {'jobs': jobs},
-                   f'repos/{REPO}/actions/runs/77': self.RUN if run is None else run}
-        if status:
-            fixture[f"POST repos/{REPO}/statuses/{'c' * 40}"] = status
-        # A deadline on every call, so that no change to the watcher can make a test wait an hour.
-        if '--minutes' not in args:
-            args = ('--minutes', '0.05', *args)
-        full = dict(RUN_ID='77', RUN_ATTEMPT='1', HEAD_SHA='c' * 40, RUN_URL='https://example.invalid/runs/77',
-                    HOST='{"arch":["arm64"]}', CONTAINER='{"arch":["arm64"]}')
-        full.update(env)
-        code, out, calls = self.tool('unit-watch', '--interval', '0.05', *args, fixture=fixture, env=full)
-        return code, out, [(c['method'], c['path'].split('/', 3)[-1], c['fields']) for c in calls if c['method'] != 'GET'], calls
-
-    FAILED = [HOST_FAILED, CONTAINER_FAILED]
-
-    def test_two_failed_unit_steps_mark_the_head_and_then_cancel_the_run(self):
-        code, out, writes, _ = self.watch(self.FAILED)
-        self.assertEqual(code, 0, out)
-        self.assertEqual([(m, p) for m, p, _ in writes], [('POST', 'statuses/' + 'c' * 40), ('POST', 'actions/runs/77/cancel')])
-        fields = writes[0][2]
-        self.assertEqual((fields['state'], fields['context']), ('failure', 'ci/pool'))
-        self.assertIn('test-unit on Host-arm64, container-test-unit on Container-arm64', fields['description'])
-        self.assertLessEqual(len(fields['description']), 140)
-
-    def test_a_run_is_not_cancelled_when_the_status_could_not_be_written(self):
-        # A cancelled run reports no Summary: cancelled without the status, the head would
-        # show nothing at all.
-        code, out, writes, _ = self.watch(self.FAILED, status='FAIL')
-        self.assertEqual(code, 0, out)
-        self.assertEqual([(m, p) for m, p, _ in writes], [('POST', 'statuses/' + 'c' * 40)])
-        self.assertIn('the run is left to finish', out)
-
-    def test_nothing_is_cancelled_when_one_unit_step_fails_or_something_else_does(self):
-        for jobs in ([with_steps('Host-arm64', None, test_unit='success'), with_steps('Container-arm64', 'success', container_test_unit='success')],
-                     [self.HOST_FAILED, with_steps('Container-arm64', 'success', container_test_unit='success')],
-                     [self.HOST_FAILED, with_steps('Container-arm64', 'failure', Install_dependencies='failure')],
-                     [self.HOST_FAILED, with_steps('Container-arm64', 'cancelled')],
-                     [with_steps('Host-arm64', 'failure', Install_dependencies='failure'), self.CONTAINER_FAILED],
-                     [self.HOST_FAILED, with_steps('Host-Root-arm64-SnapshotEnabled', 'failure', test_unit='failure'),
-                      with_steps('Container-arm64', 'success', container_test_unit='success')]):
-            code, out, writes, _ = self.watch(jobs)
-            self.assertEqual((code, writes), (0, []), out)
-            self.assertIn('nothing to cancel', out)
-
-    def test_it_stops_watching_at_its_deadline_and_never_fails_the_run(self):
-        code, out, writes, calls = self.watch([with_steps('Host-arm64', None, test_unit=None)], '--minutes', '0.005')
-        self.assertEqual((code, writes), (0, []), out)
-        self.assertIn('no longer watching', out)
-        self.assertGreaterEqual(len(calls), 2, 'it did not look again before its deadline')
-        code, out, writes, calls = self.watch([], '--minutes', '0.005')
-        self.assertIn('no longer watching', out)
-        self.assertGreaterEqual(len(calls), 3, 'an empty job list ended the watch')
-        code, out, writes, _ = self.watch('FAIL', '--minutes', '0.005')
-        self.assertEqual((code, writes), (0, []), out)
-        self.assertIn('could not read the jobs', out)
-
-    def test_it_acts_only_on_a_pull_requests_run_of_this_workflow_on_the_head_it_was_given(self):
-        for run in (dict(self.RUN, path='.github/workflows/other.yml'), dict(self.RUN, head_sha='d' * 40),
-                    dict(self.RUN, path='dynamic/ci.yml'), dict(self.RUN, event='push'), dict(self.RUN, event='workflow_dispatch'),
-                    dict(self.RUN, event='workflow_run'), dict(self.RUN, event='pull_request_target'), {}, 'FAIL'):
-            code, out, writes, _ = self.watch(self.FAILED, run=run)
-            self.assertEqual((code, writes), (0, []), f'{run}: {out}')
-            self.assertIn('nothing is watched', out)
-        self.assertEqual(len(self.watch(self.FAILED)[2]), 2)
-
-    def test_a_rerun_is_not_watched(self):
-        # A later attempt's job list still shows, for the lanes that were not run again,
-        # the steps that failed the first time.
-        for attempt in ('2', '3', '', 'x'):
-            code, out, writes, calls = self.watch(self.FAILED, RUN_ATTEMPT=attempt)
-            self.assertEqual((code, writes), (0, []), out)
-            self.assertIn('nothing is watched', out)
-            self.assertNotIn(f'repos/{REPO}/actions/runs/77/jobs?per_page=100', [c['path'] for c in calls])
-
-    def test_a_run_whose_plan_cannot_be_read_or_has_one_unit_lane_is_not_watched(self):
-        for env in ({'HOST': '', 'CONTAINER': ''}, {'HOST': 'x'}, {'CONTAINER': '{"arch":[]}'},
-                    {'HOST': '{"arch":[]}', 'CONTAINER': '{"arch":[]}'}, {'HOST': '{"arch":["riscv"]}'}):
-            code, out, writes, _ = self.watch(self.FAILED, **env)
-            self.assertEqual((code, writes), (0, []), f'{env}: {out}')
-            self.assertIn('nothing is watched', out)
-
-    def test_only_names_and_conclusions_from_the_api_decide_never_what_a_test_printed(self):
-        # A job that is not a lane, or a step that is not the unit step, cannot stop a run
-        # whatever it is called; and the watcher asks for no log and no artifact at all.
-        for job in (with_steps('Host-arm64 (hosted)', None, test_unit='failure'),
-                    with_steps('host-arm64', None, test_unit='failure'),
-                    with_steps('Host-arm64', None, **{'test_unit_': 'failure', 'TEST_UNIT': 'failure'}),
-                    with_steps('Host-arm64', None, **{'test-unit failed on Host-arm64': 'failure'})):
-            code, out, writes, calls = self.watch([job, self.CONTAINER_FAILED], '--minutes', '0.005')
-            self.assertEqual(writes, [], job)
-        _, _, _, calls = self.watch(self.FAILED)
-        asked = [c['path'] for c in calls if c['method'] == 'GET']
-        self.assertEqual(asked, [f'repos/{REPO}/actions/runs/77', f'repos/{REPO}/actions/runs/77/jobs?per_page=100'])
-        source = TOOL.read_text().split('def unit_verdict(', 1)[1].split('\n# ---', 1)[0]
-        for reader in ('log_tail', 'classify_log', 'annotations', '/logs', 'artifacts'):
-            self.assertNotIn(reader, source)
-
-    def test_the_watcher_job_runs_no_code_of_the_change_and_takes_every_value_through_env(self):
-        text = CI.read_text()
-        body = text.split('\njobs:\n', 1)[1]
-        block = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', body, re.M | re.S))['unit-watch']
-        # The default branch's copy of the tool, and nothing else of the repository.
-        checkout = re.search(r'      - uses: actions/checkout@.*\n        with:\n((?:          .*\n)+)', block)[1]
-        self.assertIn('ref: ${{ github.event.repository.default_branch }}', checkout)
-        self.assertIn('sparse-checkout: scripts/ci-pool', checkout)
-        self.assertIn('persist-credentials: false', checkout)
-        self.assertEqual(len(re.findall(r'^\s+(?:- )?uses:', block, re.M)), 1, 'the watcher job uses an action besides checkout')
-        # No expression inside the script text: every value arrives through env.
-        script = block.split('        run: |\n', 1)[1]
-        self.assertNotIn('${{', script)
-        self.assertNotRegex(script, r'\bmake\b|cargo|\./scripts|bash scripts')
-        self.assertIn('runs-on: ubuntu-latest', block)
-
-    def test_the_watcher_job_does_not_run_for_a_fork_or_another_repositorys_workflow_run(self):
-        import importlib.util as util
-        scope = util.spec_from_file_location('scope', ROOT / 'scripts/test-ci-stack-scope.py')
-        helpers = util.module_from_spec(scope)
-        scope.loader.exec_module(helpers)
-        gate = helpers.job_if(helpers.jobs(CI.read_text())['unit-watch'])
-
-        def runs(event, **event_fields):
-            return bool(helpers.evaluate(gate, {
-                'needs': {'changes': {'outputs': {'code': 'true'}}, 'skip_check': {'outputs': {'skip': 'false'}}},
-                'github': {'event_name': event, 'repository': REPO, 'event': event_fields}}))
-
-        ours, theirs = {'repo': {'full_name': REPO}}, {'repo': {'full_name': 'someone/fork'}}
-        self.assertTrue(runs('pull_request', pull_request={'head': ours}))
-        self.assertFalse(runs('pull_request', pull_request={'head': theirs}))
-        # Main's run is the only run its commit gets, and a dispatch asked for its lanes by
-        # name (a bisect probe, whose head must not be marked from one run).
-        for event in ('push', 'workflow_dispatch', 'workflow_run', 'pull_request_target', 'schedule'):
-            self.assertFalse(runs(event), event)
-            self.assertFalse(runs(event, pull_request={'head': ours}, workflow_run={'head_repository': {'full_name': REPO}}), event)
-        text = CI.read_text()
-        self.assertNotIn('pull_request_target', text.split('\njobs:\n', 1)[0])
-
-    def test_the_watcher_names_the_steps_the_lanes_have(self):
-        text = CI.read_text()
-        body = text.split('\njobs:\n', 1)[1]
-        blocks = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', body, re.M | re.S))
-        self.assertIn('      - name: test-unit\n', blocks['host'])
-        self.assertIn('      - name: container-test-unit\n', blocks['container'])
-        self.assertEqual(set(ci_pool.UNIT_STEPS), {l for l in ci_pool.LANES if l.startswith(('Host-a', 'Host-x', 'Container-'))})
-        self.assertIn('python3 scripts/ci-pool/ci_pool.py unit-watch --minutes 60', blocks['unit-watch'])
-        for line in ('HOST: ${{ needs.skip-check.outputs.host }}', 'CONTAINER: ${{ needs.skip-check.outputs.container }}',
-                     'RUN_ATTEMPT: ${{ github.run_attempt }}', 'HEAD_SHA: ${{ github.event.pull_request.head.sha }}'):
-            self.assertIn(f'          {line}\n', blocks['unit-watch'])
-        self.assertNotIn('unit-watch', re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1])
 
 
 def takes_fcvm_with_default_features(root):

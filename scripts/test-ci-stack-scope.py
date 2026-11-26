@@ -401,15 +401,12 @@ class Workflow(unittest.TestCase):
                     'BASE_REF: ${{ github.event.pull_request.base.ref }}', 'run: bash scripts/ci-pr-scope.sh'):
             self.assertIn(env, block)
 
-    def test_only_the_status_job_and_the_unit_watcher_may_write_statuses(self):
+    def test_only_the_status_job_may_write_statuses(self):
         text = CI.read_text()
-        self.assertEqual(text.count('statuses: write'), 2)
-        self.assertIn('statuses: write', jobs(text)['unit-watch'])
-        # Cancelling a run takes actions: write. Only the watcher has it: no job that runs
-        # the change under test on a self-hosted runner does.
-        self.assertEqual(text.count('actions: write'), 1)
-        self.assertIn('actions: write', jobs(text)['unit-watch'])
-        self.assertIn('runs-on: ubuntu-latest', jobs(text)['unit-watch'])
+        self.assertEqual(text.count('statuses: write'), 1)
+        # No job may cancel or rerun a run: a watcher that stopped runs was measured and
+        # taken out (docs/ci-pool.md, "A run that was stopped").
+        self.assertNotIn('actions: write', text)
         block = jobs(text)['pool-status']
         self.assertIn('statuses: write', block)
         self.assertIn('run: python3 scripts/ci-pool/ci_pool.py mark', block)

@@ -1676,7 +1676,7 @@ def diagnose(members, states_at, causes_at, tries_at, spent, required=PR_LANES, 
         missing = [lane for lane in required if at_top.get(lane) not in (PASS, RERUN_PASS)]
         stopped = [lane for lane in missing if at_top.get(lane) == CANCELLED]
         if stopped and len(stopped) == len(missing):
-            # The run was stopped (by the unit watcher, or by hand) and whatever failed has
+            # The run was stopped by hand and whatever failed has
             # since passed. Nothing is running and nothing will run these lanes unless asked.
             if spent >= cap:
                 return {'outcome': NOT_ISOLATED, 'lanes': stopped, 'causes': [],
@@ -2373,117 +2373,6 @@ def cmd_flush(args, gh, default_branch):
     return code
 
 
-# ----------------------------------------------------------------------------- unit watch
-
-# The step of each lane that runs the unit suite. A change that breaks a unit test, or
-# whose tests do not compile, fails that step on every lane that has one about 20 minutes
-# in, and the lanes without one go on to their own 34 to 57 minutes. The watcher stops a
-# pull request's run once that step has failed on two lanes.
-#
-# Two, because the step is more than the suite: `make test-unit` first checks the disk and
-# builds, and `make container-test-unit` first builds the image from a registry. One lane
-# failing there may be its host. Two lanes are two hosts, and in a pull request's run one
-# of them is always a Host lane, which builds no image.
-UNIT_STEPS = {'Host-arm64': 'test-unit', 'Host-x64': 'test-unit',
-              'Container-arm64': 'container-test-unit', 'Container-x64': 'container-test-unit'}
-UNIT_FAILURES_TO_STOP = 2
-
-
-def unit_lanes(host, container):
-    """The lanes with a unit step that a run's plan takes, from the planner's `host` and
-    `container` outputs ({"arch": [...]} as JSON). None when they cannot be read."""
-    try:
-        lanes = [f'Host-{arch}' for arch in json.loads(host)['arch']]
-        lanes += [f'Container-{arch}' for arch in json.loads(container)['arch']]
-    except (ValueError, KeyError, TypeError):
-        return None
-    return lanes if all(lane in UNIT_STEPS for lane in lanes) else None
-
-
-def unit_verdict(jobs, expected):
-    """What the unit steps of a run's lanes show so far: ('failed', [lanes]) once the step
-    has failed on UNIT_FAILURES_TO_STOP of them, ('done', []) when that can no longer
-    happen, else ('running', []). `expected` is the lanes with a unit step that the run's
-    plan takes: one that is not listed yet is still to come, so a job list read before
-    the lanes appear is never taken for a run with nothing to watch. Only a step that ran
-    and failed counts: a lane that lost its runner or was cancelled has no failed unit
-    step."""
-    failed, waiting = [], 0
-    for lane in expected:
-        job = next((job for job in jobs if job['name'] == lane), None)
-        step = next((s for s in (job or {}).get('steps') or [] if s['name'] == UNIT_STEPS[lane]), None)
-        if step and step.get('conclusion') == 'failure':
-            failed.append(lane)
-        elif job is None or (job.get('conclusion') is None and not (step and step.get('conclusion'))):
-            waiting += 1
-    if len(failed) >= UNIT_FAILURES_TO_STOP:
-        return 'failed', failed
-    return ('running' if len(failed) + waiting >= UNIT_FAILURES_TO_STOP else 'done'), []
-
-
-def cmd_unit_watch(args, gh, _default_branch):
-    """ci.yml's `unit-watch` job: cancel this run when the unit suite fails on two lanes.
-    Reads RUN_ID, RUN_ATTEMPT, HEAD_SHA, RUN_URL, HOST and CONTAINER. It never fails the
-    run: whatever it cannot read, it reads again, and at its deadline it stops watching."""
-    env = os.environ
-    # It may stop one run: a pull request's run of this workflow, on the head it was
-    # started for, on its first attempt. Anything else it is pointed at, it leaves alone.
-    # Not main's run, which is the only run its commit gets. Not a dispatch, which asked
-    # for its lanes by name (a bisect probe). Not a rerun, whose job list still shows the
-    # steps that failed the first time on the lanes that were not run again.
-    try:
-        run = gh.one(f"repos/{gh.repo}/actions/runs/{env['RUN_ID']}", '{path, head_sha, event}')
-    except Blocked as why:
-        note(f'could not read the run: {why}: nothing is watched')
-        return 0
-    if (run.get('path') != '.github/workflows/ci.yml' or run.get('head_sha') != env['HEAD_SHA']
-            or run.get('event') != 'pull_request'):
-        note(f"run {env['RUN_ID']} is not a pull request's run of ci.yml on {env['HEAD_SHA'][:12]}: nothing is watched")
-        return 0
-    if env.get('RUN_ATTEMPT') != '1':
-        note(f"attempt {env.get('RUN_ATTEMPT')} of the run: only a first attempt is watched, so nothing is watched")
-        return 0
-    expected = unit_lanes(env.get('HOST', ''), env.get('CONTAINER', ''))
-    if expected is None:
-        note('could not read which lanes this run takes: nothing is watched')
-        return 0
-    if len(expected) < UNIT_FAILURES_TO_STOP:
-        note(f"this run takes {len(expected)} lane(s) with a unit step, and {UNIT_FAILURES_TO_STOP} must fail it: nothing is watched")
-        return 0
-    deadline = time.monotonic() + args.minutes * 60
-    while True:
-        try:
-            jobs = gh.call(f"repos/{gh.repo}/actions/runs/{env['RUN_ID']}/jobs?per_page=100",
-                           '.jobs[] | {name, conclusion, steps: [.steps[]? | {name, conclusion}]}', paginate=True)
-            verdict, lanes = unit_verdict(jobs, expected)
-        except Blocked as why:
-            note(f'could not read the jobs: {why}')
-            verdict, lanes = 'running', []
-        if verdict == 'failed':
-            where = ', '.join(f'{UNIT_STEPS[lane]} on {lane}' for lane in lanes)
-            note(f'::error::{where} failed: cancelling the run.')
-            # The status first, and the run is cancelled only if it was written: a cancelled
-            # run reports no Summary, so without the status the head would say nothing.
-            try:
-                gh.call(f"repos/{gh.repo}/statuses/{env['HEAD_SHA']}", method='POST',
-                        fields=status_fields('failure', f'failed: {where}; the run was cancelled there', env['RUN_URL']))
-            except Blocked as why:
-                note(f'the status could not be written, so the run is left to finish: {why}')
-                return 0
-            try:
-                gh.call(f"repos/{gh.repo}/actions/runs/{env['RUN_ID']}/cancel", method='POST')
-            except Blocked as why:
-                note(f'the run could not be cancelled: {why}')
-            return 0
-        if verdict == 'done':
-            note(f'the unit step can no longer fail on {UNIT_FAILURES_TO_STOP} lanes: nothing to cancel')
-            return 0
-        if time.monotonic() >= deadline:
-            note(f'still running after {args.minutes} minutes: no longer watching')
-            return 0
-        time.sleep(args.interval)
-
-
 # ---------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -2523,9 +2412,6 @@ def main(argv=None):
     land.add_argument('--despite', action='append', metavar='JOB=#ISSUE',
                       help='accept, by name, a failed job that is not a lane, with the issue that owns the failure')
     land.add_argument('--go', action='store_true', help='retarget and merge')
-    watch = sub.add_parser('unit-watch', help="cancel this CI run when the unit step fails on two lanes (ci.yml's unit-watch job)")
-    watch.add_argument('--minutes', type=float, default=60)
-    watch.add_argument('--interval', type=float, default=60)
     sub.add_parser('mark', help="state what this CI run showed as ci/pool statuses (ci.yml's pool-status job)")
     bisect = sub.add_parser('bisect', help='the next step for a pool whose top is red')
     bisect.add_argument('--of', required=True, help='a pull request or branch of the pool')
@@ -2557,8 +2443,8 @@ def main(argv=None):
         if repo.count('/') != 1:
             raise Blocked(f'cannot tell the repository from {repo!r}: pass --repo owner/name')
         gh = Gh(repo, max_requests=getattr(args, 'max_requests', None))
-        if args.command in ('plan', 'mark', 'unit-watch'):
-            return {'plan': cmd_plan, 'mark': cmd_mark, 'unit-watch': cmd_unit_watch}[args.command](args, gh, None)
+        if args.command in ('plan', 'mark'):
+            return {'plan': cmd_plan, 'mark': cmd_mark}[args.command](args, gh, None)
         if args.command == 'lane-files':
             top = git('rev-parse', '--show-toplevel')
             text = ('# Files that define the CI lanes. Derived: `python3 scripts/ci-pool/ci_pool.py lane-files --write`.\n'
