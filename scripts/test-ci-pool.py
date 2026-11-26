@@ -2293,8 +2293,9 @@ class UnitWatch(Sandbox):
         self.assertEqual(verdict([running, with_steps('Host-x64', None, test_unit='failure')]), ('failed', 'Host-x64'))
         self.assertEqual(verdict([]), ('done', None))
 
-    def watch(self, jobs, *args):
-        fixture = {f'repos/{REPO}/actions/runs/77/jobs?per_page=100': jobs if jobs == 'FAIL' else {'jobs': jobs}}
+    def watch(self, jobs, *args, run=None):
+        fixture = {f'repos/{REPO}/actions/runs/77/jobs?per_page=100': jobs if jobs == 'FAIL' else {'jobs': jobs},
+                   f'repos/{REPO}/actions/runs/77': {'path': '.github/workflows/ci.yml', 'head_sha': 'c' * 40} if run is None else run}
         # A deadline on every call, so that no change to the watcher can make a test wait an hour.
         if '--minutes' not in args:
             args = ('--minutes', '0.05', *args)
@@ -2327,6 +2328,71 @@ class UnitWatch(Sandbox):
         self.assertEqual((code, writes), (0, []), out)
         self.assertIn('could not read the jobs', out)
 
+    FAILED = [with_steps('Host-arm64', None, test_unit='failure')]
+
+    def test_it_acts_only_on_a_run_of_this_workflow_on_the_head_it_was_given(self):
+        for run in ({'path': '.github/workflows/other.yml', 'head_sha': 'c' * 40},
+                    {'path': '.github/workflows/ci.yml', 'head_sha': 'd' * 40},
+                    {'path': 'dynamic/ci.yml', 'head_sha': 'c' * 40}, {}, 'FAIL'):
+            code, out, writes, _ = self.watch(self.FAILED, run=run)
+            self.assertEqual((code, writes), (0, []), f'{run}: {out}')
+            self.assertIn('nothing is watched', out)
+        self.assertEqual(len(self.watch(self.FAILED)[2]), 2)
+
+    def test_only_names_and_conclusions_from_the_api_decide_never_what_a_test_printed(self):
+        # A job that is not a lane, or a step that is not the unit step, cannot stop a run
+        # whatever it is called; and the watcher asks for no log and no artifact at all.
+        for jobs in ([with_steps('Host-arm64 (hosted)', None, test_unit='failure')],
+                     [with_steps('host-arm64', None, test_unit='failure')],
+                     [with_steps('Host-arm64', None, **{'test_unit_': 'failure', 'TEST_UNIT': 'failure'})],
+                     [with_steps('Host-arm64', None, **{'test-unit failed on Host-arm64': 'failure'})]):
+            code, out, writes, calls = self.watch(jobs, '--minutes', '0.005')
+            self.assertEqual(writes, [], jobs)
+        _, _, _, calls = self.watch(self.FAILED)
+        asked = [c['path'] for c in calls if c['method'] == 'GET']
+        self.assertEqual(asked, [f'repos/{REPO}/actions/runs/77', f'repos/{REPO}/actions/runs/77/jobs?per_page=100'])
+        source = TOOL.read_text().split('def unit_verdict(', 1)[1].split('\n# ---', 1)[0]
+        for reader in ('log_tail', 'classify_log', 'annotations', '/logs', 'artifacts'):
+            self.assertNotIn(reader, source)
+
+    def test_the_watcher_job_runs_no_code_of_the_change_and_takes_every_value_through_env(self):
+        text = CI.read_text()
+        body = text.split('\njobs:\n', 1)[1]
+        block = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', body, re.M | re.S))['unit-watch']
+        # The default branch's copy of the tool, and nothing else of the repository.
+        checkout = re.search(r'      - uses: actions/checkout@.*\n        with:\n((?:          .*\n)+)', block)[1]
+        self.assertIn('ref: ${{ github.event.repository.default_branch }}', checkout)
+        self.assertIn('sparse-checkout: scripts/ci-pool', checkout)
+        self.assertIn('persist-credentials: false', checkout)
+        self.assertEqual(len(re.findall(r'^\s+(?:- )?uses:', block, re.M)), 1, 'the watcher job uses an action besides checkout')
+        # No expression inside the script text: every value arrives through env.
+        script = block.split('        run: |\n', 1)[1]
+        self.assertNotIn('${{', script)
+        self.assertNotRegex(script, r'\bmake\b|cargo|\./scripts|bash scripts')
+        self.assertIn('runs-on: ubuntu-latest', block)
+
+    def test_the_watcher_job_does_not_run_for_a_fork_or_another_repositorys_workflow_run(self):
+        import importlib.util as util
+        scope = util.spec_from_file_location('scope', ROOT / 'scripts/test-ci-stack-scope.py')
+        helpers = util.module_from_spec(scope)
+        scope.loader.exec_module(helpers)
+        gate = helpers.job_if(helpers.jobs(CI.read_text())['unit-watch'])
+
+        def runs(event, **event_fields):
+            return bool(helpers.evaluate(gate, {
+                'needs': {'changes': {'outputs': {'code': 'true'}}, 'skip_check': {'outputs': {'skip': 'false'}}},
+                'github': {'event_name': event, 'repository': REPO, 'event': event_fields}}))
+
+        ours, theirs = {'repo': {'full_name': REPO}}, {'repo': {'full_name': 'someone/fork'}}
+        self.assertTrue(runs('pull_request', pull_request={'head': ours}))
+        self.assertFalse(runs('pull_request', pull_request={'head': theirs}))
+        self.assertTrue(runs('push'))
+        self.assertTrue(runs('workflow_dispatch'))
+        self.assertTrue(runs('workflow_run', workflow_run={'head_repository': {'full_name': REPO}}))
+        self.assertFalse(runs('workflow_run', workflow_run={'head_repository': {'full_name': 'someone/fork'}}))
+        text = CI.read_text()
+        self.assertNotIn('pull_request_target', text.split('\njobs:\n', 1)[0])
+
     def test_the_watcher_names_the_steps_the_lanes_have(self):
         text = CI.read_text()
         body = text.split('\njobs:\n', 1)[1]
@@ -2334,7 +2400,7 @@ class UnitWatch(Sandbox):
         self.assertIn('      - name: test-unit\n', blocks['host'])
         self.assertIn('      - name: container-test-unit\n', blocks['container'])
         self.assertEqual(set(ci_pool.UNIT_STEPS), {l for l in ci_pool.LANES if l.startswith(('Host-a', 'Host-x', 'Container-'))})
-        self.assertIn('run: python3 scripts/ci-pool/ci_pool.py unit-watch', blocks['unit-watch'])
+        self.assertIn('python3 scripts/ci-pool/ci_pool.py unit-watch --minutes 60', blocks['unit-watch'])
         self.assertNotIn('unit-watch', re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1])
 
 

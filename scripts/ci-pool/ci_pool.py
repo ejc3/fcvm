@@ -2184,6 +2184,16 @@ def cmd_unit_watch(args, gh, _default_branch):
     Reads RUN_ID, HEAD_SHA and RUN_URL. It never fails the run: whatever it cannot read,
     it reads again, and at its deadline it stops watching."""
     env = os.environ
+    # It may stop one run: a run of this workflow, on the head it was started for. Anything
+    # else it is pointed at, it leaves alone.
+    try:
+        run = gh.one(f"repos/{gh.repo}/actions/runs/{env['RUN_ID']}", '{path, head_sha}')
+    except Blocked as why:
+        note(f'could not read the run: {why}: nothing is watched')
+        return 0
+    if run.get('path') != '.github/workflows/ci.yml' or run.get('head_sha') != env['HEAD_SHA']:
+        note(f"run {env['RUN_ID']} is not a run of ci.yml on {env['HEAD_SHA'][:12]}: nothing is watched")
+        return 0
     deadline = time.monotonic() + args.minutes * 60
     while True:
         try:
