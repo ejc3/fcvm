@@ -303,12 +303,36 @@ impl BoundaryMarks {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        // Staged beside the mark and renamed over it: the mark's content says which
-        // snapshot's it is, and a write that fails must leave the mark that was there.
-        let staged = path.with_extension("staged");
-        std::fs::write(&staged, content)
-            .and_then(|()| std::fs::rename(&staged, path))
-            .with_context(|| format!("writing {}", path.display()))
+        Self::write_mark_with(path, content, |staged, content| {
+            std::fs::write(staged, content)
+        })
+    }
+
+    /// Stage the mark's new content beside it and rename it over the mark: the content
+    /// says which snapshot's the boundary is, and a write that fails must leave the mark
+    /// that was there. The staged file's name is its writer's own (process id and a
+    /// count), so two writers never stage over each other, and it is removed when the
+    /// write or the rename fails. `write` is the write of the staged file.
+    fn write_mark_with(
+        path: &Path,
+        content: &str,
+        write: impl FnOnce(&Path, &str) -> io::Result<()>,
+    ) -> Result<()> {
+        static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let staged = path.with_extension(format!(
+            "staged.{}.{}",
+            std::process::id(),
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let written = write(&staged, content).and_then(|()| std::fs::rename(&staged, path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&staged);
+        }
+        written.with_context(|| format!("writing {}", path.display()))
     }
 
     /// Mark a source's boundary owed, with the token of the snapshot create that closed
@@ -417,8 +441,21 @@ pub fn boundary_token(args: &[String]) -> Result<Option<&str>> {
 
 /// A resume was given the token of another snapshot create than the one whose boundary
 /// is owed here, and did nothing (#2159).
+///
+/// The refusal says which token the owed boundary has, on the stderr the host reads
+/// (`OWED_TOKEN_REPORT`): the host's state can hold another, and an operator who has to
+/// open the gate by hand cannot read the mark any other way from a guest whose restarted
+/// agent serves the resume alone. The token orders resumes and is not a secret.
 #[derive(Debug)]
-pub struct StaleResume;
+pub struct StaleResume {
+    /// The token in the `owed` mark, if it has one.
+    pub owed: Option<String>,
+}
+
+/// What precedes the owed boundary's token in a stale refusal: the token, or `none` for a
+/// mark without one. The host finds it by this text (`OWED_TOKEN_REPORT` in
+/// src/commands/common.rs).
+pub(crate) const OWED_TOKEN_REPORT: &str = "owed-boundary-token=";
 
 impl std::fmt::Display for StaleResume {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -426,7 +463,8 @@ impl std::fmt::Display for StaleResume {
             f,
             "refused: this resume is not the one the boundary owed in this guest is waiting \
              for (another snapshot's token, or none where the boundary has one); nothing \
-             was changed"
+             was changed. {OWED_TOKEN_REPORT}{}",
+            self.owed.as_deref().unwrap_or("none")
         )
     }
 }
@@ -441,12 +479,66 @@ impl std::error::Error for StaleResume {}
 pub(crate) const AGENT_RESTARTED_REPORT: &str =
     "the agent that served this snapshot's prepare died before its resume";
 
+/// How long a restarted agent waits for the boundary lock before it gives up on its note:
+/// `NOTE_LOCK_TRIES` tries, `NOTE_LOCK_PAUSE` apart.
+const NOTE_LOCK_TRIES: u32 = 100;
+const NOTE_LOCK_PAUSE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// An agent that starts and finds a source's boundary owed says so in the mark, for the
-/// resume that comes.
-pub fn note_the_agent_restarted_in_a_boundary() {
-    if let Err(error) = BoundaryMarks::system().note_agent_restarted() {
-        eprintln!("[fc-agent] WARNING: {error:#}; the host will not learn that the agent restarted in the middle of its snapshot");
+/// resume that comes. Before it opens exec, so no resume it serves misses the note.
+pub async fn note_the_agent_restarted_in_a_boundary() {
+    let noted = note_agent_restart_under_the_lock(
+        &BoundaryMarks::system(),
+        Path::new(BOUNDARY_LOCK_PATH),
+        NOTE_LOCK_TRIES,
+        NOTE_LOCK_PAUSE,
+    )
+    .await;
+    if let Err(error) = noted {
+        eprintln!(
+            "[fc-agent] WARNING: {error:#}; the host will not learn that the agent restarted \
+             in the middle of its snapshot"
+        );
     }
+}
+
+/// Write the restarted-agent note into the `owed` mark, under the boundary lock. `true`
+/// when it was written, `false` when no source's boundary is owed any more.
+///
+/// The note is a read of the mark and a write of it. Every other writer of the mark (a
+/// prepare, a resume, a restore's dispatch aside) holds the boundary lock, so without it
+/// the note could write back a mark a resume had just cleared, or put an older prepare's
+/// token over a newer one's. Under the lock, and with the mark looked at again there,
+/// it cannot.
+///
+/// Who can hold the lock when an agent starts: a one-shot that the agent before this one
+/// started. With the unit's default kill mode systemd kills it with that agent, a second
+/// before this one starts, and the kernel drops its lock, so the first try gets the lock.
+/// A unit that leaves the dead agent's children running (`KillMode=process`) lets such a
+/// one-shot outlive the restart; it is short (a prepare, or a resume's few tries), and
+/// this waits for it. A lock still held after the wait leaves the note unwritten, with a
+/// warning.
+async fn note_agent_restart_under_the_lock(
+    marks: &BoundaryMarks,
+    lock: &Path,
+    tries: u32,
+    pause: std::time::Duration,
+) -> Result<bool> {
+    for attempt in 1..=tries {
+        if let BoundaryLock::Free(_held) = try_boundary_lock_at(lock) {
+            if !marks.source_owed() {
+                return Ok(false);
+            }
+            return marks.note_agent_restarted().map(|()| true);
+        }
+        if attempt < tries {
+            tokio::time::sleep(pause).await;
+        }
+    }
+    bail!(
+        "the snapshot boundary's lock stayed held for {tries} tries, so the restarted \
+         agent's note was not written"
+    )
 }
 
 /// Whether any part of the snapshot gate is installed, in either family: a gate chain,
@@ -722,20 +814,65 @@ fn source_gate_is_owed_with(
     marks.source_owed() && gate_is_installed().unwrap_or(true)
 }
 
+/// How long the watchdog gives one rules listing before it kills it.
+const GATE_LISTING_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The gate's state for the freeze watchdog, from a thread: each listing is bounded
+/// twice. `-w 2` gives up on the xtables lock after two seconds, where the plain `-w` of
+/// the one-shots waits for good, and a listing that has not ended after
+/// `GATE_LISTING_LIMIT` is killed. Either is an error, which the caller takes for an
+/// installed gate.
 fn gate_is_installed_blocking() -> Result<bool> {
+    gate_is_installed_from(|program| output_within(program, &["-w", "2", "-S"], GATE_LISTING_LIMIT))
+}
+
+/// Whether either family's listing holds the gate. `listing` gives one family's rules.
+fn gate_is_installed_from(mut listing: impl FnMut(&str) -> Result<String>) -> Result<bool> {
     for program in ["iptables", "ip6tables"] {
-        let output = std::process::Command::new(program)
-            .args(["-w", "-S"])
-            .output()
-            .with_context(|| format!("spawning {program}"))?;
-        if !output.status.success() {
-            bail!("{program} -w -S exited with {}", output.status);
-        }
-        if rules_hold_the_gate(&String::from_utf8_lossy(&output.stdout)) {
+        if rules_hold_the_gate(&listing(program)?) {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Run `program` and return what it wrote to stdout, killing it when it has not ended
+/// within `limit`. An exit status other than 0 is an error.
+fn output_within(program: &str, args: &[&str], limit: std::time::Duration) -> Result<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning {program}"))?;
+    let mut stdout = child.stdout.take().context("the child has no stdout")?;
+    // Read on a thread of its own: a listing longer than the pipe holds would otherwise
+    // block the child until it is killed for it.
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("waiting for the child")? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{program} {args:?} did not end within {limit:?} and was killed");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    if !status.success() {
+        bail!("{program} {args:?} exited with {status}");
+    }
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading {program}'s output panicked"))
 }
 
 /// Whether a snapshot boundary is being worked on right now: a prepare, a resume or a
@@ -3471,7 +3608,11 @@ pub async fn resume_source_network(host_time: Option<&str>, token: Option<&str>)
     resume_source_network_in(&marks, Path::new(BOUNDARY_LOCK_PATH), token, || async {
         let gate = IptablesGate::new(SystemCommandRunner);
         let store = FileManifestStore::default();
-        resume_source_network_with(&gate, &store, &marks, host_time).await
+        let rcu = (
+            Path::new(RCU_EXPEDITED_KNOB),
+            Path::new(RCU_EXPEDITED_RECORD),
+        );
+        resume_source_network_with(&gate, &store, &marks, rcu, host_time).await
     })
     .await
 }
@@ -3503,7 +3644,12 @@ where
     }
     // Under the lock: the mark is the one the boundary now owed was given.
     if !marks.resume_is_for_the_owed_boundary(token) {
-        return SourceResume::owed(StaleResume.into());
+        return SourceResume::owed(
+            StaleResume {
+                owed: marks.owed_token(),
+            }
+            .into(),
+        );
     }
     resume().await
 }
@@ -3536,15 +3682,13 @@ async fn resume_source_network_with<G: FirewallGate, S: ManifestStore>(
     gate: &G,
     store: &S,
     marks: &BoundaryMarks,
+    (rcu_knob, rcu_record): (&Path, &Path),
     host_time: Option<&str>,
 ) -> SourceResume {
     let started = std::time::Instant::now();
     // A barrier that was killed with `rcu_expedited` on (#2141). This one-shot holds the
     // boundary lock, which every barrier runs under.
-    ExpeditedGracePeriods::put_back(
-        Path::new(RCU_EXPEDITED_KNOB),
-        Path::new(RCU_EXPEDITED_RECORD),
-    );
+    ExpeditedGracePeriods::put_back(rcu_knob, rcu_record);
     // The pause is over (or never happened, after a failed prepare). A failure only
     // leaves the agent's lines held until the hold's cap.
     if let Err(error) = crate::console::request_source_release().await {
@@ -9837,7 +9981,7 @@ mod tests {
         // reads the note before it retires the mark.
         let agent = include_str!("agent.rs").replace(char::is_whitespace, "");
         let noted = agent
-            .find("crate::snapshot_network::note_the_agent_restarted_in_a_boundary();")
+            .find("crate::snapshot_network::note_the_agent_restarted_in_a_boundary().await;")
             .expect("the agent notes its restart");
         assert!(
             noted
@@ -9971,27 +10115,175 @@ mod tests {
         assert!(watchdog.contains("source_owed: &crate::snapshot_network::source_gate_is_owed,"));
     }
 
-    /// The `owed` mark is replaced whole or not at all. Its content says which snapshot's
-    /// boundary is owed and whether the agent restarted in it; written in place, a write
-    /// that failed after the truncation left an empty mark, which any tokenless resume
-    /// may act on.
+    /// The `owed` mark is replaced whole or not at all, and a write that fails leaves
+    /// nothing behind. Its content says which snapshot's boundary is owed and whether the
+    /// agent restarted in it; written in place, a write that failed after the truncation
+    /// left an empty mark, which any tokenless resume may act on. Staged under one fixed
+    /// name, two writers staged over each other, and a failed write left its staged file.
     #[test]
     fn a_failed_write_of_the_owed_mark_leaves_the_mark_that_was_there() {
         let dir = tempfile::tempdir().unwrap();
         let marks = marks_in(dir.path());
         marks.mark_owed(Some("create-a")).unwrap();
-        // the staged file cannot be written: its name is a directory's
-        let staged = marks.owed.with_extension("staged");
-        std::fs::create_dir(&staged).unwrap();
-        assert!(marks.mark_owed(Some("create-b")).is_err());
-        assert!(marks.note_agent_restarted().is_err());
-        assert_eq!(marks.owed_token().as_deref(), Some("create-a"));
-        assert!(!marks.agent_restarted());
-        std::fs::remove_dir(&staged).unwrap();
+        let files = || {
+            let mut names: Vec<String> = std::fs::read_dir(marks.owed.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let only_the_mark = files();
+        assert_eq!(only_the_mark.len(), 1);
+
+        // the staged file is written in part and the write fails (a full /run)
+        let staged_names = Mutex::new(Vec::new());
+        for _ in 0..2 {
+            let failed =
+                BoundaryMarks::write_mark_with(&marks.owed, "token=create-b\n", |staged, _| {
+                    staged_names.lock().unwrap().push(staged.to_path_buf());
+                    std::fs::write(staged, "tok")?;
+                    Err(io::Error::other("no space left on device"))
+                });
+            assert!(failed.is_err());
+            assert_eq!(marks.owed_token().as_deref(), Some("create-a"));
+            assert_eq!(
+                files(),
+                only_the_mark,
+                "a failed write left its staged file"
+            );
+        }
+        // each write stages under a name of its own, beside the mark
+        let staged_names = staged_names.into_inner().unwrap();
+        assert_ne!(staged_names[0], staged_names[1]);
+        assert!(staged_names
+            .iter()
+            .all(|staged| staged.parent() == marks.owed.parent() && *staged != marks.owed));
+        // the rename fails: the same
+        let in_the_way = dir.path().join("in-the-way");
+        std::fs::create_dir_all(in_the_way.join("kept")).unwrap();
+        assert!(BoundaryMarks::write_mark(&in_the_way, "x").is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "a failed rename left its staged file"
+        );
+
+        // every writer of the mark goes through it
         marks.note_agent_restarted().unwrap();
         assert_eq!(marks.owed_token().as_deref(), Some("create-a"));
         assert!(marks.agent_restarted());
-        assert!(!staged.exists());
+        assert_eq!(files(), only_the_mark);
+        let source = include_str!("snapshot_network.rs");
+        let marks_impl = &source[source.find("\nimpl BoundaryMarks {").unwrap()..];
+        let marks_impl = &marks_impl[..marks_impl.find("\n}\n").unwrap()];
+        assert_eq!(
+            marks_impl.matches("std::fs::write(").count(),
+            1,
+            "a mark is written in place"
+        );
+        assert!(marks_impl.contains("std::fs::write(staged, content)"));
+    }
+
+    /// The restarted agent's note is written under the boundary lock, with the mark
+    /// looked at again there. It is a read of the mark and a write of it, and every other
+    /// writer holds the lock: without it the note wrote back a mark a resume had just
+    /// cleared, or put an older prepare's token over a newer one's.
+    #[tokio::test]
+    async fn the_restarted_agents_note_waits_for_the_boundary_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = marks_in(dir.path());
+        let lock = dir.path().join("run").join("lock");
+        let pause = std::time::Duration::from_millis(5);
+        let note = |tries: u32| note_agent_restart_under_the_lock(&marks, &lock, tries, pause);
+
+        // nothing owed: nothing written, no mark made
+        assert!(!note(1).await.unwrap());
+        assert!(!marks.owed.exists());
+        // a source's boundary, nobody at work on it: noted, the token kept
+        marks.mark_owed(Some("create-a")).unwrap();
+        assert!(note(1).await.unwrap());
+        assert!(marks.agent_restarted());
+        assert_eq!(marks.owed_token().as_deref(), Some("create-a"));
+
+        // A resume holds the lock. The note does not touch the mark while it does; the
+        // resume clears the mark and lets go; the note finds nothing owed and writes
+        // nothing back.
+        marks.mark_owed(Some("create-b")).unwrap();
+        let held = acquire_boundary_lock_at(&lock).unwrap();
+        let before = std::fs::read_to_string(&marks.owed).unwrap();
+        let resume = async {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            assert_eq!(
+                std::fs::read_to_string(&marks.owed).unwrap(),
+                before,
+                "the note was written while a one-shot held the boundary lock"
+            );
+            BoundaryMarks::clear(&marks.owed).unwrap();
+            drop(held);
+        };
+        let (noted, ()) = tokio::join!(note(2_000), resume);
+        assert!(!noted.unwrap());
+        assert!(
+            !marks.owed.exists(),
+            "the note wrote back a mark a resume had cleared"
+        );
+
+        // a lock that stays held: given up on, the mark as it was
+        marks.mark_owed(Some("create-c")).unwrap();
+        let before = std::fs::read_to_string(&marks.owed).unwrap();
+        let held = acquire_boundary_lock_at(&lock).unwrap();
+        assert!(note(3).await.is_err());
+        assert_eq!(std::fs::read_to_string(&marks.owed).unwrap(), before);
+        drop(held);
+        // a restore's boundary is not a source's
+        begin_restore_boundary_in(&marks).unwrap();
+        assert!(!note(1).await.unwrap());
+    }
+
+    /// The gate's state as the freeze watchdog reads it: either family's listing, with a
+    /// failed listing an error, and a listing that does not end killed at its limit.
+    #[test]
+    fn the_watchdogs_gate_read_is_bounded() {
+        let asked = Mutex::new(Vec::new());
+        let read = |v4: Result<&'static str>, v6: Result<&'static str>| {
+            let mut answers = vec![v6, v4];
+            gate_is_installed_from(|program| {
+                asked.lock().unwrap().push(program.to_string());
+                answers.pop().unwrap().map(str::to_string)
+            })
+        };
+        assert!(!read(Ok("-P INPUT ACCEPT"), Ok("-P INPUT ACCEPT")).unwrap());
+        assert!(read(Ok("-P INPUT ACCEPT"), Ok("-N FCVM_SNAPSHOT_OUT")).unwrap());
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["iptables", "ip6tables", "iptables", "ip6tables"]
+        );
+        assert!(read(
+            Ok("-A INPUT -j FCVM_SNAPSHOT_IN"),
+            Err(anyhow::anyhow!("unread"))
+        )
+        .unwrap());
+        assert!(read(Ok("-P INPUT ACCEPT"), Err(anyhow::anyhow!("xtables lock"))).is_err());
+        assert!(read(Err(anyhow::anyhow!("xtables lock")), Ok("")).is_err());
+
+        let limit = std::time::Duration::from_secs(20);
+        assert_eq!(
+            output_within("sh", &["-c", "printf '%s\\n' '-N FCVM_SNAPSHOT_IN'"], limit).unwrap(),
+            "-N FCVM_SNAPSHOT_IN\n"
+        );
+        assert!(output_within("sh", &["-c", "exit 4"], limit).is_err());
+        assert!(output_within("fcvm-no-such-program", &[], limit).is_err());
+        // one that does not end is killed, and the read returns
+        let started = std::time::Instant::now();
+        let hung = output_within("sleep", &["60"], std::time::Duration::from_millis(200));
+        assert!(format!("{:#}", hung.unwrap_err()).contains("was killed"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
+        // what the watchdog runs: a wait for the xtables lock that ends by itself
+        let source = include_str!("snapshot_network.rs");
+        assert!(
+            source.contains("output_within(program, &[\"-w\", \"2\", \"-S\"], GATE_LISTING_LIMIT)")
+        );
     }
 
     /// A resume that opened the gate tries the cleanup more than once before it settles
@@ -10064,7 +10356,15 @@ mod tests {
         let gate = ModelGate(state.clone());
         // the restore was dispatched while the resume waited: its mark is there now
         begin_restore_boundary_in(&marks).unwrap();
-        let resumed = resume_source_network_with(&gate, &store, &marks, None).await;
+        // The `rcu_expedited` switch and its record are a directory's here, not the
+        // machine's.
+        let rcu = (
+            dir.path().join("rcu_expedited"),
+            dir.path().join("rcu-before"),
+        );
+        let resumed =
+            resume_source_network_with(&gate, &store, &marks, (&rcu.0, &rcu.1), None).await;
+        assert!(!rcu.0.exists() && !rcu.1.exists());
         assert!(!resumed.gate_open);
         assert!(resumed
             .result
@@ -10114,10 +10414,21 @@ mod tests {
                     .result
                     .is_err_and(|error| error.downcast_ref::<StaleResume>().is_some())
         };
+        // The refusal names the owed boundary's token, where the host reads it: the
+        // host's state can hold another, and a restarted agent serves no `cat`.
+        let reported = |resumed: SourceResume| {
+            let said = format!("{:#}", resumed.result.unwrap_err());
+            said.split_once(OWED_TOKEN_REPORT)
+                .map(|(_, token)| token.to_string())
+        };
 
         // create B's prepare; create A's resume arrives late, and so does one with no token
         marks.mark_owed(Some("create-b")).unwrap();
         let mark = std::fs::read_to_string(&marks.owed).unwrap();
+        assert_eq!(
+            reported(resume(Some("create-a")).await).as_deref(),
+            Some("create-b")
+        );
         assert!(refused(resume(Some("create-a")).await));
         assert!(refused(resume(None).await));
         assert_eq!(ran.load(Ordering::SeqCst), 0, "a stale resume ran");
@@ -10131,7 +10442,15 @@ mod tests {
 
         // a prepare with no token (run by hand): only a resume with none
         marks.mark_owed(None).unwrap();
+        assert_eq!(
+            reported(resume(Some("create-a")).await).as_deref(),
+            Some("none")
+        );
         assert!(refused(resume(Some("create-a")).await));
+        let host = include_str!("../../src/commands/common.rs");
+        assert!(host.contains(&format!(
+            "const OWED_TOKEN_REPORT: &str = \"{OWED_TOKEN_REPORT}\";"
+        )));
         assert!(resume(None).await.gate_open);
 
         // nothing owed: a resume opens nothing a boundary relies on, whatever it carries
