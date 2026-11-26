@@ -138,6 +138,46 @@ outcome is `NOT-ISOLATED`: no member is named and none is called tested.
 
 `bisect` never dispatches on `main`, and it never cancels a run.
 
+## A run that is stopped at its unit step
+
+A change that breaks a unit test, or whose tests do not compile, fails `test-unit` on the
+Host lanes and `container-test-unit` on the Container lanes about 20 minutes in, while the
+Host-Root lanes, which have no such step, go on for 34 to 57 minutes. The `Unit watch`
+job (`ci_pool.py unit-watch`) reads its own run's jobs once a minute and, when the unit
+step has failed on two lanes, puts a `ci/pool` failure on the head and cancels the run.
+
+- Two lanes, not one. The step is more than the suite: `make test-unit` first checks the
+  disk and builds, and `make container-test-unit` first builds an image from a registry.
+  One lane failing there may be its host. Two lanes are two hosts, and in a pull
+  request's run one of the two is always a Host lane, which builds no image.
+- Only a pull request's run from this repository, on its first attempt. Not `main`'s
+  run, which is the only one its commit gets; not a dispatch, which asked for its lanes
+  by name (a `bisect` probe must not mark a head); not a rerun, whose job list still
+  shows the steps that failed the first time on the lanes that were not run again.
+- The lanes it waits for come from the run's own plan (the `Skip Check` outputs), so a
+  job list read before the lanes are listed is not taken for a run with nothing to watch.
+- The status is written first and the run is cancelled only if it was: a cancelled run
+  reports no `Summary`, and without the status the head would say nothing.
+- It decides from job and step names and conclusions as the API gives them. It reads no
+  log, runs no code of the change (it checks out `scripts/ci-pool` of the default
+  branch), and never fails its run.
+
+Measured on the pull request runs of the week of 2026-11-19 (first attempts, a lane
+charged for two minutes after the deciding step failed): the unit step failed on two
+lanes in 20 runs, whose lanes cost $41.32, of which $11.01 came after the stop. The
+second failure came a median of 8.5 minutes after the first. Stopping at the first
+failed unit step would have stopped 28 runs and saved $25.17 of $57.84; in 2 of the 8
+runs where only one lane failed the step, the other lane passed it. None of the 28 was a
+disk, build or registry failure.
+
+After a stop, `bisect` goes on from the lanes that failed. If they failed for one test on
+two lanes, that is two hosts and no rerun is spent. Otherwise one failed lane's job is
+run again alone (`actions/jobs/<id>/rerun`: "the run's failed jobs" would run every
+cancelled lane as well, before it is known whether the failure repeats), one job per
+step, because a run takes one attempt at a time. If what failed passes, the cancelled
+lanes have still never run and nothing would start them, so the next step runs them
+(`rerun-failed-jobs` on that run), counted against the cap like any other extra run.
+
 ## What is and is not a verdict
 
 `ci/pool` on a member's head is the verdict. GitHub's own roll-up of a pull request's
