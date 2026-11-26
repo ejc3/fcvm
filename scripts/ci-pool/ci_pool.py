@@ -1192,6 +1192,208 @@ def cmd_failures(args, gh, _default_branch):
     return 0
 
 
+# ------------------------------------------------------------------------------ red pool
+
+# When the top of a pool is red, `diagnose` says what to do next from what the runs on the
+# members' heads show, and nothing else: no state is kept anywhere, so any session can
+# take the next step. Each member's head is the tree of a prefix of the pool, so a
+# failure is located by running the failing lanes on a lower member's branch.
+
+# Extra runs (reruns of the top, probes of prefixes) one red top may cost. Past it the
+# outcome is NOT_ISOLATED and every member stays untested.
+MAX_EXTRA_RUNS = 8
+
+# USD of one run of each lane: its median successful minutes in the week of 2026-11-19
+# (`cost`, 1,160 itemised runs) at the recorded spot price. Used only to choose the
+# cheapest lanes that show a failure.
+LANE_USD = {
+    'Host-arm64': 0.41, 'Host-x64': 0.81,
+    'Host-Root-arm64-SnapshotDisabled': 0.37, 'Host-Root-arm64-SnapshotEnabled': 0.56,
+    'Host-Root-x64-SnapshotDisabled': 0.76, 'Host-Root-x64-SnapshotEnabled': 1.14,
+    'Container-arm64': 0.52, 'Container-x64': 1.04,
+}
+
+WAITING, GREEN, PASSED_ON_RERUN, RERUN, PROBE, CULPRIT, NOT_ISOLATED = (
+    'waiting', 'green', 'passed-on-rerun', 'rerun', 'probe', 'culprit', 'not-isolated')
+
+# Causes that say what happened to the job, not which test failed. A test that failed the
+# same way on two hosts has been reproduced; a mirror outage or a reclaimed spot pool
+# also takes several lanes at once and has not.
+NOT_A_TEST = ('runner lost', 'step failed', 'job time limit', 'cancelled in step', NO_LOG, 'no failure in')
+
+
+def is_test_cause(cause):
+    return not cause.startswith(NOT_A_TEST) and not cause.endswith('(cause not read)')
+
+
+def merge_lane_states(per_run):
+    """One state per lane from every run on a commit. A lane that failed in one run or
+    attempt and passed in another did both: RERUN_PASS. Otherwise a failure, then a pass,
+    then an unfinished run decide, in that order."""
+    merged = {}
+    for lane in LANES:
+        seen = {states[lane] for states in per_run if lane in states}
+        if not seen:
+            continue
+        if RERUN_PASS in seen or (FAIL in seen and PASS in seen):
+            merged[lane] = RERUN_PASS
+        elif FAIL in seen:
+            merged[lane] = FAIL
+        elif PASS in seen:
+            merged[lane] = PASS
+        else:
+            merged[lane] = OPEN
+    return merged
+
+
+def probe_lanes(causes_by_lane):
+    """The cheapest lanes that between them show every failing cause. A failed lane whose
+    cause could not be read stands for itself."""
+    wanted = {}
+    for lane, causes in causes_by_lane.items():
+        for cause in causes or [f'{lane} (cause not read)']:
+            wanted.setdefault(cause, set()).add(lane)
+    chosen, uncovered = [], set(wanted)
+    while uncovered:
+        def worth(lane):
+            return LANE_USD[lane] / len([c for c in uncovered if lane in wanted[c]])
+        lane = min((l for l in LANES if any(l in wanted[c] for c in uncovered)), key=lambda l: (worth(l), LANES.index(l)))
+        chosen.append(lane)
+        uncovered -= {c for c in uncovered if lane in wanted[c]}
+    return tuple(l for l in LANES if l in chosen)
+
+
+def test_file_of(cause):
+    """The source files a failing test's name points at, or ()."""
+    parts = cause.split()
+    if len(parts) != 2:
+        return ()
+    binary, name = parts
+    if '::' in binary:                      # an integration test: fcvm::test_x name
+        return (f"tests/{binary.split('::')[-1]}.rs",)
+    module = name.split('::tests::')[0].split('::test::')[0] if '::tests' in name or '::test::' in name else None
+    if not module:
+        return ()
+    path = module.replace('::', '/')
+    return (f'src/{path}.rs', f'src/{path}/mod.rs')
+
+
+def suspects(causes, files_by_member):
+    """Members to look at first: for each failing test whose file exactly one member
+    changed, that member. This orders the probes and is never a verdict: the member that
+    wrote a test is not always the one that broke it."""
+    out = []
+    for cause in causes:
+        owners = [index for index, files in sorted(files_by_member.items()) if set(test_file_of(cause)) & set(files)]
+        if len(owners) == 1 and owners[0] not in out:
+            out.append(owners[0])
+    return out
+
+
+def diagnose(members, states_at, causes_at, tries_at, spent, required=PR_LANES, first=(), base=None, cap=MAX_EXTRA_RUNS):
+    """The next step for a pool, as {'outcome': ..., ...}.
+
+    members: [{'number', 'head', 'sha'}] bottom to top. states_at: {sha: {lane: state}},
+    every run on that commit merged. causes_at: {sha: {lane: [cause]}} for failed lanes.
+    tries_at: {sha: {lane: finished attempts}}. spent: extra runs already made for this
+    top. required: the lanes the top's own run takes. first: member indexes to probe
+    around first. base: {lane: state} of the default branch's own run, when known."""
+    top = members[-1]
+    at_top = states_at.get(top['sha'], {})
+    if not at_top:
+        return {'outcome': WAITING, 'why': f"no run of the lanes on #{top['number']} at {top['sha'][:9]} yet"}
+    if OPEN in at_top.values():
+        return {'outcome': WAITING, 'why': 'the run on the top has not finished'}
+    failed = [lane for lane in LANES if at_top.get(lane) == FAIL]
+    if not failed:
+        missing = [lane for lane in required if lane not in at_top]
+        if missing:
+            return {'outcome': WAITING, 'why': f"the top's run has not run {', '.join(missing)}"}
+        again = [lane for lane in LANES if at_top.get(lane) == RERUN_PASS]
+        if again:
+            return {'outcome': PASSED_ON_RERUN, 'lanes': again,
+                    'causes': sorted({c for lane in again for c in causes_at.get(top['sha'], {}).get(lane, [])})}
+        return {'outcome': GREEN}
+    causes_by_lane = {lane: list(causes_at.get(top['sha'], {}).get(lane, [])) for lane in failed}
+    all_causes = sorted({c for causes in causes_by_lane.values() for c in causes})
+
+    def spend(action):
+        if spent >= cap:
+            return {'outcome': NOT_ISOLATED, 'lanes': failed, 'causes': all_causes,
+                    'why': f'{spent} extra runs spent, the cap is {cap}'}
+        return action
+
+    # One rerun of the failed lanes, unless the same test already failed on two lanes:
+    # those were two hosts, so it has been reproduced.
+    reproduced = {c for c in all_causes if is_test_cause(c) and sum(c in causes for causes in causes_by_lane.values()) >= 2}
+    once = [lane for lane in failed if tries_at.get(top['sha'], {}).get(lane, 1) < 2
+            and not (causes_by_lane[lane] and set(causes_by_lane[lane]) <= reproduced)]
+    if once:
+        return spend({'outcome': RERUN, 'lanes': once, 'causes': all_causes})
+
+    lanes = probe_lanes(causes_by_lane)
+    probed = {c for lane in lanes for c in causes_by_lane[lane]}
+
+    def prefix(index):
+        states = {lane: states_at.get(members[index]['sha'], {}).get(lane) for lane in lanes}
+        if FAIL in states.values():
+            seen = {c for lane in lanes if states[lane] == FAIL for c in causes_at.get(members[index]['sha'], {}).get(lane, [])}
+            return FAIL if (seen & probed or not seen or not probed) else 'other'
+        if OPEN in states.values():
+            return OPEN
+        if RERUN_PASS in states.values():
+            return RERUN_PASS
+        return PASS if all(state == PASS for state in states.values()) else None
+
+    found = {index: prefix(index) for index in range(len(members))}
+    name = lambda index: f"#{members[index]['number']}"  # noqa: E731
+    unsteady = [i for i, state in found.items() if state == RERUN_PASS]
+    if unsteady:
+        return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
+                'why': f"the failing lanes both failed and passed on the prefix ending at {name(unsteady[0])}: "
+                       'the failure does not reproduce the same way'}
+    other = [i for i, state in found.items() if state == 'other']
+    if other:
+        return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
+                'why': f'the prefix ending at {name(other[0])} fails these lanes for another cause'}
+    fails = [i for i, state in found.items() if state == FAIL]
+    passes = [i for i, state in found.items() if state == PASS]
+    hi, lo = min(fails), max([i for i in passes], default=-1)
+    if passes and lo > hi:
+        return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
+                'why': f'the prefix ending at {name(hi)} fails and the longer one ending at {name(lo)} passes'}
+    if hi - lo == 1:
+        result = {'outcome': CULPRIT, 'member': hi, 'lanes': lanes, 'causes': all_causes, 'passing': lo}
+        if lo >= 0:
+            result['text'] = (f"first failing prefix: the failure appears when {name(hi)} is added to the pool. "
+                              f"The prefix ending at {name(lo)} passes {', '.join(lanes)}.")
+        elif base and all(base.get(lane) == PASS for lane in lanes):
+            result['text'] = (f"first failing prefix: the failure appears with {name(hi)}, the bottom of the pool. "
+                              f"The default branch passes {', '.join(lanes)}.")
+        elif base and any(base.get(lane) == FAIL for lane in lanes):
+            return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
+                    'why': 'the default branch fails these lanes too: the failure is not shown to be the pool\'s'}
+        else:
+            result['text'] = (f"first failing prefix: {name(hi)}, the bottom of the pool. Nothing shows these lanes "
+                              'passing on the default branch, so the failure may have been there before the pool.')
+        return result
+    unknown = [i for i in range(lo + 1, hi) if found[i] is None]
+    if any(found[i] == OPEN for i in range(lo + 1, hi)):
+        return {'outcome': WAITING, 'why': 'a run of the failing lanes on a lower member has not finished'}
+    target = None
+    for suspect in first:
+        if lo < suspect - 1 < hi and found[suspect - 1] is None:
+            target = suspect - 1
+        elif lo < suspect < hi and found[suspect] is None:
+            target = suspect
+        if target is not None:
+            break
+    if target is None:
+        target = unknown[(len(unknown) - 1) // 2]
+    return spend({'outcome': PROBE, 'member': target, 'lanes': lanes, 'causes': all_causes,
+                  'between': (lo, hi)})
+
+
 # ---------------------------------------------------------------------------------- main
 
 def main(argv=None):

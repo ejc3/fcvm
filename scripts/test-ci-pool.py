@@ -1161,6 +1161,256 @@ class Wiring(unittest.TestCase):
         self.assertFalse(ci_pool.lane_defining('tests/test_sanity.rs'))
 
 
+BOUNDARY = 'fcvm commands::common::tests::a_boundarys_token_is_on_the_state_from_its_prepare_until_its_gate_is_open'
+SIX = ('Host-arm64', 'Host-x64', 'Host-Root-arm64-SnapshotDisabled', 'Host-Root-arm64-SnapshotEnabled',
+       'Host-Root-x64-SnapshotEnabled', 'Container-arm64')
+
+
+class RedPool(unittest.TestCase):
+    """What `diagnose` says for a pool, from the states of the runs on its members' heads."""
+
+    def pool(self, size):
+        return [{'number': 100 + n, 'head': f'm{n}', 'sha': f'{n:040x}'} for n in range(size)]
+
+    def diagnose(self, members, states=None, causes=None, tries=None, spent=0, **kw):
+        at = lambda table: {members[i]['sha']: value for i, value in (table or {}).items()}
+        return ci_pool.diagnose(members, at(states), at(causes), at(tries), spent, **kw)
+
+    def all(self, state, lanes=ci_pool.PR_LANES):
+        return {lane: state for lane in lanes}
+
+    # ---- the live case of 2026-11-25: a pool of nine, a failure that needs two members
+
+    def live(self, more=None):
+        members = [{'number': n, 'head': h, 'sha': f'{i:040x}'} for i, (n, h) in enumerate((
+            (2062, 'confine-2-seccomp'), (2133, 'wake-model'), (2167, 'restore-no-view-listing'),
+            (2161, 'ami-boots-checkout-kernel'), (2175, 'runner-arm64-nic-order'), (2170, 'renders-host-rate'),
+            (2171, 'renders-host-image'), (2166, 'boundary-token'), (2077, 'state-store-buckets')))]
+        states = {6: self.all('pass', SIX), 8: self.all('fail', SIX)}
+        states.update(more or {})
+        causes = {8: {lane: [BOUNDARY] for lane in SIX}}
+        # boundary-token (index 7) wrote the failing test; state-store-buckets (8) moved the state.
+        files = {7: ['src/commands/common.rs', 'src/boundary.rs'], 8: ['src/state/manager.rs', 'src/paths.rs']}
+        first = ci_pool.suspects([BOUNDARY], files)
+        return members, self.diagnose(members, states, causes, required=SIX, first=first), first
+
+    def test_live_a_test_that_failed_on_six_hosts_is_not_run_again(self):
+        _, step, _ = self.live()
+        self.assertNotEqual(step['outcome'], 'rerun')
+
+    def test_live_the_one_unknown_prefix_is_probed_on_the_cheapest_lane_that_shows_it(self):
+        members, step, first = self.live()
+        self.assertEqual(first, [7], 'the member that wrote the failing test is where to look first')
+        self.assertEqual((step['outcome'], members[step['member']]['number']), ('probe', 2166))
+        self.assertEqual(step['lanes'], ('Host-Root-arm64-SnapshotDisabled',))
+        self.assertEqual(step['between'], (6, 8))
+
+    def test_live_the_verdict_names_the_prefix_and_not_the_member_alone(self):
+        members, step, first = self.live({7: {'Host-Root-arm64-SnapshotDisabled': 'pass'}})
+        self.assertEqual((step['outcome'], members[step['member']]['number']), ('culprit', 2077))
+        self.assertIn('the failure appears when #2077 is added to the pool', step['text'])
+        self.assertIn('The prefix ending at #2166 passes', step['text'])
+        self.assertNotRegex(step['text'], r'alone|by itself|on its own')
+        # The suspect was #2166, which is not the first failing prefix: a suspect orders
+        # the probes and is never the verdict.
+        self.assertNotEqual(first, [step['member']])
+
+    def test_live_had_the_probe_failed_the_member_that_wrote_the_test_is_the_first_failing_prefix(self):
+        members, step, _ = self.live({7: {'Host-Root-arm64-SnapshotDisabled': 'fail'}})
+        self.assertEqual((step['outcome'], members[step['member']]['number']), ('culprit', 2166))
+
+    # ---- green and waiting
+
+    def test_nothing_is_concluded_before_the_tops_run_has_finished(self):
+        members = self.pool(3)
+        self.assertEqual(self.diagnose(members)['outcome'], 'waiting')
+        self.assertEqual(self.diagnose(members, {2: dict(self.all('pass'), **{'Host-arm64': 'open'})})['outcome'], 'waiting')
+        self.assertEqual(self.diagnose(members, {2: dict(self.all('fail'), **{'Host-arm64': 'open'})})['outcome'], 'waiting')
+
+    def test_green_needs_every_lane_the_tops_run_takes(self):
+        members = self.pool(3)
+        self.assertEqual(self.diagnose(members, {2: self.all('pass')})['outcome'], 'green')
+        partial = {lane: 'pass' for lane in ci_pool.PR_LANES[:-1]}
+        step = self.diagnose(members, {2: partial})
+        self.assertEqual(step['outcome'], 'waiting')
+        self.assertIn(ci_pool.PR_LANES[-1], step['why'])
+        # A lower member's green run says nothing about the top.
+        self.assertEqual(self.diagnose(members, {1: self.all('pass')})['outcome'], 'waiting')
+        self.assertEqual(self.diagnose(members, {2: {}}, required=())['outcome'], 'waiting')
+
+    def test_a_lane_that_failed_and_then_passed_is_not_simply_green(self):
+        members = self.pool(3)
+        states = dict(self.all('pass'), **{'Host-arm64': 'pass-on-rerun'})
+        step = self.diagnose(members, {2: states}, {2: {'Host-arm64': ['fcvm::test_x sometimes']}})
+        self.assertEqual((step['outcome'], step['lanes'], step['causes']), ('passed-on-rerun', ['Host-arm64'], ['fcvm::test_x sometimes']))
+
+    # ---- the rerun
+
+    def test_a_failure_seen_once_is_run_again_once(self):
+        members = self.pool(4)
+        states = dict(self.all('pass'), **{'Host-arm64': 'fail'})
+        causes = {3: {'Host-arm64': ['fcvm::test_x fails']}}
+        step = self.diagnose(members, {3: states}, causes, {3: {'Host-arm64': 1}})
+        self.assertEqual((step['outcome'], step['lanes']), ('rerun', ['Host-arm64']))
+        again = self.diagnose(members, {3: states}, causes, {3: {'Host-arm64': 2}}, spent=1)
+        self.assertEqual(again['outcome'], 'probe')
+
+    def test_a_cause_that_is_not_a_test_is_run_again_even_when_it_took_several_lanes(self):
+        # A mirror outage or a reclaimed spot pool takes several lanes at once.
+        members = self.pool(4)
+        for cause in ('runner lost: shutdown signal', 'runner lost: no contact', 'log not available',
+                      'step failed without a failed test: ./fcvm/scripts/ci-apt-get.sh update',
+                      'job time limit, in step: make test-root', 'no failure in the last 3 MB of the log'):
+            states = dict(self.all('pass'), **{'Host-arm64': 'fail', 'Container-arm64': 'fail'})
+            causes = {3: {'Host-arm64': [cause], 'Container-arm64': [cause]}}
+            step = self.diagnose(members, {3: states}, causes, {3: {'Host-arm64': 1, 'Container-arm64': 1}})
+            self.assertEqual(step['outcome'], 'rerun', cause)
+        unread = self.diagnose(members, {3: dict(self.all('pass'), **{'Host-arm64': 'fail', 'Container-arm64': 'fail'})})
+        self.assertEqual(unread['outcome'], 'rerun', 'failed lanes whose cause was not read were not run again')
+
+    def test_only_the_lanes_not_yet_reproduced_are_run_again(self):
+        members = self.pool(4)
+        states = dict(self.all('pass'), **{'Host-arm64': 'fail', 'Container-arm64': 'fail', 'Host-Root-arm64-SnapshotEnabled': 'fail'})
+        causes = {3: {'Host-arm64': ['fcvm::test_x fails'], 'Container-arm64': ['fcvm::test_x fails'],
+                      'Host-Root-arm64-SnapshotEnabled': ['fcvm::test_y fails_here_only']}}
+        step = self.diagnose(members, {3: states}, causes)
+        self.assertEqual((step['outcome'], step['lanes']), ('rerun', ['Host-Root-arm64-SnapshotEnabled']))
+
+    # ---- the bisect
+
+    def red(self, size, culprit, probes=(), cause='fcvm::test_x fails', lane='Host-arm64'):
+        """A pool whose top fails `lane` twice, and what the probes so far showed."""
+        members = self.pool(size)
+        states = {size - 1: dict(self.all('pass'), **{lane: 'fail'})}
+        causes = {size - 1: {lane: [cause]}}
+        for index in probes:
+            states[index] = {lane: 'fail' if index >= culprit else 'pass'}
+            if index >= culprit:
+                causes[index] = {lane: [cause]}
+        return members, states, causes, {size - 1: {lane: 2}}
+
+    def bisect(self, size, culprit, **kw):
+        probes, steps = [], []
+        for _ in range(size + 2):
+            members, states, causes, tries = self.red(size, culprit, probes)
+            step = self.diagnose(members, states, causes, tries, spent=1 + len(probes), **kw)
+            steps.append(step)
+            if step['outcome'] != 'probe':
+                return step, probes
+            self.assertNotIn(step['member'], probes, 'a prefix was probed twice')
+            probes.append(step['member'])
+        self.fail(f'no verdict after {steps}')
+
+    def test_every_culprit_position_is_found_in_about_log2_runs(self):
+        for size in (2, 3, 5, 8, 12, 16):
+            bound = (size - 1).bit_length()
+            for culprit in range(size):
+                step, probes = self.bisect(size, culprit, cap=99)
+                self.assertEqual((step['outcome'], step['member']), ('culprit', culprit), (size, culprit, probes))
+                self.assertLessEqual(len(probes), bound, (size, culprit, probes))
+
+    def test_a_suspect_is_settled_first_and_a_wrong_one_costs_at_most_two_runs(self):
+        step, probes = self.bisect(16, 11, first=[11], cap=99)
+        self.assertEqual((step['member'], probes), (11, [10, 11]))
+        step, probes = self.bisect(16, 3, first=[11], cap=99)
+        self.assertEqual(step['member'], 3)
+        self.assertLessEqual(len(probes), 2 + 4)
+
+    def test_the_bottom_is_named_with_what_is_known_about_the_default_branch(self):
+        members, states, causes, tries = self.red(3, 0, probes=(0, 1))
+        unknown = self.diagnose(members, states, causes, tries, spent=3)
+        self.assertEqual((unknown['outcome'], unknown['member']), ('culprit', 0))
+        self.assertIn('may have been there before the pool', unknown['text'])
+        passing = self.diagnose(members, states, causes, tries, spent=3, base={'Host-arm64': 'pass'})
+        self.assertIn('The default branch passes Host-arm64', passing['text'])
+        failing = self.diagnose(members, states, causes, tries, spent=3, base={'Host-arm64': 'fail'})
+        self.assertEqual(failing['outcome'], 'not-isolated')
+        self.assertIn('the default branch fails these lanes too', failing['why'])
+
+    def test_a_probe_in_flight_is_waited_for_and_not_dispatched_again(self):
+        members, states, causes, tries = self.red(8, 5)
+        states[3] = {'Host-arm64': 'open'}
+        self.assertEqual(self.diagnose(members, states, causes, tries, spent=2)['outcome'], 'waiting')
+
+    def test_two_causes_are_probed_with_the_cheapest_lanes_that_cover_both(self):
+        self.assertEqual(ci_pool.probe_lanes({'Host-Root-x64-SnapshotEnabled': ['t a'], 'Host-arm64': ['t a'],
+                                              'Container-arm64': ['t b'], 'Container-x64': ['t b']}),
+                         ('Host-arm64', 'Container-arm64'))
+        self.assertEqual(ci_pool.probe_lanes({'Host-arm64': ['t a', 't b'], 'Host-Root-arm64-SnapshotDisabled': ['t a']}),
+                         ('Host-arm64',))
+        self.assertEqual(ci_pool.probe_lanes({'Host-x64': [], 'Host-arm64': ['t a']}), ('Host-arm64', 'Host-x64'))
+
+    # ---- what cannot be isolated
+
+    def test_the_cap_ends_it_with_every_member_untested(self):
+        members, states, causes, tries = self.red(16, 9)
+        step = self.diagnose(members, states, causes, tries, spent=ci_pool.MAX_EXTRA_RUNS)
+        self.assertEqual(step['outcome'], 'not-isolated')
+        self.assertIn('the cap is 8', step['why'])
+        once = self.diagnose(members, states, causes, {15: {'Host-arm64': 1}}, spent=ci_pool.MAX_EXTRA_RUNS)
+        self.assertEqual(once['outcome'], 'not-isolated', 'a rerun was asked for past the cap')
+        # A verdict the runs already show is still given past the cap: it costs nothing.
+        members, states, causes, tries = self.red(4, 2, probes=(1, 2))
+        self.assertEqual(self.diagnose(members, states, causes, tries, spent=50)['outcome'], 'culprit')
+
+    def test_the_worst_case_fits_under_the_cap(self):
+        # One rerun and a bisect of the largest pool the size table covers.
+        self.assertLessEqual(1 + (16 - 1).bit_length(), ci_pool.MAX_EXTRA_RUNS)
+
+    def test_a_longer_prefix_that_passes_above_one_that_fails_is_not_resolved_by_guessing(self):
+        members, states, causes, tries = self.red(8, 5)
+        states[2], causes[2] = {'Host-arm64': 'fail'}, {'Host-arm64': ['fcvm::test_x fails']}
+        states[4] = {'Host-arm64': 'pass'}
+        step = self.diagnose(members, states, causes, tries, spent=3)
+        self.assertEqual(step['outcome'], 'not-isolated')
+        self.assertIn('#102 fails and the longer one ending at #104 passes', step['why'])
+
+    def test_a_prefix_that_both_failed_and_passed_ends_it(self):
+        members, states, causes, tries = self.red(8, 5)
+        states[3] = {'Host-arm64': 'pass-on-rerun'}
+        step = self.diagnose(members, states, causes, tries, spent=3)
+        self.assertEqual(step['outcome'], 'not-isolated')
+        self.assertIn('does not reproduce the same way', step['why'])
+
+    def test_a_prefix_that_fails_for_another_cause_is_not_counted_as_the_failure(self):
+        members, states, causes, tries = self.red(8, 5)
+        states[3], causes[3] = {'Host-arm64': 'fail'}, {'Host-arm64': ['runner lost: shutdown signal']}
+        step = self.diagnose(members, states, causes, tries, spent=3)
+        self.assertEqual(step['outcome'], 'not-isolated')
+        self.assertIn('#103 fails these lanes for another cause', step['why'])
+
+    def test_no_outcome_marks_a_member_green_but_green(self):
+        # Every path out of a red top leaves the other members untested: only GREEN and
+        # PASSED_ON_RERUN speak for the pool, and both need the top's own lanes.
+        self.assertEqual({ci_pool.GREEN, ci_pool.PASSED_ON_RERUN, ci_pool.WAITING, ci_pool.RERUN, ci_pool.PROBE,
+                          ci_pool.CULPRIT, ci_pool.NOT_ISOLATED},
+                         {'green', 'passed-on-rerun', 'waiting', 'rerun', 'probe', 'culprit', 'not-isolated'})
+
+    # ---- helpers
+
+    def test_states_of_several_runs_on_one_commit_merge(self):
+        merge = ci_pool.merge_lane_states
+        self.assertEqual(merge([{'Host-arm64': 'fail'}, {'Host-arm64': 'pass'}]), {'Host-arm64': 'pass-on-rerun'})
+        self.assertEqual(merge([{'Host-arm64': 'pass'}, {'Host-arm64': 'fail'}]), {'Host-arm64': 'pass-on-rerun'})
+        self.assertEqual(merge([{'Host-arm64': 'fail'}, {'Host-arm64': 'open'}]), {'Host-arm64': 'fail'})
+        self.assertEqual(merge([{'Host-arm64': 'pass'}, {'Host-arm64': 'open'}, {}]), {'Host-arm64': 'pass'})
+        self.assertEqual(merge([{'Host-arm64': 'open'}]), {'Host-arm64': 'open'})
+        self.assertEqual(merge([{'Host-arm64': 'pass'}, {'Host-x64': 'fail'}]), {'Host-arm64': 'pass', 'Host-x64': 'fail'})
+        self.assertEqual(merge([]), {})
+
+    def test_a_failing_tests_name_points_at_its_file(self):
+        self.assertEqual(ci_pool.test_file_of(BOUNDARY), ('src/commands/common.rs', 'src/commands/common/mod.rs'))
+        self.assertEqual(ci_pool.test_file_of('fcvm::test_netpool clones_run_in_recycled_namespaces'), ('tests/test_netpool.rs',))
+        for cause in ('runner lost: no contact', 'does not compile: fcvm (test "test_fleet_coord")', 'log not available'):
+            self.assertEqual(ci_pool.test_file_of(cause), (), cause)
+
+    def test_a_suspect_is_the_only_member_that_changed_the_tests_file(self):
+        files = {2: ['src/commands/common.rs'], 5: ['src/state/manager.rs']}
+        self.assertEqual(ci_pool.suspects([BOUNDARY], files), [2])
+        self.assertEqual(ci_pool.suspects([BOUNDARY], {2: files[2], 5: ['src/commands/common.rs']}), [])
+        self.assertEqual(ci_pool.suspects(['runner lost: no contact', 'fcvm::test_x y'], files), [])
+
+
 class Lanes(unittest.TestCase):
     def test_the_planned_matrix_expands_to_the_lanes_names(self):
         # The names the Actions API reports are the job name templates of ci.yml filled in
