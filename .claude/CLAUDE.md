@@ -2673,13 +2673,39 @@ and oomd killed a session scope holding 138 GB, VM included (#1028).
 2. **A harness that places fcvm in a cgroup of its own sets `FCVM_CGROUP_PARENT=none`**,
    or a root fcvm moves out of it (`bench/chromium/guardexec.py`, `corpus_mem.py`,
    `bench.sh`). `--no-swap` is refused there, and for an unprivileged fcvm.
-3. **Scope identity is (pid, start time)**, and sweep and creation run under an `flock`
-   on the parent. Never remove a scope by pid alone. The name is the scope's owner record
+3. **Scope identity is (pid, start time)**. A start holds the parent's `flock` shared
+   while it makes and enters its scope, and the sweep, which a start runs at most once per
+   5 s and parent (`src/sweep.rs`), removes only under that lock held exclusively. Never
+   remove a scope by pid alone. The name is the scope's owner record
    and the sweep is its reclaim: a `reclaim::Resource` record is per data_dir and per
    user, and a cgroup is per kernel.
 
 `test_each_vm_and_memory_server_has_its_own_cgroup` (`tests/test_vm_cgroup.rs`) pins the
 placement, the charge, `--no-swap` and removal.
+
+### A SWEEP RUNS ONCE AN INTERVAL, AND THERE IS ONE GATE FOR ALL OF THEM
+
+Removing what killed fcvm processes left means visiting every entry of a table: the VM
+states, the owner records, a cgroup parent's scopes, the routed address leases. Each of the
+four once ran in every start under a lock the other starts needed, and each bound the start
+rate (#2077, #2126, #2178, #2202). `src/sweep.rs` is the one mechanism they share.
+
+1. **A start sweeps only when it has the turn** (`sweep::turn_if_due`): no sweep began
+   within the interval, in this boot, and no other process is sweeping. A start without
+   the turn reads one stamp by name. The stamp is `<boot id> <CLOCK_BOOTTIME ns>`, so one
+   kept on a disk never holds off the first sweep of the next boot.
+2. **A table whose entries are made in two steps is held shared by starts and exclusively
+   by the sweep** (`sweep::table`, `sweep::sweep_table`). The sweep asks for the lock only
+   when it found something and waits at most 100 ms; what it found then waits for the
+   next sweep.
+3. **A new sweep is a `Sweep` constant in `sweep.rs`, listed in `sweep::ALL`, with a caller
+   that runs the matrix** (`sweep::testing::caller_matrix!`, and `table_matrix!` for a
+   table). Never write another stamp or another sweep lock by hand:
+   `every_sweep_defined_here_is_listed` fails a sweep that is defined elsewhere or has no
+   matrix caller.
+4. **`FCVM_SWEEP_EVERY_MS` names sweeps** (`state=`, `reclaim=`, `cgroup-scopes=`,
+   `routed-leases=`, and `*` for the rest). A test that must not meet a sweep holds off the
+   ones it knows by name and sets `*=0`, so a sweep added later runs in every start there.
 
 ### Container Build Rules
 
@@ -2877,8 +2903,8 @@ On serve process exit (SIGTERM/SIGINT):
 2. **A periodic sweep, not one per start.** The fast path of a start reads no other VM's
    state, so its cost does not grow with the number of VMs (with every state read on every
    start, a start waited 25 s on the name lock with 800 VMs up, bench/start-rate). Once a
-   minute per state directory (`maybe_sweep`: `sweep.stamp` missing or expired, and
-   `sweep.lock` won), one launch runs `cleanup_stale_state()` after its claim; that launch
+   minute per state directory (`maybe_sweep`: the turn of `sweep::STATE`, behind
+   `sweep.stamp` and `sweep.lock`), one launch runs `cleanup_stale_state()` after its claim; that launch
    pays for the scan, and no other start waits for it. The sweep removes the states of dead
    or replaced processes, and the PID entries, name tokens and claim directories that
    outlive them. Until it runs a stale state holds nothing: its owner is not live.

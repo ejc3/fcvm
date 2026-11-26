@@ -566,6 +566,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so every write goes to the host as it is made and the guest takes a file's size and mtime from the host even while a guest process has it open for writing. Read-only maps never use that cache, and a run with no read-write map is the same run with or without it |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
+| `FCVM_SWEEP_EVERY_MS` | unset | How often a start sweeps for what killed fcvm processes left, as `name=milliseconds` pairs separated by commas. The sweeps are `state` (VM states, 60 s), `reclaim` (owner records, 1 s), `cgroup-scopes` (per-VM cgroups, 5 s) and `routed-leases` (routed IPv6 address leases, 5 s); `*` names every sweep not named. `0` makes every start sweep, which costs each start a pass over every VM running |
 | `FCVM_CGROUP_PARENT` | `fcvm.slice` | Parent, below the cgroup2 root, of the cgroup each VM and memory server runs in; `none` keeps fcvm in the cgroup it was started in. See [A VM's own cgroup](#a-vms-own-cgroup) |
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
 | `FCVM_FIRECRACKER_LOG_LEVEL` | `Info` | Level of Firecracker's own per-VM `firecracker.log`: `Error`, `Warning`, `Info` or `Debug`. `Debug` adds one line per vsock packet, which is gigabytes an hour under FUSE-over-vsock volumes. Teardown copies the log's last 16 MiB to `/tmp/fcvm-firecracker-<vm_id>.log` |
@@ -691,8 +692,9 @@ memory does not take the VM with it. `FCVM_CGROUP_PARENT` moves the scopes under
 parent (for instance a slice your oomd watches), or `none` keeps fcvm where it was started;
 to run a VM in a systemd unit instead, start fcvm in one with
 `systemd-run --scope [-p MemorySwapMax=0] env FCVM_CGROUP_PARENT=none fcvm ...`.
-fcvm removes its scope when it exits; a scope whose fcvm was killed is removed by the next
-fcvm that starts. An unprivileged fcvm stays in its own cgroup.
+fcvm removes its scope when it exits; a scope whose fcvm was killed is removed by the first
+fcvm that starts under that parent 5 s or more after the last sweep of it began. An
+unprivileged fcvm stays in its own cgroup.
 
 `--no-swap` (on all four commands) sets `memory.swap.max` to 0 on that cgroup before the
 VMM starts. It needs the cgroup, so fcvm refuses the flag when it cannot create one with a
