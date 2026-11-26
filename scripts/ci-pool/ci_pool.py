@@ -1002,13 +1002,16 @@ def list_runs(gh, since, until):
     return list(runs.values())
 
 
+JOB_CACHE_VERSION = 'v2'
 JOB_JQ = ('.jobs[] | {id, name, conclusion, created_at, started_at, completed_at, labels, run_attempt, runner_name}')
 
 
 def jobs_of(gh, run, cache):
     """A completed run's jobs, every attempt. Cached by run and attempt: a completed
     attempt does not change."""
-    path = cache / f"{run['id']}-{run['run_attempt']}.json"
+    # The file name carries the version of what is kept per job: a list cached before a
+    # field was added is read again, not taken as having no value for it.
+    path = cache / f"{run['id']}-{run['run_attempt']}-{JOB_CACHE_VERSION}.json"
     if path.exists():
         return json.loads(path.read_text())
     jobs = gh.call(f"repos/{gh.repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100", JOB_JQ, paginate=True)
