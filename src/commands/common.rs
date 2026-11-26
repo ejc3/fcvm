@@ -2831,8 +2831,8 @@ pub struct SnapshotRestoreConfig {
 /// first ("An error occurred during bitcode serialization: <cause>"), which is what
 /// v1.17.0 reports for a format 11 snapshot.
 const FIRECRACKER_UNREADABLE_SNAPSHOT: [&str; 2] = [
-    "Invalid data version",
-    "An error occurred during bitcode serialization",
+    crate::firecracker::error_text::INVALID_DATA_VERSION,
+    crate::firecracker::error_text::STATE_DOES_NOT_DECODE,
 ];
 
 /// Why a Firecracker restore runs on the binary it runs on.
@@ -12356,6 +12356,42 @@ mod tests {
             config.metadata.firecracker_bin,
             Some(PathBuf::from("/fc/firecracker-default-abc.bin"))
         );
+    }
+
+    /// What the Firecracker pinned from upstream main says for a snapshot of another layout:
+    /// one an earlier build wrote (no layout mark) and one a build of the chain with another
+    /// layout number wrote. Both are refused before anything is decoded, and both get the
+    /// re-create hint when the binary is not the one the snapshot recorded.
+    #[test]
+    fn a_snapshot_of_another_layout_gets_the_recreate_hint() {
+        let bin = Path::new("/fc/firecracker-default-new.bin");
+        for refusal in [
+            "Invalid data version: the snapshot has no layout mark, so another Firecracker \
+             build wrote it",
+            "Invalid data version: the snapshot's state has layout 2 and this build reads \
+             layout 1",
+        ] {
+            let error = anyhow::anyhow!(
+                "Firecracker API error: 400 Bad Request - {{\"fault_message\":\"Load snapshot \
+                 error: Failed to restore from snapshot: Failed to get snapshot state from \
+                 file: Failed to load snapshot state from file: {refusal}\"}}"
+            )
+            .context("loading snapshot");
+            for choice in [
+                FirecrackerChoice::NotRecorded,
+                FirecrackerChoice::RecordedMissing(PathBuf::from("/fc/older.bin")),
+            ] {
+                let hint = choice
+                    .load_failure_hint(&error, bin)
+                    .unwrap_or_else(|| panic!("no hint for {refusal:?} under {choice:?}"));
+                assert!(hint.contains("re-create the snapshot"), "{hint}");
+                assert!(hint.contains("--firecracker-bin"), "{hint}");
+            }
+            assert_eq!(
+                FirecrackerChoice::Recorded.load_failure_hint(&error, bin),
+                None
+            );
+        }
     }
 
     #[test]

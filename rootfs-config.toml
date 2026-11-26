@@ -81,41 +81,65 @@ archives = [
 ]
 
 # Default Firecracker binary, for every kernel profile that does not set its
-# own firecracker_repo (all of them except nested.arm64).
-# Build from the fork's patch chain rebased onto upstream v1.17.0 (95f868c8e,
-# 2026-09-04): vsock muxer capacity + the bounded UFFD-minor memory backend,
-# and a Full snapshot written to a new memory file leaves all-zero 4 KiB pages
-# as holes, and with dirty tracking on a diff holds the pages a discard emptied
-# (balloon, free page reporting) as zeros. nested.arm64 builds its own NV2
-# fork, which has neither change; its Full snapshot leaves only never-written
-# guest memory as holes. This build's snapshot load takes drive_overrides, so a clone opens its
-# own disks and needs no mount namespace; its --version says so (+fcvm.drive-overrides).
-# It also takes --numa-balancing-after-secs, which keeps new guest memory out of NUMA
-# balancing for that long (+fcvm.drive-overrides.numa-window; fcvm passes 60). Guest memory
-# that maps a memfd (a clone of a --uffd-mode minor serve) is left as it is.
-# fcvm builds it for the gnu target, which has no seccomp policy of its own, so the
-# default policy is upstream's unimplemented.json: every syscall of the native
-# architecture allowed, the same program for the API, vCPU and VMM threads. This build
-# installs that program once per process and its threads inherit it, where each thread
-# installed a copy (one kernel BPF program per thread to compile and to free).
-# A net device takes host_dev_fd, a TAP queue the process inherited, which is how a clone
-# in a pooled namespace gets its TAP (`tap-fd` in the same build metadata).
-# On x86_64 a snapshot load ends with a paravirtual kick for every vCPU the snapshot holds
-# as runnable, in a guest that was offered KVM_FEATURE_PV_UNHALT: KVM keeps a spinlock kick
-# that is pending for a runnable vCPU in a flag no ioctl reads, so the snapshot does not
-# hold it, and without the kick a vCPU restored just before the HLT of its lock wait halts
-# with interrupts off for good (#2131). KVM from 6.15 on clears the kick again on the
-# vCPU's first entry (#2132) unless it carries the patch that keeps it
-# (kernel/README.md): every x86_64 kernel below that builds KVM does, the host kernel and
-# the guest kernels that run KVM themselves, and no distribution kernel does. The
-# gpu, phone and nested amd64 profiles pin the same fix on their own branches, and
-# every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore fails when one of these
-# pins moves to a commit that is not listed as carrying it.
-# v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
-# build cannot restore format 12. A restore uses the binary the snapshot
-# recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
-# snapshot that records none is loaded with this build, so a format 11 one
-# fails to load, and the error says to re-create it or pass --firecracker-bin.
+# own firecracker_repo.
+# Built from the fork's patch chain on upstream Firecracker's main branch
+# (2a8d0138c, 2026-11-25, 1.19.0-dev). The branch is named for its upstream base
+# and only grows; a later base gets a new branch. What the chain adds to upstream:
+# - vsock: 16384 connections and a 2048-entry kill queue, for the egress proxy;
+# - the UffdMinor memory backend: clones map one sealed file of the snapshot's
+#   memory and share its clean pages (--uffd-mode minor);
+# - a Full snapshot written to a new memory file leaves all-zero 4 KiB pages and
+#   never-mapped guest memory as holes, and with dirty tracking a snapshot holds
+#   the pages a discard emptied (balloon, free page reporting) as zeros;
+# - --numa-balancing-after-secs, which keeps new guest memory out of NUMA
+#   balancing for that long (fcvm passes 60). Guest memory that maps a memfd (a
+#   clone of a --uffd-mode minor serve) is left as it is;
+# - mem_backend.write_set_path: a File-backend load populates the recorded write
+#   set before the guest runs;
+# - host_dev_fd: a net device takes a TAP queue the process inherited, which is
+#   how a clone in a pooled namespace gets its TAP;
+# - drive backing files opened with POSIX_FADV_RANDOM;
+# - a Diff snapshot of a VM that maps its memory file privately without dirty
+#   tracking (a File or UFFD minor restore) takes the pages the guest wrote from
+#   /proc/self/pagemap, where upstream takes every page of the file that is in
+#   the page cache (mincore);
+# - a balloon inflate on 2 MiB pages zeroes a huge page it covers only in part
+#   when that allocates nothing, and leaves it otherwise: upstream zeroes it
+#   always, which on a clone served from a shared memfd copied a huge page for
+#   every 4 KiB of balloon (850 MiB for a 1536 MiB inflate of a 2 GiB guest);
+# - on arm64 a restore gives the GIC the enable and active state the snapshot
+#   holds: the saved value used to be written to the clear-registers as well,
+#   which left every interrupt the new VM starts with enabled (all sixteen SGIs)
+#   enabled whatever the guest had done (#2172, firecracker#6486);
+# - the default seccomp policy installed once per process. fcvm builds for the
+#   gnu target, which has no policy of its own, so that policy is upstream's
+#   unimplemented.json: every syscall of the native architecture allowed;
+# - on x86_64 a snapshot load ends with a paravirtual kick for every vCPU the
+#   snapshot holds as runnable, in a guest that was offered KVM_FEATURE_PV_UNHALT:
+#   KVM keeps a spinlock kick that is pending for a runnable vCPU in a flag no
+#   ioctl reads, so the snapshot does not hold it, and without the kick a vCPU
+#   restored just before the HLT of its lock wait halts with interrupts off for
+#   good (#2131). KVM from 6.15 on clears the kick again on the vCPU's first
+#   entry (#2132) unless it carries the patch that keeps it (kernel/README.md):
+#   every x86_64 kernel below that builds KVM does, the host kernel and the guest
+#   kernels that run KVM themselves, and no distribution kernel does. The gpu,
+#   phone and nested amd64 profiles pin the same fix on their own branches, and
+#   every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore fails when one
+#   of these pins moves to a commit that is not listed as carrying it.
+# A snapshot load's drive_overrides is upstream's own on this base
+# (firecracker#6402); a clone opens its own disks through it.
+# `--version` names what fcvm reads before it uses a field or flag:
+# +fcvm.drive-overrides.numa-window.write-set.tap-fd.pagemap-dirty.
+# Snapshots: upstream's format is 13.0.0, and the chain ends every state file
+# with a mark of its own layout, checked before anything is decoded. A file
+# without the mark, which is every file an earlier build wrote (formats 10, 12
+# and the nested builds' 13), and a file of another layout are refused with
+# "Invalid data version". A restore uses the binary the snapshot recorded
+# (SnapshotMetadata::firecracker_bin) while that file exists. A snapshot whose
+# binary is gone, or that records none, is loaded with this build, is refused,
+# and the error says to re-create it or pass --firecracker-bin. An earlier
+# build refuses a file of this one: its decode fails ("bitcode error" from the
+# v1.17.0-based builds, default and nested).
 # `fcvm setup` builds this automatically; `find_firecracker()` uses it.
 # `commit` is required. Setup keeps a binary already built for it without
 # contacting the remote. Otherwise it fetches the commit by its hash, which
@@ -127,8 +151,8 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-pv-kick-restore"
-commit = "2a33289b55b7f611959891dd5295438a416f386e"
+branch = "wip/fcvm-base-2a8d0138"
+commit = "ec5f7d36ddbc9c6b25dc68a6858ed35cfd7bca82"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).

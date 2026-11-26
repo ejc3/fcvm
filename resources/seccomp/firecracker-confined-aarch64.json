@@ -319,6 +319,256 @@
         ],
         "filter_action": "allow"
     },
+    "blk_worker": {
+        "default_action": "trap",
+        "filter": [
+            {
+                "comment": "Used to canonicalize VMDK descriptor paths during drive patch",
+                "syscall": "newfstatat"
+            },
+            {
+                "comment": "Used to canonicalize VMDK descriptor paths during drive patch",
+                "syscall": "readlinkat"
+            },
+            {
+                "comment": "Used by imago to read VMDK extents",
+                "syscall": "preadv"
+            },
+            {
+                "syscall": "epoll_ctl"
+            },
+            {
+                "syscall": "epoll_pwait"
+            },
+            {
+                "comment": "SyncFileEngine seeks to the request offset before each read/write",
+                "syscall": "lseek"
+            },
+            {
+                "comment": "Locking the Arc<Mutex<ThreadedWorker>> data path",
+                "syscall": "futex"
+            },
+            {
+                "comment": "Called for expanding the heap",
+                "syscall": "brk"
+            },
+            {
+                "comment": "Used for re-allocating large memory regions, for example vectors",
+                "syscall": "mremap"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "libc::MADV_DONTNEED",
+                        "index": 2,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 4
+                    }
+                ],
+                "comment": "Triggered by musl for some customer workloads",
+                "syscall": "madvise"
+            },
+            {
+                "comment": "Used by the rust standard library in std::sync::mpmc. Firecracker uses mpsc channels from this module for inter-thread communication",
+                "syscall": "sched_yield"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "libc::MAP_ANONYMOUS | libc::MAP_PRIVATE",
+                        "index": 3,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 34
+                    },
+                    {
+                        "comment": "Ensure PROT_EXEC is not set",
+                        "index": 2,
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "type": "dword",
+                        "val": 0
+                    }
+                ],
+                "comment": "Allocator growth during I/O",
+                "syscall": "mmap"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "libc::MAP_SHARED",
+                        "index": 3,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1
+                    },
+                    {
+                        "comment": "Ensure PROT_EXEC is not set",
+                        "index": 2,
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "type": "dword",
+                        "val": 0
+                    }
+                ],
+                "comment": "Used for reading the timezone in LocalTime::now()",
+                "syscall": "mmap"
+            },
+            {
+                "syscall": "munmap"
+            },
+            {
+                "syscall": "sigaltstack"
+            },
+            {
+                "syscall": "rt_sigprocmask"
+            },
+            {
+                "syscall": "rt_sigreturn"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "SIGABRT",
+                        "index": 0,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 6
+                    }
+                ],
+                "comment": "rt_sigaction is used by libc::abort during a panic to install the default handler for SIGABRT",
+                "syscall": "rt_sigaction"
+            },
+            {
+                "comment": "Worker thread exit on Finish",
+                "syscall": "exit"
+            },
+            {
+                "comment": "Used by the fatal signal handlers (vmm::signal_handler::exit_with_code) to terminate the process",
+                "syscall": "exit_group"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "SIGABRT",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 6
+                    }
+                ],
+                "comment": "tkill is used by libc::abort during a panic to raise SIGABRT",
+                "syscall": "tkill"
+            },
+            {
+                "syscall": "read"
+            },
+            {
+                "syscall": "write"
+            },
+            {
+                "syscall": "fsync"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 3
+                    }
+                ],
+                "comment": "Used by the VirtIO block device to punch holes for discard on regular backing files",
+                "syscall": "fallocate"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "BLKDISCARD",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 4727
+                    }
+                ],
+                "comment": "Used by the VirtIO block device to pass discard through to block-device backing files",
+                "syscall": "ioctl"
+            },
+            {
+                "comment": "Used to open the replacement backing file during drive patch and rescan",
+                "syscall": "openat"
+            },
+            {
+                "syscall": "close"
+            },
+            {
+                "comment": "Rust std uses it during panic to print the thread id.",
+                "syscall": "gettid"
+            },
+            {
+                "comment": "Used for metrics and logging, via the helpers in utils/src/time.rs. It's not called on some platforms, because of vdso optimisations.",
+                "syscall": "clock_gettime"
+            },
+            {
+                "args": [
+                    {
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 0
+                    }
+                ],
+                "comment": "Needed for rate limiting and metrics",
+                "syscall": "timerfd_settime"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "FCNTL_F_SETFD",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 2
+                    },
+                    {
+                        "comment": "FCNTL_FD_CLOEXEC",
+                        "index": 2,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1
+                    }
+                ],
+                "comment": "Used by snapshotting, drive patching and rescanning",
+                "syscall": "fcntl"
+            },
+            {
+                "comment": "Used by disk update",
+                "syscall": "fstat"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "SIGABRT",
+                        "index": 2,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 6
+                    }
+                ],
+                "comment": "glibc's raise and abort (musl uses tkill)",
+                "syscall": "tgkill"
+            },
+            {
+                "comment": "glibc's raise and pthread_kill pass its own pid to tgkill (musl's tkill takes none)",
+                "syscall": "getpid"
+            }
+        ],
+        "filter_action": "allow"
+    },
     "vcpu": {
         "default_action": "trap",
         "filter": [
@@ -670,6 +920,26 @@
             {
                 "args": [
                     {
+                        "comment": "KVM_SET_USER_MEMORY_REGION, Used by VFIO passthrough BAR relocation",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1075883590
+                    }
+                ],
+                "syscall": "ioctl"
+            },
+            {
+                "comment": "Used by VFIO passthrough to read device PCI config and BAR regions on vCPU MMIO/PIO exits",
+                "syscall": "pread64"
+            },
+            {
+                "comment": "Used by VFIO passthrough to write device PCI config and BAR regions on vCPU MMIO/PIO exits",
+                "syscall": "pwrite64"
+            },
+            {
+                "args": [
+                    {
                         "comment": "SIGABRT",
                         "index": 2,
                         "op": "eq",
@@ -691,8 +961,12 @@
         "default_action": "trap",
         "filter": [
             {
-                "comment": "Used when creating snapshots in vmm:persist::snapshot_memory_to_file through std::fs::File::metadata",
+                "comment": "Used when creating snapshots in vmm::vstate::vm::snapshot_memory_to_path through std::fs::File::metadata",
                 "syscall": "newfstatat"
+            },
+            {
+                "comment": "Used by the threaded block worker's EventManager::new(), which runs on the spawned worker thread under the inherited vmm filter before it applies its own blk_worker filter",
+                "syscall": "epoll_create1"
             },
             {
                 "syscall": "epoll_ctl"
@@ -711,6 +985,10 @@
             },
             {
                 "syscall": "read"
+            },
+            {
+                "comment": "Used to canonicalize VMDK descriptor paths on drive patch",
+                "syscall": "readlinkat"
             },
             {
                 "syscall": "write"
@@ -776,6 +1054,14 @@
             {
                 "comment": "Used by the block device",
                 "syscall": "lseek"
+            },
+            {
+                "comment": "Used by the imago VMDK disk image backend",
+                "syscall": "preadv"
+            },
+            {
+                "comment": "Needed for VFIO device hotplug and teardown",
+                "syscall": "readlinkat"
             },
             {
                 "comment": "Used for re-allocating large memory regions, for example vectors",
@@ -910,19 +1196,6 @@
             {
                 "args": [
                     {
-                        "comment": "advice, the fourth argument of fadvise64(fd, offset, len, advice) on aarch64: POSIX_FADV_RANDOM",
-                        "index": 3,
-                        "op": "eq",
-                        "type": "dword",
-                        "val": 1
-                    }
-                ],
-                "comment": "POSIX_FADV_RANDOM on a drive's backing file when it is opened, so the host reads only what the guest asked for",
-                "syscall": "fadvise64"
-            },
-            {
-                "args": [
-                    {
                         "comment": "libc::MPOL_DEFAULT",
                         "index": 2,
                         "op": "eq",
@@ -939,6 +1212,19 @@
                 ],
                 "comment": "Returns guest memory to the default NUMA policy when its window out of NUMA balancing ends (vstate::memory::defer_numa_balancing)",
                 "syscall": "mbind"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "advice, the fourth argument of fadvise64(fd, offset, len, advice) on aarch64: POSIX_FADV_RANDOM",
+                        "index": 3,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1
+                    }
+                ],
+                "comment": "POSIX_FADV_RANDOM on a drive's backing file when it is opened, so the host reads only what the guest asked for",
+                "syscall": "fadvise64"
             },
             {
                 "args": [
@@ -1108,6 +1394,48 @@
             {
                 "args": [
                     {
+                        "comment": "libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK",
+                        "index": 3,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 131106
+                    },
+                    {
+                        "comment": "Ensure PROT_EXEC is not set",
+                        "index": 2,
+                        "op": {
+                            "masked_eq": 4
+                        },
+                        "type": "dword",
+                        "val": 0
+                    }
+                ],
+                "comment": "Used to allocate the threaded block worker's thread stack (spawned from the VMM thread, so checked against this inherited filter)",
+                "syscall": "mmap"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "libc::MAP_SHARED | libc::MAP_FIXED | libc::MAP_POPULATE",
+                        "index": 3,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 32785
+                    },
+                    {
+                        "comment": "libc::PROT_READ | libc::PROT_WRITE",
+                        "index": 2,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 3
+                    }
+                ],
+                "comment": "Used to overlay NE CMA memory for a hotplugged enclave device's DMB (confidential mode)",
+                "syscall": "mmap"
+            },
+            {
+                "args": [
+                    {
                         "comment": "MFD_CLOEXEC | MFD_ALLOW_SEALING",
                         "index": 1,
                         "op": "eq",
@@ -1129,6 +1457,19 @@
                     }
                 ],
                 "comment": "Used by IovDeque to seal memfd during net device hotplug",
+                "syscall": "fcntl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "F_DUPFD_CLOEXEC",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1030
+                    }
+                ],
+                "comment": "Used by EventFd::try_clone() when spawning the threaded block worker (control_evt/queue_evts duplication on the VMM thread)",
                 "syscall": "fcntl"
             },
             {
@@ -1248,6 +1589,19 @@
             {
                 "args": [
                     {
+                        "comment": "TUNGETIFF",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 2147767506
+                    }
+                ],
+                "comment": "Needed for checking an inherited tap queue during net hotplug",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
                         "comment": "FIONBIO",
                         "index": 1,
                         "op": "eq",
@@ -1256,6 +1610,71 @@
                     }
                 ],
                 "comment": "Used to make vsock UDS nonblocking",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "NE_ADD_DEVICE",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 3278417446
+                    }
+                ],
+                "comment": "NE_ADD_DEVICE, used to attach a virtio device to a running enclave (device hotplug)",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "NE_SET_VRING_CALL",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1074834983
+                    }
+                ],
+                "comment": "NE_SET_VRING_CALL, used to wire a hotplugged enclave device's call eventfd",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "NE_SET_VRING_KICK",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1074834984
+                    }
+                ],
+                "comment": "NE_SET_VRING_KICK, used to wire a hotplugged enclave device's kick eventfd",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "NE_SET_INFO_EVENT_FD",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1074310699
+                    }
+                ],
+                "comment": "NE_SET_INFO_EVENT_FD, used to wire a hotplugged enclave device's info-event eventfd",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "NE_UPDATE_DEVICE_CONFIG",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1079029292
+                    }
+                ],
+                "comment": "NE_UPDATE_DEVICE_CONFIG, used to push virtio config space changes to an enclave device",
                 "syscall": "ioctl"
             },
             {
@@ -1374,6 +1793,32 @@
             {
                 "args": [
                     {
+                        "comment": "VFIO_DEVICE_RESET",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15215
+                    }
+                ],
+                "comment": "Needed for VFIO device hotplug and teardown",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_GROUP_UNSET_CONTAINER",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15209
+                    }
+                ],
+                "comment": "Needed for VFIO device teardown",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
                         "comment": "TUNSETIFF",
                         "index": 1,
                         "op": "eq",
@@ -1382,19 +1827,6 @@
                     }
                 ],
                 "comment": "Needed for opening tap device during net hotplug",
-                "syscall": "ioctl"
-            },
-            {
-                "args": [
-                    {
-                        "comment": "TUNGETIFF",
-                        "index": 1,
-                        "op": "eq",
-                        "type": "dword",
-                        "val": 2147767506
-                    }
-                ],
-                "comment": "Needed for checking an inherited tap queue during net hotplug",
                 "syscall": "ioctl"
             },
             {
@@ -1505,6 +1937,236 @@
                 ],
                 "comment": "Used by memory hotplug to protect access to underlying host memory",
                 "syscall": "mprotect"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "Require the pthread clone flags and allow only the optional obsolete CLONE_DETACHED bit",
+                        "index": 0,
+                        "op": {
+                            "masked_eq": 4290772991
+                        },
+                        "type": "dword",
+                        "val": 4001536
+                    }
+                ],
+                "comment": "Used by musl pthread_create to spawn the block worker thread",
+                "syscall": "clone"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "PR_SET_NAME",
+                        "index": 0,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15
+                    }
+                ],
+                "comment": "Used by musl to set the block worker thread name",
+                "syscall": "prctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "PR_SET_NO_NEW_PRIVS",
+                        "index": 0,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 38
+                    },
+                    {
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1
+                    }
+                ],
+                "comment": "Used to set no_new_privs before applying the block worker seccomp filter",
+                "syscall": "prctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "SECCOMP_SET_MODE_FILTER",
+                        "index": 0,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1
+                    },
+                    {
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 0
+                    }
+                ],
+                "comment": "Used to apply the block worker seccomp filter",
+                "syscall": "seccomp"
+            },
+            {
+                "comment": "Used by VFIO hotplug for reading device PCI config space",
+                "syscall": "pread64"
+            },
+            {
+                "comment": "Used by VFIO hotplug for writing device PCI config space",
+                "syscall": "pwrite64"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "KVM_CREATE_DEVICE",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 3222056672
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to create the KVM VFIO device",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_GET_API_VERSION",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15204
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to query the VFIO API version",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_CHECK_EXTENSION",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15205
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to check VFIO IOMMU type extension",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_SET_IOMMU",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15206
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to set the IOMMU type on the container",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_GROUP_GET_STATUS",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15207
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to get the VFIO group status",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_GROUP_SET_CONTAINER",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15208
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to bind the VFIO group to the container",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_GROUP_GET_DEVICE_FD",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15210
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to obtain a fd for a device in the group",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_DEVICE_GET_INFO",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15211
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to get general device info",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_DEVICE_GET_REGION_INFO",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15212
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to query device region (BAR) info",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_DEVICE_GET_IRQ_INFO",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15213
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to query device IRQ info (MSI-X)",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_DEVICE_SET_IRQS",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15214
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to set up MSI-X interrupts on the device",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
+                        "comment": "VFIO_IOMMU_MAP_DMA",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 15217
+                    }
+                ],
+                "comment": "Used by VFIO hotplug to map guest memory for DMA",
+                "syscall": "ioctl"
             },
             {
                 "args": [

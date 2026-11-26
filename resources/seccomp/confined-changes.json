@@ -1,7 +1,7 @@
 {
     "fork": {
         "repo": "ejc3/firecracker",
-        "commit": "2a33289b55b7f611959891dd5295438a416f386e",
+        "commit": "ec5f7d36ddbc9c6b25dc68a6858ed35cfd7bca82",
         "files": "resources/seccomp/fork-<arch>-unknown-linux-musl.json, the fork's resources/seccomp/<arch>-unknown-linux-musl.json at that commit"
     },
     "remove": [
@@ -35,7 +35,8 @@
             "classes": [
                 "vmm",
                 "api",
-                "vcpu"
+                "vcpu",
+                "blk_worker"
             ],
             "rule": {
                 "syscall": "tgkill",
@@ -81,7 +82,8 @@
             "classes": [
                 "vmm",
                 "api",
-                "vcpu"
+                "vcpu",
+                "blk_worker"
             ],
             "rule": {
                 "syscall": "getpid",
@@ -142,7 +144,8 @@
                 "x86_64"
             ],
             "classes": [
-                "vmm"
+                "vmm",
+                "blk_worker"
             ],
             "rule": {
                 "syscall": "newfstatat",
@@ -155,7 +158,8 @@
             ],
             "classes": [
                 "vmm",
-                "api"
+                "api",
+                "blk_worker"
             ],
             "rule": {
                 "syscall": "epoll_wait",

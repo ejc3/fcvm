@@ -200,7 +200,7 @@ const SECCOMP_POLICY: &str = include_str!("../resources/seccomp/firecracker-conf
 /// from (resources/seccomp/confined-changes.json); `[firecracker] commit` in
 /// rootfs-config.toml must be this commit. A VMM built from another commit is not confined:
 /// its syscalls were never checked against the policy.
-pub const CONFINED_FIRECRACKER_COMMIT: &str = "2a33289b55b7f611959891dd5295438a416f386e";
+pub const CONFINED_FIRECRACKER_COMMIT: &str = "ec5f7d36ddbc9c6b25dc68a6858ed35cfd7bca82";
 
 /// The environment a confined VMM starts with, on top of fcvm's own.
 ///
@@ -1485,7 +1485,7 @@ mod tests {
 
     /// The thread categories the confined policy was audited for: the ones the pinned
     /// Firecracker installs a filter for, each on the threads of that kind.
-    const AUDITED_THREAD_CLASSES: [&str; 3] = ["api", "vcpu", "vmm"];
+    const AUDITED_THREAD_CLASSES: [&str; 4] = ["api", "blk_worker", "vcpu", "vmm"];
 
     /// The thread categories of a filter file, sorted.
     fn thread_classes(filter: &serde_json::Value) -> Vec<String> {

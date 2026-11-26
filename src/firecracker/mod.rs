@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod error_text;
 pub mod vm;
 
 pub use api::FirecrackerClient;
