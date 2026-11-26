@@ -1773,11 +1773,25 @@ pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
 
     let (plan, _, _) = crate::setup::rootfs::load_plan()
         .context("reading the config that names the Cloud Hypervisor build")?;
+    find_configured_cloud_hypervisor(&plan, cloud_hypervisor_version, || {
+        which::which("cloud-hypervisor").map_err(Into::into)
+    })
+}
+
+/// [`find_cloud_hypervisor`] for the loaded config `plan`: the build it names, in the store
+/// of the assets directory it names. Both come from that one config and not from this
+/// process's paths: `fcvm fleet` starts with the default paths, and its agent looks up the
+/// build that its `fcvm vm run` commands, which read the config, run.
+fn find_configured_cloud_hypervisor(
+    plan: &crate::setup::rootfs::Plan,
+    version_of: impl Fn(&std::path::Path) -> Option<String>,
+    on_path: impl FnOnce() -> Result<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
     find_cloud_hypervisor_in(
         plan.cloud_hypervisor.as_ref(),
-        &crate::setup::kernel::cloud_hypervisor_store_dir(),
-        cloud_hypervisor_version,
-        || which::which("cloud-hypervisor").map_err(Into::into),
+        &crate::setup::kernel::cloud_hypervisor_store_of(plan),
+        version_of,
+        on_path,
     )
 }
 
@@ -11175,6 +11189,34 @@ mod tests {
             "{message}"
         );
         assert!(message.contains(&pin.commit), "{message}");
+    }
+
+    /// The build is looked up in the assets directory the config names, also in a process
+    /// that started with the default paths, as `fcvm fleet` does. Its agent looked in the
+    /// default store and refused to start with a build its `fcvm vm run` commands find.
+    #[test]
+    fn the_configured_build_is_found_in_the_configured_assets_dir() {
+        crate::paths::init_with_defaults();
+        let assets = tempfile::tempdir().unwrap();
+        let mut plan: crate::setup::rootfs::Plan =
+            toml::from_str(crate::setup::rootfs::EMBEDDED_CONFIG).unwrap();
+        plan.paths.assets_dir = assets.path().to_str().unwrap().to_string();
+        let pin = plan
+            .cloud_hypervisor
+            .as_ref()
+            .expect("the embedded config pins Cloud Hypervisor");
+        let store = assets.path().join("cloud-hypervisor");
+        std::fs::create_dir_all(&store).unwrap();
+        let built = crate::setup::kernel::cloud_hypervisor_path_in(&store, pin).unwrap();
+        std::fs::write(&built, b"the configured build").unwrap();
+
+        let found = find_configured_cloud_hypervisor(
+            &plan,
+            |_| Some("cloud-hypervisor v0".to_string()),
+            || anyhow::bail!("PATH is not consulted when a commit is configured"),
+        )
+        .unwrap();
+        assert_eq!(found, built);
     }
 
     /// The configured commit's build is the one that runs, whatever else the store holds,

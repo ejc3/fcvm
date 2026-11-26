@@ -3311,6 +3311,12 @@ pub(crate) fn cloud_hypervisor_store_dir() -> PathBuf {
     paths::assets_dir().join("cloud-hypervisor")
 }
 
+/// The store directory of the config `plan`: where a setup run with that config installs,
+/// whatever paths this process started with ([`paths::configured_assets_dir`]).
+pub(crate) fn cloud_hypervisor_store_of(plan: &crate::setup::rootfs::Plan) -> PathBuf {
+    paths::configured_assets_dir(plan).join("cloud-hypervisor")
+}
+
 /// The Rust toolchain this fcvm is built with: the `channel` of its `rust-toolchain.toml`.
 fn pinned_rust_toolchain() -> Result<String> {
     let file: toml::Value = toml::from_str(include_str!("../../rust-toolchain.toml"))
