@@ -103,15 +103,16 @@ from it and runs the check on its running kernel, and only an image that passes 
 operation for 6.6 s and 5.9 s while namespaces died, and nine tests lost their namespace
 holder at its 5 s readiness deadline.
 
-Every job on our runners that starts VMs runs `scripts/check-runner-kernel.py` before it
-builds anything. The script computes the host kernel release the checkout's `host_kernel`
+Every job on our runners runs `scripts/check-runner-kernel.py` before it builds anything,
+except six that are listed with their reasons in `tests/test_ci_workflow_coverage.rs`. The script computes the host kernel release the checkout's `host_kernel`
 table gives for the runner's architecture (`<kernel_version>-fcvm-<hash>`, the hash
 `fcvm setup` computes from the table's `kernel_version` and `build_inputs`) and compares it
 with `uname -r`, so a patch added to a host set changes what the script expects with no edit
 to it. An x86-only patch changes the x86_64 release alone. The job fails on a kernel fcvm did
 not build, and on an fcvm build that is neither the checkout's nor one main's inputs gave in
 the last 24 hours. A check that cannot evaluate (no readable config, no git, main's history
-not fetchable, any error the script does not expect) exits 2.
+not fetchable, any error the script does not expect) exits 2. The script needs Python 3.11;
+reading main's history also needs 3.11.4 and git 2.29, and exits 2 without them.
 
 The 24 hours cover the image that follows a host kernel change: the change starts Build
 Kernels (it is under `kernel/` or in `rootfs-config.toml`), which starts Build Runner AMI,
@@ -142,7 +143,9 @@ What follows from that for a change to a host kernel input:
 
 `weekly.yml`'s benchmark job passes `--current-only`, which accepts the checkout's build and
 no other. The kernel build jobs do not run the check: they build what the next image needs,
-on whatever image the runners have. `every_self_hosted_job_checks_the_runner_kernel` reads
+so they have to run on whatever image the runners have. They are not free of VMs
+(`fcvm setup` boots the Layer 2 setup VM in them when the runner has no rootfs yet); the
+exemption is for that ordering alone. `every_self_hosted_job_checks_the_runner_kernel` reads
 every job of every workflow that is not on one of GitHub's own runners, and fails for one
 that neither runs the step first nor is listed there with a reason.
 

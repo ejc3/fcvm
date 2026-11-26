@@ -1633,6 +1633,40 @@ fn merge_with(
     Ok(stats)
 }
 
+/// For a confined start, as soon as its Firecracker binary is known and before anything is
+/// created: the binary has the seccomp filter `fcvm setup` compiled for it, unchanged
+/// ([`crate::confine::Decision::require_filter`]). A host that was upgraded and not set up
+/// again is refused here with nothing started, and so is a start whose Firecracker binary
+/// cannot be found: no start builds one (`fcvm setup` does), so there is nothing to wait
+/// for. The launch makes this check again on the binary it runs, and hands the VMM the bytes
+/// it checked.
+pub fn require_confined_filter(
+    decision: &crate::confine::Decision,
+    runtime_config: &RuntimeConfig,
+) -> Result<()> {
+    if decision.confinement().is_none() {
+        return Ok(());
+    }
+    let unfound = |why: String| {
+        anyhow::anyhow!(
+            "this start must be confined and cannot be; nothing was started:\n  seccomp: \
+             {why}, so its confined seccomp filter cannot be checked. Run `fcvm setup`"
+        )
+    };
+    let firecracker = match runtime_config.firecracker_bin.clone() {
+        Some(path) => path,
+        None => find_firecracker(runtime_config)
+            .map_err(|error| unfound(format!("no Firecracker binary was found ({error:#})")))?,
+    };
+    if !firecracker.exists() {
+        return Err(unfound(format!(
+            "the Firecracker binary {} does not exist",
+            firecracker.display()
+        )));
+    }
+    decision.require_filter(&firecracker)
+}
+
 /// Returns the path to the Firecracker binary if it exists and meets minimum version requirements.
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///
@@ -3452,6 +3486,33 @@ fn view_children(view: &Path, wanted: fn(&std::fs::FileType) -> bool) -> Result<
     Ok(children)
 }
 
+/// The mount view of a clone's VMM, or `None` when the snapshot load overrides every source
+/// path and the VMM needs no mount namespace.
+///
+/// With `None` nothing under `view` is read. `view` is the directory every VM's runtime
+/// directory is in, so listing it costs a directory entry per VM alive, and btrfs takes a
+/// directory's lock exclusively to open it for reading and again in each read of it, which
+/// is the lock every other start's `mkdir` of its own runtime directory needs. Two listings
+/// a start (directories, then files) made that lock the one thing every start queued on:
+/// of 1555 ms a clone spent asleep on locks and I/O in a ramp of 1000 at 512 at a time,
+/// 641 ms was these listings waiting for it and 133 ms the `mkdir`s waiting behind them
+/// (c8gd.metal-24xl, 7.0.0-1018-aws, btrfs on NVMe, 2026-11-25).
+fn clone_mount_redirects(
+    overrides: LoadOverrides,
+    view: &Path,
+    pairs: Vec<(PathBuf, PathBuf)>,
+    clone_dir: &Path,
+    vsock_target_dir: &Path,
+) -> Result<Option<crate::utils::MountRedirects>> {
+    if overrides == LoadOverrides::Everything {
+        return Ok(None);
+    }
+    let entries = view_entries(view)?;
+    let mut redirects = clone_mount_view(view, pairs, clone_dir, vsock_target_dir, &entries)?;
+    redirects.keep_files = view_files(view)?;
+    Ok(Some(redirects))
+}
+
 /// The mount namespace for a clone's VMM: `pairs` (from [`build_clone_mount_redirects`])
 /// under a tmpfs over `view`, the directory every VM's runtime directory is in.
 ///
@@ -3933,29 +3994,22 @@ async fn prepare_clone_substrate(
             .context("creating disks backing dir inside the vsock target")?;
     }
     let view = paths::data_dir().join("vm-disks");
-    let redirects = match view_entries(&view).and_then(|entries| {
-        let mut redirects =
-            clone_mount_view(&view, redirects, data_dir, &vsock_target_dir, &entries)?;
-        redirects.keep_files = view_files(&view)?;
-        Ok(redirects)
-    }) {
-        Ok(redirects) => redirects,
+    match clone_mount_redirects(overrides, &view, redirects, data_dir, &vsock_target_dir) {
+        Ok(Some(redirects)) => {
+            info!(
+                view = %redirects.view.display(),
+                redirects = ?redirects.pairs.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
+                "enabling mount namespace for path isolation"
+            );
+            namespace.mount_redirects = Some(redirects);
+        }
+        Ok(None) => info!(
+            "the snapshot load overrides every source path; the VMM runs without a mount namespace"
+        ),
         Err(error) => {
             cleanup_failed_clone_holder(&mut holder_child, "building the clone's mount view").await;
             return Err(error);
         }
-    };
-    info!(
-        view = %redirects.view.display(),
-        redirects = ?redirects.pairs.iter().map(|(m, s)| format!("{} <- {}", m.display(), s.display())).collect::<Vec<_>>(),
-        "enabling mount namespace for path isolation"
-    );
-    if overrides == LoadOverrides::Everything {
-        info!(
-            "the snapshot load overrides every source path; the VMM runs without a mount namespace"
-        );
-    } else {
-        namespace.mount_redirects = Some(redirects);
     }
 
     // The VMM opens the snapshot's disks at these directories' paths, which its view binds
@@ -4336,6 +4390,10 @@ pub async fn restore_from_snapshot(
                 }
             })?;
         let load_duration = load_start.elapsed();
+        // The load built the VM and left it paused. A confined VMM's threads are checked
+        // here, before the guest is resumed, so a clone never runs unfiltered: a failure
+        // leaves this block, whose error path kills the VMM.
+        vm_manager.check_confined().await?;
         if let Some(sender) = prefilled_sender {
             // The load returned, so Firecracker connected and mapped the backing: the sender
             // has finished, and a failure there already failed the load.
@@ -6303,8 +6361,123 @@ pub(crate) fn recorded_vsock_socket_path(vm_state: &VmState) -> Result<&Path> {
 /// The caller supplies the exact socket recorded in the running VM's state.
 /// This is intentionally part of both snapshot APIs: deriving a conventional
 /// runtime path here would silently bypass `--vsock-dir`.
+///
+/// This is the prepare, and it begins a boundary: the create's token goes into the VM's
+/// state first and then to the guest, which writes it into its `owed` mark (#2159). Every
+/// resume reads the token back from the state ([`ask_source_to_reopen`]), so the reopen
+/// after a prepare whose reply was lost carries it too.
 async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &str) -> Result<()> {
-    run_fc_agent_one_shot(vsock_socket, vm_id, flag).await
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let token = begin_source_boundary(&state_manager, vm_id).await?;
+    let mut args = vec![flag];
+    if let Some(token) = &token {
+        args.extend(["--boundary", token]);
+    }
+    run_fc_agent_command(vsock_socket, vm_id, &args)
+        .await
+        .map(|_| ())
+}
+
+/// Give a snapshot create's boundary its token and write it on the VM's state.
+///
+/// A resume the host gave up on can still be delivered later: its exec runs on a blocking
+/// thread that goes on connecting after the try was cut off, and a delivered one-shot can
+/// wait in the guest for the boundary lock. Landing between a later create's prepare and
+/// its pause it would open the gate, and the pause would save an image with the gate open
+/// and no manifest. The guest obeys a resume only when its token is the one in the mark,
+/// so that resume finds the later create's token and does nothing.
+///
+/// `Ok(None)` for a VM with no state file: the prepare is then sent no token, and the
+/// resumes, which find no state either, send none, which the guest takes as a pair. A
+/// state that is there and cannot be written is an error, and the prepare is not sent: a
+/// prepare with no token beside a state that still holds an earlier boundary's would have
+/// every resume of this create refused as stale, with the gate closed.
+async fn begin_source_boundary(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+) -> Result<Option<String>> {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let written = state_manager
+        .update_state(vm_id, |state| state.boundary_token = Some(token.clone()))
+        .await
+        .map_err(|error| {
+            error.context(PrepareNotSent {
+                vm_id: vm_id.to_string(),
+            })
+        })?;
+    Ok(written.map(|_| token))
+}
+
+/// A snapshot's prepare was not sent to the guest: the boundary's token could not be
+/// written on the VM's state first. Nothing in the guest changed, so there is no gate to
+/// reopen, and the creators skip the reopen ([`prepare_was_sent`]). Every other failure of
+/// a prepare leaves open whether it ran.
+#[derive(Debug)]
+struct PrepareNotSent {
+    vm_id: String,
+}
+
+impl std::fmt::Display for PrepareNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "writing the snapshot boundary's token on the state of VM {}; nothing was sent \
+             to its guest",
+            self.vm_id
+        )
+    }
+}
+
+/// Whether a failed prepare may have run in the guest. False only for a prepare that was
+/// never sent.
+fn prepare_was_sent(prepare_error: &anyhow::Error) -> bool {
+    prepare_error.downcast_ref::<PrepareNotSent>().is_none()
+}
+
+/// The token of the boundary the VM's guest is owed a resume for, from its state.
+/// `Ok(None)` when the state holds none or there is no state file. A state that is there
+/// and cannot be read is an error, never "no token": a resume sent without the token the
+/// guest's mark holds is refused as stale.
+async fn owed_boundary_token(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+) -> Result<Option<String>> {
+    match state_manager.load_state(vm_id).await {
+        Ok(state) => Ok(state.boundary_token),
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.context(format!(
+            "reading the snapshot boundary's token from the state of VM {vm_id}"
+        ))),
+    }
+}
+
+/// The arguments of one resume: the host's clock when a pause preceded it, and the token
+/// of the owed boundary as the VM's state holds it now.
+///
+/// Read at every try. A later create cannot have written another token meanwhile: the
+/// tries run under the per-VM snapshot lock. A try that is cut off and delivered late
+/// carries what it read when it was sent.
+async fn resume_args(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+    pause_preceded: bool,
+) -> Result<Vec<String>> {
+    let mut args = vec!["--resume-snapshot-network".to_string()];
+    if pause_preceded {
+        let host_time = crate::utils::host_clock_now().as_nanos().to_string();
+        args.extend(["--host-time-ns".to_string(), host_time]);
+    }
+    if let Some(token) = owed_boundary_token(state_manager, vm_id).await? {
+        args.extend(["--boundary".to_string(), token]);
+    }
+    Ok(args)
 }
 
 /// Reopen the source's network once a pause has been invoked, and set the source's
@@ -6342,7 +6515,23 @@ async fn resume_paused_source(vsock_socket: &Path, vm_id: &str) -> Result<()> {
 
 /// Reopen the source's network after a prepare that failed, whose failure does not prove
 /// it did not run. No pause preceded it, so the guest's clock is left alone.
-async fn reopen_source_after_failed_prepare(vsock_socket: &Path, vm_id: &str) -> Result<()> {
+///
+/// One failure does prove it: a prepare that was never sent ([`PrepareNotSent`]). Nothing
+/// is asked of the guest then. Asked, it would be asked for the whole bound with the
+/// state still unreadable, and the create would end by reporting a gate left closed that
+/// was never closed.
+async fn reopen_source_after_failed_prepare(
+    vsock_socket: &Path,
+    vm_id: &str,
+    prepare_error: &anyhow::Error,
+) -> Result<()> {
+    if !prepare_was_sent(prepare_error) {
+        info!(
+            vm_id,
+            "the snapshot's prepare was not sent to the guest; there is no gate to reopen"
+        );
+        return Ok(());
+    }
     reopen_source_network(vsock_socket, vm_id, false)
         .await
         .map(|_agent_restarted| ())
@@ -6355,9 +6544,84 @@ const SOURCE_AGENT_RESTARTED_REPORT: &str =
     "the agent that served this snapshot's prepare died before its resume";
 
 /// The exit status of a boundary one-shot that the guest refused because a restore is
-/// under way in it (`REFUSED_EXIT` in fc-agent's main.rs). Running it again changes
-/// nothing, and the guest's gate is its restore's, not this snapshot's to open.
+/// under way in it (`REFUSED_EXIT` in fc-agent's main.rs), and for nothing else. Running
+/// it again changes nothing, and the guest's gate is its restore's, not this snapshot's
+/// to open or to record.
 const ONE_SHOT_REFUSED_EXIT: i32 = 3;
+
+/// The exit status of a resume the guest refused because its token is not the one of the
+/// boundary the guest owes (`STALE_RESUME_EXIT` in fc-agent's main.rs). Unlike the
+/// restore's refusal it says nothing about the gate, which can be this source's own and
+/// closed: the record and the token stay, and the create reports the source left gated.
+const ONE_SHOT_STALE_EXIT: i32 = 5;
+
+/// What precedes the owed boundary's token in a stale refusal's stderr: the token, or
+/// `none` (`OWED_TOKEN_REPORT` in fc-agent's snapshot_network.rs, which holds the two
+/// equal).
+const OWED_TOKEN_REPORT: &str = "owed-boundary-token=";
+
+/// The token of the guest's owed boundary, as a stale refusal reported it: `Some(None)`
+/// for a mark with no token, `None` when the refusal reports nothing this host can put
+/// into a command (letters, digits and `-`, as the guest takes them).
+fn reported_owed_token(stderr: &str) -> Option<Option<String>> {
+    let (_, after) = stderr.split_once(OWED_TOKEN_REPORT)?;
+    let token: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    match token.as_str() {
+        "" => None,
+        "none" => Some(None),
+        _ if token.len() <= 64 => Some(Some(token)),
+        _ => None,
+    }
+}
+
+/// The exit status of a resume that opened the gate and could not remove the boundary's
+/// manifest or mark afterwards (`OPEN_UNCLEAN_EXIT` in fc-agent's main.rs). The gate is
+/// open: the state must say so, and the next prepare writes both anew.
+const ONE_SHOT_OPEN_UNCLEAN_EXIT: i32 = 4;
+
+/// What a resume one-shot's result says about the gate.
+fn reopen_try_of(vm_id: &str, output: crate::commands::exec::ExecOutput) -> ReopenTry {
+    let open = |output: &crate::commands::exec::ExecOutput| {
+        if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {
+            ReopenTry::OpenAfterAgentRestart
+        } else {
+            ReopenTry::Open
+        }
+    };
+    match output.exit_code {
+        0 => {
+            // The one-shot's own report, including the size of the clock step, reaches no
+            // console: it is this exec's stderr.
+            debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
+            open(&output)
+        }
+        ONE_SHOT_OPEN_UNCLEAN_EXIT => {
+            warn!(
+                vm_id,
+                guest = %output.stderr.trim(),
+                "the source's network gate is open, and its guest could not remove the \
+                 boundary's manifest or mark; the next snapshot's prepare writes both anew"
+            );
+            open(&output)
+        }
+        code => {
+            let error = anyhow::anyhow!(
+                "`fc-agent --resume-snapshot-network` failed in guest {vm_id} with exit code \
+                 {code}: stdout={:?}, stderr={:?}",
+                output.stdout,
+                output.stderr
+            );
+            match code {
+                ONE_SHOT_REFUSED_EXIT => ReopenTry::Refused(error),
+                ONE_SHOT_STALE_EXIT => ReopenTry::Stale(error, reported_owed_token(&output.stderr)),
+                _ => ReopenTry::Failed(error),
+            }
+        }
+    }
+}
 
 /// How long a snapshot create keeps asking its source to reopen, in all: every try is
 /// cut off at what is left of it, so the create is over `SOURCE_REOPEN_BOUND` after its
@@ -6385,16 +6649,24 @@ const SOURCE_REOPEN_ONE_ASK: std::time::Duration = std::time::Duration::from_sec
 /// Why a source's network was not reopened.
 #[derive(Debug)]
 enum ReopenFailure {
-    /// The guest refused: a restore is under way in it, and its gate is that restore's.
+    /// The guest refused because a restore is under way in it: its gate is that restore's,
+    /// and nothing is recorded of it.
     Refused(anyhow::Error),
-    /// The bound passed with the gate still closed.
+    /// The bound passed with the gate still closed. The state records it.
     LeftGated(anyhow::Error),
+    /// The guest refused this resume as not its owed boundary's: the token the state
+    /// holds is not the one in the guest's mark. Nothing is known of the gate from that,
+    /// so it is recorded closed and the token is kept, as for `LeftGated`. With the
+    /// mark's token as the refusal reported it ([`reported_owed_token`]).
+    Stale(anyhow::Error, Option<Option<String>>),
 }
 
 impl ReopenFailure {
     fn into_error(self) -> anyhow::Error {
         match self {
-            ReopenFailure::Refused(error) | ReopenFailure::LeftGated(error) => error,
+            ReopenFailure::Refused(error)
+            | ReopenFailure::LeftGated(error)
+            | ReopenFailure::Stale(error, _) => error,
         }
     }
 }
@@ -6406,8 +6678,11 @@ enum ReopenTry {
     /// Open, and the one-shot reported that the agent which served the prepare died
     /// before this resume (`SOURCE_AGENT_RESTARTED_REPORT`).
     OpenAfterAgentRestart,
-    /// The guest refused: a restore is under way in it.
+    /// The guest refused because a restore is under way in it (exit 3).
     Refused(anyhow::Error),
+    /// The guest refused the resume as another boundary's (exit 5), and said which token
+    /// its owed boundary has.
+    Stale(anyhow::Error, Option<Option<String>>),
     /// The one-shot failed, or could not be run at all.
     Failed(anyhow::Error),
 }
@@ -6446,12 +6721,26 @@ async fn reopen_source_network(
     .map_err(ReopenFailure::into_error)
 }
 
-/// Write `network_gate_closed` on the VM's state. Best-effort: the create's own error
+/// Write `network_gate_closed` on the VM's state, and take the boundary's token off it
+/// when the gate is open: no resume is owed then. Best-effort: the create's own error
 /// already names the VM, and a VM being torn down has no state to write.
 async fn record_source_gate(vm_id: &str, closed: bool) {
     let state_manager = crate::state::StateManager::new(paths::state_dir());
+    record_source_gate_in(&state_manager, vm_id, closed).await
+}
+
+async fn record_source_gate_in(
+    state_manager: &crate::state::StateManager,
+    vm_id: &str,
+    closed: bool,
+) {
     match state_manager
-        .update_state(vm_id, |state| state.network_gate_closed = closed)
+        .update_state(vm_id, |state| {
+            state.network_gate_closed = closed;
+            if !closed {
+                state.boundary_token = None;
+            }
+        })
         .await
     {
         Ok(_) => {}
@@ -6491,8 +6780,9 @@ async fn refuse_a_source_left_gated(vsock_socket: &Path, vm_id: &str) -> Result<
             Ok(())
         }
         Err(failure) => Err(failure.into_error().context(format!(
-            "snapshot create of VM {vm_id} is refused: an earlier snapshot create left its \
-             network gate closed, and it still cannot be opened"
+            "snapshot create of VM {vm_id} is refused: its state records its network gate \
+             closed since an earlier snapshot create (left closed, or refused a resume \
+             without saying), and its guest still does not report it open"
         ))),
     }
 }
@@ -6507,49 +6797,95 @@ async fn ask_source_to_reopen(
     max_tries: u32,
     gated: bool,
 ) -> std::result::Result<bool, ReopenFailure> {
-    reopen_until_open(
+    let state_manager = crate::state::StateManager::new(paths::state_dir());
+    let state_manager = &state_manager;
+    let reopened = reopen_until_open(
         vm_id,
         bound,
         (SOURCE_REOPEN_PAUSE, SOURCE_REOPEN_LEAST_TRY),
         max_tries,
         gated,
         |limit| async move {
-            let host_time = crate::utils::host_clock_now().as_nanos().to_string();
-            let mut args = vec!["--resume-snapshot-network"];
-            if pause_preceded {
-                args.extend(["--host-time-ns", &host_time]);
-            }
+            // A state that cannot be read is a try that failed, and is tried again: sent
+            // without the token the guest's mark holds, the resume would be refused.
+            let args = match resume_args(state_manager, vm_id, pause_preceded).await {
+                Ok(args) => args,
+                Err(error) => return ReopenTry::Failed(error),
+            };
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
             match run_fc_agent_command_any_exit(vsock_socket, vm_id, &args, Some(limit)).await {
-                Ok(output) if output.exit_code == 0 => {
-                    // The one-shot's own report, including the size of the clock step,
-                    // reaches no console: it is this exec's stderr.
-                    debug!(vm_id, guest = %output.stderr.trim(), "source network reopened");
-                    if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {
-                        ReopenTry::OpenAfterAgentRestart
-                    } else {
-                        ReopenTry::Open
-                    }
-                }
-                Ok(output) => {
-                    let error = anyhow::anyhow!(
-                        "`fc-agent --resume-snapshot-network` failed in guest {vm_id} with \
-                         exit code {}: stdout={:?}, stderr={:?}",
-                        output.exit_code,
-                        output.stdout,
-                        output.stderr
-                    );
-                    if output.exit_code == ONE_SHOT_REFUSED_EXIT {
-                        ReopenTry::Refused(error)
-                    } else {
-                        ReopenTry::Failed(error)
-                    }
-                }
+                Ok(output) => reopen_try_of(vm_id, output),
                 Err(error) => ReopenTry::Failed(error),
             }
         },
         |closed| record_source_gate(vm_id, closed),
     )
-    .await
+    .await;
+    match reopened {
+        Ok(agent_restarted) => Ok(agent_restarted),
+        Err(failure @ ReopenFailure::Refused(_)) => Err(failure),
+        Err(failure) => {
+            let state = state_manager.load_state(vm_id).await.ok();
+            let pid = state.as_ref().and_then(|state| state.pid);
+            let token = state.and_then(|state| state.boundary_token);
+            Err(with_the_resume_by_hand(failure, pid, token.as_deref()))
+        }
+    }
+}
+
+/// Put before a left-gated or stale failure what an operator runs to open the gate by
+/// hand. The guest runs only the resume that carries the token in its `owed` mark.
+fn with_the_resume_by_hand(
+    failure: ReopenFailure,
+    pid: Option<u32>,
+    token: Option<&str>,
+) -> ReopenFailure {
+    let exec = match pid {
+        Some(pid) => format!("fcvm exec --pid {pid} --vm --"),
+        None => "fcvm exec --pid <the VM's fcvm pid> --vm --".to_string(),
+    };
+    match failure {
+        ReopenFailure::LeftGated(error) => {
+            let boundary = token
+                .map(|token| format!(" --boundary {token}"))
+                .unwrap_or_default();
+            ReopenFailure::LeftGated(error.context(format!(
+                "to open the gate by hand: `{exec} {FC_AGENT_PATH} --resume-snapshot-network\
+                 {boundary}`"
+            )))
+        }
+        ReopenFailure::Stale(error, owed) => {
+            let held = token.unwrap_or("none");
+            let resume = format!("{exec} {FC_AGENT_PATH} --resume-snapshot-network");
+            let by_hand = match &owed {
+                Some(Some(owed)) => format!(
+                    "its guest's owed boundary has the token {owed}. To open the gate by \
+                     hand: `{resume} --boundary {owed}`"
+                ),
+                Some(None) => format!(
+                    "its guest's owed boundary has no token. To open the gate by hand: \
+                     `{resume}`"
+                ),
+                // A guest that did not say: the mark holds it. A restarted agent that
+                // serves the resume alone refuses this read.
+                None => format!(
+                    "its guest did not say which token its owed boundary has. To open the \
+                     gate by hand, read the mark: `{exec} /usr/bin/cat \
+                     /run/fcvm/snapshot-boundary-owed`, then run the resume with the value \
+                     after `token=`: `{resume} --boundary <that value>` (with no \
+                     `--boundary` when the mark has no `token=` line)"
+                ),
+            };
+            ReopenFailure::Stale(
+                error.context(format!(
+                    "the token this VM's state holds ({held}) is not the one of the boundary \
+                     its guest owes: {by_hand}"
+                )),
+                owed,
+            )
+        }
+        refused @ ReopenFailure::Refused(_) => refused,
+    }
 }
 
 /// The loop of [`reopen_source_network`], with the try and the state's record as
@@ -6621,6 +6957,27 @@ where
                      it, and its gate is that restore's"
                 ))));
             }
+            // Not tried again: the same resume gets the same answer. The record written
+            // before the first try stays, and so does the token, because the gate can be
+            // this source's own and closed.
+            ReopenTry::Stale(error, owed) => {
+                error!(
+                    vm_id,
+                    error = %format!("{error:#}"),
+                    "CRITICAL: the source VM's guest refused the resume as another \
+                     boundary's; its network gate may be closed"
+                );
+                return Err(ReopenFailure::Stale(
+                    error.context(format!(
+                        "source VM {vm_id} MAY BE LEFT WITH ITS NETWORK GATE CLOSED: its guest \
+                     refused the resume because the resume's token is not the one of the \
+                     boundary the guest owes. Its state records the gate closed; the next \
+                     `fcvm snapshot create` of it asks again and is refused while the guest \
+                     answers the same"
+                    )),
+                    owed,
+                ));
+            }
             ReopenTry::Failed(error) => error,
         };
         if tries >= max_tries || started.elapsed() + pause + least_try > bound {
@@ -6636,7 +6993,8 @@ where
                  has, and refuses every new TCP connection, in and out, until \
                  `{FC_AGENT_PATH} --resume-snapshot-network` succeeds in it. Its state \
                  records the closed gate; the next `fcvm snapshot create` of it asks again, \
-                 clears the record when the gate opens, and is refused while it stays closed",
+                 clears the record when the gate opens, and is refused while it stays \
+                 closed",
                 started.elapsed()
             ))));
         }
@@ -7197,10 +7555,13 @@ pub async fn create_snapshot_core(
         // invoked yet.
         let operation_error =
             error.context("preparing guest network boundary for Firecracker snapshot");
-        let guest_network_resume_result =
-            reopen_source_after_failed_prepare(vsock_socket_path, &snapshot_config.vm_id)
-                .await
-                .context("reopening guest network after Firecracker preparation failure");
+        let guest_network_resume_result = reopen_source_after_failed_prepare(
+            vsock_socket_path,
+            &snapshot_config.vm_id,
+            &operation_error,
+        )
+        .await
+        .context("reopening guest network after Firecracker preparation failure");
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(operation_error),
@@ -7744,10 +8105,14 @@ impl<'a> ChSnapshotGuest<'a> {
 
     /// Reopen the boundary after a failed `prepare`, whose failure does not prove it did
     /// not run. Guest-side flock serialization makes the unconditional reopen exact.
-    async fn reopen_after_failed_prepare(&self, vm_id: &str) -> Result<()> {
+    async fn reopen_after_failed_prepare(
+        &self,
+        vm_id: &str,
+        prepare_error: &anyhow::Error,
+    ) -> Result<()> {
         match self {
             ChSnapshotGuest::FcAgent { vsock_socket_path } => {
-                reopen_source_after_failed_prepare(vsock_socket_path, vm_id).await
+                reopen_source_after_failed_prepare(vsock_socket_path, vm_id, prepare_error).await
             }
             ChSnapshotGuest::Raw => Ok(()),
         }
@@ -7862,7 +8227,7 @@ pub async fn create_snapshot_ch(
         let operation_error =
             error.context("preparing guest network boundary for Cloud Hypervisor snapshot");
         let guest_network_resume_result = guest
-            .reopen_after_failed_prepare(&snapshot_config.vm_id)
+            .reopen_after_failed_prepare(&snapshot_config.vm_id, &operation_error)
             .await
             .context("reopening guest network after Cloud Hypervisor preparation failure");
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
@@ -8027,6 +8392,36 @@ mod tests {
             .await;
         crate::companion::forget(holder_pid);
         crate::network::netns_agent::forget(holder_pid);
+    }
+
+    /// A confined start whose Firecracker binary cannot be found is refused at the
+    /// preflight, where nothing has been created yet. It used to pass there and fail at the
+    /// launch, after namespaces and disks existed.
+    #[test]
+    fn the_confined_preflight_refuses_a_binary_it_cannot_find() {
+        let confined = crate::confine::Decision::for_test(Some(crate::confine::Confinement {
+            landlock_abi: crate::confine::LANDLOCK_ABI_FLOOR,
+            layers: vec![
+                crate::confine::Layer::Process,
+                crate::confine::Layer::Seccomp,
+            ],
+            core_limit: 1,
+            seccomp: Some(crate::confine::SeccompMode::Enforce),
+        }));
+        let absent = super::RuntimeConfig {
+            firecracker_bin: Some("/nonexistent/firecracker".into()),
+            ..super::RuntimeConfig::default()
+        };
+        let refused = super::require_confined_filter(&confined, &absent)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("nothing was started")
+                && refused.contains("/nonexistent/firecracker does not exist"),
+            "{refused}"
+        );
+        // An unconfined start needs no filter and is not asked for the binary here.
+        super::require_confined_filter(&crate::confine::Decision::for_test(None), &absent).unwrap();
     }
 
     /// `SO_NETNS_COOKIE` of a socket: the identity of the network namespace it was made in.
@@ -8967,6 +9362,74 @@ mod tests {
         );
     }
 
+    /// A restore whose load overrides every source path reads nothing under the view, the
+    /// directory every VM's runtime directory is in: it needs no mount namespace, and listing
+    /// that directory takes the lock every other start's `mkdir` needs. The other two kinds
+    /// of load list it, for the directories and the files they keep visible.
+    ///
+    /// RED BEFORE THE FIX: every restore listed the view twice and threw the result away
+    /// when the load overrode everything, so here, where the view cannot be listed, it
+    /// failed.
+    #[test]
+    fn a_load_that_overrides_every_path_does_not_list_the_view() {
+        let root = tempfile::tempdir().unwrap();
+        // Not a directory: listing it fails, so a restore that succeeds did not list it.
+        let unlistable = root.path().join("not-a-directory");
+        std::fs::write(&unlistable, b"").unwrap();
+        let clone = unlistable.join("vm-clone");
+        let redirects = clone_mount_redirects(
+            LoadOverrides::Everything,
+            &unlistable,
+            Vec::new(),
+            &clone,
+            &clone,
+        )
+        .expect("a load that overrides everything listed the view");
+        assert!(redirects.is_none(), "it needs no mount namespace");
+        for overrides in [LoadOverrides::None, LoadOverrides::Vsock] {
+            let error = clone_mount_redirects(overrides, &unlistable, Vec::new(), &clone, &clone)
+                .expect_err("a load that needs the view did not list it");
+            assert!(
+                format!("{error:#}").contains("for the clone's mount view"),
+                "{error:#}"
+            );
+        }
+
+        // A load that needs the view gets what the view holds.
+        let view = root.path().join("vm-disks");
+        let (clone, other) = (view.join("vm-clone"), view.join("vm-other"));
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(view.join("ro.img"), b"").unwrap();
+        let redirects =
+            clone_mount_redirects(LoadOverrides::Vsock, &view, Vec::new(), &clone, &clone)
+                .unwrap()
+                .expect("a load that does not override the disks needs the view");
+        assert_eq!(redirects.keep, vec![other]);
+        assert_eq!(redirects.keep_files, vec![view.join("ro.img")]);
+        assert!(clone_mount_redirects(
+            LoadOverrides::Everything,
+            &view,
+            Vec::new(),
+            &clone,
+            &clone
+        )
+        .unwrap()
+        .is_none());
+
+        // The restore goes through that function and lists nothing itself.
+        let source = include_str!("common.rs");
+        let prepare = &source[source.find("async fn prepare_clone_substrate(").unwrap()..];
+        let prepare = &prepare[..prepare.find("\n}\n").unwrap()];
+        assert!(prepare.contains("clone_mount_redirects(overrides, &view,"));
+        for listing in ["view_entries(", "view_files(", "read_dir("] {
+            assert!(
+                !prepare.contains(listing),
+                "prepare_clone_substrate calls {listing} itself"
+            );
+        }
+    }
+
     /// A read-only `--disk` under another directory of vm-disks stays reachable,
     /// whatever that directory is called: every directory the view holds that no
     /// redirect replaces is kept, bound onto itself when it still exists as the VMM starts.
@@ -9574,11 +10037,11 @@ mod tests {
         left.pid_start_time = None;
         left.restore_acknowledged = true;
         left.lifecycle_ready = true;
-        std::fs::write(
-            tmp.path().join("vm-sticky-gone.json"),
-            serde_json::to_string(&left).unwrap(),
-        )
-        .unwrap();
+        // Written where `save_state` reads the state it replaces, or the save below would
+        // find nothing to inherit from and prove nothing.
+        let left_file = manager.state_file("vm-sticky-gone");
+        std::fs::create_dir_all(left_file.parent().unwrap()).unwrap();
+        std::fs::write(&left_file, serde_json::to_string(&left).unwrap()).unwrap();
         left.restore_acknowledged = false;
         left.lifecycle_ready = false;
         manager.save_state(&left).await.unwrap();
@@ -10900,6 +11363,108 @@ mod tests {
             "the gate of a restoring clone is not this create's to record"
         );
 
+        // stale (#2159): the guest refused the resume as another boundary's, which says
+        // nothing of the gate. Asked once, and the record written before the ask stays:
+        // the gate can be this source's own, closed. Taken for the restore's refusal, the
+        // record and the token were erased over a gated, frozen source.
+        let tries = AtomicU32::new(0);
+        let error = reopen_until_open(
+            "vm-source",
+            Duration::from_secs(30),
+            spacing,
+            u32::MAX,
+            false,
+            |_| async {
+                tries.fetch_add(1, Ordering::SeqCst);
+                ReopenTry::Stale(anyhow::anyhow!("exit code 5"), Some(Some("9f8e".into())))
+            },
+            record,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(&error, ReopenFailure::Stale(_, Some(Some(owed))) if owed == "9f8e"),
+            "{error:?}"
+        );
+        assert_eq!(
+            take(),
+            vec![true],
+            "the record of a stale refusal was taken back"
+        );
+        // What the operator is told: the one command, with the token the guest's own
+        // refusal reported. A `cat` of the mark would be refused by a restarted agent that
+        // serves the resume alone, so the operator could not learn it.
+        let told = format!(
+            "{:#}",
+            with_the_resume_by_hand(error, Some(4242), Some("0a1b")).into_error()
+        );
+        for part in [
+            "the token this VM's state holds (0a1b) is not the one of the boundary its guest owes",
+            "its guest's owed boundary has the token 9f8e",
+            "`fcvm exec --pid 4242 --vm -- /usr/local/bin/fc-agent --resume-snapshot-network --boundary 9f8e`",
+            "MAY BE LEFT WITH ITS NETWORK GATE CLOSED",
+        ] {
+            assert!(told.contains(part), "{part}\n{told}");
+        }
+        assert!(!told.contains("cat "), "{told}");
+        let stale = |owed| ReopenFailure::Stale(anyhow::anyhow!("exit code 5"), owed);
+        let told = |failure| {
+            format!(
+                "{:#}",
+                with_the_resume_by_hand(failure, Some(4242), None).into_error()
+            )
+        };
+        // a mark with no token: the resume with none
+        let tokenless = told(stale(Some(None)));
+        assert!(
+            tokenless.contains(
+                "`fcvm exec --pid 4242 --vm -- /usr/local/bin/fc-agent --resume-snapshot-network`"
+            ) && tokenless.contains("(none)"),
+            "{tokenless}"
+        );
+        // a guest that did not say: the mark is read, by absolute path
+        let unsaid = told(stale(None));
+        assert!(
+            unsaid.contains(
+                "`fcvm exec --pid 4242 --vm -- /usr/bin/cat /run/fcvm/snapshot-boundary-owed`"
+            ),
+            "{unsaid}"
+        );
+        // the report, as the guest writes it in its refusal
+        let report = |stderr: &str| reported_owed_token(stderr);
+        assert_eq!(
+            report("refused: nothing was changed. owed-boundary-token=9f8e-01\n"),
+            Some(Some("9f8e-01".to_string()))
+        );
+        assert_eq!(report("x owed-boundary-token=none\n"), Some(None));
+        assert_eq!(report("refused, and nothing more"), None);
+        assert_eq!(report("owed-boundary-token=\n"), None);
+        assert_eq!(
+            report(&format!("owed-boundary-token={}", "a".repeat(65))),
+            None
+        );
+        // only what the guest's own argument check takes ends up in a printed command
+        assert_eq!(
+            report("owed-boundary-token=ab`rm -rf`"),
+            Some(Some("ab".to_string()))
+        );
+        let told = format!(
+            "{:#}",
+            with_the_resume_by_hand(
+                ReopenFailure::LeftGated(anyhow::anyhow!("LEFT WITH ITS NETWORK GATE CLOSED")),
+                Some(4242),
+                Some("0a1b")
+            )
+            .into_error()
+        );
+        assert!(
+            told.starts_with(
+                "to open the gate by hand: `fcvm exec --pid 4242 --vm -- /usr/local/bin/fc-agent --resume-snapshot-network --boundary 0a1b`: LEFT WITH"
+            ),
+            "{told}"
+        );
+
         // What a later create gives a source recorded gated: one ask. Still closed, the
         // record stays as it is; open, it is cleared.
         let tries = AtomicU32::new(0);
@@ -10943,8 +11508,9 @@ mod tests {
         assert!(ask.contains("|closed| record_source_gate(vm_id, closed),"));
         // A create whose source's agent died in the boundary fails once the gate is
         // open, and both creators discard the image on that error.
-        assert!(ask.contains(
-            "if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {\n                        ReopenTry::OpenAfterAgentRestart"
+        assert!(ask.contains("Ok(output) => reopen_try_of(vm_id, output),"));
+        assert!(body_of(source, "fn reopen_try_of(").contains(
+            "if output.stderr.contains(SOURCE_AGENT_RESTARTED_REPORT) {\n            ReopenTry::OpenAfterAgentRestart"
         ));
         let resume = body_of(source, "async fn resume_paused_source(");
         assert!(resume.contains("if reopen_source_network(vsock_socket, vm_id, true).await? {"));
@@ -10991,6 +11557,7 @@ mod tests {
         let saved = serde_json::to_string(&state).unwrap();
         let loaded: crate::state::VmState = serde_json::from_str(&saved).unwrap();
         assert!(loaded.network_gate_closed);
+        assert!(!saved.contains("boundary_token"));
 
         // The status the guest refuses with is the one the host reads: fc-agent's
         // `a_refused_one_shot_exits_with_the_status_the_host_reads` reads this constant.
@@ -10999,6 +11566,199 @@ mod tests {
         // the exec's 54 s of connect retries.
         assert!(SOURCE_REOPEN_BOUND > Duration::from_secs(90 + 30));
         assert!(SOURCE_REOPEN_ONE_ASK > Duration::from_secs(54));
+    }
+
+    /// What the host takes a resume one-shot's result for. A resume that opened the gate
+    /// and could not remove the manifest or the mark exits with a status of its own, and
+    /// is an open gate: read as a failed try, it had the host record a closed gate over an
+    /// open one and refuse every later snapshot of the VM.
+    #[test]
+    fn a_resume_that_opened_the_gate_and_could_not_clean_up_is_an_open_gate() {
+        let said = |exit_code: i32, stderr: &str| {
+            reopen_try_of(
+                "vm-source",
+                crate::commands::exec::ExecOutput {
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                    exit_code,
+                },
+            )
+        };
+        assert!(matches!(said(0, "gate=open"), ReopenTry::Open));
+        assert!(matches!(
+            said(0, SOURCE_AGENT_RESTARTED_REPORT),
+            ReopenTry::OpenAfterAgentRestart
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_OPEN_UNCLEAN_EXIT, "the gate is open, and"),
+            ReopenTry::Open
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_OPEN_UNCLEAN_EXIT, SOURCE_AGENT_RESTARTED_REPORT),
+            ReopenTry::OpenAfterAgentRestart
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_REFUSED_EXIT, ""),
+            ReopenTry::Refused(_)
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_STALE_EXIT, "owed-boundary-token=9f8e"),
+            ReopenTry::Stale(_, Some(Some(owed))) if owed == "9f8e"
+        ));
+        assert!(matches!(
+            said(ONE_SHOT_STALE_EXIT, ""),
+            ReopenTry::Stale(_, None)
+        ));
+        assert!(matches!(said(1, ""), ReopenTry::Failed(_)));
+        // the left-gated and stale errors give the commands an operator would run:
+        // `a_source_is_asked_to_reopen_until_its_gate_is_open_or_the_bound_has_passed`
+    }
+
+    /// A snapshot create's boundary has a token, on the VM's state from before its
+    /// prepare until its gate is reported open (#2159).
+    ///
+    /// The prepare sends it to the guest, which writes it into its `owed` mark, and every
+    /// resume reads it from the state and sends it: the reopen after the VMM resume, the
+    /// reopen after a prepare whose reply was lost, and the one ask of a later create to
+    /// a source recorded gated. A resume the host gave up on carries the token it read
+    /// when it was sent, so one delivered into a later create's boundary carries the
+    /// earlier token and the guest does nothing (fc-agent's
+    /// `a_resume_acts_only_on_the_boundary_it_was_sent_for`).
+    ///
+    /// RED BEFORE THE FIX: no one-shot carried anything that said which snapshot it
+    /// belonged to.
+    #[tokio::test]
+    async fn a_boundarys_token_is_on_the_state_from_its_prepare_until_its_gate_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_manager = crate::state::StateManager::new(dir.path().to_path_buf());
+        state_manager.init().await.unwrap();
+        // a VM with no state: no token, for the prepare and so for the resumes
+        assert_eq!(
+            begin_source_boundary(&state_manager, "vm-gone")
+                .await
+                .unwrap(),
+            None
+        );
+        let token_of =
+            |vm: &'static str| async { owed_boundary_token(&state_manager, vm).await.unwrap() };
+        assert_eq!(token_of("vm-gone").await, None);
+        assert_eq!(
+            resume_args(&state_manager, "vm-gone", false).await.unwrap(),
+            ["--resume-snapshot-network"]
+        );
+
+        let state = crate::state::VmState::new("vm-source".into(), "alpine".into(), 1, 128);
+        state_manager.save_state(&state).await.unwrap();
+        assert_eq!(token_of("vm-source").await, None);
+        let first = begin_source_boundary(&state_manager, "vm-source")
+            .await
+            .unwrap()
+            .expect("a VM with a state gets a token");
+        // what fc-agent's `boundary_token` accepts
+        assert!(first.len() == 32 && first.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(token_of("vm-source").await.as_deref(), Some(first.as_str()));
+        // every resume carries it, with the host's clock when a pause preceded it
+        assert_eq!(
+            resume_args(&state_manager, "vm-source", false)
+                .await
+                .unwrap(),
+            ["--resume-snapshot-network", "--boundary", first.as_str()]
+        );
+        let after_pause = resume_args(&state_manager, "vm-source", true)
+            .await
+            .unwrap();
+        assert_eq!(after_pause.len(), 5);
+        assert_eq!(after_pause[1], "--host-time-ns");
+        assert_eq!(after_pause[3..], ["--boundary", first.as_str()]);
+        // left gated: the token stays for the later create's one ask
+        record_source_gate_in(&state_manager, "vm-source", true).await;
+        let gated = state_manager.load_state("vm-source").await.unwrap();
+        assert!(gated.network_gate_closed);
+        assert_eq!(gated.boundary_token.as_deref(), Some(first.as_str()));
+        // open: nothing is owed, and the state is as it was before the create
+        record_source_gate_in(&state_manager, "vm-source", false).await;
+        let open = state_manager.load_state("vm-source").await.unwrap();
+        assert!(!open.network_gate_closed && open.boundary_token.is_none());
+        // the next create's boundary is another one
+        let second = begin_source_boundary(&state_manager, "vm-source")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first, second);
+
+        // A state that is there and cannot be read or written is an error on both
+        // sides, never "no token". Sent without the token its mark holds, the guest
+        // refuses the resume as stale, with the gate closed; a prepare sent tokenless
+        // beside a state that holds an earlier token gets every resume refused.
+        let state_file = state_manager.state_file("vm-source");
+        let good = std::fs::read_to_string(&state_file).unwrap();
+        std::fs::write(&state_file, "{ not a state").unwrap();
+        assert!(owed_boundary_token(&state_manager, "vm-source")
+            .await
+            .is_err());
+        assert!(resume_args(&state_manager, "vm-source", false)
+            .await
+            .is_err());
+        let refused = begin_source_boundary(&state_manager, "vm-source")
+            .await
+            .unwrap_err();
+        assert!(format!("{refused:#}").contains("nothing was sent to its guest"));
+        // A prepare that was never sent has no gate to reopen. Both creators hand the
+        // prepare's error to the reopen, which then asks the guest nothing; asked, it was
+        // asked for the whole bound and the create ended by reporting a gate left closed
+        // that had never been closed. (The socket here leads nowhere: an ask would not
+        // return within the test's five seconds.)
+        assert!(!prepare_was_sent(&refused));
+        let as_the_creators_wrap_it = refused.context("preparing guest network boundary");
+        assert!(!prepare_was_sent(&as_the_creators_wrap_it));
+        assert!(prepare_was_sent(&anyhow::anyhow!("exec: no reply")));
+        let nowhere = dir.path().join("no-vsock.sock");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reopen_source_after_failed_prepare(&nowhere, "vm-source", &as_the_creators_wrap_it),
+        )
+        .await
+        .expect("a reopen was asked of a guest that was sent no prepare")
+        .unwrap();
+        std::fs::write(&state_file, good).unwrap();
+        assert_eq!(
+            token_of("vm-source").await.as_deref(),
+            Some(second.as_str())
+        );
+
+        // The prepare of both creators sends the token, and every resume reads it from
+        // the state at its own try and sends it.
+        let source = include_str!("common.rs");
+        let prepare = body_of(source, "async fn run_snapshot_network_command(");
+        assert!(
+            prepare
+                .find("begin_source_boundary(&state_manager, vm_id)")
+                .unwrap()
+                < prepare
+                    .find("args.extend([\"--boundary\", token]);")
+                    .unwrap()
+        );
+        // The prepare is not sent when the token could not be written, and a try whose
+        // arguments cannot be read from the state is a failed try, which is tried again.
+        assert!(prepare.contains("begin_source_boundary(&state_manager, vm_id).await?;"));
+        assert!(body_of(source, "pub async fn create_snapshot_core(").contains(
+            "reopen_source_after_failed_prepare(\n            vsock_socket_path,\n            &snapshot_config.vm_id,\n            &operation_error,"
+        ));
+        assert!(body_of(source, "pub async fn create_snapshot_ch(")
+            .contains(".reopen_after_failed_prepare(&snapshot_config.vm_id, &operation_error)"));
+        let ask = body_of(source, "async fn ask_source_to_reopen(");
+        assert!(ask.contains(
+            "let args = match resume_args(state_manager, vm_id, pause_preceded).await {\n                Ok(args) => args,\n                Err(error) => return ReopenTry::Failed(error),"
+        ));
+        for creator in [
+            "pub async fn create_snapshot_core(",
+            "async fn prepare(&self, vm_id: &str)",
+        ] {
+            assert!(
+                body_of(source, creator).contains("run_snapshot_network_command("),
+                "{creator} does not prepare through the token"
+            );
+        }
     }
 
     /// Every reopen of the source's network after a pause has been invoked sets the
@@ -11071,9 +11831,13 @@ mod tests {
         assert!(body_of(source, "async fn reopen_source_network(").contains(
             "ask_source_to_reopen(\n        vsock_socket,\n        vm_id,\n        pause_preceded,"
         ));
-        let reopen = body_of(source, "async fn ask_source_to_reopen(");
-        assert!(reopen.contains("if pause_preceded {"));
-        assert!(reopen.contains("args.extend([\"--host-time-ns\", &host_time]);"));
+        assert!(body_of(source, "async fn ask_source_to_reopen(")
+            .contains("resume_args(state_manager, vm_id, pause_preceded)"));
+        // The clock goes with a resume exactly when a pause preceded it, read at that
+        // try: `a_boundarys_token_is_on_the_state_from_its_prepare_until_its_gate_is_open`
+        // runs `resume_args` both ways.
+        let args = body_of(source, "async fn resume_args(");
+        assert!(args.contains("if pause_preceded {\n        let host_time = crate::utils::host_clock_now().as_nanos().to_string();"));
     }
 
     /// A memory snapshot's balloon record is read from the VMM inside
@@ -11348,7 +12112,9 @@ mod tests {
         assert!(matches!(raw, ChSnapshotGuest::Raw));
         // Nothing to reach: every step succeeds without a socket.
         raw.prepare("vm-raw").await.unwrap();
-        raw.reopen_after_failed_prepare("vm-raw").await.unwrap();
+        raw.reopen_after_failed_prepare("vm-raw", &anyhow::anyhow!("prepare"))
+            .await
+            .unwrap();
         raw.resume("vm-raw").await.unwrap();
 
         // `snapshot create` reads the fc-agent socket only for a guest that runs fc-agent.

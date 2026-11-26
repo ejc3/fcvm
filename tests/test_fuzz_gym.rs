@@ -807,15 +807,7 @@ impl Started {
         );
         let state_dir = fcvm::paths::state_dir();
         let mut left = Vec::new();
-        for entry in std::fs::read_dir(&state_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
+        for path in fcvm::state::StateManager::new(state_dir).state_files() {
             let name = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())

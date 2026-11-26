@@ -481,7 +481,17 @@ async fn apply_restore_epoch(
     // Published: the gate is open and the boundary is nobody's. Before the
     // acknowledgement, so a host that snapshots this clone the moment it is told the
     // restore is done is not refused.
-    crate::snapshot_network::end_restore_boundary();
+    // A mark that cannot be removed fails the restore: acknowledged with it, the clone
+    // would refuse every snapshot for the rest of its life.
+    if let Err(error) = crate::snapshot_network::end_restore_boundary() {
+        signals.restore_status.fail();
+        eprintln!(
+            "[fc-agent] FATAL: clone restore failed closed (epoch={}): {:#}; the clone would \
+             refuse every snapshot; shutting down clone",
+            current, error
+        );
+        crate::system::shutdown_vm(1).await;
+    }
     if let Err(error) = crate::vsock::notify_restore_complete(current, &phases).await {
         signals.restore_status.fail();
         eprintln!(

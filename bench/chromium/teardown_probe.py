@@ -32,6 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from reqbench import (  # noqa: E402
     DirWatch, children_of, clone_cdp_endpoint, find_state, pidfd_open, proc_comm,
+    refuse_unconverted_state_layout,
     reap_disk, scan_state, wait_port,
 )
 
@@ -147,6 +148,7 @@ def main():
     a = ap.parse_args()
     a.fcvm = os.path.abspath(a.fcvm)
     state_dir = os.path.join(a.data_root, "state")
+    refuse_unconverted_state_layout(state_dir)
 
     rows: list = []
     leaked = False
