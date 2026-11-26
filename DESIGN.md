@@ -400,7 +400,7 @@ Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace
 - Requires root and a host with a global IPv6 /64 subnet (or `--ipv6-prefix` to specify one explicitly)
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
 - Each VM gets a unique IPv6 derived from the host's /64 prefix, or the address `--ipv6-address` names inside the prefix in use (not its address 0 or 1)
-- A VM leases its address before using it: an exclusive `flock` on `/run/fcvm/routed-ipv6/<address>.lock`, held until its network is torn down and released by the kernel if the process dies. Of two VMs that ask for one address together, exactly one gets it. If the lease is free but the host already has a /128 route for the address, in any routing table, the route belongs to something other than a live fcvm VM (the host itself, a VM that died without cleanup, another program), so a given address is refused and a derived one is re-derived
+- A VM leases its address before using it: an exclusive `flock` on `/run/fcvm/routed-ipv6/<address>.lock`, held until its network is torn down and released by the kernel if the process dies. A killed VM's lease file is removed by a sweep of the directory, which a start runs at most once per 5 s (`src/sweep.rs`); a start holds the directory's `flock` shared while it opens and locks its own file, and the sweep tries the files' locks only under that lock held exclusively. Of two VMs that ask for one address together, exactly one gets it. If the lease is free but the host already has a /128 route for the address, in any routing table, the route belongs to something other than a live fcvm VM (the host itself, a VM that died without cleanup, another program), so a given address is refused and a derived one is re-derived
 - Port forwarding via built-in TCP proxy (`setns` + tokio relay): a mapping listens on its HOSTIP, or on the VM's loopback IP (same allocation as rootless) when it names none
 - Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
 
@@ -634,6 +634,70 @@ kick. It cannot tell whether a commit does. The fork's own tests do that
 and nothing at run time tells a kernel that keeps the kick from one that clears it. On
 x86_64 the direct snapshot run tests require the kick line in the clone's Firecracker log,
 which shows the `[firecracker]` build ran the step, not that the kick lasted.
+
+### Cloud Hypervisor: the build and its snapshots
+
+fcvm's Cloud Hypervisor is upstream's main branch at the commit `[cloud_hypervisor]` in
+`rootfs-config.toml` names, with no patch of fcvm's own. Until 2026-11 it was a fork branch
+49 commits past v52.0 carrying a restore mode of fcvm's (`memory_restore_mode=map`). Upstream
+has had the same mechanism since v54.0 as `copyonwrite`, and in the 2,412 commits between
+the two it fixed three defects in arm64 snapshot and restore that fcvm hit on the fork
+(#2155).
+
+- **One build.** `fcvm setup --cloud-hypervisor` clones the repository, checks out the
+  configured commit, refuses a checkout whose HEAD is anything else, and builds it with
+  `--locked` and the toolchain in fcvm's `rust-toolchain.toml`. It installs the binary only
+  if its `--version` ends in `-g` and the commit's first twelve digits, the form
+  `git describe` gives it. The binary is
+  `cloud-hypervisor-<hash>.bin` in the store, the hash over the repository, the commit, the
+  architecture and the libc. Launch computes that name from the config and runs that file.
+  When it is absent the launch fails and names the setup command: no other build in the
+  store and nothing on PATH stands in. `FCVM_CLOUD_HYPERVISOR_BIN` names another binary on
+  purpose.
+- **What a restore passes** (`ch_restore_args`, `src/commands/common.rs`):
+  - `memory_restore_mode=copyonwrite` maps the snapshot's memory file `MAP_PRIVATE` over
+    guest RAM, so clones of one snapshot share its clean pages through the page cache.
+    Upstream falls back to reading the whole file, with one line in its log, when it
+    judges the guest's RAM unsuitable. fcvm configures nothing that triggers it, and reads
+    the VMM's `/proc/<pid>/maps` after the resume: a restore whose VMM does not map the
+    memory file fails.
+  - `clock_restore_mode=preserve` resumes the guest's clock at its value when the source
+    was paused. Upstream's default (`advance`) adds the wall time since the snapshot, so a
+    clone of a day-old snapshot would start a day ahead on CLOCK_MONOTONIC with every armed
+    timer expired. The guest's wall clock is fcvm's to set: fc-agent's restore handler
+    steps it from the host's time, and a raw guest's agent sets it from the clock line its
+    namespace serves. `preserve` is on upstream's main (2026-11-23) and in no release.
+- **A snapshot belongs to the build that wrote it.** The snapshot's metadata records what
+  its VMM printed for `--version`, and a restore on a build that prints anything else, or of
+  a snapshot that records none, is refused before it creates anything, with both builds
+  named. A create whose VMM's build cannot be named (its binary was replaced after it
+  started) fails before the pause. Cloud Hypervisor's `state.json` is that build's device
+  state, and upstream promises compatibility for live migration from the two previous
+  releases only. The snapshot cache key holds the binary's path, which holds the commit for
+  the configured build, so a cached snapshot is taken again after the pin moves. A binary
+  named by `FCVM_CLOUD_HYPERVISOR_BIN` and replaced in place keeps its path: `podman run`
+  then meets the refusal, deletes the cached entry and boots fresh. The fleet's Windows gold
+  snapshot is keyed by the build too (`gold_key`, `src/fleet/agent/windows.rs`).
+- **The config section is `repo` and `commit`.** A config written by an older fcvm has
+  `branch` and no `commit` there and does not parse; `make build` and
+  `fcvm setup --generate-config --force` write the current one.
+- **A source resumed in place keeps the host's time.** `snapshot create` without `--stop`
+  pauses the VM, saves it and resumes it. On x86_64 the fork set the guest's clock back to
+  its value at the pause, so the guest fell behind by every pause; upstream sets it with
+  the wall time that passed. On arm64 the counter runs through the pause on both (#2173).
+  Measured in docs/fleet/windows-sandboxes.md, "The fork against upstream".
+- **A snapshot of a clone** is written by cloning the extents of the memory file the clone
+  maps (FICLONERANGE) and then writing the pages the clone changed. The result holds every
+  page: `test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot` deletes the
+  parent snapshot and reads back memory from both generations.
+- **`vm.create`** asks for the virtio-net offloads (checksum, TSO, UFO), which upstream
+  stopped offering by default in v54.0.
+
+**Moving the pin.** Change `commit`, read upstream's release notes and the commits since
+the old one for the options and defaults above, then run the Cloud Hypervisor tests
+(`make test-root FILTER="-E 'test(/cloud_hypervisor/) | test(/^gym_pairs_/)'"`) on arm64 and
+`fleet/windows/measure-restore.sh` on an x86_64 host. Every Cloud Hypervisor snapshot is
+created again afterwards.
 
 ### Disk-Only Snapshots & Cold-Boot Clones
 
@@ -1293,7 +1357,7 @@ command runs, and every child (Firecracker, holder, pasta) and every in-process 
 | unprivileged | stays in its own cgroup, one log line |
 | `--no-swap` | `memory.swap.max=0` on the scope before the VMM starts; refused when there is no scope with a memory controller |
 | lifetime | pdeathsig is per process and survives the move: a VM dies with its launcher where the launcher armed it; a foreground fcvm dies with its terminal's SIGHUP; a detached one outlives the session |
-| removal | at exit fcvm moves back to the cgroup it came from and removes the scope; each entry sweeps scopes whose (pid, start time) is gone, and empty `fcvm-<pid>.scope`s of earlier releases, under an `flock` on the parent that covers the empty window between a scope's `mkdir` and its owner's entry. The name is the owner record, not a `reclaim` record, because reclaim records are per data_dir and per user and a cgroup is per kernel |
+| removal | at exit fcvm moves back to the cgroup it came from and removes the scope; a start sweeps the parent when a sweep is due (`src/sweep.rs`: at most once per 5 s and parent, behind a stamp under `<data_dir>/cgroup-sweep/`), removing the scopes whose (pid, start time) is gone and the empty `fcvm-<pid>.scope`s of earlier releases. A start holds the parent's `flock` shared across the empty window between its scope's `mkdir` and its entry, and a sweep removes only under that lock held exclusively, which it waits for at most 100 ms. The name is the owner record, not a `reclaim` record, because reclaim records are per data_dir and per user and a cgroup is per kernel |
 
 ---
 
@@ -1567,6 +1631,7 @@ One async session per connection:
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm balloon` | Print a VM's balloon target and size; with MIB, set the target first |
 | `fcvm ls` | List running VMs |
+| `fcvm paths` | Print the state and data directories this binary uses |
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Spawn clone from memory server |
@@ -2046,6 +2111,25 @@ my-nginx       12345   running   healthy   bridged   nginx:alpine
 clone-1        12350   running   healthy   rootless  (clone)
 ```
 
+#### `fcvm paths`
+
+**Purpose**: Name the directories this binary keeps VM state and data in, for tools
+outside fcvm that read state files (the benchmark harnesses under `bench/`).
+
+**Usage**:
+```bash
+fcvm paths [--json]
+```
+
+With `--json` it prints one JSON object on one line, for example
+`{"state_dir":"/mnt/fcvm-btrfs/state","data_dir":"/mnt/fcvm-btrfs"}`; without, one
+`name<TAB>path` line per directory. Each value is what `paths::state_dir()` and
+`paths::data_dir()` return for this config and `FCVM_DATA_DIR`, so a tool that asks
+follows the binary wherever it keeps its state. Fields are added, never renamed or
+removed. It reads no VM state and creates nothing. A tool asks with the binary and
+environment its VMs run with: `sudo` without `-E` drops FCVM_DATA_DIR, and the answer
+under it is then the configured directory, as it is for the VMs.
+
 #### `fcvm balloon`
 
 **Purpose**: Read or set the balloon target of a running VM.
@@ -2183,6 +2267,7 @@ fcvm/
 │   │   ├── common.rs       # Shared utilities
 │   │   ├── exec.rs         # fcvm exec
 │   │   ├── ls.rs           # fcvm ls
+│   │   ├── paths.rs        # fcvm paths
 │   │   ├── podman.rs       # fcvm podman run
 │   │   ├── setup.rs        # fcvm setup
 │   │   ├── snapshot.rs     # fcvm snapshot {create,serve,run} + UFFD server
@@ -2345,7 +2430,7 @@ Override with `FCVM_BASE_DIR` environment variable.
 │   └── {vm-id}/disks/rootfs.raw
 ├── snapshots/         # Firecracker snapshots
 ├── state/             # VM state JSON files
-│   └── {vm-id}.json
+│   └── vms/<b>/{vm-id}.json
 └── cache/             # Downloaded images and packages
     ├── ubuntu-24.04-arm64-{sha}.img  # Cloud image cache
     └── packages-{sha}/               # Downloaded .deb files

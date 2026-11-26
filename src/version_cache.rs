@@ -23,8 +23,7 @@
 //! cache entries stay valid).
 //!
 //! Only *successful* derivations are cached. A binary that fails to run (wrong
-//! arch, missing loader) re-runs every time and keeps producing its real error,
-//! which is what the fallback logic in `find_cloud_hypervisor()` depends on.
+//! arch, missing loader) re-runs every time and keeps producing its real error.
 //!
 //! Cache IO never fails a derivation: an unreadable or unwritable cache degrades
 //! to recomputing (so a root-created cache dir does not break unprivileged

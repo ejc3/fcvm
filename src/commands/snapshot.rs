@@ -3282,8 +3282,8 @@ async fn cmd_snapshot_run_inner(
     //
     // What VMs of processes killed without teardown left on the host goes first. The
     // clone's data directory is recorded before anything creates it, so a SIGKILLed
-    // clone leaves it to the next launch to reclaim (crate::reclaim).
-    crate::reclaim::reclaim_abandoned().await;
+    // clone leaves it to the next sweep to reclaim (crate::reclaim).
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
@@ -4253,6 +4253,7 @@ async fn cmd_snapshot_run_inner(
         hugepages,
         extra_disks: snapshot_config.metadata.extra_disks.clone(),
         snapshot_dir: Some(snapshot_dir),
+        cloud_hypervisor_version: snapshot_config.metadata.cloud_hypervisor_version.clone(),
     };
 
     // Run clone setup using shared restore function
@@ -6297,7 +6298,7 @@ async fn cmd_snapshot_run_raw(
         "restoring a raw VM"
     );
 
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
@@ -6400,6 +6401,7 @@ async fn cmd_snapshot_run_raw(
         hugepages: false,
         extra_disks: meta.extra_disks.clone(),
         snapshot_dir: Some(paths::snapshot_dir().join(&snapshot_name)),
+        cloud_hypervisor_version: meta.cloud_hypervisor_version.clone(),
     };
     // The clone's first boot is generation 0 of its own id, served from before it resumes.
     if let Err(e) = super::vm::write_generation(&data_dir, &vm_id, 0) {
@@ -7793,6 +7795,7 @@ mod tests {
             image_disk_identity: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
+            cloud_hypervisor_version: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
             page_reporting_order: None,

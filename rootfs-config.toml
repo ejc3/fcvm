@@ -106,15 +106,17 @@ branch = "agent/uffd-minor-v1.17.0-pv-kick-restore"
 commit = "2a33289b55b7f611959891dd5295438a416f386e"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
-# Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
-# Pinned to a fork branch carrying the aarch64 SVE register save/restore fix
-# (upstream CH PR #8268), which landed after the v52.0 release and is in no tagged
-# release yet. Required for CH snapshot/restore on SVE-capable hosts (Graviton3+).
-# The branch also carries memory_restore_mode=map (ejc3/cloud-hypervisor#1), which fcvm's
-# Cloud Hypervisor restores use: the snapshot's memory file mapped instead of copied.
+# Built on demand with `fcvm setup --cloud-hypervisor`. This is upstream's main branch at
+# `commit` (v55.0 plus 117 commits), with no patch of fcvm's own: the restore options fcvm
+# passes are upstream's (memory_restore_mode=copyonwrite since v54.0, and
+# clock_restore_mode=preserve, which is on main and in no release yet).
+# `commit` is required. The binary's name is a hash of the repo, the commit, the
+# architecture and the libc, launch runs that file and no other, and setup refuses a
+# checkout whose HEAD is not the commit. A snapshot restores only on the build that wrote
+# it, so moving this pin means every Cloud Hypervisor snapshot is created again.
 [cloud_hypervisor]
-repo = "ejc3/cloud-hypervisor"
-branch = "fcvm-v52-sve-fix"
+repo = "cloud-hypervisor/cloud-hypervisor"
+commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
 
 # Rootfs Modification Plan
 #
