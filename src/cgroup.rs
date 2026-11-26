@@ -52,17 +52,44 @@
 //! Removal: a cgroup can be removed once it holds no process, and a process cannot remove
 //! the cgroup it is in. On a normal exit fcvm moves itself back to the cgroup it came from
 //! and removes its scope. A scope that is still populated then, or whose owner was killed,
-//! is removed by the next entry's sweep: every entry removes the scopes whose owner, the
-//! (pid, start time) in the name, is gone.
+//! is removed by a sweep of the parent: the scopes whose owner, the (pid, start time) in
+//! the name, is gone.
 //!
-//! The sweep and the creation run under an exclusive `flock` on the parent directory. A
-//! scope is empty between its `mkdir` and the write that moves its owner in, and the owner
-//! holds the lock across that window, so no sweep can remove it there. Outside the window a
-//! scope holds its owner's processes, and the kernel refuses `rmdir` of a populated cgroup.
-//! That covers an owner in another pid namespace, whose pid this process cannot resolve.
+//! A start sweeps only when a sweep is due ([`sweep_if_due`]): at most once per interval
+//! and parent, from the start that has the turn (`crate::sweep`, the mechanism the owner
+//! records and the routed address leases share). A sweep in every start listed every scope
+//! under the parent's exclusive lock, so starts ran one at a time and each took longer the
+//! more VMs were running (#2178).
+//!
+//! The parent directory's `flock` orders creation against removal (`crate::sweep::table`).
+//! A scope is empty between its `mkdir` and the write that moves its owner in. A start
+//! holds the lock SHARED across that window, so starts do not wait for each other; a sweep
+//! removes only under the lock held EXCLUSIVELY, so it never meets a scope in that window.
+//! Outside the window a scope holds its owner's processes, and the kernel refuses `rmdir`
+//! of a populated cgroup. That covers an owner in another pid namespace, whose pid the
+//! sweeper cannot resolve.
+//!
+//! cgroupfs holds no ordinary file, so the sweep's stamp and lock are on the store, in
+//! this user's directory under `<data_dir>/cgroup-sweep/` (made as the owner records'
+//! directory is), under names keyed by the parent. Two stores whose root launches share
+//! one parent (`fcvm.slice`) each keep a stamp and each sweep it on their own interval. A
+//! stamp on a disk outlives the boot whose scopes it speaks of: it names that boot, and
+//! the first start of the next boot sweeps.
+//!
+//! The cases, each with a test below or in `crate::sweep`:
+//!
+//! | case | what happens |
+//! |------|---------------|
+//! | a sweep finds a scope between its mkdir and its owner's entry | the owner is alive, so the scope is not listed as dead; listed anyway (an owner in another pid namespace), the sweep waits for the exclusive lock and by then the scope is populated |
+//! | a sweeper dies | the kernel releases its locks; what it had not removed waits for the next sweep, one interval later |
+//! | two starts find a sweep due together | one has the turn |
+//! | the owner's pid was reused | the name carries the start time, and the scope of the earlier process is dead |
+//! | a scope's own teardown and a sweep remove it together | whichever is second finds it gone |
+//! | an fcvm is SIGKILLed | its scope is removed by the first start under that parent that begins an interval or more after the last sweep began; until then it is an empty cgroup |
+//! | the lock stays held (shared, by a stream of starts) for a sweep's whole wait | that sweep removes nothing and the next one tries again |
+//! | the stamp cannot be read or written | no sweep from this start, not a sweep in every start |
 
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -157,36 +184,44 @@ pub struct SweepCount {
     pub populated: usize,
 }
 
-/// Remove the scopes in `parent` whose owner is gone. `start_time_of` gives a live
-/// process's start time, or `None` when no process has that pid.
-///
-/// The caller holds the parent's lock ([`lock_parent`]), so no scope here is between its
-/// creation and its owner's entry except the caller's own, which it has not made yet.
-fn sweep(parent: &Path, start_time_of: &dyn Fn(u32) -> Option<u64>) -> SweepCount {
-    let mut count = SweepCount::default();
+/// The scopes in `parent` whose owner is gone. `start_time_of` gives a live process's
+/// start time, or `None` when no process has that pid. Reads only: no lock is needed to
+/// look.
+fn dead_scopes(parent: &Path, start_time_of: &dyn Fn(u32) -> Option<u64>) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(parent) else {
-        return count;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(owner) = name.to_str().and_then(scope_owner) else {
-            continue;
-        };
-        let owner_alive = match owner {
-            ScopeOwner::Process { pid, start_time } => start_time_of(pid) == Some(start_time),
-            // A pid alone cannot tell a reused pid from the owner, and an rmdir of a scope
-            // that still holds Firecracker fails, so the kernel is the only check.
-            ScopeOwner::Legacy => false,
-        };
-        if owner_alive {
-            continue;
-        }
-        let path = entry.path();
-        match std::fs::remove_dir(&path) {
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            match name.to_str().and_then(scope_owner) {
+                Some(ScopeOwner::Process { pid, start_time }) => {
+                    start_time_of(pid) != Some(start_time)
+                }
+                // A pid alone cannot tell a reused pid from the owner, and an rmdir of a
+                // scope that still holds Firecracker fails, so the kernel is the only check.
+                Some(ScopeOwner::Legacy) => true,
+                None => false,
+            }
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Remove `scopes`, each one's owner gone. The caller holds the parent's lock exclusively
+/// (`crate::sweep::sweep_table`), so none of them is between its creation and its owner's
+/// entry: a start holds the lock shared across that window. A scope that holds a process
+/// after all is refused by the kernel.
+fn remove_scopes(scopes: &[PathBuf]) -> SweepCount {
+    let mut count = SweepCount::default();
+    for path in scopes {
+        match std::fs::remove_dir(path) {
             Ok(()) => {
                 count.removed += 1;
                 debug!(scope = %path.display(), "removed the scope of a process that is gone");
             }
+            // Its own teardown, or another sweep, removed it first.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             // EBUSY on cgroupfs (still has processes or child cgroups); ENOTEMPTY elsewhere.
             Err(e) => {
@@ -198,17 +233,79 @@ fn sweep(parent: &Path, start_time_of: &dyn Fn(u32) -> Option<u64>) -> SweepCoun
     count
 }
 
-/// Hold an exclusive `flock` on the parent directory. Released when the file is dropped.
-fn lock_parent(parent: &Path) -> io::Result<std::fs::File> {
-    let dir = std::fs::File::open(parent)?;
-    loop {
-        // SAFETY: flock on a descriptor this function owns.
-        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(dir);
+/// Remove the scopes in `parent` whose owner is gone, when a sweep is due: at most once
+/// per interval and parent, by the start that has the turn (`crate::sweep::CGROUP_SCOPES`).
+///
+/// Every start used to sweep, under the parent's lock held exclusively: a listing of
+/// every scope and a /proc read for each, so a start's time under the lock grew with the
+/// VMs running and starts ran one at a time. With 2000 clones entering scopes of one
+/// parent, 512 at a time, that was 73 starts a second with 15 of 96 cores busy, against
+/// 620 or more with the clones in cgroups made beforehand (#2178).
+///
+/// Looking needs no lock. Removing takes the lock exclusively, and only when something
+/// was found, so in the steady state a sweep holds nothing. A sweep that cannot get the
+/// lock within `crate::sweep::TABLE_WAIT`, or that dies part way, leaves the rest to the
+/// next one. A stamp that cannot be read or written (the store refuses it) means no sweep
+/// from this start, not a sweep in every start.
+fn sweep_if_due(
+    hierarchy: &Hierarchy,
+    parent: &Path,
+    start_time_of: &dyn Fn(u32) -> Option<u64>,
+) -> SweepCount {
+    use crate::sweep::TableSweep;
+    let swept = hierarchy.stamps.dir().and_then(|stamps| {
+        let dir = crate::sweep::open_dir(&stamps)?;
+        let key = sweep_key(parent);
+        crate::sweep::sweep_table(
+            &crate::sweep::Place::keyed(&dir, &stamps, &key),
+            hierarchy.sweep_every,
+            parent,
+            crate::sweep::TABLE_WAIT,
+            || dead_scopes(parent, start_time_of),
+            |dead| remove_scopes(&dead),
+        )
+    });
+    match swept {
+        Ok(TableSweep::Swept(count)) => count,
+        Ok(TableSweep::NotDue | TableSweep::NothingFound) => SweepCount::default(),
+        Ok(TableSweep::TableBusy) => {
+            debug!(parent = %parent.display(), "the scopes' parent stayed locked; the next sweep removes what this one found");
+            SweepCount::default()
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        Err(error) => {
+            debug!(parent = %parent.display(), error = %format!("{error:#}"), "no sweep of the scopes' parent from this start");
+            SweepCount::default()
+        }
+    }
+}
+
+/// The key of `parent`'s sweep among the sweeps kept in one directory.
+fn sweep_key(parent: &Path) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(parent.as_os_str().as_encoded_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Where the sweeps of scopes' parents keep their stamps and locks.
+#[derive(Debug, Clone)]
+pub enum Stamps {
+    /// In this user's directory under `<data_dir>/cgroup-sweep/`, made when first asked
+    /// for: an fcvm that enters no scope makes nothing on the store.
+    OnTheStore,
+    /// In this directory.
+    At(PathBuf),
+}
+
+impl Stamps {
+    fn dir(&self) -> Result<PathBuf> {
+        match self {
+            Self::OnTheStore => {
+                crate::reclaim::owner_dir_under(&crate::paths::data_dir(), "cgroup-sweep")
+            }
+            Self::At(dir) => Ok(dir.clone()),
         }
     }
 }
@@ -259,14 +356,21 @@ fn enable_memory_below(root: &Path, parent: &Path) -> io::Result<()> {
 pub struct Hierarchy {
     pub root: PathBuf,
     pub mkdir: fn(&Path) -> io::Result<()>,
+    /// Where the sweeps of the parents keep their stamps and locks ([`sweep_if_due`]).
+    pub stamps: Stamps,
+    /// How often a start sweeps a parent.
+    pub sweep_every: std::time::Duration,
 }
 
 impl Hierarchy {
-    /// The host's hierarchy at [`CGROUP2_ROOT`].
+    /// The host's hierarchy at [`CGROUP2_ROOT`], swept at
+    /// `crate::sweep::CGROUP_SCOPES`'s interval, with its stamps on the store.
     pub fn system() -> Self {
         Self {
             root: PathBuf::from(CGROUP2_ROOT),
             mkdir: |path| std::fs::create_dir(path),
+            stamps: Stamps::OnTheStore,
+            sweep_every: crate::sweep::CGROUP_SCOPES.interval(),
         }
     }
 }
@@ -285,7 +389,7 @@ impl VmScope {
     }
 
     /// Move back to the cgroup this process came from and remove the scope. A scope that
-    /// still holds a process, or whose origin is gone, stays for the next entry's sweep.
+    /// still holds a process, or whose origin is gone, stays for the next sweep.
     pub fn leave(self) {
         let Some(origin) = &self.origin else {
             return;
@@ -293,7 +397,7 @@ impl VmScope {
         if let Err(e) = write_interface(&origin.join("cgroup.procs"), &self.pid.to_string()) {
             debug!(
                 origin = %origin.display(), scope = %self.path.display(), error = %e,
-                "could not move back to the cgroup fcvm started in; the next fcvm sweeps the scope"
+                "could not move back to the cgroup fcvm started in; the next sweep removes the scope"
             );
             return;
         }
@@ -301,7 +405,7 @@ impl VmScope {
             Ok(()) => debug!(scope = %self.path.display(), "removed the VM's cgroup"),
             Err(e) => debug!(
                 scope = %self.path.display(), error = %e,
-                "the VM's cgroup still holds a process; the next fcvm sweeps it"
+                "the VM's cgroup still holds a process; the next sweep removes it"
             ),
         }
     }
@@ -373,10 +477,7 @@ pub fn enter(
             Some(&e),
         ));
     }
-    let lock = lock_parent(&parent)
-        .map_err(|e| not_entered(format!("locking {}: {e}", parent.display()), Some(&e)))?;
-
-    let swept = sweep(&parent, start_time_of);
+    let swept = sweep_if_due(hierarchy, &parent, start_time_of);
     if swept.removed > 0 || swept.populated > 0 {
         info!(
             parent = %parent.display(), removed = swept.removed, still_populated = swept.populated,
@@ -393,6 +494,13 @@ pub fn enter(
             ));
         }
     }
+    // Shared, from before the scope exists until this process is inside it: a sweep, which
+    // removes under the exclusive lock, never meets the scope empty. Starts do not wait
+    // for each other.
+    let lock = crate::sweep::table::shared(&parent).map_err(|e| {
+        let e = io::Error::from(e);
+        not_entered(format!("locking {}: {e}", parent.display()), Some(&e))
+    })?;
     let path = parent.join(scope_name(pid, start_time));
     (hierarchy.mkdir)(&path)
         .map_err(|e| not_entered(format!("creating {}: {e}", path.display()), Some(&e)))?;
@@ -557,6 +665,7 @@ fn swap_disabled_in(root: &Path, proc_cgroup: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sweep::Sweep;
 
     /// A `mkdir` that adds the interface files cgroupfs gives a new cgroup. Controller files
     /// appear only when the parent enables the controller, as in the kernel.
@@ -592,9 +701,13 @@ mod tests {
         };
         std::fs::write(dir.path().join("cgroup.subtree_control"), control).unwrap();
         std::fs::write(dir.path().join("cgroup.procs"), "").unwrap();
+        let stamps = dir.path().join("stamps");
+        std::fs::create_dir(&stamps).unwrap();
         let hierarchy = Hierarchy {
             root: dir.path().to_path_buf(),
             mkdir: fake_mkdir,
+            stamps: Stamps::At(stamps),
+            sweep_every: crate::sweep::CGROUP_SCOPES.every,
         };
         (dir, hierarchy)
     }
@@ -791,7 +904,7 @@ mod tests {
         std::fs::write(parent.join("fcvm-500.scope/held"), "").unwrap();
         let start_time_of = |pid: u32| (pid == 100).then_some(5);
 
-        let count = sweep(&parent, &start_time_of);
+        let count = remove_scopes(&dead_scopes(&parent, &start_time_of));
         assert_eq!(
             count,
             SweepCount {
@@ -827,32 +940,150 @@ mod tests {
         assert!(parent.join("fcvm-4242-77.scope").exists());
     }
 
-    /// An entry holds the parent's lock from its sweep until its process is inside its
-    /// scope, so a concurrent entry's sweep cannot remove a scope in the window where it is
-    /// empty. Here the test holds the lock and the entry must wait for it.
-    #[test]
-    fn entry_waits_for_the_parent_lock() {
-        let (_dir, h) = fake_root(true);
+    /// A copy of `h` for another thread.
+    fn same(h: &Hierarchy) -> Hierarchy {
+        Hierarchy {
+            root: h.root.clone(),
+            mkdir: h.mkdir,
+            stamps: h.stamps.clone(),
+            sweep_every: h.sweep_every,
+        }
+    }
+
+    fn slice(h: &Hierarchy) -> PathBuf {
         let parent = h.root.join("fcvm.slice");
         std::fs::create_dir(&parent).unwrap();
         std::fs::write(parent.join("cgroup.subtree_control"), "memory\n").unwrap();
-        let held = lock_parent(&parent).unwrap();
-        let root = h.root.clone();
-        let entry = std::thread::spawn(move || {
+        parent
+    }
+
+    /// Two sweeps of the same dead scopes, and a teardown racing a sweep: whichever comes
+    /// second finds the scope gone and counts nothing.
+    #[test]
+    fn a_scope_removed_twice_is_removed_once() {
+        let (_dir, h) = fake_root(true);
+        let parent = slice(&h);
+        std::fs::create_dir(parent.join("fcvm-200-9.scope")).unwrap();
+        let dead = dead_scopes(&parent, &nobody);
+        assert_eq!(remove_scopes(&dead).removed, 1);
+        assert_eq!(remove_scopes(&dead), SweepCount::default());
+    }
+
+    /// A stamp that cannot be written means no sweep from that start, not a sweep in
+    /// every start: a sweep per start is what ran starts one at a time.
+    #[test]
+    fn a_start_that_cannot_write_the_stamp_does_not_sweep() {
+        let (_dir, mut h) = fake_root(true);
+        h.stamps = Stamps::At(h.root.join("no-such-directory"));
+        let parent = slice(&h);
+        std::fs::create_dir(parent.join("fcvm-200-9.scope")).unwrap();
+        enter(&h, &default_placement(), 4242, 77, None, false, &nobody).unwrap();
+        assert!(parent.join("fcvm-200-9.scope").exists());
+    }
+
+    /// The scopes' parent as a caller of the sweep (`crate::sweep::testing`): a parent in
+    /// a fake hierarchy, scopes of dead and of live owners, and what an entry does.
+    struct ScopesOfAParent {
+        _dir: tempfile::TempDir,
+        h: Hierarchy,
+        parent: PathBuf,
+        entered: std::sync::atomic::AtomicU32,
+    }
+
+    /// The processes of [`ScopesOfAParent`] that are alive: pids from 50000, started at 7.
+    fn alive_from_50000(pid: u32) -> Option<u64> {
+        (pid >= 50_000).then_some(7)
+    }
+
+    impl crate::sweep::testing::Caller for ScopesOfAParent {
+        const SWEEP: &'static Sweep = &crate::sweep::CGROUP_SCOPES;
+
+        fn new() -> Self {
+            let (dir, h) = fake_root(true);
+            let parent = slice(&h);
+            Self {
+                _dir: dir,
+                h,
+                parent,
+                entered: std::sync::atomic::AtomicU32::new(60_000),
+            }
+        }
+
+        fn abandon(&self, n: usize) -> PathBuf {
+            let scope = self.parent.join(scope_name(9_000 + n as u32, 1));
+            std::fs::create_dir(&scope).unwrap();
+            scope
+        }
+
+        fn live(&self, n: usize) -> (PathBuf, Box<dyn std::any::Any>) {
+            let scope = self.parent.join(scope_name(50_000 + n as u32, 7));
+            std::fs::create_dir(&scope).unwrap();
+            (scope, Box::new(()))
+        }
+
+        fn start(&self, every: std::time::Duration) {
+            let pid = self
+                .entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let h = Hierarchy {
-                root,
-                mkdir: fake_mkdir,
+                sweep_every: every,
+                ..same(&self.h)
             };
-            enter(&h, &default_placement(), 4242, 77, None, false, &nobody).map(|s| s.path)
-        });
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            !parent.join("fcvm-4242-77.scope").exists(),
-            "the entry made its scope while another process held the parent's lock"
+            enter(
+                &h,
+                &default_placement(),
+                pid,
+                7,
+                None,
+                false,
+                &alive_from_50000,
+            )
+            .unwrap();
+        }
+
+        fn with_place<R>(&self, f: impl FnOnce(&crate::sweep::Place) -> R) -> R {
+            let stamps = self.h.stamps.dir().unwrap();
+            let dir = crate::sweep::open_dir(&stamps).unwrap();
+            f(&crate::sweep::Place::keyed(
+                &dir,
+                &stamps,
+                &sweep_key(&self.parent),
+            ))
+        }
+
+        fn listed(&self) -> Vec<PathBuf> {
+            vec![self.parent.clone()]
+        }
+
+        fn table(&self) -> Option<PathBuf> {
+            Some(self.parent.clone())
+        }
+    }
+
+    crate::sweep::testing::caller_matrix!(ScopesOfAParent);
+    crate::sweep::testing::table_matrix!(ScopesOfAParent);
+
+    /// The sweeps of two parents kept in one directory have a stamp and a lock each, under
+    /// names that are a file's and not a path's.
+    #[test]
+    fn each_parent_has_its_own_stamp() {
+        let (_dir, h) = fake_root(true);
+        let (a, b) = (h.root.join("fcvm.slice"), h.root.join("ring/fcvm.slice"));
+        assert_ne!(sweep_key(&a), sweep_key(&b));
+        assert_eq!(sweep_key(&a), sweep_key(&h.root.join("fcvm.slice")));
+        assert!(sweep_key(&b).bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let parent = slice(&h);
+        enter(&h, &default_placement(), 4242, 77, None, false, &nobody).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(h.stamps.dir().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let key = sweep_key(&parent);
+        assert_eq!(
+            names,
+            [format!(".sweep-lock-{key}"), format!(".sweep-stamp-{key}")]
         );
-        drop(held);
-        let path = entry.join().unwrap().unwrap();
-        assert!(path.exists());
     }
 
     #[test]

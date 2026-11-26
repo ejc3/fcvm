@@ -964,7 +964,7 @@ fn many_other_vms(dir: &std::path::Path, count: usize) {
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
         std::fs::write(path.with_extension("json.lock"), b"").unwrap();
     }
-    std::fs::write(dir.join("sweep.stamp"), b"now").unwrap();
+    manager.set_sweep_stamp(std::time::Duration::ZERO).unwrap();
 }
 
 /// Watch `dir` and every directory under it (the buckets the other VMs' states are in) for
@@ -1032,12 +1032,8 @@ async fn starting_a_vm_reads_no_other_vms_state() {
     let manager = StateManager::new(temp_dir.path().to_path_buf());
     manager.init().await.unwrap();
     many_other_vms(temp_dir.path(), 2000);
-    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::options()
-        .write(true)
-        .open(temp_dir.path().join("sweep.stamp"))
-        .unwrap()
-        .set_modified(long_ago)
+    manager
+        .set_sweep_stamp(std::time::Duration::from_secs(3600))
         .unwrap();
     let _sweeping = nix::fcntl::Flock::lock(
         std::fs::File::create(temp_dir.path().join("sweep.lock")).unwrap(),
@@ -1278,13 +1274,9 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
     std::fs::write(slot.join("4000000000.1.vm-crashed"), b"").unwrap();
     // The sweep is due, so the owner's claim rewrites the stamp root's claim wrote.
     let stamp = state.join("sweep.stamp");
-    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::options()
-        .write(true)
-        .open(&stamp)
-        .unwrap()
-        .set_modified(long_ago)
-        .unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+    manager.set_sweep_stamp(hour).unwrap();
+    let aged = std::fs::read_to_string(&stamp).unwrap();
 
     let binary = base.path().join("test_state_manager");
     std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
@@ -1296,7 +1288,16 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
         .env("FCVM_TEST_ROOTLESS_STATE_DIR", &state)
         .output()
         .unwrap();
-    let swept_at = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+    let after_the_owner = std::fs::read_to_string(&stamp).unwrap();
+    // The reverse: the sweep is due again, and root's claim rewrites the stamp the owner
+    // wrote.
+    manager.set_sweep_stamp(hour).unwrap();
+    let aged_again = std::fs::read_to_string(&stamp).unwrap();
+    let mut second = VmState::new("vm-root-2".to_string(), "alpine:latest".to_string(), 1, 512);
+    second.name = Some("root-2".to_string());
+    manager.claim_name(&mut second).await.unwrap();
+    let after_root = std::fs::read_to_string(&stamp).unwrap();
+    manager.delete_state("vm-root-2").await.unwrap();
     manager.delete_state("vm-root").await.unwrap();
 
     assert!(
@@ -1305,9 +1306,26 @@ async fn a_rootless_launch_writes_its_state_after_a_root_launch_in_the_same_dire
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    // A stamp is `<boot id> <nanoseconds since boot>` of the sweep that last began. An aged
+    // one is another boot's when this host has been up for less than its age.
+    let this_boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let newer = |stamp: &str, than: &str| {
+        let parts = |stamp: &str| -> (String, u64) {
+            let (boot, began) = stamp.split_once(' ').unwrap();
+            (boot.to_string(), began.parse().unwrap())
+        };
+        let (stamp, than) = (parts(stamp), parts(than));
+        stamp.0 == this_boot.trim() && (than.0 != stamp.0 || stamp.1 > than.1)
+    };
     assert!(
-        swept_at > long_ago + std::time::Duration::from_secs(60),
-        "the owner's claim could not rewrite the sweep stamp root wrote"
+        newer(&after_the_owner, &aged),
+        "the owner's claim could not rewrite the sweep stamp root wrote: {aged:?} then \
+         {after_the_owner:?}"
+    );
+    assert!(
+        newer(&after_root, &aged_again),
+        "root's claim did not rewrite the sweep stamp the owner wrote: {aged_again:?} then \
+         {after_root:?}"
     );
 }
 
@@ -1384,7 +1402,7 @@ async fn a_dead_state_without_a_name_entry_does_not_hide_the_live_vm_by_name() {
     )
     .unwrap();
     // A sweep ran just now, so this claim does not sweep the dead state away.
-    std::fs::write(temp_dir.path().join("sweep.stamp"), b"now").unwrap();
+    manager.set_sweep_stamp(std::time::Duration::ZERO).unwrap();
     let mut live = VmState::new("vm-live".to_string(), "alpine:latest".to_string(), 1, 512);
     live.name = Some("web".to_string());
     manager.claim_name(&mut live).await.unwrap();
