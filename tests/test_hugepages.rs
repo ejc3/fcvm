@@ -533,6 +533,9 @@ async fn test_balloon_inflate_on_a_hugepage_minor_clone_copies_no_huge_pages() -
     )
     .await
     .context("starting the minor-mode serve")?;
+    // The clone finds the serve through its state file and its socket, which exist once it has
+    // copied the snapshot into its backing memfd.
+    common::poll_serve_ready(&snap_name, serve_pid, 120).await?;
     let (mut clone_child, clone_pid) = common::spawn_fcvm(&[
         "snapshot",
         "run",
