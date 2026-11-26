@@ -978,7 +978,9 @@ def main(argv=None):
     build.add_argument('--of', help='rebuild the pool this pull request or branch is in')
     build.add_argument('--sync-main', action='store_true', help='merge the default branch into the bottom')
     build.add_argument('--dry-run', action='store_true')
-    build.add_argument('--pending', action='append', metavar='BRANCH=COMMIT', help=argparse.SUPPRESS)
+    build.add_argument('--pending', action='append', metavar='BRANCH=COMMIT',
+                       help="start this member from a local commit that contains its remote branch; repeat it to "
+                            "put several members' commits into the pool in one push")
     build.add_argument('--lock-wait', type=float, default=600)
 
     publish = sub.add_parser('publish', help="put a member's local commits into its pool")

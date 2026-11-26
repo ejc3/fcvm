@@ -56,6 +56,11 @@ above it move in the same push and only the top runs the lanes. A plain `git pus
 branch in the middle starts that member's own run of the lanes, because the member above
 does not contain the new commit yet.
 
+Fixes to several members go in together: `build --of <top> --pending <branch>=<commit>`,
+once per member, starts each named member from that commit (it must contain the member's
+remote branch) and pushes every branch in the same atomic push, so the top's run restarts
+once however many members changed.
+
 `status` prints each pool bottom to top, and for every lower member the `Stack CI` commit
 status its head carries: the top's passing run posts it on each lower head it contains
 (`scripts/ci-stack-coverage.sh`). A lower head without it has not been tested, whatever

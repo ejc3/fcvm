@@ -364,6 +364,30 @@ class Publish(Sandbox):
         self.assertTrue(self.contains('c', new))
         self.assertEqual((self.dir / 'pushes').read_text().count('push'), 1, 'more than one push')
 
+    def test_several_members_commits_go_in_one_push(self):
+        # Fixes to more than one member: one build, one push, so the top's run restarts once.
+        members = self.pool()
+        prs = self.prs(*members)
+        fix_a = self.commit('a', {'a.txt': 'a fixed\n'}, 'fix a', push=False)
+        fix_c = self.commit('c', {'c.txt': 'c fixed\n'}, 'fix c', push=False)
+        self.git('checkout', '-q', '--detach', 'origin/main')
+        self.hook_log()
+        code, out, _ = self.tool('build', '--of', '3', '--pending', f'a={fix_a}', '--pending', f'c={fix_c}', prs=prs)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.remote('a'), fix_a)
+        for branch in 'bc':
+            self.assertTrue(self.contains(branch, fix_a), branch)
+        self.assertTrue(self.contains('c', fix_c))
+        self.assertEqual((self.dir / 'pushes').read_text().count('push'), 1, 'more than one push')
+
+    def test_a_pending_commit_for_a_branch_outside_the_pool_is_refused(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        code, out, calls = self.tool('build', '--of', '3', '--pending', f"zzz={self.remote('a')}", prs=prs)
+        self.assertEqual(code, 2, out)
+        self.assertIn('zzz is not a member of this pool', out)
+        self.assertEqual(self.writes(calls), [])
+
     def hook_log(self):
         path = self.origin / 'hooks' / 'pre-receive'
         path.write_text(f'#!/bin/sh\necho push >> {self.dir}/pushes\ncat > /dev/null\n')
