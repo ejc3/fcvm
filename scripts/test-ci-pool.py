@@ -430,7 +430,8 @@ class Publish(Sandbox):
 
 class Cost(unittest.TestCase):
     def job(self, name, conclusion, minutes, labels, attempt=1, runner=True):
-        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+        # A job that really ran again started later; only GitHub's copies keep the old start.
+        start = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc) + dt.timedelta(hours=2 * (attempt - 1))
         return {'name': name, 'conclusion': conclusion, 'run_attempt': attempt, 'labels': labels,
                 'runner_name': runner, 'started_at': start.isoformat(),
                 'completed_at': (start + dt.timedelta(minutes=minutes)).isoformat()}
@@ -452,6 +453,24 @@ class Cost(unittest.TestCase):
         self.assertEqual(ci_pool.job_minutes(self.job('Lint', 'success', 12, ['ubuntu-latest'])), 12)
         self.assertEqual(ci_pool.job_minutes(self.job('Lint', 'skipped', 12, ['ubuntu-latest'])), 0)
         self.assertEqual(ci_pool.job_minutes(self.job('Host-arm64', 'cancelled', 12, self.ARM, runner=False)), 0)
+
+    def test_a_job_listed_again_by_a_rerun_of_another_job_is_not_an_execution(self):
+        # Run 45237585205, 2026-11-23: one lane was run again twice, and the API lists every
+        # other job three times, each with a new id, the new attempt number and the old times.
+        ran = self.job('Container-arm64', 'failure', 30, self.ARM)
+        copies = [dict(ran, run_attempt=2), dict(ran, run_attempt=3)]
+        again = self.job('Host-arm64', 'failure', 20, self.ARM)
+        later = self.job('Host-arm64', 'success', 20, self.ARM, attempt=2)
+        jobs = [copies[1], later, ran, copies[0], again, dict(later, run_attempt=3)]
+        kept = ci_pool.executions(jobs)
+        self.assertEqual(sorted((j['name'], j['run_attempt']) for j in kept),
+                         [('Container-arm64', 1), ('Host-arm64', 1), ('Host-arm64', 2)])
+        account = ci_pool.summarise([self.a_run(1)], {1: jobs})
+        self.assertAlmostEqual(sum(g['minutes'] for g in account['groups'].values()), 30 + 20 + 20)
+        self.assertEqual(sum(g['jobs'] for g in account['groups'].values()), 3)
+        # A job that has not started is never taken for a copy of another.
+        queued = [dict(ran, started_at=None, completed_at=None, conclusion=None, run_attempt=n) for n in (1, 2)]
+        self.assertEqual(len(ci_pool.executions(queued)), 2)
 
     def test_every_class_of_runner_has_a_price(self):
         for labels in (self.ARM, self.X64, self.ARM + ['on-demand'], self.X64 + ['on-demand'], ['ubuntu-latest']):
@@ -687,6 +706,15 @@ class Failures(unittest.TestCase):
         got = {job['id']: job['again'] for job in ci_pool.failed_lane_jobs([run], jobs)}
         self.assertEqual(got, {10: True, 12: False, 13: None, 14: None})
 
+    def test_a_copied_failure_is_one_failed_attempt_and_was_not_run_again(self):
+        run = {'id': 1, 'event': 'pull_request'}
+        failed = self.failed(10, 'Container-arm64')
+        other = self.failed(12, 'Host-arm64')
+        rerun = dict(self.failed(13, 'Host-arm64', 'success', attempt=2))
+        jobs = {1: [failed, dict(failed, id=11, run_attempt=2), other, rerun]}
+        got = {job['id']: job['again'] for job in ci_pool.failed_lane_jobs([run], jobs)}
+        self.assertEqual(got, {10: None, 12: True})
+
     def test_rows_count_each_cause_and_split_a_jobs_cost_between_its_causes(self):
         failed = [{'id': 1, 'lane': 'Host-arm64', 'at': '2026-01-02T00:00:00Z', 'again': True, 'usd': 1.0},
                   {'id': 2, 'lane': 'Host-x64', 'at': '2026-01-01T00:00:00Z', 'again': False, 'usd': 2.0},
@@ -710,7 +738,7 @@ class FailuresCommand(Sandbox):
         job = lambda number, conclusion, attempt: {
             'id': number, 'name': 'Host-arm64', 'conclusion': conclusion, 'run_attempt': attempt,
             'labels': ['self-hosted', 'Linux', 'arm64'], 'runner_name': 'example-runner',
-            'started_at': '2026-01-01T00:00:00Z', 'completed_at': '2026-01-01T01:00:00Z'}
+            'started_at': f'2026-01-01T0{attempt}:00:00Z', 'completed_at': f'2026-01-01T0{attempt + 1}:00:00Z'}
         fixture = {window: {'total_count': 1, 'workflow_runs': [run]},
                    f'repos/{REPO}/actions/runs/1/jobs?filter=all&per_page=100': {'jobs': [job(10, 'failure', 1), job(11, 'failure', 2)]}}
         logs = self.dir / 'logs'
@@ -736,7 +764,7 @@ class FailuresCommand(Sandbox):
         window = f'repos/{REPO}/actions/runs?created=2026-01-01T00:00:00Z..2026-01-01T23:59:59Z&per_page=100'
         run = {'id': 1, 'name': 'CI', 'path': '.github/workflows/ci.yml', 'event': 'push', 'status': 'completed',
                'conclusion': 'failure', 'run_attempt': 1, 'created_at': '2026-01-01T00:00:00Z', 'pull_requests': []}
-        job = lambda number: {'id': number, 'name': 'Host-x64', 'conclusion': 'failure', 'run_attempt': 1,
+        job = lambda number: {'id': number, 'name': {20: 'Host-x64', 21: 'Container-x64'}[number], 'conclusion': 'failure', 'run_attempt': 1,
                               'labels': ['self-hosted', 'Linux', 'x64'], 'runner_name': 'example-runner',
                               'started_at': '2026-01-01T00:00:00Z', 'completed_at': '2026-01-01T01:00:00Z'}
         fixture = {window: {'total_count': 1, 'workflow_runs': [run]},
