@@ -3388,14 +3388,10 @@ pub async fn ensure_cloud_hypervisor(
     // whose version does not name its commit is not installed: Cloud Hypervisor's build
     // falls back to the bare crate version when `git describe` fails, and every pin past
     // one release would then print the same string.
-    let printed = Command::new(&binary)
-        .arg("--version")
-        .output()
-        .await
-        .context("running the built cloud-hypervisor --version");
-    let named = printed.and_then(|out| {
-        cloud_hypervisor_version_names(&String::from_utf8_lossy(&out.stdout), commit)
-    });
+    // The probe every launch uses for this binary (`find_cloud_hypervisor`).
+    let named = crate::version_cache::version_output(&binary)
+        .context("running the built cloud-hypervisor --version")
+        .and_then(|version| cloud_hypervisor_version_names(&version, commit));
     if let Err(error) = named {
         flock.unlock().map_err(|(_, err)| err)?;
         return Err(error);
