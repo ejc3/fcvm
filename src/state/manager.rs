@@ -72,7 +72,7 @@ fn is_bucket(name: &str) -> bool {
 
 /// How often a claim sweeps the state directory for what SIGKILLed VMs left
 /// (`StateManager::maybe_sweep`).
-const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+const SWEEP_EVERY: std::time::Duration = crate::sweep::STATE.every;
 
 /// The prefix of an index directory being made, before it is renamed into place
 /// (`StateManager::index_dir`).
@@ -234,6 +234,33 @@ impl NameToken {
 fn slot_name(name: &str) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(name.as_bytes()))
+}
+
+/// What a claim has made and not yet handed to a published state
+/// (`StateManager::claim_name_with_hooks`): its claim directory, and its token once the claim
+/// is renamed onto the name's slot. Dropped while armed, on an error return or when the
+/// claim's future is dropped, it removes both, and the slot when that leaves it empty, so
+/// the name is free again without this process exiting. Everything it removes carries this
+/// claim's own identity in its name, and a slot with another claim's token in it is not
+/// removed. The undo is a few unlinks and an rmdir, blocking calls made from `drop`, as
+/// the error path made them before.
+struct ClaimUndo {
+    claim: PathBuf,
+    token: PathBuf,
+    armed: bool,
+}
+
+impl Drop for ClaimUndo {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        remove_claim_dir(&self.claim);
+        let _ = remove_if_exists(&self.token);
+        if let Some(slot) = self.token.parent() {
+            let _ = std::fs::remove_dir(slot);
+        }
+    }
 }
 
 /// Remove a claim directory and the token in it. Best effort: what a failure leaves names
@@ -1115,6 +1142,15 @@ impl StateManager {
     /// With a PID, the state is also entered in the PID index (`pid/<pid>.<vm_id>`), under
     /// the same lock, which is what lets `load_state_by_pid` find it without a scan.
     pub async fn save_state(&self, state: &VmState) -> Result<()> {
+        self.check_layout_for_write().await?;
+        self.write_state(state)
+    }
+
+    /// `save_state` after its layout check. It has no await, so a claim cannot be dropped
+    /// between taking its name and publishing its state (`claim_name`). The write is a few
+    /// kilobytes into the page cache; the flock and the rename that publishes already block
+    /// the calling thread.
+    fn write_state(&self, state: &VmState) -> Result<()> {
         tracing::debug!(
             vm_id = %state.vm_id,
             pid = ?state.pid,
@@ -1122,7 +1158,6 @@ impl StateManager {
             "save_state: starting save"
         );
 
-        self.check_layout_for_write().await?;
         self.bucket_dir(VMS_DIR, &bucket_of(&state.vm_id))
             .context("making the VM's state bucket")?;
         let state_file = self.state_file(&state.vm_id);
@@ -1139,7 +1174,7 @@ impl StateManager {
             .context("acquiring exclusive lock on state file")?;
 
         // Now we have exclusive access, perform the write
-        let result = async {
+        let result = (|| {
             // Update last_updated timestamp before saving
             let mut state = state.clone();
             state.last_updated = jiff::Timestamp::now();
@@ -1155,17 +1190,14 @@ impl StateManager {
             let state_json = serde_json::to_string_pretty(&state)?;
 
             // Write to temp file first
-            fs::write(&temp_file, &state_json)
-                .await
-                .context("writing temp state file")?;
+            std::fs::write(&temp_file, &state_json).context("writing temp state file")?;
 
             // Set file permissions to 0644 (world-readable) so non-root can list VMs
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let permissions = std::fs::Permissions::from_mode(0o644);
-                tokio::fs::set_permissions(&temp_file, permissions)
-                    .await
+                std::fs::set_permissions(&temp_file, permissions)
                     .context("setting file permissions on state file")?;
             }
 
@@ -1195,8 +1227,7 @@ impl StateManager {
             );
 
             Ok::<(), anyhow::Error>(())
-        }
-        .await;
+        })();
 
         // Release lock (happens automatically when flock is dropped, but being explicit)
         // NOTE: We intentionally do NOT delete lock files - see allocate_loopback_ip comment
@@ -1233,6 +1264,23 @@ impl StateManager {
     /// The state is written after the name is held, with this process's PID and start time.
     /// Nothing here reads another VM's state unless that VM holds the name and is dead, so
     /// the cost does not grow with the number of VMs.
+    ///
+    /// A claim that returns an error or whose future is dropped gives back what it made
+    /// (`ClaimUndo`), so the name is free again while this process runs on. What there is
+    /// depends on the await it stopped at:
+    /// - `check_layout_for_write`, which waits only while it converts a store of layout 1:
+    ///   nothing of the claim exists yet.
+    /// - the rename loop, while a dead holder's state is read and deleted (`load_state`,
+    ///   `delete_state`): the claim directory with this claim's token in it, which the undo
+    ///   removes. The slot holds no token of this claim. A dead holder's deletion left half
+    ///   done is finished by the next claim of the name or by the sweep.
+    /// - `maybe_sweep`, after the state is published: the claim is complete, and the VM
+    ///   keeps its name and state until `delete_state`.
+    ///
+    /// From the rename onto the slot until the state is published there is no await
+    /// (`write_state`), so a drop cannot land there. An error or a panic there leaves this
+    /// claim's token in the slot, which the undo removes, with the slot when that empties it;
+    /// no state file or PID index entry exists before the state is published.
     pub async fn claim_name(&self, vm_state: &mut VmState) -> Result<()> {
         self.claim_name_with_hooks(vm_state, || {}, || {}).await
     }
@@ -1278,23 +1326,23 @@ impl StateManager {
         let slot = bucket.join(slot_name(&name));
         let claim = bucket.join(format!("{CLAIM_PREFIX}{}", token.file_name()));
 
-        let held = self
-            .rename_claim_onto_slot(&name, &token, &claim, &slot, before_rename)
-            .await;
-        if held.is_err() {
-            remove_claim_dir(&claim);
-        }
-        held?;
+        // From here until the state is published, an error return or a drop of this future
+        // gives back what the claim made.
+        let mut undo = ClaimUndo {
+            claim: claim.clone(),
+            token: slot.join(token.file_name()),
+            armed: true,
+        };
+        self.rename_claim_onto_slot(&name, &token, &claim, &slot, before_rename)
+            .await?;
         after_rename();
 
         vm_state.pid = Some(pid);
         vm_state.pid_start_time = Some(start);
-        if let Err(error) = self.save_state(vm_state).await {
-            // The name is held by a VM with no state; give it back.
-            let _ = remove_if_exists(&slot.join(token.file_name()));
-            let _ = std::fs::remove_dir(&slot);
-            return Err(error);
-        }
+        // Not `save_state`: the layout is checked above, and `write_state` has no await, so
+        // this future cannot be dropped while it holds the name without a state.
+        self.write_state(vm_state)?;
+        undo.armed = false;
 
         self.maybe_sweep().await;
         Ok(())
@@ -1546,46 +1594,50 @@ impl StateManager {
         }
     }
 
-    /// Sweep the state directory (`cleanup_stale_state`) at most once a `SWEEP_EVERY` per
-    /// state directory, from the one launch that wins `sweep.lock`, after its claim. A
+    /// Sweep the state directory (`cleanup_stale_state`) at most once an interval per
+    /// state directory, from the one launch that has the turn (`crate::sweep::STATE`,
+    /// behind `sweep.stamp` and `sweep.lock`), after its claim. A
     /// claim scans no other VM's state, so this is what removes the states SIGKILLed VMs
     /// leave and the index entries that outlive them; until it runs they
     /// hold nothing (a dead owner is not live, and a stale index entry names a state that
-    /// is gone). Best effort: a sweep that cannot take its lock leaves it to the next.
+    /// is gone). Best effort: a sweep that cannot take its turn leaves it to the next.
     async fn maybe_sweep(&self) {
-        let stamp = self.state_dir.join("sweep.stamp");
-        let fresh = |stamp: &Path| {
-            std::fs::metadata(stamp)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age < SWEEP_EVERY)
+        self.maybe_sweep_every(crate::sweep::STATE.interval()).await
+    }
+
+    /// [`StateManager::maybe_sweep`] with the interval given.
+    async fn maybe_sweep_every(&self, every: std::time::Duration) {
+        let turn = self.with_sweep_place(|place| crate::sweep::turn_if_due(place, every));
+        let _turn = match turn {
+            Ok(Some(turn)) => turn,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "maybe_sweep: cannot take the sweep's turn");
+                return;
+            }
         };
-        if fresh(&stamp) {
-            return;
-        }
-        let Ok(file) = open_lock_file(&self.state_dir.join("sweep.lock")) else {
-            return;
-        };
-        let Ok(_guard) = Flock::lock(file, FlockArg::LockExclusiveNonblock) else {
-            return;
-        };
-        if fresh(&stamp) {
-            return;
-        }
-        // Opened like a lock file (mode 0666), so root and the state directory's owner can
-        // each rewrite a stamp the other wrote.
-        let now = jiff::Timestamp::now().to_string();
-        let written = open_lock_file(&stamp).and_then(|mut file| {
-            use std::io::Write;
-            file.set_len(0)?;
-            file.write_all(now.as_bytes()).map_err(anyhow::Error::from)
-        });
-        if let Err(error) = written {
-            tracing::warn!(%error, "maybe_sweep: cannot write the sweep stamp");
-            return;
-        }
         self.cleanup_stale_state().await;
+    }
+
+    /// Run `f` with the place of this state directory's sweep. Root and the directory's
+    /// owner both launch in it, so its files are everyone's to rewrite
+    /// (`crate::sweep::Place::shared`).
+    fn with_sweep_place<R>(&self, f: impl FnOnce(&crate::sweep::Place) -> Result<R>) -> Result<R> {
+        let dir = std::fs::File::open(&self.state_dir)
+            .with_context(|| format!("opening {}", self.state_dir.display()))?;
+        f(&crate::sweep::Place::shared(
+            &dir,
+            &self.state_dir,
+            "sweep.stamp",
+            "sweep.lock",
+        ))
+    }
+
+    /// Set the sweep's stamp to a sweep that began `ago` before now, for tests of what a
+    /// launch does with a fresh stamp and with an old one.
+    #[doc(hidden)]
+    pub fn set_sweep_stamp(&self, ago: std::time::Duration) -> Result<()> {
+        self.with_sweep_place(|place| crate::sweep::set_stamp(place, ago))
     }
 
     /// Load VM state
@@ -1702,23 +1754,17 @@ impl StateManager {
 
     /// Remove the state files of processes that no longer exist, now. For a caller that
     /// has just killed a set of VMs and must leave nothing of them behind.
-    /// Takes the sweep's lock, waiting up to 30 s for a launch's own sweep to finish, so two
-    /// sweeps never scan at once.
+    /// Takes the sweep's turn, waiting up to 30 s for a launch's own sweep to finish, so two
+    /// sweeps never scan at once, and stamps it as any sweep is.
     pub async fn sweep_stale(&self) {
-        let Ok(mut file) = open_lock_file(&self.state_dir.join("sweep.lock")) else {
-            return;
-        };
         let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let _guard = loop {
-            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(guard) => break guard,
-                Err((returned, _)) => {
-                    if std::time::Instant::now() >= until {
-                        return;
-                    }
-                    file = returned;
+        let _turn = loop {
+            match self.with_sweep_place(crate::sweep::turn_now) {
+                Ok(Some(turn)) => break turn,
+                Ok(None) if std::time::Instant::now() < until => {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
+                Ok(None) | Err(_) => return,
             }
         };
         self.cleanup_stale_state().await;
@@ -1860,16 +1906,44 @@ impl StateManager {
 
     /// The path of every state file there is now, in every bucket. For tests and tools
     /// that inspect the store without loading it; `list_vms` is the listing to act on.
+    ///
+    /// An error when `vms/` or one of its buckets cannot be listed: a caller that checks the
+    /// store for what a VM left must not pass because it could not look. A store with no
+    /// `vms/` has no state files. The sweeps pass over such a bucket instead
+    /// (`bucket_entries`), since they run again.
     #[doc(hidden)]
-    pub fn state_files(&self) -> Vec<PathBuf> {
-        self.bucket_entries(VMS_DIR)
-            .into_iter()
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
+    pub fn state_files(&self) -> Result<Vec<PathBuf>> {
+        let vms = self.state_dir.join(VMS_DIR);
+        let buckets = match std::fs::read_dir(&vms) {
+            Ok(buckets) => buckets,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).with_context(|| format!("listing {}", vms.display())),
+        };
+        let mut files = Vec::new();
+        for bucket in buckets {
+            let bucket = bucket.with_context(|| format!("listing {}", vms.display()))?;
+            if !bucket.file_name().to_str().is_some_and(is_bucket) {
+                continue;
+            }
+            let path = bucket.path();
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("listing {}", path.display()))
+                }
+            };
+            for entry in entries {
+                let entry = entry.with_context(|| format!("listing {}", path.display()))?;
+                if entry
+                    .path()
+                    .extension()
                     .is_some_and(|extension| extension == "json")
-            })
-            .collect()
+                {
+                    files.push(entry.path());
+                }
+            }
+        }
+        Ok(files)
     }
 
     /// The entries of every bucket of `kind`. A bucket that cannot be read is passed over:
@@ -2546,6 +2620,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::sweep::Sweep;
 
     /// Everything `list_vms` logs at WARN or above while scanning `dir`.
     fn warnings_from_listing(dir: &std::path::Path) -> (usize, String) {
@@ -2715,6 +2790,74 @@ mod tests {
 
     /// Write a state file as it is, bypassing `save_state`, which records the start time
     /// of whatever process is at the PID now.
+    /// A state directory as a caller of the sweep (`crate::sweep::testing`): states of
+    /// dead and of live processes, and what a claim does about sweeping.
+    struct StatesOfADirectory {
+        dir: tempfile::TempDir,
+        manager: StateManager,
+    }
+
+    impl StatesOfADirectory {
+        /// Write the state of a VM owned by `pid`, and return its file.
+        fn state_of(&self, vm_id: &str, pid: u32) -> PathBuf {
+            let mut state = VmState::new(vm_id.to_string(), "alpine:latest".to_string(), 1, 512);
+            state.pid = Some(pid);
+            state.pid_start_time = process_start_time(pid);
+            write_state_file(self.dir.path(), &state);
+            self.manager.state_file(vm_id)
+        }
+    }
+
+    impl crate::sweep::testing::Caller for StatesOfADirectory {
+        const SWEEP: &'static Sweep = &crate::sweep::STATE;
+
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = StateManager::new(dir.path().to_path_buf());
+            std::fs::create_dir_all(dir.path().join(VMS_DIR)).unwrap();
+            Self { dir, manager }
+        }
+
+        fn abandon(&self, n: usize) -> PathBuf {
+            // No process has a pid this high.
+            self.state_of(&format!("vm-dead-{n}"), 4_000_000_000 + n as u32)
+        }
+
+        fn live(&self, n: usize) -> (PathBuf, Box<dyn std::any::Any>) {
+            (
+                self.state_of(&format!("vm-live-{n}"), std::process::id()),
+                Box::new(()),
+            )
+        }
+
+        fn start(&self, every: std::time::Duration) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(self.manager.maybe_sweep_every(every));
+        }
+
+        fn with_place<R>(&self, f: impl FnOnce(&crate::sweep::Place) -> R) -> R {
+            self.manager.with_sweep_place(|place| Ok(f(place))).unwrap()
+        }
+
+        fn listed(&self) -> Vec<PathBuf> {
+            let vms = self.dir.path().join(VMS_DIR);
+            let mut dirs = vec![vms.clone()];
+            dirs.extend(
+                std::fs::read_dir(&vms)
+                    .unwrap()
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir()),
+            );
+            dirs
+        }
+    }
+
+    crate::sweep::testing::caller_matrix!(StatesOfADirectory);
+
     fn write_state_file(dir: &Path, state: &VmState) {
         let path = StateManager::new(dir.to_path_buf()).state_file(&state.vm_id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2956,6 +3099,44 @@ mod tests {
         assert_eq!(tokens_of(&manager, "slot-3").len(), 1);
     }
 
+    /// A dead holder's token frees its name whatever the state under its vm_id says of a
+    /// process: here that state records no PID at all. The token is what names the holder
+    /// that is gone; a state with no PID names no process and is no live owner, so the claim
+    /// deletes it with the name and publishes the new holder.
+    #[tokio::test]
+    async fn a_dead_holders_state_with_no_pid_goes_with_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        let mut old = named_state("vm-no-pid", "slot-5");
+        old.pid = None;
+        old.pid_start_time = None;
+        write_state_file(dir.path(), &old);
+        plant_token(&manager, "slot-5", &dead_token("vm-no-pid"), b"");
+        assert!(manager.state_file("vm-no-pid").exists());
+
+        let mut new = named_state("vm-new", "slot-5");
+        manager.claim_name(&mut new).await.unwrap();
+        assert!(
+            !manager.state_file("vm-no-pid").exists(),
+            "the dead holder's state outlived its name"
+        );
+        let listed: Vec<String> = manager
+            .list_vms()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|vm| vm.vm_id)
+            .collect();
+        assert_eq!(listed, vec!["vm-new".to_string()]);
+        let me = std::process::id();
+        let holder = NameToken {
+            pid: me,
+            start: process_start_time(me).unwrap(),
+            vm_id: "vm-new".to_string(),
+        };
+        assert_eq!(tokens_of(&manager, "slot-5"), vec![holder.file_name()]);
+    }
+
     /// A claimer killed between creating its token and writing it leaves an empty file.
     /// Its file name still says who owned it, so the slot is not wedged: a dead owner's is
     /// taken over, a live owner's keeps the name, and neither needs the content.
@@ -3139,6 +3320,161 @@ mod tests {
                 "deleting the last holder left its slot"
             );
         }
+    }
+
+    /// The listing of state files fails when it cannot look, so a test that checks the store
+    /// for what a VM left cannot pass on a bucket it could not read. A store with no `vms/`,
+    /// or an empty one, lists nothing and is no error.
+    #[test]
+    fn listing_state_files_fails_when_a_bucket_cannot_be_listed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        assert!(
+            manager.state_files().unwrap().is_empty(),
+            "a store with no vms/"
+        );
+        std::fs::create_dir(dir.path().join(VMS_DIR)).unwrap();
+        assert!(manager.state_files().unwrap().is_empty(), "an empty vms/");
+        write_state_file(dir.path(), &named_state("vm-listed", "listed"));
+        assert_eq!(
+            manager.state_files().unwrap(),
+            vec![manager.state_file("vm-listed")]
+        );
+
+        let bucket = manager.vm_bucket("vm-listed");
+        let unreadable = if nix::unistd::geteuid().is_root() {
+            // Root lists a directory whatever its mode, so the bucket is replaced by a file
+            // of its name, which cannot be listed.
+            std::fs::remove_dir_all(&bucket).unwrap();
+            std::fs::write(&bucket, b"").unwrap();
+            "a bucket that is a file (run as root)"
+        } else {
+            std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o000)).unwrap();
+            "a bucket of mode 000 (run as a user other than root)"
+        };
+        let listed = manager.state_files();
+        if bucket.is_dir() {
+            // So the temporary directory can be removed.
+            std::fs::set_permissions(&bucket, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let Err(error) = listed else {
+            panic!("listed a store with {unreadable} without an error");
+        };
+        assert!(
+            format!("{error:#}").contains(&bucket.display().to_string()),
+            "the error does not name the bucket: {error:#}"
+        );
+    }
+
+    /// Wakes the thread that polls a future by hand (`poll_then_drop`).
+    struct Woken(std::sync::Mutex<bool>, std::sync::Condvar);
+
+    impl std::task::Wake for Woken {
+        fn wake(self: std::sync::Arc<Self>) {
+            *self.0.lock().unwrap() = true;
+            self.1.notify_all();
+        }
+    }
+
+    /// Poll `future` up to `polls` times, each poll after the await it stopped at has woken
+    /// it, then drop it. Its output when it completed within those polls. Each poll takes it
+    /// past every await that is ready, so after `n` polls it is stopped at its `n`th await
+    /// that was not.
+    fn poll_then_drop<F: std::future::Future>(future: F, polls: usize) -> Option<F::Output> {
+        let woken = std::sync::Arc::new(Woken(
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        ));
+        let waker = std::task::Waker::from(woken.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        for poll in 0..polls {
+            if poll > 0 {
+                let flag = woken.0.lock().unwrap();
+                let (mut flag, wait) = woken
+                    .1
+                    .wait_timeout_while(flag, std::time::Duration::from_secs(10), |woken| !*woken)
+                    .unwrap();
+                assert!(!wait.timed_out(), "not woken within 10 s of poll {poll}");
+                *flag = false;
+            }
+            if let std::task::Poll::Ready(output) =
+                std::future::Future::poll(future.as_mut(), &mut context)
+            {
+                return Some(output);
+            }
+        }
+        None
+    }
+
+    /// A claim whose future is dropped at any of its awaits leaves nothing of itself, so this
+    /// process can claim the name again at once under another vm_id. The slot is held by a
+    /// dead holder, so the claim reads and deletes that holder's state before its rename,
+    /// which are its awaits. Each round polls a new claim one time more than the last and
+    /// drops it, until a round lets it complete; that claim keeps its name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_dropped_at_any_await_leaves_nothing_of_it() {
+        let me = std::process::id();
+        let mut dropped = 0;
+        for polls in 1..=32 {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = StateManager::new(dir.path().to_path_buf());
+            let dead_holder = dead_token("vm-dead");
+            let mut dead = named_state("vm-dead", "dropped");
+            dead.pid = Some(dead_holder.pid);
+            dead.pid_start_time = Some(dead_holder.start);
+            write_state_file(dir.path(), &dead);
+            plant_token(&manager, "dropped", &dead_holder, b"");
+
+            let mut vm = named_state("vm-dropped", "dropped");
+            if let Some(claimed) = poll_then_drop(manager.claim_name(&mut vm), polls) {
+                claimed.unwrap();
+                assert!(
+                    dropped > 0,
+                    "the claim completed at its first poll, so no await was dropped"
+                );
+                assert_eq!(
+                    tokens_of(&manager, "dropped"),
+                    vec![format!("{me}.{}.vm-dropped", vm.pid_start_time.unwrap())]
+                );
+                let mut other = named_state("vm-other", "dropped");
+                assert!(
+                    manager.claim_name(&mut other).await.is_err(),
+                    "a claim that completed lost its name"
+                );
+                return;
+            }
+            dropped = polls;
+
+            let bucket = manager.name_slot("dropped").parent().unwrap().to_path_buf();
+            let claims: Vec<String> = std::fs::read_dir(&bucket)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.file_name().into_string().unwrap())
+                .filter(|name| name.starts_with(CLAIM_PREFIX))
+                .collect();
+            assert!(
+                claims.is_empty(),
+                "a claim dropped after {polls} polls left its claim directory: {claims:?}"
+            );
+            let tokens = tokens_of(&manager, "dropped");
+            assert!(
+                !tokens.iter().any(|token| token.ends_with(".vm-dropped")),
+                "a claim dropped after {polls} polls left its token: {tokens:?}"
+            );
+            assert!(
+                !manager.state_file("vm-dropped").exists()
+                    && !manager.pid_entry(me, "vm-dropped").exists(),
+                "a claim dropped after {polls} polls left a state or a PID index entry"
+            );
+            let mut next = named_state("vm-next", "dropped");
+            manager.claim_name(&mut next).await.unwrap_or_else(|error| {
+                panic!("after a claim dropped after {polls} polls: {error:#}")
+            });
+            manager.delete_state("vm-next").await.unwrap();
+        }
+        panic!("the claim did not complete within 32 polls");
     }
 
     /// One claim running inside another's window, at each seam.
@@ -3479,6 +3815,95 @@ mod tests {
     }
 
     /// The names in `dir`, sorted.
+    /// An older build's VM that was killed leaves its state where layout 1 kept it: its
+    /// fcvm ran no teardown. That file is not a running VM. While the process lives the
+    /// store is refused by name and PID; once it is killed (before it is reaped, and
+    /// after), and when another process has taken its PID since, a reader lists nothing
+    /// and removes nothing, and a launch takes the dead VM's name and clears what layout
+    /// 1 left. A store is never refused over a dead VM.
+    #[tokio::test]
+    async fn a_killed_older_vms_state_refuses_nothing_and_a_launch_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut old = named_state("vm-old-killed", "old-web");
+        old.pid = Some(pid);
+        old.pid_start_time = process_start_time(pid);
+        assert!(old.pid_start_time.is_some(), "the child has no start time");
+        let old_state = dir.path().join("vm-old-killed.json");
+        std::fs::write(&old_state, serde_json::to_string(&old).unwrap()).unwrap();
+        std::fs::write(dir.path().join("vm-old-killed.json.lock"), "").unwrap();
+        std::fs::write(dir.path().join("names.lock"), "").unwrap();
+        std::fs::create_dir(dir.path().join("name")).unwrap();
+        std::fs::write(dir.path().join("name").join("abc.json"), "{}").unwrap();
+        let list = || async {
+            // A manager of its own each time: one that has passed the layout check does
+            // not check again.
+            StateManager::new(dir.path().to_path_buf()).list_vms().await
+        };
+
+        let refusal = format!("{:#}", list().await.unwrap_err());
+        assert!(
+            refusal.contains("'old-web'") && refusal.contains(&format!("pid {pid}")),
+            "{refusal}"
+        );
+
+        // SIGKILL. Until its parent waits for it the process is a zombie, which runs
+        // nothing.
+        child.kill().unwrap();
+        let zombie = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !read_proc_stat(pid).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+        }) {
+            assert!(
+                std::time::Instant::now() < zombie,
+                "the killed child never became a zombie"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            list().await.unwrap().is_empty(),
+            "a killed VM, not yet reaped"
+        );
+        child.wait().unwrap();
+        assert!(list().await.unwrap().is_empty(), "a killed VM, reaped");
+
+        // The dead VM's PID, taken by another process since: this test's own PID with
+        // another start time.
+        let me = std::process::id();
+        let mut reused = named_state("vm-old-reused", "old-db");
+        reused.pid = Some(me);
+        reused.pid_start_time = process_start_time(me).map(|start| start + 1);
+        std::fs::write(
+            dir.path().join("vm-old-reused.json"),
+            serde_json::to_string(&reused).unwrap(),
+        )
+        .unwrap();
+        let before = top_level(dir.path());
+        assert!(list().await.unwrap().is_empty(), "a dead VM's PID, reused");
+        assert_eq!(top_level(dir.path()), before, "a listing changed the store");
+
+        // A launch takes the dead VM's name, and what layout 1 left is gone.
+        let manager = StateManager::new(dir.path().to_path_buf());
+        let mut new = named_state("vm-new", "old-web");
+        manager.claim_name(&mut new).await.unwrap();
+        assert!(
+            !old_state.exists()
+                && !dir.path().join("vm-old-reused.json").exists()
+                && !dir.path().join("name").exists(),
+            "a launch left files of layout 1: {:?}",
+            top_level(dir.path())
+        );
+        let listed = manager.list_vms().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].vm_id, "vm-new");
+    }
+
     fn top_level(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()

@@ -445,7 +445,7 @@ pub async fn rewrite_memory_file(snapshot_dir: &Path) -> Result<Rewrite> {
 }
 
 /// Remove an unused copy and its reclaim record. A copy that cannot be removed stays recorded,
-/// so the next launch's reclaim removes it.
+/// so the next sweep removes it.
 fn discard_copy(temp: &Path, owner: crate::reclaim::Owner) {
     match std::fs::remove_file(temp) {
         Ok(()) => {}

@@ -440,18 +440,13 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
     println!("================================================================");
 
     // Cloud Hypervisor is an optional VMM backend. Gate on the SAME resolution fcvm uses
-    // (FCVM_CLOUD_HYPERVISOR_BIN → content-addressed build under assets_dir → PATH): when
+    // (FCVM_CLOUD_HYPERVISOR_BIN, else the build of the commit the config pins): when
     // resolvable (local dev, or CI after `fcvm setup --cloud-hypervisor`) the test runs and
     // its assertion is definitive; when absent, skip rather than fail. The binary must live
     // on a namespace-accessible path (the content-addressed assets_dir works, like the
     // firecracker fork binary), NOT a 0700 home dir, since the rootless user namespace
     // cannot exec a file owned by an unmapped uid.
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!(
-            "SKIP: cloud-hypervisor not found — skipping CH backend test (build it with \
-             `fcvm setup --cloud-hypervisor`, set FCVM_CLOUD_HYPERVISOR_BIN, or install on \
-             PATH; see #632/#61)"
-        );
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
 
@@ -496,8 +491,7 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
 /// or restored a snapshot.
 #[tokio::test]
 async fn test_cloud_hypervisor_podman_run_uses_the_snapshot_cache() -> Result<()> {
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     ch_cache_round_trip("ch-cache", &[]).await
@@ -508,8 +502,7 @@ async fn test_cloud_hypervisor_podman_run_uses_the_snapshot_cache() -> Result<()
 /// so the second run failed once the cache was wired.
 #[tokio::test]
 async fn test_cloud_hypervisor_podman_run_with_a_balloon_uses_the_snapshot_cache() -> Result<()> {
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     ch_cache_round_trip("ch-cache-balloon", &["--balloon", "64"]).await
@@ -573,8 +566,7 @@ async fn ch_cache_round_trip(prefix: &str, extra: &[&str]) -> Result<()> {
 async fn test_cloud_hypervisor_guest_nic_is_eth0() -> Result<()> {
     use std::time::Duration;
 
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found — skipping CH NIC name test (#632/#61)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     let (vm_name, _, _, _) = common::unique_names("ch-nic");
@@ -640,12 +632,7 @@ async fn test_cloud_hypervisor_snapshot_roundtrip() -> Result<()> {
     println!("\nTest Cloud Hypervisor snapshot create + restore roundtrip");
     println!("==========================================================");
 
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!(
-            "SKIP: cloud-hypervisor not found — skipping CH snapshot roundtrip (build it with \
-             `fcvm setup --cloud-hypervisor`, set FCVM_CLOUD_HYPERVISOR_BIN, or install on \
-             PATH; see #632/#61)"
-        );
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
 
@@ -729,6 +716,420 @@ async fn test_cloud_hypervisor_snapshot_roundtrip() -> Result<()> {
     common::kill_process(baseline_pid).await;
     let _ = tokio::time::timeout(Duration::from_secs(15), clone.wait()).await;
     let _ = tokio::time::timeout(Duration::from_secs(15), baseline.wait()).await;
+    Ok(())
+}
+
+/// Each vCPU's GICR_ISENABLER0 and GICR_PENDBASER in a Cloud Hypervisor snapshot's `rdist`
+/// array (hypervisor/src/kvm/aarch64/gic/redist_regs.rs upstream): every vCPU's 7 words
+/// of redistributor registers first, of which GICR_PENDBASER is the fifth and sixth, then
+/// every vCPU's 17 words of SGI and PPI registers, of which GICR_ISENABLER0 is the third.
+#[cfg(target_arch = "aarch64")]
+fn saved_enables_and_pending_tables(state_json: &std::path::Path) -> Result<Vec<(u32, u64)>> {
+    let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(state_json)?)?;
+    let gic = doc["snapshots"]["device-manager"]["snapshots"]["gic-v3-its"]["snapshot_data"]
+        ["state"]
+        .as_str()
+        .context("the snapshot's state file has no vGIC state")?;
+    let gic: serde_json::Value = serde_json::from_str(gic)?;
+    let rdist: Vec<u32> = serde_json::from_value(gic["Kvm"]["rdist"].clone())
+        .context("the vGIC state has no rdist array")?;
+    anyhow::ensure!(
+        !rdist.is_empty() && rdist.len().is_multiple_of(24),
+        "rdist has {} words, not 24 per vCPU",
+        rdist.len()
+    );
+    let vcpus = rdist.len() / 24;
+    Ok((0..vcpus)
+        .map(|v| {
+            let pendbaser = u64::from(rdist[v * 7 + 4]) | u64::from(rdist[v * 7 + 5]) << 32;
+            (rdist[vcpus * 7 + v * 17 + 2], pendbaser)
+        })
+        .collect())
+}
+
+/// #2155: the Cloud Hypervisor fcvm built before it moved to upstream's main (a fork at
+/// v52.0 plus 49 commits) saved, for a VM that was booted and not restored, vCPU 0's
+/// redistributor and CPU interface registers once per vCPU, because the identities that
+/// address each vCPU's registers were set on the restore path only. Upstream derives them
+/// from the vCPU ids at every save and restore since v54.0 (18366e1b7). A clone then ran every
+/// vCPU on vCPU 0's interrupt state. When vCPU 0 was inside an interrupt handler at the
+/// pause, the clone's CPU 1 inherited an active priority that nothing ended: it took no
+/// interrupt again, and the restore never completed.
+///
+/// No race is needed to see the save: guest CPU 1 is taken offline, which disables its timer
+/// interrupt (PPI 27), so the two vCPUs' enable registers differ for certain. The snapshot
+/// has to hold each vCPU's own, and a clone of it has to bring CPU 1 back with a working
+/// timer.
+#[cfg(target_arch = "aarch64")]
+#[tokio::test]
+async fn test_cloud_hypervisor_snapshot_saves_each_vcpus_own_gic_state() -> Result<()> {
+    use std::time::Duration;
+
+    if !common::cloud_hypervisor_built()? {
+        return Ok(());
+    }
+    const TIMER_PPI: u32 = 1 << 27;
+    let (vm_name, clone_name, tag, _) = common::unique_names("ch-gic");
+
+    // Cold boot: only a VM that was never restored had the defect.
+    let (_child, pid) = common::spawn_fcvm_with_env(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            "--cpu",
+            "2",
+            common::TEST_IMAGE,
+        ],
+        &[("FCVM_NO_SNAPSHOT", "1")],
+    )
+    .await?;
+    let result = async {
+        common::poll_health_by_pid(pid, 240).await?;
+        let online = common::exec_in_vm(
+            pid,
+            &["echo 0 > /sys/devices/system/cpu/cpu1/online; cat /sys/devices/system/cpu/online"],
+        )
+        .await?;
+        anyhow::ensure!(
+            online.trim() == "0",
+            "guest CPU 1 did not go offline: {online}"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(120),
+            common::create_snapshot_by_pid(pid, &tag),
+        )
+        .await
+        .context("snapshot create timed out")??;
+        let saved = saved_enables_and_pending_tables(
+            &fcvm::paths::snapshot_dir()
+                .join(&tag)
+                .join("ch")
+                .join("state.json"),
+        )?;
+        println!("saved (GICR_ISENABLER0, GICR_PENDBASER) per vCPU: {saved:x?}");
+        anyhow::ensure!(saved.len() == 2, "expected two vCPUs, found {saved:x?}");
+        let enables = [saved[0].0, saved[1].0];
+        anyhow::ensure!(
+            enables[0] & TIMER_PPI != 0,
+            "vCPU 0's saved GICR_ISENABLER0 {:#x} has no timer interrupt",
+            enables[0]
+        );
+        anyhow::ensure!(
+            enables[1] & TIMER_PPI == 0,
+            "guest CPU 1 is offline, and the snapshot says its timer interrupt is enabled: \
+             vCPU 1's saved GICR_ISENABLER0 {:#x} is vCPU 0's ({:#x})",
+            enables[1],
+            enables[0]
+        );
+        // The guest gives each redistributor an LPI pending table of its own.
+        anyhow::ensure!(
+            saved[0].1 != 0 && saved[0].1 != saved[1].1,
+            "the snapshot holds one LPI pending table for both vCPUs: {saved:x?}"
+        );
+
+        // The clone: CPU 1 comes back and takes timer interrupts.
+        let (_clone, clone_pid) =
+            common::spawn_fcvm(&["snapshot", "run", "--snapshot", &tag, "--name", &clone_name])
+                .await?;
+        let clone = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            let ticks = common::exec_in_vm(
+                clone_pid,
+                &["echo 1 > /sys/devices/system/cpu/cpu1/online; \
+                   t() { awk '/arch_timer/ {print $3; exit}' /proc/interrupts; }; \
+                   a=$(t); sleep 2; b=$(t); echo $(nproc) $((b - a))"],
+            )
+            .await?;
+            let fields: Vec<u64> = ticks
+                .split_whitespace()
+                .filter_map(|field| field.parse().ok())
+                .collect();
+            anyhow::ensure!(
+                fields.len() == 2 && fields[0] == 2 && fields[1] > 0,
+                "the clone's CPU 1 did not come back with a timer (cpus, timer interrupts on \
+                 CPU 1 in 2 s): {ticks}"
+            );
+            Ok(())
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        clone
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&tag));
+    result
+}
+
+/// Seconds since the guest booted (`/proc/uptime`, CLOCK_BOOTTIME), read through exec.
+async fn guest_uptime(pid: u32) -> Result<f64> {
+    let out = common::exec_in_vm(pid, &["cat", "/proc/uptime"]).await?;
+    out.split_whitespace()
+        .next()
+        .and_then(|seconds| seconds.parse().ok())
+        .with_context(|| format!("no uptime in {out:?}"))
+}
+
+/// Boot the nginx VM the Cloud Hypervisor snapshot tests start from.
+async fn ch_baseline(vm_name: &str) -> Result<(tokio::process::Child, u32)> {
+    let (child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            vm_name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            common::TEST_IMAGE,
+        ],
+        vm_name,
+    )
+    .await
+    .context("spawning the Cloud Hypervisor baseline VM")?;
+    common::poll_health_by_pid(pid, 300)
+        .await
+        .context("the Cloud Hypervisor baseline VM should become healthy")?;
+    Ok((child, pid))
+}
+
+/// `fcvm snapshot create --pid <pid> --tag <tag>`, failing with its stderr.
+async fn ch_snapshot(pid: u32, tag: &str) -> Result<()> {
+    let out = tokio::process::Command::new(common::find_fcvm_binary()?)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            tag,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "snapshot create of {tag} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+/// A Cloud Hypervisor clone's clock continues from the snapshot: it does not jump by the
+/// snapshot's age.
+///
+/// Cloud Hypervisor's default on restore (`clock_restore_mode=advance`) adds the wall time
+/// since the snapshot to the guest's counter, so a clone of a day-old snapshot would start
+/// with CLOCK_MONOTONIC a day ahead and every armed timer expired at once. fcvm passes
+/// `preserve`, and the guest's wall clock is set by fc-agent's restore handler. The clone is
+/// restored `AGE` seconds after the snapshot: with `preserve` its uptime is the source's at
+/// the snapshot plus the time it has run since, with `advance` it is `AGE` more.
+///
+/// It also prints how far the SOURCE's clock moved across the snapshot create, which pauses
+/// and resumes it in place (#2173).
+#[tokio::test]
+async fn test_cloud_hypervisor_clone_keeps_the_snapshots_clock() -> Result<()> {
+    use std::time::{Duration, Instant};
+    const AGE: Duration = Duration::from_secs(20);
+    // What the reads through exec and the restore's own bookkeeping can add.
+    const SLACK: f64 = 2.0;
+
+    if !common::cloud_hypervisor_built()? {
+        return Ok(());
+    }
+    let (vm_name, clone_name, snap, _) = common::unique_names("ch-clock");
+    let (mut baseline, baseline_pid) = ch_baseline(&vm_name).await?;
+
+    let before = guest_uptime(baseline_pid).await?;
+    let create_started = Instant::now();
+    ch_snapshot(baseline_pid, &snap).await?;
+    let create_took = create_started.elapsed().as_secs_f64();
+    let after = guest_uptime(baseline_pid).await?;
+    println!(
+        "  source: uptime {before:.2} s before the snapshot create and {after:.2} s after \
+         (+{:.2} s); the create took {create_took:.2} s on the host",
+        after - before
+    );
+    // The pause lies between the two reads, so the snapshot's clock does too.
+    assert!(
+        AGE.as_secs_f64() > (after - before) + 2.0 * SLACK,
+        "the snapshot create moved the source's clock {:.1} s, too close to the {} s the clone \
+         waits for the two restore modes to be told apart",
+        after - before,
+        AGE.as_secs()
+    );
+
+    tokio::time::sleep(AGE).await;
+
+    let restore_started = Instant::now();
+    let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snap,
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning the clone")?;
+    common::poll_health_by_pid(clone_pid, 300)
+        .await
+        .context("the clone should become healthy")?;
+    let clone_uptime = guest_uptime(clone_pid).await?;
+    let since_restore = restore_started.elapsed().as_secs_f64();
+    println!(
+        "  clone: uptime {clone_uptime:.2} s, {since_restore:.2} s after its restore began, \
+         {} s after the snapshot",
+        AGE.as_secs()
+    );
+    assert!(
+        clone_uptime >= before,
+        "the clone's clock ({clone_uptime:.2} s) is behind the source's before the snapshot \
+         ({before:.2} s)"
+    );
+    assert!(
+        clone_uptime <= after + since_restore + SLACK,
+        "the clone's clock jumped: uptime {clone_uptime:.2} s, when the source was at \
+         {after:.2} s after the snapshot and the clone has run for at most {since_restore:.2} s \
+         (a restore that adds the snapshot's age would read {:.2} s or more)",
+        before + AGE.as_secs_f64() + since_restore
+    );
+
+    // The wall clock is the host's, set by the guest agent's restore handler.
+    let guest_now: f64 = common::exec_in_vm(clone_pid, &["date", "+%s.%N"])
+        .await?
+        .trim()
+        .parse()
+        .context("parsing the clone's date")?;
+    let host_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs_f64();
+    assert!(
+        (guest_now - host_now).abs() < SLACK,
+        "the clone's wall clock is {:.2} s from the host's",
+        guest_now - host_now
+    );
+
+    common::kill_process(clone_pid).await;
+    common::kill_process(baseline_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), clone.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), baseline.wait()).await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&snap));
+    Ok(())
+}
+
+/// A snapshot of a Cloud Hypervisor clone stands on its own: it restores after the snapshot
+/// the clone came from is deleted.
+///
+/// A clone maps its snapshot's memory file, and Cloud Hypervisor writes a snapshot of such a
+/// VM by cloning that file's extents (FICLONERANGE) and then writing only the pages the clone
+/// changed. The new file must hold every page all the same: what the source wrote before the
+/// first snapshot (inherited through the clone, never written by it) and what the clone
+/// wrote. Both are files in the guest's tmpfs, so they exist in guest memory only.
+#[tokio::test]
+async fn test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot() -> Result<()> {
+    use std::time::Duration;
+
+    if !common::cloud_hypervisor_built()? {
+        return Ok(());
+    }
+    let (vm_name, clone_name, parent_snap, _) = common::unique_names("ch-lineage");
+    let child_snap = format!("{parent_snap}-child");
+    let grandchild_name = format!("{clone_name}-2");
+    // 32 MiB of bytes no page of which is zero or repeats, with its checksum.
+    let fill = |name: &str| {
+        format!(
+            "head -c 33554432 /dev/urandom > /dev/shm/{name} && sha256sum /dev/shm/{name} | cut -d' ' -f1"
+        )
+    };
+    let sum = |name: &str| format!("sha256sum /dev/shm/{name} | cut -d' ' -f1");
+
+    let (mut baseline, baseline_pid) = ch_baseline(&vm_name).await?;
+    let from_source = common::exec_in_vm(baseline_pid, &[&fill("from-source")])
+        .await?
+        .trim()
+        .to_string();
+    ch_snapshot(baseline_pid, &parent_snap).await?;
+
+    let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &parent_snap,
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await?;
+    common::poll_health_by_pid(clone_pid, 300).await?;
+    let from_clone = common::exec_in_vm(clone_pid, &[&fill("from-clone")])
+        .await?
+        .trim()
+        .to_string();
+    ch_snapshot(clone_pid, &child_snap).await?;
+
+    // The clone and the parent snapshot go; the child snapshot is all that is left of them.
+    common::kill_process(clone_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), clone.wait()).await;
+    common::kill_process(baseline_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), baseline.wait()).await;
+    let delete = tokio::process::Command::new(common::find_fcvm_binary()?)
+        .args(["snapshots", "delete", "--force", &parent_snap])
+        .output()
+        .await?;
+    assert!(
+        delete.status.success(),
+        "deleting the parent snapshot failed: {}",
+        String::from_utf8_lossy(&delete.stderr)
+    );
+
+    let (mut grandchild, grandchild_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &child_snap,
+            "--name",
+            &grandchild_name,
+        ],
+        &grandchild_name,
+    )
+    .await?;
+    common::poll_health_by_pid(grandchild_pid, 300)
+        .await
+        .context("a clone of the child snapshot should become healthy without the parent")?;
+    assert_eq!(
+        from_source.len(),
+        64,
+        "no checksum from the source: {from_source:?}"
+    );
+    assert_eq!(
+        common::exec_in_vm(grandchild_pid, &[&sum("from-source")])
+            .await?
+            .trim(),
+        from_source,
+        "memory the source wrote before the first snapshot did not survive"
+    );
+    assert_eq!(
+        common::exec_in_vm(grandchild_pid, &[&sum("from-clone")])
+            .await?
+            .trim(),
+        from_clone,
+        "memory the clone wrote did not survive"
+    );
+
+    common::kill_process(grandchild_pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), grandchild.wait()).await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&child_snap));
     Ok(())
 }
 

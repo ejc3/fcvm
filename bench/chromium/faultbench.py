@@ -42,11 +42,14 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import reqbench  # noqa: E402  (the state directory and the bucket layout's readers)
 REPO_ROOT = SCRIPT_DIR.parent.parent
 # Overridable so this can run against an instrumented build in a separate target dir
 # without swapping the binary that a concurrently running bench.sh is invoking.
 FCVM = Path(os.environ.get("FCVM", REPO_ROOT / "target" / "release" / "fcvm"))
-STATE_DIR = Path("/mnt/fcvm-btrfs/state")
+# Where FCVM keeps VM state, asked of it once (state_dir()); never a join of a data root.
+STATE_DIR = None
 SNAP_DIR = Path("/mnt/fcvm-btrfs/snapshots")
 
 PAGE = 4096
@@ -301,6 +304,28 @@ def firecracker_pids(proc="/proc"):
     return out
 
 
+def state_dir() -> str:
+    """FCVM's state directory, from `fcvm paths --json` (reqbench.fcvm_paths), asked once
+    with the environment the serves and clones get. A failure stops the run."""
+    global STATE_DIR
+    if STATE_DIR is None:
+        try:
+            STATE_DIR = reqbench.fcvm_state_dir(str(FCVM))
+        except RuntimeError as error:
+            raise SystemExit(f"[faultbench] {error}") from error
+    return str(STATE_DIR)
+
+
+def vm_states():
+    """Every VM state in FCVM's store, in its bucket layout (reqbench's readers)."""
+    store = state_dir()
+    reqbench.require_state_layout(store)
+    for path in reqbench.list_state_paths(store):
+        state = reqbench.read_state_file(path)
+        if state is not None:
+            yield state
+
+
 def serve_pid_for(tag: str, umode: str):
     """The pid of the serve for this tag AND this UFFD mode.
 
@@ -310,11 +335,7 @@ def serve_pid_for(tag: str, umode: str):
     later signal it, so both the measurement and the teardown would land on a stranger.
     `uffd_mode` is written into the serve's own state entry by `snapshot serve`.
     """
-    for p in STATE_DIR.glob("*.json"):
-        try:
-            st = json.loads(p.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
+    for st in vm_states():
         cfg = st.get("config") or {}
         if (cfg.get("process_type") == "serve"
                 and cfg.get("snapshot_name") == tag
@@ -604,15 +625,8 @@ def require_fresh_out_dir(out):
 def wait_clones_gone(prefix, timeout=120):
     t_dead = time.time() + timeout
     while time.time() < t_dead:
-        alive = 0
-        for p in STATE_DIR.glob("*.json"):
-            try:
-                st = json.loads(p.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            cfg = st.get("config") or {}
-            if cfg.get("process_type") == "clone" and (cfg.get("name") or "").startswith(prefix):
-                alive += 1
+        # A VM's name is a top-level field of its state; the prefix is this run's.
+        alive = sum(1 for st in vm_states() if (st.get("name") or "").startswith(prefix))
         if alive == 0:
             return True
         time.sleep(0.5)
