@@ -2929,7 +2929,10 @@ both.
   is written like a lock file (0666). Nothing is made world-writable.
 - **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
   by every command while a VM of it is running: the error lists each one's name and PID,
-  and they are stopped with the fcvm that started them. The layout check of a command
+  and they are listed and stopped with the fcvm that started them (this build's `fcvm ls`
+  is refused too, so it shows nothing of them). A VM of it that was killed leaves a state
+  file that is not a running VM (its PID is gone, a zombie, or another process's by start
+  time): a reader lists nothing and a launch removes it. The layout check of a command
   that only reads (`check_layout_for_read`) decides refuse or proceed and writes nothing,
   so `fcvm ls`, which only lists, needs no write access and removes nothing of an older
   launch in progress. A lookup by PID that misses still runs the sweep
@@ -3897,7 +3900,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
 ├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
-├── reclaim/{euid}/{id}.json       # what a live fcvm made on the host; the next launch reclaims a dead one's (src/reclaim.rs)
+├── reclaim/{euid}/<b>/{id}.json   # what a live fcvm made on the host, in buckets; a dead one's is reclaimed by the first launch 1 s or more after the last sweep began, or the next setup, snapshot import or export (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy
 └── snapshots/{name}/             # Firecracker snapshots
