@@ -1428,7 +1428,7 @@ mod snapshot_dir_tests {
     fn a_snapshot_disk_is_counted_once() {
         use std::io::{Seek, SeekFrom, Write};
         use std::os::fd::AsRawFd;
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = crate::storage::extents::test_dir::extent_mapped_tempdir();
         let disk = dir.path().join("disk.raw");
         let mut file = std::fs::File::create(&disk).unwrap();
         for block in 0..3u64 {

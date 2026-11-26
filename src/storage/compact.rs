@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn a_copy_keeps_bytes_holes_length_and_mtime() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = crate::storage::extents::test_dir::extent_mapped_tempdir();
         let memory = dir.path().join(SNAPSHOT_MEMORY_FILE);
         {
             let file = File::create(&memory).unwrap();

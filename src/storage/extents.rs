@@ -299,6 +299,39 @@ pub fn reports_shared_extents(file: &File) -> std::io::Result<bool> {
     Ok(shared)
 }
 
+/// The directory for tests that read the extents of files they create.
+#[cfg(test)]
+pub(crate) mod test_dir {
+    use std::path::Path;
+
+    /// Says why tests cannot read file extents in `dir`, or nothing when they can: it writes a
+    /// file there and asks the filesystem for its extents.
+    pub(crate) fn extent_mapping_unavailable(dir: &Path) -> Option<String> {
+        let probe = dir.join("extent-probe");
+        std::fs::write(&probe, [0u8; 4096]).unwrap();
+        let asked = super::extents_up_to(&std::fs::File::open(&probe).unwrap(), 1);
+        std::fs::remove_file(&probe).unwrap();
+        let err = asked.err()?;
+        Some(format!(
+            "this test reads the extents (FIEMAP) of files it creates in {}, and that filesystem \
+             does not map extents ({err}). tmpfs does not. Check the repository out on ext4, btrfs \
+             or xfs",
+            dir.display()
+        ))
+    }
+
+    /// A temporary directory beside the crate, on the checkout's filesystem. A checkout on a
+    /// filesystem that does not map extents fails the test here, with what to change, where the
+    /// test's own extent call would fail with "Operation not supported".
+    pub(crate) fn extent_mapped_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        if let Some(why) = extent_mapping_unavailable(dir.path()) {
+            panic!("{why}");
+        }
+        dir
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,11 +349,25 @@ mod tests {
         path
     }
 
+    /// The preflight speaks for a filesystem without extent mapping and is silent for one with
+    /// it. /dev/shm is tmpfs on every Linux host, and the three tests below need the crate's
+    /// directory to pass the same check.
+    #[test]
+    fn the_extent_preflight_names_what_the_filesystem_lacks() {
+        let tmpfs = tempfile::tempdir_in("/dev/shm").unwrap();
+        let why = test_dir::extent_mapping_unavailable(tmpfs.path())
+            .expect("tmpfs answered FIEMAP, so this check proves nothing here");
+        for expected in ["FIEMAP", "tmpfs", "ext4, btrfs or xfs", "/dev/shm"] {
+            assert!(why.contains(expected), "no {expected:?} in: {why}");
+        }
+        assert!(std::fs::read_dir(tmpfs.path()).unwrap().next().is_none());
+    }
+
     /// The count stops one past the limit. The files are made in the crate's directory, on
     /// the build's filesystem: tmpfs does not answer FIEMAP.
     #[test]
     fn extents_are_counted_up_to_one_past_the_limit() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = test_dir::extent_mapped_tempdir();
         let file = File::open(three_extents(dir.path(), "a")).unwrap();
         assert_eq!(extents_up_to(&file, 10).unwrap(), 3);
         assert_eq!(extents_up_to(&file, 3).unwrap(), 3);
@@ -344,7 +391,7 @@ mod tests {
     /// Writing a file changes its identity, and it is counted again.
     #[test]
     fn a_written_file_is_counted_again() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = test_dir::extent_mapped_tempdir();
         let path = three_extents(dir.path(), "disk.raw");
         let paths = [path.clone()];
         assert_eq!(recorded_extents_in_files_up_to(&paths, 10).unwrap(), 3);
@@ -363,7 +410,7 @@ mod tests {
     /// Several files count together, up to one past the limit.
     #[test]
     fn extents_of_several_files_are_counted_together() {
-        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let dir = test_dir::extent_mapped_tempdir();
         let paths = [
             three_extents(dir.path(), "a"),
             three_extents(dir.path(), "b"),
