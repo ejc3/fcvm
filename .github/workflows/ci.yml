@@ -274,6 +274,8 @@ jobs:
         run: make test-runner-acceptance
       - name: Test the pull request scope and stack coverage
         run: make test-ci-scope
+      - name: Test the pool tool
+        run: make test-ci-pool
       - name: Test the runner kernel check
         run: make test-runner-kernel
       - name: Test cached release downloads

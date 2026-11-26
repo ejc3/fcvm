@@ -48,6 +48,12 @@ test-runner-acceptance:
 test-ci-scope:
 	python3 scripts/test-ci-stack-scope.py
 
+# scripts/ci-pool/ci_pool.py (pooled CI, docs/ci-pool.md) against a fake gh and temporary
+# git repositories. Needs git, jq and Python 3.9 or later; no network.
+.PHONY: test-ci-pool
+test-ci-pool:
+	python3 scripts/test-ci-pool.py
+
 # scripts/check-runner-kernel.py against fixture repositories. Needs git 2.29 and Python 3.11.4
 # (tomllib, tarfile's extraction filter, fetch --no-write-fetch-head) or later.
 .PHONY: test-runner-kernel

@@ -745,6 +745,7 @@ fcvm/
 | [DESIGN.md](DESIGN.md) | Architecture, internals, configuration reference |
 | [Durable remote workloads](docs/durable-workloads.md) | Proposed persistent, cell-based remote execution architecture |
 | [CI merge train](docs/ci-train.md) | Pooled CI: one full matrix per batch of low-risk PRs |
+| [Pooled CI](docs/ci-pool.md) | Pools read from pull request bases, and what CI costs and why it fails |
 | [PERFORMANCE.md](PERFORMANCE.md) | Benchmarks, tuning, tracing |
 | [NESTED.md](NESTED.md) | Nested virtualization setup |
 
