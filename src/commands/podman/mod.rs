@@ -1651,6 +1651,7 @@ async fn prepare_vm_for_lifecycle(
         firecracker_args: profile_firecracker_args(&args).as_deref(),
         unsupported: None,
         kernel_profile: args.kernel_profile.as_deref(),
+        passthrough_devices: args.gpu.len(),
     })?;
     info!(
         lifecycle = ?lifecycle,

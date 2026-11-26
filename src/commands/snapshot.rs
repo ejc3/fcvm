@@ -3271,6 +3271,7 @@ async fn cmd_snapshot_run_inner(
         firecracker_args: runtime_config.effective_firecracker_args().as_deref(),
         unsupported: None,
         kernel_profile: snapshot_config.metadata.kernel_profile.as_deref(),
+        passthrough_devices: args.gpu.len(),
     })?;
     crate::commands::common::require_confined_filter(&decision, &runtime_config)?;
 
@@ -6284,6 +6285,7 @@ async fn cmd_snapshot_run_raw(
         firecracker_args: args.firecracker_args.as_deref(),
         unsupported: Some("clones of raw VM snapshots do not support confinement yet"),
         kernel_profile: None,
+        passthrough_devices: args.gpu.len(),
     })?;
     anyhow::ensure!(
         port_mappings.is_empty(),

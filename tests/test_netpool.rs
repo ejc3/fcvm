@@ -396,6 +396,7 @@ impl Helper {
                         firecracker_args: None,
                         unsupported: None,
                         kernel_profile: None,
+                        passthrough_devices: 0,
                     })
                     .expect("deciding the stand-in VMM's confinement"),
                 )

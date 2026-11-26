@@ -352,6 +352,8 @@ pub enum Mechanism {
     Seccomp,
     /// The command itself.
     Command,
+    /// A host device passed through to the VM.
+    Device,
 }
 
 impl std::fmt::Display for Mechanism {
@@ -364,6 +366,7 @@ impl std::fmt::Display for Mechanism {
             Mechanism::Process => "process",
             Mechanism::Seccomp => "seccomp",
             Mechanism::Command => "command",
+            Mechanism::Device => "device",
         })
     }
 }
@@ -417,6 +420,8 @@ pub struct Request<'a> {
     /// The kernel profile the VMM starts with (`None`: default); it names the Firecracker
     /// build the VMM runs.
     pub kernel_profile: Option<&'a str>,
+    /// The host PCI devices this start passes through to the VM (`--gpu`).
+    pub passthrough_devices: usize,
 }
 
 /// What the host offers, read once per start.
@@ -580,6 +585,20 @@ pub fn missing(request: &Request<'_>, host: &Host) -> Vec<Missing> {
                  derived from Firecracker {CONFINED_FIRECRACKER_COMMIT}, and another build's \
                  syscalls were never checked against it",
                 request.kernel_profile.unwrap_or("default")
+            ),
+        );
+    }
+    // The confined policy has none of what a passthrough device needs (confined-changes.json
+    // removes the VFIO requests and the reads and writes of a device's configuration space),
+    // so the VMM would be stopped in the middle of attaching one.
+    if request.passthrough_devices > 0 {
+        add(
+            Mechanism::Device,
+            format!(
+                "--gpu passes {} host PCI device(s) through to the VM; the confined syscall \
+                 policy allows no VFIO request, so confinement does not support device \
+                 passthrough",
+                request.passthrough_devices
             ),
         );
     }
@@ -1307,6 +1326,7 @@ mod tests {
             firecracker_args: None,
             unsupported: None,
             kernel_profile: None,
+            passthrough_devices: 0,
         }
     }
 
@@ -1525,6 +1545,38 @@ mod tests {
                          whose seccomp category the confined policy was never audited for",
                         path.display()
                     );
+                }
+            }
+        }
+        assert!(read > 50, "only {read} source files were read");
+    }
+
+    /// No request fcvm sends asks Firecracker for a Nitro Enclave (its enclave resource) or
+    /// names a drive's image format, whose only other value than raw is VMDK. The confined
+    /// policy has none of what either needs (confined-changes.json), so one that appears in
+    /// fcvm fails here first. The names are spelled so this test's own text holds neither.
+    #[test]
+    fn no_request_asks_for_an_enclave_or_a_vmdk_image() {
+        let names = [concat!("/encl", "ave"), concat!("image", "_format")];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut read = 0;
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    read += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for name in names {
+                        assert!(
+                            !text.contains(name),
+                            "{} names {name}, a Firecracker feature the confined policy has \
+                             no syscalls for",
+                            path.display()
+                        );
+                    }
                 }
             }
         }
@@ -1987,6 +2039,7 @@ mod tests {
             firecracker_args: Some("--enable-nv2 --no-seccomp"),
             unsupported: None,
             kernel_profile: None,
+            passthrough_devices: 2,
         };
         let host = Host {
             mode: Mode::Off,
@@ -2009,6 +2062,7 @@ mod tests {
             vec![
                 Mechanism::Landlock,
                 Mechanism::Backend,
+                Mechanism::Device,
                 Mechanism::Network,
                 Mechanism::Debugging,
                 Mechanism::Debugging,
@@ -2019,6 +2073,7 @@ mod tests {
         let error = decide(&request, &host).unwrap_err().to_string();
         for needle in [
             "backend: confinement supports the Firecracker backend only",
+            "device: --gpu passes 2 host PCI device(s) through to the VM",
             "network: --network bridged runs the VMM as root",
             "debugging: FCVM_STRACE_FC",
             "debugging: FCVM_NO_SECCOMP",
@@ -2054,6 +2109,49 @@ mod tests {
             ..host(Ok(11))
         };
         assert!(decide(&request(true), &default).unwrap().is_some());
+    }
+
+    /// A start with a passed-through device is refused whatever build its profile runs: the
+    /// confined policy has no VFIO request, and a VMM stopped while it attaches a device is a
+    /// dead VM, not an error. Both commands that take `--gpu` say how many they were given.
+    #[test]
+    fn a_passed_through_device_is_refused() {
+        let default = Host {
+            firecracker_commit: Some(CONFINED_FIRECRACKER_COMMIT.to_string()),
+            ..host(Ok(11))
+        };
+        let with_gpu = Request {
+            passthrough_devices: 1,
+            ..request(true)
+        };
+        let error = decide(&with_gpu, &default).unwrap_err().to_string();
+        assert!(
+            error.contains("device: --gpu passes 1 host PCI device(s) through to the VM"),
+            "{error}"
+        );
+        assert!(decide(&request(true), &default).unwrap().is_some());
+        let required = Host {
+            mode: Mode::Required,
+            ..default
+        };
+        let unflagged = Request {
+            flag: false,
+            ..with_gpu
+        };
+        assert!(decide(&unflagged, &required).is_err());
+        let count = concat!("passthrough_devices: args", ".gpu.len(),");
+        for (path, text) in [
+            (
+                "commands/podman/mod.rs",
+                include_str!("commands/podman/mod.rs"),
+            ),
+            ("commands/snapshot.rs", include_str!("commands/snapshot.rs")),
+        ] {
+            assert!(
+                text.contains(count),
+                "{path} does not tell confinement how many devices --gpu passes through"
+            );
+        }
     }
 
     #[test]

@@ -603,7 +603,8 @@ Firecracker with two layers:
 A start that cannot be confined is refused, never run unconfined. Confinement needs
 rootless networking, the Firecracker backend, the default build of Firecracker, and a
 kernel with Landlock ABI 9 or later. A kernel profile that pins its own Firecracker is
-refused. `fcvm setup` compiles the allowlist beside each Firecracker it builds from the
+refused, and so is a start that passes a host device through (`--gpu`): the allowlist has
+no VFIO request. `fcvm setup` compiles the allowlist beside each Firecracker it builds from the
 commit the allowlist is derived from, and records the compiled file's SHA-256 beside it
 (`<filter>.sha256`). A confined start opens the filter without following a symbolic link
 and refuses one that is not a regular file owned by the user (or root, or the owner of

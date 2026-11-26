@@ -3018,6 +3018,7 @@ fn layer2_setup_confinement_request() -> crate::confine::Request<'static> {
              first (it is a one-time step), then start VMs confined",
         ),
         kernel_profile: None,
+        passthrough_devices: 0,
     }
 }
 
