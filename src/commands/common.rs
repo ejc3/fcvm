@@ -9902,11 +9902,11 @@ mod tests {
         left.pid_start_time = None;
         left.restore_acknowledged = true;
         left.lifecycle_ready = true;
-        std::fs::write(
-            tmp.path().join("vm-sticky-gone.json"),
-            serde_json::to_string(&left).unwrap(),
-        )
-        .unwrap();
+        // Written where `save_state` reads the state it replaces, or the save below would
+        // find nothing to inherit from and prove nothing.
+        let left_file = manager.state_file("vm-sticky-gone");
+        std::fs::create_dir_all(left_file.parent().unwrap()).unwrap();
+        std::fs::write(&left_file, serde_json::to_string(&left).unwrap()).unwrap();
         left.restore_acknowledged = false;
         left.lifecycle_ready = false;
         manager.save_state(&left).await.unwrap();
@@ -11501,7 +11501,7 @@ mod tests {
         // sides, never "no token". Sent without the token its mark holds, the guest
         // refuses the resume as stale, with the gate closed; a prepare sent tokenless
         // beside a state that holds an earlier token gets every resume refused.
-        let state_file = dir.path().join("vm-source.json");
+        let state_file = state_manager.state_file("vm-source");
         let good = std::fs::read_to_string(&state_file).unwrap();
         std::fs::write(&state_file, "{ not a state").unwrap();
         assert!(owed_boundary_token(&state_manager, "vm-source")
