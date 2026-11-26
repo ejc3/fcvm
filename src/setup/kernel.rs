@@ -3025,6 +3025,23 @@ fn pinned_rust_toolchain() -> Result<String> {
         .context("fcvm's rust-toolchain.toml names no toolchain channel")
 }
 
+/// Check that what a Cloud Hypervisor build prints for `--version` names `commit`: the
+/// `git describe` form `v55.0-117-g4969a51a3d3f`, with the twelve digits the build is given
+/// (`core.abbrev`). A commit that is itself a release tag prints the bare tag and is refused
+/// here: nothing pins one today, and its version string would say nothing about the commit.
+fn cloud_hypervisor_version_names(version: &str, commit: &str) -> Result<()> {
+    let wanted = format!("-g{}", &commit[..12]);
+    if !version.trim().ends_with(&wanted) {
+        bail!(
+            "the cloud-hypervisor built from commit {commit} prints {:?} for --version, which \
+             does not end in {wanted}: its build did not get the commit from git describe, so \
+             the binary is not installed",
+            version.trim()
+        );
+    }
+    Ok(())
+}
+
 /// Put the source of `commit` in `build_dir`, which must not exist yet, and
 /// check that the checkout's HEAD is `commit`.
 ///
@@ -3120,8 +3137,12 @@ pub async fn ensure_cloud_hypervisor(
     }
 
     // Resolve the build toolchain before creating anything: a missing cargo
-    // must not cost a network clone or leave a fresh dir/lock behind.
+    // must not cost a network clone or leave a fresh dir/lock behind. The build
+    // uses the toolchain this fcvm is built with: the Cloud Hypervisor tree names
+    // none, so it would otherwise build with whichever default the host's rustup
+    // has (and fail where it has none).
     let cargo = cargo_program()?;
+    let toolchain = pinned_rust_toolchain()?;
 
     // Acquire per-filename lock so concurrent setups don't collide
     let mut lock_name = bin_path
@@ -3161,16 +3182,7 @@ pub async fn ensure_cloud_hypervisor(
     }
 
     // Build cloud-hypervisor. `--locked` builds the dependency versions the commit's
-    // Cargo.lock names or fails, and the toolchain is the one this fcvm is built with: the
-    // Cloud Hypervisor tree names none, so its build would otherwise use whichever default
-    // the host's rustup has (and fail where it has none).
-    let toolchain = match pinned_rust_toolchain() {
-        Ok(toolchain) => toolchain,
-        Err(error) => {
-            flock.unlock().map_err(|(_, err)| err)?;
-            return Err(error);
-        }
-    };
+    // Cargo.lock names or fails.
     // The build names its version with `git describe`, whose abbreviated hash grows with
     // the repository. A snapshot restores only on a build that prints the version it
     // recorded, so the length is fixed: two builds of one commit print the same.
@@ -3203,6 +3215,22 @@ pub async fn ensure_cloud_hypervisor(
     if !binary.exists() {
         flock.unlock().map_err(|(_, err)| err)?;
         bail!("cloud-hypervisor binary not found at {}", binary.display());
+    }
+    // A snapshot restores only on a build that prints the version it recorded, so a build
+    // whose version does not name its commit is not installed: Cloud Hypervisor's build
+    // falls back to the bare crate version when `git describe` fails, and every pin past
+    // one release would then print the same string.
+    let printed = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .await
+        .context("running the built cloud-hypervisor --version");
+    let named = printed.and_then(|out| {
+        cloud_hypervisor_version_names(&String::from_utf8_lossy(&out.stdout), commit)
+    });
+    if let Err(error) = named {
+        flock.unlock().map_err(|(_, err)| err)?;
+        return Err(error);
     }
 
     // Copy to a temp name in the same directory, then atomically rename onto the
@@ -3379,6 +3407,26 @@ mod tests {
             body.contains(".env(\"GIT_CONFIG_KEY_0\", \"core.abbrev\")"),
             "the build's version string depends on the size of the clone"
         );
+        // The version a snapshot records has to name the commit, or the binary is not
+        // installed: checked between the build and the publish.
+        let check = body
+            .find("cloud_hypervisor_version_names(")
+            .expect("setup does not check the built binary's version");
+        assert!(check < body.find("temp.publish(").unwrap());
+        let commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7";
+        cloud_hypervisor_version_names("cloud-hypervisor v55.0-117-g4969a51a3d3f\n", commit)
+            .unwrap();
+        for wrong in [
+            "cloud-hypervisor v55.0.0",
+            "cloud-hypervisor v55.0-117-g4969a51a",
+            "cloud-hypervisor v55.0-117-g4969a51a3d3f-dirty",
+            "",
+        ] {
+            assert!(
+                cloud_hypervisor_version_names(wrong, commit).is_err(),
+                "{wrong:?}"
+            );
+        }
         assert!(
             body.contains("checkout_cloud_hypervisor_source(&clone_url, commit, &build_dir)"),
             "the build does not check out the configured commit"

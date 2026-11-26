@@ -22,6 +22,8 @@
 #   GOLD_TAG      restore this existing snapshot instead of making one
 #   KEEP_GOLD=1   leave the gold snapshot in place afterwards
 set -euo pipefail
+# A failure inside $(...) fails the script too.
+shopt -s inherit_errexit
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
@@ -95,8 +97,9 @@ vmm_of() {
     }'
 }
 
-# CPU seconds (user + system) a process has used.
-cpu_secs() { awk -v hz="$(getconf CLK_TCK)" '{ sub(/^.*\) /, ""); printf "%.3f", ($12 + $13) / hz }' "/proc/$1/stat"; }
+# CPU seconds (user + system) a process has used. A process that has exited is an error: awk
+# would read an empty figure as 0, which passes for an idle VMM.
+cpu_secs() { [ -r "/proc/$1/stat" ] || die "process $1 has exited"; awk -v hz="$(getconf CLK_TCK)" '{ sub(/^.*\) /, ""); printf "%.3f", ($12 + $13) / hz }' "/proc/$1/stat"; }
 
 # Share of one core process $1 uses over $2 seconds.
 cpu_share() {
@@ -230,9 +233,9 @@ for n in $COUNTS; do
     read -r r p d <<<"$mem"
     rss+=("$r"); pss+=("$p"); dirty+=("$d"); maps+=("$kind")
   done
-  a=0; for v in "${vmms[@]}"; do a=$(awk -v a="$a" -v b="$(cpu_secs "$v")" 'BEGIN { print a + b }'); done
+  a=0; for v in "${vmms[@]}"; do c=$(cpu_secs "$v"); a=$(awk -v a="$a" -v b="$c" 'BEGIN { print a + b }'); done
   sleep 5
-  b=0; for v in "${vmms[@]}"; do b=$(awk -v a="$b" -v b="$(cpu_secs "$v")" 'BEGIN { print a + b }'); done
+  b=0; for v in "${vmms[@]}"; do c=$(cpu_secs "$v"); b=$(awk -v a="$b" -v b="$c" 'BEGIN { print a + b }'); done
   share=$(awk -v a="$a" -v b="$b" -v n="$n" 'BEGIN { printf "%.3f", (b - a) / 5 / n }')
   sock=$(ls_field "${pids[0]}" .config.rdp_socket)
   desktop=$(logon "$sock" "$OUT/desktop-clone-$n.ppm")

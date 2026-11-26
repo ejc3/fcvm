@@ -440,18 +440,13 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
     println!("================================================================");
 
     // Cloud Hypervisor is an optional VMM backend. Gate on the SAME resolution fcvm uses
-    // (FCVM_CLOUD_HYPERVISOR_BIN → content-addressed build under assets_dir → PATH): when
+    // (FCVM_CLOUD_HYPERVISOR_BIN, else the build of the commit the config pins): when
     // resolvable (local dev, or CI after `fcvm setup --cloud-hypervisor`) the test runs and
     // its assertion is definitive; when absent, skip rather than fail. The binary must live
     // on a namespace-accessible path (the content-addressed assets_dir works, like the
     // firecracker fork binary), NOT a 0700 home dir, since the rootless user namespace
     // cannot exec a file owned by an unmapped uid.
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!(
-            "SKIP: cloud-hypervisor not found — skipping CH backend test (build it with \
-             `fcvm setup --cloud-hypervisor`, set FCVM_CLOUD_HYPERVISOR_BIN, or install on \
-             PATH; see #632/#61)"
-        );
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
 
@@ -496,8 +491,7 @@ async fn test_cloud_hypervisor_cold_boot() -> Result<()> {
 /// or restored a snapshot.
 #[tokio::test]
 async fn test_cloud_hypervisor_podman_run_uses_the_snapshot_cache() -> Result<()> {
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     ch_cache_round_trip("ch-cache", &[]).await
@@ -508,8 +502,7 @@ async fn test_cloud_hypervisor_podman_run_uses_the_snapshot_cache() -> Result<()
 /// so the second run failed once the cache was wired.
 #[tokio::test]
 async fn test_cloud_hypervisor_podman_run_with_a_balloon_uses_the_snapshot_cache() -> Result<()> {
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     ch_cache_round_trip("ch-cache-balloon", &["--balloon", "64"]).await
@@ -573,8 +566,7 @@ async fn ch_cache_round_trip(prefix: &str, extra: &[&str]) -> Result<()> {
 async fn test_cloud_hypervisor_guest_nic_is_eth0() -> Result<()> {
     use std::time::Duration;
 
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found — skipping CH NIC name test (#632/#61)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     let (vm_name, _, _, _) = common::unique_names("ch-nic");
@@ -640,12 +632,7 @@ async fn test_cloud_hypervisor_snapshot_roundtrip() -> Result<()> {
     println!("\nTest Cloud Hypervisor snapshot create + restore roundtrip");
     println!("==========================================================");
 
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!(
-            "SKIP: cloud-hypervisor not found — skipping CH snapshot roundtrip (build it with \
-             `fcvm setup --cloud-hypervisor`, set FCVM_CLOUD_HYPERVISOR_BIN, or install on \
-             PATH; see #632/#61)"
-        );
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
 
@@ -778,8 +765,7 @@ fn saved_enables_and_pending_tables(state_json: &std::path::Path) -> Result<Vec<
 async fn test_cloud_hypervisor_snapshot_saves_each_vcpus_own_gic_state() -> Result<()> {
     use std::time::Duration;
 
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found (#632/#61)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     const TIMER_PPI: u32 = 1 << 27;
@@ -952,8 +938,7 @@ async fn test_cloud_hypervisor_clone_keeps_the_snapshots_clock() -> Result<()> {
     // What the reads through exec and the restore's own bookkeeping can add.
     const SLACK: f64 = 2.0;
 
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found (`fcvm setup --cloud-hypervisor`)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     let (vm_name, clone_name, snap, _) = common::unique_names("ch-clock");
@@ -1036,6 +1021,7 @@ async fn test_cloud_hypervisor_clone_keeps_the_snapshots_clock() -> Result<()> {
     common::kill_process(baseline_pid).await;
     let _ = tokio::time::timeout(Duration::from_secs(15), clone.wait()).await;
     let _ = tokio::time::timeout(Duration::from_secs(15), baseline.wait()).await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&snap));
     Ok(())
 }
 
@@ -1051,8 +1037,7 @@ async fn test_cloud_hypervisor_clone_keeps_the_snapshots_clock() -> Result<()> {
 async fn test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot() -> Result<()> {
     use std::time::Duration;
 
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!("SKIP: cloud-hypervisor not found (`fcvm setup --cloud-hypervisor`)");
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     let (vm_name, clone_name, parent_snap, _) = common::unique_names("ch-lineage");
@@ -1144,6 +1129,7 @@ async fn test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot(
 
     common::kill_process(grandchild_pid).await;
     let _ = tokio::time::timeout(Duration::from_secs(15), grandchild.wait()).await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&child_snap));
     Ok(())
 }
 

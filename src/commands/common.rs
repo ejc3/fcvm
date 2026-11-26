@@ -4693,10 +4693,16 @@ fn ch_restore_launch_error(error: anyhow::Error, ch_bin: &std::path::Path) -> an
 /// `recorded` is what the VMM that wrote the snapshot printed for
 /// `--version` ([`SnapshotMetadata::cloud_hypervisor_version`]), and `None` for a snapshot
 /// from before fcvm recorded it, which one of the v52-based fork builds fcvm pinned
-/// earlier wrote. Whether another build's state loads, and loads correctly, is not something
-/// fcvm can tell from the file, so it restores a snapshot only on the build that wrote it.
+/// earlier wrote (a create that cannot name its VMM's build fails,
+/// [`snapshot_cloud_hypervisor_version`]). Whether another build's state loads, and loads
+/// correctly, is not something fcvm can tell from the file, so it restores a snapshot only
+/// on the build that wrote it. `podman run` treats the refusal of a cached snapshot as an
+/// unusable entry: it deletes it and boots fresh ([`CH_SNAPSHOT_OF_ANOTHER_BUILD`]).
 ///
 /// [`SnapshotMetadata::cloud_hypervisor_version`]: crate::storage::SnapshotMetadata
+pub(crate) const CH_SNAPSHOT_OF_ANOTHER_BUILD: &str =
+    "a Cloud Hypervisor snapshot restores only on the build that wrote it";
+
 fn ensure_ch_snapshot_written_by(
     recorded: Option<&str>,
     running: &str,
@@ -4705,15 +4711,15 @@ fn ensure_ch_snapshot_written_by(
     match recorded {
         Some(recorded) if recorded == running => Ok(()),
         Some(recorded) => bail!(
-            "this snapshot was written by `{recorded}` and this host runs `{running}` ({}): a \
-             Cloud Hypervisor snapshot restores only on the build that wrote it. Create the \
-             snapshot again, or set FCVM_CLOUD_HYPERVISOR_BIN to the build that wrote it",
+            "this snapshot was written by `{recorded}` and this host runs `{running}` ({}): \
+             {CH_SNAPSHOT_OF_ANOTHER_BUILD}. Create the snapshot again, or set \
+             FCVM_CLOUD_HYPERVISOR_BIN to the build that wrote it",
             ch_bin.display()
         ),
         None => bail!(
             "this snapshot records no Cloud Hypervisor build, so an earlier Cloud Hypervisor \
-             than `{running}` ({}) wrote it: a Cloud Hypervisor snapshot restores only on the \
-             build that wrote it. Create the snapshot again",
+             than `{running}` ({}) wrote it: {CH_SNAPSHOT_OF_ANOTHER_BUILD}. Create the \
+             snapshot again",
             ch_bin.display()
         ),
     }
@@ -4740,15 +4746,20 @@ fn maps_names_file(maps: &str, ino: u64, file_name: &str) -> bool {
 /// every clone then holds a private copy of the whole guest (4,097 MiB against 840 MiB for
 /// eight 4 GiB Windows clones) and reads it before it runs. fcvm configures none of those,
 /// so a fallback is a defect to see at the restore, not in a host's memory a day later.
-fn ensure_ch_mapped_the_memory_file(vmm_pid: u32, memory_file: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let ino = std::fs::metadata(memory_file)
-        .with_context(|| format!("reading {}", memory_file.display()))?
-        .ino();
+///
+/// `memory_ino` is the file's inode as the caller read it before the VMM started
+/// ([`memory_file_inode`]): the clone's memory file is a link into the snapshot, and a
+/// snapshot replaced under its tag after the VMM mapped it would otherwise be compared with
+/// the new file's inode.
+fn ensure_ch_mapped_the_memory_file(
+    vmm_pid: u32,
+    memory_ino: u64,
+    memory_file: &Path,
+) -> Result<()> {
     let maps_path = format!("/proc/{vmm_pid}/maps");
     let maps = std::fs::read_to_string(&maps_path)
         .with_context(|| format!("reading {maps_path} to check the restored memory mapping"))?;
-    if !maps_names_file(&maps, ino, CH_MEMORY_FILE) {
+    if !maps_names_file(&maps, memory_ino, CH_MEMORY_FILE) {
         bail!(
             "Cloud Hypervisor (pid {vmm_pid}) restored without mapping {}: it copied the \
              guest's memory instead (its log says why, at \"falling back to copy\"), which \
@@ -4757,6 +4768,14 @@ fn ensure_ch_mapped_the_memory_file(vmm_pid: u32, memory_file: &Path) -> Result<
         );
     }
     Ok(())
+}
+
+/// The inode of the file `path` names, following a link.
+fn memory_file_inode(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .ino())
 }
 
 /// Restore a Cloud Hypervisor VM from a snapshot (#632 P2).
@@ -4797,7 +4816,7 @@ pub async fn restore_from_snapshot_ch(
         vm_name,
         data_dir,
         socket_path,
-        runtime_config: _, // CH binary is resolved via find_cloud_hypervisor (env/PATH)
+        runtime_config: _, // the binary is find_cloud_hypervisor's: the configured build
         restore_config,
         network_config,
         restore_epoch: _,      // delivered by the caller's boot-plan vsock listener
@@ -4879,7 +4898,7 @@ pub async fn restore_from_snapshot_ch(
     // to the clone's TAP before restoring (the FC path does the equivalent via
     // LoadSnapshot's `network_overrides`). Copying also avoids mutating the shared snapshot,
     // which concurrent clones restore from.
-    let clone_prepare: Result<PathBuf> = async {
+    let clone_prepare: Result<(PathBuf, u64)> = async {
         let clone_ch_dir = data_dir.join("ch-restore");
         let _ = tokio::fs::remove_dir_all(&clone_ch_dir).await;
         tokio::fs::create_dir_all(&clone_ch_dir)
@@ -4904,10 +4923,12 @@ pub async fn restore_from_snapshot_ch(
         .await
         .context("writing CH restore config.json")?;
 
-        Ok(clone_ch_dir)
+        // Read before the VMM starts, for the mapping check after the resume.
+        let memory_ino = memory_file_inode(&clone_ch_dir.join(CH_MEMORY_FILE))?;
+        Ok((clone_ch_dir, memory_ino))
     }
     .await;
-    let clone_ch_dir = match clone_prepare {
+    let (clone_ch_dir, memory_ino) = match clone_prepare {
         Ok(prepared) => prepared,
         Err(error) => {
             cleanup_failed_clone_holder(
@@ -5010,7 +5031,7 @@ pub async fn restore_from_snapshot_ch(
             .context("resuming Cloud Hypervisor after restore")?;
         // The resume is answered once the restore has finished, so the mapping is there now
         // if it ever will be.
-        ensure_ch_mapped_the_memory_file(vm_pid, &clone_ch_dir.join(CH_MEMORY_FILE))?;
+        ensure_ch_mapped_the_memory_file(vm_pid, memory_ino, &clone_ch_dir.join(CH_MEMORY_FILE))?;
 
         vm_state.pid = Some(std::process::id());
         // Future snapshots of this clone must redirect using the original vsock vm_id.
@@ -5350,7 +5371,7 @@ pub fn build_snapshot_config(
             image_disk_identity: vm_state.config.image_disk_identity.clone(),
             hypervisor: vm_state.config.hypervisor,
             firecracker_bin: snapshot_firecracker_bin(vm_state, firecracker_pid),
-            cloud_hypervisor_version: snapshot_cloud_hypervisor_version(vm_state, firecracker_pid),
+            cloud_hypervisor_version: snapshot_cloud_hypervisor_version(vm_state, firecracker_pid)?,
             balloon_mib: vm_state.config.balloon_mib,
             balloon_free_page_reporting: vm_state.config.balloon_free_page_reporting,
             // Read from the guest by `create_snapshot_core`, just before the pause.
@@ -5383,21 +5404,44 @@ fn snapshot_firecracker_bin(vm_state: &VmState, firecracker_pid: Option<u32>) ->
 }
 
 /// The Cloud Hypervisor build a snapshot of `vm_state` records: what the executable of the
-/// VM's VMM process prints for `--version`. A restore compares it with its own build
-/// ([`ensure_ch_snapshot_written_by`]). Nothing is recorded when that executable was
-/// replaced after the process started or does not run, and such a snapshot is refused at
-/// restore. Without a process to ask, the build this host resolves is the one that
-/// launched the VM, unless the config changed under it. Firecracker VMs record none.
-fn snapshot_cloud_hypervisor_version(vm_state: &VmState, vmm_pid: Option<u32>) -> Option<String> {
+/// VM's VMM process prints for `--version`, which a restore compares with its own build
+/// ([`ensure_ch_snapshot_written_by`]). Without a process to ask, it is the build this host
+/// resolves. Firecracker VMs record none.
+///
+/// A Cloud Hypervisor VM whose build cannot be named fails the create, before anything is
+/// paused: its executable was replaced after it started (so no path names the build that is
+/// running), or does not answer `--version`. A snapshot written without the record would be
+/// one no restore accepts.
+fn snapshot_cloud_hypervisor_version(
+    vm_state: &VmState,
+    vmm_pid: Option<u32>,
+) -> Result<Option<String>> {
     if vm_state.config.hypervisor != crate::hypervisor::Backend::CloudHypervisor {
-        return None;
+        return Ok(None);
     }
     let bin = match vmm_pid.map(running_executable) {
         Some(RunningExecutable::Path(exe)) => exe,
-        Some(RunningExecutable::Replaced) => return None,
-        Some(RunningExecutable::Unreadable) | None => find_cloud_hypervisor().ok()?,
+        Some(RunningExecutable::Unreadable) | None => find_cloud_hypervisor()
+            .context("finding the Cloud Hypervisor build to record in the snapshot")?,
+        Some(RunningExecutable::Replaced) => bail!(
+            "VM {} runs a Cloud Hypervisor whose binary was replaced after it started, so the \
+             build that would write this snapshot cannot be named and no restore would \
+             accept it; restart the VM on the current build, then snapshot it",
+            vm_state.vm_id
+        ),
     };
-    cloud_hypervisor_version(&bin)
+    ch_version_for_snapshot(&bin, cloud_hypervisor_version(&bin)).map(Some)
+}
+
+/// The version to record, or why there is none.
+fn ch_version_for_snapshot(bin: &Path, version: Option<String>) -> Result<String> {
+    version.with_context(|| {
+        format!(
+            "{} failed `--version`, so the build that would write this snapshot cannot be \
+             named and no restore would accept it",
+            bin.display()
+        )
+    })
 }
 
 /// What /proc/<pid>/exe says about the executable a process runs.
@@ -10786,13 +10830,16 @@ mod tests {
         .to_string();
         assert!(other.contains("v52.0-49-ga354afd77"), "{other}");
         assert!(other.contains(running), "{other}");
+        // The text `podman run` classifies a cached entry by.
+        assert!(other.contains(CH_SNAPSHOT_OF_ANOTHER_BUILD), "{other}");
         assert!(other.contains("Create the snapshot again"), "{other}");
 
         let unrecorded = ensure_ch_snapshot_written_by(None, running, bin)
             .unwrap_err()
             .to_string();
         assert!(
-            unrecorded.contains("records no Cloud Hypervisor build"),
+            unrecorded.contains("records no Cloud Hypervisor build")
+                && unrecorded.contains(CH_SNAPSHOT_OF_ANOTHER_BUILD),
             "{unrecorded}"
         );
         assert!(
@@ -10836,12 +10883,31 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(CH_MEMORY_FILE);
         std::fs::write(&file, b"x").unwrap();
-        let error = ensure_ch_mapped_the_memory_file(std::process::id(), &file)
+        let ino = memory_file_inode(&file).unwrap();
+        let error = ensure_ch_mapped_the_memory_file(std::process::id(), ino, &file)
             .unwrap_err()
             .to_string();
         assert!(error.contains("restored without mapping"), "{error}");
         // A VMM that has exited cannot be checked, which is an error too, not a pass.
-        assert!(ensure_ch_mapped_the_memory_file(u32::MAX, &file).is_err());
+        assert!(ensure_ch_mapped_the_memory_file(u32::MAX, ino, &file).is_err());
+        // The inode is the snapshot's file, through the clone's link, read before the VMM
+        // starts: a snapshot replaced under its tag afterwards does not change it.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert_eq!(memory_file_inode(&link).unwrap(), ino);
+        let body = body_of(
+            include_str!("common.rs"),
+            "pub async fn restore_from_snapshot_ch(",
+        );
+        assert_in_order(
+            "restore_from_snapshot_ch",
+            body,
+            &[
+                "memory_file_inode(",
+                ".spawn(&spec)",
+                "ensure_ch_mapped_the_memory_file(",
+            ],
+        );
     }
 
     /// A Cloud Hypervisor clone maps the snapshot's memory file (`memory_restore_mode=copyonwrite`),
@@ -10912,7 +10978,7 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
             body,
             &[
                 ".resume()",
-                "ensure_ch_mapped_the_memory_file(vm_pid, &clone_ch_dir.join(CH_MEMORY_FILE))",
+                "ensure_ch_mapped_the_memory_file(",
                 "save_vm_state_with_network(",
             ],
         );
@@ -12147,17 +12213,58 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
     fn snapshot_records_no_firecracker_for_a_cloud_hypervisor_vm() {
         let mut state = make_vm_state("vm-ch", None);
         state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
-        let config = build_snapshot_config(
+        assert_eq!(
+            snapshot_firecracker_bin(&state, Some(std::process::id())),
+            None
+        );
+    }
+
+    /// A snapshot of a Cloud Hypervisor VM records its VMM's build or is not written: one
+    /// with no record is refused by every restore, and `snapshot create --stop` would have
+    /// stopped the VM to write it. The executable replaced under a running VMM (a rebuild of
+    /// the pinned commit) and one that does not answer `--version` both fail the create. A
+    /// Firecracker VM records none and is not asked.
+    #[test]
+    fn a_ch_snapshot_whose_build_cannot_be_named_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud-hypervisor-old.bin");
+        let mut vmm = spawn_running_copy_of_sh(&path);
+        std::fs::remove_file(&path).unwrap();
+        let mut state = make_vm_state("vm-ch", None);
+        state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
+        let error = build_snapshot_config(
             &state,
             "key",
             SnapshotType::User,
             Path::new("/tmp/snap"),
             vec![],
             vec![],
-            Some(std::process::id()),
+            Some(vmm.id()),
         )
-        .unwrap();
-        assert_eq!(config.metadata.firecracker_bin, None);
+        .expect_err("a snapshot with no build recorded was configured");
+        vmm.kill().unwrap();
+        vmm.wait().unwrap();
+        assert!(
+            format!("{error:#}").contains("was replaced after it started"),
+            "{error:#}"
+        );
+
+        let bin = Path::new("/assets/cloud-hypervisor/cloud-hypervisor-abc.bin");
+        let silent = ch_version_for_snapshot(bin, None).unwrap_err();
+        assert!(
+            format!("{silent:#}").contains("failed `--version`"),
+            "{silent:#}"
+        );
+        assert_eq!(
+            ch_version_for_snapshot(bin, Some("cloud-hypervisor v1".to_string())).unwrap(),
+            "cloud-hypervisor v1"
+        );
+
+        let firecracker = make_vm_state("vm-fc", None);
+        assert_eq!(
+            snapshot_cloud_hypervisor_version(&firecracker, Some(std::process::id())).unwrap(),
+            None
+        );
     }
 
     /// Copy `sh` to `path`, run the copy, and return once the copy is running.

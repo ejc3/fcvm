@@ -1346,6 +1346,27 @@ async fn exec_with_timeout(pid: u32, cmd: &[&str], vm: bool) -> anyhow::Result<S
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Whether a Cloud Hypervisor test has a VMM to run on. `Ok(false)` means skip: the build
+/// the config pins has not been built on this host (`fcvm setup --cloud-hypervisor`, which
+/// `make test-root` runs first), or the config pins none and PATH has none. Anything else
+/// that keeps fcvm from resolving the binary (a config that does not parse, a build that
+/// does not answer `--version`) is an error: such a host would otherwise pass every Cloud
+/// Hypervisor test without running one.
+pub fn cloud_hypervisor_built() -> anyhow::Result<bool> {
+    match fcvm::commands::common::find_cloud_hypervisor() {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let text = format!("{error:#}");
+            if text.contains("is not built here") || text.contains("cloud-hypervisor not found") {
+                eprintln!("SKIP: {text}");
+                Ok(false)
+            } else {
+                Err(error.context("resolving the Cloud Hypervisor build for a test"))
+            }
+        }
+    }
+}
+
 /// Execute a command in the guest VM via exec (--vm flag for VM-level, default is container)
 pub async fn exec_in_vm(pid: u32, cmd: &[&str]) -> anyhow::Result<String> {
     exec_with_timeout(pid, cmd, true).await

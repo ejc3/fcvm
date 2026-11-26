@@ -646,7 +646,9 @@ the two it fixed three defects in arm64 snapshot and restore that fcvm hit on th
 
 - **One build.** `fcvm setup --cloud-hypervisor` clones the repository, checks out the
   configured commit, refuses a checkout whose HEAD is anything else, and builds it with
-  `--locked` and the toolchain in fcvm's `rust-toolchain.toml`. The binary is
+  `--locked` and the toolchain in fcvm's `rust-toolchain.toml`. It installs the binary only
+  if its `--version` ends in `-g` and the commit's first twelve digits, the form
+  `git describe` gives it. The binary is
   `cloud-hypervisor-<hash>.bin` in the store, the hash over the repository, the commit, the
   architecture and the libc. Launch computes that name from the config and runs that file.
   When it is absent the launch fails and names the setup command: no other build in the
@@ -666,13 +668,19 @@ the two it fixed three defects in arm64 snapshot and restore that fcvm hit on th
     steps it from the host's time, and a raw guest's agent sets it from the clock line its
     namespace serves. `preserve` is on upstream's main (2026-11-23) and in no release.
 - **A snapshot belongs to the build that wrote it.** The snapshot's metadata records what
-  its VMM printed for `--version`, and a restore on a build that prints anything else is
-  refused before it creates anything, with both builds named. Cloud Hypervisor's
-  `state.json` is that build's device state, and upstream promises compatibility for live
-  migration from the two previous releases only. The snapshot cache key holds the binary's
-  path, which holds the commit, so a cached snapshot is taken again after the pin moves.
-  The fleet's Windows gold snapshot is keyed by the build too
-  (`gold_key`, `src/fleet/agent/windows.rs`).
+  its VMM printed for `--version`, and a restore on a build that prints anything else, or of
+  a snapshot that records none, is refused before it creates anything, with both builds
+  named. A create whose VMM's build cannot be named (its binary was replaced after it
+  started) fails before the pause. Cloud Hypervisor's `state.json` is that build's device
+  state, and upstream promises compatibility for live migration from the two previous
+  releases only. The snapshot cache key holds the binary's path, which holds the commit for
+  the configured build, so a cached snapshot is taken again after the pin moves. A binary
+  named by `FCVM_CLOUD_HYPERVISOR_BIN` and replaced in place keeps its path: `podman run`
+  then meets the refusal, deletes the cached entry and boots fresh. The fleet's Windows gold
+  snapshot is keyed by the build too (`gold_key`, `src/fleet/agent/windows.rs`).
+- **The config section is `repo` and `commit`.** A config written by an older fcvm has
+  `branch` and no `commit` there and does not parse; `make build` and
+  `fcvm setup --generate-config --force` write the current one.
 - **A snapshot of a clone** is written by cloning the extents of the memory file the clone
   maps (FICLONERANGE) and then writing the pages the clone changed. The result holds every
   page: `test_cloud_hypervisor_snapshot_of_a_clone_outlives_its_parent_snapshot` deletes the
