@@ -683,7 +683,9 @@ fn the_compiled_filter_traps_a_syscall_the_policy_does_not_list() -> Result<()> 
     let programs: std::collections::HashMap<String, Vec<u64>> = bitcode::deserialize(&bytes)?;
     let mut classes: Vec<&str> = programs.keys().map(String::as_str).collect();
     classes.sort();
-    assert_eq!(classes, ["api", "vcpu", "vmm"]);
+    // Every category the pinned Firecracker has a filter for, `blk_worker` included: no VM of
+    // fcvm's has such a thread, and its program still has to refuse what the others refuse.
+    assert_eq!(classes, ["api", "blk_worker", "vcpu", "vmm"]);
     let (native, foreign) = AUDIT_ARCH;
     let denied = [
         ("clone", libc::SYS_clone),
