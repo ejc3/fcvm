@@ -75,7 +75,7 @@ async fn stop(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
 /// Run a VM to completion. Its launch sweeps: it reclaims what killed fcvm processes left.
 /// A launch sweeps when none began within `RECLAIM_EVERY`, and another launch of the suite
 /// may have swept just before the kill, so these launches set the interval to nothing
-/// (`FCVM_RECLAIM_EVERY_MS=0`) and always sweep, as every launch did before the interval.
+/// (`FCVM_SWEEP_EVERY_MS=reclaim=0`) and always sweep, as every launch did before the interval.
 async fn next_launch() -> Result<()> {
     next_launch_on("rootless").await
 }
@@ -89,7 +89,7 @@ async fn next_launch_on(network: &str) -> Result<()> {
 /// [`next_launch_on`] with `env` set for the launch, such as a data dir of its own.
 async fn next_launch_with(network: &str, env: &[(&str, &str)]) -> Result<()> {
     let mut env = env.to_vec();
-    env.push((fcvm::reclaim::RECLAIM_EVERY_ENV, "0"));
+    env.push((fcvm::sweep::EVERY_ENV, "reclaim=0"));
     launch_to_completion(network, &env).await
 }
 
@@ -200,7 +200,7 @@ async fn a_sigkilled_vm_leaves_its_runtime_dir_and_pasta_pid_file_to_the_next_la
 /// interval is set to an hour for them, and the stamp is written by the test: first as a
 /// sweep that began this instant, which stays inside an hour however long the launch takes
 /// to read it, then as one that began two hours ago. The default interval is pinned in
-/// `reclaim::tests::a_stamp_is_fresh_only_within_the_interval_of_this_boot`.
+/// `reclaim::tests::a_launch_does_not_sweep_or_wait_while_another_sweeps`.
 ///
 /// RED BEFORE THE GATE: every launch swept, so the launch inside the interval removed the
 /// directory.
@@ -215,7 +215,7 @@ async fn a_launch_inside_the_interval_leaves_a_killed_vm_to_the_launch_after_it(
     let data_dir_str = data_dir.to_str().context("data dir path")?.to_string();
     let env = [
         ("FCVM_DATA_DIR", data_dir_str.as_str()),
-        (fcvm::reclaim::RECLAIM_EVERY_ENV, "3600000"),
+        (fcvm::sweep::EVERY_ENV, "reclaim=3600000"),
     ];
     let owners = fcvm::reclaim::owner_dir_in(&data_dir)?;
     let result = async {

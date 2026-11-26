@@ -72,7 +72,7 @@ fn is_bucket(name: &str) -> bool {
 
 /// How often a claim sweeps the state directory for what SIGKILLed VMs left
 /// (`StateManager::maybe_sweep`).
-const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+const SWEEP_EVERY: std::time::Duration = crate::sweep::STATE.every;
 
 /// The prefix of an index directory being made, before it is renamed into place
 /// (`StateManager::index_dir`).
@@ -1594,46 +1594,50 @@ impl StateManager {
         }
     }
 
-    /// Sweep the state directory (`cleanup_stale_state`) at most once a `SWEEP_EVERY` per
-    /// state directory, from the one launch that wins `sweep.lock`, after its claim. A
+    /// Sweep the state directory (`cleanup_stale_state`) at most once an interval per
+    /// state directory, from the one launch that has the turn (`crate::sweep::STATE`,
+    /// behind `sweep.stamp` and `sweep.lock`), after its claim. A
     /// claim scans no other VM's state, so this is what removes the states SIGKILLed VMs
     /// leave and the index entries that outlive them; until it runs they
     /// hold nothing (a dead owner is not live, and a stale index entry names a state that
-    /// is gone). Best effort: a sweep that cannot take its lock leaves it to the next.
+    /// is gone). Best effort: a sweep that cannot take its turn leaves it to the next.
     async fn maybe_sweep(&self) {
-        let stamp = self.state_dir.join("sweep.stamp");
-        let fresh = |stamp: &Path| {
-            std::fs::metadata(stamp)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .is_some_and(|age| age < SWEEP_EVERY)
+        self.maybe_sweep_every(crate::sweep::STATE.interval()).await
+    }
+
+    /// [`StateManager::maybe_sweep`] with the interval given.
+    async fn maybe_sweep_every(&self, every: std::time::Duration) {
+        let turn = self.with_sweep_place(|place| crate::sweep::turn_if_due(place, every));
+        let _turn = match turn {
+            Ok(Some(turn)) => turn,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "maybe_sweep: cannot take the sweep's turn");
+                return;
+            }
         };
-        if fresh(&stamp) {
-            return;
-        }
-        let Ok(file) = open_lock_file(&self.state_dir.join("sweep.lock")) else {
-            return;
-        };
-        let Ok(_guard) = Flock::lock(file, FlockArg::LockExclusiveNonblock) else {
-            return;
-        };
-        if fresh(&stamp) {
-            return;
-        }
-        // Opened like a lock file (mode 0666), so root and the state directory's owner can
-        // each rewrite a stamp the other wrote.
-        let now = jiff::Timestamp::now().to_string();
-        let written = open_lock_file(&stamp).and_then(|mut file| {
-            use std::io::Write;
-            file.set_len(0)?;
-            file.write_all(now.as_bytes()).map_err(anyhow::Error::from)
-        });
-        if let Err(error) = written {
-            tracing::warn!(%error, "maybe_sweep: cannot write the sweep stamp");
-            return;
-        }
         self.cleanup_stale_state().await;
+    }
+
+    /// Run `f` with the place of this state directory's sweep. Root and the directory's
+    /// owner both launch in it, so its files are everyone's to rewrite
+    /// (`crate::sweep::Place::shared`).
+    fn with_sweep_place<R>(&self, f: impl FnOnce(&crate::sweep::Place) -> Result<R>) -> Result<R> {
+        let dir = std::fs::File::open(&self.state_dir)
+            .with_context(|| format!("opening {}", self.state_dir.display()))?;
+        f(&crate::sweep::Place::shared(
+            &dir,
+            &self.state_dir,
+            "sweep.stamp",
+            "sweep.lock",
+        ))
+    }
+
+    /// Set the sweep's stamp to a sweep that began `ago` before now, for tests of what a
+    /// launch does with a fresh stamp and with an old one.
+    #[doc(hidden)]
+    pub fn set_sweep_stamp(&self, ago: std::time::Duration) -> Result<()> {
+        self.with_sweep_place(|place| crate::sweep::set_stamp(place, ago))
     }
 
     /// Load VM state
@@ -1750,23 +1754,17 @@ impl StateManager {
 
     /// Remove the state files of processes that no longer exist, now. For a caller that
     /// has just killed a set of VMs and must leave nothing of them behind.
-    /// Takes the sweep's lock, waiting up to 30 s for a launch's own sweep to finish, so two
-    /// sweeps never scan at once.
+    /// Takes the sweep's turn, waiting up to 30 s for a launch's own sweep to finish, so two
+    /// sweeps never scan at once, and stamps it as any sweep is.
     pub async fn sweep_stale(&self) {
-        let Ok(mut file) = open_lock_file(&self.state_dir.join("sweep.lock")) else {
-            return;
-        };
         let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let _guard = loop {
-            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(guard) => break guard,
-                Err((returned, _)) => {
-                    if std::time::Instant::now() >= until {
-                        return;
-                    }
-                    file = returned;
+        let _turn = loop {
+            match self.with_sweep_place(crate::sweep::turn_now) {
+                Ok(Some(turn)) => break turn,
+                Ok(None) if std::time::Instant::now() < until => {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
+                Ok(None) | Err(_) => return,
             }
         };
         self.cleanup_stale_state().await;
@@ -2622,6 +2620,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::sweep::Sweep;
 
     /// Everything `list_vms` logs at WARN or above while scanning `dir`.
     fn warnings_from_listing(dir: &std::path::Path) -> (usize, String) {
@@ -2791,6 +2790,74 @@ mod tests {
 
     /// Write a state file as it is, bypassing `save_state`, which records the start time
     /// of whatever process is at the PID now.
+    /// A state directory as a caller of the sweep (`crate::sweep::testing`): states of
+    /// dead and of live processes, and what a claim does about sweeping.
+    struct StatesOfADirectory {
+        dir: tempfile::TempDir,
+        manager: StateManager,
+    }
+
+    impl StatesOfADirectory {
+        /// Write the state of a VM owned by `pid`, and return its file.
+        fn state_of(&self, vm_id: &str, pid: u32) -> PathBuf {
+            let mut state = VmState::new(vm_id.to_string(), "alpine:latest".to_string(), 1, 512);
+            state.pid = Some(pid);
+            state.pid_start_time = process_start_time(pid);
+            write_state_file(self.dir.path(), &state);
+            self.manager.state_file(vm_id)
+        }
+    }
+
+    impl crate::sweep::testing::Caller for StatesOfADirectory {
+        const SWEEP: &'static Sweep = &crate::sweep::STATE;
+
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = StateManager::new(dir.path().to_path_buf());
+            std::fs::create_dir_all(dir.path().join(VMS_DIR)).unwrap();
+            Self { dir, manager }
+        }
+
+        fn abandon(&self, n: usize) -> PathBuf {
+            // No process has a pid this high.
+            self.state_of(&format!("vm-dead-{n}"), 4_000_000_000 + n as u32)
+        }
+
+        fn live(&self, n: usize) -> (PathBuf, Box<dyn std::any::Any>) {
+            (
+                self.state_of(&format!("vm-live-{n}"), std::process::id()),
+                Box::new(()),
+            )
+        }
+
+        fn start(&self, every: std::time::Duration) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(self.manager.maybe_sweep_every(every));
+        }
+
+        fn with_place<R>(&self, f: impl FnOnce(&crate::sweep::Place) -> R) -> R {
+            self.manager.with_sweep_place(|place| Ok(f(place))).unwrap()
+        }
+
+        fn listed(&self) -> Vec<PathBuf> {
+            let vms = self.dir.path().join(VMS_DIR);
+            let mut dirs = vec![vms.clone()];
+            dirs.extend(
+                std::fs::read_dir(&vms)
+                    .unwrap()
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir()),
+            );
+            dirs
+        }
+    }
+
+    crate::sweep::testing::caller_matrix!(StatesOfADirectory);
+
     fn write_state_file(dir: &Path, state: &VmState) {
         let path = StateManager::new(dir.to_path_buf()).state_file(&state.vm_id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
