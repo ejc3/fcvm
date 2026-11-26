@@ -75,7 +75,7 @@
                 "index": 1,
                 "val": 3222056672
             },
-            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: confinement refuses a start that passes a device through (a_passed_through_device_is_refused), and the gpu and phone profiles run another build, which it refuses as well. KVM_CREATE_DEVICE for the KVM VFIO device. KVM_SET_DEVICE_ATTR stays on x86_64, because the aarch64 policy needs the same request for the GIC and a removal names a request, not an architecture; without KVM_CREATE_DEVICE the VMM has no device descriptor to use it on."
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: confinement refuses a start that passes a device through (a_passed_through_device_is_refused), and the gpu and phone profiles run another build, which it refuses as well. KVM_CREATE_DEVICE for the KVM VFIO device."
         },
         {
             "syscall": "ioctl",
@@ -243,11 +243,28 @@
         },
         {
             "syscall": "readlink",
+            "arches": [
+                "x86_64"
+            ],
             "why": "the imago VMDK disk backend and its descriptor paths: a drive is a VMDK image only when its request says so, and fcvm's requests never name an image format (no_request_asks_for_an_enclave_or_a_vmdk_image). Canonicalizing a descriptor's path on x86_64; the VFIO hot-plug reads a device's group link with it too."
         },
         {
             "syscall": "readlinkat",
+            "arches": [
+                "aarch64"
+            ],
             "why": "the imago VMDK disk backend and its descriptor paths: a drive is a VMDK image only when its request says so, and fcvm's requests never name an image format (no_request_asks_for_an_enclave_or_a_vmdk_image). Canonicalizing a descriptor's path on aarch64; the VFIO hot-plug reads a device's group link with it too."
+        },
+        {
+            "syscall": "ioctl",
+            "arg": {
+                "index": 1,
+                "val": 1075359457
+            },
+            "arches": [
+                "x86_64"
+            ],
+            "why": "VFIO device passthrough, attached to a running VM through PUT /device-passthrough: confinement refuses a start that passes a device through (a_passed_through_device_is_refused), and the gpu and phone profiles run another build, which it refuses as well. KVM_SET_DEVICE_ATTR on the KVM VFIO device. On x86_64 only: on aarch64 the same request sets the GIC's state, and the previous pin's filter had it there."
         }
     ],
     "add": [

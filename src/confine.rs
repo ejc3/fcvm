@@ -1452,6 +1452,15 @@ mod tests {
     /// Whether `removal` (an entry of the changes' `remove`) takes `rule` out: every rule of
     /// its syscall, or, when it names an `arg`, only the rules that compare that argument
     /// with that value.
+    /// Whether `removal` applies to `arch`: one without `arches` applies to both, one with it
+    /// to the architectures it lists (a syscall that exists on one only, or a request one
+    /// architecture's policy must keep).
+    fn removal_is_for(removal: &serde_json::Value, arch: &str) -> bool {
+        removal
+            .get("arches")
+            .is_none_or(|arches| arches.as_array().unwrap().iter().any(|a| a == arch))
+    }
+
     fn removes(removal: &serde_json::Value, rule: &serde_json::Value) -> bool {
         if removal["syscall"] != rule["syscall"] {
             return false;
@@ -1477,7 +1486,11 @@ mod tests {
         let mut policy = fork.clone();
         for (class, filter) in policy.as_object_mut().unwrap().iter_mut() {
             let rules = filter["filter"].as_array_mut().unwrap();
-            rules.retain(|rule| !removed.iter().any(|removal| removes(removal, rule)));
+            rules.retain(|rule| {
+                !removed
+                    .iter()
+                    .any(|removal| removal_is_for(removal, arch) && removes(removal, rule))
+            });
             for add in changes["add"].as_array().unwrap() {
                 let listed = |key: &str, value: &str| {
                     add[key].as_array().unwrap().iter().any(|v| v == value)
@@ -1723,6 +1736,21 @@ mod tests {
             // Every removal and addition still means something against this fork filter.
             for removal in changes["remove"].as_array().unwrap() {
                 let syscall = removal["syscall"].as_str().unwrap();
+                // A removal names the architectures it is for, or none: a name that is no
+                // architecture would apply nowhere and be checked nowhere.
+                if let Some(arches) = removal.get("arches") {
+                    let arches = arches.as_array().unwrap();
+                    assert!(
+                        !arches.is_empty()
+                            && arches
+                                .iter()
+                                .all(|a| SECCOMP_ARCHES.contains(&a.as_str().unwrap())),
+                        "{removal} lists something that is not an architecture"
+                    );
+                }
+                if !removal_is_for(removal, arch) {
+                    continue;
+                }
                 assert!(
                     fork.as_object()
                         .unwrap()
@@ -1900,10 +1928,8 @@ mod tests {
             ("vcpu", "KVM_GET_MSRS"),
             ("vcpu", "KVM_GET_CPUID2"),
         ];
-        // KVM_SET_DEVICE_ATTR is in both: aarch64 sets the GIC's state with it, and the
-        // x86_64 filter lists it for the KVM VFIO device, whose KVM_CREATE_DEVICE the
-        // changes remove (a removal names a request, not an architecture).
         const AARCH64_ONLY_IOCTLS: &[(&str, &str)] = &[
+            ("vmm", "KVM_SET_DEVICE_ATTR"),
             ("vmm", "KVM_GET_DEVICE_ATTR"),
             ("vcpu", "KVM_GET_ONE_REG"),
             ("vcpu", "KVM_GET_REG_LIST"),

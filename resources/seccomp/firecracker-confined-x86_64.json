@@ -1799,19 +1799,6 @@
             {
                 "args": [
                     {
-                        "comment": "KVM_SET_DEVICE_ATTR",
-                        "index": 1,
-                        "op": "eq",
-                        "type": "dword",
-                        "val": 1075359457
-                    }
-                ],
-                "comment": "Needed for VFIO device hotplug and teardown",
-                "syscall": "ioctl"
-            },
-            {
-                "args": [
-                    {
                         "comment": "TUNSETIFF",
                         "index": 1,
                         "op": "eq",
