@@ -178,13 +178,35 @@ of this holds:
 - It contains `main` as it was before the push. A pull request's run tests the merge of
   its head into its base, and that merge has the head's tree only when the head already
   holds the base.
-- Between `main` before the push and that commit, no file that defines the lanes changed:
-  nothing under `.github/`, `scripts/` or `.cargo/`, not the Makefile, a Containerfile,
-  `.config/nextest.toml` or `rust-toolchain.toml`. A pull request's run executes the pull
-  request's own copy of those files, so a change to one of them could produce a job with
-  a lane's name that tested nothing. Such a landing runs every lane on `main`, under the
-  files that landed. A comparison of 300 files or more may be cut short by the API and
-  proves nothing either.
+- Between `main` before the push and that commit, no file that defines the lanes changed.
+  A pull request's run executes the pull request's own copy of the workflow, the Makefile
+  and the scripts, so a change to one of them could produce a job with a lane's name that
+  tested nothing. Such a landing runs every lane on `main`, under the files that landed.
+  A comparison of 300 files or more may be cut short by the API and proves nothing
+  either.
+
+Which files define the lanes is derived, not listed by hand: `ci_pool.py lane-files`
+reads `ci.yml` and the Makefile and gives
+
+- `ci.yml`, the Makefile, `.config/nextest.toml`, `rust-toolchain.toml`, `.cargo/` and
+  every Containerfile;
+- the local actions used by the jobs that are lanes or decide which lanes run
+  (`changes`, `skip-check`, `host`, `host-root`, `container`);
+- every script those jobs name, every script named by the Makefile text that runs when
+  a target they make is made (recipes, prerequisites, the targets recipes make in turn,
+  the variables all of that uses, and definitions that run a shell command when the
+  Makefile is read), and every script those scripts name in turn, by path or, within one
+  directory, by file name. A name followed by a glob or a variable, and a directory's
+  name, stand for everything that starts with them.
+
+The result is committed as `scripts/ci-pool/lane-defining.txt`, and a test fails when the
+committed list is not what the derivation gives, so a script that `ci.yml` or the
+Makefile starts to call cannot stay off it. `ci.yml`, the Makefile and everything under
+`scripts/ci-pool/` count whatever the list says. When the list cannot be read or is
+empty, everything under `.github/` and `scripts/` counts. The derivation cannot follow a
+script whose name is built at run time; a new way of calling one is a change to `ci.yml`,
+the Makefile or a listed script. A Makefile target that cannot be followed makes the
+whole Makefile's scripts count.
 
 Each lane is judged alone. A lane that passed in a run whose `Summary` failed for another
 job is proven; a lane that passed only when it was run again is not, and runs on `main`.
@@ -198,8 +220,10 @@ a pull request based on `main` it follows from the third condition. For the top 
 pool the base is the member below, which `build` and `publish` keep inside the top; a
 member branch pushed by hand, or forced, between a run and the landing breaks it.
 
-In the week of 2026-11-19, 114 first-parent commits on `main` touched code and 31 of
-them touched a lane-defining file (21 under `.github/`, 7 the Makefile, 3 `scripts/`).
+In the week of 2026-11-19, 114 first-parent commits on `main` touched code. 17 of them
+changed a file on the list (7 the Makefile, 6 `ci.yml`, 4 a listed script) and would run
+every lane on `main`. Counting everything under `.github/` and `scripts/` instead, it
+would be 31.
 
 ## Cost
 

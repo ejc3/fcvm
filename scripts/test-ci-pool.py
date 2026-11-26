@@ -947,27 +947,47 @@ class Evidence(unittest.TestCase):
         self.assertEqual((lanes, no_lanes), ({}, None))
         self.assertIn('another tree', why)
 
+    LISTED = ['.config/nextest.toml', '.github/actions/checkout-deps/*', 'Containerfile*', 'rust-toolchain.toml', '.cargo/*',
+              'scripts/ci-pr-scope.sh', 'scripts/root-test-runner.sh', 'scripts/confine-*', 'scripts/lib/*']
+
     def test_a_landing_that_changes_what_defines_the_lanes_proves_nothing(self):
         # A pull request runs its own workflow, Makefile and scripts: a job named like a
         # lane in such a run may have tested nothing.
         for path in ('.github/workflows/ci.yml', '.github/actions/checkout-deps/action.yml', 'Makefile',
                      '.config/nextest.toml', 'scripts/ci-pr-scope.sh', 'scripts/ci-pool/ci_pool.py',
-                     'scripts/root-test-runner.sh', 'Containerfile', 'Containerfile.nested', 'rust-toolchain.toml',
+                     'scripts/ci-pool/lane-defining.txt', 'scripts/root-test-runner.sh', 'scripts/confine-gate.sh',
+                     'scripts/lib/vm-evidence.sh', 'Containerfile', 'Containerfile.nested', 'rust-toolchain.toml',
                      '.cargo/config.toml'):
-            lanes, no_lanes, why = self.proof(passed(ci_pool.LANES), compare={'status': 'ahead', 'files': ['src/lib.rs', path]})
-            self.assertEqual((lanes, no_lanes), ({}, None), path)
-            self.assertIn(path, why)
-            skipped = self.proof(SCOPE_SKIPPED, compare={'status': 'ahead', 'files': [path]})
-            self.assertEqual(skipped[:2], ({}, None), path)
+            for listed in (self.LISTED, None):
+                compare = {'status': 'ahead', 'files': ['src/lib.rs', path]}
+                lanes, no_lanes, why = self.proof(passed(ci_pool.LANES), compare=compare, listed=listed)
+                self.assertEqual((lanes, no_lanes), ({}, None), path)
+                self.assertIn(path, why)
+                skipped = self.proof(SCOPE_SKIPPED, compare={'status': 'ahead', 'files': [path]}, listed=listed)
+                self.assertEqual(skipped[:2], ({}, None), path)
         for path in ('src/lib.rs', 'tests/test_sanity.rs', 'docs/scripts/x.md', 'fleet/web/Makefile', 'bench/scripts/a.sh'):
-            self.assertEqual(self.proof(passed(['Host-arm64']), compare={'status': 'ahead', 'files': [path]})[0],
-                             {'Host-arm64': 7}, path)
+            for listed in (self.LISTED, None):
+                self.assertEqual(self.proof(passed(['Host-arm64']), compare={'status': 'ahead', 'files': [path]}, listed=listed)[0],
+                                 {'Host-arm64': 7}, path)
+
+    def test_the_list_narrows_what_counts_and_its_absence_widens_it(self):
+        # A script no lane runs, and a workflow that is not ci.yml, define no lane. Without a
+        # readable list nothing is known about them, so they count.
+        for path in ('scripts/claude-assistant/index.ts', 'scripts/docs-helper.sh', '.github/workflows/fleet-web-deploy.yml'):
+            compare = {'status': 'ahead', 'files': [path]}
+            self.assertEqual(self.proof(passed(['Host-arm64']), compare=compare, listed=self.LISTED)[0], {'Host-arm64': 7}, path)
+            self.assertEqual(self.proof(passed(['Host-arm64']), compare=compare, listed=None)[0], {}, path)
+            self.assertEqual(self.proof(passed(['Host-arm64']), compare=compare, listed=[])[0], {}, path)
+
+    def test_the_list_cannot_take_itself_the_tool_the_workflow_or_the_makefile_off(self):
+        for path in ('.github/workflows/ci.yml', 'Makefile', 'scripts/ci-pool/ci_pool.py', 'scripts/ci-pool/lane-defining.txt'):
+            self.assertTrue(ci_pool.lane_defining(path, ['src/unrelated']), path)
 
     def test_a_renamed_file_is_judged_by_both_of_its_names(self):
         # landing_evidence lists a renamed file under both names: moving a script out of
         # scripts/ is a change to what defines the lanes.
-        compare = {'status': 'ahead', 'files': ['tools/x.sh', 'scripts/x.sh']}
-        self.assertEqual(self.proof(passed(ci_pool.LANES), compare=compare)[0], {})
+        compare = {'status': 'ahead', 'files': ['tools/x.sh', 'scripts/root-test-runner.sh']}
+        self.assertEqual(self.proof(passed(ci_pool.LANES), compare=compare, listed=self.LISTED)[0], {})
 
     def test_a_comparison_that_may_be_cut_short_or_was_not_read_proves_nothing(self):
         many = {'status': 'ahead', 'files': [f'src/{n}.rs' for n in range(300)]}
@@ -1192,6 +1212,20 @@ class PlanCommand(Sandbox):
         self.assertEqual(planned, self.ALL)
         self.assertIn('the landing changes what defines the lanes: .github/workflows/ci.yml', text)
 
+    def test_the_planner_reads_the_committed_list_and_falls_back_to_everything_without_it(self):
+        other = {'status': 'ahead', 'files': ['src/lib.rs', '.github/workflows/fleet-web-deploy.yml', 'scripts/docs-helper.sh']}
+        fixture = self.answers([('pull_request', passed(ci_pool.LANES))], compare=other)
+        code, text, planned, _ = self.plan(fixture)
+        self.assertEqual(planned, self.ALL, 'with no list every script and workflow must count')
+        self.assertIn('cannot be read', text)
+        (self.clone / 'scripts/ci-pool').mkdir(parents=True)
+        (self.clone / 'scripts/ci-pool/lane-defining.txt').write_text('# derived\nscripts/root-test-runner.sh\n')
+        self.assertEqual(self.plan(fixture)[2], set())
+        listed = {'status': 'ahead', 'files': ['src/lib.rs', 'scripts/root-test-runner.sh']}
+        self.assertEqual(self.plan(self.answers([('pull_request', passed(ci_pool.LANES))], compare=listed))[2], self.ALL)
+        (self.clone / 'scripts/ci-pool/lane-defining.txt').write_text('# nothing\n')
+        self.assertEqual(self.plan(fixture)[2], self.ALL, 'an empty list was taken as nothing being lane-defining')
+
     def test_a_job_named_like_a_lane_in_a_run_of_another_workflow_proves_nothing(self):
         for path in ('.github/workflows/other.yml', '.github/workflows/ci.yml.bak', 'ci.yml', '.github/workflows/fork/ci.yml',
                      'dynamic/.github/workflows/ci.yml'):
@@ -1268,26 +1302,145 @@ class Wiring(unittest.TestCase):
         uses = [line.strip().split(':', 1)[0] for line in text.splitlines() if 'inputs.lanes' in line]
         self.assertEqual(uses, ['LANES', 'name'])
 
-    def test_every_script_and_local_action_a_lane_runs_is_lane_defining(self):
-        text = CI.read_text()
-        body = text.split('\njobs:\n', 1)[1]
-        blocks = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', body, re.M | re.S))
-        used = set()
-        for name in ('changes', 'skip-check', 'host', 'host-root', 'container'):
-            used |= set(re.findall(r'(?:\./)?(?:fcvm/)?(scripts/[\w./-]+)', blocks[name]))
-            used |= {'.github/' + path for path in re.findall(r'uses: \./(?:fcvm/)?\.github/([\w./-]+)', blocks[name])}
-            used |= set(re.findall(r'(Containerfile[\w.-]*)', blocks[name]))
-        self.assertTrue({'scripts/ci-pr-scope.sh', 'scripts/ci-pool/ci_pool.py', '.github/actions/checkout-deps'} <= used, used)
-        for path in sorted(used) + ['.github/workflows/ci.yml', 'Makefile', '.config/nextest.toml', 'rust-toolchain.toml']:
-            self.assertTrue(ci_pool.lane_defining(path.rstrip('.')), f'{path} is run by a lane and is not lane-defining')
-        self.assertTrue((ROOT / '.config/nextest.toml').exists() and (ROOT / 'rust-toolchain.toml').exists())
+    def test_the_committed_list_is_what_ci_yml_and_the_makefile_give(self):
+        # A script that ci.yml or the Makefile starts to call has to reach the list:
+        # `python3 scripts/ci-pool/ci_pool.py lane-files --write`.
+        self.assertEqual(ci_pool.read_lane_files(ROOT), ci_pool.lane_files(ROOT))
 
-    def test_what_the_makefiles_test_recipes_run_is_lane_defining(self):
-        makefile = (ROOT / 'Makefile').read_text()
-        for path in sorted(set(re.findall(r'(?:\./|\$\(MAKEFILE_DIR\))(scripts/[\w./-]+)', makefile))):
-            self.assertTrue(ci_pool.lane_defining(path), path)
-        self.assertFalse(ci_pool.lane_defining('src/main.rs'))
-        self.assertFalse(ci_pool.lane_defining('tests/test_sanity.rs'))
+    def test_the_committed_list_holds_what_the_lanes_are_known_to_run(self):
+        listed = ci_pool.read_lane_files(ROOT)
+        for path in ('.github/workflows/ci.yml', 'Makefile', '.config/nextest.toml', 'rust-toolchain.toml',
+                     '.github/actions/checkout-deps/action.yml', 'scripts/ci-pr-scope.sh', 'scripts/ci-pool/ci_pool.py',
+                     'scripts/root-test-runner.sh', 'scripts/with-test-config.sh', 'scripts/cargo-target-run.sh',
+                     'scripts/cargo-target-lib.sh', 'scripts/ci-apt-get.sh', 'scripts/check-runner-kernel.py',
+                     'scripts/no-sudo.sh', 'Containerfile'):
+            self.assertTrue(ci_pool.lane_defining(path, listed), f'{path} is run by a lane and is not on the list')
+        for path in ('src/main.rs', 'tests/test_sanity.rs', '.github/workflows/fleet-web-deploy.yml',
+                     'scripts/check-review-threads.sh', 'scripts/analyze_ci_vms.py'):
+            self.assertFalse(ci_pool.lane_defining(path, listed), path)
+        for entry in listed:
+            self.assertTrue('*' in entry or (ROOT / entry).exists(), f'{entry} is listed and does not exist')
+
+
+MAKEFILE = """\
+RUNNER := ./scripts/runner.sh
+WRAP = $(RUNNER) --wrap
+STAMP := $(shell scripts/stamp.sh)
+OTHER := scripts/unused-var.sh
+export EVERYWHERE
+
+build: private SHELL := scripts/lease-shell.sh
+build: prepare
+\tcargo build
+
+prepare:
+\t./scripts/prepare.sh
+
+test-unit: build _test-unit
+_test-unit:
+\t$(WRAP) cargo test \\
+\t\t--release
+
+test-root: build
+\t$(MAKE) --no-print-directory _test-root
+_test-root:
+\tscripts/root-runner.sh
+
+docs:
+\tscripts/docs-only.sh
+"""
+
+
+class LaneFiles(Sandbox):
+    """The derivation, on a small tree."""
+
+    def test_the_makefile_is_followed_from_the_targets_the_lanes_make(self):
+        text = ci_pool.makefile_text_for(MAKEFILE, ['test-unit'])
+        for part in ('scripts/runner.sh', 'scripts/prepare.sh', 'scripts/lease-shell.sh', 'scripts/stamp.sh', '--release'):
+            self.assertIn(part, text)
+        for part in ('scripts/root-runner.sh', 'scripts/docs-only.sh', 'scripts/unused-var.sh'):
+            self.assertNotIn(part, text)
+        self.assertIn('scripts/root-runner.sh', ci_pool.makefile_text_for(MAKEFILE, ['test-root']))
+
+    def test_a_target_that_is_not_a_rule_is_not_followed(self):
+        self.assertIsNone(ci_pool.makefile_text_for(MAKEFILE, ['test-unit', 'no-such-target']))
+
+    def tree(self, files):
+        for name, text in files.items():
+            path = self.clone / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'tree')
+        return ci_pool.lane_files(self.clone)
+
+    CI_YML = """\
+name: CI
+jobs:
+  changes:
+    steps:
+      - run: bash scripts/scope.sh
+  skip-check:
+    steps:
+      - run: python3 scripts/ci-pool/ci_pool.py plan
+  host:
+    steps:
+      - uses: ./fcvm/.github/actions/checkout-deps
+      - run: ./fcvm/scripts/apt.sh update
+      - run: make test-unit
+      - run: for t in scripts/suite-*.sh; do "$t"; done
+  host-root:
+    steps:
+      - run: make test-root
+  container:
+    steps:
+      - run: make test-unit
+  fleet:
+    steps:
+      - run: bash scripts/fleet-only.sh
+      - uses: ./.github/actions/fleet-setup
+"""
+
+    FILES = {'.github/workflows/ci.yml': CI_YML, 'Makefile': MAKEFILE, '.github/actions/checkout-deps/action.yml': 'x',
+             '.github/actions/fleet-setup/action.yml': 'x', '.github/workflows/other.yml': 'x',
+             'scripts/scope.sh': 'x', 'scripts/ci-pool/ci_pool.py': 'x', 'scripts/apt.sh': '. "$HERE/apt-lib.sh"\nscripts/tools/\n',
+             'scripts/apt-lib.sh': 'x', 'scripts/tools/a.sh': 'x', 'scripts/tools/b.sh': 'x', 'scripts/suite-1.sh': 'x',
+             'scripts/suite-2.sh': 'x', 'scripts/fleet-only.sh': 'x', 'scripts/runner.sh': 'x', 'scripts/prepare.sh': 'x',
+             'scripts/lease-shell.sh': 'x', 'scripts/stamp.sh': 'x', 'scripts/root-runner.sh': 'x', 'scripts/docs-only.sh': 'x',
+             'scripts/unused-var.sh': 'x', 'scripts/other/apt-lib.sh': 'x', 'Containerfile.nested': 'x', 'src/lib.rs': 'x'}
+
+    def test_what_the_lanes_run_is_listed_and_what_they_do_not_run_is_not(self):
+        listed = self.tree(self.FILES)
+        on = lambda path: ci_pool.lane_defining(path, [e for e in listed])
+        for path in ('scripts/scope.sh', 'scripts/apt.sh', 'scripts/runner.sh', 'scripts/prepare.sh', 'scripts/lease-shell.sh',
+                     'scripts/stamp.sh', 'scripts/root-runner.sh', '.github/actions/checkout-deps/action.yml',
+                     'Containerfile.nested', '.github/workflows/ci.yml', 'Makefile'):
+            self.assertTrue(on(path), path)
+        # Named by another listed script: by file name beside it, and by directory.
+        for path in ('scripts/apt-lib.sh', 'scripts/tools/a.sh', 'scripts/tools/b.sh', 'scripts/tools/later.sh'):
+            self.assertTrue(on(path), path)
+        # Named with a glob: whatever starts that way, files added later included.
+        for path in ('scripts/suite-1.sh', 'scripts/suite-2.sh', 'scripts/suite-new.sh'):
+            self.assertTrue(on(path), path)
+        # Run only by a job that is not a lane, by a Makefile target no lane makes, or by nothing.
+        entries = set(listed)
+        for path in ('scripts/fleet-only.sh', 'scripts/docs-only.sh', 'scripts/unused-var.sh', 'scripts/other/apt-lib.sh'):
+            self.assertNotIn(path, entries, path)
+        self.assertFalse(any(entry.startswith('.github/actions/fleet-setup') for entry in listed))
+        self.assertFalse(any('other.yml' in entry or entry.startswith('src/') for entry in listed))
+
+    def test_a_makefile_that_cannot_be_followed_is_taken_whole(self):
+        files = dict(self.FILES, **{'.github/workflows/ci.yml': self.CI_YML.replace('make test-root', 'make no-such-target')})
+        self.assertIn('scripts/docs-only.sh', self.tree(files))
+
+    def test_the_command_prints_the_list_and_writes_it_only_when_asked(self):
+        self.tree(self.FILES)
+        code, out, _ = self.tool('lane-files')
+        self.assertEqual(code, 0, out)
+        self.assertIn('scripts/root-runner.sh\n', out)
+        self.assertFalse((self.clone / 'scripts/ci-pool/lane-defining.txt').exists())
+        code, out, _ = self.tool('lane-files', '--write')
+        self.assertEqual(ci_pool.read_lane_files(self.clone), ci_pool.lane_files(self.clone))
 
 
 BOUNDARY = 'fcvm commands::common::tests::a_boundarys_token_is_on_the_state_from_its_prepare_until_its_gate_is_open'
