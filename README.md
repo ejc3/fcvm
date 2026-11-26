@@ -772,6 +772,8 @@ fcvm/
 
 **KVM not available?** Both Firecracker and Cloud Hypervisor require bare-metal KVM or nested virtualization. On AWS, use `.metal` instances.
 
+**"holds N running VM(s) started by an older fcvm"?** A new fcvm keeps VM state in another layout than the build that started those VMs, and refuses every command, `fcvm ls` included, while one of them runs. It changes nothing in the state directory and leaves the VMs running. List and stop them with the fcvm binary that started them (its `ls` shows them; the new one's does not), then run the command again. A VM of the older build that was killed leaves a state file and holds nothing up: the new build does not list it, and its first launch removes what the older layout left.
+
 **Network issues?** Test incrementally inside a VM:
 ```bash
 ./fcvm exec --name web -- ping -c1 10.0.2.2        # Gateway

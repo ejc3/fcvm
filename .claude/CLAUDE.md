@@ -2929,7 +2929,10 @@ both.
   is written like a lock file (0666). Nothing is made world-writable.
 - **A store of layout 1** (`state/<vm_id>.json`, `name/`, `pid/`, `names.lock`) is refused
   by every command while a VM of it is running: the error lists each one's name and PID,
-  and they are stopped with the fcvm that started them. The layout check of a command
+  and they are listed and stopped with the fcvm that started them (this build's `fcvm ls`
+  is refused too, so it shows nothing of them). A VM of it that was killed leaves a state
+  file that is not a running VM (its PID is gone, a zombie, or another process's by start
+  time): a reader lists nothing and a launch removes it. The layout check of a command
   that only reads (`check_layout_for_read`) decides refuse or proceed and writes nothing,
   so `fcvm ls`, which only lists, needs no write access and removes nothing of an older
   launch in progress. A lookup by PID that misses still runs the sweep

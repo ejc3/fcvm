@@ -2345,7 +2345,7 @@ Override with `FCVM_BASE_DIR` environment variable.
 │   └── {vm-id}/disks/rootfs.raw
 ├── snapshots/         # Firecracker snapshots
 ├── state/             # VM state JSON files
-│   └── {vm-id}.json
+│   └── vms/<b>/{vm-id}.json
 └── cache/             # Downloaded images and packages
     ├── ubuntu-24.04-arm64-{sha}.img  # Cloud image cache
     └── packages-{sha}/               # Downloaded .deb files
