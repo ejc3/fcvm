@@ -709,8 +709,8 @@ class ThisRepository(unittest.TestCase):
         # kernel`; an input outside it, or a link out of it, would give another release there.
         inside = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--is-inside-work-tree"],
                                 capture_output=True, text=True)
-        if inside.returncode != 0:
-            self.skipTest("not a git checkout")
+        # Outside a checkout this fails: a skip would read as a pass.
+        self.assertEqual(inside.returncode, 0, "not a git checkout: " + inside.stderr)
         module = load_script()
         dirty = subprocess.run(
             ["git", "-C", str(ROOT), "status", "--porcelain", "--", "rootfs-config.toml", "kernel"],
