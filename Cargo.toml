@@ -111,7 +111,7 @@ libfuse-test = []
 ffmpeg-tests = []
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 tokio = { version = "1.51.6", features = ["test-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
