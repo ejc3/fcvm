@@ -1039,6 +1039,8 @@ class Evidence(unittest.TestCase):
         self.assertEqual(states(lane('Host-arm64', 'cancelled', 1), lane('Host-arm64', 'success', 2)), {'Host-arm64': 'pass-on-rerun'})
         self.assertEqual(states(lane('Host-arm64', 'success', 1), lane('Host-arm64', 'success', 2)), {'Host-arm64': 'pass'})
         self.assertEqual(states(lane('Host-arm64', 'failure', 1), lane('Host-arm64', None, 2)), {'Host-arm64': 'open'})
+        for ended in ('cancelled', 'neutral', 'action_required', 'stale'):
+            self.assertEqual(states(lane('Host-arm64', ended)), {'Host-arm64': 'cancelled'}, ended)
         self.assertEqual(states(lane('Host-arm64', 'skipped', 1)), {})
 
     def test_a_lane_that_passed_only_on_a_rerun_is_not_proven_unless_asked(self):
@@ -1691,6 +1693,10 @@ class RedPool(unittest.TestCase):
         self.assertEqual(merge([{'Host-arm64': 'fail'}, {'Host-arm64': 'open'}]), {'Host-arm64': 'fail'})
         self.assertEqual(merge([{'Host-arm64': 'pass'}, {'Host-arm64': 'open'}, {}]), {'Host-arm64': 'pass'})
         self.assertEqual(merge([{'Host-arm64': 'open'}]), {'Host-arm64': 'open'})
+        self.assertEqual(merge([{'Host-arm64': 'cancelled'}]), {'Host-arm64': 'cancelled'})
+        self.assertEqual(merge([{'Host-arm64': 'cancelled'}, {'Host-arm64': 'open'}]), {'Host-arm64': 'open'})
+        self.assertEqual(merge([{'Host-arm64': 'cancelled'}, {'Host-arm64': 'pass'}]), {'Host-arm64': 'pass'})
+        self.assertEqual(merge([{'Host-arm64': 'cancelled'}, {'Host-arm64': 'fail'}]), {'Host-arm64': 'fail'})
         self.assertEqual(merge([{'Host-arm64': 'pass'}, {'Host-x64': 'fail'}]), {'Host-arm64': 'pass', 'Host-x64': 'fail'})
         self.assertEqual(merge([]), {})
 
@@ -1762,12 +1768,29 @@ class BisectCommand(PoolOfThree):
         self.add_run(2, dict(self.green(), **{'Host-arm64': 'failure'}))
         code, out, writes = self.bisect()
         self.assertEqual((code, writes), (0, []), out)
-        self.assertRegex(out, r'NEXT: run the failed jobs of run \d+ again')
+        self.assertIn('NEXT: run Host-arm64 again on the top', out)
 
-    def test_a_failure_seen_once_reruns_the_failed_jobs_of_that_run(self):
-        run = self.add_run(2, dict(self.green(), **{'Host-arm64': 'failure'}))
+    def test_a_failure_seen_once_reruns_that_lanes_job_and_no_other(self):
+        # Not "the run's failed jobs": after the unit watcher stopped a run, that would run
+        # every cancelled lane again.
+        lanes = dict(self.green(), **{'Host-arm64': 'failure', 'Container-arm64': 'cancelled'})
+        run = self.add_run(2, lanes)
+        failed = run * 100 + list(lanes).index('Host-arm64')
         code, out, writes = self.bisect('--go')
-        self.assertEqual(writes, [('POST', f'actions/runs/{run}/rerun-failed-jobs', {})], out)
+        self.assertEqual(writes, [('POST', f'actions/jobs/{failed}/rerun', {})], out)
+
+    def test_a_run_stopped_at_a_failed_unit_step_is_diagnosed_from_the_lane_that_failed(self):
+        lanes = {lane_name: 'cancelled' for lane_name in ci_pool.PR_LANES}
+        lanes['Host-arm64'] = ['failure', 'failure']
+        self.add_run(2, lanes, attempt=2)
+        code, out, writes = self.bisect('--go')
+        self.assertNotIn('WAITING', out)
+        self.assertEqual(writes, [('POST', 'actions/workflows/ci.yml/dispatches', {'ref': 'a', 'inputs[lanes]': 'Host-arm64'})], out)
+
+    def test_a_top_whose_lanes_were_only_cancelled_is_not_green(self):
+        self.add_run(2, dict(self.green(), **{'Container-arm64': 'cancelled'}))
+        code, out, writes = self.bisect('--go')
+        self.assertIn("WAITING: the top's run has not run Container-arm64", out)
 
     def test_a_failure_seen_twice_dispatches_the_failing_lane_on_a_lower_member(self):
         self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=2)
@@ -1795,8 +1818,10 @@ class BisectCommand(PoolOfThree):
         source = TOOL.read_text()
         body = source.split('def cmd_bisect(', 1)[1].split('\n# ---', 1)[0]
         self.assertEqual(re.findall(r"status_fields\('(\w+)'", body), ['failure'])
-        self.assertEqual(source.count('/statuses/'), 2, 'a status is posted somewhere other than mark and bisect')
-        self.assertEqual(source.split('def cmd_mark(', 1)[1].count('/statuses/'), 1)
+        self.assertEqual(source.count('/statuses/'), 3, 'a status is posted somewhere other than mark, bisect and unit-watch')
+        watcher = source.split('def cmd_unit_watch(', 1)[1].split('\n# ---', 1)[0]
+        self.assertEqual(re.findall(r"status_fields\('(\w+)'", watcher), ['failure'])
+        self.assertEqual(source.split('def cmd_mark(', 1)[1].split('\n# ---', 1)[0].count('/statuses/'), 1)
 
     def test_a_failure_that_then_passed_is_filed_under_the_issue_that_owns_its_cause(self):
         run = self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'success']}), attempt=2,
@@ -2227,6 +2252,146 @@ class Inventory(unittest.TestCase):
     def test_a_hosted_workflow_on_pull_requests_is_not(self):
         self.assertEqual(ci_pool.per_branch_self_hosted(self.HOSTED), [])
         self.assertEqual(self.reasons('  pull_request:\n', '    runs-on: ubuntu-24.04-arm\n'), [])
+
+
+def with_steps(name, conclusion, **steps):
+    return {'name': name, 'conclusion': conclusion, 'steps': [{'name': k.replace('_', '-'), 'conclusion': v} for k, v in steps.items()]}
+
+
+class UnitWatch(Sandbox):
+    """The watcher that stops a run at the first failed unit step."""
+
+    def test_a_failed_unit_step_is_the_only_thing_that_counts_as_failed(self):
+        verdict = ci_pool.unit_verdict
+        self.assertEqual(verdict([with_steps('Host-arm64', None, test_unit='failure')]), ('failed', 'Host-arm64'))
+        self.assertEqual(verdict([with_steps('Container-x64', 'failure', container_test_unit='failure')]), ('failed', 'Container-x64'))
+        # Another step failed, the runner was lost, or the lane was cancelled: not the unit suite.
+        for job in (with_steps('Host-arm64', 'failure', test_unit='success', test_fast='failure'),
+                    with_steps('Host-arm64', 'failure', Install_dependencies='failure'),
+                    with_steps('Host-arm64', 'failure'), with_steps('Host-arm64', 'cancelled', test_unit='cancelled'),
+                    with_steps('Host-Root-arm64-SnapshotEnabled', 'failure', test_root='failure'),
+                    with_steps('Lint', 'failure', test_unit='failure')):
+            self.assertEqual(verdict([job]), ('done', None), job)
+
+    def test_it_keeps_watching_until_every_unit_step_is_over(self):
+        verdict = ci_pool.unit_verdict
+        running = with_steps('Host-arm64', None, Install_dependencies='success', test_unit=None)
+        self.assertEqual(verdict([running]), ('running', None))
+        self.assertEqual(verdict([with_steps('Host-arm64', None)]), ('running', None))
+        past = with_steps('Host-arm64', None, test_unit='success', test_fast=None)
+        self.assertEqual(verdict([past, with_steps('Container-arm64', 'success', container_test_unit='success')]), ('done', None))
+        self.assertEqual(verdict([past, running]), ('running', None))
+        self.assertEqual(verdict([running, with_steps('Host-x64', None, test_unit='failure')]), ('failed', 'Host-x64'))
+        self.assertEqual(verdict([]), ('done', None))
+
+    def watch(self, jobs, *args):
+        fixture = {f'repos/{REPO}/actions/runs/77/jobs?per_page=100': jobs if jobs == 'FAIL' else {'jobs': jobs}}
+        # A deadline on every call, so that no change to the watcher can make a test wait an hour.
+        if '--minutes' not in args:
+            args = ('--minutes', '0.05', *args)
+        code, out, calls = self.tool('unit-watch', '--interval', '0.05', *args, fixture=fixture,
+                                     env=dict(RUN_ID='77', HEAD_SHA='c' * 40, RUN_URL='https://example.invalid/runs/77'))
+        return code, out, [(c['method'], c['path'].split('/', 3)[-1], c['fields']) for c in calls if c['method'] != 'GET'], calls
+
+    def test_a_failed_unit_step_marks_the_head_and_cancels_the_run(self):
+        code, out, writes, _ = self.watch([with_steps('Host-arm64', None, test_unit='failure'),
+                                           with_steps('Container-arm64', None, container_test_unit=None)])
+        self.assertEqual(code, 0, out)
+        self.assertEqual([(m, p) for m, p, _ in writes], [('POST', 'statuses/' + 'c' * 40), ('POST', 'actions/runs/77/cancel')])
+        fields = writes[0][2]
+        self.assertEqual((fields['state'], fields['context']), ('failure', 'ci/pool'))
+        self.assertIn('test-unit on Host-arm64', fields['description'])
+
+    def test_nothing_is_cancelled_when_the_unit_steps_pass_or_something_else_fails(self):
+        for jobs in ([with_steps('Host-arm64', None, test_unit='success'), with_steps('Container-arm64', 'success', container_test_unit='success')],
+                     [with_steps('Host-arm64', 'failure', Install_dependencies='failure')],
+                     [with_steps('Host-Root-arm64-SnapshotEnabled', 'failure', test_root='failure')]):
+            code, out, writes, _ = self.watch(jobs)
+            self.assertEqual((code, writes), (0, []), out)
+
+    def test_it_stops_watching_at_its_deadline_and_never_fails_the_run(self):
+        code, out, writes, calls = self.watch([with_steps('Host-arm64', None, test_unit=None)], '--minutes', '0.005')
+        self.assertEqual((code, writes), (0, []), out)
+        self.assertIn('no longer watching', out)
+        self.assertGreaterEqual(len(calls), 2, 'it did not look again before its deadline')
+        code, out, writes, _ = self.watch('FAIL', '--minutes', '0.005')
+        self.assertEqual((code, writes), (0, []), out)
+        self.assertIn('could not read the jobs', out)
+
+    def test_the_watcher_names_the_steps_the_lanes_have(self):
+        text = CI.read_text()
+        body = text.split('\njobs:\n', 1)[1]
+        blocks = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', body, re.M | re.S))
+        self.assertIn('      - name: test-unit\n', blocks['host'])
+        self.assertIn('      - name: container-test-unit\n', blocks['container'])
+        self.assertEqual(set(ci_pool.UNIT_STEPS), {l for l in ci_pool.LANES if l.startswith(('Host-a', 'Host-x', 'Container-'))})
+        self.assertIn('run: python3 scripts/ci-pool/ci_pool.py unit-watch', blocks['unit-watch'])
+        self.assertNotIn('unit-watch', re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1])
+
+
+def takes_fcvm_with_default_features(root):
+    """The workspace members whose manifest takes the `fcvm` package with its default
+    features, as 'member: table' strings. fcvm's default features are its integration
+    test tiers, and Cargo unifies features across a workspace build: one such dependency
+    compiles the VM tests into `make test-unit`, which runs with --no-default-features on
+    a box with no VM setup."""
+    import tomllib
+    root = Path(root)
+    workspace = tomllib.loads((root / 'Cargo.toml').read_text())
+    found = []
+    for member in workspace['workspace']['members']:
+        manifest = tomllib.loads((root / member / 'Cargo.toml').read_text())
+        tables = {name: manifest.get(name, {}) for name in ('dependencies', 'dev-dependencies', 'build-dependencies')}
+        for target, body in manifest.get('target', {}).items():
+            for name in ('dependencies', 'dev-dependencies', 'build-dependencies'):
+                tables[f'target.{target}.{name}'] = body.get(name, {})
+        for table, dependencies in tables.items():
+            for name, spec in dependencies.items():
+                package = spec.get('package', name) if isinstance(spec, dict) else name
+                if package != 'fcvm':
+                    continue
+                if not isinstance(spec, dict) or spec.get('default-features', True) is not False:
+                    found.append(f'{member}: {table}.{name}')
+    return found
+
+
+class UnitStep(unittest.TestCase):
+    """What `make test-unit` may contain."""
+
+    def test_no_workspace_member_takes_fcvm_with_its_default_features(self):
+        # 2026-11-22: a new workspace member did, and the unit step of four jobs ran and
+        # failed 127 to 208 VM tests (#2190). The fix pinned that one manifest; this
+        # reads them all.
+        self.assertEqual(takes_fcvm_with_default_features(ROOT), [])
+
+    def test_the_check_reads_every_member_and_every_dependency_table(self):
+        with tempfile.TemporaryDirectory(prefix='ci-pool-manifests-') as tmp:
+            root = Path(tmp)
+            members = {
+                'ok': '[dependencies]\nfcvm = { path = "..", default-features = false }\nserde = "1"\n',
+                'plain': '[dependencies]\nfcvm = { path = ".." }\n',
+                'version': '[dependencies]\nfcvm = "0.1"\n',
+                'explicit': '[dependencies]\nfcvm = { path = "..", default-features = true }\n',
+                'dev': '[dev-dependencies]\nfcvm = { path = ".." }\n',
+                'build': '[build-dependencies]\nfcvm = { path = "..", default-features = false }\n',
+                'renamed': '[dependencies]\nvm = { path = "..", package = "fcvm" }\n',
+                'target': '[target.\'cfg(unix)\'.dependencies]\nfcvm = { path = ".." }\n',
+                'other': '[dependencies]\nfcvm-extras = { path = "x" }\n',
+            }
+            (root / 'Cargo.toml').write_text('[workspace]\nmembers = [".", ' + ', '.join(f'"{m}"' for m in members) + ']\n'
+                                             '[package]\nname = "fcvm"\n[features]\ndefault = ["integration-fast"]\n')
+            for member, text in members.items():
+                (root / member).mkdir()
+                (root / member / 'Cargo.toml').write_text(f'[package]\nname = "{member}"\n' + text)
+            self.assertEqual(takes_fcvm_with_default_features(root),
+                             ['plain: dependencies.fcvm', 'version: dependencies.fcvm', 'explicit: dependencies.fcvm',
+                              'dev: dev-dependencies.fcvm', 'renamed: dependencies.vm', "target: target.cfg(unix).dependencies.fcvm"])
+
+    def test_the_unit_step_runs_without_default_features(self):
+        makefile = (ROOT / 'Makefile').read_text()
+        recipe = re.search(r'^_test-unit:.*\n((?:\t.*\n)+)', makefile, re.M)[1]
+        self.assertIn('--no-default-features', recipe)
+        self.assertNotIn('--features', recipe.replace('--no-default-features', ''))
 
 
 class Lanes(unittest.TestCase):

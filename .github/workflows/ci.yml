@@ -1630,6 +1630,39 @@ jobs:
         if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
 
+  # Stops the run when the unit suite fails on a lane (scripts/ci-pool/ci_pool.py
+  # unit-watch). A change that breaks a unit test, or does not compile, fails `test-unit`
+  # or `container-test-unit` about 20 minutes into each lane that has that step, and every
+  # lane then went on to its own 34 to 57 minutes: in the week of 2026-11-19, 54 runs
+  # spent $152 of lane time that way. The watcher reads this run's jobs once a minute,
+  # and at the first failed unit step it puts a `ci/pool` failure on the head and cancels
+  # the run. A lane that lost its runner, or failed any other step, cancels nothing.
+  #
+  # It tests nothing and Summary does not wait for it. Cancelling takes write access to
+  # Actions, which this job has and no lane job is given.
+  unit-watch:
+    name: Unit watch
+    needs: [changes, skip-check]
+    if: ${{ needs.changes.outputs.code == 'true' && needs.skip-check.outputs.skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      actions: write
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Watch the unit steps
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 scripts/ci-pool/ci_pool.py unit-watch --minutes 60
+
   # States what this run showed as a `ci/pool` commit status (scripts/ci-pool/ci_pool.py
   # mark). A run that tested nothing (a draft, a lower member of a pool) puts `pending` on
   # its head, so the pull request does not read as passed on the strength of

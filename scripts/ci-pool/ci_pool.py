@@ -625,7 +625,7 @@ def read_lane_files(root='.'):
     return entries or None
 
 
-PASS, RERUN_PASS, FAIL, OPEN = 'pass', 'pass-on-rerun', 'fail', 'open'
+PASS, RERUN_PASS, FAIL, OPEN, CANCELLED = 'pass', 'pass-on-rerun', 'fail', 'open', 'cancelled'
 MAX_EVIDENCE_AGE_DAYS = 7
 COMPARE_FILE_CAP = 300
 EVIDENCE_EVENTS = ('pull_request', 'workflow_dispatch', 'push')
@@ -648,7 +648,8 @@ def lane_states(jobs):
     """Each lane's state from a run's jobs, every attempt: its latest attempt decides,
     whatever the earlier ones were. PASS when it succeeded and no earlier attempt of it
     ended otherwise, RERUN_PASS when it succeeded after one that did, FAIL when it failed
-    or timed out, OPEN when it was cancelled or has not finished. A skipped lane is not
+    or timed out, OPEN when it has not finished, CANCELLED when it ended without a verdict
+    (cancelled, or any other conclusion). A skipped lane is not
     evidence and is absent, and so is every job whose name is not exactly a lane's."""
     states = {}
     for lane in LANES:
@@ -662,7 +663,7 @@ def lane_states(jobs):
         elif last in ('failure', 'timed_out'):
             states[lane] = FAIL
         else:
-            states[lane] = OPEN
+            states[lane] = OPEN if last is None else CANCELLED
     return states
 
 
@@ -1488,7 +1489,8 @@ def is_test_cause(cause):
 def merge_lane_states(per_run):
     """One state per lane from every run on a commit. A lane that failed in one run or
     attempt and passed in another did both: RERUN_PASS. Otherwise a failure, then a pass,
-    then an unfinished run decide, in that order."""
+    then an unfinished run decide, in that order; a lane that was only ever cancelled is
+    CANCELLED."""
     merged = {}
     for lane in LANES:
         seen = {states[lane] for states in per_run if lane in states}
@@ -1501,7 +1503,7 @@ def merge_lane_states(per_run):
         elif PASS in seen:
             merged[lane] = PASS
         else:
-            merged[lane] = OPEN
+            merged[lane] = OPEN if OPEN in seen else CANCELLED
     return merged
 
 
@@ -1567,7 +1569,7 @@ def diagnose(members, states_at, causes_at, tries_at, spent, required=PR_LANES, 
         return {'outcome': WAITING, 'why': 'the run on the top has not finished'}
     failed = [lane for lane in LANES if at_top.get(lane) == FAIL]
     if not failed:
-        missing = [lane for lane in required if lane not in at_top]
+        missing = [lane for lane in required if at_top.get(lane) not in (PASS, RERUN_PASS)]
         if missing:
             return {'outcome': WAITING, 'why': f"the top's run has not run {', '.join(missing)}"}
         again = [lane for lane in LANES if at_top.get(lane) == RERUN_PASS]
@@ -1799,9 +1801,18 @@ def cmd_bisect(args, gh, default_branch):
                 note(f'  would file or append to the issue for: {cause}')
         return 0
     if outcome == RERUN:
-        note(f"NEXT: run the failed jobs of run {failing_run['id']} again ({', '.join(step['lanes'])} failed once).")
+        # Job by job, not "the run's failed jobs": that would also run again every lane
+        # that was cancelled when the run was stopped early.
+        again = {}
+        for run in runs_by_sha[top['sha']]:
+            for job in run['jobs']:
+                if job['name'] in step['lanes'] and job.get('conclusion') in ('failure', 'timed_out'):
+                    if (job['run_attempt'], job['id']) > again.get(job['name'], (0, 0)):
+                        again[job['name']] = (job['run_attempt'], job['id'])
+        note(f"NEXT: run {', '.join(step['lanes'])} again on the top (failed once).")
         if args.go:
-            gh.call(f"repos/{gh.repo}/actions/runs/{failing_run['id']}/rerun-failed-jobs", method='POST')
+            for lane, (_attempt, job_id) in sorted(again.items()):
+                gh.call(f'repos/{gh.repo}/actions/jobs/{job_id}/rerun', method='POST')
             note('  asked for.')
         return 0
     if outcome == PROBE:
@@ -1900,7 +1911,7 @@ def cmd_mark(_args, gh, _default_branch):
         attempt = int(env.get('RUN_ATTEMPT') or 1)
         failed_jobs = [job['name'] for job in jobs if job['run_attempt'] == attempt and job.get('conclusion') == 'failure']
         if env['SUMMARY'] == 'success':
-            if FAIL in lanes.values() or OPEN in lanes.values():
+            if {FAIL, OPEN, CANCELLED} & set(lanes.values()):
                 raise Blocked(f'Summary passed but a lane did not: {lanes}')
             lower = lower_members(gh, env['DEFAULT_BRANCH'], env['PR'], head)
     for sha, state, description in marks(ran, env.get('REASON', ''), env['SUMMARY'], lanes, failed_jobs,
@@ -2134,6 +2145,68 @@ def cmd_flush(args, gh, default_branch):
     return code
 
 
+# ----------------------------------------------------------------------------- unit watch
+
+# The step of each lane that runs the unit suite. A change that breaks a unit test, or
+# does not compile, fails that step on every lane that has one about 20 minutes in, and
+# then every lane goes on to its own 34 to 57 minutes. The watcher stops the run at the
+# first such failure.
+UNIT_STEPS = {'Host-arm64': 'test-unit', 'Host-x64': 'test-unit',
+              'Container-arm64': 'container-test-unit', 'Container-x64': 'container-test-unit'}
+
+
+def unit_verdict(jobs):
+    """What the unit steps of a run's lanes show so far: ('failed', lane) as soon as one
+    has failed, ('done', None) when every lane that has one is past it or has ended, else
+    ('running', None). Only a step that ran and failed counts: a lane that lost its runner
+    or was cancelled has no failed unit step."""
+    waiting = False
+    for job in jobs:
+        step_name = UNIT_STEPS.get(job['name'])
+        if not step_name:
+            continue
+        step = next((s for s in job.get('steps') or [] if s['name'] == step_name), None)
+        if step and step.get('conclusion') == 'failure':
+            return 'failed', job['name']
+        if job.get('conclusion') is None and not (step and step.get('conclusion')):
+            waiting = True
+    return ('running' if waiting else 'done'), None
+
+
+def cmd_unit_watch(args, gh, _default_branch):
+    """ci.yml's `unit-watch` job: cancel this run when the unit suite fails on a lane.
+    Reads RUN_ID, HEAD_SHA and RUN_URL. It never fails the run: whatever it cannot read,
+    it reads again, and at its deadline it stops watching."""
+    env = os.environ
+    deadline = time.monotonic() + args.minutes * 60
+    while True:
+        try:
+            jobs = gh.call(f"repos/{gh.repo}/actions/runs/{env['RUN_ID']}/jobs?per_page=100",
+                           '.jobs[] | {name, conclusion, steps: [.steps[]? | {name, conclusion}]}', paginate=True)
+            verdict, lane = unit_verdict(jobs)
+        except Blocked as why:
+            note(f'could not read the jobs: {why}')
+            verdict, lane = 'running', None
+        if verdict == 'failed':
+            note(f'::error::{UNIT_STEPS[lane]} failed on {lane}: cancelling the run. The other lanes would fail the same step.')
+            for path, fields in ((f"repos/{gh.repo}/statuses/{env['HEAD_SHA']}",
+                                  status_fields('failure', f'failed: {UNIT_STEPS[lane]} on {lane}; the run was cancelled there',
+                                                env['RUN_URL'])),
+                                 (f"repos/{gh.repo}/actions/runs/{env['RUN_ID']}/cancel", None)):
+                try:
+                    gh.call(path, method='POST', fields=fields)
+                except Blocked as why:
+                    note(f'{path}: {why}')
+            return 0
+        if verdict == 'done':
+            note('every unit step has finished without a failure: nothing to cancel')
+            return 0
+        if time.monotonic() >= deadline:
+            note(f'still running after {args.minutes} minutes: no longer watching')
+            return 0
+        time.sleep(args.interval)
+
+
 # ---------------------------------------------------------------------------------- main
 
 def main(argv=None):
@@ -2173,6 +2246,9 @@ def main(argv=None):
     land.add_argument('--despite', action='append', metavar='JOB=#ISSUE',
                       help='accept, by name, a failed job that is not a lane, with the issue that owns the failure')
     land.add_argument('--go', action='store_true', help='retarget and merge')
+    watch = sub.add_parser('unit-watch', help="cancel this CI run when a lane's unit step fails (ci.yml's unit-watch job)")
+    watch.add_argument('--minutes', type=float, default=60)
+    watch.add_argument('--interval', type=float, default=60)
     sub.add_parser('mark', help="state what this CI run showed as ci/pool statuses (ci.yml's pool-status job)")
     bisect = sub.add_parser('bisect', help='the next step for a pool whose top is red')
     bisect.add_argument('--of', required=True, help='a pull request or branch of the pool')
@@ -2204,8 +2280,8 @@ def main(argv=None):
         if repo.count('/') != 1:
             raise Blocked(f'cannot tell the repository from {repo!r}: pass --repo owner/name')
         gh = Gh(repo, max_requests=getattr(args, 'max_requests', None))
-        if args.command in ('plan', 'mark'):
-            return {'plan': cmd_plan, 'mark': cmd_mark}[args.command](args, gh, None)
+        if args.command in ('plan', 'mark', 'unit-watch'):
+            return {'plan': cmd_plan, 'mark': cmd_mark, 'unit-watch': cmd_unit_watch}[args.command](args, gh, None)
         if args.command == 'lane-files':
             top = git('rev-parse', '--show-toplevel')
             text = ('# Files that define the CI lanes. Derived: `python3 scripts/ci-pool/ci_pool.py lane-files --write`.\n'
