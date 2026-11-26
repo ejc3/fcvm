@@ -2968,6 +2968,44 @@ mod tests {
         assert_eq!(tokens_of(&manager, "slot-3").len(), 1);
     }
 
+    /// A dead holder's token frees its name whatever the state under its vm_id says of a
+    /// process: here that state records no PID at all. The token is what names the holder
+    /// that is gone; a state with no PID names no process and is no live owner, so the claim
+    /// deletes it with the name and publishes the new holder.
+    #[tokio::test]
+    async fn a_dead_holders_state_with_no_pid_goes_with_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        let mut old = named_state("vm-no-pid", "slot-5");
+        old.pid = None;
+        old.pid_start_time = None;
+        write_state_file(dir.path(), &old);
+        plant_token(&manager, "slot-5", &dead_token("vm-no-pid"), b"");
+        assert!(manager.state_file("vm-no-pid").exists());
+
+        let mut new = named_state("vm-new", "slot-5");
+        manager.claim_name(&mut new).await.unwrap();
+        assert!(
+            !manager.state_file("vm-no-pid").exists(),
+            "the dead holder's state outlived its name"
+        );
+        let listed: Vec<String> = manager
+            .list_vms()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|vm| vm.vm_id)
+            .collect();
+        assert_eq!(listed, vec!["vm-new".to_string()]);
+        let me = std::process::id();
+        let holder = NameToken {
+            pid: me,
+            start: process_start_time(me).unwrap(),
+            vm_id: "vm-new".to_string(),
+        };
+        assert_eq!(tokens_of(&manager, "slot-5"), vec![holder.file_name()]);
+    }
+
     /// A claimer killed between creating its token and writing it leaves an empty file.
     /// Its file name still says who owned it, so the slot is not wedged: a dead owner's is
     /// taken over, a live owner's keeps the name, and neither needs the content.
