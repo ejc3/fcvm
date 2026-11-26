@@ -528,8 +528,9 @@ main
         function = function[:function.index("\n}\n") + 3]
         head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
                               text=True, capture_output=True)
-        if head.returncode != 0:
-            self.skipTest("not a git checkout")
+        # The function reads a commit's files with `git archive`, so this test needs the
+        # checkout it runs in. Outside one it fails: a skip would read as a pass.
+        self.assertEqual(head.returncode, 0, "not a git checkout: " + head.stderr)
         dirty = subprocess.run(
             ["git", "-C", str(root), "status", "--porcelain", "--", "rootfs-config.toml", "kernel",
              "scripts/check-runner-kernel.py"], text=True, capture_output=True, check=True).stdout

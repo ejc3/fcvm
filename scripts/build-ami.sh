@@ -978,6 +978,9 @@ main() {
     reject_candidate "$ami_id"
     exit 1
   fi
+  # kernel_version already equals expected_kernel here (the image is created only then), so
+  # the second comparison cannot fail on its own. It is kept so that this check holds by
+  # itself if the earlier one is ever moved or removed.
   if [ "$boot_kernel" != "$kernel_version" ] || [ "$boot_kernel" != "$expected_kernel" ]; then
     echo "ERROR: the image booted $boot_kernel, not the $kernel_version the builder installed" \
       "(this commit builds $expected_kernel)" >&2
