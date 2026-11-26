@@ -54,21 +54,27 @@ for this file: 14 x64 root lanes started between 11:08 and 15:55 UTC name that k
 ## Build
 
 ```sh
-make verify           # cd verify && lake build: every proof and every recorded break, in the kernel
-make verify-search    # lake exe breaks: the exhaustive search and the audit, every rule book
+make verify           # the build and every check the CI job runs (below)
+make verify-search    # all 76 searches against WakeVerify/search.expected (JOBS=7: side by side)
 make verify-harness   # the model's kernel rules against the kernel's own functions (needs cc, network)
 ```
 
-The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.35.0`; elan installs it on first
-use). Lean's core only: no Mathlib, no other package.
+`make verify` runs, in this order, what `.github/workflows/verify.yml` runs:
 
-Measured on a shared arm64 dev box (Neoverse), toolchain already installed:
-
-| Command | Wall time | Peak memory |
+| Step | What it checks | Cost |
 |---|---|---|
-| `lake build`, every module but `Spec` and `Properties` rebuilt | 3 min 36 s, of which `Lemmas.lean` 206 s | 1.5 GB |
-| `lake exe breaks` (76 searches and audits, 449.8 million states in all) | 7 min 50 s as seven processes side by side (one a rule book, 6.5 to 7.9 min each; the restore orders, 2 min); 45 min 33 s of CPU in all, which is what one process takes | 3.3 GB a process |
-| `harness/run.sh` after `lake build`, kernel source already fetched | 1.3 s | 0.1 GB |
+| `check-imports.sh` | every file of the library is imported by `Axioms.lean`; `lakefile.toml` builds the library whole (`defaultTargets`, `globs`); the executables' sources declare no theorem or axiom | under 1 s |
+| `lake build` | every proof and every recorded break, in Lean's kernel | 3 min 37 s from cold, 1.5 GB |
+| `check-sweep.sh` | the axiom sweep, elaborated again whatever the build directory holds; `warningAsError` in `lakefile.toml` | 1 s |
+| `test-search.sh` | the search program's own gates: 15 cases | 24 s, 0.7 GB |
+| `harness/test-run.sh` | the harness against the kernel's functions, and the harness script's own gates: 8 cases | 15 s after the first fetch |
+| `search-expected.sh quick` | the 19 small searches against `WakeVerify/search.expected` | about 2 min, 1.2 GB |
+
+The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.35.0`; elan installs it on first
+use). Lean's core only: no Mathlib, no other package. The costs are from a shared arm64 dev box
+(Neoverse) with the toolchain installed, one run each: they say what to expect, and are not
+benchmarks. All of `make verify` on a built directory took 2 min 48 s and 1.6 GB. `make verify-search` is 76 searches and 449.8 million states: about 45 min of CPU and
+3.3 GB in one process, or 7 min 53 s with `JOBS=7` (one process a rule book, 3.3 GB each).
 
 ## The files
 
@@ -83,7 +89,10 @@ Measured on a shared arm64 dev box (Neoverse), toolchain already installed:
 | `WakeVerify/Proofs.lean` | `Sound`, `reachable_inv`, the `sound_*` and `design_*` theorems, which kernels are sound, and the smaller facts the documents cite |
 | `WakeVerify/Axioms.lean` | Fails the build if anything declared in a module of the library rests on more than `propext`, `Quot.sound`, `Classical.choice`, or if a module declares an axiom (a sweep by module, so a private theorem or one outside the namespace is looked at too), and pins the axioms of the cited theorems |
 | `Search.lean` | `lake exe breaks`: breadth-first search, kinds of break, shortest runs, the audit |
-| `HostOps.lean`, `harness/` | `lake exe hostops` and the C harness: the kernel's own functions against the rule books |
+| `WakeVerify/search.expected`, `search-expected.sh` | what every search prints (states, kinds with their counts and shortest runs, the audit's numbers), and its comparison with a run |
+| `HostOps.lean`, `harness/` | `lake exe hostops` and the C harness: the kernel's own functions against the rule books. `harness/operations.expected` pins how many operations each kernel is compared on |
+| `check-imports.sh`, `check-sweep.sh` | what `lake build` cannot check about itself |
+| `test-search.sh`, `harness/test-run.sh` | tests of the search program's gates and of the harness script's |
 
 ## The properties
 
@@ -151,9 +160,10 @@ Also proved:
   a statement about every restore, not one run (BREAKS.md, 3).
 - `hlt_rechecks`: the step after every HLT of the modelled guest paths goes back to the read.
 - `allActs_complete`, `allLabels_complete`: the list of labels the search iterates over has every
-  label. `replay_reachable`: the end of a recorded run is a `Reachable` state.
-- Every run in `Breaks.lean`: possible, and breaking its property, by `decide`. The design on the
-  same runs (`design_survives`): possible, and fine. `design_reaches_a_due_sleeper`: the design
+  label. `allLabels_fit_edge_encoding`: there are at most 64, which the search's graph encoding
+  needs. `replay_reachable`: the end of a recorded run is a `Reachable` state.
+- Every run in `Breaks.lean`: possible, and breaking its property, by `decide`. The design on
+  seven of those 44 runs (`design_survives`): possible, and fine. `design_reaches_a_due_sleeper`: the design
   does reach a state where a vCPU sleeps with its lock byte released, so the theorems are not
   empty of cases.
 
@@ -189,8 +199,10 @@ progress.) Then:
 - under the design there must be no such state, in any configuration;
 - under every rule book, each such vCPU must be flagged by a property of its own in that state
   (its own lost kick, missing waker, stuck call, orphan halt, lost timer or stranded node), or
-  have that flag ahead of it. "Ahead" is one case: a vCPU waiting in a cross-CPU call for a vCPU
-  that has lost its kick and has not executed its HLT yet.
+  have that flag ahead of it. "Ahead" means a state in which the vCPU is flagged can be reached
+  from this one over the audit's steps; it does not mean every continuation reaches one. In the
+  searches it is one case: a vCPU waiting in a cross-CPU call for a vCPU that has lost its kick
+  and has not executed its HLT yet.
 
 A dead vCPU with neither, or any dead vCPU under the design, fails the run (exit status 1), and so
 does a search that stops at its state limit, which is not audited. In the run recorded in
@@ -244,10 +256,16 @@ occupied; then every recorded run of `Breaks.lean` whose rule book has that kern
 The output must equal what `Today.lean` and `Design.lean` compute: 2,867, 4,804 and 2,951
 operations agree for v6.14, v7.3.3 and v7.3.3 with the patch. The harness proves it can fail by
 running v7.3.3's functions against the patched rule book: 55 operations differ, as they must.
-A step that cannot be carried out (the operations not generated in full, the functions crashing,
-`diff` unable to compare) ends the run as BLOCKED with exit status 2, for a kernel's own
-comparison and for the self-test alike; `harness/test-run.sh` injects each failure and checks
-that.
+The counts are pinned in `harness/operations.expected`: a run that compares a different number
+exits 1. Before it compares anything `run.sh` checks that every run of `Breaks.lean` is in
+`recordedRuns`, the hand-kept list `hostops` replays.
+
+A step that cannot be carried out ends the run as BLOCKED with exit status 2, never as agreement
+and never as a disagreement (exit 1). `harness/test-run.sh` injects five such failures through a
+stand-in tool on PATH and checks each: `hostops` failing after ten rows, the self-test's `diff`
+exiting 2 and exiting 0, a kernel's own `diff` exiting 2, the count of differing operations
+unreadable, and the compiler failing. It does not inject a crash of the compiled functions, a
+failed fetch or a failed `sed` or `paste`; those are checked in the script and not tested.
 
 **What it does not run.**
 
@@ -407,16 +425,30 @@ hang:
 
 ## CI
 
-`.github/workflows/verify.yml`, job `lean` (check name "Lean"): `cd verify && lake build` on a
-hosted runner, on every pull request that changes `verify/**` (no base-branch filter, so stacked
-pull requests are checked) and on every push to main. elan comes from a checksum-pinned release
-file, the toolchain is the one `lean-toolchain` names, both are cached with the build directory,
-and the job is capped at 15 minutes. It is a workflow of its own and is not part of `Summary`.
+`.github/workflows/verify.yml`, job `lean` (check name "Lean"), on a hosted runner, on every pull
+request that changes `verify/**` or the kernel patch the harness applies (no base-branch filter,
+so stacked pull requests are checked) and on every push to main. It runs the six steps of `make
+verify` (the table under "Build"), capped at 15 minutes. elan comes from a checksum-pinned release
+file, the toolchain is the one `lean-toolchain` names, and both are cached with the build
+directory. It is a workflow of its own and is not part of `Summary`.
 `tests/test_ci_workflow_coverage.rs` (`the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main`)
-pins its triggers and its build step.
+pins its triggers and each of the six lines of its build step.
 
-What fails it, each observed on this tree by breaking the model one way in a copy of this
-directory and running `lake build` (exit status 1 each time, and 0 for the unchanged copy):
+A second job, `search`, runs all 76 searches against `search.expected` when the workflow is
+dispatched by hand (`gh workflow run verify.yml --ref <branch>`): run it after a change to
+`Spec.lean`, `Today.lean`, `Design.lean`, `Properties.lean` or `Search.lean`.
+
+**Why the sweep has a step of its own.** CI restores `verify/.lake` from an earlier run, and `lake
+build` elaborates `Axioms.lean`, and so its sweep, only when something that file imports changed.
+A new module that nothing imports, holding an `axiom` and a theorem resting on it, built with exit
+0 on such a directory. Now `check-imports.sh` refuses the file before the build (it is not among
+`Axioms.lean`'s imports), and `check-sweep.sh` elaborates `Axioms.lean` after it on every run,
+where the sweep refuses it too. A library dropped from `defaultTargets`, or given a list of named
+modules in place of its glob, is refused by `check-imports.sh`: with either, a `sorry` in
+`Proofs.lean` built with exit 0.
+
+What fails `lake build`, each observed by breaking the model one way in a copy of this directory
+(exit status 1 each time, and 0 for the unchanged copy):
 
 | Broken | How | `lake build` |
 |---|---|---|
@@ -428,16 +460,16 @@ directory and running `lake build` (exit status 1 each time, and 0 for the uncha
 | a recorded break | the last step of `Run.pageReady` removed | fails in `Breaks.lean`: "`decide` proved that the proposition ... is false" |
 | a run under the design that stops being possible | `design_survives` asked about `Run.pageReady` in a configuration without locks taken with interrupts off | fails in `Breaks.lean`: "`decide` proved that the proposition `after (replay Design.rules ...) NoLostKick ∧ ...` is false" (`after` is false for a run that cannot be replayed) |
 
-The search (`make verify-search`) and the harness (`make verify-harness`, which fetches kernel
-source) are not in CI: run them by hand after a change to `Spec.lean`, `Today.lean`, `Design.lean`
-or `Properties.lean`. Each has a test of its own gates, also run by hand, each case observed
-failing with its fix reverted:
+What the other steps fail on, each observed the same way:
 
-- `./test-search.sh`: a search that stops at the state limit is not audited and fails the run,
-  under any rule book; and with `ownFlag` in a copy of `Search.lean` made blind to a lost kick
-  and a missing waker, the search of v7.3.3 without the restore kick and without snapshots exits
-  1 ("2088 dead vCPUs that no property flags"), where unchanged it exits 0.
-- `harness/test-run.sh`: `run.sh` ends as BLOCKED (exit 2) when `hostops` or `diff` fails.
+| Step | Broken | Result |
+|---|---|---|
+| `check-imports.sh` | a module nothing imports; `WakeVerify` out of `defaultTargets`; seven named modules for the glob | exit 1, naming it (`lake build` alone: exit 0 each time) |
+| `check-sweep.sh` | the module nothing imports, on a built directory | exit 1: "WakeVerify.Extra is not imported by WakeVerify.Axioms" |
+| `check-sweep.sh` | `warningAsError` removed and a definition Lean warns about | exit 1 (`lake build` alone: exit 0, with the warning printed) |
+| `test-search.sh` | the audit run on an unfinished search; `main` ignoring the audit's count; a pattern that matches no search; a panic | its cases fail: see the script's header |
+| `harness/test-run.sh` | `run.sh` before its checks | its cases fail: 3 of the first 5 against the script as first committed, the 3 added later against the script before them |
+| `search-expected.sh` | a kind removed from, added to or changed in `search.expected`, or a search's block dropped | exit 1: "the search differs" |
 
 ## Conventions
 
