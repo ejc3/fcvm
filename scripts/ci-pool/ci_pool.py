@@ -431,19 +431,178 @@ def cmd_status(args, gh, default_branch):
 # ci.yml on a commit with that tree. A pull request's run executes the pull request's own
 # workflow, Makefile and scripts, so a change to any of them could produce a job with a
 # lane's name that tested nothing. A run therefore proves nothing for a landing that
-# changes one of these paths: the lanes run again on the default branch, under the files
-# that landed. scripts/test-ci-pool.py fails when a lane job of ci.yml runs a script or a
-# local action that no pattern here matches.
-LANE_DEFINING = ('.github/*', 'Makefile', '.config/nextest.toml', 'scripts/*', 'Containerfile*',
-                 'rust-toolchain.toml', '.cargo/*')
+# changes a file that defines the lanes: the lanes run again on the default branch, under
+# the files that landed.
+#
+# Which files those are is derived from ci.yml and the Makefile (`lane_files`) and
+# committed as LANE_FILES_LIST, one path or pattern a line. scripts/test-ci-pool.py fails
+# when the committed list is not what the derivation gives, so a script that ci.yml or
+# the Makefile starts to call cannot stay off it. ALWAYS holds what the list cannot speak
+# for: itself, this tool, and the two files it is derived from.
+LANE_FILES_LIST = 'scripts/ci-pool/lane-defining.txt'
+ALWAYS = ('.github/workflows/ci.yml', 'Makefile', 'scripts/ci-pool/*')
+# What counts when the list cannot be read: everything a lane could be running.
+CONSERVATIVE = ('.github/*', 'Makefile', '.config/nextest.toml', 'scripts/*', 'Containerfile*',
+                'rust-toolchain.toml', '.cargo/*')
+# The jobs of ci.yml that are lanes or decide which lanes run.
+LANE_JOBS = ('changes', 'skip-check', 'host', 'host-root', 'container')
+# Listed files that name other scripts as data and run none of them: the scope script
+# classifies paths, and this tool and its test name scripts to list and to test them. They
+# are on the list themselves; the names inside them are not followed.
+NAMES_AS_DATA = ('scripts/ci-pr-scope.sh', 'scripts/ci-pool/*', 'scripts/test-ci-pool.py')
+SCRIPT_MENTION = re.compile(r'scripts/[\w./-]*[\w/-]')
+
+
+def makefile_text_for(makefile, targets):
+    """The Makefile text that runs when these targets are made: their recipes, their
+    prerequisites' and those of every target a recipe makes in turn, the definitions of
+    the variables all of that uses, and every definition that runs a shell command when
+    the Makefile is read. None when a target is not a rule of the Makefile: what cannot
+    be followed is not guessed at."""
+    lines = makefile.replace('\\\n', ' ').split('\n')
+    variables, rules, current = {}, {}, None
+    for line in lines:
+        if line.startswith('\t'):
+            if current:
+                for name in current:
+                    rules[name]['text'].append(line)
+            continue
+        specific = re.match(r'^([\w./%-]+(?:\s+[\w./%-]+)*)\s*:\s*(?:private\s+|export\s+)*([\w.-]+)\s*[:?+]?=\s*(.*)$', line)
+        define = re.match(r'^(?:export\s+|override\s+)*([\w.-]+)\s*[:?+]?=\s*(.*)$', line)
+        rule = re.match(r'^([^\s:#=$][^:=#]*):(?!=)([^=]*)$', line)
+        if specific:
+            for name in specific[1].split():
+                rules.setdefault(name, {'needs': [], 'text': []})['text'].append(specific[3])
+            current = None
+        elif define:
+            variables.setdefault(define[1], []).append(define[2])
+            current = None
+        elif rule:
+            current = rule[1].split()
+            for name in current:
+                entry = rules.setdefault(name, {'needs': [], 'text': []})
+                entry['needs'] += rule[2].replace('|', ' ').split()
+        elif line.strip() and not line.startswith('#'):
+            current = None
+    out, todo, done = [], list(targets), set()
+    while todo:
+        name = todo.pop()
+        if name in done:
+            continue
+        done.add(name)
+        if name not in rules:
+            if name in targets:
+                return None
+            continue
+        text = '\n'.join(rules[name]['text'])
+        out.append(text)
+        todo += [need for need in rules[name]['needs'] if need in rules]
+        todo += [made for made in re.findall(r'(?:\$\(MAKE\)|\bmake)\s+(?:-[\w-]+\s+)*([\w-]+)', text) if made in rules]
+    used, pending = set(), [name for text in out for name in re.findall(r'\$[({]([\w.-]+)[)}]', text)]
+    pending += [name for name, values in variables.items() if any('$(shell' in value for value in values)]
+    while pending:
+        name = pending.pop()
+        if name in used or name not in variables:
+            continue
+        used.add(name)
+        for value in variables[name]:
+            out.append(value)
+            pending += re.findall(r'\$[({]([\w.-]+)[)}]', value)
+    return '\n'.join(out)
+
+
+def lane_files(root):
+    """The paths and patterns that define the lanes, derived from the tree at `root`:
+
+    - ci.yml, the Makefile, the nextest configuration, the toolchain pin, .cargo/ and
+      every Containerfile;
+    - every local action a lane job of ci.yml uses;
+    - every script named by a lane job of ci.yml, or by the Makefile text that runs when
+      a target those jobs make is made (`makefile_text_for`; the whole Makefile when a
+      target cannot be followed), and every script those name in turn, by path or by
+      file name. A name followed by a glob or a variable, and the name of a directory,
+      stand for everything that starts with them.
+
+    What this cannot follow is a script reached through a name built at run time. A new
+    way of calling one shows up as a change to ci.yml, the Makefile or a listed script,
+    each of which is on the list itself."""
+    root = Path(root)
+    tracked = git('ls-files', cwd=root).split('\n')
+    scripts = [path for path in tracked if path.startswith('scripts/')]
+    found = {'.github/workflows/ci.yml', 'Makefile', '.config/nextest.toml', 'rust-toolchain.toml', '.cargo/*',
+             'Containerfile*', LANE_FILES_LIST}
+    ci = (root / '.github/workflows/ci.yml').read_text()
+    body = ci.split('\njobs:\n', 1)[1]
+    blocks = dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', body, re.M | re.S))
+    makefile = (root / 'Makefile').read_text()
+    made = sorted({target for name in LANE_JOBS
+                   for target in re.findall(r'\bmake\s+(?:-[\w-]+\s+)*([\w-]+)', blocks[name])})
+    sources = [blocks[name] for name in LANE_JOBS] + [makefile_text_for(makefile, made) or makefile]
+    found.add('scripts/ci-pr-scope.sh')
+    for block in sources[:-1]:
+        found |= {f'.github/{path.rstrip("/")}/*' for path in re.findall(r'uses: \./(?:fcvm/)?\.github/([\w./-]+)', block)}
+
+    def named_in(text):
+        out = set()
+        for match in SCRIPT_MENTION.finditer(text):
+            name, after = match[0].rstrip('/'), text[match.end():match.end() + 1]
+            if name in scripts:
+                out.add(name)
+            elif any(path.startswith(name + '/') for path in scripts):
+                out.add(name + '/*')
+            elif after in ('*', '$', '{') and any(path.startswith(name) for path in scripts):
+                out.add(name + '*')
+        return out
+
+    todo = set()
+    for text in sources:
+        todo |= named_in(text)
+    seen = set()
+    while todo:
+        entry = todo.pop()
+        if entry in seen:
+            continue
+        seen.add(entry)
+        for path in (p for p in scripts if fnmatch.fnmatchcase(p, entry)):
+            if any(fnmatch.fnmatchcase(path, pattern) for pattern in NAMES_AS_DATA):
+                continue
+            try:
+                text = (root / path).read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            todo |= named_in(text)
+            # A script in the same directory, named by its file name alone ("$HERE/other.sh").
+            for other in scripts:
+                if other != path and Path(other).parent == Path(path).parent and Path(other).name in text:
+                    todo.add(other)
+    found |= seen
+    # A pattern already on the list speaks for the paths under it.
+    patterns = {entry for entry in found if '*' in entry}
+    return sorted(entry for entry in found
+                  if '*' in entry or not any(fnmatch.fnmatchcase(entry, pattern) for pattern in patterns))
+
+
+def read_lane_files(root='.'):
+    """The committed list, or None when it cannot be read."""
+    try:
+        lines = (Path(root) / LANE_FILES_LIST).read_text().splitlines()
+    except OSError:
+        return None
+    entries = [line.strip() for line in lines if line.strip() and not line.startswith('#')]
+    return entries or None
+
+
 PASS, RERUN_PASS, FAIL, OPEN = 'pass', 'pass-on-rerun', 'fail', 'open'
 MAX_EVIDENCE_AGE_DAYS = 7
 COMPARE_FILE_CAP = 300
 EVIDENCE_EVENTS = ('pull_request', 'workflow_dispatch', 'push')
 
 
-def lane_defining(path):
-    return any(fnmatch.fnmatchcase(path, pattern) for pattern in LANE_DEFINING)
+def lane_defining(path, listed=None):
+    """Whether a changed path defines the lanes. `listed` is the committed list; without
+    it, everything a lane could be running counts."""
+    patterns = ALWAYS + (tuple(listed) if listed else CONSERVATIVE)
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
 
 
 def latest(jobs, name):
@@ -487,7 +646,7 @@ def scope_skipped_the_lanes(jobs):
             and not any(job['name'] in LANES for job in jobs))
 
 
-def proof_from(commit, runs, landing_tree, compare, accept_rerun=False):
+def proof_from(commit, runs, landing_tree, compare, accept_rerun=False, listed=None):
     """What the runs on one commit prove for a landing: (lanes, no_lanes, why_not).
 
     commit: {'sha', 'tree'}. runs: [{'id', 'event', 'jobs'}]. compare: the comparison of
@@ -505,7 +664,7 @@ def proof_from(commit, runs, landing_tree, compare, accept_rerun=False):
         return {}, None, f"{commit['sha'][:12]} does not contain the default branch ({compare['status']})"
     if len(compare['files']) >= COMPARE_FILE_CAP:
         return {}, None, f"{len(compare['files'])} changed files, more than the comparison lists"
-    changed = sorted(path for path in compare['files'] if lane_defining(path))
+    changed = sorted(path for path in compare['files'] if lane_defining(path, listed))
     if changed:
         return {}, None, f"the landing changes what defines the lanes: {', '.join(changed[:3])}"
     lanes, no_lanes = {}, None
@@ -574,7 +733,7 @@ def landing_evidence(gh, sha, now=None):
     return landing['tree'], out
 
 
-def plan_lanes(event, landing_tree=None, evidence=(), confine=False, lanes_input=''):
+def plan_lanes(event, landing_tree=None, evidence=(), confine=False, lanes_input='', listed=None):
     """(lanes, reasons): the self-hosted lanes this run takes, and why.
 
     A pull request takes PR_LANES (and Host-x64 for a change to confinement). A push takes
@@ -588,7 +747,7 @@ def plan_lanes(event, landing_tree=None, evidence=(), confine=False, lanes_input
         return LANES, [f'event {event}']
     have, reasons = {}, []
     for commit, runs, compare in evidence:
-        lanes, no_lanes, why_not = proof_from(commit, runs, landing_tree, compare)
+        lanes, no_lanes, why_not = proof_from(commit, runs, landing_tree, compare, listed=listed)
         if why_not:
             reasons.append(f'no proof: {why_not}')
             continue
@@ -638,8 +797,11 @@ def cmd_plan(_args, gh, _default_branch):
             tree, evidence = landing_evidence(gh, os.environ['SHA'])
         except (Blocked, KeyError) as why:
             note(f'no evidence for this push: {why}')
+    listed = read_lane_files()
+    if event == 'push' and listed is None:
+        note(f'{LANE_FILES_LIST} cannot be read: every file a lane could run counts as lane-defining')
     lanes, reasons = plan_lanes(event, tree, evidence, os.environ.get('CONFINE') == 'true',
-                                os.environ.get('LANES', ''))
+                                os.environ.get('LANES', ''), listed)
     for reason in reasons:
         note(reason)
     note(f"Self-hosted jobs for this {event or 'event'}: {' '.join(lanes) or 'none'}")
@@ -1217,6 +1379,8 @@ def main(argv=None):
     publish.add_argument('--lock-wait', type=float, default=900)
 
     sub.add_parser('status', help="pools, members and whether each member's head has been tested")
+    lane_list = sub.add_parser('lane-files', help='the files that define the lanes, derived from ci.yml and the Makefile')
+    lane_list.add_argument('--write', action='store_true', help=f'write {LANE_FILES_LIST}')
     sub.add_parser('plan', help="the self-hosted lanes of this CI run (ci.yml's skip-check job)")
 
     for name, text in (('cost', 'runs, runner-minutes and dollars from the Actions API'),
@@ -1247,6 +1411,16 @@ def main(argv=None):
         gh = Gh(repo, max_requests=getattr(args, 'max_requests', None))
         if args.command == 'plan':
             return cmd_plan(args, gh, None)
+        if args.command == 'lane-files':
+            top = git('rev-parse', '--show-toplevel')
+            text = ('# Files that define the CI lanes. Derived: `python3 scripts/ci-pool/ci_pool.py lane-files --write`.\n'
+                    '# A landing that changes one of these runs every lane on the default branch (docs/ci-pool.md).\n'
+                    + '\n'.join(lane_files(top)) + '\n')
+            if args.write:
+                (Path(top) / LANE_FILES_LIST).write_text(text)
+            else:
+                print(text, end='')
+            return 0
         default_branch = os.environ.get('DEFAULT_BRANCH') or gh.one(f'repos/{repo}', '.default_branch')
         return {'build': cmd_build, 'publish': cmd_publish, 'status': cmd_status,
                 'cost': cmd_cost, 'failures': cmd_failures}[args.command](args, gh, default_branch)
