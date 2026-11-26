@@ -1172,10 +1172,16 @@ cannot. The top PR's run tests every layer: its `changes` job classifies the who
 `main`, not only the top PR's files, so a docs-only top cannot skip the matrix for code changed
 lower down.
 
-When the top's `Summary` passes, the `Stack coverage` job posts a **`Stack CI`** success status
-on each lower PR's head, naming the run, but only on heads that are ancestors of the tested
-head (`scripts/ci-stack-coverage.sh`). A lower PR is tested when it carries `Summary` success or
-`Stack CI` success on its current head; `Summary (deferred)` alone means nothing ran for it.
+Every pull request run states what it showed as a **`ci/pool`** commit status (the `Pool status`
+job, `scripts/ci-pool/ci_pool.py mark`). A run that tested nothing puts `pending` on its head. A
+run that passed puts `success`, naming the run, on its head and on each lower PR's head that is
+an ancestor of the tested head. A run that failed puts `failure` on its own head only. A PR is
+tested when its current head carries `ci/pool` success; `Summary (deferred)` alone means nothing
+ran for it, and its `ci/pool` status then reads `pending`.
+
+When the top is red, `python3 scripts/ci-pool/ci_pool.py bisect --of <PR>` reads the runs on every
+layer's head and prints the next step (run the failed jobs again once, run the failing lanes on a
+lower layer, or the first failing prefix); `--go` takes it. See `docs/ci-pool.md`.
 
 A lower PR defers only to a child whose head already contains its new head. Push every
 updated layer of a stack in one command (`git push origin layer-1 layer-2 layer-3`): a lower

@@ -8,7 +8,7 @@
 # the top of the stack, whose head holds every lower PR's commits. The top's run
 # classifies the whole stack's diff against the default branch, not only its own
 # files, so a docs-only top PR cannot skip the matrix for code changed lower down.
-# `ci-stack-coverage.sh` then marks the lower PRs' heads as covered.
+# `scripts/ci-pool/ci_pool.py mark` then puts a `ci/pool` status on the lower PRs' heads.
 #
 # Every lookup that fails runs the full matrix: a scope that cannot be computed
 # must not skip anything.

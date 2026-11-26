@@ -48,7 +48,7 @@ FAKE_GH = textwrap.dedent('''\
         log.write(json.dumps({'method': method, 'path': path, 'fields': fields}) + '\\n')
     fixture = json.load(open(os.environ['FAKE_GH_FIXTURE']))
     if method != 'GET':
-        answer = {}
+        answer = fixture.get(method + ' ' + path, {})
     else:
         answer = fixture.get(path)
         if answer is None:
@@ -195,7 +195,8 @@ class Sandbox(unittest.TestCase):
 
     def tool(self, *args, prs=(), fixture=None, cwd=None, env=None):
         answers = {f'repos/{REPO}/pulls?state=open&per_page=100': list(prs),
-                   f'repos/{REPO}/commits/*': {'statuses': []}}
+                   f'repos/{REPO}/commits/*': {'statuses': []},
+                   f'repos/{REPO}/actions/runs?head_sha=*': {'workflow_runs': []}}
         answers.update(fixture or {})
         (self.dir / 'fixture.json').write_text(json.dumps(answers))
         full = dict(self.env, GH=str(self.dir / 'gh'), FAKE_GH_FIXTURE=str(self.dir / 'fixture.json'),
@@ -229,12 +230,11 @@ class Build(Sandbox):
         bases = [(path, fields['base']) for method, path, fields in self.writes(calls) if method == 'PATCH']
         self.assertEqual(bases, [('pulls/2', 'a'), ('pulls/3', 'b')])
 
-    def test_the_tool_posts_no_status(self):
+    def test_a_build_posts_no_status(self):
         # Whether a head was tested is something only a run can state.
         self.three()
         _, _, calls = self.tool('build', '1', '2', '3', prs=self.prs((1, 'a', 'main'), (2, 'b', 'main'), (3, 'c', 'main')))
         self.assertEqual([path for method, path, _ in self.writes(calls) if method == 'POST'], [])
-        self.assertNotIn('/statuses/', TOOL.read_text())
 
     def test_a_member_that_conflicts_is_left_out_whole(self):
         a = self.commit('a', {'shared.txt': 'from a\n'}, 'a')
@@ -391,6 +391,135 @@ class Publish(Sandbox):
         self.assertEqual(code, 2, out)
         self.assertIn('zzz is not a member of this pool', out)
         self.assertEqual(self.writes(calls), [])
+
+    # ---- the queue
+
+    def flying(self, sha, jobs=(), number=900):
+        return {f'repos/{REPO}/actions/runs?head_sha={sha}&per_page=100': {'workflow_runs': [
+                    {'id': number, 'path': '.github/workflows/ci.yml', 'event': 'pull_request', 'status': 'in_progress',
+                     'created_at': '2026-01-01T00:00:00Z'}]},
+                f'repos/{REPO}/actions/runs/{number}/jobs?filter=latest&per_page=100': {'jobs': list(jobs)}}
+
+    def queued(self):
+        out = self.git('ls-remote', str(self.origin), 'refs/ci-pool/pending/*')
+        return {line.split('\t')[1].rsplit('/', 1)[-1]: line.split('\t')[0] for line in out.splitlines() if line}
+
+    RUNNING = [{'name': 'Host-arm64', 'conclusion': None}, {'name': 'Container-arm64', 'conclusion': 'success'}]
+
+    def test_a_publish_while_the_tops_run_is_in_flight_is_queued_and_moves_no_branch(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        before = {branch: self.remote(branch) for branch in 'abc'}
+        new = self.commit('b', {'b.txt': 'b fixed\n'}, 'fix b', push=False)
+        self.hook_log()
+        code, out, calls = self.tool('publish', prs=prs, fixture=self.flying(before['c'], self.RUNNING))
+        self.assertEqual(code, 0, out)
+        self.assertIn('QUEUED: b at', out)
+        self.assertEqual({branch: self.remote(branch) for branch in 'abc'}, before)
+        self.assertEqual(self.queued(), {'b': new})
+        self.assertEqual(self.writes(calls), [])
+        # status shows it, from any clone
+        _, out, _ = self.tool('status', prs=prs)
+        self.assertRegex(out, rf'#2 .*\[queued: {new[:9]}, age unknown')
+        made = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=45)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        _, out, _ = self.tool('status', prs=prs, fixture={f'repos/{REPO}/git/commits/{new}': {'committer': {'date': made}}})
+        self.assertRegex(out, rf'#2 .*\[queued: {new[:9]}, committed 4[45] min ago: `flush` puts it in\]')
+        long_ago = {f'repos/{REPO}/git/commits/{new}': {'committer': {'date': '2026-01-01T00:00:00Z'}}}
+        self.assertRegex(self.tool('status', prs=prs, fixture=long_ago)[1], r'committed \d+ h ago')
+
+    def test_a_publish_goes_in_at_once_when_nothing_is_in_flight_or_a_lane_has_already_failed(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        top = self.remote('c')
+        new = self.commit('b', {'b.txt': 'b fixed\n'}, 'fix b', push=False)
+        failed = self.RUNNING + [{'name': 'Host-Root-arm64-SnapshotEnabled', 'conclusion': 'failure'}]
+        code, out, _ = self.tool('publish', prs=prs, fixture=self.flying(top, failed))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((self.remote('b'), self.queued()), (new, {}))
+        prs = self.prs(*members)
+        newer = self.commit('b', {'b.txt': 'b fixed again\n'}, 'fix b again', push=False)
+        code, out, _ = self.tool('publish', '--now', prs=prs, fixture=self.flying(self.remote('c'), self.RUNNING))
+        self.assertEqual((code, self.remote('b'), self.queued()), (0, newer, {}), out)
+
+    def test_a_run_on_the_top_that_has_finished_holds_nothing(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        top = self.remote('c')
+        new = self.commit('b', {'b.txt': 'b fixed\n'}, 'fix b', push=False)
+        fixture = self.flying(top, self.RUNNING)
+        fixture[f'repos/{REPO}/actions/runs?head_sha={top}&per_page=100']['workflow_runs'][0]['status'] = 'completed'
+        code, out, _ = self.tool('publish', prs=prs, fixture=fixture)
+        self.assertEqual((code, self.remote('b'), self.queued()), (0, new, {}), out)
+
+    def test_a_run_on_the_top_that_is_not_its_own_run_of_the_lanes_holds_nothing(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        top = self.remote('c')
+        new = self.commit('b', {'b.txt': 'b fixed\n'}, 'fix b', push=False)
+        fixture = self.flying(top, [{'name': 'Changes', 'conclusion': 'success'}, {'name': 'Summary (deferred)', 'conclusion': None}])
+        code, out, _ = self.tool('publish', prs=prs, fixture=fixture)
+        self.assertEqual((code, self.remote('b')), (0, new), out)
+
+    def test_a_later_publish_must_contain_what_is_already_queued(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        fixture = self.flying(self.remote('c'), self.RUNNING)
+        first = self.commit('b', {'b.txt': 'first\n'}, 'first', push=False)
+        self.assertEqual(self.tool('publish', prs=prs, fixture=fixture)[0], 0)
+        second = self.commit('b', {'b.txt': 'second\n'}, 'second', push=False)
+        code, out, _ = self.tool('publish', prs=prs, fixture=fixture)
+        self.assertEqual((code, self.queued()), (0, {'b': second}), out)
+        other = self.dir / 'other'
+        self.git('clone', '-q', str(self.origin), str(other), cwd=self.dir)
+        self.git('checkout', '-q', 'b', cwd=other)
+        (other / 'x.txt').write_text('from another checkout\n')
+        self.git('add', 'x.txt', cwd=other)
+        self.git('commit', '-q', '-m', 'another', cwd=other)
+        code, out, _ = self.tool('publish', prs=prs, fixture=fixture, cwd=other)
+        self.assertEqual(code, 2, out)
+        self.assertIn('already has', out)
+        self.assertEqual(self.queued(), {'b': second}, 'a queued publish was dropped')
+
+    def test_flush_waits_for_the_run_and_then_puts_everything_queued_in_with_one_push(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        top = self.remote('c')
+        fixture = self.flying(top, self.RUNNING)
+        fix_a = self.commit('a', {'a.txt': 'a fixed\n'}, 'fix a', push=False)
+        self.assertEqual(self.tool('publish', prs=prs, fixture=fixture)[0], 0)
+        fix_c = self.commit('c', {'c.txt': 'c fixed\n'}, 'fix c', push=False)
+        self.assertEqual(self.tool('publish', prs=prs, fixture=fixture)[0], 0)
+        self.git('checkout', '-q', '--detach', 'origin/main')
+        code, out, _ = self.tool('flush', '--of', '2', prs=prs, fixture=fixture)
+        self.assertEqual(code, 0, out)
+        self.assertIn('WAITING: run 900', out)
+        self.assertEqual((self.remote('c'), set(self.queued())), (top, {'a', 'c'}))
+        self.hook_log()
+        code, out, _ = self.tool('flush', '--of', '2', prs=prs)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.remote('a'), fix_a)
+        for branch in 'bc':
+            self.assertTrue(self.contains(branch, fix_a), branch)
+        self.assertTrue(self.contains('c', fix_c))
+        self.assertEqual(self.queued(), {})
+        # One push for the branches, one for the queue entries.
+        self.assertEqual((self.dir / 'pushes').read_text().count('push'), 2)
+        self.assertIn('nothing is queued', self.tool('flush', '--of', '2', prs=self.prs(*members))[1])
+
+    def test_a_flush_that_conflicts_keeps_the_queue(self):
+        members = self.pool()
+        prs = self.prs(*members)
+        fixture = self.flying(self.remote('c'), self.RUNNING)
+        self.commit('c', {'shared.txt': 'from c\n'}, 'c touches shared')
+        prs = self.prs(*members)
+        fixture = self.flying(self.remote('c'), self.RUNNING)
+        fix_a = self.commit('a', {'shared.txt': 'from a\n'}, 'a touches shared', push=False)
+        self.assertEqual(self.tool('publish', prs=prs, fixture=fixture)[0], 0)
+        self.git('checkout', '-q', '--detach', 'origin/main')
+        code, out, _ = self.tool('flush', '--of', '2', prs=prs)
+        self.assertEqual(code, 3, out)
+        self.assertIn('CONFLICT', out)
+        self.assertEqual(self.queued(), {'a': fix_a})
 
     def hook_log(self):
         path = self.origin / 'hooks' / 'pre-receive'
@@ -771,13 +900,13 @@ class Tool(Sandbox):
         a = self.commit('a', {'a.txt': 'a\n'}, 'a')
         self.commit('b', {'b.txt': 'b\n'}, 'b', start='a')
         verdict = {'statuses': [{'context': 'other', 'state': 'failure'},
-                                {'context': 'Stack CI', 'state': 'success', 'description': 'Tested by #2'}]}
+                                {'context': 'ci/pool', 'state': 'success', 'description': 'Tested by #2'}]}
         code, out, _ = self.tool('status', prs=self.prs((1, 'a', 'main'), (2, 'b', 'a')) + [pr(9, 'x', 'gone')],
                                  fixture={f'repos/{REPO}/commits/{a}/status': verdict})
         self.assertEqual(code, 0, out)
         self.assertRegex(out, r'pool of 2, top #2 b')
         self.assertRegex(out, r'1\. #1 .* success .*Tested by #2')
-        self.assertRegex(out, r'2\. #2 .* top .*its own run')
+        self.assertRegex(out, r'2\. #2 .* none ')
         self.assertRegex(out, r'#9 x: NOT A POOL')
 
 
@@ -1236,7 +1365,9 @@ class RedPool(unittest.TestCase):
         self.assertIn(ci_pool.PR_LANES[-1], step['why'])
         # A lower member's green run says nothing about the top.
         self.assertEqual(self.diagnose(members, {1: self.all('pass')})['outcome'], 'waiting')
-        self.assertEqual(self.diagnose(members, {2: {}}, required=())['outcome'], 'waiting')
+        # No lane is required only when the top's own run found that the change needs none.
+        self.assertEqual(self.diagnose(members, {2: {}}, required=())['outcome'], 'green')
+        self.assertEqual(self.diagnose(members, {2: {}})['outcome'], 'waiting')
 
     def test_a_lane_that_failed_and_then_passed_is_not_simply_green(self):
         members = self.pool(3)
@@ -1409,6 +1540,477 @@ class RedPool(unittest.TestCase):
         self.assertEqual(ci_pool.suspects([BOUNDARY], files), [2])
         self.assertEqual(ci_pool.suspects([BOUNDARY], {2: files[2], 5: ['src/commands/common.rs']}), [])
         self.assertEqual(ci_pool.suspects(['runner lost: no contact', 'fcvm::test_x y'], files), [])
+
+
+class PoolOfThree(Sandbox):
+    """A pool of three on a fake GitHub, and runs on its members' heads."""
+
+    def setUp(self):
+        super().setUp()
+        self.SHAS = ['1' * 40, '2' * 40, '3' * 40]
+        self.logs = self.dir / 'logs'
+        self.logs.mkdir()
+        self.next_run = 500
+        self.fixture = {f'repos/{REPO}/actions/runs?head_sha=*': {'workflow_runs': []},
+                        f'repos/{REPO}/check-runs/*': [], f'repos/{REPO}/compare/*': {'files': []},
+                        f'repos/{REPO}/issues?state=open&per_page=100': []}
+        self.members = [pr(11, 'a', 'main', self.SHAS[0]), pr(12, 'b', 'a', self.SHAS[1]), pr(13, 'c', 'b', self.SHAS[2])]
+
+    def add_run(self, index, lanes, event='pull_request', attempt=1, test='fcvm::test_x fails'):
+        """A run on member `index` with {lane: conclusion or [conclusion per attempt]}."""
+        self.next_run += 1
+        number, jobs = self.next_run, []
+        for lane_name, conclusions in lanes.items():
+            for n, conclusion in enumerate(conclusions if isinstance(conclusions, list) else [conclusions], 1):
+                job_id = number * 100 + len(jobs)
+                jobs.append({'id': job_id, 'name': lane_name, 'conclusion': conclusion, 'run_attempt': n})
+                if conclusion == 'failure':
+                    (self.logs / f'{job_id}.log').write_text(
+                        f'     Summary [  1.0s] 9 tests run: 8 passed, 1 failed\n        FAIL [   0.1s] ( 3/9) {test}\n')
+        key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[index]}&per_page=100'
+        listed = self.fixture.setdefault(key, {'workflow_runs': []})['workflow_runs']
+        listed.append({'id': number, 'path': '.github/workflows/ci.yml', 'event': event, 'status': 'completed',
+                       'run_attempt': attempt, 'html_url': f'https://example.invalid/runs/{number}',
+                       'created_at': '2026-01-01T00:00:00Z'})
+        self.fixture[f'repos/{REPO}/actions/runs/{number}/jobs?filter=all&per_page=100'] = {'jobs': jobs}
+        return number
+
+    def green(self):
+        return {lane_name: 'success' for lane_name in ci_pool.PR_LANES}
+
+
+class BisectCommand(PoolOfThree):
+    """`bisect`: what it reads, says and does."""
+
+    def bisect(self, *args):
+        code, out, calls = self.tool('bisect', '--of', '13', *args, prs=self.members, fixture=self.fixture,
+                                     env={'CI_POOL_LOGS': str(self.logs)})
+        return code, out, self.writes(calls)
+
+    def test_a_green_top_needs_nothing(self):
+        self.add_run(2, self.green())
+        code, out, writes = self.bisect('--go')
+        self.assertEqual((code, writes), (0, []), out)
+        self.assertIn('GREEN', out)
+
+    def test_without_go_nothing_is_done(self):
+        self.add_run(2, dict(self.green(), **{'Host-arm64': 'failure'}))
+        code, out, writes = self.bisect()
+        self.assertEqual((code, writes), (0, []), out)
+        self.assertRegex(out, r'NEXT: run the failed jobs of run \d+ again')
+
+    def test_a_failure_seen_once_reruns_the_failed_jobs_of_that_run(self):
+        run = self.add_run(2, dict(self.green(), **{'Host-arm64': 'failure'}))
+        code, out, writes = self.bisect('--go')
+        self.assertEqual(writes, [('POST', f'actions/runs/{run}/rerun-failed-jobs', {})], out)
+
+    def test_a_failure_seen_twice_dispatches_the_failing_lane_on_a_lower_member(self):
+        self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=2)
+        code, out, writes = self.bisect('--go')
+        self.assertEqual(writes, [('POST', 'actions/workflows/ci.yml/dispatches', {'ref': 'a', 'inputs[lanes]': 'Host-arm64'})], out)
+        self.assertIn('1 of 8 extra runs spent', out)
+
+    def test_a_probe_that_passes_names_the_first_failing_prefix_and_posts_it_on_that_member(self):
+        top = self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=2)
+        self.add_run(0, {'Host-arm64': 'success'}, event='workflow_dispatch')
+        self.add_run(1, {'Host-arm64': 'success'}, event='workflow_dispatch')
+        code, out, writes = self.bisect('--go')
+        self.assertIn('VERDICT: first failing prefix: the failure appears when #13 is added to the pool', out)
+        self.assertIn('3 of 8 extra runs spent', out)
+        self.assertEqual(len(writes), 1, writes)
+        method, path, fields = writes[0]
+        self.assertEqual((method, path), ('POST', f'statuses/{self.SHAS[2]}'))
+        self.assertEqual((fields['state'], fields['context'], fields['target_url']),
+                         ('failure', 'ci/pool', f'https://example.invalid/runs/{top}'))
+        self.assertIn('fails when #13 is added', fields['description'])
+        self.assertLessEqual(len(fields['description']), 140)
+
+    def test_the_only_status_bisect_posts_is_a_failure(self):
+        # A success is a claim that lanes passed: only the run that passed states it (`mark`).
+        source = TOOL.read_text()
+        body = source.split('def cmd_bisect(', 1)[1].split('\n# ---', 1)[0]
+        self.assertEqual(re.findall(r"status_fields\('(\w+)'", body), ['failure'])
+        self.assertEqual(source.count('/statuses/'), 2, 'a status is posted somewhere other than mark and bisect')
+        self.assertEqual(source.split('def cmd_mark(', 1)[1].count('/statuses/'), 1)
+
+    def test_a_failure_that_then_passed_is_filed_under_the_issue_that_owns_its_cause(self):
+        run = self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'success']}), attempt=2,
+                           test='fcvm::test_fuzz_gym gym_pairs_04')
+        self.fixture[f'repos/{REPO}/issues?state=open&per_page=100'] = [
+            {'number': 70, 'body': 'no marker here'},
+            # A marker owns a cause it equals, or one that continues it after a space: not any longer name.
+            {'number': 71, 'body': '<!-- ci-pool-cause: fcvm::test_fuzz_gym_other -->'},
+            {'number': 72, 'body': '<!-- ci-pool-cause: fcvm::test_fuzz -->'},
+            # A pull request whose description quotes a marker owns nothing.
+            {'number': 80, 'body': '<!-- ci-pool-cause: fcvm::test_fuzz_gym -->', 'pull_request': {}},
+            {'number': 85, 'body': '<!-- ci-pool-cause: fcvm::test_fuzz_gym -->\n<!-- ci-pool-cause: runner lost: no contact -->'}]
+        self.fixture[f'repos/{REPO}/issues/85/comments?per_page=100'] = [{'body': 'an earlier run'}]
+        code, out, writes = self.bisect('--go')
+        self.assertEqual(code, 0, out)
+        self.assertIn('PASSED ON RERUN', out)
+        self.assertIn('issue #85', out)
+        self.assertEqual([(m, p) for m, p, _ in writes], [('POST', 'issues/85/comments')])
+        self.assertIn(f'https://example.invalid/runs/{run}', writes[0][2]['body'])
+        # The same run is not reported twice.
+        self.fixture[f'repos/{REPO}/issues/85/comments?per_page=100'].append({'body': writes[0][2]['body']})
+        self.assertEqual(self.bisect('--go')[2], [])
+
+    def test_a_cause_no_issue_owns_gets_a_new_issue_that_owns_it(self):
+        self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'success']}), attempt=2)
+        self.fixture[f'POST repos/{REPO}/issues'] = {'number': 99}
+        code, out, writes = self.bisect('--go')
+        self.assertIn('issue #99', out)
+        self.assertEqual([(m, p) for m, p, _ in writes], [('POST', 'issues')])
+        self.assertEqual(writes[0][2]['title'], 'CI failure: fcvm::test_x fails')
+        self.assertTrue(writes[0][2]['body'].startswith('<!-- ci-pool-cause: fcvm::test_x fails -->'))
+
+    def test_reruns_of_the_top_and_dispatches_on_members_are_the_extra_runs_spent(self):
+        self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure', 'failure']}), attempt=3)
+        self.add_run(0, {'Host-arm64': 'success'}, event='workflow_dispatch')
+        self.add_run(0, self.green())      # a pull request's own run is not an extra run
+        _, out, _ = self.bisect()
+        self.assertIn('3 of 8 extra runs spent', out)
+
+    def test_the_cap_stops_it_and_says_every_member_is_untested(self):
+        self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=9)
+        code, out, writes = self.bisect('--go')
+        self.assertEqual((code, writes), (3, []), out)
+        self.assertIn('NOT-ISOLATED: 8 extra runs spent, the cap is 8', out)
+        self.assertIn('every member stays untested', out)
+
+    def test_only_a_run_of_its_own_lanes_makes_the_top_green(self):
+        # A dispatch that named one lane passed on the top, and its pull request's run was
+        # cancelled before a lane started: the lanes a pull request takes have not run.
+        self.add_run(2, {'Host-arm64': 'success'}, event='workflow_dispatch')
+        code, out, writes = self.bisect('--go')
+        self.assertIn('WAITING', out)
+        self.assertNotIn('GREEN', out)
+
+    def test_a_top_whose_scope_needed_no_lane_is_green(self):
+        self.next_run += 1
+        key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[2]}&per_page=100'
+        self.fixture[key] = {'workflow_runs': [{'id': self.next_run, 'path': '.github/workflows/ci.yml', 'event': 'pull_request',
+                                                'status': 'completed', 'run_attempt': 1, 'html_url': 'https://example.invalid/r',
+                                                'created_at': '2026-01-01T00:00:00Z'}]}
+        self.fixture[f'repos/{REPO}/actions/runs/{self.next_run}/jobs?filter=all&per_page=100'] = {
+            'jobs': [dict(job, id=n) for n, job in enumerate(SCOPE_SKIPPED)]}
+        code, out, writes = self.bisect('--go')
+        self.assertIn('GREEN', out)
+        self.fixture[f'repos/{REPO}/actions/runs/{self.next_run}/jobs?filter=all&per_page=100'] = {
+            'jobs': [dict(job, id=n) for n, job in enumerate(DEFERRED)]}
+        self.assertIn('WAITING', self.bisect('--go')[1])
+
+    def test_a_probe_still_running_is_waited_for(self):
+        self.add_run(2, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=2)
+        self.add_run(0, {'Host-arm64': None}, event='workflow_dispatch')
+        code, out, writes = self.bisect('--go')
+        self.assertEqual((code, writes), (0, []), out)
+        self.assertIn('WAITING', out)
+
+    def test_a_run_list_that_cannot_be_read_blocks(self):
+        self.add_run(2, self.green())
+        self.fixture[f'repos/{REPO}/actions/runs?head_sha={self.SHAS[1]}&per_page=100'] = 'FAIL'
+        code, out, writes = self.bisect('--go')
+        self.assertEqual((code, writes), (2, []), out)
+
+    def test_the_member_that_changed_the_failing_tests_file_is_probed_first(self):
+        self.SHAS += ['4' * 40, '5' * 40, '6' * 40]
+        self.members += [pr(14, 'd', 'c', self.SHAS[3]), pr(15, 'e', 'd', self.SHAS[4]), pr(16, 'f', 'e', self.SHAS[5])]
+        self.add_run(5, dict(self.green(), **{'Host-arm64': ['failure', 'failure']}), attempt=2)
+        self.fixture[f'repos/{REPO}/compare/{self.SHAS[3]}...{self.SHAS[4]}'] = {'files': [{'filename': 'tests/test_x.rs'}]}
+        code, out, writes = self.tool('bisect', '--of', '16', '--go', prs=self.members, fixture=self.fixture,
+                                      env={'CI_POOL_LOGS': str(self.logs)})
+        self.assertEqual([c['fields'].get('ref') for c in writes if c['method'] == 'POST'], ['d'], out)
+
+
+class Landing(unittest.TestCase):
+    MEMBERS = [{'number': 11, 'head': 'a', 'sha': 'a' * 40}, {'number': 12, 'head': 'b', 'sha': 'b' * 40}]
+
+    def blockers(self, facts=None, contains_main=True, contained=None, failed=(), despite=None):
+        return ci_pool.landing_blockers(self.MEMBERS, facts or {'outcome': 'green'}, contains_main,
+                                        {11: True, 12: True} if contained is None else contained, list(failed), despite or {})
+
+    def test_a_green_head_that_contains_main_and_every_member_may_land(self):
+        self.assertEqual(self.blockers(), [])
+        self.assertEqual(self.blockers({'outcome': 'passed-on-rerun', 'lanes': ['Host-arm64']}), [])
+
+    def test_anything_but_green_blocks(self):
+        for outcome in ('waiting', 'rerun', 'probe', 'culprit', 'not-isolated'):
+            reasons = self.blockers({'outcome': outcome, 'why': 'x', 'lanes': ['Host-arm64']})
+            self.assertTrue(any('the lanes are not green' in reason for reason in reasons), outcome)
+
+    def test_a_head_that_lacks_main_or_a_member_blocks(self):
+        self.assertIn('--sync-main', ' '.join(self.blockers(contains_main=False)))
+        self.assertIn('does not contain #11', ' '.join(self.blockers(contained={11: False, 12: True})))
+        self.assertIn('does not contain #11', ' '.join(self.blockers(contained={12: True})))
+
+    def test_a_failed_job_blocks_unless_it_is_accepted_by_name_and_is_not_a_lane(self):
+        self.assertIn('Fleet Web failed', ' '.join(self.blockers(failed=['Fleet Web'])))
+        self.assertEqual(self.blockers(failed=['Fleet Web'], despite={'Fleet Web': '#2177'}), [])
+        self.assertIn('Lint failed', ' '.join(self.blockers(failed=['Fleet Web', 'Lint'], despite={'Fleet Web': '#2177'})))
+        for name in ('Host-arm64', 'Host-${{ matrix.arch }}'):
+            self.assertTrue(self.blockers(failed=[name], despite={name: '#1'}), name)
+        self.assertIn('is a lane', ' '.join(self.blockers(despite={'Container-x64': '#1'})))
+
+    def test_the_message_names_the_members_the_head_and_the_run_of_each_lane(self):
+        text = ci_pool.landing_message(self.MEMBERS, self.MEMBERS[-1], ('Host-arm64', 'Container-arm64'),
+                                       {'Host-arm64': 7, 'Container-arm64': 8}, {'Host-arm64': 85}, {'Fleet Web': '#2177'})
+        for part in ('Land a pool of 2: #11, #12', 'Tested head: ' + 'b' * 40, '- Host-arm64: run 7', '- Container-arm64: run 8',
+                     '- Host-arm64 failed and then passed on this commit: #85', 'Landed with Fleet Web failing: #2177',
+                     '- #11 a at aaaaaaaaaaaa'):
+            self.assertIn(part, text)
+        self.assertIn('No lane:', ci_pool.landing_message(self.MEMBERS, self.MEMBERS[-1], (), {}, {}, {}))
+
+
+class LandCommand(PoolOfThree):
+    """`land` on the pool of three."""
+
+    MAIN = '9' * 40
+
+    def land(self, *args, compares=None):
+        self.fixture.setdefault(f'repos/{REPO}/commits/main', {'sha': self.MAIN})
+        self.fixture[f'repos/{REPO}/compare/{self.MAIN}...{self.SHAS[2]}'] = {'status': 'ahead'}
+        self.fixture[f'repos/{REPO}/compare/{self.MAIN}...{self.SHAS[1]}'] = {'status': 'ahead'}
+        for sha in self.SHAS[:2]:
+            self.fixture.setdefault(f'repos/{REPO}/compare/{sha}...{self.SHAS[2]}', {'status': 'ahead'})
+        self.fixture.setdefault(f'repos/{REPO}/compare/{self.SHAS[0]}...{self.SHAS[1]}', {'status': 'ahead'})
+        self.fixture.update(compares or {})
+        self.fixture[f'PUT repos/{REPO}/pulls/13/merge'] = {'sha': 'f' * 40, 'merged': True}
+        self.fixture[f'PUT repos/{REPO}/pulls/12/merge'] = {'sha': 'f' * 40, 'merged': True}
+        self.fixture.setdefault(f'repos/{REPO}/git/commits/{"f" * 40}', {'tree': {'sha': T1}})
+        for sha in self.SHAS:
+            self.fixture.setdefault(f'repos/{REPO}/git/commits/{sha}', {'tree': {'sha': T1}})
+        code, out, calls = self.tool('land', '--of', '13', *args, prs=self.members, fixture=self.fixture,
+                                     env={'CI_POOL_LOGS': str(self.logs)})
+        return code, out, self.writes(calls)
+
+    def full(self, extra=None):
+        return dict(dict(self.green(), **{'Summary': 'success', 'Lint': 'success'}), **(extra or {}))
+
+    def test_a_green_pool_lands_with_bases_first_and_one_merge_of_the_tested_head(self):
+        run = self.add_run(2, self.full())
+        code, out, writes = self.land('--go')
+        self.assertEqual(code, 0, out)
+        self.assertEqual([(m, p) for m, p, _ in writes], [('PATCH', 'pulls/12'), ('PATCH', 'pulls/13'), ('PUT', 'pulls/13/merge')])
+        self.assertEqual([f['base'] for m, _, f in writes if m == 'PATCH'], ['main', 'main'])
+        merge = writes[-1][2]
+        self.assertEqual((merge['merge_method'], merge['sha']), ('merge', self.SHAS[2]))
+        for part in ('Land a pool of 3: #11, #12, #13', f'- Host-arm64: run {run}'):
+            self.assertIn(part, merge['commit_message'])
+
+    def test_without_go_nothing_is_changed(self):
+        self.add_run(2, self.full())
+        code, out, writes = self.land()
+        self.assertEqual((code, writes), (0, []), out)
+        self.assertIn('would retarget 3 pull requests', out)
+
+    def test_nothing_lands_on_anything_but_green(self):
+        cases = {'no run': None,
+                 'a failed lane': self.full({'Host-arm64': 'failure'}),
+                 'a lane still running': self.full({'Host-arm64': None}),
+                 'a lane missing': {k: v for k, v in self.full().items() if k != 'Container-arm64'},
+                 'a hosted job failed': self.full({'Fleet Web': 'failure', 'Summary': 'failure'}),
+                 'a deferred run': {job['name']: job['conclusion'] for job in DEFERRED}}
+        for name, jobs in cases.items():
+            self.setUp()
+            if jobs is not None:
+                self.add_run(2, jobs)
+            code, out, writes = self.land('--go')
+            self.assertEqual((code, writes), (2, []), f'{name}: {out}')
+            self.assertIn('BLOCKED', out, name)
+
+    def test_a_filtered_dispatch_on_the_head_does_not_make_it_landable(self):
+        self.add_run(2, {'Host-arm64': 'success', 'Summary (some lanes)': 'success'}, event='workflow_dispatch')
+        code, out, writes = self.land('--go')
+        self.assertEqual((code, writes), (2, []), out)
+
+    def test_a_head_that_lacks_main_or_a_member_does_not_land(self):
+        self.add_run(2, self.full())
+        for key, word in ((f'repos/{REPO}/compare/{self.MAIN}...{self.SHAS[2]}', '--sync-main'),
+                          (f'repos/{REPO}/compare/{self.SHAS[0]}...{self.SHAS[2]}', 'does not contain #11')):
+            for status in ('diverged', 'behind'):
+                code, out, writes = self.land('--go', compares={key: {'status': status}})
+                self.assertEqual((code, writes), (2, []), out)
+                self.assertIn(word, out)
+            code, out, writes = self.land('--go', compares={key: 'FAIL'})
+            self.assertEqual((code, writes), (2, []), out)
+            del self.fixture[key]
+
+    def test_a_failed_hosted_job_lands_only_when_accepted_by_name_and_the_message_says_so(self):
+        self.add_run(2, self.full({'Fleet Web': 'failure', 'Summary': 'failure'}))
+        code, out, writes = self.land('--go', '--despite', 'Fleet Web=#2177')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Landed with Fleet Web failing: #2177', writes[-1][2]['commit_message'])
+        self.setUp()
+        self.add_run(2, self.full({'Fleet Web': 'failure', 'Summary': 'failure'}))
+        self.assertEqual(self.land('--go', '--despite', 'Fleet Web')[0], 2)
+        self.setUp()
+        self.add_run(2, self.full({'Host-arm64': 'failure', 'Summary': 'failure'}))
+        code, out, writes = self.land('--go', '--despite', 'Host-arm64=#1')
+        self.assertEqual((code, writes), (2, []), out)
+
+    def test_a_pool_that_passed_on_a_rerun_lands_with_its_issue_in_the_message(self):
+        self.add_run(2, self.full({'Host-arm64': ['failure', 'success']}), attempt=2)
+        self.fixture[f'POST repos/{REPO}/issues'] = {'number': 99}
+        code, out, writes = self.land('--go')
+        self.assertEqual(code, 0, out)
+        self.assertEqual([(m, p) for m, p, _ in writes][0], ('POST', 'issues'))
+        self.assertIn('- Host-arm64 failed and then passed on this commit: #99', writes[-1][2]['commit_message'])
+
+    def test_a_lower_part_lands_on_a_run_of_its_own_head_and_the_member_above_moves_to_main(self):
+        self.add_run(2, self.full())
+        code, out, writes = self.land('--go', '--through', '12')
+        self.assertEqual((code, writes), (2, []), 'the top\'s run was taken as a run of the lower head: ' + out)
+        self.add_run(1, self.full(), event='workflow_dispatch')
+        code, out, writes = self.land('--go', '--through', '12')
+        self.assertEqual(code, 0, out)
+        self.assertEqual([(m, p) for m, p, _ in writes], [('PATCH', 'pulls/12'), ('PUT', 'pulls/12/merge'), ('PATCH', 'pulls/13')])
+        self.assertEqual(writes[1][2]['sha'], self.SHAS[1])
+
+    def test_a_lower_part_does_not_land_on_some_of_its_lanes(self):
+        self.add_run(2, self.full())
+        self.add_run(1, {'Host-arm64': 'success', 'Summary (some lanes)': 'success'}, event='workflow_dispatch')
+        code, out, writes = self.land('--go', '--through', '12')
+        self.assertEqual((code, writes), (2, []), out)
+        self.assertIn('has not run', out)
+
+    def test_lanes_that_passed_in_a_run_that_has_not_finished_do_not_land(self):
+        # Its other jobs are still running: what failed outside the lanes is not known yet.
+        number = self.add_run(2, self.green())
+        key = f'repos/{REPO}/actions/runs?head_sha={self.SHAS[2]}&per_page=100'
+        self.fixture[key]['workflow_runs'][0]['status'] = 'in_progress'
+        code, out, writes = self.land('--go')
+        self.assertEqual((code, writes), (2, []), out)
+        self.assertIn('no finished run on the head', out)
+        self.assertTrue(number)
+
+    def test_a_landing_whose_tree_is_not_the_tested_one_says_so(self):
+        self.add_run(2, self.full())
+        self.fixture[f'repos/{REPO}/git/commits/{"f" * 40}'] = {'tree': {'sha': T2}}
+        code, out, _ = self.land('--go')
+        self.assertIn('a tree no run tested', out)
+
+    def test_a_member_outside_the_pool_cannot_be_the_end_of_a_landing(self):
+        self.add_run(2, self.full())
+        self.members.append(pr(20, 'z', 'main', 'e' * 40))
+        code, out, writes = self.land('--go', '--through', '20')
+        self.assertEqual((code, writes), (2, []), out)
+
+
+class Marks(unittest.TestCase):
+    """The `ci/pool` statuses a run states, from what it showed."""
+
+    HEAD = 'c' * 40
+    LOWER = [(12, 'b' * 40), (11, 'a' * 40)]
+
+    def marks(self, ran=True, summary='success', lanes=None, failed=(), lower=LOWER, reason='stacked under #14'):
+        lanes = {lane_name: 'pass' for lane_name in ci_pool.PR_LANES} if lanes is None else lanes
+        return ci_pool.marks(ran, reason, summary, lanes, list(failed), '13', self.HEAD, list(lower), 77)
+
+    def test_a_run_that_tested_nothing_is_pending_on_its_own_head_and_nowhere_else(self):
+        for summary in ('success', 'failure', 'skipped'):
+            got = self.marks(ran=False, summary=summary)
+            self.assertEqual([(sha, state) for sha, state, _ in got], [(self.HEAD, 'pending')])
+            self.assertIn('not tested by this run: stacked under #14', got[0][2])
+
+    def test_a_passing_run_marks_its_head_and_every_lower_head_it_contains(self):
+        got = self.marks()
+        self.assertEqual([(sha, state) for sha, state, _ in got],
+                         [(self.HEAD, 'success'), ('b' * 40, 'success'), ('a' * 40, 'success')])
+        self.assertIn('5 lanes passed: run 77 on ccccccccc', got[0][2])
+        self.assertIn('#13 run 77', got[1][2])
+
+    def test_a_lane_that_passed_only_on_a_rerun_is_named(self):
+        lanes = dict({lane_name: 'pass' for lane_name in ci_pool.PR_LANES}, **{'Host-arm64': 'pass-on-rerun'})
+        self.assertIn('1 only on a rerun (Host-arm64)', self.marks(lanes=lanes)[0][2])
+
+    def test_a_run_whose_scope_needed_no_lane_says_so(self):
+        self.assertIn('no lane needed', self.marks(lanes={})[0][2])
+
+    def test_a_failed_run_marks_only_its_own_head(self):
+        lanes = dict({lane_name: 'pass' for lane_name in ci_pool.PR_LANES}, **{'Host-arm64': 'fail'})
+        got = self.marks(summary='failure', lanes=lanes, failed=['Host-arm64', 'Summary'])
+        self.assertEqual([(sha, state) for sha, state, _ in got], [(self.HEAD, 'failure')])
+        self.assertIn('failed: Host-arm64; 4 of 5 lanes passed', got[0][2])
+
+    def test_a_run_that_failed_outside_the_lanes_says_which_job_and_that_the_lanes_passed(self):
+        # 2026-11-25: every lane passed and Fleet Web failed. The head is not green, and the
+        # status says what is and is not.
+        got = self.marks(summary='failure', failed=['Fleet Web', 'Summary'])
+        self.assertEqual([(sha, state) for sha, state, _ in got], [(self.HEAD, 'failure')])
+        self.assertIn('failed: Fleet Web; 5 of 5 lanes passed', got[0][2])
+
+    def test_a_cancelled_or_skipped_summary_states_nothing(self):
+        for summary in ('cancelled', 'skipped', ''):
+            self.assertEqual(self.marks(summary=summary), [])
+
+    def test_no_state_but_these_three_is_ever_stated(self):
+        states = set()
+        for ran in (True, False):
+            for summary in ('success', 'failure', 'cancelled', 'skipped'):
+                states |= {state for _, state, _ in self.marks(ran=ran, summary=summary)}
+        self.assertEqual(states, {'success', 'failure', 'pending'})
+
+
+class MarkCommand(Sandbox):
+    """`mark` as ci.yml's pool-status job runs it."""
+
+    HEAD = 'c' * 40
+
+    def mark(self, prs, jobs, compares=None, ran='true', summary='success', **more):
+        fixture = {f'repos/{REPO}/actions/runs/77/jobs?filter=all&per_page=100': {'jobs': jobs}}
+        for sha, status in (compares or {}).items():
+            fixture[f'repos/{REPO}/compare/{sha}...{self.HEAD}'] = status if status == 'FAIL' else {'status': status}
+        fixture.update(more)
+        env = dict(RAN=ran, REASON='stacked under #14: CI runs on the top of the stack', SUMMARY=summary, PR='13',
+                   HEAD_SHA=self.HEAD, RUN_ID='77', RUN_ATTEMPT='1', RUN_URL='https://example.invalid/runs/77')
+        code, out, calls = self.tool('mark', prs=prs, fixture=fixture, env=env)
+        posts = [(c['path'].rsplit('/', 1)[-1], c['fields']['state'], c['fields']['context']) for c in calls if c['method'] == 'POST']
+        return code, out, posts, calls
+
+    STACK = [pr(11, 'feature-a', 'main', 'a' * 40), pr(12, 'feature-b', 'feature-a', 'b' * 40),
+             pr(13, 'feature-c', 'feature-b', 'c' * 40)]
+
+    def test_each_lower_member_whose_head_this_run_tested_is_marked(self):
+        code, out, posts, calls = self.mark(self.STACK, passed(ci_pool.PR_LANES), {'b' * 40: 'ahead', 'a' * 40: 'ahead'})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(posts, [('c' * 40, 'success', 'ci/pool'), ('b' * 40, 'success', 'ci/pool'), ('a' * 40, 'success', 'ci/pool')])
+        self.assertEqual({c['fields']['target_url'] for c in calls if c['method'] == 'POST'}, {'https://example.invalid/runs/77'})
+
+    def test_a_lower_member_that_moved_after_this_head_is_not_marked_nor_anything_below(self):
+        for moved in ('diverged', 'behind', 'FAIL'):
+            _, out, posts, _ = self.mark(self.STACK, passed(ci_pool.PR_LANES), {'b' * 40: moved, 'a' * 40: 'ahead'})
+            self.assertEqual(posts, [('c' * 40, 'success', 'ci/pool')], moved)
+
+    def test_a_fork_pull_request_on_the_base_branch_is_not_marked(self):
+        stack = [pr(12, 'feature-b', 'main', 'b' * 40, repo='someone/fork'), pr(13, 'feature-c', 'feature-b', 'c' * 40)]
+        _, out, posts, _ = self.mark(stack, passed(ci_pool.PR_LANES), {'b' * 40: 'ahead'})
+        self.assertEqual(posts, [('c' * 40, 'success', 'ci/pool')], out)
+
+    def test_a_pool_that_cannot_be_read_marks_only_this_head(self):
+        _, out, posts, _ = self.mark(self.STACK, passed(ci_pool.PR_LANES), {'b' * 40: 'ahead', 'a' * 40: 'ahead'},
+                                     **{f'repos/{REPO}/pulls?state=open&per_page=100': 'FAIL'})
+        self.assertEqual(posts, [('c' * 40, 'success', 'ci/pool')], out)
+
+    def test_a_deferred_run_asks_nothing_and_marks_its_head_pending(self):
+        code, out, posts, calls = self.mark(self.STACK, [], ran='false')
+        self.assertEqual((code, posts), (0, [('c' * 40, 'pending', 'ci/pool')]), out)
+        self.assertEqual([c for c in calls if c['method'] == 'GET'], [])
+
+    def test_a_failed_run_marks_only_its_head_and_looks_at_no_other_member(self):
+        jobs = passed(ci_pool.PR_LANES) + [lane('Fleet Web', 'failure'), lane('Summary', 'failure')]
+        code, out, posts, calls = self.mark(self.STACK, jobs, summary='failure')
+        self.assertEqual((code, posts), (0, [('c' * 40, 'failure', 'ci/pool')]), out)
+        self.assertFalse([c for c in calls if '/compare/' in c['path'] or '/pulls' in c['path']])
+
+    def test_a_passing_summary_over_a_lane_that_did_not_pass_states_nothing(self):
+        jobs = passed(ci_pool.PR_LANES[1:]) + [lane(ci_pool.PR_LANES[0], 'failure')]
+        code, out, posts, _ = self.mark(self.STACK, jobs)
+        self.assertEqual((code, posts), (2, []), out)
+
+    def test_a_job_list_that_cannot_be_read_states_nothing(self):
+        code, out, posts, _ = self.mark(self.STACK, [], **{f'repos/{REPO}/actions/runs/77/jobs?filter=all&per_page=100': 'FAIL'})
+        self.assertEqual((code, posts), (2, []), out)
 
 
 class Lanes(unittest.TestCase):

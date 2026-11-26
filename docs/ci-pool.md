@@ -61,11 +61,101 @@ once per member, starts each named member from that commit (it must contain the 
 remote branch) and pushes every branch in the same atomic push, so the top's run restarts
 once however many members changed.
 
-`status` prints each pool bottom to top, and for every lower member the `Stack CI` commit
-status its head carries: the top's passing run posts it on each lower head it contains
-(`scripts/ci-stack-coverage.sh`). A lower head without it has not been tested, whatever
-its own `Summary (deferred)` says. The tool posts no status: whether a head was tested is
-something only a run can state.
+`status` prints each pool bottom to top with the `ci/pool` commit status on every
+member's head.
+
+## What a run states: the `ci/pool` status
+
+Every pull request run of `ci.yml` ends with the `Pool status` job (`ci_pool.py mark`),
+which states what the run showed:
+
+- `pending` on its own head when it tested nothing (a draft, or a lower member whose
+  lanes run on the top). The pull request then shows a pending status, not a row of
+  green checks under `Summary (deferred)`.
+- `success` on its own head, and on the head of every lower member that head contains,
+  when its `Summary` passed. The description names the run, and any lane that passed
+  only on a rerun. The walk down stops at the first member whose head is not an ancestor
+  of the tested head.
+- `failure` on its own head only when its `Summary` failed, naming the failed lanes or
+  the other job that failed and how many lanes passed. Which member broke a pool is not
+  known from one run, so no lower member is marked.
+
+The status is a display for people and sessions. Nothing reads it to decide what to
+skip or land: `plan` and `land` read the runs. A success is stated only by the run that
+passed; the one status the tool posts from a session is the `failure` that `bisect`
+puts on a first failing prefix.
+
+## When the top is red
+
+`ci_pool.py bisect --of <member>` reads the runs on every member's head and prints what
+they show and the next step. With `--go` it takes that step. It keeps no state: run it
+again after the run it started has finished, from any session.
+
+1. The failure's facts: the failed lanes of the top, and for each the tests its log ends
+   with (as `failures` reads them).
+2. One rerun of the failed jobs, when a failure has been seen once. Not when the same
+   test already failed on two lanes: those were two hosts. A cause that is not a test (a
+   lost runner, a setup step, a missing log) is always run again, however many lanes it
+   took.
+3. If the rerun passes, the pool is not simply green: the lane failed and passed on one
+   commit. Each cause is appended to the open issue that owns it (an issue body lists
+   the causes it owns as `<!-- ci-pool-cause: X -->`; X also owns causes that start with
+   X and a space, so one issue can own every case of a test binary), or a new issue is
+   opened. The pool may land with that issue open; `main` runs those lanes again.
+4. If it fails again, the failing lanes are run on a lower member's branch
+   (`workflow_dispatch` with `lanes`), halving the unknown prefixes each time: about
+   log2 of the pool size runs, each of one or two lanes, not of the matrix. The lanes
+   are the cheapest that between them show every failing cause. Runs that already exist
+   count: a member that was the top earlier has its lanes on record. If exactly one
+   member changed the failing test's file, the prefixes around it are run first. That
+   only orders the runs.
+5. The verdict is the first failing prefix: the member at which the failure appears,
+   given the members below it. `bisect --go` puts a `ci/pool` failure on that member's
+   head. It does not say the member fails alone, because no run shows that: on
+   2026-11-25 a pool of nine failed one test that the member which wrote it and the
+   member above it each passed without the other. The fix goes forward: the owner
+   publishes a repair, or a revert of the member on its own branch, and the pool's next
+   run is the confirmation. Two culprits take two rounds.
+
+A red top may cost 8 extra runs (reruns and probes, counted from the runs themselves).
+Past that, or when a prefix both failed and passed, a longer prefix passes above one
+that fails, a prefix fails for another cause, or `main` itself fails those lanes, the
+outcome is `NOT-ISOLATED`: no member is named and none is called tested.
+
+`bisect` never dispatches on `main`, and it never cancels a run.
+
+## Landing
+
+`ci_pool.py land --of <member>` lands a pool with one push to `main`: it sets every
+member's base to `main` (a base edit starts no run), then merges the top pull request
+with one merge commit of the tested head, which closes every member as merged. Without
+`--go` it only says what it would do.
+
+It lands nothing unless, on the head that would land:
+
+- every lane a pull request takes passed (`bisect` would say GREEN or PASSED ON RERUN),
+  in a run that has finished. A run that named some lanes with the `lanes` input does not
+  count for the others;
+- the head contains `main`'s tip. Then the merge commit has the head's tree, and `main`'s
+  planner finds the lanes proven for it. `build --sync-main` gets a pool there; that
+  moves the top, so its run has to finish again. If `main` moves between the check and
+  the merge, the merge still happens, the tree that lands is one no run tested, `land`
+  says so, and `main` runs every lane;
+- the head contains every member's head;
+- no other job of the head's newest finished run failed. A failed job that is not a lane
+  can be accepted by name, with the issue that owns the failure:
+  `--despite "Fleet Web=#2177"`. The merge commit's message records it. A lane cannot be
+  accepted this way.
+
+A pool that passed only on a rerun lands with an issue filed or appended for each cause,
+named in the merge commit's message, and `main` runs those lanes again.
+
+`--through <member>` lands the lower part of a pool up to that member. Its head needs a
+run of its own first: as a lower member it deferred, so dispatch `ci.yml` on its branch
+and let that finish. The member above it is then based on `main`.
+
+The merge commit's message lists the members, the tested head and the run that shows
+each lane.
 
 ## What main runs after a landing
 
@@ -167,15 +257,46 @@ vanishes uploads no log, so a job without one is classified from GitHub's annota
 `INCOMPLETE`; a log that shows no failure in its last 3 MB says so. A cause is never
 guessed. `CI_POOL_LOGS` names a directory of `<job id>.log` files to read instead.
 
-## When to publish
+## When a publish goes in
 
-Every push to a pool's top starts a new run of the lanes and cancels the one in flight.
-In the week of 2026-11-19, before pooling, 164 of 265 pull request runs of the lanes were
-cancelled by a newer push, $165 of the $478 those runs cost. A pool does the same to
-itself if its members publish one at a time while a run is in flight: a lane takes 34 to
-57 minutes (medians), so a publish every half hour means no run ever finishes. Until the
-tool holds publishes back itself, publish once per round of fixes, and when a run is in
-flight let it finish unless what you publish fixes the failure it is about to report.
+Every push to a pool's top cancels the top's run and starts another. With publishes
+arriving at rate r while a run of length T is in flight (T is 57 minutes, the longest
+lane's median), a run finishes with probability e^(-rT), and the runner time spent per
+finished run is (e^(rT) - 1)/(rT) runs:
+
+| publishes per hour into the pool | a run finishes | cost per finished run, cancelling | hours to a finished run | cost per publish, queued |
+|---|---|---|---|---|
+| 0.5 | 0.62 | $3.84 | 1.2 | $3.00 |
+| 1 | 0.39 | $5.01 | 1.6 | $3.00 |
+| 2 | 0.15 | $8.98 | 2.8 | $1.58 |
+| 4 | 0.02 | $34.50 | 10.9 | $0.79 |
+| 8 | 0.00 | $788 | 250 | $0.39 |
+
+In the week of 2026-11-19, before pooling, 164 of 265 pull request runs of the lanes
+were cancelled by a newer push ($165 of $478): one pull request alone already sat near
+the second row. A pool of eight members each publishing at that rate is the last row:
+its run never finishes. So a pool cannot take publishes as they come.
+
+`publish` therefore looks at the top's own run first. If it is in flight and no lane of
+it has failed, the publish is queued: the commit goes to `refs/ci-pool/pending/<branch>`
+on the remote, which starts no run, is visible to every session (`status` lists it) and
+is never dropped (a later publish of the same branch must contain the queued commit).
+`flush --of <member>` puts everything queued into the pool with one build and one push,
+and does nothing while the run is still in flight. So a run that started finishes, each
+run costs one run, and a publish gets its verdict within one to two run lengths (57 to
+114 minutes at the medians).
+
+A publish goes in at once when there is nothing to wait for: no run in flight, or a
+run in which a lane has already failed (its verdict is known, and what is being
+published may be the fix). `--now` on `publish` or `flush` goes in regardless.
+
+A new member that joins on top moves no member below it, so the old top's run keeps
+going while the new top starts its own. That costs a second run and buys the prefix
+evidence a bisect would otherwise have to pay for: on 2026-11-25 the seven-member top's
+run finished green while the nine-member top went red, and one probe was left.
+
+Nothing flushes by itself. A job in CI could not: a push made with the workflow's own
+token starts no run. Whoever watches the top's run flushes when it ends.
 
 ## Moving an existing stack to this tool
 

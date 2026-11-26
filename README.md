@@ -722,7 +722,7 @@ make test-fc-mock    # Container mode tests (no KVM, uses fc-mock)
 
 CI runs on every PR across ARM64 and x64 with both snapshot-enabled and snapshot-disabled modes. Tests include POSIX compliance (pjdfstest), VM lifecycle, networking, snapshot/clone workflows, and egress connectivity.
 
-**CI merge train:** batches of independent low-risk PRs (dependabot bumps, docs, isolated fixes) can share ONE full CI matrix instead of one per PR — `make train-create PRS="689 690" && make train-dispatch`, then `make train-land` on green or `make train-bisect` on red. See [docs/ci-train.md](docs/ci-train.md) for the protocol, the cost math, and when pooling is (in)appropriate.
+**Pooled CI:** pull requests are tested together as a pool read from their bases: `scripts/ci-pool/ci_pool.py` builds and publishes pools, finds what broke a red one, lands a tested one and accounts for CI cost. See [docs/ci-pool.md](docs/ci-pool.md).
 
 </details>
 
@@ -744,7 +744,6 @@ fcvm/
 |----------|---------|
 | [DESIGN.md](DESIGN.md) | Architecture, internals, configuration reference |
 | [Durable remote workloads](docs/durable-workloads.md) | Proposed persistent, cell-based remote execution architecture |
-| [CI merge train](docs/ci-train.md) | Pooled CI: one full matrix per batch of low-risk PRs |
 | [Pooled CI](docs/ci-pool.md) | Pools read from pull request bases, and what CI costs and why it fails |
 | [PERFORMANCE.md](PERFORMANCE.md) | Benchmarks, tuning, tracing |
 | [NESTED.md](NESTED.md) | Nested virtualization setup |

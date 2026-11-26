@@ -2,8 +2,8 @@
 """Tests of CI's pull request scope: drafts and lower stack PRs run nothing, the top
 of a stack classifies the whole stack's diff, and a passing top marks the lower PRs.
 
-Runs scripts/ci-pr-scope.sh and scripts/ci-stack-coverage.sh against a fake `gh`
-that answers from a fixture and applies --jq with the real jq. Run with
+Runs scripts/ci-pr-scope.sh against a fake `gh` that answers from a fixture and applies
+--jq with the real jq. What a passing top marks is tested in scripts/test-ci-pool.py. Run with
 make test-ci-scope.
 """
 import ast
@@ -265,47 +265,6 @@ class PrScope(Harness):
         self.assertEqual(outputs['bench'], 'true')
 
 
-class StackCoverage(Harness):
-    def cover(self, fixture, base_ref='feature-b'):
-        return self.run_script('ci-stack-coverage.sh', fixture, PR='13', HEAD_SHA='c' * 40,
-                               BASE_REF=base_ref, RUN_URL='https://example.invalid/run/1')
-
-    def posts(self, calls):
-        return [(c['path'], c['fields']['context'], c['fields']['state']) for c in calls if c['method'] == 'POST']
-
-    def test_each_lower_pr_whose_head_this_run_tested_is_marked(self):
-        fixture = {
-            f'repos/{REPO}/pulls?state=open&head=example-owner:feature-b&per_page=100': [pr(12, 'feature-b', 'feature-a', 'b' * 40)],
-            f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'ahead'},
-            f'repos/{REPO}/pulls?state=open&head=example-owner:feature-a&per_page=100': [pr(11, 'feature-a', 'main', 'a' * 40)],
-            f'repos/{REPO}/compare/{"a" * 40}...{"c" * 40}': {'status': 'ahead'},
-        }
-        _, calls, _ = self.cover(fixture)
-        self.assertEqual(self.posts(calls), [(f'repos/{REPO}/statuses/' + 'b' * 40, 'Stack CI', 'success'),
-                                             (f'repos/{REPO}/statuses/' + 'a' * 40, 'Stack CI', 'success')])
-
-    def test_a_lower_pr_that_moved_after_this_head_is_not_marked_nor_anything_below(self):
-        fixture = {
-            f'repos/{REPO}/pulls?state=open&head=example-owner:feature-b&per_page=100': [pr(12, 'feature-b', 'feature-a', 'b' * 40)],
-            f'repos/{REPO}/compare/{"b" * 40}...{"c" * 40}': {'status': 'diverged'},
-            f'repos/{REPO}/pulls?state=open&head=example-owner:feature-a&per_page=100': [pr(11, 'feature-a', 'main', 'a' * 40)],
-            f'repos/{REPO}/compare/{"a" * 40}...{"c" * 40}': {'status': 'ahead'},
-        }
-        _, calls, _ = self.cover(fixture)
-        self.assertEqual(self.posts(calls), [])
-
-    def test_a_base_with_no_open_pr_ends_the_walk(self):
-        fixture = {f'repos/{REPO}/pulls?state=open&head=example-owner:feature-b&per_page=100': []}
-        _, calls, _ = self.cover(fixture)
-        self.assertEqual(self.posts(calls), [])
-
-    def test_a_fork_pr_with_the_same_branch_name_is_not_marked(self):
-        fixture = {f'repos/{REPO}/pulls?state=open&head=example-owner:feature-b&per_page=100':
-                   [pr(12, 'feature-b', 'main', 'b' * 40, repo='someone/fork')]}
-        _, calls, _ = self.cover(fixture)
-        self.assertEqual(self.posts(calls), [])
-
-
 def jobs(text):
     body = text.split('\njobs:\n', 1)[1]
     found = {}
@@ -367,8 +326,9 @@ def evaluate(expression, context):
 
 class Workflow(unittest.TestCase):
     def test_a_deferred_run_skips_every_job_that_tests(self):
-        # Every job other than the scope, the matrix planner and the report must be
-        # skipped when `changes` says run=false, whatever the planner says.
+        # Every job other than the scope, the matrix planner, the report and the status job
+        # (which tests nothing and says so) must be skipped when `changes` says run=false,
+        # whatever the planner says.
         deferred = {k: 'false' for k in ('run', 'code', 'bench', 'fleet', 'web')}
         context = {
             'needs': {'changes': {'outputs': deferred, 'result': 'success'},
@@ -379,7 +339,7 @@ class Workflow(unittest.TestCase):
                        'repository': {'default_branch': 'main'}}, 'repository': REPO},
         }
         for name, block in jobs(CI.read_text()).items():
-            if name in ('changes', 'skip-check', 'summary'):
+            if name in ('changes', 'skip-check', 'summary', 'pool-status'):
                 continue
             with self.subTest(job=name):
                 gate = job_if(block)
@@ -426,34 +386,49 @@ class Workflow(unittest.TestCase):
                     'BASE_REF: ${{ github.event.pull_request.base.ref }}', 'run: bash scripts/ci-pr-scope.sh'):
             self.assertIn(env, block)
 
-    def test_only_the_coverage_job_may_write_statuses(self):
+    def test_only_the_status_job_may_write_statuses(self):
         text = CI.read_text()
         self.assertEqual(text.count('statuses: write'), 1)
-        self.assertIn('statuses: write', jobs(text)['stack-coverage'])
-        self.assertIn("needs.summary.result == 'success'", jobs(text)['stack-coverage'])
+        block = jobs(text)['pool-status']
+        self.assertIn('statuses: write', block)
+        self.assertIn('run: python3 scripts/ci-pool/ci_pool.py mark', block)
+        for env in ('RAN: ${{ needs.changes.outputs.run }}', 'SUMMARY: ${{ needs.summary.result }}',
+                    'HEAD_SHA: ${{ github.event.pull_request.head.sha }}', 'RUN_ID: ${{ github.run_id }}'):
+            self.assertIn(env, block)
 
-    def test_the_coverage_job_runs_when_summary_waited_for_a_skipped_job(self):
-        # GitHub adds success() to an `if:` that names no status function, and success() is false
-        # when a job anywhere before this one in the needs graph was skipped. Summary waits for
-        # jobs most PRs skip (the bench and fleet tests), so a coverage job gated on the event and
-        # Summary's result alone is skipped on every stack whose top passed, and no lower PR is
-        # ever marked as tested.
-        blocks = jobs(CI.read_text())
-        waited_for = re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1].split(', ')
-        can_skip = [name for name in waited_for if job_if(blocks[name]) is not None]
-        self.assertTrue(can_skip, 'summary waits for no job that can be skipped')
-        gate = job_if(blocks['stack-coverage'])
-        self.assertTrue(gate.startswith('!cancelled() && '),
-                        f'stack-coverage is skipped whenever one of {can_skip} is: {gate}')
-        passed = {
+    def status_gate(self, **override):
+        context = {
             'needs': {'changes': {'outputs': {'run': 'true'}, 'result': 'success'}, 'summary': {'result': 'success'}},
             'github': {'event_name': 'pull_request', 'repository': REPO,
-                       'event': {'pull_request': {'base': {'ref': 'feature-a'}, 'head': {'repo': {'full_name': REPO}}},
+                       'event': {'action': 'synchronize',
+                                 'pull_request': {'base': {'ref': 'feature-a'}, 'head': {'repo': {'full_name': REPO}}},
                                  'repository': {'default_branch': 'main'}}},
         }
-        self.assertTrue(evaluate(gate, passed), f'stack-coverage does not run for the top of a stack that passed: {gate}')
-        failed = {**passed, 'needs': {**passed['needs'], 'summary': {'result': 'failure'}}}
-        self.assertFalse(evaluate(gate, failed), f'stack-coverage runs after a failed Summary: {gate}')
+        context['github']['event'].update(override.pop('event', {}))
+        context['github'].update(override)
+        return evaluate(job_if(jobs(CI.read_text())['pool-status']), context)
+
+    def test_the_status_job_runs_whatever_summary_waited_for_and_however_it_ended(self):
+        # GitHub adds success() to an `if:` that names no status function, and success() is false
+        # when a job anywhere before this one in the needs graph was skipped. Summary waits for
+        # jobs most PRs skip (the bench and fleet tests), so a status job gated on the event alone
+        # would be skipped on every pool. It also has to run after a failed Summary (to say so)
+        # and on a run that tested nothing (to say that).
+        blocks = jobs(CI.read_text())
+        waited_for = re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1].split(', ')
+        self.assertTrue([name for name in waited_for if job_if(blocks[name]) is not None])
+        gate = job_if(blocks['pool-status'])
+        self.assertTrue(gate.startswith('!cancelled() && '), gate)
+        self.assertNotIn('needs.summary.result', gate)
+        self.assertNotIn('needs.changes.outputs.run', gate)
+        self.assertTrue(self.status_gate())
+
+    def test_the_status_job_never_runs_with_a_forks_code_or_outside_a_pull_request(self):
+        fork = {'pull_request': {'base': {'ref': 'main'}, 'head': {'repo': {'full_name': 'someone/fork'}}}}
+        self.assertFalse(self.status_gate(event=fork))
+        self.assertFalse(self.status_gate(event={'action': 'closed'}))
+        for event in ('push', 'workflow_dispatch', 'workflow_run', 'pull_request_target'):
+            self.assertFalse(self.status_gate(event_name=event), event)
 
 
 if __name__ == '__main__':
