@@ -114,7 +114,8 @@ start_unit() {  # wait|no-block, then the module's further arguments
 # fcvm's state and data directories as the unit's fcvm resolves them, asked of that binary
 # with the unit's environment (unit_props: this user, HOME, XDG_RUNTIME_DIR, PATH and
 # nothing else). The state directory is fcvm's answer, never a join of the data root. Set
-# before census_args runs, because a failure inside its process substitution would be lost.
+# before census_args runs: a failure inside its process substitution is lost, so census_args
+# prints nothing without them and its callers refuse an empty census.
 FCVM_STATE_DIR="" FCVM_DATA_ROOT=""
 load_fcvm_paths() {
     local paths
@@ -131,6 +132,8 @@ load_fcvm_paths() {
 
 census_args() {  # what renders_teardown_check.py counts, for both checks
     local a p n
+    case "${FCVM_STATE_DIR:-}" in /*) ;; *) echo "BLOCKED: census_args: no state directory from fcvm's 'paths --json' (FCVM_STATE_DIR='${FCVM_STATE_DIR:-}')" >&2; return 2 ;; esac
+    case "${FCVM_DATA_ROOT:-}" in /*) ;; *) echo "BLOCKED: census_args: no data directory from fcvm's 'paths --json' (FCVM_DATA_ROOT='${FCVM_DATA_ROOT:-}')" >&2; return 2 ;; esac
     printf '%s\0' --unit "$UNIT" --status "$STATUS" --teardown "$OUT/teardown.json" \
         --run-dir "$RUN_DIR" --state-dir "$FCVM_STATE_DIR" --vm-dir "$FCVM_DATA_ROOT/vm-disks" \
         --data-dir "$FCVM_DATA_ROOT" --snapshot-tag "$TAG"
@@ -143,19 +146,21 @@ case "$mode" in
     run) start_unit wait "$@" ;;
     start) start_unit no-block "$@" ;;
     teardown-check)
-        load_fcvm_paths || exit 2
         stages="${1:-start,cgroups,replays,serve-starting,serve,engines-starting,engines,workers,running,running:TERM}"
+        load_fcvm_paths || exit 2
         count=()
         while IFS= read -r -d '' a; do count+=("$a"); done < <(census_args)
+        [ "${#count[@]}" -gt 0 ] || { echo "BLOCKED: the census has no arguments" >&2; exit 2; }
         python3 "$HERE/renders_teardown_check.py" "${count[@]}" --stages "$stages" \
             --after-s "${AFTER_S:-20}" --timeout-s "${STAGE_TIMEOUT_S:-1800}" --out "$OUT.teardown-check.json" \
             -- "$0" start
         ;;
     agent-check)
-        load_fcvm_paths || exit 2
         stages="${1:-start,cgroups,replays,serve-starting,serve,engines-starting,engines,workers,running,running:TERM}"
+        load_fcvm_paths || exit 2
         count=() props=() agent=()
         while IFS= read -r -d '' a; do count+=("$a"); done < <(census_args)
+        [ "${#count[@]}" -gt 0 ] || { echo "BLOCKED: the census has no arguments" >&2; exit 2; }
         while IFS= read -r -d '' a; do props+=("$a"); done < <(unit_props)
         while IFS= read -r -d '' a; do agent+=("$a"); done < <(agent_args)
         engines=(--engines)

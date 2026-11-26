@@ -2,7 +2,8 @@
 //!
 //! The benchmark harnesses read VM state files. Three times a change to where or how fcvm
 //! keeps that state broke them, because each joined `state` to a data root of its own
-//! (`os.path.join(data_root, "state")`, `$DATA_ROOT/state`, `/mnt/fcvm-btrfs/state`). They
+//! (`os.path.join(data_root, "state")`, `$DATA_ROOT/state`, `data + "/state"`,
+//! `/mnt/fcvm-btrfs/state`). They
 //! now ask the binary they run (`fcvm paths --json`, src/commands/paths.rs) and read inside
 //! the directory it names. This test keeps the join from coming back: it scans every text
 //! file under `bench/` and `fleet/` and fails on a line that joins `state` to a directory.
@@ -30,6 +31,8 @@ const JOIN_PATTERNS: &[&str] = &[
     r#"\.join\(\s*"state"\s*\)"#,
     // Path(data_root) / "state"
     r#"/\s*["']state["']"#,
+    // data + "/state"
+    r#"\+\s*["']/state["']"#,
     // $DATA_ROOT/state, ${DATA_ROOT}/state, "$data/state", {data_root}/state,
     // $(dirname "$x")/state, /mnt/fcvm-btrfs/state
     r#"(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\{[A-Za-z_][A-Za-z0-9_.]*\}|fcvm-btrfs|\))["']?/state(?:[/"'\s):}\]]|$)"#,
@@ -177,6 +180,7 @@ fn the_join_patterns_match_joins_and_nothing_else() {
         r#"rm -rf ${DATA_ROOT}/state"#,
         r#"path = f"{data_root}/state""#,
         r#"STATE_DIR="$(dirname "$x")/state""#,
+        r#"args = ["--state-dir", data + "/state", "--vm-dir", data + "/vm-disks"]"#,
     ] {
         assert!(regex.is_match(joined), "not caught: {joined}");
     }
@@ -188,6 +192,8 @@ fn the_join_patterns_match_joins_and_nothing_else() {
         r#"args.state_dir = fcvm_state_dir(args.fcvm)"#,
         r#"STATE_DIR=$(jq -er '.state_dir' <<<"$paths")"#,
         r#"--exclude=./vm-disks --exclude=./statefile"#,
+        r#"args = ["--state-dir", paths["state_dir"], "--vm-dir", data + "/vm-disks"]"#,
+        r#"url = base + "/state/summary""#,
     ] {
         assert!(!regex.is_match(other), "caught by mistake: {other}");
     }
