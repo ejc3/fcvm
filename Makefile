@@ -788,12 +788,17 @@ test-all: show-notes check-disk setup-fcvm _test-all
 CONFINE_TEST_FILTER ?= -E 'test(/^test_confine_/) | test(=the_compiled_filter_traps_a_syscall_the_policy_does_not_list) | test(=firecracker::vm::tests::a_trapped_syscall_stops_the_vmm_and_is_reported) | test(=test_sanity_rootless) | test(=test_large_boot_plan_rootless) | test(=test_first_firecracker_log_line_from_the_api_thread_rootless) | test(=test_exec_rootless) | (test(/^test_pmem_/) & !test(/sudo/)) | test(/^test_fuse_snapshot_matrix_/) | test(/snapshot_clone/) | test(=test_clone_while_baseline_running_rootless)'
 # How many tests that filter matches. A filter that matches fewer fails the gate; raise it
 # with the filter.
-CONFINE_TEST_MIN ?= 36
+CONFINE_TEST_MIN ?= 37
 # The tests in the filter that start no VMM through the test helpers: one loads the compiled
-# filter in a child process, one runs a Firecracker that serves no guest.
-CONFINE_NO_VMM_TESTS ?= the_compiled_filter_traps_a_syscall_the_policy_does_not_list firecracker::vm::tests::a_trapped_syscall_stops_the_vmm_and_is_reported
+# filter in a child process, one runs a Firecracker that serves no guest, and one starts a
+# VMM that fcvm has to kill.
+CONFINE_NO_VMM_TESTS ?= the_compiled_filter_traps_a_syscall_the_policy_does_not_list firecracker::vm::tests::a_trapped_syscall_stops_the_vmm_and_is_reported test_confine_cold_boot_kills_a_vmm_whose_filter_installs_nothing
+# The tests in the filter whose VM has to fail its boot: it never turns healthy, so the gate
+# takes a VMM read as confined while the VM was starting for these and for no other test.
+CONFINE_BOOT_FAILS_TESTS ?= test_pmem_covered_through_a_guest_symlink_fails_the_boot test_pmem_covering_an_earlier_disk_through_a_guest_symlink_fails_the_boot
 test-confine: show-notes check-disk setup-fcvm
-	CONFINE_GATE_NO_VMM_TESTS="$(CONFINE_NO_VMM_TESTS)" ./scripts/confine-gate.sh $(CONFINE_TEST_MIN) \
+	CONFINE_GATE_NO_VMM_TESTS="$(CONFINE_NO_VMM_TESTS)" CONFINE_GATE_BOOT_FAILS_TESTS="$(CONFINE_BOOT_FAILS_TESTS)" \
+		./scripts/confine-gate.sh $(CONFINE_TEST_MIN) \
 		$(MAKE) --no-print-directory _test-all FILTER="$(CONFINE_TEST_FILTER)"
 
 # The confined seccomp policies are generated: the fork's shipped filters for the pinned

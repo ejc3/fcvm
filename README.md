@@ -606,17 +606,31 @@ refused. `fcvm setup` compiles the allowlist beside each Firecracker it builds f
 commit the allowlist is derived from, and records the compiled file's SHA-256 beside it
 (`<filter>.sha256`). A confined start opens the filter without following a symbolic link
 and refuses one that is not a regular file owned by the user (or root, or the owner of
-the Firecracker binary), that other users can write, or whose bytes are not the recorded
-ones. It checks before anything is created, so a host that was upgraded and not set up
-again is told to run `fcvm setup` with nothing started; `fcvm setup` rebuilds a filter
-that does not match its record. The launch checks again and hands the VMM the bytes it
+the Firecracker binary), that its group or other users can write, that sits under a
+directory someone else owns or its group or other users can write (a sticky directory
+such as `/tmp` excepted), or whose bytes are not the recorded ones. It checks before
+anything is created, so a host that was upgraded and not set up again, or whose
+Firecracker binary is not there, is told to run `fcvm setup` with nothing started.
+`fcvm setup` rebuilds a filter that does not match its record, writes the filter and the
+record with mode 0644 whatever the umask, and takes group and other write off the
+directory of the Firecracker it builds. The launch checks again and hands the VMM the bytes it
 checked, in a sealed memory file. Another binary (`--firecracker-bin`, or the one an
 older snapshot recorded) has no recorded filter and is refused the same way. Once
 Firecracker has built the VM, fcvm reads every thread of the VMM from `/proc` and
-requires each to run under a seccomp filter; otherwise it kills the VMM and fails the
-start naming the threads, because Firecracker accepts a filter file that installs
+requires each to run under a seccomp filter of its own: more filters than fcvm's own
+threads have, since a VMM inherits whatever fcvm runs under (a systemd unit's
+`SystemCallFilter=`, a container's default profile). Otherwise it kills the VMM and fails
+the start naming the threads, because Firecracker accepts a filter file that installs
 nothing. A restore is checked before its guest resumes; a boot within 5 s of its guest's
-start. `fcvm ls` shows the layers a VM runs with.
+start (the check waited 0 to 6 ms in the test suites). `fcvm ls` shows the layers a VM
+runs with.
+
+The `[confine]` table takes `mode` and `allow_seccomp_log` and refuses any other key, so
+a misspelled `mode` is an error and not `off`. When `fcvm setup` cannot build the
+allowlist's compiler it warns, removes the build's checkout and records the failure
+beside the Firecracker binary (`<firecracker>.seccompiler-bin.build-failed`); it does not
+build again for a day or until that file is removed, and a confined start is refused
+meanwhile.
 
 **What the two layers do not stop.** The record and the filter belong to the same user
 as fcvm, so the digest catches a damaged, truncated or half-replaced filter and not a
