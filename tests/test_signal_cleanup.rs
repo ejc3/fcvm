@@ -2375,11 +2375,7 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         let artifacts_for =
             |want_pid: u32| -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
                 let dir = fcvm::paths::state_dir();
-                for entry in std::fs::read_dir(&dir).context("reading state dir")? {
-                    let path = entry?.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                        continue;
-                    }
+                for path in fcvm::state::StateManager::new(dir).state_files()? {
                     let Ok(text) = std::fs::read_to_string(&path) else {
                         continue;
                     };
@@ -2424,7 +2420,10 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         // The BASELINE's pair, captured now so the fixture's own teardown can be
         // held to the same standard. It is torn down gracefully, so fcvm's
         // `cleanup_vm` runs and BOTH of these must be GONE afterwards.
-        let base_artifacts = artifacts_for(base_pid)?;
+        // Required, and asserted after the teardown below with the other verdicts: an
+        // early return here would skip the baseline's and the serve's shutdown.
+        let base_artifacts = artifacts_for(base_pid)
+            .and_then(|found| found.context("no state file recorded for the baseline"));
 
         // THE FAST TEARDOWN: one signal to fcvm. Nothing else is signalled by us.
         send_signal(clone_pid, "KILL").context("SIGKILL to clone fcvm")?;
@@ -2519,8 +2518,9 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
 
         let base_leak = base_artifacts
             .as_ref()
+            .ok()
             .map(|(s, d)| (s.exists(), d.is_dir()));
-        if let Some((s, d)) = &base_artifacts {
+        if let Ok((s, d)) = &base_artifacts {
             std::fs::remove_file(s).ok();
             std::fs::remove_dir_all(d).ok();
         }
@@ -2607,7 +2607,11 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
         // its artifacts must be gone. With the old `Child::kill()` teardown they
         // both survived — by this test's own state_survived/data_survived logic —
         // and every run leaked a state file plus a multi-GB reflinked rootfs.
-        if let (Some((s, d)), Some((s_left, d_left))) = (&base_artifacts, base_leak) {
+        {
+            let (s, d) = base_artifacts
+                .as_ref()
+                .unwrap_or_else(|error| panic!("the baseline's artifacts: {error:#}"));
+            let (s_left, d_left) = base_leak.expect("measured whenever the artifacts were found");
             assert!(
                 !s_left && !d_left,
                 "the BASELINE VM's teardown leaked: state_file_left={} ({}) \

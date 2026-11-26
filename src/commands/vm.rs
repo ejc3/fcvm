@@ -580,7 +580,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
 
     // What VMs of processes killed without teardown left goes first, then this VM's
     // runtime directory is recorded before anything creates it (crate::reclaim).
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
@@ -594,6 +594,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         network: args.network.into(),
         firecracker_args: None,
         unsupported: Some("fcvm vm run does not support confinement yet"),
+        kernel_profile: None,
     })?;
     let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)

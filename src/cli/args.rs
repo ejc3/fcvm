@@ -20,6 +20,8 @@ pub struct Cli {
 pub enum Commands {
     /// List running VMs
     Ls(LsArgs),
+    /// Print the directories this binary keeps its state and data in
+    Paths(PathsArgs),
     /// Podman-compatible container operations
     Podman(Box<PodmanArgs>),
     /// Snapshot operations (create, serve, run, export)
@@ -595,7 +597,8 @@ pub struct FleetCoordArgs {
 
     /// On-demand rates the spend meter uses, `<instance type>=<USD per hour>`, comma
     /// separated, over its built-in rates for the fleet's instance types (us-east-1 list
-    /// prices). Spot instances are priced at their current spot price.
+    /// prices). Spot instances are priced at their current spot price. A host group launches
+    /// only types this table prices.
     #[arg(long, env = "FLEET_SPEND_RATES", value_delimiter = ',')]
     pub spend_rates: Vec<String>,
 
@@ -1778,13 +1781,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_swap: bool,
 
-    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
-    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
-    /// for one, make a new user namespace and hold capabilities there), files or sockets;
-    /// later layers do. Rootless mode and the Firecracker backend only, on a
-    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
-    /// never run unconfined. The host's `[confine] mode = "required"` (or
-    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    /// Confine this VM's VMM: no capabilities, none regained by its exec, no_new_privs,
+    /// no core dumps, and a syscall allowlist per thread. A syscall outside the allowlist
+    /// kills the VMM, and the guest with it; FCVM_CONFINE_SECCOMP=log records such
+    /// syscalls instead, to check a workload before enforcing (README, "Confining the
+    /// VMM"). It does not yet restrict files or sockets; later layers do. Rootless mode,
+    /// the Firecracker backend and the default Firecracker build only, on a kernel with
+    /// Landlock ABI 9 or later; a start that cannot be confined is refused, never run
+    /// unconfined. The host's `[confine] mode = "required"` (or FCVM_CONFINE=required)
+    /// confines every start. Not part of any snapshot key.
     #[arg(long)]
     pub confine: bool,
 }
@@ -2078,13 +2083,15 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub no_swap: bool,
 
-    /// Confine this VM's VMM. This layer: no capabilities, none regained by its exec,
-    /// no_new_privs, no core dumps. It does not yet restrict syscalls (the VMM can still,
-    /// for one, make a new user namespace and hold capabilities there), files or sockets;
-    /// later layers do. Rootless mode and the Firecracker backend only, on a
-    /// kernel with Landlock ABI 9 or later; a start that cannot be confined is refused,
-    /// never run unconfined. The host's `[confine] mode = "required"` (or
-    /// FCVM_CONFINE=required) confines every start. Not part of any snapshot key.
+    /// Confine this VM's VMM: no capabilities, none regained by its exec, no_new_privs,
+    /// no core dumps, and a syscall allowlist per thread. A syscall outside the allowlist
+    /// kills the VMM, and the guest with it; FCVM_CONFINE_SECCOMP=log records such
+    /// syscalls instead, to check a workload before enforcing (README, "Confining the
+    /// VMM"). It does not yet restrict files or sockets; later layers do. Rootless mode,
+    /// the Firecracker backend and the default Firecracker build only, on a kernel with
+    /// Landlock ABI 9 or later; a start that cannot be confined is refused, never run
+    /// unconfined. The host's `[confine] mode = "required"` (or FCVM_CONFINE=required)
+    /// confines every start. Not part of any snapshot key.
     #[arg(long)]
     pub confine: bool,
 
@@ -2490,6 +2497,17 @@ pub struct LsArgs {
     /// Filter by fcvm process PID
     #[arg(long)]
     pub pid: Option<u32>,
+}
+
+// ============================================================================
+// Paths Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct PathsArgs {
+    /// Print one JSON object instead of one `name<TAB>path` line per directory
+    #[arg(long)]
+    pub json: bool,
 }
 
 // ============================================================================

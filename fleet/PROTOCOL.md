@@ -778,11 +778,18 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   30 minutes), on demand at the on-demand rate of its type. `--spend-rates` (also
   `FLEET_SPEND_RATES`) sets on-demand rates, `<instance type>=<USD per hour>` comma
   separated, over the built-in us-east-1 list prices of `g4dn.metal` (7.824), `g4dn.xlarge`
-  (0.526), `g5g.metal` (2.744), `g5g.xlarge` (0.42) and `c8gd.metal-24xl` (4.70304, pages
-  mode's host). The meter errs high where it cannot
+  (0.526), `g5g.metal` (2.744), `g5g.xlarge` (0.42), `m8gd.metal-24xl` (5.53536, pages mode's
+  host) and `c8gd.metal-24xl` (4.70304). The meter errs high where it cannot
   know: a spot instance without a spot price is charged its on-demand rate, an instance
   type without a rate the highest rate known, and a region it cannot list keeps its last
   listed instances; each marks the `spend` component degraded (`degraded`).
+- A host group (`--host-template`, `--renders-template`) launches only instance types the
+  table above prices (built in and `--spend-rates`, with or without `--daily-spend-usd`). When
+  a template's validated default starts a type without a rate, the group sends no
+  `CreateFleet` and marks its component (`scale`, `scale-renders`) degraded with the template,
+  the type, and how to give it a rate. An instance of such a type that is already running is
+  still metered, at the highest rate known. EC2 tiles (`--ec2 aws`) launch from their
+  templates by `RunInstances` without reading the template's type, and are not checked.
 - Every 30 s the coordinator writes one CloudWatch embedded metric format line to stdout,
   namespace `FCVM/Fleet`, dimension `Fleet` (`--fleet-name`), with or without a ceiling:
   `ActiveViewers` (joined viewers whose page is not hidden), `VerifiedViewers` (joined

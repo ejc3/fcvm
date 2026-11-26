@@ -159,7 +159,7 @@ pub(crate) fn store_temp_path(final_path: &Path) -> std::path::PathBuf {
 /// guard does that.
 ///
 /// A SIGKILLed build drops nothing, so the temp is recorded with an owner of its own
-/// before it exists (`crate::reclaim`), and the next launch removes it.
+/// before it exists (`crate::reclaim`), and the next sweep removes it.
 pub(crate) struct StoreTemp {
     path: std::path::PathBuf,
     published: bool,
@@ -266,7 +266,7 @@ impl Drop for StoreTemp {
         };
         match removed {
             Ok(()) => self.discard_record(),
-            // The record stays, and the next launch tries again.
+            // The record stays, and the next sweep tries again.
             Err(err) => {
                 warn!(path = %self.path.display(), %err, "removing an unpublished store temp")
             }
@@ -543,7 +543,7 @@ mod store_ownership_tests {
             .collect();
         assert!(left.is_empty(), "{left:?}");
         assert_eq!(
-            std::fs::read_dir(&owners).unwrap().count(),
+            crate::reclaim::record_files(&owners).len(),
             0,
             "the temps' records were left"
         );
@@ -589,7 +589,7 @@ mod store_ownership_tests {
         );
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
         assert_eq!(
-            std::fs::read_dir(&owners).unwrap().count(),
+            crate::reclaim::record_files(&owners).len(),
             0,
             "records were left"
         );

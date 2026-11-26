@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Proofs run only on the four broker-owned image builders/validators.
+"""Proofs run only on the broker-owned image builders/validators (the pair's four, the renders
+track's two).
 
 Secrets stay in RAM or private runtime files. Standard output is a small proof;
 commands and secret-bearing exception text are never returned to CodeBuild.
@@ -9,6 +10,7 @@ import contextlib
 import datetime
 import hashlib
 import hmac
+import importlib.util
 import io
 import ipaddress
 import json
@@ -34,6 +36,16 @@ TLS = Path("/run/fcvm-fleet/tls")
 GUARD = "cve-2026-98432-mitigation.service"
 DIAGNOSTIC_LOG = Path("/var/log/fleet-image-phase.log")
 DIAGNOSTIC_LIMIT = 1024 * 1024
+# The build phases of each kind, for the private diagnostics archive.
+PHASES = {"host": {"prep", "build", "bake"}, "tile": {"prep", "image", "trace", "bake"},
+          "renders": {"prep", "build", "bake"}}
+# The units each kind's image starts for the fleet, with the recipe file each must be byte for
+# byte (build-ami.sh's guard proof). The renders host shares the GPU host's store unit.
+GUARDED_UNITS = {"fcvm-fleet-agent.service": "host", "fcvm-fleet-store.service": "host",
+                 "fcvm-fleet-renderer.service": "tile", "fcvm-fleet-nginx.service": "tile",
+                 "fcvm-fleet-renders-agent.service": "renders"}
+RENDERS_RECORD = Path("/etc/fcvm-fleet/renders-build.json")
+RENDERS_CONF = Path("/etc/fcvm-fleet/renders.conf")
 
 
 def need(value, message):
@@ -55,9 +67,8 @@ def guard():
     proof = source.split("# BEGIN IMAGE GUARD PROOF\n", 1)[1].split("# END IMAGE GUARD PROOF", 1)[0]
     implementation = AMI / "common/cve-2026-98432-mitigation.py"
     argv = ["-", hashlib.sha256(implementation.read_bytes()).hexdigest()]
-    for kind, names in (("host", ("fcvm-fleet-agent.service", "fcvm-fleet-store.service")),
-                        ("tile", ("fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service"))):
-        argv.extend(name + "=" + hashlib.sha256((AMI / kind / name).read_bytes()).hexdigest() for name in names)
+    argv.extend(name + "=" + hashlib.sha256((AMI / kind / name).read_bytes()).hexdigest()
+                for name, kind in GUARDED_UNITS.items())
     previous = sys.argv
     try:
         sys.argv = argv
@@ -137,8 +148,7 @@ def upload(client, bucket, key, path):
 
 
 def export_diagnostics(bucket, prefix, region, kind, phase):
-    need(kind in {"host", "tile"} and phase in ({"prep", "build", "bake"} if kind == "host"
-         else {"prep", "image", "trace", "bake"}), "invalid diagnostics phase")
+    need(phase in PHASES.get(kind, ()), "invalid diagnostics phase")
     client = bucket_client(bucket, prefix, region)
     descriptor = os.open(DIAGNOSTIC_LOG, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -232,11 +242,11 @@ def sanitized():
 
 
 def seal(kind):
-    need(kind in {"host", "tile"}, "invalid factory kind")
+    need(kind in {"host", "tile", "renders"}, "invalid factory kind")
     clean_identity()
     sanitized()
     guard()
-    if kind == "host":
+    if kind in ("host", "renders"):
         store_parts()
     command(["cloud-init", "clean", "--logs", "--seed"])
     Path("/etc/machine-id").write_text("")
@@ -346,9 +356,10 @@ def tls_proof(port, document):
 
 
 def ordering(kind):
-    names = ("fcvm-fleet-store.service",) if kind == "host" else (
+    names = ("fcvm-fleet-store.service",) if kind in ("host", "renders") else (
         "fcvm-fleet-renderer.service", "fcvm-fleet-nginx.service")
-    ready = ("fcvm-fleet-vfio.service", *names) if kind == "host" else names
+    ready = (("fcvm-fleet-vfio.service", *names) if kind == "host"
+             else ("fcvm-fleet-hugepages.service", *names) if kind == "renders" else names)
     deadline = time.monotonic() + 1800
     while True:
         remaining = deadline - time.monotonic()
@@ -648,10 +659,225 @@ def verify(kind, expected_image, build_arn, test_arn, region, *proofs):
             "build_cert_sha256": cert_hash(old["cert"]), "test_cert_sha256": cert_hash(new["cert"])}
 
 
+# A renders validator's failures as the record keeps them: host-check.py's fixed sentences and the
+# agent check's case names, never a URL or a token. An entry that is not such a string is kept as
+# RENDERS_UNREADABLE, so the record has one entry for each failure. A verdict is never read from
+# this text: each proof decides from its raw result (an exit status, a raw problem or case list).
+RENDERS_TEXT = re.compile(r"[A-Za-z0-9 :./,()'_+=-]{1,160}")
+RENDERS_UNREADABLE = "a failure whose text the record does not keep"
+RENDERS_FAILURES_MAX = 40
+RENDERS_UNIT = Path("/etc/systemd/system/fcvm-fleet-renders-agent.service")
+# The transient unit the cold boot starts the image's agent unit's words in.
+RENDERS_UNIT_CHECK = "fcvm-fleet-renders-unit-check"
+# renders_agent_check.py's running case (Check.running_cases), in its order.
+AGENT_RUNNING_CASES = ("hello", "renders", "overlay", "stop")
+
+
+def plain(items):
+    return [item if isinstance(item, str) and RENDERS_TEXT.fullmatch(item) and "//" not in item
+            else RENDERS_UNREADABLE for item in items][:RENDERS_FAILURES_MAX]
+
+
+def renders_conf():
+    """host-check.py, and the image's renders.conf as host-check.py reads it."""
+    spec = importlib.util.spec_from_file_location("renders_host_check", AMI / "renders/host-check.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module, module.read_conf(RENDERS_CONF.read_text())
+
+
+def renders_record():
+    """What the renders build made (host-check.py record), for the factory's manifest."""
+    record = json.loads(RENDERS_RECORD.read_text())
+    module, conf = renders_conf()
+    need(isinstance(record, dict) and set(record) == set(module.RECORD_FIELDS), "the renders build record is malformed")
+    need(all(re.fullmatch(r"[0-9a-f]{40}", record[k]) for k in ("fcvm_commit", "kitesurf_commit"))
+         and re.fullmatch(r"[0-9a-f]{64}", record["bundle_sha256"])
+         and module.RELEASE.fullmatch(record["kernel_release"])
+         and record["boot_params"] == conf["RENDERS_BOOT_PARAMS"]
+         and record["hugepages"] == int(conf["RENDERS_HUGEPAGES"]), "the renders build record is malformed")
+    return record
+
+
+def renders_host_proof():
+    """(passed, problems): host-check.py host on this boot. It passed only when it exited 0 and
+    its result says ok with no problem; any other result is a failure, with a problem named."""
+    done = subprocess.run(["python3", str(AMI / "renders/host-check.py"), "host"], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=3600)
+    try:
+        result = json.loads(done.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        result = None
+    problems = result.get("problems") if isinstance(result, dict) else None
+    passed = done.returncode == 0 and isinstance(result, dict) and result.get("ok") is True and problems == []
+    if passed:
+        return True, []
+    if not isinstance(problems, list) or not problems:
+        problems = ["the renders host check exited " + str(done.returncode) + " without a problem it could name"]
+    return False, problems
+
+
+def agent_check_cases(check_py):
+    """Every case name `make test-fleet-renders-agent` runs with its defaults (CASES unset): the
+    running case's, a stop at each hold stage, a kill at each stage. The stage lists are the
+    check's own defaults, read from its parser (renders_bench.sh hands it the same)."""
+    spec = importlib.util.spec_from_file_location("renders_agent_check", check_py)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    opts = module.parse(["--unit", "u", "--status", "s", "--teardown", "t", "--run-dir", "r", "--pages", "1", "--", "x"])
+    kills = []
+    for entry in filter(None, opts.stages.split(",")):
+        stage, _, signame = entry.partition(":")
+        kills.append(f"kill:{stage}:{signame or 'KILL'}")
+    return [*AGENT_RUNNING_CASES, *("stop:" + s for s in filter(None, opts.hold_stages.split(","))), *kills]
+
+
+def check_verdict(code, path, expected):
+    """(passed, failures) of an agent check that exited `code` and wrote its record at `path`:
+    passed only with a clean exit, a record whose cases are exactly `expected`, and nothing
+    failed. A missing or unreadable record is a failure."""
+    try:
+        record = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        record = None
+    rows = record.get("rows") if isinstance(record, dict) else None
+    failed = record.get("failed") if isinstance(record, dict) else None
+    if not isinstance(rows, list) or not isinstance(failed, list):
+        return False, ["the agent check wrote no readable record (exit " + str(code) + ")"]
+    names = [row.get("case") if isinstance(row, dict) else None for row in rows]
+    failures = [case if isinstance(case, str) else repr(case) for case in failed]
+    failures += ["the agent check did not run " + name for name in expected if name not in names]
+    failures += ["the agent check ran a case it does not define" for name in names if name not in expected]
+    if code != 0 and not failures:
+        failures.append("the agent check exited " + str(code))
+    passed = code == 0 and failed == [] and names == list(expected)
+    if not passed and not failures:
+        failures.append("the agent check's cases are not its own list in order")
+    return passed, failures
+
+
+def renders_agent_proof():
+    """(passed, failures): pages mode on this image under its agent, with the coordinator played by
+    the host check (make test-fleet-renders-agent: hello, renders on both sides, an overlay, stops
+    while rendering and while held, SIGKILL at every stage, each with nothing left). Run as the
+    build user, the agent's user, from the image's own checkout, every case."""
+    _, conf = renders_conf()
+    user, uid = conf["RENDERS_USER"], conf["RENDERS_UID"]
+    expected = agent_check_cases(Path(conf["RENDERS_SRC"], "bench/chromium/renders_agent_check.py"))
+    with tempfile.TemporaryDirectory(dir="/mnt/fcvm-btrfs") as out:
+        os.chown(out, int(uid), int(uid))
+        check = out + "/check"
+        # The check's own log names the run's paths and processes; it stays on the validator.
+        done = subprocess.run(["runuser", "-u", conf["RENDERS_USER"], "--", "env", "HOME=/home/" + user,
+                               "XDG_RUNTIME_DIR=/run/user/" + uid, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                               "make", "-C", conf["RENDERS_SRC"], "test-fleet-renders-agent", "OUT=" + check,
+                               "FCVM=/usr/local/bin/fcvm", "TAG=" + conf["RENDERS_SNAPSHOT_TAG"],
+                               "KITESURF=" + conf["RENDERS_KITESURF"], "DIST=" + conf["RENDERS_DIST"],
+                               "MAX_FCVM=" + conf["RENDERS_CHECK_MAX_FCVM"], "MAX_ENGINES=" + conf["RENDERS_CHECK_MAX_ENGINES"]],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5400)
+        return check_verdict(done.returncode, check + ".agent-check.json", expected)
+
+
+def unit_command(unit_text, agent_env, name):
+    """The installed agent unit as a transient unit `name` on the caller's pipes: every setting of
+    its [Service] section as a property, its agent.env replaced by `agent_env`, and its ExecStart's
+    words, which systemd-run expands from the environment files as the unit's ExecStart is."""
+    service = unit_text.split("[Service]\n", 1)[1].split("\n[", 1)[0]
+    props, command = [], None
+    for line in service.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key == "ExecStart":
+            command = value.split()
+            continue
+        if key == "EnvironmentFile" and value == "/etc/fcvm-fleet/agent.env":
+            value = agent_env
+        props += ["-p", key + "=" + value]
+    need(command, "the agent unit has no ExecStart")
+    return ["systemd-run", "--unit", name, "--collect", "--quiet", "--pipe", *props, *command]
+
+
+def unit_census(conf, name):
+    """renders_bench.sh census_args for the module the image's renders.env runs, under unit `name`."""
+    out, data = conf["RENDERS_OUT"], "/mnt/fcvm-btrfs"
+    args = ["--unit", name, "--status", out + ".status.json", "--teardown", out + "/teardown.json",
+            "--run-dir", conf["RENDERS_RUN_DIR"], "--state-dir", data + "/state", "--vm-dir", data + "/vm-disks",
+            "--data-dir", data, "--snapshot-tag", conf["RENDERS_SNAPSHOT_TAG"]]
+    for address in ("127.0.0.1", "127.0.0.3"):
+        for port in (80, 443):
+            args += ["--port", f"{address}:{port}"]
+    args += ["--port", "127.0.0.1:53"]
+    args += [arg for n in range(int(conf["RENDERS_MAX_ENGINES"])) for arg in ("--port", f"127.0.0.1:{28800 + n}")]
+    return args
+
+
+def renders_unit_proof():
+    """(passed, failures): the image's own agent unit, as the fleet starts it. systemd-analyze
+    verify accepts the installed unit, and renders_agent_check.py's running case (hello, renders
+    on both sides, an overlay, a stop with nothing left) passes on the unit's own words: its
+    [Service] settings and ExecStart, with the image's renders.env (the module at its maxima, its
+    CPU sets, the --setup commits, --host-from-imds) and a validation agent.env whose only
+    argument is --stdio, the connection the check plays the coordinator on."""
+    module, conf = renders_conf()
+    failures = []
+    verify = subprocess.run(["systemd-analyze", "verify", str(RENDERS_UNIT)], stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=120)
+    if verify.returncode != 0:
+        failures.append("systemd-analyze verify refused the agent's unit")
+    src = Path(conf["RENDERS_SRC"], "bench/chromium")
+    urls = module.campaign_urls(src / "corpus_campaign.sh")
+    with tempfile.TemporaryDirectory(dir="/mnt/fcvm-btrfs") as tmp:
+        env = Path(tmp, "agent.env")
+        env.write_text('FLEET_AGENT_ARGS="--stdio"\n')
+        env.chmod(0o644)
+        Path(tmp).chmod(0o755)
+        out = tmp + "/unit-check.json"
+        command = unit_command(RENDERS_UNIT.read_text(), str(env), RENDERS_UNIT_CHECK)
+        done = subprocess.run(["python3", str(src / "renders_agent_check.py"), *unit_census(conf, RENDERS_UNIT_CHECK),
+                               "--pages", str(len(urls.split(","))), "--engines", "--cases", "running",
+                               "--log", tmp + "/unit-check.log", "--out", out, "--", *command],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600)
+        passed, more = check_verdict(done.returncode, out, AGENT_RUNNING_CASES)
+    failures += more
+    return passed and verify.returncode == 0, failures
+
+
+# Proofs a renders validator runs only when asked (the cold boot). The frame server's viewer
+# acceptance is added here, and in pipeline.py RENDERS_COLD_PROOFS, once it exists.
+RENDERS_PROOFS = ("renders-agent", "renders-unit")
+
+
+def verify_renders(*proofs):
+    """A renders image's validation boot: the security proofs every image carries, its units up in
+    order, the fleet's launch path, the flavor's own check (host-check.py: the -fcvm kernel the
+    build installed with the reference's boot line, the pool, /dev/kvm, the units, the pieces),
+    and, when asked, the agent check and the agent unit's own words. Each verdict is its proof's
+    own; the record holds one entry for each failure and their count."""
+    need(set(proofs) <= set(RENDERS_PROOFS), "unknown validator proof")
+    sanitized()
+    guard()
+    ordering("renders")
+    launch_path_proof()
+    result = {**boot(), "guard": True, "sanitized": True, "launch_path": True}
+    for name, key, proof, label in (("renders-host", "renders_host", renders_host_proof, "problem"),
+                                    ("renders-agent", "renders_agent", renders_agent_proof, "failure"),
+                                    ("renders-unit", "renders_unit", renders_unit_proof, "failure")):
+        if name != "renders-host" and name not in proofs:
+            result[key] = False
+            continue
+        passed, raw = proof()
+        result[key] = passed is True
+        result[f"{key}_{label}_count"] = len(raw)
+        if raw:
+            result[f"{key}_{label}s"] = plain(raw)
+    return result
+
+
 def main():
     actions = {"boot": boot, "renderer": renderer, "export-renderer": export_renderer,
         "export-store": export_store, "export-diagnostics": export_diagnostics, "tile-tls": tile_tls, "tile-ready": tile_ready,
-        "seal": seal, "verify": verify}
+        "seal": seal, "verify": verify, "verify-renders": verify_renders, "renders-record": renders_record}
     try:
         need(len(sys.argv) >= 2 and sys.argv[1] in actions, "unknown image operation")
         result = actions[sys.argv[1]](*sys.argv[2:])

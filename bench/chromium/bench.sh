@@ -44,7 +44,8 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." &>/dev/null && pwd)
 FCVM=${FCVM:-$REPO_ROOT/target/release/fcvm}
 PAGES_DIR=$SCRIPT_DIR/pages
 IMAGE=localhost/chromium-bench
-STATE_DIR=/mnt/fcvm-btrfs/state
+# Where fcvm keeps VM state: its own answer, set by load_state_dir before any phase.
+STATE_DIR=""
 SNAP_DIR=/mnt/fcvm-btrfs/snapshots
 
 R=${R:-12}
@@ -189,7 +190,7 @@ cleanup() {
     log "cleanup (rc=$rc)"
     [ -n "${LOAD_PID:-}" ] && kill "$LOAD_PID" 2>/dev/null || true
     # our clones / baselines still alive (state file names carry the run id)
-    for f in "$STATE_DIR"/*.json; do
+    for f in ${STATE_DIR:+"$STATE_DIR"/vms/*/*.json}; do
         [ -e "$f" ] || continue
         local nm pid
         nm=$(jq -r '.name // ""' "$f" 2>/dev/null) || continue
@@ -311,13 +312,37 @@ fx() {  # fx <sudoflag> <args...>
     else RUST_LOG=$FCVM_LOG "$FCVM" "$@"; fi
 }
 
+# One answer of `fcvm paths --json` for the state directory, with the privileges
+# fx "$1" runs fcvm with. Never a join of a data root.
+fcvm_state_dir() {  # $1 sudoflag
+    local paths
+    paths=$(fx "$1" paths --json) || return 1
+    jq -er '.state_dir | select(type == "string" and startswith("/"))' <<<"$paths" \
+        || { log "'$FCVM paths --json' printed no state_dir: $paths"; return 1; }
+}
+
+# STATE_DIR, from the fcvm this script runs, asked as this user and, when the sudo
+# modes can run, under sudo too: the helpers below read one directory, so the two
+# must agree.
+load_state_dir() {
+    STATE_DIR=$(fcvm_state_dir "") \
+        || die "'$FCVM paths --json' failed or named no state directory (its stderr is above)"
+    if [ "$SKIP_SUDO" != 1 ] && sudo -n true 2>/dev/null; then
+        local root_dir
+        root_dir=$(fcvm_state_dir sudo) \
+            || die "'sudo $FCVM paths --json' failed or named no state directory (its stderr is above)"
+        [ "$root_dir" = "$STATE_DIR" ] \
+            || die "fcvm keeps state in $STATE_DIR for this user and in $root_dir under sudo; this script reads one directory"
+    fi
+}
+
 state_pid_by_name() {  # $1 vm name -> pid or empty
-    jq -r --arg n "$1" 'select(.name==$n) | .pid // empty' "$STATE_DIR"/*.json 2>/dev/null | head -1
+    jq -r --arg n "$1" 'select(.name==$n) | .pid // empty' "$STATE_DIR"/vms/*/*.json 2>/dev/null | head -1
 }
 
 serve_pid_by_snap() {  # $1 snapshot tag
     jq -r --arg s "$1" 'select(.config.process_type=="serve" and .config.snapshot_name==$s) | .pid // empty' \
-        "$STATE_DIR"/*.json 2>/dev/null | head -1
+        "$STATE_DIR"/vms/*/*.json 2>/dev/null | head -1
 }
 
 wait_state_gone() {  # $1 name, $2 timeout_s
@@ -937,7 +962,7 @@ wait_clones_gone() {  # $1 timeout
     while :; do
         local n
         n=$(jq -r --arg p "cb-$RUNID" 'select((.name // "") | startswith($p)) | .name' \
-            "$STATE_DIR"/*.json 2>/dev/null | grep -c '' || true)
+            "$STATE_DIR"/vms/*/*.json 2>/dev/null | grep -c '' || true)
         [ "${n:-0}" = 0 ] && return 0
         [ $((SECONDS - t0)) -ge "$1" ] && { log "WARN: $n clones still up after ${1}s"; return 1; }
         sleep 1
@@ -1290,6 +1315,7 @@ phase6() {
 # ---------------------------------------------------------------------------
 main() {
     local what=${1:-run}
+    [ "$what" = phase6 ] || load_state_dir
     case "$what" in
         run)    phase0; start_load_sampler; start_host_servers; phase1; mem_baseline quiescent-pre
                 phase3; phase4; phase4b; phase5; mem_baseline quiescent-post; phase6 ;;
