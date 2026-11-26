@@ -13,6 +13,9 @@
 #                    nothing. run.sh must not pass the self-test on a count it could not read.
 #   cc fails         the compiler exits 1. That is a step that could not be carried out (exit 2),
 #                    not a kernel that disagrees with its rule book (exit 1).
+#   fetch fails      with no kernel source in the build directory, `curl` exits 22. run.sh must
+#                    end as BLOCKED, and must have called curl with a time limit and retries
+#                    (`--max-time`, `--retry`): without them a stalled fetch lasts to the job's cap.
 #   count pinned     with one operation count in operations.expected changed, run.sh must fail:
 #                    a run that compares fewer operations than the documents quote is not the
 #                    run they describe.
@@ -22,7 +25,7 @@
 # Every case runs run.sh in a build directory of its own (HARNESS_BUILD), seeded with the kernel
 # source already fetched, so the cases do not disturb a run of run.sh going on beside them.
 #
-# usage: harness/test-run.sh       from verify/, after `lake build` (it runs run.sh eight times,
+# usage: harness/test-run.sh       from verify/, after `lake build` (it runs run.sh nine times,
 #                                  about 15 s)
 set -euo pipefail
 
@@ -42,6 +45,12 @@ mkdir "$HARNESS_BUILD"
 [ ! -d "$here/build/src" ] || cp -r "$here/build/src" "$HARNESS_BUILD/src"
 
 mkdir "$tmp/hostops-fails" "$tmp/diff-wrapped" "$tmp/grep-silent" "$tmp/cc-fails" "$tmp/expected"
+mkdir "$tmp/curl-fails" "$tmp/empty-build"
+cat > "$tmp/curl-fails/curl" <<WRAP
+#!/bin/bash
+echo "\$*" >> "$tmp/curl-args"
+exit 22
+WRAP
 cat > "$tmp/grep-silent/grep" <<WRAP
 #!/bin/bash
 if [ "\$1 \$2" = "-c ^<" ]; then exit 2; fi
@@ -67,7 +76,8 @@ echo "\$n" > "$tmp/diff-calls"
 if [ "\$n" = "\${TEST_RUN_DIFF_CALL:-}" ]; then exit "\$TEST_RUN_DIFF_STATUS"; fi
 exec "$real_diff" "\$@"
 WRAP
-chmod +x "$tmp/hostops-fails/lake" "$tmp/diff-wrapped/diff" "$tmp/grep-silent/grep" "$tmp/cc-fails/cc"
+chmod +x "$tmp/hostops-fails/lake" "$tmp/diff-wrapped/diff" "$tmp/grep-silent/grep" "$tmp/cc-fails/cc" \
+  "$tmp/curl-fails/curl"
 
 failures=0
 # case NAME WANT_STATUS WANT_TEXT FORBIDDEN_TEXT -- command...
@@ -107,6 +117,14 @@ case_ "the count of differing operations cannot be read" 2 "BLOCKED: the self-te
   env PATH="$tmp/grep-silent:$PATH" "$here/run.sh"
 case_ "the compiler fails" 2 "BLOCKED: harness/run.sh line" "agree with the model" -- \
   env PATH="$tmp/cc-fails:$PATH" "$here/run.sh"
+case_ "the fetch of the kernel source fails" 2 "BLOCKED: harness/run.sh line" "agree with the model" -- \
+  env PATH="$tmp/curl-fails:$PATH" HARNESS_BUILD="$tmp/empty-build" "$here/run.sh"
+for flag in --max-time --retry; do
+  if ! grep -q -- "$flag " "$tmp/curl-args" 2>/dev/null; then
+    echo "FAIL the fetch: run.sh called curl without $flag: $(head -n 1 "$tmp/curl-args" 2>/dev/null)"
+    failures=$((failures + 1))
+  fi
+done
 sed 's/^v6\.14 .*/v6.14 7/' "$here/operations.expected" > "$tmp/expected/operations.expected"
 case_ "an operation count differs from operations.expected" 1 "v6.14: .* operations, and operations.expected says 7" "" -- \
   env HARNESS_EXPECTED="$tmp/expected/operations.expected" "$here/run.sh"

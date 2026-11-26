@@ -67,7 +67,7 @@ make verify-harness   # the model's kernel rules against the kernel's own functi
 | `lake build` | every proof and every recorded break, in Lean's kernel | 3 min 37 s from cold, 1.5 GB |
 | `check-sweep.sh` | the axiom sweep, elaborated again whatever the build directory holds; `warningAsError` in `lakefile.toml` | 1 s |
 | `test-search.sh` | the search program's own gates: 15 cases | 24 s, 0.7 GB |
-| `harness/test-run.sh` | the harness against the kernel's functions, and the harness script's own gates: 8 cases | 15 s after the first fetch |
+| `harness/test-run.sh` | the harness against the kernel's functions, and the harness script's own gates: 9 cases | 15 s after the first fetch |
 | `search-expected.sh quick` | the 19 small searches against `WakeVerify/search.expected` | about 2 min, 1.2 GB |
 
 The toolchain is pinned in `lean-toolchain` (`leanprover/lean4:v4.35.0`; elan installs it on first
@@ -261,11 +261,12 @@ exits 1. Before it compares anything `run.sh` checks that every run of `Breaks.l
 `recordedRuns`, the hand-kept list `hostops` replays.
 
 A step that cannot be carried out ends the run as BLOCKED with exit status 2, never as agreement
-and never as a disagreement (exit 1). `harness/test-run.sh` injects five such failures through a
+and never as a disagreement (exit 1). `harness/test-run.sh` injects six such failures through a
 stand-in tool on PATH and checks each: `hostops` failing after ten rows, the self-test's `diff`
 exiting 2 and exiting 0, a kernel's own `diff` exiting 2, the count of differing operations
-unreadable, and the compiler failing. It does not inject a crash of the compiled functions, a
-failed fetch or a failed `sed` or `paste`; those are checked in the script and not tested.
+unreadable, the compiler failing, and the fetch of the kernel source failing (where it also
+checks that `curl` was given `--max-time` and `--retry`). It does not inject a crash of the
+compiled functions or a failed `sed` or `paste`; those are checked in the script and not tested.
 
 **What it does not run.**
 
@@ -432,18 +433,30 @@ verify` (the table under "Build"), capped at 15 minutes. elan comes from a check
 file, the toolchain is the one `lean-toolchain` names, and both are cached with the build
 directory. It is a workflow of its own and is not part of `Summary`.
 `tests/test_ci_workflow_coverage.rs` (`the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main`)
-pins its triggers and each of the six lines of its build step.
+pins its triggers and the build step's commands as an exact list in order, so a line added
+ahead of the checks (`set +e`, `exit 0`) fails it as a dropped check does.
 
-A second job, `search`, runs all 76 searches against `search.expected` when the workflow is
-dispatched by hand (`gh workflow run verify.yml --ref <branch>`): run it after a change to
-`Spec.lean`, `Today.lean`, `Design.lean`, `Properties.lean` or `Search.lean`.
+**57 of the 76 searches are compared only by the full run.** The job above compares the 19
+small ones on every run. The other 57 (every search of the fcvm configuration with snapshots,
+and the nested, Xen, hotplug, SEV, NMI and write-back configurations) are compared by `make
+verify-search`, or by a second job, `search`, which runs all 76 when the workflow is dispatched
+by hand (`gh workflow run verify.yml --ref <branch>`, possible once `verify.yml` is on the
+default branch). When to run it: before merging any change to `Spec.lean`, `Today.lean`,
+`Design.lean`, `Properties.lean`, `Search.lean` or `search.expected`, on the tree to be merged.
+Nothing else changes what a search prints, so there is no reason to run it on a schedule. A
+change to one of those files that is merged without it leaves 57 blocks of `search.expected`
+unchecked. The last run that compared all 76 is recorded in BREAKS.md, "The run", with its date
+and tree: update that line with every full run.
 
 **Why the sweep has a step of its own.** CI restores `verify/.lake` from an earlier run, and `lake
 build` elaborates `Axioms.lean`, and so its sweep, only when something that file imports changed.
 A new module that nothing imports, holding an `axiom` and a theorem resting on it, built with exit
 0 on such a directory. Now `check-imports.sh` refuses the file before the build (it is not among
 `Axioms.lean`'s imports), and `check-sweep.sh` elaborates `Axioms.lean` after it on every run,
-where the sweep refuses it too. A library dropped from `defaultTargets`, or given a list of named
+where the sweep refuses it too. The sweep walks the library's directory and every directory
+below it and asks Lean which modules were imported, so a module in a subdirectory whose `import`
+line sits inside a comment of `Axioms.lean` (which `check-imports.sh`, reading text, accepts) is
+refused there. A library dropped from `defaultTargets`, or given a list of named
 modules in place of its glob, is refused by `check-imports.sh`: with either, a `sorry` in
 `Proofs.lean` built with exit 0.
 
@@ -466,7 +479,8 @@ What the other steps fail on, each observed the same way:
 |---|---|---|
 | `check-imports.sh` | a module nothing imports; `WakeVerify` out of `defaultTargets`; seven named modules for the glob | exit 1, naming it (`lake build` alone: exit 0 each time) |
 | `check-sweep.sh` | the module nothing imports, on a built directory | exit 1: "WakeVerify.Extra is not imported by WakeVerify.Axioms" |
-| `check-sweep.sh` | `warningAsError` removed and a definition Lean warns about | exit 1 (`lake build` alone: exit 0, with the warning printed) |
+| `check-sweep.sh` | `warningAsError` removed, or moved below the last table of `lakefile.toml` where it no longer applies, and a definition Lean warns about | exit 1 (`lake build` alone: exit 0, with the warning printed) |
+| `check-sweep.sh` | a module in a subdirectory, its `import` inside a block comment of `Axioms.lean` | exit 1 (`check-imports.sh` and `lake build`: exit 0) |
 | `test-search.sh` | the audit run on an unfinished search; `main` ignoring the audit's count; a pattern that matches no search; a panic | its cases fail: see the script's header |
 | `harness/test-run.sh` | `run.sh` before its checks | its cases fail: 3 of the first 5 against the script as first committed, the 3 added later against the script before them |
 | `search-expected.sh` | a kind removed from, added to or changed in `search.expected`, or a search's block dropped | exit 1: "the search differs" |

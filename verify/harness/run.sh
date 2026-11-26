@@ -74,7 +74,9 @@ while read -r sum path; do
   dest="$build/src/$path"
   if ! { [ -f "$dest" ] && echo "$sum  $dest" | sha256sum --check --status; }; then
     mkdir -p "$(dirname "$dest")"
-    curl -fsSL "$base/$tag/$file" -o "$dest"
+    # a stalled or refused fetch ends in minutes, not at the job's cap; each file is under 1 MB
+    curl -fsSL --connect-timeout 20 --max-time 120 --retry 3 --retry-delay 2 \
+      "$base/$tag/$file" -o "$dest"
     echo "$sum  $dest" | sha256sum --check --status ||
       { echo "BLOCKED: $path does not match its pinned checksum" >&2; exit 2; }
   fi

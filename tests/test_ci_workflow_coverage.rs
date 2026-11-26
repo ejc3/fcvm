@@ -3343,6 +3343,8 @@ fn host_jobs_install_from_cached_apt_archives_and_save_on_a_miss() {
 ///   `./check-sweep.sh`, the two gate tests and the search comparison after it, still builds
 ///   every proof and no longer checks what those check: the axiom sweep is not elaborated
 ///   again on a restored build directory, and nothing else runs the search or the harness.
+/// - a `set +e` or an `exit 0` ahead of the checks leaves every line in place and turns them
+///   all off, so the step's commands are compared with an exact list, not searched for.
 #[test]
 fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
     let wf = parse_workflow("verify.yml");
@@ -3456,40 +3458,39 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
         "the `lake build` step must fail when any of its commands fails: {script:?}"
     );
 
-    // The same step runs, each on a line of its own, what the model's documents rely on
-    // beside the build:
+    // The step is exactly these commands, in this order, and nothing else: comment lines and
+    // blank lines apart, any other line fails this test. A list of lines that must be present
+    // would pass a `set +e` or an `exit 0` put ahead of the checks, which turns every one of
+    // them off. What each line is for:
+    // - `set -euo pipefail` first, so any command that fails ends the step;
     // - the import check before the build, because lake does not elaborate Axioms.lean again
     //   when a file nothing imports is added, so the axiom sweep inside it does not see one;
     // - after the build, the sweep elaborated again whatever the build directory holds, the
     //   tests of the search's and the harness's own gates, and the small searches compared
     //   with the result the documents quote.
-    let lines: Vec<&str> = script.lines().map(str::trim).collect();
-    let line_of = |what: &str, wanted: &dyn Fn(&str) -> bool| -> usize {
-        lines
-            .iter()
-            .position(|l| wanted(l))
-            .unwrap_or_else(|| panic!("the `lake build` step does not run {what}: {script:?}"))
-    };
-    let imports = line_of("`./check-imports.sh` on a line of its own", &|l| {
-        l == "./check-imports.sh"
-    });
-    let built = line_of("`lake build`", &|l| l == "lake build");
-    assert!(
-        imports < built,
-        "`./check-imports.sh` must run before `lake build`: {script:?}"
-    );
-    for after in [
+    // A model added to verify/ adds its own lines here, in the place they run.
+    let commands: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let allowed = [
+        "set -euo pipefail",
+        "export PATH=\"$HOME/.elan/bin:$PATH\"",
+        "lean --version",
+        "./check-imports.sh",
+        "lake build",
         "./check-sweep.sh",
         "./test-search.sh",
         "./harness/test-run.sh",
         "./search-expected.sh quick",
-    ] {
-        let at = line_of(&format!("`{after}` on a line of its own"), &|l| l == after);
-        assert!(
-            built < at,
-            "`{after}` runs what `lake build` makes, so it must come after it: {script:?}"
-        );
-    }
+    ];
+    assert_eq!(
+        commands, allowed,
+        "the `lake build` step must run exactly the allowed commands, in order; a line \
+         outside the list (a `set +e`, an `exit 0`, a check dropped or moved) changes what \
+         the job checks"
+    );
 
     // The toolchain is the one verify/lean-toolchain pins, read from the file, and its cache
     // is keyed on that file: a toolchain bump cannot be served the old compiler.

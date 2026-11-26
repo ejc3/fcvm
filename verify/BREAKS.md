@@ -18,8 +18,10 @@ snapshots it finds nothing, which `v614_sound_without_snapshots` then proves.
 |---|---|---|---|---|
 | `JOBS=7 ./search-expected.sh full` | 76 (6 rule books x 12 configurations, 4 restore orders) | 449,763,133 | 7 min 53 s as seven processes side by side (one a rule book, and one for the restore orders); about 45 min of CPU in all | 3.3 GB a process |
 
-Run on 2026-11-26 on a shared arm64 dev box. One process for all 76 searches takes the sum and
-was not timed. No search hit its state limit. What every search printed (its states, each kind
+**The last run that compared all 76 searches with `search.expected`**: 2026-11-26, `make
+verify-search JOBS=7`, on the tree of commit fa402c356 (which has the `Spec.lean`, `Today.lean`,
+`Design.lean`, `Properties.lean` and `Search.lean` this file is committed with), on a shared arm64
+dev box: 76 searches agree. One process for all 76 searches takes the sum and was not timed. No search hit its state limit. What every search printed (its states, each kind
 with its count and the length of its shortest run, the audit's numbers) is committed as
 `WakeVerify/search.expected`, and `search-expected.sh` fails on any difference from it, in either
 direction: `quick` (19 searches) in `make verify` and in CI, `full` (all 76) in `make

@@ -35,13 +35,16 @@ elab "#check_wake_axioms" : command => do
   let env ← getEnv
   let allowed : List Name := [``propext, ``Quot.sound, ``Classical.choice]
   let lib : Name := `WakeVerify
-  -- every source file of the library is imported by this one
+  -- every source file of the library, in its directory or any directory below it, is imported
+  -- by this one. `modules` is what Lean imported, not what the text of this file says.
   let dir := (System.FilePath.mk (← getFileName)).parent.getD "."
+  let depth := dir.components.length
   let here := env.header.mainModule
   let modules := env.header.moduleNames
-  for entry in (← dir.readDir) do
-    if entry.path.extension == some "lean" then
-      let name := lib ++ Name.mkSimple (entry.path.fileStem.getD "")
+  for path in (← dir.walkDir) do
+    if path.extension == some "lean" then
+      let name := ((path.withExtension "").components.drop depth).foldl
+        (fun n c => n ++ Name.mkSimple c) lib
       unless name == here || modules.contains name do
         throwError "{name} is not imported by {here}: the axiom sweep would not see it"
   -- everything declared in the library's modules
