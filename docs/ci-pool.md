@@ -101,7 +101,8 @@ again after the run it started has finished, from any session.
    commit. Each cause is appended to the open issue that owns it (an issue body lists
    the causes it owns as `<!-- ci-pool-cause: X -->`; X also owns causes that start with
    X and a space, so one issue can own every case of a test binary), or a new issue is
-   opened. The pool may land with that issue open; `main` runs those lanes again.
+   opened. The pool may land with that issue open; `main` runs those lanes again,
+   because a lane that failed in any run on the landed commit is not proven for it.
 4. If it fails again, the failing lanes are run on a lower member's branch
    (`workflow_dispatch` with `lanes`), halving the unknown prefixes each time: about
    log2 of the pool size runs, each of one or two lanes, not of the matrix. The lanes
@@ -117,12 +118,46 @@ again after the run it started has finished, from any session.
    publishes a repair, or a revert of the member on its own branch, and the pool's next
    run is the confirmation. Two culprits take two rounds.
 
-A red top may cost 8 extra runs (reruns and probes, counted from the runs themselves).
-Past that, or when a prefix both failed and passed, a longer prefix passes above one
-that fails, a prefix fails for another cause, or `main` itself fails those lanes, the
+A verdict needs a prefix that passes. When every prefix fails, down to the bottom, the
+bottom is named only if the commit of `main` the pool is based on passes the same lanes:
+the merge base of the bottom with `main` (not `main`'s tip, which has moved on), read
+from the runs on that commit and on the tested head that landed as it, since `main`
+skips the lanes a landing proved. With nothing passing there, the failure may be older
+than the pool and nobody is marked.
+
+A failure is the same failure only when its cause was read and matches. A failed lane
+whose log could not be fetched, or whose log shows no failure, is compared with nothing:
+`bisect` says so and reads it again the next time it is run.
+
+A red top may cost 8 extra runs (reruns and probes, counted from the runs themselves; a
+job that GitHub lists again under a later attempt because another job was rerun is not
+a run). Past that, or when a prefix both failed and passed, a longer prefix passes above
+one that fails, a prefix fails for another cause or for one that could not be read, or
+the commit the pool is based on fails those lanes or is not shown to pass them, the
 outcome is `NOT-ISOLATED`: no member is named and none is called tested.
 
 `bisect` never dispatches on `main`, and it never cancels a run.
+
+## What is and is not a verdict
+
+`ci/pool` on a member's head is the verdict. GitHub's own roll-up of a pull request's
+checks, and `gh pr checks`, are not, for a stack member:
+
+- A lower member's run reports `Summary (deferred)`, which passes having tested nothing.
+- GitHub sometimes starts two runs for one push (two `synchronize` events in the same
+  second: 18 of 588 heads in the week of 2026-11-19, five of nine on 2026-11-26). The
+  second cancels the first, and the first run's cancelled jobs stay on the head. Until
+  2026-11-26 its `Summary` also ran and failed, and on a lower member nothing ever
+  replaced it, because the second run's is named `Summary (deferred)`: the roll-up read
+  FAILURE for good. `Summary` now does not run when the run itself was cancelled.
+- So a cancelled run has no `Summary`. Nothing may take that for a pass: `plan` counts
+  lanes and a `Summary` that succeeded, `land` needs a finished, uncancelled run that
+  reported `Summary`, and `mark` does not run in a cancelled run.
+
+A lane job that ends `cancelled` while its run goes on (its own `timeout-minutes`, a lost
+runner) is different: the run was not cancelled, `Summary` runs, and its gate fails on
+the cancelled result (run 45243521397, 2026-11-23: `Host-x64` over its hour, `Summary`
+failed).
 
 ## Landing
 
@@ -134,18 +169,26 @@ with one merge commit of the tested head, which closes every member as merged. W
 It lands nothing unless, on the head that would land:
 
 - every lane a pull request takes passed (`bisect` would say GREEN or PASSED ON RERUN),
-  in a run that has finished. A run that named some lanes with the `lanes` input does not
-  count for the others;
+  and no run on the head is unfinished: lanes can read green in a run whose other jobs
+  have not failed yet. A run that named some lanes with the `lanes` input does not count
+  for the others;
+- a run on the head reached a verdict: it finished, was not cancelled, and reported
+  `Summary` (or `Summary (some lanes)`). A deferred run tested nothing, and a cancelled
+  run reports no Summary at all, so neither is one;
 - the head contains `main`'s tip. Then the merge commit has the head's tree, and `main`'s
   planner finds the lanes proven for it. `build --sync-main` gets a pool there; that
   moves the top, so its run has to finish again. If `main` moves between the check and
   the merge, the merge still happens, the tree that lands is one no run tested, `land`
   says so, and `main` runs every lane;
 - the head contains every member's head;
-- no other job of the head's newest finished run failed. A failed job that is not a lane
+- no other job of the newest such run failed or was cancelled. A failed job that is not a lane
   can be accepted by name, with the issue that owns the failure:
   `--despite "Fleet Web=#2177"`. The merge commit's message records it. A lane cannot be
   accepted this way.
+
+If GitHub refuses the merge, or a base edit, the bases already moved are put back and
+`land` exits 2 with the pool as it was. If one cannot be put back it exits 4 and names
+the pull request and the base to restore.
 
 A pool that passed only on a rerun lands with an issue filed or appended for each cause,
 named in the merge commit's message, and `main` runs those lanes again.
@@ -167,23 +210,35 @@ lane fails the job. A push to `main` takes every lane that is not already proven
 tree, and anything the planner cannot look up counts as not proven.
 
 A lane is proven for a pushed commit by a job of exactly that lane's name that succeeded
-on its first attempt, in a run of `.github/workflows/ci.yml`, on a commit for which all
-of this holds:
+on its first attempt, in a run of `.github/workflows/ci.yml`, when the lane never failed
+in any counted run on that commit (a second run that passes does not undo a first that
+failed), on a commit for which all of this holds:
 
 - It is one of the pushed commit's other parents, or the head of a pull request of this
   repository that GitHub ties to the pushed commit. This is how the evidence is found:
   by the commit, not by searching recent runs.
 - Its tree is the pushed commit's tree. The tree is read from the commit, never from
   anything the run reported.
-- It contains `main` as it was before the push. A pull request's run tests the merge of
-  its head into its base, and that merge has the head's tree only when the head already
-  holds the base.
+- It contains `main` as it was before the push. "Before the push" is the push event's
+  own `before`, not the pushed commit's first parent: after a fast-forward of several
+  commits the first parent already holds part of the change. A push that names no
+  earlier commit proves nothing.
+- The run recorded the pushed commit's tree as the tree it tested. A pull request's run
+  tests the merge of its head into its base, and the Actions API records only the head.
+  The same head can be run against a base it does not contain: a second pull request of
+  the same commit into another branch, or a stack member whose lower branch had moved.
+  Such a run tested a tree that never lands, under that base's Makefile. So every run of
+  the planner writes the tree of the commit it was given as a notice titled
+  `ci-pool tested tree` on the `Skip Check` job, and the planner on `main` reads it back
+  from that job and no other (`Skip Check` runs no test, so nothing a test prints can
+  write it). A run with no record, or with two that differ, counts for nothing, neither
+  for a lane nor against one.
 - Between `main` before the push and that commit, no file that defines the lanes changed.
   A pull request's run executes the pull request's own copy of the workflow, the Makefile
   and the scripts, so a change to one of them could produce a job with a lane's name that
   tested nothing. Such a landing runs every lane on `main`, under the files that landed.
   A comparison of 300 files or more may be cut short by the API and proves nothing
-  either.
+  either, and neither does one that says the commit is ahead and lists no file.
 
 Which files define the lanes is derived, not listed by hand: `ci_pool.py lane-files`
 reads `ci.yml` and the Makefile and gives
@@ -214,11 +269,10 @@ The one case where a run speaks for all lanes: a pull request's run that reporte
 `Summary` (never `Summary (deferred)`) with every self-hosted job skipped by its own
 scope means the tree needs no lane.
 
-One assumption is not checked, because GitHub does not record it: that the branch a
-pull request was based on did not hold commits its head lacked when the run started. For
-a pull request based on `main` it follows from the third condition. For the top of a
-pool the base is the member below, which `build` and `publish` keep inside the top; a
-member branch pushed by hand, or forced, between a run and the landing breaks it.
+The record of the tested tree is written by the run's own copy of the tool. A run whose
+merge held another copy (a base branch with an edited `scripts/ci-pool/`) could write a
+false one; that takes a deliberate edit, which is what review of changes to those files
+is for. A base with an older copy writes none, and its runs count for nothing.
 
 In the week of 2026-11-19, 114 first-parent commits on `main` touched code. 17 of them
 changed a file on the list (7 the Makefile, 6 `ci.yml`, 4 a listed script) and would run
@@ -345,7 +399,15 @@ run costs one run, and a publish gets its verdict within one to two run lengths 
 
 A publish goes in at once when there is nothing to wait for: no run in flight, or a
 run in which a lane has already failed (its verdict is known, and what is being
-published may be the fix). `--now` on `publish` or `flush` goes in regardless.
+published may be the fix). `--now` on `publish` or `flush` goes in regardless. A publish
+that goes in takes everything queued for the pool with it in the same push: it rebuilds
+every member above, and a commit left queued for one of them would no longer contain
+its branch.
+
+A queue entry is removed once its commit is inside its branch, and only while it still
+names that commit (`--force-with-lease` on the removal of that one ref, never on a
+branch). A publish queued for the same branch in the meantime contains the first and
+stays queued.
 
 A new member that joins on top moves no member below it, so the old top's run keeps
 going while the new top starts its own. That costs a second run and buys the prefix

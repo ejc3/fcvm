@@ -423,6 +423,25 @@ class Workflow(unittest.TestCase):
         self.assertNotIn('needs.changes.outputs.run', gate)
         self.assertTrue(self.status_gate())
 
+    def test_summary_reports_on_every_run_that_was_not_itself_cancelled(self):
+        # A cancelled run's failed Summary stayed on the head for good: on a lower member of
+        # a stack no later check has its name. So Summary does not report on a cancelled run.
+        blocks = jobs(CI.read_text())
+        self.assertEqual(job_if(blocks['summary']), '!cancelled()')
+        # cancelled() is about the run. A lane that ended cancelled while the run went on
+        # (its own timeout, a lost runner) must still fail Summary: Summary waits for every
+        # lane job, and the step that fails it looks for a cancelled result as for a failed
+        # one. Run 45830927225 (a throwaway probe, 2026-11-26): a job that hit its
+        # timeout-minutes ended cancelled, and a job needing it with this `if:` ran and
+        # read `needs.<job>.result == 'cancelled'`.
+        waited_for = re.search(r'^    needs: \[(.*)\]$', blocks['summary'], re.M)[1].split(', ')
+        for lane_job in ('host', 'host-root', 'container'):
+            self.assertIn(lane_job, waited_for)
+        gate = re.search(r"      - name: Fail if any gating job did not succeed\n        if: (.*)\n", blocks['summary'])
+        self.assertEqual(gate[1], "contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')")
+        step = blocks['summary'][gate.end():].split('\n      - ', 1)[0]
+        self.assertRegex(step, r'(?m)^\s+exit 1$')
+
     def test_the_status_job_never_runs_with_a_forks_code_or_outside_a_pull_request(self):
         fork = {'pull_request': {'base': {'ref': 'main'}, 'head': {'repo': {'full_name': 'someone/fork'}}}}
         self.assertFalse(self.status_gate(event=fork))

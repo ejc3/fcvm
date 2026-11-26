@@ -22,7 +22,7 @@ the membership: there is no other list. CI runs the self-hosted lanes once, on t
 
 docs/ci-pool.md has the rules. Exit codes: 0 done, 2 blocked (a dependency, a lookup or a
 precondition failed: nothing was changed), 3 a member conflicted or an account is
-incomplete, 4 a push was refused because a branch moved.
+incomplete, 4 a push or a write was refused part way: the message says what is left.
 """
 import argparse
 import datetime as dt
@@ -415,9 +415,27 @@ def cmd_publish(args, gh, default_branch):
             note(f"QUEUED: {branch} at {head[:9]}. Run {flying['id']} on the top #{top['number']} (started "
                  f"{flying['created_at']}) is in flight; `flush --of {branch}` puts it in when that run has ended.")
             return 0
-    args.members, args.of, args.pending = [], branch, [f'{branch}={head}']
+    # Going in now takes everything queued for the pool along: this build moves every
+    # member above, and a commit queued for one of them would no longer contain its branch.
+    prs = open_prs(gh)
+    heads = {member['head'] for member in chain_of(prs, gh.repo, default_branch, find_pr(prs, gh.repo, branch))}
+    queued = {name: sha for name, sha in pending_refs(args.remote).items() if name in heads}
+    pending = dict(queued)
+    for name in queued:
+        git('fetch', '-q', args.remote, PENDING + name, timeout=300)
+    if branch in queued and queued[branch] != head and not is_ancestor(queued[branch], head, work):
+        raise Blocked(f'{branch} already has {queued[branch][:9]} queued, which these commits do not contain: '
+                      f'`git fetch {args.remote} {PENDING}{branch}`, merge FETCH_HEAD, and publish again')
+    pending[branch] = head
+    args.members, args.of, args.pending = [], branch, [f'{name}={sha}' for name, sha in sorted(pending.items())]
     args.sync_main = False
-    return cmd_build(args, gh, default_branch)
+    code = cmd_build(args, gh, default_branch)
+    if code == 0 and queued and not args.dry_run:
+        left = drop_queued(args.remote, queued)
+        if left:
+            note(f"the pool is built, but the queue entries of {', '.join(left)} could not be removed")
+            return 4
+    return code
 
 
 # -------------------------------------------------------------------------------- status
@@ -679,6 +697,26 @@ def scope_skipped_the_lanes(jobs):
             and not any(job['name'] in LANES for job in jobs))
 
 
+def merge_lane_states(per_run):
+    """One state per lane from every run on a commit. A lane that failed in one run or
+    attempt and passed in another did both: RERUN_PASS. Otherwise a failure, then a pass,
+    then an unfinished run decide, in that order."""
+    merged = {}
+    for lane in LANES:
+        seen = {states[lane] for states in per_run if lane in states}
+        if not seen:
+            continue
+        if RERUN_PASS in seen or (FAIL in seen and PASS in seen):
+            merged[lane] = RERUN_PASS
+        elif FAIL in seen:
+            merged[lane] = FAIL
+        elif PASS in seen:
+            merged[lane] = PASS
+        else:
+            merged[lane] = OPEN
+    return merged
+
+
 def proof_from(commit, runs, landing_tree, compare, accept_rerun=False, listed=None):
     """What the runs on one commit prove for a landing: (lanes, no_lanes, why_not).
 
@@ -688,27 +726,35 @@ def proof_from(commit, runs, landing_tree, compare, accept_rerun=False, listed=N
     - the commit's tree is the landing's tree, so its runs tested what landed;
     - the commit contains the default branch as it was before the landing, so a pull
       request's run, which tests the merge of its head into its base, tested that tree;
-    - the comparison lists every changed file, and none is lane-defining."""
+    - the comparison lists every changed file, and none is lane-defining.
+
+    A lane is then proven when it passed on this commit and never failed on it: its state
+    over all of the commit's runs together, not in any one of them. Only a run that
+    recorded the landing's tree as the tree it tested counts ('tested_tree'): a pull
+    request's run tests the merge of its head into its base, which is the head's tree only
+    when the head contained that base."""
     if commit['tree'] != landing_tree:
         return {}, None, f"{commit['sha'][:12]} has another tree"
     if compare is None:
         return {}, None, f"could not compare {commit['sha'][:12]} with the default branch"
     if compare['status'] not in ('ahead', 'identical'):
         return {}, None, f"{commit['sha'][:12]} does not contain the default branch ({compare['status']})"
+    if compare['status'] == 'ahead' and not compare['files']:
+        return {}, None, f"the comparison of {commit['sha'][:12]} with the default branch lists no changed file"
     if len(compare['files']) >= COMPARE_FILE_CAP:
         return {}, None, f"{len(compare['files'])} changed files, more than the comparison lists"
     changed = sorted(path for path in compare['files'] if lane_defining(path, listed))
     if changed:
         return {}, None, f"the landing changes what defines the lanes: {', '.join(changed[:3])}"
-    lanes, no_lanes = {}, None
-    for run in runs:
-        if run['event'] not in EVIDENCE_EVENTS:
-            continue
-        if run['event'] == 'pull_request' and scope_skipped_the_lanes(run['jobs']):
-            no_lanes = run['id']
-        for lane, state in lane_states(run['jobs']).items():
-            if state == PASS or (state == RERUN_PASS and accept_rerun):
-                lanes.setdefault(lane, run['id'])
+    counted = [run for run in runs if run['event'] in EVIDENCE_EVENTS and run.get('tested_tree') == landing_tree]
+    no_lanes = next((run['id'] for run in counted
+                     if run['event'] == 'pull_request' and scope_skipped_the_lanes(run['jobs'])), None)
+    per_run = [(run['id'], lane_states(run['jobs'])) for run in counted]
+    merged = merge_lane_states([states for _, states in per_run])
+    lanes = {}
+    for lane, state in merged.items():
+        if state == PASS or (state == RERUN_PASS and accept_rerun):
+            lanes[lane] = next(run for run, states in per_run if states.get(lane) in (PASS, RERUN_PASS))
     return lanes, no_lanes, None
 
 
@@ -722,8 +768,46 @@ def validate_lanes(text):
     return tuple(lane for lane in LANES if lane in names) if names else LANES
 
 
-def landing_evidence(gh, sha, now=None):
+PLAN_JOB = 'Skip Check'
+TREE_NOTICE = 'ci-pool tested tree'
+
+
+def say_tested_tree():
+    """Record which tree this run tests, as a notice on the planning job. A pull request's
+    run tests the merge of its head into its base, and the Actions API records the head
+    only: the same head can be run against a base it does not contain (another pull
+    request of the same commit, or a stack member whose lower branch moved), and such a
+    run tested a tree that never lands. The planner on the default branch reads this
+    notice back, from the job named PLAN_JOB and no other, which runs no test."""
+    try:
+        tree = git('rev-parse', 'HEAD^{tree}')
+    except Blocked as why:
+        note(f'the tested tree is not recorded: {why}')
+        return
+    if re.fullmatch(r'[0-9a-f]{40}', tree.strip()):
+        print(f'::notice title={TREE_NOTICE}::{tree.strip()}', flush=True)
+
+
+def tested_tree_of(gh, jobs):
+    """The tree a run recorded that it tested, or None when its planning job recorded
+    none, or more than one."""
+    trees = set()
+    for job in jobs:
+        if job['name'] != PLAN_JOB:
+            continue
+        try:
+            trees.update(gh.call(f"repos/{gh.repo}/check-runs/{job['id']}/annotations?per_page=100",
+                                 f'.[] | select(.annotation_level == "notice" and .title == "{TREE_NOTICE}") | .message',
+                                 paginate=True))
+        except Blocked as why:
+            note(f"could not read what job {job['id']} recorded: {why}")
+    return trees.pop() if len(trees) == 1 else None
+
+
+def landing_evidence(gh, sha, before, now=None):
     """(tree, [(commit, runs, compare)]) for a commit pushed to the default branch.
+    `before` is the default branch's tip before the push, from the push event: the pushed
+    commit's first parent is not that on a fast-forward of several commits.
 
     The commits whose runs can have tested its tree: its other parents (a merge commit
     has the tree of the branch it merged when that branch contained the default branch)
@@ -732,9 +816,10 @@ def landing_evidence(gh, sha, now=None):
     unproven."""
     now = now or dt.datetime.now(dt.timezone.utc)
     landing = gh.one(f'repos/{gh.repo}/git/commits/{sha}', '{tree: .tree.sha, parents: [.parents[].sha]}')
-    if not landing['parents']:
+    if not re.fullmatch(r'[0-9a-f]{40}', str(before)) or set(before) == {'0'}:
+        note('the push does not say what the default branch was before it')
         return landing['tree'], []
-    before, candidates = landing['parents'][0], list(landing['parents'][1:])
+    candidates = list(landing['parents'][1:])
     try:
         candidates += gh.call(f'repos/{gh.repo}/commits/{sha}/pulls?per_page=100',
                               f'.[] | select(.head.repo.full_name == "{gh.repo}") | .head.sha', paginate=True)
@@ -758,7 +843,11 @@ def landing_evidence(gh, sha, now=None):
                 if (now - instant(run['created_at'])).days >= MAX_EVIDENCE_AGE_DAYS:
                     continue
                 run['jobs'] = gh.call(f"repos/{gh.repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100",
-                                      '.jobs[] | {name, conclusion, run_attempt}', paginate=True)
+                                      '.jobs[] | {id, name, conclusion, run_attempt}', paginate=True)
+                run['tested_tree'] = tested_tree_of(gh, run['jobs'])
+                if run['tested_tree'] != landing['tree']:
+                    note(f"run {run['id']} on {head[:12]} counts for nothing: it recorded that it tested "
+                         f"{(run['tested_tree'] or 'no tree')[:12]}, and what landed is {landing['tree'][:12]}")
                 runs.append(run)
             out.append((commit, runs, compare))
         except Blocked as why:
@@ -820,14 +909,15 @@ def matrix_outputs(lanes):
 
 
 def cmd_plan(_args, gh, _default_branch):
-    """ci.yml's `skip-check` job. Reads EVENT, SHA, CONFINE and LANES and writes
+    """ci.yml's `skip-check` job. Reads EVENT, SHA, BEFORE, CONFINE and LANES and writes
     the matrix to $GITHUB_OUTPUT. Whatever cannot be looked up proves nothing, so the
     lanes run."""
     event = os.environ['EVENT']
+    say_tested_tree()
     tree, evidence = None, []
     if event == 'push':
         try:
-            tree, evidence = landing_evidence(gh, os.environ['SHA'])
+            tree, evidence = landing_evidence(gh, os.environ['SHA'], os.environ['BEFORE'])
         except (Blocked, KeyError) as why:
             note(f'no evidence for this push: {why}')
     listed = read_lane_files()
@@ -1025,6 +1115,22 @@ def jobs_of(gh, run, cache):
     return jobs
 
 
+def executions(jobs):
+    """A run's jobs with GitHub's copies taken out. When one job of a run is run again,
+    every other job is listed again under the new attempt, with a new id and the old
+    conclusion, start and end. Those records are not executions: nothing ran and no runner
+    was held. A job is a copy when an earlier attempt lists the same name with the same
+    start; the earliest record is kept."""
+    kept, seen = [], set()
+    for job in sorted(jobs, key=lambda job: (job.get('run_attempt') or 0)):
+        key = (job['name'], job.get('started_at'))
+        if job.get('started_at') and key in seen:
+            continue
+        seen.add(key)
+        kept.append(job)
+    return kept
+
+
 def first_attempt(jobs, names):
     """Each named job's conclusion in the run's first attempt."""
     return {j['name']: j['conclusion'] for j in jobs if j['name'] in names and j['run_attempt'] == 1}
@@ -1041,6 +1147,7 @@ def summarise(runs, jobs_by_run):
         jobs = jobs_by_run.get(run['id'])
         if jobs is None:
             continue
+        jobs = executions(jobs)
         for job in jobs:
             kind = runner_class(job['labels'])
             minutes = job_minutes(job)
@@ -1365,7 +1472,7 @@ def failed_lane_jobs(runs, jobs_by_run):
     lane in the same run said (True passed, False failed again, None not run again)."""
     out = []
     for run in runs:
-        jobs = jobs_by_run.get(run['id']) or []
+        jobs = executions(jobs_by_run.get(run['id']) or [])
         for job in jobs:
             if job['name'] not in LANES or job['conclusion'] not in ('failure', 'timed_out'):
                 continue
@@ -1487,28 +1594,16 @@ WAITING, GREEN, PASSED_ON_RERUN, RERUN, PROBE, CULPRIT, NOT_ISOLATED = (
 NOT_A_TEST = ('runner lost', 'step failed', 'job time limit', 'cancelled in step', NO_LOG, 'no failure in')
 
 
+NEED_BASE = 'need-base'
+
+
+def unread(causes):
+    """Whether nothing says why a lane failed: no cause, or only that the log shows none."""
+    return not causes or set(causes) == {NO_FAILURE_IN_LOG}
+
+
 def is_test_cause(cause):
     return not cause.startswith(NOT_A_TEST) and not cause.endswith('(cause not read)')
-
-
-def merge_lane_states(per_run):
-    """One state per lane from every run on a commit. A lane that failed in one run or
-    attempt and passed in another did both: RERUN_PASS. Otherwise a failure, then a pass,
-    then an unfinished run decide, in that order."""
-    merged = {}
-    for lane in LANES:
-        seen = {states[lane] for states in per_run if lane in states}
-        if not seen:
-            continue
-        if RERUN_PASS in seen or (FAIL in seen and PASS in seen):
-            merged[lane] = RERUN_PASS
-        elif FAIL in seen:
-            merged[lane] = FAIL
-        elif PASS in seen:
-            merged[lane] = PASS
-        else:
-            merged[lane] = OPEN
-    return merged
 
 
 def probe_lanes(causes_by_lane):
@@ -1562,7 +1657,10 @@ def diagnose(members, states_at, causes_at, tries_at, spent, required=PR_LANES, 
     every run on that commit merged. causes_at: {sha: {lane: [cause]}} for failed lanes.
     tries_at: {sha: {lane: finished attempts}}. spent: extra runs already made for this
     top. required: the lanes the top's own run takes, empty only when that run found by
-    its scope that the change needs none. first: member indexes to probe around first. base: {lane: state} of the default branch's own run, when known."""
+    its scope that the change needs none. first: member indexes to probe around first.
+    base: {lane: state} on the commit of the default branch that the pool is based on;
+    None when it has not been looked up, and then a pool whose every prefix fails gets
+    NEED_BASE in place of a verdict."""
     top = members[-1]
     at_top = states_at.get(top['sha'], {})
     if not at_top and not required:
@@ -1598,14 +1696,24 @@ def diagnose(members, states_at, causes_at, tries_at, spent, required=PR_LANES, 
     if once:
         return spend({'outcome': RERUN, 'lanes': once, 'causes': all_causes})
 
+    # A failure whose cause was not read cannot be told from another failure of the same
+    # lane, so nothing is compared with it: reading the log again is free, a wrong verdict
+    # is not.
+    blind = [lane for lane in failed if unread(causes_by_lane[lane])]
+    if blind:
+        return {'outcome': NOT_ISOLATED, 'lanes': failed, 'causes': all_causes,
+                'why': f"why {', '.join(blind)} failed on the top could not be read, so no prefix can be compared "
+                       'with it: run `bisect` again'}
     lanes = probe_lanes(causes_by_lane)
     probed = {c for lane in lanes for c in causes_by_lane[lane]}
 
     def prefix(index):
         states = {lane: states_at.get(members[index]['sha'], {}).get(lane) for lane in lanes}
         if FAIL in states.values():
-            seen = {c for lane in lanes if states[lane] == FAIL for c in causes_at.get(members[index]['sha'], {}).get(lane, [])}
-            return FAIL if (seen & probed or not seen or not probed) else 'other'
+            per_lane = [causes_at.get(members[index]['sha'], {}).get(lane, []) for lane in lanes if states[lane] == FAIL]
+            if any(unread(causes) for causes in per_lane):
+                return 'unread'
+            return FAIL if {c for causes in per_lane for c in causes} & probed else 'other'
         if OPEN in states.values():
             return OPEN
         if RERUN_PASS in states.values():
@@ -1619,6 +1727,11 @@ def diagnose(members, states_at, causes_at, tries_at, spent, required=PR_LANES, 
         return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
                 'why': f"the failing lanes both failed and passed on the prefix ending at {name(unsteady[0])}: "
                        'the failure does not reproduce the same way'}
+    blind = [i for i, state in found.items() if state == 'unread']
+    if blind:
+        return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
+                'why': f'why the prefix ending at {name(blind[0])} fails could not be read, so it is not known to be '
+                       'the same failure: run `bisect` again'}
     other = [i for i, state in found.items() if state == 'other']
     if other:
         return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
@@ -1634,15 +1747,21 @@ def diagnose(members, states_at, causes_at, tries_at, spent, required=PR_LANES, 
         if lo >= 0:
             result['text'] = (f"first failing prefix: the failure appears when {name(hi)} is added to the pool. "
                               f"The prefix ending at {name(lo)} passes {', '.join(lanes)}.")
-        elif base and all(base.get(lane) == PASS for lane in lanes):
-            result['text'] = (f"first failing prefix: the failure appears with {name(hi)}, the bottom of the pool. "
-                              f"The default branch passes {', '.join(lanes)}.")
-        elif base and any(base.get(lane) == FAIL for lane in lanes):
+            return result
+        # Every prefix fails. The bottom is the first failing prefix only if the commit the
+        # pool is based on is shown to pass: with no passing prefix there is no verdict.
+        if base is None:
+            return {'outcome': NEED_BASE, 'lanes': lanes, 'causes': all_causes}
+        if any(base.get(lane) == FAIL for lane in lanes):
             return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
-                    'why': 'the default branch fails these lanes too: the failure is not shown to be the pool\'s'}
-        else:
-            result['text'] = (f"first failing prefix: {name(hi)}, the bottom of the pool. Nothing shows these lanes "
-                              'passing on the default branch, so the failure may have been there before the pool.')
+                    'why': 'the commit the pool is based on fails these lanes too: the failure is not shown to be the pool\'s'}
+        if not all(base.get(lane) == PASS for lane in lanes):
+            return {'outcome': NOT_ISOLATED, 'lanes': lanes, 'causes': all_causes,
+                    'why': f"every prefix fails, down to {name(hi)}, the bottom of the pool, and nothing shows "
+                           f"{', '.join(lanes)} passing on the commit the pool is based on: the failure may have "
+                           'been there before the pool'}
+        result['text'] = (f"first failing prefix: the failure appears with {name(hi)}, the bottom of the pool. "
+                          f"The commit the pool is based on passes {', '.join(lanes)}.")
         return result
     unknown = [i for i in range(lo + 1, hi) if found[i] is None]
     if any(found[i] == OPEN for i in range(lo + 1, hi)):
@@ -1668,10 +1787,10 @@ def runs_on(gh, sha):
     """Every run of ci.yml on a commit, with its jobs (every attempt)."""
     runs = gh.call(f'repos/{gh.repo}/actions/runs?head_sha={sha}&per_page=100',
                    '.workflow_runs[] | select(.path == ".github/workflows/ci.yml") | '
-                   '{id, event, status, run_attempt, html_url, created_at}', paginate=True)
+                   '{id, event, status, conclusion, run_attempt, html_url, created_at}', paginate=True)
     for run in runs:
         run['jobs'] = gh.call(f"repos/{gh.repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100",
-                              '.jobs[] | {id, name, conclusion, run_attempt}', paginate=True)
+                              '.jobs[] | {id, name, conclusion, run_attempt, started_at}', paginate=True)
     return runs
 
 
@@ -1689,6 +1808,20 @@ def cause_of(gh, job_id):
     return found or []
 
 
+def states_of(run):
+    """A run's lane states for a pool's diagnosis. While the run has not finished, a lane
+    with no job in its current attempt is OPEN: the attempt may still run it, and until
+    then nothing new may be started for it. Without this, the minute between a dispatch or
+    a rerun being asked for and its jobs being listed looks like nothing was asked."""
+    states = lane_states(run['jobs'])
+    if run.get('status') != 'completed':
+        current = {job['name'] for job in run['jobs'] if job['run_attempt'] == run['run_attempt']}
+        for lane in LANES:
+            if lane not in current:
+                states[lane] = OPEN
+    return states
+
+
 def pool_facts(gh, members):
     """What the runs on the members' heads show: (states_at, causes_at, tries_at, spent,
     required, runs_by_sha). Extra runs spent on this top are counted from the runs
@@ -1699,13 +1832,14 @@ def pool_facts(gh, members):
     for member in members:
         sha = member['sha']
         runs = runs_by_sha[sha] = runs_on(gh, sha)
-        states_at[sha] = merge_lane_states([lane_states(run['jobs']) for run in runs])
+        states_at[sha] = merge_lane_states([states_of(run) for run in runs])
         tries, causes = {}, {}
         for run in runs:
             spent += run['event'] == 'workflow_dispatch'
             if sha == top:
                 spent += max(0, run['run_attempt'] - 1)
-            for job in run['jobs']:
+            # A lane that ran once is listed once more under every later attempt of its run.
+            for job in executions(run['jobs']):
                 if job['name'] in LANES and job.get('conclusion') in ('success', 'failure', 'timed_out'):
                     tries[job['name']] = tries.get(job['name'], 0) + 1
         for lane, state in states_at[sha].items():
@@ -1725,6 +1859,23 @@ def pool_facts(gh, members):
         took = {lane for run in own for lane in lane_states(run['jobs'])}
         required = tuple(lane for lane in LANES if lane in PR_LANES or lane in took)
     return states_at, causes_at, tries_at, spent, required, runs_by_sha
+
+
+def base_states(gh, bottom, default_branch):
+    """{lane: state} on the commit of the default branch that a pool is based on: the
+    merge base of its bottom with the default branch, which is not the branch's tip once
+    the branch has moved on. The runs counted are those on that commit and on its other
+    parents that have its tree (the tested head of the pool that landed as that commit).
+    {} when it cannot be read, which shows nothing passing."""
+    try:
+        base = gh.one(f"repos/{gh.repo}/compare/{default_branch}...{bottom['sha']}", '.merge_base_commit.sha')
+        commit = gh.one(f'repos/{gh.repo}/git/commits/{base}', '{tree: .tree.sha, parents: [.parents[].sha]}')
+        shas = [base] + [parent for parent in commit['parents'][1:]
+                         if gh.one(f'repos/{gh.repo}/git/commits/{parent}', '.tree.sha') == commit['tree']]
+        return merge_lane_states([states_of(run) for sha in shas for run in runs_on(gh, sha)])
+    except Blocked as why:
+        note(f'could not read the runs on the commit the pool is based on: {why}')
+        return {}
 
 
 def own_files(gh, members, default_branch, indexes):
@@ -1770,10 +1921,9 @@ def cmd_bisect(args, gh, default_branch):
         lo, hi = step['between']
         first = suspects(step['causes'], own_files(gh, members, default_branch, range(max(lo, 0), hi + 1)))
         step = diagnose(members, states_at, causes_at, tries_at, spent, required, first=first)
-    if step['outcome'] == CULPRIT and step['passing'] < 0:
-        main_sha = gh.one(f'repos/{gh.repo}/commits/{default_branch}', '.sha')
-        base = merge_lane_states([lane_states(run['jobs']) for run in runs_on(gh, main_sha)])
-        step = diagnose(members, states_at, causes_at, tries_at, spent, required, base=base)
+    if step['outcome'] == NEED_BASE:
+        step = diagnose(members, states_at, causes_at, tries_at, spent, required,
+                        base=base_states(gh, members[0], default_branch))
 
     note(f"pool of {len(members)}, top #{top['number']} {top['head']} at {top['sha'][:9]}; "
          f'{spent} of {MAX_EXTRA_RUNS} extra runs spent')
@@ -1918,6 +2068,9 @@ def cmd_mark(_args, gh, _default_branch):
 
 # ---------------------------------------------------------------------------------- land
 
+VERDICT_JOBS = ('Summary', 'Summary (some lanes)')
+
+
 def landing_blockers(members, facts, contains_main, contained, jobs_failed, despite):
     """Why a pool, or its lower part up to and including the last of `members`, may not
     land: a list of reasons, empty when it may. Everything is read from the runs on the
@@ -1996,11 +2149,21 @@ def cmd_land(args, gh, default_branch):
     for member in members[:-1]:
         contained[member['number']] = gh.one(f"repos/{gh.repo}/compare/{member['sha']}...{top['sha']}",
                                              '.status') in ('ahead', 'identical')
-    finished = [run for run in runs_by_sha[top['sha']] if run['status'] == 'completed' and run['event'] in EVIDENCE_EVENTS
-                and any(job['name'].startswith('Summary') for job in run['jobs'])]
+    # What else failed is read from the newest run on the head that reached a verdict: one
+    # that finished, was not cancelled, and reported `Summary` for this head (a deferred
+    # run tested nothing). A cancelled run has no Summary and is never that run. While any
+    # run on the head is unfinished nothing lands: its lanes may read green before a job
+    # outside the lanes has failed.
+    runs = [run for run in runs_by_sha[top['sha']] if run['event'] in EVIDENCE_EVENTS]
+    unfinished = [run for run in runs if run['status'] != 'completed']
+    verdicts = [run for run in runs if run['status'] == 'completed' and run.get('conclusion') != 'cancelled'
+                and any(job['name'] in VERDICT_JOBS for job in run['jobs'])]
     jobs_failed = []
-    if finished:
-        newest = max(finished, key=lambda run: run['id'])
+    if unfinished:
+        if facts['outcome'] != WAITING:
+            facts = {'outcome': WAITING, 'why': f"run {unfinished[0]['id']} on the head has not finished"}
+    elif verdicts:
+        newest = max(verdicts, key=lambda run: run['id'])
         attempt = max(job['run_attempt'] for job in newest['jobs'])
         jobs_failed = sorted({job['name'] for job in newest['jobs'] if job['run_attempt'] == attempt
                               and job.get('conclusion') in ('failure', 'timed_out', 'cancelled')
@@ -2036,14 +2199,33 @@ def cmd_land(args, gh, default_branch):
             for cause in causes_at[top['sha']].get(lane) or [f'{lane} failed once with no cause read']:
                 rerun_issues[lane] = issue_for(gh, cause, {'run': failing['html_url'], 'text': text})
     # Bases first, top last: an edit of a base starts no run, and once the top is merged
-    # into the default branch every member based on it shows as merged.
-    for member in members:
-        if member['base'] != default_branch:
-            gh.call(f"repos/{gh.repo}/pulls/{member['number']}", method='PATCH', fields={'base': default_branch})
-    merged = gh.one(f"repos/{gh.repo}/pulls/{top['number']}/merge", '{sha, merged}', method='PUT',
-                    fields={'merge_method': 'merge', 'sha': top['sha'],
-                            'commit_title': f"Land a pool of {len(members)} through #{top['number']}",
-                            'commit_message': landing_message(members, top, required, proven_by, rerun_issues, despite)})
+    # into the default branch every member based on it shows as merged. If a write is
+    # refused, the bases already moved are put back, so that a refused landing leaves the
+    # pool as it was.
+    moved = []
+    try:
+        for member in members:
+            if member['base'] != default_branch:
+                gh.call(f"repos/{gh.repo}/pulls/{member['number']}", method='PATCH', fields={'base': default_branch})
+                moved.append(member)
+        merged = gh.one(f"repos/{gh.repo}/pulls/{top['number']}/merge", '{sha, merged}', method='PUT',
+                        fields={'merge_method': 'merge', 'sha': top['sha'],
+                                'commit_title': f"Land a pool of {len(members)} through #{top['number']}",
+                                'commit_message': landing_message(members, top, required, proven_by, rerun_issues, despite)})
+    except Blocked as why:
+        left = []
+        for member in reversed(moved):
+            try:
+                gh.call(f"repos/{gh.repo}/pulls/{member['number']}", method='PATCH', fields={'base': member['base']})
+            except Blocked:
+                left.append(member)
+        if not left:
+            raise Blocked(f'nothing landed and every base is as it was: {why}')
+        note(f'BLOCKED: nothing landed: {why}')
+        for member in left:
+            note(f"  #{member['number']} is now based on {default_branch} and could not be put back on "
+                 f"{member['base']}: `gh pr edit {member['number']} --base {member['base']}`")
+        return 4
     note(f"merged: {merged.get('sha')}")
     if above:
         gh.call(f"repos/{gh.repo}/pulls/{above[0]['number']}", method='PATCH', fields={'base': default_branch})
@@ -2109,6 +2291,22 @@ def queue(remote, branch, head):
         raise Blocked(f'could not queue {branch}: {pushed.stderr.strip()[:300]}')
 
 
+def drop_queued(remote, queued):
+    """Remove queue entries whose commits are now inside their branches. Each is removed
+    only if it still names the commit that went in: a publish queued for the same branch
+    in the meantime contains that commit and more, and stays queued. Returns the branches
+    whose entry is still the commit that went in, which is a removal that failed."""
+    if not queued:
+        return []
+    git('push', remote, *[f'--force-with-lease={PENDING}{branch}:{sha}' for branch, sha in sorted(queued.items())],
+        *[f':{PENDING}{branch}' for branch in sorted(queued)], check=False, timeout=300)
+    now = pending_refs(remote)
+    for branch in sorted(queued):
+        if branch in now and now[branch] != queued[branch]:
+            note(f'  {branch}: {now[branch][:9]} was queued while this ran and stays queued')
+    return [branch for branch in sorted(queued) if now.get(branch) == queued[branch]]
+
+
 def cmd_flush(args, gh, default_branch):
     """Put every queued publish of a pool into it with one build, unless the top's run is
     still in flight."""
@@ -2133,9 +2331,9 @@ def cmd_flush(args, gh, default_branch):
     code = cmd_build(args, gh, default_branch)
     if code == 0:
         # Each queued commit is now inside its branch: the queue entry has done its work.
-        dropped = git('push', args.remote, *[f':{PENDING}{branch}' for branch in sorted(queued)], check=False, timeout=300)
-        if dropped.returncode != 0:
-            note(f'the pool is built, but the queue entries could not be removed: {dropped.stderr.strip()[:300]}')
+        left = drop_queued(args.remote, queued)
+        if left:
+            note(f"the pool is built, but the queue entries of {', '.join(left)} could not be removed")
             return 4
     return code
 

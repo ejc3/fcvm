@@ -444,9 +444,11 @@ jobs:
   #
   # A push to main runs every job not already proven for its tree: a job of the same name
   # that succeeded, on its first attempt, in a run of this workflow on a commit with the
-  # pushed commit's tree. The commits looked at are the pushed commit's other parents and
-  # the heads of the pull requests GitHub ties to it, so the evidence is found whatever
-  # else ran since, and a lane counts even when another job of that run failed. A run
+  # pushed commit's tree, and that never failed in any run on that commit. The commits
+  # looked at are the pushed commit's other parents and the heads of the pull requests
+  # GitHub ties to it, so the evidence is found whatever else ran since, and a lane counts
+  # even when another job of that run failed. Changes are judged against main as it was
+  # before the push. A run
   # proves nothing when the landing changes a file that defines the lanes (this workflow,
   # the Makefile, the scripts, the nextest configuration): a pull request runs its own
   # copy of those. If a pull request's run of that tree skipped the matrix by its own
@@ -476,6 +478,7 @@ jobs:
           REPO: ${{ github.repository }}
           CONFINE: ${{ needs.changes.outputs.confine }}
           SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
           LANES: ${{ github.event.inputs.lanes }}
         run: python3 scripts/ci-pool/ci_pool.py plan
 
@@ -674,6 +677,25 @@ jobs:
       - name: Runner kernel check
         working-directory: fcvm
         run: ./scripts/check-runner-kernel.py
+      # Directly after the kernel check, so a job that fails in any later step still uploads
+      # its own captures, and none of an earlier job's (#2164).
+      - name: Create test log directory
+        id: test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
+          # Teardown's VMM log copies from an earlier job on this runner are not this job's.
+          sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. It goes to $RUNNER_TEMP, which the runner empties
+          # for each job, so a job whose sampler never started saves no record rather than an
+          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
+          # record" stops and waits on. Detached from the step's output so the step does not
+          # wait on it; the runner reaps it with the job's other processes.
+          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
+            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
@@ -859,23 +881,6 @@ jobs:
           # no longer matched ("database static dir ... does not match", podman
           # exit 125 before any test ran, 2026-08-13).
           ./fcvm/scripts/runner-podman-hygiene.sh
-      - name: Create test log directory
-        id: test-logs
-        run: |
-          sudo rm -rf /tmp/fcvm-test-logs
-          mkdir -p /tmp/fcvm-test-logs
-          # Teardown's VMM log copies from an earlier job on this runner are not this job's.
-          sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
-          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
-          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
-          # EBS instead) would slow it down. It goes to $RUNNER_TEMP, which the runner empties
-          # for each job, so a job whose sampler never started saves no record rather than an
-          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
-          # record" stops and waits on. Detached from the step's output so the step does not
-          # wait on it; the runner reaps it with the job's other processes.
-          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
-            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -1037,6 +1042,25 @@ jobs:
       - name: Runner kernel check
         working-directory: fcvm
         run: ./scripts/check-runner-kernel.py
+      # Directly after the kernel check, so a job that fails in any later step still uploads
+      # its own captures, and none of an earlier job's (#2164).
+      - name: Create test log directory
+        id: test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
+          # Teardown's VMM log copies from an earlier job on this runner are not this job's.
+          sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. It goes to $RUNNER_TEMP, which the runner empties
+          # for each job, so a job whose sampler never started saves no record rather than an
+          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
+          # record" stops and waits on. Detached from the step's output so the step does not
+          # wait on it; the runner reaps it with the job's other processes.
+          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
+            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
@@ -1196,23 +1220,6 @@ jobs:
           ./fcvm/scripts/runner-podman-hygiene.sh
           # Install iperf3 for network benchmarks
           ./fcvm/scripts/ci-apt-get.sh update && ./fcvm/scripts/ci-apt-get.sh install -y iperf3 || true
-      - name: Create test log directory
-        id: test-logs
-        run: |
-          sudo rm -rf /tmp/fcvm-test-logs
-          mkdir -p /tmp/fcvm-test-logs
-          # Teardown's VMM log copies from an earlier job on this runner are not this job's.
-          sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
-          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
-          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
-          # EBS instead) would slow it down. It goes to $RUNNER_TEMP, which the runner empties
-          # for each job, so a job whose sampler never started saves no record rather than an
-          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
-          # record" stops and waits on. Detached from the step's output so the step does not
-          # wait on it; the runner reaps it with the job's other processes.
-          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
-            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -1408,6 +1415,25 @@ jobs:
       - name: Runner kernel check
         working-directory: fcvm
         run: ./scripts/check-runner-kernel.py
+      # Directly after the kernel check, so a job that fails in any later step still uploads
+      # its own captures, and none of an earlier job's (#2164).
+      - name: Create test log directory
+        id: test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs
+          mkdir -p /tmp/fcvm-test-logs
+          # Teardown's VMM log copies from an earlier job on this runner are not this job's.
+          sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. It goes to $RUNNER_TEMP, which the runner empties
+          # for each job, so a job whose sampler never started saves no record rather than an
+          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
+          # record" stops and waits on. Detached from the step's output so the step does not
+          # wait on it; the runner reaps it with the job's other processes.
+          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
+            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       # A self-hosted runner is reused forever, so a leaked microVM is inherited by every
       # later job. Report (and reap) what the PREVIOUS job left behind before doing anything
       # else — on 2026-08-06 two runners had accumulated ~498 live firecracker processes and
@@ -1459,23 +1485,6 @@ jobs:
           path: ${{ github.workspace }}/cargo-cache
           key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-${{ runner.os }}-${{ runner.arch }}-
-      - name: Create test log directory
-        id: test-logs
-        run: |
-          sudo rm -rf /tmp/fcvm-test-logs
-          mkdir -p /tmp/fcvm-test-logs
-          # Teardown's VMM log copies from an earlier job on this runner are not this job's.
-          sudo find /tmp -maxdepth 1 -name 'fcvm-firecracker-*.log' -delete
-          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
-          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
-          # EBS instead) would slow it down. It goes to $RUNNER_TEMP, which the runner empties
-          # for each job, so a job whose sampler never started saves no record rather than an
-          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
-          # record" stops and waits on. Detached from the step's output so the step does not
-          # wait on it; the runner reaps it with the job's other processes.
-          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
-            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
-          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -1537,10 +1546,20 @@ jobs:
     # lanes)": a passing `Summary` on a commit always means every lane its event takes.
     name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
     needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-minecraft, fleet-web, host, host-root, container]
-    if: always()
+    # Summary reports on every run but one that was itself cancelled: superseded by a newer
+    # run of the same pull request, or stopped by a person or the unit watcher. Under
+    # `always()` such a run left a failed `Summary` on the head for good. GitHub sometimes
+    # starts two runs for one push; the second cancels the first, and on a lower member of
+    # a stack the first run's failed `Summary` then stood beside the second's
+    # `Summary (deferred)`, which no later check replaces (2026-11-26: five of nine heads
+    # of one push). `cancelled()` is true only when the RUN was cancelled. A job that ends
+    # `cancelled` while the run goes on (its own `timeout-minutes`, a lost runner) leaves it
+    # false, so Summary still runs and the gate step below fails it. A run with no Summary
+    # passed nothing: `ci_pool.py` reads lanes and never takes an absent Summary for a pass.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      # `if: always()` is what lets this job report on a run whose tests failed —
+      # A status function in the `if:` is what lets this job report on a run whose tests failed —
       # and it is also why Summary's own result says nothing about theirs unless
       # it looks. Without this step Summary reported success over genuinely failed
       # gating jobs in 8 of the last 40 runs (Lint, Container-*, Host-Root-*), so

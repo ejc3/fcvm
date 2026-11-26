@@ -20,7 +20,17 @@ VMM go on (short of a snapshot restore or an NMI, which the audit does not accep
 Each such vCPU must be flagged by a property in that very state, and the designed system must
 have none. A dead vCPU that no property flags fails the run: the exit status is 1. So does a
 search that stops at the state limit, under any rule book: it is not audited, and it establishes
-nothing. `test-search.sh` tests both.
+nothing. An argument the program does not understand, or a pattern that matches no search, ends it
+with exit status 2 before anything is searched. `test-search.sh` tests each of these.
+
+A panic in this program (an array index out of bounds) prints a message and by default goes on
+with a default value, so the exit status alone would not show it. Run it with
+`LEAN_ABORT_ON_PANIC=1`, as `make verify-search`, `search-expected.sh` and `test-search.sh` do:
+a panic then aborts the process.
+
+`--summary` prints what `WakeVerify/search.expected` holds, and `search-expected.sh` compares the
+two: the states of every search, each kind of break with its count and the length of its shortest
+run, and the audit's numbers.
 
 Every configuration lets interrupts from sources the model does not follow (devices, the tick)
 arrive at a blocked vCPU that can take them, so that a vCPU asleep with interrupts on is not
@@ -174,7 +184,9 @@ structure Graph where
   states : Array State
   /-- for each state but the first: the state it was first reached from, and by which label -/
   parent : Array (Nat × Nat)
-  /-- successors of each state, one number an edge: `target * 64 + label` -/
+  /-- successors of each state, one number an edge: `target * 64 + label`. There are 61 labels;
+  `allLabels_fit_edge_encoding` in `Proofs.lean` fails the build past 64, and `main` refuses to
+  run. -/
   succ : Array (Array Nat)
   complete : Bool
 
@@ -437,29 +449,49 @@ structure Run where
   rules : Rules
   cfg : Cfg
   cfgName : String
+  /-- one of the small searches that `--quick` selects (`search-expected.sh quick`) -/
+  quick : Bool := false
+
+def Run.title (r : Run) : String := s!"{r.name}, {r.cfgName}"
+
+/-- How much a search prints. `summary` is the form `WakeVerify/search.expected` holds: no
+timings and no runs, one line a kind, no blank line inside a search's block. -/
+inductive Mode where
+  | verbose | quiet | summary
+  deriving DecidableEq
 
 /-- Search one rule book in one configuration and audit it. Returns whether the search visited
 every reachable state, whether no property broke, how many states have a dead vCPU, and how many
 dead vCPUs no property flags. A search that stopped at the state limit is not audited: its graph
 has successors for the expanded states only. -/
-def report (r : Run) (limit : Nat) (verbose : Bool) : IO (Bool × Bool × Nat × Nat) := do
+def report (r : Run) (limit : Nat) (mode : Mode) : IO (Bool × Bool × Nat × Nat) := do
   let t0 ← IO.monoMsNow
   let g := explore r.rules r.cfg limit
   let found := findBreaks r.rules r.cfg g
   let t1 ← IO.monoMsNow
-  IO.println s!"\n## {r.name}, {r.cfgName}"
-  IO.println s!"{g.states.size} reachable states{if g.complete then "" else " (LIMIT REACHED: NOT EXHAUSTIVE)"}, {t1 - t0} ms"
+  let summary := mode == .summary
+  IO.println s!"{if summary then "" else "\n"}## {r.title}"
+  if summary then
+    IO.println s!"set: {if r.quick then "quick" else "full only"}"
+  let size := if g.complete then s!"{g.states.size} reachable states"
+    else s!"{g.states.size} states visited (LIMIT REACHED: NOT EXHAUSTIVE)"
+  IO.println (if summary then size else s!"{size}, {t1 - t0} ms")
   if found.isEmpty then
-    IO.println "no reachable state breaks a property"
+    IO.println (if g.complete then "no reachable state breaks a property"
+      else "no property breaks in the states visited")
   for f in found do
     let tr := g.trace f.first
-    IO.println s!"\n### {f.check}: {f.kind}"
-    IO.println s!"{f.count} states; shortest run {tr.length} steps, {vidName f.who}"
-    if verbose then
-      printTrace r.rules r.cfg tr
-    IO.println s!"    Lean: [{", ".intercalate (tr.map labelTerm)}]"
+    if summary then
+      IO.println s!"kind: {f.check}: {f.kind}; {f.count} states; shortest run {tr.length} steps"
+    else
+      IO.println s!"\n### {f.check}: {f.kind}"
+      IO.println s!"{f.count} states; shortest run {tr.length} steps, {vidName f.who}"
+      if mode == .verbose then
+        printTrace r.rules r.cfg tr
+      IO.println s!"    Lean: [{", ".intercalate (tr.map labelTerm)}]"
   if !g.complete then
     IO.println "audit: not run, the search did not finish"
+    if summary then IO.println ""
     (← IO.getStdout).flush
     return (false, found.isEmpty, 0, 0)
   let a := audit g
@@ -467,8 +499,9 @@ def report (r : Run) (limit : Nat) (verbose : Bool) : IO (Bool × Bool × Nat ×
   match a.witness with
   | some (idx, i) =>
     IO.println s!"  first dead vCPU with no flag of its own, now or ahead: {vidName i} after"
-    printTrace r.rules r.cfg (g.trace idx)
+    if !summary then printTrace r.rules r.cfg (g.trace idx)
   | none => pure ()
+  if summary then IO.println ""
   (← IO.getStdout).flush
   return (true, found.isEmpty, a.dead, a.unexplained)
 
@@ -483,66 +516,106 @@ def books : List (String × Rules) :=
     ("v7.3.3 with the #2130 patch, no restore kick", Partial.v733Patched),
     ("Design: v7.3.3 with the #2130 patch and the #2131 restore kick", Design.rules) ]
 
-def cfgs : List (String × Cfg) :=
-  [ ("fcvm configuration", fcvm),
-    ("no snapshot taken", { fcvm with snapshot := false }),
-    ("guest booted with no-kvmapf", { fcvm with pvApf := false }),
-    ("with host page faults in the lock, call and idle paths", { fcvm with kernelFaults := true }),
-    ("with NMIs", { fcvm with nmi := true }),
-    ("with the idle timer, no host page faults",
+/-- The configurations. The Bool marks the small ones (under 3.2 million states each), which
+`--quick` selects: between them they have every letter of the table in BREAKS.md but M. -/
+def cfgs : List (String × Bool × Cfg) :=
+  [ ("fcvm configuration", false, fcvm),
+    ("no snapshot taken", true, { fcvm with snapshot := false }),
+    ("guest booted with no-kvmapf", true, { fcvm with pvApf := false }),
+    ("with host page faults in the lock, call and idle paths", false,
+      { fcvm with kernelFaults := true }),
+    ("with NMIs", false, { fcvm with nmi := true }),
+    ("with the idle timer, no host page faults", true,
       { fcvm with timer := true, plainLocks := false, faults := false }),
-    ("with the idle timer and host page faults, no snapshot taken",
+    ("with the idle timer and host page faults, no snapshot taken", false,
       { fcvm with timer := true, plainLocks := false, snapshot := false }),
-    ("with a nested guest", { fcvm with nested := true }),
-    ("with Xen SCHEDOP_poll", { fcvm with xen := true }),
-    ("with CPU hotplug (INIT, SIPI, vCPU reset)", { fcvm with hotplug := true }),
-    ("with SEV AP reset hold and SNP AP creation", { fcvm with hotplug := true, sev := true }),
-    ("outside the design: userspace writes mp_state back on a paused VM",
+    ("with a nested guest", false, { fcvm with nested := true }),
+    ("with Xen SCHEDOP_poll", false, { fcvm with xen := true }),
+    ("with CPU hotplug (INIT, SIPI, vCPU reset)", false, { fcvm with hotplug := true }),
+    ("with SEV AP reset hold and SNP AP creation", false,
+      { fcvm with hotplug := true, sev := true }),
+    ("outside the design: userspace writes mp_state back on a paused VM", false,
       { fcvm with userSetMp := true }) ]
 
 /-- Restore orders that no VMM here uses, to see which orders matter. -/
-def orders : List (String × Rules × String × Cfg) :=
-  [ ("Order: v7.3.3 with the #2130 patch, the kick BEFORE KVM_SET_MP_STATE", Order.kickFirst,
-      "fcvm configuration", fcvm),
-    ("Order: v6.14, the kick BEFORE KVM_SET_MP_STATE", Order.kickFirst614,
-      "fcvm configuration", fcvm),
-    ("Order: v7.3.3 with the #2130 patch, KVM_SET_MSRS BEFORE KVM_SET_LAPIC", Order.msrsFirst,
-      "idle timer, guest booted with no-kvmapf, no host page faults",
-      { fcvm with timer := true, plainLocks := false, faults := false, pvApf := false }),
-    ("Order: v7.3.3 with the #2130 patch, no KVM_SET_LAPIC", Order.noLapic,
-      "fcvm configuration", fcvm) ]
+def orders : List Run :=
+  [ { name := "Order: v7.3.3 with the #2130 patch, the kick BEFORE KVM_SET_MP_STATE",
+      rules := Order.kickFirst, cfgName := "fcvm configuration", cfg := fcvm },
+    { name := "Order: v6.14, the kick BEFORE KVM_SET_MP_STATE",
+      rules := Order.kickFirst614, cfgName := "fcvm configuration", cfg := fcvm },
+    { name := "Order: v7.3.3 with the #2130 patch, KVM_SET_MSRS BEFORE KVM_SET_LAPIC",
+      rules := Order.msrsFirst,
+      cfgName := "idle timer, guest booted with no-kvmapf, no host page faults",
+      cfg := { fcvm with timer := true, plainLocks := false, faults := false, pvApf := false },
+      quick := true },
+    { name := "Order: v7.3.3 with the #2130 patch, no KVM_SET_LAPIC",
+      rules := Order.noLapic, cfgName := "fcvm configuration", cfg := fcvm } ]
+
+/-- Every search, in the order they are run and printed: each rule book in each configuration,
+then the restore orders. -/
+def searches : List Run :=
+  (books.flatMap fun (bn, rules) =>
+    cfgs.map fun (cn, quick, cfg) => { name := bn, rules, cfg, cfgName := cn, quick }) ++ orders
+
+/-- The designed system in a configuration its theorems cover: no property may break and no vCPU
+may be dead. -/
+def Run.isDesign (r : Run) : Bool :=
+  r.name.startsWith "Design" && !r.cfg.userSetMp
+
+def usage : String :=
+  "usage: breaks [LIMIT] [--quiet | --summary] [--quick] [PATTERN...]\n" ++
+  "  LIMIT      stop a search at this many states (default 40000000); such a search fails\n" ++
+  "  --quiet    no step-by-step runs\n" ++
+  "  --summary  the form WakeVerify/search.expected holds: no timings, no runs\n" ++
+  "  --quick    the small searches only\n" ++
+  "  PATTERN    searches whose title contains it; every pattern must match one\n" ++
+  "exit status: 0 nothing failed; 1 a gate failed (FAILED lines say which); 2 nothing was\n" ++
+  "searched: an argument was not understood, or no search matched"
 
 def main (args : List String) : IO UInt32 := do
-  let limit := (args.head? >>= String.toNat?).getD 40000000
-  let only := args.drop 1
-  let verbose := !only.contains "--quiet"
-  let want (name : String) : Bool :=
-    let pats := only.filter (fun p => !p.startsWith "--")
-    pats.isEmpty || pats.any (fun p => (name.splitOn p).length > 1)
+  -- An edge of the graph is `target * 64 + label` (`Graph.succ`).
+  if labels.size > 64 then
+    IO.eprintln s!"breaks: {labels.size} labels do not fit the graph's edge encoding (64)"
+    return 2
+  let (limit, rest) := match args with
+    | a :: more => match a.toNat? with
+      | some n => (n, more)
+      | none => (40000000, args)
+    | [] => (40000000, [])
+  let flags := rest.filter (·.startsWith "--")
+  let pats := rest.filter (!·.startsWith "--")
+  for f in flags do
+    if !["--quiet", "--summary", "--quick"].contains f then
+      IO.eprintln s!"breaks: unknown option {f}\n{usage}"
+      return 2
+  if flags.contains "--quiet" && flags.contains "--summary" then
+    IO.eprintln s!"breaks: --quiet and --summary are two forms of output\n{usage}"
+    return 2
+  let mode : Mode := if flags.contains "--summary" then .summary
+    else if flags.contains "--quiet" then .quiet else .verbose
+  let pool := if flags.contains "--quick" then searches.filter (·.quick) else searches
+  let has (name pat : String) : Bool := (name.splitOn pat).length > 1
+  for p in pats do
+    if !pool.any (fun r => has r.title p) then
+      IO.eprintln s!"breaks: no search matches {repr p}: nothing was searched"
+      return 2
+  let chosen := pool.filter fun r => pats.isEmpty || pats.any (has r.title)
+  if chosen.isEmpty then
+    IO.eprintln "breaks: no search to run"
+    return 2
   let mut failures : Array String := #[]
-  IO.println "# Lost wake-up search"
-  for (bn, rules) in books do
-    for (cn, cfg) in cfgs do
-      if want s!"{bn}, {cn}" then
-        let (complete, clean, dead, unexplained) ←
-          report { name := bn, rules, cfg, cfgName := cn } limit verbose
-        if !complete then
-          failures := failures.push s!"{bn}, {cn}: the search did not finish, so nothing is established"
-        if unexplained > 0 then
-          failures := failures.push s!"{bn}, {cn}: {unexplained} dead vCPUs that no property flags"
-        if bn.startsWith "Design" && !cfg.userSetMp then
-          if !clean then
-            failures := failures.push s!"{bn}, {cn}: a property breaks"
-          if dead > 0 then
-            failures := failures.push s!"{bn}, {cn}: {dead} states with a vCPU that can never run again"
-  for (bn, rules, cn, cfg) in orders do
-    if want s!"{bn}, {cn}" then
-      let (complete, _, _, unexplained) ←
-        report { name := bn, rules, cfg, cfgName := cn } limit verbose
-      if !complete then
-        failures := failures.push s!"{bn}, {cn}: the search did not finish, so nothing is established"
-      if unexplained > 0 then
-        failures := failures.push s!"{bn}, {cn}: {unexplained} dead vCPUs that no property flags"
+  if mode != .summary then IO.println "# Lost wake-up search"
+  for r in chosen do
+    let (complete, clean, dead, unexplained) ← report r limit mode
+    if !complete then
+      failures := failures.push s!"{r.title}: the search did not finish, so nothing is established"
+    if unexplained > 0 then
+      failures := failures.push s!"{r.title}: {unexplained} dead vCPUs that no property flags"
+    if r.isDesign then
+      if !clean then
+        failures := failures.push s!"{r.title}: a property breaks"
+      if dead > 0 then
+        failures := failures.push s!"{r.title}: {dead} states with a vCPU that can never run again"
   if !failures.isEmpty then
     IO.println "\nFAILED:"
     for f in failures do IO.println s!"  {f}"

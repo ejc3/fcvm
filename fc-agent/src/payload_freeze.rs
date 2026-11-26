@@ -406,26 +406,37 @@ pub(crate) const UNCOUNTED_LOOKS_CAP: u32 = 900;
 /// count as before. At most [`UNCOUNTED_LOOKS_CAP`] looks at one freeze go uncounted. Thawed in the middle of a clone's restore, the container ran behind
 /// the closed gate, where each connection it made was answered with a reset.
 pub(crate) fn watchdog_in(env: &Env, watch: &mut Watch) -> usize {
-    let Ok(_held) = lock(env.lock) else {
-        return 0;
-    };
-    let Some(record) = Record::read(env.record) else {
+    // What the look asks of the boundary is asked before the freeze lock is taken:
+    // `source_owed` runs `iptables`, which can wait seconds for the xtables lock, and
+    // every thaw (a resume's, a restore's) waits for the freeze lock. The record is
+    // looked at here without the lock, and again under it.
+    let Some(seen) = Record::read(env.record) else {
         *watch = Watch::default();
         return 0;
     };
-    if watch.id != Some(record.id) {
+    if watch.id != Some(seen.id) {
         *watch = Watch {
-            id: Some(record.id),
+            id: Some(seen.id),
             looks: 0,
             uncounted: 0,
             asked: 0,
         };
     }
-    if (env.boundary_in_progress)() && watch.uncounted < UNCOUNTED_LOOKS_CAP {
+    let working = watch.uncounted < UNCOUNTED_LOOKS_CAP && (env.boundary_in_progress)();
+    let asking = !working && watch.asked < SOURCE_REOPEN_LOOKS && (env.source_owed)();
+    let Ok(_held) = lock(env.lock) else {
+        return 0;
+    };
+    // The freeze that was asked about. One that ended or was replaced meanwhile is the
+    // next look's.
+    let Some(record) = Record::read(env.record).filter(|record| record.id == seen.id) else {
+        return 0;
+    };
+    if working {
         watch.uncounted += 1;
         return 0;
     }
-    if (env.source_owed)() && watch.asked < SOURCE_REOPEN_LOOKS {
+    if asking {
         watch.asked += 1;
         return 0;
     }
@@ -502,6 +513,7 @@ mod tests {
         /// What the watchdog is told when it asks whether the boundary is being worked on.
         in_progress: std::cell::Cell<bool>,
         owed: std::cell::Cell<bool>,
+        asked_under_the_lock: std::cell::Cell<bool>,
     }
 
     impl Tree {
@@ -511,6 +523,7 @@ mod tests {
                 watch: RefCell::new(Watch::default()),
                 in_progress: std::cell::Cell::new(false),
                 owed: std::cell::Cell::new(false),
+                asked_under_the_lock: std::cell::Cell::new(false),
             }
         }
 
@@ -533,7 +546,21 @@ mod tests {
                 lock: &lock,
                 froze,
                 boundary_in_progress: &|| self.in_progress.get(),
-                source_owed: &|| self.owed.get(),
+                source_owed: &|| {
+                    // Asked with the freeze lock free: a flock from another open file
+                    // is refused while the watchdog holds it.
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(false)
+                        .write(true)
+                        .open(&lock)
+                    {
+                        if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+                            self.asked_under_the_lock.set(true);
+                        }
+                    }
+                    self.owed.get()
+                },
             })
         }
 
@@ -658,6 +685,12 @@ mod tests {
         );
         assert_eq!(asked.watchdog(1), 1);
         assert!(!frozen(&source));
+        // The question runs `iptables` and can take seconds, and a thaw waits for the
+        // freeze lock: the question is asked before that lock is taken.
+        assert!(
+            !asked.asked_under_the_lock.get(),
+            "the watchdog asked for the gate's state while it held the freeze lock"
+        );
         // one look a second, for the host's whole bound
         let host = include_str!("../../src/commands/common.rs");
         assert!(host.contains(&format!(
