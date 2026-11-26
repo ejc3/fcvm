@@ -1910,9 +1910,11 @@ verify-lake:
 verify: verify-lake
 	verify/check-imports.sh
 	cd verify && "$(VERIFY_LAKE)" build
-	cd verify && "$(VERIFY_LAKE)" exe gate-breaks summary | diff GateVerify/search.expected -
-	cd verify && "$(VERIFY_LAKE)" exe resume-breaks | diff ResumeVerify/search.expected -
-	cd verify && "$(VERIFY_LAKE)" exe resume-breaks mutants | diff ResumeVerify/mutants.expected -
+	set -o pipefail; cd verify && "$(VERIFY_LAKE)" exe gate-breaks summary | diff GateVerify/search.expected -
+	set -o pipefail; cd verify && "$(VERIFY_LAKE)" exe resume-breaks | diff ResumeVerify/search.expected -
+	set -o pipefail; cd verify && "$(VERIFY_LAKE)" exe resume-breaks mutants | diff ResumeVerify/mutants.expected -
+	set -o pipefail; cd verify && "$(VERIFY_LAKE)" exe resume-breaks traces | ./gen-resume-breaks.py | diff ResumeVerify/Breaks.lean -
+	set -o pipefail; cd verify && "$(VERIFY_LAKE)" exe resume-breaks mutants traces | ./gen-resume-breaks.py mutants | diff ResumeVerify/MutantBreaks.lean -
 
 verify-search: verify-lake
 	cd verify && "$(VERIFY_LAKE)" exe breaks

@@ -104,19 +104,17 @@ def parked (c : Vcpu) : Vcpu := { c with thr := .user }
 
 /-- The round trip. For a sound rule book, the VM described by the save of a VM is that VM:
 every interrupt bit, every timer register, where each guest CPU is, what the device waits for.
+It holds for any VM whose SGIs have no line (an SGI is edge-triggered and never has one), not
+only for one that satisfies the invariant: any enables, any pending or active state.
 What differs is what a new VM differs in: its threads have not entered `KVM_RUN`, its counter
 offset was set by `KVM_ARM_SET_COUNTER_OFFSET`, and its counter is the image's. -/
-theorem roundTrip {R : Rules} {C : Cfg} {s : State} (hR : Sound R) (h : MOk C s.vm) :
+theorem roundTrip {R : Rules} {s : State} (hR : Sound R)
+    (s0 : s.vm.c0.sgi.line = false) (s1 : s.vm.c1.sgi.line = false) :
     rebuilt (save R s) =
       { s.vm with c0 := parked s.vm.c0, c1 := parked s.vm.c1, ctr := (save R s).s0.cnt,
                   offFlag := true, restored := true, clone := true } := by
-  obtain ⟨v0, v1, pa, p1, pl, pn, gi, pe⟩ := h
-  have s0 := v0.sl
-  have s1 := v1.sl
-  have i0 := v0.ich
-  have i1 := v1.ich
   rcases hm : s.vm with ⟨c0, c1, spi, dev, gicEn, ctr, offFlag, ideal, restored, clone⟩
-  rw [hm] at s0 s1 i0 i1
+  rw [hm] at s0 s1
   rcases c0 with ⟨g0, call0, gOff0, thr0, st0, pmr0, grp0, ap0, ⟨te0, tl0, tn0, ta0⟩, ⟨se0, sl0, sn0, sa0⟩, tEn0, cv0, ow0, l20, ic0⟩
   rcases c1 with ⟨g1, call1, gOff1, thr1, st1, pmr1, grp1, ap1, ⟨te1, tl1, tn1, ta1⟩, ⟨se1, sl1, sn1, sa1⟩, tEn1, cv1, ow1, l21, ic1⟩
   rcases spi with ⟨pe', pl', pn', pa'⟩
@@ -129,7 +127,7 @@ theorem parked_ok {c : Vcpu} (h : VOk c) : VOk (parked c) := by
 /-- So the VM built from the save of a VM satisfies the invariant. -/
 theorem rebuilt_ok {R : Rules} {C : Cfg} {s : State} (hR : Sound R) (h : MOk C s.vm) :
     MOk C (rebuilt (save R s)) := by
-  rw [roundTrip hR h]
+  rw [roundTrip hR h.v0.sl h.v1.sl]
   exact ⟨parked_ok h.v0, parked_ok h.v1, h.pact, h.p1, h.platch, h.pline, h.gic, h.pen⟩
 
 theorem save_since {R : Rules} {s : State} (hR : Sound R)

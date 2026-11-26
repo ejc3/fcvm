@@ -1536,15 +1536,23 @@ was not identified.
 The "nested tests are too slow/flaky" disables (Jan 2026) traced to TWO snapshot-lifecycle
 bugs, both fixed. Neither was an inherent NV2 limitation:
 
-**1. Timer-domain skew on restore (firecracker fork fix).** Restore replayed CNTVCT/CNTPCT
-(KVM adjusts per-timer offsets, which for HAS_EL2 guests live in CNTVOFF_EL2 storage), then
-replayed CNTVOFF_EL2 — clobbering the adjustment. The guest's monotonic clock jumped forward
-by the host time elapsed since the snapshot, every armed timer CVAL landed in the past, and
-KVM's emulated EL1 timers (NV2 traps these) re-fired in a storm (~14k kvm_timer_emulate/s
-measured) that starved the vCPUs 25-300x. Fix: firecracker owns the VM-wide counter offset
-via `KVM_ARM_SET_COUNTER_OFFSET` — set at boot (zero-based counters), set coherently before
-the register replay on restore, and advanced by the pause duration on resume so the guest
-clock FREEZES while a VM is paused (fcvm's pre-start snapshot pauses VMs for many seconds).
+**1. The guest's clock ran while it was paused (firecracker fork fix).** Nothing owned the
+VM's counter offset, so the guest's counter kept running while the vCPUs were out of
+`KVM_RUN`: a VM resumed in place after a snapshot had its clock ahead by the whole pause, and
+every timer that came due in that time fired at once. A restore's register replay does not
+move the clock forward: on a `CNTVCT`/`CNTPCT` write KVM stores `now - value` in the VM-wide
+physical offset and keeps nothing in `CNTVOFF_EL2` storage (read at v6.18.3 and v7.3.3;
+measured by `verify/probe` on v7.3.3 only), so the counters continue from the saved values,
+except that a saved `CNTVOFF_EL2` of X on the last vCPU replayed leaves the physical counter X
+behind. Why restore-hit boots measured slow before the fix and fast after is not explained by
+this and is open. `kvm_timer_emulate` at about 14k a second can be the exit rate of a guest
+hypervisor without FEAT_ECV (read: both EL1 timers are emulated again on every exit whether
+or not one fires), so that count alone does not show timers firing; the trace's `should_fire`
+field would. Fix: firecracker owns the VM-wide counter offset via `KVM_ARM_SET_COUNTER_OFFSET`.
+It is set at boot (zero-based counters), set before the register replay on restore, and
+advanced by the pause duration on resume, so the guest clock FREEZES while a VM is paused
+(fcvm's pre-start snapshot pauses VMs for many seconds). The reading and the measurement are
+in `verify/ResumeVerify/REPAIRS.md`, 7 (`make verify-counter-probe`).
 
 **2. Event-loop starvation after pause→save→resume (fcvm design fix).** Resuming the VM that
 just produced a snapshot intermittently left Firecracker's single device event-loop thread

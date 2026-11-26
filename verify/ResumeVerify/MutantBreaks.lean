@@ -227,6 +227,24 @@ theorem mutant_chInitLate_breaks :
 theorem mutant_chInitLate_not_sound : ¬ Sound Mutant.chInitLate :=
   not_sound_of_run (C := Cfg.plain) (run := MutantRun.chInitLate) (by decide)
 
+/-- R1 lostTick, `mutant-ch-no-regs1` in `plain`, 5 steps:
+1. CPU 1 programs its tick timer one unit ahead
+2. the VMM pauses the vCPUs
+3. the VMM saves the state
+4. a new VM is restored from the image
+5. the VMM resumes the vCPUs
+
+Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en] tick-owed; spi[en latch]; counter exact -/
+def MutantRun.chNoRegs1 : List Label :=
+  [.g true .arm, .pause, .save, .restore, .resume]
+
+theorem mutant_chNoRegs1_breaks :
+    (replay Mutant.chNoRegs1 Cfg.plain MutantRun.chNoRegs1 (init Cfg.plain)).map (lostTick) = some true := by
+  decide
+
+theorem mutant_chNoRegs1_not_sound : ¬ Sound Mutant.chNoRegs1 :=
+  not_sound_of_run (C := Cfg.plain) (run := MutantRun.chNoRegs1) (by decide)
+
 /-- R2 lostEnable, `mutant-ch-no-icc1` in `plain`, 4 steps:
 1. the VMM pauses the vCPUs
 2. the VMM saves the state

@@ -471,11 +471,16 @@ def freshVcpu : Vcpu :=
     tmr := IrqSt.none, sgi := { IrqSt.none with en := true },
     tEn := false, cv := 0, owed := false, l2 := false, ichv := false }
 
+/-- A new vCPU of a restored VM. What the guest keeps in its own memory is there whatever the
+VMM does to KVM, because the memory file is the guest's memory: that a tick is owed, and that a
+cross-call is outstanding. -/
+def memVcpu (s : Slot) : Vcpu := { freshVcpu with owed := s.owed, call := s.call }
+
 /-- The VM a restore starts from: no vCPU and no vGIC yet. The device's own state and the time
 the guest has run are not KVM's: the first is restored by the VMM's device model, the second is
 the model's reference. -/
 def emptyVM (i : Image) : VM :=
-  { c0 := freshVcpu, c1 := freshVcpu, spi := IrqSt.none, dev := i.dev, gicEn := false,
+  { c0 := memVcpu i.s0, c1 := memVcpu i.s1, spi := IrqSt.none, dev := i.dev, gicEn := false,
     ctr := .fresh false, offFlag := false, ideal := i.ideal, restored := true, clone := true }
 
 /-- A clear-register written with `clr`, then its set-register with `set`: a bit that was set
@@ -491,7 +496,7 @@ def apply (R : Rules) (C : Cfg) (i : Image) (m : VM) : Op → VM
   | .create v =>
     -- `kvm_timer_vcpu_init` (arch_timer.c:1105-1122): unless the VM's offset was set by
     -- `KVM_ARM_SET_COUNTER_OFFSET`, a new vCPU resets the VM-wide offsets
-    let m := m.set v freshVcpu
+    let m := m.set v (memVcpu (i.slot v))
     if m.offFlag then m else { m with ctr := .fresh C.nv }
   | .init v off =>
     -- `kvm_arch_vcpu_ioctl_vcpu_init` (arm.c:1870-1905) and `kvm_timer_vcpu_reset`
@@ -518,8 +523,7 @@ def apply (R : Rules) (C : Cfg) (i : Image) (m : VM) : Op → VM
   | .regs v =>
     let c := m.get v
     let s := i.slot v
-    m.set v { c with g := s.g, call := s.call, gOff := s.gOff, tEn := s.tEn, cv := s.cv,
-                     owed := s.owed, l2 := s.l2 }
+    m.set v { c with g := s.g, gOff := s.gOff, tEn := s.tEn, cv := s.cv, l2 := s.l2 }
   | .mp v =>
     -- `kvm_arch_vcpu_ioctl_set_mpstate` (arm.c:816-840)
     let c := m.get v

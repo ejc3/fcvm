@@ -105,3 +105,7 @@ jobs:
           # Every mutant of the resume model's designs (each repair put back, each thing a VMM
           # must not do) has a break: the command exits 1 if one has none.
           lake exe resume-breaks mutants | diff ResumeVerify/mutants.expected -
+          # The recorded runs of both are what the generator makes of the search today, so a
+          # break or a mutant added to the search has its kernel-checked theorem.
+          lake exe resume-breaks traces | ./gen-resume-breaks.py | diff ResumeVerify/Breaks.lean -
+          lake exe resume-breaks mutants traces | ./gen-resume-breaks.py mutants | diff ResumeVerify/MutantBreaks.lean -

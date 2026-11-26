@@ -13,7 +13,7 @@ where a pin moves.
 | 4 | Save and restore `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` | both VMMs | 3 | not done; nothing under fcvm needs it today |
 | 5 | Save and restore a guest hypervisor's `ICH_*_EL2` registers | Firecracker fork, nested pin | 8 | not done (#2179) |
 | 6 | Pass the CPU-interface registers at 64 bits | Cloud Hypervisor fork | 7 | on the branch (35d0e9ab), upstream 2018dd4b0 |
-| 7 | Correct the project's record of #630 | CLAUDE.md | "Least sure", 1 | proposed below, with the measurement |
+| 7 | Correct the project's record of #630 | CLAUDE.md | "Least sure", 1 | done in this pull request, with the measurement |
 
 ## 1. Per-vCPU addressing in Cloud Hypervisor's save
 
@@ -53,8 +53,9 @@ the one counter hides:
 
 - **`KVM_ARM_SET_COUNTER_OFFSET` sets the virtual and the physical offset to the same value**
   (arch_timer.c:1745-1754), and from then on every `KVM_SET_ONE_REG` of either counter is
-  ignored for the life of the VM (sys_regs.c:1791-1796). Measured: `../probe`, the two
-  "KVM_ARM_SET_COUNTER_OFFSET then the replay" cases.
+  ignored for the life of the VM (sys_regs.c:1791-1796). Measured: `../probe`, the three
+  "KVM_ARM_SET_COUNTER_OFFSET then other values written" cases write `P + 500 s` and `V + 700 s`
+  after the ioctl and both counters still read their saved values.
 - **Which saved register the offset is computed from depends on the guest.** An ordinary guest
   ticks on the virtual counter: the offset is `host counter - saved CNTVCT_EL0`
   (`KVM_REG_ARM_TIMER_CNT`). A guest hypervisor ticks on the physical one: `host counter -
@@ -130,9 +131,9 @@ fcvm's behaviour and the owner's call.
 Use a `u64` for the value behind `KVM_DEV_ARM_VGIC_GRP_CPU_SYSREGS`, as the Firecracker fork
 does (`RegChunk = u64`, gicv3/regs/icc_regs.rs:78).
 
-## 7. The record of #630: a proposed correction
+## 7. The record of #630, corrected
 
-CLAUDE.md's "NV2 Snapshot Lifecycle" says a restore "replayed CNTVCT/CNTPCT (KVM adjusts
+CLAUDE.md's "NV2 Snapshot Lifecycle" said a restore "replayed CNTVCT/CNTPCT (KVM adjusts
 per-timer offsets, which for HAS_EL2 guests live in CNTVOFF_EL2 storage), then replayed
 CNTVOFF_EL2, clobbering the adjustment", so that "the guest's monotonic clock jumped forward by
 the host time elapsed since the snapshot".
@@ -145,11 +146,13 @@ CNTVCT`, the fix sets it to `host counter - saved CNTPCT`, and the two saved cou
 
 **What the measurement says** (`../probe/counter-replay.c`, `../probe/expected.txt`; an
 m8gd.metal-24xl, kernel 7.3.3 with fcvm's host patches, `kvm-arm.mode=nested`): on a vCPU with
-`KVM_ARM_VCPU_HAS_EL2`, after writing `CNTPCT_EL0 = V`, `KVM_REG_ARM_TIMER_CNT = V` and
-`CNTVOFF_EL2 = 0` with no `KVM_ARM_SET_COUNTER_OFFSET`, both counters read V plus the second
-slept. The record predicts a value near the host's counter, which was 10,000 s away. With
-`CNTVOFF_EL2 = X`, the saved virtual counter being `V - X`, the physical counter reads X behind
-and the virtual one 2X behind; with the ioctl first, both are right.
+`KVM_ARM_VCPU_HAS_EL2`, after writing `CNTPCT_EL0 = P` and `KVM_REG_ARM_TIMER_CNT = P` with no
+`KVM_ARM_SET_COUNTER_OFFSET`, `CNTVOFF_EL2` reads zero, and after `CNTVOFF_EL2 = 0` is written
+both counters read P plus the second slept. The record predicts a value near the host's
+counter, which was 10,000 s away, against a tolerance of 50 ms. With a saved `CNTVOFF_EL2 = X`,
+the saved virtual counter being `P - X`, each counter reads X behind its saved value; with the
+ioctl first, both read their saved values. Measured on that one kernel, for one vCPU, through
+`KVM_GET_ONE_REG`.
 
 So the record's restore sentence describes a mechanism the kernel does not have. Its second
 half is right: a resume in place did move the clock forward by the whole pause, and the fix's
@@ -162,17 +165,22 @@ improvement came from the freeze, on a restored VM that fcvm then paused for its
 snapshot; or from something else. The record's own second finding ("create+resume stormed 3/3;
 restore was clean 12/12") fits the pause path.
 
-**Proposed text**, for the first two sentences of that paragraph, if the coordinating session
-accepts the measurement (a run of the probe on a v6.18.3 nested host would cover the kernel of
-that time; the code is the same by reading):
+**The text now in CLAUDE.md** (item 1 of that section, edited in this pull request; the
+wording is the delta reviewer's, which says what was read at which kernel, what was measured
+on v7.3.3 only, and what stays open):
 
-> **1. The guest's clock moved by the time it was paused (firecracker fork fix).** Nothing owned
-> the VM's counter offset, so the counter ran while the vCPUs were paused: a VM resumed after a
-> snapshot had its clock ahead by the whole pause, and every armed timer CVAL in the past. On a
-> restore the register replay kept the counters continuous (KVM stores `now - value` in the
-> VM-wide physical offset on a `CNTVCT`/`CNTPCT` write; nothing is kept in `CNTVOFF_EL2`
-> storage; measured by `verify/probe`), except that when the last vCPU replayed had
-> `CNTVOFF_EL2` not zero the physical counter was set back by it. `kvm_timer_emulate` at about
-> 14k a second can be the exit rate of a guest hypervisor without FEAT_ECV, which re-emulates
-> both EL1 timers on every exit whether or not a timer fires; the trace's `should_fire` field
-> would have told which it was.
+> **1. The guest's clock ran while it was paused (firecracker fork fix).** Nothing owned the
+> VM's counter offset, so the guest's counter kept running while the vCPUs were out of
+> `KVM_RUN`: a VM resumed in place after a snapshot had its clock ahead by the whole pause, and
+> every timer that came due in that time fired at once. A restore's register replay does not
+> move the clock forward: on a `CNTVCT`/`CNTPCT` write KVM stores `now - value` in the VM-wide
+> physical offset and keeps nothing in `CNTVOFF_EL2` storage (read at v6.18.3 and v7.3.3;
+> measured by `verify/probe` on v7.3.3 only), so the counters continue from the saved values,
+> except that a saved `CNTVOFF_EL2` of X on the last vCPU replayed leaves the physical counter X
+> behind. Why restore-hit boots measured slow before the fix and fast after is not explained by
+> this and is open. `kvm_timer_emulate` at about 14k a second can be the exit rate of a guest
+> hypervisor without FEAT_ECV (read: both EL1 timers are emulated again on every exit whether
+> or not one fires), so that count alone does not show timers firing; the trace's `should_fire`
+> field would.
+
+A run of the probe on a v6.18.3 nested host would turn "read at v6.18.3" into "measured".

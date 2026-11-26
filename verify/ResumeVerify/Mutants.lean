@@ -45,6 +45,9 @@ def chInitLate : Rules :=
               .create false, .cntp false, .cntv false, .regs false, .init false false, .mp false,
               .create true, .cntp true, .cntv true, .regs true, .init true true, .mp true,
               .gic, .dist, .redist false, .redist true, .icc false, .icc true, .level] }
+/-- vCPU 1's registers are not replayed: its timer's control and compare value among them -/
+def chNoRegs1 : Rules :=
+  { ch with name := "mutant-ch-no-regs1", restore := ch.restore.filter (· != .regs true) }
 /-- vCPU 1's CPU interface is not restored: its priority mask stays shut -/
 def chNoIcc1 : Rules :=
   { ch with name := "mutant-ch-no-icc1", restore := ch.restore.filter (· != .icc true) }
@@ -77,7 +80,7 @@ open Mutant in
 def mutants : List Rules :=
   [chSlotsVcpu0, chCounterOfSave, chNoFreeze, chNoFreezeLoaded, chAdvance, chNoOffset,
    chLastCounterSkipped, chLinesNotSaved, chLinesNotRestored, chClearSavedBits, chNoNestedIcc,
-   chInitLate, chNoIcc1, chNoMp1, chSaveStopsVcpu1, chSaveInitsVcpu0, chSaveUnpendsVcpu1,
+   chInitLate, chNoRegs1, chNoIcc1, chNoMp1, chSaveStopsVcpu1, chSaveInitsVcpu0, chSaveUnpendsVcpu1,
    fcCounterOfSave, fcNoFreeze, fcNoFreezeLoaded, fcNoOffset, fcLinesNotSaved, fcLinesNotRestored,
    fcClearSavedBits, fcNoNestedIcc, fcResumeStopsVcpu1]
 

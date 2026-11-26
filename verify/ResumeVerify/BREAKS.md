@@ -215,11 +215,15 @@ fire once and `CLOCK_MONOTONIC` includes the pause. For a guest hypervisor it wa
   replay gave it. It would not hold for a guest hypervisor's vCPU with `CNTVOFF_EL2` set (5),
   which upstream refuses to snapshot.
 - Every vCPU is created and initialised before any state is replayed (vmm/src/cpu.rs:
-  1065-1094, 1169-1205), and the states are replayed on several threads. That order is the
-  safe one by the model's rules: a `KVM_CREATE_VCPU` after a replay resets the VM's counter
-  offsets, and a `KVM_ARM_VCPU_INIT` after a replay disarms the replayed timer
-  (`mutant_chInitLate_breaks`, R1 lostTick). `upstream_replay_order`: either order of the two
-  replays builds the same VM.
+  1065-1094, 1169-1205), and the states are replayed on several threads. That is a safe order
+  by the model's rules. So is a354afd77's (create, init and replay one vCPU, then the next),
+  which is the design's and is proved sound. The two orders the mutants show unsafe: a
+  `KVM_ARM_VCPU_INIT` of a vCPU after that vCPU's own replay disarms its timer
+  (`mutant_chInitLate_breaks`, R1 lostTick), and a `KVM_CREATE_VCPU` after the last counter
+  write, with none after it, leaves the counter as the new vCPU set it
+  (`mutant_chLastCounterSkipped_breaks`). `upstream_replay_order` and
+  `upstream_replay_interleaved`: the two sequential orders of the replays and two
+  interleavings build the same VM, because the counter is written once more after them.
 - The per-vCPU register replay still writes each vCPU's saved counter (kvm/mod.rs:3256-3261);
   the write at the resume comes last and wins.
 
@@ -231,7 +235,8 @@ arch_timer.c:1048-1053). The saved virtual counter is the physical one less `CNT
 the guest hypervisor's clock comes out behind by the `CNTVOFF_EL2` of the last vCPU replayed,
 and an armed timer does not fire for that long (`nv-l2`, R4@5 and R1 timerCannotFire@6: a CPU
 arms its timer, another loads a nested vCPU, pause, save, restore, resume). Measured for one
-vCPU by `../probe` ("EL2 vCPU, CNTVOFF_EL2 = X, registers replayed"). Unreachable today: the
+vCPU by `../probe` ("EL2 vCPU, CNTVOFF_EL2 = X, saved counters written": each counter reads X
+behind its saved value). Unreachable today: the
 nested pin issues `KVM_ARM_SET_COUNTER_OFFSET` first, which makes that write do nothing. See
 "Least sure", 1, for how this differs from the project's record of #630.
 

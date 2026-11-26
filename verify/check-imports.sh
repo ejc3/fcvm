@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Every Lean file of a library is imported by that library's Axioms.lean, the library's root
 # imports Axioms.lean, the sweep is the last command of Axioms.lean, every library and
-# executable is a default target of `lake build`, and the executables' modules declare no
-# theorem. The axiom sweep in Axioms.lean looks at what the modules it
+# executable is a default target of `lake build`, every library builds its whole directory
+# (`globs`), and the executables' modules declare no theorem. The axiom sweep in Axioms.lean looks at what the modules it
 # imports declare; lake does not elaborate Axioms.lean again when a file it does not import is
 # added, so this is checked here, outside lake, on every run of `make verify` and of the CI job.
 set -euo pipefail
@@ -48,9 +48,18 @@ while IFS= read -r t; do
     rc=1
   fi
 done <<<"$declared"
+# Each model's library is declared with `globs = ["<Lib>.*"]`, which builds every file of its
+# directory. With a list of named modules in its place, a file left off the list (Proofs.lean,
+# Axioms.lean) is not built, and neither this script nor `lake build` nor a search would say so.
+libglobs=$(awk '/^\[\[/ { inlib = ($0 == "[[lean_lib]]"); name = ""; next }
+                inlib && /^name *=/ { name = $0; gsub(/[" ]/, "", name); sub(/^name=/, "", name) }
+                inlib && /^globs *=/ { g = $0; gsub(/ /, "", g); sub(/^globs=/, "", g); print name "=" g }' lakefile.toml)
 for lib in WakeVerify GateVerify ResumeVerify; do
   if ! grep -qxF "$lib" <<<"$declared"; then
     echo "check-imports: lakefile.toml does not declare the library $lib" >&2
+    rc=1
+  elif ! grep -qxF "$lib=[\"$lib.*\"]" <<<"$libglobs"; then
+    echo "check-imports: the library $lib is not declared with globs = [\"$lib.*\"] (after its name): files of $lib/ could go unbuilt" >&2
     rc=1
   fi
 done

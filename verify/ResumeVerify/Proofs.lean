@@ -240,7 +240,7 @@ theorem sound_noLostNestedMask (hR : Sound R) (h : Reachable R C s) : lostNested
   have i := (reachable_inv hR h).m
   simp [lostNestedMask, anyVcpu, i.v0.ich, i.v1.ich]
 
-/-- R2: no SGI is pending that nobody sent, and no latch sits on the timer interrupt. -/
+/-- R2: no SGI is pending that nobody sent. -/
 theorem sound_noStrayPending (hR : Sound R) (h : Reachable R C s) : strayPending s = false := by
   have i := (reachable_inv hR h).m
   simp [strayPending, anyVcpu, i.v0.call, i.v1.call]
@@ -324,12 +324,12 @@ theorem clearSet_inv (c s : Bool) : clearSet c (!s) s = s := by
 theorem Design.cloudHypervisor_sound : Sound Design.cloudHypervisor :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, quiet_nil, quiet_kick, fun C i => by
     simp [build, Design.cloudHypervisor, apply, clrOf, clearSet_inv, rebuilt, vcpuOf, emptyVM,
-      freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
+      memVcpu, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
 theorem Design.firecracker_sound : Sound Design.firecracker :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, quiet_devEvent, quiet_nil, fun C i => by
     simp [build, Design.firecracker, Today.fcOrder, apply, clrOf, clearSet_inv, rebuilt, vcpuOf,
-      emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
+      emptyVM, memVcpu, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none]⟩
 
 /-- `KVM_ARM_SET_COUNTER_OFFSET` may also come last in a restore: it overwrites whatever the
 register replay left in the VM's offsets. (It may not be combined with a counter write after
@@ -344,7 +344,7 @@ theorem Design.cloudHypervisorOffsetLast_sound : Sound Design.cloudHypervisorOff
     cases hnv : C.nv <;> cases h0 : i.s0.l2 <;> cases h1 : i.s1.l2 <;> cases hc0 : i.s0.cnt <;>
       cases hc1 : i.s1.cnt <;>
       simp [build, Design.cloudHypervisorOffsetLast, Design.cloudHypervisor, apply, clrOf,
-        clearSet_inv, rebuilt, vcpuOf, emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none,
+        clearSet_inv, rebuilt, vcpuOf, emptyVM, memVcpu, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none,
         hnv, h0, h1, hc0, hc1]⟩
 
 theorem design_cloudHypervisor {C : Cfg} {s : State} (h : Reachable Design.cloudHypervisor C s) :
@@ -431,6 +431,84 @@ theorem r5_fails_resumeStops :
       = some true := by
   decide
 
+/-! ### R5 for today's rule books, for every configuration and run
+
+What today's VMMs write to a paused source disturbs no VM at all, with no invariant needed. -/
+
+/-- A list of requests that leaves every VM undisturbed. -/
+def Harmless (ops : List SrcOp) : Prop := ∀ (C : Cfg) (m : VM), undisturbed m (srcOps C ops m) = true
+
+theorem harmless_nil : Harmless [] := by
+  intro C m
+  simp [srcOps, undisturbed]
+
+theorem harmless_kick : Harmless [.kick] := by
+  intro C m
+  simp only [srcOps, List.foldl, srcApply]
+  split <;> simp [undisturbed]
+
+theorem harmless_devEvent : Harmless [.devEvent] := by
+  intro C m
+  simp only [srcOps, List.foldl, srcApply]
+  split
+  · simp [undisturbed]
+  · cases hl : C.spiLevel <;> simp [undisturbed]
+
+theorem r5_step {R : Rules} {C : Cfg} {s t : State} {l : Label} (hS : Harmless R.onSave)
+    (hRe : Harmless R.onResume) (ih : s.disturbed = false) (hs : step R C l s = some t) :
+    t.disturbed = false := by
+  cases l with
+  | g v x => simp only [step] at hs; peel; obtain ⟨m', _, rfl⟩ := map_some hs; exact ih
+  | fire v => simp only [step] at hs; peel; obtain ⟨m', _, rfl⟩ := map_some hs; exact ih
+  | wake v => simp only [step] at hs; peel; obtain ⟨m', _, rfl⟩ := map_some hs; exact ih
+  | dev => simp only [step] at hs; peel; obtain ⟨m', _, rfl⟩ := map_some hs; exact ih
+  | tick => simp only [step] at hs; peel; simp only [Option.some.injEq] at hs; subst hs; exact ih
+  | wait => simp only [step] at hs; peel; simp only [Option.some.injEq] at hs; subst hs; exact ih
+  | pause => simp only [step] at hs; peel; simp only [Option.some.injEq] at hs; subst hs; exact ih
+  | save =>
+    simp only [step] at hs
+    peel
+    simp only [Option.some.injEq] at hs
+    subst hs
+    simp [ih, hS C s.vm]
+  | resume =>
+    cases hp : s.ph <;> simp only [step, hp] at hs
+    · exact nomatch hs
+    · simp only [Option.some.injEq] at hs
+      subst hs
+      simp [ih, hRe C s.vm]
+    · simp only [Option.some.injEq] at hs
+      subst hs
+      exact ih
+  | restore =>
+    cases hi : s.img <;> simp only [step, hi] at hs
+    · exact nomatch hs
+    · peel
+      simp only [Option.some.injEq] at hs
+      subst hs
+      exact ih
+
+theorem r5_of_harmless {R : Rules} {C : Cfg} {s : State} (hS : Harmless R.onSave)
+    (hRe : Harmless R.onResume) (h : Reachable R C s) : sourceDisturbed s = false := by
+  induction h with
+  | init => rfl
+  | step l _ hst ih => exact r5_step hS hRe ih hst
+
+theorem today_r5_cloudHypervisor {C : Cfg} {s : State} (h : Reachable Today.cloudHypervisor C s) :
+    sourceDisturbed s = false := r5_of_harmless harmless_nil harmless_kick h
+theorem today_r5_cloudHypervisorRepin {C : Cfg} {s : State}
+    (h : Reachable Today.cloudHypervisorRepin C s) : sourceDisturbed s = false :=
+  r5_of_harmless harmless_nil harmless_kick h
+theorem today_r5_cloudHypervisorUpstream {a : Bool} {C : Cfg} {s : State}
+    (h : Reachable (Today.cloudHypervisorUpstream a) C s) : sourceDisturbed s = false :=
+  r5_of_harmless harmless_nil harmless_kick h
+theorem today_r5_forkBefore630 {C : Cfg} {s : State} (h : Reachable Today.forkBefore630 C s) :
+    sourceDisturbed s = false := r5_of_harmless harmless_devEvent harmless_kick h
+theorem today_r5_forkDefault {C : Cfg} {s : State} (h : Reachable Today.forkDefault C s) :
+    sourceDisturbed s = false := r5_of_harmless harmless_devEvent harmless_nil h
+theorem today_r5_forkNested {C : Cfg} {s : State} (h : Reachable Today.forkNested C s) :
+    sourceDisturbed s = false := r5_of_harmless harmless_devEvent harmless_kick h
+
 /-- What today's VMMs do write to a paused source takes nothing from it, and shows as an
 interrupt with nothing behind it: Cloud Hypervisor's resume raises the device's interrupt. -/
 theorem cloudHypervisor_kicks :
@@ -447,15 +525,40 @@ theorem firecracker_save_raises_device :
 
 /-! ## Cloud Hypervisor upstream's two clock modes, on one run -/
 
-/-- Upstream replays the vCPUs' states on several threads. Either order builds the same VM:
-the counter is written once more, through vCPU 0, after both. -/
+/-- Upstream replays the vCPUs' states on several threads. Either of the two sequential orders
+builds the same VM: the counter is written once more, through vCPU 0, after both. -/
 theorem upstream_replay_order (advance : Bool) (C : Cfg) (i : Image) :
     build (Today.cloudHypervisorUpstream advance) C i
       = build (Today.cloudHypervisorUpstreamSwapped advance) C i := by
   cases hnv : C.nv <;> cases h0 : i.s0.l2 <;> cases h1 : i.s1.l2 <;> cases hc0 : i.s0.cnt <;>
     cases hc1 : i.s1.cnt <;>
     simp [build, Today.cloudHypervisorUpstream, Today.cloudHypervisorUpstreamSwapped, apply, clrOf,
-      emptyVM, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none, hnv, h0, h1, hc0, hc1]
+      emptyVM, memVcpu, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none, hnv, h0, h1, hc0, hc1]
+
+/-- The same with the two vCPUs' requests interleaved, as threads may. -/
+def Today.cloudHypervisorUpstreamInterleaved (advance : Bool) (mid : List Op) : Rules :=
+  { Today.cloudHypervisorUpstream advance with
+    restore := [.create false, .init false false, .create true, .init true true] ++ mid ++
+               [.gic, .dist, .redist false, .redist true, .icc false, .icc true, .cntv false] }
+
+/-- Two interleavings of the two replays build the VM the sequential order builds. Not every
+interleaving is enumerated; the reason is the same for each: no request of one vCPU's replay
+reads what the other's writes, except the VM-wide counter, which is written last. -/
+theorem upstream_replay_interleaved (advance : Bool) (C : Cfg) (i : Image) :
+    build (Today.cloudHypervisorUpstream advance) C i
+        = build (Today.cloudHypervisorUpstreamInterleaved advance
+            [.cntp false, .cntp true, .cntv true, .cntv false, .regs true, .regs false,
+             .mp false, .mp true]) C i
+      ∧ build (Today.cloudHypervisorUpstream advance) C i
+        = build (Today.cloudHypervisorUpstreamInterleaved advance
+            [.cntp true, .cntp false, .cntv false, .regs false, .cntv true, .mp false,
+             .regs true, .mp true]) C i := by
+  constructor <;>
+    cases hnv : C.nv <;> cases h0 : i.s0.l2 <;> cases h1 : i.s1.l2 <;> cases hc0 : i.s0.cnt <;>
+      cases hc1 : i.s1.cnt <;>
+      simp [build, Today.cloudHypervisorUpstream, Today.cloudHypervisorUpstreamInterleaved, apply,
+        clrOf, emptyVM, memVcpu, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none, hnv, h0, h1,
+        hc0, hc1]
 
 /-- The run: CPU 0 arms its timer one unit ahead, the VM is paused and saved, host time passes,
 a clone is restored and resumed. -/

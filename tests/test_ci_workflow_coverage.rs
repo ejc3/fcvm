@@ -3415,7 +3415,8 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
     //   passes on any order the model knows, an earlier one included);
     // - the boundary model's search, compared with the result its documents quote;
     // - the resume model's search, likewise;
-    // - the resume model's mutants, each of which must have a break.
+    // - the resume model's mutants, each of which must have a break;
+    // - the resume model's recorded runs, which must be what its generator makes today.
     let lines: Vec<&str> = script.lines().map(str::trim).collect();
     let line_of = |what: &str, wanted: &dyn Fn(&str) -> bool| -> usize {
         lines
@@ -3458,8 +3459,25 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
         "`lake exe resume-breaks mutants | diff ResumeVerify/mutants.expected -`",
         &|l| l == "lake exe resume-breaks mutants | diff ResumeVerify/mutants.expected -",
     );
+    let resume_runs = line_of(
+        "`lake exe resume-breaks traces | ./gen-resume-breaks.py | diff ResumeVerify/Breaks.lean -`",
+        &|l| {
+            l == "lake exe resume-breaks traces | ./gen-resume-breaks.py | diff ResumeVerify/Breaks.lean -"
+        },
+    );
+    let resume_mutant_runs = line_of(
+        "`lake exe resume-breaks mutants traces | ./gen-resume-breaks.py mutants | diff ResumeVerify/MutantBreaks.lean -`",
+        &|l| {
+            l == "lake exe resume-breaks mutants traces | ./gen-resume-breaks.py mutants | diff ResumeVerify/MutantBreaks.lean -"
+        },
+    );
     assert!(
-        built < drift && built < search && built < resume_search && built < resume_mutants,
+        built < drift
+            && built < search
+            && built < resume_search
+            && built < resume_mutants
+            && built < resume_runs
+            && built < resume_mutant_runs,
         "the drift check and the searches run the executables `lake build` makes: {script:?}"
     );
 
