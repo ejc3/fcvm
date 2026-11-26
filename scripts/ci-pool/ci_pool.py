@@ -844,6 +844,49 @@ def cmd_plan(_args, gh, _default_branch):
     return 0
 
 
+# ----------------------------------------------------------------------------- inventory
+
+def workflow_shape(text):
+    """(triggers, self_hosted_jobs) of a workflow file, read without a YAML parser:
+    triggers is {event: its block's text}, self_hosted_jobs the ids of the jobs whose
+    `runs-on` names a self-hosted runner."""
+    block = re.search(r'^(?:on|"on"|\'on\'):[ \t]*(.*)\n((?:[ \t]+.*\n|\n)*)', text + '\n', re.M)
+    triggers = {}
+    if block:
+        if block[1].strip():
+            for event in re.findall(r'[\w-]+', block[1]):
+                triggers[event] = ''
+        for event, body in re.findall(r'^  ([\w-]+):[ \t]*(.*(?:\n(?:    .*|\s*)$)*)', block[2], re.M):
+            triggers[event] = body
+    jobs = text.split('\njobs:\n', 1)[1] if '\njobs:\n' in text else ''
+    self_hosted = []
+    for name, body in re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', jobs, re.M | re.S):
+        runs_on = re.search(r'^    runs-on:(.*(?:\n      .*)*)', body, re.M)
+        if runs_on and 'self-hosted' in runs_on[1]:
+            self_hosted.append(name)
+    return triggers, self_hosted
+
+
+def per_branch_self_hosted(text, default_branch='main'):
+    """The reasons a workflow would run a self-hosted job once per pull request or per
+    pushed branch: the events that do it. Empty for a workflow with no self-hosted job."""
+    triggers, self_hosted = workflow_shape(text)
+    if not self_hosted:
+        return []
+    reasons = []
+    for event in ('pull_request', 'pull_request_target', 'merge_group'):
+        if event in triggers:
+            reasons.append(event)
+    if 'push' in triggers:
+        branches = re.search(r'branches:\s*(\[[^\]]*\]|(?:\n\s*-\s*.*)+)', triggers['push'])
+        listed = branches[1] if branches else ''
+        named = (re.findall(r"[\w./*-]+", listed) if listed.startswith('[')
+                 else [name.strip().strip('\'"') for name in re.findall(r'-[ \t]+(.+)', listed)])
+        if named != [default_branch] and not (named == [] and re.search(r'^\s*tags:', triggers['push'], re.M)):
+            reasons.append('push to branches other than ' + default_branch)
+    return reasons
+
+
 # ---------------------------------------------------------------------------------- cost
 
 def instant(text):
@@ -866,6 +909,15 @@ def job_minutes(job):
     if not job.get('started_at') or not job.get('completed_at'):
         return 0.0
     return max(0.0, (instant(job['completed_at']) - instant(job['started_at'])).total_seconds()) / 60
+
+
+def waited_minutes(job):
+    """Minutes a job waited for a runner after it was created, or None when not recorded."""
+    if job.get('conclusion') == 'skipped' or not job.get('runner_name'):
+        return None
+    if not job.get('created_at') or not job.get('started_at'):
+        return None
+    return max(0.0, (instant(job['started_at']) - instant(job['created_at'])).total_seconds()) / 60
 
 
 def usd(kind, minutes):
@@ -949,7 +1001,7 @@ def list_runs(gh, since, until):
     return list(runs.values())
 
 
-JOB_JQ = ('.jobs[] | {id, name, conclusion, started_at, completed_at, labels, run_attempt, runner_name}')
+JOB_JQ = ('.jobs[] | {id, name, conclusion, created_at, started_at, completed_at, labels, run_attempt, runner_name}')
 
 
 def jobs_of(gh, run, cache):
@@ -976,7 +1028,7 @@ def summarise(runs, jobs_by_run):
     """The account: minutes and dollars by workflow, event and runner class; by lane; the
     cost of one run of the lanes at the median successful duration; and how often a pull
     request's run of the lanes failed."""
-    groups, lanes, durations = {}, {}, {}
+    groups, lanes, durations, waits = {}, {}, {}, {}
     passed = failed = rerun = rerun_passed = 0
     failed_cost, failed_runs_cost = [], []
     for run in runs:
@@ -986,6 +1038,9 @@ def summarise(runs, jobs_by_run):
         for job in jobs:
             kind = runner_class(job['labels'])
             minutes = job_minutes(job)
+            waited = waited_minutes(job)
+            if waited is not None:
+                waits.setdefault((kind[0], kind[1], job.get('created_at', '')[:10]), []).append(waited)
             if minutes == 0:
                 continue
             key = (run['name'], run['event'], kind)
@@ -1035,7 +1090,7 @@ def summarise(runs, jobs_by_run):
                 failed_cost.append(cost / pr_run)
         share = min(1.0, statistics.mean(failed_cost)) if failed_cost else None
     return {
-        'groups': groups, 'lanes': lanes, 'median_minutes': median,
+        'groups': groups, 'lanes': lanes, 'median_minutes': median, 'waits': waits,
         'pr_run_usd': pr_run, 'full_run_usd': full_run,
         'pr_runs_passed': passed, 'pr_runs_failed': failed,
         'failure_rate': failed / (passed + failed) if passed + failed else None,
@@ -1066,6 +1121,15 @@ def print_account(account, since, until, counts):
     for (lane, market), g in sorted(account['lanes'].items()):
         note(f"{g['usd']:9.2f} {g['minutes']:9.0f} {g['jobs']:6d}  {lane} / {market}")
     note()
+    if account['waits']:
+        note('minutes a job waited for a runner, by the day it was created:')
+        note(f"  {'day':10}  {'runner':18} {'jobs':>5} {'median':>7} {'p90':>7} {'longest':>8}")
+        for (kind, arch, day), values in sorted(account['waits'].items(), key=lambda item: (item[0][2], item[0][0], item[0][1])):
+            values = sorted(values)
+            runner = kind if arch == '-' else f'{kind}/{arch}'
+            note(f"  {day:10}  {runner:18} {len(values):5d} {statistics.median(values):7.1f} "
+                 f"{values[int(len(values) * 0.9) - (len(values) == 1)] if len(values) > 1 else values[0]:7.1f} {values[-1]:8.1f}")
+        note()
     note('one run of the lanes, at each lane\'s median successful duration and the spot price:')
     for lane in LANES:
         if lane in account['median_minutes']:

@@ -464,7 +464,7 @@ class Publish(Sandbox):
         members = self.pool()
         prs = self.prs(*members)
         fixture = self.flying(self.remote('c'), self.RUNNING)
-        first = self.commit('b', {'b.txt': 'first\n'}, 'first', push=False)
+        self.commit('b', {'b.txt': 'first\n'}, 'first', push=False)
         self.assertEqual(self.tool('publish', prs=prs, fixture=fixture)[0], 0)
         second = self.commit('b', {'b.txt': 'second\n'}, 'second', push=False)
         code, out, _ = self.tool('publish', prs=prs, fixture=fixture)
@@ -581,6 +581,18 @@ class Cost(unittest.TestCase):
         self.assertEqual(ci_pool.job_minutes(self.job('Lint', 'success', 12, ['ubuntu-latest'])), 12)
         self.assertEqual(ci_pool.job_minutes(self.job('Lint', 'skipped', 12, ['ubuntu-latest'])), 0)
         self.assertEqual(ci_pool.job_minutes(self.job('Host-arm64', 'cancelled', 12, self.ARM, runner=False)), 0)
+
+    def test_the_wait_for_a_runner_is_from_a_jobs_creation_to_its_start(self):
+        job = dict(self.job('Host-arm64', 'success', 30, self.ARM), created_at='2025-12-31T23:00:00+00:00')
+        self.assertEqual(ci_pool.waited_minutes(job), 60)
+        self.assertIsNone(ci_pool.waited_minutes(self.job('Host-arm64', 'success', 30, self.ARM)))
+        self.assertIsNone(ci_pool.waited_minutes(dict(job, conclusion='skipped')))
+        self.assertIsNone(ci_pool.waited_minutes(dict(job, runner_name=False)))
+        account = ci_pool.summarise([self.a_run(1)], {1: [job, dict(job, created_at='2025-12-31T23:30:00+00:00'),
+                                                          dict(self.job('Lint', 'success', 3, ['ubuntu-latest']),
+                                                               created_at='2025-12-31T23:59:58+00:00')]})
+        self.assertEqual(account['waits'][('self-hosted', 'arm64', '2025-12-31')], [60, 30])
+        self.assertEqual(len(account['waits'][('github-hosted', '-', '2025-12-31')]), 1)
 
     def test_every_class_of_runner_has_a_price(self):
         for labels in (self.ARM, self.X64, self.ARM + ['on-demand'], self.X64 + ['on-demand'], ['ubuntu-latest']):
@@ -2164,6 +2176,57 @@ class MarkCommand(Sandbox):
     def test_a_job_list_that_cannot_be_read_states_nothing(self):
         code, out, posts, _ = self.mark(self.STACK, [], **{f'repos/{REPO}/actions/runs/77/jobs?filter=all&per_page=100': 'FAIL'})
         self.assertEqual((code, posts), (2, []), out)
+
+
+class Inventory(unittest.TestCase):
+    """Only ci.yml may run a self-hosted job once per pull request or per pushed branch:
+    its lanes are pooled. Any other workflow that did would pay per pull request again."""
+
+    HOSTED = "name: X\non:\n  pull_request:\n    paths:\n      - 'a/**'\n  push:\n    branches: [main]\njobs:\n  build:\n    runs-on: ubuntu-24.04\n"
+    METAL = '    runs-on: ["self-hosted", "Linux", "ARM64"]\n'
+
+    def reasons(self, on, runs_on=METAL):
+        return ci_pool.per_branch_self_hosted(f'name: X\non:\n{on}jobs:\n  one:\n    name: One\n{runs_on}    steps: []\n')
+
+    def test_no_workflow_but_ci_yml_runs_a_self_hosted_job_per_pull_request_or_branch(self):
+        found = {}
+        for path in sorted((ROOT / '.github/workflows').glob('*.y*ml')):
+            reasons = ci_pool.per_branch_self_hosted(path.read_text())
+            if reasons:
+                found[path.name] = reasons
+        self.assertEqual(found, {'ci.yml': ['pull_request']},
+                         'a workflow other than ci.yml runs a self-hosted job per pull request or per branch: '
+                         'pool it (docs/ci-pool.md) or move it to a GitHub-hosted runner')
+
+    def test_the_workflows_known_to_use_self_hosted_runners_are_seen_as_such(self):
+        # The reader must see a self-hosted job where there is one, or the test above cannot fail.
+        seen = {path.name for path in (ROOT / '.github/workflows').glob('*.yml')
+                if ci_pool.workflow_shape(path.read_text())[1]}
+        for name in ('ci.yml', 'weekly.yml', 'kernels.yml', 'teardown-evidence.yml'):
+            self.assertIn(name, seen)
+        self.assertEqual(sorted(ci_pool.workflow_shape((ROOT / '.github/workflows/ci.yml').read_text())[1]),
+                         ['container', 'host', 'host-root'])
+
+    def test_a_self_hosted_job_on_a_pull_request_or_any_branch_is_found(self):
+        self.assertEqual(self.reasons('  pull_request:\n    paths:\n      - x\n'), ['pull_request'])
+        self.assertEqual(self.reasons('  pull_request_target:\n'), ['pull_request_target'])
+        self.assertEqual(self.reasons('  push:\n'), ['push to branches other than main'])
+        self.assertEqual(self.reasons("  push:\n    branches: ['**']\n"), ['push to branches other than main'])
+        self.assertEqual(self.reasons('  push:\n    branches:\n      - main\n      - release\n'), ['push to branches other than main'])
+        self.assertEqual(self.reasons('  push:\n    paths:\n      - x\n'), ['push to branches other than main'])
+        matrix = '    runs-on: ${{ fromJSON(format(\'["self-hosted","Linux","{0}"]\', matrix.arch)) }}\n'
+        self.assertEqual(self.reasons('  pull_request:\n', matrix), ['pull_request'])
+        folded = '    runs-on:\n      - self-hosted\n      - Linux\n'
+        self.assertEqual(self.reasons('  pull_request:\n', folded), ['pull_request'])
+
+    def test_a_self_hosted_job_on_main_a_schedule_or_a_dispatch_is_not(self):
+        for on in ('  push:\n    branches: [main]\n', '  push:\n    branches:\n      - main\n', '  schedule:\n    - cron: "0 4 * * *"\n',
+                   '  workflow_dispatch:\n', '  workflow_run:\n    workflows: ["CI"]\n', '  workflow_call:\n'):
+            self.assertEqual(self.reasons(on), [], on)
+
+    def test_a_hosted_workflow_on_pull_requests_is_not(self):
+        self.assertEqual(ci_pool.per_branch_self_hosted(self.HOSTED), [])
+        self.assertEqual(self.reasons('  pull_request:\n', '    runs-on: ubuntu-24.04-arm\n'), [])
 
 
 class Lanes(unittest.TestCase):

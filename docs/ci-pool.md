@@ -265,6 +265,39 @@ testing alone: a larger pool also holds every member back while one culprit is f
 which a count of runs does not price. Runs that someone chose to rerun are not a random sample of failures, so the split
 is an estimate; once failed pools are always rerun once, it stops being a selected one.
 
+## Every workflow, by what it costs
+
+Runs created 2026-11-19 to 2026-11-25. Dollars are from `cost`; run counts and wall
+times are from the run list as of 2026-11-25 22:00 UTC. A run that skipped everything
+counts as a run. `claude.yml` and `claude-lint.yml` had no run in that week.
+
+| workflow | triggers | runner | runs | median wall minutes | self-hosted USD |
+|---|---|---|---|---|---|
+| `ci.yml` | pull_request | self-hosted lanes, GitHub-hosted checks | 817 | 0.9 (34 to 57 a lane when lanes run) | 497.30 |
+| `ci.yml` | push to main | same | 145 | 34.0 | 264.52 |
+| `ci.yml` | workflow_dispatch | same | 35 | 128.4 | 116.00 |
+| `ci.yml` | after Build Kernels | same | 13 | 47.8 | 19.28 |
+| `weekly.yml` (Daily) | schedule | self-hosted | 7 | 97.5 | 13.05 |
+| `fleet-coordinator-deploy.yml` | push to main, after the lane image | GitHub-hosted, one self-hosted smoke | 124 | 32.5 on a push | 0.90 |
+| `fleet-prod-promote.yml` | after a staging deploy, schedule | GitHub-hosted, one self-hosted smoke | 170 | 0.0 | 0.90 |
+| `fleet-web-deploy.yml` | push to main | GitHub-hosted, one self-hosted smoke | 23 | 13.0 | 0.39 |
+| `kernels.yml` | push to main (kernel paths) | self-hosted | 14 | 74.0 | 0.54 |
+| `fleet-release-gate.yml` | schedule every 5 minutes, dispatch | GitHub-hosted, one self-hosted smoke | 951 | 0.4 | 0.39 |
+| `fleet-viewer-smoke.yml`, `fleet-prod-smoke.yml` | schedule, dispatch, called | self-hosted | 33 | 1.8 to 4.7 | 0.21 |
+| `fleet-lambda-image.yml` | pull_request and push to main (paths) | GitHub-hosted | 328 | 11.7 | 0 |
+| `build-runner-ami.yml` | after Build Kernels, dispatch | GitHub-hosted | 16 | 47.6 | 0 |
+| `verify.yml`, `pages.yml`, `fleet-ami-pipeline.yml`, `fleet-ops-terraform.yml`, `verify-kernel-releases.yml` | various | GitHub-hosted | 220 | under 2 | 0 |
+
+`ci.yml` is $897 of the $913. It is the only workflow that runs a self-hosted job once
+per pull request or per pushed branch, and a test fails if another one starts to
+(`per_branch_self_hosted`): such a workflow would pay per pull request again, outside
+the pool. The workflows that run per pull request on GitHub-hosted runners
+(`fleet-lambda-image.yml`, `verify.yml`) cost nothing on a public
+repository and were not waiting for runners either: a GitHub-hosted job waited a median
+of 2 seconds for its runner that week (90th percentile 4 seconds), a self-hosted one a
+median of 61 minutes on 2026-11-24. `cost` prints those waits by day. So they are left
+as they are.
+
 ## Failures
 
 `failures` lists, for the same kind of date range, every failed attempt of a self-hosted
