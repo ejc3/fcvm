@@ -1494,6 +1494,89 @@ mod tests {
         classes
     }
 
+    /// fcvm attaches every drive and pmem device before the guest boots, and never to a running
+    /// VM. Firecracker starts a block worker thread for a drive while it attaches it: at boot
+    /// and at a snapshot load that is before the VMM thread's filter is installed, and for a
+    /// drive attached later it is under that filter, which then has to allow creating a thread.
+    /// A hot-plug added to fcvm fails here, and not as a confined VM stopped in the field.
+    #[test]
+    fn every_drive_is_attached_before_the_guest_boots() {
+        // The attach calls, spelled so this test's own text holds none of them.
+        let attach = [
+            concat!(".add", "_drive("),
+            concat!(".add", "_pmem("),
+            concat!(".put", "_pmem("),
+        ];
+        // The files that attach, each with the call after which it may attach nothing: the
+        // boot. The two without one are what the others call into (the Hypervisor trait's
+        // Firecracker implementation, and the pre-boot configuration it applies).
+        let may_attach: [(&str, Option<&str>); 5] = [
+            ("commands/podman/vm_config.rs", Some("hv.boot().await")),
+            ("commands/vm.rs", Some("backend.boot().await")),
+            ("setup/rootfs.rs", Some("InstanceAction::InstanceStart")),
+            ("hypervisor/firecracker.rs", None),
+            ("firecracker/config.rs", None),
+        ];
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        assert!(
+            files.len() > 50,
+            "only {} source files were read",
+            files.len()
+        );
+        let mut attaching = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            if !attach.iter().any(|call| text.contains(call)) {
+                continue;
+            }
+            let name = file
+                .strip_prefix(&src)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            let Some((_, boot)) = may_attach.iter().find(|(allowed, _)| *allowed == name) else {
+                panic!(
+                    "{name} attaches a drive or pmem device. If it does so before the guest \
+                     boots, list it here with its boot call; a device attached to a running VM \
+                     starts a Firecracker thread under the VMM thread's seccomp filter, which \
+                     the confined policy does not allow"
+                );
+            };
+            if let Some(boot) = boot {
+                let booted = text
+                    .find(boot)
+                    .unwrap_or_else(|| panic!("{name} no longer calls {boot}"));
+                for call in attach {
+                    assert!(
+                        !text[booted..].contains(call),
+                        "{name} calls {call} after {boot}"
+                    );
+                }
+            }
+            attaching.push(name);
+        }
+        attaching.sort();
+        let mut expected: Vec<&str> = may_attach.iter().map(|(name, _)| *name).collect();
+        expected.sort();
+        assert_eq!(
+            attaching, expected,
+            "a listed file no longer attaches anything"
+        );
+    }
+
     /// The pinned Firecracker's own filter says which thread categories the binary has, and
     /// a custom filter file must carry every one of them: Firecracker looks its filter up
     /// by category when a thread of that kind starts. The policy is generated from that
