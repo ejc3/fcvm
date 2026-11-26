@@ -818,8 +818,8 @@ def lane(name, conclusion, attempt=1):
     return {'name': name, 'conclusion': conclusion, 'run_attempt': attempt}
 
 
-def a_run(number, jobs, event='pull_request'):
-    return {'id': number, 'event': event, 'jobs': jobs}
+def a_run(number, jobs, event='pull_request', tested=T1):
+    return {'id': number, 'event': event, 'jobs': jobs, 'tested_tree': tested}
 
 
 def passed(names):
@@ -894,6 +894,9 @@ class Evidence(unittest.TestCase):
         self.assertEqual(self.proof(passed(ci_pool.LANES), compare=None)[0], {})
         nearly = {'status': 'ahead', 'files': [f'src/{n}.rs' for n in range(299)]}
         self.assertEqual(len(self.proof(passed(ci_pool.LANES), compare=nearly)[0]), len(ci_pool.LANES))
+        # A commit ahead of the default branch changed something: a comparison that lists
+        # nothing did not list it.
+        self.assertEqual(self.proof(passed(ci_pool.LANES), compare={'status': 'ahead', 'files': []})[0], {})
 
     def test_a_commit_that_does_not_contain_the_default_branch_proves_nothing(self):
         # A pull request's run tests the merge of its head into its base, which is its
@@ -1006,9 +1009,30 @@ class Plan(unittest.TestCase):
 
     def test_lanes_add_up_across_runs_and_commits_of_one_tree(self):
         evidence = [({'sha': HEAD, 'tree': T1}, [a_run(7, passed(['Host-arm64'])),
-                                                  a_run(8, passed(['Host-x64']) + [lane('Host-arm64', 'failure')], 'workflow_dispatch')], CLEAN),
+                                                  a_run(8, passed(['Host-x64']) + [lane('Container-arm64', 'failure')], 'workflow_dispatch')], CLEAN),
                     ({'sha': 'd' * 40, 'tree': T2}, [a_run(9, passed(['Container-x64']))], CLEAN)]
         self.assertEqual(self.ALL - set(ci_pool.plan_lanes('push', T1, evidence)[0]), {'Host-arm64', 'Host-x64'})
+
+    def test_a_lane_that_failed_in_one_run_on_the_commit_and_passed_in_another_is_not_proven(self):
+        # A dispatch, or closing and reopening the pull request, gives the same commit a
+        # second run whose first attempt passes. The lane still failed on this commit once.
+        for first, second in (('pull_request', 'workflow_dispatch'), ('workflow_dispatch', 'pull_request'),
+                              ('pull_request', 'pull_request')):
+            evidence = [({'sha': HEAD, 'tree': T1}, [a_run(7, [lane('Host-arm64', 'failure')] + passed(['Host-x64']), first),
+                                                      a_run(8, passed(['Host-arm64']), second)], CLEAN)]
+            self.assertEqual(self.ALL - set(ci_pool.plan_lanes('push', T1, evidence)[0]), {'Host-x64'}, (first, second))
+        both = ci_pool.proof_from({'sha': HEAD, 'tree': T1}, evidence[0][1], T1, CLEAN, accept_rerun=True)[0]
+        self.assertEqual(set(both), {'Host-arm64', 'Host-x64'})
+
+    def test_a_run_that_did_not_record_the_landed_tree_as_tested_counts_for_nothing(self):
+        # The same head run against a base it does not contain tested another tree: the
+        # merge into that base, with that base's Makefile.
+        for tested in (T2, None, ''):
+            other = a_run(7, passed(ci_pool.LANES), tested=tested)
+            skipped = a_run(8, SCOPE_SKIPPED, tested=tested)
+            failed = a_run(6, [lane('Host-x64', 'failure')], tested=tested)
+            evidence = [({'sha': HEAD, 'tree': T1}, [failed, other, skipped, a_run(9, passed(['Host-x64']), 'workflow_dispatch')], CLEAN)]
+            self.assertEqual(self.ALL - set(ci_pool.plan_lanes('push', T1, evidence)[0]), {'Host-x64'}, tested)
 
     def test_evidence_is_never_applied_to_another_event(self):
         for event in ('workflow_dispatch', 'workflow_run', 'schedule', 'merge_group', ''):
@@ -1050,23 +1074,29 @@ class PlanCommand(Sandbox):
     """`plan` as ci.yml's skip-check job runs it, for a commit pushed to the default branch."""
 
     def answers(self, runs, parents=(BEFORE, HEAD), pulls=(), head_tree=T1, compare=CLEAN, path='.github/workflows/ci.yml',
-                created=None, head=HEAD):
+                created=None, head=HEAD, before=BEFORE, tested=T1):
         created = created or dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         fixture = {f'repos/{REPO}/git/commits/{LANDED}': {'tree': {'sha': T1}, 'parents': [{'sha': p} for p in parents]},
                    f'repos/{REPO}/commits/{LANDED}/pulls?per_page=100': [
                        {'head': {'sha': sha, 'repo': {'full_name': repo}}} for sha, repo in pulls],
                    f'repos/{REPO}/git/commits/{head}': {'tree': {'sha': head_tree}},
-                   f'repos/{REPO}/compare/{BEFORE}...{head}': {
+                   f'repos/{REPO}/compare/{before}...{head}': {
                        'status': compare['status'], 'files': [{'filename': name} for name in compare['files']]},
                    f'repos/{REPO}/actions/runs?head_sha={head}&per_page=100': {'workflow_runs': [
                        {'id': 100 + n, 'path': path, 'event': event, 'created_at': created} for n, (event, _) in enumerate(runs)]}}
         for n, (_, jobs) in enumerate(runs):
+            # Each run's planning job, and the notice in which it recorded the tree it tested.
+            planner = dict(lane('Skip Check', 'success'), id=9000 + n)
+            jobs = [dict(job, id=job.get('id', 1000 * (n + 1) + k)) for k, job in enumerate(jobs) if job['name'] != 'Skip Check'] + [planner]
             fixture[f'repos/{REPO}/actions/runs/{100 + n}/jobs?filter=all&per_page=100'] = {'jobs': jobs}
+            fixture[f'repos/{REPO}/check-runs/{9000 + n}/annotations?per_page=100'] = [] if tested is None else [
+                {'annotation_level': 'notice', 'title': 'ci-pool tested tree', 'message': tested}]
         return fixture
 
     def plan(self, fixture, event='push', **env):
         out = self.dir / 'github_output'
         out.write_text('')
+        env.setdefault('BEFORE', BEFORE)
         code, text, calls = self.tool('plan', fixture=fixture, env=dict(EVENT=event, SHA=LANDED, GITHUB_OUTPUT=str(out), **env))
         outputs = dict(line.split('=', 1) for line in out.read_text().splitlines())
         planned = set()
@@ -1155,6 +1185,73 @@ class PlanCommand(Sandbox):
         squashed[f'repos/{REPO}/commits/{LANDED}/pulls?per_page=100'] = 'FAIL'
         self.assertEqual(self.plan(squashed)[2], self.ALL)
 
+    def test_changes_are_judged_against_main_before_the_push_not_the_tips_first_parent(self):
+        # A fast-forward of two commits: the first changes the Makefile, the second is the
+        # pull request's head. The tip's first parent already has the Makefile change.
+        older = 'e' * 40
+        fixture = self.answers([('pull_request', passed(ci_pool.LANES))], parents=(BEFORE,), pulls=[(HEAD, REPO)], before=older,
+                               compare={'status': 'ahead', 'files': ['Makefile', 'src/lib.rs']})
+        fixture[f'repos/{REPO}/compare/{BEFORE}...{HEAD}'] = {'status': 'ahead', 'files': [{'filename': 'src/lib.rs'}]}
+        code, text, planned, calls = self.plan(fixture, BEFORE=older)
+        self.assertEqual(planned, self.ALL, text)
+        self.assertIn('the landing changes what defines the lanes: Makefile', text)
+        self.assertNotIn(f'repos/{REPO}/compare/{BEFORE}...{HEAD}', [c['path'] for c in calls])
+
+    def test_a_push_that_does_not_say_what_main_was_before_proves_nothing(self):
+        for before in ('', '0' * 40, 'main', 'abc'):
+            # Even if the comparison with such a name were answered.
+            good = self.answers([('pull_request', passed(ci_pool.LANES))], before=before)
+            code, text, planned, _ = self.plan(good, BEFORE=before)
+            self.assertEqual(planned, self.ALL, before)
+            self.assertIn('does not say what the default branch was before it', text)
+
+    def test_a_run_counts_only_when_its_planning_job_recorded_the_landed_tree(self):
+        # The head was also run against a base it does not contain (a second pull request
+        # of the same commit, or a stack member whose lower branch had moved): that run
+        # tested the merge into that base and recorded that merge's tree.
+        jobs = [('pull_request', passed(ci_pool.LANES))]
+        self.assertEqual(self.plan(self.answers(jobs))[2], set())
+        for tested in (T2, None, 'not a tree'):
+            code, text, planned, _ = self.plan(self.answers(jobs, tested=tested))
+            self.assertEqual(planned, self.ALL, tested)
+            self.assertIn('counts for nothing', text)
+        # Only a notice with this title on the planning job is the record.
+        for change in ({'title': 'another title'}, {'annotation_level': 'warning'}):
+            fixture = self.answers(jobs)
+            fixture[f'repos/{REPO}/check-runs/9000/annotations?per_page=100'][0].update(change)
+            self.assertEqual(self.plan(fixture)[2], self.ALL, change)
+        printed_by_a_lane = self.answers(jobs, tested=None)
+        printed_by_a_lane[f'repos/{REPO}/check-runs/1000/annotations?per_page=100'] = [
+            {'annotation_level': 'notice', 'title': 'ci-pool tested tree', 'message': T1}]
+        self.assertEqual(self.plan(printed_by_a_lane)[2], self.ALL)
+        # Two records that disagree are no record, whichever is read first.
+        class Answers:
+            repo = REPO
+
+            def __init__(self, messages):
+                self.messages = messages
+
+            def call(self, *_args, **_kwargs):
+                return self.messages
+        planner = [dict(lane('Skip Check', 'success'), id=1)]
+        self.assertEqual(ci_pool.tested_tree_of(Answers([T1, T1]), planner), T1)
+        for messages in ([T1, T2], [T2, T1], []):
+            self.assertIsNone(ci_pool.tested_tree_of(Answers(messages), planner), messages)
+        unreadable = self.answers(jobs)
+        unreadable[f'repos/{REPO}/check-runs/9000/annotations?per_page=100'] = 'FAIL'
+        self.assertEqual(self.plan(unreadable)[2], self.ALL)
+
+    def test_every_run_of_the_planner_records_the_tree_it_is_run_on(self):
+        tree = subprocess.run(['git', 'rev-parse', 'HEAD^{tree}'], cwd=self.clone, capture_output=True, text=True).stdout.strip()
+        for event in ('pull_request', 'workflow_dispatch', 'push'):
+            code, text, _, _ = self.plan({}, event=event)
+            self.assertIn(f'::notice title=ci-pool tested tree::{tree}\n', text, event)
+
+    def test_a_lane_that_failed_in_another_run_on_the_merged_head_runs_on_main(self):
+        fixture = self.answers([('pull_request', passed(l for l in ci_pool.LANES if l != 'Host-arm64') + [lane('Host-arm64', 'failure')]),
+                                ('workflow_dispatch', passed(['Host-arm64']))])
+        self.assertEqual(self.plan(fixture)[2], {'Host-arm64'})
+
     def test_a_push_without_its_commit_runs_the_lanes(self):
         out = self.dir / 'github_output'
         out.write_text('')
@@ -1194,6 +1291,7 @@ class Wiring(unittest.TestCase):
         block = text.split('\n  skip-check:\n', 1)[1].split('\n  # Runner 0', 1)[0]
         for line in ('run: python3 scripts/ci-pool/ci_pool.py plan', 'EVENT: ${{ github.event_name }}', 'SHA: ${{ github.sha }}',
                      'REPO: ${{ github.repository }}', 'CONFINE: ${{ needs.changes.outputs.confine }}',
+                     'BEFORE: ${{ github.event.before }}',
                      'LANES: ${{ github.event.inputs.lanes }}', 'GH_TOKEN: ${{ github.token }}', 'id: check'):
             self.assertIn(line, block)
         # An input is data: it reaches the planner through the environment, never a script.

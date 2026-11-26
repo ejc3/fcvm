@@ -77,23 +77,35 @@ lane fails the job. A push to `main` takes every lane that is not already proven
 tree, and anything the planner cannot look up counts as not proven.
 
 A lane is proven for a pushed commit by a job of exactly that lane's name that succeeded
-on its first attempt, in a run of `.github/workflows/ci.yml`, on a commit for which all
-of this holds:
+on its first attempt, in a run of `.github/workflows/ci.yml`, when the lane never failed
+in any counted run on that commit (a second run that passes does not undo a first that
+failed), on a commit for which all of this holds:
 
 - It is one of the pushed commit's other parents, or the head of a pull request of this
   repository that GitHub ties to the pushed commit. This is how the evidence is found:
   by the commit, not by searching recent runs.
 - Its tree is the pushed commit's tree. The tree is read from the commit, never from
   anything the run reported.
-- It contains `main` as it was before the push. A pull request's run tests the merge of
-  its head into its base, and that merge has the head's tree only when the head already
-  holds the base.
+- It contains `main` as it was before the push. "Before the push" is the push event's
+  own `before`, not the pushed commit's first parent: after a fast-forward of several
+  commits the first parent already holds part of the change. A push that names no
+  earlier commit proves nothing.
+- The run recorded the pushed commit's tree as the tree it tested. A pull request's run
+  tests the merge of its head into its base, and the Actions API records only the head.
+  The same head can be run against a base it does not contain: a second pull request of
+  the same commit into another branch, or a stack member whose lower branch had moved.
+  Such a run tested a tree that never lands, under that base's Makefile. So every run of
+  the planner writes the tree of the commit it was given as a notice titled
+  `ci-pool tested tree` on the `Skip Check` job, and the planner on `main` reads it back
+  from that job and no other (`Skip Check` runs no test, so nothing a test prints can
+  write it). A run with no record, or with two that differ, counts for nothing, neither
+  for a lane nor against one.
 - Between `main` before the push and that commit, no file that defines the lanes changed.
   A pull request's run executes the pull request's own copy of the workflow, the Makefile
   and the scripts, so a change to one of them could produce a job with a lane's name that
   tested nothing. Such a landing runs every lane on `main`, under the files that landed.
   A comparison of 300 files or more may be cut short by the API and proves nothing
-  either.
+  either, and neither does one that says the commit is ahead and lists no file.
 
 Which files define the lanes is derived, not listed by hand: `ci_pool.py lane-files`
 reads `ci.yml` and the Makefile and gives
@@ -124,11 +136,10 @@ The one case where a run speaks for all lanes: a pull request's run that reporte
 `Summary` (never `Summary (deferred)`) with every self-hosted job skipped by its own
 scope means the tree needs no lane.
 
-One assumption is not checked, because GitHub does not record it: that the branch a
-pull request was based on did not hold commits its head lacked when the run started. For
-a pull request based on `main` it follows from the third condition. For the top of a
-pool the base is the member below, which `build` and `publish` keep inside the top; a
-member branch pushed by hand, or forced, between a run and the landing breaks it.
+The record of the tested tree is written by the run's own copy of the tool. A run whose
+merge held another copy (a base branch with an edited `scripts/ci-pool/`) could write a
+false one; that takes a deliberate edit, which is what review of changes to those files
+is for. A base with an older copy writes none, and its runs count for nothing.
 
 In the week of 2026-11-19, 114 first-parent commits on `main` touched code. 17 of them
 changed a file on the list (7 the Makefile, 6 `ci.yml`, 4 a listed script) and would run

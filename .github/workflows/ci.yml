@@ -444,9 +444,11 @@ jobs:
   #
   # A push to main runs every job not already proven for its tree: a job of the same name
   # that succeeded, on its first attempt, in a run of this workflow on a commit with the
-  # pushed commit's tree. The commits looked at are the pushed commit's other parents and
-  # the heads of the pull requests GitHub ties to it, so the evidence is found whatever
-  # else ran since, and a lane counts even when another job of that run failed. A run
+  # pushed commit's tree, and that never failed in any run on that commit. The commits
+  # looked at are the pushed commit's other parents and the heads of the pull requests
+  # GitHub ties to it, so the evidence is found whatever else ran since, and a lane counts
+  # even when another job of that run failed. Changes are judged against main as it was
+  # before the push. A run
   # proves nothing when the landing changes a file that defines the lanes (this workflow,
   # the Makefile, the scripts, the nextest configuration): a pull request runs its own
   # copy of those. If a pull request's run of that tree skipped the matrix by its own
@@ -476,6 +478,7 @@ jobs:
           REPO: ${{ github.repository }}
           CONFINE: ${{ needs.changes.outputs.confine }}
           SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
           LANES: ${{ github.event.inputs.lanes }}
         run: python3 scripts/ci-pool/ci_pool.py plan
 

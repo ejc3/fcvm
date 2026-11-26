@@ -646,6 +646,26 @@ def scope_skipped_the_lanes(jobs):
             and not any(job['name'] in LANES for job in jobs))
 
 
+def merge_lane_states(per_run):
+    """One state per lane from every run on a commit. A lane that failed in one run or
+    attempt and passed in another did both: RERUN_PASS. Otherwise a failure, then a pass,
+    then an unfinished run decide, in that order."""
+    merged = {}
+    for lane in LANES:
+        seen = {states[lane] for states in per_run if lane in states}
+        if not seen:
+            continue
+        if RERUN_PASS in seen or (FAIL in seen and PASS in seen):
+            merged[lane] = RERUN_PASS
+        elif FAIL in seen:
+            merged[lane] = FAIL
+        elif PASS in seen:
+            merged[lane] = PASS
+        else:
+            merged[lane] = OPEN
+    return merged
+
+
 def proof_from(commit, runs, landing_tree, compare, accept_rerun=False, listed=None):
     """What the runs on one commit prove for a landing: (lanes, no_lanes, why_not).
 
@@ -655,27 +675,35 @@ def proof_from(commit, runs, landing_tree, compare, accept_rerun=False, listed=N
     - the commit's tree is the landing's tree, so its runs tested what landed;
     - the commit contains the default branch as it was before the landing, so a pull
       request's run, which tests the merge of its head into its base, tested that tree;
-    - the comparison lists every changed file, and none is lane-defining."""
+    - the comparison lists every changed file, and none is lane-defining.
+
+    A lane is then proven when it passed on this commit and never failed on it: its state
+    over all of the commit's runs together, not in any one of them. Only a run that
+    recorded the landing's tree as the tree it tested counts ('tested_tree'): a pull
+    request's run tests the merge of its head into its base, which is the head's tree only
+    when the head contained that base."""
     if commit['tree'] != landing_tree:
         return {}, None, f"{commit['sha'][:12]} has another tree"
     if compare is None:
         return {}, None, f"could not compare {commit['sha'][:12]} with the default branch"
     if compare['status'] not in ('ahead', 'identical'):
         return {}, None, f"{commit['sha'][:12]} does not contain the default branch ({compare['status']})"
+    if compare['status'] == 'ahead' and not compare['files']:
+        return {}, None, f"the comparison of {commit['sha'][:12]} with the default branch lists no changed file"
     if len(compare['files']) >= COMPARE_FILE_CAP:
         return {}, None, f"{len(compare['files'])} changed files, more than the comparison lists"
     changed = sorted(path for path in compare['files'] if lane_defining(path, listed))
     if changed:
         return {}, None, f"the landing changes what defines the lanes: {', '.join(changed[:3])}"
-    lanes, no_lanes = {}, None
-    for run in runs:
-        if run['event'] not in EVIDENCE_EVENTS:
-            continue
-        if run['event'] == 'pull_request' and scope_skipped_the_lanes(run['jobs']):
-            no_lanes = run['id']
-        for lane, state in lane_states(run['jobs']).items():
-            if state == PASS or (state == RERUN_PASS and accept_rerun):
-                lanes.setdefault(lane, run['id'])
+    counted = [run for run in runs if run['event'] in EVIDENCE_EVENTS and run.get('tested_tree') == landing_tree]
+    no_lanes = next((run['id'] for run in counted
+                     if run['event'] == 'pull_request' and scope_skipped_the_lanes(run['jobs'])), None)
+    per_run = [(run['id'], lane_states(run['jobs'])) for run in counted]
+    merged = merge_lane_states([states for _, states in per_run])
+    lanes = {}
+    for lane, state in merged.items():
+        if state == PASS or (state == RERUN_PASS and accept_rerun):
+            lanes[lane] = next(run for run, states in per_run if states.get(lane) in (PASS, RERUN_PASS))
     return lanes, no_lanes, None
 
 
@@ -689,8 +717,46 @@ def validate_lanes(text):
     return tuple(lane for lane in LANES if lane in names) if names else LANES
 
 
-def landing_evidence(gh, sha, now=None):
+PLAN_JOB = 'Skip Check'
+TREE_NOTICE = 'ci-pool tested tree'
+
+
+def say_tested_tree():
+    """Record which tree this run tests, as a notice on the planning job. A pull request's
+    run tests the merge of its head into its base, and the Actions API records the head
+    only: the same head can be run against a base it does not contain (another pull
+    request of the same commit, or a stack member whose lower branch moved), and such a
+    run tested a tree that never lands. The planner on the default branch reads this
+    notice back, from the job named PLAN_JOB and no other, which runs no test."""
+    try:
+        tree = git('rev-parse', 'HEAD^{tree}')
+    except Blocked as why:
+        note(f'the tested tree is not recorded: {why}')
+        return
+    if re.fullmatch(r'[0-9a-f]{40}', tree.strip()):
+        print(f'::notice title={TREE_NOTICE}::{tree.strip()}', flush=True)
+
+
+def tested_tree_of(gh, jobs):
+    """The tree a run recorded that it tested, or None when its planning job recorded
+    none, or more than one."""
+    trees = set()
+    for job in jobs:
+        if job['name'] != PLAN_JOB:
+            continue
+        try:
+            trees.update(gh.call(f"repos/{gh.repo}/check-runs/{job['id']}/annotations?per_page=100",
+                                 f'.[] | select(.annotation_level == "notice" and .title == "{TREE_NOTICE}") | .message',
+                                 paginate=True))
+        except Blocked as why:
+            note(f"could not read what job {job['id']} recorded: {why}")
+    return trees.pop() if len(trees) == 1 else None
+
+
+def landing_evidence(gh, sha, before, now=None):
     """(tree, [(commit, runs, compare)]) for a commit pushed to the default branch.
+    `before` is the default branch's tip before the push, from the push event: the pushed
+    commit's first parent is not that on a fast-forward of several commits.
 
     The commits whose runs can have tested its tree: its other parents (a merge commit
     has the tree of the branch it merged when that branch contained the default branch)
@@ -699,9 +765,10 @@ def landing_evidence(gh, sha, now=None):
     unproven."""
     now = now or dt.datetime.now(dt.timezone.utc)
     landing = gh.one(f'repos/{gh.repo}/git/commits/{sha}', '{tree: .tree.sha, parents: [.parents[].sha]}')
-    if not landing['parents']:
+    if not re.fullmatch(r'[0-9a-f]{40}', str(before)) or set(before) == {'0'}:
+        note('the push does not say what the default branch was before it')
         return landing['tree'], []
-    before, candidates = landing['parents'][0], list(landing['parents'][1:])
+    candidates = list(landing['parents'][1:])
     try:
         candidates += gh.call(f'repos/{gh.repo}/commits/{sha}/pulls?per_page=100',
                               f'.[] | select(.head.repo.full_name == "{gh.repo}") | .head.sha', paginate=True)
@@ -725,7 +792,11 @@ def landing_evidence(gh, sha, now=None):
                 if (now - instant(run['created_at'])).days >= MAX_EVIDENCE_AGE_DAYS:
                     continue
                 run['jobs'] = gh.call(f"repos/{gh.repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100",
-                                      '.jobs[] | {name, conclusion, run_attempt}', paginate=True)
+                                      '.jobs[] | {id, name, conclusion, run_attempt}', paginate=True)
+                run['tested_tree'] = tested_tree_of(gh, run['jobs'])
+                if run['tested_tree'] != landing['tree']:
+                    note(f"run {run['id']} on {head[:12]} counts for nothing: it recorded that it tested "
+                         f"{(run['tested_tree'] or 'no tree')[:12]}, and what landed is {landing['tree'][:12]}")
                 runs.append(run)
             out.append((commit, runs, compare))
         except Blocked as why:
@@ -787,14 +858,15 @@ def matrix_outputs(lanes):
 
 
 def cmd_plan(_args, gh, _default_branch):
-    """ci.yml's `skip-check` job. Reads EVENT, SHA, CONFINE and LANES and writes
+    """ci.yml's `skip-check` job. Reads EVENT, SHA, BEFORE, CONFINE and LANES and writes
     the matrix to $GITHUB_OUTPUT. Whatever cannot be looked up proves nothing, so the
     lanes run."""
     event = os.environ['EVENT']
+    say_tested_tree()
     tree, evidence = None, []
     if event == 'push':
         try:
-            tree, evidence = landing_evidence(gh, os.environ['SHA'])
+            tree, evidence = landing_evidence(gh, os.environ['SHA'], os.environ['BEFORE'])
         except (Blocked, KeyError) as why:
             note(f'no evidence for this push: {why}')
     listed = read_lane_files()
