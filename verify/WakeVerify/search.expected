@@ -1,0 +1,886 @@
+## Today: v6.14, Firecracker without the restore kick, fcvm configuration
+set: full only
+7165820 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 2464 states; shortest run 16 steps
+audit: 2192 states in which a vCPU can never run again; of those vCPUs, 1952 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, no snapshot taken
+set: quick
+713831 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, guest booted with no-kvmapf
+set: quick
+552594 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 236 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 236 states; shortest run 24 steps
+kind: NoLostKick (interrupts on): queue head; the snapshot does not hold the kick; 218 states; shortest run 16 steps
+kind: NoLostKick (interrupts on): queue node; the snapshot does not hold the kick; 218 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 18 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 18 states; shortest run 26 steps
+kind: HasWaker: any; 656 states; shortest run 16 steps
+audit: 532 states in which a vCPU can never run again; of those vCPUs, 508 are flagged by a property of their own there, 60 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, with host page faults in the lock, call and idle paths
+set: full only
+8747292 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1000 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1000 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 176 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 176 states; shortest run 26 steps
+kind: HasWaker: any; 2720 states; shortest run 16 steps
+audit: 2464 states in which a vCPU can never run again; of those vCPUs, 2176 are flagged by a property of their own there, 464 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, with NMIs
+set: full only
+7165884 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 2464 states; shortest run 16 steps
+audit: 2192 states in which a vCPU can never run again; of those vCPUs, 1952 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, with the idle timer, no host page faults
+set: quick
+3113602 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 4352 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 4352 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 768 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 768 states; shortest run 26 steps
+kind: HasWaker: any; 14336 states; shortest run 16 steps
+audit: 10752 states in which a vCPU can never run again; of those vCPUs, 9472 are flagged by a property of their own there, 2048 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, with the idle timer and host page faults, no snapshot taken
+set: full only
+5135091 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, with a nested guest
+set: full only
+7983182 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1072 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1072 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 3136 states; shortest run 16 steps
+audit: 2528 states in which a vCPU can never run again; of those vCPUs, 2288 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, with Xen SCHEDOP_poll
+set: full only
+7340572 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 928 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 928 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 2560 states; shortest run 16 steps
+audit: 2240 states in which a vCPU can never run again; of those vCPUs, 2000 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, with CPU hotplug (INIT, SIPI, vCPU reset)
+set: full only
+7788788 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1040 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1040 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 3008 states; shortest run 16 steps
+audit: 2464 states in which a vCPU can never run again; of those vCPUs, 2224 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, with SEV AP reset hold and SNP AP creation
+set: full only
+7943996 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1088 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1088 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 3200 states; shortest run 16 steps
+audit: 2560 states in which a vCPU can never run again; of those vCPUs, 2320 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Today: v6.14, Firecracker without the restore kick, outside the design: userspace writes mp_state back on a paused VM
+set: full only
+7165820 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 2464 states; shortest run 16 steps
+audit: 2192 states in which a vCPU can never run again; of those vCPUs, 1952 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, fcvm configuration
+set: full only
+7256272 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2108 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3140 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2108 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3140 states; shortest run 25 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 132 states; shortest run 34 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 132 states; shortest run 37 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2876 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2876 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 80 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 80 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 27 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 36 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 39 steps
+kind: HasWaker: any; 16208 states; shortest run 15 steps
+audit: 15816 states in which a vCPU can never run again; of those vCPUs, 13624 are flagged by a property of their own there, 3248 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, no snapshot taken
+set: quick
+725475 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 522 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 522 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 522 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 522 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 482 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 482 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 40 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 40 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 40 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 40 states; shortest run 27 steps
+kind: HasWaker: any; 2172 states; shortest run 15 steps
+audit: 2248 states in which a vCPU can never run again; of those vCPUs, 2248 are flagged by a property of their own there, 160 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, guest booted with no-kvmapf
+set: quick
+563958 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 236 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 648 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 236 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 648 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the snapshot does not hold the kick; 218 states; shortest run 16 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 594 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the snapshot does not hold the kick; 218 states; shortest run 24 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 594 states; shortest run 25 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 18 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 54 states; shortest run 19 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 18 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 54 states; shortest run 27 steps
+kind: HasWaker: any; 2384 states; shortest run 16 steps
+audit: 2152 states in which a vCPU can never run again; of those vCPUs, 1912 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, with host page faults in the lock, call and idle paths
+set: full only
+8905216 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2364 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1000 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3492 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2364 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1000 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3492 states; shortest run 25 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 132 states; shortest run 34 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 132 states; shortest run 37 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3164 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3164 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 308 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 96 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 416 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 308 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 96 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 416 states; shortest run 27 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 36 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 39 steps
+kind: HasWaker: any; 17936 states; shortest run 15 steps
+audit: 17960 states in which a vCPU can never run again; of those vCPUs, 15288 are flagged by a property of their own there, 3984 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, with NMIs
+set: full only
+7256336 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2108 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3140 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2108 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3140 states; shortest run 25 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 132 states; shortest run 34 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 132 states; shortest run 37 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2876 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2876 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 80 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 80 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 27 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 36 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 39 steps
+kind: HasWaker: any; 16208 states; shortest run 15 steps
+audit: 15816 states in which a vCPU can never run again; of those vCPUs, 13624 are flagged by a property of their own there, 3248 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, with the idle timer, no host page faults
+set: quick
+3142722 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 4352 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 4352 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 3360 states; shortest run 33 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 3360 states; shortest run 36 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 768 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 768 states; shortest run 26 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 384 states; shortest run 35 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 384 states; shortest run 38 steps
+kind: HasWaker: any; 19520 states; shortest run 16 steps
+audit: 20288 states in which a vCPU can never run again; of those vCPUs, 16960 are flagged by a property of their own there, 4864 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, with the idle timer and host page faults, no snapshot taken
+set: full only
+5226195 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 7592 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 7592 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 7592 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 7592 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 640 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 640 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 640 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 640 states; shortest run 27 steps
+kind: HasWaker: any; 25248 states; shortest run 15 steps
+audit: 32928 states in which a vCPU can never run again; of those vCPUs, 32928 are flagged by a property of their own there, 2560 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, with a nested guest
+set: full only
+8085414 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2368 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1072 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3576 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2368 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1072 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3576 states; shortest run 25 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 144 states; shortest run 34 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 144 states; shortest run 37 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3312 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3312 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 80 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 80 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 27 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 36 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 39 steps
+kind: HasWaker: any; 19840 states; shortest run 15 steps
+audit: 17568 states in which a vCPU can never run again; of those vCPUs, 15376 are flagged by a property of their own there, 3248 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, with Xen SCHEDOP_poll
+set: full only
+7433552 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2168 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 928 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3228 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2168 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 928 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3228 states; shortest run 25 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 136 states; shortest run 34 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 136 states; shortest run 37 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2964 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2964 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 80 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 80 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 27 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 36 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 39 steps
+kind: HasWaker: any; 16880 states; shortest run 15 steps
+audit: 16168 states in which a vCPU can never run again; of those vCPUs, 13976 are flagged by a property of their own there, 3248 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, with CPU hotplug (INIT, SIPI, vCPU reset)
+set: full only
+7889608 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2352 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1040 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3516 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2352 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1040 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3516 states; shortest run 25 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 144 states; shortest run 34 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 144 states; shortest run 37 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3252 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3252 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 80 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 80 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 27 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 36 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 39 steps
+kind: HasWaker: any; 19312 states; shortest run 15 steps
+audit: 17352 states in which a vCPU can never run again; of those vCPUs, 15160 are flagged by a property of their own there, 3248 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, with SEV AP reset hold and SNP AP creation
+set: full only
+8046728 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2392 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1088 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3596 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2392 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1088 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3596 states; shortest run 25 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 144 states; shortest run 34 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 144 states; shortest run 37 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3332 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3332 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 80 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 80 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 336 states; shortest run 27 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 36 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 12 states; shortest run 39 steps
+kind: HasWaker: any; 20096 states; shortest run 15 steps
+audit: 17688 states in which a vCPU can never run again; of those vCPUs, 15496 are flagged by a property of their own there, 3248 have their own flag ahead, 0 have neither
+
+## Today: v7.3.3, Firecracker without the restore kick, outside the design: userspace writes mp_state back on a paused VM
+set: full only
+7695480 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1564 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; setMpSame cleared the kick; 3376 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1564 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 352 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; setMpSame cleared the kick; 3376 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 352 states; shortest run 31 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 88 states; shortest run 34 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 88 states; shortest run 37 steps
+kind: NoLostKick (interrupts on): queue head; setMpSame cleared the kick; 2876 states; shortest run 16 steps
+kind: NoLostKick (interrupts on): queue node; setMpSame cleared the kick; 2876 states; shortest run 24 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 196 states; shortest run 17 steps
+kind: NoStuckCall: queue head; setMpSame cleared the kick; 2468 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 80 states; shortest run 18 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 196 states; shortest run 25 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 32 states; shortest run 25 steps
+kind: NoStuckCall: queue node; setMpSame cleared the kick; 2468 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 80 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 32 states; shortest run 33 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 8 states; shortest run 36 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 8 states; shortest run 39 steps
+kind: HasWaker: any; 66224 states; shortest run 15 steps
+audit: 17016 states in which a vCPU can never run again; of those vCPUs, 13624 are flagged by a property of their own there, 4448 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, fcvm configuration
+set: full only
+7141152 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, no snapshot taken
+set: quick
+713831 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, guest booted with no-kvmapf
+set: quick
+549595 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, with host page faults in the lock, call and idle paths
+set: full only
+8740200 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, with NMIs
+set: full only
+7141152 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, with the idle timer, no host page faults
+set: quick
+3123842 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, with the idle timer and host page faults, no snapshot taken
+set: full only
+5135091 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, with a nested guest
+set: full only
+7959206 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, with Xen SCHEDOP_poll
+set: full only
+7314800 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, with CPU hotplug (INIT, SIPI, vCPU reset)
+set: full only
+7765944 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, with SEV AP reset hold and SNP AP creation
+set: full only
+7922744 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v6.14 with the #2131 restore kick, outside the design: userspace writes mp_state back on a paused VM
+set: full only
+7141152 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, fcvm configuration
+set: full only
+7239536 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2108 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1048 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3140 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2108 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1048 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3140 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2876 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2876 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 27 steps
+kind: HasWaker: any; 16808 states; shortest run 15 steps
+audit: 15696 states in which a vCPU can never run again; of those vCPUs, 13648 are flagged by a property of their own there, 3104 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, no snapshot taken
+set: quick
+725475 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 522 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 522 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 522 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 522 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 482 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 482 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 40 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 40 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 40 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 40 states; shortest run 27 steps
+kind: HasWaker: any; 2172 states; shortest run 15 steps
+audit: 2248 states in which a vCPU can never run again; of those vCPUs, 2248 are flagged by a property of their own there, 160 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, guest booted with no-kvmapf
+set: quick
+565107 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 890 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 890 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 818 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 818 states; shortest run 25 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 72 states; shortest run 19 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 72 states; shortest run 27 steps
+kind: HasWaker: any; 2408 states; shortest run 17 steps
+audit: 2164 states in which a vCPU can never run again; of those vCPUs, 1924 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, with host page faults in the lock, call and idle paths
+set: full only
+8891544 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2364 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1144 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3492 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2364 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1144 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3492 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3164 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3164 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 308 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 120 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 428 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 308 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 120 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 428 states; shortest run 27 steps
+kind: HasWaker: any; 18536 states; shortest run 15 steps
+audit: 17808 states in which a vCPU can never run again; of those vCPUs, 15312 are flagged by a property of their own there, 3808 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, with NMIs
+set: full only
+7239536 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2108 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1048 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3140 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2108 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1048 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3140 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2876 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2876 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 27 steps
+kind: HasWaker: any; 16808 states; shortest run 15 steps
+audit: 15696 states in which a vCPU can never run again; of those vCPUs, 13648 are flagged by a property of their own there, 3104 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, with the idle timer, no host page faults
+set: quick
+3140546 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 8096 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 8096 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1344 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1344 states; shortest run 26 steps
+kind: HasWaker: any; 23648 states; shortest run 16 steps
+audit: 20288 states in which a vCPU can never run again; of those vCPUs, 17728 are flagged by a property of their own there, 4096 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, with the idle timer and host page faults, no snapshot taken
+set: full only
+5226195 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 7592 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 7592 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 7592 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 7592 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 640 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 640 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 640 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 640 states; shortest run 27 steps
+kind: HasWaker: any; 25248 states; shortest run 15 steps
+audit: 32928 states in which a vCPU can never run again; of those vCPUs, 32928 are flagged by a property of their own there, 2560 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, with a nested guest
+set: full only
+8067596 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2368 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1240 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3576 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2368 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1240 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3576 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3312 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3312 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 27 steps
+kind: HasWaker: any; 20608 states; shortest run 15 steps
+audit: 17472 states in which a vCPU can never run again; of those vCPUs, 15424 are flagged by a property of their own there, 3104 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, with Xen SCHEDOP_poll
+set: full only
+7416152 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2168 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1076 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3228 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2168 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1076 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3228 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2964 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 2964 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 27 steps
+kind: HasWaker: any; 17504 states; shortest run 15 steps
+audit: 16048 states in which a vCPU can never run again; of those vCPUs, 14000 are flagged by a property of their own there, 3104 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, with CPU hotplug (INIT, SIPI, vCPU reset)
+set: full only
+7871496 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2344 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1204 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3516 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2344 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1204 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3516 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3252 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3252 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 27 steps
+kind: HasWaker: any; 20032 states; shortest run 15 steps
+audit: 17232 states in which a vCPU can never run again; of those vCPUs, 15184 are flagged by a property of their own there, 3104 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, with SEV AP reset hold and SNP AP creation
+set: full only
+8028348 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2384 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1252 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3596 states; shortest run 17 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 2384 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1252 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3596 states; shortest run 25 steps
+kind: NoLostKick (interrupts on): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3332 states; shortest run 17 steps
+kind: NoLostKick (interrupts on): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 3332 states; shortest run 25 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 17 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 19 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 244 states; shortest run 25 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 104 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 348 states; shortest run 27 steps
+kind: HasWaker: any; 20816 states; shortest run 15 steps
+audit: 17568 states in which a vCPU can never run again; of those vCPUs, 15520 are flagged by a property of their own there, 3104 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2131 restore kick, outside the design: userspace writes mp_state back on a paused VM
+set: full only
+7708436 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1564 states; shortest run 15 steps
+kind: NoLostKick (hang: interrupts off): queue head; setMpSame cleared the kick; 3332 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1048 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1564 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 352 states; shortest run 23 steps
+kind: NoLostKick (hang: interrupts off): queue node; setMpSame cleared the kick; 3332 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 1048 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 352 states; shortest run 31 steps
+kind: NoLostKick (interrupts on): queue head; setMpSame cleared the kick; 2876 states; shortest run 16 steps
+kind: NoLostKick (interrupts on): queue node; setMpSame cleared the kick; 2876 states; shortest run 24 steps
+kind: NoStuckCall: queue head; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 200 states; shortest run 17 steps
+kind: NoStuckCall: queue head; setMpSame cleared the kick; 2476 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 100 states; shortest run 18 steps
+kind: NoStuckCall: queue node; a page-ready completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 200 states; shortest run 25 steps
+kind: NoStuckCall: queue head; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 32 states; shortest run 25 steps
+kind: NoStuckCall: queue node; setMpSame cleared the kick; 2476 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the restore's wake-everyone completion cleared the kick (v7.3.3 kvm_arch_async_page_present); 100 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the completion of a synthetic halt cleared the kick (v7.3.3 kvm_arch_async_page_present); 32 states; shortest run 33 steps
+kind: HasWaker: any; 66824 states; shortest run 15 steps
+audit: 17040 states in which a vCPU can never run again; of those vCPUs, 13648 are flagged by a property of their own there, 4448 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, fcvm configuration
+set: full only
+7165820 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 2464 states; shortest run 16 steps
+audit: 2192 states in which a vCPU can never run again; of those vCPUs, 1952 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, no snapshot taken
+set: quick
+713831 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, guest booted with no-kvmapf
+set: quick
+552594 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 236 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 236 states; shortest run 24 steps
+kind: NoLostKick (interrupts on): queue head; the snapshot does not hold the kick; 218 states; shortest run 16 steps
+kind: NoLostKick (interrupts on): queue node; the snapshot does not hold the kick; 218 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 18 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 18 states; shortest run 26 steps
+kind: HasWaker: any; 656 states; shortest run 16 steps
+audit: 532 states in which a vCPU can never run again; of those vCPUs, 508 are flagged by a property of their own there, 60 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, with host page faults in the lock, call and idle paths
+set: full only
+8747292 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1000 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1000 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 176 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 176 states; shortest run 26 steps
+kind: HasWaker: any; 2720 states; shortest run 16 steps
+audit: 2464 states in which a vCPU can never run again; of those vCPUs, 2176 are flagged by a property of their own there, 464 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, with NMIs
+set: full only
+7165884 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 2464 states; shortest run 16 steps
+audit: 2192 states in which a vCPU can never run again; of those vCPUs, 1952 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, with the idle timer, no host page faults
+set: quick
+3113602 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 4352 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 4352 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 768 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 768 states; shortest run 26 steps
+kind: HasWaker: any; 14336 states; shortest run 16 steps
+audit: 10752 states in which a vCPU can never run again; of those vCPUs, 9472 are flagged by a property of their own there, 2048 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, with the idle timer and host page faults, no snapshot taken
+set: full only
+5135091 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, with a nested guest
+set: full only
+7983182 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1072 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1072 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 3136 states; shortest run 16 steps
+audit: 2528 states in which a vCPU can never run again; of those vCPUs, 2288 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, with Xen SCHEDOP_poll
+set: full only
+7340188 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 928 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 928 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 2560 states; shortest run 16 steps
+audit: 2240 states in which a vCPU can never run again; of those vCPUs, 2000 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, with CPU hotplug (INIT, SIPI, vCPU reset)
+set: full only
+7788788 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1040 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1040 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 3008 states; shortest run 16 steps
+audit: 2464 states in which a vCPU can never run again; of those vCPUs, 2224 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, with SEV AP reset hold and SNP AP creation
+set: full only
+7943996 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 1088 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 1088 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 3200 states; shortest run 16 steps
+audit: 2560 states in which a vCPU can never run again; of those vCPUs, 2320 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## v7.3.3 with the #2130 patch, no restore kick, outside the design: userspace writes mp_state back on a paused VM
+set: full only
+7695480 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; setMpSame cleared the kick; 5380 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; setMpSame cleared the kick; 5380 states; shortest run 24 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoLostKick (interrupts on): queue head; setMpSame cleared the kick; 2876 states; shortest run 16 steps
+kind: NoLostKick (interrupts on): queue node; setMpSame cleared the kick; 2876 states; shortest run 24 steps
+kind: NoStuckCall: queue head; setMpSame cleared the kick; 2640 states; shortest run 18 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; setMpSame cleared the kick; 2640 states; shortest run 26 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 66224 states; shortest run 16 steps
+audit: 15672 states in which a vCPU can never run again; of those vCPUs, 13624 are flagged by a property of their own there, 3104 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, fcvm configuration
+set: full only
+7141152 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, no snapshot taken
+set: quick
+713831 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, guest booted with no-kvmapf
+set: quick
+549595 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, with host page faults in the lock, call and idle paths
+set: full only
+8740200 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, with NMIs
+set: full only
+7141152 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, with the idle timer, no host page faults
+set: quick
+3123842 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, with the idle timer and host page faults, no snapshot taken
+set: full only
+5135091 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, with a nested guest
+set: full only
+7959206 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, with Xen SCHEDOP_poll
+set: full only
+7314416 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, with CPU hotplug (INIT, SIPI, vCPU reset)
+set: full only
+7765944 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, with SEV AP reset hold and SNP AP creation
+set: full only
+7922744 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Design: v7.3.3 with the #2130 patch and the #2131 restore kick, outside the design: userspace writes mp_state back on a paused VM
+set: full only
+7733072 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; setMpSame cleared the kick; 6308 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; setMpSame cleared the kick; 6308 states; shortest run 24 steps
+kind: NoLostKick (interrupts on): queue head; setMpSame cleared the kick; 2876 states; shortest run 16 steps
+kind: NoLostKick (interrupts on): queue node; setMpSame cleared the kick; 2876 states; shortest run 24 steps
+kind: NoStuckCall: queue head; setMpSame cleared the kick; 2928 states; shortest run 18 steps
+kind: NoStuckCall: queue node; setMpSame cleared the kick; 2928 states; shortest run 26 steps
+kind: HasWaker: any; 69536 states; shortest run 16 steps
+audit: 15720 states in which a vCPU can never run again; of those vCPUs, 13672 are flagged by a property of their own there, 3104 have their own flag ahead, 0 have neither
+
+## Order: v7.3.3 with the #2130 patch, the kick BEFORE KVM_SET_MP_STATE, fcvm configuration
+set: full only
+7165820 reachable states
+kind: NoLostKick (hang: interrupts off): queue head; the snapshot does not hold the kick; 904 states; shortest run 16 steps
+kind: NoLostKick (hang: interrupts off): queue node; the snapshot does not hold the kick; 904 states; shortest run 24 steps
+kind: NoStuckCall: queue head; the snapshot does not hold the kick; 144 states; shortest run 18 steps
+kind: NoStuckCall: queue node; the snapshot does not hold the kick; 144 states; shortest run 26 steps
+kind: HasWaker: any; 2464 states; shortest run 16 steps
+audit: 2192 states in which a vCPU can never run again; of those vCPUs, 1952 are flagged by a property of their own there, 384 have their own flag ahead, 0 have neither
+
+## Order: v6.14, the kick BEFORE KVM_SET_MP_STATE, fcvm configuration
+set: full only
+7141152 reachable states
+no reachable state breaks a property
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Order: v7.3.3 with the #2130 patch, KVM_SET_MSRS BEFORE KVM_SET_LAPIC, idle timer, guest booted with no-kvmapf, no host page faults
+set: quick
+399039 reachable states
+kind: NoLostTimer: idle; 672 states; shortest run 5 steps
+audit: 0 states in which a vCPU can never run again; of those vCPUs, 0 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+
+## Order: v7.3.3 with the #2130 patch, no KVM_SET_LAPIC, fcvm configuration
+set: full only
+6659025 reachable states
+kind: NoStuckCall (interrupt lost): any; 15189 states; shortest run 4 steps
+audit: 15189 states in which a vCPU can never run again; of those vCPUs, 15254 are flagged by a property of their own there, 0 have their own flag ahead, 0 have neither
+

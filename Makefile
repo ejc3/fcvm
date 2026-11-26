@@ -348,8 +348,9 @@ help:
 	@echo "  check-host-kernel-build  Check packages and free space install-host-kernel needs"
 	@echo ""
 	@echo "Formal model (verify/, Lean 4):"
-	@echo "  verify             Check the wake-up model: every proof and every recorded break (lake build)"
-	@echo "  verify-search      Run the exhaustive search for lost wake-ups (about 10 minutes, 2 GB)"
+	@echo "  verify             Check the wake-up model: every proof and every recorded break (lake build),"
+	@echo "                     the axiom sweep, the gate tests and the 19 small searches (7 min from cold, 3 min built; 1.6 GB)"
+	@echo "  verify-search      Run all 76 searches against search.expected (45 min of CPU, 3.3 GB; JOBS=7: 8 min, 3.3 GB each)"
 	@echo "  verify-harness     Compare the model's kernel rules with the kernel's own functions"
 	@echo ""
 	@echo "Kernel patches:"
@@ -1967,11 +1968,22 @@ verify-lake:
 		echo "BLOCKED: lake not found. Install elan (https://github.com/leanprover/elan); it reads verify/lean-toolchain." >&2; \
 		exit 2; }
 
+# What the CI job (.github/workflows/verify.yml) runs, in the same order. check-imports.sh and
+# check-sweep.sh are what `lake build` cannot check about itself; the two test scripts and the
+# quick comparison are the gates of the search and of the harness (verify/README.md, "CI").
 verify: verify-lake
+	verify/check-imports.sh
 	cd verify && "$(VERIFY_LAKE)" build
+	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/check-sweep.sh
+	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/test-search.sh
+	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/harness/test-run.sh
+	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/search-expected.sh quick
 
+# All 76 searches, compared with verify/WakeVerify/search.expected. JOBS=7 runs one process a
+# rule book. For the step-by-step runs: cd verify && LEAN_ABORT_ON_PANIC=1 lake exe breaks [PATTERN]
 verify-search: verify-lake
-	cd verify && "$(VERIFY_LAKE)" exe breaks
+	cd verify && "$(VERIFY_LAKE)" build breaks
+	PATH="$(dir $(VERIFY_LAKE)):$$PATH" JOBS=$(or $(JOBS),1) verify/search-expected.sh full
 
 verify-harness: verify-lake
 	PATH="$(dir $(VERIFY_LAKE)):$$PATH" verify/harness/run.sh
