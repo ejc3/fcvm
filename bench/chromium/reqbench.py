@@ -1900,20 +1900,49 @@ def libc_version_tag() -> str:
     return "libc-unknown"
 
 
-def firecracker_build_name(profile: str, repo: str, branch: str, commit: str,
-                           arch: str, libc_tag: str) -> str:
-    """The file name fcvm setup gives a Firecracker build of these fields.
+# libseccomp's configure arguments, which fcvm hashes into the archive's name
+# (CONFIGURE_ARGS in src/setup/libseccomp.rs).
+LIBSECCOMP_CONFIGURE_ARGS = ("--enable-static", "--disable-shared", "--with-pic")
 
-    compute_firecracker_sha_for_fields in src/setup/kernel.rs: SHA-256 over a
-    domain tag and each field length-prefixed as a little-endian u64, first
-    six bytes in hex. FirecrackerBuildNamePin holds the two to the same bytes.
-    """
-    digest = hashlib.sha256(b"fcvm-firecracker-cache-v2\0")
-    for field in (repo, branch, commit, arch, libc_tag):
+
+def _length_prefixed_digest(tag: bytes, fields) -> str:
+    """SHA-256 over a domain tag and each field length-prefixed as a
+    little-endian u64, first six bytes in hex: how fcvm names what it builds."""
+    digest = hashlib.sha256(tag)
+    for field in fields:
         encoded = field.encode()
         digest.update(len(encoded).to_bytes(8, "little"))
         digest.update(encoded)
-    return f"firecracker-{profile}-{digest.digest()[:6].hex()}.bin"
+    return digest.digest()[:6].hex()
+
+
+def libseccomp_identity(pin, arch: str, libc_tag: str) -> str:
+    """The name fcvm setup gives the libseccomp archive a Firecracker build
+    links, which is one of the fields of that build's own name.
+
+    content_hash_for in src/setup/libseccomp.rs. pin is rootfs-config.toml's
+    [libseccomp] table; without one the build links the host's library and the
+    identity is empty.
+    """
+    if not pin:
+        return ""
+    return _length_prefixed_digest(
+        b"fcvm-libseccomp-v1\0",
+        (pin["version"], pin["archive_sha256"], arch, libc_tag,
+         *LIBSECCOMP_CONFIGURE_ARGS))
+
+
+def firecracker_build_name(profile: str, repo: str, branch: str, commit: str,
+                           arch: str, libc_tag: str, libseccomp: str) -> str:
+    """The file name fcvm setup gives a Firecracker build of these fields.
+
+    compute_firecracker_sha_for_fields in src/setup/kernel.rs.
+    FirecrackerBuildNamePin holds the two to the same bytes.
+    """
+    sha = _length_prefixed_digest(
+        b"fcvm-firecracker-cache-v3\0",
+        (repo, branch, commit, arch, libc_tag, libseccomp))
+    return f"firecracker-{profile}-{sha}.bin"
 
 
 def firecracker_identity(binary, config_text: str, arch: str = None,
@@ -1922,9 +1951,9 @@ def firecracker_identity(binary, config_text: str, arch: str = None,
 
     binary is the snapshot's metadata.firecracker_bin, the build restores run
     on. config_text is rootfs-config.toml at the run's source revision; its
-    [firecracker] table pins repo, branch and commit, and fcvm setup names the
-    binary it builds from exactly those fields, so a matching name ties the
-    binary to that commit. commit_matches_binary says whether it did; a
+    [firecracker] table pins repo, branch and commit and its [libseccomp] table
+    the library the build links, and fcvm setup names the binary it builds from
+    exactly those fields, so a matching name ties the binary to that commit. commit_matches_binary says whether it did; a
     binary built from anything else keeps its path and hash and no commit.
     """
     import tomllib
@@ -1938,14 +1967,17 @@ def firecracker_identity(binary, config_text: str, arch: str = None,
             pass
     if not config_text:
         return record
-    pin = tomllib.loads(config_text).get("firecracker") or {}
+    config = tomllib.loads(config_text)
+    pin = config.get("firecracker") or {}
     repo, branch, commit = pin.get("repo"), pin.get("branch"), pin.get("commit")
     if not all(isinstance(value, str) and value for value in (repo, branch, commit)):
         return record
     record.update(repo=repo, branch=branch)
+    arch = arch or platform.machine()
+    libc_tag = libc_tag or libc_version_tag()
     expected = firecracker_build_name(
-        "default", repo, branch, commit,
-        arch or platform.machine(), libc_tag or libc_version_tag(),
+        "default", repo, branch, commit, arch, libc_tag,
+        libseccomp_identity(config.get("libseccomp"), arch, libc_tag),
     )
     if isinstance(binary, str) and os.path.basename(binary) == expected:
         record.update(commit=commit, commit_matches_binary=True)

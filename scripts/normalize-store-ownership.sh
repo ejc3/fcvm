@@ -26,7 +26,7 @@ group="$(id -gn)"
 [ "$user" = "root" ] && exit 0
 
 dirs=()
-for d in kernels pasta firecracker cloud-hypervisor initrd rootfs cache; do
+for d in kernels pasta libseccomp firecracker cloud-hypervisor initrd rootfs cache; do
     [ -d "$STORE/$d" ] && dirs+=("$STORE/$d")
 done
 [ "${#dirs[@]}" -eq 0 ] && exit 0

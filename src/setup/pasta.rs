@@ -154,67 +154,6 @@ pub async fn ensure_pasta(config: Option<&PastaConfig>) -> Result<Option<PathBuf
     Ok(Some(bin_path))
 }
 
-/// Delay before the second attempt of an archive download; it doubles for the third.
-const ARCHIVE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Download the pinned source archive to `dest` from the first of `urls` that
-/// serves bytes with `sha256`. Each URL gets three attempts, `retry_delay`
-/// apart (doubling), so one dropped TLS handshake costs a retry, not the setup
-/// (#1008). The checksum decides what is built, never the host it came from.
-async fn fetch_verified_archive(
-    urls: &[String],
-    sha256: &str,
-    dest: &Path,
-    retry_delay: std::time::Duration,
-) -> Result<()> {
-    let mut failures = Vec::new();
-    for url in urls {
-        let mut delay = retry_delay;
-        for attempt in 1..=3 {
-            let download = super::run_build_as_sudo_invoker(Command::new("curl").args([
-                "-fsSL",
-                "--connect-timeout",
-                "20",
-                "--max-time",
-                "600",
-                "-o",
-            ]))
-            .arg(dest)
-            .arg(url)
-            .output()
-            .await
-            .context("running curl (is curl installed?)")?;
-            let outcome = if !download.status.success() {
-                format!(
-                    "curl {}: {}",
-                    download.status,
-                    String::from_utf8_lossy(&download.stderr).trim()
-                )
-            } else {
-                let bytes = tokio::fs::read(dest)
-                    .await
-                    .with_context(|| format!("reading {}", dest.display()))?;
-                let got = hex::encode(Sha256::digest(&bytes));
-                if got == sha256 {
-                    return Ok(());
-                }
-                format!("sha256 {got}, want {sha256}")
-            };
-            debug!(url, attempt, outcome, "pasta source archive attempt failed");
-            failures.push(format!("{url} (attempt {attempt}): {outcome}"));
-            let _ = tokio::fs::remove_file(dest).await;
-            if attempt < 3 {
-                tokio::time::sleep(delay).await;
-                delay *= 2;
-            }
-        }
-    }
-    bail!(
-        "no source served the pinned pasta archive (sha256 {sha256}):\n  {}",
-        failures.join("\n  ")
-    )
-}
-
 async fn build_pasta(config: &PastaConfig, build_dir: &Path, bin_path: &Path) -> Result<()> {
     // The whole build runs as the sudo invoker (see run_build_as_sudo_invoker):
     // the deterministic /tmp/pasta-build-{sha} tree must never be left
@@ -228,11 +167,12 @@ async fn build_pasta(config: &PastaConfig, build_dir: &Path, bin_path: &Path) ->
         bail!("failed to create {}", build_dir.display());
     }
     let archive = build_dir.join("passt.tar.xz");
-    fetch_verified_archive(
+    super::fetch_verified_archive(
+        "pasta",
         &config.archives,
         &config.archive_sha256,
         &archive,
-        ARCHIVE_RETRY_DELAY,
+        super::ARCHIVE_RETRY_DELAY,
     )
     .await?;
     let status = super::run_build_as_sudo_invoker(
@@ -329,44 +269,6 @@ async fn stage_pasta_binary(built: &Path, bin_path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// One archive, two sources: the first does not answer (or serves other
-    /// bytes) and the second serves the pinned archive. The fetch takes the
-    /// second, and fails only when no source serves the pinned bytes (#1008).
-    #[tokio::test]
-    async fn the_pasta_archive_falls_through_to_the_next_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let good = dir.path().join("good.tar.xz");
-        let other = dir.path().join("other.tar.xz");
-        std::fs::write(&good, b"the pinned archive").unwrap();
-        std::fs::write(&other, b"some other archive").unwrap();
-        let sha = hex::encode(Sha256::digest(b"the pinned archive"));
-        let url = |path: &Path| format!("file://{}", path.display());
-        let absent = url(&dir.path().join("absent.tar.xz"));
-        let dest = dir.path().join("dest.tar.xz");
-        let no_wait = std::time::Duration::ZERO;
-
-        for first in [absent.clone(), url(&other)] {
-            fetch_verified_archive(&[first.clone(), url(&good)], &sha, &dest, no_wait)
-                .await
-                .unwrap_or_else(|e| panic!("{first} then the pinned archive: {e:#}"));
-            assert_eq!(std::fs::read(&dest).unwrap(), b"the pinned archive");
-        }
-
-        let err = fetch_verified_archive(&[absent.clone(), url(&other)], &sha, &dest, no_wait)
-            .await
-            .expect_err("no source served the pinned archive");
-        let text = format!("{err:#}");
-        assert!(
-            text.contains(&absent) && text.contains("other.tar.xz"),
-            "{text}"
-        );
-        assert!(
-            !dest.exists(),
-            "a rejected download was left at {}",
-            dest.display()
-        );
-    }
 
     /// The store can be a directory several VMs share over FUSE. The build lock
     /// is an flock, which each guest kernel grants on its own there, so two VMs

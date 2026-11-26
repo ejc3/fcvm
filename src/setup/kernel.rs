@@ -1874,22 +1874,61 @@ fn validate_full_git_commit(commit: &str, source: &str) -> Result<()> {
     Ok(())
 }
 
+/// What a Firecracker build takes from the machine and the config besides its
+/// source. Every field is part of the binary's name.
+#[derive(Clone, Copy)]
+struct FirecrackerBuildEnvironment<'a> {
+    arch: &'a str,
+    libc_tag: &'a str,
+    /// Content hash of the pinned libseccomp archive the build links
+    /// (`super::libseccomp::content_hash`), or empty when the config has no
+    /// `[libseccomp]` section and the build links the host's library. The
+    /// build script compiles the binary's seccomp policy with it.
+    libseccomp: &'a str,
+}
+
+impl<'a> FirecrackerBuildEnvironment<'a> {
+    /// A build on this machine's architecture.
+    fn host(libc_tag: &'a str, libseccomp: &'a str) -> Self {
+        Self {
+            arch: std::env::consts::ARCH,
+            libc_tag,
+            libseccomp,
+        }
+    }
+}
+
+/// The libseccomp identity of `profile`'s Firecracker builds
+/// ([`FirecrackerBuildEnvironment::libseccomp`]). Config loading gives every
+/// profile the `[libseccomp]` pin, so setup and launch compute one value.
+fn profile_libseccomp_identity(profile: &KernelProfile) -> String {
+    profile
+        .firecracker_libseccomp
+        .as_ref()
+        .map(super::libseccomp::content_hash)
+        .unwrap_or_default()
+}
+
 /// Compute SHA for a profile Firecracker binary.
 ///
-/// Repo, ref, full commit, architecture, and libc all affect the executable;
-/// every one is part of the cache identity.
+/// Repo, ref, full commit, architecture, libc, and the libseccomp the build
+/// links all affect the executable; every one is part of the cache identity.
 fn compute_firecracker_sha_for_fields(
     repo: &str,
     branch: &str,
     commit_hash: &str,
-    arch: &str,
-    libc_tag: &str,
+    build: FirecrackerBuildEnvironment<'_>,
 ) -> String {
+    let FirecrackerBuildEnvironment {
+        arch,
+        libc_tag,
+        libseccomp,
+    } = build;
     let mut hasher = Sha256::new();
-    hasher.update(b"fcvm-firecracker-cache-v2\0");
+    hasher.update(b"fcvm-firecracker-cache-v3\0");
     // Length-prefix every field so shifting a byte across a field boundary
     // cannot alias another valid source/build identity.
-    for field in [repo, branch, commit_hash, arch, libc_tag] {
+    for field in [repo, branch, commit_hash, arch, libc_tag, libseccomp] {
         hasher.update((field.len() as u64).to_le_bytes());
         hasher.update(field.as_bytes());
     }
@@ -1903,10 +1942,9 @@ fn profile_firecracker_path_for_build(
     repo: &str,
     branch: &str,
     commit_hash: &str,
-    arch: &str,
-    libc_tag: &str,
+    build: FirecrackerBuildEnvironment<'_>,
 ) -> PathBuf {
-    let sha = compute_firecracker_sha_for_fields(repo, branch, commit_hash, arch, libc_tag);
+    let sha = compute_firecracker_sha_for_fields(repo, branch, commit_hash, build);
     dir.join(format!("firecracker-{profile_name}-{sha}.bin"))
 }
 
@@ -1975,8 +2013,8 @@ const FIRECRACKER_RESOLVE_TTL_ENV: &str = "FCVM_FIRECRACKER_RESOLVE_TTL_SECS";
 /// A previously completed remote resolution of a profile's firecracker binary.
 ///
 /// Persisted under `assets_dir/firecracker/` with a profile plus full
-/// repo/ref/architecture/libc identity so VM launches can reuse it instead of
-/// paying a `git ls-remote` round trip to GitHub. Independent build
+/// repo/ref/architecture/libc/libseccomp identity so VM launches can reuse it
+/// instead of paying a `git ls-remote` round trip to GitHub. Independent build
 /// environments never overwrite one another's record.
 ///
 /// Concurrency: written with a unique temp file + atomic rename, never a lock —
@@ -2001,10 +2039,14 @@ fn firecracker_cache_dir() -> PathBuf {
     paths::assets_dir().join("firecracker")
 }
 
-fn firecracker_resolution_identity(repo: &str, branch: &str, arch: &str, libc_tag: &str) -> String {
+fn firecracker_resolution_identity(
+    repo: &str,
+    branch: &str,
+    build: FirecrackerBuildEnvironment<'_>,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"fcvm-firecracker-resolution-v1\0");
-    for field in [repo, branch, arch, libc_tag] {
+    hasher.update(b"fcvm-firecracker-resolution-v2\0");
+    for field in [repo, branch, build.arch, build.libc_tag, build.libseccomp] {
         hasher.update((field.len() as u64).to_le_bytes());
         hasher.update(field.as_bytes());
     }
@@ -2023,8 +2065,7 @@ fn firecracker_resolution_path(
         profile_name,
         repo,
         branch,
-        std::env::consts::ARCH,
-        &libc_version_tag(),
+        FirecrackerBuildEnvironment::host(&libc_version_tag(), ""),
     )
 }
 
@@ -2033,10 +2074,9 @@ fn firecracker_resolution_path_for_build(
     profile_name: &str,
     repo: &str,
     branch: &str,
-    arch: &str,
-    libc_tag: &str,
+    build: FirecrackerBuildEnvironment<'_>,
 ) -> PathBuf {
-    let identity = firecracker_resolution_identity(repo, branch, arch, libc_tag);
+    let identity = firecracker_resolution_identity(repo, branch, build);
     dir.join(format!("{profile_name}-{identity}.resolved.json"))
 }
 
@@ -2069,11 +2109,9 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Return the cached resolution for `profile_name` if it is usable right now:
-/// same repo/branch, within the TTL, and pointing at a binary that still exists.
-///
-/// Any parse/IO problem is a miss (the caller re-resolves), never an error —
-/// a corrupt cache must not be able to block a VM launch.
+/// [`fresh_cached_firecracker_resolution_in_for_build`] for a build on this host
+/// with no libseccomp pin.
+#[cfg(test)]
 fn fresh_cached_firecracker_resolution_in(
     dir: &Path,
     profile_name: &str,
@@ -2087,25 +2125,28 @@ fn fresh_cached_firecracker_resolution_in(
         repo,
         branch,
         ttl_secs,
-        std::env::consts::ARCH,
-        &libc_version_tag(),
+        FirecrackerBuildEnvironment::host(&libc_version_tag(), ""),
     )
 }
 
+/// Return the cached resolution for `profile_name` if it is usable right now:
+/// same repo/branch and build environment, within the TTL, and pointing at a
+/// binary that still exists.
+///
+/// Any parse/IO problem is a miss (the caller re-resolves), never an error:
+/// a corrupt cache must not be able to block a VM launch.
 fn fresh_cached_firecracker_resolution_in_for_build(
     dir: &Path,
     profile_name: &str,
     repo: &str,
     branch: &str,
     ttl_secs: u64,
-    arch: &str,
-    libc_tag: &str,
+    build: FirecrackerBuildEnvironment<'_>,
 ) -> Option<PathBuf> {
     if ttl_secs == 0 {
         return None;
     }
-    let path =
-        firecracker_resolution_path_for_build(dir, profile_name, repo, branch, arch, libc_tag);
+    let path = firecracker_resolution_path_for_build(dir, profile_name, repo, branch, build);
     let raw = std::fs::read_to_string(&path).ok()?;
     let entry: FirecrackerResolution = match serde_json::from_str(&raw) {
         Ok(e) => e,
@@ -2131,8 +2172,7 @@ fn fresh_cached_firecracker_resolution_in_for_build(
         repo,
         branch,
         &entry.commit_hash,
-        arch,
-        libc_tag,
+        build,
     );
     if entry.resolved_path != expected_path {
         warn!(
@@ -2163,12 +2203,9 @@ fn fresh_cached_firecracker_resolution_in_for_build(
     Some(entry.resolved_path)
 }
 
-/// Persist a completed remote resolution so later launches can skip the network.
-///
-/// Written atomically (unique temp + rename) because several fcvm processes may
-/// resolve the same profile concurrently; readers then always see a whole file.
-/// Only called with a `resolved_path` that exists, so the cache never advertises
-/// a binary that was never built.
+/// [`record_firecracker_resolution_in_for_build`] for a build on this host with
+/// no libseccomp pin.
+#[cfg(test)]
 fn record_firecracker_resolution_in(
     dir: &Path,
     profile_name: &str,
@@ -2184,19 +2221,16 @@ fn record_firecracker_resolution_in(
         branch,
         commit_hash,
         resolved_path,
-        FirecrackerBuildEnvironment {
-            arch: std::env::consts::ARCH,
-            libc_tag: &libc_version_tag(),
-        },
+        FirecrackerBuildEnvironment::host(&libc_version_tag(), ""),
     );
 }
 
-#[derive(Clone, Copy)]
-struct FirecrackerBuildEnvironment<'a> {
-    arch: &'a str,
-    libc_tag: &'a str,
-}
-
+/// Persist a completed remote resolution so later launches can skip the network.
+///
+/// Written atomically (unique temp + rename) because several fcvm processes may
+/// resolve the same profile concurrently; readers then always see a whole file.
+/// Only called with a `resolved_path` that exists, so the cache never advertises
+/// a binary that was never built.
 fn record_firecracker_resolution_in_for_build(
     dir: &Path,
     profile_name: &str,
@@ -2213,14 +2247,7 @@ fn record_firecracker_resolution_in_for_build(
         resolved_path: resolved_path.to_path_buf(),
         resolved_at_secs: unix_now_secs(),
     };
-    let final_path = firecracker_resolution_path_for_build(
-        dir,
-        profile_name,
-        repo,
-        branch,
-        build.arch,
-        build.libc_tag,
-    );
+    let final_path = firecracker_resolution_path_for_build(dir, profile_name, repo, branch, build);
     if let Err(e) = write_json_atomic(&final_path, &entry) {
         // Non-fatal: the next launch just pays the ls-remote again.
         warn!(
@@ -2238,21 +2265,23 @@ fn record_firecracker_resolution_in_for_build(
     );
 }
 
-/// [`record_firecracker_resolution_in`] against the real assets dir.
+/// [`record_firecracker_resolution_in_for_build`] against the real assets dir.
 fn record_firecracker_resolution(
     profile_name: &str,
     repo: &str,
     branch: &str,
     commit_hash: &str,
     resolved_path: &Path,
+    build: FirecrackerBuildEnvironment<'_>,
 ) {
-    record_firecracker_resolution_in(
+    record_firecracker_resolution_in_for_build(
         &firecracker_cache_dir(),
         profile_name,
         repo,
         branch,
         commit_hash,
         resolved_path,
+        build,
     );
 }
 
@@ -2433,6 +2462,9 @@ async fn get_profile_firecracker_path_in(
         None => return Ok(None),
     };
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
+    let libc_tag = libc_version_tag();
+    let libseccomp = profile_libseccomp_identity(profile);
+    let build = FirecrackerBuildEnvironment::host(&libc_tag, &libseccomp);
 
     // An immutable pin makes the launch path fully offline and forbids falling
     // back to a different cached build. `fcvm setup` fetched this exact commit
@@ -2445,20 +2477,20 @@ async fn get_profile_firecracker_path_in(
             repo,
             branch,
             commit_hash,
-            std::env::consts::ARCH,
-            &libc_version_tag(),
+            build,
         );
         return Ok(Some(resolved));
     }
 
     // Fast path: reuse the last remote resolution and skip the network entirely.
     let ttl_secs = firecracker_resolve_ttl_secs();
-    if let Some(cached) = fresh_cached_firecracker_resolution_in(
+    if let Some(cached) = fresh_cached_firecracker_resolution_in_for_build(
         firecracker_dir,
         profile_name,
         repo,
         branch,
         ttl_secs,
+        build,
     ) {
         return Ok(Some(cached));
     }
@@ -2472,20 +2504,20 @@ async fn get_profile_firecracker_path_in(
                 repo,
                 branch,
                 &commit_hash,
-                std::env::consts::ARCH,
-                &libc_version_tag(),
+                build,
             );
             // Only cache resolutions that name a binary that actually exists, so
             // a not-yet-built profile keeps re-resolving (and keeps failing loudly
             // in get_firecracker_for_profile) instead of caching a dead path.
             if resolved.exists() {
-                record_firecracker_resolution_in(
+                record_firecracker_resolution_in_for_build(
                     firecracker_dir,
                     profile_name,
                     repo,
                     branch,
                     &commit_hash,
                     &resolved,
+                    build,
                 );
             }
             Ok(Some(resolved))
@@ -2495,8 +2527,7 @@ async fn get_profile_firecracker_path_in(
             profile_name,
             repo,
             branch,
-            std::env::consts::ARCH,
-            &libc_version_tag(),
+            build,
         )? {
             Some(cached) => {
                 warn!(
@@ -2522,8 +2553,7 @@ fn offline_cached_firecracker_resolution_in(
     profile_name: &str,
     repo: &str,
     branch: &str,
-    arch: &str,
-    libc_tag: &str,
+    build: FirecrackerBuildEnvironment<'_>,
 ) -> Result<Option<PathBuf>> {
     Ok(fresh_cached_firecracker_resolution_in_for_build(
         firecracker_dir,
@@ -2531,8 +2561,7 @@ fn offline_cached_firecracker_resolution_in(
         repo,
         branch,
         u64::MAX,
-        arch,
-        libc_tag,
+        build,
     ))
 }
 
@@ -2648,19 +2677,22 @@ enum FirecrackerSetupStep {
 /// resolving the branch. Without a pin, `remote_commit` (the `git ls-remote`
 /// of the branch, passed in so tests can count the calls) picks the commit,
 /// and when the remote cannot be reached the branch's recorded binary is kept.
+/// `libseccomp` is the build's libseccomp identity
+/// ([`FirecrackerBuildEnvironment::libseccomp`]).
 async fn plan_firecracker_setup<Fut>(
     firecracker_dir: &Path,
     profile_name: &str,
     repo: &str,
     branch: &str,
     pinned_commit: Option<&str>,
+    libseccomp: &str,
     remote_commit: impl FnOnce() -> Fut,
 ) -> Result<FirecrackerSetupStep>
 where
     Fut: std::future::Future<Output = Result<String>>,
 {
-    let arch = std::env::consts::ARCH;
     let libc_tag = libc_version_tag();
+    let build = FirecrackerBuildEnvironment::host(&libc_tag, libseccomp);
     let (commit, source) = match pinned_commit {
         // A pin names its binary on its own, so a built one is kept and a
         // missing one is built without asking where the branch points.
@@ -2676,8 +2708,7 @@ where
                     profile_name,
                     repo,
                     branch,
-                    arch,
-                    &libc_tag,
+                    build,
                 )
             })? {
                 RemoteResolutionOutcome::Resolved(commit) => (commit, FirecrackerSource::BranchTip),
@@ -2693,8 +2724,7 @@ where
         repo,
         branch,
         &commit,
-        arch,
-        &libc_tag,
+        build,
     );
     let record_resolution = source == FirecrackerSource::BranchTip;
     Ok(if path.exists() {
@@ -2798,10 +2828,213 @@ async fn checkout_firecracker_source(
     verify_firecracker_checkout_commit(commit, String::from_utf8_lossy(&checkout.stdout).trim())
 }
 
+/// Where Firecracker's seccompiler tells rustc to look for libseccomp, ahead of every other
+/// directory (`cargo::rustc-link-search` in its build script).
+const SECCOMPILER_LINK_SEARCH: &str = "/usr/local/lib";
+
+/// A libseccomp in `dir`, which a link that searches `dir` first would take.
+fn libseccomp_in(dir: &Path) -> Option<PathBuf> {
+    ["libseccomp.so", "libseccomp.a"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|path| path.exists())
+}
+
+/// Why the search path fcvm adds to `build.rustflags` would not reach the libseccomp link of
+/// the Firecracker checked out in `build_dir`, from its cargo configuration, if it would not:
+/// - it sets rustc flags for a target (`[target.*] rustflags`), and cargo then takes those
+///   in place of `build.rustflags`;
+/// - it names a build target. With a target, cargo keeps `build.rustflags` from build
+///   scripts, and the libseccomp link is in one.
+///
+/// `build.rustflags` of its own is no conflict: cargo joins that array with the one fcvm
+/// passes (the v1.17.0-based pins set `-Ccodegen-units=1` there).
+fn checkout_config_conflict(build_dir: &Path) -> Result<Option<&'static str>> {
+    for name in [".cargo/config.toml", ".cargo/config"] {
+        let path = build_dir.join(name);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+        };
+        let config: toml::Value =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let target_flags = config
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|targets| targets.values().any(|t| t.get("rustflags").is_some()));
+        if target_flags {
+            return Ok(Some(
+                "sets rustc flags for a target, which cargo takes in place of build.rustflags",
+            ));
+        }
+        if config
+            .get("build")
+            .and_then(|build| build.get("target"))
+            .is_some()
+        {
+            return Ok(Some(
+                "names a build target, and with one cargo keeps build.rustflags from build \
+                 scripts",
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// What cargo reads rustc flags from in the environment, each in place of `build.rustflags`,
+/// and the variable that names a build target.
+const CARGO_ENV_OVERRIDES: [&str; 4] = [
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUSTFLAGS",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_TARGET",
+];
+
+/// The name a dynamically linked program records for libseccomp (`DT_NEEDED`), whatever its
+/// version suffix.
+const SHARED_LIBSECCOMP: &[u8] = b"libseccomp.so";
+
+/// Checks, after a Firecracker build with a libseccomp pin, that the `firecracker` package's
+/// build script under cargo's `release_dir` linked libseccomp statically, which is how the
+/// pinned archive is linked: its store entry holds no shared library.
+///
+/// The build script is the program that compiles the seccomp policy into the binary. If
+/// the search path fcvm passes ever stops reaching its link (cargo given a target, a
+/// change in how cargo passes flags to build scripts), the link takes the host's shared
+/// library, and succeeds wherever that library is new enough. The binary would then be
+/// named for a libseccomp it was not built against. A build script that names a shared
+/// libseccomp, or no build script to look at, fails the build.
+fn verify_build_script_links_libseccomp_statically(release_dir: &Path) -> Result<()> {
+    let build_dir = release_dir.join("build");
+    let mut checked = 0;
+    let entries = std::fs::read_dir(&build_dir)
+        .with_context(|| format!("reading {}", build_dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", build_dir.display()))?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("firecracker-"))
+        {
+            continue;
+        }
+        let script = entry.path().join("build-script-build");
+        let bytes = match std::fs::read(&script) {
+            Ok(bytes) => bytes,
+            // The same package has a second directory, for the script's output.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", script.display()))
+            }
+        };
+        checked += 1;
+        if bytes
+            .windows(SHARED_LIBSECCOMP.len())
+            .any(|window| window == SHARED_LIBSECCOMP)
+        {
+            bail!(
+                "{} is linked against a shared libseccomp, so the Firecracker build did not \
+                 link the pinned archive: the library search path fcvm passes did not reach \
+                 the build script's link",
+                script.display()
+            );
+        }
+    }
+    if checked == 0 {
+        bail!(
+            "no firecracker build script under {}, so which libseccomp the build linked \
+             cannot be checked",
+            build_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// The cargo command that builds Firecracker in the checkout `build_dir`.
+///
+/// Firecracker's seccompiler links libseccomp (`-lseccomp`) into the build
+/// script that compiles the binary's seccomp policy. With a `[libseccomp]` pin
+/// the link takes fcvm's static archive: its directory is given to rustc as a
+/// library search path, `-L native=<dir>`, which the linker searches before any
+/// directory of its own. It is passed as `--config build.rustflags=[...]`,
+/// which cargo joins with the `build.rustflags` of the checkout's own
+/// configuration, so the checkout's flags stay.
+///
+/// `LIBRARY_PATH` does not do this. gcc searches an entry `DIR` of it as
+/// `DIR/<multiarch>/<version>/`, `DIR/<multiarch>/` and `DIR/../lib/` ahead of
+/// the system directories, and `DIR/` itself only after them
+/// (`LIBRARY_PATH=/x cc -print-search-dirs`), so on a host with libseccomp-dev
+/// installed the system's `libseccomp.so` was linked and the build ended in
+/// `undefined reference to seccomp_export_bpf_mem`.
+///
+/// With a pin the build's rustc flags come from configuration alone:
+/// `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` and `CARGO_BUILD_RUSTFLAGS` of this
+/// process are not passed on, because cargo takes any of them in place of
+/// `build.rustflags`, and neither is `CARGO_BUILD_TARGET`. Three cases are
+/// refused before cargo runs, each of which would link another library than the
+/// one the binary is named for:
+/// - the pin's archive is not in `libseccomp_store` (the error names `fcvm setup`);
+/// - `seccompiler_search` holds a libseccomp, which the link would take first;
+/// - the checkout's cargo configuration keeps `build.rustflags` from the link
+///   (`checkout_config_conflict`).
+///
+/// After the build, `verify_build_script_links_libseccomp_statically` checks what
+/// the build script linked.
+fn firecracker_build_command(
+    cargo: &Path,
+    build_dir: &Path,
+    libseccomp: Option<&super::libseccomp::LibseccompConfig>,
+    libseccomp_store: &Path,
+    seccompiler_search: &Path,
+) -> Result<Command> {
+    let mut command = Command::new(cargo);
+    command
+        .args(["build", "--release", "-p", "firecracker"])
+        .current_dir(build_dir);
+    if let Some(config) = libseccomp {
+        let dir = super::libseccomp::libseccomp_dir_in(libseccomp_store, config)
+            .context("the firecracker build links the pinned libseccomp")?;
+        let dir = dir
+            .to_str()
+            .with_context(|| format!("the libseccomp store path {} is not UTF-8", dir.display()))?;
+        if let Some(other) = libseccomp_in(seccompiler_search) {
+            bail!(
+                "{} would be linked into the Firecracker build in place of the pinned \
+                 libseccomp {}: Firecracker's build searches {} first. Remove it, or drop \
+                 the [libseccomp] section to build against the host's library",
+                other.display(),
+                config.version,
+                seccompiler_search.display()
+            );
+        }
+        if let Some(conflict) = checkout_config_conflict(build_dir)? {
+            bail!(
+                "the Firecracker checkout's cargo configuration {conflict}, so the build \
+                 would not link the pinned libseccomp: change how firecracker_build_command \
+                 passes its search path"
+            );
+        }
+        // A JSON array of strings is also a TOML array of basic strings: the escapes
+        // serde_json writes (\", \\, \n and the like, \uXXXX) are TOML's too.
+        let flags = serde_json::to_string(&["-L".to_string(), format!("native={dir}")])
+            .context("encoding the libseccomp search path")?;
+        command
+            .arg("--config")
+            .arg(format!("build.rustflags={flags}"));
+        for name in CARGO_ENV_OVERRIDES {
+            command.env_remove(name);
+        }
+    }
+    Ok(command)
+}
+
 /// Ensure the firecracker binary for a kernel profile exists.
 ///
 /// Uses content-addressed naming: firecracker-{profile}-{sha}.bin, where SHA
-/// covers repo + ref + full commit + architecture + libc.
+/// covers repo + ref + full commit + architecture + libc + the pinned
+/// libseccomp. A build links that libseccomp, which is built first when the
+/// store does not hold it (`super::libseccomp`).
 ///
 /// With a configured commit pin, a built binary for it is kept without
 /// contacting the remote. Otherwise setup fetches the pinned commit by its hash,
@@ -3122,12 +3355,16 @@ pub async fn ensure_profile_firecracker(
     // already on disk (all 764 unit tests had passed; `git ls-remote` then
     // could not reach GitHub).
     let firecracker_dir = paths::assets_dir().join("firecracker");
+    let libc_tag = libc_version_tag();
+    let libseccomp_identity = profile_libseccomp_identity(profile);
+    let build = FirecrackerBuildEnvironment::host(&libc_tag, &libseccomp_identity);
     let step = plan_firecracker_setup(
         &firecracker_dir,
         profile_name,
         repo,
         branch,
         profile.firecracker_commit.as_deref(),
+        &libseccomp_identity,
         || fetch_remote_firecracker_commit(repo, branch),
     )
     .await?;
@@ -3144,7 +3381,7 @@ pub async fn ensure_profile_firecracker(
                 "firecracker binary exists"
             );
             if record_resolution {
-                record_firecracker_resolution(profile_name, repo, branch, &commit, &path);
+                record_firecracker_resolution(profile_name, repo, branch, &commit, &path, build);
             }
             let source = if profile.firecracker_commit.is_some() {
                 FirecrackerSource::Pin
@@ -3177,6 +3414,14 @@ pub async fn ensure_profile_firecracker(
     // must not cost a network clone or leave a fresh dir/lock behind.
     let cargo = cargo_program()?;
 
+    // The libseccomp the build links, built here when `fcvm setup` has not
+    // already made it its own step. Before the lock and the clone: a host
+    // without what the archive's build needs fails in seconds.
+    let libseccomp = profile.firecracker_libseccomp.as_ref();
+    super::libseccomp::ensure_libseccomp(libseccomp)
+        .await
+        .context("setting up libseccomp for the firecracker build")?;
+
     // Create directory and acquire lock
     let mut lock_path = bin_path.clone().into_os_string();
     lock_path.push(".lock");
@@ -3187,7 +3432,14 @@ pub async fn ensure_profile_firecracker(
         debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
         flock.unlock().map_err(|(_, err)| err)?;
         if record_resolution {
-            record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
+            record_firecracker_resolution(
+                profile_name,
+                repo,
+                branch,
+                &commit_hash,
+                &bin_path,
+                build,
+            );
         }
         // The other process may not have reached the filters, or may be an fcvm from
         // before they existed.
@@ -3223,10 +3475,19 @@ pub async fn ensure_profile_firecracker(
     }
 
     // Build firecracker
-    let mut build_cmd = Command::new(&cargo);
-    build_cmd
-        .args(["build", "--release", "-p", "firecracker"])
-        .current_dir(&build_dir);
+    let mut build_cmd = match firecracker_build_command(
+        &cargo,
+        &build_dir,
+        libseccomp,
+        &super::libseccomp::store_dir(),
+        Path::new(SECCOMPILER_LINK_SEARCH),
+    ) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            flock.unlock().map_err(|(_, err)| err)?;
+            return Err(error);
+        }
+    };
     super::run_build_as_sudo_invoker(&mut build_cmd);
     let status = build_cmd.status().await.context("building firecracker")?;
 
@@ -3249,6 +3510,14 @@ pub async fn ensure_profile_firecracker(
                 binary.display(),
                 alt_binary.display()
             );
+        }
+    }
+
+    if libseccomp.is_some() {
+        let release_dir = binary.parent().expect("the binary is in a directory");
+        if let Err(error) = verify_build_script_links_libseccomp_statically(release_dir) {
+            flock.unlock().map_err(|(_, err)| err)?;
+            return Err(error);
         }
     }
 
@@ -3282,7 +3551,7 @@ pub async fn ensure_profile_firecracker(
     println!("  ✓ Firecracker ready: {}", bin_path.display());
 
     if record_resolution {
-        record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
+        record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path, build);
     }
     ensure_confined_seccomp_or_warn(&bin_path, repo, branch, &commit_hash, source).await;
 
@@ -4707,7 +4976,16 @@ cp vmlinux arch/arm64/boot/Image
     ) -> String {
         let repo = profile.firecracker_repo.as_deref().unwrap_or("");
         let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
-        compute_firecracker_sha_for_fields(repo, branch, commit_hash, arch, libc_tag)
+        compute_firecracker_sha_for_fields(repo, branch, commit_hash, build_env(arch, libc_tag))
+    }
+
+    /// A build environment with no libseccomp pin.
+    fn build_env<'a>(arch: &'a str, libc_tag: &'a str) -> FirecrackerBuildEnvironment<'a> {
+        FirecrackerBuildEnvironment {
+            arch,
+            libc_tag,
+            libseccomp: "",
+        }
     }
 
     #[test]
@@ -4761,6 +5039,314 @@ cp vmlinux arch/arm64/boot/Image
         );
     }
 
+    /// A libseccomp pin for tests; nothing downloads it.
+    fn libseccomp_pin(version: &str) -> crate::setup::libseccomp::LibseccompConfig {
+        crate::setup::libseccomp::LibseccompConfig {
+            version: version.to_string(),
+            archive_sha256: "ab".repeat(32),
+            archives: vec!["https://example.invalid/libseccomp.tar.gz".to_string()],
+        }
+    }
+
+    /// The build script links libseccomp and compiles the binary's seccomp
+    /// policy with it. A binary built against one libseccomp must not be found
+    /// under the name of a build against another, or against the host's own.
+    #[test]
+    fn firecracker_cache_key_includes_the_libseccomp_identity() {
+        let name = |libc_tag: &str, libseccomp: &str| {
+            compute_firecracker_sha_for_fields(
+                REPO,
+                BRANCH,
+                PINNED_COMMIT,
+                FirecrackerBuildEnvironment {
+                    arch: "aarch64",
+                    libc_tag,
+                    libseccomp,
+                },
+            )
+        };
+        assert_eq!(
+            name("libc-2.39", "0123456789ab"),
+            name("libc-2.39", "0123456789ab"),
+            "one build named two binaries"
+        );
+        assert_ne!(
+            name("libc-2.39", ""),
+            name("libc-2.39", "0123456789ab"),
+            "a build against the host's libseccomp and one against the pin share a name"
+        );
+        assert_ne!(
+            name("libc-2.39", "0123456789ab"),
+            name("libc-2.39", "ba9876543210"),
+            "builds against two libseccomp archives share a name"
+        );
+        assert_ne!(
+            name("libc-2.3", "90123456789ab"),
+            name("libc-2.39", "0123456789ab"),
+            "a byte moved between the libc and libseccomp fields names the same binary"
+        );
+    }
+
+    /// bench/chromium/reqbench.py computes the same name from the same fields
+    /// (`firecracker_build_name`), to tie the binary a golden ran on to a commit.
+    /// Its test `test_the_name_fcvm_gives_these_fields` holds this literal too.
+    #[test]
+    fn the_firecracker_binary_name_is_the_one_the_bench_harness_computes() {
+        let eights = "8".repeat(40);
+        let name = |libseccomp: &str| {
+            profile_firecracker_path_for_build(
+                Path::new("/store"),
+                "default",
+                "ejc3/firecracker",
+                "agent/uffd-minor",
+                &eights,
+                FirecrackerBuildEnvironment {
+                    arch: "aarch64",
+                    libc_tag: "libc-2.39",
+                    libseccomp,
+                },
+            )
+        };
+        assert_eq!(
+            name("22445fa649f2"),
+            Path::new("/store/firecracker-default-bfa6c545b763.bin")
+        );
+        assert_eq!(
+            name(""),
+            Path::new("/store/firecracker-default-dc3c73e0fee4.bin")
+        );
+    }
+
+    /// Setup names the binary it builds from the profile's libseccomp pin, and
+    /// a launch resolves the pinned commit to that name without the network. A
+    /// profile without the pin names another binary: the one built against the
+    /// host's library.
+    #[tokio::test]
+    async fn setup_and_launch_name_one_binary_for_a_libseccomp_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let pin = libseccomp_pin("2.6.1");
+        let profile = KernelProfile {
+            firecracker_repo: Some(REPO.to_string()),
+            firecracker_branch: Some(BRANCH.to_string()),
+            firecracker_commit: Some(PINNED_COMMIT.to_string()),
+            firecracker_libseccomp: Some(pin.clone()),
+            ..Default::default()
+        };
+        let identity = profile_libseccomp_identity(&profile);
+        assert_eq!(identity, crate::setup::libseccomp::content_hash(&pin));
+
+        let calls = std::cell::Cell::new(0);
+        let step = plan_firecracker_setup(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            Some(PINNED_COMMIT),
+            &identity,
+            moved_branch_remote(&calls),
+        )
+        .await
+        .unwrap();
+        let FirecrackerSetupStep::Build { path: built, .. } = step else {
+            panic!("nothing is built yet, got {step:?}");
+        };
+        let launched = |profile: KernelProfile| async move {
+            get_profile_firecracker_path_in(&profile, "default", dir)
+                .await
+                .unwrap()
+                .expect("the profile configures a Firecracker")
+        };
+        assert_eq!(launched(profile.clone()).await, built);
+        assert_eq!(calls.get(), 0);
+
+        let moved_pin = KernelProfile {
+            firecracker_libseccomp: Some(libseccomp_pin("2.6.2")),
+            ..profile.clone()
+        };
+        let unpinned = KernelProfile {
+            firecracker_libseccomp: None,
+            ..profile
+        };
+        assert_eq!(profile_libseccomp_identity(&unpinned), "");
+        assert_ne!(launched(moved_pin).await, built);
+        assert_ne!(launched(unpinned).await, built);
+    }
+
+    /// A Firecracker build with a libseccomp pin gives rustc the archive's
+    /// directory as a library search path through `--config build.rustflags`,
+    /// takes cargo's flag and target variables out of the build's environment,
+    /// and is refused before cargo runs when it would link another library: the
+    /// archive is missing (the error names the setup step), a libseccomp sits
+    /// where Firecracker's build looks first, or the checkout's configuration
+    /// keeps `build.rustflags` from the link.
+    #[test]
+    fn the_firecracker_build_links_the_pinned_libseccomp_or_names_fcvm_setup() {
+        let store = tempfile::tempdir().unwrap();
+        let search = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let (search, tree) = (search.path(), tree.path());
+        let pin = libseccomp_pin("2.6.1");
+        let cargo = Path::new("/usr/bin/cargo");
+        let build = |pin: Option<&crate::setup::libseccomp::LibseccompConfig>| {
+            firecracker_build_command(cargo, tree, pin, store.path(), search)
+        };
+        let args = |command: &Command| {
+            command
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let removed = |command: &Command| {
+            let mut names: Vec<_> = command
+                .as_std()
+                .get_envs()
+                .map(|(name, value)| {
+                    assert_eq!(value, None, "{name:?} is set");
+                    name.to_str().unwrap().to_string()
+                })
+                .collect();
+            names.sort();
+            names
+        };
+
+        let error = build(Some(&pin)).expect_err("the archive is not built");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("fcvm setup") && text.contains("libseccomp"),
+            "{text}"
+        );
+
+        let archive_dir = store
+            .path()
+            .join(crate::setup::libseccomp::content_hash(&pin));
+        std::fs::create_dir(&archive_dir).unwrap();
+        std::fs::write(archive_dir.join("libseccomp.a"), b"!<arch>\n").unwrap();
+
+        let command = build(Some(&pin)).unwrap();
+        let args_with_pin = args(&command);
+        assert_eq!(
+            args_with_pin[..5],
+            ["build", "--release", "-p", "firecracker", "--config"]
+        );
+        // The value is TOML that cargo reads as build.rustflags and joins with
+        // the checkout's own.
+        assert_eq!(args_with_pin.len(), 6);
+        let config: toml::Value = toml::from_str(&args_with_pin[5]).unwrap();
+        assert_eq!(
+            config["build"]["rustflags"],
+            toml::Value::Array(vec![
+                toml::Value::String("-L".into()),
+                toml::Value::String(format!("native={}", archive_dir.display())),
+            ])
+        );
+        assert_eq!(
+            removed(&command),
+            [
+                "CARGO_BUILD_RUSTFLAGS",
+                "CARGO_BUILD_TARGET",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "RUSTFLAGS"
+            ]
+        );
+        assert_eq!(command.as_std().get_current_dir(), Some(tree));
+
+        // No pin: the build links the host's library, with the command and the
+        // environment as they were.
+        let command = build(None).unwrap();
+        assert_eq!(args(&command), ["build", "--release", "-p", "firecracker"]);
+        assert!(removed(&command).is_empty());
+
+        // A libseccomp where Firecracker's build looks first would be linked in
+        // place of the pinned one.
+        for shadow in ["libseccomp.so", "libseccomp.a"] {
+            let shadow = search.join(shadow);
+            std::fs::write(&shadow, b"").unwrap();
+            let error = build(Some(&pin)).expect_err("another libseccomp would be linked");
+            let text = format!("{error:#}");
+            assert!(
+                text.contains(shadow.to_str().unwrap()) && text.contains("2.6.1"),
+                "{text}"
+            );
+            // Without a pin that library is the one the build is meant to link.
+            build(None).unwrap();
+            std::fs::remove_file(&shadow).unwrap();
+        }
+
+        // build.rustflags of the checkout's own is joined with the search path:
+        // the v1.17.0-based pins set it.
+        std::fs::create_dir(tree.join(".cargo")).unwrap();
+        let config = tree.join(".cargo/config.toml");
+        std::fs::write(
+            &config,
+            "[build]\ntarget-dir = \"build/cargo_target\"\nrustflags = [\"-Ccodegen-units=1\"]\n",
+        )
+        .unwrap();
+        assert_eq!(args(&build(Some(&pin)).unwrap()), args_with_pin);
+        // Flags for a target take the place of build.rustflags, and with a build
+        // target cargo keeps build.rustflags from build scripts.
+        for (conflict, says) in [
+            (
+                "[target.'cfg(target_env = \"musl\")']\nrustflags = [\"-C\", \"target-feature=+crt-static\"]\n",
+                "for a target",
+            ),
+            (
+                "[build]\ntarget = \"aarch64-unknown-linux-musl\"\n",
+                "names a build target",
+            ),
+        ] {
+            std::fs::write(&config, conflict).unwrap();
+            let error = build(Some(&pin)).expect_err("the search path would not reach the link");
+            assert!(format!("{error:#}").contains(says), "{error:#}");
+            build(None).unwrap();
+        }
+    }
+
+    /// After a build with a libseccomp pin, a build script that names a shared
+    /// libseccomp fails the build, and so does having no build script to check: the
+    /// pinned archive is linked statically, so either means the search path did not
+    /// reach the link.
+    #[test]
+    fn a_build_script_linked_against_a_shared_libseccomp_fails_the_build() {
+        let release = tempfile::tempdir().unwrap();
+        let release = release.path();
+        let verify = || verify_build_script_links_libseccomp_statically(release);
+
+        let error = verify().expect_err("no build directory");
+        assert!(format!("{error:#}").contains("build"), "{error:#}");
+
+        // cargo's layout: one directory with the script, one with its output, and
+        // other packages' beside them.
+        let script_dir = release.join("build/firecracker-0123456789abcdef");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::create_dir_all(release.join("build/firecracker-fedcba9876543210/out")).unwrap();
+        let other = release.join("build/aws-lc-sys-0123456789abcdef");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("build-script-build"), b"\x7fELF libseccomp.so.2").unwrap();
+        let error = verify().expect_err("no firecracker build script");
+        assert!(
+            format!("{error:#}").contains("cannot be checked"),
+            "{error:#}"
+        );
+
+        let script = script_dir.join("build-script-build");
+        std::fs::write(
+            &script,
+            b"\x7fELF libc.so.6 seccomp_export_bpf_mem libgcc_s.so.1",
+        )
+        .unwrap();
+        verify().expect("a statically linked libseccomp");
+
+        std::fs::write(&script, b"\x7fELF libc.so.6 libseccomp.so.2 libgcc_s.so.1").unwrap();
+        let error = verify().expect_err("a shared libseccomp");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(script.to_str().unwrap()) && text.contains("shared libseccomp"),
+            "{text}"
+        );
+    }
+
     /// A remote lookup that counts its calls and answers that the branch has
     /// moved past the pin, the way a force-push leaves it.
     fn moved_branch_remote(
@@ -4787,6 +5373,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             Some(PINNED_COMMIT),
+            "",
             moved_branch_remote(&calls),
         )
         .await
@@ -4825,6 +5412,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             Some(PINNED_COMMIT),
+            "",
             moved_branch_remote(&calls),
         )
         .await
@@ -4864,6 +5452,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             Some("ABCDEF"),
+            "",
             moved_branch_remote(&calls),
         )
         .await
@@ -4889,6 +5478,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             None,
+            "",
             moved_branch_remote(&calls),
         )
         .await
@@ -4909,7 +5499,7 @@ cp vmlinux arch/arm64/boot/Image
             other => panic!("the branch's built commit must be kept, got {other:?}"),
         }
 
-        let step = plan_firecracker_setup(dir, "default", REPO, BRANCH, None, || {
+        let step = plan_firecracker_setup(dir, "default", REPO, BRANCH, None, "", || {
             std::future::ready(Ok(PINNED_COMMIT.to_string()))
         })
         .await
@@ -4937,7 +5527,7 @@ cp vmlinux arch/arm64/boot/Image
             other => panic!("a branch commit that is not built must be built, got {other:?}"),
         }
 
-        let step = plan_firecracker_setup(dir, "default", REPO, BRANCH, None, || {
+        let step = plan_firecracker_setup(dir, "default", REPO, BRANCH, None, "", || {
             std::future::ready(Err(anyhow::anyhow!(
                 "git ls-remote failed: could not resolve host"
             )))
@@ -5133,8 +5723,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             commit,
-            std::env::consts::ARCH,
-            &libc_version_tag(),
+            FirecrackerBuildEnvironment::host(&libc_version_tag(), ""),
         )
     }
 
@@ -5187,8 +5776,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             PINNED_COMMIT,
-            "aarch64",
-            "glibc-2.39",
+            build_env("aarch64", "glibc-2.39"),
         );
         std::fs::write(&arm_path, b"arm firecracker").unwrap();
         record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &arm_path);
@@ -5200,8 +5788,7 @@ cp vmlinux arch/arm64/boot/Image
                 REPO,
                 BRANCH,
                 TTL,
-                "x86_64",
-                "glibc-2.39",
+                build_env("x86_64", "glibc-2.39"),
             )
             .is_none(),
             "a manifest path for another architecture must not bypass the cache key"
@@ -5213,8 +5800,7 @@ cp vmlinux arch/arm64/boot/Image
                 REPO,
                 BRANCH,
                 TTL,
-                "aarch64",
-                "musl-1.2.5",
+                build_env("aarch64", "musl-1.2.5"),
             )
             .is_none(),
             "a manifest path for another libc must not bypass the cache key"
@@ -5231,8 +5817,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             PINNED_COMMIT,
-            "aarch64",
-            "glibc-2.39",
+            build_env("aarch64", "glibc-2.39"),
         );
         let x86_path = profile_firecracker_path_for_build(
             dir,
@@ -5240,8 +5825,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             PINNED_COMMIT,
-            "x86_64",
-            "glibc-2.39",
+            build_env("x86_64", "glibc-2.39"),
         );
         std::fs::write(&arm_path, b"arm firecracker").unwrap();
         std::fs::write(&x86_path, b"x86 firecracker").unwrap();
@@ -5253,10 +5837,7 @@ cp vmlinux arch/arm64/boot/Image
             BRANCH,
             PINNED_COMMIT,
             &arm_path,
-            FirecrackerBuildEnvironment {
-                arch: "aarch64",
-                libc_tag: "glibc-2.39",
-            },
+            build_env("aarch64", "glibc-2.39"),
         );
         record_firecracker_resolution_in_for_build(
             dir,
@@ -5265,10 +5846,7 @@ cp vmlinux arch/arm64/boot/Image
             BRANCH,
             PINNED_COMMIT,
             &x86_path,
-            FirecrackerBuildEnvironment {
-                arch: "x86_64",
-                libc_tag: "glibc-2.39",
-            },
+            build_env("x86_64", "glibc-2.39"),
         );
 
         assert_eq!(
@@ -5278,8 +5856,7 @@ cp vmlinux arch/arm64/boot/Image
                 REPO,
                 BRANCH,
                 TTL,
-                "aarch64",
-                "glibc-2.39",
+                build_env("aarch64", "glibc-2.39"),
             ),
             Some(arm_path),
             "publishing x86 must not evict the ARM resolution manifest"
@@ -5291,8 +5868,7 @@ cp vmlinux arch/arm64/boot/Image
                 REPO,
                 BRANCH,
                 TTL,
-                "x86_64",
-                "glibc-2.39",
+                build_env("x86_64", "glibc-2.39"),
             ),
             Some(x86_path),
             "both exact binaries must remain available to offline launches"
@@ -5312,8 +5888,7 @@ cp vmlinux arch/arm64/boot/Image
                 "default",
                 REPO,
                 BRANCH,
-                "aarch64",
-                "glibc-2.39",
+                build_env("aarch64", "glibc-2.39"),
             )
             .unwrap()
             .is_none(),
@@ -5393,8 +5968,7 @@ cp vmlinux arch/arm64/boot/Image
                 "default",
                 REPO,
                 BRANCH,
-                std::env::consts::ARCH,
-                &libc_version_tag(),
+                FirecrackerBuildEnvironment::host(&libc_version_tag(), ""),
             )
             .unwrap(),
             Some(binary)
@@ -5417,8 +5991,7 @@ cp vmlinux arch/arm64/boot/Image
             REPO,
             BRANCH,
             PINNED_COMMIT,
-            std::env::consts::ARCH,
-            &libc_version_tag(),
+            FirecrackerBuildEnvironment::host(&libc_version_tag(), ""),
         );
         std::fs::write(&binary, b"pinned firecracker").unwrap();
         record_firecracker_resolution_in(dir, "default", REPO, BRANCH, PINNED_COMMIT, &binary);

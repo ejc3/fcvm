@@ -466,6 +466,7 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
 - For bridged: sudo, iptables, iproute2
 - For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set), and `net.ipv6.conf.all.forwarding=1` (fcvm refuses routed mode without it)
 - For rootfs build: qemu-utils, e2fsprogs
+- `fcvm setup` builds the static libseccomp pinned in `[libseccomp]` for the Firecracker build to link, into the assets directory; nothing is installed on the host
 
 **Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
 

@@ -64,6 +64,10 @@ pub struct Plan {
     /// src/setup/pasta.rs for the why and the robustness rules.
     #[serde(default)]
     pub pasta: Option<PastaConfig>,
+    /// Pinned libseccomp release, built as a static archive that every
+    /// Firecracker source build links (src/setup/libseccomp.rs).
+    #[serde(default)]
+    pub libseccomp: Option<super::libseccomp::LibseccompConfig>,
     /// Kernel profiles: kernel_profiles.{name}.{arch} = KernelProfile
     /// E.g., kernel_profiles.nested.arm64 = { kernel_version = "6.18", ... }
     #[serde(default)]
@@ -217,6 +221,13 @@ pub struct KernelProfile {
     /// of `firecracker_branch`
     #[serde(default)]
     pub firecracker_commit: Option<String>,
+
+    /// The `[libseccomp]` pin this profile's Firecracker is built against. Not a
+    /// profile key: config loading copies the section here, the way the default
+    /// profile gets `[firecracker]`, so setup and launch name one binary from the
+    /// profile alone.
+    #[serde(skip)]
+    pub firecracker_libseccomp: Option<super::libseccomp::LibseccompConfig>,
 
     /// Extra CLI args for firecracker
     #[serde(default)]
@@ -1152,6 +1163,7 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
     // A profile may override the VMM selection. Otherwise the explicit default
     // profile inherits the global Firecracker build just like every cold boot.
     apply_default_firecracker_config(&mut config);
+    apply_libseccomp_config(&mut config);
 
     let arch = config_arch();
     if config
@@ -1286,6 +1298,24 @@ fn apply_default_firecracker_config(plan: &mut Plan) {
             profile.firecracker_branch = Some(firecracker.branch.clone());
             profile.firecracker_commit = Some(firecracker.commit.clone());
         }
+    }
+}
+
+/// Give every kernel profile the `[libseccomp]` pin its Firecracker is built
+/// against.
+///
+/// The archive is linked into Firecracker's build script, which compiles the
+/// seccomp policy into the binary, so the pin is part of the binary's name
+/// (`compute_firecracker_sha_for_fields`). Setup and launch both name the binary
+/// from the profile, and a profile that carried no pin would name another one.
+fn apply_libseccomp_config(plan: &mut Plan) {
+    let libseccomp = plan.libseccomp.clone();
+    for profile in plan
+        .kernel_profiles
+        .values_mut()
+        .flat_map(|profiles| profiles.values_mut())
+    {
+        profile.firecracker_libseccomp = libseccomp.clone();
     }
 }
 
@@ -3119,6 +3149,44 @@ mod tests {
         )
         .expect_err("a [pasta] section with only repo and commit");
         assert!(error.to_string().contains("archive_sha256"), "{error}");
+    }
+
+    /// Setup builds a profile's Firecracker and launch resolves it, each from a
+    /// profile config loading handed out. Every profile carries the `[libseccomp]`
+    /// pin after a load, so the two name the same binary, and a profile key of that
+    /// name in the file is not read.
+    #[test]
+    fn every_profile_carries_the_libseccomp_pin_after_a_load() {
+        let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let pin = plan.libseccomp.clone().expect("[libseccomp] is configured");
+        assert!(
+            plan.kernel_profiles
+                .values()
+                .flat_map(|profiles| profiles.values())
+                .all(|profile| profile.firecracker_libseccomp.is_none()),
+            "a profile read a libseccomp pin of its own from the file"
+        );
+        apply_libseccomp_config(&mut plan);
+        let mut profiles = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            for (arch, profile) in arches {
+                assert_eq!(
+                    profile.firecracker_libseccomp.as_ref(),
+                    Some(&pin),
+                    "{name}.{arch}"
+                );
+                profiles += 1;
+            }
+        }
+        assert!(profiles > 0);
+
+        plan.libseccomp = None;
+        apply_libseccomp_config(&mut plan);
+        assert!(plan
+            .kernel_profiles
+            .values()
+            .flat_map(|profiles| profiles.values())
+            .all(|profile| profile.firecracker_libseccomp.is_none()));
     }
 
     /// A proxy that only tunnels (CONNECT) answers a plain-HTTP request with 405, so a

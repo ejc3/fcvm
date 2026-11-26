@@ -1305,7 +1305,9 @@ git clone https://github.com/ejc3/fuser.git
 
 # 7. Build + full setup (downloads released kernels, builds pasta + the
 #    firecracker fork, creates the rootfs; ~10 min on 64 cores when the kernel
-#    releases exist, plus a local kernel build when one does not)
+#    releases exist, plus a local kernel build when one does not). Setup also
+#    builds the static libseccomp pinned in [libseccomp] for the Firecracker
+#    build to link, into the assets directory; nothing is installed on the host.
 cd ~/src/fcvm && make build && make setup-fcvm
 ```
 

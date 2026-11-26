@@ -122,6 +122,17 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         println!("  ✓ Pasta ready: {}", path.display());
     }
 
+    // Build the pinned libseccomp if configured in [libseccomp] section: the
+    // static archive every Firecracker source build below links (see
+    // src/setup/libseccomp.rs). A Firecracker build makes it too when it is
+    // missing; here it is a step of its own, with its own line.
+    if let Some(path) = crate::setup::ensure_libseccomp(config.libseccomp.as_ref())
+        .await
+        .context("setting up libseccomp")?
+    {
+        println!("  ✓ libseccomp ready: {}", path.display());
+    }
+
     // Build default Firecracker if configured in [firecracker] section
     // The [firecracker] config is applied to explicit default profiles at load time.
     if config.firecracker.is_some() {

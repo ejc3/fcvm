@@ -90,19 +90,43 @@ class FirecrackerIdentity(unittest.TestCase):
 
     PIN = ('[firecracker]\nrepo = "ejc3/firecracker"\n'
            'branch = "agent/uffd-minor"\ncommit = "' + "8" * 40 + '"\n')
+    LIBSECCOMP = {"version": "2.6.1", "archive_sha256": "ab" * 32}
+    LIBSECCOMP_PIN = ('[libseccomp]\nversion = "2.6.1"\n'
+                      'archive_sha256 = "' + "ab" * 32 + '"\narchives = []\n')
+
+    def named(self, libseccomp):
+        return reqbench.firecracker_build_name(
+            "default", "ejc3/firecracker", "agent/uffd-minor", "8" * 40,
+            "aarch64", "libc-2.39", libseccomp)
 
     def test_a_binary_named_for_the_pin_records_the_commit(self):
-        name = reqbench.firecracker_build_name(
-            "default", "ejc3/firecracker", "agent/uffd-minor", "8" * 40,
-            "aarch64", "libc-2.39")
         with tempfile.TemporaryDirectory() as d:
-            binary = write(d, name, "firecracker bytes")
+            binary = write(d, self.named(""), "firecracker bytes")
             record = reqbench.firecracker_identity(binary, self.PIN, "aarch64", "libc-2.39")
         self.assertEqual(record, {
             "binary": binary, "sha256": hashlib.sha256(b"firecracker bytes").hexdigest(),
             "repo": "ejc3/firecracker", "branch": "agent/uffd-minor", "commit": "8" * 40,
             "commit_matches_binary": True,
         })
+
+    def test_the_name_carries_the_libseccomp_the_build_linked(self):
+        """A config with a [libseccomp] table names another binary than one
+        without: fcvm setup builds Firecracker against that archive, and the
+        archive's name is a field of the binary's."""
+        identity = reqbench.libseccomp_identity(self.LIBSECCOMP, "aarch64", "libc-2.39")
+        self.assertNotEqual(self.named(identity), self.named(""))
+        self.assertEqual(reqbench.libseccomp_identity(None, "aarch64", "libc-2.39"), "")
+        config = self.PIN + self.LIBSECCOMP_PIN
+        with tempfile.TemporaryDirectory() as d:
+            pinned = write(d, self.named(identity), "x")
+            host = write(d, self.named(""), "x")
+            matches = {
+                (binary == pinned, text == config):
+                reqbench.firecracker_identity(
+                    binary, text, "aarch64", "libc-2.39")["commit_matches_binary"]
+                for binary in (pinned, host) for text in (config, self.PIN)}
+        self.assertEqual(matches, {(True, True): True, (False, False): True,
+                                   (True, False): False, (False, True): False})
 
     def test_a_binary_built_from_anything_else_records_no_commit(self):
         with tempfile.TemporaryDirectory() as d:
@@ -112,14 +136,16 @@ class FirecrackerIdentity(unittest.TestCase):
         self.assertFalse(record["commit_matches_binary"])
         self.assertEqual(record["sha256"], hashlib.sha256(b"x").hexdigest())
 
-    def test_the_known_build_name(self):
-        """The binary `fcvm setup` built for rootfs-config.toml's pin on an
-        aarch64 Ubuntu 24.04 host (glibc 2.39), observed on 2026-10-22."""
-        self.assertEqual(
-            reqbench.firecracker_build_name(
-                "default", "ejc3/firecracker", "agent/uffd-minor-v1.17.0-discard-dirty",
-                "8819f112ad79ad3efb1b4717c1175229fd21b3cb", "aarch64", "libc-2.39"),
-            "firecracker-default-0834213edfce.bin")
+    def test_the_name_fcvm_gives_these_fields(self):
+        """The names fcvm's own tests hold for the same fields:
+        the_content_hash_is_the_one_the_bench_harness_computes in
+        src/setup/libseccomp.rs and
+        the_firecracker_binary_name_is_the_one_the_bench_harness_computes in
+        src/setup/kernel.rs."""
+        identity = reqbench.libseccomp_identity(self.LIBSECCOMP, "aarch64", "libc-2.39")
+        self.assertEqual(identity, "22445fa649f2")
+        self.assertEqual(self.named(identity), "firecracker-default-bfa6c545b763.bin")
+        self.assertEqual(self.named(""), "firecracker-default-dc3c73e0fee4.bin")
 
     def test_the_repository_config_pins_a_commit(self):
         with open(os.path.join(REPO, "rootfs-config.toml"), "rb") as handle:
@@ -135,12 +161,26 @@ class FirecrackerBuildNamePin(unittest.TestCase):
         with open(os.path.join(REPO, "src", "setup", "kernel.rs")) as handle:
             source = handle.read()
         for needle in (
-            'hasher.update(b"fcvm-firecracker-cache-v2\\0");',
-            "for field in [repo, branch, commit_hash, arch, libc_tag] {",
+            'hasher.update(b"fcvm-firecracker-cache-v3\\0");',
+            "for field in [repo, branch, commit_hash, arch, libc_tag, libseccomp] {",
             "hasher.update((field.len() as u64).to_le_bytes());",
             "hex::encode(&result[..6])",
             'dir.join(format!("firecracker-{profile_name}-{sha}.bin"))',
             'return format!("libc-{}", ver);',
+        ):
+            self.assertIn(needle, source)
+
+    def test_the_rust_side_names_libseccomp_the_way_the_harness_reads_it(self):
+        with open(os.path.join(REPO, "src", "setup", "libseccomp.rs")) as handle:
+            source = handle.read()
+        arguments = ", ".join(f'"{argument}"' for argument in
+                              reqbench.LIBSECCOMP_CONFIGURE_ARGS)
+        for needle in (
+            'hasher.update(b"fcvm-libseccomp-v1\\0");',
+            f"const CONFIGURE_ARGS: &[&str] = &[{arguments}];",
+            "for field in fields.into_iter().chain(CONFIGURE_ARGS.iter().copied()) {",
+            "hasher.update((field.len() as u64).to_le_bytes());",
+            "hex::encode(&hasher.finalize()[..6])",
         ):
             self.assertIn(needle, source)
 

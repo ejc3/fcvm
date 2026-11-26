@@ -85,6 +85,7 @@ const STORE_BUILDERS: &[(&str, &str)] = &[
     ("src/setup/kernel.rs", "download_kernel_binary"),
     ("src/setup/kernel.rs", "build_kernel_locally"),
     ("src/setup/kernel.rs", "ensure_cloud_hypervisor"),
+    ("src/setup/libseccomp.rs", "build_and_publish"),
     ("src/commands/podman/image.rs", "build_storage_image"),
     ("src/commands/podman/mod.rs", "export_localhost_image_disk"),
 ];
@@ -126,6 +127,7 @@ fn no_setup_source_builds_a_fixed_temp_name() {
         "src/setup/rootfs.rs",
         "src/setup/kernel.rs",
         "src/setup/pasta.rs",
+        "src/setup/libseccomp.rs",
         "src/setup/nvidia.rs",
         "src/setup/storage.rs",
     ] {

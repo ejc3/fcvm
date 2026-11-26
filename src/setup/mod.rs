@@ -1,13 +1,14 @@
 pub mod kernel;
+pub mod libseccomp;
 pub mod nvidia;
 pub mod pasta;
 pub mod rootfs;
 pub mod storage;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use nix::fcntl::{Flock, FlockArg, OFlag};
 use std::path::Path;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// The user who invoked sudo, resolved from SUDO_USER via passwd.
 ///
@@ -54,8 +55,8 @@ fn open_store_entry_nofollow(path: &Path) -> nix::Result<std::os::fd::OwnedFd> {
 
 /// Hand a content-addressed store entry back to the user who invoked sudo.
 ///
-/// The stores under assets_dir (kernels, pasta, firecracker, cloud-hypervisor,
-/// initrd, rootfs, cache; the list lives in src/paths.rs and in
+/// The stores under assets_dir (kernels, pasta, libseccomp, firecracker,
+/// cloud-hypervisor, initrd, rootfs, cache; the list lives in src/paths.rs and in
 /// scripts/normalize-store-ownership.sh) belong to the operator; root only
 /// writes there on the operator's behalf (`sudo fcvm setup`). Anything root
 /// leaves behind blocks the next rootless run from writing: a failed root
@@ -353,12 +354,78 @@ pub(crate) async fn lock_store_dir(lock_path: &Path, what: &str) -> Result<Flock
     }
 }
 
+/// Delay before the second attempt of an archive download; it doubles for the third.
+pub(crate) const ARCHIVE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Download a pinned source archive to `dest` from the first of `urls` that
+/// serves bytes with `sha256`. `what` names the archive in the error (pasta,
+/// libseccomp). Each URL gets three attempts, `retry_delay` apart (doubling),
+/// so one dropped TLS handshake costs a retry, not the setup (#1008). The
+/// checksum decides what is built, never the host it came from. The download
+/// runs as the sudo invoker, like the build that reads it.
+pub(crate) async fn fetch_verified_archive(
+    what: &str,
+    urls: &[String],
+    sha256: &str,
+    dest: &Path,
+    retry_delay: std::time::Duration,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut failures = Vec::new();
+    for url in urls {
+        let mut delay = retry_delay;
+        for attempt in 1..=3 {
+            let download = run_build_as_sudo_invoker(tokio::process::Command::new("curl").args([
+                "-fsSL",
+                "--connect-timeout",
+                "20",
+                "--max-time",
+                "600",
+                "-o",
+            ]))
+            .arg(dest)
+            .arg(url)
+            .output()
+            .await
+            .context("running curl (is curl installed?)")?;
+            let outcome = if !download.status.success() {
+                format!(
+                    "curl {}: {}",
+                    download.status,
+                    String::from_utf8_lossy(&download.stderr).trim()
+                )
+            } else {
+                let bytes = tokio::fs::read(dest)
+                    .await
+                    .with_context(|| format!("reading {}", dest.display()))?;
+                let got = hex::encode(Sha256::digest(&bytes));
+                if got == sha256 {
+                    return Ok(());
+                }
+                format!("sha256 {got}, want {sha256}")
+            };
+            debug!(what, url, attempt, outcome, "source archive attempt failed");
+            failures.push(format!("{url} (attempt {attempt}): {outcome}"));
+            let _ = tokio::fs::remove_file(dest).await;
+            if attempt < 3 {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+    }
+    bail!(
+        "no source served the pinned {what} archive (sha256 {sha256}):\n  {}",
+        failures.join("\n  ")
+    )
+}
+
 pub use kernel::{
     ensure_cloud_hypervisor, ensure_kernel, ensure_profile_firecracker,
     get_configured_firecracker_for_profile, get_firecracker_for_profile, get_kernel_path,
     get_kernel_url_hash, get_profile_firecracker_path, install_host_kernel,
     newest_cached_cloud_hypervisor, rebuild_kernel_from_source,
 };
+pub use libseccomp::{ensure_libseccomp, libseccomp_dir_for_config, LibseccompConfig};
 pub use nvidia::{
     ensure_nvidia_driver_image, get_nvidia_driver_image_path, profile_module_type,
     profile_nvidia_driver_image, ModuleType,
@@ -606,5 +673,55 @@ mod store_ownership_tests {
             .unwrap();
         assert!(!staged.exists());
         assert_eq!(std::fs::read(&dest).unwrap(), b"bytes");
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// One archive, two sources: the first does not answer (or serves other
+    /// bytes) and the second serves the pinned archive. The fetch takes the
+    /// second, and fails only when no source serves the pinned bytes (#1008).
+    #[tokio::test]
+    async fn a_source_archive_falls_through_to_the_next_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.tar.xz");
+        let other = dir.path().join("other.tar.xz");
+        std::fs::write(&good, b"the pinned archive").unwrap();
+        std::fs::write(&other, b"some other archive").unwrap();
+        let sha = hex::encode(Sha256::digest(b"the pinned archive"));
+        let url = |path: &Path| format!("file://{}", path.display());
+        let absent = url(&dir.path().join("absent.tar.xz"));
+        let dest = dir.path().join("dest.tar.xz");
+        let no_wait = std::time::Duration::ZERO;
+
+        for first in [absent.clone(), url(&other)] {
+            fetch_verified_archive("pasta", &[first.clone(), url(&good)], &sha, &dest, no_wait)
+                .await
+                .unwrap_or_else(|e| panic!("{first} then the pinned archive: {e:#}"));
+            assert_eq!(std::fs::read(&dest).unwrap(), b"the pinned archive");
+        }
+
+        let err = fetch_verified_archive(
+            "pasta",
+            &[absent.clone(), url(&other)],
+            &sha,
+            &dest,
+            no_wait,
+        )
+        .await
+        .expect_err("no source served the pinned archive");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&absent) && text.contains("other.tar.xz") && text.contains("pasta"),
+            "{text}"
+        );
+        assert!(
+            !dest.exists(),
+            "a rejected download was left at {}",
+            dest.display()
+        );
     }
 }
