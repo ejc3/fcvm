@@ -315,6 +315,19 @@
                 ]
             },
             {
+                "syscall": "ioctl",
+                "comment": "KVM_ARM_SET_COUNTER_OFFSET, used to keep the guest counter coherent across pause/resume",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 1074835125,
+                        "comment": "KVM_ARM_SET_COUNTER_OFFSET"
+                    }
+                ]
+            },
+            {
                 "syscall": "mmap",
                 "comment": "Used for reading the timezone in LocalTime::now()",
                 "args": [

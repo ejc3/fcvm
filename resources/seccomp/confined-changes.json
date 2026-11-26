@@ -1,7 +1,7 @@
 {
     "fork": {
         "repo": "ejc3/firecracker",
-        "commit": "df341d66cfef596c957d4ebd0865d6f39b787784",
+        "commit": "96d35ac08e49bdb3b88d26109e054fa314f5804d",
         "files": "resources/seccomp/fork-<arch>-unknown-linux-musl.json, the fork's resources/seccomp/<arch>-unknown-linux-musl.json at that commit"
     },
     "remove": [

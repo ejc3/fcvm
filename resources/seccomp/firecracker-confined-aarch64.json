@@ -1232,6 +1232,19 @@
             {
                 "args": [
                     {
+                        "comment": "KVM_ARM_SET_COUNTER_OFFSET",
+                        "index": 1,
+                        "op": "eq",
+                        "type": "dword",
+                        "val": 1074835125
+                    }
+                ],
+                "comment": "KVM_ARM_SET_COUNTER_OFFSET, used to keep the guest counter coherent across pause/resume",
+                "syscall": "ioctl"
+            },
+            {
+                "args": [
+                    {
                         "comment": "libc::MAP_SHARED",
                         "index": 3,
                         "op": "eq",

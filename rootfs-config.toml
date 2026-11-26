@@ -132,12 +132,30 @@ archives = [
 #   phone and nested amd64 profiles pin the same fix on their own branches, and
 #   every_x86_64_firecracker_pin_kicks_runnable_vcpus_on_restore fails when one
 #   of these pins moves to a commit that is not listed as carrying it.
+# - on x86_64 a snapshot holds each vCPU's nested virtualization state
+#   (KVM_GET_NESTED_STATE). Without it a restored guest that runs KVM itself
+#   comes back outside VMX operation and its own VMs never start (#664). Only
+#   the nested profile's guests use it;
+# - on arm64 the VMM owns the VM's counter offset: the guest's counter starts at
+#   zero at boot, goes on at a snapshot load from where it stopped when its
+#   source was paused, however long the save took and however long the VM stays
+#   loaded before its resume, and stands still while the VM is paused, so a
+#   snapshot create does not move the source's clock (#2173);
+# - on arm64 a snapshot with dirty tracking empties KVM's dirty logs a slot at a
+#   time, where KVM_GET_DIRTY_LOG write-protects every nested stage-2 MMU once
+#   per 64 dirty pages;
+# - on arm64 --enable-nv2 gives the guest a virtual EL2 (the nested profile
+#   passes it), and a snapshot holds a guest hypervisor's ICH_*_EL2 registers,
+#   without which a snapshot taken while an inner VM runs restores that VM with
+#   its interrupts masked (#2179). Upstream documents nested virtualization as
+#   unsupported.
 # A snapshot load's drive_overrides is upstream's own on this base
 # (firecracker#6402); a clone opens its own disks through it.
 # `--version` names what fcvm reads before it uses a field or flag:
 # +fcvm.drive-overrides.numa-window.write-set.tap-fd.pagemap-dirty.
 # Snapshots: upstream's format is 13.0.0, and the chain ends every state file
-# with a mark of its own layout, checked before anything is decoded. A file
+# with a mark of its own layout (4 at this commit), checked before anything is
+# decoded. A file
 # without the mark, which is every file an earlier build wrote (formats 10, 12
 # and the nested builds' 13), and a file of another layout are refused with
 # "Invalid data version". A restore uses the binary the snapshot recorded
@@ -157,8 +175,8 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "wip/fcvm-base-2a8d0138"
-commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
+branch = "wip/fcvm-base-2a8d0138-nv2-r2"
+commit = "96d35ac08e49bdb3b88d26109e054fa314f5804d"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
@@ -556,20 +574,9 @@ patches_dir = "kernel/patches-arm64"
 # Base config for VM kernel (Firecracker's microvm config)
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 
-# Firecracker fork: diff snapshot fix + NV2 nested virt (ARM64)
-# PR: https://github.com/firecracker-microvm/firecracker/pull/5696
-# nv2-on-main plus a Full snapshot that leaves never-written guest memory as
-# holes instead of reading it, which would map it to the zero page and make
-# the resumed guest's first write to each page a copy-on-write (#1264), and a
-# dirty log reset that turns logging off and on instead of KVM_GET_DIRTY_LOG,
-# which write-protects every nested stage-2 MMU once per 64 dirty pages, and a
-# restore kick that replays the vsock TX queue notification, as the default
-# build's does: a TX descriptor the guest published just before the pause is in
-# the snapshot but its notification is not, and under EVENT_IDX the guest never
-# notifies again, so the clone never reached the host over vsock (#1207).
-firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "fix/vsock-restore-tx-kick-nv2"
-firecracker_commit = "dbea5779fb3777e5f237e8cc1d0d15e4e1d22448"
+# The [firecracker] build with --enable-nv2: the guest gets a virtual EL2
+# (KVM_ARM_VCPU_HAS_EL2, VHE), boots at EL2h with PSCI over SMC, and the vsock
+# handlers execute DSB SY before they read a queue.
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM
@@ -625,16 +632,9 @@ patches_dir = "kernel/patches-x86"
 # Base config for VM kernel (Firecracker's microvm config)
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/7614ab4d258ad66eee72a34f2fbf3712c3664c65/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
-# The default fork plus the vCPU's nested virtualization state in snapshots
-# (ejc3/firecracker#23, on the default branch's pinned commit). Without it a
-# restored L1 comes back outside VMX operation and its L2 never starts, which
-# kept the x86_64 L2 tests off the SnapshotEnabled runners (#664).
-# The pin adds the paravirtual kick a snapshot load gives every runnable vCPU (#2131, see
-# [firecracker]).
+# Runs the [firecracker] build, whose snapshots hold the vCPU's nested
+# virtualization state.
 # No special boot_args needed for x86.
-firecracker_repo = "ejc3/firecracker"
-firecracker_branch = "agent/uffd-minor-v1.17.0-nested-state-pv-kick-restore"
-firecracker_commit = "af888e7aec38fe4727fd75878aaed017a3113028"
 
 # Host kernel configuration for x86 nested profile
 # Uses the running kernel's config (/boot/config-$(uname -r)) as base,

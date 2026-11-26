@@ -3652,13 +3652,11 @@ branch = "agent/nv2"
     /// x86_64 profile builds. KVM holds a spinlock kick that is pending for a runnable vCPU
     /// in a flag no ioctl reads, so a snapshot does not hold it, and a clone restored
     /// without the kick can halt a vCPU with interrupts off for good (#2131).
-    const RESTORE_KICK_COMMITS: [&str; 3] = [
-        // [firecracker]: the default, btrfs and mountinfo profiles.
-        "df341d66cfef596c957d4ebd0865d6f39b787784",
+    const RESTORE_KICK_COMMITS: [&str; 2] = [
+        // [firecracker]: the default, btrfs, mountinfo and nested profiles.
+        "96d35ac08e49bdb3b88d26109e054fa314f5804d",
         // gpu.amd64 and phone.amd64.
         "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
-        // nested.amd64.
-        "af888e7aec38fe4727fd75878aaed017a3113028",
     ];
 
     /// A pin that moves to a commit without the restore kick brings #2131 back with no test
