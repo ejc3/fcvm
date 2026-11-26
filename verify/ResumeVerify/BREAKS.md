@@ -10,14 +10,14 @@ where one could be.
 | # | Cause | Rule books | Tests | Class | Severity |
 |---|---|---|---|---|---|
 | 1 | The save reads vCPU 0's redistributor and CPU interface for every vCPU of a booted VM | `cloud-hypervisor` | R1 lostIpi, R2 stuckActive, stuckPriority, strayPending, strayEnable, R3 spins, timerLoops; a lost LPI (read) | real, reachable | high: a clone's vCPU that never takes an interrupt again |
-| 2 | Clear-registers written with the saved bits | `cloud-hypervisor`, every fork pin | R2 strayEnable | real, reachable | low |
-| 3 | No `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` | all of today's | R1 lostDeviceIrq | real, unreachable: no device of either VMM under fcvm holds a level line | none today |
+| 2 | Clear-registers written with the saved bits | `cloud-hypervisor`, every fork pin (not `fork-rebase`) | R2 strayEnable | real, reachable | low |
+| 3 | No `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` | all of today's, `fork-rebase` included | R1 lostDeviceIrq | real, unreachable: no device of either VMM under fcvm holds a level line | none today |
 | 4 | Nothing owns the counter offset: a pause in place moves the clock | every `cloud-hypervisor` book, `fork-default`, `fork-before-630` | R4 clockOff | real, reachable | low for an ordinary guest; #630 for a guest hypervisor |
 | 4a | `clock_restore_mode=advance`: a restore adds the wall time since the pause | `cloud-hypervisor-upstream-advance` | R4 clockOffClone | real; unreachable if fcvm passes `preserve` | by design upstream; every armed timer due at once in an old snapshot's clone |
 | 5 | `CNTVCT_EL0` replayed into the physical offset with `CNTVOFF_EL2` not zero | `fork-before-630` | R4 clockOff, R1 timerCannotFire | real, unreachable today: the nested pin sets the offset first | was high |
-| 6 | The image holds the counter of the save; load to resume is not taken out | `fork-nested` (and every book of 4 but upstream Cloud Hypervisor) | R4 clockOff | real, reachable, bounded by fcvm's own latency | low |
+| 6 | The image holds the counter of the save; load to resume is not taken out | `fork-nested`, `fork-rebase` (and every book of 4 but upstream Cloud Hypervisor) | R4 clockOff | real, reachable, bounded by fcvm's own latency | low |
 | 7 | CPU-interface registers passed as 32 bits | `cloud-hypervisor` | not modelled | real, reachable | no value changed on the write side; an overrun of four bytes on every read |
-| 8 | A guest hypervisor's `ICH_*_EL2` registers are not in the image | every fork pin | R2 lostNestedMask; lost nested interrupts (read) | real, reachable: a nested-profile VM snapshotted while an inner VM runs | high for that inner VM: a nested vCPU that takes no interrupt again |
+| 8 | A guest hypervisor's `ICH_*_EL2` registers are not in the image | every fork pin (not `fork-rebase`) | R2 lostNestedMask; lost nested interrupts (read) | real, reachable: a nested-profile VM snapshotted while an inner VM runs | high for that inner VM: a nested vCPU that takes no interrupt again |
 
 Not breaks, reported by the search as `-- sourceKicked`: what today's VMMs write to a paused
 source. Section 9.
@@ -335,6 +335,87 @@ kind as `-- sourceKicked`.
 - Nothing else on either VMM's pause, save or resume writes to KVM: the vGIC and vCPU saves
   are reads, and `KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES` and the ITS table save write guest
   memory.
+
+## 10. The fork re-based on upstream main
+
+`fork-rebase` is ejc3/firecracker 139f0e595157 (branch wip/fcvm-base-2a8d0138-nv2), read at
+that commit; its code had not run on a box when this was written. It is meant to become the
+behaviour of every arm64 pin, so it runs in all eight configurations. The lines are in the doc
+comment of `Today.forkRebase`.
+
+**What it keeps.** R2, R3 and R6 in every configuration searched, with break 2 and break 8
+gone; R5 proved (`today_r5_forkRebase`); R1 but for break 3; R4 but for break 6.
+
+**How it differs from `design-firecracker`** (`forkRebase_vs_design`, by `rfl`): three rules
+and the place of one request.
+
+| Difference | Rule | Break | What closes it |
+|---|---|---|---|
+| The image holds `CNTPCT_EL0` as read at the save (vcpu.rs:238), which comes after the devices are saved (lib.rs:631) and after whatever the caller does between its pause and its snapshot request | `cntAtPause` | 6, pause to save: R4 clockOff@5 in `lags` and `nv-lags` | the VMM knows the guest's counter at the pause without reading it: `paused_at_counter - counter_offset` (lib.rs:337-340). Use that at the load in place of vCPU 0's saved register |
+| A VM built from a snapshot has `paused_at_counter: None` (builder.rs:725-726), so its first resume moves the offset by nothing (lib.rs:546-555) | `freezeLoaded` | 6, load to resume | keep the host counter read for the load's offset (builder.rs:627) and store it as `paused_at_counter` when the ioctl succeeded |
+| No `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` | `levelInfo` | 3: R1 lostDeviceIrq@4 in `level` | `REPAIRS.md`, 4. No device under fcvm holds a level line today |
+| `KVM_ARM_SET_COUNTER_OFFSET` comes after the vCPUs and the vGIC are made, where the design has it first | the order of `restore` | none | nothing to close: `Design.forkRebaseRepaired_sound` proves the three repairs sound in the fork's own order |
+
+With the first three, `forkRebase_repaired` proves R1 to R6 for every configuration.
+
+**The load-to-resume gap.** It is break 6's second half, unchanged from the nested pin. The
+ioctl of a load is issued before the vCPU registers are replayed (builder.rs:618-646 against
+651-664), so the guest's counter runs through the rest of the load (register replay, vGIC,
+device restore, vCPU threads), and under fcvm through `patch_drive`, the balloon request and
+read and the `restore.post_network_pre_resume` failpoint, up to the `Resumed` request
+(fcvm src/commands/common.rs:4315-4440 at 9a90c5242). A load with `resume_vm: true` still has
+the first part. The clone's clock is ahead by that much. fcvm logs the three durations
+(`snapshot load completed`, `disk patch completed`, `balloon target settled`); their sum is an
+upper bound. Committed figures for the load alone run from 6 ms for load and resume of a small
+guest (PERFORMANCE.md, "snapshot load + resume") to 3.4 to 6.9 s for the GPU guests of
+DESIGN.md, whose load attaches the GPU. Where that attach sits against the ioctl was not
+determined, and nothing here was measured for this note.
+
+`forkRebase_loadLag` is the run (pause, save, restore, host time passes, resume: the clone's
+clock is off, for an ordinary guest and a guest hypervisor). `forkRebaseLoadRecorded_loadLag`:
+with the pause recorded at the load the same run leaves the clock right. It has to be the
+counter read the offset was computed from: a second read where the `Vmm` is built would leave
+the register replay, the vGIC and the device restore in the clock.
+`forkRebaseLoadRecorded_saveLag`: that change does not close the other half, which needs the
+first row of the table.
+
+**`ICH_*_EL2` (break 8).** Closed by the model's rule (`nestedIcc`: R2 lostNestedMask is gone
+in `nv-l2`) and, by reading, in the kernel: `vgic_v3_create_shadow_state` builds a nested
+guest's interface from `ICH_HCR_EL2`, `ICH_VMCR_EL2`, the list registers and the active
+priority registers at every load (vgic/vgic-v3-nested.c:248-269, 323-361), and
+`vgic_v3_sync_nested` and `vgic_v3_put_nested` write them back at every exit and put (278-321,
+363-382), so with the vCPUs out of `KVM_RUN` those are all of it. The maintenance interrupt is
+not lost with its line: KVM computes it from `ICH_HCR_EL2` and the list registers at every
+entry and exit of such a vCPU (vgic/vgic.c:1087-1088, 1172-1173). The order among the
+registers and against the redistributor does not matter: the setters store the value and
+touch nothing else (vgic-sys-reg-v3.c:300-305, 314-323), and the request goes through the
+vGIC device, which loads no vCPU.
+
+A list register cannot double an interrupt of the redistributor. The list registers saved here
+are the guest hypervisor's, and they hold its nested guest's interrupts; the redistributor's
+pending and active bits are the guest hypervisor's own. The one place the two meet is a list
+register with the HW bit, which names one of the guest hypervisor's own interrupts (its nested
+guest's timer): that interrupt is active in the redistributor while it is pending or active in
+the list register, by the architecture, and both halves are in the image.
+
+Two limits. A guest hypervisor on a host kernel whose vGIC does not list these registers is
+saved without them and nothing says so (`has_ich_regs` turns every refusal into "none",
+icc_regs.rs:214-218). And the model has one bit for all of this (`Vcpu.ichv`): that the list
+registers and active priorities are carried is read, not modelled.
+
+**The dirty log.** With `KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2` the take copies each slot's log
+and then turns `KVM_MEM_LOG_DIRTY_PAGES` off and on for the slot
+(src/vmm/src/vstate/vm.rs:665-711). That writes nothing R5 is about: no vCPU's interrupt,
+timer or power state and no interrupt of a device. The model has no request for it and
+`onSave` is unchanged. What it changes is stage-2 write protection and KVM's log, which a
+guest sees only as write faults after it runs again, and the end state is the one
+`KVM_GET_DIRTY_LOG` left before: every page of the slot write-protected and an empty log. By
+reading, no page can be dirtied through KVM between the copy and the reset: KVM marks pages
+from a vCPU's context (a stage-2 write fault, stolen time at a vCPU load) and from the vGIC's
+table saves, the vCPUs answer a state save only while paused (src/vmm/src/vstate/vcpu.rs:290-
+291), and the state save, which holds every vCPU and vGIC request, comes before the memory
+(src/vmm/src/persist.rs:251-269). The take has no other caller. This is about the contents of
+a later diff snapshot, which the model does not cover.
 
 ## Also read, and found sound
 

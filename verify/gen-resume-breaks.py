@@ -20,6 +20,7 @@ BOOK = {
     "fork-default": ("Today.forkDefault", "fork", "Design.firecracker"),
     "fork-before-630": ("Today.forkBefore630", "before630", "Design.firecracker"),
     "fork-nested": ("Today.forkNested", "nested", "Design.firecracker"),
+    "fork-rebase": ("Today.forkRebase", "rebase", "Design.firecracker"),
 }
 CFG = {"plain": "plain", "level": "level", "offline": "offline", "dump": "dump", "lags": "lags",
        "nv-dump": "nvDump", "nv-l2": "nvL2", "nv-lags": "nvLags"}

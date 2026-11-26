@@ -174,6 +174,61 @@ def forkNested : Rules :=
     advance := false, levelInfo := false, clearInverted := false,
     nestedIcc := false, onSave := [.devEvent], onResume := [.kick], restore := fcOrder true }
 
+/-- The fork re-based on upstream main, ejc3/firecracker 139f0e595157 (branch
+wip/fcvm-base-2a8d0138-nv2: upstream 2a8d0138cdf9, the default chain to 9e4961dad6ab, and five
+commits). Read at that commit; written, not yet run. Its counter and vGIC code is not behind
+`--enable-nv2`, so it is the rule book of an ordinary guest and of a guest hypervisor.
+
+* Addressing as every pin of the fork: each vCPU's redistributor and CPU interface by that
+  vCPU's saved MPIDR (`construct_kvm_mpidrs`, src/vmm/src/lib.rs:932-940, 647-651).
+* The clear-registers are written with the complement of the saved value
+  (src/vmm/src/arch/aarch64/gic/regs.rs:139-151; `clears_on_write`,
+  gicv3/regs/redist_regs.rs:66, dist_regs.rs:120): 9e4961dad6ab, `clearInverted`.
+* A guest hypervisor's `ICH_HCR_EL2`, `ICH_VMCR_EL2`, `ICH_LR0..15_EL2` and the
+  `ICH_AP0Rn_EL2`/`ICH_AP1Rn_EL2` its priority bits allow are read where the `ICC_*` registers
+  are, when `KVM_HAS_DEVICE_ATTR` finds `ICH_HCR_EL2` for that MPIDR, and written after them
+  (gicv3/regs/icc_regs.rs:39-72, 188-202, 214-218, 243-270): `nestedIcc`. KVM answers that
+  attribute for a vCPU with a virtual EL2 only (v7.3.3 vgic-sys-reg-v3.c:366-370, 461-472),
+  bounds the active-priority index as it does for `ICC_APxRn_EL1` (314-335), and its setters
+  store the value and nothing else (300-305).
+* The image's counter is the one read at the save: `save_state` reads every register of the
+  list (src/vmm/src/arch/aarch64/vcpu.rs:233-240), and a pause does not move the offset
+  (`cntAtPause := false`).
+* `pause_vm` records the host counter after the vCPUs are parked, once
+  (src/vmm/src/lib.rs:568-581); `resume_vm` moves the offset on by the host time since, before
+  the devices are kicked and the vCPUs run (lib.rs:543-558): `freeze`. A VM built from a
+  snapshot starts with `paused_at_counter: None` (src/vmm/src/builder.rs:725-726), so its first
+  resume moves nothing and the host time since the ioctl of the load is in its counter
+  (`freezeLoaded := false`). At a boot the offset is the host counter (builder.rs:389-403).
+* No request for `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` anywhere under src/vmm/src.
+* The save still publishes the vsock reset in the source's event queue and raises its
+  interrupt (src/vmm/src/devices/virtio/vsock/device.rs:258-290, 479-487): `.devEvent`. A
+  resume raises that queue's interrupt only while the event waits for the guest
+  (device.rs:436-457), as the default pin does.
+* A load: every vCPU made and the vGIC after them (`create_vcpus`,
+  src/vmm/src/vstate/vm.rs:292-308; src/vmm/src/arch/aarch64/vm.rs:103-109), then
+  `KVM_ARM_SET_COUNTER_OFFSET` with the host counter less vCPU 0's saved `CNTPCT_EL0`
+  (builder.rs:618-646), then for each vCPU its `KVM_ARM_VCPU_INIT`, its registers in the saved
+  order and `KVM_SET_MP_STATE` (builder.rs:651-656; vcpu.rs:270-300), then the distributor and
+  per vCPU its redistributor and its CPU interface (builder.rs:662-664;
+  gicv3/regs/mod.rs:44-58), then the devices. `KVM_ARM_VCPU_INIT` is issued after the ioctl,
+  not before it; it resets no offset (v7.3.3 arch_timer.c `kvm_timer_vcpu_reset`). This is
+  `fcOrder true`.
+* This is the path on which the ioctl succeeds and the snapshot was made by a VM this build
+  booted or restored, whose two saved counters are equal. A failed ioctl or an image with no
+  `CNTPCT_EL0` is logged and leaves the counters to the register replay (builder.rs:625-645).
+  A snapshot of an earlier layout is refused (src/vmm/src/snapshot/mod.rs:82-84). -/
+def forkRebase : Rules :=
+  { name := "fork-rebase",
+    slotsFromRestore := false, cntAtPause := false, freeze := true, freezeLoaded := false,
+    advance := false, levelInfo := false, clearInverted := true,
+    nestedIcc := true, onSave := [.devEvent], onResume := [], restore := fcOrder true }
+
+/-- `forkRebase` with the pause recorded at the load: the host counter read for the offset of
+the load kept as `paused_at_counter`, so that the first resume takes out the time since. -/
+def forkRebaseLoadRecorded : Rules :=
+  { forkRebase with name := "fork-rebase-load-recorded", freezeLoaded := true }
+
 end Today
 
 end Resume

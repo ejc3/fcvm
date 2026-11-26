@@ -120,10 +120,12 @@ partial def pathTo (f : Found) (i : Nat) : List Label :=
       go p (labels[li]! :: acc)
   go i []
 
-def nvBooks : List Rules := [Today.forkBefore630, Today.forkNested, Design.firecracker]
+def nvBooks : List Rules :=
+  [Today.forkBefore630, Today.forkNested, Today.forkRebase, Design.firecracker]
 def elBooks : List Rules :=
   [Today.cloudHypervisor, Today.cloudHypervisorRepin, Today.cloudHypervisorUpstream false,
-   Today.cloudHypervisorUpstream true, Today.forkDefault, Design.cloudHypervisor, Design.firecracker]
+   Today.cloudHypervisorUpstream true, Today.forkDefault, Today.forkRebase, Design.cloudHypervisor,
+   Design.firecracker]
 
 def booksFor (C : Cfg) : List Rules := if C.nv then nvBooks else elBooks
 

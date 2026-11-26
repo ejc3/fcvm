@@ -8,10 +8,10 @@ where a pin moves.
 | # | Repair | Where | For break | Status |
 |---|---|---|---|---|
 | 1 | Address each vCPU's redistributor and CPU interface as that vCPU's, on the save as on the restore | Cloud Hypervisor fork | 1 | on the fork's branch `fcvm-v52-gic-identities` (bf326e7c, 4ae9f7c5), upstream 18366e1b7; the pin has to move, or fcvm moves to upstream |
-| 2 | Write the clear-registers with the complement of the saved bits | Cloud Hypervisor fork; Firecracker fork | 2 | Cloud Hypervisor: on the same branch (4c327e57), upstream 1ede69b5b. Firecracker: not done, in the fork or upstream (#2172) |
-| 3 | Own the counter offset | Cloud Hypervisor; the default Firecracker pin; two gaps on the nested pin | 4, 6 | nested pin: partly (0baf5b0b). Upstream Cloud Hypervisor with `preserve`: the clone's half. Elsewhere: not done (#2173) |
+| 2 | Write the clear-registers with the complement of the saved bits | Cloud Hypervisor fork; Firecracker fork | 2 | Cloud Hypervisor: on the same branch (4c327e57), upstream 1ede69b5b. Firecracker: in the re-based fork (9e4961dad6ab); not on today's pins (#2172) |
+| 3 | Own the counter offset | Cloud Hypervisor; the default Firecracker pin; two gaps on the nested pin | 4, 6 | nested pin: partly (0baf5b0b). The re-based fork: the same for every guest, with the same two gaps (`BREAKS.md`, 10). Upstream Cloud Hypervisor with `preserve`: the clone's half. Elsewhere: not done (#2173) |
 | 4 | Save and restore `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` | both VMMs | 3 | not done; nothing under fcvm needs it today |
-| 5 | Save and restore a guest hypervisor's `ICH_*_EL2` registers | Firecracker fork, nested pin | 8 | not done (#2179) |
+| 5 | Save and restore a guest hypervisor's `ICH_*_EL2` registers | Firecracker fork, nested pin | 8 | in the re-based fork (139f0e595157), written and not yet run; not on today's pins (#2179) |
 | 6 | Pass the CPU-interface registers at 64 bits | Cloud Hypervisor fork | 7 | on the branch (35d0e9ab), upstream 2018dd4b0 |
 | 7 | Correct the project's record of #630 | CLAUDE.md | "Least sure", 1 | done in this pull request, with the measurement |
 
@@ -77,6 +77,10 @@ asks for it, and a guest whose timers all come due at a resume does work it woul
 done. Whether that is worth changing for ordinary guests is a judgement the model does not
 make: Linux tolerates the jump, and it is what every KVM pause does. In order of what it buys:
 
+- **The re-based fork (139f0e595157)** owns the offset for every guest, from boot, and
+  computes a load's offset from `CNTPCT_EL0`, which is right for an ordinary guest too because
+  a VM it booted or restored has its two counters equal. It has the nested pin's two gaps, and
+  `BREAKS.md`, 10 names the change for each.
 - **Nested pin, the two gaps of break 6.** Small today. `paused_at_counter` set at the load
   closes the second; saving the counter captured at `pause_vm` (the fork already has it) in
   place of the one read at the save closes the first. Worth doing before anything is put
