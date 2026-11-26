@@ -2469,6 +2469,30 @@ class UnitStep(unittest.TestCase):
         self.assertNotIn('--features', recipe.replace('--no-default-features', ''))
 
 
+class HostRecord(unittest.TestCase):
+    """What a lane keeps about its host, so that a failure can be attributed afterwards."""
+
+    def blocks(self):
+        body = CI.read_text().split('\njobs:\n', 1)[1]
+        return dict(re.findall(r'^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)', body, re.M | re.S))
+
+    def test_the_lanes_that_run_on_the_host_record_its_memory_swap_load_and_oom_kills(self):
+        # The Host lane runs the unit suite and Host-Root the privileged one: both on the
+        # runner itself. Until #2199 no artifact recorded host memory at all.
+        for job in ('host', 'host-root'):
+            block = self.blocks()[job]
+            step = re.search(r'      - name: Capture host load record\n        if: always\(\)\n        run: \|\n((?:          .*\n|\n)+)', block)
+            self.assertTrue(step, f'{job} has no "Capture host load record" step that always runs')
+            for command in ('LC_ALL=C sar -q', 'LC_ALL=C sar -u', 'LC_ALL=C sar -r', 'LC_ALL=C sar -S',
+                            "grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|Committed_AS):' /proc/meminfo",
+                            "grep -E '^oom_kill ' /proc/vmstat", 'cat /proc/loadavg'):
+                self.assertIn(command, step[1], f'{job}: {command}')
+            self.assertIn('> /tmp/fcvm-test-logs/host-load.log', step[1])
+            # It is written before the directory is uploaded.
+            self.assertLess(block.index('name: Capture host load record'), block.index('name: Upload test logs'), job)
+            self.assertIn('path: /tmp/fcvm-test-logs/', block.split('name: Upload test logs', 1)[1][:600])
+
+
 class Lanes(unittest.TestCase):
     def test_the_planned_matrix_expands_to_the_lanes_names(self):
         # The names the Actions API reports are the job name templates of ci.yml filled in

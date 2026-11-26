@@ -929,6 +929,32 @@ jobs:
         if: always()
         working-directory: fcvm
         run: ./scripts/ci-stray-vm-guard.sh post
+      # Host memory, load and swap for the day, and the kernel's out-of-memory kill count.
+      # sysstat samples every 10 minutes, so a peak of a minute or two can fall between
+      # samples: Committed_AS and oom_kill are what still show it afterwards. Before this
+      # no artifact of any lane recorded host memory (#2199).
+      - name: Capture host load record
+        if: always()
+        run: |
+          {
+            echo "### /proc/loadavg at capture time"
+            cat /proc/loadavg
+            echo "### nproc"
+            nproc
+            echo "### sar -q (run queue and load average, whole day)"
+            LC_ALL=C sar -q 2>&1 || echo "sar -q unavailable"
+            echo "### sar -u (CPU utilisation, whole day)"
+            LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
+            echo "### sar -r (memory, whole day)"
+            LC_ALL=C sar -r 2>&1 || echo "sar -r unavailable"
+            echo "### sar -S (swap, whole day)"
+            LC_ALL=C sar -S 2>&1 || echo "sar -S unavailable"
+            echo "### /proc/meminfo at capture time"
+            grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|Committed_AS):' /proc/meminfo
+            echo "### oom_kill since boot (/proc/vmstat)"
+            grep -E '^oom_kill ' /proc/vmstat || echo "oom_kill not reported"
+          } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
+          echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
       - name: Save disk I/O record
         if: always()
         run: |
@@ -1310,6 +1336,14 @@ jobs:
             LC_ALL=C sar -q 2>&1 || echo "sar -q unavailable"
             echo "### sar -u (CPU utilisation, whole day)"
             LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
+            echo "### sar -r (memory, whole day)"
+            LC_ALL=C sar -r 2>&1 || echo "sar -r unavailable"
+            echo "### sar -S (swap, whole day)"
+            LC_ALL=C sar -S 2>&1 || echo "sar -S unavailable"
+            echo "### /proc/meminfo at capture time"
+            grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|Committed_AS):' /proc/meminfo
+            echo "### oom_kill since boot (/proc/vmstat)"
+            grep -E '^oom_kill ' /proc/vmstat || echo "oom_kill not reported"
           } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
           echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
       - name: Save disk I/O record
