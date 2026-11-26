@@ -2988,9 +2988,52 @@ fn firecracker_build_command(
     libseccomp_store: &Path,
     seccompiler_search: &Path,
 ) -> Result<Command> {
+    fork_build_command(
+        cargo,
+        build_dir,
+        &["-p", "firecracker"],
+        libseccomp,
+        libseccomp_store,
+        seccompiler_search,
+    )
+}
+
+/// The `seccompiler-bin` build of the same checkout, for the confined filters
+/// ([`ensure_confined_seccomp`]). It links libseccomp as the Firecracker build does, so it
+/// takes the same search path and the same refusals ([`firecracker_build_command`]): built
+/// against a host libseccomp older than 2.6 its link ends in
+/// `undefined reference to seccomp_export_bpf_mem`.
+fn seccompiler_build_command(
+    cargo: &Path,
+    build_dir: &Path,
+    libseccomp: Option<&super::libseccomp::LibseccompConfig>,
+    libseccomp_store: &Path,
+    seccompiler_search: &Path,
+) -> Result<Command> {
+    fork_build_command(
+        cargo,
+        build_dir,
+        &["-p", "seccompiler", "--bin", "seccompiler-bin"],
+        libseccomp,
+        libseccomp_store,
+        seccompiler_search,
+    )
+}
+
+/// `cargo build --release <what>` in a checkout of the Firecracker fork, linking the pinned
+/// libseccomp when there is one ([`firecracker_build_command`] says how and what is refused).
+fn fork_build_command(
+    cargo: &Path,
+    build_dir: &Path,
+    what: &[&str],
+    libseccomp: Option<&super::libseccomp::LibseccompConfig>,
+    libseccomp_store: &Path,
+    seccompiler_search: &Path,
+) -> Result<Command> {
     let mut command = Command::new(cargo);
     command
-        .args(["build", "--release", "-p", "firecracker"])
+        .args(["build", "--release"])
+        .args(what)
         .current_dir(build_dir);
     if let Some(config) = libseccomp {
         let dir = super::libseccomp::libseccomp_dir_in(libseccomp_store, config)
@@ -3056,8 +3099,11 @@ async fn ensure_confined_seccomp_or_warn(
     branch: &str,
     commit: &str,
     source: FirecrackerSource,
+    libseccomp: Option<&super::libseccomp::LibseccompConfig>,
 ) {
-    if let Err(error) = ensure_confined_seccomp(firecracker, repo, branch, commit, source).await {
+    if let Err(error) =
+        ensure_confined_seccomp(firecracker, repo, branch, commit, source, libseccomp).await
+    {
         warn!(
             firecracker = %firecracker.display(),
             error = %format!("{error:#}"),
@@ -3080,6 +3126,7 @@ async fn ensure_confined_seccomp(
     branch: &str,
     commit: &str,
     source: FirecrackerSource,
+    libseccomp: Option<&super::libseccomp::LibseccompConfig>,
 ) -> Result<()> {
     use crate::confine::{filter_path, seccompiler_path, SeccompMode, SECCOMP_ARCH};
     if !crate::confine::policy_is_for(commit) {
@@ -3107,6 +3154,11 @@ async fn ensure_confined_seccomp(
     let result = async {
         if !compiler.exists() {
             let cargo = cargo_program()?;
+            // The compiler links libseccomp as Firecracker does. A Firecracker that was
+            // already built leaves this the first build to need the pinned one.
+            super::libseccomp::ensure_libseccomp(libseccomp)
+                .await
+                .context("setting up libseccomp for the seccompiler-bin build")?;
             let build_dir = firecracker_build_dir(&compiler, uuid::Uuid::new_v4());
             let url = format!("https://github.com/{repo}");
             install_seccompiler(
@@ -3116,17 +3168,13 @@ async fn ensure_confined_seccomp(
                     checkout_firecracker_source(&url, branch, commit, source, &dir).await
                 },
                 |dir| async move {
-                    let mut build = Command::new(&cargo);
-                    build
-                        .args([
-                            "build",
-                            "--release",
-                            "-p",
-                            "seccompiler",
-                            "--bin",
-                            "seccompiler-bin",
-                        ])
-                        .current_dir(&dir);
+                    let mut build = seccompiler_build_command(
+                        &cargo,
+                        &dir,
+                        libseccomp,
+                        &super::libseccomp::store_dir(),
+                        Path::new(SECCOMPILER_LINK_SEARCH),
+                    )?;
                     super::run_build_as_sudo_invoker(&mut build);
                     let status = build.status().await.context("running cargo")?;
                     anyhow::ensure!(status.success(), "cargo build exited with {status}");
@@ -3388,7 +3436,15 @@ pub async fn ensure_profile_firecracker(
             } else {
                 FirecrackerSource::BranchTip
             };
-            ensure_confined_seccomp_or_warn(&path, repo, branch, &commit, source).await;
+            ensure_confined_seccomp_or_warn(
+                &path,
+                repo,
+                branch,
+                &commit,
+                source,
+                profile.firecracker_libseccomp.as_ref(),
+            )
+            .await;
             return Ok(Some(path));
         }
         FirecrackerSetupStep::ReuseCached { path, error } => {
@@ -3443,7 +3499,8 @@ pub async fn ensure_profile_firecracker(
         }
         // The other process may not have reached the filters, or may be an fcvm from
         // before they existed.
-        ensure_confined_seccomp_or_warn(&bin_path, repo, branch, &commit_hash, source).await;
+        ensure_confined_seccomp_or_warn(&bin_path, repo, branch, &commit_hash, source, libseccomp)
+            .await;
         return Ok(Some(bin_path));
     }
 
@@ -3553,7 +3610,8 @@ pub async fn ensure_profile_firecracker(
     if record_resolution {
         record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path, build);
     }
-    ensure_confined_seccomp_or_warn(&bin_path, repo, branch, &commit_hash, source).await;
+    ensure_confined_seccomp_or_warn(&bin_path, repo, branch, &commit_hash, source, libseccomp)
+        .await;
 
     Ok(Some(bin_path))
 }
@@ -3916,6 +3974,7 @@ mod tests {
                 "example-branch",
                 crate::confine::CONFINED_FIRECRACKER_COMMIT,
                 FirecrackerSource::Pin,
+                None,
             )
         };
         let entries = || {
@@ -4073,6 +4132,7 @@ mod tests {
             "example-branch",
             "0000000000000000000000000000000000000000",
             FirecrackerSource::Pin,
+            None,
         )
         .await
         .unwrap();
@@ -5251,6 +5311,37 @@ cp vmlinux arch/arm64/boot/Image
             ]
         );
         assert_eq!(command.as_std().get_current_dir(), Some(tree));
+
+        // The seccompiler-bin build of the same checkout links libseccomp too, and gets the
+        // same search path and environment. The confined filter build is what runs it.
+        let compiler =
+            seccompiler_build_command(cargo, tree, Some(&pin), store.path(), search).unwrap();
+        let compiler_args = args(&compiler);
+        assert_eq!(
+            compiler_args[..7],
+            [
+                "build",
+                "--release",
+                "-p",
+                "seccompiler",
+                "--bin",
+                "seccompiler-bin",
+                "--config"
+            ]
+        );
+        assert_eq!(compiler_args[7..], args_with_pin[5..]);
+        assert_eq!(removed(&compiler), removed(&command));
+        let source = include_str!("kernel.rs");
+        let filters = &source[source
+            .find(concat!("async fn ensure_confined", "_seccomp("))
+            .unwrap()..];
+        let filters = &filters[..filters.find("\n}\n").unwrap()];
+        assert!(
+            filters.contains("seccompiler_build_command(")
+                && filters.contains("ensure_libseccomp(libseccomp)"),
+            "the confined filter build does not build its compiler against the pinned \
+             libseccomp"
+        );
 
         // No pin: the build links the host's library, with the command and the
         // environment as they were.
