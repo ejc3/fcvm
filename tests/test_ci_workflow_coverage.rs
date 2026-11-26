@@ -4653,3 +4653,90 @@ fn the_lean_workflow_checks_verify_on_stacked_pull_requests_and_on_main() {
         "the ~/.elan cache must be keyed on verify/lean-toolchain: {toolchain_caches:?}"
     );
 }
+
+/// The cargo tools the `cargo install` lines of `text` install, each with the versions it
+/// is pinned to (`tool@version`), or `None` for an install that names no version.
+fn cargo_installs(text: &str) -> BTreeMap<String, BTreeSet<Option<String>>> {
+    let mut installs: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((_, arguments)) = line.split_once("cargo install ") else {
+            continue;
+        };
+        for word in arguments.split_whitespace() {
+            if !word.starts_with("cargo-") {
+                continue;
+            }
+            let (tool, version) = match word.split_once('@') {
+                Some((tool, version)) => (tool, Some(version.to_string())),
+                None => (word, None),
+            };
+            installs
+                .entry(tool.to_string())
+                .or_default()
+                .insert(version);
+        }
+    }
+    installs
+}
+
+#[test]
+fn cargo_installs_reads_pinned_and_unpinned_tools() {
+    let installs = cargo_installs(concat!(
+        "RUN cargo install cargo-nextest cargo-deny@0.18.9 --locked\n",
+        "          which cargo-deny || cargo install cargo-deny@0.18.9 --locked\n",
+        "          which cargo-audit || cargo install cargo-audit@0.22.0 --locked\n",
+        "  # Verifies cargo install works without source tree access\n",
+    ));
+    let versions =
+        |tool: &str| -> Vec<Option<&str>> { installs[tool].iter().map(|v| v.as_deref()).collect() };
+    assert_eq!(installs.len(), 3);
+    assert_eq!(versions("cargo-nextest"), [None]);
+    assert_eq!(versions("cargo-deny"), [Some("0.18.9")]);
+    assert_eq!(versions("cargo-audit"), [Some("0.22.0")]);
+}
+
+/// The test container installs the cargo tools at the versions the workflows install.
+///
+/// The Containerfile once installed them with no version. The image's layer was cached,
+/// so nothing rebuilt it, until the newest cargo-deny needed a newer rustc than the
+/// image's: from then on any change that rebuilt the layer failed every container lane
+/// (#2205). The host lanes had been pinned all along, in the workflows.
+#[test]
+fn the_test_container_installs_the_cargo_tools_the_workflows_pin() {
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    };
+    let mut pinned: BTreeMap<String, BTreeSet<Option<String>>> = BTreeMap::new();
+    for workflow in ["ci.yml", "weekly.yml"] {
+        for (tool, versions) in cargo_installs(&read(workflow_path(workflow))) {
+            pinned.entry(tool).or_default().extend(versions);
+        }
+    }
+    for tool in ["cargo-nextest", "cargo-audit", "cargo-deny"] {
+        assert!(
+            pinned.contains_key(tool),
+            "no workflow installs {tool}: this test read nothing to compare with"
+        );
+    }
+    for (tool, versions) in &pinned {
+        assert!(
+            versions.len() == 1 && versions.iter().all(Option::is_some),
+            "the workflows install {tool} at {versions:?}: one version, in every step"
+        );
+    }
+    let containerfile = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Containerfile");
+    let in_container = cargo_installs(&read(containerfile));
+    assert!(
+        !in_container.is_empty(),
+        "the Containerfile installs no cargo tool: this test read nothing to compare"
+    );
+    for (tool, versions) in &in_container {
+        assert_eq!(
+            Some(versions),
+            pinned.get(tool),
+            "the Containerfile installs {tool} at {versions:?} and the workflows at {:?}",
+            pinned.get(tool)
+        );
+    }
+}

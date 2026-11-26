@@ -8,8 +8,9 @@ RUN RUST_VERSION=$(grep 'channel' /tmp/rust-toolchain.toml | cut -d'"' -f2) && \
     rustup component add rustfmt clippy && \
     rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
 
-# Install cargo tools
-RUN cargo install cargo-nextest cargo-audit cargo-deny --locked
+# Install cargo tools, at the versions the workflows install
+# (tests/test_ci_workflow_coverage.rs holds the two together).
+RUN cargo install cargo-nextest@0.9.115 cargo-audit@0.22.0 cargo-deny@0.18.9 --locked
 
 # Install system dependencies (including kernel build tools: flex, bison, bc, libelf-dev, libssl-dev)
 RUN apt-get update && apt-get install -y \
