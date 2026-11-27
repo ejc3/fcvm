@@ -466,6 +466,7 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
 - For bridged: sudo, iptables, iproute2
 - For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set), and `net.ipv6.conf.all.forwarding=1` (fcvm refuses routed mode without it)
 - For rootfs build: qemu-utils, e2fsprogs
+- `fcvm setup` builds the static libseccomp pinned in `[libseccomp]` for the Firecracker build to link, into the assets directory; nothing is installed on the host
 
 **Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
 
@@ -562,6 +563,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FCVM_DATA_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
+| `FCVM_RUNTIME_DIR` | `/run/fcvm-<uid>` if it exists or as root, else `<data_dir>/runtime` | Base directory under which each data directory keeps its VM states and namespace pool, in a subdirectory named from the data directory's path (`paths.runtime_dir` in the config). `sudo fcvm setup --runtime-dir` makes `/run/fcvm-<uid>` (tmpfs: faster starts) and installs `/etc/tmpfiles.d/fcvm-<uid>.conf`, which makes it at every boot; remove that file to undo. Every process that uses a data directory must see the same directory: a container with its own `/run` needs a base named here, and fcvm refuses a data directory whose runtime directory it cannot see. `fcvm ls --runtime-dir` prints where a data directory's states are |
 | `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
 | `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so every write goes to the host as it is made and the guest takes a file's size and mtime from the host even while a guest process has it open for writing. Read-only maps never use that cache, and a run with no read-write map is the same run with or without it |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
@@ -604,7 +606,8 @@ Firecracker with two layers:
 A start that cannot be confined is refused, never run unconfined. Confinement needs
 rootless networking, the Firecracker backend, the default build of Firecracker, and a
 kernel with Landlock ABI 9 or later. A kernel profile that pins its own Firecracker is
-refused. `fcvm setup` compiles the allowlist beside each Firecracker it builds from the
+refused, and so is a start that passes a host device through (`--gpu`): the allowlist has
+no VFIO request. `fcvm setup` compiles the allowlist beside each Firecracker it builds from the
 commit the allowlist is derived from, and records the compiled file's SHA-256 beside it
 (`<filter>.sha256`). A confined start opens the filter without following a symbolic link
 and refuses one that is not a regular file owned by the user (or root, or the owner of

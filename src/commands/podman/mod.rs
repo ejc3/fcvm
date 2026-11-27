@@ -59,6 +59,7 @@ use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
     RuntimeConfig, VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE,
 };
+use crate::firecracker::error_text;
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, RoutedNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
@@ -1163,14 +1164,14 @@ enum RestoreFault {
 ///   configured build but not for a binary given by `FCVM_CLOUD_HYPERVISOR_BIN` or found on
 ///   PATH and replaced in place.
 const UNUSABLE_SNAPSHOT_MARKERS: &[&str] = &[
-    "Failed to load snapshot state from file",
-    "Invalid data version",
-    "An error occurred during bitcode serialization",
-    "Invalid snapshot state",
-    "Unknown Network Device",
-    "Unknown Vsock Device",
-    "Unknown Block Device",
-    "frequency not present in the given snapshot",
+    error_text::STATE_FILE_UNREADABLE,
+    error_text::INVALID_DATA_VERSION,
+    error_text::STATE_DOES_NOT_DECODE,
+    error_text::INVALID_SNAPSHOT_STATE,
+    error_text::UNKNOWN_NETWORK_DEVICE,
+    error_text::UNKNOWN_VSOCK_DEVICE,
+    error_text::UNKNOWN_BLOCK_DEVICE,
+    error_text::NO_TSC_FREQUENCY,
     "image disk build changed",
     "snapshot pmem image changed",
     crate::commands::common::CH_SNAPSHOT_OF_ANOTHER_BUILD,
@@ -1198,7 +1199,7 @@ fn classify_restore_failure(err: &anyhow::Error) -> RestoreFault {
     {
         return RestoreFault::UnusableSnapshot;
     }
-    if rendered.contains("Load snapshot error") {
+    if rendered.contains(error_text::LOAD_SNAPSHOT_ERROR) {
         return RestoreFault::LoadFailed;
     }
     RestoreFault::Other
@@ -1655,6 +1656,7 @@ async fn prepare_vm_for_lifecycle(
         firecracker_args: profile_firecracker_args(&args).as_deref(),
         unsupported: None,
         kernel_profile: args.kernel_profile.as_deref(),
+        passthrough_devices: args.gpu.len(),
     })?;
     info!(
         lifecycle = ?lifecycle,
@@ -2299,6 +2301,24 @@ async fn prepare_vm_for_lifecycle(
         );
     }
 
+    // A VM that publishes ports on a loopback address of its own leases the address
+    // before its first state is written, so that state carries it and no state of the VM
+    // is ever listed without the address its ports are on.
+    let leases_loopback_ip = match args.network {
+        NetworkMode::Rootless => true,
+        NetworkMode::Routed => RoutedNetwork::mappings_need_loopback_ip(&port_mappings),
+        NetworkMode::Bridged => false,
+    };
+    let loopback_lease = if leases_loopback_ip {
+        Some(
+            state_manager
+                .lease_loopback_ip_for_claim(&mut vm_state)
+                .context("allocating loopback IP")?,
+        )
+    } else {
+        None
+    };
+
     // The VM's first state is written here, under its name, and refused when a live
     // VM already has that name. Every error from here on removes the state again.
     if let Err(e) = state_manager
@@ -2308,6 +2328,10 @@ async fn prepare_vm_for_lifecycle(
     {
         cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
         return Err(e);
+    }
+    // The state holds the address now, and gives it back when it is deleted.
+    if let Some(lease) = loopback_lease {
+        lease.keep();
     }
 
     // Bridged and routed re-derive this from the namespace they reserve (see
@@ -2356,21 +2380,19 @@ async fn prepare_vm_for_lifecycle(
                 net.preflight_check()
                     .context("routed mode preflight check failed")?;
                 if net.needs_loopback_ip() {
-                    let loopback_ip = state_manager
-                        .allocate_loopback_ip(&mut vm_state)
-                        .await
-                        .context("allocating loopback IP for routed mode")?;
+                    let loopback_ip = vm_state.config.network.loopback_ip.clone().context(
+                        "a routed VM with a port on its loopback address has no address \
+                         leased before its name claim",
+                    )?;
                     net = net.with_loopback_ip(loopback_ip);
                 }
                 Box::new(net)
             }
             NetworkMode::Rootless => {
-                // For rootless mode, allocate loopback IP atomically with state persistence
-                // This prevents race conditions when starting multiple VMs concurrently
-                let loopback_ip = state_manager
-                    .allocate_loopback_ip(&mut vm_state)
-                    .await
-                    .context("allocating loopback IP")?;
+                // Leased before the name claim, whose state write carries it.
+                let loopback_ip = vm_state.config.network.loopback_ip.clone().context(
+                    "a rootless VM has no loopback address leased before its name claim",
+                )?;
 
                 // --dns reaches pasta as well as the guest: naming the pasta
                 // gateway as the resolver means "the service on host
@@ -4901,6 +4923,31 @@ mod tests {
             reclaimed < owned && owned < recorded && recorded < created,
             "a restore must reclaim, begin its owner and record its runtime directory, in \
              that order, before creating the directory"
+        );
+    }
+
+    /// A VM leases its loopback address before it claims its name, so no state of it is
+    /// ever written without the address its ports are on. Nothing after the claim leases
+    /// one.
+    #[test]
+    fn a_vm_leases_its_loopback_address_before_its_name_claim() {
+        let source = include_str!("mod.rs");
+        let body = &source[source.find("async fn prepare_vm_for_lifecycle(").unwrap()..];
+        let lease = body
+            .find(".lease_loopback_ip_for_claim(&mut vm_state)")
+            .expect("podman run leases the VM's loopback address");
+        let claim = body
+            .find(".claim_name(&mut vm_state)")
+            .expect("podman run claims the VM's name");
+        let kept = body.find("lease.keep();").expect("the lease is kept");
+        assert!(lease < claim && claim < kept);
+        let end = claim
+            + body[claim..]
+                .find("\nasync fn ")
+                .unwrap_or(body.len() - claim);
+        assert!(
+            !body[claim..end].contains("allocate_loopback_ip("),
+            "an address leased after the name claim is in no state until the next write"
         );
     }
 
@@ -7860,6 +7907,12 @@ mod restore_fault_classifier_tests {
              state from file: Failed to load snapshot state from file: CRC64 validation failed",
             "Load snapshot error: Failed to restore from snapshot: Invalid snapshot state: \
              No DRAM memory region defined.",
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: Invalid data version: \
+             the snapshot has no layout mark, so another Firecracker build wrote it",
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: Invalid data version: \
+             the snapshot's state has layout 2 and this build reads layout 1",
         ] {
             assert_eq!(classify(text), RestoreFault::UnusableSnapshot, "{text}");
         }

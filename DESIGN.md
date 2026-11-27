@@ -497,7 +497,7 @@ Each VM has:
 │       ├── vmstate.snap       # VM memory snapshot
 │       ├── disk.snap          # Disk snapshot
 │       └── config.json        # VM configuration
-├── state/                     # VM state JSON files
+├── state/                     # markers: which runtime directory holds the VM states
 ├── image-cache/               # Container image layers (sha256:{digest}/)
 └── cache/                     # Downloaded cloud images
 ```
@@ -2429,8 +2429,7 @@ Override with `FCVM_BASE_DIR` environment variable.
 ├── vm-disks/          # Per-VM CoW disk copies
 │   └── {vm-id}/disks/rootfs.raw
 ├── snapshots/         # Firecracker snapshots
-├── state/             # VM state JSON files
-│   └── vms/<b>/{vm-id}.json
+├── state/             # markers: layout, runtime (the directory that holds the VM states)
 └── cache/             # Downloaded images and packages
     ├── ubuntu-24.04-arm64-{sha}.img  # Cloud image cache
     └── packages-{sha}/               # Downloaded .deb files
@@ -2446,7 +2445,7 @@ This ensures automatic cache invalidation when any component changes.
 
 ### State Persistence
 
-**VM State** (`/mnt/fcvm-btrfs/state/vms/<b>/{vm-id}.json`, `<b>` the first hex digit of the vm-id's SHA-256):
+**VM State** (`<runtime_dir>/state/vms/<b>/{vm-id}.json`, `<b>` the first hex digit of the vm-id's SHA-256; the runtime directory is `/run/fcvm-<uid>/<key of the data directory>/boot-<boot id>` when root has made that base (`sudo fcvm setup`) or the caller is root, else `<data_dir>/runtime/boot-<boot id>`, unless `paths.runtime_dir` names a base; the data directory records which one it is bound to in `state/runtime`, and `fcvm ls --runtime-dir` prints it):
 ```json
 {
   "schema_version": 1,

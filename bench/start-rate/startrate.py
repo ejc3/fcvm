@@ -242,6 +242,36 @@ def list_vms(fcvm, sudo):
     return vms
 
 
+def state_location(fcvm, sudo):
+    """Where the fcvm under measurement keeps VM states since this boot: the directory, asked
+    of fcvm while its VMs are up (`fcvm ls --runtime-dir`), and that directory's filesystem.
+
+    A start's state writes are directory operations there, so runs with the states on tmpfs
+    and runs with them on the store are different measurements (`report` refuses to print
+    them together unless asked). A build that does not answer (it keeps its states in the
+    data directory, or none are bound) is recorded with no directory and what it said."""
+    try:
+        r = subprocess.run(fcvm_cmd(fcvm, sudo) + ["ls", "--runtime-dir"], text=True, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"dir": None, "fs": None, "note": str(e)[-200:]}
+    d = r.stdout.strip()
+    if r.returncode != 0 or not d.startswith("/") or "\n" in d:
+        return {"dir": None, "fs": None, "note": (r.stderr.strip() or d)[-200:]}
+    fs = subprocess.run((["sudo"] if sudo else []) + ["stat", "-f", "-c", "%T", d], text=True, capture_output=True)
+    if fs.returncode != 0 or not fs.stdout.strip():
+        return {"dir": None, "fs": None, "note": f"{d}: {fs.stderr.strip()[-160:]}"}
+    return {"dir": d, "fs": fs.stdout.strip()}
+
+
+def location_key(summary):
+    """What must be equal for two runs to be printed side by side: the filesystem their VM
+    states were on. `unrecorded` for a summary from before the harness recorded it, and
+    `unknown` for a build that did not say."""
+    if "state_location" not in summary:
+        return "unrecorded"
+    return (summary["state_location"] or {}).get("fs") or "unknown"
+
+
 def cmd_teardown(a):
     prep = json.loads(Path(a.prep).read_text())
     for key in ("serve_pid", "baseline_pid"):
@@ -700,6 +730,7 @@ def cmd_run(a):
             "alive_at_end": alive,
         }
         print(json.dumps(verify))
+        location = state_location(a.fcvm, prep["sudo"])
         if a.hold:
             # Keep every clone up so host.tsv and pidstat record what the idle clones cost.
             print(f"holding {alive} clones for {a.hold}s")
@@ -734,7 +765,7 @@ def cmd_run(a):
             "t0_wall": t0_wall, "all_done_wall": t0_wall + (t_all - t0) / 1e9,
             "hold_end_wall": t0_wall + (t_hold_end - t0) / 1e9,
         }) + "\n")
-        summary = summarize(out, verify=verify, teardown_s=teardown_s, t0_wall=t0_wall)
+        summary = summarize(out, verify=verify, teardown_s=teardown_s, t0_wall=t0_wall, location=location)
         print_summary(summary)
         bad = (
             verify["state_healthy"] != verify["log_healthy"]
@@ -1365,6 +1396,7 @@ def cmd_churn(a):
         with cv:
             steady = [c.name for c in clones if c.name in before and c.stop_ns is None]
         state_healthy = [n for n in steady if by_name.get(n, {}).get("health_status") == "healthy"]
+        location = state_location(a.fcvm, prep["sudo"])
 
         stop_launching()
         drain0 = now_ns()
@@ -1429,6 +1461,7 @@ def cmd_churn(a):
                            if warm else f"starts were not all recycled within {a.warmup_limit} s",
             "state_steady": len(steady), "state_healthy": len(state_healthy),
             "left": left_after, "polls_failed": polls["failed"],
+            "state_location": location,
             "drain": {"clones": left, "teardown_s": round(teardown_s, 2), "until_pool_idle_s": round(drain_s, 2)},
             # The harness's own cost over the window: one process, its reader and launcher
             # threads under one interpreter lock. Near one core, the harness is the limit.
@@ -1463,6 +1496,7 @@ def churn_summary(cfg, t0_wall, rows, alive_samples, pool_samples, run):
         "drain": run.get("drain"),
         "left": run.get("left"),
         "driver": driver,
+        **({"state_location": run["state_location"]} if "state_location" in run else {}),
     }
 
 
@@ -1627,7 +1661,7 @@ def pacing_summary(rows, rate):
     }
 
 
-def summarize(out, verify=None, teardown_s=None, t0_wall=None):
+def summarize(out, verify=None, teardown_s=None, t0_wall=None, location=None):
     out = Path(out)
     rows = [json.loads(ln) for ln in (out / "samples.jsonl").read_text().splitlines() if ln.strip()]
     host = json.loads((out / "host.json").read_text())
@@ -1689,6 +1723,8 @@ def summarize(out, verify=None, teardown_s=None, t0_wall=None):
         "teardown_s": round(teardown_s, 2) if teardown_s is not None else None,
         "t0_wall": t0_wall,
     }
+    if location is not None:
+        s["state_location"] = location
     if verify is not None:
         (out / "summary.json").write_text(json.dumps(s, indent=2) + "\n")
     return s
@@ -1714,6 +1750,9 @@ def print_summary(s):
     lat = s["spawn_to_healthy_ms"]
     print(f"   spawn->healthy p50 {lat['p50']} p90 {lat['p90']} p99 {lat['p99']} max {lat['max']} ms; popen p50 {s['popen_ms']['p50']} ms")
     print(f"   peak load1 {s['peak_load1']} procs_running {s['peak_procs_running']} min MemAvailable {s['min_mem_avail_mib']} MiB")
+    loc = s.get("state_location")
+    if loc is not None:
+        print(f"   VM states in {loc['dir']} ({loc['fs']})" if loc["dir"] else f"   VM states: not named by this fcvm ({loc['note']})")
     for k, v in s["stages_ms"].items():
         print(f"   {k:<16} p50 {v['p50']} p99 {v['p99']} (n={v['n']})")
     if s["errors"]:
@@ -1721,6 +1760,16 @@ def print_summary(s):
 
 
 def cmd_report(a):
+    # Runs whose VM states were on different filesystems are different measurements: a
+    # difference between them is the location's before it is anything else's.
+    keys = {}
+    for d in a.dirs:
+        p = Path(d) / "summary.json"
+        keys[d] = location_key(json.loads(p.read_text())) if p.exists() else "unrecorded"
+    if len(set(keys.values())) > 1 and not a.across_state_locations:
+        lines = "\n".join(f"  {k:<10} {d}" for d, k in keys.items())
+        sys.exit("BLOCKED: these runs kept their VM states on different filesystems, so they are not one "
+                 f"comparison:\n{lines}\nPass --across-state-locations to print them together.")
     for d in a.dirs:
         host = Path(d) / "host.json"
         mode = json.loads(host.read_text()).get("config", {}).get("mode") if host.exists() else None
@@ -1794,6 +1843,8 @@ def build_parser():
     q = sub.add_parser("report")
     q.add_argument("dirs", nargs="+")
     q.add_argument("--json", action="store_true", help="print a churn directory's summary as JSON")
+    q.add_argument("--across-state-locations", action="store_true",
+                   help="print runs together although their VM states were on different filesystems")
     q.set_defaults(fn=cmd_report)
     return ap
 
