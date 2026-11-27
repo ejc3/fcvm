@@ -5054,3 +5054,121 @@ fn bench_vm_reuses_the_test_root_build() {
         "bench-vm uses the bench profile again: {bench}"
     );
 }
+
+/// Whether a test file is compiled into the fc-mock job's build (the default features plus
+/// privileged-tests), judged by its file-level `#![cfg(...)]` only.
+fn in_the_mock_vmm_build(text: &str) -> bool {
+    let Some(cfg) = text
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("#![cfg("))
+    else {
+        return true;
+    };
+    let cfg: String = cfg.chars().filter(|c| !c.is_whitespace()).collect();
+    if cfg.contains("not(feature=\"privileged-tests\")") {
+        return false;
+    }
+    let built = ["integration-fast", "integration-slow", "privileged-tests"];
+    let features = regex::Regex::new(r#"feature="([^"]+)""#).unwrap();
+    features.captures_iter(&cfg).all(|c| built.contains(&&c[1])) && !cfg.contains("target_arch")
+}
+
+/// The fc-mock job (GitHub-hosted) names on its command line the binaries that hold the
+/// tests its filter selects, so the build skips the rest. A test added under a matching
+/// name in another file would otherwise drop out of the job without a sign.
+#[test]
+fn the_mock_vmm_job_builds_the_binaries_its_filter_selects() {
+    let ci = parse_workflow("ci.yml");
+    let step = workflow_job(&ci, "fc-mock")["steps"]
+        .as_sequence()
+        .expect("fc-mock steps")
+        .iter()
+        .find(|s| s.get("name").and_then(Value::as_str) == Some("Test fc-mock"))
+        .expect("fc-mock has a Test fc-mock step");
+    let run = step["run"].as_str().expect("run");
+    let words: Vec<&str> = run.split_whitespace().collect();
+    let named: BTreeSet<&str> = words
+        .windows(2)
+        .filter(|w| w[0] == "--test")
+        .map(|w| w[1])
+        .collect();
+    let lib = words.contains(&"--lib");
+    let patterns: Vec<regex::Regex> = regex::Regex::new(r"test\(/([^/]+)/\)")
+        .unwrap()
+        .captures_iter(run)
+        .map(|c| regex::Regex::new(&c[1]).unwrap())
+        .collect();
+    let excluded: BTreeSet<String> = regex::Regex::new(r"not test\(=([^)]+)\)")
+        .unwrap()
+        .captures_iter(run)
+        .map(|c| c[1].to_string())
+        .collect();
+    assert!(
+        patterns.len() >= 3,
+        "read {} patterns from: {run}",
+        patterns.len()
+    );
+
+    // A test function: a `fn` whose attribute lines just above name a test attribute.
+    let test_fns = |text: &str| -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let fn_name = regex::Regex::new(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap();
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(c) = fn_name.captures(line) else {
+                continue;
+            };
+            let attrs = lines[i.saturating_sub(4)..i].join("\n");
+            if attrs.contains("#[test]") || attrs.contains("::test") {
+                found.push(c[1].to_string());
+            }
+        }
+        found
+    };
+    let selected =
+        |name: &str| !excluded.contains(name) && patterns.iter().any(|p| p.is_match(name));
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut wanted = BTreeSet::new();
+    for entry in std::fs::read_dir(root.join("tests")).expect("tests/") {
+        let path = entry.expect("entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = read_file(path.clone());
+        if !in_the_mock_vmm_build(&text) {
+            continue;
+        }
+        if test_fns(&text).iter().any(|n| selected(n)) {
+            wanted.insert(path.file_stem().unwrap().to_string_lossy().into_owned());
+        }
+    }
+    let mut lib_wanted = Vec::new();
+    let mut pending = vec![root.join("src")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let text = read_file(path.clone());
+                lib_wanted.extend(test_fns(&text).into_iter().filter(|n| selected(n)));
+            }
+        }
+    }
+    assert!(
+        !wanted.is_empty(),
+        "found no test file the filter selects: the scan read nothing"
+    );
+    let named_owned: BTreeSet<String> = named.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        named_owned, wanted,
+        "the fc-mock step's --test list must be exactly the files holding tests its filter selects"
+    );
+    assert_eq!(
+        lib,
+        !lib_wanted.is_empty(),
+        "--lib on the fc-mock step: library tests the filter selects: {lib_wanted:?}"
+    );
+}

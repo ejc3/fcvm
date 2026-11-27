@@ -618,9 +618,15 @@ jobs:
         env:
           FCVM_FIRECRACKER_BIN: /usr/local/bin/fc-mock
           RUST_LOG: "fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn"
+        # --lib and --test name the binaries that hold the tests the filter selects, so cargo
+        # builds those and not the other ~120 test binaries: the build of all of them took
+        # 37.8 of this job's 39 min to run 9 tests (run 45935858819).
+        # the_mock_vmm_job_builds_the_binaries_its_filter_selects pins the list against the sources.
         run: |
           cargo nextest run --release -p fcvm --profile fc-mock \
             --features privileged-tests \
+            --lib --test test_fc_mock --test test_health_monitor \
+            --test test_kernel_patch_invariants --test test_nested_harness_invariants \
             -E 'package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)'
 
   # Runner 1a: Host (bare metal with KVM)
