@@ -355,13 +355,15 @@ remove_dirs = [
 # "# CONFIG_INET_DIAG is not set", which leaves SOCK_DESTROY unavailable and no
 # way to retire a restored clone's snapshot-time sockets. kernel_sha is the
 # verified content hash of build_inputs and lets installed binaries resolve the
-# release artifact without retaining a source checkout. The pin follows the
+# release artifact without retaining a source checkout. kernel_artifact_sha256 is
+# the SHA-256 of the released vmlinux; setup refuses a download with any other. The pin follows the
 # deployable-profile rule above.
 [kernel_profiles.default.arm64]
 description = "Default fcvm guest kernel"
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "ca1837829fd0"
+kernel_artifact_sha256 = "28115c483723c3f8a7e3cc86958084cfd121223f6ea7beb09716154d868b8aab"
 build_inputs = [
     "kernel/default-arm64.build.toml",
     "kernel/default.conf",
@@ -379,6 +381,7 @@ description = "Default fcvm guest kernel (x86_64)"
 kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "cb9d7ff723d3"
+kernel_artifact_sha256 = "d3768ed71d18647617bfeec9bcb45b6f6c75835d51a22d3be41e0a23d5dc43df"
 build_inputs = [
     "kernel/default-amd64.build.toml",
     "kernel/default-x86.conf",
@@ -549,6 +552,7 @@ guest_kvm = true
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "2889ae84beea"
+kernel_artifact_sha256 = "c92d9f7c3c415d1a0fd3d738bb3f8fead961d6de177623bb067301616061403c"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
@@ -618,6 +622,7 @@ guest_kvm = true
 kernel_version = "6.18.60"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "6544a8efc8d3"
+kernel_artifact_sha256 = "91663ff28780213635e539f4dd92f3bfd50b7265fba4c060a291b2ad3b5a2c55"
 
 # Build configuration - these files determine when kernel needs rebuilding
 build_inputs = [
@@ -672,6 +677,7 @@ description = "Kernel with FUSE and btrfs support for efficient container storag
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "b1dd099392e5"
+kernel_artifact_sha256 = "464accf3e4d36668921442202fbd58f474349ff9df083aba90a2933966a86385"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.
@@ -697,6 +703,7 @@ description = "Kernel with FUSE and btrfs support for efficient container storag
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "e710148cf2c4"
+kernel_artifact_sha256 = "6ead06a21e9329bed557b15fb4d234ba48bee8f66083c891b59f114be0f04d5c"
 
 # The patches are build inputs: the build applies them, so the tag has to
 # change when one of them does.

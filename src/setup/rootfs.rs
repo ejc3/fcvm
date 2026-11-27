@@ -182,6 +182,14 @@ pub struct KernelProfile {
     #[serde(default)]
     pub kernel_sha: Option<String>,
 
+    /// SHA-256 of the published release asset, recorded when the release is made.
+    /// Setup refuses a downloaded kernel whose bytes have another digest: the
+    /// release name says which build inputs made it, not which bytes were uploaded
+    /// under it, and a release asset can be replaced. A published table without it
+    /// is built locally (with --build-kernels) rather than downloaded unverified.
+    #[serde(default)]
+    pub kernel_artifact_sha256: Option<String>,
+
     /// `false` for a table no job publishes a release of (a GPU or experiment
     /// kernel): setup then builds it with --build-kernels and never asks GitHub
     /// for a release that does not exist. Absent means published.

@@ -409,6 +409,25 @@ async fn ensure_custom_kernel(
         return Ok(kernel_path);
     }
 
+    // A release is downloaded only when the table records the digest of its bytes:
+    // the name says which inputs built it, not what was uploaded under that name.
+    let Some(artifact_sha256) = profile.kernel_artifact_sha256.as_deref() else {
+        let message = format!(
+            "kernel profile '{profile_name}' records no kernel_artifact_sha256 for its release, \
+             so the release is not downloaded"
+        );
+        if allow_build {
+            println!("  → {message}; building locally (may take 10-20 minutes)...");
+            let built = build_kernel_locally(profile, profile_name, &kernel_path).await;
+            flock.unlock().map_err(|(_, err)| err)?;
+            built?;
+            println!("  ✓ Kernel built (profile: {})", profile_name);
+            return Ok(kernel_path);
+        }
+        flock.unlock().map_err(|(_, err)| err)?;
+        bail!("{message}. Record it in rootfs-config.toml, or build: fcvm setup --kernel-profile {profile_name} --build-kernels");
+    };
+
     // Try to download from GitHub releases
     let tag = custom_kernel_release_tag(profile_name, &profile.kernel_version, &sha);
     let download_url = format!(
@@ -419,7 +438,8 @@ async fn ensure_custom_kernel(
     println!("⚙️  Downloading kernel (profile: {})...", profile_name);
     info!(url = %download_url, tag = %tag, "downloading kernel from GitHub releases");
 
-    let download_result = download_kernel_binary(&download_url, &kernel_path).await;
+    let download_result =
+        download_kernel_binary(&download_url, artifact_sha256, &kernel_path).await;
 
     match download_result {
         Ok(_) => {
@@ -667,8 +687,36 @@ pub fn custom_kernel_filename(profile_name: &str, kernel_version: &str, sha: &st
     )
 }
 
-async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
-    let temp = super::StoreTemp::new(dest)?;
+/// Download a release kernel to `dest`, refusing bytes whose SHA-256 is not
+/// `sha256`.
+async fn download_kernel_binary(url: &str, sha256: &str, dest: &Path) -> Result<()> {
+    download_kernel_binary_in(
+        &crate::reclaim::owner_dir()?,
+        url,
+        sha256,
+        dest,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+/// [`download_kernel_binary`] with the store temp's record in `owners` and the wait
+/// between attempts given, for the tests.
+async fn download_kernel_binary_in(
+    owners: &Path,
+    url: &str,
+    sha256: &str,
+    dest: &Path,
+    retry_delay: std::time::Duration,
+) -> Result<()> {
+    anyhow::ensure!(
+        sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "kernel_artifact_sha256 '{sha256}' is not 64 lowercase hex digits"
+    );
+    let temp = super::StoreTemp::new_in(owners, dest)?;
     let temp_path = temp.path();
     let max_retries = 3;
 
@@ -693,12 +741,21 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
                 attempt,
                 max_retries,
                 error = %stderr.trim(),
-                "kernel download failed, retrying in 5s"
+                "kernel download failed, retrying"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(retry_delay).await;
         } else {
             bail!("curl failed after {} attempts: {}", max_retries, stderr);
         }
+    }
+
+    let got = crate::commands::snapshot_export::sha256_hex(temp_path)?;
+    if got != sha256 {
+        bail!(
+            "the release asset {url} has SHA-256 {got}, but rootfs-config.toml records \
+             {sha256} for it (kernel_artifact_sha256): refusing it, since a release asset \
+             can be replaced under the same name"
+        );
     }
 
     // Verify it's a valid kernel binary
@@ -6500,5 +6557,46 @@ cp vmlinux arch/arm64/boot/Image
         std::fs::create_dir_all(&bare_home).unwrap();
         let found = resolve_cargo(None, Some(empty.into_os_string()), &[bare_home]);
         assert_eq!(found, None);
+    }
+
+    /// A release kernel is installed only as the bytes its table records: an asset
+    /// replaced under the same release name is refused and nothing is published.
+    #[tokio::test]
+    async fn a_release_kernel_whose_bytes_are_not_the_recorded_ones_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let owners = crate::reclaim::owner_dir_in(records.path()).unwrap();
+        let mut kernel = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        kernel.resize(64, 0);
+        let recorded = hex::encode(Sha256::digest(&kernel));
+        let asset = dir
+            .path()
+            .join("vmlinux-default-1.0-x86_64-0123456789ab.bin");
+        let url = format!("file://{}", asset.display());
+        let dest = dir.path().join("store-vmlinux.bin");
+        let no_wait = std::time::Duration::ZERO;
+
+        let mut replaced = kernel.clone();
+        replaced[63] = 1;
+        std::fs::write(&asset, &replaced).unwrap();
+        let err = download_kernel_binary_in(&owners, &url, &recorded, &dest, no_wait)
+            .await
+            .expect_err("an asset whose bytes are not the recorded ones was accepted");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&recorded) && text.contains("kernel_artifact_sha256"),
+            "{text}"
+        );
+        assert!(
+            !dest.exists(),
+            "a refused kernel was published at {}",
+            dest.display()
+        );
+
+        std::fs::write(&asset, &kernel).unwrap();
+        download_kernel_binary_in(&owners, &url, &recorded, &dest, no_wait)
+            .await
+            .expect("the recorded bytes are the release");
+        assert_eq!(std::fs::read(&dest).unwrap(), kernel);
     }
 }
