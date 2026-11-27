@@ -121,7 +121,9 @@ async fn test_vsock_integrity_nested() -> Result<()> {
     // The fcvm in L1's container is root and must enter its VM's own cgroup. It could not
     // while fc-agent made the container's parent a thread root: the container was a threaded
     // cgroup, every cgroup below it "domain invalid", and fcvm logged "no cgroup of the VM's
-    // own ... Operation not supported" (#2226).
+    // own ... Operation not supported" (#2226). An absence check needs the whole capture:
+    // the child's exit does not join the tasks copying its output.
+    common::wait_for_log_eof(&log_path, std::time::Duration::from_secs(120)).await?;
     let log = std::fs::read_to_string(&log_path)
         .with_context(|| format!("reading {}", log_path.display()))?;
     let missed: Vec<&str> = log

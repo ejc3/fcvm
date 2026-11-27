@@ -3543,7 +3543,9 @@ async fn cmd_snapshot_run_inner(
     };
 
     // The clone's first state is written here, under its name, and refused when a
-    // live VM already has that name.
+    // live VM already has that name. It records the clone's runtime directory from the
+    // start: the memory server writes why it refused or killed this clone's VMM there.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     setup_try!(state_manager
         .claim_name(&mut vm_state)
         .await
@@ -3592,7 +3594,6 @@ async fn cmd_snapshot_run_inner(
     // state; snapshot control must address this socket. The recorded source
     // starts as the snapshot's embedded path, and the restore replaces it with
     // this socket when the load overrides the vsock path.
-    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     vm_state.config.vsock_socket_path = Some(clone_vsock_base.clone());
     vm_state.config.source_vsock_socket_path =
         Some(snapshot_config.source_vsock_socket_path.clone());
