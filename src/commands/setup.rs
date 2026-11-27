@@ -109,7 +109,7 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             )
         })?;
         println!("Building Cloud Hypervisor backend...");
-        let path = crate::setup::ensure_cloud_hypervisor(ch)
+        let path = crate::setup::ensure_cloud_hypervisor(ch, true)
             .await
             .context("setting up cloud-hypervisor")?;
         println!("  ✓ Cloud Hypervisor ready: {}", path.display());
@@ -357,7 +357,7 @@ async fn write_vmm_artifacts(
         }
     }
     if let Some(ch) = config.cloud_hypervisor.as_ref() {
-        let path = crate::setup::kernel::ensure_cloud_hypervisor_from(ch, false)
+        let path = crate::setup::ensure_cloud_hypervisor(ch, false)
             .await
             .context("building Cloud Hypervisor")?;
         add(&path, &ch.commit)?;

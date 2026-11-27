@@ -690,20 +690,14 @@ pub fn custom_kernel_filename(profile_name: &str, kernel_version: &str, sha: &st
 /// Download a release kernel to `dest`, refusing bytes whose SHA-256 is not
 /// `sha256`.
 async fn download_kernel_binary(url: &str, sha256: &str, dest: &Path) -> Result<()> {
-    download_kernel_binary_in(
-        &crate::reclaim::owner_dir()?,
-        url,
-        sha256,
-        dest,
-        std::time::Duration::from_secs(5),
-    )
-    .await
+    let temp = super::StoreTemp::new(dest)?;
+    download_kernel_into(temp, url, sha256, dest, std::time::Duration::from_secs(5)).await
 }
 
-/// [`download_kernel_binary`] with the store temp's record in `owners` and the wait
-/// between attempts given, for the tests.
-async fn download_kernel_binary_in(
-    owners: &Path,
+/// [`download_kernel_binary`] into a store temp the caller made (the tests record its owner
+/// elsewhere), with the wait between attempts given.
+async fn download_kernel_into(
+    temp: super::StoreTemp,
     url: &str,
     sha256: &str,
     dest: &Path,
@@ -716,7 +710,6 @@ async fn download_kernel_binary_in(
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "kernel_artifact_sha256 '{sha256}' is not 64 lowercase hex digits"
     );
-    let temp = super::StoreTemp::new_in(owners, dest)?;
     let temp_path = temp.path();
     let max_retries = 3;
 
@@ -3875,15 +3868,10 @@ async fn checkout_cloud_hypervisor_source(url: &str, commit: &str, build_dir: &P
 /// Otherwise setup clones the repository, checks out the commit by its hash and
 /// refuses a checkout whose HEAD is anything else, so the installed file is
 /// always the build of the commit its name was computed from.
+///
+/// With `published`, a build recorded in `[vmm_artifacts]` is installed instead of built;
+/// without it the binary is always built from source (`fcvm setup --vmm-artifacts`).
 pub async fn ensure_cloud_hypervisor(
-    config: &super::rootfs::CloudHypervisorConfig,
-) -> Result<PathBuf> {
-    ensure_cloud_hypervisor_from(config, true).await
-}
-
-/// [`ensure_cloud_hypervisor`], taking a published build recorded in `[vmm_artifacts]` when
-/// `published` is true, and always building from source when it is false (`vmm.yml`).
-pub async fn ensure_cloud_hypervisor_from(
     config: &super::rootfs::CloudHypervisorConfig,
     published: bool,
 ) -> Result<PathBuf> {
@@ -4404,7 +4392,7 @@ mod tests {
         );
         let source = include_str!("kernel.rs");
         let body = &source[source
-            .find("pub async fn ensure_cloud_hypervisor_from(")
+            .find("pub async fn ensure_cloud_hypervisor(")
             .expect("ensure_cloud_hypervisor is gone")..];
         let body = &body[..body.find("\n}\n").unwrap()];
         assert!(
@@ -6707,9 +6695,15 @@ cp vmlinux arch/arm64/boot/Image
         let mut replaced = kernel.clone();
         replaced[63] = 1;
         std::fs::write(&asset, &replaced).unwrap();
-        let err = download_kernel_binary_in(&owners, &url, &recorded, &dest, no_wait)
-            .await
-            .expect_err("an asset whose bytes are not the recorded ones was accepted");
+        let err = download_kernel_into(
+            crate::setup::StoreTemp::new_in(&owners, &dest).unwrap(),
+            &url,
+            &recorded,
+            &dest,
+            no_wait,
+        )
+        .await
+        .expect_err("an asset whose bytes are not the recorded ones was accepted");
         let text = format!("{err:#}");
         assert!(
             text.contains(&recorded) && text.contains("kernel_artifact_sha256"),
@@ -6722,9 +6716,15 @@ cp vmlinux arch/arm64/boot/Image
         );
 
         std::fs::write(&asset, &kernel).unwrap();
-        download_kernel_binary_in(&owners, &url, &recorded, &dest, no_wait)
-            .await
-            .expect("the recorded bytes are the release");
+        download_kernel_into(
+            crate::setup::StoreTemp::new_in(&owners, &dest).unwrap(),
+            &url,
+            &recorded,
+            &dest,
+            no_wait,
+        )
+        .await
+        .expect("the recorded bytes are the release");
         assert_eq!(std::fs::read(&dest).unwrap(), kernel);
     }
 

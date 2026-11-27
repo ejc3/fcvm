@@ -523,7 +523,7 @@ mod store_ownership_tests {
     #[test]
     fn helpers_of_functions_that_make_store_temps_hold_their_locks() {
         // git and cargo build a checkout of their own; the temp is written by a copy here.
-        const NOT_WRITERS: &[&str] = &["ensure_cloud_hypervisor_from"];
+        const NOT_WRITERS: &[&str] = &["ensure_cloud_hypervisor"];
         for (file, source) in [
             ("src/setup/kernel.rs", include_str!("kernel.rs")),
             ("src/setup/rootfs.rs", include_str!("rootfs.rs")),

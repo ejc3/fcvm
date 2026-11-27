@@ -80,36 +80,12 @@ fn check_digest(sha256: &str) -> Result<()> {
 /// Install the recorded build named `dest`'s file name at `dest`. `Ok(false)` when none is
 /// recorded; an error when one is recorded but does not arrive with its digest, or `check`
 /// refuses it. The caller builds locally in both cases.
-pub async fn install<C>(
+pub async fn install(
     artifacts: &VmmArtifacts,
     dest: &Path,
     retry_delay: std::time::Duration,
-    check: C,
-) -> Result<bool>
-where
-    C: FnOnce(&Path) -> Result<()>,
-{
-    install_in(
-        &crate::reclaim::owner_dir()?,
-        artifacts,
-        dest,
-        retry_delay,
-        check,
-    )
-    .await
-}
-
-/// [`install`] with the store temp's record in `owners`, for the tests.
-pub(crate) async fn install_in<C>(
-    owners: &Path,
-    artifacts: &VmmArtifacts,
-    dest: &Path,
-    retry_delay: std::time::Duration,
-    check: C,
-) -> Result<bool>
-where
-    C: FnOnce(&Path) -> Result<()>,
-{
+    check: impl FnOnce(&Path) -> Result<()>,
+) -> Result<bool> {
     let name = dest
         .file_name()
         .and_then(|n| n.to_str())
@@ -120,8 +96,10 @@ where
     if artifacts.repo.is_empty() {
         bail!("[vmm_artifacts] records {name} but names no repo");
     }
-    install_from_in(
-        owners,
+    check_digest(&artifact.sha256)?;
+    let temp = super::StoreTemp::new(dest)?;
+    install_into(
+        temp,
         &artifacts.url(artifact),
         &artifact.sha256,
         dest,
@@ -132,10 +110,11 @@ where
     Ok(true)
 }
 
-/// Download `url` beside `dest`, refuse it unless its SHA-256 is `sha256` and `check` accepts
-/// it, make it executable and publish it at `dest`.
-pub(crate) async fn install_from_in<C>(
-    owners: &Path,
+/// Download `url` into `temp`, refuse it unless its SHA-256 is `sha256` and `check` accepts
+/// it, make it executable and publish it at `dest`. The tests make `temp` with its owner
+/// recorded elsewhere.
+pub(crate) async fn install_into<C>(
+    temp: super::StoreTemp,
     url: &str,
     sha256: &str,
     dest: &Path,
@@ -147,7 +126,6 @@ where
 {
     use std::os::unix::fs::PermissionsExt;
     check_digest(sha256)?;
-    let temp = super::StoreTemp::new_in(owners, dest)?;
     super::fetch_verified_archive(
         "published VMM build",
         &[url.to_string()],
@@ -210,16 +188,28 @@ mod tests {
         let no_wait = std::time::Duration::ZERO;
 
         std::fs::write(&asset, b"#!/bin/sh\necho something else\n").unwrap();
-        let err = install_from_in(&owners, &url, &recorded, &dest, no_wait, |_| Ok(()))
-            .await
-            .expect_err("bytes that are not the recorded ones were installed");
+        let err = install_into(
+            super::super::StoreTemp::new_in(&owners, &dest).unwrap(),
+            &url,
+            &recorded,
+            &dest,
+            no_wait,
+            |_| Ok(()),
+        )
+        .await
+        .expect_err("bytes that are not the recorded ones were installed");
         assert!(format!("{err:#}").contains(&recorded), "{err:#}");
         assert!(!dest.exists());
 
         std::fs::write(&asset, &built).unwrap();
-        let err = install_from_in(&owners, &url, &recorded, &dest, no_wait, |_| {
-            bail!("the version does not name the commit")
-        })
+        let err = install_into(
+            super::super::StoreTemp::new_in(&owners, &dest).unwrap(),
+            &url,
+            &recorded,
+            &dest,
+            no_wait,
+            |_| bail!("the version does not name the commit"),
+        )
         .await
         .expect_err("a build the check refused was installed");
         assert!(
@@ -228,9 +218,16 @@ mod tests {
         );
         assert!(!dest.exists());
 
-        install_from_in(&owners, &url, &recorded, &dest, no_wait, |_| Ok(()))
-            .await
-            .expect("the recorded bytes install");
+        install_into(
+            super::super::StoreTemp::new_in(&owners, &dest).unwrap(),
+            &url,
+            &recorded,
+            &dest,
+            no_wait,
+            |_| Ok(()),
+        )
+        .await
+        .expect("the recorded bytes install");
         assert_eq!(std::fs::read(&dest).unwrap(), built);
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
@@ -245,9 +242,7 @@ mod tests {
             "firecracker-default-0123456789ab.bin",
             &recorded,
         );
-        assert!(!install_in(&owners, &none, &other, no_wait, |_| Ok(()))
-            .await
-            .unwrap());
+        assert!(!install(&none, &other, no_wait, |_| Ok(())).await.unwrap());
         assert!(!other.exists());
     }
 }

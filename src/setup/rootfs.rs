@@ -2825,10 +2825,14 @@ async fn download_packages(plan: &Plan, image_dpkg_status: &[u8]) -> Result<Path
                     .context("downloading packages with podman")?;
                 if run.status.is_none() {
                     // The killed client leaves its container running.
-                    let _ = Command::new("podman")
-                        .args(["rm", "--force", "--time=0", &container])
-                        .output()
-                        .await;
+                    // Through the temp, like every helper spawned while it exists: the
+                    // helper holds the temp's owner lock (#1316).
+                    if let Ok(mut rm) = download.command("podman") {
+                        let _ = rm
+                            .args(["rm", "--force", "--time=0", &container])
+                            .output()
+                            .await;
+                    }
                 }
                 Ok((run, download))
             }
