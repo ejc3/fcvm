@@ -3263,15 +3263,10 @@ async fn test_lifecycle_interleave_bridged_subnet_lock_spans_data_dirs() -> Resu
     let (a_name, b_name, _, _) = common::unique_names("ilv-hostlock");
     let scratch = tempfile::tempdir().context("creating the go-file directory")?;
     let go = scratch.path().join("go");
-    let data_dir = |tag: &str| {
-        // Short: a VM's sockets sit under <data>/vm-disks/<bucket>/vm-<32 hex>/, and AF_UNIX
-        // paths stop at 108 bytes.
-        fcvm::paths::data_dir().join(format!(
-            "rt-{tag}{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..7]
-        ))
-    };
-    let (a_dir, b_dir) = (data_dir("a"), data_dir("b"));
+    let (a_dir, b_dir) = (
+        common::short_data_dir(&fcvm::paths::data_dir(), "ra"),
+        common::short_data_dir(&fcvm::paths::data_dir(), "rb"),
+    );
     let a_fp = format!("bridged.subnet_locked:block_until_file:{}", go.display());
     let b_fp = "bridged.subnet_locked:sleep:0".to_string();
     let mut children: Vec<tokio::process::Child> = Vec::new();

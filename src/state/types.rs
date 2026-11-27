@@ -552,6 +552,42 @@ impl VmState {
 mod tests {
     use super::*;
 
+    /// Every start records its VM's runtime directory before it writes the VM's first state
+    /// (`claim_name`): a reader of a running VM's directory (exec, health, the memory server
+    /// writing why it refused a clone) takes it from the state, and one written without it is
+    /// read as the layout before the buckets, a directory the VM does not have.
+    #[test]
+    fn every_start_records_its_runtime_directory_before_the_first_state() {
+        let sources = [
+            ("podman/mod.rs", include_str!("../commands/podman/mod.rs")),
+            ("snapshot.rs", include_str!("../commands/snapshot.rs")),
+            ("vm.rs", include_str!("../commands/vm.rs")),
+        ];
+        let mut claims = 0;
+        for (file, source) in sources {
+            for (at, _) in source.match_indices(".claim_name(&mut vm_state)") {
+                if source[..at].ends_with('"') {
+                    continue;
+                }
+                let function = ["\nfn ", "\npub fn ", "\nasync fn ", "\npub async fn "]
+                    .iter()
+                    .filter_map(|start| source[..at].rfind(start))
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    source[function..at].contains("config.vm_runtime_dir = Some("),
+                    "{file}: the state is first written at byte {at} before its runtime \
+                     directory is recorded"
+                );
+                claims += 1;
+            }
+        }
+        assert_eq!(
+            claims, 4,
+            "podman run, snapshot run, the raw restore and vm run"
+        );
+    }
+
     #[test]
     fn test_vm_state_new() {
         let state = VmState::new("vm-123".to_string(), "nginx:latest".to_string(), 2, 512);

@@ -1984,6 +1984,10 @@ async fn prepare_vm_for_lifecycle(
     // file identity. Without the snapshot cache nothing is keyed or staged.
     let mut disk_dir_staging = None;
     if !no_snapshot && (!args.disk.is_empty() || !args.disk_dir.is_empty()) {
+        // The runtime directory first, through the helper that makes its bucket with
+        // vm-disks' owner and mode: the staging below would otherwise make the bucket
+        // itself, with this process's owner and umask (root's, in a user's store).
+        paths::create_vm_runtime_dir(&vm_id).await?;
         let root = paths::vm_runtime_dir(&vm_id).join("disk-dir-staging");
         let (disk, disk_dir) = (args.disk.clone(), args.disk_dir.clone());
         let (staging, resolved) = tokio::task::spawn_blocking(move || {
@@ -2319,7 +2323,10 @@ async fn prepare_vm_for_lifecycle(
     };
 
     // The VM's first state is written here, under its name, and refused when a live
-    // VM already has that name. Every error from here on removes the state again.
+    // VM already has that name. Every error from here on removes the state again. It
+    // records the VM's runtime directory from the start: every reader of a running VM's
+    // directory (exec, health, the memory server's failure note) takes it from there.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     if let Err(e) = state_manager
         .claim_name(&mut vm_state)
         .await
@@ -2478,7 +2485,6 @@ async fn prepare_vm_for_lifecycle(
     // Snapshot control must connect to the socket the VMM actually bound. In
     // particular, `--vsock-dir` deliberately places it outside `data_dir`, so
     // reconstructing the path from vm_id would target the wrong socket.
-    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     vm_state.config.vsock_socket_path = Some(vsock_socket_path.clone());
     // A cold-boot VMM embeds the same exact path it binds. A restored clone
     // records the path its VMM state names: its own listener when the load
@@ -4904,6 +4910,11 @@ mod tests {
         assert!(
             recorded < staged && recorded < created,
             "the runtime directory is created before it is recorded"
+        );
+        assert!(
+            created < staged,
+            "the --disk-dir staging makes the VM's bucket itself, with this process's owner \
+             and umask, unless the runtime directory (and its bucket) is made first"
         );
 
         // The same order in a restore.

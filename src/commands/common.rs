@@ -3626,14 +3626,17 @@ fn view_children(view: &Path, wanted: fn(&std::fs::FileType) -> bool) -> Result<
 /// directories). A bucket that held a mountpoint and were bound onto itself would put that
 /// mountpoint on the host's real directory under it, whose removal by its VM's teardown
 /// detaches the clone's mount (#1187); kept whole after the pairs, it would cover them.
-/// So such a bucket is made in the view's tmpfs like the mountpoints in it, and only its
-/// VM directories are kept, one bucket's worth of entries, not every VM's.
+/// So such a bucket is made in the view's tmpfs like the mountpoints in it, and its entries
+/// are kept one by one, one bucket's worth, not every VM's: its directories (returned first)
+/// and its regular files (returned second, for `keep_files`), such as a read-only `--disk`
+/// image a source VM was given from inside the bucket.
 fn expand_buckets(
     entries: Vec<PathBuf>,
     pairs: &[(PathBuf, PathBuf)],
     own: &[&Path],
-) -> Result<Vec<PathBuf>> {
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut expanded = Vec::with_capacity(entries.len());
+    let mut files = Vec::new();
     for entry in entries {
         let bucket = entry
             .file_name()
@@ -3646,12 +3649,14 @@ fn expand_buckets(
             .any(|path| path != entry && path.starts_with(&entry));
         if bucket && holds {
             expanded.extend(view_entries(&entry)?);
+            files.extend(view_files(&entry)?);
         } else {
             expanded.push(entry);
         }
     }
     expanded.sort();
-    Ok(expanded)
+    files.sort();
+    Ok((expanded, files))
 }
 
 /// The mount view of a clone's VMM, or `None` when the snapshot load overrides every source
@@ -3675,9 +3680,11 @@ fn clone_mount_redirects(
     if overrides == LoadOverrides::Everything {
         return Ok(None);
     }
-    let entries = expand_buckets(view_entries(view)?, &pairs, &[clone_dir, vsock_target_dir])?;
+    let (entries, bucket_files) =
+        expand_buckets(view_entries(view)?, &pairs, &[clone_dir, vsock_target_dir])?;
     let mut redirects = clone_mount_view(view, pairs, clone_dir, vsock_target_dir, &entries)?;
     redirects.keep_files = view_files(view)?;
+    redirects.keep_files.extend(bucket_files);
     Ok(Some(redirects))
 }
 
@@ -9804,7 +9811,7 @@ mod tests {
             std::fs::create_dir_all(dir).unwrap();
         }
         let pairs = vec![(source.clone(), clone.clone())];
-        let entries = expand_buckets(view_entries(&view).unwrap(), &pairs, &[&clone]).unwrap();
+        let (entries, _) = expand_buckets(view_entries(&view).unwrap(), &pairs, &[&clone]).unwrap();
         assert_eq!(
             entries,
             [
@@ -9835,6 +9842,38 @@ mod tests {
                 .any(|(mountpoint, _)| *mountpoint == held),
             "{:?}",
             redirects.pairs
+        );
+    }
+
+    /// A regular file directly in a bucket the mount view opens (a read-only `--disk` image
+    /// a source VM was given at `<vm-disks>/<b>/data.raw`) stays reachable to the clone's
+    /// VMM: the view keeps it, as it keeps a file directly in `vm-disks`.
+    #[test]
+    fn a_file_in_an_opened_bucket_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let held = view.join("3c");
+        let (source, clone) = (held.join("vm-source"), view.join("a0").join("vm-clone"));
+        for dir in [&source, &clone] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let disk = held.join("data.raw");
+        std::fs::write(&disk, b"").unwrap();
+        let top = view.join("top.raw");
+        std::fs::write(&top, b"").unwrap();
+        let redirects = clone_mount_redirects(
+            LoadOverrides::None,
+            &view,
+            vec![(source.clone(), clone.clone())],
+            &clone,
+            &clone,
+        )
+        .unwrap()
+        .expect("a mount view");
+        assert!(
+            redirects.keep_files.contains(&disk) && redirects.keep_files.contains(&top),
+            "{:?}",
+            redirects.keep_files
         );
     }
 
