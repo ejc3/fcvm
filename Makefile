@@ -79,6 +79,16 @@ CONTAINER_ARCH ?= $(shell uname -m)
 # Per-mode data directories (prevents UID conflicts between test modes)
 ROOT_DATA_DIR := /mnt/fcvm-btrfs/root
 CONTAINER_DATA_DIR := /mnt/fcvm-btrfs/container
+# Where fcvm inside the test container keeps its VM states (FCVM_RUNTIME_DIR). The
+# container's fcvm is root with a /run of its own, made new for every run, so by default
+# its states would go there, and the data directory, which outlives the run, records where
+# its states are: the next run in the same boot would be refused a data directory whose
+# runtime directory it cannot see. So the container is given a base on the store, the same
+# in every run. It is short because the namespace pool binds each slot's pasta control
+# socket at <base>/<key>/boot-<boot>/netpool/<user>/slots/<n>/pasta.ctl, which must fit
+# sockaddr_un's 107 bytes: under $(CONTAINER_DATA_DIR)/runtime-dirs it was 114 and every
+# pool test timed out (the pool now refuses such a base at start).
+CONTAINER_RUNTIME_DIR := /mnt/fcvm-btrfs/crt
 
 # Test options: FILTER=pattern STREAM=1 LIST=1 IGNORED=1
 FILTER ?=
@@ -291,7 +301,7 @@ CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
 	--ulimit nofile=65536:65536 --ulimit nproc=-1:-1 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
 	-v $(TEST_LOG_DIR):$(TEST_LOG_DIR) $(CARGO_CACHE_MOUNT) \
-	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) $(CONTAINER_TEST_OPTIONS)
+	-e FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) -e FCVM_RUNTIME_DIR=$(CONTAINER_RUNTIME_DIR) $(CONTAINER_TEST_OPTIONS)
 
 # Container run with high process limits (for parallel test suites)
 CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=65536
@@ -548,9 +558,17 @@ clean-test-data: cargo-target-link $(if $(filter 1,$(CLEAN_PRUNE)),build)
 	sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*
 	sudo rm -rf $(ROOT_DATA_DIR)/vm-disks/* $(CONTAINER_DATA_DIR)/vm-disks/*
 	@echo "==> Cleaning state files..."
-	sudo rm -rf /mnt/fcvm-btrfs/state/vms /mnt/fcvm-btrfs/state/names /mnt/fcvm-btrfs/state/pids /mnt/fcvm-btrfs/state/*.lock
-	sudo rm -rf $(ROOT_DATA_DIR)/state/vms $(ROOT_DATA_DIR)/state/names $(ROOT_DATA_DIR)/state/pids $(ROOT_DATA_DIR)/state/*.lock
-	sudo rm -rf $(CONTAINER_DATA_DIR)/state/vms $(CONTAINER_DATA_DIR)/state/names $(CONTAINER_DATA_DIR)/state/pids $(CONTAINER_DATA_DIR)/state/*.lock
+	@# The VMs were killed above, so their states (in the runtime directories) and each
+	@# data directory's record of its runtime directory go together: the next fcvm binds
+	@# a new one. What an older layout kept in the data directory goes too.
+	@# A runtime directory is /run/fcvm-<uid>/<key> or <data_dir>/runtime, the key being
+	@# 16 hex digits of the SHA-256 of the data directory's canonical path
+	@# (src/runtime_dir.rs).
+	for d in /mnt/fcvm-btrfs $(ROOT_DATA_DIR) $(CONTAINER_DATA_DIR); do \
+		key=$$(printf %s "$$(realpath -m $$d)" | sha256sum | cut -c1-16); \
+		sudo rm -rf /run/fcvm-*/$$key $$d/runtime $(CONTAINER_RUNTIME_DIR) \
+			$$d/state/runtime $$d/state/vms $$d/state/names $$d/state/pids $$d/state/*.json* $$d/state/sweep.*; \
+	done
 	@echo "==> Removing root owner records that root does not own..."
 	@# A reclaim/0 owned by another uid was written by a rootless container's root (host uid
 	@# 1000), and every root fcvm on this host refuses it. Root's own records stay for reclaim.
