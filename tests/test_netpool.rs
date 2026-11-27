@@ -473,8 +473,10 @@ impl Pool {
     /// [`Self::start`] with `env` in the pool's environment.
     async fn start_with(slots: usize, env: &[(&str, &str)]) -> Self {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        // Short: a VM's deepest socket is <data>/vm-disks/<bucket>/vm-<32 hex>/vsock.sock_inode_tables,
+        // 72 bytes below the data directory, and AF_UNIX paths stop at 107.
         let data_dir = PathBuf::from(format!(
-            "/mnt/fcvm-btrfs/netpool-test-{}-{}",
+            "/mnt/fcvm-btrfs/np-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));

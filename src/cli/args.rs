@@ -1718,7 +1718,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub kernel_profile: Option<String>,
 
-    /// Directory for vsock socket (default: auto-generated in vm-disks)
+    /// Directory for vsock socket (default: auto-generated in vm-disks/<bucket>/<vm_id>)
     /// Use this to create a predictable socket path for external listeners.
     /// Example: --vsock-dir /tmp/myvm creates /tmp/myvm/vsock.sock
     #[arg(long)]

@@ -2219,8 +2219,7 @@ async fn prepare_vm_for_lifecycle(
     // the cause (observed as "VolumeServer failed to signal ready: channel
     // closed"), so refuse it here where the path can still be named.
     paths::check_socket_path_budget(&vm_id)?;
-    let data_dir = paths::vm_runtime_dir(&vm_id);
-    tokio::fs::create_dir_all(&data_dir)
+    let data_dir = paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory")?;
 
@@ -2479,6 +2478,7 @@ async fn prepare_vm_for_lifecycle(
     // Snapshot control must connect to the socket the VMM actually bound. In
     // particular, `--vsock-dir` deliberately places it outside `data_dir`, so
     // reconstructing the path from vm_id would target the wrong socket.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     vm_state.config.vsock_socket_path = Some(vsock_socket_path.clone());
     // A cold-boot VMM embeds the same exact path it binds. A restored clone
     // records the path its VMM state names: its own listener when the load
@@ -4896,7 +4896,7 @@ mod tests {
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
         let staged = at("DiskDirStaging::resolve(");
-        let created = at("tokio::fs::create_dir_all(&data_dir)");
+        let created = at("paths::create_vm_runtime_dir(&vm_id)");
         assert!(
             reclaimed < owned && owned < recorded,
             "the launch must reclaim, then begin its owner, then record"
@@ -4918,7 +4918,7 @@ mod tests {
         let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
-        let created = at("tokio::fs::create_dir_all(&data_dir)");
+        let created = at("paths::create_vm_runtime_dir(&vm_id)");
         assert!(
             reclaimed < owned && owned < recorded && recorded < created,
             "a restore must reclaim, begin its owner and record its runtime directory, in \

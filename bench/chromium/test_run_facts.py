@@ -892,7 +892,7 @@ fake = (
 )
 vm_id = "vm-" + "1" * 32
 state = os.path.join(d, vm_id + ".json")
-data = os.path.join(d, "vm-disks", vm_id)
+data = reqbench.vm_runtime_dir(d, vm_id)
 os.makedirs(os.path.join(data, "disks"))
 with open(state, "w") as f:
     json.dump({"vm_id": vm_id}, f)

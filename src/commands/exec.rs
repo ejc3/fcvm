@@ -99,9 +99,7 @@ fn exec_vsock_socket_path(vm_state: &crate::state::VmState) -> Result<PathBuf> {
         Ok(path) => Ok(path.to_path_buf()),
         // Resolved only here: `vm_runtime_dir` reads the loaded config, and a VM that
         // recorded its own socket has no reason to make the caller depend on that.
-        Err(error) => {
-            conventional_exec_socket(&crate::paths::vm_runtime_dir(&vm_state.vm_id), error)
-        }
+        Err(error) => conventional_exec_socket(&vm_state.vm_runtime_dir(), error),
     }
 }
 
@@ -1153,6 +1151,33 @@ mod tests {
         assert_eq!(
             exec_vsock_socket_path_in(&state, runtime_dir.path()).unwrap(),
             PathBuf::from("/srv/custom/vsock.sock")
+        );
+    }
+
+    /// exec finds a VM where its state says the VM's runtime directory is, whatever layout
+    /// the fcvm that started it used: a state naming the flat layout (`vm-disks/<id>`,
+    /// before the buckets) reaches that directory, not the one this build would make.
+    #[test]
+    fn exec_reaches_the_runtime_directory_a_vm_recorded() {
+        let id = "vm-0123456789abcdef0123456789abcdef";
+        let store = tempfile::tempdir().expect("data dir");
+        let flat = store.path().join("vm-disks").join(id);
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("vsock.sock"), b"").unwrap();
+        let mut state = crate::state::VmState::new(id.to_string(), "alpine".to_string(), 1, 128);
+        state.config.vsock_socket_path = None;
+        state.config.vm_runtime_dir = Some(flat.clone());
+        assert_eq!(state.vm_runtime_dir(), flat);
+        assert_eq!(
+            exec_vsock_socket_path(&state).unwrap(),
+            flat.join("vsock.sock"),
+            "exec must use the recorded runtime directory, not the current layout's"
+        );
+        // A state written before the record existed is from a build that used the flat layout.
+        state.config.vm_runtime_dir = None;
+        assert_eq!(
+            state.vm_runtime_dir(),
+            crate::paths::vm_disks_dir().join(id)
         );
     }
 

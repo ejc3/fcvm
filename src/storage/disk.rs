@@ -98,11 +98,7 @@ pub fn take_reflink_slot(base_dir: &Path, slots: usize) -> std::io::Result<Optio
     for slot in 0..slots {
         let path = reflink_slot_path(base_dir, slot)
             .ok_or_else(|| std::io::Error::other("the disk directory has no parent"))?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)?;
+        let file = crate::utils::open_shared_lock_file(&path)?;
         // SAFETY: flock on a descriptor this function owns.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(Some(file));

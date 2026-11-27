@@ -1194,6 +1194,17 @@ def vm_state_path(state_dir: str, vm_id: str) -> str:
     return os.path.join(state_dir, "vms", bucket_of(vm_id), f"{vm_id}.json")
 
 
+def vm_disks_bucket(vm_id: str) -> str:
+    """The bucket of ``vm-disks`` holding a VM's runtime directory: the first byte of SHA-256
+    of the id as two hex digits (``fcvm::paths::vm_bucket``)."""
+    return hashlib.sha256(vm_id.encode()).hexdigest()[:2]
+
+
+def vm_runtime_dir(data_root: str, vm_id: str) -> str:
+    """A VM's runtime directory, ``<data_root>/vm-disks/<bucket>/<vm_id>``."""
+    return os.path.join(data_root, "vm-disks", vm_disks_bucket(vm_id), vm_id)
+
+
 def pid_bucket_dir(state_dir: str, pid: int) -> str:
     return os.path.join(state_dir, "pids", bucket_of(str(pid)))
 
@@ -1683,7 +1694,7 @@ def clone_data_dir(data_root: str, state: dict) -> str:
     vm_id = state.get("vm_id")
     if not valid_vm_id(vm_id):
         raise RuntimeError(f"clone state has an invalid vm_id: {vm_id!r}")
-    return os.path.join(data_root, "vm-disks", vm_id)
+    return vm_runtime_dir(data_root, vm_id)
 
 
 def wait_port(
@@ -2373,19 +2384,18 @@ def valid_snapshot_name(name) -> bool:
 
 
 def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
-    """Return an exact child of this run's trusted ``vm-disks`` root, else "".
+    """Return the exact ``vm-disks/<bucket>/<vm_id>`` directory of this run, else "".
 
-    Every call site computes `os.path.join(data_root, "vm-disks", vm_id)` from a
-    state file, and `state.get("vm_id", "")` is empty on a partially-written
-    file. `os.path.join("/mnt/fcvm-btrfs", "vm-disks", "")` is
-    `/mnt/fcvm-btrfs/vm-disks/`, `os.path.isdir` says True, and the rmtree below
-    then deletes EVERY VM's disks on the box — under sudo. Commit e1286e3f called
+    Every call site computes `vm_runtime_dir(data_root, vm_id)` from a state
+    file, and `state.get("vm_id", "")` is empty on a partially-written file.
+    With an empty id the path is a whole bucket of `vm-disks`, `os.path.isdir`
+    says True, and the rmtree below then deletes EVERY VM's disks in it — under sudo. Commit e1286e3f called
     exactly this arithmetic catastrophic and guarded `tests/test_signal_cleanup.rs`
     (`an_empty_vm_id_resolves_to_the_shared_disk_root_and_must_be_rejected`); the
     Python harness that does the identical computation was left unguarded, so the
     guarantee held only for the Rust fixture.
 
-    Symlinks are resolved on both sides before comparing, so a `vm-disks/<id>`
+    Symlinks are resolved on both sides before comparing, so a `vm-disks/<bucket>/<id>`
     that points somewhere else cannot smuggle the deletion out of the tree.
     """
     if not data_root or not state_path or not data_dir:
@@ -2407,7 +2417,7 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
         return ""
     raw = os.path.abspath(os.path.normpath(data_dir))
     head, vm_id = os.path.split(raw)
-    expected = os.path.join(trusted, vm_id)
+    expected = os.path.join(trusted, vm_disks_bucket(vm_id), vm_id)
     real = os.path.realpath(raw)
     try:
         contained = os.path.commonpath((trusted, real)) == trusted
@@ -2416,7 +2426,7 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
     if (
         not valid_vm_id(vm_id)
         or os.path.basename(state_path) != f"{vm_id}.json"
-        or os.path.realpath(head) != trusted
+        or os.path.realpath(head) != os.path.join(trusted, vm_disks_bucket(vm_id))
         or os.path.islink(raw)
         or real != expected
         or not contained
@@ -2641,8 +2651,8 @@ def reap_disk(
         if not safe:
             out.setdefault("disk_errors", []).append(
                 f"{data_dir}: refusing to remove — not an exact child of "
-                f"{os.path.join(data_root, 'vm-disks')} "
-                f"(an empty vm_id collapses to the SHARED disk root)"
+                f"{os.path.join(data_root, 'vm-disks', '<bucket>')} "
+                f"(an empty vm_id collapses to a SHARED bucket)"
             )
             # The state file is the only durable pointer to the disk we just
             # refused to touch.  Deleting it here would orphan that disk, so an

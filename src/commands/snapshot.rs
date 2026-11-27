@@ -1629,7 +1629,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     crate::storage::validate_new_snapshot_name(&snapshot_name)?;
 
     // Connect to running VM
-    let socket_path = paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock");
+    let socket_path = vm_state.vm_runtime_dir().join("firecracker.sock");
 
     // Check if socket exists
     if !socket_path.exists() {
@@ -1640,7 +1640,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     }
 
     // Check VM disk exists
-    let vm_disk_path = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.raw");
+    let vm_disk_path = vm_state.vm_runtime_dir().join("disks/rootfs.raw");
     if !vm_disk_path.exists() {
         anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
     }
@@ -3553,7 +3553,7 @@ async fn cmd_snapshot_run_inner(
         lease.keep();
     }
 
-    setup_try!(tokio::fs::create_dir_all(&data_dir)
+    setup_try!(paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory"));
 
@@ -3592,6 +3592,7 @@ async fn cmd_snapshot_run_inner(
     // state; snapshot control must address this socket. The recorded source
     // starts as the snapshot's embedded path, and the restore replaces it with
     // this socket when the load overrides the vsock path.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     vm_state.config.vsock_socket_path = Some(clone_vsock_base.clone());
     vm_state.config.source_vsock_socket_path =
         Some(snapshot_config.source_vsock_socket_path.clone());
@@ -6359,15 +6360,17 @@ async fn cmd_snapshot_run_raw(
     let ch_bin = super::common::find_cloud_hypervisor()?;
 
     let data_dir = paths::vm_runtime_dir(&vm_id);
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     vm_state.config.rdp_socket = Some(super::vm::rdp_socket_path(&data_dir));
     if let Err(e) = async {
         state_manager
             .claim_name(&mut vm_state)
             .await
             .context("claiming the VM name")?;
-        tokio::fs::create_dir_all(&data_dir)
+        paths::create_vm_runtime_dir(&vm_id)
             .await
             .context("creating VM data directory")
+            .map(|_| ())
     }
     .await
     {

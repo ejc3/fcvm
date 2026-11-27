@@ -1578,12 +1578,11 @@ async fn test_snapshot_restore_survives_ancestor_dir_cleanup() -> Result<()> {
     // Same base resolution as snapshot_dir(): FCVM_DATA_DIR, falling back to
     // fcvm's config default (/mnt/fcvm-btrfs) — NOT the Makefile's per-suite
     // override, which only exists when FCVM_DATA_DIR is exported anyway.
-    let vm_disks = std::env::var("FCVM_DATA_DIR")
+    let data_dir = std::env::var("FCVM_DATA_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs"))
-        .join("vm-disks");
+        .unwrap_or_else(|_| std::path::PathBuf::from("/mnt/fcvm-btrfs"));
     for id in [&vm_id_a, &vm_id_b] {
-        let dir = vm_disks.join(id);
+        let dir = fcvm::paths::vm_runtime_dir_under(&data_dir, id);
         // Normal cleanup removes it within a few seconds of SIGTERM.
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while dir.exists() && std::time::Instant::now() < deadline {

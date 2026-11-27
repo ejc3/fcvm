@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn vm_disks(vm_id: &str) -> PathBuf {
-    fcvm::paths::data_dir().join("vm-disks").join(vm_id)
+    fcvm::paths::vm_runtime_dir(vm_id)
 }
 
 /// What `fcvm ls --json` says about the VM whose fcvm process is `pid`.
@@ -241,6 +241,8 @@ async fn a_launch_inside_the_interval_leaves_a_killed_vm_to_the_launch_after_it(
                 std::fs::read_dir(data_dir.join("vm-disks"))
                     .ok()?
                     .flatten()
+                    .filter_map(|bucket| std::fs::read_dir(bucket.path()).ok())
+                    .flat_map(|bucket| bucket.flatten())
                     .map(|entry| entry.path())
                     .find(|dir| dir.join("disks/rootfs.raw").exists())
             },

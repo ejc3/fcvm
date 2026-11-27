@@ -264,6 +264,12 @@ pub struct VmConfig {
     /// `source_vsock_socket_path`, since the source may use `--vsock-dir`.
     #[serde(default)]
     pub original_vsock_vm_id: Option<String>,
+    /// This VM's runtime directory (`paths::vm_runtime_dir` when it started: its API socket,
+    /// log, disks), recorded so a later fcvm finds it where the build that started the VM put
+    /// it, whatever layout that build used (`VmState::vm_runtime_dir`). None in a state written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_runtime_dir: Option<std::path::PathBuf>,
     /// Actual host-side base socket used for this running VM's vsock device.
     ///
     /// This may live outside the per-VM runtime directory when `--vsock-dir`
@@ -455,6 +461,16 @@ impl VmConfig {
 }
 
 impl VmState {
+    /// This VM's runtime directory: the one its state recorded when it started. Every fcvm
+    /// that puts a VM's directory in a bucket of `vm-disks` records it, so a state without
+    /// the record was written by a build that put it directly in `vm-disks`.
+    pub fn vm_runtime_dir(&self) -> std::path::PathBuf {
+        match &self.config.vm_runtime_dir {
+            Some(dir) => dir.clone(),
+            None => crate::paths::vm_disks_dir().join(&self.vm_id),
+        }
+    }
+
     pub fn new(vm_id: String, image: String, vcpu: u8, memory_mib: u32) -> Self {
         let now = jiff::Timestamp::now();
         Self {
@@ -477,6 +493,7 @@ impl VmState {
             created_at: now,
             last_updated: now,
             config: VmConfig {
+                vm_runtime_dir: None,
                 image,
                 vcpu,
                 memory_mib,
