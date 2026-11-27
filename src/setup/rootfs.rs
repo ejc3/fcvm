@@ -68,6 +68,11 @@ pub struct Plan {
     /// Firecracker source build links (src/setup/libseccomp.rs).
     #[serde(default)]
     pub libseccomp: Option<super::libseccomp::LibseccompConfig>,
+    /// Published builds of the pinned Firecracker and Cloud Hypervisor (`vmm.yml`), each
+    /// with the SHA-256 of its bytes. Setup downloads one whose name it would build and
+    /// builds locally otherwise (src/setup/vmm_artifacts.rs).
+    #[serde(default)]
+    pub vmm_artifacts: super::vmm_artifacts::VmmArtifacts,
     /// Kernel profiles: kernel_profiles.{name}.{arch} = KernelProfile
     /// E.g., kernel_profiles.nested.arm64 = { kernel_version = "6.18", ... }
     #[serde(default)]
@@ -119,6 +124,9 @@ pub struct CloudHypervisorConfig {
     /// Exact full commit to build, fetched by its hash. Required, so the build
     /// is always one known commit and launch resolves it without the network.
     pub commit: String,
+    /// The `[vmm_artifacts]` table, copied here by config loading.
+    #[serde(skip)]
+    pub artifacts: super::vmm_artifacts::VmmArtifacts,
 }
 
 fn default_branch() -> String {
@@ -234,6 +242,11 @@ pub struct KernelProfile {
     /// profile alone.
     #[serde(skip)]
     pub firecracker_libseccomp: Option<super::libseccomp::LibseccompConfig>,
+
+    /// The `[vmm_artifacts]` table, copied here by config loading as `[libseccomp]` is,
+    /// so setup can download this profile's Firecracker instead of building it.
+    #[serde(skip)]
+    pub vmm_artifacts: super::vmm_artifacts::VmmArtifacts,
 
     /// Extra CLI args for firecracker
     #[serde(default)]
@@ -1177,6 +1190,7 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
     // profile inherits the global Firecracker build just like every cold boot.
     apply_default_firecracker_config(&mut config);
     apply_libseccomp_config(&mut config);
+    apply_vmm_artifacts(&mut config);
 
     let arch = config_arch();
     if config
@@ -1332,13 +1346,29 @@ fn apply_libseccomp_config(plan: &mut Plan) {
     }
 }
 
+/// Give every kernel profile, and the Cloud Hypervisor config, the `[vmm_artifacts]`
+/// table, so the setup step that builds a VMM can look for its published build.
+fn apply_vmm_artifacts(plan: &mut Plan) {
+    let artifacts = plan.vmm_artifacts.clone();
+    for profile in plan
+        .kernel_profiles
+        .values_mut()
+        .flat_map(|profiles| profiles.values_mut())
+    {
+        profile.vmm_artifacts = artifacts.clone();
+    }
+    if let Some(ch) = plan.cloud_hypervisor.as_mut() {
+        ch.artifacts = artifacts;
+    }
+}
+
 /// Load the discovered config path used by runtime helpers.
 pub fn load_plan() -> Result<(Plan, String, String)> {
     load_config(None)
 }
 
 /// Get the arch name used in config files ("arm64" or "amd64")
-fn config_arch() -> &'static str {
+pub(crate) fn config_arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
         "x86_64" => "amd64",

@@ -78,6 +78,16 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Build the pinned VMMs from source for vmm.yml and exit. Before the store setup: the
+    // builds need only the assets directory, and the publishing runner has no btrfs.
+    if let Some(dir) = args.vmm_artifacts.as_deref() {
+        let (config, _, _) = load_config(args.config.as_deref())?;
+        paths::init_from_loaded_config(&config);
+        std::fs::create_dir_all(paths::assets_dir())
+            .with_context(|| format!("creating {}", paths::assets_dir().display()))?;
+        return write_vmm_artifacts(&config, std::path::Path::new(dir)).await;
+    }
+
     // Ensure btrfs storage is ready (creates loopback if needed)
     // This must be done before accessing any paths under the configured assets_dir
     crate::setup::ensure_storage(args.config.as_deref()).context("initializing storage")?;
@@ -286,6 +296,77 @@ fn runtime_base_exists(data_dir: &std::path::Path) -> bool {
             .join(format!("fcvm-{}", metadata.uid()))
             .is_dir()
     })
+}
+
+/// Build every pinned VMM from source into the store and copy each binary, with a
+/// manifest.json of `[vmm_artifacts]` entries, to `dir` (`fcvm setup --vmm-artifacts`).
+async fn write_vmm_artifacts(
+    config: &crate::setup::rootfs::Plan,
+    dir: &std::path::Path,
+) -> Result<()> {
+    use crate::setup::vmm_artifacts::VmmArtifact;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let arch = std::env::consts::ARCH;
+    let libc = crate::setup::kernel::libc_version_tag();
+    let mut files: Vec<VmmArtifact> = Vec::new();
+    let mut add = |path: &std::path::Path, commit: &str| -> Result<()> {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("a built VMM has no file name")?
+            .to_string();
+        if files.iter().any(|f| f.name == name) {
+            return Ok(());
+        }
+        let copy = dir.join(&name);
+        std::fs::copy(path, &copy)
+            .with_context(|| format!("copying {} to {}", path.display(), copy.display()))?;
+        let sha256 = crate::commands::snapshot_export::sha256_hex(&copy)?;
+        println!("  {name} {sha256}");
+        files.push(VmmArtifact {
+            name,
+            commit: commit.to_string(),
+            arch: arch.to_string(),
+            libc: libc.clone(),
+            sha256,
+        });
+        Ok(())
+    };
+    let mut profiles: Vec<_> = config
+        .kernel_profiles
+        .iter()
+        .filter_map(|(name, by_arch)| {
+            by_arch
+                .get(crate::setup::rootfs::config_arch())
+                .map(|p| (name, p))
+        })
+        .filter(|(_, p)| p.is_published() && p.firecracker_repo.is_some())
+        .collect();
+    profiles.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, profile) in profiles {
+        let commit = profile
+            .firecracker_commit
+            .clone()
+            .with_context(|| format!("profile {name} builds Firecracker from no pinned commit, so nothing can be published for it"))?;
+        if let Some(path) =
+            crate::setup::kernel::ensure_profile_firecracker_from(profile, name, false)
+                .await
+                .with_context(|| format!("building Firecracker for profile {name}"))?
+        {
+            add(&path, &commit)?;
+        }
+    }
+    if let Some(ch) = config.cloud_hypervisor.as_ref() {
+        let path = crate::setup::kernel::ensure_cloud_hypervisor_from(ch, false)
+            .await
+            .context("building Cloud Hypervisor")?;
+        add(&path, &ch.commit)?;
+    }
+    let manifest = dir.join("manifest.json");
+    std::fs::write(&manifest, serde_json::to_vec_pretty(&files)?)
+        .with_context(|| format!("writing {}", manifest.display()))?;
+    println!("Wrote {} builds and {}", files.len(), manifest.display());
+    Ok(())
 }
 
 #[cfg(test)]

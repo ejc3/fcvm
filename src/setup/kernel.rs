@@ -3416,6 +3416,17 @@ pub async fn ensure_profile_firecracker(
     profile: &KernelProfile,
     profile_name: &str,
 ) -> Result<Option<PathBuf>> {
+    ensure_profile_firecracker_from(profile, profile_name, true).await
+}
+
+/// [`ensure_profile_firecracker`], taking a published build recorded in `[vmm_artifacts]`
+/// when `published` is true, and always building from source when it is false (the build
+/// `vmm.yml` publishes must not be a download of an earlier publish).
+pub async fn ensure_profile_firecracker_from(
+    profile: &KernelProfile,
+    profile_name: &str,
+    published: bool,
+) -> Result<Option<PathBuf>> {
     // Check if profile needs custom firecracker
     let repo = match profile.firecracker_repo.as_deref() {
         Some(r) => r,
@@ -3498,6 +3509,65 @@ pub async fn ensure_profile_firecracker(
         } => (commit, path, source, record_resolution),
     };
 
+    // A published build of exactly this binary (same name, so same pin, architecture,
+    // libc and libseccomp), checked against its recorded digest, instead of the build.
+    let libseccomp = profile.firecracker_libseccomp.as_ref();
+    let bin_name = bin_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if published && profile.vmm_artifacts.find(&bin_name).is_some() {
+        let mut lock_path = bin_path.clone().into_os_string();
+        lock_path.push(".lock");
+        let flock = super::lock_store_dir(Path::new(&lock_path), "firecracker install").await?;
+        let installed = if bin_path.exists() {
+            Ok(true)
+        } else {
+            super::vmm_artifacts::install(
+                &profile.vmm_artifacts,
+                &bin_path,
+                super::ARCHIVE_RETRY_DELAY,
+                |_| Ok(()),
+            )
+            .await
+        };
+        flock.unlock().map_err(|(_, err)| err)?;
+        match installed {
+            Ok(true) => {
+                println!(
+                    "  ✓ Firecracker ready (published build, SHA-256 checked): {}",
+                    bin_path.display()
+                );
+                if record_resolution {
+                    record_firecracker_resolution(
+                        profile_name,
+                        repo,
+                        branch,
+                        &commit_hash,
+                        &bin_path,
+                        build,
+                    );
+                }
+                ensure_confined_seccomp_or_warn(
+                    &bin_path,
+                    repo,
+                    branch,
+                    &commit_hash,
+                    source,
+                    libseccomp,
+                )
+                .await;
+                return Ok(Some(bin_path));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(name = %bin_name, error = %format!("{error:#}"), "the published firecracker build was not installed; building it");
+                println!("  → The published build of {bin_name} was not installed ({error:#}); building it");
+            }
+        }
+    }
+
     // Resolve the build toolchain before creating anything: a missing cargo
     // must not cost a network clone or leave a fresh dir/lock behind.
     let cargo = cargo_program()?;
@@ -3505,7 +3575,6 @@ pub async fn ensure_profile_firecracker(
     // The libseccomp the build links, built here when `fcvm setup` has not
     // already made it its own step. Before the lock and the clone: a host
     // without what the archive's build needs fails in seconds.
-    let libseccomp = profile.firecracker_libseccomp.as_ref();
     super::libseccomp::ensure_libseccomp(libseccomp)
         .await
         .context("setting up libseccomp for the firecracker build")?;
@@ -3809,6 +3878,15 @@ async fn checkout_cloud_hypervisor_source(url: &str, commit: &str, build_dir: &P
 pub async fn ensure_cloud_hypervisor(
     config: &super::rootfs::CloudHypervisorConfig,
 ) -> Result<PathBuf> {
+    ensure_cloud_hypervisor_from(config, true).await
+}
+
+/// [`ensure_cloud_hypervisor`], taking a published build recorded in `[vmm_artifacts]` when
+/// `published` is true, and always building from source when it is false (`vmm.yml`).
+pub async fn ensure_cloud_hypervisor_from(
+    config: &super::rootfs::CloudHypervisorConfig,
+    published: bool,
+) -> Result<PathBuf> {
     let ch_dir = cloud_hypervisor_store_dir();
     let bin_path = cloud_hypervisor_path_in(&ch_dir, config)?;
     let (repo, commit) = (config.repo.as_str(), config.commit.as_str());
@@ -3844,6 +3922,37 @@ pub async fn ensure_cloud_hypervisor(
         debug!(path = %bin_path.display(), "cloud-hypervisor exists (built by another process)");
         flock.unlock().map_err(|(_, err)| err)?;
         return Ok(bin_path);
+    }
+
+    // A published build of exactly this binary, checked against its recorded digest and,
+    // as a local build is, against the commit its version names.
+    if published {
+        let installed = super::vmm_artifacts::install(
+            &config.artifacts,
+            &bin_path,
+            super::ARCHIVE_RETRY_DELAY,
+            |path| {
+                crate::version_cache::version_output(path)
+                    .context("running the published cloud-hypervisor --version")
+                    .and_then(|version| cloud_hypervisor_version_names(&version, commit))
+            },
+        )
+        .await;
+        match installed {
+            Ok(true) => {
+                flock.unlock().map_err(|(_, err)| err)?;
+                println!(
+                    "  ✓ Cloud Hypervisor ready (published build, SHA-256 checked): {}",
+                    bin_path.display()
+                );
+                return Ok(bin_path);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(path = %bin_path.display(), error = %format!("{error:#}"), "the published cloud-hypervisor build was not installed; building it");
+                println!("  → The published Cloud Hypervisor build was not installed ({error:#}); building it");
+            }
+        }
     }
 
     println!("  → Building cloud-hypervisor from {repo} (commit: {commit})...");
@@ -4289,7 +4398,7 @@ mod tests {
         );
         let source = include_str!("kernel.rs");
         let body = &source[source
-            .find("pub async fn ensure_cloud_hypervisor(")
+            .find("pub async fn ensure_cloud_hypervisor_from(")
             .expect("ensure_cloud_hypervisor is gone")..];
         let body = &body[..body.find("\n}\n").unwrap()];
         assert!(
@@ -6598,5 +6707,126 @@ cp vmlinux arch/arm64/boot/Image
             .await
             .expect("the recorded bytes are the release");
         assert_eq!(std::fs::read(&dest).unwrap(), kernel);
+    }
+
+    /// The VMM pins of `plan` that have published builds for `arch` but none named as a host
+    /// with `libc` would name its build: such a host keeps building from source.
+    fn vmm_names_missing_from_publish(
+        plan: &crate::setup::rootfs::Plan,
+        arch: &str,
+        libc: &str,
+    ) -> Vec<String> {
+        let recorded = &plan.vmm_artifacts.files;
+        let mut problems = Vec::new();
+        let mut check = |kind: &str, commit: &str, prefix: &str, ours: String| {
+            let published: Vec<&str> = recorded
+                .iter()
+                .filter(|f| f.commit == commit && f.arch == arch && f.name.starts_with(prefix))
+                .map(|f| f.name.as_str())
+                .collect();
+            if !published.is_empty() && !published.contains(&ours.as_str()) {
+                problems.push(format!(
+                    "{kind} at {commit}: a host on {arch} with {libc} builds {ours}, and the \
+                     published builds are {published:?}"
+                ));
+            }
+        };
+        for (name, profile) in vmm_profiles(plan) {
+            let commit = profile.firecracker_commit.as_deref().unwrap();
+            check(
+                &format!("Firecracker for profile {name}"),
+                commit,
+                &format!("firecracker-{name}-"),
+                firecracker_name_for(name, profile, libc, arch),
+            );
+        }
+        if let Some(ch) = plan.cloud_hypervisor.as_ref() {
+            let ours = cloud_hypervisor_file_name(&ch.repo, &ch.commit, arch, libc);
+            check("Cloud Hypervisor", &ch.commit, "cloud-hypervisor-", ours);
+        }
+        problems
+    }
+
+    /// The published kernel profiles of this architecture that build a pinned Firecracker.
+    fn vmm_profiles(plan: &crate::setup::rootfs::Plan) -> Vec<(&String, &KernelProfile)> {
+        plan.kernel_profiles
+            .iter()
+            .filter_map(|(name, by_arch)| {
+                by_arch
+                    .get(crate::setup::rootfs::config_arch())
+                    .map(|p| (name, p))
+            })
+            .filter(|(_, p)| {
+                p.is_published() && p.firecracker_repo.is_some() && p.firecracker_commit.is_some()
+            })
+            .collect()
+    }
+
+    fn firecracker_name_for(name: &str, profile: &KernelProfile, libc: &str, arch: &str) -> String {
+        let libseccomp = profile_libseccomp_identity(profile);
+        let build = FirecrackerBuildEnvironment {
+            arch,
+            libc_tag: libc,
+            libseccomp: &libseccomp,
+        };
+        profile_firecracker_path_for_build(
+            Path::new(""),
+            name,
+            profile.firecracker_repo.as_deref().unwrap(),
+            profile.firecracker_branch.as_deref().unwrap_or("main"),
+            profile.firecracker_commit.as_deref().unwrap(),
+            build,
+        )
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+    }
+
+    fn repo_plan() -> crate::setup::rootfs::Plan {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/rootfs-config.toml");
+        crate::setup::rootfs::load_config(Some(path)).unwrap().0
+    }
+
+    /// A self-hosted lane computes its VMM names from this host's libc and architecture. Where
+    /// a pin has published builds for this architecture, one of them must be this host's name,
+    /// or the lane quietly keeps building from source (a libc tag that differs from the
+    /// publishing runner's is the usual cause). A pin with no builds recorded yet is skipped.
+    #[test]
+    fn this_hosts_vmm_names_are_published_wherever_its_pins_are() {
+        let problems = vmm_names_missing_from_publish(
+            &repo_plan(),
+            std::env::consts::ARCH,
+            &libc_version_tag(),
+        );
+        assert!(problems.is_empty(), "{problems:#?}");
+    }
+
+    /// The check above on recorded builds written for it: a build published from another libc
+    /// is a finding for this host, and the build named as this host names it is not.
+    #[test]
+    fn a_vmm_build_published_from_another_libc_is_a_finding() {
+        let mut plan = repo_plan();
+        let (name, profile) = vmm_profiles(&plan)
+            .into_iter()
+            .map(|(n, p)| (n.clone(), p.clone()))
+            .next()
+            .expect("a published profile builds a pinned Firecracker");
+        let arch = std::env::consts::ARCH;
+        let entry = |libc: &str| crate::setup::vmm_artifacts::VmmArtifact {
+            name: firecracker_name_for(&name, &profile, libc, arch),
+            commit: profile.firecracker_commit.clone().unwrap(),
+            arch: arch.to_string(),
+            libc: libc.to_string(),
+            sha256: "a".repeat(64),
+        };
+        plan.vmm_artifacts.files = vec![entry("libc-9.99")];
+        let found = vmm_names_missing_from_publish(&plan, arch, "libc-2.39");
+        assert_eq!(found.len(), 1, "{found:?}");
+        plan.vmm_artifacts.files.push(entry("libc-2.39"));
+        assert_eq!(
+            vmm_names_missing_from_publish(&plan, arch, "libc-2.39"),
+            Vec::<String>::new()
+        );
     }
 }

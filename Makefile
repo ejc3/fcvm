@@ -54,6 +54,11 @@ test-ci-scope:
 test-ci-pool:
 	python3 scripts/test-ci-pool.py
 
+# scripts/vmm-artifacts.py (vmm.yml's publisher and digest recorder) against fixtures. No network.
+.PHONY: test-vmm-artifacts
+test-vmm-artifacts:
+	python3 scripts/test-vmm-artifacts.py
+
 # scripts/check-runner-kernel.py against fixture repositories. Needs git 2.29 and Python 3.11.4
 # (tomllib, tarfile's extraction filter, fetch --no-write-fetch-head) or later.
 .PHONY: test-runner-kernel

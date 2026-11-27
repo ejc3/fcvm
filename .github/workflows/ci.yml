@@ -294,6 +294,8 @@ jobs:
         run: make test-ci-scope
       - name: Test the pool tool
         run: make test-ci-pool
+      - name: Test the VMM build publisher and digest recorder
+        run: make test-vmm-artifacts
       - name: Test the runner kernel check
         run: make test-runner-kernel
       - name: Test cached release downloads

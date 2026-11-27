@@ -181,6 +181,15 @@ commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
 repo = "cloud-hypervisor/cloud-hypervisor"
 commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
 
+# Published builds of the pinned VMMs above (src/setup/vmm_artifacts.rs). vmm.yml builds each
+# Firecracker pin of a published kernel profile and the Cloud Hypervisor pin from source, per
+# architecture and libc, on GitHub-hosted runners, publishes each binary as a release asset of
+# `repo` named for its store file, and pushes the entries below to a vmm-digests/ branch.
+# Setup installs an entry whose name is the one it would build, checked against `sha256`, and
+# builds locally when there is none. A pin change builds locally until its entries land.
+[vmm_artifacts]
+repo = "ejc3/fcvm"
+
 # Rootfs Modification Plan
 #
 # The SHA256 of the generated setup script determines the image name: layer2-{sha}.raw
