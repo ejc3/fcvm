@@ -157,7 +157,7 @@ archives = [
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "wip/fcvm-base-2a8d0138"
+branch = "fcvm/base-2a8d0138"
 commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
