@@ -860,6 +860,14 @@ mod tests {
         ] {
             std::fs::write(path.join(file), "")?;
         }
+        // Below a threaded cgroup or a thread root the kernel makes only invalid domains.
+        let parent_type = std::fs::read_to_string(path.parent().unwrap().join("cgroup.type"))
+            .unwrap_or_else(|_| "domain".to_string());
+        let kind = match parent_type.trim() {
+            "threaded" | "domain threaded" | "domain invalid" => "domain invalid",
+            _ => "domain",
+        };
+        std::fs::write(path.join("cgroup.type"), format!("{kind}\n"))?;
         if fake_enabled(&path.parent().unwrap().join("cgroup.subtree_control")) {
             std::fs::write(path.join("memory.swap.max"), "max\n")?;
             std::fs::write(path.join("memory.current"), "0\n")?;
@@ -1443,6 +1451,33 @@ mod tests {
         assert!(!h.root.join("fcvm.slice/fcvm-4242-77.scope").exists());
         // Without --no-swap the scope is entered all the same.
         enter(&h, &default_placement(), 4242, 77, None, false, &nobody).unwrap();
+    }
+
+    /// Below a cgroup namespace root that is threaded (its parent is a thread root) or is a
+    /// thread root itself, the kernel makes only invalid domains: a scope there can be made
+    /// and never entered, EOPNOTSUPP on `cgroup.procs` (#2226, fcvm in a guest's container
+    /// before fc-agent stopped making its unit a thread root). fcvm says so and makes nothing.
+    #[test]
+    fn a_threaded_namespace_root_gets_no_scope_and_nothing_made() {
+        for kind in ["threaded", "domain threaded"] {
+            let (_dir, h) = fake_root(true);
+            std::fs::write(h.root.join("cgroup.type"), format!("{kind}\n")).unwrap();
+            let error = enter(
+                &h,
+                &default_placement(),
+                8,
+                344,
+                Some(Path::new("/")),
+                false,
+                &nobody,
+            )
+            .unwrap_err();
+            assert!(error.reason.contains("thread"), "{kind}: {}", error.reason);
+            assert!(
+                !h.root.join("fcvm.slice").exists(),
+                "{kind}: fcvm.slice was made"
+            );
+        }
     }
 
     #[test]
