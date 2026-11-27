@@ -262,7 +262,7 @@ impl PmemStore {
 
     /// `open` for the sudo invoker `invoker`, calling `steps` while it creates directories.
     fn open_with(data_dir: &Path, invoker: Option<&User>, steps: CreateSteps<'_>) -> Result<Self> {
-        std::fs::create_dir_all(data_dir)
+        crate::paths::ensure_dir(data_dir)
             .with_context(|| format!("creating data directory {}", data_dir.display()))?;
         let data = open_data_dir(data_dir)?
             .with_context(|| format!("data directory {} vanished", data_dir.display()))?;

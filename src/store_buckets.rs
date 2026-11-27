@@ -117,7 +117,7 @@ pub fn ensure(parent: &Path, bucket: &str) -> Result<usize> {
     let fd = match open() {
         Ok(fd) => fd,
         Err(nix::errno::Errno::ENOENT) => {
-            std::fs::create_dir_all(parent)
+            crate::paths::ensure_dir(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
             open().with_context(|| format!("opening {}", parent.display()))?
         }

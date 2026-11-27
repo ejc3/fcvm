@@ -646,7 +646,7 @@ async fn build_storage_image_in(
     tmp_img: &Path,
     temps: &crate::reclaim::Owner,
 ) -> Result<()> {
-    tokio::fs::create_dir_all(tmp_dir)
+    crate::paths::ensure_dir_async(tmp_dir)
         .await
         .context("creating temp storage dir")?;
 

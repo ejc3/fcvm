@@ -746,9 +746,16 @@ async fn verify_prepared_snapshot_in(
 ) -> Result<Option<PreparedSnapshot>> {
     let snapshot_key = target.name.as_str();
     let snapshot_dir = snapshot_root.join(snapshot_key);
-    tokio::fs::create_dir_all(snapshot_root)
+    // Looked up first: a mkdir of a directory that exists still takes its parent's lock for
+    // writing, and every launch comes through here.
+    if !tokio::fs::metadata(snapshot_root)
         .await
-        .context("creating snapshot directory")?;
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        crate::paths::ensure_dir_async(snapshot_root)
+            .await
+            .context("creating snapshot directory")?;
+    }
     let generation_lock = super::common::acquire_snapshot_dir_lock(&snapshot_dir, false).await?;
 
     let config_path = snapshot_dir.join("config.json");
@@ -1461,9 +1468,14 @@ async fn export_localhost_image_disk(
 
     // Use content-addressable cache: /mnt/fcvm-btrfs/image-cache/{digest}/
     let image_cache_dir = paths::image_cache_dir();
-    tokio::fs::create_dir_all(&image_cache_dir)
+    if !tokio::fs::metadata(&image_cache_dir)
         .await
-        .context("creating image-cache directory")?;
+        .is_ok_and(|metadata| metadata.is_dir())
+    {
+        crate::paths::ensure_dir_async(&image_cache_dir)
+            .await
+            .context("creating image-cache directory")?;
+    }
 
     // Lock per-digest to prevent concurrent exports of the same image
     let lock_file = lock_image_cache_entries(&image_cache_dir, &digest)?;
@@ -2519,7 +2531,7 @@ async fn prepare_vm_for_lifecycle(
             let absolute_dir = socket_path
                 .parent()
                 .expect("a custom vsock socket path always has a parent");
-            tokio::fs::create_dir_all(absolute_dir)
+            crate::paths::ensure_dir_async(absolute_dir)
                 .await
                 .with_context(|| format!("creating vsock dir: {:?}", absolute_dir))?;
             Ok(socket_path)

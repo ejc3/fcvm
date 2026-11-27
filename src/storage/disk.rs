@@ -629,7 +629,7 @@ fn snapshot_disks_extents(base_dir: &Path, limit: u64) -> Option<u64> {
 /// 860,177 extents measured 9 to 11 s per clone, a subvolume snapshot 20 ms.
 pub async fn create_dir_or_subvolume(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        crate::paths::ensure_dir_async(parent)
             .await
             .with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -651,7 +651,7 @@ pub async fn create_dir_or_subvolume(path: &Path) -> Result<()> {
         %reason,
         "not a btrfs subvolume; created as a directory (copies of it reflink its files)"
     );
-    fs::create_dir_all(path)
+    crate::paths::ensure_dir_async(path)
         .await
         .with_context(|| format!("creating {}", path.display()))
 }
@@ -1022,7 +1022,7 @@ impl DiskManager {
 
         {
             let started = std::time::Instant::now();
-            fs::create_dir_all(&self.vm_dir)
+            crate::paths::ensure_dir_async(&self.vm_dir)
                 .await
                 .context("creating VM directory")?;
             info!(
@@ -1084,7 +1084,7 @@ impl DiskManager {
     /// exist yet, and give the base disk `disk_path`'s name.
     async fn snapshot_base_subvolume(&self, base_dir: &Path, disk_path: &Path) -> Result<()> {
         if let Some(parent) = self.vm_dir.parent() {
-            fs::create_dir_all(parent)
+            crate::paths::ensure_dir_async(parent)
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }

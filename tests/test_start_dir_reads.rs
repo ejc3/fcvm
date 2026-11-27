@@ -94,6 +94,9 @@ struct Trace {
     /// Entry-creating calls that succeeded (a directory made, a file opened with O_CREAT, a
     /// rename's target, a link, a symlink, a node), by the directory the entry is in.
     creates: BTreeMap<String, u64>,
+    /// What those calls were, by the same directory: the call, the entry's name and its
+    /// result (`mkdirat snapshots = -1 EEXIST`), so a finding names them.
+    created: BTreeMap<String, BTreeSet<String>>,
     /// Such calls whose directory strace's log does not name (a relative path of a call
     /// that takes no directory descriptor).
     unplaced_creates: u64,
@@ -104,7 +107,7 @@ enum Pending {
     Listing(Option<String>),
     Exec(String),
     /// A call that may create a directory entry: where it lands, if it creates one.
-    Create(Option<Placed>),
+    Create(Option<Placed>, String),
 }
 
 /// The directory an entry-creating call puts its entry in, or that the log does not say, or
@@ -387,7 +390,26 @@ fn placed_by(name: &str, args: &[String]) -> Result<Option<Placed>> {
     )))
 }
 
-fn finish_create(placed: Option<Placed>, result: &str, trace: &mut Trace) {
+/// The call and the name of the entry it creates, for a finding to name: `mkdirat snapshots`.
+fn create_label(call: &str, args: &[String]) -> String {
+    let path = CREATING
+        .iter()
+        .find(|(name, _, _)| *name == call)
+        .and_then(|&(_, _, path)| args.get(path))
+        .and_then(|arg| string_arg(arg));
+    let name = path
+        .as_deref()
+        .map(|path| {
+            path.rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(path)
+                .to_string()
+        })
+        .unwrap_or_else(|| "?".to_string());
+    format!("{call} {name}")
+}
+
+fn finish_create(placed: Option<Placed>, label: &str, result: &str, trace: &mut Trace) {
     // "?" is a process that died in the call. A call that failed ("-1 EEXIST", a rename that
     // lost, an O_CREAT open of a file another start made) still took the directory's lock to
     // find that out, so it counts like one that made its entry.
@@ -395,7 +417,15 @@ fn finish_create(placed: Option<Placed>, result: &str, trace: &mut Trace) {
         return;
     }
     match placed {
-        Some(Placed::In(dir)) => *trace.creates.entry(dir).or_default() += 1,
+        Some(Placed::In(dir)) => {
+            let result = result.split(" (").next().unwrap_or(result);
+            trace
+                .created
+                .entry(dir.clone())
+                .or_default()
+                .insert(format!("{label} = {result}"));
+            *trace.creates.entry(dir).or_default() += 1;
+        }
         Some(Placed::Unplaced) => trace.unplaced_creates += 1,
         Some(Placed::Bucket) | None => {}
     }
@@ -539,20 +569,23 @@ fn parse_line(line: &str, trace: &mut Trace, processes: &mut Processes) -> Resul
         {
             let (args, after) = call_args(args);
             let placed = placed_by(call, &args)?;
+            let label = create_label(call, &args);
             match result_of(after)? {
-                Some(result) => finish_create(placed, result, trace),
+                Some(result) => finish_create(placed, &label, result, trace),
                 None => {
-                    processes.pending.insert(pid, Pending::Create(placed));
+                    processes
+                        .pending
+                        .insert(pid, Pending::Create(placed, label));
                 }
             }
             return Ok(());
         }
         if let Some(rest) = rest.strip_prefix(&format!("<... {call} resumed>")) {
-            let Some(Pending::Create(placed)) = processes.pending.remove(&pid) else {
+            let Some(Pending::Create(placed, label)) = processes.pending.remove(&pid) else {
                 bail!("the end of a {call} whose beginning is not in the log");
             };
             let result = result_of(rest)?.context("a resumed call that is unfinished again")?;
-            finish_create(placed, result, trace);
+            finish_create(placed, &label, result, trace);
             return Ok(());
         }
     }
@@ -792,8 +825,22 @@ fn creates_of(trace: &Trace, roots: &[Root]) -> Creates {
     for (dir, calls) in &trace.creates {
         *creates.entry(create_key(dir, roots)).or_default() += calls;
     }
+    let mut labels = CREATE_LABELS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (dir, made) in &trace.created {
+        labels
+            .entry(create_key(dir, roots))
+            .or_default()
+            .extend(made.iter().cloned());
+    }
     creates
 }
+
+/// The entry-creating calls each directory key received in the traced starts of this
+/// process ([`creates_of`]), for a finding to name. One test runs per process.
+static CREATE_LABELS: std::sync::Mutex<BTreeMap<String, BTreeSet<String>>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 /// A store directory more than one traced start creates an entry in, or a family of buckets
 /// every start writes into that has fewer than [`MIN_FAN_OUT`] buckets, with the calls of
@@ -1094,6 +1141,14 @@ mod parsing {
         assert_eq!(
             trace.creates,
             BTreeMap::from([("/srv/store".to_string(), 2)])
+        );
+        assert_eq!(
+            trace.created["/srv/store"],
+            BTreeSet::from([
+                "mkdirat vm-disks = -1 EEXIST".to_string(),
+                "openat x.lock = 5</srv/store/x.lock>".to_string(),
+            ]),
+            "a finding names each call, its entry and its result"
         );
     }
 
@@ -1773,6 +1828,17 @@ mod start {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// The calls a finding about `dir` names, from [`CREATE_LABELS`].
+    fn labels_of(dir: &str) -> String {
+        let labels = CREATE_LABELS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        labels
+            .get(dir)
+            .map(|made| made.iter().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default()
+    }
+
     /// The clones alive when the first measured start begins, and the clones added before
     /// the second: the first measured clone itself and four more.
     const ALIVE_AT_FIRST: usize = 1;
@@ -2341,17 +2407,19 @@ mod start {
                         per_start,
                         fan_out: 1,
                     }) => format!(
-                        "more than one start created an entry in {dir} ({per_start:?} calls): \
-                         the starts that write into one directory take turns on its inode lock\n"
+                        "more than one start created an entry in {dir} ({per_start:?} calls: {}): \
+                         the starts that write into one directory take turns on its inode lock\n",
+                        labels_of(&dir)
                     ),
                     CreateFinding::Shared(SharedCreate {
                         dir,
                         per_start,
                         fan_out,
                     }) => format!(
-                        "every start created an entry in a bucket of {dir} ({per_start:?} calls), \
-                         a family of {fan_out} buckets: each bucket's lock is shared by one start \
-                         in {fan_out}, fewer than one in {MIN_FAN_OUT}\n"
+                        "every start created an entry in a bucket of {dir} ({per_start:?} calls: \
+                         {}), a family of {fan_out} buckets: each bucket's lock is shared by one \
+                         start in {fan_out}, fewer than one in {MIN_FAN_OUT}\n",
+                        labels_of(&dir)
                     ),
                     CreateFinding::StaleAllowance { dir, issue } => format!(
                         "{dir} is allowed as a directory the starts share (#{issue}) and the \

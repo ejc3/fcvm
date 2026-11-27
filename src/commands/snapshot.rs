@@ -1702,7 +1702,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // exclusive through its atomic replacement, and a distinct diff parent is held shared
     // through the base copy/merge. Both locks are acquired in canonical path order so two
     // creates with inverse target/parent relationships cannot deadlock.
-    tokio::fs::create_dir_all(paths::snapshot_dir())
+    crate::paths::ensure_dir_async(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
     let mut expected_parent_name = vm_state.config.snapshot_name.clone();
@@ -2440,7 +2440,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // serving the memory inode it opened at startup; allowing the tag to be
     // deleted/recreated underneath it would make its public snapshot name point
     // at a different disk/memory generation than the bytes it actually serves.
-    tokio::fs::create_dir_all(paths::snapshot_dir())
+    crate::paths::ensure_dir_async(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
     let _snapshot_generation_lock = super::common::acquire_snapshot_dir_lock(
@@ -3181,7 +3181,7 @@ async fn cmd_snapshot_run_inner(
     // while atomically replacing the directory, so a concurrent re-create of this tag
     // can never swap generations under us mid-restore (mixed disk/memory) or remove
     // the directory between our reads.
-    tokio::fs::create_dir_all(paths::snapshot_dir())
+    crate::paths::ensure_dir_async(paths::snapshot_dir())
         .await
         .context("creating snapshot directory")?;
     let snapshot_shared_lock = super::common::acquire_snapshot_dir_lock(
@@ -6239,7 +6239,7 @@ async fn clone_vsock_base(vsock_dir: Option<&str>, data_dir: &Path) -> Result<Pa
     let parent = socket_path
         .parent()
         .expect("a custom vsock socket path always has a parent");
-    tokio::fs::create_dir_all(parent)
+    crate::paths::ensure_dir_async(parent)
         .await
         .with_context(|| format!("creating vsock dir: {:?}", parent))?;
     // A caller-owned directory can hold a stale socket from a previous
