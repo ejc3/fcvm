@@ -4659,3 +4659,81 @@ fn the_test_container_installs_the_cargo_tools_the_workflows_pin() {
         );
     }
 }
+
+/// The condition every self-hosted job of a pull_request-triggered workflow carries: true for
+/// every other event, and for a pull request only when its head branch is in this
+/// repository.
+const NOT_A_FORK: &str = "(github.event_name != 'pull_request' || \
+                          github.event.pull_request.head.repo.full_name == github.repository)";
+
+/// A pull request from a fork runs no job on a runner of ours, even once a maintainer has
+/// approved its run. `pull_request` runs the fork's code, the self-hosted jobs run it with
+/// passwordless sudo, and the instance then serves jobs on main, kernels.yml (which holds
+/// `contents: write`) and the fleet smoke (environment secrets): #2223. A job that calls
+/// another workflow is held to the same rule, since its called jobs may be self-hosted.
+#[test]
+fn self_hosted_jobs_refuse_fork_pull_requests() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut findings = Vec::new();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("read .github/workflows") {
+        let path = entry.expect("dir entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
+            continue;
+        }
+        let workflow = parse_workflow(&name);
+        let on = triggers(&workflow);
+        let from_pull_requests = match on {
+            Value::String(event) => event.starts_with("pull_request"),
+            Value::Sequence(events) => events
+                .iter()
+                .any(|e| e.as_str().is_some_and(|e| e.starts_with("pull_request"))),
+            Value::Mapping(events) => events
+                .keys()
+                .any(|e| e.as_str().is_some_and(|e| e.starts_with("pull_request"))),
+            _ => panic!("{name}: cannot read its `on:`"),
+        };
+        if !from_pull_requests {
+            continue;
+        }
+        let jobs = workflow["jobs"].as_mapping().expect("jobs");
+        for (id, job) in jobs {
+            let id = id.as_str().unwrap_or_default();
+            match runner_of(job) {
+                Ok(Runner::GitHub) => continue,
+                Ok(Runner::Ours) | Ok(Runner::Caller(_)) | Err(_) => {}
+            }
+            checked += 1;
+            let condition = job.get("if").and_then(Value::as_str).unwrap_or_default();
+            let inner = condition
+                .trim()
+                .strip_prefix("${{")
+                .and_then(|c| c.strip_suffix("}}"))
+                .unwrap_or(condition)
+                .trim();
+            // The guard must be a conjunct of the whole condition, not inside an `||`.
+            let guarded = inner == NOT_A_FORK
+                || inner.strip_prefix(NOT_A_FORK).is_some_and(|rest| {
+                    rest.trim_start().starts_with("&&") && !rest.contains("||")
+                });
+            if !guarded {
+                findings.push(format!("{name}: job {id} has `if: {condition}`"));
+            }
+        }
+    }
+    assert!(
+        checked >= 3,
+        "found {checked} self-hosted jobs in pull_request workflows; expected at least host, \
+         host-root and container in ci.yml"
+    );
+    assert!(
+        findings.is_empty(),
+        "self-hosted jobs a fork's pull request can reach; each must start its `if` with \
+         {NOT_A_FORK} &&: {findings:#?}"
+    );
+}

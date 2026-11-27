@@ -629,7 +629,11 @@ jobs:
   host:
     name: Host-${{ matrix.arch }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
+    # A pull request from a fork runs no self-hosted job, even once its run is approved:
+    # the jobs run its code with passwordless sudo on instances that later serve main,
+    # kernels.yml and the fleet smoke (#2223). The same guard is on host-root and
+    # container; self_hosted_jobs_refuse_fork_pull_requests pins it.
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
@@ -1021,7 +1025,7 @@ jobs:
   host-root:
     name: Host-Root-${{ matrix.arch }}-${{ matrix.mode }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_root_run == 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'container' && needs.skip-check.outputs.host_root_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
@@ -1400,7 +1404,7 @@ jobs:
   container:
     name: Container-${{ matrix.arch }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.container_run == 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'host' && needs.skip-check.outputs.container_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
@@ -1578,7 +1582,9 @@ jobs:
   summary:
     # A dispatch that named some lanes ran only those, so its report is "Summary (some
     # lanes)": a passing `Summary` on a commit always means every lane its event takes.
-    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
+    # A fork's run skips every self-hosted job, so its report is not `Summary`: neither the
+    # required check nor ci_pool.py may read it as a run that tested the lanes.
+    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'Summary (fork, no self-hosted lanes)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
     needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-minecraft, fleet-web, host, host-root, container]
     # Summary reports on every run but one that was itself cancelled: superseded by a newer
     # run of the same pull request, or stopped by a person. Under
