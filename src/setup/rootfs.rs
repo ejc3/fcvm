@@ -2312,7 +2312,7 @@ async fn create_layer2_rootless(
     }
 
     // Step 5: Download packages on host (host has network!)
-    let packages_dir = download_packages(plan, script_sha_short, &image_dpkg_status).await?;
+    let packages_dir = download_packages(plan, &image_dpkg_status).await?;
 
     // Step 6: Create initrd for Layer 2 setup with embedded packages
     // The initrd runs before systemd and:
@@ -2543,43 +2543,190 @@ fn apt_transport(
     }
 }
 
+/// What decides the package set, as the name of its cache directory: the script that runs in
+/// the container (codename, package list, conmon patch), the container image, the architecture
+/// and the cloud image's dpkg status. The rootfs type, the init and setup scripts and the fc-agent
+/// services change what is done with the packages, not which are downloaded, so the default and
+/// the btrfs rootfs share one set.
+fn package_set_key(plan: &Plan, image_dpkg_status: &[u8]) -> String {
+    let inputs = format!(
+        "image ubuntu:{}\narch {}\ndpkg-status {}\nscript\n{}",
+        plan.base.codename,
+        std::env::consts::ARCH,
+        compute_sha256(image_dpkg_status),
+        generate_download_script(plan)
+    );
+    compute_sha256(inputs.as_bytes())[..12].to_string()
+}
+
+/// Attempts of the package download container before setup fails.
+const PACKAGE_DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// How long one attempt of the package download container may run before it is stopped and
+/// retried: `FCVM_PACKAGE_DOWNLOAD_ATTEMPT_SECS`, default PACKAGE_ATTEMPT_DEFAULT_SECS s.
+/// apt retries its own failed fetches inside the container (`apt_retry`); this limit covers an
+/// attempt that stops making progress without failing.
+fn package_download_attempt_limit() -> std::time::Duration {
+    let secs = std::env::var("FCVM_PACKAGE_DOWNLOAD_ATTEMPT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(PACKAGE_ATTEMPT_DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+const PACKAGE_ATTEMPT_DEFAULT_SECS: u64 = 600;
+
+/// How one streamed run ended.
+#[derive(Debug)]
+pub(crate) struct StreamedRun {
+    /// The exit status, or `None` when the run reached its limit and was killed.
+    pub status: Option<std::process::ExitStatus>,
+    /// The last lines of its stdout and stderr, oldest first.
+    pub tail: Vec<String>,
+    pub elapsed: std::time::Duration,
+}
+
+/// Lines of output a [`StreamedRun`] keeps for an error message.
+const STREAMED_TAIL_LINES: usize = 40;
+
+/// Run `command` with each line of its stdout and stderr handed to `sink` as it arrives, and
+/// kill it when it runs longer than `limit`.
+pub(crate) async fn run_streamed(
+    mut command: Command,
+    limit: std::time::Duration,
+    mut sink: impl FnMut(&str),
+) -> Result<StreamedRun> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let started = std::time::Instant::now();
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting the command")?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut readers = Vec::new();
+    if let Some(out) = child.stdout.take() {
+        let tx = tx.clone();
+        readers.push(tokio::spawn(async move {
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(line);
+            }
+        }));
+    }
+    if let Some(err) = child.stderr.take() {
+        let tx = tx.clone();
+        readers.push(tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(line);
+            }
+        }));
+    }
+    drop(tx);
+    let mut tail = std::collections::VecDeque::with_capacity(STREAMED_TAIL_LINES);
+    let mut keep = |line: String, sink: &mut dyn FnMut(&str)| {
+        sink(&line);
+        if tail.len() == STREAMED_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    };
+    let deadline = tokio::time::sleep(limit);
+    tokio::pin!(deadline);
+    let mut streaming = true;
+    let status = loop {
+        tokio::select! {
+            line = rx.recv(), if streaming => match line {
+                Some(line) => keep(line, &mut sink),
+                None => streaming = false,
+            },
+            status = child.wait() => break Some(status.context("waiting for the command")?),
+            _ = &mut deadline => break None,
+        }
+    };
+    if status.is_none() {
+        let _ = child.kill().await;
+    }
+    // What the command wrote before it ended. A descendant that kept the pipes open cannot
+    // hold this past a few seconds.
+    let drain = async {
+        while let Some(line) = rx.recv().await {
+            keep(line, &mut sink);
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), drain).await;
+    for reader in readers {
+        reader.abort();
+    }
+    Ok(StreamedRun {
+        status,
+        tail: tail.into_iter().collect(),
+        elapsed: started.elapsed(),
+    })
+}
+
+/// Run `one` up to `attempts` times, until a run ends on its own (with any exit status) before
+/// its limit. A run that reached its limit is reported by name, with its last output, and run
+/// again; when every attempt reached it, the error says so. `limit` and `limit_var` (the
+/// variable that sets it) are only for the messages: `one` applies the limit.
+async fn run_attempts<T, F, Fut>(
+    what: &str,
+    attempts: u32,
+    limit: std::time::Duration,
+    limit_var: &str,
+    mut one: F,
+) -> Result<(u32, StreamedRun, T)>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<(StreamedRun, T)>>,
+{
+    for attempt in 1..=attempts {
+        let (run, held) = one(attempt).await?;
+        if run.status.is_some() {
+            return Ok((attempt, run, held));
+        }
+        let last_lines = run.tail.join("\n");
+        if attempt == attempts {
+            bail!(
+                "{what} ran past its {}s limit ({limit_var}) in all {attempts} attempts and was \
+                 stopped each time; the last attempt's output ended with:\n{last_lines}",
+                limit.as_secs()
+            );
+        }
+        warn!(
+            attempt,
+            attempts,
+            "{what} attempt {attempt}/{attempts} ran past its {}s limit ({limit_var}) and was \
+             stopped; trying again. Its output ended with:\n{last_lines}",
+            limit.as_secs()
+        );
+    }
+    bail!("{what}: no attempts were allowed")
+}
+
 /// Download all required .deb packages on the host
 ///
 /// Returns the path to the packages directory (not an ISO).
 /// Packages will be embedded directly in the initrd.
 ///
 /// NOTE: fc-agent is NOT included - it will be injected per-VM at boot time.
-async fn download_packages(
-    plan: &Plan,
-    script_sha_short: &str,
-    image_dpkg_status: &[u8],
-) -> Result<PathBuf> {
+async fn download_packages(plan: &Plan, image_dpkg_status: &[u8]) -> Result<PathBuf> {
     let cache_dir = paths::cache_dir();
-    // The set depends on the cloud image it is resolved against as well as on
-    // the script, so a newer cached image never reuses an older image's set.
-    let status_sha = &compute_sha256(image_dpkg_status)[..12];
-    let packages_dir = cache_dir.join(format!("packages-{script_sha_short}-{status_sha}"));
+    let packages_dir = cache_dir.join(format!(
+        "packages-{}",
+        package_set_key(plan, image_dpkg_status)
+    ));
 
     // If packages directory already exists with .deb files, use it.
     // The directory is populated under a temp name and renamed into place only
     // after the download succeeds, so its existence implies a complete set.
     if packages_dir.exists() {
-        let mut has_debs = false;
-        if let Ok(mut entries) = tokio::fs::read_dir(&packages_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if entry
-                    .path()
-                    .extension()
-                    .map(|e| e == "deb")
-                    .unwrap_or(false)
-                {
-                    has_debs = true;
-                    break;
-                }
-            }
-        }
-        if has_debs {
+        if count_debs(&packages_dir).await > 0 {
             info!(path = %packages_dir.display(), "using cached packages directory");
+            println!("  ✓ Packages ready (cached): {}", packages_dir.display());
             return Ok(packages_dir);
         }
         // The publish below never produces a directory without packages, and a
@@ -2587,13 +2734,8 @@ async fn download_packages(
         let _ = tokio::fs::remove_dir_all(&packages_dir).await;
     }
 
-    // Download into a temp directory of this builder's own, then atomically
-    // rename it to the final cache path on success. An interrupted or failed
-    // download must never leave a partial package set at the content-addressed
-    // path, and the temp is removed when `download` drops unpublished.
-    let download = super::StoreTemp::new(&packages_dir)?;
-    let download_dir = download.path();
-    tokio::fs::create_dir_all(download_dir).await?;
+    let status_sha = &compute_sha256(image_dpkg_status)[..12];
+    tokio::fs::create_dir_all(&cache_dir).await?;
     super::give_store_entry_to_invoker(&cache_dir);
     // The status file the container reads, removed when it drops.
     let status_file = super::StoreTemp::new(&cache_dir.join(format!("dpkg-status-{status_sha}")))?;
@@ -2603,12 +2745,7 @@ async fn download_packages(
 
     let codename = &plan.base.codename;
     let container_image = format!("ubuntu:{}", codename);
-
-    info!(codename = %codename, "downloading .deb packages using container");
-
-    // Use the same script that's included in the hash
     let download_script = generate_download_script(plan);
-
     let transport = apt_transport(
         std::env::var("http_proxy")
             .or_else(|_| std::env::var("HTTP_PROXY"))
@@ -2620,70 +2757,94 @@ async fn download_packages(
             .as_deref(),
         host_ca_bundle(),
     );
-    let mut podman_args = vec![
-        "run".to_string(),
-        "--rm".to_string(),
-        "--cgroups=disabled".to_string(),
-        "--network=host".to_string(),
-    ];
-    for (name, value) in &transport.env {
-        podman_args.extend(["-e".to_string(), format!("{name}={value}")]);
-    }
-    for (host, guest) in &transport.mounts {
-        podman_args.extend(["-v".to_string(), format!("{}:{guest}:ro", host.display())]);
-    }
-    podman_args.extend([
-        "-v".to_string(),
-        format!("{}:{IMAGE_DPKG_STATUS}:ro", status_file.path().display()),
-        "-v".to_string(),
-        format!("{}:/packages", download_dir.display()),
-        container_image.clone(),
-        "bash".to_string(),
-        "-c".to_string(),
-        format!("{}{download_script}", transport.prelude),
-    ]);
+    let limit = package_download_attempt_limit();
 
-    let output = download
-        .command("podman")?
-        .args(&podman_args)
-        .output()
-        .await
-        .context("downloading packages with podman")?;
-
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "Package download failed (podman exited with {:?}). stdout={}, stderr={}",
-            output.status.code(),
-            stdout.trim(),
-            stderr.trim()
-        );
-    }
-
-    // Count downloaded packages
-    let mut count = 0;
-    if let Ok(mut entries) = tokio::fs::read_dir(download_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry
-                .path()
-                .extension()
-                .map(|e| e == "deb")
-                .unwrap_or(false)
-            {
-                count += 1;
+    let (attempt, run, download) = run_attempts(
+        "the package download",
+        PACKAGE_DOWNLOAD_ATTEMPTS,
+        limit,
+        "FCVM_PACKAGE_DOWNLOAD_ATTEMPT_SECS",
+        |attempt| {
+            let transport = &transport;
+            let container_image = &container_image;
+            let download_script = &download_script;
+            let status_file = status_file.path();
+            let packages_dir = &packages_dir;
+            async move {
+                // Each attempt downloads into a temp directory of its own, renamed to the
+                // final cache path only on success. An interrupted, failed or stopped attempt
+                // never leaves a partial package set at the content-addressed path, and the
+                // temp is removed when it drops unpublished.
+                let download = super::StoreTemp::new(packages_dir)?;
+                tokio::fs::create_dir_all(download.path()).await?;
+                let container = format!("fcvm-packages-{}", uuid::Uuid::new_v4().simple());
+                let mut podman_args = vec![
+                    "run".to_string(),
+                    "--rm".to_string(),
+                    format!("--name={container}"),
+                    "--cgroups=disabled".to_string(),
+                    "--network=host".to_string(),
+                ];
+                for (name, value) in &transport.env {
+                    podman_args.extend(["-e".to_string(), format!("{name}={value}")]);
+                }
+                for (host, guest) in &transport.mounts {
+                    podman_args
+                        .extend(["-v".to_string(), format!("{}:{guest}:ro", host.display())]);
+                }
+                podman_args.extend([
+                    "-v".to_string(),
+                    format!("{}:{IMAGE_DPKG_STATUS}:ro", status_file.display()),
+                    "-v".to_string(),
+                    format!("{}:/packages", download.path().display()),
+                    container_image.clone(),
+                    "bash".to_string(),
+                    "-c".to_string(),
+                    format!("{}{download_script}", transport.prelude),
+                ]);
+                info!(
+                    codename = %codename,
+                    attempt,
+                    attempts = PACKAGE_DOWNLOAD_ATTEMPTS,
+                    limit_secs = limit.as_secs(),
+                    "downloading .deb packages using container"
+                );
+                println!(
+                    "  → Downloading packages for Ubuntu {codename} (attempt {attempt}/{PACKAGE_DOWNLOAD_ATTEMPTS}, limit {}s)...",
+                    limit.as_secs()
+                );
+                let mut command = download.command("podman")?;
+                command.args(&podman_args);
+                // Printed, not logged: setup's log filter hides info, and a stalled download
+                // has to show where it stopped.
+                let run = run_streamed(command, limit, |line| println!("    [packages] {line}"))
+                    .await
+                    .context("downloading packages with podman")?;
+                if run.status.is_none() {
+                    // The killed client leaves its container running.
+                    let _ = Command::new("podman")
+                        .args(["rm", "--force", "--time=0", &container])
+                        .output()
+                        .await;
+                }
+                Ok((run, download))
             }
-        }
-    }
-
-    if count == 0 {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        },
+    )
+    .await?;
+    let last_lines = run.tail.join("\n");
+    let status = run
+        .status
+        .expect("run_attempts returns a run that ended on its own");
+    if !status.success() {
         bail!(
-            "No packages downloaded. stdout={}, stderr={}",
-            stdout.trim(),
-            stderr.trim()
+            "Package download failed (podman exited with {:?}); its output ended with:\n{last_lines}",
+            status.code()
         );
+    }
+    let count = count_debs(download.path()).await;
+    if count == 0 {
+        bail!("No packages downloaded; the output ended with:\n{last_lines}");
     }
 
     // Atomically publish the completed download as the cache directory. When
@@ -2694,9 +2855,32 @@ async fn download_packages(
     download
         .publish(&packages_dir, "downloaded packages")
         .await?;
-
-    info!(path = %packages_dir.display(), count = count, "packages downloaded");
+    info!(
+        path = %packages_dir.display(),
+        count,
+        attempt,
+        elapsed_secs = run.elapsed.as_secs(),
+        "packages downloaded"
+    );
+    println!(
+        "  ✓ Packages ready: {} ({count} packages, attempt {attempt}, {}s)",
+        packages_dir.display(),
+        run.elapsed.as_secs()
+    );
     Ok(packages_dir)
+}
+
+/// The number of .deb files directly in `dir`, 0 when it cannot be read.
+async fn count_debs(dir: &Path) -> usize {
+    let mut count = 0;
+    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.path().extension().is_some_and(|e| e == "deb") {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// The cloud image's `/var/lib/dpkg/status`, read from its ext4 root partition
@@ -3331,6 +3515,150 @@ mod tests {
             }
         }
         panic!("download script has no function {name}");
+    }
+
+    /// The default and the btrfs rootfs differ only in what is done with the packages, so
+    /// they download one set: the cache directory is named for what decides the download, not
+    /// for the rootfs script hash, which carries the rootfs type. On a fresh CI store the btrfs
+    /// rootfs downloaded the whole set a second time.
+    #[test]
+    fn default_and_btrfs_rootfs_share_one_package_set() {
+        let source = include_str!("rootfs.rs");
+        let source = &source[..source.find("\n#[cfg(test)]\nmod tests").unwrap()];
+        let at = source
+            .find("async fn download_packages(")
+            .expect("download_packages is gone");
+        let body = &source[at..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            !body.contains("script_sha"),
+            "download_packages is keyed by the rootfs script hash, which carries the rootfs \
+             type, so the default and the btrfs rootfs download the same packages twice"
+        );
+        assert!(body.contains("package_set_key(plan, image_dpkg_status)"));
+
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let status = b"Package: base-files\nStatus: install ok installed\n";
+        let key = package_set_key(&plan, status);
+        assert_eq!(key.len(), 12);
+        assert_eq!(key, package_set_key(&plan, status));
+        assert_ne!(key, package_set_key(&plan, b"Package: other\n"));
+        let mut other = plan.clone();
+        other.base.codename.push('x');
+        assert_ne!(key, package_set_key(&other, status));
+        let mut other = plan.clone();
+        other.packages.system.push("example-package".into());
+        assert_ne!(key, package_set_key(&other, status));
+    }
+
+    /// The streamed-run tests' hang guard: below the 120 s at which nextest's default profile
+    /// kills a test (60 s slow period, terminate after 2), so the guard's message is what a hang
+    /// reports.
+    const STREAM_TEST_GUARD_SECS: u64 = 90;
+
+    /// Each line the command writes reaches the sink while the command still runs, and the
+    /// run returns its exit status and its last lines. The child writes its last line only
+    /// after the sink has received its first one, so output held until the command ends never
+    /// arrives.
+    #[tokio::test]
+    async fn a_streamed_run_hands_over_each_line_as_it_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let go = dir.path().join("go");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                r#"echo first; echo second >&2; while [ ! -e "$GO" ]; do sleep 0.05; done; echo last; exit 3"#,
+            ])
+            .env("GO", &go);
+        let mut seen = Vec::new();
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(STREAM_TEST_GUARD_SECS),
+            run_streamed(command, std::time::Duration::from_secs(600), |line| {
+                if line == "first" {
+                    std::fs::write(&go, b"").unwrap();
+                }
+                seen.push(line.to_string());
+            }),
+        )
+        .await
+        .expect(
+            "hang guard: 90 s without the child's last line, which it writes only after the \
+             sink has received its first line",
+        )
+        .unwrap();
+        assert_eq!(run.status.and_then(|s| s.code()), Some(3));
+        assert!(seen.contains(&"second".to_string()), "{seen:?}");
+        // stdout and stderr are separate pipes, read by separate tasks: no order is fixed.
+        for line in ["first", "last"] {
+            assert!(seen.contains(&line.to_string()), "{line} missing: {seen:?}");
+        }
+        assert_eq!(run.tail, seen);
+    }
+
+    /// A run past its limit is killed and reported as such, with what it wrote.
+    #[tokio::test]
+    async fn a_streamed_run_past_its_limit_is_killed() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo started; exec sleep 600"]);
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(STREAM_TEST_GUARD_SECS),
+            run_streamed(command, std::time::Duration::from_secs(1), |_| {}),
+        )
+        .await
+        .expect("hang guard: a run past its 1 s limit was not stopped in 90 s")
+        .unwrap();
+        assert!(run.status.is_none(), "{run:?}");
+        assert_eq!(run.tail, vec!["started".to_string()]);
+    }
+
+    /// An attempt that ran past its limit is run again, and the error after the last one names
+    /// the step, the limit and the variable that sets it, with the last output.
+    #[tokio::test]
+    async fn an_attempt_past_its_limit_is_retried_and_named() {
+        fn ran(status: Option<i32>, line: &str) -> StreamedRun {
+            use std::os::unix::process::ExitStatusExt;
+            StreamedRun {
+                status: status.map(|c| std::process::ExitStatus::from_raw(c << 8)),
+                tail: vec![line.to_string()],
+                elapsed: std::time::Duration::ZERO,
+            }
+        }
+        let limit = std::time::Duration::from_secs(7);
+        let mut calls = Vec::new();
+        let (attempt, run, held) = run_attempts("the step", 3, limit, "EXAMPLE_SECS", |a| {
+            calls.push(a);
+            async move {
+                Ok((
+                    if a == 1 {
+                        ran(None, "stuck")
+                    } else {
+                        ran(Some(0), "done")
+                    },
+                    a,
+                ))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((attempt, held, calls), (2, 2, vec![1, 2]));
+        assert_eq!(run.tail, vec!["done".to_string()]);
+
+        let err = run_attempts("the step", 3, limit, "EXAMPLE_SECS", |_| async {
+            Ok((ran(None, "still stuck"), ()))
+        })
+        .await
+        .expect_err("three attempts past the limit succeeded");
+        let err = format!("{err:#}");
+        for part in [
+            "the step",
+            "7s limit",
+            "EXAMPLE_SECS",
+            "all 3 attempts",
+            "still stuck",
+        ] {
+            assert!(err.contains(part), "{part:?} missing from: {err}");
+        }
     }
 
     fn embedded_download_script() -> String {
