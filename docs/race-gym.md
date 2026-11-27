@@ -54,7 +54,7 @@ protects it. The gym's failpoints sit at the create, use and cleanup steps in th
 | image cache | archive and storage image built under UUID temps and renamed; per-digest flock | rename is safe across VMs, the flock is not | removal of an invalid archive (`podman/mod.rs:1055`) relies on the flock alone |
 | setup store | rootfs, initrd and kernel downloads use fixed temp names under a store flock (`setup/mod.rs:179`) | flock | two L1 VMs on one map share the fixed temp names |
 | network | netns names settle on `ip netns add` EEXIST; bridged subnet under `bridged-subnet.lock`; routed IPv6 lease flock | mixed | bridged DNAT and FORWARD rules unlocked; clones share one host route |
-| process tree | pdeathsig on firecracker, holder, pasta; `root-test-runner.sh` for the sudo hop | kernel; the vm dir (with pasta's PID file), a restore's mountpoint and image-cache temps are recorded with an owner whose flock the kernel releases, and the next launch reclaims them (`reclaim.rs`) | on fcvm SIGKILL the bridged netns and rules have no reclaimer (#1184) |
+| process tree | pdeathsig on firecracker, holder, pasta; `root-test-runner.sh` for the sudo hop | kernel; the vm dir (with pasta's PID file), a restore's mountpoint and image-cache temps are recorded with an owner whose flock the kernel releases, and the next sweep reclaims them (`reclaim.rs`) | on fcvm SIGKILL the bridged netns and rules have no reclaimer (#1184) |
 
 ## 3. Control: park and release
 

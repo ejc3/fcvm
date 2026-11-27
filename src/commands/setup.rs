@@ -80,11 +80,11 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
     if args.cloud_hypervisor {
         let ch = config.cloud_hypervisor.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "--cloud-hypervisor requires a [cloud_hypervisor] section (repo + branch) in the config"
+                "--cloud-hypervisor requires a [cloud_hypervisor] section (repo + commit) in the config"
             )
         })?;
         println!("Building Cloud Hypervisor backend...");
-        let path = crate::setup::ensure_cloud_hypervisor(&ch.repo, &ch.branch)
+        let path = crate::setup::ensure_cloud_hypervisor(ch)
             .await
             .context("setting up cloud-hypervisor")?;
         println!("  ✓ Cloud Hypervisor ready: {}", path.display());

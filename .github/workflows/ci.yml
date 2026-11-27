@@ -11,6 +11,10 @@ on:
           - both
           - host
           - container
+      lanes:
+        description: 'Self-hosted lanes to run, by exact job name, separated by spaces or commas (empty: all)'
+        type: string
+        default: ''
   # No `branches:` filter. That filter matches the PR's BASE branch, and stacked
   # PRs (the documented default in AGENTS.md) are based on the previous PR's
   # branch, not main — so `branches: [main]` skipped every job below for exactly
@@ -274,6 +278,8 @@ jobs:
         run: make test-runner-acceptance
       - name: Test the pull request scope and stack coverage
         run: make test-ci-scope
+      - name: Test the pool tool
+        run: make test-ci-pool
       - name: Test the runner kernel check
         run: make test-runner-kernel
       - name: Test cached release downloads
@@ -428,21 +434,28 @@ jobs:
           bash fleet/phone-app/test-build-apk.sh
           bash fleet/phone-app/test-gradle-dist.sh
 
-  # Plans which self-hosted jobs this run needs.
+  # Plans which self-hosted jobs this run needs (scripts/ci-pool/ci_pool.py plan).
   #
   # A pull_request runs every arm64 job and ONE x64 job, Host-Root-x64-SnapshotEnabled.
   # It runs the privileged suite through a snapshot miss and then a restore, which is
   # where the x86-specific code lives (KVM setup, vCPU state save and restore). The other
-  # three x64 jobs run paths the arm64 jobs already cover on every PR.
+  # three x64 jobs run paths the arm64 jobs already cover on every PR. A change to the
+  # VMM's confinement adds Host-x64.
   #
-  # A push to main runs every job that has NOT already succeeded on a PR run of the same
-  # tree. A fast-forward or rebase merge keeps the PR tip's tree, so main runs exactly
-  # the x64 jobs the PR left out, and x86 still gets its full matrix before a release.
-  # If that PR run skipped the matrix altogether (its `changes` job found nothing the
-  # matrix can check), main skips it too.
+  # A push to main runs every job not already proven for its tree: a job of the same name
+  # that succeeded, on its first attempt, in a run of this workflow on a commit with the
+  # pushed commit's tree, and that never failed in any run on that commit. The commits
+  # looked at are the pushed commit's other parents and the heads of the pull requests
+  # GitHub ties to it, so the evidence is found whatever else ran since, and a lane counts
+  # even when another job of that run failed. Changes are judged against main as it was
+  # before the push. A run
+  # proves nothing when the landing changes a file that defines the lanes (this workflow,
+  # the Makefile, the scripts, the nextest configuration): a pull request runs its own
+  # copy of those. If a pull request's run of that tree skipped the matrix by its own
+  # scope, main skips it too.
   #
-  # Anything else - workflow_dispatch, the Build Kernels workflow_run, a push whose tree
-  # never passed on a PR - runs the full matrix.
+  # A workflow_dispatch runs the lanes named in its `lanes` input, all of them by default.
+  # Anything else, and every lookup that fails, runs the full matrix.
   skip-check:
     name: Skip Check
     needs: [changes]
@@ -464,103 +477,10 @@ jobs:
           EVENT: ${{ github.event_name }}
           REPO: ${{ github.repository }}
           CONFINE: ${{ needs.changes.outputs.confine }}
-        run: |
-          set -euo pipefail
-          # Names of the jobs that already passed for this tree on a PR, one per line.
-          PASSED=""
-          if [ "$EVENT" = "push" ]; then
-            TREE_SHA=$(git rev-parse 'HEAD^{tree}')
-            echo "Current tree SHA: $TREE_SHA"
-            # GitHub Actions results are check runs, not commit statuses, so the
-            # legacy status API never reports them. Look for successful runs of
-            # this CI workflow on a PR whose head commit has the same tree SHA.
-            if ! RUNS=$(gh run list --repo "$REPO" --workflow ci.yml --event pull_request \
-                --status success --limit 30 --json databaseId,headSha \
-                --jq '.[] | "\(.databaseId) \(.headSha)"'); then
-              echo "Could not list workflow runs, running the full matrix"
-              RUNS=""
-            fi
-            while read -r run sha; do
-              [ -n "$run" ] || continue
-              if ! COMMIT_TREE=$(gh api "repos/$REPO/git/commits/$sha" --jq '.tree.sha'); then
-                echo "Could not look up commit $sha, ignoring it"
-                continue
-              fi
-              [ "$COMMIT_TREE" = "$TREE_SHA" ] || continue
-              if ! NAMES=$(gh api "repos/$REPO/actions/runs/$run/jobs" --paginate \
-                  --jq '.jobs[] | select(.conclusion == "success" or .conclusion == "skipped") | .name'); then
-                echo "Could not list the jobs of run $run, ignoring it"
-                continue
-              fi
-              # Only a run that tested something counts. A draft's or a lower stack
-              # PR's run skips every job and still succeeds, under a Summary named
-              # "Summary (deferred)"; reusing it would skip the whole matrix here.
-              if ! grep -qxF Summary <<< "$NAMES"; then
-                echo "Run $run tested nothing (no passing Summary), ignoring it"
-                continue
-              fi
-              echo "Tree SHA $TREE_SHA already passed CI on PR commit $sha (run $run)"
-              PASSED="$PASSED"$'\n'"$NAMES"
-            done <<< "$RUNS"
-          fi
-          # A matrix job skipped by its `if:` is reported under its unexpanded name,
-          # with the literal matrix.arch placeholder in it. In a passing PR run that
-          # means `changes` skipped the matrix for this tree.
-          MATRIX_SKIPPED=false
-          if grep -q 'matrix\.arch' <<< "$PASSED"; then
-            MATRIX_SKIPPED=true
-          fi
-          want() {
-            case "$EVENT" in
-              pull_request)
-                case "$1" in
-                  *-arm64 | *-arm64-* | Host-Root-x64-SnapshotEnabled) return 0 ;;
-                  # The x86_64 seccomp policy is exercised under real confinement only by
-                  # Host-x64's test-confine step: a PR that touches confinement runs it.
-                  Host-x64) [ "$CONFINE" = true ] ;;
-                  *) return 1 ;;
-                esac
-                ;;
-              push)
-                [ "$MATRIX_SKIPPED" = false ] && ! grep -qxF -- "$1" <<< "$PASSED"
-                ;;
-              *) return 0 ;;
-            esac
-          }
-          host=""
-          host_root=""
-          container=""
-          planned=""
-          for arch in arm64 x64; do
-            if want "Host-$arch"; then
-              host="$host${host:+,}\"$arch\""
-              planned="$planned Host-$arch"
-            fi
-            for mode in SnapshotDisabled SnapshotEnabled; do
-              want "Host-Root-$arch-$mode" || continue
-              # SnapshotDisabled runs the suite once with FCVM_NO_SNAPSHOT=1.
-              # SnapshotEnabled runs it twice on one runner: a snapshot miss, then a hit.
-              if [ "$mode" = SnapshotDisabled ]; then nosnap=1; runs=1; else nosnap=""; runs=2; fi
-              host_root="$host_root${host_root:+,}{\"arch\":\"$arch\",\"mode\":\"$mode\",\"fcvm_no_snapshot\":\"$nosnap\",\"test_runs\":\"$runs\"}"
-              planned="$planned Host-Root-$arch-$mode"
-            done
-            if want "Container-$arch"; then
-              container="$container${container:+,}\"$arch\""
-              planned="$planned Container-$arch"
-            fi
-          done
-          echo "Self-hosted jobs for this $EVENT:${planned:- none}"
-          # A matrix with no combinations fails the run instead of skipping the job, so
-          # every list comes with a flag the job's `if:` checks first.
-          {
-            echo "host={\"arch\":[$host]}"
-            echo "host_run=$([ -n "$host" ] && echo true || echo false)"
-            echo "host_root={\"include\":[$host_root]}"
-            echo "host_root_run=$([ -n "$host_root" ] && echo true || echo false)"
-            echo "container={\"arch\":[$container]}"
-            echo "container_run=$([ -n "$container" ] && echo true || echo false)"
-            echo "skip=$([ -z "$planned" ] && echo true || echo false)"
-          } >> "$GITHUB_OUTPUT"
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+          LANES: ${{ github.event.inputs.lanes }}
+        run: python3 scripts/ci-pool/ci_pool.py plan
 
   # Runner 0: Lint (default GitHub runner, no KVM needed)
   # Fast checks: fmt, clippy, audit, deny
@@ -807,7 +727,7 @@ jobs:
         id: apt-prep
         run: |
           # The package list lives here only; later steps read it from the environment.
-          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev"
+          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev strace"
           {
             echo "APT_PACKAGES=$APT_PACKAGES"
             echo "APT_DIR=${{ runner.temp }}/apt-archives"
@@ -982,11 +902,11 @@ jobs:
           sudo chmod 666 /dev/kvm
       # #61: provision the optional Cloud Hypervisor backend so the
       # --hypervisor cloud-hypervisor sanity tests run (instead of skipping).
-      # Built from the [cloud_hypervisor] fork (SVE register fix, CH #8268) and
-      # content-addressed under assets_dir, exactly like the firecracker fork.
+      # Built from the commit [cloud_hypervisor] pins (upstream main) and
+      # content-addressed under assets_dir, like the firecracker fork.
       # The assets dir (/mnt/fcvm-btrfs) persists across runs, so this rebuilds
-      # only when the fork commit moves (a new content-addressed filename);
-      # otherwise it is an instant no-op, like the kernel/rootfs/firecracker setup.
+      # only when the pinned commit changes (a new content-addressed filename);
+      # otherwise it returns without the network, like the kernel/rootfs/firecracker setup.
       - name: Build Cloud Hypervisor backend
         working-directory: fcvm
         run: ./target/release/fcvm setup --cloud-hypervisor
@@ -1014,6 +934,32 @@ jobs:
         if: always()
         working-directory: fcvm
         run: ./scripts/ci-stray-vm-guard.sh post
+      # Host memory, load and swap for the day, and the kernel's out-of-memory kill count.
+      # sysstat samples every 10 minutes, so a peak of a minute or two can fall between
+      # samples: Committed_AS and oom_kill are what still show it afterwards. Before this
+      # no artifact of any lane recorded host memory (#2199).
+      - name: Capture host load record
+        if: always()
+        run: |
+          {
+            echo "### /proc/loadavg at capture time"
+            cat /proc/loadavg
+            echo "### nproc"
+            nproc
+            echo "### sar -q (run queue and load average, whole day)"
+            LC_ALL=C sar -q 2>&1 || echo "sar -q unavailable"
+            echo "### sar -u (CPU utilisation, whole day)"
+            LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
+            echo "### sar -r (memory, whole day)"
+            LC_ALL=C sar -r 2>&1 || echo "sar -r unavailable"
+            echo "### sar -S (swap, whole day)"
+            LC_ALL=C sar -S 2>&1 || echo "sar -S unavailable"
+            echo "### /proc/meminfo at capture time"
+            grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|Committed_AS):' /proc/meminfo
+            echo "### oom_kill since boot (/proc/vmstat)"
+            grep -E '^oom_kill ' /proc/vmstat || echo "oom_kill not reported"
+          } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
+          echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
       - name: Save disk I/O record
         if: always()
         run: |
@@ -1180,7 +1126,7 @@ jobs:
         id: apt-prep
         run: |
           # The package list lives here only; later steps read it from the environment.
-          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev"
+          APT_PACKAGES="fuse3 libfuse3-dev libclang-dev clang musl-tools iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch podman skopeo busybox-static cpio zstd autoconf automake libtool cmake libseccomp-dev nfs-kernel-server flex bison bc libelf-dev libssl-dev strace"
           {
             echo "APT_PACKAGES=$APT_PACKAGES"
             echo "APT_DIR=${{ runner.temp }}/apt-archives"
@@ -1397,6 +1343,14 @@ jobs:
             LC_ALL=C sar -q 2>&1 || echo "sar -q unavailable"
             echo "### sar -u (CPU utilisation, whole day)"
             LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
+            echo "### sar -r (memory, whole day)"
+            LC_ALL=C sar -r 2>&1 || echo "sar -r unavailable"
+            echo "### sar -S (swap, whole day)"
+            LC_ALL=C sar -S 2>&1 || echo "sar -S unavailable"
+            echo "### /proc/meminfo at capture time"
+            grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree|Committed_AS):' /proc/meminfo
+            echo "### oom_kill since boot (/proc/vmstat)"
+            grep -E '^oom_kill ' /proc/vmstat || echo "oom_kill not reported"
           } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
           echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
       - name: Save disk I/O record
@@ -1622,12 +1576,24 @@ jobs:
   # named "Summary (deferred)", so a reader or a tool looking for a passing
   # Summary on that commit finds none.
   summary:
-    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || 'Summary' }}
+    # A dispatch that named some lanes ran only those, so its report is "Summary (some
+    # lanes)": a passing `Summary` on a commit always means every lane its event takes.
+    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
     needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-minecraft, fleet-web, host, host-root, container]
-    if: always()
+    # Summary reports on every run but one that was itself cancelled: superseded by a newer
+    # run of the same pull request, or stopped by a person. Under
+    # `always()` such a run left a failed `Summary` on the head for good. GitHub sometimes
+    # starts two runs for one push; the second cancels the first, and on a lower member of
+    # a stack the first run's failed `Summary` then stood beside the second's
+    # `Summary (deferred)`, which no later check replaces (2026-11-26: five of nine heads
+    # of one push). `cancelled()` is true only when the RUN was cancelled. A job that ends
+    # `cancelled` while the run goes on (its own `timeout-minutes`, a lost runner) leaves it
+    # false, so Summary still runs and the gate step below fails it. A run with no Summary
+    # passed nothing: `ci_pool.py` reads lanes and never takes an absent Summary for a pass.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
-      # `if: always()` is what lets this job report on a run whose tests failed —
+      # A status function in the `if:` is what lets this job report on a run whose tests failed,
       # and it is also why Summary's own result says nothing about theirs unless
       # it looks. Without this step Summary reported success over genuinely failed
       # gating jobs in 8 of the last 40 runs (Lint, Container-*, Host-Root-*), so
@@ -1717,27 +1683,31 @@ jobs:
         if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
 
-  # The top of a stack tests every lower PR's commits. When its run passes, each
-  # lower PR whose head is an ancestor of this head gets a "Stack CI" success
-  # status naming this run, which is what says that PR was tested.
+  # States what this run showed as a `ci/pool` commit status (scripts/ci-pool/ci_pool.py
+  # mark). A run that tested nothing (a draft, a lower member of a pool) puts `pending` on
+  # its head, so the pull request does not read as passed on the strength of
+  # `Summary (deferred)`. A run that passed puts `success` on its head and on the head of
+  # every lower member of its pool that it contains. A run that failed puts `failure` on
+  # its own head only.
+  #
+  # The status is a display. What main skips after a landing is decided from the runs
+  # themselves (the skip-check job), so a pull request that edits this job gains nothing.
   #
   # `!cancelled()` is what lets this job run at all. Without a status function
   # GitHub adds success() to the condition, and success() is false when a job
   # anywhere before this one in the needs graph was skipped. Summary waits for
-  # jobs most PRs skip (the bench and fleet tests), so this job was skipped on
-  # every stack. Summary's own result is still required below.
-  stack-coverage:
-    name: Stack coverage
+  # jobs most PRs skip (the bench and fleet tests).
+  pool-status:
+    name: Pool status
     needs: [changes, summary]
     if: >-
       !cancelled() &&
       github.event_name == 'pull_request' &&
-      needs.changes.outputs.run == 'true' &&
-      needs.summary.result == 'success' &&
-      github.event.pull_request.base.ref != github.event.repository.default_branch &&
+      github.event.action != 'closed' &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
       pull-requests: read
       statuses: write
@@ -1745,13 +1715,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Mark the lower PRs of this stack as tested
+      - name: State what this run showed
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RAN: ${{ needs.changes.outputs.run }}
+          REASON: ${{ needs.changes.outputs.reason }}
+          SUMMARY: ${{ needs.summary.result }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: bash scripts/ci-stack-coverage.sh
+        run: python3 scripts/ci-pool/ci_pool.py mark

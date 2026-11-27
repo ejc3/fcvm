@@ -323,17 +323,18 @@ impl Capabilities {
 
     /// Cloud Hypervisor's capabilities (#632). Cold boot (P1) and snapshot/restore/clone (P2)
     /// both work: the SVE register-save bug is fixed upstream (#8268), so `snapshots` is enabled
-    /// below (explicit `snapshot create` / `snapshot run` via `--restore`, copy-mode).
+    /// below (explicit `snapshot create` / `snapshot run` via `--restore`).
     pub fn cloud_hypervisor() -> Self {
         Self {
             diff_snapshots: false,
-            // memory_restore_mode=map (our fork): the memory file mapped MAP_PRIVATE over
+            // memory_restore_mode=copyonwrite: the memory file mapped MAP_PRIVATE over
             // guest RAM, clean pages shared through the page cache.
             file_backed_cow_restore: true,
             // CH's UFFD handler is in-process — no external page server can drive it.
             external_uffd_lazy_restore: false,
-            // memory_restore_mode=ondemand exists (v52) but is unused: CH restores with map,
-            // which is lazy and shares pages, where ondemand copies each page per VM.
+            // memory_restore_mode=ondemand exists but is unused: CH restores with
+            // copyonwrite, which is lazy and shares pages, where ondemand copies each page
+            // per VM.
             internal_uffd_lazy_restore: false,
             // No PATCH /drives equivalent — uses the bind-mount redirect instead.
             drive_retarget: false,
@@ -342,7 +343,7 @@ impl Capabilities {
             // No aarch64 virtual-EL2 path.
             nested_arm64: false,
             // P2: explicit `snapshot create` / `snapshot run` work for CH (pause→vm.snapshot
-            // →resume; `--restore source_url=…/ch-restore,memory_restore_mode=map`). The automatic
+            // →resume; `--restore source_url=…/ch-restore,memory_restore_mode=copyonwrite`). The automatic
             // pre-start cache integration for CH is a follow-on (still gated off in podman run).
             snapshots: true,
         }

@@ -33,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import reqscale  # noqa: E402
+import state_fixture  # noqa: E402
 import reqscale_analyze  # noqa: E402
 
 
@@ -2534,9 +2535,9 @@ class HarnessOutputFeedsTheAnalyzer(unittest.TestCase):
 # starts a Firecracker-named child that dies with it and a helper that exits at
 # once, then publishes a ready clone state with a loopback endpoint.
 set -eu
-if [ "${{1:-}}" = --version ]; then echo "fcvm fake"; exit 0; fi
+{state_fixture.SH_STATE_PATH}if [ "${{1:-}}" = --version ]; then echo "fcvm fake"; exit 0; fi
 if [ "$2" = serve ]; then
-    exec python3 -c {shlex.quote(serve)} {state_dir}/serve-$$.json "$3" "$5"
+    exec python3 -c {shlex.quote(serve)} "$(fixture_state_path {state_dir} serve-$$)" "$3" "$5"
 fi
 name=""
 while [ $# -gt 0 ]; do [ "$1" = --name ] && name=$2; shift; done
@@ -2545,10 +2546,11 @@ until [ -e {d}/firecracker-$$.armed ]; do sleep 0.002; done
 true &
 read -r stat < /proc/$$/stat; stat=${{stat##*) }}; read -ra fields <<< "$stat"
 vm=vm-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \\n')
+sp=$(fixture_state_path {state_dir} "$vm")
 printf '{{"vm_id":"%s","name":"%s","pid":%d,"pid_start_time":%d,"lifecycle_ready":true,"config":{{"network":{{"loopback_ip":"127.0.0.1"}}}}}}\\n' \\
-    "$vm" "$name" $$ "${{fields[19]}}" > {state_dir}/$vm.json.tmp
-: > {state_dir}/$vm.json.lock
-mv {state_dir}/$vm.json.tmp {state_dir}/$vm.json
+    "$vm" "$name" $$ "${{fields[19]}}" > "$sp.tmp"
+: > "$sp.lock"
+mv "$sp.tmp" "$sp"
 wait
 """)
         chromium = self._stub(os.path.join(d, "bin", "chromium"), """#!/bin/bash
@@ -2596,8 +2598,7 @@ exec sleep 600
 
         with tempfile.TemporaryDirectory() as d, contextlib.ExitStack() as stack:
             data_root = os.path.join(d, "data")
-            state_dir = os.path.join(data_root, "state")
-            os.makedirs(state_dir)
+            state_dir = state_fixture.make_store(os.path.join(data_root, "state"))
             ProvenanceFailsClosed.make_snapshot(None, data_root)
             fcvm, chromium = self._fakes(d, state_dir)
             run_dir = os.path.join(d, "run")
