@@ -5271,24 +5271,36 @@ fn fleet_web_shards_run_every_playwright_config() {
     );
 }
 
-/// CI compiles fcvm with codegen-units=16 and no LTO: the shipped profile (codegen-units=1,
-/// thin LTO) compiles the 220k-line fcvm crate on one core, 420 s for make build and 546 s
-/// for test-root's test build on a 96-vCPU arm64 box, against 128 and 132 s. One self-hosted
-/// lane (Host-Root-arm64-SnapshotDisabled) and Packaging keep the shipped profile, so a test
-/// still runs the shipped codegen and the packaging check builds what ships.
+/// CI compiles this workspace with codegen-units=16 and no LTO: the shipped profile
+/// (codegen-units=1, thin LTO) compiles the 220k-line fcvm crate on one core, 420 s for make
+/// build and 546 s for test-root's test build on a 96-vCPU arm64 box, against 128 and 132 s.
+/// The Makefile gives the profile as `--config` to this workspace's cargo commands only
+/// (FCVM_CI_PROFILE=light): through CARGO_PROFILE_RELEASE_* in the environment it also
+/// reached the Firecracker and Cloud Hypervisor builds `fcvm setup` runs, overriding their own
+/// profiles, in every lane. One self-hosted lane (Host-Root-arm64-SnapshotDisabled) and
+/// Packaging keep the shipped profile. fc-mock runs cargo directly and builds nothing else,
+/// so it sets the environment.
 #[test]
 fn ci_builds_use_the_light_profile_but_one_lane() {
-    let manifest: toml::Table =
-        read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
-            .parse()
-            .expect("Cargo.toml parses");
-    let release = &manifest["profile"]["release"];
+    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
+    let line = |prefix: &str| -> String {
+        makefile
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("the Makefile has no `{prefix}` line"))
+            .to_string()
+    };
     assert_eq!(
-        release["codegen-units"].as_integer(),
-        Some(1),
-        "the shipped codegen-units"
+        line("CARGO_CI_CONFIG ="),
+        "CARGO_CI_CONFIG = $(if $(filter light,$(FCVM_CI_PROFILE)),--config \
+         profile.release.codegen-units=16 --config 'profile.release.lto=\"off\"')"
     );
-    assert_eq!(release["lto"].as_str(), Some("thin"), "the shipped LTO");
+    assert!(line("override CARGO =").ends_with("$(CARGO_CI_CONFIG)"));
+    assert!(line("NEXTEST :=").contains("$(CARGO_CI_CONFIG)"));
+    assert!(
+        makefile.contains("CONTAINER_TEST_OPTIONS += -e FCVM_CI_PROFILE\n"),
+        "the container build must receive the CI profile"
+    );
 
     let ci = parse_workflow("ci.yml");
     let env_of = |job: &str, name: &str| -> Option<String> {
@@ -5296,48 +5308,49 @@ fn ci_builds_use_the_light_profile_but_one_lane() {
             .as_str()
             .map(str::to_string)
     };
-    for job in ["host", "container", "fc-mock"] {
+    for job in ["host", "container"] {
         assert_eq!(
-            env_of(job, "CARGO_PROFILE_RELEASE_CODEGEN_UNITS").as_deref(),
-            Some("16"),
-            "{job}"
-        );
-        assert_eq!(
-            env_of(job, "CARGO_PROFILE_RELEASE_LTO").as_deref(),
-            Some("off"),
+            env_of(job, "FCVM_CI_PROFILE").as_deref(),
+            Some("light"),
             "{job}"
         );
     }
-    let shipped_lane = "(matrix.arch == 'arm64' && matrix.mode == 'SnapshotDisabled')";
     assert_eq!(
-        env_of("host-root", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS").as_deref(),
-        Some(format!("${{{{ {shipped_lane} && '1' || '16' }}}}").as_str())
+        env_of("host-root", "FCVM_CI_PROFILE").as_deref(),
+        Some(
+            "${{ (matrix.arch == 'arm64' && matrix.mode == 'SnapshotDisabled') && 'shipped' \
+             || 'light' }}"
+        )
     );
     assert_eq!(
-        env_of("host-root", "CARGO_PROFILE_RELEASE_LTO").as_deref(),
-        Some(format!("${{{{ {shipped_lane} && 'thin' || 'off' }}}}").as_str())
+        env_of("fc-mock", "CARGO_PROFILE_RELEASE_CODEGEN_UNITS").as_deref(),
+        Some("16")
     );
+    assert_eq!(
+        env_of("fc-mock", "CARGO_PROFILE_RELEASE_LTO").as_deref(),
+        Some("off")
+    );
+    // Nothing that runs `fcvm setup` (which builds Firecracker and Cloud Hypervisor) carries
+    // the environment overrides, and Packaging carries no profile at all.
+    for job in ["host", "host-root", "container", "packaging"] {
+        for name in [
+            "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
+            "CARGO_PROFILE_RELEASE_LTO",
+        ] {
+            assert_eq!(env_of(job, name), None, "{job} sets {name}");
+        }
+    }
+    assert_eq!(env_of("packaging", "FCVM_CI_PROFILE"), None);
     for name in [
+        "FCVM_CI_PROFILE",
         "CARGO_PROFILE_RELEASE_CODEGEN_UNITS",
         "CARGO_PROFILE_RELEASE_LTO",
     ] {
-        assert_eq!(
-            env_of("packaging", name),
-            None,
-            "Packaging builds the shipped profile"
-        );
         assert!(
             ci["env"][name].is_null(),
             "{name} must not be workflow-wide"
         );
     }
-    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
-    assert!(
-        makefile.contains(
-            "CONTAINER_TEST_OPTIONS += -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS -e CARGO_PROFILE_RELEASE_LTO"
-        ),
-        "the container build must receive the CI profile"
-    );
 }
 
 /// A recipe that runs under TARGET_LEASE_SHELL needs target/: the wrapper refuses to run

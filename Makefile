@@ -23,7 +23,7 @@ CARGO_BIN ?= cargo
 # exclusively before pruning idle artifacts, so age-check -> delete cannot race
 # a build.  `override` prevents `make CARGO=cargo ...` from silently bypassing
 # the safety protocol; CARGO_BIN remains available for toolchain selection.
-override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) $(CARGO_LOCAL_CONFIG)
+override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) $(CARGO_LOCAL_CONFIG) $(CARGO_CI_CONFIG)
 
 # Custom dependencies bin directory
 CUSTOM_DEPS_BIN := /mnt/fcvm-btrfs/deps/bin
@@ -186,6 +186,11 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Use one absolute path for Cargo, provenance, and the container bind mount.
 FUSE_BACKEND_RS_OVERRIDE_PATH := $(if $(strip $(FUSE_BACKEND_RS_OVERRIDE)),$(shell realpath -m -- "$(FUSE_BACKEND_RS_OVERRIDE)"))
 CARGO_LOCAL_CONFIG = $(if $(FUSE_BACKEND_RS_OVERRIDE_PATH),--config 'patch."https://github.com/ejc3/fuse-backend-rs.git".fuse-backend-rs.path="$(FUSE_BACKEND_RS_OVERRIDE_PATH)"')
+# CI's build profile for this workspace (ci.yml sets FCVM_CI_PROFILE=light): codegen-units=16 and
+# no LTO, given to this workspace's cargo commands only. Environment overrides
+# (CARGO_PROFILE_RELEASE_*) would also reach the Firecracker and Cloud Hypervisor builds that
+# `fcvm setup` runs, which keep their own profiles. Unset, cargo builds the shipped profile.
+CARGO_CI_CONFIG = $(if $(filter light,$(FCVM_CI_PROFILE)),--config profile.release.codegen-units=16 --config 'profile.release.lto="off"')
 # cargo-deny 0.18.9 cannot consume Cargo's CLI patch configuration.
 ifneq ($(FUSE_BACKEND_RS_OVERRIDE_PATH),)
 ifneq ($(filter lint,$(MAKECMDGOALS)),)
@@ -198,7 +203,7 @@ endif
 # (a prerequisite of every build/test target).
 export CARGO_TARGET_DIR := target
 # Cargo does not forward global --config to external subcommands.
-NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) --release
+NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) $(CARGO_CI_CONFIG) --release
 TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
 # sudo resets the environment, so a caller's FCVM_CONFIG_DIR has to be passed
 # through explicitly; without it `fcvm setup` under sudo regenerates and reads
@@ -266,8 +271,8 @@ TEST_LOG_DIR := /tmp/fcvm-test-logs
 # as arguments instead would need FILTER's own quotes (-E 'test(...)') quoted again.
 # Without this, `make container-test-unit FILTER=x` ran every test.
 CONTAINER_TEST_OPTIONS := -e FILTER -e STREAM -e LIST -e IGNORED
-# CI's build profile (ci.yml sets both); unset outside CI, so the container builds the shipped one.
-CONTAINER_TEST_OPTIONS += -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS -e CARGO_PROFILE_RELEASE_LTO
+# CI's build profile (CARGO_CI_CONFIG); unset outside CI, so the container builds the shipped one.
+CONTAINER_TEST_OPTIONS += -e FCVM_CI_PROFILE
 
 # Container run command (base)
 # Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode

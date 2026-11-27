@@ -590,7 +590,8 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
-    # The CI build profile, as in the Host job.
+    # The CI build profile, as in the Host job, set through the environment: this job runs
+    # cargo directly and builds nothing else.
     env:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
       CARGO_PROFILE_RELEASE_LTO: "off"
@@ -673,13 +674,13 @@ jobs:
       fail-fast: false
       # arm64 and x64, as planned by skip-check (arm64 only on a pull_request).
       matrix: ${{ fromJSON(needs.skip-check.outputs.host) }}
-    # The CI build profile (ci_builds_use_the_light_profile_but_one_lane): codegen-units=16
-    # and no LTO instead of the shipped 1 and thin. Measured on one 96-vCPU arm64 box
-    # (c8g.24xlarge): make build 420 -> 128 s, test-root's test build 546 -> 132 s.
-    # Host-Root-arm64-SnapshotDisabled and Packaging keep the shipped profile.
+    # The CI build profile (the Makefile's CARGO_CI_CONFIG; ci_builds_use_the_light_profile_but_one_lane):
+    # codegen-units=16 and no LTO for this workspace instead of the shipped 1 and thin.
+    # Measured on one 96-vCPU arm64 box (c8g.24xlarge): make build 420 -> 128 s,
+    # test-root's test build 546 -> 132 s. Host-Root-arm64-SnapshotDisabled and Packaging
+    # keep the shipped profile.
     env:
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-      CARGO_PROFILE_RELEASE_LTO: "off"
+      FCVM_CI_PROFILE: light
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -1073,10 +1074,9 @@ jobs:
       matrix: ${{ fromJSON(needs.skip-check.outputs.host_root) }}
     env:
       FCVM_NO_SNAPSHOT: ${{ matrix.fcvm_no_snapshot }}
-      # The CI build profile, but this lane builds the shipped one (codegen-units=1, thin
-      # LTO, as Cargo.toml's [profile.release]) so a test still runs the shipped codegen.
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ (matrix.arch == 'arm64' && matrix.mode == 'SnapshotDisabled') && '1' || '16' }}
-      CARGO_PROFILE_RELEASE_LTO: ${{ (matrix.arch == 'arm64' && matrix.mode == 'SnapshotDisabled') && 'thin' || 'off' }}
+      # The CI build profile (the Makefile's CARGO_CI_CONFIG), but this lane builds the
+      # shipped one, so a test still runs the shipped codegen.
+      FCVM_CI_PROFILE: ${{ (matrix.arch == 'arm64' && matrix.mode == 'SnapshotDisabled') && 'shipped' || 'light' }}
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -1458,9 +1458,8 @@ jobs:
       packages: write
     env:
       CONTAINER_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}
-      # The CI build profile; the Makefile passes both into the container.
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
-      CARGO_PROFILE_RELEASE_LTO: "off"
+      # The CI build profile; the Makefile passes it into the container.
+      FCVM_CI_PROFILE: light
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
