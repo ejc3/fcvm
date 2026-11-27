@@ -360,6 +360,44 @@ pub struct Hierarchy {
     pub stamps: Stamps,
     /// How often a start sweeps a parent.
     pub sweep_every: std::time::Duration,
+    /// Whether the caller is root, which may write every cgroup.
+    pub caller_is_root: bool,
+    /// Whether the caller can make a cgroup in this one and move a process into it.
+    pub writable: fn(&Path) -> bool,
+    /// Whether a service manager marked this cgroup as delegated (`user.delegate` or
+    /// `trusted.delegate` set to `1`).
+    pub delegated: fn(&Path) -> bool,
+}
+
+/// Whether this process can make a cgroup in `level` and write its `cgroup.procs`.
+fn writable_by_this_process(level: &Path) -> bool {
+    let access = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            // SAFETY: access on a NUL-terminated path.
+            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0)
+    };
+    access(level) && access(&level.join("cgroup.procs"))
+}
+
+/// Whether a service manager marked `level` as delegated. systemd sets both xattrs to `1`
+/// on a cgroup it delegates; an unprivileged caller can read only `user.delegate`.
+fn marked_delegated(level: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(level.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    [c"user.delegate", c"trusted.delegate"].iter().any(|name| {
+        let mut value = [0u8; 8];
+        // SAFETY: getxattr into a buffer of the length passed, on NUL-terminated strings.
+        let len = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        len == 1 && value[0] == b'1'
+    })
 }
 
 impl Hierarchy {
@@ -371,6 +409,9 @@ impl Hierarchy {
             mkdir: |path| std::fs::create_dir(path),
             stamps: Stamps::OnTheStore,
             sweep_every: crate::sweep::CGROUP_SCOPES.interval(),
+            caller_is_root: nix::unistd::geteuid().is_root(),
+            writable: writable_by_this_process,
+            delegated: marked_delegated,
         }
     }
 }
@@ -668,8 +709,12 @@ mod tests {
     use crate::sweep::Sweep;
 
     /// A `mkdir` that adds the interface files cgroupfs gives a new cgroup. Controller files
-    /// appear only when the parent enables the controller, as in the kernel.
+    /// appear only when the parent enables the controller, as in the kernel. A parent marked
+    /// read-only ([`readonly`]) refuses, as one owned by another user does.
     fn fake_mkdir(path: &Path) -> io::Result<()> {
+        if !fake_writable(path.parent().unwrap()) {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
         std::fs::create_dir(path)?;
         for file in [
             "cgroup.procs",
@@ -708,8 +753,109 @@ mod tests {
             mkdir: fake_mkdir,
             stamps: Stamps::At(stamps),
             sweep_every: crate::sweep::CGROUP_SCOPES.every,
+            caller_is_root: true,
+            writable: fake_writable,
+            delegated: fake_delegated,
         };
         (dir, hierarchy)
+    }
+
+    /// A cgroup the caller cannot write: another user's, or root's for an unprivileged caller.
+    fn readonly(cgroup: &Path) {
+        std::fs::write(cgroup.join(".fake-readonly"), "").unwrap();
+    }
+
+    fn fake_writable(cgroup: &Path) -> bool {
+        !cgroup.join(".fake-readonly").exists()
+    }
+
+    /// A cgroup a service manager marked as delegated (`user.delegate=1`).
+    fn delegate(cgroup: &Path) {
+        std::fs::write(cgroup.join(".fake-delegated"), "").unwrap();
+    }
+
+    fn fake_delegated(cgroup: &Path) -> bool {
+        cgroup.join(".fake-delegated").exists()
+    }
+
+    /// The cgroup `relative` below the fake root, each missing level made as the kernel
+    /// makes one, whatever the caller may write.
+    fn cgroup(h: &Hierarchy, relative: &str) -> PathBuf {
+        let mut level = h.root.clone();
+        for part in Path::new(relative).components() {
+            level.push(part);
+            if !level.exists() {
+                std::fs::create_dir(&level).unwrap();
+                for file in [
+                    "cgroup.procs",
+                    "cgroup.subtree_control",
+                    "cgroup.controllers",
+                ] {
+                    std::fs::write(level.join(file), "").unwrap();
+                }
+            }
+        }
+        level
+    }
+
+    fn enable_memory(cgroup: &Path) {
+        std::fs::write(cgroup.join("cgroup.subtree_control"), "memory\n").unwrap();
+    }
+
+    /// The systemd user manager of uid 1000 in [`systemd_host`].
+    const USER_MANAGER: &str = "user.slice/user-1000.slice/user@1000.service";
+
+    /// A systemd host as an unprivileged caller (uid 1000) sees it: the root and the slices
+    /// are root's; `user@1000.service` is the user's, marked delegated by the system manager
+    /// and holding the user manager in its `init.scope`; memory is enabled down to it.
+    fn systemd_host() -> (tempfile::TempDir, Hierarchy) {
+        let (dir, mut h) = fake_root(true);
+        h.caller_is_root = false;
+        cgroup(&h, "init.scope");
+        for slice in ["system.slice", "user.slice", "user.slice/user-1000.slice"] {
+            let slice = cgroup(&h, slice);
+            enable_memory(&slice);
+            readonly(&slice);
+        }
+        let manager = cgroup(&h, USER_MANAGER);
+        enable_memory(&manager);
+        delegate(&manager);
+        cgroup(&h, &format!("{USER_MANAGER}/init.scope"));
+        enable_memory(&cgroup(&h, &format!("{USER_MANAGER}/app.slice")));
+        readonly(&h.root);
+        (dir, h)
+    }
+
+    /// A system unit run for the user with `Delegate=yes` and `DelegateSubgroup=payload`
+    /// (`systemd-run --uid=1000 -p Delegate=yes -p DelegateSubgroup=payload`): the unit's
+    /// cgroup is the user's, marked delegated, and holds no process; the payload runs in its
+    /// leaf. An unprivileged fcvm started there gets a scope with a memory controller inside
+    /// the unit, and creates nothing outside it.
+    #[test]
+    fn an_unprivileged_start_in_a_delegated_unit_gets_a_scope_with_memory() {
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, "system.slice/plan.service");
+        delegate(&unit);
+        let payload = cgroup(&h, "system.slice/plan.service/payload");
+        std::fs::write(payload.join("cgroup.procs"), "100\n4242\n").unwrap();
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/system.slice/plan.service/payload")),
+            false,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(scope.path(), unit.join("fcvm.slice/fcvm-4242-77.scope"));
+        assert!(fake_enabled(&unit.join("cgroup.subtree_control")));
+        assert!(fake_enabled(
+            &unit.join("fcvm.slice/cgroup.subtree_control")
+        ));
+        assert!(scope.path().join("memory.swap.max").exists());
+        assert!(!h.root.join("fcvm.slice").exists());
+        assert_eq!(scope.origin.as_deref(), Some(payload.as_path()));
     }
 
     fn default_placement() -> Placement {
@@ -947,6 +1093,9 @@ mod tests {
             mkdir: h.mkdir,
             stamps: h.stamps.clone(),
             sweep_every: h.sweep_every,
+            caller_is_root: h.caller_is_root,
+            writable: h.writable,
+            delegated: h.delegated,
         }
     }
 
