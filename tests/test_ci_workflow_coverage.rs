@@ -4668,6 +4668,93 @@ fn the_test_container_installs_the_cargo_tools_the_workflows_pin() {
 const NOT_A_FORK: &str = "(github.event_name != 'pull_request' || \
                           github.event.pull_request.head.repo.full_name == github.repository)";
 
+/// The self-hosted jobs a fork's pull request could reach in one workflow, with how many
+/// self-hosted jobs of pull-request-triggered workflows were read. Under `pull_request` a job
+/// must start its `if` with [`NOT_A_FORK`] as a conjunct. Under `pull_request_target` no
+/// self-hosted job is accepted at all: that event runs with the base repository's secrets
+/// and write token, and [`NOT_A_FORK`] reads only `pull_request`, so it is true there for
+/// every fork.
+fn fork_guard_findings(name: &str, workflow: &Value) -> (usize, Vec<String>) {
+    let on = triggers(workflow);
+    let events: Vec<&str> = match on {
+        Value::String(event) => vec![event.as_str()],
+        Value::Sequence(events) => events.iter().filter_map(Value::as_str).collect(),
+        Value::Mapping(events) => events.keys().filter_map(Value::as_str).collect(),
+        _ => panic!("{name}: cannot read its `on:`"),
+    };
+    let target = events.contains(&"pull_request_target");
+    if !target && !events.contains(&"pull_request") {
+        return (0, Vec::new());
+    }
+    let mut checked = 0;
+    let mut findings = Vec::new();
+    let jobs = workflow["jobs"].as_mapping().expect("jobs");
+    for (id, job) in jobs {
+        let id = id.as_str().unwrap_or_default();
+        match runner_of(job) {
+            Ok(Runner::GitHub) => continue,
+            Ok(Runner::Ours) | Ok(Runner::Caller(_)) | Err(_) => {}
+        }
+        checked += 1;
+        if target {
+            findings.push(format!(
+                "{name}: job {id} is not GitHub-hosted in a pull_request_target workflow"
+            ));
+            continue;
+        }
+        let condition = job.get("if").and_then(Value::as_str).unwrap_or_default();
+        let inner = condition
+            .trim()
+            .strip_prefix("${{")
+            .and_then(|c| c.strip_suffix("}}"))
+            .unwrap_or(condition)
+            .trim();
+        // The guard must be a conjunct of the whole condition, not inside an `||`.
+        let guarded = inner == NOT_A_FORK
+            || inner
+                .strip_prefix(NOT_A_FORK)
+                .is_some_and(|rest| rest.trim_start().starts_with("&&") && !rest.contains("||"));
+        if !guarded {
+            findings.push(format!("{name}: job {id} has `if: {condition}`"));
+        }
+    }
+    (checked, findings)
+}
+
+/// [`fork_guard_findings`] on workflows written for it: the guard is accepted under
+/// `pull_request` and refused under `pull_request_target`, where it does not exclude forks.
+#[test]
+fn the_fork_guard_check_refuses_self_hosted_jobs_under_pull_request_target() {
+    let workflow = |on: &str, condition: &str| -> Value {
+        serde_norway::from_str(&format!(
+            "on: {on}\njobs:\n  lane:\n    runs-on: [self-hosted, Linux, ARM64]\n    if: ${{{{ {condition} }}}}\n    steps: []\n  hosted:\n    runs-on: ubuntu-latest\n    steps: []\n"
+        ))
+        .expect("fixture parses")
+    };
+    let guarded = format!("{NOT_A_FORK} && github.event.inputs.job != 'container'");
+    assert_eq!(
+        fork_guard_findings("pr.yml", &workflow("pull_request", &guarded)),
+        (1, vec![])
+    );
+    let (_, unguarded) = fork_guard_findings("pr.yml", &workflow("pull_request", "true"));
+    assert_eq!(unguarded.len(), 1, "{unguarded:?}");
+    let (_, target) = fork_guard_findings("target.yml", &workflow("pull_request_target", &guarded));
+    assert_eq!(
+        target.len(),
+        1,
+        "a guarded self-hosted job under pull_request_target: {target:?}"
+    );
+    let (_, both) = fork_guard_findings(
+        "both.yml",
+        &workflow("[pull_request, pull_request_target]", &guarded),
+    );
+    assert_eq!(both.len(), 1, "{both:?}");
+    assert_eq!(
+        fork_guard_findings("push.yml", &workflow("push", "true")),
+        (0, vec![])
+    );
+}
+
 /// A pull request from a fork runs no job on a runner of ours, even once a maintainer has
 /// approved its run. `pull_request` runs the fork's code, the self-hosted jobs run it with
 /// passwordless sudo, and the instance then serves jobs on main, kernels.yml (which holds
@@ -4688,45 +4775,9 @@ fn self_hosted_jobs_refuse_fork_pull_requests() {
         if !(name.ends_with(".yml") || name.ends_with(".yaml")) {
             continue;
         }
-        let workflow = parse_workflow(&name);
-        let on = triggers(&workflow);
-        let from_pull_requests = match on {
-            Value::String(event) => event.starts_with("pull_request"),
-            Value::Sequence(events) => events
-                .iter()
-                .any(|e| e.as_str().is_some_and(|e| e.starts_with("pull_request"))),
-            Value::Mapping(events) => events
-                .keys()
-                .any(|e| e.as_str().is_some_and(|e| e.starts_with("pull_request"))),
-            _ => panic!("{name}: cannot read its `on:`"),
-        };
-        if !from_pull_requests {
-            continue;
-        }
-        let jobs = workflow["jobs"].as_mapping().expect("jobs");
-        for (id, job) in jobs {
-            let id = id.as_str().unwrap_or_default();
-            match runner_of(job) {
-                Ok(Runner::GitHub) => continue,
-                Ok(Runner::Ours) | Ok(Runner::Caller(_)) | Err(_) => {}
-            }
-            checked += 1;
-            let condition = job.get("if").and_then(Value::as_str).unwrap_or_default();
-            let inner = condition
-                .trim()
-                .strip_prefix("${{")
-                .and_then(|c| c.strip_suffix("}}"))
-                .unwrap_or(condition)
-                .trim();
-            // The guard must be a conjunct of the whole condition, not inside an `||`.
-            let guarded = inner == NOT_A_FORK
-                || inner.strip_prefix(NOT_A_FORK).is_some_and(|rest| {
-                    rest.trim_start().starts_with("&&") && !rest.contains("||")
-                });
-            if !guarded {
-                findings.push(format!("{name}: job {id} has `if: {condition}`"));
-            }
-        }
+        let (count, found) = fork_guard_findings(&name, &parse_workflow(&name));
+        checked += count;
+        findings.extend(found);
     }
     assert!(
         checked >= 3,
