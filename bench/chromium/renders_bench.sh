@@ -41,7 +41,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd -P)"
 mode="${1:-}"; [ $# -gt 0 ] && shift
 
-for tool in systemd-run systemctl python3 sudo; do
+for tool in systemd-run systemctl python3 sudo jq; do
     command -v "$tool" >/dev/null 2>&1 || { echo "BLOCKED: '$tool' missing" >&2; exit 2; }
 done
 : "${OUT:?OUT=DIR is where the records go}"
@@ -111,11 +111,32 @@ start_unit() {  # wait|no-block, then the module's further arguments
     sudo systemd-run "${props[@]}" "${wait[@]}" "$FCVM" "${args[@]}" "$@"
 }
 
+# fcvm's state and data directories as the unit's fcvm resolves them, asked of that binary
+# with the unit's environment (unit_props: this user, HOME, XDG_RUNTIME_DIR, PATH and
+# nothing else). The state directory is fcvm's answer, never a join of the data root. Set
+# before census_args runs: a failure inside its process substitution is lost, so census_args
+# prints nothing without them and its callers refuse an empty census.
+FCVM_STATE_DIR="" FCVM_DATA_ROOT=""
+load_fcvm_paths() {
+    local paths
+    paths=$(env -i HOME="$HOME" XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+        PATH="$PATH" "$FCVM" paths --json) \
+        || { echo "BLOCKED: '$FCVM paths --json' failed (its stderr is above)" >&2; return 2; }
+    FCVM_STATE_DIR=$(jq -er '.state_dir | select(type == "string" and startswith("/"))' \
+        <<<"$paths") \
+        || { echo "BLOCKED: '$FCVM paths --json' printed no state_dir: $paths" >&2; return 2; }
+    FCVM_DATA_ROOT=$(jq -er '.data_dir | select(type == "string" and startswith("/"))' \
+        <<<"$paths") \
+        || { echo "BLOCKED: '$FCVM paths --json' printed no data_dir: $paths" >&2; return 2; }
+}
+
 census_args() {  # what renders_teardown_check.py counts, for both checks
-    local data="${FCVM_DATA_DIR:-/mnt/fcvm-btrfs}" a p n
+    local a p n
+    case "${FCVM_STATE_DIR:-}" in /*) ;; *) echo "BLOCKED: census_args: no state directory from fcvm's 'paths --json' (FCVM_STATE_DIR='${FCVM_STATE_DIR:-}')" >&2; return 2 ;; esac
+    case "${FCVM_DATA_ROOT:-}" in /*) ;; *) echo "BLOCKED: census_args: no data directory from fcvm's 'paths --json' (FCVM_DATA_ROOT='${FCVM_DATA_ROOT:-}')" >&2; return 2 ;; esac
     printf '%s\0' --unit "$UNIT" --status "$STATUS" --teardown "$OUT/teardown.json" \
-        --run-dir "$RUN_DIR" --state-dir "$data/state" --vm-dir "$data/vm-disks" \
-        --data-dir "$data" --snapshot-tag "$TAG"
+        --run-dir "$RUN_DIR" --state-dir "$FCVM_STATE_DIR" --vm-dir "$FCVM_DATA_ROOT/vm-disks" \
+        --data-dir "$FCVM_DATA_ROOT" --snapshot-tag "$TAG"
     for a in 127.0.0.1 127.0.0.3; do for p in 80 443; do printf '%s\0' --port "$a:$p"; done; done
     printf '%s\0' --port 127.0.0.1:53
     for n in $(seq 0 $(( ${MAX_ENGINES:-48} - 1 ))); do printf '%s\0' --port "127.0.0.1:$((28800 + n))"; done
@@ -126,16 +147,20 @@ case "$mode" in
     start) start_unit no-block "$@" ;;
     teardown-check)
         stages="${1:-start,cgroups,replays,serve-starting,serve,engines-starting,engines,workers,running,running:TERM}"
+        load_fcvm_paths || exit 2
         count=()
         while IFS= read -r -d '' a; do count+=("$a"); done < <(census_args)
+        [ "${#count[@]}" -gt 0 ] || { echo "BLOCKED: the census has no arguments" >&2; exit 2; }
         python3 "$HERE/renders_teardown_check.py" "${count[@]}" --stages "$stages" \
             --after-s "${AFTER_S:-20}" --timeout-s "${STAGE_TIMEOUT_S:-1800}" --out "$OUT.teardown-check.json" \
             -- "$0" start
         ;;
     agent-check)
         stages="${1:-start,cgroups,replays,serve-starting,serve,engines-starting,engines,workers,running,running:TERM}"
+        load_fcvm_paths || exit 2
         count=() props=() agent=()
         while IFS= read -r -d '' a; do count+=("$a"); done < <(census_args)
+        [ "${#count[@]}" -gt 0 ] || { echo "BLOCKED: the census has no arguments" >&2; exit 2; }
         while IFS= read -r -d '' a; do props+=("$a"); done < <(unit_props)
         while IFS= read -r -d '' a; do agent+=("$a"); done < <(agent_args)
         engines=(--engines)

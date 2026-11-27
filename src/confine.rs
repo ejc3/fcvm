@@ -2143,7 +2143,7 @@ mod tests {
         let inner = body(snapshot, "async fn cmd_snapshot_run_inner(");
         let resolve = inner.find("crate::confine::resolve(").unwrap();
         for effect in [
-            "reclaim_abandoned()",
+            "reclaim_abandoned_if_due()",
             "Owner::begin(",
             "EarlyPrefill::start(",
         ] {
@@ -2154,7 +2154,7 @@ mod tests {
         }
         let raw = body(snapshot, "async fn cmd_snapshot_run_raw(");
         let resolve = raw.find("crate::confine::resolve(").unwrap();
-        for effect in ["reclaim_abandoned()", "Owner::begin("] {
+        for effect in ["reclaim_abandoned_if_due()", "Owner::begin("] {
             assert!(
                 resolve < raw.find(effect).unwrap(),
                 "raw restore: {effect} first"

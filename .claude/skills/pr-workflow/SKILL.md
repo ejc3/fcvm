@@ -264,9 +264,9 @@ gh pr checks <N>
 
 CI runs only on the top of a stack (see AGENTS.md "CI runs on the top of a stack"). Drafts, and
 lower PRs under a ready PR whose head contains theirs, get `Summary (deferred)`. A ready PR
-under a draft runs, so mark a stack's layers ready back to back (see AGENTS.md for the order). A lower PR is tested when its head carries `Summary` success
-or the `Stack CI` status that the top's passing run posts; bisect a failing top with
-`gh workflow run ci.yml --ref <layer-branch>`.
+under a draft runs, so mark a stack's layers ready back to back (see AGENTS.md for the order). A PR is tested when its head carries the `ci/pool` success status
+that a passing run posts on its own head and on the lower heads it contains (`pending` means nothing ran for it);
+find what broke a failing top with `python3 scripts/ci-pool/ci_pool.py bisect --of <PR>`.
 
 ```bash
 git checkout pr1-branch

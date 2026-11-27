@@ -172,6 +172,8 @@ async fn run(cli: cli::Cli) -> Result<()> {
     // This must be done AFTER setting up the tracing subscriber
     let _ = LogTracer::init();
 
+    fcvm::sweep::warn_about_unknown_names();
+
     // A command that starts a VMM or a memory server moves this process into the VM's own
     // cgroup before it starts anything, so what its children allocate is charged there and
     // not to the caller's session (#1028, `fcvm::cgroup`).
@@ -190,6 +192,7 @@ async fn run(cli: cli::Cli) -> Result<()> {
     // Dispatch to appropriate command handler
     let result = match cli.cmd {
         Commands::Ls(args) => commands::cmd_ls(args).await,
+        Commands::Paths(args) => commands::cmd_paths(args),
         Commands::Podman(args) => commands::cmd_podman(*args).await,
         Commands::Snapshot(args) => commands::cmd_snapshot(args).await,
         Commands::Snapshots(args) => commands::cmd_snapshots(args).await,

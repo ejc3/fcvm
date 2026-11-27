@@ -22,6 +22,11 @@ STAND_IN_REQBENCH = textwrap.dedent('''
     calls = []
     def become_child_subreaper():
         calls.append("subreaper")
+    def fcvm_state_dir(fcvm):
+        calls.append(("fcvm_state_dir", fcvm))
+        if fcvm == "/bin/false":
+            raise RuntimeError("`/bin/false paths --json` exited with status 1")
+        return "/stand-in/state"
     class Interrupted(BaseException):
         pass
     def run_cdp_request(args, rep, fast):
@@ -115,8 +120,10 @@ class WorkerProtocol(unittest.TestCase):
         self.assertEqual(lines[3]["ok"], False)
         import reqbench
         self.assertEqual(reqbench.calls[0], "subreaper")
+        # the state directory is asked of the fcvm the clones run
+        self.assertEqual(reqbench.calls[1], ("fcvm_state_dir", "/bin/true"))
         # the clone joins the side's cgroup through the guard, and the viewport reaches it
-        self.assertEqual(reqbench.calls[1],
+        self.assertEqual(reqbench.calls[2],
                          ("https://a.test/", 0, True, "1280x720", "/sys/fs/cgroup/x/cgroup.procs"))
 
     def test_a_request_that_raises_is_a_failed_row_and_the_worker_goes_on(self):
@@ -168,6 +175,19 @@ class WorkerProtocol(unittest.TestCase):
                                             "--viewport", "1280-720"],
                                     stdin=io.StringIO(""), stdout=stdout)
             self.assertEqual(stdout.getvalue(), "")
+
+    def test_an_fcvm_that_cannot_name_its_state_directory_ends_the_worker(self):
+        """No render is tried, and the worker never says it is ready."""
+        stdout = io.StringIO()
+        with self.assertRaises(SystemExit):
+            renders_worker.main(
+                ["--side", "fcvm", "--index", "0", "--bench", self.dir.name,
+                 "--run-id", "r", "--out-dir", self.dir.name, "--fcvm", "/bin/false",
+                 "--serve-pid", "42", "--data-root", self.dir.name,
+                 "--cgroup-procs", "/sys/fs/cgroup/x/cgroup.procs"],
+                stdin=io.StringIO('{"seq": 1, "page": 0, "url": "https://a.test/"}\n'),
+                stdout=stdout)
+        self.assertEqual(stdout.getvalue(), "")
 
     def test_the_fcvm_side_refuses_to_start_without_its_arguments(self):
         with self.assertRaises(SystemExit):

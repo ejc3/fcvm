@@ -229,6 +229,27 @@ pub struct NetConfig {
     pub tap: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mac: Option<String>,
+    /// Checksum, TCP segmentation and UDP fragmentation offload between the guest's
+    /// virtio-net and the tap. Cloud Hypervisor offered all three unless told otherwise
+    /// until v54.0 and offers none since (the host then segments and checksums for the
+    /// guest). fcvm asks for them: without TSO a guest sends one MTU-sized frame per
+    /// virtqueue buffer, and Firecracker's virtio-net offers the same three.
+    pub offload_csum: bool,
+    pub offload_tso: bool,
+    pub offload_ufo: bool,
+}
+
+impl NetConfig {
+    /// A virtio-net device on the host tap `tap`, with the offloads on.
+    pub fn new(tap: String, mac: Option<String>) -> Self {
+        Self {
+            tap,
+            mac,
+            offload_csum: true,
+            offload_tso: true,
+            offload_ufo: true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

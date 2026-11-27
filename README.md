@@ -461,7 +461,7 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
 **Dependencies:**
 - Rust 1.93 (pinned by `rust-toolchain.toml`) with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH (default backend)
-- Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): build the pinned fork with `fcvm setup --cloud-hypervisor`, or set `FCVM_CLOUD_HYPERVISOR_BIN`, or put `cloud-hypervisor` in PATH (resolved in that order)
+- Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): `fcvm setup --cloud-hypervisor` builds the upstream commit that `[cloud_hypervisor]` in `rootfs-config.toml` pins, and fcvm runs that build and no other. `FCVM_CLOUD_HYPERVISOR_BIN` names another binary instead; it has to take the restore options fcvm passes (`memory_restore_mode=copyonwrite`, in releases from v54.0, and `clock_restore_mode=preserve`, on upstream's main since 2026-11-23 and in no release up to v55.0). `cloud-hypervisor` on PATH is used only with a config that has no `[cloud_hypervisor]` section. A snapshot restores only on the Cloud Hypervisor build that wrote it
 - For rootless: `passt` package (provides `pasta`)
 - For bridged: sudo, iptables, iproute2
 - For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set), and `net.ipv6.conf.all.forwarding=1` (fcvm refuses routed mode without it)
@@ -518,6 +518,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | `fcvm exec` | Execute command in running VM/container |
 | `fcvm balloon` | Print a VM's balloon target and size as one JSON line; with a MIB argument, set the target first |
 | `fcvm ls` | List running VMs (`--json` for JSON) |
+| `fcvm paths` | Print the state and data directories this binary uses (`--json`: one JSON object, `state_dir` and `data_dir`) |
 | `fcvm snapshot create` | Snapshot a running VM (a clone only once its restore is acknowledged; `--await-restore` waits for that) |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
 | `fcvm snapshot run` | Clone from snapshot (`--publish` chooses where its ports listen) |
@@ -565,8 +566,9 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so every write goes to the host as it is made and the guest takes a file's size and mtime from the host even while a guest process has it open for writing. Read-only maps never use that cache, and a run with no read-write map is the same run with or without it |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
+| `FCVM_SWEEP_EVERY_MS` | unset | How often a start sweeps for what killed fcvm processes left, as `name=milliseconds` pairs separated by commas. The sweeps are `state` (VM states, 60 s), `reclaim` (owner records, 1 s), `cgroup-scopes` (per-VM cgroups, 5 s) and `routed-leases` (routed IPv6 address leases, 5 s); `*` names every sweep not named. `0` makes every start sweep, which costs each start a pass over every VM running |
 | `FCVM_CGROUP_PARENT` | `fcvm.slice` | Parent, below the cgroup2 root, of the cgroup each VM and memory server runs in; `none` keeps fcvm in the cgroup it was started in. See [A VM's own cgroup](#a-vms-own-cgroup) |
-| `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |
+| `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to a `cloud-hypervisor` binary to run instead of the build `[cloud_hypervisor]` pins |
 | `FCVM_FIRECRACKER_LOG_LEVEL` | `Info` | Level of Firecracker's own per-VM `firecracker.log`: `Error`, `Warning`, `Info` or `Debug`. `Debug` adds one line per vsock packet, which is gigabytes an hour under FUSE-over-vsock volumes. Teardown copies the log's last 16 MiB to `/tmp/fcvm-firecracker-<vm_id>.log` |
 | `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` | `3600` | How long a cached firecracker-fork resolution stays valid before a launch re-queries the remote; `0` forces a query every launch |
 | `FCVM_CONFINE` | config | `required` confines every VMM this host starts (see [Confining the VMM](#confining-the-vmm---confine)); it can tighten the config's `[confine] mode`, never loosen it |
@@ -690,8 +692,9 @@ memory does not take the VM with it. `FCVM_CGROUP_PARENT` moves the scopes under
 parent (for instance a slice your oomd watches), or `none` keeps fcvm where it was started;
 to run a VM in a systemd unit instead, start fcvm in one with
 `systemd-run --scope [-p MemorySwapMax=0] env FCVM_CGROUP_PARENT=none fcvm ...`.
-fcvm removes its scope when it exits; a scope whose fcvm was killed is removed by the next
-fcvm that starts. An unprivileged fcvm stays in its own cgroup.
+fcvm removes its scope when it exits; a scope whose fcvm was killed is removed by the first
+fcvm that starts under that parent 5 s or more after the last sweep of it began. An
+unprivileged fcvm stays in its own cgroup.
 
 `--no-swap` (on all four commands) sets `memory.swap.max` to 0 on that cgroup before the
 VMM starts. It needs the cgroup, so fcvm refuses the flag when it cannot create one with a
@@ -736,7 +739,7 @@ make test-fc-mock    # Container mode tests (no KVM, uses fc-mock)
 
 CI runs on every PR across ARM64 and x64 with both snapshot-enabled and snapshot-disabled modes. Tests include POSIX compliance (pjdfstest), VM lifecycle, networking, snapshot/clone workflows, and egress connectivity.
 
-**CI merge train:** batches of independent low-risk PRs (dependabot bumps, docs, isolated fixes) can share ONE full CI matrix instead of one per PR — `make train-create PRS="689 690" && make train-dispatch`, then `make train-land` on green or `make train-bisect` on red. See [docs/ci-train.md](docs/ci-train.md) for the protocol, the cost math, and when pooling is (in)appropriate.
+**Pooled CI:** pull requests are tested together as a pool read from their bases: `scripts/ci-pool/ci_pool.py` builds and publishes pools, finds what broke a red one, lands a tested one and accounts for CI cost. See [docs/ci-pool.md](docs/ci-pool.md).
 
 </details>
 
@@ -758,7 +761,7 @@ fcvm/
 |----------|---------|
 | [DESIGN.md](DESIGN.md) | Architecture, internals, configuration reference |
 | [Durable remote workloads](docs/durable-workloads.md) | Proposed persistent, cell-based remote execution architecture |
-| [CI merge train](docs/ci-train.md) | Pooled CI: one full matrix per batch of low-risk PRs |
+| [Pooled CI](docs/ci-pool.md) | Pools read from pull request bases, and what CI costs and why it fails |
 | [PERFORMANCE.md](PERFORMANCE.md) | Benchmarks, tuning, tracing |
 | [NESTED.md](NESTED.md) | Nested virtualization setup |
 
@@ -771,6 +774,8 @@ fcvm/
 **Tests hang?** Kill test VMs: `ps aux | grep fcvm | grep test | awk '{print $2}' | xargs sudo kill`
 
 **KVM not available?** Both Firecracker and Cloud Hypervisor require bare-metal KVM or nested virtualization. On AWS, use `.metal` instances.
+
+**"holds N running VM(s) started by an older fcvm"?** A new fcvm keeps VM state in another layout than the build that started those VMs, and refuses every command, `fcvm ls` included, while one of them runs. It changes nothing in the state directory and leaves the VMs running. List and stop them with the fcvm binary that started them (its `ls` shows them; the new one's does not), then run the command again. A VM of the older build that was killed leaves a state file and holds nothing up: the new build does not list it, and its first launch removes what the older layout left.
 
 **Network issues?** Test incrementally inside a VM:
 ```bash

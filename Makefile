@@ -48,6 +48,12 @@ test-runner-acceptance:
 test-ci-scope:
 	python3 scripts/test-ci-stack-scope.py
 
+# scripts/ci-pool/ci_pool.py (pooled CI, docs/ci-pool.md) against a fake gh and temporary
+# git repositories. Needs git, jq and Python 3.9 or later; no network.
+.PHONY: test-ci-pool
+test-ci-pool:
+	python3 scripts/test-ci-pool.py
+
 # scripts/check-runner-kernel.py against fixture repositories. Needs git 2.29 and Python 3.11.4
 # (tomllib, tarfile's extraction filter, fetch --no-write-fetch-head) or later.
 .PHONY: test-runner-kernel
@@ -411,12 +417,7 @@ help:
 	@echo "  bench-start-rate-churn                The start rate held with ALIVE clones up, each for LIFETIME, in a namespace pool (PREP=, OUT=, ALIVE=, LIFETIME=, CONCURRENCY=, DURATION=)"
 	@echo "  bench-start-pieces[-build]            One piece of a clone start, N times at C (PIECE=, OUT=, COUNT=, CONCURRENCY=, ALIVE=)"
 	@echo ""
-	@echo "CI merge train (pooled CI for a batch of PRs, see docs/ci-train.md):"
-	@echo "  train-create PRS=\"689 690\"  Build the ci-train branch from a batch of PRs"
-	@echo "  train-dispatch     Push the train and dispatch ONE full CI matrix for the batch"
-	@echo "  train-status       Show the train run's state"
-	@echo "  train-land         After a green run, merge every batch PR in order"
-	@echo "  train-bisect       Split a red train into two half-trains (recurse with TRAIN=ci-train-a)"
+	@echo "Pooled CI (docs/ci-pool.md): python3 scripts/ci-pool/ci_pool.py build|publish|flush|status|bisect|land|cost|failures"
 	@echo ""
 	@echo "Other:"
 	@echo "  lint               Run linting (auto-installs tools if needed)"
@@ -1921,36 +1922,6 @@ update-dependency: cargo-target-link
 .PHONY: dependency-metadata
 dependency-metadata: cargo-target-link
 	@$(CARGO) metadata --format-version 1 $(METADATA_FLAGS)
-
-# CI merge train - pooled CI for a batch of independent low-risk PRs.
-# One full CI matrix validates the whole batch instead of one per PR.
-# Protocol, cost math, and when (not) to pool: docs/ci-train.md
-# TRAIN selects the branch (default ci-train; bisect halves are ci-train-a/-b).
-TRAIN ?= ci-train
-
-.PHONY: train-create train-dispatch train-status train-land train-bisect
-train-create:
-	@if [ -n "$(CONTINUE)" ]; then \
-		./scripts/ci-train.sh --branch $(TRAIN) create --continue; \
-	elif [ -n "$(PRS)" ]; then \
-		./scripts/ci-train.sh --branch $(TRAIN) create $(PRS); \
-	else \
-		echo 'ERROR: PRS required (e.g., make train-create PRS="689 690"),'; \
-		echo '       or CONTINUE=1 to resume after a manual conflict resolution'; \
-		exit 1; \
-	fi
-
-train-dispatch:
-	./scripts/ci-train.sh --branch $(TRAIN) dispatch
-
-train-status:
-	./scripts/ci-train.sh --branch $(TRAIN) status
-
-train-land:
-	./scripts/ci-train.sh --branch $(TRAIN) land
-
-train-bisect:
-	./scripts/ci-train.sh --branch $(TRAIN) bisect
 
 fmt: cargo-target-link
 	$(CARGO) fmt
