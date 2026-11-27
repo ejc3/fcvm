@@ -1525,14 +1525,16 @@ jobs:
           path: ${{ github.workspace }}/cargo-cache
           key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-${{ runner.os }}-${{ runner.arch }}-
+      # CLEAN_PRUNE=0: this job builds fcvm only inside the container, so the host-side clean
+      # skips `fcvm snapshots prune` and the host build it needed (7.5 to 9.3 min, runs
+      # 45931415934 and 45935858819); the same recipe removes those directories with rm.
       - name: Clean test data
         working-directory: fcvm
-        run: make clean-test-data || true
-      - name: container-test-unit
-        env:
-          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
-        working-directory: fcvm
-        run: make container-test-unit
+        run: make clean-test-data CLEAN_PRUNE=0 || true
+      # No container-test-unit step: its tests (no features) are all in container-test's build
+      # (the default features), and the step compiled the workspace once more to run them
+      # (11.6 to 13.0 min). container-setup-fcvm builds fcvm in the container first.
+      # ci_jobs_build_one_test_feature_set pins it.
       - name: container-setup-fcvm
         env:
           CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache

@@ -4883,11 +4883,6 @@ fn make_targets(run: &str) -> Vec<String> {
     targets
 }
 
-/// Self-hosted jobs that still compile a second test feature set, with the targets that do
-/// it. Each entry is removed by the change that folds it into the job's other build.
-const SECOND_TEST_BUILD: &[(&str, &[&str])] =
-    &[("container", &["container-test-unit", "container-test"])];
-
 /// Every distinct cargo feature set is a full rebuild of the workspace crates: 11 to 13.7
 /// minutes for the test binaries on the self-hosted runners (runs 45931415934 and
 /// 45935858819). A job that compiles its tests twice, once for a set whose tests are all in
@@ -4943,21 +4938,9 @@ fn ci_jobs_build_one_test_feature_set() {
             continue;
         }
         checked += 1;
-        if sets.len() == 1 {
-            assert!(
-                !SECOND_TEST_BUILD.iter().any(|(job, _)| *job == id),
-                "{id} builds one test feature set now: remove it from SECOND_TEST_BUILD"
-            );
-            continue;
-        }
-        let targets: BTreeSet<&str> = sets.values().flatten().map(String::as_str).collect();
-        let allowed = SECOND_TEST_BUILD
-            .iter()
-            .find(|(job, _)| *job == id)
-            .map(|(_, t)| t.iter().copied().collect::<BTreeSet<_>>());
         assert_eq!(
-            Some(targets),
-            allowed,
+            sets.len(),
+            1,
             "{id} compiles its tests for {} feature sets ({sets:?}); each is a full rebuild",
             sets.len()
         );

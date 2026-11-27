@@ -512,8 +512,12 @@ check-disk: cargo-target-link
 # Clean leftover test data (VM disks, snapshots, state files)
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
 # CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
+# CLEAN_PRUNE=0 skips `fcvm snapshots prune` and therefore the build it needs; the rm lines
+# below remove the same directories. The Container job uses it: it builds fcvm only inside
+# the container.
+CLEAN_PRUNE ?= 1
 clean-test-data: private SHELL := $(TARGET_LEASE_SHELL)
-clean-test-data: build
+clean-test-data: $(if $(filter 1,$(CLEAN_PRUNE)),build)
 	@echo "==> Killing stale VM processes from previous runs..."
 	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sudo kill -9 $$(pgrep -x sleep -P 1) 2>/dev/null; sleep 1; true
 	@echo "==> Cleaning stale network namespaces..."
@@ -526,10 +530,10 @@ clean-test-data: build
 	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true
 	@echo "==> Cleaning snapshots via fcvm (handles btrfs CoW properly)..."
 	@# Use fcvm's snapshot prune for proper cleanup - handles reflinks correctly
-	sudo ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
 	@# Also clean per-mode directories
-	sudo FCVM_DATA_DIR=$(ROOT_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
-	sudo FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo FCVM_DATA_DIR=$(ROOT_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
 	@# Fallback: remove any snapshots that prune couldn't parse (stale/incompatible configs)
 	sudo rm -rf /mnt/fcvm-btrfs/snapshots/*
 	sudo rm -rf $(ROOT_DATA_DIR)/snapshots/* $(CONTAINER_DATA_DIR)/snapshots/*
