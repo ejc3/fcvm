@@ -1775,9 +1775,10 @@ pub struct RunArgs {
 
     /// Disable swap for this VM: memory.swap.max=0 on the VM's own cgroup, which fcvm
     /// enters before it starts anything (see `FCVM_CGROUP_PARENT`). Guest memory is then
-    /// never swapped; under pressure the kernel evicts file cache instead. Needs root on a
-    /// cgroup2 host where the memory controller can be enabled for the VM's cgroup; fcvm
-    /// refuses to start without it. Not part of any snapshot key.
+    /// never swapped; under pressure the kernel evicts file cache instead. Needs root, or an
+    /// unprivileged start in a cgroup delegated to its user, on a cgroup2 host where the
+    /// memory controller can be enabled for the VM's cgroup; fcvm refuses to start without
+    /// it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
 
@@ -2032,9 +2033,9 @@ pub struct SnapshotServeArgs {
 
     /// Disable swap for the memory server: memory.swap.max=0 on its own cgroup, which
     /// fcvm enters before it maps the snapshot (see `FCVM_CGROUP_PARENT`). In minor mode
-    /// this keeps the shared memfd every clone maps out of swap. Needs root on a cgroup2
-    /// host where the memory controller can be enabled for the server's cgroup; fcvm
-    /// refuses to start without it.
+    /// this keeps the shared memfd every clone maps out of swap. Needs root, or an unprivileged
+    /// start in a cgroup delegated to its user, on a cgroup2 host where the memory
+    /// controller can be enabled for the server's cgroup; fcvm refuses to start without it.
     #[arg(long)]
     pub no_swap: bool,
 }
@@ -2077,9 +2078,10 @@ pub struct SnapshotRunArgs {
 
     /// Disable swap for this VM: memory.swap.max=0 on the VM's own cgroup, which fcvm
     /// enters before it starts anything (see `FCVM_CGROUP_PARENT`). Guest memory is then
-    /// never swapped; under pressure the kernel evicts file cache instead. Needs root on a
-    /// cgroup2 host where the memory controller can be enabled for the VM's cgroup; fcvm
-    /// refuses to start without it. Not part of any snapshot key.
+    /// never swapped; under pressure the kernel evicts file cache instead. Needs root, or an
+    /// unprivileged start in a cgroup delegated to its user, on a cgroup2 host where the
+    /// memory controller can be enabled for the VM's cgroup; fcvm refuses to start without
+    /// it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
 

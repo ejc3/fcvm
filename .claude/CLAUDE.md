@@ -2728,7 +2728,8 @@ and oomd killed a session scope holding 138 GB, VM included (#1028).
    allocates stays charged to the caller.
 2. **A harness that places fcvm in a cgroup of its own sets `FCVM_CGROUP_PARENT=none`**,
    or a root fcvm moves out of it (`bench/chromium/guardexec.py`, `corpus_mem.py`,
-   `bench.sh`). `--no-swap` is refused there, and for an unprivileged fcvm.
+   `bench.sh`). `--no-swap` is refused there, and for an unprivileged fcvm outside a
+   cgroup delegated to its user.
 3. **Scope identity is (pid, start time)**. A start holds the parent's `flock` shared
    while it makes and enters its scope, and the sweep, which a start runs at most once per
    5 s and parent (`src/sweep.rs`), removes only under that lock held exclusively. Never

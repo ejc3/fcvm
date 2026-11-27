@@ -567,7 +567,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
 | `FCVM_SWEEP_EVERY_MS` | unset | How often a start sweeps for what killed fcvm processes left, as `name=milliseconds` pairs separated by commas. The sweeps are `state` (VM states, 60 s), `reclaim` (owner records, 1 s), `cgroup-scopes` (per-VM cgroups, 5 s) and `routed-leases` (routed IPv6 address leases, 5 s); `*` names every sweep not named. `0` makes every start sweep, which costs each start a pass over every VM running |
-| `FCVM_CGROUP_PARENT` | `fcvm.slice` | Parent, below the cgroup2 root, of the cgroup each VM and memory server runs in; `none` keeps fcvm in the cgroup it was started in. See [A VM's own cgroup](#a-vms-own-cgroup) |
+| `FCVM_CGROUP_PARENT` | `fcvm.slice` | Parent, below the cgroup2 root, of the cgroup each VM and memory server runs in; `none` keeps fcvm in the cgroup it was started in. Unset, an unprivileged fcvm puts `fcvm.slice` inside the cgroup delegated to it. See [A VM's own cgroup](#a-vms-own-cgroup) |
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to a `cloud-hypervisor` binary to run instead of the build `[cloud_hypervisor]` pins |
 | `FCVM_FIRECRACKER_LOG_LEVEL` | `Info` | Level of Firecracker's own per-VM `firecracker.log`: `Error`, `Warning`, `Info` or `Debug`. `Debug` adds one line per vsock packet, which is gigabytes an hour under FUSE-over-vsock volumes. Teardown copies the log's last 16 MiB to `/tmp/fcvm-firecracker-<vm_id>.log` |
 | `FCVM_FIRECRACKER_RESOLVE_TTL_SECS` | `3600` | How long a cached firecracker-fork resolution stays valid before a launch re-queries the remote; `0` forces a query every launch |
@@ -693,13 +693,30 @@ parent (for instance a slice your oomd watches), or `none` keeps fcvm where it w
 to run a VM in a systemd unit instead, start fcvm in one with
 `systemd-run --scope [-p MemorySwapMax=0] env FCVM_CGROUP_PARENT=none fcvm ...`.
 fcvm removes its scope when it exits; a scope whose fcvm was killed is removed by the first
-fcvm that starts under that parent 5 s or more after the last sweep of it began. An
-unprivileged fcvm stays in its own cgroup.
+fcvm that starts under that parent 5 s or more after the last sweep of it began.
+
+An unprivileged fcvm with `FCVM_CGROUP_PARENT` unset makes its scope in
+`<delegated>/fcvm.slice/`, inside a cgroup delegated to its user, when it was started in one:
+
+- a system unit run for the user with `Delegate=yes` and `DelegateSubgroup=`:
+  `sudo systemd-run --uid=$USER --gid=$(id -g) -p Delegate=yes -p DelegateSubgroup=payload ... fcvm ...`.
+  `DelegateSubgroup=` runs the command in a leaf, so the unit's cgroup holds no process and
+  can give its children a memory controller; without it fcvm gets no scope;
+- a subtree root made and handed to the user (`mkdir`, `echo +memory >
+  cgroup.subtree_control`, `chown -R`) outside any systemd manager's tree.
+
+The kernel lets a process move only inside a subtree whose root it can write, so an fcvm
+started from an SSH session, a system service or a CI runner stays in its own cgroup, as
+does one started in a unit of the systemd user manager: `user@<uid>.service` belongs to the
+user manager, and systemd 255 to 262 do not mark the user manager's units delegated, so a
+`systemd-run --user -p Delegate=yes` unit cannot be told apart from one fcvm must not write.
+A systemd with commit 70a8c5eb ("core: Apply more cgroups for the user manager", after v262)
+marks them, and `systemd-run --user -p Delegate=yes -p DelegateSubgroup=payload` works there.
 
 `--no-swap` (on all four commands) sets `memory.swap.max` to 0 on that cgroup before the
 VMM starts. It needs the cgroup, so fcvm refuses the flag when it cannot create one with a
-memory controller: unprivileged, with `FCVM_CGROUP_PARENT=none`, or on a host without
-cgroup2.
+memory controller: unprivileged outside a delegated cgroup, with `FCVM_CGROUP_PARENT=none`,
+or on a host without cgroup2.
 
 ### Image Delivery Modes
 
