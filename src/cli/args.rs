@@ -1300,6 +1300,14 @@ pub struct SetupArgs {
     /// built on demand rather than on every setup.
     #[arg(long)]
     pub cloud_hypervisor: bool,
+
+    /// Only make the tmpfs directory the data directory's owner keeps VM states in
+    /// (/run/fcvm-<uid>) and install the tmpfiles.d rule that makes it at every boot
+    /// (/etc/tmpfiles.d/fcvm-<uid>.conf; remove that file to undo). Needs root. A full
+    /// setup run as root does this too. Without it a user's VM states are kept in the
+    /// data directory, where starts are slower.
+    #[arg(long)]
+    pub runtime_dir: bool,
 }
 
 // ============================================================================
@@ -2493,6 +2501,12 @@ pub struct LsArgs {
     /// Output in JSON format
     #[arg(long)]
     pub json: bool,
+
+    /// Print the directory this data directory's VM states and namespace pool are in
+    /// since this boot, and nothing else. Fails when it has none: no VM was started in
+    /// this boot. For scripts and benchmarks, which must not build that path themselves
+    #[arg(long, conflicts_with_all = ["json", "pid"])]
+    pub runtime_dir: bool,
 
     /// Filter by fcvm process PID
     #[arg(long)]

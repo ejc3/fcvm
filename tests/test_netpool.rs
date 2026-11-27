@@ -503,8 +503,13 @@ impl Pool {
                 pool.child.try_wait().unwrap().is_none(),
                 "the pool exited while starting"
             );
-            let sockets: Vec<PathBuf> = std::fs::read_dir(pool.data_dir.join("netpool"))
+            // The pool is in the runtime directory its data directory is bound to, which
+            // fcvm is asked for: under /run or on the store, per host.
+            let runtime_dir = fcvm::runtime_dir::bound_to(&pool.data_dir)
+                .expect("reading where the pool's data directory keeps its runtime files");
+            let sockets: Vec<PathBuf> = runtime_dir
                 .into_iter()
+                .flat_map(|dir| std::fs::read_dir(dir.join("netpool")))
                 .flatten()
                 .flatten()
                 .map(|owner| owner.path().join("pool.sock"))
@@ -1007,7 +1012,9 @@ async fn a_killed_pool_leaves_no_process_and_ends_every_lease() {
 
 /// The state of the VM named `name` in `data_dir`, once it has one.
 fn vm_state(data_dir: &std::path::Path, name: &str) -> Option<serde_json::Value> {
-    for path in fcvm::state::StateManager::new(data_dir.join("state"))
+    let runtime_dir = fcvm::runtime_dir::bound_to(data_dir)
+        .expect("reading where the data directory keeps its VM states")?;
+    for path in fcvm::state::StateManager::new(runtime_dir.join("state"))
         .state_files()
         .expect("listing the state files")
     {
