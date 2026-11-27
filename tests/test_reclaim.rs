@@ -206,12 +206,7 @@ async fn a_sigkilled_vm_leaves_its_runtime_dir_and_pasta_pid_file_to_the_next_la
 /// directory.
 #[tokio::test]
 async fn a_launch_inside_the_interval_leaves_a_killed_vm_to_the_launch_after_it() -> Result<()> {
-    // Short: a VM's sockets sit under <data>/vm-disks/vm-<32 hex>/, and AF_UNIX paths stop at
-    // 108 bytes.
-    let data_dir = fcvm::paths::data_dir().join(format!(
-        "rg-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let data_dir = common::short_data_dir(&fcvm::paths::data_dir(), "rg");
     let data_dir_str = data_dir.to_str().context("data dir path")?.to_string();
     let env = [
         ("FCVM_DATA_DIR", data_dir_str.as_str()),
@@ -1333,12 +1328,7 @@ async fn wait_for_helpers(locks: &[PathBuf]) -> Result<()> {
 async fn a_sigkilled_image_export_leaves_its_temporaries_to_the_next_launch() -> Result<()> {
     let image = format!("localhost/fcvm-reclaim-{}", uuid::Uuid::new_v4().simple());
     let key = unique_localhost_image(&image).await?;
-    // Short: a VM's sockets sit under <data>/vm-disks/vm-<32 hex>/, and AF_UNIX paths stop at
-    // 108 bytes.
-    let data_dir = fcvm::paths::data_dir().join(format!(
-        "rt-{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let data_dir = common::short_data_dir(&fcvm::paths::data_dir(), "rt");
     let data_dir_str = data_dir.to_str().context("data dir path")?.to_string();
     let env = [("FCVM_DATA_DIR", data_dir_str.as_str())];
     let owners = fcvm::reclaim::owner_dir_in(&data_dir)?;
