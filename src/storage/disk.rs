@@ -273,6 +273,133 @@ pub fn subvolume_snapshot_burst(base_dir: &Path) -> bool {
 /// `ioctl(FICLONE)`: make the destination share the source's extents.
 const FICLONE: libc::c_ulong = 0x4004_9409;
 
+/// `BTRFS_IOCTL_MAGIC` from linux/btrfs.h.
+const BTRFS_IOCTL_MAGIC: u8 = 0x94;
+
+/// `BTRFS_SUBVOL_NAME_MAX` from linux/btrfs.h: the longest name a snapshot can be given.
+const BTRFS_SUBVOL_NAME_MAX: usize = 4039;
+
+/// `struct btrfs_ioctl_vol_args_v2` from linux/btrfs.h, the argument of
+/// `BTRFS_IOC_SNAP_CREATE_V2`:
+///
+/// ```c
+/// struct btrfs_ioctl_vol_args_v2 {
+///     __s64 fd;
+///     __u64 transid;
+///     __u64 flags;
+///     union {
+///         struct {
+///             __u64 size;
+///             struct btrfs_qgroup_inherit *qgroup_inherit;
+///         };
+///         __u64 unused[4];
+///     };
+///     union {
+///         char name[BTRFS_SUBVOL_NAME_MAX + 1];
+///         __u64 devid;
+///         __u64 subvolid;
+///     };
+/// };
+/// ```
+///
+/// The first union is `unused`'s 32 bytes (the struct beside it is 16), all zero here: no
+/// qgroup inheritance. The second is the 4040-byte name; its `__u64` members give the struct
+/// 8-byte alignment, which the `i64` gives this one, and 56 + 4040 is 4096, a multiple of 8,
+/// so neither has padding.
+#[repr(C)]
+// The kernel reads the fields; Rust only writes them.
+#[allow(dead_code)]
+struct BtrfsIoctlVolArgsV2 {
+    fd: i64,
+    transid: u64,
+    flags: u64,
+    unused: [u64; 4],
+    name: [u8; BTRFS_SUBVOL_NAME_MAX + 1],
+}
+
+/// `_IOW(kind, nr, size)` in the generic encoding, which x86_64 and aarch64 use: the
+/// direction (1, write) in bits 30 and 31, the size in bits 16 to 29, the type in 8 to 15
+/// and the number in 0 to 7.
+const fn ioc_write(kind: u8, nr: u8, size: usize) -> libc::c_ulong {
+    const IOC_WRITE: libc::c_ulong = 1;
+    (IOC_WRITE << 30)
+        | ((size as libc::c_ulong) << 16)
+        | ((kind as libc::c_ulong) << 8)
+        | nr as libc::c_ulong
+}
+
+/// `BTRFS_IOC_SNAP_CREATE_V2`: `_IOW(BTRFS_IOCTL_MAGIC, 23, struct btrfs_ioctl_vol_args_v2)`.
+const BTRFS_IOC_SNAP_CREATE_V2: libc::c_ulong = ioc_write(
+    BTRFS_IOCTL_MAGIC,
+    23,
+    std::mem::size_of::<BtrfsIoctlVolArgsV2>(),
+);
+
+/// Make `dest`, which must not exist, a read-write snapshot of the btrfs subvolume `src`
+/// with one `BTRFS_IOC_SNAP_CREATE_V2` on `dest`'s parent directory, in this process: the
+/// ioctl `btrfs subvolume snapshot` makes, without a fork and an exec of the btrfs tool for
+/// each snapshot. It blocks until the snapshot's transaction commit ends. A refusal creates
+/// nothing: a parent that is not on btrfs answers ENOTTY, a source on another filesystem
+/// EXDEV, a source this user does not own EPERM, an existing `dest` EEXIST.
+///
+/// Both directories are opened for reading: the kernel takes the source from a descriptor
+/// it can read, and an ioctl on an `O_PATH` descriptor fails with EBADF.
+pub fn snapshot_subvolume_blocking(src: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let invalid = |why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} {why}", dest.display()),
+        )
+    };
+    let name = dest
+        .file_name()
+        .ok_or_else(|| invalid("has no file name"))?
+        .as_bytes();
+    if name.len() > BTRFS_SUBVOL_NAME_MAX || name.contains(&0) {
+        return Err(invalid("is not a name a subvolume can have"));
+    }
+    let parent = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let open_dir = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(path)
+    };
+    let source = open_dir(src)?;
+    let parent = open_dir(parent)?;
+    let mut args = BtrfsIoctlVolArgsV2 {
+        fd: i64::from(source.as_raw_fd()),
+        transid: 0,
+        flags: 0,
+        unused: [0; 4],
+        name: [0; BTRFS_SUBVOL_NAME_MAX + 1],
+    };
+    args.name[..name.len()].copy_from_slice(name);
+    let request: *mut BtrfsIoctlVolArgsV2 = &mut args;
+    // SAFETY: both descriptors are open for the duration of the call, and `args` is a
+    // `btrfs_ioctl_vol_args_v2` with a NUL-terminated name that outlives it.
+    let rc = unsafe { libc::ioctl(parent.as_raw_fd(), BTRFS_IOC_SNAP_CREATE_V2 as _, request) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// [`snapshot_subvolume_blocking`] on a blocking thread: the ioctl waits out a transaction
+/// commit, 20 ms to seconds.
+pub async fn snapshot_subvolume(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let (src, dest) = (src.to_path_buf(), dest.to_path_buf());
+    tokio::task::spawn_blocking(move || snapshot_subvolume_blocking(&src, &dest))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// Make `dst`, which must not exist, a reflink of `src`, as `cp --reflink=always` did: created
 /// with `src`'s permission bits (less the umask), then cloned with FICLONE in this process. A
 /// `cp` exec per clone was about 1 ms of CPU and a fork of this process. A clone that fails
@@ -497,8 +624,8 @@ fn snapshot_disks_extents(base_dir: &Path, limit: u64) -> Option<u64> {
 /// Create `path` as a btrfs subvolume, or as an ordinary directory where that
 /// fails (a store that is not btrfs, or btrfs behind a FUSE map in a nested
 /// guest, whose ioctls do not pass). A snapshot's disk directory that is a
-/// subvolume is what lets a clone get its disks with one `btrfs subvolume
-/// snapshot`, whatever the disks' extent count; a reflink of a 154 GB disk with
+/// subvolume is what lets a clone get its disks with one subvolume snapshot
+/// ([`snapshot_subvolume`]), whatever the disks' extent count; a reflink of a 154 GB disk with
 /// 860,177 extents measured 9 to 11 s per clone, a subvolume snapshot 20 ms.
 pub async fn create_dir_or_subvolume(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -643,18 +770,7 @@ pub async fn snapshot_disk_subvolume(
             dest.display()
         );
     }
-    let output = crate::utils::helper_command("btrfs")
-        .args(["subvolume", "snapshot"])
-        .arg(src)
-        .arg(dest)
-        .output()
-        .await;
-    let refused = match output {
-        Ok(output) if output.status.success() => None,
-        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
-        Err(error) => Some(format!("btrfs tool unavailable: {error}")),
-    };
-    if let Some(reason) = refused {
+    if let Err(reason) = snapshot_subvolume(src, dest).await {
         info!(src = %src.display(), %reason,
             "could not snapshot the VM's disk subvolume; reflinking the disks instead");
         clear_staging(dest).await?;
@@ -733,18 +849,7 @@ pub async fn stage_from_parent_subvolume(parent: &Path, staging: &Path) -> Resul
         );
     }
     let started = std::time::Instant::now();
-    let output = crate::utils::helper_command("btrfs")
-        .args(["subvolume", "snapshot"])
-        .arg(parent)
-        .arg(staging)
-        .output()
-        .await;
-    let refused = match output {
-        Ok(output) if output.status.success() => None,
-        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
-        Err(error) => Some(format!("btrfs tool unavailable: {error}")),
-    };
-    if let Some(reason) = refused {
+    if let Err(reason) = snapshot_subvolume(parent, staging).await {
         info!(parent = %parent.display(), %reason,
             "could not snapshot the parent's subvolume; reflinking its memory file instead");
         clear_staging(staging).await?;
@@ -983,21 +1088,15 @@ impl DiskManager {
                 .await
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let output = crate::utils::helper_command("btrfs")
-            .args(["subvolume", "snapshot"])
-            .arg(base_dir)
-            .arg(&self.vm_dir)
-            .output()
+        snapshot_subvolume(base_dir, &self.vm_dir)
             .await
-            .context("running btrfs subvolume snapshot")?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "btrfs subvolume snapshot {} {}: {}",
-                base_dir.display(),
-                self.vm_dir.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+            .with_context(|| {
+                format!(
+                    "snapshotting the subvolume {} as {}",
+                    base_dir.display(),
+                    self.vm_dir.display()
+                )
+            })?;
         let source_name = self
             .base_rootfs
             .file_name()
@@ -2309,6 +2408,167 @@ mod snapshot_dir_tests {
             "a refused staging left {}",
             staging.display()
         );
+    }
+
+    /// The argument of `BTRFS_IOC_SNAP_CREATE_V2` is laid out as linux/btrfs.h lays out
+    /// `struct btrfs_ioctl_vol_args_v2`, and the request number is `_IOW(0x94, 23, 4096)`.
+    /// A wrong size changes the request number itself, and the kernel answers ENOTTY.
+    #[test]
+    fn the_snapshot_ioctl_argument_has_the_kernels_layout() {
+        use std::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<BtrfsIoctlVolArgsV2>(), 4096);
+        assert_eq!(align_of::<BtrfsIoctlVolArgsV2>(), 8);
+        assert_eq!(offset_of!(BtrfsIoctlVolArgsV2, fd), 0);
+        assert_eq!(offset_of!(BtrfsIoctlVolArgsV2, transid), 8);
+        assert_eq!(offset_of!(BtrfsIoctlVolArgsV2, flags), 16);
+        assert_eq!(offset_of!(BtrfsIoctlVolArgsV2, unused), 24);
+        assert_eq!(offset_of!(BtrfsIoctlVolArgsV2, name), 56);
+        assert_eq!(size_of::<[u8; BTRFS_SUBVOL_NAME_MAX + 1]>(), 4040);
+        assert_eq!(BTRFS_IOC_SNAP_CREATE_V2, 0x5000_9417);
+        // The encoding against a request whose number is known: FICLONE is
+        // _IOW(0x94, 9, int).
+        assert_eq!(ioc_write(0x94, 9, size_of::<libc::c_int>()), FICLONE);
+    }
+
+    /// A temporary directory on the btrfs store, which every host that runs these tests has.
+    fn btrfs_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir_in("/mnt/fcvm-btrfs").expect("temp dir on the btrfs store");
+        assert_eq!(
+            nix::sys::statfs::statfs(dir.path())
+                .unwrap()
+                .filesystem_type(),
+            nix::sys::statfs::BTRFS_SUPER_MAGIC,
+            "/mnt/fcvm-btrfs is not btrfs here, so this test would not cover a subvolume"
+        );
+        dir
+    }
+
+    /// A btrfs subvolume at `path`, made as a snapshot's disk directory is.
+    async fn subvolume(path: &Path) {
+        create_dir_or_subvolume(path).await.unwrap();
+        assert!(
+            is_btrfs_subvolume(path),
+            "{} was made as a plain directory",
+            path.display()
+        );
+    }
+
+    /// A temporary directory on tmpfs, where no btrfs ioctl is answered.
+    fn tmpfs_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in("/dev/shm").expect("temp dir on /dev/shm")
+    }
+
+    /// The snapshot is made in process, by the ioctl: the copy is a subvolume holding the
+    /// source's files, and a write to it leaves the source alone. A second snapshot onto
+    /// the same name is refused with EEXIST and changes nothing.
+    #[tokio::test]
+    async fn a_subvolume_is_snapshotted_by_the_ioctl() {
+        let root = btrfs_tempdir();
+        let src = root.path().join("src");
+        subvolume(&src).await;
+        std::fs::write(src.join("disk.raw"), b"source").unwrap();
+        let dest = root.path().join("dest");
+        snapshot_subvolume(&src, &dest).await.unwrap();
+        assert!(is_btrfs_subvolume(&dest), "the snapshot is not a subvolume");
+        assert_eq!(std::fs::read(dest.join("disk.raw")).unwrap(), b"source");
+        std::fs::write(dest.join("disk.raw"), b"copy").unwrap();
+        assert_eq!(std::fs::read(src.join("disk.raw")).unwrap(), b"source");
+        let again = snapshot_subvolume(&src, &dest).await.unwrap_err();
+        assert_eq!(again.raw_os_error(), Some(libc::EEXIST), "{again}");
+        assert_eq!(std::fs::read(dest.join("disk.raw")).unwrap(), b"copy");
+        for dir in [&src, &dest] {
+            remove_snapshot_dir(dir).await.unwrap();
+        }
+    }
+
+    /// A snapshot whose destination is not on btrfs is refused by the kernel (ENOTTY: tmpfs
+    /// answers no btrfs ioctl) and creates nothing, and so is one whose source is not on the
+    /// destination's filesystem. The callers that take a subvolume snapshot then fall back
+    /// to reflinks and leave no staging directory behind.
+    #[tokio::test]
+    async fn a_refused_snapshot_creates_nothing_and_the_caller_falls_back() {
+        let root = btrfs_tempdir();
+        let shm = tmpfs_tempdir();
+        let src = root.path().join("disks");
+        subvolume(&src).await;
+        std::fs::write(src.join("rootfs.raw"), b"disk").unwrap();
+
+        let onto_tmpfs = shm.path().join("dest");
+        let refused = snapshot_subvolume(&src, &onto_tmpfs).await.unwrap_err();
+        assert!(
+            matches!(
+                refused.raw_os_error(),
+                Some(libc::ENOTTY | libc::EOPNOTSUPP)
+            ),
+            "{refused}"
+        );
+        assert!(!onto_tmpfs.exists());
+        let from_tmpfs = root.path().join("from-tmpfs");
+        snapshot_subvolume(shm.path(), &from_tmpfs)
+            .await
+            .expect_err("a source on tmpfs cannot be snapshotted on btrfs");
+        assert!(!from_tmpfs.exists());
+
+        let staging = shm.path().join("snap.creating");
+        std::fs::create_dir(&staging).unwrap();
+        let dest = staging.join("disk");
+        assert!(
+            !snapshot_disk_subvolume(&src, &dest, std::ffi::OsStr::new("rootfs.raw"), &[])
+                .await
+                .unwrap(),
+            "a refused snapshot of the VM's disk subvolume was taken"
+        );
+        assert!(!dest.exists(), "a refused snapshot left {}", dest.display());
+        let staged = shm.path().join("parent.creating");
+        assert!(!stage_from_parent_subvolume(&src, &staged).await.unwrap());
+        assert!(
+            !staged.exists(),
+            "a refused staging left {}",
+            staged.display()
+        );
+        remove_snapshot_dir(&src).await.unwrap();
+    }
+
+    /// Write `path` as a file of `extents` separate 4 KiB extents, each followed by a hole.
+    fn file_of_extents(path: &Path, extents: u64) {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::create(path).unwrap();
+        for extent in 0..extents {
+            let block = [(extent % 251) as u8 + 1; 4096];
+            file.write_all_at(&block, extent * 2 * 4096).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+
+    /// A clone of a disk too large to reflink takes the subvolume snapshot, and when the
+    /// kernel refuses it (here EEXIST: the clone's disk directory is already there) the
+    /// clone reflinks the disk instead, as it did when the btrfs tool failed.
+    #[tokio::test]
+    async fn a_refused_clone_snapshot_falls_back_to_a_reflink() {
+        let root = btrfs_tempdir();
+        let base_dir = root.path().join("snap").join("disk");
+        subvolume(&base_dir).await;
+        let base = base_dir.join("disk.raw");
+        file_of_extents(&base, REFLINK_MAX_EXTENTS + 1);
+        assert!(
+            !reflink_is_cheaper(
+                snapshot_disks_extents(&base_dir, REFLINK_MAX_EXTENTS),
+                REFLINK_MAX_EXTENTS
+            ),
+            "the fixture is cheap enough to reflink, so it would not reach the snapshot"
+        );
+        let vm_dir = root.path().join("vm").join("disks");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let disk = DiskManager::new("vm-test".to_string(), base.clone(), vm_dir.clone());
+        let made = disk.create_cow_disk().await.unwrap();
+        assert_eq!(made, vm_dir.join("rootfs.raw"));
+        assert!(
+            !is_btrfs_subvolume(&vm_dir),
+            "the clone's disk directory is a subvolume although its snapshot was refused"
+        );
+        assert!(std::fs::read(&made).unwrap() == std::fs::read(&base).unwrap());
+        disk.cleanup().await.unwrap();
+        remove_snapshot_dir(&base_dir).await.unwrap();
     }
 
     /// A plain snapshot directory is removed file by file, and a missing one is not an error.

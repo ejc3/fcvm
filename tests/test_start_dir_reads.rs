@@ -60,6 +60,12 @@
 //! (an entry named by one or two hex digits, or that name staged under a dotted temporary
 //! name) happens once in a store's life and is not counted.
 //!
+//! No traced start runs the `btrfs` tool. A clone's disks are made in fcvm's own process, as
+//! a reflink or as one subvolume snapshot ioctl, and a btrfs child per start was a fork of
+//! fcvm and an exec on every start that took the subvolume snapshot. The four starts added
+//! between the measured two take that path (`FCVM_REFLINK_MAX_EXTENTS=0` makes the test VM's
+//! small disk one to snapshot), so both ways of making a clone's disks are traced.
+//!
 //! `strace` is a requirement. Without it, or with one that lacks an option used here, every
 //! test in this file that needs it fails: a detector that cannot run has seen nothing.
 
@@ -985,8 +991,35 @@ fn require_tracer() -> Result<()> {
         .map_err(anyhow::Error::msg)
 }
 
+/// The programs of `trace` whose file name is `name`, wherever on the PATH they were found.
+fn programs_named<'a>(trace: &'a Trace, name: &str) -> Vec<&'a (u32, String)> {
+    trace
+        .execs
+        .iter()
+        .filter(|(_, program)| Path::new(program).file_name() == Some(std::ffi::OsStr::new(name)))
+        .collect()
+}
+
 mod parsing {
     use super::*;
+
+    /// A start that runs the btrfs tool is found by the program it became, at any path, and
+    /// a failed exec of it is not a run of it.
+    #[test]
+    fn a_run_of_the_btrfs_tool_is_found_by_its_program_name() {
+        let trace = parse_trace(concat!(
+            "5201<strace> execve(\"/usr/bin/fcvm\", [\"fcvm\"], 0xffffe7050040 /* 56 vars */) = 0\n",
+            "5202<fcvm> execve(\"/usr/local/sbin/btrfs\", [\"btrfs\", \"subvolume\", \"snapshot\", \"/srv/store/snapshots/s/disk\", \"/srv/store/vm-disks/7f/vm-1/disks\"], 0xc92bc1362188 /* 56 vars */) = -1 ENOENT (No such file or directory)\n",
+            "5202<fcvm> execve(\"/usr/bin/btrfs\", [\"btrfs\", \"subvolume\", \"snapshot\", \"/srv/store/snapshots/s/disk\", \"/srv/store/vm-disks/7f/vm-1/disks\"], 0xc92bc1362188 /* 56 vars */) = 0\n",
+            "5203<fcvm> execve(\"/usr/bin/btrfs-progs-helper\", [\"x\"], 0xc92bc1362188 /* 56 vars */) = 0\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            programs_named(&trace, "btrfs"),
+            [&(5202, "/usr/bin/btrfs".to_string())]
+        );
+        assert!(programs_named(&trace, "cp").is_empty());
+    }
 
     fn read(entries: u64, readers: &[&str]) -> DirRead {
         DirRead {
@@ -2008,6 +2041,13 @@ mod start {
             log.display(),
             trace.unplaced_creates
         );
+        let btrfs = programs_named(&trace, "btrfs");
+        ensure!(
+            btrfs.is_empty(),
+            "start {name} ran the btrfs tool ({btrfs:?}): a clone's disks are made in fcvm's \
+             own process, and a child per start is a fork and an exec on every start (log {})",
+            log.display()
+        );
         // Being traced must not change how the start sets its namespace up.
         let traced_map = id_map_of(&fcvm_log)?;
         ensure!(
@@ -2208,13 +2248,17 @@ mod start {
             .await?;
             // The first measured clone is one of the clones added; these are the others. They
             // are traced too: every traced start's creates are compared ([`judge_creates`]).
+            // They take the subvolume snapshot of the snapshot's disks, which the measured two,
+            // whose small disk is reflinked, do not.
+            let mut snapshotting_env = env.clone();
+            snapshotting_env.push((fcvm::storage::disk::REFLINK_MAX_EXTENTS_ENV, "0"));
             let mut creates = vec![first_creates];
             for index in 1..ADDED {
                 let (_, made) = listings_of_one_start(
                     &runner,
                     &snapshot,
                     &format!("{clone}-b{index}"),
-                    &env,
+                    &snapshotting_env,
                     &roots,
                     untraced_map,
                     &mut running,

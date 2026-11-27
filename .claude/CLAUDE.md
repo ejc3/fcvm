@@ -3309,7 +3309,8 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
 - VM disks: `/mnt/fcvm-btrfs/vm-disks/{bucket}/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
 - A snapshot keeps its disks (`disk.raw` and the extra disks) in `snapshots/{tag}/disk/`, a btrfs subvolume, and a
-  clone's `disks/` directory is one `btrfs subvolume snapshot` of it with the disk renamed to `rootfs.raw`. A reflink
+  clone's `disks/` directory is one subvolume snapshot of it with the disk renamed to `rootfs.raw`, made in fcvm's own
+  process with `BTRFS_IOC_SNAP_CREATE_V2` (`snapshot_subvolume`; a start forks and execs no `btrfs` tool). A reflink
   copy of the disk is O(extents): 9 to 11 s per clone on a 154 GB www root disk with 860,177 extents, 11 of a 25 s
   restore ACK (2026-10-15); the subvolume snapshot costs one transaction commit whatever the extent count: 20 to 60 ms
   on a quiet host, 0.2 to 1.0 s on a shared devserver at load 14 to 46. The disks sit in their own
@@ -3349,8 +3350,8 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   freed its space at once; `df` right after many clone teardowns can read high for a while.
 - Each snapshot directory is a btrfs subvolume too, and a diff snapshot is staged as a subvolume snapshot of its
   parent's directory, keeping only the parent's `memory.bin`, which the diff is then written into
-  (`stage_from_parent_subvolume`). A memory file written by in-place diffs fragments: one written by eight of them
-  held 11,824,233 extents, a reflink of it took 133 s and removing that copy 52 s, while the subvolume snapshot and
+  (`stage_from_parent_subvolume`, by the same ioctl). A memory file written by in-place diffs fragments: one
+  written by eight of them held 11,824,233 extents, a reflink of it took 133 s and removing that copy 52 s, while the subvolume snapshot and
   its delete each finished within a second (2026-10-27). The parent's directory was synced when its own snapshot
   finished, so the flush a subvolume snapshot does first finds little. Snapshot directories are deleted with
   `btrfs subvolume delete` (`remove_snapshot_dir`), which detaches them at once, where `rm -rf` would drop the memory
