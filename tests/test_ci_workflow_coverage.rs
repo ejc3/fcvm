@@ -4737,3 +4737,288 @@ fn self_hosted_jobs_refuse_fork_pull_requests() {
          {NOT_A_FORK} &&: {findings:#?}"
     );
 }
+
+fn read_file(path: PathBuf) -> String {
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+/// The Makefile's rules as `target -> (prerequisites, recipe lines)`. Only plain
+/// `name: prerequisites` rules are read; a target-specific variable line
+/// (`name: private SHELL := ...`) is skipped.
+fn makefile_rules(makefile: &str) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
+    let mut rules: BTreeMap<String, (Vec<String>, Vec<String>)> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in makefile.lines() {
+        if let Some(recipe) = line.strip_prefix('\t') {
+            if let Some(name) = &current {
+                rules
+                    .entry(name.clone())
+                    .or_default()
+                    .1
+                    .push(recipe.to_string());
+            }
+            continue;
+        }
+        current = None;
+        let Some((head, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if head.is_empty()
+            || !head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || rest.starts_with('=')
+            || rest.contains(":=")
+            || rest.contains("?=")
+        {
+            continue;
+        }
+        let prerequisites = rest
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        rules
+            .entry(head.to_string())
+            .or_default()
+            .0
+            .extend(prerequisites);
+        current = Some(head.to_string());
+    }
+    rules
+}
+
+/// The run-only test targets (`_test-*`) that `target` reaches, through its prerequisites
+/// and the targets its recipe names, transitively.
+fn run_only_test_targets(
+    rules: &BTreeMap<String, (Vec<String>, Vec<String>)>,
+    target: &str,
+) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![target.to_string()];
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some((prerequisites, recipe)) = rules.get(&name) else {
+            continue;
+        };
+        // A recipe names other targets only where it runs make (`$(MAKE)` or `make`): the
+        // words after that, up to the end of the command. Other words are text and paths.
+        let named = recipe
+            .iter()
+            .flat_map(|line| make_targets(&line.replace("$(MAKE)", "make")))
+            .filter(|word| rules.contains_key(word.trim_end_matches(';')))
+            .map(|word| word.trim_end_matches(';').to_string());
+        for next in prerequisites.iter().cloned().chain(named) {
+            if next.starts_with("_test-") {
+                found.insert(next.clone());
+            }
+            pending.push(next);
+        }
+    }
+    found
+}
+
+/// The cargo features a run-only test target compiles the workspace with, read from its
+/// recipe: the package defaults unless it passes `--no-default-features`, plus every
+/// `--features` list.
+fn compiled_features(
+    rules: &BTreeMap<String, (Vec<String>, Vec<String>)>,
+    defaults: &BTreeSet<String>,
+    run_only: &str,
+) -> BTreeSet<String> {
+    let recipe = rules
+        .get(run_only)
+        .unwrap_or_else(|| panic!("the Makefile has no {run_only} rule"))
+        .1
+        .join(" ");
+    let mut features = if recipe.contains("--no-default-features") {
+        BTreeSet::new()
+    } else {
+        defaults.clone()
+    };
+    let words: Vec<&str> = recipe.split_whitespace().collect();
+    for pair in words.windows(2) {
+        if pair[0] == "--features" {
+            features.extend(pair[1].split(',').map(str::to_string));
+        }
+    }
+    features
+}
+
+fn default_features() -> BTreeSet<String> {
+    let manifest = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"));
+    let manifest: toml::Table = manifest.parse().expect("Cargo.toml parses");
+    manifest["features"]["default"]
+        .as_array()
+        .expect("Cargo.toml has [features] default")
+        .iter()
+        .map(|f| f.as_str().expect("feature name").to_string())
+        .collect()
+}
+
+/// The make targets a step's commands name: the words after each `make`, up to the end of
+/// that command, without variable assignments and options.
+fn make_targets(run: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in run.lines() {
+        let line = line.split('#').next().unwrap_or_default();
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let mut i = 0;
+        while i < words.len() {
+            if words[i].rsplit('/').next() == Some("make") {
+                for word in &words[i + 1..] {
+                    if ["||", "&&", ";", "|"].contains(word) {
+                        break;
+                    }
+                    if !word.contains('=') && !word.starts_with('-') {
+                        targets.push(word.to_string());
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    targets
+}
+
+/// Self-hosted jobs that still compile a second test feature set, with the targets that do
+/// it. Each entry is removed by the change that folds it into the job's other build.
+const SECOND_TEST_BUILD: &[(&str, &[&str])] = &[
+    ("host", &["test-fast", "test-confine"]),
+    ("container", &["container-test-unit", "container-test"]),
+];
+
+/// Every distinct cargo feature set is a full rebuild of the workspace crates: 11 to 13.7
+/// minutes for the test binaries on the self-hosted runners (runs 45931415934 and
+/// 45935858819). A job that compiles its tests twice, once for a set whose tests are all in
+/// the other, pays that for no test it would not run anyway: the Host job's test-unit step
+/// was one (no features, a subset of test-fast's integration-fast).
+#[test]
+fn ci_jobs_build_one_test_feature_set() {
+    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
+    let rules = makefile_rules(&makefile);
+    let defaults = default_features();
+    let features_of = |target: &str| -> Option<BTreeSet<String>> {
+        let run_only = run_only_test_targets(&rules, target);
+        assert!(
+            run_only.len() <= 1,
+            "make {target} reaches several run-only test targets: {run_only:?}"
+        );
+        run_only
+            .first()
+            .map(|t| compiled_features(&rules, &defaults, t))
+    };
+
+    // The reader itself, on targets whose feature sets are known.
+    let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+    assert_eq!(features_of("test-unit"), Some(set(&[])));
+    assert_eq!(features_of("test-fast"), Some(set(&["integration-fast"])));
+    assert_eq!(features_of("test-confine"), Some(defaults.clone()));
+    let mut root = defaults.clone();
+    root.insert("privileged-tests".into());
+    assert_eq!(features_of("test-root"), Some(root));
+    assert_eq!(features_of("container-test"), Some(defaults.clone()));
+    assert_eq!(features_of("setup-fcvm"), None);
+
+    let ci = parse_workflow("ci.yml");
+    let jobs = ci["jobs"].as_mapping().expect("ci.yml has jobs");
+    let mut checked = 0;
+    for (id, job) in jobs {
+        let id = id.as_str().expect("job id");
+        if !matches!(runner_of(job), Ok(Runner::Ours)) {
+            continue;
+        }
+        let mut sets: BTreeMap<BTreeSet<String>, Vec<String>> = BTreeMap::new();
+        for step in job["steps"].as_sequence().into_iter().flatten() {
+            let Some(run) = step.get("run").and_then(Value::as_str) else {
+                continue;
+            };
+            for target in make_targets(run) {
+                if let Some(features) = features_of(&target) {
+                    sets.entry(features).or_default().push(target);
+                }
+            }
+        }
+        if sets.is_empty() {
+            continue;
+        }
+        checked += 1;
+        if sets.len() == 1 {
+            assert!(
+                !SECOND_TEST_BUILD.iter().any(|(job, _)| *job == id),
+                "{id} builds one test feature set now: remove it from SECOND_TEST_BUILD"
+            );
+            continue;
+        }
+        let targets: BTreeSet<&str> = sets.values().flatten().map(String::as_str).collect();
+        let allowed = SECOND_TEST_BUILD
+            .iter()
+            .find(|(job, _)| *job == id)
+            .map(|(_, t)| t.iter().copied().collect::<BTreeSet<_>>());
+        assert_eq!(
+            Some(targets),
+            allowed,
+            "{id} compiles its tests for {} feature sets ({sets:?}); each is a full rebuild",
+            sets.len()
+        );
+    }
+    assert!(
+        checked >= 3,
+        "found test steps in {checked} self-hosted jobs; expected host, host-root and container"
+    );
+}
+
+/// Why one build per job loses no test: the tests compiled without a feature are a subset
+/// of those compiled with it only while no code is gated on a feature being OFF. Only
+/// `privileged-tests` is (test_no_sudo.rs, and tests ignored outside a privileged build),
+/// and no unprivileged lane is folded into a privileged one.
+#[test]
+fn no_code_is_gated_on_an_integration_feature_being_off() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders = Vec::new();
+    let mut scanned = 0;
+    let mut pending = vec![root.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let entry = entry.expect("dir entry");
+            let file_type = entry.file_type().expect("file type");
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            for feature in ["integration-fast", "integration-slow"] {
+                for negation in ["not(feature=", "not(any(feature=", "not(all(feature="] {
+                    if squeezed.contains(&format!("{negation}\"{feature}\"")) {
+                        offenders.push(format!("{}: {negation}\"{feature}\"", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "scanned {scanned} .rs files; the walk found too few to mean anything"
+    );
+    assert!(
+        offenders.is_empty(),
+        "code gated on an integration feature being off: {offenders:?}"
+    );
+}

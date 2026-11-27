@@ -624,7 +624,7 @@ jobs:
             -E 'package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)'
 
   # Runner 1a: Host (bare metal with KVM)
-  # Runs: test-unit → test-fast (quick tests, no privileged)
+  # Runs: test-fast (unit tests and quick VM tests, no privileged) and test-confine
   # Self-hosted runners with nested virtualization (ARM64: c7g.metal, x86: c5.metal)
   host:
     name: Host-${{ matrix.arch }}
@@ -888,9 +888,10 @@ jobs:
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
-      - name: test-unit
-        working-directory: fcvm
-        run: make test-unit
+      # No test-unit step: no test is gated on a missing integration feature, so every test
+      # of `make test-unit` (no features) is also in test-fast's build (integration-fast),
+      # and a separate step compiled the whole workspace once more to run them (11.7 min on
+      # arm64, 12.8 on x64, run 45935858819). ci_jobs_build_one_test_feature_set pins it.
       - name: setup-fcvm
         working-directory: fcvm
         run: make setup-fcvm
