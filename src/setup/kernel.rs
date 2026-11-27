@@ -409,6 +409,25 @@ async fn ensure_custom_kernel(
         return Ok(kernel_path);
     }
 
+    // A release is downloaded only when the table records the digest of its bytes:
+    // the name says which inputs built it, not what was uploaded under that name.
+    let Some(artifact_sha256) = profile.kernel_artifact_sha256.as_deref() else {
+        let message = format!(
+            "kernel profile '{profile_name}' records no kernel_artifact_sha256 for its release, \
+             so the release is not downloaded"
+        );
+        if allow_build {
+            println!("  → {message}; building locally (may take 10-20 minutes)...");
+            let built = build_kernel_locally(profile, profile_name, &kernel_path).await;
+            flock.unlock().map_err(|(_, err)| err)?;
+            built?;
+            println!("  ✓ Kernel built (profile: {})", profile_name);
+            return Ok(kernel_path);
+        }
+        flock.unlock().map_err(|(_, err)| err)?;
+        bail!("{message}. Record it in rootfs-config.toml, or build: fcvm setup --kernel-profile {profile_name} --build-kernels");
+    };
+
     // Try to download from GitHub releases
     let tag = custom_kernel_release_tag(profile_name, &profile.kernel_version, &sha);
     let download_url = format!(
@@ -419,7 +438,8 @@ async fn ensure_custom_kernel(
     println!("⚙️  Downloading kernel (profile: {})...", profile_name);
     info!(url = %download_url, tag = %tag, "downloading kernel from GitHub releases");
 
-    let download_result = download_kernel_binary(&download_url, &kernel_path).await;
+    let download_result =
+        download_kernel_binary(&download_url, artifact_sha256, &kernel_path).await;
 
     match download_result {
         Ok(_) => {
@@ -667,8 +687,36 @@ pub fn custom_kernel_filename(profile_name: &str, kernel_version: &str, sha: &st
     )
 }
 
-async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
-    let temp = super::StoreTemp::new(dest)?;
+/// Download a release kernel to `dest`, refusing bytes whose SHA-256 is not
+/// `sha256`.
+async fn download_kernel_binary(url: &str, sha256: &str, dest: &Path) -> Result<()> {
+    download_kernel_binary_in(
+        &crate::reclaim::owner_dir()?,
+        url,
+        sha256,
+        dest,
+        std::time::Duration::from_secs(5),
+    )
+    .await
+}
+
+/// [`download_kernel_binary`] with the store temp's record in `owners` and the wait
+/// between attempts given, for the tests.
+async fn download_kernel_binary_in(
+    owners: &Path,
+    url: &str,
+    sha256: &str,
+    dest: &Path,
+    retry_delay: std::time::Duration,
+) -> Result<()> {
+    anyhow::ensure!(
+        sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "kernel_artifact_sha256 '{sha256}' is not 64 lowercase hex digits"
+    );
+    let temp = super::StoreTemp::new_in(owners, dest)?;
     let temp_path = temp.path();
     let max_retries = 3;
 
@@ -693,12 +741,21 @@ async fn download_kernel_binary(url: &str, dest: &Path) -> Result<()> {
                 attempt,
                 max_retries,
                 error = %stderr.trim(),
-                "kernel download failed, retrying in 5s"
+                "kernel download failed, retrying"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(retry_delay).await;
         } else {
             bail!("curl failed after {} attempts: {}", max_retries, stderr);
         }
+    }
+
+    let got = crate::commands::snapshot_export::sha256_hex(temp_path)?;
+    if got != sha256 {
+        bail!(
+            "the release asset {url} has SHA-256 {got}, but rootfs-config.toml records \
+             {sha256} for it (kernel_artifact_sha256): refusing it, since a release asset \
+             can be replaced under the same name"
+        );
     }
 
     // Verify it's a valid kernel binary
@@ -3359,6 +3416,17 @@ pub async fn ensure_profile_firecracker(
     profile: &KernelProfile,
     profile_name: &str,
 ) -> Result<Option<PathBuf>> {
+    ensure_profile_firecracker_from(profile, profile_name, true).await
+}
+
+/// [`ensure_profile_firecracker`], taking a published build recorded in `[vmm_artifacts]`
+/// when `published` is true, and always building from source when it is false (the build
+/// `vmm.yml` publishes must not be a download of an earlier publish).
+pub async fn ensure_profile_firecracker_from(
+    profile: &KernelProfile,
+    profile_name: &str,
+    published: bool,
+) -> Result<Option<PathBuf>> {
     // Check if profile needs custom firecracker
     let repo = match profile.firecracker_repo.as_deref() {
         Some(r) => r,
@@ -3441,6 +3509,65 @@ pub async fn ensure_profile_firecracker(
         } => (commit, path, source, record_resolution),
     };
 
+    // A published build of exactly this binary (same name, so same pin, architecture,
+    // libc and libseccomp), checked against its recorded digest, instead of the build.
+    let libseccomp = profile.firecracker_libseccomp.as_ref();
+    let bin_name = bin_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if published && profile.vmm_artifacts.find(&bin_name).is_some() {
+        let mut lock_path = bin_path.clone().into_os_string();
+        lock_path.push(".lock");
+        let flock = super::lock_store_dir(Path::new(&lock_path), "firecracker install").await?;
+        let installed = if bin_path.exists() {
+            Ok(true)
+        } else {
+            super::vmm_artifacts::install(
+                &profile.vmm_artifacts,
+                &bin_path,
+                super::ARCHIVE_RETRY_DELAY,
+                |_| Ok(()),
+            )
+            .await
+        };
+        flock.unlock().map_err(|(_, err)| err)?;
+        match installed {
+            Ok(true) => {
+                println!(
+                    "  ✓ Firecracker ready (published build, SHA-256 checked): {}",
+                    bin_path.display()
+                );
+                if record_resolution {
+                    record_firecracker_resolution(
+                        profile_name,
+                        repo,
+                        branch,
+                        &commit_hash,
+                        &bin_path,
+                        build,
+                    );
+                }
+                ensure_confined_seccomp_or_warn(
+                    &bin_path,
+                    repo,
+                    branch,
+                    &commit_hash,
+                    source,
+                    libseccomp,
+                )
+                .await;
+                return Ok(Some(bin_path));
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(name = %bin_name, error = %format!("{error:#}"), "the published firecracker build was not installed; building it");
+                println!("  → The published build of {bin_name} was not installed ({error:#}); building it");
+            }
+        }
+    }
+
     // Resolve the build toolchain before creating anything: a missing cargo
     // must not cost a network clone or leave a fresh dir/lock behind.
     let cargo = cargo_program()?;
@@ -3448,7 +3575,6 @@ pub async fn ensure_profile_firecracker(
     // The libseccomp the build links, built here when `fcvm setup` has not
     // already made it its own step. Before the lock and the clone: a host
     // without what the archive's build needs fails in seconds.
-    let libseccomp = profile.firecracker_libseccomp.as_ref();
     super::libseccomp::ensure_libseccomp(libseccomp)
         .await
         .context("setting up libseccomp for the firecracker build")?;
@@ -3752,6 +3878,15 @@ async fn checkout_cloud_hypervisor_source(url: &str, commit: &str, build_dir: &P
 pub async fn ensure_cloud_hypervisor(
     config: &super::rootfs::CloudHypervisorConfig,
 ) -> Result<PathBuf> {
+    ensure_cloud_hypervisor_from(config, true).await
+}
+
+/// [`ensure_cloud_hypervisor`], taking a published build recorded in `[vmm_artifacts]` when
+/// `published` is true, and always building from source when it is false (`vmm.yml`).
+pub async fn ensure_cloud_hypervisor_from(
+    config: &super::rootfs::CloudHypervisorConfig,
+    published: bool,
+) -> Result<PathBuf> {
     let ch_dir = cloud_hypervisor_store_dir();
     let bin_path = cloud_hypervisor_path_in(&ch_dir, config)?;
     let (repo, commit) = (config.repo.as_str(), config.commit.as_str());
@@ -3787,6 +3922,37 @@ pub async fn ensure_cloud_hypervisor(
         debug!(path = %bin_path.display(), "cloud-hypervisor exists (built by another process)");
         flock.unlock().map_err(|(_, err)| err)?;
         return Ok(bin_path);
+    }
+
+    // A published build of exactly this binary, checked against its recorded digest and,
+    // as a local build is, against the commit its version names.
+    if published {
+        let installed = super::vmm_artifacts::install(
+            &config.artifacts,
+            &bin_path,
+            super::ARCHIVE_RETRY_DELAY,
+            |path| {
+                crate::version_cache::version_output(path)
+                    .context("running the published cloud-hypervisor --version")
+                    .and_then(|version| cloud_hypervisor_version_names(&version, commit))
+            },
+        )
+        .await;
+        match installed {
+            Ok(true) => {
+                flock.unlock().map_err(|(_, err)| err)?;
+                println!(
+                    "  ✓ Cloud Hypervisor ready (published build, SHA-256 checked): {}",
+                    bin_path.display()
+                );
+                return Ok(bin_path);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(path = %bin_path.display(), error = %format!("{error:#}"), "the published cloud-hypervisor build was not installed; building it");
+                println!("  → The published Cloud Hypervisor build was not installed ({error:#}); building it");
+            }
+        }
     }
 
     println!("  → Building cloud-hypervisor from {repo} (commit: {commit})...");
@@ -4232,7 +4398,7 @@ mod tests {
         );
         let source = include_str!("kernel.rs");
         let body = &source[source
-            .find("pub async fn ensure_cloud_hypervisor(")
+            .find("pub async fn ensure_cloud_hypervisor_from(")
             .expect("ensure_cloud_hypervisor is gone")..];
         let body = &body[..body.find("\n}\n").unwrap()];
         assert!(
@@ -6500,5 +6666,167 @@ cp vmlinux arch/arm64/boot/Image
         std::fs::create_dir_all(&bare_home).unwrap();
         let found = resolve_cargo(None, Some(empty.into_os_string()), &[bare_home]);
         assert_eq!(found, None);
+    }
+
+    /// A release kernel is installed only as the bytes its table records: an asset
+    /// replaced under the same release name is refused and nothing is published.
+    #[tokio::test]
+    async fn a_release_kernel_whose_bytes_are_not_the_recorded_ones_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let owners = crate::reclaim::owner_dir_in(records.path()).unwrap();
+        let mut kernel = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        kernel.resize(64, 0);
+        let recorded = hex::encode(Sha256::digest(&kernel));
+        let asset = dir
+            .path()
+            .join("vmlinux-default-1.0-x86_64-0123456789ab.bin");
+        let url = format!("file://{}", asset.display());
+        let dest = dir.path().join("store-vmlinux.bin");
+        let no_wait = std::time::Duration::ZERO;
+
+        let mut replaced = kernel.clone();
+        replaced[63] = 1;
+        std::fs::write(&asset, &replaced).unwrap();
+        let err = download_kernel_binary_in(&owners, &url, &recorded, &dest, no_wait)
+            .await
+            .expect_err("an asset whose bytes are not the recorded ones was accepted");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&recorded) && text.contains("kernel_artifact_sha256"),
+            "{text}"
+        );
+        assert!(
+            !dest.exists(),
+            "a refused kernel was published at {}",
+            dest.display()
+        );
+
+        std::fs::write(&asset, &kernel).unwrap();
+        download_kernel_binary_in(&owners, &url, &recorded, &dest, no_wait)
+            .await
+            .expect("the recorded bytes are the release");
+        assert_eq!(std::fs::read(&dest).unwrap(), kernel);
+    }
+
+    /// The VMM pins of `plan` that have published builds for `arch` but none named as a host
+    /// with `libc` would name its build: such a host keeps building from source.
+    fn vmm_names_missing_from_publish(
+        plan: &crate::setup::rootfs::Plan,
+        arch: &str,
+        libc: &str,
+    ) -> Vec<String> {
+        let recorded = &plan.vmm_artifacts.files;
+        let mut problems = Vec::new();
+        let mut check = |kind: &str, commit: &str, prefix: &str, ours: String| {
+            let published: Vec<&str> = recorded
+                .iter()
+                .filter(|f| f.commit == commit && f.arch == arch && f.name.starts_with(prefix))
+                .map(|f| f.name.as_str())
+                .collect();
+            if !published.is_empty() && !published.contains(&ours.as_str()) {
+                problems.push(format!(
+                    "{kind} at {commit}: a host on {arch} with {libc} builds {ours}, and the \
+                     published builds are {published:?}"
+                ));
+            }
+        };
+        for (name, profile) in vmm_profiles(plan) {
+            let commit = profile.firecracker_commit.as_deref().unwrap();
+            check(
+                &format!("Firecracker for profile {name}"),
+                commit,
+                &format!("firecracker-{name}-"),
+                firecracker_name_for(name, profile, libc, arch),
+            );
+        }
+        if let Some(ch) = plan.cloud_hypervisor.as_ref() {
+            let ours = cloud_hypervisor_file_name(&ch.repo, &ch.commit, arch, libc);
+            check("Cloud Hypervisor", &ch.commit, "cloud-hypervisor-", ours);
+        }
+        problems
+    }
+
+    /// The published kernel profiles of this architecture that build a pinned Firecracker.
+    fn vmm_profiles(plan: &crate::setup::rootfs::Plan) -> Vec<(&String, &KernelProfile)> {
+        plan.kernel_profiles
+            .iter()
+            .filter_map(|(name, by_arch)| {
+                by_arch
+                    .get(crate::setup::rootfs::config_arch())
+                    .map(|p| (name, p))
+            })
+            .filter(|(_, p)| {
+                p.is_published() && p.firecracker_repo.is_some() && p.firecracker_commit.is_some()
+            })
+            .collect()
+    }
+
+    fn firecracker_name_for(name: &str, profile: &KernelProfile, libc: &str, arch: &str) -> String {
+        let libseccomp = profile_libseccomp_identity(profile);
+        let build = FirecrackerBuildEnvironment {
+            arch,
+            libc_tag: libc,
+            libseccomp: &libseccomp,
+        };
+        profile_firecracker_path_for_build(
+            Path::new(""),
+            name,
+            profile.firecracker_repo.as_deref().unwrap(),
+            profile.firecracker_branch.as_deref().unwrap_or("main"),
+            profile.firecracker_commit.as_deref().unwrap(),
+            build,
+        )
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+    }
+
+    fn repo_plan() -> crate::setup::rootfs::Plan {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/rootfs-config.toml");
+        crate::setup::rootfs::load_config(Some(path)).unwrap().0
+    }
+
+    /// A self-hosted lane computes its VMM names from this host's libc and architecture. Where
+    /// a pin has published builds for this architecture, one of them must be this host's name,
+    /// or the lane quietly keeps building from source (a libc tag that differs from the
+    /// publishing runner's is the usual cause). A pin with no builds recorded yet is skipped.
+    #[test]
+    fn this_hosts_vmm_names_are_published_wherever_its_pins_are() {
+        let problems = vmm_names_missing_from_publish(
+            &repo_plan(),
+            std::env::consts::ARCH,
+            &libc_version_tag(),
+        );
+        assert!(problems.is_empty(), "{problems:#?}");
+    }
+
+    /// The check above on recorded builds written for it: a build published from another libc
+    /// is a finding for this host, and the build named as this host names it is not.
+    #[test]
+    fn a_vmm_build_published_from_another_libc_is_a_finding() {
+        let mut plan = repo_plan();
+        let (name, profile) = vmm_profiles(&plan)
+            .into_iter()
+            .map(|(n, p)| (n.clone(), p.clone()))
+            .next()
+            .expect("a published profile builds a pinned Firecracker");
+        let arch = std::env::consts::ARCH;
+        let entry = |libc: &str| crate::setup::vmm_artifacts::VmmArtifact {
+            name: firecracker_name_for(&name, &profile, libc, arch),
+            commit: profile.firecracker_commit.clone().unwrap(),
+            arch: arch.to_string(),
+            libc: libc.to_string(),
+            sha256: "a".repeat(64),
+        };
+        plan.vmm_artifacts.files = vec![entry("libc-9.99")];
+        let found = vmm_names_missing_from_publish(&plan, arch, "libc-2.39");
+        assert_eq!(found.len(), 1, "{found:?}");
+        plan.vmm_artifacts.files.push(entry("libc-2.39"));
+        assert_eq!(
+            vmm_names_missing_from_publish(&plan, arch, "libc-2.39"),
+            Vec::<String>::new()
+        );
     }
 }

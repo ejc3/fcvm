@@ -15,6 +15,7 @@ import {
   phonesView,
   PHONE_ASPECT,
   restoreText,
+  screenAspect,
   screenYScale,
   statsOf,
   STATS_STALE_MS,
@@ -684,6 +685,22 @@ describe("taps on the held phone's screen", () => {
     // the drawn picture leaves out the stamp band: its bottom edge is the band's top
     expect(tapPoint({ ...t, yScale: 1272 / 1280 }, 200, 690)!.y).toBeCloseTo(1272 / 1280, 4);
     expect(tapPoint({ ...t, box: { ...t.box, w: 0 } }, 100, 60)).toBeNull();
+  });
+
+  it("keeps the held screen where it is when the stream's next frame comes at another size of the same shape", () => {
+    const s = held();
+    const box = (width: number, height: number) => {
+      const frames = { at: EPOCH, tiles: { "d:phone:1": { connected: true, fps: 30, newestT: 1, width, height, fullHeight: height, behind: false, decodeMs: null, lag: null } } };
+      return viewOf({ ...s, frames: frames as unknown as ClientState["frames"] }, { takeover: "video" }).taps!.targets[0]!.box;
+    };
+    // one phone asked at two sizes: the encoder's whole pixels put the pictures 0.564 and 0.566
+    expect(box(158, 280)).toEqual(box(162, 286));
+    expect(box(720, 1272)).toEqual(box(162, 286));
+    // a turned phone still turns, and a picture of another shape is drawn at its own
+    const turned = box(286, 162);
+    expect(turned.w).toBeGreaterThan(turned.h);
+    expect(screenAspect(1280, 720)).toBe(1 / PHONE_ASPECT);
+    expect(screenAspect(1000, 1000)).toBe(1);
   });
 
   it("scales a cropped picture's height into the whole screen's", () => {

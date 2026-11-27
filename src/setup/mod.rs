@@ -4,6 +4,7 @@ pub mod nvidia;
 pub mod pasta;
 pub mod rootfs;
 pub mod storage;
+pub mod vmm_artifacts;
 
 use anyhow::{bail, Context, Result};
 use nix::fcntl::{Flock, FlockArg, OFlag};
@@ -522,7 +523,7 @@ mod store_ownership_tests {
     #[test]
     fn helpers_of_functions_that_make_store_temps_hold_their_locks() {
         // git and cargo build a checkout of their own; the temp is written by a copy here.
-        const NOT_WRITERS: &[&str] = &["ensure_cloud_hypervisor"];
+        const NOT_WRITERS: &[&str] = &["ensure_cloud_hypervisor_from"];
         for (file, source) in [
             ("src/setup/kernel.rs", include_str!("kernel.rs")),
             ("src/setup/rootfs.rs", include_str!("rootfs.rs")),
