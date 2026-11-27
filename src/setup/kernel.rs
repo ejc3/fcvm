@@ -3901,14 +3901,6 @@ pub async fn ensure_cloud_hypervisor_from(
         return Ok(bin_path);
     }
 
-    // Resolve the build toolchain before creating anything: a missing cargo
-    // must not cost a network clone or leave a fresh dir/lock behind. The build
-    // uses the toolchain this fcvm is built with: the Cloud Hypervisor tree names
-    // none, so it would otherwise build with whichever default the host's rustup
-    // has (and fail where it has none).
-    let cargo = cargo_program()?;
-    let toolchain = pinned_rust_toolchain()?;
-
     // Acquire per-filename lock so concurrent setups don't collide
     let mut lock_name = bin_path
         .file_name()
@@ -3954,6 +3946,20 @@ pub async fn ensure_cloud_hypervisor_from(
             }
         }
     }
+
+    // Resolve the build toolchain before the clone, and after the published install: a host
+    // without cargo installs a published build, and a missing cargo must not cost a network
+    // clone. The build uses the toolchain this fcvm is built with: the Cloud Hypervisor tree
+    // names none, so it would otherwise build with whichever default the host's rustup has
+    // (and fail where it has none).
+    let toolchain = cargo_program().and_then(|cargo| Ok((cargo, pinned_rust_toolchain()?)));
+    let (cargo, toolchain) = match toolchain {
+        Ok(found) => found,
+        Err(error) => {
+            flock.unlock().map_err(|(_, err)| err)?;
+            return Err(error);
+        }
+    };
 
     println!("  → Building cloud-hypervisor from {repo} (commit: {commit})...");
     println!("    This may take 5-10 minutes...");
@@ -4405,6 +4411,19 @@ mod tests {
             body.contains("\"--locked\""),
             "the build does not pass --locked"
         );
+        // A host without cargo installs a published build: the toolchain is resolved after
+        // the install, and before the clone it is needed for.
+        let install = body
+            .find("vmm_artifacts::install(")
+            .expect("no published install");
+        for needed in ["cargo_program()", "pinned_rust_toolchain()"] {
+            let at = body.find(needed).expect(needed);
+            assert!(
+                install < at && at < body.find("checkout_cloud_hypervisor_source(").unwrap(),
+                "{needed} is resolved before the published install, so a host without it \
+                 cannot install the published Cloud Hypervisor"
+            );
+        }
         assert!(
             body.contains(".env(\"RUSTUP_TOOLCHAIN\", &toolchain)"),
             "the build does not name its toolchain"
