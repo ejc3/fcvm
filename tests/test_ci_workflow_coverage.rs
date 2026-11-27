@@ -5003,3 +5003,54 @@ fn no_code_is_gated_on_an_integration_feature_being_off() {
         "code gated on an integration feature being off: {offenders:?}"
     );
 }
+
+/// The SnapshotEnabled lanes run bench-vm right after test-root. `cargo bench` builds in the
+/// bench profile, which cargo keeps apart from release, so it rebuilt the workspace crates
+/// test-root had just built (7.6 to 7.9 min, run 45935858819). bench-vm builds the benches
+/// as `cargo test` with test-root's profile and features, so only the two bench binaries
+/// compile.
+#[test]
+fn bench_vm_reuses_the_test_root_build() {
+    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
+    let rules = makefile_rules(&makefile);
+    let root_recipe = rules["_test-root"].1.join(" ");
+    let root_features: Vec<&str> = root_recipe
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|w| w[0] == "--features")
+        .map(|w| w[1])
+        .collect();
+    assert_eq!(root_features, ["privileged-tests"], "_test-root's features");
+    let nextest = makefile
+        .lines()
+        .find(|l| l.starts_with("NEXTEST :="))
+        .expect("Makefile defines NEXTEST");
+    assert!(
+        root_recipe.contains("$(NEXTEST)") && nextest.contains("--release"),
+        "_test-root builds through $(NEXTEST) in the release profile: {nextest}"
+    );
+
+    let bench = rules["bench-vm"].1.join(" ");
+    let bench = bench.replace("$(BENCH_VM_CARGO)", "");
+    let cargo = makefile
+        .lines()
+        .skip_while(|l| !l.starts_with("BENCH_VM_CARGO ="))
+        .take_while(|l| !l.starts_with("bench-vm:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        cargo.contains("$(CARGO) test --release --features privileged-tests"),
+        "BENCH_VM_CARGO must build with test-root's profile and features: {cargo}"
+    );
+    for name in ["exec", "clone"] {
+        assert!(
+            bench.contains(&format!("--bench {name} -- --test")),
+            "bench-vm must run the {name} benchmarks once each: {bench}"
+        );
+    }
+    assert!(
+        !bench.contains("$(CARGO) bench") && !cargo.contains("$(CARGO) bench"),
+        "bench-vm uses the bench profile again: {bench}"
+    );
+}

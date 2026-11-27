@@ -1771,15 +1771,19 @@ bench-protocol: build
 bench-quick: BENCH_ARGS := --sample-size 10 --warm-up-time 1 --measurement-time 3
 bench-quick: bench
 
-# VM benchmarks (exec, clone) - require KVM, Firecracker, setup
+# VM benchmarks (exec, clone) - require KVM, Firecracker, setup. Each benchmark runs once
+# (criterion's --test). They are built as `cargo test --release` with test-root's features
+# and package set, not with `cargo bench`: the bench profile is a separate profile, so
+# `cargo bench` rebuilt the workspace crates after test-root had built them (7.6 to 7.9
+# min in the SnapshotEnabled lanes, run 45935858819). This way only the two bench
+# binaries are compiled.
+BENCH_VM_CARGO = CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	$(CARGO) test --release --features privileged-tests
 bench-vm: build setup-default
 	@echo "==> Running VM benchmarks..."
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench --bench exec -- --test
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench --bench clone -- --test
+	$(BENCH_VM_CARGO) --bench exec -- --test
+	$(BENCH_VM_CARGO) --bench clone -- --test
 
 # Hugepages benchmark: compare clone speed with 4KB vs 2MB pages
 # Full mode: 32GB VM, 16GB dirty memory (~20 min)
