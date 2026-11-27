@@ -20,19 +20,25 @@ def entry(name, sha256, commit="c" * 40, arch="x86_64", libc="libc-2.39"):
 
 class Record(unittest.TestCase):
     config = (ROOT / "rootfs-config.toml").read_text()
+    # The checked-in config with its entries removed: the tests hold whether or not
+    # rootfs-config.toml records any builds yet.
+    bare = vmm.record(config, {})
 
-    def test_no_entries_leaves_the_config_as_it_is(self):
-        self.assertEqual(vmm.record(self.config, {}), self.config)
+    def test_the_checked_in_entries_are_written_as_the_recorder_writes_them(self):
+        recorded = {f["name"]: f for f in tomllib.loads(self.config)["vmm_artifacts"].get("files", [])}
+        self.assertEqual(vmm.record(self.config, recorded), self.config)
+        self.assertNotIn("[[vmm_artifacts.files]]", self.bare)
+        self.assertEqual(vmm.record(self.bare, {}), self.bare)
 
     def test_entries_parse_back_and_rewriting_them_changes_nothing(self):
         entries = {"b.bin": entry("b.bin", "a" * 64), "a.bin": entry("a.bin", "b" * 64, arch="aarch64")}
-        once = vmm.record(self.config, entries)
+        once = vmm.record(self.bare, entries)
         self.assertEqual(vmm.record(once, entries), once)
         parsed = tomllib.loads(once)["vmm_artifacts"]
         self.assertEqual(parsed["repo"], "ejc3/fcvm")
         self.assertEqual(parsed["files"], [entries["a.bin"], entries["b.bin"]])
         # everything outside the table is as it was
-        self.assertEqual(vmm.record(once, {}), self.config)
+        self.assertEqual(vmm.record(once, {}), self.bare)
         self.assertEqual({k: v for k, v in tomllib.loads(once).items() if k != "vmm_artifacts"},
                          {k: v for k, v in tomllib.loads(self.config).items() if k != "vmm_artifacts"})
 
