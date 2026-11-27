@@ -37,7 +37,7 @@ until [ "$(stats | jq -r .ready)" = "$SLOTS" ]; do
 done
 echo "pool of $SLOTS namespaces built in $((SECONDS - build_start)) s"
 stats > "$out_root/pool-built.json"
-socket=$(echo "$data_dir"/netpool/*/pool.sock)
+socket=$(stats | jq -er .socket) || { echo "netpool stats names no socket"; exit 1; }
 
 cell() {  # OUT C COUNT
   local cell=$1/netpool-c$2-n$3-a$ALIVE

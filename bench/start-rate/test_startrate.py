@@ -233,6 +233,39 @@ class FailClosed(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 startrate.list_vms(f, False)
 
+    def test_the_state_location_is_what_fcvm_names_and_its_filesystem(self):
+        with tempfile.TemporaryDirectory() as t:
+            f = self.fake_fcvm(Path(t), f'[ "$1 $2" = "ls --runtime-dir" ] && echo {t}')
+            loc = startrate.state_location(f, False)
+            self.assertEqual(loc["dir"], t)
+            self.assertTrue(loc["fs"])
+
+    def test_a_build_that_names_no_state_location_is_recorded_as_unknown(self):
+        with tempfile.TemporaryDirectory() as t:
+            for body in ("echo 'no VM states in this boot' >&2; exit 1", "echo '[]'", "echo /nonexistent/dir"):
+                loc = startrate.state_location(self.fake_fcvm(Path(t), body), False)
+                self.assertEqual((loc["dir"], loc["fs"]), (None, None), body)
+                self.assertTrue(loc["note"], body)
+
+    def test_report_refuses_runs_with_states_on_different_filesystems(self):
+        with tempfile.TemporaryDirectory() as t:
+            dirs = []
+            for name, loc in (("a", {"dir": "/run/x", "fs": "tmpfs"}), ("b", {"dir": "/mnt/x", "fs": "btrfs"}),
+                              ("c", {"dir": None, "fs": None, "note": "no answer"})):
+                d = Path(t) / name
+                d.mkdir()
+                (d / "summary.json").write_text(json.dumps({"state_location": loc}))
+                dirs.append(str(d))
+            old = Path(t) / "old"
+            old.mkdir()
+            (old / "summary.json").write_text("{}")
+            self.assertEqual([startrate.location_key(json.loads((Path(d) / "summary.json").read_text())) for d in dirs],
+                             ["tmpfs", "btrfs", "unknown"])
+            for pair in ([dirs[0], dirs[1]], [dirs[0], dirs[2]], [dirs[0], str(old)]):
+                with self.assertRaises(SystemExit) as e:
+                    startrate.cmd_report(argparse.Namespace(dirs=pair, json=False, across_state_locations=False))
+                self.assertIn("different filesystems", str(e.exception))
+
 
 
 class FakeRlimit:
@@ -1072,7 +1105,7 @@ class ChurnRecords(unittest.TestCase):
             self.assertEqual(s["driver"]["cpu_cores"], 0.1)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                startrate.cmd_report(argparse.Namespace(dirs=[t], json=False))
+                startrate.cmd_report(argparse.Namespace(dirs=[t], json=False, across_state_locations=False))
             self.assertIn("window 60.0 s: 10.0 starts/s", out.getvalue())
             self.assertNotIn("NOT SUSTAINED", out.getvalue())
             self.assertIn("20.0 up + 1.0 starting of 20 asked for", out.getvalue())
@@ -1084,11 +1117,11 @@ class ChurnRecords(unittest.TestCase):
             self.write(d, run=run)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                startrate.cmd_report(argparse.Namespace(dirs=[t], json=False))
+                startrate.cmd_report(argparse.Namespace(dirs=[t], json=False, across_state_locations=False))
             self.assertTrue(out.getvalue().startswith("NOT SUSTAINED: window 60.0 s"), out.getvalue()[:80])
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                startrate.cmd_report(argparse.Namespace(dirs=[t], json=True))
+                startrate.cmd_report(argparse.Namespace(dirs=[t], json=True, across_state_locations=False))
             s = json.loads(out.getvalue())
             self.assertEqual((s["ok"], s["sustained"]), (False, None))
 
