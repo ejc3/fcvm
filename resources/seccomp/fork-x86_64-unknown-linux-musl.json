@@ -1794,6 +1794,19 @@
             },
             {
                 "syscall": "ioctl",
+                "comment": "Saving a vCPU's nested virtualization state in a snapshot, on the vCPU thread",
+                "args": [
+                    {
+                        "index": 1,
+                        "type": "dword",
+                        "op": "eq",
+                        "val": 3229658814,
+                        "comment": "KVM_GET_NESTED_STATE"
+                    }
+                ]
+            },
+            {
+                "syscall": "ioctl",
                 "args": [
                     {
                         "index": 1,
