@@ -115,11 +115,22 @@ pub async fn wait_for_cgroup_controllers() {
 }
 
 /// The cgroups whose `cgroup.subtree_control` must list the pids controller for a container
-/// started from `my_cgroup` (a path below the cgroup2 root, from `/proc/self/cgroup`).
+/// started from `my_cgroup` (a path below the cgroup2 root, from `/proc/self/cgroup`): the
+/// root and every cgroup above `my_cgroup`, never `my_cgroup` itself.
+///
+/// fc-agent is a process in `my_cgroup`. A non-root cgroup that holds a process may enable
+/// only threaded controllers (pids is one), and enabling one makes it a thread root. Then
+/// podman `--cgroups=split` cannot move the processes of `my_cgroup` into its `runtime`
+/// child (EOPNOTSUPP, which podman logs only at debug), crun finds `my_cgroup` still
+/// populated and enables only the threaded controllers there, and the container below is a
+/// threaded cgroup with cpuset, cpu and pids and no memory: a root fcvm inside it can make
+/// a scope but not enter it (#2226). Left alone, `my_cgroup` is emptied by podman's move
+/// first, and crun enables every controller, memory included, for the container.
 fn controller_chain(my_cgroup: &str) -> Vec<String> {
     let mut chain = vec!["/sys/fs/cgroup".to_string()];
     let mut current = "/sys/fs/cgroup".to_string();
-    for component in my_cgroup.split('/').filter(|c| !c.is_empty()) {
+    let components: Vec<&str> = my_cgroup.split('/').filter(|c| !c.is_empty()).collect();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
         current = format!("{current}/{component}");
         chain.push(current.clone());
     }
