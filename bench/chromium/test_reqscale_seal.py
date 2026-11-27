@@ -16,6 +16,7 @@ sys.path.insert(0, HERE)
 import reqbench  # noqa: E402
 import reqscale  # noqa: E402
 import reqscale_analyze  # noqa: E402
+import state_fixture  # noqa: E402
 import test_reqbench  # noqa: E402
 from test_reqscale import CompleteAnalyzerFixture  # noqa: E402
 
@@ -69,8 +70,9 @@ class ScaleRefusesAGoldenFromAnotherRuntime(unittest.TestCase):
     def _run(self, d, creator_overrides):
         bundle = os.path.join(d, "bundle")
         os.makedirs(bundle)
-        with open(os.path.join(bundle, "fcvm"), "wb") as f:
-            f.write(b"#!/bin/sh\nexit 0\n")
+        # The staged fcvm, which reqscale asks for its state directory before measuring.
+        state_fixture.write_fake_fcvm(os.path.join(bundle, "fcvm"),
+                                      os.path.join(d, "data", "state"))
         with open(os.path.join(bundle, "MANIFEST.sha256"), "w") as f:
             f.write("fixture manifest\n")
         revision = "e" * 40
@@ -167,7 +169,7 @@ class ScaleShell(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             binx = os.path.join(d, "bin")
             os.makedirs(binx)
-            for name, body in (("fcvm", "#!/bin/bash\nexit 0\n"),
+            for name, body in (("fcvm", "#!/bin/bash\n" + state_fixture.SH_FCVM_PATHS + "exit 0\n"),
                                ("fc-agent", "#!/bin/bash\nexit 0\n"),
                                ("bin/sudo", '#!/bin/bash\nprintf "%s\\n" "$@" > "$SUDO_ARGV"\n')):
                 with open(os.path.join(d, name), "w") as f:
@@ -175,7 +177,8 @@ class ScaleShell(unittest.TestCase):
                 os.chmod(os.path.join(d, name), 0o755)
             os.makedirs(os.path.join(d, "state"))
             env = dict(os.environ, PATH=binx + os.pathsep + os.environ["PATH"],
-                       RESULTS=os.path.join(d, "results"), STATE_DIR=os.path.join(d, "state"),
+                       RESULTS=os.path.join(d, "results"),
+                       FCVM_FAKE_STATE_DIR=os.path.join(d, "state"),
                        RUNID="0" * 32, FCVM=os.path.join(d, "fcvm"),
                        FC_AGENT=os.path.join(d, "fc-agent"), TAG="cb-scale",
                        SUDO_ARGV=os.path.join(d, "argv"))
@@ -393,7 +396,7 @@ class ScaleOutputOwnership(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             binx = os.path.join(d, "bin")
             os.makedirs(binx)
-            for name, body in (("fcvm", "#!/bin/bash\nexit 0\n"),
+            for name, body in (("fcvm", "#!/bin/bash\n" + state_fixture.SH_FCVM_PATHS + "exit 0\n"),
                                ("fc-agent", "#!/bin/bash\nexit 0\n"),
                                ("bin/sudo", '#!/bin/bash\nprintf "%s\\n" "$*" >> "$SUDO_LOG"\n')):
                 with open(os.path.join(d, name), "w") as f:
@@ -403,7 +406,8 @@ class ScaleOutputOwnership(unittest.TestCase):
             out = os.path.join(d, "results", "scale")
             os.makedirs(out)  # already there before this run: reqscale.py refuses it
             env = dict(os.environ, PATH=binx + os.pathsep + os.environ["PATH"],
-                       RESULTS=os.path.join(d, "results"), STATE_DIR=os.path.join(d, "state"),
+                       RESULTS=os.path.join(d, "results"),
+                       FCVM_FAKE_STATE_DIR=os.path.join(d, "state"),
                        RUNID="0" * 32, FCVM=os.path.join(d, "fcvm"),
                        FC_AGENT=os.path.join(d, "fc-agent"), TAG="cb-scale",
                        SUDO_LOG=os.path.join(d, "sudo.log"))

@@ -53,7 +53,7 @@ mod helper_spawn_tests {
     /// Every program the storage and snapshot paths run is a helper that the kernel kills
     /// when fcvm exits (`crate::utils::helper_command`). A create's `btrfs subvolume create`
     /// or `btrfs subvolume snapshot` spawned bare outlived a SIGKILLed create: stopped before
-    /// it made the staging directory, it made it after the next launch's reclaim pass had
+    /// it made the staging directory, it made it after the next sweep had
     /// removed the record of it, and nothing then removed the directory (#1918). The same
     /// holds for the clone's subvolume snapshot and reflink, and for `truncate`, which
     /// creates the disk it is asked to extend when the disk is gone.

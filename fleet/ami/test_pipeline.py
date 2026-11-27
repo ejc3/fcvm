@@ -2564,26 +2564,88 @@ class RendersUnitProofTests(unittest.TestCase):
         self.assertEqual(argv[-6:], settings["ExecStart"][0].split())
 
     def test_the_census_is_renders_bench_shs(self):
+        # Both take the state and data directories from fcvm's own answer. The state directory
+        # here is not under the data directory, so neither side can have joined one to the other.
         conf = host_check().read_conf((RENDERS / "renders.conf").read_text())
-        ours = guest.unit_census(conf, "fcvm-fleet-renders-unit-check")
+        paths = {"state_dir": "/run/example-runtime/state", "data_dir": "/mnt/example-data"}
+        ours = guest.unit_census(conf, "fcvm-fleet-renders-unit-check", paths)
+        self.assertEqual(ours[ours.index("--state-dir") + 1], "/run/example-runtime/state")
+        self.assertEqual(ours[ours.index("--vm-dir") + 1], "/mnt/example-data/vm-disks")
         bench = (HERE.parents[1] / "bench/chromium/renders_bench.sh").read_text()
         fn = re.search(r"\ncensus_args\(\) \{.*?\n\}\n", bench, re.S).group(0)
         env = {"PATH": "/usr/bin:/bin", "UNIT": "fcvm-fleet-renders-unit-check",
                "STATUS": conf["RENDERS_OUT"] + ".status.json", "OUT": conf["RENDERS_OUT"],
                "RUN_DIR": conf["RENDERS_RUN_DIR"], "TAG": conf["RENDERS_SNAPSHOT_TAG"],
-               "MAX_ENGINES": conf["RENDERS_MAX_ENGINES"], "FCVM_DATA_DIR": "/mnt/fcvm-btrfs"}
+               "MAX_ENGINES": conf["RENDERS_MAX_ENGINES"],
+               "FCVM_STATE_DIR": paths["state_dir"], "FCVM_DATA_ROOT": paths["data_dir"]}
         done = subprocess.run(["bash", "-c", fn + "census_args"], capture_output=True, env=env, timeout=10)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(ours, done.stdout.decode().split("\0")[:-1])
 
+    def test_a_census_without_fcvms_directories_prints_nothing(self):
+        # Without fcvm's answer (unset, empty or not absolute) the census is refused whole: a
+        # census of an empty state directory would count no state and pass.
+        bench = (HERE.parents[1] / "bench/chromium/renders_bench.sh").read_text()
+        fn = re.search(r"\ncensus_args\(\) \{.*?\n\}\n", bench, re.S).group(0)
+        base = {"PATH": "/usr/bin:/bin", "UNIT": "u", "STATUS": "/s", "OUT": "/o", "RUN_DIR": "/r", "TAG": "t",
+                "MAX_ENGINES": "2", "FCVM_DATA_DIR": "/mnt/fcvm-btrfs"}
+        good = {"FCVM_STATE_DIR": "/state", "FCVM_DATA_ROOT": "/data"}
+        for missing in ({}, {"FCVM_STATE_DIR": "/state"}, {"FCVM_DATA_ROOT": "/data"},
+                        {**good, "FCVM_STATE_DIR": ""}, {**good, "FCVM_DATA_ROOT": "data"}):
+            with self.subTest(missing=missing):
+                done = subprocess.run(["bash", "-c", fn + "census_args"], capture_output=True,
+                                      env={**base, **missing}, timeout=10)
+                self.assertEqual(done.returncode, 2, done.stderr)
+                self.assertEqual(done.stdout, b"")
+                self.assertIn(b"BLOCKED: census_args", done.stderr)
+        # and each mode loads fcvm's answer before it takes the census, and refuses an empty one
+        for mode in ("teardown-check", "agent-check"):
+            body = bench.split(f"    {mode})\n", 1)[1].split(";;", 1)[0]
+            self.assertLess(body.index("load_fcvm_paths || exit 2"), body.index("< <(census_args)"), mode)
+            self.assertIn('[ "${#count[@]}" -gt 0 ] ||', body, mode)
+
+    def unit_with(self, binary):
+        return ("[Unit]\nDescription=x\n\n[Service]\nUser=ubuntu\n"
+                "Environment=HOME=/home/example XDG_RUNTIME_DIR=/run/user/1000 RUST_LOG=info\n"
+                "Environment=PATH=/usr/bin:/bin\n"
+                f"ExecStart={binary} fleet agent $FLEET_AGENT_ARGS\n\n[Install]\nWantedBy=multi-user.target\n")
+
+    def test_the_units_fcvm_names_the_directories_or_the_proof_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake, seen = Path(directory, "fcvm"), Path(directory, "seen")
+            def answer(body):
+                fake.write_text("#!/bin/bash\n" + body)
+                fake.chmod(0o755)
+                return guest.unit_fcvm_paths(self.unit_with(fake))
+            # the unit's binary, asked `paths --json`, with the unit's Environment= and nothing else
+            paths = answer(f'printf \'%s|%s|%s\\n\' "$*" "$HOME" "${{FCVM_DATA_DIR-unset}}" > {seen}\n'
+                           'echo \'{"state_dir":"/run/example/state","data_dir":"/mnt/example","more":1}\'\n')
+            self.assertEqual(paths, {"state_dir": "/run/example/state", "data_dir": "/mnt/example"})
+            self.assertEqual(seen.read_text(), "paths --json|/home/example|unset\n")
+            for body in ("exit 3\n", "echo not json\n", "echo '[1]'\n",
+                         'echo \'{"state_dir":"/s"}\'\n', 'echo \'{"state_dir":"","data_dir":"/d"}\'\n',
+                         'echo \'{"state_dir":"state","data_dir":"/d"}\'\n',
+                         'echo \'{"state_dir":"/s","data_dir":7}\'\n'):
+                with self.subTest(body=body):
+                    with self.assertRaisesRegex(RuntimeError, "paths --json"):
+                        answer(body)
+        with self.assertRaisesRegex(RuntimeError, "no ExecStart"):
+            guest.unit_fcvm_paths("[Service]\nUser=ubuntu\n")
+
     def test_the_proof_needs_the_unit_verified_and_every_running_case(self):
         names = ["hello", "renders", "overlay", "stop"]
+        census = []
+        paths_answer = '{"state_dir": "/run/example/state", "data_dir": "/mnt/example"}'
         def run(verify_code, record):
             real = tempfile.TemporaryDirectory
             with real() as directory:
                 def go(argv, **kwargs):
                     if argv[0] == "systemd-analyze":
                         return SimpleNamespace(returncode=verify_code, stdout="", stderr="")
+                    if argv[1:] == ["paths", "--json"]:
+                        self.assertEqual(argv[0], "/usr/local/bin/fcvm")
+                        return SimpleNamespace(returncode=0 if paths_answer else 1, stdout=paths_answer, stderr="")
+                    census.append(argv)
                     out = argv[argv.index("--out") + 1]
                     if record is not None:
                         Path(out).write_text(json.dumps(record))
@@ -2599,6 +2661,16 @@ class RendersUnitProofTests(unittest.TestCase):
                     return guest.renders_unit_proof()
         good = {"rows": [{"case": n, "ok": True} for n in names], "cases": 4, "failed": []}
         self.assertEqual(run(0, good), (True, []))
+        # the check counted the directories the unit's fcvm named
+        self.assertEqual(census[-1][census[-1].index("--state-dir") + 1], "/run/example/state")
+        self.assertEqual(census[-1][census[-1].index("--data-dir") + 1], "/mnt/example")
+        # a unit whose fcvm does not name them fails the proof before any check runs
+        ran, paths_answer = len(census), ""
+        ok, failures = run(0, good)
+        self.assertIs(ok, False)
+        self.assertEqual(failures, ["the agent unit's fcvm did not name its state and data directories"])
+        self.assertEqual(len(census), ran)
+        paths_answer = '{"state_dir": "/run/example/state", "data_dir": "/mnt/example"}'
         for verify_code, record in ((1, good), (0, None), (0, {**good, "rows": good["rows"][:2], "cases": 2}),
                                     (0, {**good, "failed": ["renders"]})):
             with self.subTest(verify=verify_code, record=None if record is None else record["cases"]):
