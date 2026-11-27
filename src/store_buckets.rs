@@ -103,15 +103,26 @@ pub fn ensure_at(parent: &impl AsFd, parent_path: &Path, bucket: &str) -> Result
     Ok(made)
 }
 
-/// [`ensure_at`] by path: `parent` is made if it is missing.
+/// [`ensure_at`] by path. `parent` is made only when it is missing: a mkdir of a directory
+/// that exists fails with EEXIST but still takes the lock of the directory it would be made
+/// in, for writing, which every start would then queue on.
 pub fn ensure(parent: &Path, bucket: &str) -> Result<usize> {
-    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    let fd = nix::fcntl::open(
-        parent,
-        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )
-    .with_context(|| format!("opening {}", parent.display()))?;
+    let open = || {
+        nix::fcntl::open(
+            parent,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+    };
+    let fd = match open() {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            open().with_context(|| format!("opening {}", parent.display()))?
+        }
+        Err(errno) => return Err(errno).with_context(|| format!("opening {}", parent.display())),
+    };
     ensure_at(&fd, parent, bucket)
 }
 

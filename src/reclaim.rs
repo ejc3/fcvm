@@ -303,10 +303,21 @@ pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
 /// directory is: mode 0700, owned by this user, refused when anyone else can write it. Root
 /// and a user share a data directory but never such a directory.
 pub fn owner_dir_under(data_dir: &Path, area: &str) -> Result<PathBuf> {
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    // Each directory is looked up before it is made: a mkdir of one that exists fails with
+    // EEXIST but still takes, for writing, the lock of the directory it would be made in,
+    // which every launch would then queue on.
+    let present = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    if !present(data_dir) {
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    }
     let shared = data_dir.join(area);
-    match std::fs::DirBuilder::new().mode(0o1777).create(&shared) {
+    let made = if present(&shared) {
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+    } else {
+        std::fs::DirBuilder::new().mode(0o1777).create(&shared)
+    };
+    match made {
         // Like /tmp: every user makes a directory of its own here, and the sticky bit
         // keeps users from removing each other's. The umask cleared some of the bits.
         Ok(()) => std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))

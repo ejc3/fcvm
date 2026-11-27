@@ -382,8 +382,10 @@ fn placed_by(name: &str, args: &[String]) -> Result<Option<Placed>> {
 }
 
 fn finish_create(placed: Option<Placed>, result: &str, trace: &mut Trace) {
-    // "?" is a process that died in the call, "-1 ..." a call that failed: nothing was made.
-    if result.starts_with('?') || result.starts_with('-') {
+    // "?" is a process that died in the call. A call that failed ("-1 EEXIST", a rename that
+    // lost, an O_CREAT open of a file another start made) still took the directory's lock to
+    // find that out, so it counts like one that made its entry.
+    if result.starts_with('?') {
         return;
     }
     match placed {
@@ -1042,8 +1044,10 @@ mod parsing {
         assert_eq!(trace.unplaced_creates, 0);
     }
 
+    /// A create that failed (a mkdir of a directory that exists) took the directory's lock
+    /// as one that succeeded does, so it counts; one whose process died in it does not.
     #[test]
-    fn a_create_that_failed_or_never_ended_made_nothing_and_a_split_one_counts_once() {
+    fn a_failed_create_counts_one_that_never_ended_does_not_and_a_split_one_counts_once() {
         let trace = parse_trace(concat!(
             "5111<fcvm> mkdirat(AT_FDCWD</h>, \"/srv/store/vm-disks\", 0777) = -1 EEXIST (File exists)\n",
             "5111<fcvm> openat(AT_FDCWD</h>, \"/srv/store/x.lock\", O_RDWR|O_CREAT|O_CLOEXEC, 0666 <unfinished ...>\n",
@@ -1056,7 +1060,7 @@ mod parsing {
         .unwrap();
         assert_eq!(
             trace.creates,
-            BTreeMap::from([("/srv/store".to_string(), 1)])
+            BTreeMap::from([("/srv/store".to_string(), 2)])
         );
     }
 
