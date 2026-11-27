@@ -54,7 +54,7 @@ pub struct Plan {
     /// Used when no kernel profile overrides it.
     #[serde(default)]
     pub firecracker: Option<FirecrackerConfig>,
-    /// Cloud Hypervisor build configuration (repo + branch to build from), #632.
+    /// Cloud Hypervisor build configuration (repo + commit to build from), #632.
     /// Optional VMM backend (`--hypervisor cloud-hypervisor`); built on demand via
     /// `fcvm setup --cloud-hypervisor`, content-addressed like firecracker.
     #[serde(default)]
@@ -108,19 +108,17 @@ pub struct FirecrackerConfig {
 
 /// Cloud Hypervisor build configuration (#632).
 ///
-/// When set, `fcvm setup --cloud-hypervisor` builds Cloud Hypervisor from the
-/// specified repo/branch (content-addressed, like firecracker) and
-/// `find_cloud_hypervisor()` uses it. CH is an optional backend, so it is built on
-/// demand rather than on every `fcvm setup`. Pinned to a fork branch carrying the
-/// aarch64 SVE register save/restore fix (upstream PR #8268), which landed after the
-/// v52.0 release and is not in any tagged release yet.
+/// When set, `fcvm setup --cloud-hypervisor` builds Cloud Hypervisor from this
+/// commit of this repository and `find_cloud_hypervisor()` runs that build and
+/// no other. It is an optional backend, so it is built on demand rather than on
+/// every `fcvm setup`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct CloudHypervisorConfig {
-    /// GitHub repo (e.g., "ejc3/cloud-hypervisor")
+    /// GitHub repo (e.g., "cloud-hypervisor/cloud-hypervisor")
     pub repo: String,
-    /// Branch to build from (default: "main")
-    #[serde(default = "default_branch")]
-    pub branch: String,
+    /// Exact full commit to build, fetched by its hash. Required, so the build
+    /// is always one known commit and launch resolves it without the network.
+    pub commit: String,
 }
 
 fn default_branch() -> String {
@@ -3658,6 +3656,45 @@ branch = "agent/nv2"
         // gpu.amd64 and phone.amd64.
         "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
     ];
+
+    /// The fork commits whose arm64 snapshot load writes the complement of the saved bits to
+    /// the vGIC's clear-registers (`VgicRegEngine::clears_on_write`, ejc3/firecracker), one
+    /// for each branch an arm64 profile builds. A load that writes the saved bits themselves
+    /// leaves every interrupt enabled that the new VM starts with and the guest had
+    /// disabled: all sixteen SGIs of each vCPU (#2172).
+    const RESTORE_CLEARS_GIC_STATE_COMMITS: [&str; 2] = [
+        // [firecracker]: the default, btrfs and nested profiles. The chain on upstream main
+        // carries the fix as its own commit (9e4961dad, firecracker#6486), not as a descendant
+        // of the v1.17.0-based branches' commit.
+        "96d35ac08e49bdb3b88d26109e054fa314f5804d",
+        // gpu.arm64.
+        "51247b891bceddcdd06169f61d5a64b33f5e0ba5",
+    ];
+
+    /// A pin that moves to a commit without that fix brings #2172 back, and only a test that
+    /// reads KVM's own state as root would say so.
+    #[test]
+    fn every_arm64_firecracker_pin_restores_the_gic_enables_as_saved() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let global = &plan.firecracker.as_ref().unwrap().commit;
+        let mut checked = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            let Some(profile) = arches.get("arm64") else {
+                continue;
+            };
+            // A profile that names no fork of its own runs the [firecracker] build.
+            let commit = profile.firecracker_commit.as_ref().unwrap_or(global);
+            checked += 1;
+            assert!(
+                RESTORE_CLEARS_GIC_STATE_COMMITS.contains(&commit.as_str()),
+                "{name}.arm64 pins Firecracker {commit}, which is not known to restore the \
+                 vGIC's enable bits as saved. Add it to RESTORE_CLEARS_GIC_STATE_COMMITS once \
+                 `git merge-base --is-ancestor <a listed commit of its branch> {commit}` \
+                 succeeds in the fork, or the fix has been cherry-picked onto it"
+            );
+        }
+        assert!(checked > 3, "only {checked} arm64 profiles were checked");
+    }
 
     /// A pin that moves to a commit without the restore kick brings #2131 back with no test
     /// of fcvm's failing: the window is a few guest instructions wide.

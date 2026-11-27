@@ -331,6 +331,7 @@ async fn read_vm_state(pid: u32) -> Result<Vec<VmDisplay>> {
 fn state_files_for_vm(vm_name: &str) -> Vec<PathBuf> {
     fcvm::state::StateManager::new(fcvm::paths::state_dir())
         .state_files()
+        .expect("listing the state files")
         .into_iter()
         .filter(|p| {
             std::fs::read_to_string(p)

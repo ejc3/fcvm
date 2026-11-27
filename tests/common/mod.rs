@@ -35,7 +35,7 @@ pub fn direct_wget<'a>(args: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Standard log directory for test logs
-const TEST_LOG_DIR: &str = "/tmp/fcvm-test-logs";
+pub const TEST_LOG_DIR: &str = "/tmp/fcvm-test-logs";
 
 /// Test logger that writes detailed logs to a file while keeping console output clean.
 ///
@@ -662,7 +662,20 @@ pub async fn spawn_fcvm_with_env_and_log_path(
     args: &[&str],
     env_vars: &[(&str, &str)],
 ) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
-    spawn_fcvm_with_env_and_log_path_inner(args, env_vars, &[]).await
+    spawn_fcvm_with_env_and_log_path_inner(&[], args, env_vars, &[]).await
+}
+
+/// Same as `spawn_fcvm_with_env_and_log_path`, with fcvm started by `wrapper`: a program and
+/// its own arguments, which the fcvm binary and `args` follow.
+///
+/// The returned PID is the wrapper's. It is fcvm's only when the wrapper becomes fcvm by
+/// exec, as `strace -D` does (tests/test_start_dir_reads.rs).
+pub async fn spawn_fcvm_under_with_env_and_log_path(
+    wrapper: &[&str],
+    args: &[&str],
+    env_vars: &[(&str, &str)],
+) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
+    spawn_fcvm_with_env_and_log_path_inner(wrapper, args, env_vars, &[]).await
 }
 
 /// Same as `spawn_fcvm_with_env_and_log_path`, but with the snapshot lifecycle
@@ -678,7 +691,7 @@ pub async fn spawn_fcvm_snapshots_enabled_with_env_and_log_path(
     args: &[&str],
     env_vars: &[(&str, &str)],
 ) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
-    spawn_fcvm_with_env_and_log_path_inner(args, env_vars, &["FCVM_NO_SNAPSHOT"]).await
+    spawn_fcvm_with_env_and_log_path_inner(&[], args, env_vars, &["FCVM_NO_SNAPSHOT"]).await
 }
 
 /// Like [`spawn_fcvm_snapshots_enabled_with_env_and_log_path`], and also removes each of
@@ -690,12 +703,13 @@ pub async fn spawn_fcvm_snapshots_enabled_with_env_removed_and_log_path(
 ) -> anyhow::Result<(tokio::process::Child, u32, PathBuf)> {
     let mut remove = vec!["FCVM_NO_SNAPSHOT"];
     remove.extend_from_slice(env_remove);
-    spawn_fcvm_with_env_and_log_path_inner(args, env_vars, &remove).await
+    spawn_fcvm_with_env_and_log_path_inner(&[], args, env_vars, &remove).await
 }
 
 /// Shared implementation: spawn fcvm with `env_vars` set and `env_remove`
 /// explicitly REMOVED from the child's environment (overriding inheritance).
 async fn spawn_fcvm_with_env_and_log_path_inner(
+    wrapper: &[&str],
     args: &[&str],
     env_vars: &[(&str, &str)],
     env_remove: &[&str],
@@ -716,7 +730,14 @@ async fn spawn_fcvm_with_env_and_log_path_inner(
     let logger = TestLogger::new(name);
     let log_path = logger.path().clone();
 
-    let mut cmd = tokio::process::Command::new(&fcvm_path);
+    let mut cmd = match wrapper.split_first() {
+        Some((program, wrapper_args)) => {
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(wrapper_args).arg(&fcvm_path);
+            cmd
+        }
+        None => tokio::process::Command::new(&fcvm_path),
+    };
     cmd.args(&final_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -742,8 +763,8 @@ async fn spawn_fcvm_with_env_and_log_path_inner(
         .ok_or_else(|| anyhow::anyhow!("failed to get fcvm PID"))?;
 
     logger.info(&format!(
-        "Spawned fcvm PID={} args={:?} env={:?} env_removed={:?}",
-        pid, args, env_vars, env_remove
+        "Spawned fcvm PID={} args={:?} env={:?} env_removed={:?} under={:?}",
+        pid, args, env_vars, env_remove, wrapper
     ));
 
     spawn_log_consumer_to_file(child.stdout.take(), name, Some(logger.clone()), false);
@@ -1650,6 +1671,27 @@ async fn exec_with_timeout(pid: u32, cmd: &[&str], vm: bool) -> anyhow::Result<S
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Whether a Cloud Hypervisor test has a VMM to run on. `Ok(false)` means skip: the build
+/// the config pins has not been built on this host (`fcvm setup --cloud-hypervisor`, which
+/// `make test-root` runs first), or the config pins none and PATH has none. Anything else
+/// that keeps fcvm from resolving the binary (a config that does not parse, a build that
+/// does not answer `--version`) is an error: such a host would otherwise pass every Cloud
+/// Hypervisor test without running one.
+pub fn cloud_hypervisor_built() -> anyhow::Result<bool> {
+    match fcvm::commands::common::find_cloud_hypervisor() {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            let text = format!("{error:#}");
+            if text.contains("is not built here") || text.contains("cloud-hypervisor not found") {
+                eprintln!("SKIP: {text}");
+                Ok(false)
+            } else {
+                Err(error.context("resolving the Cloud Hypervisor build for a test"))
+            }
+        }
+    }
 }
 
 /// Execute a command in the guest VM via exec (--vm flag for VM-level, default is container)
