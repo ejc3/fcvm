@@ -47,6 +47,19 @@
 //! with rootless, bridged and routed networking, and an unprivileged user's. An unprivileged
 //! strace cannot trace a rootless start as it runs untraced, see the `start` module.
 //!
+//! The same traces hold every call that can create a directory entry (mkdir, an open with
+//! O_CREAT, a rename's target, link, symlink, mknod). Each takes the directory's inode lock
+//! for writing, and on btrfs the holder can wait out a transaction commit (a clone's disk is
+//! a subvolume snapshot, each ending in one), so a store directory that every start writes
+//! into makes the starts take turns however few entries it holds: measured on fcvm's host
+//! kernel, `vm-disks`, where every start makes its runtime directory, held 968 of 1411 ms of
+//! lock wait per clone at 512 starts in flight. So every start is traced, the measured two
+//! and the four added beside them, and a directory under the data directory that each of
+//! the six created an entry in, and that is not a VM's own (no component is a VM id), fails.
+//! A hashed bucket of 16 is in every one of six starts with odds of 16^-5. Making a bucket
+//! (an entry named by one or two hex digits, or that name staged under a dotted temporary
+//! name) happens once in a store's life and is not counted.
+//!
 //! `strace` is a requirement. Without it, or with one that lacks an option used here, every
 //! test in this file that needs it fails: a detector that cannot run has seen nothing.
 
@@ -72,12 +85,50 @@ struct Trace {
     execs: Vec<(u32, String)>,
     /// Entries read through descriptors strace printed no path for.
     unnamed_entries: u64,
+    /// Entry-creating calls that succeeded (a directory made, a file opened with O_CREAT, a
+    /// rename's target, a link, a symlink, a node), by the directory the entry is in.
+    creates: BTreeMap<String, u64>,
+    /// Such calls whose directory strace's log does not name (a relative path of a call
+    /// that takes no directory descriptor).
+    unplaced_creates: u64,
 }
 
 /// A call strace logged the beginning of, by the process that is still in it.
 enum Pending {
     Listing(Option<String>),
     Exec(String),
+    /// A call that may create a directory entry: where it lands, if it creates one.
+    Create(Option<Placed>),
+}
+
+/// The directory an entry-creating call puts its entry in, or that the log does not say, or
+/// that the entry is a bucket of a hashed layout ([`makes_a_bucket`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Placed {
+    In(String),
+    Bucket,
+    Unplaced,
+}
+
+/// Whether an entry named `name` is a bucket of a hashed layout: one or two lowercase hex
+/// digits (`vm-disks/<b>`, `state/vms/<b>`), or such a name staged under a temporary dotted
+/// name before it is renamed into place (`.7f.<uuid>`, `.index-staging.4.<uuid>`). A store
+/// makes each bucket once in its life, not once a start, so making one is not counted.
+fn makes_a_bucket(name: &str) -> bool {
+    let hex = |part: &str, len: std::ops::RangeInclusive<usize>| {
+        len.contains(&part.len())
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')
+    };
+    if hex(name, 1..=2) {
+        return true;
+    }
+    let Some(staged) = name.strip_prefix('.') else {
+        return false;
+    };
+    let parts: Vec<&str> = staged.split('.').collect();
+    parts.len() >= 2 && hex(parts[parts.len() - 1], 32..=36) && hex(parts[parts.len() - 2], 1..=2)
 }
 
 /// What the parser knows of the processes in the log so far.
@@ -203,6 +254,143 @@ fn result_of(rest: &str) -> Result<Option<&str>> {
     }
     let (_, result) = rest.rsplit_once(" = ").context("a call with no result")?;
     Ok(Some(result.trim()))
+}
+
+/// A call's arguments as strace printed them, split at the commas between them (not those
+/// in a quoted string or in a descriptor's `<path>`), up to the closing parenthesis or the
+/// end of an unfinished call; and what follows them.
+fn call_args(text: &str) -> (Vec<String>, &str) {
+    let bytes = text.as_bytes();
+    let (mut args, mut start, mut at) = (Vec::new(), 0, 0);
+    let (mut quoted, mut angle) = (false, false);
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if quoted {
+            if byte == b'\\' {
+                at += 2;
+                continue;
+            }
+            quoted = byte != b'"';
+        } else if angle {
+            angle = byte != b'>';
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte == b'<' {
+            if text[at..].starts_with(UNFINISHED) {
+                break;
+            }
+            angle = true;
+        } else if byte == b',' {
+            args.push(text[start..at].trim().to_string());
+            start = at + 1;
+        } else if byte == b')' {
+            break;
+        }
+        at += 1;
+    }
+    let last = text[start..at.min(text.len())].trim();
+    if !last.is_empty() {
+        args.push(last.to_string());
+    }
+    (args, &text[at.min(text.len())..])
+}
+
+/// The string a quoted argument holds.
+fn string_arg(arg: &str) -> Option<String> {
+    let inner = arg.strip_prefix('"')?.strip_suffix('"')?;
+    Some(unescape(inner))
+}
+
+/// The path `-y` printed for a directory descriptor argument (`AT_FDCWD</cwd>`, `5</dir>`).
+fn dir_arg(arg: &str) -> Option<String> {
+    let (_, named) = arg.split_once('<')?;
+    let path = named.strip_suffix('>')?;
+    Some(unescape(path))
+}
+
+/// The directory the entry `path`, relative to the directory descriptor `dir` when it is not
+/// absolute, is created in.
+fn place(dir: Option<&str>, path: &str) -> Placed {
+    let full = if path.starts_with('/') {
+        PathBuf::from(path)
+    } else {
+        match dir.and_then(dir_arg) {
+            Some(dir) => Path::new(&dir).join(path),
+            None => return Placed::Unplaced,
+        }
+    };
+    // `a/b/` names the entry `b`: its directory is `a`, like `a/b`'s.
+    let full: PathBuf = full.components().collect();
+    if full
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(makes_a_bucket)
+    {
+        return Placed::Bucket;
+    }
+    match full.parent() {
+        Some(parent) => Placed::In(parent.display().to_string()),
+        None => Placed::Unplaced,
+    }
+}
+
+/// The calls that can create a directory entry, by name, with where each puts it: the index
+/// of its directory descriptor argument (if it takes one) and of the entry's path.
+const CREATING: [(&str, Option<usize>, usize); 15] = [
+    ("openat", Some(0), 1),
+    ("open", None, 0),
+    ("creat", None, 0),
+    ("mkdirat", Some(0), 1),
+    ("mkdir", None, 0),
+    ("renameat2", Some(2), 3),
+    ("renameat", Some(2), 3),
+    ("rename", None, 1),
+    ("linkat", Some(2), 3),
+    ("link", None, 1),
+    ("symlinkat", Some(1), 2),
+    ("symlink", None, 1),
+    ("mknodat", Some(0), 1),
+    ("mknod", None, 0),
+    ("openat2", Some(0), 1),
+];
+
+/// Where the call `name` with arguments `args` creates an entry, or `None` for a call that
+/// creates none (an open without O_CREAT).
+fn placed_by(name: &str, args: &[String]) -> Result<Option<Placed>> {
+    let &(_, dir, path) = CREATING
+        .iter()
+        .find(|(call, _, _)| *call == name)
+        .context("not an entry-creating call")?;
+    let flags = match name {
+        "openat" | "openat2" => args.get(2),
+        "open" => args.get(1),
+        _ => None,
+    };
+    if matches!(name, "openat" | "openat2" | "open")
+        && !flags.is_some_and(|flags| flags.contains("O_CREAT"))
+    {
+        return Ok(None);
+    }
+    let path = args
+        .get(path)
+        .and_then(|arg| string_arg(arg))
+        .with_context(|| format!("{name} printed no path: {args:?}"))?;
+    Ok(Some(place(
+        dir.and_then(|dir| args.get(dir)).map(String::as_str),
+        &path,
+    )))
+}
+
+fn finish_create(placed: Option<Placed>, result: &str, trace: &mut Trace) {
+    // "?" is a process that died in the call, "-1 ..." a call that failed: nothing was made.
+    if result.starts_with('?') || result.starts_with('-') {
+        return;
+    }
+    match placed {
+        Some(Placed::In(dir)) => *trace.creates.entry(dir).or_default() += 1,
+        Some(Placed::Unplaced) => trace.unplaced_creates += 1,
+        Some(Placed::Bucket) | None => {}
+    }
 }
 
 fn finish_listing(
@@ -335,6 +523,30 @@ fn parse_line(line: &str, trace: &mut Trace, processes: &mut Processes) -> Resul
             processes.became(pid, program, trace);
         }
         return Ok(());
+    }
+    for (call, _, _) in CREATING {
+        if let Some(args) = rest
+            .strip_prefix(call)
+            .and_then(|rest| rest.strip_prefix('('))
+        {
+            let (args, after) = call_args(args);
+            let placed = placed_by(call, &args)?;
+            match result_of(after)? {
+                Some(result) => finish_create(placed, result, trace),
+                None => {
+                    processes.pending.insert(pid, Pending::Create(placed));
+                }
+            }
+            return Ok(());
+        }
+        if let Some(rest) = rest.strip_prefix(&format!("<... {call} resumed>")) {
+            let Some(Pending::Create(placed)) = processes.pending.remove(&pid) else {
+                bail!("the end of a {call} whose beginning is not in the log");
+            };
+            let result = result_of(rest)?.context("a resumed call that is unfinished again")?;
+            finish_create(placed, result, trace);
+            return Ok(());
+        }
     }
     bail!("not a line of the calls this test asks strace for")
 }
@@ -506,6 +718,115 @@ fn judge(few: &Reads, many: &Reads, added: u64, allowances: &[Allowance]) -> Vec
     findings
 }
 
+/// The entry-creating calls of one start, per directory name ([`create_key`]).
+type Creates = BTreeMap<String, u64>;
+
+/// The name a directory a start created an entry in is compared under: [`dir_key`]'s, with
+/// every component that is a VM's id (`vm-` and 32 hex digits) as `<vm>`, so a directory of
+/// the start's own VM is named the same in every start and is known to be its own.
+fn create_key(dir: &str, roots: &[Root]) -> String {
+    dir_key(dir, roots)
+        .split('/')
+        .map(|part| {
+            let id = part.strip_prefix("vm-");
+            if id.is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())) {
+                "<vm>"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn creates_of(trace: &Trace, roots: &[Root]) -> Creates {
+    let mut creates = Creates::new();
+    for (dir, calls) in &trace.creates {
+        *creates.entry(create_key(dir, roots)).or_default() += calls;
+    }
+    creates
+}
+
+/// A store directory every traced start creates an entry in, with the calls of each start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedCreate {
+    dir: String,
+    per_start: Vec<u64>,
+}
+
+/// A store directory every start is still known to create an entry in, with its issue.
+/// Checked both ways, like [`Allowance`]: an entry whose directory some start no longer
+/// writes into fails until it is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CreateAllowance {
+    dir: &'static str,
+    issue: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreateFinding {
+    Shared(SharedCreate),
+    StaleAllowance { dir: &'static str, issue: u32 },
+}
+
+/// The directories under the data directory that every one of `starts` created an entry in
+/// and that are no start's own (no `<vm>` component). Each such call takes the directory's
+/// inode lock for writing, and on btrfs the holder can wait out a transaction commit, so a
+/// directory that every start writes into makes the starts take turns. A hashed bucket of
+/// 16 is one start's in 16, so with six starts it is every start's with odds of 16^-5.
+fn judge_creates(starts: &[Creates], allowances: &[CreateAllowance]) -> Vec<CreateFinding> {
+    let every = |dir: &str| {
+        starts
+            .iter()
+            .all(|start| start.get(dir).is_some_and(|n| *n > 0))
+    };
+    let mut findings = Vec::new();
+    for allowance in allowances {
+        if !every(allowance.dir) {
+            findings.push(CreateFinding::StaleAllowance {
+                dir: allowance.dir,
+                issue: allowance.issue,
+            });
+        }
+    }
+    let Some(first) = starts.first() else {
+        return findings;
+    };
+    for dir in first.keys() {
+        let ours = dir == "<data>" || dir.starts_with("<data>/");
+        let a_vms_own = dir.split('/').any(|part| part == "<vm>");
+        if !ours || a_vms_own || !every(dir) {
+            continue;
+        }
+        if allowances.iter().any(|allowance| allowance.dir == dir) {
+            continue;
+        }
+        findings.push(CreateFinding::Shared(SharedCreate {
+            dir: dir.clone(),
+            per_start: starts.iter().map(|start| start[dir]).collect(),
+        }));
+    }
+    findings
+}
+
+/// Every directory any start created an entry in, with each start's calls.
+fn create_table(starts: &[Creates]) -> String {
+    let dirs: BTreeSet<&String> = starts.iter().flat_map(|start| start.keys()).collect();
+    let mut text = String::from("  calls per start  directory\n");
+    for dir in dirs {
+        let calls: Vec<String> = starts
+            .iter()
+            .map(|start| {
+                start
+                    .get(dir)
+                    .map_or_else(|| "-".to_string(), u64::to_string)
+            })
+            .collect();
+        text.push_str(&format!("  {:>15}  {dir}\n", calls.join(" ")));
+    }
+    text
+}
+
 /// Every directory either start listed, with the entries each read and who read them.
 fn table(few: &Reads, many: &Reads) -> String {
     let dirs: BTreeSet<&String> = few.keys().chain(many.keys()).collect();
@@ -532,9 +853,12 @@ fn table(few: &Reads, many: &Reads) -> String {
     text
 }
 
-/// The calls strace logs: every program a process becomes, and every directory read. The
-/// `?` keeps strace from refusing `getdents` where the architecture has only `getdents64`.
-const TRACED: &str = "trace=execve,?getdents,getdents64";
+/// The calls strace logs: every program a process becomes, every directory read, and every
+/// call that can create a directory entry ([`CREATING`]). A `?` keeps strace from refusing a
+/// call the architecture does not have (arm64 has only the `*at` forms and `renameat2`).
+const TRACED: &str =
+    "trace=execve,?getdents,getdents64,openat,?openat2,?open,?creat,mkdirat,?mkdir,\
+     renameat2,?renameat,?rename,linkat,?link,symlinkat,?symlink,mknodat,?mknod";
 
 /// strace's arguments before the command it runs. `-D` makes strace the grandchild and
 /// the command the child, so the caller's child is the command itself, with its pid. `-f`
@@ -632,6 +956,91 @@ mod parsing {
             ])
         );
         assert_eq!(trace.unnamed_entries, 0);
+    }
+
+    #[test]
+    fn an_entry_creating_call_is_counted_in_the_directory_it_creates_in() {
+        let trace = parse_trace(concat!(
+            "5101<fcvm> mkdirat(AT_FDCWD</home/u>, \"/srv/store/vm-disks/vm-1\", 0777) = 0\n",
+            "5101<fcvm> openat(AT_FDCWD</home/u>, \"/srv/store/state/vms/a/vm-1.json.tmp\", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 9</srv/store/state/vms/a/vm-1.json.tmp>\n",
+            "5101<fcvm> openat(AT_FDCWD</home/u>, \"/srv/store/state/vms/a/vm-2.json\", O_RDONLY|O_CLOEXEC) = 9</srv/store/state/vms/a/vm-2.json>\n",
+            "5101<fcvm> renameat2(AT_FDCWD</home/u>, \"/srv/store/state/vms/a/vm-1.json.tmp\", AT_FDCWD</home/u>, \"/srv/store/state/vms/a/vm-1.json\", 0) = 0\n",
+            "5101<fcvm> openat(7</srv/store/snap>, \"slot-0.lock\", O_RDWR|O_CREAT|O_CLOEXEC, 0644) = 8</srv/store/snap/slot-0.lock>\n",
+            "5101<fcvm> mkdirat(AT_FDCWD</srv/store>, \"vm-disks/vm-1/disks/\", 0777) = 0\n",
+            "5101<fcvm> symlinkat(\"/a\", AT_FDCWD</home/u>, \"/srv/store/links/l\") = 0\n",
+            "5101<fcvm> linkat(AT_FDCWD</home/u>, \"/srv/a\", AT_FDCWD</home/u>, \"/srv/store/links/h\", 0) = 0\n",
+            "5101<fcvm> mknodat(AT_FDCWD</home/u>, \"/srv/store/links/n\", S_IFIFO|0600) = 0\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            trace.creates,
+            BTreeMap::from([
+                ("/srv/store/links".to_string(), 3),
+                ("/srv/store/snap".to_string(), 1),
+                ("/srv/store/state/vms/a".to_string(), 2),
+                ("/srv/store/vm-disks".to_string(), 1),
+                ("/srv/store/vm-disks/vm-1".to_string(), 1),
+            ])
+        );
+        assert_eq!(trace.unplaced_creates, 0);
+    }
+
+    #[test]
+    fn a_create_that_failed_or_never_ended_made_nothing_and_a_split_one_counts_once() {
+        let trace = parse_trace(concat!(
+            "5111<fcvm> mkdirat(AT_FDCWD</h>, \"/srv/store/vm-disks\", 0777) = -1 EEXIST (File exists)\n",
+            "5111<fcvm> openat(AT_FDCWD</h>, \"/srv/store/x.lock\", O_RDWR|O_CREAT|O_CLOEXEC, 0666 <unfinished ...>\n",
+            "5112<fcvm> openat(AT_FDCWD</h>, \"/srv/store/y\", O_RDONLY <unfinished ...>\n",
+            "5111<fcvm> <... openat resumed>) = 5</srv/store/x.lock>\n",
+            "5112<fcvm> <... openat resumed>) = -1 ENOENT (No such file or directory)\n",
+            "5113<fcvm> mkdirat(AT_FDCWD</h>, \"/srv/store/z\", 0777 <unfinished ...>\n",
+            "5113<fcvm> +++ killed by SIGKILL +++\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            trace.creates,
+            BTreeMap::from([("/srv/store".to_string(), 1)])
+        );
+    }
+
+    #[test]
+    fn making_a_bucket_is_not_counted_as_a_create() {
+        let trace = parse_trace(concat!(
+            "5131<fcvm> mkdirat(AT_FDCWD</h>, \"/srv/store/vm-disks/.7f.0123456789abcdef0123456789abcdef\", 0777) = 0\n",
+            "5131<fcvm> renameat2(AT_FDCWD</h>, \"/srv/store/vm-disks/.7f.0123456789abcdef0123456789abcdef\", AT_FDCWD</h>, \"/srv/store/vm-disks/7f\", RENAME_NOREPLACE) = 0\n",
+            "5131<fcvm> mkdirat(AT_FDCWD</h>, \"/srv/store/state/names/.index-staging.4.41d49fbb-6143-4a3d-8cc3-6a8568fb768b\", 0777) = 0\n",
+            "5131<fcvm> mkdirat(AT_FDCWD</h>, \"/srv/store/vm-disks/7f/vm-1\", 0777) = 0\n",
+            "5131<fcvm> openat(AT_FDCWD</h>, \"/srv/store/snapshots/s.lock\", O_WRONLY|O_CREAT|O_CLOEXEC, 0666) = 9</srv/store/snapshots/s.lock>\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            trace.creates,
+            BTreeMap::from([
+                ("/srv/store/snapshots".to_string(), 1),
+                ("/srv/store/vm-disks/7f".to_string(), 1),
+            ])
+        );
+        for name in ["a", "7f", ".7f.0123456789abcdef0123456789abcdef"] {
+            assert!(makes_a_bucket(name), "{name}");
+        }
+        for name in ["vm-1", "abc", "s.lock", ".lock", "7F", ".x.y"] {
+            assert!(!makes_a_bucket(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_relative_create_with_no_directory_descriptor_is_counted_as_unplaced() {
+        let trace = parse_trace(concat!(
+            "5121<sh> openat(AT_FDCWD</srv/store>, \"made\", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3</srv/store/made>\n",
+            "5121<sh> mkdir(\"rel\", 0777) = 0\n",
+            "5121<sh> mkdir(\"/srv/abs\", 0777) = 0\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            trace.creates,
+            BTreeMap::from([("/srv".to_string(), 1), ("/srv/store".to_string(), 1)])
+        );
+        assert_eq!(trace.unplaced_creates, 1);
     }
 
     #[test]
@@ -765,7 +1174,9 @@ mod parsing {
     #[test]
     fn a_line_the_parser_does_not_know_is_an_error_not_a_skipped_listing() {
         for log in [
-            "4171<ls> openat(AT_FDCWD</srv>, \"d\", O_RDONLY) = 3</srv/d>\n",
+            // A call this test does not ask strace for (openat is one it does since the
+            // entry-creating calls are traced).
+            "4171<ls> fstat(3</srv/d>, {st_mode=S_IFDIR|0755, st_size=4096, ...}) = 0\n",
             "strace: Process 4171 attached\n",
             "4171<ls> getdents64(3</srv/store/d>, 0xb505bdacd2e0, 32768) = 208\n",
             "4171<ls> getdents64(3</srv/store/d>, 0xb505bdacd2e0 /* d_reclen == 0, problem here */, 32768) = 208\n",
@@ -810,6 +1221,73 @@ mod judging {
                 path: PathBuf::from("/sys/fs/cgroup/fcvm-dl-1.slice"),
             },
         ]
+    }
+
+    fn creates(dirs: &[(&str, u64)]) -> Creates {
+        dirs.iter().map(|(dir, n)| (dir.to_string(), *n)).collect()
+    }
+
+    #[test]
+    fn a_vms_own_directory_is_named_alike_in_every_start() {
+        let roots = roots();
+        for (dir, key) in [
+            (
+                "/mnt/store/dl-1/vm-disks/vm-0123456789abcdef0123456789abcdef/disks",
+                "<data>/vm-disks/<vm>/disks",
+            ),
+            ("/mnt/store/dl-1/vm-disks", "<data>/vm-disks"),
+            ("/mnt/store/dl-1/vm-disks/vm-12", "<data>/vm-disks/vm-12"),
+        ] {
+            assert_eq!(create_key(dir, &roots), key, "{dir}");
+        }
+    }
+
+    #[test]
+    fn a_store_directory_every_start_writes_into_is_found_and_no_other() {
+        let starts = vec![
+            creates(&[
+                ("<data>/vm-disks", 1),
+                ("<data>/vm-disks/<vm>", 2),
+                ("<data>/state/vms/a", 2),
+                ("<scopes>", 1),
+                ("/run/user/1000", 1),
+            ]),
+            creates(&[
+                ("<data>/vm-disks", 1),
+                ("<data>/vm-disks/<vm>", 2),
+                ("<data>/state/vms/3", 2),
+                ("<scopes>", 1),
+                ("/run/user/1000", 1),
+            ]),
+        ];
+        assert_eq!(
+            judge_creates(&starts, &[]),
+            [CreateFinding::Shared(SharedCreate {
+                dir: "<data>/vm-disks".to_string(),
+                per_start: vec![1, 1],
+            })]
+        );
+    }
+
+    #[test]
+    fn an_allowed_shared_directory_is_not_reported_until_a_start_stops_writing_there() {
+        let allowance = CreateAllowance {
+            dir: "<data>/snapshots/s",
+            issue: 1,
+        };
+        let shared = vec![
+            creates(&[("<data>/snapshots/s", 1)]),
+            creates(&[("<data>/snapshots/s", 2)]),
+        ];
+        assert_eq!(judge_creates(&shared, &[allowance]), []);
+        let not_every = vec![creates(&[("<data>/snapshots/s", 1)]), creates(&[])];
+        assert_eq!(
+            judge_creates(&not_every, &[allowance]),
+            [CreateFinding::StaleAllowance {
+                dir: "<data>/snapshots/s",
+                issue: 1
+            }]
+        );
     }
 
     #[test]
@@ -1073,6 +1551,49 @@ mod detector {
             "ls and cat ran in the shell's own process, so nothing shows that children are \
              followed: {:?}",
             trace.execs
+        );
+        Ok(())
+    }
+
+    /// The tracer reports the creates of real programs (a directory made, a file opened with
+    /// O_CREAT, a rename) in the directories they land in, and nothing for an open of an
+    /// existing file for reading. A tracer that saw no create would pass the start's rule.
+    #[test]
+    fn the_tracer_reports_each_create_in_its_directory() -> Result<()> {
+        require_tracer()?;
+        let root = tempfile::tempdir()?;
+        let quiet = dir_with(root.path(), "quiet", 1)?;
+        let script = format!(
+            "mkdir {r}/made; : > {r}/made/file; mv {r}/made/file {r}/made/moved; cat {quiet}/vm-0.json >/dev/null",
+            r = root.path().display(),
+            quiet = quiet.display()
+        );
+        let trace = trace_of(&["sh", "-c", &script])?;
+        let under_root: BTreeMap<&String, &u64> = trace
+            .creates
+            .iter()
+            .filter(|(dir, _)| Path::new(dir).starts_with(root.path()))
+            .collect();
+        let (made, top) = (
+            root.path().join("made").display().to_string(),
+            root.path().display().to_string(),
+        );
+        ensure!(
+            under_root == BTreeMap::from([(&top, &1), (&made, &2)]),
+            "expected one create in {top} (the mkdir) and two in {made} (the file and the \
+             rename), got {under_root:?}"
+        );
+        ensure!(trace.unplaced_creates == 0, "{trace:?}");
+        // Named under the test's root as a start's creates are.
+        let roots = [Root {
+            name: "<data>",
+            path: root.path().to_path_buf(),
+        }];
+        let named = creates_of(&trace, &roots);
+        ensure!(
+            named.get("<data>") == Some(&1) && named.get("<data>/made") == Some(&2),
+            "expected <data> 1 and <data>/made 2, got:\n{}",
+            create_table(std::slice::from_ref(&named))
         );
         Ok(())
     }
@@ -1343,9 +1864,10 @@ mod start {
     }
 
     /// Start one clone under strace and return the directories it listed from its exec
-    /// until it was healthy, with the entries read from each. The clones already running
-    /// stay up, and so does this one: strace stays attached to it until it exits.
-    /// `untraced_map` is the id map an untraced start of the same user logged.
+    /// until it was healthy, with the entries read from each, and the directories it created
+    /// entries in. The clones already running stay up, and so does this one: strace stays
+    /// attached to it until it exits. `untraced_map` is the id map an untraced start of the
+    /// same user logged.
     async fn listings_of_one_start(
         runner: &Runner,
         snapshot: &str,
@@ -1354,7 +1876,7 @@ mod start {
         roots: &[Root],
         untraced_map: Option<&'static str>,
         running: &mut Running,
-    ) -> Result<Reads> {
+    ) -> Result<(Reads, Creates)> {
         std::fs::create_dir_all(common::TEST_LOG_DIR)?;
         let log = Path::new(common::TEST_LOG_DIR).join(format!("{name}.strace"));
         let wrapper = runner.traced(&log);
@@ -1391,6 +1913,13 @@ mod start {
             log.display(),
             trace.unnamed_entries
         );
+        ensure!(
+            trace.unplaced_creates == 0,
+            "{} holds {} entry-creating calls whose directory the log does not name, so the \
+             directories a start writes into are not all known",
+            log.display(),
+            trace.unplaced_creates
+        );
         // Being traced must not change how the start sets its namespace up.
         let traced_map = id_map_of(&fcvm_log)?;
         ensure!(
@@ -1403,7 +1932,13 @@ mod start {
             "start {name} (pid {pid}): id map {traced_map:?}, strace log {}",
             log.display()
         );
-        Ok(reads_of(&trace, roots))
+        Ok((reads_of(&trace, roots), creates_of(&trace, roots)))
+    }
+
+    /// The store directories every start is still known to create an entry in. Each entry
+    /// names its issue and comes out with the fix ([`judge_creates`]).
+    fn create_allowances() -> Vec<CreateAllowance> {
+        Vec::new()
     }
 
     /// Remove the scopes' parent the starts made, with whatever empty scopes are left in it.
@@ -1440,9 +1975,9 @@ mod start {
             "this test traces its starts as root (see the module doc); run it with make \
              test-root"
         );
-        // Short: a VM's sockets sit under <data>/vm-disks/vm-<32 hex>/, and AF_UNIX paths
-        // stop at 108 bytes. strace prints the kernel's path of a descriptor, so the data
-        // directory is named without symbolic links.
+        // Short (`common::short_data_dir`): a VM's sockets sit under the data directory.
+        // strace prints the kernel's path of a descriptor, so the data directory is named
+        // without symbolic links.
         let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
         // A user's data directory is beside the store's own, where the user can reach it:
         // the root tests' data directory is root's.
@@ -1451,10 +1986,12 @@ mod start {
             None => fcvm::paths::data_dir(),
         };
         std::fs::create_dir_all(&store).with_context(|| format!("creating {}", store.display()))?;
-        let data_dir = store
-            .canonicalize()
-            .context("resolving the data directory")?
-            .join(format!("dl-{id}"));
+        let data_dir = common::short_data_dir(
+            &store
+                .canonicalize()
+                .context("resolving the data directory")?,
+            "dl",
+        );
         let data_dir_str = data_dir.to_str().context("data dir path")?.to_string();
         if let Some(user) = &runner.user {
             std::fs::create_dir(&data_dir)
@@ -1554,7 +2091,7 @@ mod start {
                 untraced_map = id_map_of(&log)?;
             }
             let scopes_entered = scopes_dir.is_dir();
-            let beside_few = listings_of_one_start(
+            let (beside_few, first_creates) = listings_of_one_start(
                 &runner,
                 &snapshot,
                 &format!("{clone}-m1"),
@@ -1564,18 +2101,23 @@ mod start {
                 &mut running,
             )
             .await?;
-            // The first measured clone is one of the clones added; these are the others.
+            // The first measured clone is one of the clones added; these are the others. They
+            // are traced too: every traced start's creates are compared ([`judge_creates`]).
+            let mut creates = vec![first_creates];
             for index in 1..ADDED {
-                clone_until_healthy(
-                    &untraced,
+                let (_, made) = listings_of_one_start(
+                    &runner,
                     &snapshot,
                     &format!("{clone}-b{index}"),
                     &env,
+                    &roots,
+                    untraced_map,
                     &mut running,
                 )
                 .await?;
+                creates.push(made);
             }
-            let beside_many = listings_of_one_start(
+            let (beside_many, last_creates) = listings_of_one_start(
                 &runner,
                 &snapshot,
                 &format!("{clone}-m2"),
@@ -1586,6 +2128,7 @@ mod start {
             )
             .await?;
 
+            creates.push(last_creates);
             let listed = table(&beside_few, &beside_many);
             println!(
                 "entries a {network} start by {who} read from each directory, beside \
@@ -1624,7 +2167,25 @@ mod start {
                     ),
                 });
             }
-            ensure!(found.is_empty(), "{report}{listed}");
+            let made = create_table(&creates);
+            println!(
+                "entry-creating calls of each of the {} traced {network} starts by {who}, by \
+                 directory:\n{made}",
+                creates.len()
+            );
+            for finding in judge_creates(&creates, &create_allowances()) {
+                report.push_str(&match finding {
+                    CreateFinding::Shared(SharedCreate { dir, per_start }) => format!(
+                        "every start created an entry in {dir} ({per_start:?} calls): a directory \
+                         every start writes into makes the starts take turns on its inode lock\n"
+                    ),
+                    CreateFinding::StaleAllowance { dir, issue } => format!(
+                        "{dir} is allowed as a directory every start writes into (#{issue}) and \
+                         not every start did: remove its entry from `create_allowances`\n"
+                    ),
+                });
+            }
+            ensure!(report.is_empty(), "{report}{listed}\n{made}");
             Ok(())
         }
         .await;

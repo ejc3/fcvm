@@ -257,7 +257,7 @@ class StateFromFcvm(unittest.TestCase):
                 os.path.join(tmp, "fcvm"), store, data_root)
             state = state_fixture.write_vm_state(store, self.VM, {"vm_id": self.VM, "pid": 1})
             open(state + ".tmp", "w").close()
-            disk = os.path.join(data_root, "vm-disks", self.VM)
+            disk = reqbench.vm_runtime_dir(data_root, self.VM)
             os.makedirs(disk)
             self.assertEqual([str(p) for p in harness.state_files(self.VM)],
                              [state, state + ".lock", state + ".tmp"])
@@ -292,7 +292,7 @@ class StateFromFcvm(unittest.TestCase):
                 os.path.join(tmp, "fcvm"), store, data_root)
             state = state_fixture.write_vm_state(store, self.VM, {"vm_id": self.VM, "pid": 1})
             open(state + ".tmp", "w").close()
-            disk = os.path.join(data_root, "vm-disks", self.VM)
+            disk = reqbench.vm_runtime_dir(data_root, self.VM)
             os.makedirs(disk)
 
             log = Path(tmp) / "victim.log"

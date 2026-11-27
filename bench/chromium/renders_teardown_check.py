@@ -72,6 +72,18 @@ def files_under(root):
     return found
 
 
+def vm_dirs(root):
+    """Every VM's runtime directory name under `root` (`vm-disks`), which holds them one level
+    down, in buckets named by two hex digits."""
+    found = set()
+    for bucket in os.listdir(root):
+        try:
+            found.update(os.listdir(os.path.join(root, bucket)))
+        except OSError:
+            continue
+    return found
+
+
 def listening():
     rows = out(["ss", "-H", "-ltn"]).splitlines() + out(["ss", "-H", "-lun"]).splitlines()
     return {row.split()[3] for row in rows if len(row.split()) > 3}
@@ -90,7 +102,7 @@ def census(opts):
         "processes": processes(),
         "namespaces": set(out(["lsns", "-t", "net", "-n", "-o", "NS"]).split()),
         "states": files_under(opts.state_dir) if opts.state_dir else set(),
-        "vms": set(os.listdir(opts.vm_dir)) if opts.vm_dir and os.path.isdir(opts.vm_dir) else set(),
+        "vms": vm_dirs(opts.vm_dir) if opts.vm_dir and os.path.isdir(opts.vm_dir) else set(),
         "pages": hugepages_free(),
     }
 

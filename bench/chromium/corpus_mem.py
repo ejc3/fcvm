@@ -684,7 +684,7 @@ def clone_forensics(args, clone, reason):
     this clone's pasta or an earlier clone's. fcvm's readiness probe counts a
     reset from the guest as an answer, so it does not show the port open. This
     records the host listeners on the port with their owners (`ss -ltnp`), the
-    clone's own pasta pid (vm-disks/<vm_id>/pasta.pid) and whether it owns the
+    clone's own pasta pid (vm-disks/<bucket>/<vm_id>/pasta.pid) and whether it owns the
     endpoint's listener, and, from inside the guest (`fcvm exec --vm`), whether
     DevTools answers on 127.0.0.1 there, which ports the guest listens on and
     by whom, the restore ingress gate's rules and counters, and whether a
@@ -722,7 +722,9 @@ def clone_forensics(args, clone, reason):
         owners = None
     pasta_pid = None
     if clone.get("vm_id"):
-        path = os.path.join(args.data_root, "vm-disks", clone["vm_id"], "pasta.pid")
+        # vm-disks/<bucket>/<vm_id>, bucket = first byte of sha256(vm_id) as two hex digits.
+        bucket = hashlib.sha256(clone["vm_id"].encode()).hexdigest()[:2]
+        path = os.path.join(args.data_root, "vm-disks", bucket, clone["vm_id"], "pasta.pid")
         try:
             with open(path) as f:
                 pasta_pid = int(f.read().strip())

@@ -264,6 +264,12 @@ pub struct VmConfig {
     /// `source_vsock_socket_path`, since the source may use `--vsock-dir`.
     #[serde(default)]
     pub original_vsock_vm_id: Option<String>,
+    /// This VM's runtime directory (`paths::vm_runtime_dir` when it started: its API socket,
+    /// log, disks), recorded so a later fcvm finds it where the build that started the VM put
+    /// it, whatever layout that build used (`VmState::vm_runtime_dir`). None in a state written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_runtime_dir: Option<std::path::PathBuf>,
     /// Actual host-side base socket used for this running VM's vsock device.
     ///
     /// This may live outside the per-VM runtime directory when `--vsock-dir`
@@ -455,6 +461,16 @@ impl VmConfig {
 }
 
 impl VmState {
+    /// This VM's runtime directory: the one its state recorded when it started. Every fcvm
+    /// that puts a VM's directory in a bucket of `vm-disks` records it, so a state without
+    /// the record was written by a build that put it directly in `vm-disks`.
+    pub fn vm_runtime_dir(&self) -> std::path::PathBuf {
+        match &self.config.vm_runtime_dir {
+            Some(dir) => dir.clone(),
+            None => crate::paths::vm_disks_dir().join(&self.vm_id),
+        }
+    }
+
     pub fn new(vm_id: String, image: String, vcpu: u8, memory_mib: u32) -> Self {
         let now = jiff::Timestamp::now();
         Self {
@@ -477,6 +493,7 @@ impl VmState {
             created_at: now,
             last_updated: now,
             config: VmConfig {
+                vm_runtime_dir: None,
                 image,
                 vcpu,
                 memory_mib,
@@ -534,6 +551,42 @@ impl VmState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every start records its VM's runtime directory before it writes the VM's first state
+    /// (`claim_name`): a reader of a running VM's directory (exec, health, the memory server
+    /// writing why it refused a clone) takes it from the state, and one written without it is
+    /// read as the layout before the buckets, a directory the VM does not have.
+    #[test]
+    fn every_start_records_its_runtime_directory_before_the_first_state() {
+        let sources = [
+            ("podman/mod.rs", include_str!("../commands/podman/mod.rs")),
+            ("snapshot.rs", include_str!("../commands/snapshot.rs")),
+            ("vm.rs", include_str!("../commands/vm.rs")),
+        ];
+        let mut claims = 0;
+        for (file, source) in sources {
+            for (at, _) in source.match_indices(".claim_name(&mut vm_state)") {
+                if source[..at].ends_with('"') {
+                    continue;
+                }
+                let function = ["\nfn ", "\npub fn ", "\nasync fn ", "\npub async fn "]
+                    .iter()
+                    .filter_map(|start| source[..at].rfind(start))
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    source[function..at].contains("config.vm_runtime_dir = Some("),
+                    "{file}: the state is first written at byte {at} before its runtime \
+                     directory is recorded"
+                );
+                claims += 1;
+            }
+        }
+        assert_eq!(
+            claims, 4,
+            "podman run, snapshot run, the raw restore and vm run"
+        );
+    }
 
     #[test]
     fn test_vm_state_new() {

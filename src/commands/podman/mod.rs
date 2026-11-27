@@ -1995,6 +1995,10 @@ async fn prepare_vm_for_lifecycle(
     // file identity. Without the snapshot cache nothing is keyed or staged.
     let mut disk_dir_staging = None;
     if !no_snapshot && (!args.disk.is_empty() || !args.disk_dir.is_empty()) {
+        // The runtime directory first, through the helper that makes its bucket with
+        // vm-disks' owner and mode: the staging below would otherwise make the bucket
+        // itself, with this process's owner and umask (root's, in a user's store).
+        paths::create_vm_runtime_dir(&vm_id).await?;
         let root = paths::vm_runtime_dir(&vm_id).join("disk-dir-staging");
         let (disk, disk_dir) = (args.disk.clone(), args.disk_dir.clone());
         let (staging, resolved) = tokio::task::spawn_blocking(move || {
@@ -2278,8 +2282,7 @@ async fn prepare_vm_for_lifecycle(
     // the cause (observed as "VolumeServer failed to signal ready: channel
     // closed"), so refuse it here where the path can still be named.
     paths::check_socket_path_budget(&vm_id)?;
-    let data_dir = paths::vm_runtime_dir(&vm_id);
-    tokio::fs::create_dir_all(&data_dir)
+    let data_dir = paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory")?;
 
@@ -2379,7 +2382,10 @@ async fn prepare_vm_for_lifecycle(
     };
 
     // The VM's first state is written here, under its name, and refused when a live
-    // VM already has that name. Every error from here on removes the state again.
+    // VM already has that name. Every error from here on removes the state again. It
+    // records the VM's runtime directory from the start: every reader of a running VM's
+    // directory (exec, health, the memory server's failure note) takes it from there.
+    vm_state.config.vm_runtime_dir = Some(data_dir.clone());
     if let Err(e) = state_manager
         .claim_name(&mut vm_state)
         .await
@@ -4970,7 +4976,7 @@ mod tests {
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
         let staged = at("DiskDirStaging::resolve(");
-        let created = at("tokio::fs::create_dir_all(&data_dir)");
+        let created = at("paths::create_vm_runtime_dir(&vm_id)");
         assert!(
             reclaimed < owned && owned < recorded,
             "the launch must reclaim, then begin its owner, then record"
@@ -4978,6 +4984,11 @@ mod tests {
         assert!(
             recorded < staged && recorded < created,
             "the runtime directory is created before it is recorded"
+        );
+        assert!(
+            created < staged,
+            "the --disk-dir staging makes the VM's bucket itself, with this process's owner \
+             and umask, unless the runtime directory (and its bucket) is made first"
         );
 
         // The same order in a restore.
@@ -4992,7 +5003,7 @@ mod tests {
         let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
-        let created = at("tokio::fs::create_dir_all(&data_dir)");
+        let created = at("paths::create_vm_runtime_dir(&vm_id)");
         assert!(
             reclaimed < owned && owned < recorded && recorded < created,
             "a restore must reclaim, begin its owner and record its runtime directory, in \

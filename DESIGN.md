@@ -490,8 +490,9 @@ Each VM has:
 ├── initrd/
 │   └── fc-agent-{sha}.initrd  # fc-agent injection initrd (SHA of binary)
 ├── vm-disks/
-│   └── vm-{id}/
-│       └── disks/rootfs.raw   # CoW reflink copy per VM
+│   └── {bucket}/              # first byte of sha256(vm-id), two hex digits
+│       └── vm-{id}/
+│           └── disks/rootfs.raw   # CoW reflink copy per VM
 ├── snapshots/
 │   └── {snapshot-name}/
 │       ├── vmstate.snap       # VM memory snapshot
@@ -517,7 +518,7 @@ Each VM has:
 
 2. **btrfs reflinks** (current implementation)
    ```bash
-   cp --reflink=always /mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw /mnt/fcvm-btrfs/vm-disks/{id}/disks/rootfs.raw
+   cp --reflink=always /mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw /mnt/fcvm-btrfs/vm-disks/{bucket}/{id}/disks/rootfs.raw
    ```
 
 **Benefits**:
@@ -2438,7 +2439,7 @@ Override with `FCVM_BASE_DIR` environment variable.
 ├── initrd/            # fc-agent injection initrds
 │   └── fc-agent-{sha}.initrd
 ├── vm-disks/          # Per-VM CoW disk copies
-│   └── {vm-id}/disks/rootfs.raw
+│   └── {bucket}/{vm-id}/disks/rootfs.raw
 ├── snapshots/         # Firecracker snapshots
 ├── state/             # markers: layout, runtime (the directory that holds the VM states)
 └── cache/             # Downloaded images and packages
