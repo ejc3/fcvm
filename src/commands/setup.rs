@@ -63,6 +63,21 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Only the tmpfs base for VM states: nothing of the store is needed but its owner.
+    if args.runtime_dir {
+        let data_dir = match std::env::var_os("FCVM_DATA_DIR") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => std::path::PathBuf::from(load_config(args.config.as_deref())?.0.paths.data_dir),
+        };
+        let (base, rule) = install_runtime_base(&data_dir)?;
+        println!("  ✓ {} is ready for VM states", base.display());
+        println!(
+            "  ✓ {} makes it at every boot (remove that file to undo)",
+            rule.display()
+        );
+        return Ok(());
+    }
+
     // Ensure btrfs storage is ready (creates loopback if needed)
     // This must be done before accessing any paths under the configured assets_dir
     crate::setup::ensure_storage(args.config.as_deref()).context("initializing storage")?;
@@ -89,6 +104,28 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
             .context("setting up cloud-hypervisor")?;
         println!("  ✓ Cloud Hypervisor ready: {}", path.display());
         return Ok(());
+    }
+
+    // Where VM states are kept (`crate::runtime_dir`). Root makes the owner's tmpfs
+    // directory and has it made at every boot. Without it a user's states are kept in
+    // the data directory, which works everywhere and is slower.
+    let data_dir = paths::data_dir();
+    if nix::unistd::geteuid().is_root() {
+        match install_runtime_base(&data_dir) {
+            Ok((base, rule)) => println!(
+                "  ✓ VM states on tmpfs: {} (made at every boot by {})",
+                base.display(),
+                rule.display()
+            ),
+            Err(error) => println!(
+                "  ! VM states stay in the data directory, where starts are slower: {error:#}"
+            ),
+        }
+    } else if !runtime_base_exists(&data_dir) {
+        println!(
+            "  VM states are kept in the data directory. For faster starts, once: \
+             sudo fcvm setup --runtime-dir"
+        );
     }
 
     println!("Setting up fcvm (this may take 5-10 minutes on first run)...");
@@ -120,6 +157,17 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         .context("setting up pasta")?
     {
         println!("  ✓ Pasta ready: {}", path.display());
+    }
+
+    // Build the pinned libseccomp if configured in [libseccomp] section: the
+    // static archive every Firecracker source build below links (see
+    // src/setup/libseccomp.rs). A Firecracker build makes it too when it is
+    // missing; here it is a step of its own, with its own line.
+    if let Some(path) = crate::setup::ensure_libseccomp(config.libseccomp.as_ref())
+        .await
+        .context("setting up libseccomp")?
+    {
+        println!("  ✓ libseccomp ready: {}", path.display());
     }
 
     // Build default Firecracker if configured in [firecracker] section
@@ -213,6 +261,31 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
 /// only when it was asked to force-build the default profile itself.
 fn rebuilds_the_default_kernel(force_build_kernels: bool, kernel_profile: Option<&str>) -> bool {
     force_build_kernels && kernel_profile == Some("default")
+}
+
+/// Make the tmpfs base of `data_dir`'s owner and its tmpfiles.d rule
+/// (`crate::runtime_dir::install_base`).
+fn install_runtime_base(
+    data_dir: &std::path::Path,
+) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use crate::runtime_dir::{install_base, Host, RUN, TMPFILES_DIR};
+    use std::path::Path;
+    install_base(
+        data_dir,
+        Path::new(RUN),
+        Path::new(TMPFILES_DIR),
+        &Host::current()?,
+    )
+}
+
+/// Whether the tmpfs base of `data_dir`'s owner is there.
+fn runtime_base_exists(data_dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(data_dir).is_ok_and(|metadata| {
+        std::path::Path::new(crate::runtime_dir::RUN)
+            .join(format!("fcvm-{}", metadata.uid()))
+            .is_dir()
+    })
 }
 
 #[cfg(test)]
