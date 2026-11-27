@@ -136,17 +136,27 @@ jobs:
   # Next.js build, and Playwright (Chromium and WebKit) against the mock fleet,
   # which needs ffmpeg for its H.264 encoder.
   fleet-web:
-    name: Fleet Web
+    name: Fleet Web (${{ matrix.shard }})
     needs: [changes]
     if: ${{ needs.changes.outputs.web == 'true' }}
     runs-on: ubuntu-latest
+    # The browser suite is seven Playwright configs, each with its own mock fleet and page,
+    # run one after another: 23 min of the job's 26 (run 45931415934; the main config 10.7,
+    # minecraft 5.9, windows 2.4, phones 2.0, potato 0.7, mirror 0.4). Each shard runs one
+    # package.json script, and `pnpm test:e2e` is those scripts in order, so local runs and
+    # CI run the same configs (fleet_web_shards_run_every_playwright_config pins it). The
+    # lint, unit and Worker steps run in the shortest shard.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [wall, phones-windows, minecraft-potato-mirror]
     # Playwright's own image carries Chromium, WebKit and their libraries, so
     # the job installs nothing with apt: the Azure mirror stalled apt for 13 to
     # 30 minutes in four runs on 2026-10-22. Tag and digest of 1.64.0, the
     # @playwright/test version in fleet/web/package.json.
     container:
       image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
-    # The suite takes about 5 minutes; anything that hangs fails instead of waiting.
+    # The longest shard takes about 12 minutes; anything that hangs fails instead of waiting.
     timeout-minutes: 30
     defaults:
       run:
@@ -215,27 +225,31 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Lint and typecheck
+        if: matrix.shard == 'phones-windows'
         run: pnpm lint && pnpm typecheck
       - name: Unit tests
+        if: matrix.shard == 'phones-windows'
         run: pnpm test
       - name: Build
         run: pnpm build
       - name: Browser tests
-        run: pnpm test:e2e
+        run: pnpm test:e2e:${{ matrix.shard }}
       # A failed browser test keeps its Playwright trace under test-results (trace:
       # "retain-on-failure"); without this it dies with the runner (#1348).
       - name: Upload Playwright traces
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fleet-web-test-results
+          name: fleet-web-test-results-${{ matrix.shard }}
           path: fleet/web/test-results
           if-no-files-found: ignore
           retention-days: 14
       # The staging deploy ships this Worker; it must serve the page, not only build.
       - name: Build the Worker
+        if: matrix.shard == 'phones-windows'
         run: pnpm cf:build
       - name: Serve the built Worker
+        if: matrix.shard == 'phones-windows'
         run: scripts/worker-smoke.sh 24110
 
   # Lints every workflow file. Lives here, not in claude-lint.yml, so `Summary`
@@ -576,6 +590,11 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
+    # The CI build profile, as in the Host job, set through the environment: this job runs
+    # cargo directly and builds nothing else.
+    env:
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_PROFILE_RELEASE_LTO: "off"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -618,18 +637,28 @@ jobs:
         env:
           FCVM_FIRECRACKER_BIN: /usr/local/bin/fc-mock
           RUST_LOG: "fcvm=debug,health-monitor=info,fuser=warn,fuse_backend_rs=warn,passthrough=warn"
+        # --lib and --test name the binaries that hold the tests the filter selects, so cargo
+        # builds those and not the other ~120 test binaries: the build of all of them took
+        # 37.8 of this job's 39 min to run 9 tests (run 45935858819).
+        # the_mock_vmm_job_builds_the_binaries_its_filter_selects pins the list against the sources.
         run: |
           cargo nextest run --release -p fcvm --profile fc-mock \
             --features privileged-tests \
+            --lib --test test_fc_mock --test test_health_monitor \
+            --test test_kernel_patch_invariants --test test_nested_harness_invariants \
             -E 'package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)'
 
   # Runner 1a: Host (bare metal with KVM)
-  # Runs: test-unit → test-fast (quick tests, no privileged)
+  # Runs: test-all (unit tests and the rootless VM tests, no privileged) and test-confine
   # Self-hosted runners with nested virtualization (ARM64: c7g.metal, x86: c5.metal)
   host:
     name: Host-${{ matrix.arch }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
+    # A pull request from a fork runs no self-hosted job, even once its run is approved:
+    # the jobs run its code with passwordless sudo on instances that later serve main,
+    # kernels.yml and the fleet smoke (#2223). The same guard is on host-root and
+    # container; self_hosted_jobs_refuse_fork_pull_requests pins it.
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
@@ -645,6 +674,13 @@ jobs:
       fail-fast: false
       # arm64 and x64, as planned by skip-check (arm64 only on a pull_request).
       matrix: ${{ fromJSON(needs.skip-check.outputs.host) }}
+    # The CI build profile (the Makefile's CARGO_CI_CONFIG; ci_builds_use_the_light_profile_but_one_lane):
+    # codegen-units=16 and no LTO for this workspace instead of the shipped 1 and thin.
+    # Measured on one 96-vCPU arm64 box (c8g.24xlarge): make build 420 -> 128 s,
+    # test-root's test build 546 -> 132 s. Host-Root-arm64-SnapshotDisabled and Packaging
+    # keep the shipped profile.
+    env:
+      FCVM_CI_PROFILE: light
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -884,9 +920,11 @@ jobs:
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
-      - name: test-unit
-        working-directory: fcvm
-        run: make test-unit
+      # One test build for the job: test-all and test-confine both compile the default
+      # features. No test is gated on a missing integration feature, so test-unit's tests (no
+      # features) and test-fast's (integration-fast) are all in that build; each extra feature
+      # set was a full rebuild of the workspace (11.0 to 12.8 min each, run 45935858819).
+      # ci_jobs_build_one_test_feature_set pins it.
       - name: setup-fcvm
         working-directory: fcvm
         run: make setup-fcvm
@@ -913,17 +951,17 @@ jobs:
       - name: test-packaging-e2e
         working-directory: fcvm
         run: ./scripts/test-packaging-e2e.sh ./target/release/fcvm
-      - name: test-fast
+      - name: test-all
         working-directory: fcvm
-        run: make test-fast
+        run: make test-all
       # --confine's gate: the rootless VM tests with every VMM confined and its syscall
       # allowlist enforcing, each run once, through scripts/confine-gate.sh: it fails on a
       # failed test, on any VMM the policy stopped, on a test that did not assert its VMM
       # confined, and on a filter that matches fewer tests than the Makefile pins. On both
       # architectures: each has its own policy, and its own libc call shapes. Host-x64 runs
-      # on a pull request only when the change touches confinement (changes.confine). The step took
-      # 12 min on arm64 (run 45517811464; 10 of them building the default-feature test
-      # binaries, which test-fast does not build); the cap is twice that.
+      # on a pull request only when the change touches confinement (changes.confine). The step
+      # reuses test-all's build; when it built its own, it took 12 min on arm64 (run
+      # 45517811464); the cap is twice that.
       - name: test-confine
         timeout-minutes: 25
         working-directory: fcvm
@@ -1021,7 +1059,7 @@ jobs:
   host-root:
     name: Host-Root-${{ matrix.arch }}-${{ matrix.mode }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_root_run == 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'container' && needs.skip-check.outputs.host_root_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
@@ -1036,6 +1074,9 @@ jobs:
       matrix: ${{ fromJSON(needs.skip-check.outputs.host_root) }}
     env:
       FCVM_NO_SNAPSHOT: ${{ matrix.fcvm_no_snapshot }}
+      # The CI build profile (the Makefile's CARGO_CI_CONFIG), but this lane builds the
+      # shipped one, so a test still runs the shipped codegen.
+      FCVM_CI_PROFILE: ${{ (matrix.arch == 'arm64' && matrix.mode == 'SnapshotDisabled') && 'shipped' || 'light' }}
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -1400,7 +1441,7 @@ jobs:
   container:
     name: Container-${{ matrix.arch }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.container_run == 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'host' && needs.skip-check.outputs.container_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
@@ -1420,6 +1461,8 @@ jobs:
       packages: write
     env:
       CONTAINER_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}
+      # The CI build profile; the Makefile passes it into the container.
+      FCVM_CI_PROFILE: light
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -1522,14 +1565,16 @@ jobs:
           path: ${{ github.workspace }}/cargo-cache
           key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-${{ runner.os }}-${{ runner.arch }}-
+      # CLEAN_PRUNE=0: this job builds fcvm only inside the container, so the host-side clean
+      # skips `fcvm snapshots prune` and the host build it needed (7.5 to 9.3 min, runs
+      # 45931415934 and 45935858819); the same recipe removes those directories with rm.
       - name: Clean test data
         working-directory: fcvm
-        run: make clean-test-data || true
-      - name: container-test-unit
-        env:
-          CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
-        working-directory: fcvm
-        run: make container-test-unit
+        run: make clean-test-data CLEAN_PRUNE=0 || true
+      # No container-test-unit step: its tests (no features) are all in container-test's build
+      # (the default features), and the step compiled the workspace once more to run them
+      # (11.6 to 13.0 min). container-setup-fcvm builds fcvm in the container first.
+      # ci_jobs_build_one_test_feature_set pins it.
       - name: container-setup-fcvm
         env:
           CARGO_CACHE_DIR: ${{ github.workspace }}/cargo-cache
@@ -1581,7 +1626,9 @@ jobs:
   summary:
     # A dispatch that named some lanes ran only those, so its report is "Summary (some
     # lanes)": a passing `Summary` on a commit always means every lane its event takes.
-    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
+    # A fork's run skips every self-hosted job, so its report is not `Summary`: neither the
+    # required check nor ci_pool.py may read it as a run that tested the lanes.
+    name: ${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'Summary (fork, no self-hosted lanes)' || (github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}
     needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-renderer, fleet-minecraft, fleet-web, host, host-root, container]
     # Summary reports on every run but one that was itself cancelled: superseded by a newer
     # run of the same pull request, or stopped by a person. Under
@@ -1668,12 +1715,16 @@ jobs:
       - name: Report skipped
         if: needs.skip-check.outputs.skip == 'true'
         run: echo "::notice::Skipped self-hosted tests — every self-hosted job already passed for this tree on a PR branch"
+      - name: Report fork
+        if: ${{ !(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        run: echo "::notice::A fork's pull request runs no self-hosted job, so this run tested none of the lanes"
       # When the test matrix was skipped, no artifacts exist and there is
       # nothing to analyze; downloading would fail on the missing directory.
+      # A fork's run skipped the self-hosted jobs, so it has no artifacts to analyse.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        if: needs.skip-check.outputs.skip != 'true'
+        if: needs.skip-check.outputs.skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       - name: Download all artifacts
-        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
+        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/ci-artifacts
@@ -1683,7 +1734,7 @@ jobs:
       # green for those PRs — it is the required check that proves the gate
       # ran, not a claim that the matrix did.
       - name: Analyze CI run
-        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
+        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
 
   # States what this run showed as a `ci/pool` commit status (scripts/ci-pool/ci_pool.py

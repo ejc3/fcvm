@@ -23,7 +23,7 @@ CARGO_BIN ?= cargo
 # exclusively before pruning idle artifacts, so age-check -> delete cannot race
 # a build.  `override` prevents `make CARGO=cargo ...` from silently bypassing
 # the safety protocol; CARGO_BIN remains available for toolchain selection.
-override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) $(CARGO_LOCAL_CONFIG)
+override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) $(CARGO_LOCAL_CONFIG) $(CARGO_CI_CONFIG)
 
 # Custom dependencies bin directory
 CUSTOM_DEPS_BIN := /mnt/fcvm-btrfs/deps/bin
@@ -196,6 +196,11 @@ MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Use one absolute path for Cargo, provenance, and the container bind mount.
 FUSE_BACKEND_RS_OVERRIDE_PATH := $(if $(strip $(FUSE_BACKEND_RS_OVERRIDE)),$(shell realpath -m -- "$(FUSE_BACKEND_RS_OVERRIDE)"))
 CARGO_LOCAL_CONFIG = $(if $(FUSE_BACKEND_RS_OVERRIDE_PATH),--config 'patch."https://github.com/ejc3/fuse-backend-rs.git".fuse-backend-rs.path="$(FUSE_BACKEND_RS_OVERRIDE_PATH)"')
+# CI's build profile for this workspace (ci.yml sets FCVM_CI_PROFILE=light): codegen-units=16 and
+# no LTO, given to this workspace's cargo commands only. Environment overrides
+# (CARGO_PROFILE_RELEASE_*) would also reach the Firecracker and Cloud Hypervisor builds that
+# `fcvm setup` runs, which keep their own profiles. Unset, cargo builds the shipped profile.
+CARGO_CI_CONFIG = $(if $(filter light,$(FCVM_CI_PROFILE)),--config profile.release.codegen-units=16 --config 'profile.release.lto="off"')
 # cargo-deny 0.18.9 cannot consume Cargo's CLI patch configuration.
 ifneq ($(FUSE_BACKEND_RS_OVERRIDE_PATH),)
 ifneq ($(filter lint,$(MAKECMDGOALS)),)
@@ -208,7 +213,7 @@ endif
 # (a prerequisite of every build/test target).
 export CARGO_TARGET_DIR := target
 # Cargo does not forward global --config to external subcommands.
-NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) --release
+NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) $(CARGO_CI_CONFIG) --release
 TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
 # sudo resets the environment, so a caller's FCVM_CONFIG_DIR has to be passed
 # through explicitly; without it `fcvm setup` under sudo regenerates and reads
@@ -276,6 +281,8 @@ TEST_LOG_DIR := /tmp/fcvm-test-logs
 # as arguments instead would need FILTER's own quotes (-E 'test(...)') quoted again.
 # Without this, `make container-test-unit FILTER=x` ran every test.
 CONTAINER_TEST_OPTIONS := -e FILTER -e STREAM -e LIST -e IGNORED
+# CI's build profile (CARGO_CI_CONFIG); unset outside CI, so the container builds the shipped one.
+CONTAINER_TEST_OPTIONS += -e FCVM_CI_PROFILE
 
 # Container run command (base)
 # Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode
@@ -522,8 +529,12 @@ check-disk: cargo-target-link
 # Clean leftover test data (VM disks, snapshots, state files)
 # Preserves cached assets (kernels, rootfs, initrd, image-cache)
 # CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
+# CLEAN_PRUNE=0 skips `fcvm snapshots prune` and therefore the build it needs; the rm lines
+# below remove the same directories. The Container job uses it: it builds fcvm only inside
+# the container. cargo-target-link stays: TARGET_LEASE_SHELL refuses to run without target/.
+CLEAN_PRUNE ?= 1
 clean-test-data: private SHELL := $(TARGET_LEASE_SHELL)
-clean-test-data: build
+clean-test-data: cargo-target-link $(if $(filter 1,$(CLEAN_PRUNE)),build)
 	@echo "==> Killing stale VM processes from previous runs..."
 	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sudo kill -9 $$(pgrep -x sleep -P 1) 2>/dev/null; sleep 1; true
 	@echo "==> Cleaning stale network namespaces..."
@@ -536,10 +547,10 @@ clean-test-data: build
 	@mount | grep fuse | grep -E '/tmp|/var/tmp' | cut -d' ' -f3 | xargs -r -I{} fusermount3 -u -z {} 2>/dev/null || true
 	@echo "==> Cleaning snapshots via fcvm (handles btrfs CoW properly)..."
 	@# Use fcvm's snapshot prune for proper cleanup - handles reflinks correctly
-	sudo ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
 	@# Also clean per-mode directories
-	sudo FCVM_DATA_DIR=$(ROOT_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
-	sudo FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo FCVM_DATA_DIR=$(ROOT_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
+	[ "$(CLEAN_PRUNE)" != 1 ] || sudo FCVM_DATA_DIR=$(CONTAINER_DATA_DIR) ./target/release/fcvm snapshots prune --all --force 2>/dev/null || true
 	@# Fallback: remove any snapshots that prune couldn't parse (stale/incompatible configs)
 	sudo rm -rf /mnt/fcvm-btrfs/snapshots/*
 	sudo rm -rf $(ROOT_DATA_DIR)/snapshots/* $(CONTAINER_DATA_DIR)/snapshots/*
@@ -1785,15 +1796,19 @@ bench-protocol: build
 bench-quick: BENCH_ARGS := --sample-size 10 --warm-up-time 1 --measurement-time 3
 bench-quick: bench
 
-# VM benchmarks (exec, clone) - require KVM, Firecracker, setup
+# VM benchmarks (exec, clone) - require KVM, Firecracker, setup. Each benchmark runs once
+# (criterion's --test). They are built as `cargo test --release` with test-root's features
+# and package set, not with `cargo bench`: the bench profile is a separate profile, so
+# `cargo bench` rebuilt the workspace crates after test-root had built them (7.6 to 7.9
+# min in the SnapshotEnabled lanes, run 45935858819). This way only the two bench
+# binaries are compiled.
+BENCH_VM_CARGO = CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
+	$(CARGO) test --release --features privileged-tests
 bench-vm: build setup-default
 	@echo "==> Running VM benchmarks..."
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench --bench exec -- --test
-	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER='$(ROOT_TEST_RUNNER)' \
-	$(CARGO) bench --bench clone -- --test
+	$(BENCH_VM_CARGO) --bench exec -- --test
+	$(BENCH_VM_CARGO) --bench clone -- --test
 
 # Hugepages benchmark: compare clone speed with 4KB vs 2MB pages
 # Full mode: 32GB VM, 16GB dirty memory (~20 min)
