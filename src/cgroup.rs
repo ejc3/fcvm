@@ -119,6 +119,7 @@
 //! | an fcvm is SIGKILLed | its scope is removed by the first start under that parent that begins an interval or more after the last sweep began; until then it is an empty cgroup |
 //! | the lock stays held (shared, by a stream of starts) for a sweep's whole wait | that sweep removes nothing and the next one tries again |
 //! | the stamp cannot be read or written | no sweep from this start, not a sweep in every start |
+//! | a level above the parent (the cgroup namespace root of a container below a thread root, #2226) is threaded, a thread root or an invalid domain | no scope and nothing made, one info line: the kernel makes only invalid domains there, which refuse a process |
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -493,6 +494,28 @@ pub struct NotEntered {
     pub reason: String,
     /// The caller lacks permission: the expected case for an unprivileged caller.
     pub unprivileged: bool,
+    /// No cgroup at the parent's place can be a domain: a level above it is threaded, a
+    /// thread root or an invalid domain. Nothing fcvm does can make a scope there.
+    pub no_domain: bool,
+}
+
+/// Why no domain cgroup can be made below `level`, from its `cgroup.type`, or `None` when
+/// one can. A threaded cgroup and a thread root ("domain threaded") hold only threaded or
+/// invalid-domain children, and an invalid domain can neither hold a process nor make a
+/// valid child. The cgroup2 root has no `cgroup.type` and can always hold domains.
+fn no_domain_below(level: &Path) -> Option<String> {
+    let kind = std::fs::read_to_string(level.join("cgroup.type")).ok()?;
+    let why = match kind.trim() {
+        "threaded" => "is a threaded cgroup (its parent is a thread root)",
+        "domain threaded" => "is a thread root (it holds processes and threaded controllers)",
+        "domain invalid" => "is an invalid domain (an ancestor is a thread root)",
+        _ => return None,
+    };
+    Some(format!(
+        "{} {why}, so no cgroup below it can be a domain that holds a process with a memory \
+         controller of its own",
+        level.display()
+    ))
 }
 
 /// The errors a caller without write access to the hierarchy gets.
@@ -599,6 +622,7 @@ pub fn enter(
     let not_entered = |reason: String, error: Option<&io::Error>| NotEntered {
         reason,
         unprivileged: error.is_some_and(is_permission_error),
+        no_domain: false,
     };
     if *placement == Placement::Stay {
         return Err(not_entered(format!("{PARENT_ENV}=none"), None));
@@ -624,12 +648,28 @@ pub fn enter(
                 return Err(NotEntered {
                     reason,
                     unprivileged: true,
+                    no_domain: false,
                 })
             }
         },
         Placement::Stay => unreachable!("returned above"),
     };
     let parent = base.join(&parent_relative);
+    // Before anything is made: a level above the parent that exists and cannot hold a domain
+    // below it (the cgroup namespace root of a container under a thread root, #2226) would
+    // give a scope that can be made and never entered.
+    if let Some(reason) = parent
+        .ancestors()
+        .take_while(|level| level.starts_with(root))
+        .filter(|level| level.exists())
+        .find_map(no_domain_below)
+    {
+        return Err(NotEntered {
+            reason,
+            unprivileged: false,
+            no_domain: true,
+        });
+    }
     let mut level = base;
     for component in parent_relative.components() {
         level.push(component);
@@ -782,6 +822,14 @@ pub fn enter_this_process(no_swap: bool) -> Result<Option<VmScope>> {
              in a cgroup delegated to its user, with {PARENT_ENV} unset",
             not.reason
         ),
+        Err(not) if not.no_domain => {
+            info!(
+                reason = %not.reason,
+                "no cgroup of the VM's own (no domain cgroup can be made here); the VM's \
+                 memory is charged to the cgroup fcvm was started in"
+            );
+            Ok(None)
+        }
         Err(not) if not.unprivileged => {
             info!(
                 reason = %not.reason,
@@ -860,6 +908,14 @@ mod tests {
         ] {
             std::fs::write(path.join(file), "")?;
         }
+        // Below a threaded cgroup or a thread root the kernel makes only invalid domains.
+        let parent_type = std::fs::read_to_string(path.parent().unwrap().join("cgroup.type"))
+            .unwrap_or_else(|_| "domain".to_string());
+        let kind = match parent_type.trim() {
+            "threaded" | "domain threaded" | "domain invalid" => "domain invalid",
+            _ => "domain",
+        };
+        std::fs::write(path.join("cgroup.type"), format!("{kind}\n"))?;
         if fake_enabled(&path.parent().unwrap().join("cgroup.subtree_control")) {
             std::fs::write(path.join("memory.swap.max"), "max\n")?;
             std::fs::write(path.join("memory.current"), "0\n")?;
@@ -1443,6 +1499,34 @@ mod tests {
         assert!(!h.root.join("fcvm.slice/fcvm-4242-77.scope").exists());
         // Without --no-swap the scope is entered all the same.
         enter(&h, &default_placement(), 4242, 77, None, false, &nobody).unwrap();
+    }
+
+    /// Below a cgroup namespace root that is threaded (its parent is a thread root) or is a
+    /// thread root itself, the kernel makes only invalid domains: a scope there can be made
+    /// and never entered, EOPNOTSUPP on `cgroup.procs` (#2226, fcvm in a guest's container
+    /// before fc-agent stopped making its unit a thread root). fcvm says so and makes nothing.
+    #[test]
+    fn a_threaded_namespace_root_gets_no_scope_and_nothing_made() {
+        for kind in ["threaded", "domain threaded"] {
+            let (_dir, h) = fake_root(true);
+            std::fs::write(h.root.join("cgroup.type"), format!("{kind}\n")).unwrap();
+            let error = enter(
+                &h,
+                &default_placement(),
+                8,
+                344,
+                Some(Path::new("/")),
+                false,
+                &nobody,
+            )
+            .unwrap_err();
+            assert!(error.no_domain, "{kind}: {}", error.reason);
+            assert!(error.reason.contains("thread"), "{kind}: {}", error.reason);
+            assert!(
+                !h.root.join("fcvm.slice").exists(),
+                "{kind}: fcvm.slice was made"
+            );
+        }
     }
 
     #[test]
