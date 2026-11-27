@@ -657,7 +657,10 @@ jobs:
     # A pull request from a fork runs no self-hosted job, even once its run is approved:
     # the jobs run its code with passwordless sudo on instances that later serve main,
     # kernels.yml and the fleet smoke (#2223). The same guard is on host-root and
-    # container; self_hosted_jobs_refuse_fork_pull_requests pins it.
+    # container; self_hosted_jobs_refuse_fork_pull_requests pins it. A pull_request run
+    # uses the workflow from the merge commit, so a fork that edits this file can drop the
+    # guard; that edit is in the diff the maintainer approves. The boundary fork code
+    # cannot edit is the runner pool (ejc3/aws#1102).
     if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
     # A rerun asks for an on-demand host once the fleet serves the label (ejc3/aws
     # #802, turned on with the repository variable ON_DEMAND_RERUNS): the first
