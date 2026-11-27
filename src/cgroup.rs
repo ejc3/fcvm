@@ -40,7 +40,8 @@
 //! common root it can write, so that is the only place it can go. The launches that find
 //! one:
 //!
-//! - root, as above;
+//! - root, or a caller that can write the cgroup2 root (a cgroup namespace whose root was
+//!   handed to it), as above;
 //! - a system unit run for the user with `Delegate=yes` and `DelegateSubgroup=` (for
 //!   instance `systemd-run --uid=<user> --gid=<group> -p Delegate=yes -p
 //!   DelegateSubgroup=payload ...`): systemd marks the unit's cgroup delegated
@@ -135,9 +136,9 @@ pub const DEFAULT_PARENT: &str = "fcvm.slice";
 /// Where this process's VM scope goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
-    /// `FCVM_CGROUP_PARENT` unset: for root, [`DEFAULT_PARENT`] below the cgroup2 root; for
-    /// anyone else, [`DEFAULT_PARENT`] inside the cgroup delegated to the caller
-    /// ([`delegated_parent`]).
+    /// `FCVM_CGROUP_PARENT` unset: for root, or a caller that can write the cgroup2 root,
+    /// [`DEFAULT_PARENT`] below that root; for anyone else, [`DEFAULT_PARENT`] inside the
+    /// cgroup delegated to the caller ([`delegated_parent`]).
     Default,
     /// Under this parent, a path relative to the cgroup2 root.
     Under(PathBuf),
@@ -612,7 +613,9 @@ pub fn enter(
     // The cgroup the parent is made in, and the parent's path below it.
     let (base, parent_relative) = match placement {
         Placement::Under(relative) => (root.clone(), relative.clone()),
-        Placement::Default if hierarchy.caller_is_root => {
+        // A caller that can write the root (a cgroup namespace whose root was handed to it)
+        // places as root does, as it did before delegated parents were looked for.
+        Placement::Default if hierarchy.caller_is_root || (hierarchy.writable)(root) => {
             (root.clone(), PathBuf::from(DEFAULT_PARENT))
         }
         Placement::Default => match delegated_parent(hierarchy, origin) {
@@ -1183,6 +1186,65 @@ mod tests {
         assert!(error.unprivileged, "{}", error.reason);
         assert!(!h.root.join("vms.slice").exists());
         assert_eq!(parents_made(&h), Vec::<PathBuf>::new());
+    }
+
+    /// A caller that is not root but can write the cgroup2 root (a cgroup namespace whose
+    /// root was delegated to it, mounted at `/sys/fs/cgroup`) places as before delegated
+    /// parents were looked for: `fcvm.slice` at that root, not nothing.
+    #[test]
+    fn a_writable_namespace_root_places_as_before() {
+        let (_dir, mut h) = fake_root(true);
+        h.caller_is_root = false;
+        delegate(&h.root);
+        cgroup(&h, "payload");
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/payload")),
+            true,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(scope.path(), h.root.join("fcvm.slice/fcvm-4242-77.scope"));
+        assert_eq!(
+            std::fs::read_to_string(scope.path().join("memory.swap.max")).unwrap(),
+            "0"
+        );
+    }
+
+    /// A subtree outside any manager whose middle level the user cannot write
+    /// (`/delegated` and `/delegated/branch/payload` the user's, `branch` root's): unmarked,
+    /// fcvm does what it did before, no scope and nothing made; marked delegated, the scope
+    /// goes in the marked cgroup, where the kernel lets the user move (it can write the
+    /// common ancestor, `/delegated`).
+    #[test]
+    fn a_root_owned_level_between_two_of_the_users() {
+        let (_dir, h) = systemd_host();
+        let delegated = cgroup(&h, "delegated");
+        enable_memory(&delegated);
+        let branch = cgroup(&h, "delegated/branch");
+        enable_memory(&branch);
+        readonly(&branch);
+        cgroup(&h, "delegated/branch/payload");
+        refused(&h, "/delegated/branch/payload", false);
+
+        delegate(&delegated);
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/delegated/branch/payload")),
+            false,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(
+            scope.path(),
+            delegated.join("fcvm.slice/fcvm-4242-77.scope")
+        );
     }
 
     /// `--no-swap` in a delegated unit: the user's scope gets `memory.swap.max` 0. Leaving
