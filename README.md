@@ -466,6 +466,7 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
 - For bridged: sudo, iptables, iproute2
 - For routed: sudo, iproute2, host with global IPv6 /64 (ip6tables also needed unless `--ipv6-prefix` is set), and `net.ipv6.conf.all.forwarding=1` (fcvm refuses routed mode without it)
 - For rootfs build: qemu-utils, e2fsprogs
+- `fcvm setup` builds the static libseccomp pinned in `[libseccomp]` for the Firecracker build to link, into the assets directory; nothing is installed on the host
 
 **Storage:** btrfs at `/mnt/fcvm-btrfs` (auto-created as loopback on non-btrfs hosts)
 
@@ -605,7 +606,8 @@ Firecracker with two layers:
 A start that cannot be confined is refused, never run unconfined. Confinement needs
 rootless networking, the Firecracker backend, the default build of Firecracker, and a
 kernel with Landlock ABI 9 or later. A kernel profile that pins its own Firecracker is
-refused. `fcvm setup` compiles the allowlist beside each Firecracker it builds from the
+refused, and so is a start that passes a host device through (`--gpu`): the allowlist has
+no VFIO request. `fcvm setup` compiles the allowlist beside each Firecracker it builds from the
 commit the allowlist is derived from, and records the compiled file's SHA-256 beside it
 (`<filter>.sha256`). A confined start opens the filter without following a symbolic link
 and refuses one that is not a regular file owned by the user (or root, or the owner of

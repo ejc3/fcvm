@@ -59,6 +59,7 @@ use crate::cli::{NetworkMode, PodmanArgs, PodmanCommands, RunArgs};
 use crate::commands::common::{
     RuntimeConfig, VSOCK_OUTPUT_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT, VSOCK_VOLUME_PORT_BASE,
 };
+use crate::firecracker::error_text;
 use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, RoutedNetwork};
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
@@ -1163,14 +1164,14 @@ enum RestoreFault {
 ///   configured build but not for a binary given by `FCVM_CLOUD_HYPERVISOR_BIN` or found on
 ///   PATH and replaced in place.
 const UNUSABLE_SNAPSHOT_MARKERS: &[&str] = &[
-    "Failed to load snapshot state from file",
-    "Invalid data version",
-    "An error occurred during bitcode serialization",
-    "Invalid snapshot state",
-    "Unknown Network Device",
-    "Unknown Vsock Device",
-    "Unknown Block Device",
-    "frequency not present in the given snapshot",
+    error_text::STATE_FILE_UNREADABLE,
+    error_text::INVALID_DATA_VERSION,
+    error_text::STATE_DOES_NOT_DECODE,
+    error_text::INVALID_SNAPSHOT_STATE,
+    error_text::UNKNOWN_NETWORK_DEVICE,
+    error_text::UNKNOWN_VSOCK_DEVICE,
+    error_text::UNKNOWN_BLOCK_DEVICE,
+    error_text::NO_TSC_FREQUENCY,
     "image disk build changed",
     "snapshot pmem image changed",
     crate::commands::common::CH_SNAPSHOT_OF_ANOTHER_BUILD,
@@ -1198,7 +1199,7 @@ fn classify_restore_failure(err: &anyhow::Error) -> RestoreFault {
     {
         return RestoreFault::UnusableSnapshot;
     }
-    if rendered.contains("Load snapshot error") {
+    if rendered.contains(error_text::LOAD_SNAPSHOT_ERROR) {
         return RestoreFault::LoadFailed;
     }
     RestoreFault::Other
@@ -1655,6 +1656,7 @@ async fn prepare_vm_for_lifecycle(
         firecracker_args: profile_firecracker_args(&args).as_deref(),
         unsupported: None,
         kernel_profile: args.kernel_profile.as_deref(),
+        passthrough_devices: args.gpu.len(),
     })?;
     info!(
         lifecycle = ?lifecycle,
@@ -7905,6 +7907,12 @@ mod restore_fault_classifier_tests {
              state from file: Failed to load snapshot state from file: CRC64 validation failed",
             "Load snapshot error: Failed to restore from snapshot: Invalid snapshot state: \
              No DRAM memory region defined.",
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: Invalid data version: \
+             the snapshot has no layout mark, so another Firecracker build wrote it",
+            "Load snapshot error: Failed to restore from snapshot: Failed to get snapshot \
+             state from file: Failed to load snapshot state from file: Invalid data version: \
+             the snapshot's state has layout 2 and this build reads layout 1",
         ] {
             assert_eq!(classify(text), RestoreFault::UnusableSnapshot, "{text}");
         }
