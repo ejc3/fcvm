@@ -45,9 +45,9 @@ protects it. The gym's failpoints sit at the create, use and cleanup steps in th
 |---|---|---|---|
 | `snapshots/<key>/` | `create_snapshot_core` builds `<key>.creating`, `atomic_replace_dir` (`common.rs:3745`) renames old aside and new in; restores read it; `delete_snapshot*` removes it | `<key>.lock` flock: creators and deleters exclusive, restores shared | between the two renames `<key>` is absent; prune lists `.creating` and `.old` and reads configs unlocked (`snapshots.rs:355`) |
 | restore lease | `cmd_snapshot_run_inner` takes `<key>.lock` shared (`snapshot.rs:1838`), drops it after `restore_from_snapshot` (`:2793`) | shared flock | after the drop the clone depends on open inodes only |
-| source VM dir `vm-disks/<source_vm_id>` | created by the source run and removed by its teardown. A restore of its snapshot never touches it on the host: the clone's VMM either opens its own disks through the load's drive overrides, or reaches them at the source's paths through binds on a tmpfs over `vm-disks` in its own mount namespace (`utils::MountRedirects`), so the teardown has nothing of a clone's to wait for (#1311) | none | none found |
-| clone disk `vm-disks/<clone>/disks/` | `create_cow_disk`: btrfs subvolume snapshot of `<key>/disk/`, rename to `rootfs.raw` (`disk.rs:238`), else reflink | inside the restore lease | none found |
-| `vm-disks/<id>/snapshot.lock` | taken by creators and `fcvm balloon` | exclusive flock | never taken by restore or teardown, and it lives inside the dir teardown removes |
+| source VM dir `vm-disks/<bucket>/<source_vm_id>` | created by the source run and removed by its teardown. A restore of its snapshot never touches it on the host: the clone's VMM either opens its own disks through the load's drive overrides, or reaches them at the source's paths through binds on a tmpfs over `vm-disks` in its own mount namespace (`utils::MountRedirects`), so the teardown has nothing of a clone's to wait for (#1311) | none | none found |
+| clone disk `vm-disks/<bucket>/<clone>/disks/` | `create_cow_disk`: btrfs subvolume snapshot of `<key>/disk/`, rename to `rootfs.raw` (`disk.rs:238`), else reflink | inside the restore lease | none found |
+| `vm-disks/<bucket>/<id>/snapshot.lock` | taken by creators and `fcvm balloon` | exclusive flock | never taken by restore or teardown, and it lives inside the dir teardown removes |
 | working-set sidecar | tmp, fsync, rename under shared `<key>.lock` and the sidecar lock (`write_set` in `working_set.rs`); `snapshot import` writes it the same way with no lock, into `<key>.creating` under the exclusive `<key>.lock`, before the directory is renamed to `<key>` (`seed_staged_generation`) | flock + identity recheck; the import's write has no other writer and no reader | tmp leaks on SIGKILL; a killed import's goes with its `<key>.creating`, which the next import or launch removes |
 | uffd socket | unlink then bind (`server.rs:1106`), removed on Drop | pid + start time in the name | leaks on SIGKILL |
 | state files | `save_state` writes `<id>.json.tmp` and renames under `<id>.json.lock`; `update_state` is locked read-modify-write; `claim_name` under `names.lock`; loopback IPs under `loopback-ip.lock` | flock, rename | the PID-collision sweep in `save_state` lists and judges liveness before any lock (`manager.rs:171`); `cleanup_stale_state` from `load_state_by_pid` runs under no global lock; `fcvm ls` judges liveness by `/proc/<pid>` alone |
@@ -156,10 +156,10 @@ Checked at every park, while every actor is stopped, and again after all actors 
    from a running guest and needs journal recovery, so `e2fsck -n` cannot judge it, and the
    restore check stands in for it.
 3. **Leaks.** The controller sets `PR_SET_CHILD_SUBREAPER`, so anything an actor orphans
-   reparents to it. After the schedule: no descendant process; no state file, `vm-disks/<id>`,
+   reparents to it. After the schedule: no descendant process; no state file, `vm-disks/<bucket>/<id>`,
    data dir, uffd socket or `.creating`/`.old` directory that names a schedule actor's VM;
    no mount under the store in `/proc/self/mountinfo`; for bridged actors, no netns, veth
-   or iptables rule naming a VM id. A recreated `vm-disks/<source_vm_id>` counts as a leak.
+   or iptables rule naming a VM id. A recreated `vm-disks/<bucket>/<source_vm_id>` counts as a leak.
 4. **State consistency.** Every state file names a pid whose `/proc/<pid>/stat` start time
    matches `pid_start_time`; a state reading `healthy` has a live VMM; `fcvm ls --json` and
    the files agree.
@@ -281,14 +281,14 @@ Built:
 Acceptance, on `main` plus the gym (GPU host above): Phase 1 of `cold-run` failed one schedule
 of 660 with the reported error, schedule 348: actor 0 held at
 `teardown.pre_remove_data_dir#1`, actor 1 at `restore.pre_load#1`, actor 0 released first.
-Actor 1's LoadSnapshot fails with `No such file or directory ... vm-disks/vm-<source>/disks/rootfs.raw`.
+Actor 1's LoadSnapshot fails with `No such file or directory ... vm-disks/<bucket>/vm-<source>/disks/rootfs.raw`.
 Its replay failed the same way 10 times out of 10. Every one of the 660 pair schedules and 40
 walks also failed the leak oracle on the converge path's orphaned source directory (#1181).
 
 With the fix for that race (#1188, merged locally for the check) the same 660 pair schedules
 gave no outcome failure. Re-recorded with the fix, schedule 348 shows the change at one step:
 releasing actor 0 at `teardown.pre_remove_data_dir#1` now records a wait on the lock of
-`vm-disks/vm-<source>`, actor 1 loads, and actor 0 continues. That re-recorded file is the case
+`vm-disks/<bucket>/vm-<source>`, actor 1 loads, and actor 0 continues. That re-recorded file is the case
 `test_lifecycle_interleave_gym_cold_run_restore_after_source_teardown`, pinned to the outcome
 oracle: with #1188 it passes (13.4 s); on `main` it fails with `REPLAY DIVERGED at step 20`.
 

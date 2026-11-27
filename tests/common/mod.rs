@@ -26,6 +26,24 @@ pub const ALPINE_IMAGE: &str = "ecr-public.aws.com/docker/library/alpine:latest"
 pub const DIRECT_WGET: [&str; 5] = ["env", "http_proxy=http://127.0.0.1:9/", "wget", "-Y", "off"];
 
 /// [`DIRECT_WGET`] followed by `args`.
+/// A data directory for one test, `<base>/<tag><6 hex>`, short enough that a VM's deepest
+/// socket under it fits `sockaddr_un` (`fcvm::paths::check_socket_path_budget_under`, which a
+/// launch also runs). Checked here, so a fixture too deep for a lane's base (the container
+/// lane's is the longest) fails with that message rather than as a launch refused partway
+/// through the test.
+pub fn short_data_dir(base: &std::path::Path, tag: &str) -> PathBuf {
+    let dir = base.join(format!(
+        "{tag}{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    ));
+    if let Err(error) =
+        fcvm::paths::check_socket_path_budget_under(&dir, "vm-00000000000000000000000000000000")
+    {
+        panic!("{error:#}");
+    }
+    dir
+}
+
 pub fn direct_wget<'a>(args: &[&'a str]) -> Vec<&'a str> {
     DIRECT_WGET
         .iter()

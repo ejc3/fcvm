@@ -260,7 +260,7 @@ jobs:
           sudo rm -rf /mnt/fcvm-btrfs/state/vms /mnt/fcvm-btrfs/state/names /mnt/fcvm-btrfs/state/pids 2>/dev/null || true
           sudo rm -rf /mnt/fcvm-btrfs/snapshots/bench-* 2>/dev/null || true
           # Clean up old benchmark VM disks
-          sudo rm -rf /mnt/fcvm-btrfs/vm-disks/vm-* 2>/dev/null || true
+          sudo rm -rf /mnt/fcvm-btrfs/vm-disks/*/vm-* 2>/dev/null || true
       - name: Run VM benchmarks
         working-directory: fcvm
         env:

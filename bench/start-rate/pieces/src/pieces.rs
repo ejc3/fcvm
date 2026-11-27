@@ -240,7 +240,7 @@ async fn isolated_network(held: &mut Held) -> Result<u32> {
     Ok(pid)
 }
 
-/// The clone's runtime directory (`vm-disks/<vm_id>`), as `cmd_snapshot_run_inner` makes it.
+/// The clone's runtime directory (`vm-disks/<bucket>/<vm_id>`), as `cmd_snapshot_run_inner` makes it.
 async fn runtime_dir(held: &mut Held) -> Result<PathBuf> {
     let dir = fcvm::paths::vm_runtime_dir(&held.vm_id);
     tokio::fs::create_dir_all(&dir).await?;

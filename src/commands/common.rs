@@ -3064,16 +3064,98 @@ fn snapshot_load_drive_overrides(
     Some(overrides)
 }
 
-/// The VM directories a restore's snapshot names its disks under: the VM the snapshot
+/// The ids of the VMs a restore's snapshot names its disks under: the VM the snapshot
 /// lineage started from, and the VM the snapshot was taken of when that is another one.
-fn clone_source_dirs(restore_config: &SnapshotRestoreConfig) -> Vec<PathBuf> {
-    let mut dirs = vec![paths::vm_runtime_dir(&restore_config.original_vm_id)];
-    if let Some(ref snapshot_vm_id) = restore_config.snapshot_vm_id {
-        if snapshot_vm_id != &restore_config.original_vm_id {
-            dirs.push(paths::vm_runtime_dir(snapshot_vm_id));
+fn source_vm_ids<'a>(original_vm_id: &'a str, snapshot_vm_id: Option<&'a str>) -> Vec<&'a str> {
+    let mut ids = vec![original_vm_id];
+    if let Some(snapshot_vm_id) = snapshot_vm_id {
+        if snapshot_vm_id != original_vm_id {
+            ids.push(snapshot_vm_id);
+        }
+    }
+    ids
+}
+
+/// The source VMs' runtime directories as the snapshot recorded them: each directory `D`
+/// named by one of `ids`, inside this host's `vm-disks`, for which a disk path the snapshot
+/// names is under `D/disks/`. What the snapshot recorded is what the VMM will open, so these
+/// are the directories to check (#608) and to redirect, whatever layout the build that made
+/// the snapshot used (`vm-disks/<id>`, or `vm-disks/<bucket>/<id>`).
+///
+/// A directory outside `vm-disks` of this data directory is not taken (a snapshot made under
+/// another data directory, #638), nor one named by another VM's id (a sibling's disk, #608):
+/// the coverage check then refuses the restore.
+fn recorded_source_dirs<'p>(
+    disk_paths: impl IntoIterator<Item = &'p Path>,
+    ids: &[&str],
+) -> Vec<PathBuf> {
+    let vm_disks = paths::vm_disks_dir();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for path in disk_paths {
+        let dir = path.ancestors().skip(1).find(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| ids.contains(&name))
+        });
+        let Some(dir) = dir else {
+            continue;
+        };
+        let under_disks = path.starts_with(dir.join("disks"));
+        if under_disks
+            && dir.starts_with(&vm_disks)
+            && dir != vm_disks
+            && !dirs.iter().any(|d| d == dir)
+        {
+            dirs.push(dir.to_path_buf());
         }
     }
     dirs
+}
+
+/// The disk paths inside this host's `vm-disks` that a VMM state names, as far as
+/// `recorded_source_dirs` needs them: for each occurrence of `<data_dir>/vm-disks/` followed
+/// by `<id>/disks/` or by one directory and `<id>/disks/`, for an id of `ids`, the path up
+/// to and including `disks/`. The serialized state gives no reliable end to a string, so the
+/// path is matched by its known parts and never read to an end; the data directory's own
+/// bytes are matched exactly.
+fn vmstate_vm_disks_paths(bytes: &[u8], ids: &[&str]) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let vm_disks = paths::vm_disks_dir();
+    let mut prefix = vm_disks.as_os_str().as_bytes().to_vec();
+    prefix.push(b'/');
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = bytes[from..]
+        .windows(prefix.len())
+        .position(|window| window == prefix.as_slice())
+    {
+        let rest = &bytes[from + at + prefix.len()..];
+        for id in ids {
+            let mut tail = id.as_bytes().to_vec();
+            tail.extend_from_slice(b"/disks/");
+            if rest.starts_with(&tail) {
+                found.push(vm_disks.join(id).join("disks/"));
+                continue;
+            }
+            // One directory between vm-disks and the id: a bucket, short and plain.
+            let Some(slash) = rest.iter().take(64).position(|byte| *byte == b'/') else {
+                continue;
+            };
+            let segment = &rest[..slash];
+            let plain =
+                !segment.is_empty() && segment.iter().all(|b| b.is_ascii_graphic() && *b != b'/');
+            if plain && rest[slash + 1..].starts_with(&tail) {
+                found.push(
+                    vm_disks
+                        .join(std::ffi::OsStr::from_bytes(segment))
+                        .join(id)
+                        .join("disks/"),
+                );
+            }
+        }
+        from += at + prefix.len();
+    }
+    found
 }
 
 /// The vsock base path a restored VMM's state names, which a snapshot of the clone
@@ -3383,7 +3465,15 @@ fn rootfs_disk_vm_ids_in_bytes(bytes: &[u8]) -> Vec<String> {
         .windows(PREFIX.len())
         .position(|w| w == PREFIX)
     {
-        let id_start = search_from + rel + PREFIX.len();
+        let mut id_start = search_from + rel + PREFIX.len();
+        // `vm-disks/<bucket>/<id>` (paths::vm_runtime_dir), or `vm-disks/<id>` from builds
+        // before the buckets.
+        let bucket = bytes.get(id_start..id_start + 3);
+        if bucket.is_some_and(|b| {
+            b[2] == b'/' && std::str::from_utf8(&b[..2]).is_ok_and(paths::is_vm_bucket)
+        }) {
+            id_start += 3;
+        }
         let mut id_end = id_start;
         while id_end < bytes.len() {
             let c = bytes[id_end];
@@ -3529,6 +3619,46 @@ fn view_children(view: &Path, wanted: fn(&std::fs::FileType) -> bool) -> Result<
     Ok(children)
 }
 
+/// The view's entries with every bucket (`paths::is_vm_bucket`) that holds a redirect's
+/// mountpoint or one of the clone's own directories replaced by that bucket's own entries.
+///
+/// The view's direct entries are buckets (and, from builds before the buckets, VM
+/// directories). A bucket that held a mountpoint and were bound onto itself would put that
+/// mountpoint on the host's real directory under it, whose removal by its VM's teardown
+/// detaches the clone's mount (#1187); kept whole after the pairs, it would cover them.
+/// So such a bucket is made in the view's tmpfs like the mountpoints in it, and its entries
+/// are kept one by one, one bucket's worth, not every VM's: its directories (returned first)
+/// and its regular files (returned second, for `keep_files`), such as a read-only `--disk`
+/// image a source VM was given from inside the bucket.
+fn expand_buckets(
+    entries: Vec<PathBuf>,
+    pairs: &[(PathBuf, PathBuf)],
+    own: &[&Path],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut expanded = Vec::with_capacity(entries.len());
+    let mut files = Vec::new();
+    for entry in entries {
+        let bucket = entry
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(paths::is_vm_bucket);
+        let holds = pairs
+            .iter()
+            .map(|(mountpoint, _)| mountpoint.as_path())
+            .chain(own.iter().copied())
+            .any(|path| path != entry && path.starts_with(&entry));
+        if bucket && holds {
+            expanded.extend(view_entries(&entry)?);
+            files.extend(view_files(&entry)?);
+        } else {
+            expanded.push(entry);
+        }
+    }
+    expanded.sort();
+    files.sort();
+    Ok((expanded, files))
+}
+
 /// The mount view of a clone's VMM, or `None` when the snapshot load overrides every source
 /// path and the VMM needs no mount namespace.
 ///
@@ -3550,9 +3680,11 @@ fn clone_mount_redirects(
     if overrides == LoadOverrides::Everything {
         return Ok(None);
     }
-    let entries = view_entries(view)?;
+    let (entries, bucket_files) =
+        expand_buckets(view_entries(view)?, &pairs, &[clone_dir, vsock_target_dir])?;
     let mut redirects = clone_mount_view(view, pairs, clone_dir, vsock_target_dir, &entries)?;
     redirects.keep_files = view_files(view)?;
+    redirects.keep_files.extend(bucket_files);
     Ok(Some(redirects))
 }
 
@@ -3658,7 +3790,7 @@ fn assert_vmstate_rootfs_covered(
     vmstate_path: &Path,
     original_vm_id: &str,
     snapshot_vm_id: Option<&str>,
-) -> Result<()> {
+) -> Result<Vec<PathBuf>> {
     // Fail CLOSED: if we cannot read vmstate we cannot verify coverage, and Firecracker
     // may still open whatever path it has embedded — so abort rather than proceed blind.
     let bytes = std::fs::read(vmstate_path).with_context(|| {
@@ -3667,12 +3799,9 @@ fn assert_vmstate_rootfs_covered(
             vmstate_path.display()
         )
     })?;
-    let mut covered_dirs = vec![paths::vm_runtime_dir(original_vm_id)];
-    if let Some(s) = snapshot_vm_id {
-        if s != original_vm_id {
-            covered_dirs.push(paths::vm_runtime_dir(s));
-        }
-    }
+    let ids = source_vm_ids(original_vm_id, snapshot_vm_id);
+    let recorded = vmstate_vm_disks_paths(&bytes, &ids);
+    let covered_dirs = recorded_source_dirs(recorded.iter().map(PathBuf::as_path), &ids);
     if vmstate_rootfs_covered(&bytes, &covered_dirs) {
         // #608 diagnostics: the observed ~0.7% sibling-disk failure has never been
         // caught with its inputs visible (the metadata-divergence hypothesis was
@@ -3691,7 +3820,7 @@ fn assert_vmstate_rootfs_covered(
             data_dir = %paths::data_dir().display(),
             "#608 coverage check passed"
         );
-        return Ok(());
+        return Ok(covered_dirs);
     }
     anyhow::bail!(
         "#608: refusing to restore — vmstate.bin does not reference a rootfs disk under any \
@@ -3747,13 +3876,17 @@ fn assert_ch_config_disks_covered(
     cfg: &serde_json::Value,
     original_vm_id: &str,
     snapshot_vm_id: Option<&str>,
-) -> Result<()> {
-    let mut covered_dirs = vec![paths::vm_runtime_dir(original_vm_id)];
-    if let Some(s) = snapshot_vm_id {
-        if s != original_vm_id {
-            covered_dirs.push(paths::vm_runtime_dir(s));
-        }
-    }
+) -> Result<Vec<PathBuf>> {
+    let ids = source_vm_ids(original_vm_id, snapshot_vm_id);
+    let disk_paths: Vec<&Path> = cfg
+        .get("disks")
+        .and_then(|disks| disks.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|disk| disk.get("path").and_then(|path| path.as_str()))
+        .map(Path::new)
+        .collect();
+    let covered_dirs = recorded_source_dirs(disk_paths, &ids);
     if let Some(path) = ch_config_uncovered_writable_disk(cfg, &covered_dirs) {
         anyhow::bail!(
             "#608 (CH): refusing to restore — snapshot config.json references writable disk \
@@ -3768,7 +3901,7 @@ fn assert_ch_config_disks_covered(
             paths::data_dir().display(),
         );
     }
-    Ok(())
+    Ok(covered_dirs)
 }
 
 /// Refuse a Cloud Hypervisor restore whose snapshot config does not name the exact
@@ -3860,9 +3993,13 @@ async fn cleanup_failed_clone_holder(holder: &mut Option<tokio::process::Child>,
 /// change for Firecracker); the only difference is it records the namespace isolation into a
 /// [`NamespaceParams`](crate::utils::NamespaceParams) instead of mutating a `VmManager`, so a
 /// Cloud Hypervisor backend can apply the same isolation to its `ProcessSpec`.
+#[allow(clippy::too_many_arguments)]
 async fn prepare_clone_substrate(
     network: &mut dyn NetworkManager,
     restore_config: &SnapshotRestoreConfig,
+    // The source VMs' runtime directories as the snapshot recorded them
+    // (`recorded_source_dirs`, from the hypervisor's coverage check).
+    source_dirs: &[PathBuf],
     vm_id: &str,
     data_dir: &Path,
     vm_state: &mut VmState,
@@ -4013,7 +4150,7 @@ async fn prepare_clone_substrate(
     // A load that overrides every such path needs neither the namespace nor the lease.
     let disk_dirs = match overrides {
         LoadOverrides::Everything => Vec::new(),
-        LoadOverrides::None | LoadOverrides::Vsock => clone_source_dirs(restore_config),
+        LoadOverrides::None | LoadOverrides::Vsock => source_dirs.to_vec(),
     };
     let vsock_target_dir = restore_config
         .vsock_target_dir
@@ -4177,7 +4314,7 @@ pub async fn restore_from_snapshot(
 
     // #608: abort BEFORE any side effects (holder/disk) if vmstate's rootfs path would not
     // be covered by the mount redirect — otherwise LoadSnapshot opens a sibling VM's disk.
-    assert_vmstate_rootfs_covered(
+    let source_dirs = assert_vmstate_rootfs_covered(
         &restore_config.vmstate_path,
         &restore_config.original_vm_id,
         restore_config.snapshot_vm_id.as_deref(),
@@ -4209,7 +4346,7 @@ pub async fn restore_from_snapshot(
         firecracker_version,
         vsock_override.is_some(),
         &vmstate,
-        &clone_source_dirs(restore_config),
+        &source_dirs,
         &restore_config.source_vsock_socket_path,
         &restore_config.extra_disks,
         &vm_dir,
@@ -4226,6 +4363,7 @@ pub async fn restore_from_snapshot(
     let mut substrate = prepare_clone_substrate(
         network,
         restore_config,
+        &source_dirs,
         vm_id,
         data_dir,
         vm_state,
@@ -4939,7 +5077,7 @@ pub async fn restore_from_snapshot_ch(
         .context("reading CH snapshot config.json")?;
     let mut cfg: serde_json::Value =
         serde_json::from_slice(&cfg_bytes).context("parsing CH snapshot config.json")?;
-    assert_ch_config_disks_covered(
+    let source_dirs = assert_ch_config_disks_covered(
         &cfg,
         &restore_config.original_vm_id,
         restore_config.snapshot_vm_id.as_deref(),
@@ -4954,6 +5092,7 @@ pub async fn restore_from_snapshot_ch(
     let mut substrate = prepare_clone_substrate(
         network,
         restore_config,
+        &source_dirs,
         vm_id,
         data_dir,
         vm_state,
@@ -5189,6 +5328,26 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The `disks` directory of the VM being snapshotted, from its rootfs path: the VM's own
+/// record of where its disks are (`<runtime dir>/disks/<rootfs>`), so a VM an older build
+/// started under another layout is found. A rootfs outside a `disks` directory named by the
+/// VM's id falls back to where this build puts a VM's disks.
+fn runtime_disks_of(disk_path: &Path, vm_id: &str) -> PathBuf {
+    disk_path
+        .parent()
+        .filter(|disks| disks.file_name().is_some_and(|name| name == "disks"))
+        .filter(|disks| {
+            disks
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == vm_id)
+        })
+        .map_or_else(
+            || paths::vm_runtime_dir(vm_id).join("disks"),
+            Path::to_path_buf,
+        )
+}
+
 /// Reflink the rootfs + any extra disks into the temp snapshot dir (instant btrfs CoW).
 /// Shared by the Firecracker and Cloud Hypervisor snapshot-create paths; the caller must
 /// have the VM paused so the disk image matches the captured memory.
@@ -5199,7 +5358,7 @@ async fn reflink_disks_to_snapshot(
     commit_free: bool,
 ) -> Result<()> {
     let disk_dir = crate::storage::snapshot::snapshot_disk_dir(temp_snapshot_dir);
-    let runtime_disks = paths::vm_runtime_dir(&snapshot_config.vm_id).join("disks");
+    let runtime_disks = runtime_disks_of(disk_path, &snapshot_config.vm_id);
     // `commit_free` (--memory-dir): disks with few extents are reflinked into an ordinary
     // directory, which commits no transaction, and a clone of the snapshot reflinks them
     // again (REFLINK_MAX_EXTENTS) rather than snapshotting a subvolume.
@@ -5250,9 +5409,7 @@ async fn reflink_disks_to_snapshot(
     }
     reflink_copy(disk_path, &disk_dir.join("disk.raw")).await?;
     for extra_disk in &snapshot_config.metadata.extra_disks {
-        let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
-            .join("disks")
-            .join(&extra_disk.filename);
+        let source = runtime_disks.join(&extra_disk.filename);
         let dest = disk_dir.join(&extra_disk.filename);
         reflink_copy(&source, &dest)
             .await
@@ -5564,7 +5721,7 @@ pub fn volume_configs_to_snapshot(
 /// External --disk files are at arbitrary host paths and don't need copying
 /// into the snapshot — clones access them directly.
 pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::SnapshotExtraDisk> {
-    let vm_data_dir = paths::vm_runtime_dir(&vm_state.vm_id);
+    let vm_data_dir = vm_state.vm_runtime_dir();
     let vm_data_prefix = vm_data_dir.to_string_lossy().to_string();
     vm_state
         .config
@@ -5812,11 +5969,7 @@ pub async fn acquire_snapshot_dir_lock(
 /// its snapshot's lock, and an O_TRUNC open takes the inode lock for writing and changes the
 /// file each time.
 fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
+    crate::utils::open_shared_lock_file(lock_path)
 }
 
 /// Take an flock on `lock_path`, created if missing, waiting for it.
@@ -6427,9 +6580,7 @@ pub async fn create_disk_only_snapshot_core(
         let temp_disk = disk_dir.join("disk.raw");
         reflink_copy(disk_path, &temp_disk).await?;
         for extra in &snapshot_config.metadata.extra_disks {
-            let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
-                .join("disks")
-                .join(&extra.filename);
+            let source = runtime_disks_of(disk_path, &snapshot_config.vm_id).join(&extra.filename);
             let dest = disk_dir.join(&extra.filename);
             reflink_copy(&source, &dest).await?;
         }
@@ -9642,6 +9793,90 @@ mod tests {
         }
     }
 
+    /// With buckets in the view: a bucket that holds a redirect's mountpoint or the clone's own
+    /// directory is opened into its VMs' directories, which are kept one by one; any other
+    /// bucket, and a VM directory of the layout before the buckets, is kept whole.
+    #[test]
+    fn a_bucket_that_holds_a_mountpoint_is_opened_and_one_that_does_not_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let (held, quiet, own) = (view.join("3c"), view.join("7f"), view.join("a0"));
+        let (source, neighbour, clone) = (
+            held.join("vm-source"),
+            held.join("vm-neighbour"),
+            own.join("vm-clone"),
+        );
+        let flat = view.join("vm-old");
+        for dir in [&source, &neighbour, &quiet.join("vm-other"), &clone, &flat] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let pairs = vec![(source.clone(), clone.clone())];
+        let (entries, _) = expand_buckets(view_entries(&view).unwrap(), &pairs, &[&clone]).unwrap();
+        assert_eq!(
+            entries,
+            [
+                clone.clone(),
+                neighbour.clone(),
+                source.clone(),
+                quiet.clone(),
+                flat.clone()
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+            "the source's bucket and the clone's are opened into their VMs' directories; the \
+             bucket with no mountpoint and the old layout's VM directory stay whole"
+        );
+        let redirects = clone_mount_view(&view, pairs, &clone, &clone, &entries).unwrap();
+        assert!(
+            !redirects.keep.iter().any(|dir| *dir == held || *dir == own),
+            "a bucket that holds a mountpoint is never bound onto itself (#1187): {:?}",
+            redirects.keep
+        );
+        assert!(redirects.keep.contains(&neighbour) && redirects.keep.contains(&quiet));
+        assert!(
+            !redirects
+                .pairs
+                .iter()
+                .any(|(mountpoint, _)| *mountpoint == held),
+            "{:?}",
+            redirects.pairs
+        );
+    }
+
+    /// A regular file directly in a bucket the mount view opens (a read-only `--disk` image
+    /// a source VM was given at `<vm-disks>/<b>/data.raw`) stays reachable to the clone's
+    /// VMM: the view keeps it, as it keeps a file directly in `vm-disks`.
+    #[test]
+    fn a_file_in_an_opened_bucket_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let view = root.path().join("vm-disks");
+        let held = view.join("3c");
+        let (source, clone) = (held.join("vm-source"), view.join("a0").join("vm-clone"));
+        for dir in [&source, &clone] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let disk = held.join("data.raw");
+        std::fs::write(&disk, b"").unwrap();
+        let top = view.join("top.raw");
+        std::fs::write(&top, b"").unwrap();
+        let redirects = clone_mount_redirects(
+            LoadOverrides::None,
+            &view,
+            vec![(source.clone(), clone.clone())],
+            &clone,
+            &clone,
+        )
+        .unwrap()
+        .expect("a mount view");
+        assert!(
+            redirects.keep_files.contains(&disk) && redirects.keep_files.contains(&top),
+            "{:?}",
+            redirects.keep_files
+        );
+    }
+
     /// A read-only `--disk` under another directory of vm-disks stays reachable,
     /// whatever that directory is called: every directory the view holds that no
     /// redirect replaces is kept, bound onto itself when it still exists as the VMM starts.
@@ -9908,6 +10143,7 @@ mod tests {
 
     fn make_vm_state(vm_id: &str, original_vsock: Option<&str>) -> VmState {
         let mut state = VmState::new(vm_id.to_string(), "nginx:alpine".to_string(), 2, 1024);
+        state.config.vm_runtime_dir = Some(paths::vm_runtime_dir(vm_id));
         state.config.network = NetworkConfig::default();
         state.config.health_check_url = Some("http://localhost/".to_string());
         state.config.hugepages = false;
@@ -15126,6 +15362,88 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
         assert_eq!(ids, vec!["vm-aaa111".to_string(), "vm-bbb222".to_string()]);
 
         assert!(rootfs_disk_vm_ids_in_bytes(&[]).is_empty());
+    }
+
+    /// The scanner reads a rootfs path of the bucketed layout and of the flat one before it.
+    #[test]
+    fn the_rootfs_scanner_reads_both_layouts() {
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"/data/vm-disks/3c/vm-aaa111/disks/rootfs.raw\x00");
+        buf.extend_from_slice(b"/data/vm-disks/vm-bbb222/disks/rootfs.raw\x00");
+        let mut ids = rootfs_disk_vm_ids_in_bytes(&buf);
+        ids.sort();
+        assert_eq!(ids, ["vm-aaa111", "vm-bbb222"]);
+    }
+
+    /// A restore takes its source directories from the paths the snapshot recorded, so a
+    /// snapshot made with the flat layout (`vm-disks/<id>`) and one made with the bucketed
+    /// layout (`vm-disks/<bucket>/<id>`) pass the coverage check (#608) through the same
+    /// function and come back with the directory each recorded; one whose rootfs is another
+    /// VM's, or under another data directory, is refused.
+    #[test]
+    fn a_snapshot_of_either_layout_restores_from_the_directory_it_recorded() {
+        let id = "vm-0123456789abcdef0123456789abcdef";
+        let vm_disks = paths::vm_disks_dir();
+        let flat = vm_disks.join(id);
+        let bucketed = paths::vm_runtime_dir(id);
+        let dir = tempfile::tempdir().unwrap();
+        let vmstate = dir.path().join("vmstate.bin");
+        let state = |rootfs: &Path, extra: &Path| {
+            let mut bytes = b"\x00\x10".to_vec();
+            bytes.extend_from_slice(rootfs.as_os_str().as_encoded_bytes());
+            bytes.extend_from_slice(b"\x00\x22");
+            bytes.extend_from_slice(extra.as_os_str().as_encoded_bytes());
+            bytes.push(0);
+            bytes
+        };
+        for recorded in [&flat, &bucketed] {
+            std::fs::write(
+                &vmstate,
+                state(
+                    &recorded.join("disks/rootfs.raw"),
+                    &recorded.join("vsock.sock"),
+                ),
+            )
+            .unwrap();
+            let dirs = assert_vmstate_rootfs_covered(&vmstate, id, None).unwrap();
+            assert_eq!(
+                dirs,
+                std::slice::from_ref(recorded),
+                "{}",
+                recorded.display()
+            );
+        }
+        let sibling = paths::vm_runtime_dir("vm-ffffffffffffffffffffffffffffffff");
+        std::fs::write(&vmstate, state(&sibling.join("disks/rootfs.raw"), &sibling)).unwrap();
+        assert!(assert_vmstate_rootfs_covered(&vmstate, id, None).is_err());
+        let elsewhere = Path::new("/other-data/vm-disks").join(id);
+        std::fs::write(
+            &vmstate,
+            state(&elsewhere.join("disks/rootfs.raw"), &elsewhere),
+        )
+        .unwrap();
+        assert!(assert_vmstate_rootfs_covered(&vmstate, id, None).is_err());
+    }
+
+    /// Only directories named by a source id, inside this host's vm-disks, holding the disk
+    /// under `disks/`, are source directories.
+    #[test]
+    fn recorded_source_dirs_are_named_by_a_source_id_inside_vm_disks() {
+        let vm_disks = paths::vm_disks_dir();
+        let (a, b) = ("vm-aaa", "vm-bbb");
+        let paths = [
+            vm_disks.join("3c").join(a).join("disks/rootfs.raw"),
+            vm_disks.join(a).join("disks/data.raw"),
+            vm_disks.join("vm-zzz").join("disks/rootfs.raw"),
+            vm_disks.join(b).join("vsock.sock"),
+            PathBuf::from("/elsewhere/vm-disks")
+                .join(b)
+                .join("disks/rootfs.raw"),
+        ];
+        assert_eq!(
+            recorded_source_dirs(paths.iter().map(PathBuf::as_path), &[a, b]),
+            [vm_disks.join("3c").join(a), vm_disks.join(a)]
+        );
     }
 
     #[test]

@@ -511,6 +511,7 @@ fn race_gym_only_run_owned_locks_make_a_pair_infeasible() {
     for owned in [
         "snapshots/#.lock",
         "vm-disks/vm-#",
+        "vm-disks/#f/vm-#/snapshot.lock",
         "vm-#/snapshot.lock",
         "state/vms/#/vm-#.json.lock",
         "state/vms/a/vm-#.json.lock",

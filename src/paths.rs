@@ -276,9 +276,157 @@ pub fn bind_runtime_dir(access: crate::runtime_dir::Access) -> anyhow::Result<bo
     Ok(true)
 }
 
-/// Directory for VM runtime data (disks, sockets, logs)
+/// The directory the VMs' runtime directories are in, one bucket down (`vm_runtime_dir`).
+pub fn vm_disks_dir() -> PathBuf {
+    data_dir().join("vm-disks")
+}
+
+/// The bucket of `vm-disks` that VM `vm_id`'s runtime directory is in: the first byte of
+/// sha256(vm_id) as two hex digits, so 256 buckets. A pure function of the id: a snapshot
+/// records its VM's paths, and a restore finds the VM's directory again from the id.
+///
+/// Every start makes its runtime directory, and a mkdir holds its parent directory's lock
+/// for writing across btrfs_mkdir, which joins the running transaction and so can wait out
+/// a commit (every clone's disk is a subvolume snapshot, which ends in one). With one
+/// `vm-disks` directory that lock was what every start queued on: 968 of 1411 ms of lock
+/// wait a clone at 512 starts in flight, fcvm's host kernel, states off btrfs (2026-11-27).
+pub fn vm_bucket(vm_id: &str) -> String {
+    use sha2::Digest;
+    format!("{:02x}", sha2::Sha256::digest(vm_id.as_bytes())[0])
+}
+
+/// Whether `name` is the name of a bucket of `vm-disks` (two lowercase hex digits). A VM id
+/// is never one (`vm-` and 32 hex digits).
+pub fn is_vm_bucket(name: &str) -> bool {
+    name.len() == 2
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Directory for VM runtime data (disks, sockets, logs): `vm-disks/<bucket>/<vm_id>`.
 pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
-    data_dir().join("vm-disks").join(vm_id)
+    vm_runtime_dir_under(&data_dir(), vm_id)
+}
+
+/// [`vm_runtime_dir`] under an explicit data directory.
+pub fn vm_runtime_dir_under(data_dir: &std::path::Path, vm_id: &str) -> PathBuf {
+    data_dir.join("vm-disks").join(vm_bucket(vm_id)).join(vm_id)
+}
+
+/// Make VM `vm_id`'s runtime directory, and its bucket when this is the first VM in it.
+///
+/// A bucket is shared by every VM whose id falls in it, root's and a user's alike when they
+/// share a data directory, so it is given the owner and the permission bits of `vm-disks`
+/// itself: a bucket root made with its own owner and umask would refuse the user's VMs,
+/// which `vm-disks` admits. It appears with them already set: it is made under a name of
+/// its own, set up, and renamed into place without replacing a bucket another start put
+/// there first, so no start ever finds a bucket that is not yet usable.
+pub async fn create_vm_runtime_dir(vm_id: &str) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    let dir = vm_runtime_dir(vm_id);
+    let bucket = dir
+        .parent()
+        .expect("a runtime directory is in a bucket")
+        .to_path_buf();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        ensure_vm_bucket(&bucket)
+            .map(|_| ())
+            .with_context(|| format!("making the bucket {}", bucket.display()))
+    })
+    .await
+    .context("the bucket task")??;
+    tokio::fs::create_dir(&dir)
+        .await
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => Ok(()),
+            _ => Err(error),
+        })
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// `bucket` exists with `vm-disks`' owner and permission bits ([`create_vm_runtime_dir`]).
+/// Returns how many directories this call made in `vm-disks`.
+///
+/// A bucket that exists costs a lookup and nothing in `vm-disks` itself. A missing one
+/// means the store has not made its buckets yet: the start takes an exclusive flock on
+/// `vm-disks`, looks again, and makes every missing bucket of the 256, so the starts of a
+/// new store make them once instead of each making its own under `vm-disks`' inode lock
+/// (with 512 starts at once, a few hundred stages, opens and renames there, measured as a
+/// 4.3 s p99). The flock only saves work: each bucket is still staged and renamed into
+/// place without replacing one, so a lock that does not reach another kernel (a FUSE map
+/// in a nested guest) costs duplicate work, never a wrong bucket.
+fn ensure_vm_bucket(bucket: &std::path::Path) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    if bucket.is_dir() {
+        return Ok(0);
+    }
+    let vm_disks = bucket.parent().context("a bucket is in vm-disks")?;
+    std::fs::create_dir_all(vm_disks)
+        .with_context(|| format!("creating {}", vm_disks.display()))?;
+    let dir =
+        std::fs::File::open(vm_disks).with_context(|| format!("opening {}", vm_disks.display()))?;
+    let dir = nix::fcntl::Flock::lock(dir, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, errno)| errno)
+        .with_context(|| format!("locking {}", vm_disks.display()))?;
+    if bucket.is_dir() {
+        return Ok(0);
+    }
+    let parent =
+        std::fs::metadata(vm_disks).with_context(|| format!("reading {}", vm_disks.display()))?;
+    let mut made = 0;
+    for byte in 0..=u8::MAX {
+        let name = format!("{byte:02x}");
+        if vm_disks.join(&name).is_dir() {
+            continue;
+        }
+        make_vm_bucket(&dir, vm_disks, &name, &parent)
+            .with_context(|| format!("making the bucket {name} in {}", vm_disks.display()))?;
+        made += 1;
+    }
+    Ok(made)
+}
+
+/// One bucket made under a name of its own, given `vm-disks`' owner and mode, then renamed
+/// into place unless another process put one there first.
+fn make_vm_bucket(
+    dir: &std::fs::File,
+    vm_disks: &std::path::Path,
+    name: &str,
+    parent: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let staged = vm_disks.join(format!(".{name}.{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&staged).with_context(|| format!("creating {}", staged.display()))?;
+    let made = (|| -> anyhow::Result<()> {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            std::os::unix::fs::chown(&staged, Some(parent.uid()), Some(parent.gid()))
+                .context("giving the bucket to vm-disks' owner")?;
+        }
+        std::fs::set_permissions(
+            &staged,
+            std::fs::Permissions::from_mode(parent.mode() & 0o7777),
+        )
+        .context("giving the bucket vm-disks' permission bits")?;
+        let staged_name = staged.file_name().context("the staged bucket has a name")?;
+        match nix::fcntl::renameat2(
+            dir,
+            staged_name,
+            dir,
+            name,
+            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        ) {
+            Ok(()) => Ok(()),
+            // Another process put the bucket there first.
+            Err(nix::errno::Errno::EEXIST) => Ok(()),
+            Err(errno) => Err(errno).context("renaming the bucket into place"),
+        }
+    })();
+    let _ = std::fs::remove_dir(&staged);
+    made
 }
 
 /// `sockaddr_un.sun_path` is 108 bytes including the NUL, so a path of 107
@@ -317,10 +465,7 @@ pub fn check_socket_path_budget_under(
     data_dir: &std::path::Path,
     vm_id: &str,
 ) -> anyhow::Result<()> {
-    let longest = data_dir
-        .join("vm-disks")
-        .join(vm_id)
-        .join(LONGEST_SOCKET_NAME);
+    let longest = vm_runtime_dir_under(data_dir, vm_id).join(LONGEST_SOCKET_NAME);
     let length = longest.as_os_str().len();
     anyhow::ensure!(
         length <= SUN_PATH_MAX,
@@ -357,8 +502,9 @@ mod tests {
         let text = error.to_string();
         // 128 bytes for the incident's firecracker.socket; the reserved name is longer now.
         let length = format!(
-            "{}/vm-disks/{VM_ID}/{LONGEST_SOCKET_NAME}",
-            too_deep.display()
+            "{}/vm-disks/{}/{VM_ID}/{LONGEST_SOCKET_NAME}",
+            too_deep.display(),
+            vm_bucket(VM_ID)
         )
         .len();
         assert!(
@@ -373,7 +519,7 @@ mod tests {
     fn the_shortened_nested_data_dir_fits() {
         let short = Path::new("/mnt/fcvm-btrfs/nd/9db69791");
         check_socket_path_budget_under(short, VM_ID)
-            .expect("91 bytes must be accepted; if this fails the budget is miscomputed");
+            .expect("94 bytes must be accepted; if this fails the budget is miscomputed");
     }
 
     /// The default layout must have room, or every VM would fail to start.
@@ -399,7 +545,11 @@ mod tests {
     /// boundary, so an off-by-one cannot creep in unnoticed.
     #[test]
     fn the_boundary_is_exact() {
-        let suffix_len = format!("/vm-disks/{VM_ID}/{LONGEST_SOCKET_NAME}").len();
+        let suffix_len = format!(
+            "/vm-disks/{}/{VM_ID}/{LONGEST_SOCKET_NAME}",
+            vm_bucket(VM_ID)
+        )
+        .len();
         let at_limit = "/".repeat(SUN_PATH_MAX - suffix_len);
         assert_eq!(
             at_limit.len() + suffix_len,
@@ -412,6 +562,96 @@ mod tests {
         let over = format!("{at_limit}x");
         check_socket_path_budget_under(Path::new(&over), VM_ID)
             .expect_err("one byte over SUN_PATH_MAX must be refused");
+    }
+
+    /// A VM's runtime directory is in the bucket its id gives, two hex digits, the same for
+    /// the same id every time (a restore finds a snapshot's source directory from the id).
+    #[test]
+    fn a_runtime_directory_is_in_the_bucket_of_its_id() {
+        let dir = vm_runtime_dir_under(Path::new("/srv/store"), VM_ID);
+        let bucket = vm_bucket(VM_ID);
+        assert_eq!(
+            dir,
+            Path::new("/srv/store/vm-disks").join(&bucket).join(VM_ID)
+        );
+        assert!(is_vm_bucket(&bucket), "{bucket}");
+        assert_eq!(vm_bucket(VM_ID), bucket);
+        let buckets: std::collections::BTreeSet<String> = (0..4096)
+            .map(|index| vm_bucket(&format!("vm-{index:032x}")))
+            .collect();
+        assert_eq!(
+            buckets.len(),
+            256,
+            "4096 ids reach every one of the 256 buckets"
+        );
+        for name in [VM_ID, "a", "abc", "AB", "0g", ".ab"] {
+            assert!(!is_vm_bucket(name), "{name} is not a bucket's name");
+        }
+    }
+
+    /// A bucket appears with vm-disks' permission bits, made by however many starts at once,
+    /// and the staging directories they make it under are all gone.
+    #[test]
+    fn a_bucket_is_made_once_with_the_permission_bits_of_vm_disks() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let vm_disks = root.path().join("vm-disks");
+        std::fs::create_dir(&vm_disks).unwrap();
+        std::fs::set_permissions(&vm_disks, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let bucket = vm_disks.join("7f");
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| ensure_vm_bucket(&bucket).unwrap());
+            }
+        });
+        let mode = std::fs::metadata(&bucket).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o1777,
+            "the bucket's mode is vm-disks', not the umask's"
+        );
+        let staged: Vec<_> = std::fs::read_dir(&vm_disks)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !is_vm_bucket(name))
+            .collect();
+        assert!(staged.is_empty(), "staging directories left: {staged:?}");
+    }
+
+    /// The first start of a store makes all 256 buckets, and the starts beside it make
+    /// none: a new store's first wave does not make its buckets one start at a time under
+    /// vm-disks' inode lock.
+    #[test]
+    fn the_first_start_of_a_store_makes_every_bucket_and_the_others_none() {
+        let root = tempfile::tempdir().unwrap();
+        let vm_disks = root.path().join("vm-disks");
+        std::fs::create_dir(&vm_disks).unwrap();
+        let made: Vec<usize> = std::thread::scope(|scope| {
+            let starts: Vec<_> = (0..32u8)
+                .map(|start| {
+                    let bucket = vm_disks.join(format!("{:02x}", start.wrapping_mul(8)));
+                    scope.spawn(move || ensure_vm_bucket(&bucket).unwrap())
+                })
+                .collect();
+            starts
+                .into_iter()
+                .map(|start| start.join().unwrap())
+                .collect()
+        });
+        let buckets = std::fs::read_dir(&vm_disks)
+            .unwrap()
+            .filter(|entry| is_vm_bucket(&entry.as_ref().unwrap().file_name().to_string_lossy()))
+            .count();
+        assert_eq!(buckets, 256, "every bucket exists after the first wave");
+        assert_eq!(
+            made.iter().sum::<usize>(),
+            256,
+            "each bucket was made once, by one start: {made:?}"
+        );
+        assert_eq!(
+            made.iter().filter(|&&n| n > 0).count(),
+            1,
+            "one start made the buckets and the others none: {made:?}"
+        );
     }
 }
 

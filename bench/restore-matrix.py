@@ -136,7 +136,7 @@ class Harness:
         """What a SIGKILLed clone left: its state files and its runtime directory."""
         for path in self.state_files(vm_id):
             path.unlink(missing_ok=True)
-        disk = self.data_root / "vm-disks" / vm_id
+        disk = Path(reqbench.vm_runtime_dir(str(self.data_root), vm_id))
         if disk.exists():
             subprocess.run(["rm", "-rf", str(disk)], timeout=60, check=False)
 
@@ -295,7 +295,7 @@ class Harness:
                 str(p)
                 for p in (
                     *self.state_files(vm_id),
-                    self.data_root / "vm-disks" / vm_id,
+                    Path(reqbench.vm_runtime_dir(str(self.data_root), vm_id)),
                 )
                 if p.exists()
             ]

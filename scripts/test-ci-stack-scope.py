@@ -383,16 +383,24 @@ class Workflow(unittest.TestCase):
         block = jobs(CI.read_text())['summary']
         name = re.search(r'^    name:\s*(.*)$', block, re.M)[1]
         self.assertEqual(name, "${{ needs.changes.outputs.run == 'false' && 'Summary (deferred)' || "
+                               "(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name "
+                               "!= github.repository) && 'Summary (fork, no self-hosted lanes)' || "
                                "(github.event.inputs.lanes && 'Summary (some lanes)' || 'Summary') }}")
-        # The name is `Summary` only for a run that deferred nothing and filtered no lane.
+        # The name is `Summary` only for a run that deferred nothing, filtered no lane and is
+        # not a fork's (whose run skips every self-hosted job).
         expression = name.removeprefix('${{').removesuffix('}}').strip()
-        def named(run, lanes):
+        def named(run, lanes, event='push', head_repo=''):
             return evaluate(expression, {'needs': {'changes': {'outputs': {'run': run}}},
-                                         'github': {'event': {'inputs': {'lanes': lanes}}}})
+                                         'github': {'event_name': event, 'repository': 'ejc3/fcvm',
+                                                    'event': {'inputs': {'lanes': lanes},
+                                                              'pull_request': {'head': {'repo': {'full_name': head_repo}}}}}})
         self.assertEqual(named('true', ''), 'Summary')
         self.assertEqual(named('true', 'Host-arm64'), 'Summary (some lanes)')
         self.assertEqual(named('false', ''), 'Summary (deferred)')
         self.assertEqual(named('false', 'Host-arm64'), 'Summary (deferred)')
+        self.assertEqual(named('true', '', 'pull_request', 'ejc3/fcvm'), 'Summary')
+        self.assertEqual(named('true', '', 'pull_request', 'someone/fcvm'), 'Summary (fork, no self-hosted lanes)')
+        self.assertEqual(named('false', '', 'pull_request', 'someone/fcvm'), 'Summary (deferred)')
 
     def test_the_scope_sees_draft_state_and_the_stack(self):
         block = jobs(CI.read_text())['changes']

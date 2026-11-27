@@ -1,7 +1,7 @@
 //! Host resources a killed fcvm leaves behind, and how the next fcvm takes them back.
 //!
 //! fcvm creates host resources that outlive its process unless teardown removes them: a
-//! VM's runtime directory (`vm-disks/<vm_id>`, with its disks), the temporaries of an
+//! VM's runtime directory (`vm-disks/<bucket>/<vm_id>`, with its disks), the temporaries of an
 //! image export. A SIGKILL skips
 //! teardown. The kernel ends the child processes (pdeathsig) and releases locks; every
 //! other resource stays.

@@ -34,6 +34,7 @@ async fn test_state_persistence() {
         created_at: now,
         last_updated: now,
         config: VmConfig {
+            vm_runtime_dir: None,
             image: "nginx:alpine".to_string(),
             vcpu: 2,
             memory_mib: 512,
@@ -160,6 +161,7 @@ async fn test_list_vms() {
             created_at: now,
             last_updated: now,
             config: VmConfig {
+                vm_runtime_dir: None,
                 image: "nginx:alpine".to_string(),
                 vcpu: 1,
                 memory_mib: 256,
@@ -256,6 +258,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             created_at: now,
             last_updated: now,
             config: VmConfig {
+                vm_runtime_dir: None,
                 image: "nginx:alpine".to_string(),
                 vcpu: 1,
                 memory_mib: 256,
@@ -347,6 +350,7 @@ async fn test_load_state_by_name_duplicate_detection() {
         created_at: now,
         last_updated: now,
         config: VmConfig {
+            vm_runtime_dir: None,
             image: "nginx:alpine".to_string(),
             vcpu: 1,
             memory_mib: 256,
@@ -506,6 +510,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
         created_at: Timestamp::now(),
         last_updated: Timestamp::now(),
         config: VmConfig {
+            vm_runtime_dir: None,
             image: "test:latest".to_string(),
             vcpu: 1,
             memory_mib: 256,
