@@ -353,7 +353,10 @@ impl Scenario for ColdRun {
                     failed.push(Failure::new(
                         "leak",
                         None,
-                        format!("VM directory vm-disks/{vm_id} outlived its VM"),
+                        format!(
+                            "VM directory vm-disks/{}/{vm_id} outlived its VM",
+                            fcvm::paths::vm_bucket(vm_id)
+                        ),
                     ));
                     let _ = std::fs::remove_dir_all(&dir);
                 }

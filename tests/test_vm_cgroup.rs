@@ -323,6 +323,46 @@ async fn test_an_unprivileged_fcvm_in_a_delegated_cgroup_has_its_own_cgroup() ->
     Ok(())
 }
 
+/// The container in a guest runs in a domain cgroup with a memory controller (#2226).
+///
+/// fc-agent used to enable pids on the cgroup of its own unit while it was a process there.
+/// A cgroup that holds a process may enable only threaded controllers, and doing so makes it
+/// a thread root, so the container below it was a threaded cgroup whose controllers were
+/// cpuset, cpu and pids: no memory, and a root fcvm inside it could make a scope but never
+/// enter one (EOPNOTSUPP on `cgroup.procs`). The container's view of its cgroup namespace
+/// root says which: `cgroup.type` and `cgroup.controllers`.
+#[tokio::test]
+async fn test_a_guest_container_has_a_memory_controller() -> Result<()> {
+    let (name, _, _, _) = common::unique_names("ctrcgroup");
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &name, common::TEST_IMAGE],
+        &name,
+    )
+    .await?;
+    common::poll_health_by_pid(pid, 180).await?;
+    let read = |file: &'static str| async move {
+        common::exec_in_container(pid, &["cat", file])
+            .await
+            .map(|text| text.trim().to_string())
+            .with_context(|| format!("reading {file} in the container"))
+    };
+    let kind = read("/sys/fs/cgroup/cgroup.type").await;
+    let controllers = read("/sys/fs/cgroup/cgroup.controllers").await;
+    stop(&mut child, pid).await?;
+    let (kind, controllers) = (kind?, controllers?);
+    println!("  container cgroup: type {kind:?}, controllers {controllers:?}");
+    assert_eq!(
+        kind, "domain",
+        "the container's cgroup is {kind:?} (controllers {controllers:?}): an ancestor is a \
+         thread root"
+    );
+    assert!(
+        controllers.split_whitespace().any(|c| c == "memory"),
+        "the container's cgroup has no memory controller: {controllers:?}"
+    );
+    Ok(())
+}
+
 /// The VM, the memory server and a clone each run in a cgroup of their own: the fcvm
 /// process and everything it started (Firecracker, the holder, pasta) are in it, the guest's
 /// memory is charged to it, `--no-swap` sets its `memory.swap.max` to 0, and the scope is

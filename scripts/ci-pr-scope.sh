@@ -162,7 +162,7 @@ while IFS= read -r f; do
     # Docs that TESTS READ are code, whatever their extension.
     # tests/test_documented_make_targets.rs reads README.md and
     # PERFORMANCE.md and fails when they name make targets that do not
-    # exist; it runs ungated under `make test-unit` in the host job. A
+    # exist; it runs ungated in every test build of the host job. A
     # PR editing only those files was getting zero gating jobs while
     # the very lints that check them sat unrun -- the same hole this
     # file fixes for bench/, one directory up.

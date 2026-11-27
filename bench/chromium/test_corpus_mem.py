@@ -3595,14 +3595,15 @@ class ZeroBasis(unittest.TestCase):
                 bench_report.measure_cgroup_set(missing, "serve-")
 
     def _forensics_box(self, tmp, pasta_pid):
-        """A results dir, a clone's vm-disks/<id>/pasta.pid, a fake `ss` that
+        """A results dir, a clone's vm-disks/<bucket>/<id>/pasta.pid, a fake `ss` that
         lists two listeners on the DevTools port and a fake fcvm whose exec
         prints what the guest would."""
         bindir = os.path.join(tmp, "bin")
         os.makedirs(bindir)
         vm_id = "vm-" + "7" * 32
-        os.makedirs(os.path.join(tmp, "vm-disks", vm_id))
-        with open(os.path.join(tmp, "vm-disks", vm_id, "pasta.pid"), "w") as f:
+        bucket = hashlib.sha256(vm_id.encode()).hexdigest()[:2]
+        os.makedirs(os.path.join(tmp, "vm-disks", bucket, vm_id))
+        with open(os.path.join(tmp, "vm-disks", bucket, vm_id, "pasta.pid"), "w") as f:
             f.write(f"{pasta_pid}\n")
         with open(os.path.join(bindir, "ss"), "w") as f:
             f.write("#!/bin/sh\n"

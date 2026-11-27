@@ -369,7 +369,12 @@ impl PeerVmm {
                 })?;
             // A blocking write on a thread of its own, so a filesystem that stops answering
             // cannot hold this task past the timeout and keep the kill below from running.
-            let dir = crate::paths::vm_runtime_dir(&vm_id);
+            // The clone's runtime directory as its state recorded it.
+            let dir = states
+                .iter()
+                .find(|state| state.vm_id == vm_id)
+                .map(crate::state::VmState::vm_runtime_dir)
+                .with_context(|| format!("no VM state for {vm_id}"))?;
             let reason = reason.to_string();
             tokio::task::spawn_blocking(move || super::failure::write_failure(&dir, &reason))
                 .await

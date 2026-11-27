@@ -62,24 +62,27 @@ async fn test_vsock_integrity_nested() -> Result<()> {
     let config_mount = format!("{0}/.config/fcvm:/root/.config/fcvm:ro", home);
 
     // Start L1 - the container's entrypoint (run-test.sh) handles everything
-    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        "--network",
-        "bridged",
-        "--kernel-profile",
-        "nested",
-        "--privileged",
-        "--mem",
-        "2048", // Need enough for L2
-        "--map",
-        "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
-        "--map",
-        &config_mount,
-        "localhost/vsock-integrity",
-    ])
+    let (mut child, fcvm_pid, log_path) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "bridged",
+            "--kernel-profile",
+            "nested",
+            "--privileged",
+            "--mem",
+            "2048", // Need enough for L2
+            "--map",
+            "/mnt/fcvm-btrfs:/mnt/fcvm-btrfs",
+            "--map",
+            &config_mount,
+            "localhost/vsock-integrity",
+        ],
+        &[],
+    )
     .await
     .context("spawning L1 VM")?;
 
@@ -114,6 +117,24 @@ async fn test_vsock_integrity_nested() -> Result<()> {
 
     // Clean up result file
     std::fs::remove_file(result_file).ok();
+
+    // The fcvm in L1's container is root and must enter its VM's own cgroup. It could not
+    // while fc-agent made the container's parent a thread root: the container was a threaded
+    // cgroup, every cgroup below it "domain invalid", and fcvm logged "no cgroup of the VM's
+    // own ... Operation not supported" (#2226). An absence check needs the whole capture:
+    // the child's exit does not join the tasks copying its output.
+    common::wait_for_log_eof(&log_path, std::time::Duration::from_secs(120)).await?;
+    let log = std::fs::read_to_string(&log_path)
+        .with_context(|| format!("reading {}", log_path.display()))?;
+    let missed: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("no cgroup of the VM's own"))
+        .collect();
+    anyhow::ensure!(
+        missed.is_empty(),
+        "an fcvm in this chain entered no cgroup of its own:\n{}",
+        missed.join("\n")
+    );
 
     match result.as_str() {
         "PASS" => {

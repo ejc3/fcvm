@@ -3307,7 +3307,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 **Architecture:**
 - All data under `/mnt/fcvm-btrfs/` — native btrfs used directly if host is btrfs, otherwise a loopback image is created (size from `paths.btrfs_size` in rootfs-config.toml, default 60G)
 - Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
-- VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
+- VM disks: `/mnt/fcvm-btrfs/vm-disks/{bucket}/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
 - A snapshot keeps its disks (`disk.raw` and the extra disks) in `snapshots/{tag}/disk/`, a btrfs subvolume, and a
   clone's `disks/` directory is one `btrfs subvolume snapshot` of it with the disk renamed to `rootfs.raw`. A reflink
   copy of the disk is O(extents): 9 to 11 s per clone on a 154 GB www root disk with 860,177 extents, 11 of a 25 s
@@ -4097,7 +4097,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 └── cache/                        # Downloaded cloud images
 
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
-├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
+├── vm-disks/{bucket}/{vm_id}/disks/  # CoW reflink copies per VM (bucket: first byte of sha256(vm_id), two hex digits)
 ├── state/{layout,runtime}        # which runtime directory holds this store's VM states
 ├── reclaim/{euid}/<b>/{id}.json   # what a live fcvm made on the host, in buckets; a dead one's is reclaimed by the first launch 1 s or more after the last sweep began, or the next setup, snapshot import or export (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
