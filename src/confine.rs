@@ -200,7 +200,7 @@ const SECCOMP_POLICY: &str = include_str!("../resources/seccomp/firecracker-conf
 /// from (resources/seccomp/confined-changes.json); `[firecracker] commit` in
 /// rootfs-config.toml must be this commit. A VMM built from another commit is not confined:
 /// its syscalls were never checked against the policy.
-pub const CONFINED_FIRECRACKER_COMMIT: &str = "2a33289b55b7f611959891dd5295438a416f386e";
+pub const CONFINED_FIRECRACKER_COMMIT: &str = "cf5d302d87823789dfdc4df30bfb98c10371cb6f";
 
 /// The environment a confined VMM starts with, on top of fcvm's own.
 ///
@@ -2143,7 +2143,7 @@ mod tests {
         let inner = body(snapshot, "async fn cmd_snapshot_run_inner(");
         let resolve = inner.find("crate::confine::resolve(").unwrap();
         for effect in [
-            "reclaim_abandoned()",
+            "reclaim_abandoned_if_due()",
             "Owner::begin(",
             "EarlyPrefill::start(",
         ] {
@@ -2154,7 +2154,7 @@ mod tests {
         }
         let raw = body(snapshot, "async fn cmd_snapshot_run_raw(");
         let resolve = raw.find("crate::confine::resolve(").unwrap();
-        for effect in ["reclaim_abandoned()", "Owner::begin("] {
+        for effect in ["reclaim_abandoned_if_due()", "Owner::begin("] {
             assert!(
                 resolve < raw.find(effect).unwrap(),
                 "raw restore: {effect} first"

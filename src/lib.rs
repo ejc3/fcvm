@@ -16,6 +16,7 @@ pub mod reclaim;
 pub mod setup;
 pub mod state;
 pub mod storage;
+pub mod sweep;
 #[cfg(test)]
 mod test_child;
 #[cfg(test)]

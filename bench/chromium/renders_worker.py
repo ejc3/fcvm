@@ -35,7 +35,7 @@ import sys
 import time
 
 
-def fcvm_args(opts, bench):
+def fcvm_args(reqbench, opts, bench):
     prefix = [sys.executable, os.path.join(bench, "guardexec.py"),
               "--expected-parent", str(os.getpid()),
               "--cgroup-procs", opts.cgroup_procs, "--"]
@@ -44,7 +44,7 @@ def fcvm_args(opts, bench):
     return argparse.Namespace(
         serve_pid=opts.serve_pid, snapshot_tag="", url="", format="jpeg", quality=80,
         cdp_port=opts.cdp_port, ws_url="", fcvm=opts.fcvm, data_root=opts.data_root,
-        state_dir=os.path.join(opts.data_root, "state"), out_dir=log_dir,
+        state_dir=reqbench.fcvm_state_dir(opts.fcvm), out_dir=log_dir,
         timeout=opts.timeout, teardown_timeout=60.0, rust_log="fcvm=debug",
         run_id=f"{opts.run_id}w{opts.index}", firecracker_fault_probe=None,
         spawn_prefix=prefix, prewire=True, engine="chromium", resolve_poll_ms=5.0,
@@ -158,7 +158,12 @@ def main(argv=None, stdin=None, stdout=None):
         # A killed fcvm's children stay readable until this worker reaps them, which is
         # how the request's teardown reads their CPU (reqbench.become_child_subreaper).
         reqbench.become_child_subreaper()
-        args = fcvm_args(opts, opts.bench)
+        # The state directory is the fcvm binary's own answer (reqbench.fcvm_paths); a
+        # failure to get it ends the worker before it says it is ready.
+        try:
+            args = fcvm_args(reqbench, opts, opts.bench)
+        except RuntimeError as error:
+            p.error(str(error))
     else:
         import cdpdrive
     # A viewport that does not parse is refused here, before the worker says it is ready,

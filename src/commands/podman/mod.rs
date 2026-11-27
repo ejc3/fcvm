@@ -1158,6 +1158,10 @@ enum RestoreFault {
 /// - "image disk build changed" is `verify_image_disk_identity`'s marker: the snapshot names a
 ///   disk build that no longer exists at that path. "snapshot pmem image changed" is
 ///   `check_snapshot_pmem_images`', for the same reason: Firecracker reopens the recorded path.
+/// - `CH_SNAPSHOT_OF_ANOTHER_BUILD` is a Cloud Hypervisor restore refusing a snapshot another
+///   build wrote. The cache key holds the binary's path, which names the commit for the
+///   configured build but not for a binary given by `FCVM_CLOUD_HYPERVISOR_BIN` or found on
+///   PATH and replaced in place.
 const UNUSABLE_SNAPSHOT_MARKERS: &[&str] = &[
     "Failed to load snapshot state from file",
     "Invalid data version",
@@ -1169,6 +1173,7 @@ const UNUSABLE_SNAPSHOT_MARKERS: &[&str] = &[
     "frequency not present in the given snapshot",
     "image disk build changed",
     "snapshot pmem image changed",
+    crate::commands::common::CH_SNAPSHOT_OF_ANOTHER_BUILD,
 ];
 
 /// Classify a failed restore of a cached snapshot.
@@ -1279,7 +1284,7 @@ pub(crate) async fn cleanup_failed_prepare(
 
 /// End the owner of a launch that a cache hit served, which made nothing of its own
 /// beyond what its record lists. A failure here does not fail the run that already
-/// finished: what remains stays recorded for the next launch.
+/// finished: what remains stays recorded for the next sweep.
 async fn complete_unused_owner(owner: crate::reclaim::Owner) {
     if let Err(e) = owner.complete().await {
         warn!(error = %format!("{e:#}"), "resources of a launch served from a snapshot remain");
@@ -1499,7 +1504,7 @@ async fn export_localhost_image_disk(
             anyhow::anyhow!("internal: localhost image id was not captured at inspect time")
         })?;
         // A UUID-keyed orphan is never overwritten by the next run, so the temp is
-        // recorded before it exists and a SIGKILLed export leaves it to the next launch
+        // recorded before it exists and a SIGKILLed export leaves it to the next sweep
         // to reclaim (crate::reclaim).
         let temps = image::temp_owner()?;
         temps.record(crate::reclaim::Resource::Temp {
@@ -1956,7 +1961,7 @@ async fn prepare_vm_for_lifecycle(
     let boot_inputs = GuestBootInputs::resolve(args.dns.as_deref(), &runtime_config);
 
     // What VMs of processes killed without teardown left on the host goes first.
-    crate::reclaim::reclaim_abandoned().await;
+    crate::reclaim::reclaim_abandoned_if_due().await;
     // Generated before the snapshot key so the staging path of a read-only --disk-dir
     // is in this VM's data directory, which teardown removes.
     let vm_id = generate_vm_id();
@@ -4854,7 +4859,7 @@ mod tests {
     /// #1183: a launch records its runtime directory with its owner before anything in
     /// it exists (the --disk-dir staging, then the directory itself), and reclaims what
     /// killed launches left before it records anything. A launch killed in between
-    /// leaves the directory to the next launch only if the record comes first.
+    /// leaves the directory to the next sweep only if the record comes first.
     #[test]
     fn a_launch_records_its_runtime_dir_before_creating_it() {
         let source = include_str!("mod.rs");
@@ -4865,7 +4870,7 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("prepare_vm_for_lifecycle has no {needle:?}"))
         };
-        let reclaimed = at("crate::reclaim::reclaim_abandoned().await");
+        let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
         let staged = at("DiskDirStaging::resolve(");
@@ -4888,7 +4893,7 @@ mod tests {
             body.find(needle)
                 .unwrap_or_else(|| panic!("cmd_snapshot_run_inner has no {needle:?}"))
         };
-        let reclaimed = at("crate::reclaim::reclaim_abandoned().await");
+        let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
         let recorded = at("crate::reclaim::Resource::RuntimeDir {");
         let created = at("tokio::fs::create_dir_all(&data_dir)");
@@ -7826,6 +7831,20 @@ mod restore_fault_classifier_tests {
             RestoreFault::UnusableSnapshot
         );
         assert_eq!(classify("some other failure"), RestoreFault::Other);
+    }
+
+    /// A cached Cloud Hypervisor snapshot that another build wrote (a binary named by
+    /// `FCVM_CLOUD_HYPERVISOR_BIN`, or on PATH, replaced in place: the key holds its path,
+    /// which did not change) is deleted and the run boots fresh. Unclassified, every later
+    /// run of that image failed on the same entry until someone deleted it by hand.
+    #[test]
+    fn a_cloud_hypervisor_snapshot_of_another_build_is_an_unusable_snapshot() {
+        let refusal = format!(
+            "this snapshot was written by `cloud-hypervisor v1` and this host runs \
+             `cloud-hypervisor v2` (/opt/ch): {}. Create the snapshot again",
+            crate::commands::common::CH_SNAPSHOT_OF_ANOTHER_BUILD
+        );
+        assert_eq!(classify(&refusal), RestoreFault::UnusableSnapshot);
     }
 
     /// A format or version rejection is the artifact: it can never load with this binary.

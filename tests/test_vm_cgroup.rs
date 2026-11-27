@@ -4,7 +4,8 @@
 //! `fcvm.slice/fcvm-<pid>-<starttime>.scope` before they start anything, so the VMM, the
 //! holder, pasta and the memory server are created there and what they allocate is charged
 //! there, not to the cgroup of whoever started fcvm. The scope is removed when fcvm exits,
-//! and a scope whose fcvm was killed is removed by the next fcvm's sweep.
+//! and a scope whose fcvm was killed is removed by the next sweep of the parent, which a
+//! start runs when one is due (`fcvm::sweep`).
 
 #![cfg(feature = "integration-slow")]
 #![cfg_attr(not(feature = "privileged-tests"), allow(dead_code, unused_imports))]
@@ -123,16 +124,23 @@ async fn stop(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Run an fcvm command that enters a scope and fails at once, which makes it sweep.
-async fn run_a_sweep() -> Result<()> {
+/// Run an fcvm command that enters a scope and fails at once, with the sweep of the scopes'
+/// parent due every `sweep_every_ms`: 0 makes this start sweep, and an hour keeps it from
+/// sweeping, since the starts before it in this test stamped the parent.
+async fn start_and_fail(sweep_every_ms: u64) -> Result<()> {
     let fcvm = common::find_fcvm_binary()?;
     let mut command = tokio::process::Command::new(&fcvm);
-    command.args([
-        "snapshot",
-        "run",
-        "--snapshot",
-        "fcvm-cgroup-test-no-such-snapshot",
-    ]);
+    command
+        .args([
+            "snapshot",
+            "run",
+            "--snapshot",
+            "fcvm-cgroup-test-no-such-snapshot",
+        ])
+        .env(
+            fcvm::sweep::EVERY_ENV,
+            format!("{}={sweep_every_ms}", fcvm::sweep::CGROUP_SCOPES.name),
+        );
     common::set_test_pdeathsig(&mut command);
     let output = command.output().await.context("running fcvm")?;
     if output.status.success() {
@@ -159,7 +167,8 @@ async fn wait_until_empty(scope: &Path) -> Result<()> {
 /// process and everything it started (Firecracker, the holder, pasta) are in it, the guest's
 /// memory is charged to it, `--no-swap` sets its `memory.swap.max` to 0, and the scope is
 /// gone after fcvm exits, removed by fcvm itself or, when fcvm was killed, by the next
-/// fcvm's sweep.
+/// sweep of the parent: a start inside the sweep's interval leaves it, and the start that
+/// sweeps removes it.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_each_vm_and_memory_server_has_its_own_cgroup() -> Result<()> {
@@ -271,19 +280,27 @@ async fn test_each_vm_and_memory_server_has_its_own_cgroup() -> Result<()> {
         baseline_scope.display()
     );
 
-    // A killed fcvm cannot remove its scope; the next fcvm's sweep does. The kill is reaped
-    // first: until then the process exists as a zombie with its start time, and its owner
-    // is not gone.
+    // A killed fcvm cannot remove its scope; the next sweep of the parent does. The kill is
+    // reaped first: until then the process exists as a zombie with its start time, and its
+    // owner is not gone.
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(serve_pid as i32),
         nix::sys::signal::Signal::SIGKILL,
     )?;
     serve.wait().await?;
     wait_until_empty(&serve_scope).await?;
-    run_a_sweep().await?;
+    // A start inside the interval does not sweep: every start once listed every scope under
+    // the parent's exclusive lock (#2178).
+    start_and_fail(3_600_000).await?;
+    assert!(
+        serve_scope.exists(),
+        "a start swept {} with no sweep due",
+        serve_scope.display()
+    );
+    start_and_fail(0).await?;
     assert!(
         !serve_scope.exists(),
-        "{} of a killed memory server survived the next fcvm's sweep",
+        "{} of a killed memory server survived a sweep",
         serve_scope.display()
     );
     Ok(())

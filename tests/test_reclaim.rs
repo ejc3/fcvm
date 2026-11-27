@@ -1,10 +1,16 @@
 //! A SIGKILLed fcvm runs no teardown. What it made on the host is recorded with its owner
-//! before it is made (src/reclaim.rs), and the next launch reclaims it.
+//! before it is made (src/reclaim.rs), and the next sweep reclaims it: the first launch
+//! that starts 1 s (`RECLAIM_EVERY`) or more after the last sweep began, or the next
+//! setup, snapshot import or snapshot export.
 //!
 //! Each test kills fcvm with SIGKILL while the resource exists, then runs another VM to
-//! completion (every launch reclaims first) and checks that the resource is gone. Another
-//! test's launch can reclaim it first, which changes nothing that is checked: each check
-//! is that the resource is gone after a launch, and that it existed while fcvm lived.
+//! completion with the interval set to nothing, so that its launch sweeps first as every
+//! launch once did, and checks that the resource is gone. Where a test says "the next
+//! launch", that is the launch it means. Another test's launch can reclaim the resource
+//! first, which changes nothing that is checked: each check is that the resource is gone
+//! after a launch that sweeps, and that it existed while fcvm lived.
+//! `a_launch_inside_the_interval_leaves_a_killed_vm_to_the_launch_after_it` is the one
+//! test of a launch that does not sweep.
 
 #![cfg(feature = "integration-fast")]
 
@@ -66,7 +72,10 @@ async fn stop(child: &mut tokio::process::Child, pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Run a VM to completion. Its launch reclaims what killed fcvm processes left.
+/// Run a VM to completion. Its launch sweeps: it reclaims what killed fcvm processes left.
+/// A launch sweeps when none began within `RECLAIM_EVERY`, and another launch of the suite
+/// may have swept just before the kill, so these launches set the interval to nothing
+/// (`FCVM_SWEEP_EVERY_MS=reclaim=0`) and always sweep, as every launch did before the interval.
 async fn next_launch() -> Result<()> {
     next_launch_on("rootless").await
 }
@@ -79,6 +88,13 @@ async fn next_launch_on(network: &str) -> Result<()> {
 
 /// [`next_launch_on`] with `env` set for the launch, such as a data dir of its own.
 async fn next_launch_with(network: &str, env: &[(&str, &str)]) -> Result<()> {
+    let mut env = env.to_vec();
+    env.push((fcvm::sweep::EVERY_ENV, "reclaim=0"));
+    launch_to_completion(network, &env).await
+}
+
+/// Run a VM to completion with exactly `env`: whether its launch sweeps is the caller's.
+async fn launch_to_completion(network: &str, env: &[(&str, &str)]) -> Result<()> {
     let (name, _, _, _) = common::unique_names("reclaim-next");
     let (mut child, _) = common::spawn_fcvm_with_env(
         &[
@@ -173,6 +189,100 @@ async fn a_sigkilled_vm_leaves_its_runtime_dir_and_pasta_pid_file_to_the_next_la
         "the killed VM's pasta PID file survived the next launch: {left:?}"
     );
     Ok(())
+}
+
+/// The contract of a launch that does not sweep, end to end: a launch that starts less
+/// than the interval after a sweep began leaves a killed VM's runtime directory and its
+/// record where they are, and the first launch after the interval removes them.
+///
+/// No sleep and no luck with the clock decide which launch is which. The launches run in a
+/// data directory of their own, so no other test's launch sweeps or stamps there. The
+/// interval is set to an hour for them, and the stamp is written by the test: first as a
+/// sweep that began this instant, which stays inside an hour however long the launch takes
+/// to read it, then as one that began two hours ago. The default interval is pinned in
+/// `reclaim::tests::a_launch_does_not_sweep_or_wait_while_another_sweeps`.
+///
+/// RED BEFORE THE GATE: every launch swept, so the launch inside the interval removed the
+/// directory.
+#[tokio::test]
+async fn a_launch_inside_the_interval_leaves_a_killed_vm_to_the_launch_after_it() -> Result<()> {
+    // Short: a VM's sockets sit under <data>/vm-disks/vm-<32 hex>/, and AF_UNIX paths stop at
+    // 108 bytes.
+    let data_dir = fcvm::paths::data_dir().join(format!(
+        "rg-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let data_dir_str = data_dir.to_str().context("data dir path")?.to_string();
+    let env = [
+        ("FCVM_DATA_DIR", data_dir_str.as_str()),
+        (fcvm::sweep::EVERY_ENV, "reclaim=3600000"),
+    ];
+    let owners = fcvm::reclaim::owner_dir_in(&data_dir)?;
+    let result = async {
+        let (name, _, _, _) = common::unique_names("reclaim-gate");
+        let (mut child, pid) = common::spawn_fcvm_with_env(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &name,
+                "--network",
+                "rootless",
+                "--no-snapshot",
+                common::TEST_IMAGE,
+            ],
+            &env,
+        )
+        .await?;
+        let observed = wait_for(
+            "the VM made no disk in its runtime directory",
+            Duration::from_secs(180),
+            || {
+                std::fs::read_dir(data_dir.join("vm-disks"))
+                    .ok()?
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|dir| dir.join("disks/rootfs.raw").exists())
+            },
+        )
+        .await;
+        sigkill(&mut child, pid).await?;
+        let runtime_dir = observed?;
+        let recorded = || {
+            fcvm::reclaim::record_files(&owners)
+                .iter()
+                .filter_map(|path| std::fs::read_to_string(path).ok())
+                .any(|record| record.contains(&*runtime_dir.to_string_lossy()))
+        };
+        anyhow::ensure!(
+            recorded(),
+            "no owner record names the killed VM's runtime directory {}",
+            runtime_dir.display()
+        );
+
+        // A sweep began this instant: a launch within the hour does not sweep.
+        fcvm::reclaim::set_sweep_stamp(&owners, Duration::ZERO)?;
+        launch_to_completion("rootless", &env).await?;
+        anyhow::ensure!(
+            runtime_dir.exists() && recorded(),
+            "a launch inside the interval swept: {} or its record is gone",
+            runtime_dir.display()
+        );
+
+        // The last sweep began two hours ago: this launch is the next sweep.
+        fcvm::reclaim::set_sweep_stamp(&owners, Duration::from_secs(7200))?;
+        launch_to_completion("rootless", &env).await?;
+        anyhow::ensure!(
+            !runtime_dir.exists() && !recorded(),
+            "the launch after the interval left the killed VM's runtime directory {} or its \
+             record",
+            runtime_dir.display()
+        );
+        Ok(())
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&data_dir).await;
+    result
 }
 
 /// The first `.reached` file under a park directory: a process parked at the point.
@@ -971,7 +1081,7 @@ async fn a_sigkilled_import_leaves_its_staged_image_disk_to_the_next_import() ->
         };
         let owners = fcvm::reclaim::owner_dir_in(data.path())?;
         let temp_records = || -> Result<Vec<String>> {
-            Ok(names_in(&owners)?
+            Ok(fcvm::reclaim::record_file_names(&owners)
                 .into_iter()
                 .filter(|name| name.starts_with("store-temp-") && name.ends_with(".json"))
                 .collect())
@@ -1012,7 +1122,7 @@ async fn a_sigkilled_import_leaves_its_staged_image_disk_to_the_next_import() ->
             anyhow::ensure!(
                 temp_records()?.len() == 1,
                 "the staged image disk has no reclaim record: {:?}",
-                names_in(&owners)?
+                fcvm::reclaim::record_file_names(&owners)
             );
             Ok(())
         }
@@ -1117,12 +1227,9 @@ fn cache_temps(key: &str) -> Vec<PathBuf> {
 
 /// Every temporary a record of the fcvm process `pid` lists, in the owner directory `dir`.
 fn recorded_temps(dir: &Path, pid: u32) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
     let mut temps = Vec::new();
-    for entry in entries.flatten() {
-        let Ok(bytes) = std::fs::read(entry.path()) else {
+    for path in fcvm::reclaim::record_files(dir) {
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -1144,16 +1251,13 @@ fn recorded_temps(dir: &Path, pid: u32) -> Vec<PathBuf> {
 
 /// The lock files of the records the fcvm process `pid` wrote in the owner directory `dir`.
 fn record_locks(dir: &Path, pid: u32) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
+    fcvm::reclaim::record_files(dir)
+        .into_iter()
+        .filter_map(|path| {
             let record: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+                serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
             (record.get("pid").and_then(|p| p.as_u64()) == Some(u64::from(pid)))
-                .then(|| entry.path().with_extension("lock"))
+                .then(|| path.with_extension("lock"))
         })
         .collect()
 }

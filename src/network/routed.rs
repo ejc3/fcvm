@@ -77,19 +77,6 @@ pub(crate) enum LeaseAttempt {
     },
 }
 
-/// Lock `dir`'s lease table: the directory itself, exclusively, waiting for it. A sweep
-/// (`remove_abandoned_leases`) and a lease's open and lock of its file each hold it, so a
-/// sweep never locks a file a VM has created and not yet locked, and that VM never
-/// mistakes the sweep for a holder. Held for a few file operations, never for a lease's
-/// lifetime.
-fn lock_lease_table(dir: &std::path::Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
-    let table = std::fs::File::open(dir)
-        .with_context(|| format!("opening the IPv6 address lease directory {}", dir.display()))?;
-    nix::fcntl::Flock::lock(table, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, error)| error)
-        .with_context(|| format!("locking the IPv6 address lease directory {}", dir.display()))
-}
-
 /// Take the lease on `address` in `dir` for VM `vm_id` of this process, or report who
 /// holds it.
 ///
@@ -97,10 +84,25 @@ fn lock_lease_table(dir: &std::path::Path) -> Result<nix::fcntl::Flock<std::fs::
 /// even before the holder has recorded its address anywhere else. The file is therefore
 /// opened without truncation: a contender opening it must not erase what the holder
 /// wrote.
+///
+/// The lease files of killed holders are swept when a sweep is due
+/// (`crate::sweep::ROUTED_LEASES`), not by every lease: the sweep lists the directory and
+/// tries every file's lock, and run by every start under the table's exclusive lock it made
+/// routed starts take turns for longer the more routed VMs ran (#2202).
 pub(crate) fn lease_address(
     dir: &std::path::Path,
     address: std::net::Ipv6Addr,
     vm_id: &str,
+) -> Result<LeaseAttempt> {
+    lease_address_sweeping(dir, address, vm_id, crate::sweep::ROUTED_LEASES.interval())
+}
+
+/// [`lease_address`] with the lease sweep's interval given.
+fn lease_address_sweeping(
+    dir: &std::path::Path,
+    address: std::net::Ipv6Addr,
+    vm_id: &str,
+    sweep_every: std::time::Duration,
 ) -> Result<LeaseAttempt> {
     use nix::fcntl::{Flock, FlockArg};
     use std::io::{Read, Seek, Write};
@@ -115,10 +117,13 @@ pub(crate) fn lease_address(
     // Ipv6Addr's Display is the canonical (RFC 5952) form, so every spelling of one
     // address names one file.
     let path = dir.join(format!("{address}.lock"));
-    // Held until this attempt has locked its file or found it held, and across the
-    // sweep, which therefore never locks a file another VM has opened and not locked.
-    let _table = lock_lease_table(dir)?;
-    remove_abandoned_leases(dir, &path);
+    sweep_abandoned_leases_if_due(dir, &path, sweep_every);
+    // The lease table (`crate::sweep::table`): held shared until this attempt has locked
+    // its file or found it held, so leases do not wait for each other. A sweep locks lease
+    // files only while it holds the table exclusively, so it never locks a file a VM has
+    // opened and not yet locked, and that VM never mistakes the sweep for a holder.
+    let _table = crate::sweep::table::shared(dir)
+        .with_context(|| format!("locking the IPv6 address lease directory {}", dir.display()))?;
     // A retry needs a holder that unlinked the file between this open and this lock,
     // which takes a release and a new lease each time.
     for _ in 0..100 {
@@ -172,40 +177,85 @@ pub(crate) fn lease_address(
     anyhow::bail!("the lease of IPv6 address {address} kept being replaced while taking it")
 }
 
-/// Remove the lease files in `dir` that no process holds, except `keep`.
+/// Sweep `dir` for the lease files of killed holders when a sweep is due: at most once
+/// per `every`, by the lease that has the turn (`crate::sweep`). The stamp and the lock of
+/// the sweep are in `dir` itself, which is on tmpfs, so a reboot clears them with the
+/// leases. A stamp that cannot be read or written means no sweep from this lease, not a
+/// sweep in every lease.
+fn sweep_abandoned_leases_if_due(
+    dir: &std::path::Path,
+    keep: &std::path::Path,
+    every: std::time::Duration,
+) {
+    use crate::sweep::TableSweep;
+    let swept = crate::sweep::open_dir(dir).and_then(|table| {
+        crate::sweep::sweep_table(
+            &crate::sweep::Place::new(&table, dir),
+            every,
+            dir,
+            crate::sweep::TABLE_WAIT,
+            || lease_files(dir, keep),
+            |files| remove_abandoned_leases(&files),
+        )
+    });
+    match swept {
+        Ok(TableSweep::Swept(_) | TableSweep::NotDue | TableSweep::NothingFound) => {}
+        Ok(TableSweep::TableBusy) => {
+            debug!(dir = %dir.display(), "the IPv6 address lease directory stayed locked; the next sweep removes abandoned leases")
+        }
+        Err(error) => {
+            debug!(dir = %dir.display(), error = %format!("{error:#}"), "no sweep of IPv6 address leases from this lease")
+        }
+    }
+}
+
+/// The lease files in `dir`, except `keep`: what a sweep may find abandoned. Reads only.
+/// Whether a file's holder is gone is known only by trying its lock, which
+/// [`remove_abandoned_leases`] does under the table's lock.
+fn lease_files(dir: &std::path::Path, keep: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(dir = %dir.display(), %error, "listing IPv6 address leases");
+            return Vec::new();
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                let path = entry.path();
+                if path != keep && path.extension().is_some_and(|ext| ext == "lock") {
+                    files.push(path);
+                }
+            }
+            Err(error) => {
+                warn!(dir = %dir.display(), %error, "listing IPv6 address leases");
+                break;
+            }
+        }
+    }
+    files
+}
+
+/// Remove those of the lease files `files` that no process holds.
 ///
 /// A holder that is SIGKILLed releases its lock but leaves its file, and derived
 /// addresses differ on every launch, so nothing else would remove it before a reboot
 /// (#1147). Each file is removed the way a holder removes its own (`AddressLease`'s
 /// Drop): under an exclusive lock, and only while the path still names the locked inode.
 /// A file another process holds refuses the lock and is kept. The caller holds the lease
-/// table (`lock_lease_table`), so no other process is between its open and its lock of a
-/// lease file, where the sweep's lock would make it report the address held.
+/// table exclusively (`crate::sweep::sweep_table`), so no other process is between its
+/// open and its lock of a lease file, where the sweep's lock would make it report the
+/// address held.
 ///
 /// Every error here is logged and skipped: a leftover file costs an inode, never a lease.
-fn remove_abandoned_leases(dir: &std::path::Path, keep: &std::path::Path) {
+fn remove_abandoned_leases(files: &[std::path::PathBuf]) {
     use nix::fcntl::{Flock, FlockArg};
     use std::os::unix::fs::MetadataExt;
 
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            warn!(dir = %dir.display(), %error, "listing IPv6 address leases");
-            return;
-        }
-    };
-    for entry in entries {
-        let path = match entry {
-            Ok(entry) => entry.path(),
-            Err(error) => {
-                warn!(dir = %dir.display(), %error, "listing IPv6 address leases");
-                return;
-            }
-        };
-        if path == keep || path.extension().is_none_or(|ext| ext != "lock") {
-            continue;
-        }
-        let file = match std::fs::File::open(&path) {
+    for path in files {
+        let file = match std::fs::File::open(path) {
             Ok(file) => file,
             // Its holder released it, or another sweep removed it.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -223,7 +273,7 @@ fn remove_abandoned_leases(dir: &std::path::Path, keep: &std::path::Path) {
                 continue;
             }
         };
-        let names_the_locked_file = match (lock.metadata(), std::fs::metadata(&path)) {
+        let names_the_locked_file = match (lock.metadata(), std::fs::metadata(path)) {
             (Ok(held), Ok(current)) => held.dev() == current.dev() && held.ino() == current.ino(),
             _ => false,
         };
@@ -231,7 +281,7 @@ fn remove_abandoned_leases(dir: &std::path::Path, keep: &std::path::Path) {
             // Removed and created again since the open: the new file is not this one.
             continue;
         }
-        match crate::state::manager::remove_if_exists(&path) {
+        match crate::state::manager::remove_if_exists(path) {
             Ok(()) => debug!(path = %path.display(), "removed an abandoned IPv6 address lease"),
             Err(error) => {
                 warn!(path = %path.display(), %error, "removing an abandoned IPv6 address lease")
@@ -1454,7 +1504,7 @@ impl NetworkManager for RoutedNetwork {
 
             // Remove the IPv6 MASQUERADE rule (only set without --ipv6-prefix) and the
             // proxy NDP entry. One that cannot be removed keeps its record, under this
-            // address's lease, for the next launch.
+            // address's lease, for the next sweep.
             match vm_ipv6.parse() {
                 Ok(address) => {
                     if let crate::reclaim::Undo::Kept(why) =
@@ -1493,7 +1543,7 @@ impl NetworkManager for RoutedNetwork {
         // Delete veth pair (auto-deletes peer, and with it any route through it). Its
         // name, and the address once the lease goes, can be another VM's from here on,
         // so the records go first (crate::reclaim). If they cannot be dropped, the veth
-        // and the namespace stay, still recorded, and the next launch removes them.
+        // and the namespace stay, still recorded, and the next sweep removes them.
         if let Err(e) = crate::reclaim::forget(&self.vm_id, |r| {
             r.is_network()
                 && !matches!(r, crate::reclaim::Resource::Netns { .. })
@@ -1502,7 +1552,7 @@ impl NetworkManager for RoutedNetwork {
             self.address_lease.take();
             anyhow::bail!(
                 "dropping the records of the routed network, so its veth and namespace stay \
-                 for the next launch: {e:#}"
+                 for the next sweep: {e:#}"
             );
         }
         if let Some(ref host_veth) = self.host_veth {
@@ -1518,7 +1568,7 @@ impl NetworkManager for RoutedNetwork {
             matches!(r, crate::reclaim::Resource::Netns { .. })
         }) {
             anyhow::bail!(
-                "dropping the record of the routed namespace, so it stays for the next launch: \
+                "dropping the record of the routed namespace, so it stays for the next sweep: \
                  {e:#}"
             );
         }
@@ -1988,6 +2038,7 @@ pub(crate) async fn detect_default_ipv6_interface() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sweep::Sweep;
 
     /// Routed relays every host proxy, loopback or not (the host's connect() hooks see
     /// the relay's connection, not the guest's), the HTTP and HTTPS proxies each on its
@@ -2296,7 +2347,7 @@ mod tests {
     /// sweep (`remove_abandoned_leases`) locks every file it may remove, including one a
     /// VM has just created and not yet locked; that VM's lock then failed and it reported
     /// the address held by nobody. Here the sweep is played by a thread that holds the
-    /// table the way a sweep does, locks the file, removes it and lets go.
+    /// table the way a sweep does (exclusively), locks the file, removes it and lets go.
     #[test]
     fn a_lease_taken_during_another_vms_sweep_is_not_refused() {
         use nix::fcntl::{Flock, FlockArg};
@@ -2307,7 +2358,7 @@ mod tests {
         let sweep = {
             let (dir, path) = (dir.path().to_path_buf(), path.clone());
             std::thread::spawn(move || {
-                let table = lock_lease_table(&dir).unwrap();
+                let table = crate::sweep::table::exclusive(&dir).unwrap();
                 let file = std::fs::OpenOptions::new()
                     .create(true)
                     .truncate(false)
@@ -2383,49 +2434,137 @@ mod tests {
         ChildHolder(holder)
     }
 
-    /// A killed holder's lease file is removed by the next lease of any address, and a
-    /// live holder's is kept (#1147). The killed holders are a file nobody ever locked and
-    /// a child that locked its file and was SIGKILLed; the live ones are a child and a
-    /// lease of this process.
+    /// A killed holder's lease file is removed by the first lease of any address that is
+    /// taken an interval or more after the last sweep began, and a live holder's is kept
+    /// (#1147). A lease inside the interval removes nothing and does not list the directory
+    /// (#2202). The killed holders are a file nobody ever locked and a child that locked
+    /// its file and was SIGKILLed; the live ones are a child and a lease of this process.
     #[test]
-    fn a_lease_removes_the_files_of_killed_holders_and_keeps_live_ones() {
+    fn a_lease_removes_the_files_of_killed_holders_when_a_sweep_is_due() {
         let dir = tempfile::tempdir().unwrap();
         let file = |address: &str| dir.path().join(format!("{address}.lock"));
+        let hour = std::time::Duration::from_secs(3600);
+        let lease = |address: &str, vm_id: &str| {
+            leased(
+                lease_address_sweeping(dir.path(), address.parse().unwrap(), vm_id, hour).unwrap(),
+            )
+        };
+        let left = || {
+            let mut left: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            left.sort();
+            left
+        };
 
+        // The first lease finds no stamp, sweeps an empty directory and stamps.
+        let _ours = lease("2001:db8::13", "vm-c").unwrap();
         std::fs::write(file("2001:db8::10"), "4242 vm-gone\n").unwrap();
         hold_in_child(&file("2001:db8::11")).kill();
         let _live = hold_in_child(&file("2001:db8::12"));
-        let _ours =
-            leased(lease_address(dir.path(), "2001:db8::13".parse().unwrap(), "vm-c").unwrap())
-                .unwrap();
         // Not a lease file: left alone.
         std::fs::write(dir.path().join("README"), "").unwrap();
 
-        let _new =
-            leased(lease_address(dir.path(), "2001:db8::14".parse().unwrap(), "vm-d").unwrap())
-                .unwrap();
-
-        let mut left: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        left.sort();
+        // A lease inside the interval: no sweep.
+        let _new = lease("2001:db8::14", "vm-d").unwrap();
         assert_eq!(
-            left,
+            left(),
             [
+                ".sweep-lock",
+                ".sweep-stamp",
+                "2001:db8::10.lock",
+                "2001:db8::11.lock",
                 "2001:db8::12.lock",
                 "2001:db8::13.lock",
                 "2001:db8::14.lock",
+                "README"
+            ]
+        );
+
+        // The interval has passed: the next lease sweeps.
+        let table = crate::sweep::open_dir(dir.path()).unwrap();
+        crate::sweep::set_stamp(
+            &crate::sweep::Place::new(&table, dir.path()),
+            hour + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let _next = lease("2001:db8::15", "vm-f").unwrap();
+        assert_eq!(
+            left(),
+            [
+                ".sweep-lock",
+                ".sweep-stamp",
+                "2001:db8::12.lock",
+                "2001:db8::13.lock",
+                "2001:db8::14.lock",
+                "2001:db8::15.lock",
                 "README"
             ],
             "only the files of live holders, and the new lease, may remain"
         );
         // The live holder still holds its address.
-        assert!(leased(
-            lease_address(dir.path(), "2001:db8::12".parse().unwrap(), "vm-e").unwrap()
-        )
-        .is_none());
+        assert!(lease("2001:db8::12", "vm-e").is_none());
     }
+
+    /// The address leases as a caller of the sweep (`crate::sweep::testing`): a lease
+    /// directory, lease files of killed and of live holders, and what a start's lease does.
+    struct LeasesOfAHost {
+        dir: tempfile::TempDir,
+        taken: std::sync::atomic::AtomicU32,
+        held: std::sync::Mutex<Vec<AddressLease>>,
+    }
+
+    impl crate::sweep::testing::Caller for LeasesOfAHost {
+        const SWEEP: &'static Sweep = &crate::sweep::ROUTED_LEASES;
+
+        fn new() -> Self {
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+                taken: std::sync::atomic::AtomicU32::new(1),
+                held: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn abandon(&self, n: usize) -> std::path::PathBuf {
+            // A killed holder's file: its lock went with the process.
+            let file = self.dir.path().join(format!("2001:db8:dead::{n:x}.lock"));
+            std::fs::write(&file, "4242 vm-gone\n").unwrap();
+            file
+        }
+
+        fn live(&self, n: usize) -> (std::path::PathBuf, Box<dyn std::any::Any>) {
+            let file = self.dir.path().join(format!("2001:db8:a11e::{n:x}.lock"));
+            let holder = crate::sweep::testing::hold_from_another_process(&file);
+            (file, Box::new(holder))
+        }
+
+        fn start(&self, every: std::time::Duration) {
+            let n = self.taken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let address = format!("2001:db8:5::{n:x}").parse().unwrap();
+            let lease = leased(
+                lease_address_sweeping(self.dir.path(), address, "vm-start", every).unwrap(),
+            )
+            .expect("an address nobody holds");
+            self.held.lock().unwrap().push(lease);
+        }
+
+        fn with_place<R>(&self, f: impl FnOnce(&crate::sweep::Place) -> R) -> R {
+            let table = crate::sweep::open_dir(self.dir.path()).unwrap();
+            f(&crate::sweep::Place::new(&table, self.dir.path()))
+        }
+
+        fn listed(&self) -> Vec<std::path::PathBuf> {
+            vec![self.dir.path().to_path_buf()]
+        }
+
+        fn table(&self) -> Option<std::path::PathBuf> {
+            Some(self.dir.path().to_path_buf())
+        }
+    }
+
+    crate::sweep::testing::caller_matrix!(LeasesOfAHost);
+    crate::sweep::testing::table_matrix!(LeasesOfAHost);
 
     /// A VM torn down to be restored in this process hands over the listeners of the
     /// mappings that name a host address, and closes those on its own loopback IP: that
@@ -2549,7 +2688,7 @@ mod tests {
             !rule.contains("\"-D\""),
             "the hairpin rule is removed somewhere"
         );
-        assert!(!rule.contains("lock_lease_table("));
+        assert!(!rule.contains("sweep::table::") && !rule.contains("lease_address("));
     }
 
     /// The rule reads devices and a destination, and nothing that attaches connection

@@ -798,11 +798,43 @@ def unit_command(unit_text, agent_env, name):
     return ["systemd-run", "--unit", name, "--collect", "--quiet", "--pipe", *props, *command]
 
 
-def unit_census(conf, name):
-    """renders_bench.sh census_args for the module the image's renders.env runs, under unit `name`."""
-    out, data = conf["RENDERS_OUT"], "/mnt/fcvm-btrfs"
+def unit_fcvm_paths(unit_text):
+    """fcvm's state and data directories as the agent unit's fcvm resolves them: the unit's
+    ExecStart binary asked `paths --json` with the unit's own Environment= settings and nothing
+    else, as bench/chromium/renders_bench.sh asks its unit's fcvm (load_fcvm_paths). Neither
+    directory is built from the other here. A call that fails, or an answer without an absolute
+    state_dir and data_dir, is an error: a census of an empty path counts nothing."""
+    service = unit_text.split("[Service]\n", 1)[1].split("\n[", 1)[0]
+    env, binary = {}, None
+    for line in service.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key == "Environment":
+            env.update(word.split("=", 1) for word in value.split() if "=" in word)
+        elif key == "ExecStart":
+            binary = value.split()[0]
+    need(binary, "the agent unit has no ExecStart")
+    done = subprocess.run([binary, "paths", "--json"], stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, env=env, timeout=120)
+    need(done.returncode == 0, f"'{binary} paths --json' failed with status {done.returncode}")
+    try:
+        answer = json.loads(done.stdout)
+    except ValueError:
+        answer = None
+    need(isinstance(answer, dict), f"'{binary} paths --json' printed no JSON object")
+    paths = {key: answer.get(key) for key in ("state_dir", "data_dir")}
+    for key, value in paths.items():
+        need(isinstance(value, str) and value.startswith("/"), f"'{binary} paths --json' printed no {key}")
+    return paths
+
+
+def unit_census(conf, name, paths):
+    """renders_bench.sh census_args for the module the image's renders.env runs, under unit `name`,
+    over the directories `paths` holds (unit_fcvm_paths)."""
+    out, data = conf["RENDERS_OUT"], paths["data_dir"]
     args = ["--unit", name, "--status", out + ".status.json", "--teardown", out + "/teardown.json",
-            "--run-dir", conf["RENDERS_RUN_DIR"], "--state-dir", data + "/state", "--vm-dir", data + "/vm-disks",
+            "--run-dir", conf["RENDERS_RUN_DIR"], "--state-dir", paths["state_dir"], "--vm-dir", data + "/vm-disks",
             "--data-dir", data, "--snapshot-tag", conf["RENDERS_SNAPSHOT_TAG"]]
     for address in ("127.0.0.1", "127.0.0.3"):
         for port in (80, 443):
@@ -827,6 +859,10 @@ def renders_unit_proof():
         failures.append("systemd-analyze verify refused the agent's unit")
     src = Path(conf["RENDERS_SRC"], "bench/chromium")
     urls = module.campaign_urls(src / "corpus_campaign.sh")
+    try:
+        paths = unit_fcvm_paths(RENDERS_UNIT.read_text())
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return False, failures + ["the agent unit's fcvm did not name its state and data directories"]
     with tempfile.TemporaryDirectory(dir="/mnt/fcvm-btrfs") as tmp:
         env = Path(tmp, "agent.env")
         env.write_text('FLEET_AGENT_ARGS="--stdio"\n')
@@ -834,7 +870,8 @@ def renders_unit_proof():
         Path(tmp).chmod(0o755)
         out = tmp + "/unit-check.json"
         command = unit_command(RENDERS_UNIT.read_text(), str(env), RENDERS_UNIT_CHECK)
-        done = subprocess.run(["python3", str(src / "renders_agent_check.py"), *unit_census(conf, RENDERS_UNIT_CHECK),
+        done = subprocess.run(["python3", str(src / "renders_agent_check.py"),
+                               *unit_census(conf, RENDERS_UNIT_CHECK, paths),
                                "--pages", str(len(urls.split(","))), "--engines", "--cases", "running",
                                "--log", tmp + "/unit-check.log", "--out", out, "--", *command],
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3600)
