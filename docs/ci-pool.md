@@ -98,7 +98,9 @@ again after the run it started has finished, from any session.
    lost runner, a setup step, a missing log) is always run again, however many lanes it
    took.
 3. If the rerun passes, the pool is not simply green: the lane failed and passed on one
-   commit. Each cause is appended to the open issue that owns it (an issue body lists
+   commit. A lane whose earlier attempt was cancelled and whose rerun passed counts the
+   same way (GitHub reports a job over its time limit as cancelled); the issue and the
+   landing message then say "was cancelled", and cite the run it was cancelled in. Each cause is appended to the open issue that owns it (an issue body lists
    the causes it owns as `<!-- ci-pool-cause: X -->`; X also owns causes that start with
    X and a space, so one issue can own every case of a test binary), or a new issue is
    opened. The pool may land with that issue open; `main` runs those lanes again,

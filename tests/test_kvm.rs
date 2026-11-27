@@ -1123,7 +1123,7 @@ async fn test_nested_l4() -> Result<()> {
 enum BenchmarkMode {
     /// No benchmarks - just verify nesting works
     None,
-    /// Standard benchmarks (egress, disk I/O, FUSE latency, memory)
+    /// Standard benchmarks (gateway reachability, disk I/O, FUSE latency, memory)
     Standard,
     /// Standard + large file tests (100MB copies)
     WithLargeFiles,
@@ -1146,7 +1146,7 @@ echo "MARKER_L${LEVEL}_OK"
 
 /// Benchmark script that runs at each nesting level
 ///
-/// Measures: egress connectivity, local disk I/O, FUSE disk I/O, FUSE latency, memory usage.
+/// Measures: gateway reachability, local disk I/O, FUSE disk I/O, FUSE latency, memory usage.
 /// Outputs MARKER_L{level}_OK on success.
 fn benchmark_script() -> &'static str {
     r#"#!/bin/bash
@@ -1155,14 +1155,21 @@ LEVEL=${1:-unknown}
 
 echo "=== BENCHMARK L${LEVEL} ==="
 
-# Test 1: Egress - can we reach the gateway?
-echo "--- Egress Test ---"
-# Test by pinging the gateway (10.0.2.2 for rootless via pasta)
-# This validates network connectivity without external dependencies
-if ping -c 1 -W 5 10.0.2.2 > /dev/null 2>&1; then
-    echo "EGRESS_L${LEVEL}=OK gateway=10.0.2.2"
+# Test 1: Ping the default gateway the routing table names. Every level runs
+# with --network bridged, so the gateway is not pasta's 10.0.2.2. No route or
+# no answer fails the level.
+echo "--- Gateway Reachability Test ---"
+ROUTES=$(ip -4 route show default)
+GATEWAY=$(printf '%s\n' "$ROUTES" | awk '$1 == "default" && $2 == "via" {print $3; exit}')
+if [ -z "$GATEWAY" ]; then
+    echo "GATEWAY_L${LEVEL}=FAIL no default gateway: $ROUTES" >&2
+    exit 1
+fi
+if ping -c 1 -W 5 "$GATEWAY"; then
+    echo "GATEWAY_L${LEVEL}=OK gateway=$GATEWAY"
 else
-    echo "EGRESS_L${LEVEL}=FAIL"
+    echo "GATEWAY_L${LEVEL}=FAIL gateway=$GATEWAY routes=$ROUTES" >&2
+    exit 1
 fi
 
 # Test 2: Local disk performance (dd to /tmp which is on rootfs)
@@ -1234,7 +1241,7 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
     START=$(date +%s%N)
     for i in $(seq 1 100); do cat "${FUSE_DIR}/lat.txt" > /dev/null; done
     END=$(date +%s%N)
-    READ_US=$(( (END - START) / 1000 ))
+    READ_US=$(( (END - START) / (1000 * 100) ))
     echo "FUSE_SMALLREAD_L${LEVEL}=${READ_US}us/op (100 ops)"
 
     rm -rf "$FUSE_DIR"
@@ -1528,7 +1535,7 @@ echo "MARKER_NET_L${{LEVEL}}_OK"
 fn print_benchmark_summary(log_content: &str, include_large_files: bool, include_network: bool) {
     println!("\n=== BENCHMARK SUMMARY ===");
     for line in log_content.lines() {
-        let is_standard = line.contains("EGRESS_L")
+        let is_standard = line.contains("GATEWAY_L")
             || line.contains("LOCAL_WRITE_L")
             || line.contains("LOCAL_READ_L")
             || line.contains("FUSE_WRITE_L")
@@ -2052,8 +2059,11 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
     // so the VM dies (and cleans up) before the test harness gives up. The L3
     // tests complete in 627 to 810 s (#660), so 840 s left them as little as 4% headroom,
     // and an L3 run on a host busy with other VM tests took 847 s and was killed.
+    // No sudo: the privileged runner already runs this test as root, and sudo
+    // would reset the environment, dropping FCVM_NO_SNAPSHOT, FCVM_DATA_DIR and
+    // FCVM_CONFIG_DIR before L1 starts.
     let fcvm_cmd = format!(
-        "timeout -k 10 1140 sudo ./target/release/fcvm podman run \
+        "timeout -k 10 1140 ./target/release/fcvm podman run \
          --name l1-nested-{}-{}-{}-{} \
          --network bridged \
          --privileged \
