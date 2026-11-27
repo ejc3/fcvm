@@ -266,6 +266,8 @@ TEST_LOG_DIR := /tmp/fcvm-test-logs
 # as arguments instead would need FILTER's own quotes (-E 'test(...)') quoted again.
 # Without this, `make container-test-unit FILTER=x` ran every test.
 CONTAINER_TEST_OPTIONS := -e FILTER -e STREAM -e LIST -e IGNORED
+# CI's build profile (ci.yml sets both); unset outside CI, so the container builds the shipped one.
+CONTAINER_TEST_OPTIONS += -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS -e CARGO_PROFILE_RELEASE_LTO
 
 # Container run command (base)
 # Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode
