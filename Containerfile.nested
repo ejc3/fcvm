@@ -4,7 +4,7 @@
 #
 # Build:
 #   cp target/release/fcvm target/release/fc-agent artifacts/
-#   cp /mnt/fcvm-btrfs/firecracker/firecracker-nested-*.bin artifacts/firecracker-nested
+#   cp <the Firecracker the nested profile runs: [firecracker]'s build> artifacts/firecracker-nested
 #   sudo podman build -t localhost/nested-test -f Containerfile.nested .
 #
 # The nested test is driven by test_nested_chain tests which:
