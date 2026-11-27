@@ -1365,6 +1365,13 @@ git clone https://github.com/ejc3/fuser.git
 #    builds the static libseccomp pinned in [libseccomp] for the Firecracker
 #    build to link, into the assets directory; nothing is installed on the host.
 cd ~/src/fcvm && make build && make setup-fcvm
+
+# 8. VM states on tmpfs. Without this step a user's VM states are kept in the data
+#    directory, which works and is slower. Makes /run/fcvm-<uid> and
+#    /etc/tmpfiles.d/fcvm-<uid>.conf, which makes it at every boot (remove that file to
+#    undo). Takes effect for a data directory at its first start after the next boot, or
+#    at once on a box that has started no VM yet.
+sudo ./target/release/fcvm setup --runtime-dir
 ```
 
 Run everything as the unprivileged user; `make` shells out to sudo exactly where
@@ -2730,7 +2737,8 @@ and oomd killed a session scope holding 138 GB, VM included (#1028).
    allocates stays charged to the caller.
 2. **A harness that places fcvm in a cgroup of its own sets `FCVM_CGROUP_PARENT=none`**,
    or a root fcvm moves out of it (`bench/chromium/guardexec.py`, `corpus_mem.py`,
-   `bench.sh`). `--no-swap` is refused there, and for an unprivileged fcvm.
+   `bench.sh`). `--no-swap` is refused there, and for an unprivileged fcvm outside a
+   cgroup delegated to its user.
 3. **Scope identity is (pid, start time)**. A start holds the parent's `flock` shared
    while it makes and enters its scope, and the sweep, which a start runs at most once per
    5 s and parent (`src/sweep.rs`), removes only under that lock held exclusively. Never
@@ -2967,13 +2975,92 @@ On serve process exit (SIGTERM/SIGINT):
    or replaced processes, and the PID entries, name tokens and claim directories that
    outlive them. Until it runs a stale state holds nothing: its owner is not live.
 
+**Where** (`src/runtime_dir.rs`). VM states and the namespace pool describe running
+processes and nothing else (a state names an fcvm process by PID and start time, and that
+process dies with the host), so they are not user state a reboot must keep, and they live
+in the runtime directory, apart from what does outlive a reboot: `vm-disks/<vm_id>`, the
+owner records that reclaim it (`reclaim/`), snapshots and their working sets, all in the
+data directory. A start rewrites its state five times, and on btrfs every rewrite is
+directory operations that join a transaction of the store's one tree: with state on the
+store a clone waited 1,667 ms of its 2,212 ms of lock wait on the state buckets'
+directory locks (512 clones at a time, 2026-11-25).
+
+The runtime directory is `<place>/boot-<16 characters of the boot id>`, and `<place>` is
+the first of:
+
+1. `<base>/<key>` when `FCVM_RUNTIME_DIR`, else `paths.runtime_dir`, names a base (`<key>`
+   is 16 hex digits of the SHA-256 of the data directory's canonical path);
+2. `/run/fcvm-<uid of the data directory's owner>/<key>` when that base exists or the
+   caller is root, who makes it for the owner (mode 0700). `sudo fcvm setup` (or `sudo
+   fcvm setup --runtime-dir` alone) makes it and installs
+   `/etc/tmpfiles.d/fcvm-<uid>.conf`, which makes it at every boot; removing that file
+   undoes it;
+3. `<data_dir>/runtime` otherwise: the default for a user with no root step, slower and
+   safe.
+
+- **Never `/dev/shm`, never `$XDG_RUNTIME_DIR`.** logind's `RemoveIPC` deletes a regular
+  user's files in `/dev/shm` when that user's last login session ends, also while a
+  service of that user runs. Measured on Ubuntu 24.04 (systemd 255), for a user without
+  lingering: a file a service of the user held in `/dev/shm` was gone 12 s after one
+  unrelated ssh login of that user ended, with the service still running; the same file
+  in a root-made `/run/fcvm-<uid>` stayed. A user with lingering, a system user and root
+  are exempt. `/run/user/<uid>` did not exist for the service before that login or after
+  it. `scripts/probe-runtime-dir-logout.sh` is that measurement; it needs two user
+  accounts and logind sessions, which no test lane has.
+- **The place is chosen once per boot and the store records it.** The first command of a
+  boot that writes a state chooses, and `<data_dir>/state/runtime` names the directory,
+  the place, a random id and the boot; the directory's `store` file holds the id and the
+  data directory. Every later command follows the store's record (`runtime_dir::locate`)
+  and compares the two (`runtime_dir::bind`), so a base made later in the boot does not
+  move a store whose VMs are running, and two first writers that located different
+  places (root, and a user with no base) end in the one the first recorded. A record of
+  another boot means a reboot: the first writer binds anew. A record of this boot whose
+  directory this process does not see, or that holds no such id, is refused: a container
+  has a `/run` of its own, and starting from an empty one would hand out names that are
+  taken. `make container-test*` therefore names a short base on the store
+  (`CONTAINER_RUNTIME_DIR`): the pool's pasta control sockets sit six levels under it and
+  must fit `sockaddr_un`, which the pool checks when it starts.
+- **The boot is in the path because two of the places can outlive a reboot** (the store,
+  and a base an operator names on a disk). A state from before the reboot names a process
+  of that boot; under another boot's directory nothing reads it, and the first writer
+  after the reboot removes those directories. So a reboot leaves, as it does on main with
+  state on btrfs, disks and owner records without a process, which reclaim collects, and
+  no state that could be taken for a running VM.
+- **Only the path functions know where it is.** A process's own: `paths::bind_runtime_dir`
+  and then `paths::runtime_dir()` / `paths::state_dir()`; before the bind those return
+  where this process would put it, which another first writer can change. Any other data
+  directory, and every test and tool: `runtime_dir::bound_to(data_dir)`; a script:
+  `fcvm ls --runtime-dir`, and `socket` in `fcvm netpool stats`. Nothing else builds a
+  path to a state, a name slot or the pool's socket.
+- **Ownership is checked on every command**: the directories fcvm made on the way to the
+  states must be real directories owned by the store's owner or root that nobody else can
+  write. What root makes there it hands to the owner.
+- **`<data_dir>/state` holds only markers now**: `layout` (`3`), `runtime`, `runtime.lock`.
+  Layouts 1 and 2 kept the states there. A VM of such a build that is still running
+  refuses the store, naming it; what dead ones left is removed by the first writer's bind
+  (layout 1's files under layout 1's `names.lock`), and a build that keeps states there
+  refuses a `layout` of 3.
+- A runtime directory under a base whose data directory no longer exists (tests make data
+  directories under temporary paths) is removed by the state sweep (`remove_orphans`).
+- **Clearing a runtime directory by hand** while the host stays up leaves its store bound
+  to a directory that is gone, and the store's next command refuses: remove
+  `<data_dir>/state/runtime` as well (`make clean-test-data` does both). To move a store
+  from `<data_dir>/runtime` to a base made since, without a reboot: stop its VMs and
+  remove `<data_dir>/runtime` and `<data_dir>/state/runtime`.
+- **Which place a lane runs in.** `make setup-fcvm` runs as the user and makes no base,
+  so the rootless lanes keep their states in `<data_dir>/runtime` and the root lanes
+  (fcvm as root) under `/run/fcvm-0`. Both places are covered by test whatever the host:
+  the unit tests of `src/runtime_dir.rs` bind each, and
+  `root_and_the_stores_owner_each_start_on_a_runtime_directory_the_other_made` runs root
+  and a store's owner through both, in both orders.
+
 **Layout** (`src/state/manager.rs`, layout 2). No directory takes every VM's writes and no
 lock is host-wide: a create or a rename holds its directory's lock exclusively, and with
 every state in one directory under one `names.lock`, clones starting together queued on
 both.
 
 ```
-/mnt/fcvm-btrfs/state/
+<runtime_dir>/state/                    # paths::state_dir(), in the runtime directory
 ├── layout                              # "2"
 ├── vms/<b>/vm-abc123.json             # { vm_id, pid, pid_start_time, name, ... }
 ├── vms/<b>/vm-abc123.json.lock        # per-VM flock; .json.tmp while a write runs
@@ -3001,11 +3088,14 @@ both.
   `load_state_by_pid()` reads the states its bucket names and scans everything only on a
   miss.
 - The only flock on the start path is the VM's own `<vm_id>.json.lock`.
-- **A state is published by exchange, not by a rename over the old one** (`publish_state`):
-  `RENAME_EXCHANGE` of `<vm_id>.json.tmp` with `<vm_id>.json`, then the old state is
-  unlinked. btrfs starts writing a file's data out inside a rename that replaces another
-  file, with the directory locked, and with many clones starting together each such
-  rename slept in the block layer. An exchange starts no I/O.
+- **On a filesystem with blocks a state is published by exchange, not by a rename over the
+  old one** (`publish_state`): `RENAME_EXCHANGE` of `<vm_id>.json.tmp` with
+  `<vm_id>.json`, then the old state is unlinked. btrfs starts writing a file's data out
+  inside a rename that replaces another file, with the directory locked, and with many
+  clones starting together each such rename slept in the block layer. An exchange starts
+  no I/O. On tmpfs, where the state directory is under `/run/fcvm-<uid>`, there is nothing to write
+  out and the write is the rename alone (`rename_replaces`): two directory operations a
+  write, not three.
 - `list_vms()` opens and reads the buckets and the state files on up to 8 threads.
 - Root and the state directory's owner share one state directory (privileged tests run as
   root beside unprivileged ones), so a directory root makes (`shared_dir`, a claim
@@ -3207,6 +3297,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
 - Leased host-wide with an abstract Unix socket (`fcvm-loopback-<address>`), which exactly one process wins and the kernel releases when that process dies, so VMs of other data directories and other users skip it (#1882)
+- The lease writes no state of its own, so a start writes its state five times, not six. A start leases before its name claim (`lease_loopback_ip_for_claim`), and the claim's write, the VM's first state, carries the address: a restore's published port listens on it before the restore writes the state again, and a VM is never listed without the address its ports are on. Until the claim has written the state the lease's guard gives the address back (a refused name, a dropped start); after it `delete_state` does
 - The search starts at an address picked from the vm_id (127.0.0.2 to 127.0.255.254), so it takes no lock and reads no other VM's state
 
 ### btrfs CoW Reflinks
@@ -4007,12 +4098,17 @@ assets_dir (default: /mnt/fcvm-btrfs)
 
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
-├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
+├── state/{layout,runtime}        # which runtime directory holds this store's VM states
 ├── reclaim/{euid}/<b>/{id}.json   # what a live fcvm made on the host, in buckets; a dead one's is reclaimed by the first launch 1 s or more after the last sweep began, or the next setup, snapshot import or export (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
 ├── pmem/{sha}.source             # symlink from an image's path and file identity to its copy
 └── snapshots/{name}/             # Firecracker snapshots
     └── disk/                     # the snapshot's disks, a btrfs subvolume (clones snapshot it)
+
+runtime_dir (/run/fcvm-<uid>/<key of data_dir>/boot-<boot>, or <data_dir>/runtime/boot-<boot>)
+├── store                         # the data directory this serves, and the binding's id
+├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
+└── netpool/<user>/               # the namespace pool's socket and lock
 ```
 
 ## Key Learnings

@@ -318,6 +318,12 @@ pub struct PathsConfig {
     /// Directory for shared content-addressed assets (kernels, rootfs, initrd, image-cache)
     #[serde(default = "default_base_dir")]
     pub assets_dir: String,
+    /// Directory under which each data directory keeps what describes running processes
+    /// only (VM states, the namespace pool), in `<runtime_dir>/<key>`. Unset:
+    /// `/run/fcvm-<uid>` when it exists or the caller is root, else `<data_dir>/runtime`
+    /// (`crate::runtime_dir`).
+    #[serde(default)]
+    pub runtime_dir: Option<String>,
     /// Size of the btrfs loopback filesystem (e.g., "60G")
     #[serde(default = "default_btrfs_size")]
     pub btrfs_size: String,
@@ -336,6 +342,7 @@ impl Default for PathsConfig {
         Self {
             data_dir: default_base_dir(),
             assets_dir: default_base_dir(),
+            runtime_dir: None,
             btrfs_size: default_btrfs_size(),
         }
     }

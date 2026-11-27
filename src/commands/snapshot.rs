@@ -3525,12 +3525,33 @@ async fn cmd_snapshot_run_inner(
         };
     }
 
+    // A clone that publishes ports on a loopback address of its own leases the address
+    // before its first state is written, so that state carries it: the published port
+    // listens before the restore writes the state again (`restore.post_network_pre_resume`
+    // holds there), and whoever lists the clone in between must find where it listens.
+    let leases_loopback_ip = match snapshot_config.metadata.network_mode {
+        FcNetworkMode::Rootless => true,
+        FcNetworkMode::Routed => RoutedNetwork::mappings_need_loopback_ip(&port_mappings),
+        FcNetworkMode::Bridged => false,
+    };
+    let loopback_lease = if leases_loopback_ip {
+        Some(setup_try!(state_manager
+            .lease_loopback_ip_for_claim(&mut vm_state)
+            .context("allocating loopback IP")))
+    } else {
+        None
+    };
+
     // The clone's first state is written here, under its name, and refused when a
     // live VM already has that name.
     setup_try!(state_manager
         .claim_name(&mut vm_state)
         .await
         .context("claiming the VM name"));
+    // The state holds the address now, and gives it back when it is deleted.
+    if let Some(lease) = loopback_lease {
+        lease.keep();
+    }
 
     setup_try!(tokio::fs::create_dir_all(&data_dir)
         .await
@@ -3806,21 +3827,20 @@ async fn cmd_snapshot_run_inner(
                 .preflight_check()
                 .context("routed mode preflight check failed"));
             if net.needs_loopback_ip() {
-                let loopback_ip = setup_try!(state_manager
-                    .allocate_loopback_ip(&mut vm_state)
-                    .await
-                    .context("allocating loopback IP for routed clone"));
+                let loopback_ip = setup_try!(vm_state.config.network.loopback_ip.clone().context(
+                    "a routed clone with a port on its loopback address has no address \
+                     leased before its name claim"
+                ));
                 net = net.with_loopback_ip(loopback_ip);
             }
             Box::new(net)
         }
         FcNetworkMode::Rootless => {
-            // For rootless mode, allocate loopback IP atomically with state persistence
-            // This prevents race conditions when starting multiple clones concurrently
-            let loopback_ip = setup_try!(state_manager
-                .allocate_loopback_ip(&mut vm_state)
-                .await
-                .context("allocating loopback IP"));
+            // Leased before the name claim, whose state write carries it.
+            let loopback_ip =
+                setup_try!(vm_state.config.network.loopback_ip.clone().context(
+                    "a rootless clone has no loopback address leased before its name claim"
+                ));
 
             // With bridge mode, guest IP is always 10.0.2.100 on pasta network
             // Each clone runs in its own namespace, so no IP conflict.
@@ -10423,6 +10443,32 @@ mod watchdog_exit_classification_tests {
                 "{name} repeated within 2000 clones"
             );
         }
+    }
+
+    /// A clone leases its loopback address before it claims its name, so its first state
+    /// carries the address: the restore's published port listens on it before the state
+    /// is written again, and `test_lifecycle_interleave_early_connection_cannot_poison_restored_ingress`
+    /// reads the address from the state at that point. Nothing after the claim leases one.
+    #[test]
+    fn a_clone_leases_its_loopback_address_before_its_name_claim() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let lease = body
+            .find(".lease_loopback_ip_for_claim(&mut vm_state)")
+            .expect("snapshot run leases the clone's loopback address");
+        let claim = body
+            .find(".claim_name(&mut vm_state)")
+            .expect("snapshot run claims the clone's name");
+        let kept = body.find("lease.keep();").expect("the lease is kept");
+        assert!(lease < claim && claim < kept);
+        let end = claim
+            + body[claim..]
+                .find("\nasync fn ")
+                .unwrap_or(body.len() - claim);
+        assert!(
+            !body[claim..end].contains("allocate_loopback_ip("),
+            "an address leased after the name claim is in no state until the next write"
+        );
     }
 
     /// Every error after the clone claims its name must go through `setup_try!`, which

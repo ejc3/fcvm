@@ -9,6 +9,14 @@
 # Override per nesting level (e.g., /mnt/fcvm-btrfs/level-1)
 data_dir = "/mnt/fcvm-btrfs"
 
+# Directory under which each data directory keeps what describes running processes only:
+# VM states and the namespace pool, in <runtime_dir>/<key of data_dir>. Unset (the
+# default): /run/fcvm-<uid of data_dir's owner> when it exists (`sudo fcvm setup` makes it
+# and has it made at every boot) or the caller is root, else <data_dir>/runtime.
+# FCVM_RUNTIME_DIR overrides it. Every process that uses a data directory must see the
+# same directory here: a container with its own /run needs a base named for it.
+# runtime_dir = "/run/fcvm-example"
+
 # Directory for shared content-addressed assets (kernels, rootfs, initrd, image-cache)
 # All nesting levels share this for deduplication via btrfs reflinks
 assets_dir = "/mnt/fcvm-btrfs"
