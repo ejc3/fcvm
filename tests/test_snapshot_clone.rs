@@ -10547,3 +10547,112 @@ async fn a_snapshot_of_a_clone_is_refused_until_its_restore_is_acknowledged() ->
     }
     checked
 }
+
+/// A read-only `--map` moved between two runs shares the pre-start snapshot, and the
+/// second run's container reads the second run's directory (#2239).
+///
+/// The pre-start key holds a read-only map's guest path and mode, not its host path, and a
+/// hit serves the map from the run's own directory. The two directories hold the same tree
+/// with different content, so a guest that served the first run's files (from the snapshot's
+/// memory or from the first directory) reads the wrong bytes. The snapshot's inode table for
+/// the volume is printed: what the guest held at the pre-start snapshot is what a moved
+/// directory must still hold.
+#[tokio::test]
+async fn test_a_read_only_map_moved_between_runs_shares_the_pre_start_snapshot() -> Result<()> {
+    let (first_name, second_name, _, _) = common::unique_names("romap-move");
+    let unique = format!("ROMAP_ID={first_name}");
+    let root = tempfile::tempdir().context("making the map directories")?;
+    let dirs = [root.path().join("a"), root.path().join("b")];
+    for (dir, content) in dirs.iter().zip(["first", "second"]) {
+        std::fs::create_dir_all(dir.join("sub"))?;
+        std::fs::write(dir.join("which"), format!("{content}\n"))?;
+        std::fs::write(dir.join("sub").join("which"), format!("{content}\n"))?;
+    }
+    let mut running: Vec<u32> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    let result = async {
+        let mut reads = Vec::new();
+        let mut choices = Vec::new();
+        for (name, dir) in [(&first_name, &dirs[0]), (&second_name, &dirs[1])] {
+            let map = format!("{}:/data:ro", dir.display());
+            let (_child, pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    name,
+                    "--map",
+                    &map,
+                    "--env",
+                    &unique,
+                    common::TEST_IMAGE,
+                ],
+                &[],
+            )
+            .await
+            .with_context(|| format!("spawning {name}"))?;
+            running.push(pid);
+            common::poll_health_by_pid(pid, 300)
+                .await
+                .with_context(|| format!("{name} never turned healthy"))?;
+            let read = common::exec_in_container(pid, &["cat /data/which /data/sub/which"])
+                .await
+                .with_context(|| format!("reading the map in {name}"))?;
+            common::kill_process(pid).await;
+            running.retain(|p| *p != pid);
+            let choice = common::cache_choice(&log)
+                .with_context(|| format!("{name}'s log names no cache choice"))?;
+            if !keys.contains(&choice.1) {
+                keys.push(choice.1.clone());
+            }
+            reads.push(read.split_whitespace().collect::<Vec<_>>().join(" "));
+            choices.push(choice);
+        }
+        let config = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&choices[0].1)
+            .await
+            .context("loading the pre-start snapshot")?;
+        let generation = config.memory_path.parent().context("memory path")?;
+        for volume in &config.metadata.volumes {
+            let table = generation.join(fcvm::volume::inode_table_file_name(volume.vsock_port));
+            println!(
+                "  pre-start inode table of {}: {}",
+                volume.guest_path,
+                std::fs::read_to_string(&table).unwrap_or_else(|e| format!("({e})"))
+            );
+        }
+        anyhow::ensure!(
+            choices[0].0 == "cold boot",
+            "control: the first run starts from a cold cache and started from a {}",
+            choices[0].0
+        );
+        anyhow::ensure!(
+            choices[1] == ("pre-start snapshot", choices[0].1.clone()),
+            "the run with the map moved did not restore the first run's pre-start snapshot \
+             {}: {:?}",
+            choices[0].1,
+            choices[1]
+        );
+        anyhow::ensure!(
+            reads[0] == "first first",
+            "the first run read {:?}",
+            reads[0]
+        );
+        anyhow::ensure!(
+            reads[1] == "second second",
+            "the second run read {:?}, not its own directory's files",
+            reads[1]
+        );
+        Ok(())
+    }
+    .await;
+    for pid in running {
+        common::kill_process(pid).await;
+    }
+    for key in keys {
+        if common::snapshot_exists(&key) {
+            let _ = common::delete_snapshot(&key).await;
+        }
+    }
+    result
+}
