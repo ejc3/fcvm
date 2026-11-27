@@ -14,6 +14,16 @@ VSOCK_PORT=9999
 MARKER="VSOCK_INTEGRITY_TEST_COMPLETE"
 RESULT_FILE="/mnt/fcvm-btrfs/vsock-test-result.txt"
 
+# A data dir of L1's own on the mapped store, as test_kvm.rs's nested scripts use. The
+# host's data dir holds the host's owner records and its runtime-directory binding, and
+# flock over fuse-pipe is granted in each guest kernel, so an L1 fcvm working in the host's
+# data dir could reclaim a live host owner's resources (#1393); fcvm refuses a store bound
+# to a runtime directory this kernel cannot see.
+NESTED_DATA=/mnt/fcvm-btrfs/nd/$(cut -c1-8 /proc/sys/kernel/random/uuid)
+mkdir -p "$NESTED_DATA/state" "$NESTED_DATA/vm-disks"
+trap 'rm -rf "$NESTED_DATA"' EXIT
+export FCVM_DATA_DIR="$NESTED_DATA"
+
 echo "=== Vsock Integrity Test ==="
 echo "Testing vsock data integrity under NV2 nested virtualization"
 echo ""

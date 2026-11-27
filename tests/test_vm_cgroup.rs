@@ -163,6 +163,166 @@ async fn wait_until_empty(scope: &Path) -> Result<()> {
     )
 }
 
+/// A cgroup tree made for one test and removed, bottom up, when it ends.
+struct TestTree {
+    dirs: Vec<PathBuf>,
+}
+
+impl TestTree {
+    fn mkdir(&mut self, path: PathBuf) -> Result<PathBuf> {
+        std::fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
+        self.dirs.push(path.clone());
+        Ok(path)
+    }
+}
+
+impl Drop for TestTree {
+    fn drop(&mut self) {
+        for dir in self.dirs.iter().rev() {
+            // What fcvm made below a level goes first: its parent, emptied by its exit.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() && !self.dirs.contains(&entry.path()) {
+                        let _ = std::fs::remove_dir(entry.path());
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Hand `cgroup` to `uid` as systemd hands a delegated unit's cgroup to the unit's user:
+/// the directory and the files that move processes and enable controllers.
+fn hand_over(cgroup: &Path, uid: u32, gid: u32) -> Result<()> {
+    for path in [
+        cgroup.to_path_buf(),
+        cgroup.join("cgroup.procs"),
+        cgroup.join("cgroup.threads"),
+        cgroup.join("cgroup.subtree_control"),
+    ] {
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid))
+            .with_context(|| format!("chown {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Run `fcvm snapshot run` of a missing snapshot as `user` from `payload`: root moves the
+/// shell there, then setpriv drops to the user (re-arming the parent-death signal the
+/// uid change clears) and execs fcvm, which enters its scope and fails at once. Returns
+/// fcvm's log.
+async fn start_unprivileged_in(payload: &Path, user: &nix::unistd::User) -> Result<String> {
+    let fcvm = common::find_fcvm_binary()?;
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args([
+            "-c",
+            "echo $$ > \"$1/cgroup.procs\" && exec setpriv --reuid \"$2\" --regid \"$3\" \
+             --init-groups --pdeathsig KILL -- \"$4\" snapshot run --snapshot \
+             fcvm-cgroup-test-no-such-snapshot",
+            "sh",
+        ])
+        .arg(payload)
+        .arg(user.uid.to_string())
+        .arg(user.gid.to_string())
+        .arg(&fcvm)
+        .env("HOME", &user.dir)
+        .env("USER", &user.name)
+        .env("LOGNAME", &user.name)
+        .env("RUST_LOG", "fcvm=debug");
+    common::set_test_pdeathsig(&mut command);
+    let output = command.output().await.context("running fcvm")?;
+    let log = String::from_utf8_lossy(&output.stderr).into_owned();
+    if output.status.success() {
+        bail!("a snapshot run of a missing snapshot succeeded:\n{log}");
+    }
+    Ok(log)
+}
+
+/// An unprivileged fcvm started in a cgroup a service manager delegated to its user, with
+/// the payload in a leaf (`systemd-run --uid= -p Delegate=yes -p DelegateSubgroup=payload`),
+/// makes its scope inside that cgroup, with a memory controller, and removes it at exit.
+/// The tree is built here as systemd builds it, so the test needs no systemd: a manager's
+/// root (a cgroup holding an `init.scope`), below it the unit's cgroup handed to the user,
+/// and the payload's leaf. Before the unit is marked `user.delegate=1`, fcvm cannot tell it
+/// from a unit it must not write, and makes nothing anywhere in the manager's tree.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_an_unprivileged_fcvm_in_a_delegated_cgroup_has_its_own_cgroup() -> Result<()> {
+    let uid: u32 = std::env::var("SUDO_UID")
+        .context("the test needs the invoking sudo user's SUDO_UID")?
+        .parse()
+        .context("SUDO_UID must be a numeric user ID")?;
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))?
+        .context("SUDO_UID must identify an existing user")?;
+    anyhow::ensure!(!user.uid.is_root(), "the fcvm under test must not be root");
+    let gid = user.gid.as_raw();
+
+    let (name, _, _, _) = common::unique_names("deleg");
+    let mut tree = TestTree { dirs: Vec::new() };
+    let manager = tree.mkdir(Path::new(CGROUP_ROOT).join(format!("fcvm-test-{name}.slice")))?;
+    tree.mkdir(manager.join("init.scope"))?;
+    std::fs::write(manager.join("cgroup.subtree_control"), "+memory")
+        .context("enabling memory for the test's manager tree")?;
+    let unit = tree.mkdir(manager.join("plan.service"))?;
+    let payload = tree.mkdir(unit.join("payload"))?;
+    hand_over(&unit, uid, gid)?;
+    hand_over(&payload, uid, gid)?;
+    let parent = unit.join(fcvm::cgroup::DEFAULT_PARENT);
+
+    let log = start_unprivileged_in(&payload, &user).await?;
+    assert!(
+        log.contains("no cgroup of the VM's own"),
+        "an unmarked unit in a manager's tree was used:\n{log}"
+    );
+    assert!(!parent.exists(), "{} was made", parent.display());
+
+    let value = b"1";
+    let path = std::ffi::CString::new(unit.as_os_str().as_encoded_bytes())?;
+    // SAFETY: setxattr with NUL-terminated strings and a buffer of the length passed.
+    let set = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            c"user.delegate".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    };
+    anyhow::ensure!(
+        set == 0,
+        "marking {} delegated: {}",
+        unit.display(),
+        std::io::Error::last_os_error()
+    );
+
+    let log = start_unprivileged_in(&payload, &user).await?;
+    let scope_prefix = format!("{}/fcvm-", parent.display());
+    let entered = log
+        .lines()
+        .find(|line| line.contains("entered the VM's cgroup"))
+        .with_context(|| format!("fcvm entered no cgroup of its own:\n{log}"))?;
+    assert!(
+        entered.contains(&scope_prefix) && !entered.contains("without a memory controller"),
+        "fcvm entered the wrong cgroup, or one without a memory controller: {entered}"
+    );
+    let control = std::fs::read_to_string(parent.join("cgroup.subtree_control"))?;
+    assert!(
+        control.split_whitespace().any(|c| c == "memory"),
+        "{}/cgroup.subtree_control is {control:?}",
+        parent.display()
+    );
+    use std::os::unix::fs::MetadataExt as _;
+    assert_eq!(std::fs::metadata(&parent)?.uid(), uid);
+    let left: Vec<String> = std::fs::read_dir(&parent)?
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.is_empty(), "scopes left after fcvm exited: {left:?}");
+    Ok(())
+}
+
 /// The VM, the memory server and a clone each run in a cgroup of their own: the fcvm
 /// process and everything it started (Firecracker, the holder, pasta) are in it, the guest's
 /// memory is charged to it, `--no-swap` sets its `memory.swap.max` to 0, and the scope is

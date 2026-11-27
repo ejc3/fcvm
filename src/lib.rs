@@ -13,6 +13,7 @@ pub mod netpool;
 pub mod network;
 pub mod paths;
 pub mod reclaim;
+pub mod runtime_dir;
 pub mod setup;
 pub mod state;
 pub mod storage;
