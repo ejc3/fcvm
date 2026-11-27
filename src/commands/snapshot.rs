@@ -2213,7 +2213,8 @@ fn ensure_gpu_snapshot_mode(gpus: &[String], disk_only: bool, gpu_warm: bool) ->
 /// map: the guest mounted every mapping when it booted, the restore keeps those mounts, and
 /// a clone cannot add or drop one. The vsock port stays the snapshot's. A volume's inode
 /// table names files by their path under the mount, so the guest's open files are found
-/// again in the new directory when it holds the same tree.
+/// again in the new directory when it holds the same tree; a restore refuses a directory
+/// that lacks one (`moved_volumes_missing_paths`).
 fn clone_volumes(
     snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
     requested: &[String],
@@ -2270,8 +2271,35 @@ pub(crate) fn moved_volumes_missing_paths(
     requested: &[String],
     snap_dir: &Path,
 ) -> Vec<(String, String)> {
-    let _ = (snapshot, requested, snap_dir);
-    Vec::new()
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut missing = Vec::new();
+    for spec in requested {
+        let Ok(mapping) = super::podman::VolumeMapping::parse(spec) else {
+            continue;
+        };
+        let Some(volume) = snapshot.iter().find(|v| v.guest_path == mapping.guest_path) else {
+            continue;
+        };
+        // Served from the directory the snapshot recorded, the volume is not moved.
+        if volume.host_path == mapping.host_path {
+            continue;
+        }
+        let table = snap_dir.join(crate::volume::inode_table_file_name(volume.vsock_port));
+        // Without a table the guest's inodes answer an error in any clone, moved or not.
+        let Ok(json) = std::fs::read_to_string(&table) else {
+            continue;
+        };
+        for path in fuse_pipe::inode_table_paths(&json) {
+            let on_host = mapping.host_path.join(std::ffi::OsStr::from_bytes(&path));
+            if std::fs::symlink_metadata(&on_host).is_err() {
+                missing.push((
+                    volume.guest_path.clone(),
+                    String::from_utf8_lossy(&path).into_owned(),
+                ));
+            }
+        }
+    }
+    missing
 }
 
 /// A warm GPU snapshot's CUDA processes wait, checkpointed, for as many GPUs as the
@@ -3192,7 +3220,25 @@ async fn cmd_snapshot_run_inner(
             &snapshot_name,
         )?;
     }
-    snapshot_config.metadata.volumes = clone_volumes(&snapshot_config.metadata.volumes, &args.map)?;
+    let recorded_volumes = snapshot_config.metadata.volumes.clone();
+    snapshot_config.metadata.volumes = clone_volumes(&recorded_volumes, &args.map)?;
+    // A moved directory must hold every file the snapshot's guest holds in that volume: a
+    // restore answers EIO for one it cannot find (#2239).
+    if let Some(generation) = snapshot_config.memory_path.parent() {
+        let missing = moved_volumes_missing_paths(&recorded_volumes, &args.map, generation);
+        if !missing.is_empty() {
+            let named: Vec<String> = missing
+                .iter()
+                .map(|(volume, path)| format!("{volume}/{path}"))
+                .collect();
+            bail!(
+                "--map: the snapshot's guest holds {}, which the directory given for {} lacks. \
+                 A moved read-only map must hold every file the guest held at the snapshot",
+                named.join(", "),
+                missing[0].0
+            );
+        }
+    }
 
     // Where this clone publishes its ports, settled before anything is allocated: a
     // --publish the snapshot cannot serve fails here with nothing to clean up.
@@ -8150,6 +8196,12 @@ mod tests {
             [("/var/creds".to_string(), "sub/held".to_string())]
         );
         assert!(moved_volumes_missing_paths(&snapshot, &[], snap.path()).is_empty());
+        let unmoved = format!("{}:/var/creds:ro", recorded.path().display());
+        assert!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[unmoved.as_str()]), snap.path())
+                .is_empty(),
+            "a volume served from the directory the snapshot recorded is not moved"
+        );
         std::fs::create_dir(here.path().join("sub")).unwrap();
         std::fs::write(here.path().join("sub/held"), "").unwrap();
         assert!(
