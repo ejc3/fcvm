@@ -244,7 +244,7 @@ jobs:
           printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/fcvm-btrfs/containers/storage"\n' > ~/.config/containers/storage.conf
           podman system migrate || true
           # Fix lock file permissions from previous sudo runs (bench-vm runs as root)
-          sudo chmod 666 /mnt/fcvm-btrfs/state/*.lock /mnt/fcvm-btrfs/state/vms/*/*.lock 2>/dev/null || true
+          sudo chmod 666 /run/fcvm-*/*/boot-*/state/*.lock /run/fcvm-*/*/boot-*/state/vms/*/*.lock 2>/dev/null || true
       - name: Clean stale state
         run: |
           # Kill any leftover fcvm processes from crashed previous runs
@@ -252,6 +252,11 @@ jobs:
           sudo pkill -9 -f firecracker 2>/dev/null || true
           sleep 2
           # Remove stale state files and snapshots from previous benchmark runs
+          # The states are in the runtime directories (under /run/fcvm-<uid>, or in the data
+          # directory's runtime/); each data directory's record of its runtime directory
+          # goes with them, so the next fcvm binds a new one.
+          sudo rm -rf /run/fcvm-*/* /mnt/fcvm-btrfs/runtime /mnt/fcvm-btrfs/*/runtime 2>/dev/null || true
+          sudo rm -rf /mnt/fcvm-btrfs/state/runtime /mnt/fcvm-btrfs/*/state/runtime 2>/dev/null || true
           sudo rm -rf /mnt/fcvm-btrfs/state/vms /mnt/fcvm-btrfs/state/names /mnt/fcvm-btrfs/state/pids 2>/dev/null || true
           sudo rm -rf /mnt/fcvm-btrfs/snapshots/bench-* 2>/dev/null || true
           # Clean up old benchmark VM disks

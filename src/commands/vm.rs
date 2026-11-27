@@ -595,6 +595,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         firecracker_args: None,
         unsupported: Some("fcvm vm run does not support confinement yet"),
         kernel_profile: None,
+        passthrough_devices: 0,
     })?;
     let data_dir = paths::vm_runtime_dir(&vm_id);
     tokio::fs::create_dir_all(&data_dir)
