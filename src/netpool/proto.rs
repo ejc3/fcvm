@@ -24,25 +24,32 @@ pub const MAX_MESSAGE: usize = 4096;
 pub const GRANT_FDS: usize = 4;
 const _: () = assert!(GRANT_FDS <= crate::network::netns_agent::MAX_PACKET_FDS);
 
-/// The area of the data directory that holds each user's pool directory.
+/// The area of the runtime directory that holds each user's pool directory.
 const AREA: &str = "netpool";
 
-/// This user's pool directory, `<data_dir>/netpool/<user>/`, made if it is missing: mode
+/// This user's pool directory, `<runtime_dir>/netpool/<user>/`, made if it is missing: mode
 /// 0700 and refused when anyone else can write it, like the owner records' directory. Root
 /// and a user share a data directory and never a pool: their namespaces map different ids.
+///
+/// In the runtime directory (`crate::runtime_dir`), not on the store: the socket and the
+/// lock are objects of the pool process, and a clone's claim is a lookup there.
 pub fn dir() -> Result<PathBuf> {
-    crate::reclaim::owner_dir_under(&crate::paths::data_dir(), AREA)
+    crate::paths::bind_runtime_dir(crate::runtime_dir::Access::Write)?;
+    crate::reclaim::owner_dir_under(&crate::paths::runtime_dir(), AREA)
 }
 
-/// The pool directory if some user's pool has ever run in this data directory, without
-/// making anything: a clone on a host with no pool pays one `stat`.
+/// The pool directory if some user's pool has ever run for this data directory since the
+/// host booted, without making anything: a clone on a host with no pool pays one `stat`.
 pub fn existing_dir() -> Result<Option<PathBuf>> {
-    let data_dir = crate::paths::data_dir();
-    match std::fs::symlink_metadata(data_dir.join(AREA)) {
+    if !crate::paths::bind_runtime_dir(crate::runtime_dir::Access::Read)? {
+        return Ok(None);
+    }
+    let runtime_dir = crate::paths::runtime_dir();
+    match std::fs::symlink_metadata(runtime_dir.join(AREA)) {
         Ok(_) => dir().map(Some),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => {
-            Err(error).with_context(|| format!("looking for {AREA} in the data directory"))
+            Err(error).with_context(|| format!("looking for {AREA} in the runtime directory"))
         }
     }
 }

@@ -15,7 +15,7 @@ async fn start_and_stop(manager: &StateManager, vm_id: &str, name: &str) {
     let mut vm = VmState::new(vm_id.to_string(), "alpine:latest".to_string(), 1, 512);
     vm.name = Some(name.to_string());
     manager.claim_name(&mut vm).await.unwrap();
-    manager.allocate_loopback_ip(&mut vm).await.unwrap();
+    manager.allocate_loopback_ip(&mut vm).unwrap();
     vm.status = VmStatus::Running;
     manager.save_state(&vm).await.unwrap();
     manager
@@ -158,15 +158,15 @@ fn state_and_temp_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// A write that replaces a state swaps the old state out of its name and unlinks it; it does
-/// not rename the new file over the old one. btrfs starts writing a file's data out inside
-/// a rename that replaces another file, with the directory locked, so with many clones
-/// starting together each such rename waited on the block device behind the VMs' disk
-/// reads. The exchange is seen from outside as the old state arriving at the temporary
-/// name.
-#[tokio::test]
-async fn a_write_that_replaces_a_state_starts_no_write_out_in_its_rename() {
-    let temp_dir = TempDir::new().unwrap();
+/// Whether `dir` is on tmpfs.
+fn on_tmpfs(dir: &std::path::Path) -> bool {
+    nix::sys::statfs::statfs(dir).unwrap().filesystem_type() == nix::sys::statfs::TMPFS_MAGIC
+}
+
+/// What one write that replaces a VM's state does in its bucket directory, as inotify
+/// reports it, sorted. The state directory is a new one inside `parent`.
+async fn bucket_events_of_a_replacing_write(parent: &std::path::Path) -> Vec<String> {
+    let temp_dir = tempfile::tempdir_in(parent).unwrap();
     let manager = StateManager::new(temp_dir.path().to_path_buf());
     manager.init().await.unwrap();
     let mut vm = VmState::new("vm-swap".to_string(), "alpine:latest".to_string(), 1, 512);
@@ -208,15 +208,6 @@ async fn a_write_that_replaces_a_state_starts_no_write_out_in_its_rename() {
         }
     }
     seen.sort();
-    assert_eq!(
-        seen,
-        [
-            "deleted vm-swap.json.tmp",
-            "moved to vm-swap.json",
-            "moved to vm-swap.json.tmp"
-        ],
-        "the write did not exchange the new state with the old one and unlink the old"
-    );
     let published: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
     assert_eq!(published["health_status"], "healthy");
@@ -226,4 +217,44 @@ async fn a_write_that_replaces_a_state_starts_no_write_out_in_its_rename() {
         "a write left a temporary file"
     );
     manager.delete_state("vm-swap").await.unwrap();
+    seen
+}
+
+/// On a filesystem with blocks, a write that replaces a state swaps the old state out of
+/// its name and unlinks it; it does not rename the new file over the old one. btrfs starts
+/// writing a file's data out inside a rename that replaces another file, with the
+/// directory locked, so with many clones starting together each such rename waited on the
+/// block device behind the VMs' disk reads. The exchange is seen from outside as the old
+/// state arriving at the temporary name.
+#[tokio::test]
+async fn a_write_that_replaces_a_state_starts_no_write_out_in_its_rename() {
+    let on_disk = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    assert!(
+        !on_tmpfs(on_disk),
+        "this test needs the build's temporary directory on a filesystem with blocks"
+    );
+    assert_eq!(
+        bucket_events_of_a_replacing_write(on_disk).await,
+        [
+            "deleted vm-swap.json.tmp",
+            "moved to vm-swap.json",
+            "moved to vm-swap.json.tmp"
+        ],
+        "the write did not exchange the new state with the old one and unlink the old"
+    );
+}
+
+/// On tmpfs, where the state directory is by default, a rename over the old state writes
+/// nothing out, so a write that replaces a state is the rename alone: two directory
+/// operations (the temporary file's create and the rename) where the exchange and its
+/// unlink make three.
+#[tokio::test]
+async fn on_tmpfs_a_write_replaces_a_state_by_one_rename() {
+    let shm = std::path::Path::new("/dev/shm");
+    assert!(on_tmpfs(shm), "/dev/shm is not tmpfs here");
+    assert_eq!(
+        bucket_events_of_a_replacing_write(shm).await,
+        ["moved to vm-swap.json"],
+        "the write exchanged and unlinked where one rename replaces the state"
+    );
 }

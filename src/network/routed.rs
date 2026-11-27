@@ -754,7 +754,13 @@ impl RoutedNetwork {
     /// `setup` reports it only then, so `loopback_ip` in the VM's state is always an
     /// address a published port answers on.
     pub fn needs_loopback_ip(&self) -> bool {
-        self.port_mappings.iter().any(|m| m.host_ip.is_none())
+        Self::mappings_need_loopback_ip(&self.port_mappings)
+    }
+
+    /// [`Self::needs_loopback_ip`] for the mappings a routed VM will be made with, for a
+    /// start that leases the address before it has made its network.
+    pub fn mappings_need_loopback_ip(port_mappings: &[PortMapping]) -> bool {
+        port_mappings.iter().any(|m| m.host_ip.is_none())
     }
 
     /// Validate that the host meets requirements for routed networking.
