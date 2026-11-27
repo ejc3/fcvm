@@ -4701,6 +4701,21 @@ mod tests {
         assert_eq!(gpu.gpu, ["0000:01:00.0"]);
     }
 
+    /// A pre-start snapshot is shared by runs that map one guest path read-only from
+    /// different host directories (its key holds no read-only host path, #2239), so a hit
+    /// serves each read-only map from this run's own directory, through `snapshot run --map`.
+    /// A read-write map is not moved: its host path is in the key, so it is the snapshot's.
+    #[test]
+    fn a_pre_start_hit_serves_the_runs_own_read_only_maps() {
+        let mut args = test_args();
+        args.map = vec![
+            "/run/b/cfg:/root/.config/fcvm:ro".to_string(),
+            "/data:/data".to_string(),
+        ];
+        let restore = snapshot_restore_args(&args, "k", Some("k".to_string()), (None, None));
+        assert_eq!(restore.map, ["/run/b/cfg:/root/.config/fcvm:ro"]);
+    }
+
     /// A cache hit restores through `snapshot run`, where a clone chooses where it
     /// publishes. The restore has to publish where THIS run asked.
     #[test]

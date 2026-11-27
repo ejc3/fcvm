@@ -2260,6 +2260,20 @@ fn clone_volumes(
     Ok(volumes)
 }
 
+/// The files a moved read-only volume's guest holds that its new host directory lacks, as
+/// (guest path, path under the mount). `requested` are `--map HOST:GUEST:ro` specs that
+/// `clone_volumes` accepted; `snap_dir` holds the snapshot's inode tables
+/// (`volume::inode_table_file_name`). A restore looks each table path up in the directory it
+/// serves, and one it cannot find leaves an inode the guest holds answering EIO.
+pub(crate) fn moved_volumes_missing_paths(
+    snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
+    requested: &[String],
+    snap_dir: &Path,
+) -> Vec<(String, String)> {
+    let _ = (snapshot, requested, snap_dir);
+    Vec::new()
+}
+
 /// A warm GPU snapshot's CUDA processes wait, checkpointed, for as many GPUs as the
 /// source parked; a restore with another count would leave them stuck, so it is refused
 /// before any side effect.
@@ -8109,6 +8123,65 @@ mod tests {
             vsock_port: port,
             portable: true,
         }
+    }
+
+    /// A moved read-only volume whose new directory lacks a file the snapshot's guest holds
+    /// (a path in the volume's inode table) is found before anything starts: a restore
+    /// would serve EIO for that inode. A volume that is not moved, or a directory that holds
+    /// the whole tree, finds nothing (#2239).
+    #[test]
+    fn a_moved_volume_whose_directory_lacks_a_held_path_is_found() {
+        let snap = tempfile::tempdir().unwrap();
+        let recorded = tempfile::tempdir().unwrap();
+        let here = tempfile::tempdir().unwrap();
+        std::fs::write(
+            snap.path().join(crate::volume::inode_table_file_name(5000)),
+            r#"{"handle_base":3,"paths":{"1":"","77":"sub/held","78":"kept"},"gone":{"79":"old"}}"#,
+        )
+        .unwrap();
+        std::fs::write(here.path().join("kept"), "").unwrap();
+        let snapshot = vec![
+            volume(recorded.path(), "/var/creds", true, 5000),
+            volume(recorded.path(), "/data", false, 5001),
+        ];
+        let moved = format!("{}:/var/creds:ro", here.path().display());
+        assert_eq!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[moved.as_str()]), snap.path()),
+            [("/var/creds".to_string(), "sub/held".to_string())]
+        );
+        assert!(moved_volumes_missing_paths(&snapshot, &[], snap.path()).is_empty());
+        std::fs::create_dir(here.path().join("sub")).unwrap();
+        std::fs::write(here.path().join("sub/held"), "").unwrap();
+        assert!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[moved.as_str()]), snap.path())
+                .is_empty()
+        );
+    }
+
+    /// The two restores that move a read-only volume check its directory before they start
+    /// anything: `snapshot run --map` refuses, between choosing the volumes and choosing the
+    /// ports, and a pre-start cache hit checks before it restores, so it can boot cold
+    /// instead (#2239).
+    #[test]
+    fn moved_volumes_are_checked_before_anything_starts() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let check = body
+            .find("moved_volumes_missing_paths(")
+            .expect("snapshot run does not check a moved volume's directory");
+        assert!(body.find("clone_volumes(").unwrap() < check);
+        assert!(check < body.find("clone_port_mappings(").unwrap());
+
+        let podman = include_str!("podman/mod.rs");
+        let hit = podman
+            .find("\"Pre-start snapshot hit! Restoring from cached snapshot\"")
+            .unwrap();
+        let branch = &podman[..hit];
+        let branch = &branch[branch.rfind("if restores_pre_start(").unwrap()..];
+        assert!(
+            branch.contains("moved_volumes_missing_paths("),
+            "a pre-start hit does not check its moved volumes before it restores"
+        );
     }
 
     /// Without --map a clone serves the snapshot's host directories. With it, a requested

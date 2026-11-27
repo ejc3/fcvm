@@ -1034,6 +1034,39 @@ mod tests {
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
+    /// A read-only map's host path is in no pre-start key: a restore serves each read-only map
+    /// from the restoring run's own directory (`snapshot run --map`), so runs that map the same
+    /// guest path read-only from different host directories, as every `make` run does with its
+    /// own test-config directory, share the pre-start snapshot (#2239). The startup snapshot
+    /// keeps the host path: its container already read the map's files. A read-write map stays
+    /// keyed by its host path, since a restore cannot move it, and so do its mode and guest path.
+    #[test]
+    fn a_read_only_maps_host_path_is_in_no_pre_start_key() {
+        let with = |maps: &[&str]| {
+            let mut config = test_config();
+            config.volume_mounts = maps.iter().map(|m| m.to_string()).collect();
+            config
+        };
+        let a = with(&["/run/a/cfg:/root/.config/fcvm:ro", "/data:/data"]);
+        let b = with(&["/run/b/cfg:/root/.config/fcvm:ro", "/data:/data"]);
+        assert_eq!(a.snapshot_key(), b.snapshot_key());
+        assert_ne!(a.startup_snapshot_base_key(), b.startup_snapshot_base_key());
+        for other in [
+            with(&["/run/a/cfg:/root/.config/fcvm:ro", "/elsewhere:/data"]),
+            with(&["/run/a/cfg:/root/.config/fcvm", "/data:/data"]),
+            with(&["/run/a/cfg:/root/.config/other:ro", "/data:/data"]),
+            with(&["/data:/data", "/run/a/cfg:/root/.config/fcvm:ro"]),
+            with(&["/data:/data"]),
+        ] {
+            assert_ne!(
+                a.snapshot_key(),
+                other.snapshot_key(),
+                "{:?}",
+                other.volume_mounts
+            );
+        }
+    }
+
     #[test]
     fn test_snapshot_key_changes_with_privileged() {
         let config1 = test_config();
