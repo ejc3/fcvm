@@ -663,7 +663,7 @@ fn make_runtime_dir(runtime: &RuntimeDir, owner: (u32, u32), host: &Host) -> Res
             // The operator's choice, on whatever filesystem it is. One that is missing is
             // made closed to everyone else, like a base under /run.
             if let Some(parent) = base.parent() {
-                std::fs::create_dir_all(parent)
+                crate::paths::ensure_dir(parent)
                     .with_context(|| format!("making {}", parent.display()))?;
             }
             make_dir(base, 0o700, owner, host)?;
@@ -972,7 +972,7 @@ pub fn bind(
         return Ok(agree.then(|| found(runtime)));
     }
 
-    std::fs::create_dir_all(data_dir)
+    crate::paths::ensure_dir(data_dir)
         .with_context(|| format!("making the data directory {}", data_dir.display()))?;
     let owner = store_owner(data_dir)?;
     make_dir(&store, 0o755, owner, host)?;
@@ -1092,7 +1092,7 @@ pub fn install_base(
     }
     make_dir(&base, 0o700, owner, host)?;
     check_dir(&base, &[owner.0, 0])?;
-    std::fs::create_dir_all(tmpfiles_dir)
+    crate::paths::ensure_dir(tmpfiles_dir)
         .with_context(|| format!("making {}", tmpfiles_dir.display()))?;
     let rule = tmpfiles_dir.join(format!("fcvm-{}.conf", owner.0));
     let content = format!(

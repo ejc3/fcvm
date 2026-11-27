@@ -185,6 +185,46 @@ pub fn cache_dir() -> PathBuf {
     assets_dir().join("cache")
 }
 
+/// Make `dir`, and any missing parent, looking each up before making it.
+///
+/// A mkdir of a directory that exists fails with EEXIST, but the kernel takes the lock of
+/// the directory it would be made in, for writing, before it finds that out, and on btrfs
+/// the holder can wait out a transaction commit. `std::fs::create_dir_all` makes that mkdir
+/// first and looks only after it fails, so every start that called it on a store directory
+/// queued on that directory's parent. This looks first: a directory that exists costs one
+/// lookup and takes no lock for writing. A missing one is made, parents first, and a mkdir
+/// that loses a race to another process (EEXIST) is success when a directory is there.
+pub fn ensure_dir(dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    let dir = dir.as_ref();
+    match std::fs::metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a directory", dir.display()),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        ensure_dir(parent)?;
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// [`ensure_dir`] on a blocking thread, for async callers.
+pub async fn ensure_dir_async(dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    let dir = dir.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || ensure_dir(dir))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 // === Mutable per-instance data (use data_dir) ===
 
 /// The runtime directory, for what describes running processes only: where the store's
@@ -501,6 +541,90 @@ mod tests {
         for name in [VM_ID, "a", "abc", "AB", "0g", ".ab"] {
             assert!(!is_vm_bucket(name), "{name} is not a bucket's name");
         }
+    }
+}
+
+#[cfg(test)]
+mod ensure_dir_tests {
+    use super::*;
+
+    /// A directory that exists is looked up and nothing is made; a missing one is made with
+    /// its missing parents; a file in the way is an error.
+    #[test]
+    fn ensure_dir_makes_only_what_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = root.path().join("a/b/c");
+        ensure_dir(&deep).unwrap();
+        assert!(deep.is_dir());
+        ensure_dir(&deep).unwrap();
+        let file = root.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        assert!(ensure_dir(&file).is_err());
+    }
+
+    /// The modules a start, a restore and their teardown run through make directories only
+    /// with [`ensure_dir`]: `create_dir_all` makes the mkdir before it looks, and a mkdir of
+    /// a directory that exists takes its parent's lock for writing. Test modules are not
+    /// checked (everything from a file's `#[cfg(test)] mod` on).
+    #[test]
+    fn the_start_path_makes_directories_only_through_ensure_dir() {
+        let sources = [
+            (
+                "commands/podman/image.rs",
+                include_str!("commands/podman/image.rs"),
+            ),
+            (
+                "commands/podman/mod.rs",
+                include_str!("commands/podman/mod.rs"),
+            ),
+            (
+                "commands/podman/snapshot.rs",
+                include_str!("commands/podman/snapshot.rs"),
+            ),
+            (
+                "commands/podman/vm_config.rs",
+                include_str!("commands/podman/vm_config.rs"),
+            ),
+            ("commands/snapshot.rs", include_str!("commands/snapshot.rs")),
+            ("commands/common.rs", include_str!("commands/common.rs")),
+            ("commands/vm.rs", include_str!("commands/vm.rs")),
+            ("storage/disk.rs", include_str!("storage/disk.rs")),
+            ("storage/disk_dir.rs", include_str!("storage/disk_dir.rs")),
+            (
+                "storage/hugepage_spares.rs",
+                include_str!("storage/hugepage_spares.rs"),
+            ),
+            (
+                "storage/pmem_store.rs",
+                include_str!("storage/pmem_store.rs"),
+            ),
+            ("storage/snapshot.rs", include_str!("storage/snapshot.rs")),
+            ("network/mod.rs", include_str!("network/mod.rs")),
+            ("network/routed.rs", include_str!("network/routed.rs")),
+            ("network/pasta.rs", include_str!("network/pasta.rs")),
+            ("store_buckets.rs", include_str!("store_buckets.rs")),
+            ("reclaim.rs", include_str!("reclaim.rs")),
+            ("state/manager.rs", include_str!("state/manager.rs")),
+            ("runtime_dir.rs", include_str!("runtime_dir.rs")),
+            ("uffd/server.rs", include_str!("uffd/server.rs")),
+            ("utils.rs", include_str!("utils.rs")),
+        ];
+        let mut found = Vec::new();
+        for (file, source) in sources {
+            let code = source
+                .find("#[cfg(test)]\nmod ")
+                .map_or(source, |at| &source[..at]);
+            for (number, line) in code.lines().enumerate() {
+                if line.contains("create_dir_all(") && !line.trim_start().starts_with("//") {
+                    found.push(format!("src/{file}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "create_dir_all on the start path (use paths::ensure_dir):\n{}",
+            found.join("\n")
+        );
     }
 }
 

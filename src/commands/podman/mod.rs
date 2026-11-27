@@ -752,7 +752,7 @@ async fn verify_prepared_snapshot_in(
         .await
         .is_ok_and(|metadata| metadata.is_dir())
     {
-        tokio::fs::create_dir_all(snapshot_root)
+        crate::paths::ensure_dir_async(snapshot_root)
             .await
             .context("creating snapshot directory")?;
     }
@@ -1472,7 +1472,7 @@ async fn export_localhost_image_disk(
         .await
         .is_ok_and(|metadata| metadata.is_dir())
     {
-        tokio::fs::create_dir_all(&image_cache_dir)
+        crate::paths::ensure_dir_async(&image_cache_dir)
             .await
             .context("creating image-cache directory")?;
     }
@@ -2531,7 +2531,7 @@ async fn prepare_vm_for_lifecycle(
             let absolute_dir = socket_path
                 .parent()
                 .expect("a custom vsock socket path always has a parent");
-            tokio::fs::create_dir_all(absolute_dir)
+            crate::paths::ensure_dir_async(absolute_dir)
                 .await
                 .with_context(|| format!("creating vsock dir: {:?}", absolute_dir))?;
             Ok(socket_path)

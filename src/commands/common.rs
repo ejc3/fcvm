@@ -4169,7 +4169,7 @@ async fn prepare_clone_substrate(
         .iter()
         .any(|(mountpoint, _)| mountpoint.file_name() == Some(std::ffi::OsStr::new("disks")))
     {
-        tokio::fs::create_dir_all(vsock_target_dir.join("disks"))
+        crate::paths::ensure_dir_async(vsock_target_dir.join("disks"))
             .await
             .context("creating disks backing dir inside the vsock target")?;
     }
@@ -5112,7 +5112,7 @@ pub async fn restore_from_snapshot_ch(
     let clone_prepare: Result<(PathBuf, u64)> = async {
         let clone_ch_dir = data_dir.join("ch-restore");
         let _ = tokio::fs::remove_dir_all(&clone_ch_dir).await;
-        tokio::fs::create_dir_all(&clone_ch_dir)
+        crate::paths::ensure_dir_async(&clone_ch_dir)
             .await
             .context("creating CH restore directory")?;
         prepare_ch_restore_files(&ch_dir, &clone_ch_dir).await?;
@@ -5399,7 +5399,7 @@ async fn reflink_disks_to_snapshot(
         }
     }
     if reflink_into_dir {
-        tokio::fs::create_dir_all(&disk_dir)
+        crate::paths::ensure_dir_async(&disk_dir)
             .await
             .context("creating the snapshot's disk directory")?;
     } else {
@@ -7773,7 +7773,7 @@ pub async fn create_snapshot_core(
     // transaction commit a file fsynced in a new subvolume forces.
     if !staged {
         if memory_dir.is_some() {
-            tokio::fs::create_dir_all(&temp_snapshot_dir)
+            crate::paths::ensure_dir_async(&temp_snapshot_dir)
                 .await
                 .context("creating temp snapshot directory")?;
         } else {
@@ -8575,7 +8575,7 @@ pub async fn create_snapshot_ch(
         .await
         .context("creating temp CH snapshot directory")?;
     let ch_dir = temp_snapshot_dir.join(CH_SNAPSHOT_SUBDIR);
-    tokio::fs::create_dir_all(&ch_dir)
+    crate::paths::ensure_dir_async(&ch_dir)
         .await
         .context("creating temp CH snapshot directory")?;
 

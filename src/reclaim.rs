@@ -308,7 +308,7 @@ pub fn owner_dir_under(data_dir: &Path, area: &str) -> Result<PathBuf> {
     // which every launch would then queue on.
     let present = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
     if !present(data_dir) {
-        std::fs::create_dir_all(data_dir)
+        crate::paths::ensure_dir(data_dir)
             .with_context(|| format!("creating data directory {}", data_dir.display()))?;
     }
     let shared = data_dir.join(area);

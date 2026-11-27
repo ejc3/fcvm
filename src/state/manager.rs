@@ -914,7 +914,7 @@ impl StateManager {
         // owner and mode; any other directory a caller names is made here.
         self.bind_runtime_dir(crate::runtime_dir::Access::Write)?;
         if std::fs::symlink_metadata(self.dir()).is_err() {
-            fs::create_dir_all(self.dir())
+            crate::paths::ensure_dir_async(self.dir())
                 .await
                 .context("creating state directory")?;
             use std::os::unix::fs::PermissionsExt;
