@@ -30,16 +30,7 @@ pub async fn wait_for_cgroup_controllers() {
 
     eprintln!("[fc-agent] current cgroup: {}", my_cgroup);
 
-    let mut paths_to_enable = vec!["/sys/fs/cgroup".to_string()];
-    let mut current_path = "/sys/fs/cgroup".to_string();
-
-    for component in my_cgroup.trim_start_matches('/').split('/') {
-        if component.is_empty() {
-            continue;
-        }
-        current_path = format!("{}/{}", current_path, component);
-        paths_to_enable.push(current_path.clone());
-    }
+    let paths_to_enable = controller_chain(&my_cgroup);
 
     eprintln!(
         "[fc-agent] enabling pids controller in cgroup chain: {:?}",
@@ -121,6 +112,18 @@ pub async fn wait_for_cgroup_controllers() {
             );
         }
     }
+}
+
+/// The cgroups whose `cgroup.subtree_control` must list the pids controller for a container
+/// started from `my_cgroup` (a path below the cgroup2 root, from `/proc/self/cgroup`).
+fn controller_chain(my_cgroup: &str) -> Vec<String> {
+    let mut chain = vec!["/sys/fs/cgroup".to_string()];
+    let mut current = "/sys/fs/cgroup".to_string();
+    for component in my_cgroup.split('/').filter(|c| !c.is_empty()) {
+        current = format!("{current}/{component}");
+        chain.push(current.clone());
+    }
+    chain
 }
 
 /// Create /dev/kvm for nested virtualization (no-op if kernel lacks CONFIG_KVM).
@@ -438,6 +441,26 @@ pub fn read_proxy_settings() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// fc-agent enables pids on the cgroups above its own and never on the one it is in.
+    /// A cgroup that holds a process may enable only threaded controllers (pids is one), and
+    /// doing so makes it a thread root: every cgroup created below it is threaded or "domain
+    /// invalid", so the container gets no memory controller and nothing inside it can enter
+    /// a cgroup of its own (#2226: a root fcvm in a guest's container, EOPNOTSUPP on
+    /// `cgroup.procs`).
+    #[test]
+    fn the_controller_chain_stops_above_the_agents_own_cgroup() {
+        assert_eq!(
+            controller_chain("/system.slice/fc-agent.service/agent"),
+            [
+                "/sys/fs/cgroup",
+                "/sys/fs/cgroup/system.slice",
+                "/sys/fs/cgroup/system.slice/fc-agent.service",
+            ]
+        );
+        // The root may hold processes and enable any controller: it stays in the chain.
+        assert_eq!(controller_chain("/"), ["/sys/fs/cgroup"]);
+    }
 
     #[test]
     fn shutdown_makes_a_hang_print_its_stacks() {
