@@ -11397,6 +11397,7 @@ mod tests {
         crate::setup::rootfs::CloudHypervisorConfig {
             repo: "example/cloud-hypervisor".to_string(),
             commit: commit.to_string(),
+            artifacts: Default::default(),
         }
     }
 
