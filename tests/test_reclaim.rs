@@ -597,6 +597,39 @@ fn every_hand_spawned_confine_start_dies_with_its_test() {
     );
 }
 
+/// Every fcvm command `test_snapshot_layout_refusal.rs` builds by hand carries the
+/// parent-death signal (CLAUDE.md, "PROCESS TEARDOWN IS PER-HOP"): its restore of a snapshot
+/// that must be refused would, if a regression let it hang or succeed, outlive a test nextest
+/// killed together with its Firecracker. Each command is armed in the function that builds it.
+#[test]
+fn every_hand_built_layout_refusal_command_dies_with_its_test() {
+    const ARMED: &str = "common::set_test_pdeathsig(&mut ";
+    let source = include_str!("test_snapshot_layout_refusal.rs");
+    let built = "Command::new(common::find_fcvm_binary()?)";
+    let mut checked = 0;
+    for (at, _) in source.match_indices(built) {
+        let function_start = source[..at].rfind("fn ").unwrap_or(0);
+        let function_end = source[at..].find("\nfn ").map_or(source.len(), |i| at + i);
+        let rest_of_function = &source[at..function_end];
+        let run = ["output()", "spawn()", "status()"]
+            .iter()
+            .filter_map(|call| rest_of_function.find(call))
+            .min()
+            .expect("a built command is run");
+        assert!(
+            source[function_start..at + run].contains(ARMED),
+            "test_snapshot_layout_refusal.rs runs an fcvm command at byte {at} without \
+             arming the parent-death signal before it runs:\n{}",
+            &source[function_start..at + run]
+        );
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 2,
+        "the file builds two fcvm commands, a create and a restore"
+    );
+}
+
 /// Every `fcvm snapshot export` and `fcvm snapshot import` the tests start by hand carries
 /// the parent-death signal (CLAUDE.md, "PROCESS TEARDOWN IS PER-HOP"): one that outlived a
 /// test nextest killed would keep its snapshot's lock. A command is armed between its
