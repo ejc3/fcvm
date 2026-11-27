@@ -21,10 +21,14 @@ use std::time::Duration;
 const LAYOUT_MARK_LEN: u64 = 16;
 
 async fn restore(snapshot: &str, clone: &str) -> Result<std::process::Output> {
-    let run = tokio::process::Command::new(common::find_fcvm_binary()?)
+    let mut command = tokio::process::Command::new(common::find_fcvm_binary()?);
+    command
         .args(["snapshot", "run", "--snapshot", snapshot, "--name", clone])
-        .kill_on_drop(true)
-        .output();
+        .kill_on_drop(true);
+    // A restore that hangs, or that a regression lets succeed, would outlive a test nextest
+    // kills: kill_on_drop does not run on SIGKILL.
+    common::set_test_pdeathsig(&mut command);
+    let run = command.output();
     tokio::time::timeout(Duration::from_secs(180), run)
         .await
         .context("the restore of a snapshot Firecracker must refuse did not return in 180 s")?
@@ -50,7 +54,9 @@ async fn a_state_file_without_the_layout_mark_is_refused_with_the_recreate_hint(
     .context("spawning the source VM")?;
     let created: Result<()> = async {
         common::poll_health_by_pid(golden_pid, 180).await?;
-        let output = tokio::process::Command::new(common::find_fcvm_binary()?)
+        let mut create = tokio::process::Command::new(common::find_fcvm_binary()?);
+        common::set_test_pdeathsig(&mut create);
+        let output = create
             .args([
                 "snapshot",
                 "create",

@@ -100,6 +100,10 @@ const BINDING_LOCK: &str = "runtime.lock";
 /// The file in a runtime directory that says which store it serves.
 const RECORD_FILE: &str = "store";
 const STAGING_PREFIX: &str = ".runtime-staging.";
+/// The directories a launch of an older layout makes in the store before or with its
+/// state: layout 1's `name/` and `pid/`, written before its `<vm_id>.json`, and layout 2's
+/// `vms/`, `names/` and `pids/`.
+const OLD_LAUNCH_DIRS: [&str; 5] = ["name", "pid", "vms", "names", "pids"];
 
 /// Which of the three places a runtime directory is in (the module documentation's list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -700,6 +704,58 @@ fn only_the_owner_or_root(runtime: &RuntimeDir, owner: (u32, u32), host: &Host) 
     Ok(())
 }
 
+/// An exclusive flock on the place directory `place`, taken only while it is still the
+/// directory at that path: `None` when it is gone or another directory is there now, or,
+/// with `wait` false, when another process holds the lock.
+fn lock_place(place: &Path, wait: bool) -> Result<Option<Flock<std::fs::File>>> {
+    use nix::fcntl::OFlag;
+    let fd = match nix::fcntl::open(
+        place,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(errno) => return Err(errno).with_context(|| format!("opening {}", place.display())),
+    };
+    let file = std::fs::File::from(fd);
+    let how = if wait {
+        FlockArg::LockExclusive
+    } else {
+        FlockArg::LockExclusiveNonblock
+    };
+    let held = match Flock::lock(file, how) {
+        Ok(held) => held,
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) if !wait => return Ok(None),
+        Err((_, errno)) => {
+            return Err(errno).with_context(|| format!("locking {}", place.display()))
+        }
+    };
+    let locked = held
+        .metadata()
+        .with_context(|| format!("reading {}", place.display()))?;
+    let same = std::fs::symlink_metadata(place)
+        .is_ok_and(|now| now.dev() == locked.dev() && now.ino() == locked.ino());
+    Ok(same.then_some(held))
+}
+
+/// Hold the lock on `runtime`'s place while the binding fills it: the orphan sweep takes
+/// the same lock to remove a place, so it never removes one a binding is filling, and one
+/// it removed while this waited is made again before the lock is held.
+fn hold_place(
+    runtime: &RuntimeDir,
+    owner: (u32, u32),
+    host: &Host,
+) -> Result<Flock<std::fs::File>> {
+    let place = place_dir(runtime)?;
+    loop {
+        if let Some(held) = lock_place(place, true)? {
+            return Ok(held);
+        }
+        make_runtime_dir(runtime, owner, host)?;
+    }
+}
+
 /// Remove the directories of other boots in `place`. A state in one names a process of a
 /// boot that is over; on tmpfs there is none to remove.
 fn remove_other_boots(place: &Path, this_boot: &std::ffi::OsStr) {
@@ -803,11 +859,21 @@ fn remove_old_entries(store: &Path) -> Result<()> {
 }
 
 /// What every command but the first writer after a boot finds: the store marked with this
-/// layout and bound, in this boot, to the directory this process located. Read by name,
-/// three small files and no directory listing: every start of every VM of the store comes
-/// through here, and on btrfs a listing takes its directory's lock exclusively. What an
-/// older layout left in the store is looked for when the binding is made, once per boot.
+/// layout and bound, in this boot, to the directory this process located, and none of the
+/// directories an older layout's launch writes its name or state into. Read by name, three
+/// small files and five lookups, no directory listing: every start of every VM of the
+/// store comes through here, and on btrfs a listing takes its directory's lock
+/// exclusively. A launch of an older build that checked the store before the `layout`
+/// marker changed can still write after the binding removed its layout's directories; it
+/// makes one of those directories again, so the command takes the full check, which
+/// refuses the store while that VM runs.
 fn already_bound(store: &Path, runtime: &Path, served: &Path, host: &Host) -> bool {
+    if OLD_LAUNCH_DIRS
+        .iter()
+        .any(|name| std::fs::symlink_metadata(store.join(name)).is_ok())
+    {
+        return false;
+    }
     let read = |path: PathBuf| std::fs::read(path).ok();
     let layout = read(store.join(LAYOUT_FILE));
     let binding = read(store.join(BINDING_FILE))
@@ -949,6 +1015,7 @@ pub fn bind(
     remove_old_entries(&store)?;
 
     make_runtime_dir(&runtime, owner, host)?;
+    let _place = hold_place(&runtime, owner, host)?;
     // No process of an earlier boot is left to own a state: its directories go, here and
     // in the store's own place when this boot's states are kept elsewhere.
     let this_boot = runtime.dir.file_name().unwrap_or_default();
@@ -1045,7 +1112,17 @@ pub fn install_base(
 /// paths, and each leaves a runtime directory. One is removed only when the data
 /// directory every record in it names is gone and no state of this boot in it has a live
 /// owner. The store's own place has nothing beside it: it goes with its data directory.
+///
+/// A place is removed under its lock (the one a binding holds while it fills its place),
+/// after a second look: the data directory may have been made again at the same path and
+/// bound to the same place since the first.
 pub fn remove_orphans(runtime: &RuntimeDir) {
+    remove_orphans_with(runtime, |_| {});
+}
+
+/// [`remove_orphans`], with `between` run after a place is judged orphaned and before it
+/// is locked, for tests to interleave a binding there.
+fn remove_orphans_with(runtime: &RuntimeDir, between: impl Fn(&Path)) {
     if runtime.place == Place::Store {
         return;
     }
@@ -1060,22 +1137,14 @@ pub fn remove_orphans(runtime: &RuntimeDir) {
         if dir == place || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
-        let records: Vec<Record> = std::fs::read_dir(&dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|boot| boot.file_name().to_string_lossy().starts_with(BOOT_PREFIX))
-            .filter_map(|boot| read_record(&boot.path()).ok().flatten())
-            .collect();
-        let gone = !records.is_empty()
-            && records.iter().all(|record| {
-                matches!(
-                    std::fs::symlink_metadata(&record.data_dir),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
-                )
-            });
-        let states = bucketed_states(&dir.join(this_boot).join("state"));
-        if !gone || !running(states.into_iter()).is_empty() {
+        if !orphaned(&dir, this_boot) {
+            continue;
+        }
+        between(&dir);
+        let Ok(Some(_held)) = lock_place(&dir, false) else {
+            continue;
+        };
+        if !orphaned(&dir, this_boot) {
             continue;
         }
         match std::fs::remove_dir_all(&dir) {
@@ -1088,6 +1157,26 @@ pub fn remove_orphans(runtime: &RuntimeDir) {
             }
         }
     }
+}
+
+/// Whether the place `dir` serves only data directories that are gone and holds no state
+/// of this boot with a live owner.
+fn orphaned(dir: &Path, this_boot: &std::ffi::OsStr) -> bool {
+    let records: Vec<Record> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|boot| boot.file_name().to_string_lossy().starts_with(BOOT_PREFIX))
+        .filter_map(|boot| read_record(&boot.path()).ok().flatten())
+        .collect();
+    let gone = !records.is_empty()
+        && records.iter().all(|record| {
+            matches!(
+                std::fs::symlink_metadata(&record.data_dir),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        });
+    gone && running(bucketed_states(&dir.join(this_boot).join("state")).into_iter()).is_empty()
 }
 
 #[cfg(test)]
@@ -1681,6 +1770,38 @@ mod tests {
         }
     }
 
+    /// A launch of an older build that checked the store before the binding changed its
+    /// layout writes its name and state after the binding removed that layout's
+    /// directories. A bound store's fast path must not hide it: the store is refused
+    /// while that VM runs, for a reader and a writer alike.
+    #[test]
+    fn a_late_launch_of_an_older_layout_refuses_a_bound_store() {
+        for layout in [1, 2] {
+            let fixture = Fixture::new();
+            let boot = host("boot-1");
+            bind(&fixture.data, &fixture.runtime(), Access::Write, &boot).unwrap();
+            let state = match layout {
+                1 => {
+                    std::fs::create_dir_all(fixture.store().join("name")).unwrap();
+                    fixture.store().join("vm-late.json")
+                }
+                _ => fixture.store().join("vms").join("a").join("vm-late.json"),
+            };
+            write_state(&state, "late-vm", std::process::id());
+            for access in [Access::Read, Access::Write] {
+                let located = fixture.locate(&boot);
+                let error = bind(&fixture.data, &located, access, &boot)
+                    .expect_err("a late launch of an older layout must refuse the bound store");
+                let text = format!("{error:#}");
+                assert!(
+                    text.contains("'late-vm'") && text.contains("older fcvm"),
+                    "layout {layout}: {text}"
+                );
+            }
+            assert!(state.exists(), "a refused command removes nothing");
+        }
+    }
+
     /// An older build's state that cannot be read, or that does not parse and is from
     /// this boot, may be a running VM's: the store is refused and nothing is removed. One
     /// cut short before this boot is what a host crash left, and goes.
@@ -1873,6 +1994,47 @@ mod tests {
             );
             assert!(!runtime.dir.parent().unwrap().exists());
         }
+    }
+
+    /// The sweep judges a place orphaned, then the data directory is made again at the
+    /// same path and a launch binds it to the same place before the sweep removes it. The
+    /// sweep must leave the new binding: its record, its state directory and its states.
+    #[test]
+    fn a_place_bound_again_after_the_sweep_judged_it_orphaned_is_kept() {
+        let fixture = Fixture::new();
+        let boot = host("boot-1");
+        let kept = fixture.runtime();
+        bind(&fixture.data, &kept, Access::Write, &boot).unwrap();
+        let data = fixture.data.parent().unwrap().join("again");
+        std::fs::create_dir(&data).unwrap();
+        let runtime = locate(None, None, &data, &fixture.run, &boot);
+        assert_eq!(runtime.place, Place::Run);
+        bind(&data, &runtime, Access::Write, &boot).unwrap();
+        std::fs::remove_dir_all(&data).unwrap();
+
+        let rebound = std::cell::Cell::new(false);
+        remove_orphans_with(&kept, |dir| {
+            if dir != place_dir(&runtime).unwrap() {
+                return;
+            }
+            std::fs::create_dir(&data).unwrap();
+            bind(&data, &runtime, Access::Write, &boot).unwrap();
+            write_state(
+                &runtime.dir.join("state/vms/0/vm-new.json"),
+                "new",
+                std::process::id(),
+            );
+            rebound.set(true);
+        });
+        assert!(rebound.get(), "the sweep judged the place orphaned first");
+        assert!(
+            runtime.dir.join(RECORD_FILE).exists()
+                && runtime.dir.join("state/vms/0/vm-new.json").exists(),
+            "the sweep removed a place bound again after it looked"
+        );
+        assert!(bind(&data, &runtime, Access::Read, &boot)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
