@@ -2252,6 +2252,19 @@ class BisectCommand(PoolOfThree):
         self.assertEqual([(m, p) for m, p, _ in writes], [('POST', 'issues')])
         self.assertIn(f'https://example.invalid/runs/{failed}', writes[0][2]['body'])
 
+    def test_a_lane_cancelled_and_then_passed_is_filed_from_the_run_it_was_cancelled_in(self):
+        # No attempt failed. The first was cancelled (a lost runner, or a job over its time
+        # limit, which GitHub reports as cancelled) and the rerun passed: still a pass on a
+        # rerun, and the run to cite is the one the lane was cancelled in.
+        run = self.add_run(2, dict(self.green(), **{'Host-arm64': ['cancelled', 'success']}), attempt=2)
+        self.fixture[f'POST repos/{REPO}/issues'] = {'number': 78}
+        code, out, writes = self.bisect('--go')
+        self.assertEqual(code, 0, out)
+        self.assertIn('PASSED ON RERUN: Host-arm64 was cancelled and then passed', out)
+        self.assertEqual([(m, p) for m, p, _ in writes], [('POST', 'issues')])
+        self.assertIn(f'https://example.invalid/runs/{run}', writes[0][2]['body'])
+        self.assertIn('Was cancelled and then passed', writes[0][2]['body'])
+
     def test_a_failure_whose_rerun_never_finished_is_not_forgotten_when_another_run_passes(self):
         # Attempt 1 failed and attempt 2 was cancelled: that run's latest state is not a
         # failure. A pass in another run beside it is still a pass after a failure.
@@ -2504,6 +2517,19 @@ class LandCommand(PoolOfThree):
         self.assertEqual([(m, p) for m, p, _ in writes][0], ('POST', 'issues'))
         self.assertIn(f'https://example.invalid/runs/{failed}', writes[0][2]['body'])
         self.assertIn('- Host-arm64 failed and then passed on this commit: #99', writes[-1][2]['commit_message'])
+
+    def test_a_lane_cancelled_and_then_passed_lands_with_its_issue(self):
+        # The same history through `land`: every required lane passed, one of them after a
+        # cancelled attempt. It lands, with the issue and the run the lane was cancelled in.
+        run = self.add_run(2, self.full({'Host-arm64': ['cancelled', 'success']}), attempt=2)
+        self.fixture[f'POST repos/{REPO}/issues'] = {'number': 98}
+        code, out, writes = self.land()
+        self.assertEqual(code, 0, out)
+        code, out, writes = self.land('--go')
+        self.assertEqual(code, 0, out)
+        self.assertEqual([(m, p) for m, p, _ in writes][0], ('POST', 'issues'))
+        self.assertIn(f'https://example.invalid/runs/{run}', writes[0][2]['body'])
+        self.assertIn('- Host-arm64 was cancelled and then passed on this commit: #98', writes[-1][2]['commit_message'])
 
     def confine(self, files, sha=None):
         self.fixture[f'repos/{REPO}/compare/{self.MAIN}...{sha or self.SHAS[2]}'] = {

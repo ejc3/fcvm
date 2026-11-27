@@ -64,6 +64,10 @@ pub struct Plan {
     /// src/setup/pasta.rs for the why and the robustness rules.
     #[serde(default)]
     pub pasta: Option<PastaConfig>,
+    /// Pinned libseccomp release, built as a static archive that every
+    /// Firecracker source build links (src/setup/libseccomp.rs).
+    #[serde(default)]
+    pub libseccomp: Option<super::libseccomp::LibseccompConfig>,
     /// Kernel profiles: kernel_profiles.{name}.{arch} = KernelProfile
     /// E.g., kernel_profiles.nested.arm64 = { kernel_version = "6.18", ... }
     #[serde(default)]
@@ -216,6 +220,13 @@ pub struct KernelProfile {
     #[serde(default)]
     pub firecracker_commit: Option<String>,
 
+    /// The `[libseccomp]` pin this profile's Firecracker is built against. Not a
+    /// profile key: config loading copies the section here, the way the default
+    /// profile gets `[firecracker]`, so setup and launch name one binary from the
+    /// profile alone.
+    #[serde(skip)]
+    pub firecracker_libseccomp: Option<super::libseccomp::LibseccompConfig>,
+
     /// Extra CLI args for firecracker
     #[serde(default)]
     pub firecracker_args: Option<String>,
@@ -307,6 +318,12 @@ pub struct PathsConfig {
     /// Directory for shared content-addressed assets (kernels, rootfs, initrd, image-cache)
     #[serde(default = "default_base_dir")]
     pub assets_dir: String,
+    /// Directory under which each data directory keeps what describes running processes
+    /// only (VM states, the namespace pool), in `<runtime_dir>/<key>`. Unset:
+    /// `/run/fcvm-<uid>` when it exists or the caller is root, else `<data_dir>/runtime`
+    /// (`crate::runtime_dir`).
+    #[serde(default)]
+    pub runtime_dir: Option<String>,
     /// Size of the btrfs loopback filesystem (e.g., "60G")
     #[serde(default = "default_btrfs_size")]
     pub btrfs_size: String,
@@ -325,6 +342,7 @@ impl Default for PathsConfig {
         Self {
             data_dir: default_base_dir(),
             assets_dir: default_base_dir(),
+            runtime_dir: None,
             btrfs_size: default_btrfs_size(),
         }
     }
@@ -1150,6 +1168,7 @@ pub fn load_config(explicit_path: Option<&str>) -> Result<(Plan, String, String)
     // A profile may override the VMM selection. Otherwise the explicit default
     // profile inherits the global Firecracker build just like every cold boot.
     apply_default_firecracker_config(&mut config);
+    apply_libseccomp_config(&mut config);
 
     let arch = config_arch();
     if config
@@ -1284,6 +1303,24 @@ fn apply_default_firecracker_config(plan: &mut Plan) {
             profile.firecracker_branch = Some(firecracker.branch.clone());
             profile.firecracker_commit = Some(firecracker.commit.clone());
         }
+    }
+}
+
+/// Give every kernel profile the `[libseccomp]` pin its Firecracker is built
+/// against.
+///
+/// The archive is linked into Firecracker's build script, which compiles the
+/// seccomp policy into the binary, so the pin is part of the binary's name
+/// (`compute_firecracker_sha_for_fields`). Setup and launch both name the binary
+/// from the profile, and a profile that carried no pin would name another one.
+fn apply_libseccomp_config(plan: &mut Plan) {
+    let libseccomp = plan.libseccomp.clone();
+    for profile in plan
+        .kernel_profiles
+        .values_mut()
+        .flat_map(|profiles| profiles.values_mut())
+    {
+        profile.firecracker_libseccomp = libseccomp.clone();
     }
 }
 
@@ -2986,6 +3023,7 @@ fn layer2_setup_confinement_request() -> crate::confine::Request<'static> {
              first (it is a one-time step), then start VMs confined",
         ),
         kernel_profile: None,
+        passthrough_devices: 0,
     }
 }
 
@@ -3117,6 +3155,44 @@ mod tests {
         )
         .expect_err("a [pasta] section with only repo and commit");
         assert!(error.to_string().contains("archive_sha256"), "{error}");
+    }
+
+    /// Setup builds a profile's Firecracker and launch resolves it, each from a
+    /// profile config loading handed out. Every profile carries the `[libseccomp]`
+    /// pin after a load, so the two name the same binary, and a profile key of that
+    /// name in the file is not read.
+    #[test]
+    fn every_profile_carries_the_libseccomp_pin_after_a_load() {
+        let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let pin = plan.libseccomp.clone().expect("[libseccomp] is configured");
+        assert!(
+            plan.kernel_profiles
+                .values()
+                .flat_map(|profiles| profiles.values())
+                .all(|profile| profile.firecracker_libseccomp.is_none()),
+            "a profile read a libseccomp pin of its own from the file"
+        );
+        apply_libseccomp_config(&mut plan);
+        let mut profiles = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            for (arch, profile) in arches {
+                assert_eq!(
+                    profile.firecracker_libseccomp.as_ref(),
+                    Some(&pin),
+                    "{name}.{arch}"
+                );
+                profiles += 1;
+            }
+        }
+        assert!(profiles > 0);
+
+        plan.libseccomp = None;
+        apply_libseccomp_config(&mut plan);
+        assert!(plan
+            .kernel_profiles
+            .values()
+            .flat_map(|profiles| profiles.values())
+            .all(|profile| profile.firecracker_libseccomp.is_none()));
     }
 
     /// A proxy that only tunnels (CONNECT) answers a plain-HTTP request with 405, so a
@@ -3583,12 +3659,53 @@ branch = "agent/nv2"
     /// without the kick can halt a vCPU with interrupts off for good (#2131).
     const RESTORE_KICK_COMMITS: [&str; 3] = [
         // [firecracker]: the default, btrfs and mountinfo profiles.
-        "2a33289b55b7f611959891dd5295438a416f386e",
+        "df341d66cfef596c957d4ebd0865d6f39b787784",
         // gpu.amd64 and phone.amd64.
         "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
         // nested.amd64.
         "af888e7aec38fe4727fd75878aaed017a3113028",
     ];
+
+    /// The fork commits whose arm64 snapshot load writes the complement of the saved bits to
+    /// the vGIC's clear-registers (`VgicRegEngine::clears_on_write`, ejc3/firecracker), one
+    /// for each branch an arm64 profile builds. A load that writes the saved bits themselves
+    /// leaves every interrupt enabled that the new VM starts with and the guest had
+    /// disabled: all sixteen SGIs of each vCPU (#2172).
+    const RESTORE_CLEARS_GIC_STATE_COMMITS: [&str; 3] = [
+        // [firecracker]: the default and btrfs profiles. The chain on upstream main carries the
+        // fix as its own commit (9e4961dad, firecracker#6486), not as a descendant of the
+        // v1.17.0-based branches' commit.
+        "df341d66cfef596c957d4ebd0865d6f39b787784",
+        // gpu.arm64.
+        "51247b891bceddcdd06169f61d5a64b33f5e0ba5",
+        // nested.arm64.
+        "8750b52190681dbc6fbf633243e1793b1841290d",
+    ];
+
+    /// A pin that moves to a commit without that fix brings #2172 back, and only a test that
+    /// reads KVM's own state as root would say so.
+    #[test]
+    fn every_arm64_firecracker_pin_restores_the_gic_enables_as_saved() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let global = &plan.firecracker.as_ref().unwrap().commit;
+        let mut checked = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            let Some(profile) = arches.get("arm64") else {
+                continue;
+            };
+            // A profile that names no fork of its own runs the [firecracker] build.
+            let commit = profile.firecracker_commit.as_ref().unwrap_or(global);
+            checked += 1;
+            assert!(
+                RESTORE_CLEARS_GIC_STATE_COMMITS.contains(&commit.as_str()),
+                "{name}.arm64 pins Firecracker {commit}, which is not known to restore the \
+                 vGIC's enable bits as saved. Add it to RESTORE_CLEARS_GIC_STATE_COMMITS once \
+                 `git merge-base --is-ancestor <a listed commit of its branch> {commit}` \
+                 succeeds in the fork, or the fix has been cherry-picked onto it"
+            );
+        }
+        assert!(checked > 3, "only {checked} arm64 profiles were checked");
+    }
 
     /// A pin that moves to a commit without the restore kick brings #2131 back with no test
     /// of fcvm's failing: the window is a few guest instructions wide.
