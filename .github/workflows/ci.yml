@@ -1406,9 +1406,12 @@ jobs:
     # attempt of a job that a spot reclaim killed is retried where no reclaim can end
     # it again (#834).
     runs-on: ${{ fromJSON(vars.ON_DEMAND_RERUNS == 'true' && github.run_attempt > 1 && format('["self-hosted","Linux","{0}","on-demand"]', matrix.arch) || format('["self-hosted","Linux","{0}"]', matrix.arch)) }}
-    # Longest of the last 6 successful runs: 21 min. ~3x headroom.
+    # Measured on main's push runs: 47 min warm (run 45887790668) and 57 min with a
+    # cold build (run 45686406677); run 45931415934 needed a cold build and a rebuild
+    # of the test image (its Containerfile pins changed) and was cut at 60 min with
+    # about 6 min of container-test left. 100 is 1.5x that 66 min.
     # See the Host job comment for why the 6h default is not acceptable here.
-    timeout-minutes: 60
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       # arm64 and x64, as planned by skip-check (arm64 only on a pull_request).
