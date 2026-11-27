@@ -134,7 +134,10 @@ fn the_vsock_integrity_l1_fcvm_uses_a_data_dir_of_its_own() {
     let run = script
         .find("fcvm podman run")
         .expect("run-test.sh starts the L2 VM");
-    assert!(export < run, "the data dir is exported before the L1 fcvm starts L2");
+    assert!(
+        export < run,
+        "the data dir is exported before the L1 fcvm starts L2"
+    );
     assert!(
         script.contains("NESTED_DATA=/mnt/fcvm-btrfs/nd/"),
         "the data dir is on the mapped store, so the L2 disk is a reflink of the base rootfs"

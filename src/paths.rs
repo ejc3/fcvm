@@ -283,7 +283,7 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 
 /// `sockaddr_un.sun_path` is 108 bytes including the NUL, so a path of 107
 /// bytes is the most that can ever be bound.
-const SUN_PATH_MAX: usize = 107;
+pub const SUN_PATH_MAX: usize = 107;
 
 /// The longest socket file placed in a VM's runtime directory.
 ///

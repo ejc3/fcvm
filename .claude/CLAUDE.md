@@ -3017,8 +3017,9 @@ the first of:
   another boot means a reboot: the first writer binds anew. A record of this boot whose
   directory this process does not see, or that holds no such id, is refused: a container
   has a `/run` of its own, and starting from an empty one would hand out names that are
-  taken. `make container-test*` therefore names a base in the container's data
-  directory (`CONTAINER_RUNTIME_DIR`).
+  taken. `make container-test*` therefore names a short base on the store
+  (`CONTAINER_RUNTIME_DIR`): the pool's pasta control sockets sit six levels under it and
+  must fit `sockaddr_un`, which the pool checks when it starts.
 - **The boot is in the path because two of the places can outlive a reboot** (the store,
   and a base an operator names on a disk). A state from before the reboot names a process
   of that boot; under another boot's directory nothing reads it, and the first writer

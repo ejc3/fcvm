@@ -83,9 +83,12 @@ CONTAINER_DATA_DIR := /mnt/fcvm-btrfs/container
 # container's fcvm is root with a /run of its own, made new for every run, so by default
 # its states would go there, and the data directory, which outlives the run, records where
 # its states are: the next run in the same boot would be refused a data directory whose
-# runtime directory it cannot see. So the container is given a base in its data directory,
-# the same in every run.
-CONTAINER_RUNTIME_DIR := $(CONTAINER_DATA_DIR)/runtime-dirs
+# runtime directory it cannot see. So the container is given a base on the store, the same
+# in every run. It is short because the namespace pool binds each slot's pasta control
+# socket at <base>/<key>/boot-<boot>/netpool/<user>/slots/<n>/pasta.ctl, which must fit
+# sockaddr_un's 107 bytes: under $(CONTAINER_DATA_DIR)/runtime-dirs it was 114 and every
+# pool test timed out (the pool now refuses such a base at start).
+CONTAINER_RUNTIME_DIR := /mnt/fcvm-btrfs/crt
 
 # Test options: FILTER=pattern STREAM=1 LIST=1 IGNORED=1
 FILTER ?=
