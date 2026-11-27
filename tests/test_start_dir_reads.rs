@@ -1975,9 +1975,9 @@ mod start {
             "this test traces its starts as root (see the module doc); run it with make \
              test-root"
         );
-        // Short: a VM's sockets sit under <data>/vm-disks/vm-<32 hex>/, and AF_UNIX paths
-        // stop at 108 bytes. strace prints the kernel's path of a descriptor, so the data
-        // directory is named without symbolic links.
+        // Short (`common::short_data_dir`): a VM's sockets sit under the data directory.
+        // strace prints the kernel's path of a descriptor, so the data directory is named
+        // without symbolic links.
         let id = &uuid::Uuid::new_v4().simple().to_string()[..8];
         // A user's data directory is beside the store's own, where the user can reach it:
         // the root tests' data directory is root's.
@@ -1986,10 +1986,12 @@ mod start {
             None => fcvm::paths::data_dir(),
         };
         std::fs::create_dir_all(&store).with_context(|| format!("creating {}", store.display()))?;
-        let data_dir = store
-            .canonicalize()
-            .context("resolving the data directory")?
-            .join(format!("dl-{id}"));
+        let data_dir = common::short_data_dir(
+            &store
+                .canonicalize()
+                .context("resolving the data directory")?,
+            "dl",
+        );
         let data_dir_str = data_dir.to_str().context("data dir path")?.to_string();
         if let Some(user) = &runner.user {
             std::fs::create_dir(&data_dir)
