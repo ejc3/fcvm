@@ -116,3 +116,27 @@ fn nested_benchmark_small_reads_report_microseconds_per_operation() {
         "FUSE_SMALLREAD is labelled us/op, so the total must be divided by the 100 reads: {calculation}"
     );
 }
+
+/// The vsock integrity test's L1 script runs fcvm against the mapped host store. It must
+/// give that fcvm a data dir of its own, as the nested scripts in test_kvm.rs do: the
+/// host's data dir holds the host's owner records and its runtime-directory binding, and an
+/// L1 fcvm there either reclaims host resources (#1393) or is refused the store.
+#[test]
+fn the_vsock_integrity_l1_fcvm_uses_a_data_dir_of_its_own() {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/vsock-integrity/run-test.sh"
+    ))
+    .expect("read the vsock integrity script");
+    let export = script
+        .find("export FCVM_DATA_DIR=\"$NESTED_DATA\"")
+        .expect("run-test.sh exports a data dir of its own for the L1 fcvm");
+    let run = script
+        .find("fcvm podman run")
+        .expect("run-test.sh starts the L2 VM");
+    assert!(export < run, "the data dir is exported before the L1 fcvm starts L2");
+    assert!(
+        script.contains("NESTED_DATA=/mnt/fcvm-btrfs/nd/"),
+        "the data dir is on the mapped store, so the L2 disk is a reflink of the base rootfs"
+    );
+}
