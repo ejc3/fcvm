@@ -497,7 +497,7 @@ Each VM has:
 │       ├── vmstate.snap       # VM memory snapshot
 │       ├── disk.snap          # Disk snapshot
 │       └── config.json        # VM configuration
-├── state/                     # VM state JSON files
+├── state/                     # markers: which runtime directory holds the VM states
 ├── image-cache/               # Container image layers (sha256:{digest}/)
 └── cache/                     # Downloaded cloud images
 ```
@@ -1350,11 +1350,11 @@ command runs, and every child (Firecracker, holder, pasta) and every in-process 
 
 | | |
 |---|---|
-| where | `fcvm.slice/fcvm-<pid>-<starttime>.scope` at the cgroup2 root, written to cgroupfs directly (`FCVM_CGROUP_PARENT` names another parent, `none` disables it) |
+| where | for root, `fcvm.slice/fcvm-<pid>-<starttime>.scope` at the cgroup2 root, written to cgroupfs directly (`FCVM_CGROUP_PARENT` names another parent, `none` disables it); unprivileged with `FCVM_CGROUP_PARENT` unset, `fcvm.slice` inside the cgroup delegated to the caller |
 | why not systemd | `systemd-run --scope` cannot place a running process; `StartTransientUnit` needs a bus client and a running systemd, which containers and nested guests do not all have. A caller that wants a systemd unit starts fcvm in one (`systemd-run --scope ... env FCVM_CGROUP_PARENT=none fcvm ...`) |
 | oomd | outside the user slice, so a rule that kills a session scope does not kill the VM; a slice oomd watches is one `FCVM_CGROUP_PARENT` away |
 | confined callers | a cgroup namespace still confines (the root is the namespace's); a root caller in a sandbox slice leaves it unless `FCVM_CGROUP_PARENT` names that slice |
-| unprivileged | stays in its own cgroup, one log line |
+| unprivileged | a scope inside the cgroup delegated to it: a system unit run for the user with `Delegate=yes` and `DelegateSubgroup=`, or a subtree handed to the user outside any systemd tree. The kernel lets a process move only inside a subtree whose root it can write, and systemd forbids cgroups below ones it manages unless delegated, so `user@<uid>.service` is never used, and a user manager unit counts only once systemd marks it (`user.delegate`, after systemd commit 70a8c5eb; systemd 255 to 262 mark none). Anywhere else (an SSH session, a service, a CI runner) it stays in its own cgroup, one log line |
 | `--no-swap` | `memory.swap.max=0` on the scope before the VMM starts; refused when there is no scope with a memory controller |
 | lifetime | pdeathsig is per process and survives the move: a VM dies with its launcher where the launcher armed it; a foreground fcvm dies with its terminal's SIGHUP; a detached one outlives the session |
 | removal | at exit fcvm moves back to the cgroup it came from and removes the scope; a start sweeps the parent when a sweep is due (`src/sweep.rs`: at most once per 5 s and parent, behind a stamp under `<data_dir>/cgroup-sweep/`), removing the scopes whose (pid, start time) is gone and the empty `fcvm-<pid>.scope`s of earlier releases. A start holds the parent's `flock` shared across the empty window between its scope's `mkdir` and its entry, and a sweep removes only under that lock held exclusively, which it waits for at most 100 ms. The name is the owner record, not a `reclaim` record, because reclaim records are per data_dir and per user and a cgroup is per kernel |
@@ -2429,8 +2429,7 @@ Override with `FCVM_BASE_DIR` environment variable.
 ├── vm-disks/          # Per-VM CoW disk copies
 │   └── {vm-id}/disks/rootfs.raw
 ├── snapshots/         # Firecracker snapshots
-├── state/             # VM state JSON files
-│   └── vms/<b>/{vm-id}.json
+├── state/             # markers: layout, runtime (the directory that holds the VM states)
 └── cache/             # Downloaded images and packages
     ├── ubuntu-24.04-arm64-{sha}.img  # Cloud image cache
     └── packages-{sha}/               # Downloaded .deb files
@@ -2446,7 +2445,7 @@ This ensures automatic cache invalidation when any component changes.
 
 ### State Persistence
 
-**VM State** (`/mnt/fcvm-btrfs/state/vms/<b>/{vm-id}.json`, `<b>` the first hex digit of the vm-id's SHA-256):
+**VM State** (`<runtime_dir>/state/vms/<b>/{vm-id}.json`, `<b>` the first hex digit of the vm-id's SHA-256; the runtime directory is `/run/fcvm-<uid>/<key of the data directory>/boot-<boot id>` when root has made that base (`sudo fcvm setup`) or the caller is root, else `<data_dir>/runtime/boot-<boot id>`, unless `paths.runtime_dir` names a base; the data directory records which one it is bound to in `state/runtime`, and `fcvm ls --runtime-dir` prints it):
 ```json
 {
   "schema_version": 1,

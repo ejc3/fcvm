@@ -7,6 +7,21 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Global directory for shared content-addressed assets
 static ASSETS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// `paths.runtime_dir` of the config this process loaded, if it names a base.
+static RUNTIME_SETTING: OnceLock<Option<String>> = OnceLock::new();
+
+/// Where VM states and the namespace pool live (`crate::runtime_dir`), once that is
+/// settled for this process: the store's record of this boot names it, or a setting does.
+static RUNTIME_DIR: OnceLock<crate::runtime_dir::RuntimeDir> = OnceLock::new();
+
+/// Until then, the directory [`runtime`] last returned: where this process would bind the
+/// store as the first writer of this boot.
+static RUNTIME_CANDIDATE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Set once this process has found its runtime directory bound to its data directory
+/// (`bind_runtime_dir`).
+static RUNTIME_BOUND: OnceLock<()> = OnceLock::new();
+
 /// Default base directory when no config file exists
 const DEFAULT_BASE_DIR: &str = "/mnt/fcvm-btrfs";
 
@@ -33,6 +48,7 @@ pub fn init_from_config() -> anyhow::Result<()> {
 /// sharing a directory such as `reclaim/0` with host root fails its ownership check.
 pub fn init_from_loaded_config(config: &crate::setup::rootfs::Plan) {
     let _ = DATA_DIR.set(resolve_data_dir(&config.paths.data_dir));
+    let _ = RUNTIME_SETTING.set(config.paths.runtime_dir.clone());
     crate::confine::set_config_mode(config.confine.mode);
     crate::confine::set_config_allow_seccomp_log(config.confine.allow_seccomp_log);
     let _ = ASSETS_DIR.set(resolve_assets_dir(&config.paths.assets_dir));
@@ -88,7 +104,8 @@ pub fn init_with_paths(data_dir: impl Into<PathBuf>, assets_dir: impl Into<PathB
     let _ = ASSETS_DIR.set(absolute(assets_dir.into(), "assets_dir"));
 }
 
-/// Directory for mutable per-instance data (vm-disks, state, snapshots).
+/// Directory for mutable per-instance data that outlives its processes (vm-disks,
+/// snapshots, owner records). VM states are in [`runtime_dir`].
 /// Configure via `paths.data_dir` in rootfs-config.toml for nested VM nesting.
 /// FCVM_DATA_DIR environment variable overrides config value. Always absolute: a relative
 /// value is taken against the working directory once, when it is first read.
@@ -170,9 +187,93 @@ pub fn cache_dir() -> PathBuf {
 
 // === Mutable per-instance data (use data_dir) ===
 
-/// Directory for VM state files
+/// The runtime directory, for what describes running processes only: where the store's
+/// record of this boot says it is, else where this process would put it as the boot's
+/// first writer (`crate::runtime_dir::locate`). With a data directory set without a config
+/// (`init_with_paths`, `init_with_defaults`) only FCVM_RUNTIME_DIR can name its base.
+///
+/// Settled once: by the store's record, by a setting, or by this process's own
+/// [`bind_runtime_dir`]. Until then every call locates again, because another first
+/// writer may choose another place between two calls.
+pub fn runtime() -> crate::runtime_dir::RuntimeDir {
+    use crate::runtime_dir::Host;
+    if let Some(runtime) = RUNTIME_DIR.get() {
+        return runtime.clone();
+    }
+    let configured = RUNTIME_SETTING.get_or_init(|| match DATA_DIR.get() {
+        Some(_) => None,
+        None => {
+            let (config, _, _) =
+                crate::setup::rootfs::load_config(None).expect("Failed to load config");
+            let _ = DATA_DIR.set(resolve_data_dir(&config.paths.data_dir));
+            config.paths.runtime_dir
+        }
+    });
+    // A host whose boot id cannot be read binds nothing: `bind_runtime_dir` returns that
+    // error before anything is made or read here.
+    let host = Host::current().unwrap_or_else(|_| Host {
+        boot_id: "unknown".to_string(),
+        euid: nix::unistd::geteuid().as_raw(),
+    });
+    let located = crate::runtime_dir::locate(
+        std::env::var_os("FCVM_RUNTIME_DIR"),
+        configured.as_deref(),
+        &data_dir(),
+        std::path::Path::new(crate::runtime_dir::RUN),
+        &host,
+    );
+    if located.settled() {
+        return RUNTIME_DIR.get_or_init(|| located).clone();
+    }
+    *RUNTIME_CANDIDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(located.dir.clone());
+    located
+}
+
+/// [`runtime`]'s directory. For a path into it, call [`bind_runtime_dir`] first: before
+/// the store is bound in this boot this is only where it would be.
+pub fn runtime_dir() -> PathBuf {
+    runtime().dir
+}
+
+/// Directory for VM state files, in the runtime directory.
 pub fn state_dir() -> PathBuf {
-    data_dir().join("state")
+    runtime_dir().join("state")
+}
+
+/// Whether `dir` is this process's own state directory: the one in the runtime directory
+/// its data directory is bound to, or would be bound to by this process. False until a
+/// path function has located it, and for the directories tests and other tools give a
+/// `StateManager` directly.
+pub fn is_store_state_dir(dir: &std::path::Path) -> bool {
+    RUNTIME_DIR
+        .get()
+        .is_some_and(|runtime| runtime.dir.join("state") == dir)
+        || RUNTIME_CANDIDATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|candidate| candidate.join("state") == dir)
+}
+
+/// Check, and for a writer make, the binding between the data directory and the runtime
+/// directory (`crate::runtime_dir::bind`), once per process once it holds. From then on
+/// [`runtime_dir`] is the directory the store is bound to, which is not the one it
+/// returned before when another first writer of this boot chose another place.
+/// `Ok(false)` tells a reader that the store has no runtime directory in this boot, so no
+/// VMs.
+pub fn bind_runtime_dir(access: crate::runtime_dir::Access) -> anyhow::Result<bool> {
+    if RUNTIME_BOUND.get().is_some() {
+        return Ok(true);
+    }
+    let host = crate::runtime_dir::Host::current()?;
+    let Some(bound) = crate::runtime_dir::bind(&data_dir(), &runtime(), access, &host)? else {
+        return Ok(false);
+    };
+    let _ = RUNTIME_DIR.set(bound);
+    let _ = RUNTIME_BOUND.set(());
+    Ok(true)
 }
 
 /// Directory for VM runtime data (disks, sockets, logs)
@@ -182,7 +283,7 @@ pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
 
 /// `sockaddr_un.sun_path` is 108 bytes including the NUL, so a path of 107
 /// bytes is the most that can ever be bound.
-const SUN_PATH_MAX: usize = 107;
+pub const SUN_PATH_MAX: usize = 107;
 
 /// The longest socket file placed in a VM's runtime directory.
 ///
