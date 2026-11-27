@@ -17,6 +17,7 @@ pub mod runtime_dir;
 pub mod setup;
 pub mod state;
 pub mod storage;
+pub mod store_buckets;
 pub mod sweep;
 #[cfg(test)]
 mod test_child;

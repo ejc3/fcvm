@@ -723,21 +723,61 @@ type Creates = BTreeMap<String, u64>;
 
 /// The name a directory a start created an entry in is compared under: [`dir_key`]'s, with
 /// every component that is a VM's id (`vm-` and 32 hex digits) as `<vm>`, so a directory of
-/// the start's own VM is named the same in every start and is known to be its own.
+/// the start's own VM is named the same in every start and is known to be its own, and every
+/// component that is a bucket of a hashed layout (one or two lowercase hex digits) as
+/// `<b16>` or `<b256>`, the number of buckets a name of that length is one of, so the
+/// buckets of one layout are one family whatever bucket each start's key fell in.
 fn create_key(dir: &str, roots: &[Root]) -> String {
     dir_key(dir, roots)
         .split('/')
         .map(|part| {
             let id = part.strip_prefix("vm-");
             if id.is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())) {
-                "<vm>"
+                "<vm>".to_string()
+            } else if let Some(buckets) = bucket_family(part) {
+                format!("<b{buckets}>")
+            } else if part
+                .strip_prefix("boot-")
+                .is_some_and(|boot| boot.len() >= 8 && boot.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                // A runtime directory's boot: one name in every start of a run.
+                "boot-<id>".to_string()
             } else {
-                part
+                part.to_string()
             }
         })
         .collect::<Vec<_>>()
         .join("/")
 }
+
+/// How many buckets a directory named `part` is one of, when it is a bucket of a hashed
+/// layout: 16 for one lowercase hex digit, 256 for two.
+fn bucket_family(part: &str) -> Option<u32> {
+    let hex = part
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    match part.len() {
+        1 | 2 if hex => Some(16u32.pow(part.len() as u32)),
+        _ => None,
+    }
+}
+
+/// The buckets a directory key's family spreads starts over: the product of its bucket
+/// components' families, 1 when it has none.
+fn fan_out(key: &str) -> u32 {
+    key.split('/')
+        .filter_map(|part| {
+            part.strip_prefix("<b")?
+                .strip_suffix('>')?
+                .parse::<u32>()
+                .ok()
+        })
+        .product()
+}
+
+/// The fewest buckets a family every start writes into may have: with more starts than
+/// that at once, each bucket's lock is shared by a sixty-fourth of them at most.
+const MIN_FAN_OUT: u32 = 64;
 
 fn creates_of(trace: &Trace, roots: &[Root]) -> Creates {
     let mut creates = Creates::new();
@@ -747,11 +787,14 @@ fn creates_of(trace: &Trace, roots: &[Root]) -> Creates {
     creates
 }
 
-/// A store directory every traced start creates an entry in, with the calls of each start.
+/// A store directory more than one traced start creates an entry in, or a family of buckets
+/// every start writes into that has fewer than [`MIN_FAN_OUT`] buckets, with the calls of
+/// each start and the family's buckets (1 for a plain directory).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SharedCreate {
     dir: String,
     per_start: Vec<u64>,
+    fan_out: u32,
 }
 
 /// A store directory every start is still known to create an entry in, with its issue.
@@ -769,33 +812,43 @@ enum CreateFinding {
     StaleAllowance { dir: &'static str, issue: u32 },
 }
 
-/// The directories under the data directory that every one of `starts` created an entry in
-/// and that are no start's own (no `<vm>` component). Each such call takes the directory's
-/// inode lock for writing, and on btrfs the holder can wait out a transaction commit, so a
-/// directory that every start writes into makes the starts take turns. A hashed bucket of
-/// 16 is one start's in 16, so with six starts it is every start's with odds of 16^-5.
+/// The directories under the data directory, no start's own (no `<vm>` component), that the
+/// starts share. Each entry-creating call takes the directory's inode lock for writing, and on
+/// btrfs the holder can wait out a transaction commit, so the starts that write into one
+/// directory take turns, and the rate is bounded by how many starts each directory is
+/// shared by. What bounds it is judged from the layout, not from which bucket six random
+/// keys fell in: a plain directory that two or more starts write into is shared by all of
+/// them; a family of buckets every start writes into shares each bucket among one start in
+/// its fan-out, which must be at least [`MIN_FAN_OUT`].
 fn judge_creates(starts: &[Creates], allowances: &[CreateAllowance]) -> Vec<CreateFinding> {
-    let every = |dir: &str| {
+    let writers = |dir: &str| {
         starts
             .iter()
-            .all(|start| start.get(dir).is_some_and(|n| *n > 0))
+            .filter(|start| start.get(dir).is_some_and(|n| *n > 0))
+            .count()
+    };
+    let shared = |dir: &str| {
+        let fan_out = fan_out(dir);
+        if fan_out == 1 {
+            writers(dir) >= 2
+        } else {
+            writers(dir) == starts.len() && fan_out < MIN_FAN_OUT
+        }
     };
     let mut findings = Vec::new();
     for allowance in allowances {
-        if !every(allowance.dir) {
+        if !shared(allowance.dir) {
             findings.push(CreateFinding::StaleAllowance {
                 dir: allowance.dir,
                 issue: allowance.issue,
             });
         }
     }
-    let Some(first) = starts.first() else {
-        return findings;
-    };
-    for dir in first.keys() {
+    let dirs: BTreeSet<&String> = starts.iter().flat_map(|start| start.keys()).collect();
+    for dir in dirs {
         let ours = dir == "<data>" || dir.starts_with("<data>/");
         let a_vms_own = dir.split('/').any(|part| part == "<vm>");
-        if !ours || a_vms_own || !every(dir) {
+        if !ours || a_vms_own || !shared(dir) {
             continue;
         }
         if allowances.iter().any(|allowance| allowance.dir == dir) {
@@ -803,7 +856,11 @@ fn judge_creates(starts: &[Creates], allowances: &[CreateAllowance]) -> Vec<Crea
         }
         findings.push(CreateFinding::Shared(SharedCreate {
             dir: dir.clone(),
-            per_start: starts.iter().map(|start| start[dir]).collect(),
+            per_start: starts
+                .iter()
+                .map(|start| start.get(dir).copied().unwrap_or(0))
+                .collect(),
+            fan_out: fan_out(dir),
         }));
     }
     findings
@@ -1237,35 +1294,62 @@ mod judging {
             ),
             ("/mnt/store/dl-1/vm-disks", "<data>/vm-disks"),
             ("/mnt/store/dl-1/vm-disks/vm-12", "<data>/vm-disks/vm-12"),
+            (
+                "/mnt/store/dl-1/vm-disks/7f/vm-0123456789abcdef0123456789abcdef",
+                "<data>/vm-disks/<b256>/<vm>",
+            ),
+            (
+                "/mnt/store/dl-1/reclaim/1000/c",
+                "<data>/reclaim/1000/<b16>",
+            ),
         ] {
             assert_eq!(create_key(dir, &roots), key, "{dir}");
         }
     }
 
+    /// A plain store directory two starts write into is shared, whichever starts; a family of
+    /// 16 buckets every start writes into is too narrow; a family of 256 is not, and neither
+    /// is a VM's own directory, a directory one start writes into, or one outside the store.
     #[test]
-    fn a_store_directory_every_start_writes_into_is_found_and_no_other() {
+    fn a_shared_store_directory_and_a_narrow_bucket_family_are_found_and_no_other() {
         let starts = vec![
             creates(&[
                 ("<data>/vm-disks", 1),
-                ("<data>/vm-disks/<vm>", 2),
-                ("<data>/state/vms/a", 2),
+                ("<data>/vm-disks/<b256>/<vm>", 2),
+                ("<data>/reclaim/1000/<b16>", 3),
+                ("<data>/vm-disks/<b256>", 1),
+                ("<data>/image-cache", 1),
+                ("<data>/snapshots/s", 1),
                 ("<scopes>", 1),
-                ("/run/user/1000", 1),
             ]),
             creates(&[
-                ("<data>/vm-disks", 1),
-                ("<data>/vm-disks/<vm>", 2),
-                ("<data>/state/vms/3", 2),
+                ("<data>/vm-disks/<b256>/<vm>", 2),
+                ("<data>/reclaim/1000/<b16>", 3),
+                ("<data>/vm-disks/<b256>", 1),
                 ("<scopes>", 1),
-                ("/run/user/1000", 1),
+            ]),
+            creates(&[
+                ("<data>/vm-disks/<b256>/<vm>", 2),
+                ("<data>/reclaim/1000/<b16>", 3),
+                ("<data>/vm-disks/<b256>", 1),
+                ("<data>/snapshots/s", 2),
+                ("<scopes>", 1),
             ]),
         ];
         assert_eq!(
             judge_creates(&starts, &[]),
-            [CreateFinding::Shared(SharedCreate {
-                dir: "<data>/vm-disks".to_string(),
-                per_start: vec![1, 1],
-            })]
+            [
+                CreateFinding::Shared(SharedCreate {
+                    dir: "<data>/reclaim/1000/<b16>".to_string(),
+                    per_start: vec![3, 3, 3],
+                    fan_out: 16,
+                }),
+                CreateFinding::Shared(SharedCreate {
+                    dir: "<data>/snapshots/s".to_string(),
+                    per_start: vec![1, 0, 2],
+                    fan_out: 1,
+                }),
+            ]
         );
     }
 
@@ -1280,9 +1364,9 @@ mod judging {
             creates(&[("<data>/snapshots/s", 2)]),
         ];
         assert_eq!(judge_creates(&shared, &[allowance]), []);
-        let not_every = vec![creates(&[("<data>/snapshots/s", 1)]), creates(&[])];
+        let not_shared = vec![creates(&[("<data>/snapshots/s", 1)]), creates(&[])];
         assert_eq!(
-            judge_creates(&not_every, &[allowance]),
+            judge_creates(&not_shared, &[allowance]),
             [CreateFinding::StaleAllowance {
                 dir: "<data>/snapshots/s",
                 issue: 1
@@ -1937,8 +2021,25 @@ mod start {
 
     /// The store directories every start is still known to create an entry in. Each entry
     /// names its issue and comes out with the fix ([`judge_creates`]).
-    fn create_allowances() -> Vec<CreateAllowance> {
-        Vec::new()
+    ///
+    /// `fallback`: the starts keep their VM states in the runtime directory's fallback place,
+    /// `<data>/runtime` (a user with no base).
+    fn create_allowances(fallback: bool) -> Vec<CreateAllowance> {
+        if !fallback {
+            return Vec::new();
+        }
+        // The 16 state buckets, on the store only in the fallback place: production and the
+        // rate measurements keep states under /run/fcvm-<uid> or a named base, on tmpfs, and
+        // changing their count is a layout change the runtime directory's upgrade refusal
+        // would have to cover for running VMs, which is not worth it for a fallback the
+        // binding already tells the operator to replace (`sudo fcvm setup --runtime-dir`).
+        [
+            "<data>/runtime/boot-<id>/state/vms/<b16>",
+            "<data>/runtime/boot-<id>/state/names/<b16>",
+            "<data>/runtime/boot-<id>/state/pids/<b16>",
+        ]
+        .map(|dir| CreateAllowance { dir, issue: 2240 })
+        .into()
     }
 
     /// Remove the scopes' parent the starts made, with whatever empty scopes are left in it.
@@ -2173,15 +2274,40 @@ mod start {
                  directory:\n{made}",
                 creates.len()
             );
-            for finding in judge_creates(&creates, &create_allowances()) {
+            let fallback = creates
+                .iter()
+                .any(|start| start.keys().any(|dir| dir.starts_with("<data>/runtime/")));
+            let allowances = create_allowances(fallback);
+            for allowance in &allowances {
+                println!(
+                    "allowed as a shared directory while states are in the fallback place \
+                     <data>/runtime (#{}): {}; production keeps states on tmpfs under \
+                     /run/fcvm-<uid> or a named base",
+                    allowance.issue, allowance.dir
+                );
+            }
+            for finding in judge_creates(&creates, &allowances) {
                 report.push_str(&match finding {
-                    CreateFinding::Shared(SharedCreate { dir, per_start }) => format!(
-                        "every start created an entry in {dir} ({per_start:?} calls): a directory \
-                         every start writes into makes the starts take turns on its inode lock\n"
+                    CreateFinding::Shared(SharedCreate {
+                        dir,
+                        per_start,
+                        fan_out: 1,
+                    }) => format!(
+                        "more than one start created an entry in {dir} ({per_start:?} calls): \
+                         the starts that write into one directory take turns on its inode lock\n"
+                    ),
+                    CreateFinding::Shared(SharedCreate {
+                        dir,
+                        per_start,
+                        fan_out,
+                    }) => format!(
+                        "every start created an entry in a bucket of {dir} ({per_start:?} calls), \
+                         a family of {fan_out} buckets: each bucket's lock is shared by one start \
+                         in {fan_out}, fewer than one in {MIN_FAN_OUT}\n"
                     ),
                     CreateFinding::StaleAllowance { dir, issue } => format!(
-                        "{dir} is allowed as a directory every start writes into (#{issue}) and \
-                         not every start did: remove its entry from `create_allowances`\n"
+                        "{dir} is allowed as a directory the starts share (#{issue}) and the \
+                         starts no longer share it: remove its entry from `create_allowances`\n"
                     ),
                 });
             }
