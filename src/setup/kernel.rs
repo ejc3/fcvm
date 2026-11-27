@@ -1782,31 +1782,6 @@ pub async fn install_host_kernel(profile: &KernelProfile, boot_args: Option<&str
 // Profile Firecracker Setup
 // ============================================================================
 
-/// Fetch the short commit identity used by the unpinned Cloud Hypervisor path.
-async fn fetch_remote_commit_hash(repo: &str, branch: &str) -> Result<String> {
-    let url = format!("https://github.com/{}", repo);
-    let output = tokio::process::Command::new("git")
-        .args(["ls-remote", &url, branch])
-        .output()
-        .await
-        .context("running git ls-remote")?;
-
-    if !output.status.success() {
-        bail!(
-            "git ls-remote failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let commit = stdout
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no commit hash in ls-remote output"))?;
-
-    Ok(commit[..12].to_string()) // First 12 chars of commit hash
-}
-
 /// Parse the commit selected for a Firecracker ref.
 ///
 /// Kept separate from the command runner so ref-resolution identity can be
@@ -2876,33 +2851,63 @@ async fn ensure_confined_seccomp(
             let cargo = cargo_program()?;
             let build_dir = firecracker_build_dir(&compiler, uuid::Uuid::new_v4());
             let url = format!("https://github.com/{repo}");
-            checkout_firecracker_source(&url, branch, commit, source, &build_dir).await?;
-            let mut build = Command::new(&cargo);
-            build
-                .args([
-                    "build",
-                    "--release",
-                    "-p",
-                    "seccompiler",
-                    "--bin",
-                    "seccompiler-bin",
-                ])
-                .current_dir(&build_dir);
-            super::run_build_as_sudo_invoker(&mut build);
-            let status = build.status().await.context("building seccompiler-bin")?;
-            anyhow::ensure!(status.success(), "the seccompiler-bin build failed");
-            let built = ["target/release", "build/cargo_target/release"]
-                .iter()
-                .map(|dir| build_dir.join(dir).join("seccompiler-bin"))
-                .find(|path| path.exists())
-                .context("seccompiler-bin is missing after its build")?;
-            let temp = firecracker_install_temp_path(&compiler, uuid::Uuid::new_v4());
-            tokio::fs::copy(&built, &temp)
-                .await
-                .context("installing seccompiler-bin")?;
-            super::publish_store_entry(&temp, &compiler, "seccompiler-bin").await?;
-            let _ = tokio::fs::remove_dir_all(&build_dir).await;
+            install_seccompiler(
+                &compiler,
+                &build_dir,
+                |dir| async move {
+                    checkout_firecracker_source(&url, branch, commit, source, &dir).await
+                },
+                |dir| async move {
+                    let mut build = Command::new(&cargo);
+                    build
+                        .args([
+                            "build",
+                            "--release",
+                            "-p",
+                            "seccompiler",
+                            "--bin",
+                            "seccompiler-bin",
+                        ])
+                        .current_dir(&dir);
+                    super::run_build_as_sudo_invoker(&mut build);
+                    let status = build.status().await.context("running cargo")?;
+                    anyhow::ensure!(status.success(), "cargo build exited with {status}");
+                    ["target/release", "build/cargo_target/release"]
+                        .iter()
+                        .map(|built| dir.join(built).join("seccompiler-bin"))
+                        .find(|path| path.exists())
+                        .context("seccompiler-bin is missing after its build")
+                },
+            )
+            .await?;
         }
+        // A confined launch refuses a filter in a directory its group or every user can
+        // write (confine::verified_filter_bytes): the directory of this Firecracker loses
+        // those bits here. A sticky directory is left as it is, and accepted.
+        if let Some(store) = firecracker.parent() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = tokio::fs::metadata(store)
+                .await
+                .with_context(|| format!("reading the mode of {}", store.display()))?
+                .permissions()
+                .mode();
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                tokio::fs::set_permissions(store, std::fs::Permissions::from_mode(mode & !0o022))
+                    .await
+                    .with_context(|| {
+                        format!("making {} writable by its owner only", store.display())
+                    })?;
+                info!(
+                    path = %store.display(),
+                    was = %format!("{:o}", mode & 0o7777),
+                    "the Firecracker directory is now writable by its owner only"
+                );
+            }
+        }
+        let store_mode = || {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::Permissions::from_mode(crate::confine::STORE_FILE_MODE)
+        };
         for (mode, path) in &missing {
             let nonce = uuid::Uuid::new_v4();
             let policy = firecracker_install_temp_path(path, nonce).with_extension("json");
@@ -2936,9 +2941,13 @@ async fn ensure_confined_seccomp(
                     status.success() && !compiled.is_empty(),
                     "seccompiler-bin rejected the confined policy"
                 );
-                // The filter, then the record of its digest. A crash between the two leaves
-                // a filter whose record does not match: the launch refuses it and the next
-                // setup rebuilds it.
+                // The filter, then the record of its digest, each writable by its owner
+                // only, whatever the umask. A crash between the two leaves a filter whose
+                // record does not match: the launch refuses it and the next setup rebuilds
+                // it.
+                tokio::fs::set_permissions(&temp, store_mode())
+                    .await
+                    .context("setting the confined seccomp filter's mode")?;
                 super::publish_store_entry(&temp, path, "confined seccomp filter").await?;
                 tokio::fs::write(
                     &digest_temp,
@@ -2946,6 +2955,9 @@ async fn ensure_confined_seccomp(
                 )
                 .await
                 .context("writing the confined seccomp filter's digest")?;
+                tokio::fs::set_permissions(&digest_temp, store_mode())
+                    .await
+                    .context("setting the mode of the confined seccomp filter's digest")?;
                 super::publish_store_entry(
                     &digest_temp,
                     &digest_path,
@@ -2968,6 +2980,98 @@ async fn ensure_confined_seccomp(
     .await;
     flock.unlock().map_err(|(_, err)| err)?;
     result
+}
+
+/// How long a recorded `seccompiler-bin` build failure keeps setup from building again.
+const SECCOMPILER_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Where a failed build of the `seccompiler-bin` at `compiler` is recorded.
+fn seccompiler_failure_path(compiler: &Path) -> PathBuf {
+    let mut path = compiler.as_os_str().to_owned();
+    path.push(".build-failed");
+    path.into()
+}
+
+/// Build `seccompiler-bin` in `build_dir` and install it at `compiler`: `checkout` fetches
+/// the Firecracker source into the directory and `compile` builds there and returns the
+/// binary.
+///
+/// The directory is removed however this ends: a failed build used to leave its checkout
+/// in /tmp, one per `fcvm setup`. A failed compile is recorded beside the compiler's path
+/// and not tried again for [`SECCOMPILER_RETRY_AFTER`], or until the record is removed:
+/// setup runs this for every Firecracker of the policy's commit whose filters are missing,
+/// on hosts that never confine a VMM too, and a build that fails for the host's own
+/// reasons (no libseccomp headers) fails the same way each time. A failed checkout is not
+/// recorded: it leaves nothing and the network can be back at the next setup.
+async fn install_seccompiler<Checkout, CheckoutFuture, Compile, CompileFuture>(
+    compiler: &Path,
+    build_dir: &Path,
+    checkout: Checkout,
+    compile: Compile,
+) -> Result<()>
+where
+    Checkout: FnOnce(PathBuf) -> CheckoutFuture,
+    CheckoutFuture: std::future::Future<Output = Result<()>>,
+    Compile: FnOnce(PathBuf) -> CompileFuture,
+    CompileFuture: std::future::Future<Output = Result<PathBuf>>,
+{
+    let failure = seccompiler_failure_path(compiler);
+    if let Ok(recorded) = tokio::fs::read_to_string(&failure).await {
+        // A record whose age cannot be read counts as fresh.
+        let age = tokio::fs::metadata(&failure)
+            .await
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .unwrap_or_default();
+        if age < SECCOMPILER_RETRY_AFTER {
+            bail!(
+                "the seccompiler-bin build for this Firecracker failed {} minutes ago and is \
+                 not tried again for {} hours ({}). A confined start is refused until it is \
+                 built: fix the cause, remove {} and run fcvm setup",
+                age.as_secs() / 60,
+                SECCOMPILER_RETRY_AFTER.as_secs() / 3600,
+                recorded.trim(),
+                failure.display()
+            );
+        }
+        let _ = tokio::fs::remove_file(&failure).await;
+    }
+    let temp = firecracker_install_temp_path(compiler, uuid::Uuid::new_v4());
+    let mut compile_failed = false;
+    let installed = async {
+        checkout(build_dir.to_owned())
+            .await
+            .context("fetching the Firecracker source for seccompiler-bin")?;
+        let built = match compile(build_dir.to_owned()).await {
+            Ok(built) => built,
+            Err(error) => {
+                compile_failed = true;
+                return Err(error.context("the seccompiler-bin build failed"));
+            }
+        };
+        tokio::fs::copy(&built, &temp)
+            .await
+            .context("installing seccompiler-bin")?;
+        super::publish_store_entry(&temp, compiler, "seccompiler-bin").await
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(build_dir).await;
+    if let Err(error) = &installed {
+        let _ = tokio::fs::remove_file(&temp).await;
+        if compile_failed {
+            match tokio::fs::write(&failure, format!("{error:#}\n")).await {
+                Ok(()) => super::give_store_entry_to_invoker(&failure),
+                Err(write) => warn!(
+                    path = %failure.display(),
+                    error = %write,
+                    "could not record the failed seccompiler-bin build; the next fcvm setup \
+                     tries it again"
+                ),
+            }
+        }
+    }
+    installed
 }
 
 pub async fn ensure_profile_firecracker(
@@ -3165,89 +3269,191 @@ pub async fn ensure_profile_firecracker(
 // ============================================================================
 //
 // Cloud Hypervisor is an OPTIONAL VMM backend (`--hypervisor cloud-hypervisor`).
-// Unlike firecracker — which is per-kernel-profile — CH is a single global binary
-// built from the `[cloud_hypervisor]` config (repo + branch). It is content-addressed
-// exactly like firecracker (SHA over repo+branch+commit+libc), built on demand via
-// `fcvm setup --cloud-hypervisor`, and resolved at launch by `find_cloud_hypervisor()`.
+// Unlike firecracker, which is per kernel profile, it is one global binary built
+// from the `[cloud_hypervisor]` config (repo + commit) by
+// `fcvm setup --cloud-hypervisor`. The binary's name is a hash of the repo, the
+// commit, the architecture and the libc, so `find_cloud_hypervisor()` computes
+// the name of the configured build and runs that file or nothing.
 
-/// Compute the content-addressed SHA for the cloud-hypervisor binary.
+/// Content-addressed name of the Cloud Hypervisor build of `commit` from `repo`.
+///
 /// Includes the target architecture and libc version: the built binary is an
 /// arch-specific, dynamically-linked ELF, so an assets_dir copied or shared between
-/// an x86_64 and an aarch64 builder must NOT resolve the same content-addressed name
-/// (otherwise the second arch sees a false cache hit and runs an `Exec format error`
-/// binary). Arch + libc segregate the cache entries.
-fn compute_cloud_hypervisor_sha(repo: &str, branch: &str, commit_hash: &str) -> String {
+/// an x86_64 and an aarch64 builder must not resolve the same name (the second
+/// arch would see a cache hit and run an `Exec format error` binary).
+fn cloud_hypervisor_file_name(repo: &str, commit: &str, arch: &str, libc_tag: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(repo.as_bytes());
-    hasher.update(branch.as_bytes());
-    hasher.update(commit_hash.as_bytes());
-    hasher.update(std::env::consts::ARCH.as_bytes());
-    hasher.update(libc_version_tag().as_bytes());
+    hasher.update(commit.as_bytes());
+    hasher.update(arch.as_bytes());
+    hasher.update(libc_tag.as_bytes());
     let result = hasher.finalize();
-    hex::encode(&result[..6]) // 12 hex chars
+    format!("cloud-hypervisor-{}.bin", hex::encode(&result[..6]))
 }
 
-/// Find the most recently modified cached cloud-hypervisor binary.
-///
-/// Used both as an offline fallback during setup and as the primary resolution
-/// path at VM-launch time (so launching never needs network / git ls-remote).
-pub fn newest_cached_cloud_hypervisor() -> Option<PathBuf> {
-    let ch_dir = paths::assets_dir().join("cloud-hypervisor");
-    let pattern = format!("{}/cloud-hypervisor-*.bin", ch_dir.display());
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-    let entries = match glob(&pattern) {
-        Ok(e) => e,
-        Err(_) => return None,
-    };
-    for path in entries.filter_map(|e| e.ok()) {
-        let mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
-            newest = Some((mtime, path));
-        }
+/// Where the build of the configured Cloud Hypervisor commit lives in the store
+/// directory `store`, whether or not it has been built.
+pub(crate) fn cloud_hypervisor_path_in(
+    store: &Path,
+    config: &super::rootfs::CloudHypervisorConfig,
+) -> Result<PathBuf> {
+    validate_full_git_commit(&config.commit, "configured cloud-hypervisor commit")?;
+    Ok(store.join(cloud_hypervisor_file_name(
+        &config.repo,
+        &config.commit,
+        std::env::consts::ARCH,
+        &libc_version_tag(),
+    )))
+}
+
+/// The store directory `fcvm setup --cloud-hypervisor` installs into.
+pub(crate) fn cloud_hypervisor_store_dir() -> PathBuf {
+    paths::assets_dir().join("cloud-hypervisor")
+}
+
+/// The store directory of the config `plan`: where a setup run with that config installs,
+/// whatever paths this process started with ([`paths::configured_assets_dir`]).
+pub(crate) fn cloud_hypervisor_store_of(plan: &crate::setup::rootfs::Plan) -> PathBuf {
+    paths::configured_assets_dir(plan).join("cloud-hypervisor")
+}
+
+/// The Rust toolchain this fcvm is built with: the `channel` of its `rust-toolchain.toml`.
+fn pinned_rust_toolchain() -> Result<String> {
+    let file: toml::Value = toml::from_str(include_str!("../../rust-toolchain.toml"))
+        .context("parsing fcvm's rust-toolchain.toml")?;
+    file.get("toolchain")
+        .and_then(|toolchain| toolchain.get("channel"))
+        .and_then(|channel| channel.as_str())
+        .map(str::to_string)
+        .context("fcvm's rust-toolchain.toml names no toolchain channel")
+}
+
+/// Check that what a Cloud Hypervisor build prints for `--version` names `commit`: the
+/// `git describe` form `v55.0-117-g4969a51a3d3f`, with the twelve digits the build is given
+/// (`core.abbrev`). A commit that is itself a release tag prints the bare tag and is refused
+/// here: nothing pins one today, and its version string would say nothing about the commit.
+fn cloud_hypervisor_version_names(version: &str, commit: &str) -> Result<()> {
+    let wanted = format!("-g{}", &commit[..12]);
+    if !version.trim().ends_with(&wanted) {
+        bail!(
+            "the cloud-hypervisor built from commit {commit} prints {:?} for --version, which \
+             does not end in {wanted}: its build did not get the commit from git describe, so \
+             the binary is not installed",
+            version.trim()
+        );
     }
-    newest.map(|(_, path)| path)
+    Ok(())
 }
 
-/// Ensure the cloud-hypervisor binary exists, building it from the configured
-/// repo/branch if missing.
+/// Put the source of `commit` in `build_dir`, which must not exist yet, and
+/// check that the checkout's HEAD is `commit`.
 ///
-/// Uses content-addressed naming: cloud-hypervisor-{sha}.bin where SHA is computed
-/// from repo + branch + commit_hash + libc. Automatically detects and rebuilds when
-/// new commits are pushed to the branch. Mirrors `ensure_profile_firecracker`.
-pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf> {
-    // Fetch latest commit hash to detect updates. This drives the fast-path existence
-    // check; the binary's final name is re-derived from the actually-built HEAD below
-    // (the branch could move between this ls-remote and the clone).
-    let commit_hash = fetch_remote_commit_hash(repo, branch).await?;
-    let mut sha = compute_cloud_hypervisor_sha(repo, branch, &commit_hash);
+/// The clone carries the history and tags without file contents
+/// (`--filter=blob:none`), because Cloud Hypervisor's build names its version
+/// with `git describe` (`v55.0-117-g4969a51a3d3f`), which needs both. A commit no
+/// branch or tag of the clone reaches is fetched by its hash, which GitHub
+/// serves while any of its refs reaches it.
+async fn checkout_cloud_hypervisor_source(url: &str, commit: &str, build_dir: &Path) -> Result<()> {
+    let dir = build_dir
+        .to_str()
+        .context("the cloud-hypervisor build directory is not UTF-8")?;
+    git_as_invoker(
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            url,
+            dir,
+        ],
+        &format!("clone {url}"),
+    )
+    .await?;
+    let have = Command::new("git")
+        .args(["-C", dir, "cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .context("looking for the cloud-hypervisor commit in the clone")?;
+    if !have.success() {
+        git_as_invoker(
+            &[
+                "-C",
+                dir,
+                "fetch",
+                "-q",
+                "--filter=blob:none",
+                "origin",
+                commit,
+            ],
+            &format!("fetch cloud-hypervisor commit {commit} from {url}"),
+        )
+        .await?;
+    }
+    git_as_invoker(
+        &["-C", dir, "checkout", "-q", "--detach", commit],
+        &format!("check out cloud-hypervisor commit {commit}"),
+    )
+    .await?;
 
-    // Content-addressed path in assets dir (alongside kernels and firecracker)
-    let ch_dir = paths::assets_dir().join("cloud-hypervisor");
-    let filename = format!("cloud-hypervisor-{}.bin", sha);
-    let mut bin_path = ch_dir.join(&filename);
+    let checkout = Command::new("git")
+        .args(["-C", dir, "rev-parse", "HEAD"])
+        .output()
+        .await
+        .context("reading cloned cloud-hypervisor HEAD")?;
+    if !checkout.status.success() {
+        bail!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
+    let head = String::from_utf8_lossy(&checkout.stdout);
+    let head = head.trim();
+    if head != commit {
+        bail!("cloned cloud-hypervisor commit {head} does not match configured commit {commit}");
+    }
+    Ok(())
+}
+
+/// Ensure the Cloud Hypervisor build of the configured commit exists, building
+/// it if missing.
+///
+/// A binary already built for the commit is kept without contacting the remote.
+/// Otherwise setup clones the repository, checks out the commit by its hash and
+/// refuses a checkout whose HEAD is anything else, so the installed file is
+/// always the build of the commit its name was computed from.
+pub async fn ensure_cloud_hypervisor(
+    config: &super::rootfs::CloudHypervisorConfig,
+) -> Result<PathBuf> {
+    let ch_dir = cloud_hypervisor_store_dir();
+    let bin_path = cloud_hypervisor_path_in(&ch_dir, config)?;
+    let (repo, commit) = (config.repo.as_str(), config.commit.as_str());
 
     // Already exists — use it
     if bin_path.exists() {
         info!(
             path = %bin_path.display(),
-            sha = %sha,
+            commit = %commit,
             "cloud-hypervisor binary exists"
         );
         return Ok(bin_path);
     }
 
     // Resolve the build toolchain before creating anything: a missing cargo
-    // must not cost a network clone or leave a fresh dir/lock behind.
+    // must not cost a network clone or leave a fresh dir/lock behind. The build
+    // uses the toolchain this fcvm is built with: the Cloud Hypervisor tree names
+    // none, so it would otherwise build with whichever default the host's rustup
+    // has (and fail where it has none).
     let cargo = cargo_program()?;
+    let toolchain = pinned_rust_toolchain()?;
 
     // Acquire per-filename lock so concurrent setups don't collide
-    let flock = super::lock_store_dir(
-        &ch_dir.join(format!("{}.lock", filename)),
-        "cloud-hypervisor build",
-    )
-    .await?;
+    let mut lock_name = bin_path
+        .file_name()
+        .context("the cloud-hypervisor binary path has no file name")?
+        .to_os_string();
+    lock_name.push(".lock");
+    let flock = super::lock_store_dir(&ch_dir.join(lock_name), "cloud-hypervisor build").await?;
 
     // Double-check after lock (another process may have built it)
     if bin_path.exists() {
@@ -3256,87 +3462,46 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
         return Ok(bin_path);
     }
 
-    println!(
-        "  → Building cloud-hypervisor from {} (branch: {}, sha: {})...",
-        repo, branch, sha
-    );
+    println!("  → Building cloud-hypervisor from {repo} (commit: {commit})...");
     println!("    This may take 5-10 minutes...");
 
     // Build in a UNIQUE temp directory. The flock above is per assets_dir/<filename>,
     // so two setups with DIFFERENT assets_dirs (e.g. a custom --config) take different
-    // locks for the same commit; a build dir keyed only on the sha would let one delete
-    // the other's checkout mid-build. A per-invocation uuid removes that overlap (uuid,
-    // not pid — separate PID namespaces reuse numbers; see the cross-VM cache race lesson).
+    // locks for the same commit; a build dir keyed only on the commit would let one
+    // delete the other's checkout mid-build. A per-invocation uuid removes that overlap
+    // (uuid, not pid — separate PID namespaces reuse numbers; see the cross-VM cache
+    // race lesson).
     let build_dir = PathBuf::from(format!(
         "/tmp/cloud-hypervisor-build-{}-{}",
-        sha,
+        &commit[..12],
         uuid::Uuid::new_v4()
     ));
-    if build_dir.exists() {
-        tokio::fs::remove_dir_all(&build_dir)
-            .await
-            .context("removing old cloud-hypervisor build directory")?;
-    }
 
-    // Clone the selected branch as the sudo invoker so the checkout is not root-owned.
-    let clone_url = format!("https://github.com/{}", repo);
-    let mut clone_cmd = Command::new("git");
-    clone_cmd.args([
-        "clone",
-        "-b",
-        branch,
-        &clone_url,
-        build_dir.to_str().unwrap(),
-    ]);
-    super::run_build_as_sudo_invoker(&mut clone_cmd);
-    let status = clone_cmd
-        .status()
-        .await
-        .context("cloning cloud-hypervisor repo")?;
-
-    if !status.success() {
+    let clone_url = format!("https://github.com/{repo}");
+    if let Err(error) = checkout_cloud_hypervisor_source(&clone_url, commit, &build_dir).await {
         let _ = tokio::fs::remove_dir_all(&build_dir).await;
         flock.unlock().map_err(|(_, err)| err)?;
-        bail!("Failed to clone cloud-hypervisor repo from {}", clone_url);
+        return Err(error);
     }
 
-    // The cache identity (sha/bin_path) was computed from the ls-remote commit, but the
-    // clone tracked the MUTABLE branch — if it moved in between, the binary would be built
-    // from a different commit than its content-addressed name claims. Re-derive the name
-    // from the actually-checked-out HEAD so the name always matches the bytes installed.
-    let head_out = Command::new("git")
-        .args(["-C", build_dir.to_str().unwrap(), "rev-parse", "HEAD"])
-        .output()
-        .await
-        .context("reading cloned cloud-hypervisor HEAD")?;
-    if head_out.status.success() {
-        let head = String::from_utf8_lossy(&head_out.stdout);
-        let head = head.trim();
-        if let Some(built) = head.get(..12) {
-            if built != commit_hash {
-                let actual_sha = compute_cloud_hypervisor_sha(repo, branch, built);
-                warn!(
-                    resolved = %commit_hash,
-                    built = %built,
-                    sha = %actual_sha,
-                    "cloud-hypervisor branch moved during build; naming binary after the built commit"
-                );
-                sha = actual_sha;
-                bin_path = ch_dir.join(format!("cloud-hypervisor-{}.bin", sha));
-                // Another process may have already built this exact commit.
-                if bin_path.exists() {
-                    let _ = tokio::fs::remove_dir_all(&build_dir).await;
-                    flock.unlock().map_err(|(_, err)| err)?;
-                    return Ok(bin_path);
-                }
-            }
-        }
-    }
-
-    // Build cloud-hypervisor
+    // Build cloud-hypervisor. `--locked` builds the dependency versions the commit's
+    // Cargo.lock names or fails.
+    // The build names its version with `git describe`, whose abbreviated hash grows with
+    // the repository. A snapshot restores only on a build that prints the version it
+    // recorded, so the length is fixed: two builds of one commit print the same.
     let mut build_cmd = Command::new(&cargo);
     build_cmd
-        .args(["build", "--release", "--bin", "cloud-hypervisor"])
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--bin",
+            "cloud-hypervisor",
+        ])
+        .env("RUSTUP_TOOLCHAIN", &toolchain)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.abbrev")
+        .env("GIT_CONFIG_VALUE_0", "12")
         .current_dir(&build_dir);
     super::run_build_as_sudo_invoker(&mut build_cmd);
     let status = build_cmd
@@ -3353,6 +3518,18 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
     if !binary.exists() {
         flock.unlock().map_err(|(_, err)| err)?;
         bail!("cloud-hypervisor binary not found at {}", binary.display());
+    }
+    // A snapshot restores only on a build that prints the version it recorded, so a build
+    // whose version does not name its commit is not installed: Cloud Hypervisor's build
+    // falls back to the bare crate version when `git describe` fails, and every pin past
+    // one release would then print the same string.
+    // The probe every launch uses for this binary (`find_cloud_hypervisor`).
+    let named = crate::version_cache::version_output(&binary)
+        .context("running the built cloud-hypervisor --version")
+        .and_then(|version| cloud_hypervisor_version_names(&version, commit));
+    if let Err(error) = named {
+        flock.unlock().map_err(|(_, err)| err)?;
+        return Err(error);
     }
 
     // Copy to a temp name in the same directory, then atomically rename onto the
@@ -3375,7 +3552,7 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
 
     info!(
         path = %bin_path.display(),
-        sha = %sha,
+        commit = %commit,
         "cloud-hypervisor binary installed"
     );
     println!("  ✓ Cloud Hypervisor ready: {}", bin_path.display());
@@ -3493,6 +3670,12 @@ mod tests {
         };
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
+        // The directory starts writable by its group, as a umask of 002 makes one, and
+        // every file is created under that umask (nextest runs each test in a process of
+        // its own, so the umask is this test's alone).
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        // SAFETY: umask takes a mode and cannot fail.
+        unsafe { libc::umask(0o002) };
         let firecracker = dir.path().join("firecracker-default-0123456789ab.bin");
         std::fs::write(&firecracker, b"").unwrap();
         // A stand-in compiler: its output is its input, so each mode's filter differs.
@@ -3530,7 +3713,19 @@ mod tests {
                 verified_filter_bytes(&firecracker, mode).unwrap(),
                 crate::confine::seccomp_policy(mode).into_bytes()
             );
+            // Written by its owner only, the record too, in a directory of the same kind:
+            // what a confined launch accepts.
+            let filter = filter_path(&firecracker, mode);
+            for path in [filter_digest_path(&filter), filter] {
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+                assert_eq!(mode, 0o644, "{}: mode {mode:o}", path.display());
+            }
         }
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o7777,
+            0o755,
+            "the directory of the Firecracker is still writable by its group"
+        );
 
         // Other bytes under the enforce filter's name; the log filter loses its record.
         let enforce = filter_path(&firecracker, SeccompMode::Enforce);
@@ -3556,6 +3751,94 @@ mod tests {
         let error = setup().await.unwrap_err().to_string();
         assert!(error.contains("seccompiler-bin rejected"), "{error}");
         assert_eq!(entries(), installed);
+    }
+
+    /// A build of `seccompiler-bin` that fails is recorded and not run again by the next
+    /// setup, and its checkout is removed however the build ends. It left a checkout in
+    /// /tmp and was rebuilt at every `fcvm setup`. A record a day old no longer stops the
+    /// build, and a checkout that fails is not recorded.
+    #[tokio::test]
+    async fn a_failed_seccompiler_build_is_recorded_and_leaves_no_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let compiler = dir
+            .path()
+            .join("firecracker-default-0123456789ab.bin.seccompiler-bin");
+        let build_dir = dir.path().join("build");
+        let failure = seccompiler_failure_path(&compiler);
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        // A checkout that leaves files, then a compile that fails or succeeds.
+        let install = |checkout_ok: bool, compile_ok: bool| {
+            let (compiler, build_dir, runs) = (&compiler, &build_dir, &runs);
+            async move {
+                install_seccompiler(
+                    compiler,
+                    build_dir,
+                    |dir| async move {
+                        runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        std::fs::create_dir_all(dir.join("src")).unwrap();
+                        std::fs::write(dir.join("src/lib.rs"), "source").unwrap();
+                        anyhow::ensure!(checkout_ok, "the network is unreachable");
+                        Ok(())
+                    },
+                    |dir| async move {
+                        anyhow::ensure!(compile_ok, "cannot find -lseccomp");
+                        let built = dir.join("seccompiler-bin");
+                        std::fs::write(&built, "compiler").unwrap();
+                        Ok(built)
+                    },
+                )
+                .await
+            }
+        };
+        let ran = || runs.load(std::sync::atomic::Ordering::SeqCst);
+
+        let error = format!("{:#}", install(true, false).await.unwrap_err());
+        assert!(error.contains("cannot find -lseccomp"), "{error}");
+        assert!(!build_dir.exists(), "a failed build left its checkout");
+        assert!(
+            std::fs::read_to_string(&failure)
+                .unwrap()
+                .contains("cannot find -lseccomp"),
+            "the failure is not recorded"
+        );
+        assert_eq!(ran(), 1);
+
+        // The next setup does not build again, and says what to remove.
+        let error = format!("{:#}", install(true, true).await.unwrap_err());
+        assert!(
+            error.contains("failed 0 minutes ago and is not tried again for 24 hours")
+                && error.contains("(the seccompiler-bin build failed: cannot find -lseccomp)")
+                && error.contains(&format!("remove {}", failure.display())),
+            "{error}"
+        );
+        assert_eq!(ran(), 1, "a recorded failure was built again");
+        assert!(!compiler.exists());
+
+        // A record older than a day does not stop the build, and a checkout that fails
+        // leaves nothing and no record.
+        std::fs::File::options()
+            .write(true)
+            .open(&failure)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    - SECCOMPILER_RETRY_AFTER
+                    - std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let error = format!("{:#}", install(false, true).await.unwrap_err());
+        assert!(error.contains("the network is unreachable"), "{error}");
+        assert!(!build_dir.exists() && !failure.exists());
+
+        // And a build that works installs the compiler and removes its checkout.
+        install(true, true).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&compiler).unwrap(), "compiler");
+        assert!(!build_dir.exists() && !failure.exists());
+        let left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left.len(), 1, "{left:?}");
     }
 
     #[tokio::test]
@@ -3590,6 +3873,97 @@ mod tests {
             .host_kernel
             .clone()
             .expect("amd64 host_kernel")
+    }
+
+    /// The Cloud Hypervisor build is one commit, its lock file's dependencies and one
+    /// toolchain: the embedded config names a full commit of the upstream repository (a
+    /// branch would build whatever it pointed at that day), the build passes `--locked`,
+    /// and the toolchain is the one fcvm's own `rust-toolchain.toml` pins.
+    #[test]
+    fn the_cloud_hypervisor_build_is_one_commit_one_lock_file_and_one_toolchain() {
+        let plan: crate::setup::rootfs::Plan =
+            toml::from_str(crate::setup::rootfs::EMBEDDED_CONFIG).unwrap();
+        let pin = plan
+            .cloud_hypervisor
+            .expect("the embedded config has a [cloud_hypervisor] section");
+        assert_eq!(pin.repo, "cloud-hypervisor/cloud-hypervisor");
+        validate_full_git_commit(&pin.commit, "the embedded cloud-hypervisor commit").unwrap();
+        // A branch in place of the commit does not parse.
+        assert!(
+            toml::from_str::<crate::setup::rootfs::CloudHypervisorConfig>(
+                "repo = \"cloud-hypervisor/cloud-hypervisor\"\nbranch = \"main\"\n"
+            )
+            .is_err()
+        );
+
+        let toolchain = pinned_rust_toolchain().unwrap();
+        assert!(
+            toolchain.chars().next().is_some_and(|c| c.is_ascii_digit()),
+            "the toolchain {toolchain:?} is a channel name, not a version"
+        );
+        let source = include_str!("kernel.rs");
+        let body = &source[source
+            .find("pub async fn ensure_cloud_hypervisor(")
+            .expect("ensure_cloud_hypervisor is gone")..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(
+            body.contains("\"--locked\""),
+            "the build does not pass --locked"
+        );
+        assert!(
+            body.contains(".env(\"RUSTUP_TOOLCHAIN\", &toolchain)"),
+            "the build does not name its toolchain"
+        );
+        assert!(
+            body.contains(".env(\"GIT_CONFIG_KEY_0\", \"core.abbrev\")"),
+            "the build's version string depends on the size of the clone"
+        );
+        // The version a snapshot records has to name the commit, or the binary is not
+        // installed: checked between the build and the publish.
+        let check = body
+            .find("cloud_hypervisor_version_names(")
+            .expect("setup does not check the built binary's version");
+        assert!(check < body.find("temp.publish(").unwrap());
+        let commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7";
+        cloud_hypervisor_version_names("cloud-hypervisor v55.0-117-g4969a51a3d3f\n", commit)
+            .unwrap();
+        for wrong in [
+            "cloud-hypervisor v55.0.0",
+            "cloud-hypervisor v55.0-117-g4969a51a",
+            "cloud-hypervisor v55.0-117-g4969a51a3d3f-dirty",
+            "",
+        ] {
+            assert!(
+                cloud_hypervisor_version_names(wrong, commit).is_err(),
+                "{wrong:?}"
+            );
+        }
+        assert!(
+            body.contains("checkout_cloud_hypervisor_source(&clone_url, commit, &build_dir)"),
+            "the build does not check out the configured commit"
+        );
+    }
+
+    /// The name of a Cloud Hypervisor build covers everything that changes its bytes: the
+    /// repository, the commit, the architecture and the libc.
+    #[test]
+    fn a_cloud_hypervisor_build_is_named_for_its_repo_commit_arch_and_libc() {
+        let name = cloud_hypervisor_file_name;
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let base = name("o/r", &a, "aarch64", "libc-2.39");
+        assert_eq!(base, name("o/r", &a, "aarch64", "libc-2.39"));
+        assert!(
+            base.starts_with("cloud-hypervisor-") && base.ends_with(".bin"),
+            "{base}"
+        );
+        for other in [
+            name("o/fork", &a, "aarch64", "libc-2.39"),
+            name("o/r", &b, "aarch64", "libc-2.39"),
+            name("o/r", &a, "x86_64", "libc-2.39"),
+            name("o/r", &a, "aarch64", "libc-2.41"),
+        ] {
+            assert_ne!(base, other);
+        }
     }
 
     /// Run a host config fragment block the way the build script does, in a directory whose

@@ -8767,7 +8767,7 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
     // nextest runs each test in a process of its own; the fcvm processes it starts inherit this
     std::env::set_var(fcvm::storage::disk::REFLINK_MAX_EXTENTS_ENV, "0");
     let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
-        clone_disks_case("subvol", false).await?;
+        clone_disks_case("subvol", Held::Nothing).await?;
     assert_eq!(
         snapshot_ino, 256,
         "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
@@ -8788,7 +8788,7 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
 #[cfg_attr(not(feature = "privileged-tests"), ignore)]
 async fn clone_disks_with_few_extents_are_reflinks() -> anyhow::Result<()> {
     let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
-        clone_disks_case("reflinked", false).await?;
+        clone_disks_case("reflinked", Held::Nothing).await?;
     assert_eq!(
         snapshot_ino, 256,
         "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
@@ -8811,7 +8811,7 @@ async fn clone_disks_with_few_extents_are_reflinks() -> anyhow::Result<()> {
 async fn a_clone_that_finds_every_reflink_slot_held_takes_the_subvolume_snapshot(
 ) -> anyhow::Result<()> {
     let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
-        clone_disks_case("slotsheld", true).await?;
+        clone_disks_case("slotsheld", Held::EverySlot).await?;
     assert_eq!(
         snapshot_ino, 256,
         "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
@@ -8822,6 +8822,266 @@ async fn a_clone_that_finds_every_reflink_slot_held_takes_the_subvolume_snapshot
     );
     clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
     Ok(())
+}
+
+/// A clone of a small disk made in a burst (SNAPSHOT_BURST clones of its snapshot taking the
+/// subvolume snapshot) takes one too, with every reflink slot free: a reflink waits out
+/// each commit that starts while it runs, and the commits carry what it dirtied.
+///
+/// RED BEFORE THE CHANGE: with a slot free the clone reflinked whatever the others did.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_clone_made_in_a_burst_of_snapshots_takes_the_subvolume_snapshot() -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("snapburst", Held::SnapshotBurst).await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_eq!(
+        disks_ino, 256,
+        "in a burst of subvolume snapshots the clone reflinked (inode {disks_ino})"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// A clone made while two clones of its snapshot are taking the subvolume snapshot
+/// reflinks, as it did before the mark: one clone that found every slot
+/// held does not send the clones after it down the snapshot path, which on a store that is
+/// writing snapshots is the slower one.
+///
+/// RED WHEN ONE MARK OR TWO ARE ENOUGH: the clone gets a subvolume.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_clone_made_beside_fewer_snapshots_than_a_burst_reflinks() -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("underburst", Held::UnderABurst).await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_ne!(
+        disks_ino, 256,
+        "beside fewer snapshots than a burst the clone took a subvolume snapshot, not a reflink"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// A clone that takes the subvolume snapshot holds the snapshot's mark for the snapshot and
+/// for the linger after it, and no longer: the mark outliving the snapshot is what makes
+/// the clones that arrive just after a commit take the snapshot too.
+///
+/// The mark is watched from outside the clone, every millisecond, while the clone is made
+/// with every reflink slot held. The mark was held for at least the time between the first
+/// and the last probe that saw it, and for at most that plus the watcher's gap before the
+/// first and its gap after the last. That upper bound must exceed the snapshot's own
+/// duration (the clone logs it) by at least half the linger, so a watcher that a loaded
+/// host kept off the CPU around either edge does not fail a mark that was held. The mark
+/// must be gone 2 s after the linger at the latest.
+///
+/// RED WITHOUT THE MARK: no probe sees it held. RED WITHOUT THE LINGER: it is held for the
+/// snapshot's duration and no longer, unless the watcher's two gaps add up to half the
+/// linger (50 ms against the 1 ms it sleeps between probes).
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_clone_holds_the_mark_for_its_snapshot_and_the_linger_after_it() -> anyhow::Result<()> {
+    let (snapshot_ino, extra_disk_names, disks_ino, entries, served) =
+        clone_disks_case("markheld", Held::EverySlotWatched).await?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_eq!(
+        disks_ino, 256,
+        "with every reflink slot held the clone reflinked (inode {disks_ino})"
+    );
+    clone_disks_hold_the_snapshots_disks(entries, extra_disk_names, &served);
+    Ok(())
+}
+
+/// What a [`MarkWatch`] saw.
+#[derive(Default)]
+struct MarkSeen {
+    /// The first and the last probe that found the mark held.
+    first: Option<std::time::Instant>,
+    last: Option<std::time::Instant>,
+    /// From the probe before `first` (or the watcher's start) to `first`.
+    gap_before: std::time::Duration,
+    /// From `last` to the first probe after it, which found the mark gone, or to the
+    /// watcher's stop.
+    gap_after: std::time::Duration,
+    probes: u64,
+}
+
+impl MarkSeen {
+    /// The time between the first and the last probe that saw the mark, which is the
+    /// shortest it can have been held. `None` when no probe saw it.
+    fn held_at_least(&self) -> Option<std::time::Duration> {
+        Some(self.last? - self.first?)
+    }
+
+    /// The longest the mark can have been held: it was taken after the probe before
+    /// `first` and dropped before the probe after `last`.
+    fn held_at_most(&self) -> Option<std::time::Duration> {
+        Some(self.held_at_least()? + self.gap_before + self.gap_after)
+    }
+
+    /// Whether the mark can have outlived a snapshot that took `snapshot` by half of
+    /// `linger`.
+    fn outlived(&self, snapshot: std::time::Duration, linger: std::time::Duration) -> bool {
+        self.held_at_most()
+            .is_some_and(|held| held >= snapshot + linger / 2)
+    }
+}
+
+/// The bound `a_clone_holds_the_mark_for_its_snapshot_and_the_linger_after_it` puts on what
+/// its watcher saw, on two made-up watches of a 30 ms snapshot with a 100 ms linger.
+///
+/// RED BEFORE THE WATCHER'S GAPS WERE COUNTED: the first watch, of a mark held for all
+/// 130 ms by a watcher that was off the CPU for 60 ms around each edge, saw the mark for
+/// 20 ms and was failed.
+#[test]
+fn a_starved_watcher_does_not_fail_a_mark_that_was_held() {
+    let ms = std::time::Duration::from_millis;
+    let (snapshot, linger) = (ms(30), ms(100));
+    let taken = std::time::Instant::now();
+    let starved = MarkSeen {
+        first: Some(taken + ms(55)),
+        last: Some(taken + ms(75)),
+        gap_before: ms(60),
+        gap_after: ms(60),
+        probes: 100,
+    };
+    assert_eq!(starved.held_at_least(), Some(ms(20)));
+    assert!(starved.outlived(snapshot, linger));
+    // A mark dropped with its snapshot, seen by a watcher that probed every millisecond.
+    let no_linger = MarkSeen {
+        first: Some(taken + ms(1)),
+        last: Some(taken + ms(29)),
+        gap_before: ms(1),
+        gap_after: ms(1),
+        probes: 100,
+    };
+    assert!(!no_linger.outlived(snapshot, linger));
+    assert!(!MarkSeen::default().outlived(snapshot, linger));
+}
+
+/// How long a [`MarkWatch`] sleeps between probes.
+const MARK_WATCH_SLEEP_MS: u64 = 1;
+
+/// Probes a snapshot's subvolume-snapshot mark every millisecond from a thread of its own.
+struct MarkWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<MarkSeen>,
+}
+
+impl MarkWatch {
+    fn start(snapshot_disk_dir: std::path::PathBuf) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut seen = MarkSeen::default();
+            // The time of the probe before this one, and whether `last` still waits for
+            // the probe that finds the mark gone.
+            let mut previous = std::time::Instant::now();
+            let mut open = false;
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                let held =
+                    fcvm::storage::disk::subvolume_snapshot_marks_held(&snapshot_disk_dir, 1) > 0;
+                let now = std::time::Instant::now();
+                if held {
+                    if seen.first.is_none() {
+                        seen.first = Some(now);
+                        seen.gap_before = now - previous;
+                    }
+                    seen.last = Some(now);
+                    open = true;
+                } else if open {
+                    seen.gap_after = now - previous;
+                    open = false;
+                }
+                seen.probes += 1;
+                previous = now;
+                std::thread::sleep(std::time::Duration::from_millis(MARK_WATCH_SLEEP_MS));
+            }
+            if open {
+                seen.gap_after = previous.elapsed();
+            }
+            seen
+        });
+        Self { stop, thread }
+    }
+
+    /// Stop probing and check what was seen against the snapshot the clone logged in
+    /// `clone_log`.
+    async fn check(
+        self,
+        clone_log: &std::path::Path,
+        snapshot_disk_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let linger = fcvm::storage::disk::SUBVOLUME_SNAPSHOT_LINGER;
+        // The linger is over well before a clone is healthy; give it the bound checked below.
+        tokio::time::sleep(linger + std::time::Duration::from_secs(2)).await;
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let seen = self
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("the mark watcher panicked"))?;
+        let probes = seen.probes;
+        let log = std::fs::read_to_string(clone_log)?;
+        let snapshot_ms = log
+            .lines()
+            .find(|line| line.contains("created the disk directory as a btrfs subvolume snapshot"))
+            .and_then(|line| {
+                // Field values can carry terminal escapes: take the digits after the name.
+                let rest = &line[line.find("duration_ms")? + "duration_ms".len()..];
+                let digits: String = rest
+                    .chars()
+                    .skip_while(|c| !c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse::<u64>().ok()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the clone logged no subvolume snapshot with a duration in {}",
+                    clone_log.display()
+                )
+            })?;
+        let snapshot = std::time::Duration::from_millis(snapshot_ms);
+        let (Some(held), Some(held_at_most)) = (seen.held_at_least(), seen.held_at_most()) else {
+            anyhow::bail!("the clone took a subvolume snapshot ({snapshot_ms} ms) and no probe of {probes} saw its mark held");
+        };
+        let (gap_before, gap_after) = (seen.gap_before, seen.gap_after);
+        anyhow::ensure!(
+            seen.outlived(snapshot, linger),
+            "the mark was seen held for {held:?} (at most {held_at_most:?}: the watcher's gaps were {gap_before:?} before and {gap_after:?} after): the snapshot took {snapshot_ms} ms and the mark must outlive it by the linger ({linger:?})"
+        );
+        anyhow::ensure!(
+            held <= snapshot + linger + std::time::Duration::from_secs(2),
+            "the mark was seen held for {held:?}, over 2 s past the snapshot ({snapshot_ms} ms) and the linger ({linger:?})"
+        );
+        anyhow::ensure!(
+            fcvm::storage::disk::subvolume_snapshot_marks_held(snapshot_disk_dir, 1) == 0,
+            "the mark is still held after the clone is healthy"
+        );
+        Ok(())
+    }
+}
+
+/// What `clone_disks_case` holds while its clone is made.
+enum Held {
+    Nothing,
+    /// Every reflink slot of the snapshot.
+    EverySlot,
+    /// Every reflink slot, with the snapshot's mark watched while the clone is made.
+    EverySlotWatched,
+    /// The marks of a burst: SNAPSHOT_BURST clones taking the snapshot's subvolume snapshot.
+    SnapshotBurst,
+    /// Two marks: a clone that found every slot held, and one more. Not a burst.
+    UnderABurst,
 }
 
 /// The clone's disk directory holds the root disk and the snapshot's extra disks and
@@ -8841,12 +9101,12 @@ fn clone_disks_hold_the_snapshots_disks(entries: Vec<String>, extra: Vec<String>
 }
 
 /// A VM with one extra disk, its snapshot, and a clone of it (made while this test holds
-/// every reflink slot of the snapshot when `hold_slots`): the inode of the snapshot's
+/// what `held` names): the inode of the snapshot's
 /// disk directory, the snapshot's extra disk names, the inode of the clone's disk
 /// directory and what it holds, and what the clone read from the extra disk.
 async fn clone_disks_case(
     prefix: &str,
-    hold_slots: bool,
+    held: Held,
 ) -> anyhow::Result<(u64, Vec<String>, u64, Vec<String>, String)> {
     use std::os::unix::fs::MetadataExt;
 
@@ -8896,7 +9156,19 @@ async fn clone_disks_case(
             "the snapshot records {extra_disk_names:?} extra disks, wanted one"
         );
         let mut slots = Vec::new();
-        if hold_slots {
+        let mut snapshot_marks = Vec::new();
+        let marks = match held {
+            Held::SnapshotBurst => fcvm::storage::disk::SNAPSHOT_BURST,
+            Held::UnderABurst => 2,
+            _ => 0,
+        };
+        for byte in 0..marks as u8 {
+            snapshot_marks.push(
+                fcvm::storage::disk::mark_subvolume_snapshot_at(&snapshot_disk_dir, byte)
+                    .ok_or_else(|| anyhow::anyhow!("a subvolume snapshot mark was not taken"))?,
+            );
+        }
+        if matches!(held, Held::EverySlot | Held::EverySlotWatched) {
             for _ in 0..fcvm::storage::disk::REFLINK_SLOTS {
                 slots.push(
                     fcvm::storage::disk::take_reflink_slot(
@@ -8910,9 +9182,26 @@ async fn clone_disks_case(
         let (mut serve, serve_pid) = common::start_memory_server(&snap_tag).await?;
         let clone = async {
             common::poll_serve_ready(&snap_tag, serve_pid, 60).await?;
-            let (mut clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+            let watch = matches!(held, Held::EverySlotWatched)
+                .then(|| MarkWatch::start(snapshot_disk_dir.clone()));
+            let serve_pid_text = serve_pid.to_string();
+            let (mut clone, clone_pid, clone_log) = common::spawn_fcvm_with_log_path(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_text,
+                    "--name",
+                    &clone_name,
+                ],
+                &clone_name,
+            )
+            .await?;
             let result = async {
                 common::poll_health(&mut clone, 300).await?;
+                if let Some(watch) = watch {
+                    watch.check(&clone_log, &snapshot_disk_dir).await?;
+                }
                 let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
                 let clone_state = states.load_state_by_pid(clone_pid).await?;
                 let disks = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("disks");
@@ -8935,6 +9224,7 @@ async fn clone_disks_case(
         common::kill_process(serve_pid).await;
         let _ = serve.wait().await;
         drop(slots);
+        drop(snapshot_marks);
         anyhow::Ok((snapshot_ino, extra_disk_names, clone?))
     }
     .await;

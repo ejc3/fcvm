@@ -355,8 +355,14 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
                 "--windows-idle-cpu {} is not a share of one core between 0 and 1",
                 args.windows_idle_cpu
             );
+            // The build every sandbox of this agent runs on: the agent's fcvm commands
+            // resolve it the same way, from the same config and environment.
+            let ch = crate::commands::common::find_cloud_hypervisor()
+                .context("the Windows sandboxes run on Cloud Hypervisor")?;
+            let vmm = crate::commands::common::cloud_hypervisor_version(&ch)
+                .with_context(|| format!("{} failed `--version`", ch.display()))?;
             Some(windows::WindowsCfg {
-                gold_key: windows::gold_key(dir, &manifest)?,
+                gold_key: windows::gold_key(dir, &manifest, &vmm)?,
                 image_check: Duration::from_secs(60),
                 bridge_stop: Duration::from_secs(10),
                 count: args.windows,

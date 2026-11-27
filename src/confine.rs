@@ -9,6 +9,14 @@
 //!
 //! - [`Layer::Process`] (this module, [`apply_process_layer`]): no capabilities, none to
 //!   regain across exec, no core dumps, `no_new_privs`.
+//! - [`Layer::Seccomp`]: a syscall allowlist per Firecracker thread category
+//!   ([`seccomp_policy`]), compiled by `fcvm setup`, handed to the VMM as bytes fcvm
+//!   verified ([`verified_filter_bytes`], [`sealed_memfd`]) and checked on the running VMM
+//!   ([`unfiltered_threads`]). [`Layer::SeccompLog`] is the same policy in log mode, which
+//!   restricts nothing.
+//!
+//! No Landlock ruleset is applied yet: the kernel's Landlock ABI is only read, as the floor
+//! the file and socket layer will need (below).
 //!
 //! Default starts are untouched: with confinement off no pre_exec step and no VMM argument
 //! is added.
@@ -58,7 +66,11 @@ impl std::str::FromStr for Mode {
 }
 
 /// The `[confine]` table of the fcvm config.
+///
+/// A key this table does not have is an error: with unknown keys ignored, a misspelled
+/// `mode` would read as `off` and a host meant to require confinement would not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfineConfig {
     #[serde(default)]
     pub mode: Mode,
@@ -458,6 +470,19 @@ fn mode_env(var: Result<String, std::env::VarError>) -> anyhow::Result<Option<St
     }
 }
 
+/// `FCVM_CONFINE_SECCOMP` as read: unset is enforce, and a value that is not `enforce` or
+/// `log` is an error, one that is not valid UTF-8 among them, as for `FCVM_CONFINE`.
+fn seccomp_env(var: Result<String, std::env::VarError>) -> anyhow::Result<SeccompMode> {
+    match var.as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("enforce") => Ok(SeccompMode::Enforce),
+        Ok("log") => Ok(SeccompMode::Log),
+        Ok(other) => anyhow::bail!("{SECCOMP_ENV}={other}: expected enforce or log"),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{SECCOMP_ENV} is set to a value that is not valid UTF-8")
+        }
+    }
+}
+
 /// Whether a start needs the rest of the host read (the Landlock probe among it): only one
 /// that asks for confinement or runs on a host that requires it. An unconfined start on an
 /// `off` host makes no Landlock syscall at all.
@@ -487,11 +512,7 @@ impl Host {
             strace_fc: std::env::var_os("FCVM_STRACE_FC").is_some(),
             no_seccomp: std::env::var_os("FCVM_NO_SECCOMP").is_some(),
             firecracker_args: std::env::var("FCVM_FIRECRACKER_ARGS").ok(),
-            seccomp: match std::env::var(SECCOMP_ENV).as_deref() {
-                Err(_) | Ok("enforce") => SeccompMode::Enforce,
-                Ok("log") => SeccompMode::Log,
-                Ok(other) => anyhow::bail!("{SECCOMP_ENV}={other}: expected enforce or log"),
-            },
+            seccomp: seccomp_env(std::env::var(SECCOMP_ENV))?,
         })
     }
 }
@@ -750,12 +771,116 @@ pub fn filter_bytes_digest(bytes: &[u8]) -> String {
 /// The largest filter or record [`read_store_file`] reads. A compiled policy is about 3 KiB.
 const FILTER_READ_LIMIT: u64 = 1 << 20;
 
+/// The mode `fcvm setup` gives a compiled filter and its digest record: written by its owner
+/// only. [`read_store_file`] refuses a file its group or every user can write.
+pub const STORE_FILE_MODE: u32 = 0o644;
+
+/// Write `bytes` to `path` with [`STORE_FILE_MODE`], whatever the umask.
+pub fn write_store_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, bytes)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(STORE_FILE_MODE))
+}
+
+/// Whether a file or directory of `owner` may hold what a confined launch trusts: this
+/// user's, root's, or the Firecracker binary's owner's, who already decides what the VMM
+/// runs (under `sudo fcvm` the store belongs to the user who ran `fcvm setup`).
+fn trusted_owner(owner: u32, binary_owner: u32) -> bool {
+    // SAFETY: geteuid has no arguments and cannot fail.
+    owner == unsafe { libc::geteuid() } || owner == 0 || owner == binary_owner
+}
+
+/// Every directory on the way to `path` is one only a trusted owner can change: owned by
+/// this user, root or `binary_owner`, and not writable by its group or by every user,
+/// unless it is sticky (`/tmp`: an entry there is renamed or removed only by its owner).
+/// Otherwise whoever can write the directory can put another file, or another directory,
+/// under the name the launch opens. Symbolic links on the way are followed one at a time,
+/// and the directory each one sits in is checked like any other. The last component is
+/// left to [`read_store_file`], which refuses a link there.
+fn refuse_a_replaceable_path(path: &std::path::Path, binary_owner: u32) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::path::Component;
+    let absolute =
+        std::path::absolute(path).with_context(|| format!("making {} absolute", path.display()))?;
+    let check = |dir: &std::path::Path| -> anyhow::Result<()> {
+        let meta = std::fs::symlink_metadata(dir)
+            .with_context(|| format!("reading the metadata of {}", dir.display()))?;
+        anyhow::ensure!(meta.is_dir(), "{} is not a directory", dir.display());
+        anyhow::ensure!(
+            trusted_owner(meta.uid(), binary_owner),
+            "the directory {} is owned by uid {}, which is not this user, root, or the owner \
+             of the Firecracker binary (uid {binary_owner}), so what is in it can be replaced",
+            dir.display(),
+            meta.uid()
+        );
+        anyhow::ensure!(
+            meta.mode() & 0o022 == 0 || meta.mode() & 0o1000 != 0,
+            "the directory {} is writable by its group or by every user (mode {:o}), so what \
+             is in it can be replaced; `chmod go-w` it, or run `fcvm setup`, which does that \
+             for the directory of the Firecracker it builds",
+            dir.display(),
+            meta.mode() & 0o7777
+        );
+        Ok(())
+    };
+    let push = |pending: &mut std::collections::VecDeque<std::ffi::OsString>,
+                at: usize,
+                target: &std::path::Path| {
+        let names: Vec<std::ffi::OsString> = target
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_owned()),
+                Component::ParentDir => Some("..".into()),
+                _ => None,
+            })
+            .collect();
+        for (offset, name) in names.into_iter().enumerate() {
+            pending.insert(at + offset, name);
+        }
+    };
+    let mut pending = std::collections::VecDeque::new();
+    push(&mut pending, 0, &absolute);
+    let mut dir = std::path::PathBuf::from("/");
+    check(&dir)?;
+    let mut links = 0;
+    while let Some(name) = pending.pop_front() {
+        if pending.is_empty() {
+            break;
+        }
+        if name == ".." {
+            dir.pop();
+            continue;
+        }
+        let entry = dir.join(&name);
+        let meta = std::fs::symlink_metadata(&entry)
+            .with_context(|| format!("reading the metadata of {}", entry.display()))?;
+        if meta.file_type().is_symlink() {
+            links += 1;
+            anyhow::ensure!(
+                links <= 40,
+                "too many symbolic links on the way to {}",
+                path.display()
+            );
+            let target = std::fs::read_link(&entry)
+                .with_context(|| format!("reading the link {}", entry.display()))?;
+            if target.is_absolute() {
+                dir = std::path::PathBuf::from("/");
+            }
+            push(&mut pending, 0, &target);
+            continue;
+        }
+        check(&entry)?;
+        dir = entry;
+    }
+    Ok(())
+}
+
 /// The bytes of a store file a confined launch depends on, opened once, without following a
 /// symbolic link and without waiting (a FIFO under the name would otherwise hold the start
-/// until something wrote to it): a regular file that others cannot write, owned by this
-/// user, by root, or by `binary_owner`, the owner of the Firecracker binary the file is for.
-/// That owner already decides what the VMM runs (under `sudo fcvm` the store belongs to the
-/// user who ran `fcvm setup`), so accepting its filter gives it nothing it lacks.
+/// until something wrote to it): a regular file that only its owner can write, owned by
+/// this user, by root, or by `binary_owner`, the owner of the Firecracker binary the file
+/// is for ([`trusted_owner`]).
 fn read_store_file(path: &std::path::Path, binary_owner: u32) -> anyhow::Result<Vec<u8>> {
     use anyhow::Context as _;
     use std::io::Read as _;
@@ -769,18 +894,16 @@ fn read_store_file(path: &std::path::Path, binary_owner: u32) -> anyhow::Result<
         .metadata()
         .with_context(|| format!("reading the metadata of {}", path.display()))?;
     anyhow::ensure!(meta.is_file(), "{} is not a regular file", path.display());
-    // SAFETY: geteuid has no arguments and cannot fail.
-    let euid = unsafe { libc::geteuid() };
     anyhow::ensure!(
-        meta.uid() == euid || meta.uid() == 0 || meta.uid() == binary_owner,
-        "{} is owned by uid {}, not by this user ({euid}), root, or the owner of the \
-         Firecracker binary (uid {binary_owner})",
+        trusted_owner(meta.uid(), binary_owner),
+        "{} is owned by uid {}, not by this user, root, or the owner of the Firecracker \
+         binary (uid {binary_owner})",
         path.display(),
         meta.uid()
     );
     anyhow::ensure!(
-        meta.mode() & 0o002 == 0,
-        "{} is writable by every user (mode {:o})",
+        meta.mode() & 0o022 == 0,
+        "{} is writable by its group or by every user (mode {:o})",
         path.display(),
         meta.mode() & 0o7777
     );
@@ -817,6 +940,9 @@ pub fn verified_filter_bytes(
             .with_context(|| format!("reading the metadata of {}", firecracker.display()))?
             .uid()
     };
+    // The digest record is beside the filter, so one walk covers both.
+    refuse_a_replaceable_path(&filter, binary_owner)
+        .map_err(|e| e.context(format!("the confined seccomp filter is unusable. {hint}")))?;
     let bytes = read_store_file(&filter, binary_owner)
         .map_err(|e| e.context(format!("the confined seccomp filter is unusable. {hint}")))?;
     let recorded = read_store_file(&filter_digest_path(&filter), binary_owner).map_err(|e| {
@@ -838,6 +964,10 @@ pub fn verified_filter_bytes(
 
 /// `bytes` in a sealed memfd, for the VMM to read as `/proc/self/fd/<n>`: what the VMM loads
 /// is what was verified, whatever happens to the file afterwards.
+///
+/// The descriptor stays open in the VMM for its life: Firecracker opens the path after the
+/// exec, so it cannot be close-on-exec, and Firecracker does not close what it inherits.
+/// It is sealed against writes and resizing and holds only the filter the VMM runs under.
 pub fn sealed_memfd(bytes: &[u8]) -> anyhow::Result<std::os::fd::OwnedFd> {
     use anyhow::Context as _;
     use std::io::Write as _;
@@ -868,11 +998,37 @@ pub fn sealed_memfd(bytes: &[u8]) -> anyhow::Result<std::os::fd::OwnedFd> {
     Ok(file.into())
 }
 
-/// The threads of `pid` that do not run under a seccomp filter, by name: every entry of
-/// `/proc/<pid>/task` whose status lacks `Seccomp: 2` (filter mode) or reports no installed
-/// filter. A thread that exits while it is read is skipped. An error when the process has
-/// no readable thread at all, so a process that is gone is never taken as filtered.
-pub fn unfiltered_threads(pid: u32) -> anyhow::Result<Vec<String>> {
+/// The most seccomp filters any thread of this process runs under (`Seccomp_filters` in
+/// `/proc/self/task/*/status`); 0 where none does or the kernel does not report the field.
+/// A child inherits its parent's filters, so a VMM this process starts shows at least this
+/// many without having installed one of its own.
+pub fn own_seccomp_filters() -> anyhow::Result<u32> {
+    use anyhow::Context as _;
+    let mut most = 0;
+    for task in std::fs::read_dir("/proc/self/task").context("listing this process's threads")? {
+        let Ok(task) = task else { continue };
+        let Ok(status) = std::fs::read_to_string(task.path().join("status")) else {
+            continue;
+        };
+        let filters = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Seccomp_filters:"))
+            .and_then(|count| count.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        most = most.max(filters);
+    }
+    Ok(most)
+}
+
+/// The threads of `pid` that do not run under a seccomp filter of the process's own, by
+/// name: every entry of `/proc/<pid>/task` whose status lacks `Seccomp: 2` (filter mode) or
+/// reports no more filters than `inherited`, the number its parent runs under
+/// ([`own_seccomp_filters`]). Where fcvm itself is filtered (a systemd unit with
+/// `SystemCallFilter=`, a container's default profile), a VMM that installed nothing still
+/// shows `Seccomp: 2` and the parent's count, and must not pass for confined. A thread that
+/// exits while it is read is skipped. An error when the process has no readable thread at
+/// all, so a process that is gone is never taken as filtered.
+pub fn unfiltered_threads(pid: u32, inherited: u32) -> anyhow::Result<Vec<String>> {
     use anyhow::Context as _;
     let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
         .with_context(|| format!("listing the threads of process {pid}"))?;
@@ -893,7 +1049,7 @@ pub fn unfiltered_threads(pid: u32) -> anyhow::Result<Vec<String>> {
         let filtered = field("Seccomp") == Some("2")
             && field("Seccomp_filters")
                 .and_then(|count| count.parse::<u32>().ok())
-                .is_some_and(|count| count >= 1);
+                .is_some_and(|count| count > inherited);
         if !filtered {
             unfiltered.push(format!(
                 "{} (tid {}, Seccomp: {}, Seccomp_filters: {})",
@@ -1183,7 +1339,8 @@ mod tests {
         let bin = std::path::Path::new("/assets/firecracker/firecracker-abc");
         for mode in SeccompMode::ALL {
             let policy: serde_json::Value = serde_json::from_str(&seccomp_policy(mode)).unwrap();
-            for class in ["vmm", "api", "vcpu"] {
+            for class in thread_classes(&policy) {
+                let class = class.as_str();
                 assert_eq!(policy[class]["default_action"], mode.action(), "{class}");
                 assert_eq!(policy[class]["filter_action"], "allow", "{class}");
             }
@@ -1252,7 +1409,8 @@ mod tests {
     fn the_seccomp_policy_denies_io_uring_process_creation_and_exec() {
         for arch in SECCOMP_ARCHES {
             let policy = read_json(&seccomp_file(&format!("firecracker-confined-{arch}.json")));
-            for class in ["vmm", "api", "vcpu"] {
+            for class in thread_classes(&policy) {
+                let class = class.as_str();
                 for rule in policy[class]["filter"].as_array().unwrap() {
                     let syscall = rule["syscall"].as_str().unwrap();
                     assert!(
@@ -1324,6 +1482,58 @@ mod tests {
     }
 
     const SECCOMP_ARCHES: [&str; 2] = ["x86_64", "aarch64"];
+
+    /// The thread categories the confined policy was audited for: the ones the pinned
+    /// Firecracker installs a filter for, each on the threads of that kind.
+    const AUDITED_THREAD_CLASSES: [&str; 3] = ["api", "vcpu", "vmm"];
+
+    /// The thread categories of a filter file, sorted.
+    fn thread_classes(filter: &serde_json::Value) -> Vec<String> {
+        let mut classes: Vec<String> = filter.as_object().unwrap().keys().cloned().collect();
+        classes.sort();
+        classes
+    }
+
+    /// The pinned Firecracker's own filter says which thread categories the binary has, and
+    /// a custom filter file must carry every one of them: Firecracker looks its filter up
+    /// by category when a thread of that kind starts. The policy is generated from that
+    /// file, so it has the same categories by construction; what a new category needs is
+    /// the audit this list stands for (which libc calls its threads make under glibc, and a
+    /// run of the paths that start such a thread). A repin to a Firecracker with another
+    /// category fails here, naming it, and not at a guest's first use of that thread.
+    #[test]
+    fn the_thread_categories_are_the_pinned_firecrackers() {
+        for arch in SECCOMP_ARCHES {
+            let fork = thread_classes(&read_json(&seccomp_file(&format!(
+                "fork-{arch}-unknown-linux-musl.json"
+            ))));
+            let policy = thread_classes(&read_json(&seccomp_file(&format!(
+                "firecracker-confined-{arch}.json"
+            ))));
+            let unaudited: Vec<&String> = fork
+                .iter()
+                .filter(|class| !AUDITED_THREAD_CLASSES.contains(&class.as_str()))
+                .collect();
+            assert!(
+                unaudited.is_empty(),
+                "{arch}: the pinned Firecracker's filter has thread categories the confined \
+                 policy was never audited for: {unaudited:?}. Decide their glibc additions in \
+                 confined-changes.json, run the audit over what starts such a thread, then \
+                 add them to AUDITED_THREAD_CLASSES"
+            );
+            assert_eq!(fork, AUDITED_THREAD_CLASSES, "{arch}: a category is gone");
+            assert_eq!(
+                policy, fork,
+                "{arch}: the confined policy and the pinned Firecracker's filter have \
+                 different thread categories"
+            );
+        }
+        // The embedded policy of this architecture, in both modes.
+        for mode in SeccompMode::ALL {
+            let policy: serde_json::Value = serde_json::from_str(&seccomp_policy(mode)).unwrap();
+            assert_eq!(thread_classes(&policy), AUDITED_THREAD_CLASSES, "{mode:?}");
+        }
+    }
 
     /// Each confined policy is the fork's shipped filter for that architecture plus the
     /// changes in confined-changes.json, so a change to the fork's filter or to the declared
@@ -1457,7 +1667,10 @@ mod tests {
                     .iter()
                     .any(|rule| rule["syscall"] == syscall)
             };
-            for class in ["vmm", "api", "vcpu"] {
+            // Every category the fork's filter has, not a list written here: a category a
+            // later Firecracker adds gets the same check.
+            for class in thread_classes(&fork) {
+                let class = class.as_str();
                 for (_, musl, glibc) in GLIBC_FOR_MUSL.iter().filter(|(a, ..)| *a == arch) {
                     if lists(&fork, class, musl) {
                         assert!(
@@ -1774,10 +1987,28 @@ mod tests {
             Some("required".to_string())
         );
         let bad = std::ffi::OsString::from_vec(vec![0xff, b'x']);
-        let error = mode_env(Err(std::env::VarError::NotUnicode(bad)))
+        let error = mode_env(Err(std::env::VarError::NotUnicode(bad.clone())))
             .unwrap_err()
             .to_string();
         assert!(error.contains("FCVM_CONFINE"), "{error}");
+
+        // The seccomp mode reads the same way. A value that was not valid UTF-8 used to
+        // read as unset there.
+        let seccomp = |value: &str| seccomp_env(Ok(value.to_string()));
+        assert_eq!(
+            seccomp_env(Err(std::env::VarError::NotPresent)).unwrap(),
+            SeccompMode::Enforce
+        );
+        assert_eq!(seccomp("enforce").unwrap(), SeccompMode::Enforce);
+        assert_eq!(seccomp("log").unwrap(), SeccompMode::Log);
+        assert!(seccomp("off").is_err() && seccomp("").is_err());
+        let error = seccomp_env(Err(std::env::VarError::NotUnicode(bad)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("FCVM_CONFINE_SECCOMP is set to a value that is not valid UTF-8"),
+            "{error}"
+        );
     }
 
     /// An unconfined start on an off host reads no more of the host: no Landlock syscall.
@@ -1912,7 +2143,7 @@ mod tests {
         let inner = body(snapshot, "async fn cmd_snapshot_run_inner(");
         let resolve = inner.find("crate::confine::resolve(").unwrap();
         for effect in [
-            "reclaim_abandoned()",
+            "reclaim_abandoned_if_due()",
             "Owner::begin(",
             "EarlyPrefill::start(",
         ] {
@@ -1923,7 +2154,7 @@ mod tests {
         }
         let raw = body(snapshot, "async fn cmd_snapshot_run_raw(");
         let resolve = raw.find("crate::confine::resolve(").unwrap();
-        for effect in ["reclaim_abandoned()", "Owner::begin("] {
+        for effect in ["reclaim_abandoned_if_due()", "Owner::begin("] {
             assert!(
                 resolve < raw.find(effect).unwrap(),
                 "raw restore: {effect} first"
@@ -2454,19 +2685,29 @@ mod tests {
 
     /// A Firecracker stand-in in a new directory, with `filter` (and, when given, a digest
     /// record holding `recorded`) under the names the enforce filter has.
+    /// A temporary directory only its owner can write. `tempfile` makes one with the
+    /// umask's mode, which is group-writable under a umask of 002, and a filter in such a
+    /// directory is refused.
+    fn store_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     fn store_with_filter(
         filter: Option<&[u8]>,
         recorded: Option<&str>,
     ) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = store_dir();
         let firecracker = dir.path().join("firecracker");
         std::fs::write(&firecracker, b"stand-in").unwrap();
         let path = filter_path(&firecracker, SeccompMode::Enforce);
         if let Some(filter) = filter {
-            std::fs::write(&path, filter).unwrap();
+            write_store_file(&path, filter).unwrap();
         }
         if let Some(recorded) = recorded {
-            std::fs::write(filter_digest_path(&path), recorded).unwrap();
+            write_store_file(&filter_digest_path(&path), recorded.as_bytes()).unwrap();
         }
         (dir, firecracker)
     }
@@ -2515,9 +2756,9 @@ mod tests {
         let (dir, firecracker) = store_with_filter(None, None);
         let path = filter_path(&firecracker, SeccompMode::Enforce);
         let elsewhere = dir.path().join("elsewhere.bpf");
-        std::fs::write(&elsewhere, good).unwrap();
+        write_store_file(&elsewhere, good).unwrap();
         std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
-        std::fs::write(filter_digest_path(&path), &digest).unwrap();
+        write_store_file(&filter_digest_path(&path), digest.as_bytes()).unwrap();
         let linked = format!(
             "{:#}",
             verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err()
@@ -2542,15 +2783,73 @@ mod tests {
             .expect("opening a FIFO under the filter's name waited for a writer");
         assert!(fifo.contains("is not a regular file"), "{fifo}");
 
-        // A filter every user can write.
-        let (_dir, firecracker) = store_with_filter(Some(good), Some(&digest));
-        let path = filter_path(&firecracker, SeccompMode::Enforce);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        let writable = format!(
-            "{:#}",
-            verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err()
-        );
-        assert!(writable.contains("writable by every user"), "{writable}");
+        // A filter, or a record, that its group or every user can write.
+        for (mode, record) in [(0o666, false), (0o664, false), (0o664, true)] {
+            let (_dir, firecracker) = store_with_filter(Some(good), Some(&digest));
+            let filter = filter_path(&firecracker, SeccompMode::Enforce);
+            let path = if record {
+                filter_digest_path(&filter)
+            } else {
+                filter
+            };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let writable = format!(
+                "{:#}",
+                verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err()
+            );
+            assert!(
+                writable.contains("is writable by its group or by every user")
+                    && writable.contains(&path.display().to_string()),
+                "mode {mode:o}, record {record}: {writable}"
+            );
+        }
+
+        // A directory on the way that its group or every user can write: the filter's own,
+        // one above it, and one a symbolic link on the way sits in. A sticky directory
+        // (the temporary directory these are made in) is accepted.
+        let nested = |writable: &str, link: bool| {
+            let dir = store_dir();
+            let store = dir.path().join("above/store");
+            std::fs::create_dir_all(&store).unwrap();
+            for d in [dir.path().join("above"), store.clone()] {
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let firecracker = if link {
+                // links/store -> ../above/store, and `links` is the directory in question.
+                let links = dir.path().join("links");
+                std::fs::create_dir(&links).unwrap();
+                std::fs::set_permissions(&links, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::os::unix::fs::symlink("../above/store", links.join("store")).unwrap();
+                links.join("store/firecracker")
+            } else {
+                store.join("firecracker")
+            };
+            std::fs::write(&firecracker, b"stand-in").unwrap();
+            let path = filter_path(&firecracker, SeccompMode::Enforce);
+            write_store_file(&path, good).unwrap();
+            write_store_file(&filter_digest_path(&path), digest.as_bytes()).unwrap();
+            assert_eq!(
+                verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap(),
+                good,
+                "before {writable} is made writable"
+            );
+            let target = dir.path().join(writable);
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o775)).unwrap();
+            let refused = format!(
+                "{:#}",
+                verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap_err()
+            );
+            assert!(
+                refused.contains(&format!("the directory {} is writable", target.display())),
+                "{writable}: {refused}"
+            );
+            // Sticky, as a shared temporary directory is: accepted.
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            verified_filter_bytes(&firecracker, SeccompMode::Enforce).unwrap();
+        };
+        nested("above/store", false);
+        nested("above", false);
+        nested("links", true);
 
         // The preflight says nothing was started, by mechanism.
         let (_dir, firecracker) = store_with_filter(None, None);
@@ -2704,6 +3003,11 @@ mod tests {
     /// [`unfiltered_threads`] of a child running [`seccomp_probe_child`] in `mode`, and the
     /// tid of the child's thread that installed the filter.
     fn seccomp_probe(mode: &str) -> (Vec<String>, String) {
+        seccomp_probe_under(mode, own_seccomp_filters().unwrap())
+    }
+
+    /// [`seccomp_probe`], as checked by a parent that itself runs under `inherited` filters.
+    fn seccomp_probe_under(mode: &str, inherited: u32) -> (Vec<String>, String) {
         use std::io::BufRead as _;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -2726,7 +3030,7 @@ mod tests {
                     .map(|at| line[at + "READY ".len()..].trim().to_string())
             })
             .expect("the probe child said READY");
-        let unfiltered = unfiltered_threads(child.id());
+        let unfiltered = unfiltered_threads(child.id(), inherited);
         drop(child.stdin.take());
         let status = child.wait().unwrap();
         assert!(status.success(), "probe child ({mode}): {status}");
@@ -2746,9 +3050,11 @@ mod tests {
             one.iter().any(|t| t.starts_with("probe-sleeper (tid ")),
             "{one:?}"
         );
+        // The others have what this process has and no more (none, outside a sandbox).
+        let own = own_seccomp_filters().unwrap();
         assert!(
             one.iter()
-                .all(|t| t.contains("Seccomp: 0, Seccomp_filters: 0")),
+                .all(|t| t.contains(&format!("Seccomp_filters: {own})"))),
             "{one:?}"
         );
         assert!(
@@ -2763,11 +3069,23 @@ mod tests {
         );
         assert!(none.len() >= 3, "{none:?}");
 
+        // A parent that itself runs under one filter: a child with one filter on every
+        // thread has only what it inherited, and no thread of it counts as filtered. Before
+        // the count was compared with the parent's, any one filter passed.
+        let (inherited_only, _) = seccomp_probe_under("all", own_seccomp_filters().unwrap() + 1);
+        assert!(
+            inherited_only.len() >= 3
+                && inherited_only
+                    .iter()
+                    .all(|t| t.contains("Seccomp: 2, Seccomp_filters: ")),
+            "{inherited_only:?}"
+        );
+
         // A process that is gone is an error, never an empty list.
         let mut gone = std::process::Command::new("true").spawn().unwrap();
         let pid = gone.id();
         gone.wait().unwrap();
-        assert!(unfiltered_threads(pid).is_err());
+        assert!(unfiltered_threads(pid, 0).is_err());
     }
 
     /// Only the Firecracker launch hands a VMM the confined filter, so every other place
@@ -2838,5 +3156,40 @@ mod tests {
             start[..spawn].contains("names no seccomp mode"),
             "a confined decision without a seccomp mode reaches the spawn"
         );
+    }
+
+    /// The `[confine]` table refuses a key it does not have, so a misspelled `mode` cannot
+    /// read as `off`, and reads both of its keys.
+    #[test]
+    fn the_confine_table_refuses_a_key_it_does_not_have() {
+        let parse = |text: &str| toml::from_str::<ConfineConfig>(text);
+        assert_eq!(
+            parse("mode = \"required\"\nallow_seccomp_log = true").unwrap(),
+            ConfineConfig {
+                mode: Mode::Required,
+                allow_seccomp_log: true
+            }
+        );
+        assert_eq!(parse("").unwrap(), ConfineConfig::default());
+        assert!(!ConfineConfig::default().allow_seccomp_log);
+        for misspelled in [
+            "mdoe = \"required\"",
+            "Mode = \"required\"",
+            "mode = \"required\"\nallow_seccomp_logs = true",
+        ] {
+            let error = parse(misspelled).unwrap_err().to_string();
+            assert!(error.contains("unknown field"), "{misspelled}: {error}");
+        }
+        // Inside the whole config, as fcvm reads it.
+        let embedded = crate::setup::rootfs::EMBEDDED_CONFIG;
+        assert!(embedded.contains("[confine]\nmode = \"off\""));
+        let misspelled = embedded.replace(
+            "[confine]\nmode = \"off\"",
+            "[confine]\nmdoe = \"required\"",
+        );
+        let whole = |text: &str| toml::from_str::<crate::setup::rootfs::Plan>(text);
+        assert_eq!(whole(embedded).unwrap().confine, ConfineConfig::default());
+        let error = whole(&misspelled).unwrap_err().to_string();
+        assert!(error.contains("unknown field `mdoe`"), "{error}");
     }
 }

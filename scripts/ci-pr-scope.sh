@@ -8,7 +8,7 @@
 # the top of the stack, whose head holds every lower PR's commits. The top's run
 # classifies the whole stack's diff against the default branch, not only its own
 # files, so a docs-only top PR cannot skip the matrix for code changed lower down.
-# `ci-stack-coverage.sh` then marks the lower PRs' heads as covered.
+# `scripts/ci-pool/ci_pool.py mark` then puts a `ci/pool` status on the lower PRs' heads.
 #
 # Every lookup that fails runs the full matrix: a scope that cannot be computed
 # must not skip anything.
@@ -200,9 +200,16 @@ while IFS= read -r f; do
     *) code=true; echo "code path: $f" ;;
   esac
   # A second question about the same path, kept out of the arms above (which say which
-  # jobs a path needs): whether it is part of the VMM's confinement.
+  # jobs a path needs): whether it is part of the VMM's confinement. The policies and
+  # their generator, the launch and the pre_exec that hand the filter over
+  # (src/utils.rs: keep_fds and the process layer), the preflight and the restore's thread
+  # check (src/commands/common.rs), setup's filter compile and digest
+  # (src/setup/kernel.rs), the gate, its script and the assertion every gate test makes
+  # (tests/common/mod.rs), the Makefile, which holds the gate's filter and count, the
+  # config, which pins the Firecracker the policies are derived for and holds [confine],
+  # its parser (src/setup/rootfs.rs), and the two commands that call the preflight.
   case "$f" in
-    resources/seccomp/*|src/confine.rs|src/firecracker/vm.rs|src/hypervisor/firecracker.rs|scripts/confine-*|tests/test_confine*.rs)
+    resources/seccomp/*|src/confine.rs|src/firecracker/vm.rs|src/hypervisor/firecracker.rs|src/utils.rs|src/commands/common.rs|src/commands/snapshot.rs|src/commands/podman/mod.rs|src/setup/kernel.rs|src/setup/rootfs.rs|rootfs-config.toml|scripts/confine-*|tests/test_confine*.rs|tests/common/mod.rs|Makefile)
       confine=true; echo "confinement path: $f" ;;
   esac
 done <<< "$files"

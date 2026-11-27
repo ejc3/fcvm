@@ -4,6 +4,7 @@ pub mod completions;
 pub mod exec;
 pub mod gpu;
 pub mod ls;
+pub mod paths;
 pub mod podman;
 pub mod serve;
 pub mod setup;
@@ -20,6 +21,7 @@ pub use completions::cmd_completions;
 pub use exec::cmd_exec;
 pub use gpu::cmd_gpu;
 pub use ls::cmd_ls;
+pub use paths::cmd_paths;
 pub use podman::cmd_podman;
 pub use podman::{
     cleanup_vm_context, prepare_vm, run_vm_loop, start_vm, LogLine, VmContext, VmHandle,

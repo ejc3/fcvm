@@ -222,7 +222,10 @@ fn find_descendants_with_comm_prefix(ancestor: u32, prefix: &str) -> Vec<Tracked
 
 /// Does any state file in the state dir belong to `vm_name`?
 fn state_file_for_name_exists(vm_name: &str) -> bool {
-    for p in fcvm::state::StateManager::new(fcvm::paths::state_dir()).state_files() {
+    for p in fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .state_files()
+        .expect("listing the state files")
+    {
         let Ok(content) = std::fs::read_to_string(&p) else {
             continue;
         };
@@ -324,7 +327,7 @@ fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
     let mut found = None;
 
     // The states are in buckets under the state directory.
-    for path in fcvm::state::StateManager::new(state_dir.clone()).state_files() {
+    for path in fcvm::state::StateManager::new(state_dir.clone()).state_files()? {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
