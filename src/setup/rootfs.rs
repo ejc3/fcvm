@@ -2563,7 +2563,7 @@ fn package_set_key(plan: &Plan, image_dpkg_status: &[u8]) -> String {
 const PACKAGE_DOWNLOAD_ATTEMPTS: u32 = 3;
 
 /// How long one attempt of the package download container may run before it is stopped and
-/// retried: `FCVM_PACKAGE_DOWNLOAD_ATTEMPT_SECS`, default PACKAGE_ATTEMPT_DEFAULT_SECS s.
+/// retried: `FCVM_PACKAGE_DOWNLOAD_ATTEMPT_SECS`, default [`PACKAGE_ATTEMPT_DEFAULT_SECS`].
 /// apt retries its own failed fetches inside the container (`apt_retry`); this limit covers an
 /// attempt that stops making progress without failing.
 fn package_download_attempt_limit() -> std::time::Duration {
@@ -2574,7 +2574,10 @@ fn package_download_attempt_limit() -> std::time::Duration {
         .unwrap_or(PACKAGE_ATTEMPT_DEFAULT_SECS);
     std::time::Duration::from_secs(secs)
 }
-const PACKAGE_ATTEMPT_DEFAULT_SECS: u64 = 600;
+/// Ten times a measured healthy attempt: 26 s on a c8g.12xlarge (arm64) with a fresh store,
+/// pulling ubuntu:noble included (`make setup-default`, 2026-11-27). A CI attempt that stalled
+/// spent 8.7 min with its disks idle.
+const PACKAGE_ATTEMPT_DEFAULT_SECS: u64 = 260;
 
 /// How one streamed run ended.
 #[derive(Debug)]
