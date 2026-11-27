@@ -483,8 +483,10 @@ fn fleet_web_uploads_the_playwright_traces_of_a_failed_run() {
         .expect("`fleet-web` has no steps");
     let browser = steps
         .iter()
-        .position(|s| s.get("run").and_then(Value::as_str) == Some("pnpm test:e2e"))
-        .expect("`fleet-web` no longer runs `pnpm test:e2e`");
+        .position(|s| {
+            s.get("run").and_then(Value::as_str) == Some("pnpm test:e2e:${{ matrix.shard }}")
+        })
+        .expect("`fleet-web` no longer runs its shard's browser tests");
     let upload = steps
         .iter()
         .position(|s| {
@@ -5170,5 +5172,71 @@ fn the_mock_vmm_job_builds_the_binaries_its_filter_selects() {
         lib,
         !lib_wanted.is_empty(),
         "--lib on the fc-mock step: library tests the filter selects: {lib_wanted:?}"
+    );
+}
+
+/// The Fleet Web job runs its browser suite in shards, one package.json script each. Every
+/// Playwright config must run in exactly one shard, and `pnpm test:e2e` (what README.md
+/// tells people to run) must be the shards in order, so CI and a local run cover the same.
+#[test]
+fn fleet_web_shards_run_every_playwright_config() {
+    let ci = parse_workflow("ci.yml");
+    let shards: Vec<String> = workflow_job(&ci, "fleet-web")["strategy"]["matrix"]["shard"]
+        .as_sequence()
+        .expect("fleet-web has a shard matrix")
+        .iter()
+        .map(|v| v.as_str().expect("shard name").to_string())
+        .collect();
+    let web = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fleet/web");
+    let package: serde_json::Value =
+        serde_json::from_str(&read_file(web.join("package.json"))).expect("package.json parses");
+    let scripts = &package["scripts"];
+    let script = |name: &str| -> String {
+        scripts[name]
+            .as_str()
+            .unwrap_or_else(|| panic!("package.json has no {name} script"))
+            .to_string()
+    };
+    let in_order = shards
+        .iter()
+        .map(|s| format!("pnpm test:e2e:{s}"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    assert_eq!(
+        script("test:e2e"),
+        in_order,
+        "test:e2e must be the CI shards in order"
+    );
+
+    let mut ran: BTreeMap<String, usize> = BTreeMap::new();
+    for shard in &shards {
+        for command in script(&format!("test:e2e:{shard}")).split("&&") {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            assert_eq!(
+                words.get(..2),
+                Some(&["playwright", "test"][..]),
+                "{shard}: {command}"
+            );
+            let config = match words.iter().position(|w| *w == "-c") {
+                Some(i) => words[i + 1].to_string(),
+                None => "playwright.config.ts".to_string(),
+            };
+            *ran.entry(config).or_default() += 1;
+        }
+    }
+    let configs: BTreeMap<String, usize> = std::fs::read_dir(&web)
+        .expect("fleet/web")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("playwright.") && n.ends_with(".config.ts"))
+        .map(|n| (n, 1))
+        .collect();
+    assert!(
+        configs.len() >= 7,
+        "found {} Playwright configs",
+        configs.len()
+    );
+    assert_eq!(
+        ran, configs,
+        "each Playwright config runs in exactly one shard"
     );
 }

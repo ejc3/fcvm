@@ -136,17 +136,27 @@ jobs:
   # Next.js build, and Playwright (Chromium and WebKit) against the mock fleet,
   # which needs ffmpeg for its H.264 encoder.
   fleet-web:
-    name: Fleet Web
+    name: Fleet Web (${{ matrix.shard }})
     needs: [changes]
     if: ${{ needs.changes.outputs.web == 'true' }}
     runs-on: ubuntu-latest
+    # The browser suite is seven Playwright configs, each with its own mock fleet and page,
+    # run one after another: 23 min of the job's 26 (run 45931415934; the main config 10.7,
+    # minecraft 5.9, windows 2.4, phones 2.0, potato 0.7, mirror 0.4). Each shard runs one
+    # package.json script, and `pnpm test:e2e` is those scripts in order, so local runs and
+    # CI run the same configs (fleet_web_shards_run_every_playwright_config pins it). The
+    # lint, unit and Worker steps run in the shortest shard.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [wall, phones-windows, minecraft-potato-mirror]
     # Playwright's own image carries Chromium, WebKit and their libraries, so
     # the job installs nothing with apt: the Azure mirror stalled apt for 13 to
     # 30 minutes in four runs on 2026-10-22. Tag and digest of 1.64.0, the
     # @playwright/test version in fleet/web/package.json.
     container:
       image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
-    # The suite takes about 5 minutes; anything that hangs fails instead of waiting.
+    # The longest shard takes about 12 minutes; anything that hangs fails instead of waiting.
     timeout-minutes: 30
     defaults:
       run:
@@ -215,27 +225,31 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Lint and typecheck
+        if: matrix.shard == 'phones-windows'
         run: pnpm lint && pnpm typecheck
       - name: Unit tests
+        if: matrix.shard == 'phones-windows'
         run: pnpm test
       - name: Build
         run: pnpm build
       - name: Browser tests
-        run: pnpm test:e2e
+        run: pnpm test:e2e:${{ matrix.shard }}
       # A failed browser test keeps its Playwright trace under test-results (trace:
       # "retain-on-failure"); without this it dies with the runner (#1348).
       - name: Upload Playwright traces
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fleet-web-test-results
+          name: fleet-web-test-results-${{ matrix.shard }}
           path: fleet/web/test-results
           if-no-files-found: ignore
           retention-days: 14
       # The staging deploy ships this Worker; it must serve the page, not only build.
       - name: Build the Worker
+        if: matrix.shard == 'phones-windows'
         run: pnpm cf:build
       - name: Serve the built Worker
+        if: matrix.shard == 'phones-windows'
         run: scripts/worker-smoke.sh 24110
 
   # Lints every workflow file. Lives here, not in claude-lint.yml, so `Summary`
