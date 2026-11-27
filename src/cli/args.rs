@@ -1301,6 +1301,13 @@ pub struct SetupArgs {
     #[arg(long)]
     pub cloud_hypervisor: bool,
 
+    /// Build every pinned Firecracker (for the profiles whose kernels are published) and the
+    /// pinned Cloud Hypervisor from source, never from a published build, and write each binary
+    /// and a manifest.json of their names, commits, architecture, libc and SHA-256 to this
+    /// directory, then exit. vmm.yml publishes what this writes.
+    #[arg(long, value_name = "DIR")]
+    pub vmm_artifacts: Option<String>,
+
     /// Only make the tmpfs directory the data directory's owner keeps VM states in
     /// (/run/fcvm-<uid>) and install the tmpfiles.d rule that makes it at every boot
     /// (/etc/tmpfiles.d/fcvm-<uid>.conf; remove that file to undo). Needs root. A full

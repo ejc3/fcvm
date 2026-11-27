@@ -40,6 +40,19 @@ export const NO_PHONES = "This fleet runs no phones.";
 
 /** A phone's screen, width over height (720 x 1280). */
 export const PHONE_ASPECT = 720 / 1280;
+/** How far a stream's picture may stray from the phone's screen shape before the page draws it as
+ *  another shape. The page asks each stream at the size it draws, and the encoder rounds that size to
+ *  whole pixels, so the first frame after a resize has a width over height a few thousandths off the
+ *  last frame's (158 x 280 is 0.564, 162 x 286 is 0.566). Drawn as is, the screen, and the tap target
+ *  over it, moved by half a pixel under a click aimed a moment earlier (e2e/phones.spec.ts, 2026-11-27). */
+export const ASPECT_SNAP = 0.02;
+/** The aspect a phone's screen is drawn at, from a picture `w` wide and `h` high: the phone's own
+ *  shape, upright or turned, when the picture is within ASPECT_SNAP of it, else the picture's own. */
+export function screenAspect(w: number, h: number): number {
+  const a = w / h;
+  for (const own of [PHONE_ASPECT, 1 / PHONE_ASPECT]) if (Math.abs(a / own - 1) <= ASPECT_SNAP) return own;
+  return Math.round(a * 1000) / 1000;
+}
 
 /** The phone body around the screen, as fractions of the screen's short side. */
 export const BEZEL = {
@@ -876,7 +889,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
   const aspects: Record<string, number> = {};
   for (const t of phones.tiles) {
     const fs = s.frames?.tiles[`d:${t.id}`];
-    if (fs && fs.width > 0 && fs.height > 0 && fs.newestT !== null) aspects[t.id] = Math.round((fs.width / fs.height) * 1000) / 1000;
+    if (fs && fs.width > 0 && fs.height > 0 && fs.newestT !== null) aspects[t.id] = screenAspect(fs.width, fs.height);
   }
   // The phone this viewer holds, opened with the GPU mirror in view: side by side with its video
   // ("both"), or in the video's place ("mirror").
@@ -884,7 +897,7 @@ export function phonesView(inp: PhonesInput): PhonesView {
   const mp = inp.mirrorPicture ?? null;
   const shown = (p: MirrorPicture) => p.h - (p.banded ? STAMP_ROWS : 0);
   // with the mirror alone there is no video to say what shape the screen is: the mirror says
-  if (takeover === "mirror" && mp && mp.w > 0 && shown(mp) > 0) aspects[mp.id] = Math.round((mp.w / shown(mp)) * 1000) / 1000;
+  if (takeover === "mirror" && mp && mp.w > 0 && shown(mp) > 0) aspects[mp.id] = screenAspect(mp.w, shown(mp));
   const heldTile = open === null ? null : (phones.tiles.find((t) => t.id === open && t.borrowed !== null && sameViewer(t.borrowed.viewer ?? null, s.you)) ?? null);
   const mirrorView = heldTile !== null && heldTile.borrowed?.session !== undefined && takeover !== "video" ? takeover : null;
   const opened = open !== null && stage ? openedArea(stage, inp.narrow) : null;

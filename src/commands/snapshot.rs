@@ -2213,7 +2213,8 @@ fn ensure_gpu_snapshot_mode(gpus: &[String], disk_only: bool, gpu_warm: bool) ->
 /// map: the guest mounted every mapping when it booted, the restore keeps those mounts, and
 /// a clone cannot add or drop one. The vsock port stays the snapshot's. A volume's inode
 /// table names files by their path under the mount, so the guest's open files are found
-/// again in the new directory when it holds the same tree.
+/// again in the new directory when it holds the same tree; a restore refuses a directory
+/// that lacks one (`moved_volumes_missing_paths`).
 fn clone_volumes(
     snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
     requested: &[String],
@@ -2258,6 +2259,47 @@ fn clone_volumes(
         volume.host_path = mapping.host_path;
     }
     Ok(volumes)
+}
+
+/// The files a moved read-only volume's guest holds that its new host directory lacks, as
+/// (guest path, path under the mount). `requested` are `--map HOST:GUEST:ro` specs that
+/// `clone_volumes` accepted; `snap_dir` holds the snapshot's inode tables
+/// (`volume::inode_table_file_name`). A restore looks each table path up in the directory it
+/// serves, and one it cannot find leaves an inode the guest holds answering EIO.
+pub(crate) fn moved_volumes_missing_paths(
+    snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
+    requested: &[String],
+    snap_dir: &Path,
+) -> Vec<(String, String)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut missing = Vec::new();
+    for spec in requested {
+        let Ok(mapping) = super::podman::VolumeMapping::parse(spec) else {
+            continue;
+        };
+        let Some(volume) = snapshot.iter().find(|v| v.guest_path == mapping.guest_path) else {
+            continue;
+        };
+        // Served from the directory the snapshot recorded, the volume is not moved.
+        if volume.host_path == mapping.host_path {
+            continue;
+        }
+        let table = snap_dir.join(crate::volume::inode_table_file_name(volume.vsock_port));
+        // Without a table the guest's inodes answer an error in any clone, moved or not.
+        let Ok(json) = std::fs::read_to_string(&table) else {
+            continue;
+        };
+        for path in fuse_pipe::inode_table_paths(&json) {
+            let on_host = mapping.host_path.join(std::ffi::OsStr::from_bytes(&path));
+            if std::fs::symlink_metadata(&on_host).is_err() {
+                missing.push((
+                    volume.guest_path.clone(),
+                    String::from_utf8_lossy(&path).into_owned(),
+                ));
+            }
+        }
+    }
+    missing
 }
 
 /// A warm GPU snapshot's CUDA processes wait, checkpointed, for as many GPUs as the
@@ -3178,7 +3220,25 @@ async fn cmd_snapshot_run_inner(
             &snapshot_name,
         )?;
     }
-    snapshot_config.metadata.volumes = clone_volumes(&snapshot_config.metadata.volumes, &args.map)?;
+    let recorded_volumes = snapshot_config.metadata.volumes.clone();
+    snapshot_config.metadata.volumes = clone_volumes(&recorded_volumes, &args.map)?;
+    // A moved directory must hold every file the snapshot's guest holds in that volume: a
+    // restore answers EIO for one it cannot find (#2239).
+    if let Some(generation) = snapshot_config.memory_path.parent() {
+        let missing = moved_volumes_missing_paths(&recorded_volumes, &args.map, generation);
+        if !missing.is_empty() {
+            let named: Vec<String> = missing
+                .iter()
+                .map(|(volume, path)| format!("{volume}/{path}"))
+                .collect();
+            bail!(
+                "--map: the snapshot's guest holds {}, which the directory given for {} lacks. \
+                 A moved read-only map must hold every file the guest held at the snapshot",
+                named.join(", "),
+                missing[0].0
+            );
+        }
+    }
 
     // Where this clone publishes its ports, settled before anything is allocated: a
     // --publish the snapshot cannot serve fails here with nothing to clean up.
@@ -8113,6 +8173,71 @@ mod tests {
             vsock_port: port,
             portable: true,
         }
+    }
+
+    /// A moved read-only volume whose new directory lacks a file the snapshot's guest holds
+    /// (a path in the volume's inode table) is found before anything starts: a restore
+    /// would serve EIO for that inode. A volume that is not moved, or a directory that holds
+    /// the whole tree, finds nothing (#2239).
+    #[test]
+    fn a_moved_volume_whose_directory_lacks_a_held_path_is_found() {
+        let snap = tempfile::tempdir().unwrap();
+        let recorded = tempfile::tempdir().unwrap();
+        let here = tempfile::tempdir().unwrap();
+        std::fs::write(
+            snap.path().join(crate::volume::inode_table_file_name(5000)),
+            r#"{"handle_base":3,"paths":{"1":"","77":"sub/held","78":"kept"},"gone":{"79":"old"}}"#,
+        )
+        .unwrap();
+        std::fs::write(here.path().join("kept"), "").unwrap();
+        let snapshot = vec![
+            volume(recorded.path(), "/var/creds", true, 5000),
+            volume(recorded.path(), "/data", false, 5001),
+        ];
+        let moved = format!("{}:/var/creds:ro", here.path().display());
+        assert_eq!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[moved.as_str()]), snap.path()),
+            [("/var/creds".to_string(), "sub/held".to_string())]
+        );
+        assert!(moved_volumes_missing_paths(&snapshot, &[], snap.path()).is_empty());
+        let unmoved = format!("{}:/var/creds:ro", recorded.path().display());
+        assert!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[unmoved.as_str()]), snap.path())
+                .is_empty(),
+            "a volume served from the directory the snapshot recorded is not moved"
+        );
+        std::fs::create_dir(here.path().join("sub")).unwrap();
+        std::fs::write(here.path().join("sub/held"), "").unwrap();
+        assert!(
+            moved_volumes_missing_paths(&snapshot, &requested(&[moved.as_str()]), snap.path())
+                .is_empty()
+        );
+    }
+
+    /// The two restores that move a read-only volume check its directory before they start
+    /// anything: `snapshot run --map` refuses, between choosing the volumes and choosing the
+    /// ports, and a pre-start cache hit checks before it restores, so it can boot cold
+    /// instead (#2239).
+    #[test]
+    fn moved_volumes_are_checked_before_anything_starts() {
+        let source = include_str!("snapshot.rs");
+        let body = &source[source.find("async fn cmd_snapshot_run_inner(").unwrap()..];
+        let check = body
+            .find("moved_volumes_missing_paths(")
+            .expect("snapshot run does not check a moved volume's directory");
+        assert!(body.find("clone_volumes(").unwrap() < check);
+        assert!(check < body.find("clone_port_mappings(").unwrap());
+
+        let podman = include_str!("podman/mod.rs");
+        let hit = podman
+            .find("\"Pre-start snapshot hit! Restoring from cached snapshot\"")
+            .unwrap();
+        let branch = &podman[..hit];
+        let branch = &branch[branch.rfind("if restores_pre_start(").unwrap()..];
+        assert!(
+            branch.contains("moved_volumes_missing_paths("),
+            "a pre-start hit does not check its moved volumes before it restores"
+        );
     }
 
     /// Without --map a clone serves the snapshot's host directories. With it, a requested

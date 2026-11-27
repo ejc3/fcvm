@@ -1865,6 +1865,17 @@ mappings it uses, a disk-only clone sets its network up from the same list, and 
 snapshot key includes the flag. `fcvm podman run` restoring from its snapshot cache
 passes its own `--publish` through the same path.
 
+`--map HOST:GUEST:ro` moves the host side of a read-only volume the snapshot mapped
+(`clone_volumes`); a read-write one is refused, since the guest keeps its sizes, times and
+pages through the writeback cache. The moved directory must hold every file the snapshot's
+guest held in that volume (the paths in its inode table): a restore answers EIO for one it
+cannot find, so `snapshot run` refuses such a directory before anything starts. The
+pre-start snapshot key holds a read-only map by its guest path and mode only, and `fcvm
+podman run` restoring from it passes its own read-only maps through the same path, so runs
+that map one guest path from different directories share it (#2239). If the run's
+directory lacks a file the snapshot's guest held, the run boots cold and takes no snapshot.
+A startup snapshot's name keeps the host path: its container already read the files.
+
 **Examples**:
 ```bash
 # Spawn a clone (inherits network/ports from snapshot)

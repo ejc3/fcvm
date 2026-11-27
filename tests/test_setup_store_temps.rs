@@ -86,6 +86,7 @@ const STORE_BUILDERS: &[(&str, &str)] = &[
     ("src/setup/kernel.rs", "build_kernel_locally"),
     ("src/setup/kernel.rs", "ensure_cloud_hypervisor"),
     ("src/setup/libseccomp.rs", "build_and_publish"),
+    ("src/setup/vmm_artifacts.rs", "install"),
     ("src/commands/podman/image.rs", "build_storage_image"),
     ("src/commands/podman/mod.rs", "export_localhost_image_disk"),
 ];
