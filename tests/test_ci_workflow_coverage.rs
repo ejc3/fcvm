@@ -4885,10 +4885,8 @@ fn make_targets(run: &str) -> Vec<String> {
 
 /// Self-hosted jobs that still compile a second test feature set, with the targets that do
 /// it. Each entry is removed by the change that folds it into the job's other build.
-const SECOND_TEST_BUILD: &[(&str, &[&str])] = &[
-    ("host", &["test-fast", "test-confine"]),
-    ("container", &["container-test-unit", "container-test"]),
-];
+const SECOND_TEST_BUILD: &[(&str, &[&str])] =
+    &[("container", &["container-test-unit", "container-test"])];
 
 /// Every distinct cargo feature set is a full rebuild of the workspace crates: 11 to 13.7
 /// minutes for the test binaries on the self-hosted runners (runs 45931415934 and

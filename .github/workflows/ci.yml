@@ -624,7 +624,7 @@ jobs:
             -E 'package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)'
 
   # Runner 1a: Host (bare metal with KVM)
-  # Runs: test-fast (unit tests and quick VM tests, no privileged) and test-confine
+  # Runs: test-all (unit tests and the rootless VM tests, no privileged) and test-confine
   # Self-hosted runners with nested virtualization (ARM64: c7g.metal, x86: c5.metal)
   host:
     name: Host-${{ matrix.arch }}
@@ -888,10 +888,11 @@ jobs:
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
-      # No test-unit step: no test is gated on a missing integration feature, so every test
-      # of `make test-unit` (no features) is also in test-fast's build (integration-fast),
-      # and a separate step compiled the whole workspace once more to run them (11.7 min on
-      # arm64, 12.8 on x64, run 45935858819). ci_jobs_build_one_test_feature_set pins it.
+      # One test build for the job: test-all and test-confine both compile the default
+      # features. No test is gated on a missing integration feature, so test-unit's tests (no
+      # features) and test-fast's (integration-fast) are all in that build; each extra feature
+      # set was a full rebuild of the workspace (11.0 to 12.8 min each, run 45935858819).
+      # ci_jobs_build_one_test_feature_set pins it.
       - name: setup-fcvm
         working-directory: fcvm
         run: make setup-fcvm
@@ -918,17 +919,17 @@ jobs:
       - name: test-packaging-e2e
         working-directory: fcvm
         run: ./scripts/test-packaging-e2e.sh ./target/release/fcvm
-      - name: test-fast
+      - name: test-all
         working-directory: fcvm
-        run: make test-fast
+        run: make test-all
       # --confine's gate: the rootless VM tests with every VMM confined and its syscall
       # allowlist enforcing, each run once, through scripts/confine-gate.sh: it fails on a
       # failed test, on any VMM the policy stopped, on a test that did not assert its VMM
       # confined, and on a filter that matches fewer tests than the Makefile pins. On both
       # architectures: each has its own policy, and its own libc call shapes. Host-x64 runs
-      # on a pull request only when the change touches confinement (changes.confine). The step took
-      # 12 min on arm64 (run 45517811464; 10 of them building the default-feature test
-      # binaries, which test-fast does not build); the cap is twice that.
+      # on a pull request only when the change touches confinement (changes.confine). The step
+      # reuses test-all's build; when it built its own, it took 12 min on arm64 (run
+      # 45517811464); the cap is twice that.
       - name: test-confine
         timeout-minutes: 25
         working-directory: fcvm
