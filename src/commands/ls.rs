@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -46,6 +46,17 @@ fn host_addr(vm: &VmState) -> &str {
 }
 
 pub async fn cmd_ls(args: LsArgs) -> Result<()> {
+    if args.runtime_dir {
+        let data_dir = paths::data_dir();
+        let dir = crate::runtime_dir::bound_to(&data_dir)?.with_context(|| {
+            format!(
+                "the data directory {} has no VM states in this boot",
+                data_dir.display()
+            )
+        })?;
+        println!("{}", dir.display());
+        return Ok(());
+    }
     // Only log in non-JSON mode to avoid mixing logs with JSON output
     if !args.json {
         info!("fcvm ls");
