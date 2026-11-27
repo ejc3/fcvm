@@ -4738,6 +4738,36 @@ fn self_hosted_jobs_refuse_fork_pull_requests() {
         "self-hosted jobs a fork's pull request can reach; each must start its `if` with \
          {NOT_A_FORK} &&: {findings:#?}"
     );
+
+    // Summary analyses the self-hosted jobs' artifacts. A fork's run has none, and the
+    // analysis fails on a missing directory, so those steps must not run for it either.
+    let ci = parse_workflow("ci.yml");
+    let mut artifact_steps = 0;
+    for step in workflow_job(&ci, "summary")["steps"]
+        .as_sequence()
+        .expect("summary steps")
+    {
+        let downloads = step
+            .get("uses")
+            .and_then(Value::as_str)
+            .is_some_and(|u| u.starts_with("actions/download-artifact@"));
+        let analyses = step
+            .get("run")
+            .and_then(Value::as_str)
+            .is_some_and(|r| r.contains("analyze_ci_vms.py"));
+        if downloads || analyses {
+            artifact_steps += 1;
+            assert!(
+                condition_of(step).contains(NOT_A_FORK),
+                "Summary step {:?} reads the self-hosted artifacts on a fork's run too",
+                step.get("name")
+            );
+        }
+    }
+    assert_eq!(
+        artifact_steps, 2,
+        "found {artifact_steps} artifact steps in Summary"
+    );
 }
 
 fn read_file(path: PathBuf) -> String {
@@ -5307,5 +5337,29 @@ fn ci_builds_use_the_light_profile_but_one_lane() {
             "CONTAINER_TEST_OPTIONS += -e CARGO_PROFILE_RELEASE_CODEGEN_UNITS -e CARGO_PROFILE_RELEASE_LTO"
         ),
         "the container build must receive the CI profile"
+    );
+}
+
+/// A recipe that runs under TARGET_LEASE_SHELL needs target/: the wrapper refuses to run
+/// without it. clean-test-data runs under it, so cargo-target-link is a prerequisite whatever
+/// CLEAN_PRUNE says; with only `build` (dropped under CLEAN_PRUNE=0) a fresh checkout's clean
+/// failed before its first command, hidden by CI's `|| true`.
+#[test]
+fn clean_test_data_links_target_without_a_build() {
+    let makefile = read_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Makefile"));
+    let rules = makefile_rules(&makefile);
+    let leased: Vec<&str> = makefile
+        .lines()
+        .filter_map(|l| l.strip_suffix(": private SHELL := $(TARGET_LEASE_SHELL)"))
+        .collect();
+    assert!(
+        leased.contains(&"clean-test-data"),
+        "clean-test-data runs under the lease"
+    );
+    let prerequisites = &rules["clean-test-data"].0;
+    assert!(
+        prerequisites.first().map(String::as_str) == Some("cargo-target-link"),
+        "clean-test-data's prerequisites must start with cargo-target-link, unconditionally: \
+         {prerequisites:?}"
     );
 }

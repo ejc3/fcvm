@@ -1713,12 +1713,16 @@ jobs:
       - name: Report skipped
         if: needs.skip-check.outputs.skip == 'true'
         run: echo "::notice::Skipped self-hosted tests — every self-hosted job already passed for this tree on a PR branch"
+      - name: Report fork
+        if: ${{ !(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+        run: echo "::notice::A fork's pull request runs no self-hosted job, so this run tested none of the lanes"
       # When the test matrix was skipped, no artifacts exist and there is
       # nothing to analyze; downloading would fail on the missing directory.
+      # A fork's run skipped the self-hosted jobs, so it has no artifacts to analyse.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        if: needs.skip-check.outputs.skip != 'true'
+        if: needs.skip-check.outputs.skip != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
       - name: Download all artifacts
-        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
+        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: /tmp/ci-artifacts
@@ -1728,7 +1732,7 @@ jobs:
       # green for those PRs — it is the required check that proves the gate
       # ran, not a claim that the matrix did.
       - name: Analyze CI run
-        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true'
+        if: needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/analyze_ci_vms.py /tmp/ci-artifacts
 
   # States what this run showed as a `ci/pool` commit status (scripts/ci-pool/ci_pool.py

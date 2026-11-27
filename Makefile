@@ -516,10 +516,10 @@ check-disk: cargo-target-link
 # CRITICAL: Uses fcvm's proper cleanup commands to handle btrfs CoW correctly
 # CLEAN_PRUNE=0 skips `fcvm snapshots prune` and therefore the build it needs; the rm lines
 # below remove the same directories. The Container job uses it: it builds fcvm only inside
-# the container.
+# the container. cargo-target-link stays: TARGET_LEASE_SHELL refuses to run without target/.
 CLEAN_PRUNE ?= 1
 clean-test-data: private SHELL := $(TARGET_LEASE_SHELL)
-clean-test-data: $(if $(filter 1,$(CLEAN_PRUNE)),build)
+clean-test-data: cargo-target-link $(if $(filter 1,$(CLEAN_PRUNE)),build)
 	@echo "==> Killing stale VM processes from previous runs..."
 	@sudo pkill -9 firecracker 2>/dev/null; sudo pkill -9 pasta 2>/dev/null; sudo kill -9 $$(pgrep -x sleep -P 1) 2>/dev/null; sleep 1; true
 	@echo "==> Cleaning stale network namespaces..."
