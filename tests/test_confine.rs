@@ -238,15 +238,16 @@ async fn default_firecracker() -> Result<std::path::PathBuf> {
 #[test]
 fn the_gate_assertion_fails_on_an_unconfined_process() {
     let failures = common::vmm_confinement_failures(std::process::id());
-    // A test runner inside a sandbox can itself run under a filter or with no_new_privs;
-    // the command line is never a confined VMM's.
+    // A test runner inside a sandbox can itself run under a filter or with no_new_privs.
+    // The command line is never a confined VMM's, and no thread here has a filter beyond
+    // the ones this process itself runs under.
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let mut needles = vec!["no --seccomp-filter /proc/self/fd/<n>"];
+    let mut needles = vec![
+        "no --seccomp-filter /proc/self/fd/<n>",
+        "threads under no seccomp filter",
+    ];
     if status.contains("\nSeccomp:\t0\n") {
-        needles.extend([
-            "threads under no seccomp filter",
-            "Seccomp: 0, Seccomp_filters: 0",
-        ]);
+        needles.push("Seccomp: 0, Seccomp_filters: 0");
     }
     if status.contains("\nNoNewPrivs:\t0\n") {
         needles.push("NoNewPrivs: 0");
@@ -272,15 +273,26 @@ async fn refused_clone(
     name: &str,
     firecracker: &std::path::Path,
 ) -> Result<String> {
-    let mut child = tokio::process::Command::new(common::find_fcvm_binary()?)
+    let mut command = tokio::process::Command::new(common::find_fcvm_binary()?);
+    command
         .args(["snapshot", "run", "--snapshot", snapshot, "--name", name])
         .args(["--confine", "--firecracker-bin"])
-        .arg(firecracker)
+        .arg(firecracker);
+    refused_start(command, name).await
+}
+
+/// Run an fcvm start that has to fail, and return what it wrote to stderr. A start that is
+/// still running after two minutes is stopped and is an error.
+async fn refused_start(mut command: tokio::process::Command, name: &str) -> Result<String> {
+    // A refused start still launches a VMM before fcvm kills it. If the test dies first,
+    // fcvm must die with it, or that VMM and its holder outlive the lane.
+    common::set_test_pdeathsig(&mut command);
+    let mut child = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("spawning fcvm snapshot run")?;
-    let pid = child.id().context("fcvm snapshot run has no pid")?;
+        .context("spawning fcvm")?;
+    let pid = child.id().context("the fcvm start has no pid")?;
     let mut stderr = child.stderr.take().context("no stderr")?;
     let read = tokio::spawn(async move {
         let mut text = String::new();
@@ -300,6 +312,119 @@ async fn refused_clone(
         }
         Err(_) => anyhow::bail!("{name} was started and ran for two minutes: {stderr}"),
     }
+}
+
+/// A copy of the default Firecracker in `dir`, with a recorded enforce-mode filter of
+/// three empty programs beside it: Firecracker loads the file and installs nothing.
+async fn firecracker_copy_with_an_empty_filter(
+    dir: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    use fcvm::confine::{filter_bytes_digest, filter_digest_path, filter_path, SeccompMode};
+    // Writable by its owner only, whatever the umask: a filter in a directory its group
+    // can write is refused.
+    std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    let firecracker = dir.join("firecracker-copy");
+    std::fs::copy(default_firecracker().await?, &firecracker)?;
+    let empty: std::collections::HashMap<String, Vec<u64>> = ["vmm", "api", "vcpu"]
+        .into_iter()
+        .map(|class| (class.to_string(), Vec::new()))
+        .collect();
+    let bytes = bitcode::serialize(&empty)?;
+    let filter = filter_path(&firecracker, SeccompMode::Enforce);
+    fcvm::confine::write_store_file(&filter, &bytes)?;
+    fcvm::confine::write_store_file(
+        &filter_digest_path(&filter),
+        filter_bytes_digest(&bytes).as_bytes(),
+    )?;
+    Ok(firecracker)
+}
+
+/// The processes that run `binary`.
+fn processes_running(binary: &std::path::Path) -> Result<Vec<u32>> {
+    Ok(std::fs::read_dir("/proc")?
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == binary))
+        .collect())
+}
+
+/// What the thread check reports for a thread that installed no filter of its own: the
+/// filters this test process runs under, which fcvm and its VMM inherit.
+fn an_unfiltered_thread() -> Result<String> {
+    let own = fcvm::confine::own_seccomp_filters()?;
+    Ok(format!(
+        "Seccomp: {}, Seccomp_filters: {own})",
+        if own == 0 { 0 } else { 2 }
+    ))
+}
+
+/// A cold boot (`podman run --no-snapshot`, the path through `boot()`) of a Firecracker
+/// whose filter file installs nothing is killed and the run fails naming the unfiltered
+/// threads. The restore path has the same case in
+/// [`test_confine_refuses_a_filter_that_does_not_confine`]; before this test the cold boot's
+/// check was pinned only by a search of the source for its call.
+///
+/// `podman run` takes its Firecracker from the config's `[firecracker]` table and has no
+/// flag for another, so the run reads a copy of the config without that table and takes
+/// the binary from `FCVM_FIRECRACKER_BIN`.
+#[tokio::test]
+async fn test_confine_cold_boot_kills_a_vmm_whose_filter_installs_nothing() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("confine-cold-empty");
+    if let Some(expected) = host_refusal() {
+        return assert_a_confined_start_is_refused(&vm_name, &expected).await;
+    }
+    let dir = tempfile::tempdir()?;
+    let firecracker = firecracker_copy_with_an_empty_filter(dir.path()).await?;
+
+    let config = std::fs::read_to_string(fcvm::setup::rootfs::find_config_file(None)?)?;
+    let mut in_table = false;
+    let without_firecracker: String = config
+        .lines()
+        .filter(|line| {
+            if line.starts_with('[') {
+                in_table = line.trim() == "[firecracker]";
+            }
+            !in_table
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let plan: fcvm::setup::rootfs::Plan = toml::from_str(&without_firecracker)?;
+    anyhow::ensure!(
+        toml::from_str::<fcvm::setup::rootfs::Plan>(&config)?
+            .firecracker
+            .is_some()
+            && plan.firecracker.is_none(),
+        "the config copy still names a Firecracker build"
+    );
+    let config_dir = dir.path().join("config");
+    std::fs::create_dir_all(config_dir.join("fcvm"))?;
+    std::fs::write(
+        config_dir.join("fcvm/rootfs-config.toml"),
+        without_firecracker,
+    )?;
+
+    let mut command = tokio::process::Command::new(common::find_fcvm_binary()?);
+    command
+        .args(["podman", "run", "--name", &vm_name])
+        .args(["--network", "rootless", "--confine", "--no-snapshot"])
+        .arg(common::TEST_IMAGE)
+        .env("FCVM_CONFIG_DIR", &config_dir)
+        .env("FCVM_FIRECRACKER_BIN", &firecracker);
+    let stderr = refused_start(command, &vm_name).await?;
+    let unfiltered = an_unfiltered_thread()?;
+    anyhow::ensure!(
+        stderr.contains("run without a seccomp filter of their own")
+            && stderr.contains(&unfiltered)
+            && stderr.contains("the confined VMM was killed"),
+        "a cold boot on a filter that installs nothing: {stderr}"
+    );
+    // Only the copy's filter installs nothing, so it was the copy that ran. None is left.
+    let leftover = processes_running(&firecracker)?;
+    anyhow::ensure!(
+        leftover.is_empty(),
+        "unfiltered VMMs still run: {leftover:?}"
+    );
+    Ok(())
 }
 
 /// A confined start whose filter is not the one `fcvm setup` recorded, or whose filter
@@ -323,14 +448,20 @@ async fn test_confine_refuses_a_filter_that_does_not_confine() -> Result<()> {
     let real = fcvm::confine::verified_filter_bytes(&store, SeccompMode::Enforce)
         .context("the default Firecracker's confined filter")?;
     let dir = tempfile::tempdir()?;
+    // Writable by its owner only, whatever the umask: a filter in a directory its group
+    // can write is refused.
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
     let firecracker = dir.path().join("firecracker-copy");
     std::fs::copy(&store, &firecracker)?;
     let filter = filter_path(&firecracker, SeccompMode::Enforce);
     let install = |bytes: &[u8], record: bool| -> Result<()> {
-        std::fs::write(&filter, bytes)?;
+        fcvm::confine::write_store_file(&filter, bytes)?;
         let digest = filter_digest_path(&filter);
         if record {
-            std::fs::write(&digest, filter_bytes_digest(bytes))?;
+            fcvm::confine::write_store_file(&digest, filter_bytes_digest(bytes).as_bytes())?;
         } else {
             let _ = std::fs::remove_file(&digest);
         }
@@ -399,17 +530,11 @@ async fn test_confine_refuses_a_filter_that_does_not_confine() -> Result<()> {
         let name = format!("{clone_name}-empty");
         let stderr = refused_clone(&snapshot, &name, &firecracker).await?;
         anyhow::ensure!(
-            stderr.contains("run without a seccomp filter")
-                && stderr.contains("Seccomp: 0, Seccomp_filters: 0"),
+            stderr.contains("run without a seccomp filter of their own")
+                && stderr.contains(&an_unfiltered_thread()?),
             "empty filter: {stderr}"
         );
-        let leftover: Vec<u32> = std::fs::read_dir("/proc")?
-            .flatten()
-            .filter_map(|e| e.file_name().to_string_lossy().parse::<u32>().ok())
-            .filter(|pid| {
-                std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == firecracker)
-            })
-            .collect();
+        let leftover = processes_running(&firecracker)?;
         anyhow::ensure!(
             leftover.is_empty(),
             "unfiltered VMMs still run: {leftover:?}"

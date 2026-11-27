@@ -54,7 +54,7 @@ pub struct Plan {
     /// Used when no kernel profile overrides it.
     #[serde(default)]
     pub firecracker: Option<FirecrackerConfig>,
-    /// Cloud Hypervisor build configuration (repo + branch to build from), #632.
+    /// Cloud Hypervisor build configuration (repo + commit to build from), #632.
     /// Optional VMM backend (`--hypervisor cloud-hypervisor`); built on demand via
     /// `fcvm setup --cloud-hypervisor`, content-addressed like firecracker.
     #[serde(default)]
@@ -104,19 +104,17 @@ pub struct FirecrackerConfig {
 
 /// Cloud Hypervisor build configuration (#632).
 ///
-/// When set, `fcvm setup --cloud-hypervisor` builds Cloud Hypervisor from the
-/// specified repo/branch (content-addressed, like firecracker) and
-/// `find_cloud_hypervisor()` uses it. CH is an optional backend, so it is built on
-/// demand rather than on every `fcvm setup`. Pinned to a fork branch carrying the
-/// aarch64 SVE register save/restore fix (upstream PR #8268), which landed after the
-/// v52.0 release and is not in any tagged release yet.
+/// When set, `fcvm setup --cloud-hypervisor` builds Cloud Hypervisor from this
+/// commit of this repository and `find_cloud_hypervisor()` runs that build and
+/// no other. It is an optional backend, so it is built on demand rather than on
+/// every `fcvm setup`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct CloudHypervisorConfig {
-    /// GitHub repo (e.g., "ejc3/cloud-hypervisor")
+    /// GitHub repo (e.g., "cloud-hypervisor/cloud-hypervisor")
     pub repo: String,
-    /// Branch to build from (default: "main")
-    #[serde(default = "default_branch")]
-    pub branch: String,
+    /// Exact full commit to build, fetched by its hash. Required, so the build
+    /// is always one known commit and launch resolves it without the network.
+    pub commit: String,
 }
 
 fn default_branch() -> String {
@@ -921,6 +919,18 @@ fn config_keeping_confinement(existing: Option<&str>) -> Result<String> {
                         "the existing config's [confine] is not a table, so whether it requires \
                          confinement cannot be told; fix it",
                     )?;
+                    // As when the config is loaded (ConfineConfig refuses unknown keys): a
+                    // misspelled `mode` is not "no mode".
+                    if let Some(unknown) = table
+                        .keys()
+                        .find(|key| !matches!(key.as_str(), "mode" | "allow_seccomp_log"))
+                    {
+                        anyhow::bail!(
+                            "the existing config's [confine] has the key {unknown:?}, which is \
+                             neither \"mode\" nor \"allow_seccomp_log\"; fix it rather than \
+                             have it replaced"
+                        );
+                    }
                     match table.get("mode") {
                         None => false,
                         Some(mode) => match mode.as_str() {
@@ -3007,6 +3017,8 @@ mod tests {
             "[confine]\nmode = \"on\"\n",
             "[confine]\nmode = 1\n",
             "confine = \"required\"\n",
+            // A misspelled key read as no mode, and the regenerated config said "off".
+            "[confine]\nmdoe = \"required\"\n",
         ] {
             assert!(
                 super::config_keeping_confinement(Some(bad)).is_err(),
@@ -3015,6 +3027,11 @@ mod tests {
         }
         assert_eq!(
             super::config_keeping_confinement(Some("[confine]\n")).unwrap(),
+            EMBEDDED_CONFIG
+        );
+        assert_eq!(
+            super::config_keeping_confinement(Some("[confine]\nallow_seccomp_log = true\n"))
+                .unwrap(),
             EMBEDDED_CONFIG
         );
     }
@@ -3566,12 +3583,51 @@ branch = "agent/nv2"
     /// without the kick can halt a vCPU with interrupts off for good (#2131).
     const RESTORE_KICK_COMMITS: [&str; 3] = [
         // [firecracker]: the default, btrfs and mountinfo profiles.
-        "2a33289b55b7f611959891dd5295438a416f386e",
+        "cf5d302d87823789dfdc4df30bfb98c10371cb6f",
         // gpu.amd64 and phone.amd64.
         "6ab54b9fe17f81cbfe6e127807c37870313ee3a5",
         // nested.amd64.
         "af888e7aec38fe4727fd75878aaed017a3113028",
     ];
+
+    /// The fork commits whose arm64 snapshot load writes the complement of the saved bits to
+    /// the vGIC's clear-registers (`VgicRegEngine::clears_on_write`, ejc3/firecracker), one
+    /// for each branch an arm64 profile builds. A load that writes the saved bits themselves
+    /// leaves every interrupt enabled that the new VM starts with and the guest had
+    /// disabled: all sixteen SGIs of each vCPU (#2172).
+    const RESTORE_CLEARS_GIC_STATE_COMMITS: [&str; 3] = [
+        // [firecracker]: the default and btrfs profiles.
+        "cf5d302d87823789dfdc4df30bfb98c10371cb6f",
+        // gpu.arm64.
+        "51247b891bceddcdd06169f61d5a64b33f5e0ba5",
+        // nested.arm64.
+        "8750b52190681dbc6fbf633243e1793b1841290d",
+    ];
+
+    /// A pin that moves to a commit without that fix brings #2172 back, and only a test that
+    /// reads KVM's own state as root would say so.
+    #[test]
+    fn every_arm64_firecracker_pin_restores_the_gic_enables_as_saved() {
+        let plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        let global = &plan.firecracker.as_ref().unwrap().commit;
+        let mut checked = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            let Some(profile) = arches.get("arm64") else {
+                continue;
+            };
+            // A profile that names no fork of its own runs the [firecracker] build.
+            let commit = profile.firecracker_commit.as_ref().unwrap_or(global);
+            checked += 1;
+            assert!(
+                RESTORE_CLEARS_GIC_STATE_COMMITS.contains(&commit.as_str()),
+                "{name}.arm64 pins Firecracker {commit}, which is not known to restore the \
+                 vGIC's enable bits as saved. Add it to RESTORE_CLEARS_GIC_STATE_COMMITS once \
+                 `git merge-base --is-ancestor <a listed commit of its branch> {commit}` \
+                 succeeds in the fork, or the fix has been cherry-picked onto it"
+            );
+        }
+        assert!(checked > 3, "only {checked} arm64 profiles were checked");
+    }
 
     /// A pin that moves to a commit without the restore kick brings #2131 back with no test
     /// of fcvm's failing: the window is a few guest instructions wide.

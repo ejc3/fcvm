@@ -231,5 +231,110 @@ class ServeTimeoutReap(unittest.TestCase):
             )
 
 
+class StateFromFcvm(unittest.TestCase):
+    """The harness asks its fcvm where state lives and reads it in the bucket layout.
+
+    RED BEFORE THE FIX: the killed-restore sweep removed `<data_root>/state/<vm_id>.json`,
+    fcvm state layout 1, so under layout 2 it removed nothing and left the residue.
+    """
+
+    VM = "vm-0123456789abcdef0123456789abcdef"
+
+    def test_the_residue_of_a_killed_clone_is_removed_from_fcvm_s_store(self):
+        import os
+        import tempfile
+
+        import reqbench
+        import state_fixture
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reqbench._FCVM_PATHS.clear()
+            self.addCleanup(reqbench._FCVM_PATHS.clear)
+            data_root = os.path.join(tmp, "data")
+            store = state_fixture.make_store(os.path.join(tmp, "elsewhere", "state"))
+            harness = make_harness(tmp, data_root=data_root)
+            harness.fcvm = state_fixture.write_fake_fcvm(
+                os.path.join(tmp, "fcvm"), store, data_root)
+            state = state_fixture.write_vm_state(store, self.VM, {"vm_id": self.VM, "pid": 1})
+            open(state + ".tmp", "w").close()
+            disk = os.path.join(data_root, "vm-disks", self.VM)
+            os.makedirs(disk)
+            self.assertEqual([str(p) for p in harness.state_files(self.VM)],
+                             [state, state + ".lock", state + ".tmp"])
+            harness.remove_residue(self.VM)
+            self.assertEqual(state_fixture.leftover(store), [])
+            self.assertFalse(os.path.exists(disk))
+
+    def test_the_kill_cell_sweeps_its_victims_state_from_the_buckets(self):
+        """The sweep at the end of the kill-mid-restore cell, driven through the cell
+        itself with the clone, the survivor and `ps` faked.
+
+        RED BEFORE THE FIX: with the store at `<data_root>/state`, where that script
+        looked, the cell left the victim's bucketed state, lock and temporary file.
+        """
+        import os
+        import tempfile
+
+        # The fixtures' directory, whether or not the script under test put it on the path.
+        chromium = str(Path(__file__).resolve().parent / "chromium")
+        if chromium not in sys.path:
+            sys.path.insert(0, chromium)
+        import reqbench
+        import state_fixture
+
+        with tempfile.TemporaryDirectory() as tmp:
+            reqbench._FCVM_PATHS.clear()
+            self.addCleanup(reqbench._FCVM_PATHS.clear)
+            data_root = os.path.join(tmp, "data")
+            store = state_fixture.make_store(os.path.join(data_root, "state"))
+            harness = make_harness(tmp, data_root=data_root)
+            harness.fcvm = state_fixture.write_fake_fcvm(
+                os.path.join(tmp, "fcvm"), store, data_root)
+            state = state_fixture.write_vm_state(store, self.VM, {"vm_id": self.VM, "pid": 1})
+            open(state + ".tmp", "w").close()
+            disk = os.path.join(data_root, "vm-disks", self.VM)
+            os.makedirs(disk)
+
+            log = Path(tmp) / "victim.log"
+            log.write_text("network namespace configured\n")
+            killed = []
+
+            class Victim:
+                def poll(self):
+                    return None
+
+                def kill(self):
+                    killed.append("kill")
+
+                def wait(self, timeout=None):
+                    killed.append("wait")
+
+            clone = {"name": "victim-0", "proc": Victim(), "log": log, "started": 0}
+            survivor = {"name": "survivor", "proc": None, "log": log, "started": 0}
+            cell = rm.Cell("uffd", "rootless", 1, False, "kill-mid-restore")
+            failures = []
+            with mock.patch.object(
+                harness, "vm_by_name", lambda name: {"vm_id": self.VM}
+            ), mock.patch.object(
+                harness, "restore_clone", lambda *a, **k: survivor
+            ), mock.patch.object(
+                harness, "wait_ready", lambda *a, **k: True
+            ), mock.patch.object(
+                harness, "validate_ready_clone", lambda *a, **k: None
+            ), mock.patch.object(
+                harness, "teardown", lambda *a, **k: None
+            ), mock.patch.object(
+                rm, "run", lambda *a, **k: types.SimpleNamespace(stdout="", returncode=0)
+            ):
+                harness.kill_mid_restore(cell, "tag", 0, 1, [clone], [], [], failures)
+
+            self.assertEqual(failures, [])
+            self.assertEqual(killed, ["kill", "wait"])
+            self.assertEqual(
+                state_fixture.leftover(store), [],
+                "the kill cell left its victim's state in the bucket")
+            self.assertFalse(os.path.exists(disk))
+
+
 if __name__ == "__main__":
     unittest.main()

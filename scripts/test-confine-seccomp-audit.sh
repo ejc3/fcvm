@@ -47,11 +47,18 @@ cat > "$work/stops-auditd.sh" <<EOF2
 #!/bin/bash
 sudo systemctl stop auditd
 EOF2
+# The script as this user without its supplementary groups (adm reads /var/log/audit on
+# Ubuntu), so that only sudo can read the audit log.
+cat > "$work/audit-without-groups.sh" <<EOF2
+#!/bin/bash
+exec sudo setpriv --reuid "$(id -u)" --regid "$(id -g)" --clear-groups "$here/confine-seccomp-audit.sh" "\$@"
+EOF2
 chmod +x "$work"/*.sh
 failures=0
+audit="$here/confine-seccomp-audit.sh"
 expect() { # NAME WANTED-STATUS WANTED-TEXT COMMAND...
   local name=$1 want=$2 text=$3; shift 3
-  local out; out=$("$here/confine-seccomp-audit.sh" "$@" 2>&1); local got=$?
+  local out; out=$("$audit" "$@" 2>&1); local got=$?
   if [ "$got" = "$want" ] && grep -q "$text" <<< "$out"; then
     echo "ok: $name"
   else
@@ -75,5 +82,16 @@ expect "a record whose executable path is hex-encoded is counted" 1 "firecracker
 # records, which read as clean.
 expect "an auditd that stopped during the lane blocks" 2 "auditd stopped during the lane" "$work/stops-auditd.sh"
 sudo systemctl start auditd
+# The line the script reads on from was counted through a redirect this shell opened. For a
+# user who cannot read the log the count was empty and never checked: the opening control was
+# met by an earlier run's record and the lane's records were every Firecracker record in the
+# file, so this lane, which logs nothing, failed on the cases above (and on a fresh log an
+# old control record let a lane pass with nothing proved).
+if sudo setpriv --reuid "$(id -u)" --regid "$(id -g)" --clear-groups test -r /var/log/audit/audit.log; then
+  echo "BLOCKED: this user reads the audit log without its groups; the unreadable-log case cannot run" >&2
+  exit 2
+fi
+audit="$work/audit-without-groups.sh"
+expect "a log only sudo can read is counted from the lane's start" 0 "clean, no unlisted syscall logged" true
 [ "$failures" -eq 0 ] || { echo "$failures failed" >&2; exit 1; }
 echo "all passed"

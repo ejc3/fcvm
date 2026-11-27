@@ -117,6 +117,14 @@ pub fn assets_dir() -> PathBuf {
         .clone()
 }
 
+/// The assets directory `config` names, as an absolute path, whatever paths this process
+/// started with. `fcvm fleet` starts with the default paths ([`init_with_defaults`]) and
+/// runs `fcvm` commands that read the config, so a lookup it shares with those commands
+/// takes the directory from the config.
+pub fn configured_assets_dir(config: &crate::setup::rootfs::Plan) -> PathBuf {
+    resolve_assets_dir(&config.paths.assets_dir)
+}
+
 /// Assets directory *only if* it has already been initialised.
 ///
 /// Unlike [`assets_dir`] this never loads the config (and so never panics when

@@ -20,6 +20,8 @@ pub struct Cli {
 pub enum Commands {
     /// List running VMs
     Ls(LsArgs),
+    /// Print the directories this binary keeps its state and data in
+    Paths(PathsArgs),
     /// Podman-compatible container operations
     Podman(Box<PodmanArgs>),
     /// Snapshot operations (create, serve, run, export)
@@ -2495,6 +2497,17 @@ pub struct LsArgs {
     /// Filter by fcvm process PID
     #[arg(long)]
     pub pid: Option<u32>,
+}
+
+// ============================================================================
+// Paths Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct PathsArgs {
+    /// Print one JSON object instead of one `name<TAB>path` line per directory
+    #[arg(long)]
+    pub json: bool,
 }
 
 // ============================================================================

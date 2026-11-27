@@ -121,6 +121,7 @@ impl ColdRun {
         let prefix = Self::name_prefix(run);
         fcvm::state::StateManager::new(fcvm::paths::state_dir())
             .state_files()
+            .expect("listing the state files")
             .into_iter()
             .filter_map(|p| {
                 let state: fcvm::state::VmState =
