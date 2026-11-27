@@ -104,7 +104,7 @@ anything only on a quiet box.
 | `disk` | `SNAPSHOT_DIR=` a snapshot directory (`.../snapshots/<tag>`) |
 | `fc-spawn` | `FIRECRACKER=` the Firecracker binary fcvm restores with |
 | `tap-attach` | nothing; `tap-floor.sh` runs its campaign |
-| `netpool` | `ARGS="--netpool-socket <data_dir>/netpool/<user>/pool.sock"` of a running `fcvm netpool serve`; `netpool.sh` runs its campaign |
+| `netpool` | `ARGS="--netpool-socket <socket>"`, the `socket` that `fcvm netpool stats` prints, of a running `fcvm netpool serve`; `netpool.sh` runs its campaign |
 | `vmm` | both; `UFFD_SOCKET=` a `snapshot serve` socket to load through UFFD |
 
 ## netpool: a namespace from the pool

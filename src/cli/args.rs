@@ -1300,6 +1300,14 @@ pub struct SetupArgs {
     /// built on demand rather than on every setup.
     #[arg(long)]
     pub cloud_hypervisor: bool,
+
+    /// Only make the tmpfs directory the data directory's owner keeps VM states in
+    /// (/run/fcvm-<uid>) and install the tmpfiles.d rule that makes it at every boot
+    /// (/etc/tmpfiles.d/fcvm-<uid>.conf; remove that file to undo). Needs root. A full
+    /// setup run as root does this too. Without it a user's VM states are kept in the
+    /// data directory, where starts are slower.
+    #[arg(long)]
+    pub runtime_dir: bool,
 }
 
 // ============================================================================
@@ -1775,9 +1783,10 @@ pub struct RunArgs {
 
     /// Disable swap for this VM: memory.swap.max=0 on the VM's own cgroup, which fcvm
     /// enters before it starts anything (see `FCVM_CGROUP_PARENT`). Guest memory is then
-    /// never swapped; under pressure the kernel evicts file cache instead. Needs root on a
-    /// cgroup2 host where the memory controller can be enabled for the VM's cgroup; fcvm
-    /// refuses to start without it. Not part of any snapshot key.
+    /// never swapped; under pressure the kernel evicts file cache instead. Needs root, or an
+    /// unprivileged start in a cgroup delegated to its user, on a cgroup2 host where the
+    /// memory controller can be enabled for the VM's cgroup; fcvm refuses to start without
+    /// it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
 
@@ -2032,9 +2041,9 @@ pub struct SnapshotServeArgs {
 
     /// Disable swap for the memory server: memory.swap.max=0 on its own cgroup, which
     /// fcvm enters before it maps the snapshot (see `FCVM_CGROUP_PARENT`). In minor mode
-    /// this keeps the shared memfd every clone maps out of swap. Needs root on a cgroup2
-    /// host where the memory controller can be enabled for the server's cgroup; fcvm
-    /// refuses to start without it.
+    /// this keeps the shared memfd every clone maps out of swap. Needs root, or an unprivileged
+    /// start in a cgroup delegated to its user, on a cgroup2 host where the memory
+    /// controller can be enabled for the server's cgroup; fcvm refuses to start without it.
     #[arg(long)]
     pub no_swap: bool,
 }
@@ -2077,9 +2086,10 @@ pub struct SnapshotRunArgs {
 
     /// Disable swap for this VM: memory.swap.max=0 on the VM's own cgroup, which fcvm
     /// enters before it starts anything (see `FCVM_CGROUP_PARENT`). Guest memory is then
-    /// never swapped; under pressure the kernel evicts file cache instead. Needs root on a
-    /// cgroup2 host where the memory controller can be enabled for the VM's cgroup; fcvm
-    /// refuses to start without it. Not part of any snapshot key.
+    /// never swapped; under pressure the kernel evicts file cache instead. Needs root, or an
+    /// unprivileged start in a cgroup delegated to its user, on a cgroup2 host where the
+    /// memory controller can be enabled for the VM's cgroup; fcvm refuses to start without
+    /// it. Not part of any snapshot key.
     #[arg(long)]
     pub no_swap: bool,
 
@@ -2493,6 +2503,12 @@ pub struct LsArgs {
     /// Output in JSON format
     #[arg(long)]
     pub json: bool,
+
+    /// Print the directory this data directory's VM states and namespace pool are in
+    /// since this boot, and nothing else. Fails when it has none: no VM was started in
+    /// this boot. For scripts and benchmarks, which must not build that path themselves
+    #[arg(long, conflicts_with_all = ["json", "pid"])]
+    pub runtime_dir: bool,
 
     /// Filter by fcvm process PID
     #[arg(long)]
