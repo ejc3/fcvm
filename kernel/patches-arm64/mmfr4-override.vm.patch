@@ -1,18 +1,31 @@
-From 33634d2b8c69d4b358862eea56b0a4b4764035e6 Mon Sep 17 00:00:00 2001
+From 52631dd658fe330aa76acf391666bc6f300a32e9 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Sat, 7 Nov 2026 14:52:16 +0000
-Subject: [PATCH] arm64: let arm64.nv2 raise ID_AA64MMFR4_EL1.NV_frac
+Date: Fri, 27 Nov 2026 22:34:54 +0000
+Subject: [PATCH] arm64: make arm64.nv2 set ID_AA64MMFR4_EL1.NV_frac to
+ NV2_ONLY
 
-The arm64.nv2 boot parameter overrides ID_AA64MMFR4_EL1.NV_frac to 2
-(NV2_ONLY), so an L1 guest kernel sees the NV2 support its host KVM
-emulates. At virtual EL2 the guest's ID register reads bypass TID3 trapping
-and see the hardware value, so without the override L1 KVM reports
-KVM_CAP_ARM_EL2=0 and cannot run L2.
+The arm64.nv2 boot parameter overrides ID_AA64MMFR4_EL1.NV_frac so that an L1
+guest kernel sees the NV2 support its host KVM emulates. At virtual EL2 the
+guest's ID register reads bypass TID3 trapping and see the hardware value, so
+without the override L1 KVM reports KVM_CAP_ARM_EL2=0 and cannot run L2.
+
+The value is 1, NV2_ONLY. The field's encoding (arch/arm64/tools/sysreg) is
+0 NV_NV2, 1 NV2_ONLY, 2 NV2P1, 3 NV3. This alias used to set 2, which told
+every guest that booted with it that the CPU has FEAT_NV2p1
+(ARM64_HAS_NV2P1), on hardware and under a host KVM that have not. A KVM
+that believes in FEAT_NV2p1 programs its guest's timer and counter traps
+through CNTKCTL_EL1 instead of CNTHCTL_EL2 (timer_set_traps), where without
+FEAT_NV2p1 the trap bits are RES0 and the write does not trap to the host,
+and it stops trapping its guest hypervisor's CPACR_EL1. The host never saw
+L1 ask to trap L2's physical counter, so it answered L2's CNTPCT_EL0 with
+L1's offset only, while CNTVOFF_EL2, a VNCR register, did carry L2's
+offset: L2's kernel read L1's counter and L2's user space the zero-based
+one, 73 s apart, and every vDSO clock in L2 was wrong by up to 2^41 ns and
+jumped in multiples of 2^33 ns (fcvm #2246).
 
 Linux 7.3 already carries the id_aa64mmfr4 override register, so this adds
 only the arm64.nv2 alias and makes E2H0 and NV_frac FTR_HIGHER_SAFE, which
 lets an override raise them.
-
 ---
  arch/arm64/kernel/cpufeature.c        | 6 ++++--
  arch/arm64/kernel/pi/idreg-override.c | 1 +
@@ -37,14 +50,14 @@ index 3ae3ad1..7d478a8 100644
  };
  
 diff --git a/arch/arm64/kernel/pi/idreg-override.c b/arch/arm64/kernel/pi/idreg-override.c
-index acaf562..0e852fa 100644
+index acaf562..cf8ecdf 100644
 --- a/arch/arm64/kernel/pi/idreg-override.c
 +++ b/arch/arm64/kernel/pi/idreg-override.c
 @@ -263,6 +263,7 @@ static const struct {
  	{ "arm64.nolva",		"id_aa64mmfr2.varange=0" },
  	{ "arm64.no32bit_el0",		"id_aa64pfr0.el0=1" },
  	{ "arm64.nompam",		"id_aa64pfr0.mpam=0 id_aa64pfr1.mpam_frac=0" },
-+	{ "arm64.nv2",			"id_aa64mmfr4.nv_frac=2" },
++	{ "arm64.nv2",			"id_aa64mmfr4.nv_frac=1" },
  };
  
  static int __init parse_hexdigit(const char *p, u64 *v)

@@ -1741,9 +1741,23 @@ make test-root FILTER=kvm
 
 **Solution**: Use kernel's ID register override mechanism with `arm64.nv2` boot parameter.
 
-1. Added `arm64.nv2` alias for `id_aa64mmfr4.nv_frac=2` (NV2_ONLY)
+1. Added `arm64.nv2` alias for `id_aa64mmfr4.nv_frac=1` (NV2_ONLY)
 2. Changed `FTR_LOWER_SAFE` to `FTR_HIGHER_SAFE` for MMFR4 to allow upward overrides
-3. Kernel patch: `kernel/patches/mmfr4-override.patch`
+3. Kernel patch: `kernel/patches-arm64/mmfr4-override.vm.patch` (guest kernels only)
+
+**The value is 1, and 2 is a different feature.** ID_AA64MMFR4_EL1.NV_frac is 0 NV_NV2,
+1 NV2_ONLY, 2 NV2P1, 3 NV3 (`arch/arm64/tools/sysreg`, Linux 7.3.3). The alias set 2 until
+2026-11-27, which told every nested guest it had FEAT_NV2p1. An L1's KVM that believes
+that writes its guests' counter and timer traps to CNTKCTL_EL1, where without FEAT_NV2p1
+the trap bits are RES0 and the host never sees them (`timer_set_traps`), and stops
+trapping its guest hypervisor's CPACR_EL1. L2's kernel then read L1's counter while L2's
+user space read the zero-based one, 73 s apart, so every vDSO clock in L2 was wrong by up
+to 2^41 ns and jumped in multiples of 2^33 ns (#2246: tokio timers firing at once,
+"Firecracker socket not ready after 5 seconds"). An override may tell a guest about a
+feature the hypervisor below emulates, never about one it does not.
+`the_nv2_boot_parameter_claims_nv2_only` pins the value, and
+`test_nested_l2_user_space_reads_the_kernels_counter` reads the counters and each level's
+FEAT_NV2p1 detection.
 
 **Why it's safe**: The host KVM *does* provide NV2 emulation - we're just fixing the guest's
 view of this capability. We're not faking a feature, we're correcting a visibility issue.
@@ -1751,7 +1765,7 @@ view of this capability. We're not faking a feature, we're correcting a visibili
 **Verification**:
 ```
 $ dmesg | grep mmfr4
-CPU features: SYS_ID_AA64MMFR4_EL1[23:20]: forced to 2
+CPU features: SYS_ID_AA64MMFR4_EL1[23:20]: forced to 1
 
 $ check_kvm_caps
 KVM_CAP_ARM_EL2 (cap 240) = 1
