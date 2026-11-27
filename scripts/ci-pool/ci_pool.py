@@ -1906,10 +1906,37 @@ def base_states(gh, bottom, default_branch):
         return {}
 
 
+def ended_otherwise(jobs):
+    """The lanes with a finished attempt among these jobs that neither passed nor was
+    skipped: failed, timed out, cancelled, or any other conclusion. `lane_states` calls a
+    pass after one of those RERUN_PASS, so every RERUN_PASS has a run this finds."""
+    return {job['name'] for job in jobs
+            if job['name'] in LANES and job.get('conclusion') not in (None, 'success', 'skipped')}
+
+
 def run_that_failed(runs, lanes):
-    """The newest of these runs in which one of the lanes failed, in any attempt, or None.
-    The failure and the pass of a lane that did both can be in different runs."""
-    return next((run for run in sorted(runs, key=lambda run: -run['id']) if failed_once(run['jobs']) & set(lanes)), None)
+    """The run to cite for lanes that passed on a rerun: the newest of these runs in which
+    one of the lanes failed or timed out, in any attempt; when none did, the newest in
+    which one ended without passing (a cancelled attempt before the pass); or None. The
+    failure and the pass of a lane that did both can be in different runs."""
+    newest = sorted(runs, key=lambda run: -run['id'])
+    for attempts in (failed_once, ended_otherwise):
+        found = next((run for run in newest if attempts(run['jobs']) & set(lanes)), None)
+        if found is not None:
+            return found
+    return None
+
+
+def cancelled_not_failed(runs, lanes):
+    """The lanes among these that never failed or timed out in any of the runs: a pass on
+    a rerun of one of them followed a cancelled attempt, not a failure."""
+    failed = set().union(*(failed_once(run['jobs']) for run in runs)) if runs else set()
+    return [lane for lane in lanes if lane not in failed]
+
+
+def rerun_words(runs, lanes):
+    """'failed' or 'was cancelled', for what these lanes did before they passed."""
+    return 'was cancelled' if lanes and len(cancelled_not_failed(runs, lanes)) == len(lanes) else 'failed'
 
 
 def own_files(gh, members, default_branch, indexes):
@@ -1977,10 +2004,14 @@ def cmd_bisect(args, gh, default_branch):
         note('GREEN: every lane the top takes passed on its first attempt.')
         return 0
     if outcome == PASSED_ON_RERUN:
-        note(f"PASSED ON RERUN: {', '.join(step['lanes'])} failed and then passed on the same commit.")
-        for cause in step['causes'] or [f"{', '.join(step['lanes'])} failed once with no cause read"]:
+        if failing_run is None:
+            raise Blocked(f"{', '.join(step['lanes'])} passed on a rerun, and no run on {top['sha'][:9]} shows "
+                          'the attempt before the pass')
+        did = rerun_words(runs_by_sha[top['sha']], step['lanes'])
+        note(f"PASSED ON RERUN: {', '.join(step['lanes'])} {did} and then passed on the same commit.")
+        for cause in step['causes'] or [f"{', '.join(step['lanes'])} {did} once with no cause read"]:
             facts = {'run': failing_run['html_url'],
-                     'text': f"Failed and then passed on the same commit `{top['sha'][:12]}` (top of a pool of "
+                     'text': f"{did.capitalize()} and then passed on the same commit `{top['sha'][:12]}` (top of a pool of "
                              f"{len(members)}, #{top['number']}): {', '.join(step['lanes'])}. Run: {failing_run['html_url']}"}
             if args.go:
                 note(f'  {cause}: issue #{issue_for(gh, cause, facts)}')
@@ -2034,6 +2065,8 @@ def cmd_bisect(args, gh, default_branch):
     note(f"  lanes: {', '.join(step['lanes'])}")
     if args.go:
         short = f"first failing prefix: fails when #{culprit['number']} is added ({', '.join(step['lanes'])})"
+        if failing_run is None:
+            raise Blocked(f"no run on {top['sha'][:9]} shows {', '.join(step['lanes'])} failing: no status posted")
         gh.call(f"repos/{gh.repo}/statuses/{culprit['sha']}", method='POST',
                 fields=status_fields('failure', short, failing_run['html_url']))
         note(f"  {STATUS_CONTEXT} failure posted on #{culprit['number']} at {culprit['sha'][:9]}.")
@@ -2179,7 +2212,7 @@ def landing_blockers(members, facts, contains_main, contained, jobs_failed, desp
     return reasons
 
 
-def landing_message(members, top, required, proven_by, rerun_issues, despite):
+def landing_message(members, top, required, proven_by, rerun_issues, despite, cancelled=()):
     """The merge commit's message: what lands and the runs that show its lanes."""
     lines = [f"Land a pool of {len(members)}: " + ', '.join(f"#{m['number']}" for m in members), '',
              f"Tested head: {top['sha']} (#{top['number']} {top['head']})."]
@@ -2189,7 +2222,8 @@ def landing_message(members, top, required, proven_by, rerun_issues, despite):
     else:
         lines.append("No lane: the head's run found by its scope that the change needs none.")
     for lane, issue in sorted(rerun_issues.items()):
-        lines.append(f'- {lane} failed and then passed on this commit: #{issue}')
+        did = 'was cancelled' if lane in cancelled else 'failed'
+        lines.append(f'- {lane} {did} and then passed on this commit: #{issue}')
     for name, issue in sorted(despite.items()):
         lines.append(f'Landed with {name} failing: {issue}')
     lines += ['', 'Members:'] + [f"- #{m['number']} {m['head']} at {m['sha'][:12]}" for m in members]
@@ -2273,17 +2307,20 @@ def cmd_land(args, gh, default_branch):
         if facts['outcome'] == PASSED_ON_RERUN:
             note(f"  {', '.join(facts['lanes'])} passed only on a rerun: an issue is filed or appended for each cause")
         return 0
-    rerun_issues = {}
+    rerun_issues, cancelled = {}, []
     if facts['outcome'] == PASSED_ON_RERUN:
         failing = run_that_failed(runs_by_sha[top['sha']], facts['lanes'])
         if failing is None:
             raise Blocked(f"{', '.join(facts['lanes'])} passed on a rerun, and no run on {top['sha'][:9]} shows the failure: "
                           'nothing landed')
-        text = (f"Failed and then passed on the same commit `{top['sha'][:12]}`, which then landed: "
+        did = rerun_words(runs_by_sha[top['sha']], facts['lanes'])
+        text = (f"{did.capitalize()} and then passed on the same commit `{top['sha'][:12]}`, which then landed: "
                 f"{', '.join(facts['lanes'])}. Run: {failing['html_url']}")
         for lane in facts['lanes']:
-            for cause in causes_at[top['sha']].get(lane) or [f'{lane} failed once with no cause read']:
+            lane_did = rerun_words(runs_by_sha[top['sha']], [lane])
+            for cause in causes_at[top['sha']].get(lane) or [f'{lane} {lane_did} once with no cause read']:
                 rerun_issues[lane] = issue_for(gh, cause, {'run': failing['html_url'], 'text': text})
+        cancelled = cancelled_not_failed(runs_by_sha[top['sha']], facts['lanes'])
     # Bases first, top last: an edit of a base starts no run, and once the top is merged
     # into the default branch every member based on it shows as merged. If a write is
     # refused, the bases already moved are put back, so that a refused landing leaves the
@@ -2297,7 +2334,7 @@ def cmd_land(args, gh, default_branch):
         merged = gh.one(f"repos/{gh.repo}/pulls/{top['number']}/merge", '{sha, merged}', method='PUT',
                         fields={'merge_method': 'merge', 'sha': top['sha'],
                                 'commit_title': f"Land a pool of {len(members)} through #{top['number']}",
-                                'commit_message': landing_message(members, top, required, proven_by, rerun_issues, despite)})
+                                'commit_message': landing_message(members, top, required, proven_by, rerun_issues, despite, cancelled)})
     except Blocked as why:
         left = []
         for member in reversed(moved):
