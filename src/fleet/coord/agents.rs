@@ -335,6 +335,52 @@ fn arm_pdeathsig(command: &mut std::process::Command) {
 mod tests {
     use super::*;
 
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// `owns` over IPv4, IPv6, IPv4-mapped sources and prefix lengths 0, 64, 80 and 128
+    /// (#1968): a host's source is its address or a prefix it was given, and nothing else.
+    #[test]
+    fn owns_matches_an_address_or_its_prefix_and_nothing_else() {
+        // exact addresses
+        assert!(owns("203.0.113.5", ip("203.0.113.5")));
+        assert!(!owns("203.0.113.5", ip("203.0.113.6")));
+        assert!(owns("2001:db8:7:7::1", ip("2001:db8:7:7::1")));
+        assert!(!owns("2001:db8:7:7::1", ip("2001:db8:7:7::2")));
+        // an IPv4-mapped IPv6 source is the IPv4 address, in either direction
+        assert!(owns("203.0.113.5", ip("::ffff:203.0.113.5")));
+        assert!(owns("::ffff:203.0.113.5", ip("203.0.113.5")));
+        assert!(!owns("203.0.113.5", ip("::ffff:203.0.113.6")));
+        // an IPv4 prefix
+        assert!(owns("203.0.113.0/24", ip("203.0.113.200")));
+        assert!(owns("203.0.113.0/24", ip("::ffff:203.0.113.200")));
+        assert!(!owns("203.0.113.0/24", ip("203.0.114.1")));
+        assert!(owns("203.0.113.5/32", ip("203.0.113.5")));
+        assert!(!owns("203.0.113.5/32", ip("203.0.113.4")));
+        // IPv6 prefixes: 0 matches every IPv6 source, 64 and 80 the bits they name, 128 one
+        assert!(owns("2001:db8:7:7::/0", ip("fd00::1")));
+        assert!(!owns("2001:db8:7:7::/0", ip("203.0.113.5")));
+        assert!(owns(
+            "2001:db8:7:7::/64",
+            ip("2001:db8:7:7:ffff:ffff:ffff:ffff")
+        ));
+        assert!(!owns("2001:db8:7:7::/64", ip("2001:db8:7:8::1")));
+        assert!(owns("2001:db8:7:7::/80", ip("2001:db8:7:7:0:ffff:1:2")));
+        assert!(!owns("2001:db8:7:7::/80", ip("2001:db8:7:7:1::1")));
+        assert!(owns("2001:db8:7:7::1/128", ip("2001:db8:7:7::1")));
+        assert!(!owns("2001:db8:7:7::1/128", ip("2001:db8:7:7::2")));
+        // a prefix of one family never matches a source of the other
+        assert!(!owns("2001:db8:7:7::/64", ip("203.0.113.5")));
+        assert!(!owns("203.0.113.0/24", ip("2001:db8:7:7::1")));
+        // refused input: a length past the family's width, no length, no address
+        assert!(!owns("2001:db8:7:7::/129", ip("2001:db8:7:7::1")));
+        assert!(!owns("203.0.113.0/33", ip("203.0.113.1")));
+        assert!(!owns("203.0.113.0/x", ip("203.0.113.1")));
+        assert!(!owns("not-an-address/24", ip("203.0.113.1")));
+        assert!(!owns("", ip("203.0.113.1")));
+    }
+
     fn hello(v: serde_json::Value) -> AgentMsg {
         let mut base = serde_json::json!({"type": "hello", "host": "i-0123456789abcdef0",
             "arch": "aarch64", "capacity": 0, "gpus": []});

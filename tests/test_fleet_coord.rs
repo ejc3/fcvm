@@ -1524,6 +1524,97 @@ async fn an_agent_on_a_host_that_is_not_this_fleets_is_refused() {
     );
 }
 
+/// Each source a host may register from is checked on a coordinator that knows only that
+/// source: the IPv4 address, and the IPv6 prefix. With both on one coordinator, a refused
+/// source the other one covers would still show the host registered (#1968).
+#[tokio::test]
+async fn an_agent_registers_from_each_of_its_hosts_sources_on_its_own() {
+    use fcvm::fleet::coord::hosts::{FakeHosts, Host, Market};
+    for (source, via_header, refused) in [
+        ("127.0.0.1", None, "2001:db8:7:7::42"),
+        (
+            "2001:db8:7:7::/80",
+            Some("2001:db8:7:7::42"),
+            "2001:db8:7:8::1",
+        ),
+    ] {
+        let fake = Arc::new(FakeHosts::default());
+        fake.hosts.lock().unwrap().insert(
+            "us-east-1".into(),
+            vec![Host {
+                id: "i-0aaaaaaaaaaaaaaa1".into(),
+                state: "running".into(),
+                market: Market::Spot,
+                sources: vec![source.into()],
+                zone: None,
+            }],
+        );
+        let identity = agents::FleetHosts {
+            groups: vec![agents::FleetGroup {
+                class: fcvm::fleet::coord::hosts::HostClass::Gpu,
+                driver: fake.clone(),
+                regions: vec!["us-east-1".into()],
+            }],
+            fleet: "prod".into(),
+        };
+        let c = coordinator_with(Opts {
+            agent_identity: Some(Arc::new(identity)),
+            ..Opts::default()
+        })
+        .await;
+        let url = c.url.replace("/live", "/agent");
+        let dial = |from: Option<&str>| {
+            let url = url.clone();
+            let from = from.map(str::to_string);
+            async move {
+                let mut req = url.as_str().into_client_request().unwrap();
+                if let Some(ip) = from {
+                    req.headers_mut()
+                        .insert("cf-connecting-ip", ip.parse().unwrap());
+                }
+                let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+                ws.send(Message::Text(
+                    serde_json::to_string(&bare_hello("i-0aaaaaaaaaaaaaaa1"))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                ws
+            }
+        };
+        // A source of another family or prefix is refused: its socket closes.
+        let mut ws = dial(Some(refused)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{refused} is refused on a coordinator that knows {source}"));
+        let _ok = dial(via_header).await;
+        let mut v = Viewer::connect(&c.url).await;
+        let s = tokio::time::timeout(
+            Duration::from_secs(10),
+            v.until(|s| {
+                s["fleet"]["agents"]["hosts"]
+                    .as_array()
+                    .is_some_and(|h| h.len() == 1)
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the host registers from {source} alone"));
+        assert_eq!(
+            s["fleet"]["agents"]["hosts"][0]["name"], "i-0aaaaaaaaaaaaaaa1",
+            "{}",
+            s["fleet"]["agents"]
+        );
+    }
+}
+
 #[tokio::test]
 async fn pings_get_the_server_clock_and_garbage_gets_an_error() {
     let (url, _h) = coordinator(allow_all()).await;
