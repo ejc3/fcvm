@@ -1,3 +1,4 @@
+pub mod cleaner;
 pub mod compact;
 pub mod disk;
 pub mod disk_dir;
