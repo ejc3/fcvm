@@ -1960,13 +1960,31 @@ mod tests {
             "network::off_the_runtime_within(",
             "tokio::task::spawn_blocking(",
         ];
+        // The byte ranges of the arguments of each helper call: a blocking call counts
+        // only when it lies inside one, that is, inside the closure handed to it.
+        let mut covered = Vec::new();
+        for helper in helpers {
+            for (at, _) in body.match_indices(helper) {
+                let open = at + helper.len() - 1;
+                let mut depth = 0usize;
+                let end = body[open..]
+                    .char_indices()
+                    .find_map(|(i, c)| {
+                        match c {
+                            '(' => depth += 1,
+                            ')' => depth -= 1,
+                            _ => {}
+                        }
+                        (depth == 0).then_some(open + i)
+                    })
+                    .expect("unbalanced helper call");
+                covered.push(open..end);
+            }
+        }
         for call in blocking {
             for (at, _) in body.match_indices(call) {
-                let before = &body[..at];
-                let helper = helpers.iter().filter_map(|h| before.rfind(h)).max();
-                let statement = before.rfind(";\n").map_or(0, |i| i + 2);
                 assert!(
-                    helper.is_some_and(|h| h >= statement.saturating_sub(2000)),
+                    covered.iter().any(|range| range.contains(&at)),
                     "handle_clone_restore calls {call} where it can hold a runtime worker \
                      (#2156): {}",
                     &body[at.saturating_sub(80)..(at + 80).min(body.len())]
