@@ -15,7 +15,7 @@ const tiles = (page: Page) => page.getByTestId("potato-tile");
 
 /** Start the game over at a size, its first round half a second from now. */
 async function startAt(size: number): Promise<void> {
-  await admin("/mock/potato", { size, next_in_ms: 500 });
+  await admin("/mock/potato", { cpus: 0, players: 8, size, next_in_ms: 500 });
   await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(size);
 }
 
@@ -145,18 +145,14 @@ test("the ball moves from tile to tile, and players sleep and wake", async ({ pa
 test("Faster caps the hold a fifth lower, then waits 2 s", async ({ page }) => {
   await startAt(8);
   await openPotato(page);
-  await expect(page.getByTestId("potato-hold")).toHaveText(/^\d+ ms$/);
   const faster = page.getByTestId("potato-faster");
   await expect(faster).toBeEnabled();
-  await expect(page.getByTestId("potato-faster-note")).toHaveText(/^cuts the hold to \d+ ms$/);
+  await expect(page.getByTestId("potato-faster-note")).toHaveCount(0);
   const before = (await mockPotato()).round!.hold_ms;
   await faster.click();
   await expect.poll(async () => (await mockPotato()).round?.pace_ms ?? null).not.toBeNull();
   const pace = (await mockPotato()).round!.pace_ms!;
   expect(pace).toBeLessThanOrEqual(before - Math.floor(before / 5));
-  await expect(page.getByTestId("potato-pace-cap")).toHaveText(`Faster: holds capped at ${pace} ms`);
-  const shown = Number((await page.getByTestId("potato-hold").textContent())!.replace(" ms", ""));
-  expect(shown).toBeLessThanOrEqual(pace);
   await expect(faster).toBeDisabled();
   await expect(page.getByTestId("potato-faster-note")).toHaveText(/^again in [12] s$/);
   await expect(faster).toBeEnabled({ timeout: 5000 });
@@ -170,7 +166,7 @@ test("Restart waits 10 s into a round, then starts the same size again without a
   await expect(page.getByTestId("potato-restart-note")).toHaveText(/^possible 10 s into a round, in \d+ s$/);
   const id = (await mockPotato()).round!.id;
   await expect(restart).toBeEnabled({ timeout: 15_000 });
-  await expect(page.getByTestId("potato-restart-note")).toHaveText("starts the ring of 8 again");
+  await expect(page.getByTestId("potato-restart-note")).toHaveText("ring of 8 again");
   await restart.click();
   await expect.poll(async () => (await mockPotato()).round?.id ?? null, { timeout: 10_000 }).toBe(id + 1);
   const p = await mockPotato();
@@ -189,11 +185,8 @@ test("a drop: the card names the player and the late stage, the ladder fills in,
   await expect(page.getByTestId("potato-drop-headline")).toHaveText(/^Player [01] was still (asleep|going to sleep|waking)(,| when)/);
   await expect(page.getByTestId("potato-drop-next")).toHaveText(/^Next: a ring of 4 in \d s$/);
   await expect(page.getByTestId("potato-ball")).toHaveAttribute("data-dropped", "true");
-  const row2 = page.getByTestId("potato-rung-2");
-  await expect(row2.getByTestId("potato-rung-record")).toHaveText(/^(\d+ ms|no lap completed)$/);
-  await expect(row2.getByTestId("potato-rung-broke")).toHaveText(/^player [01] still (asleep|going to sleep|waking) \(\d+ ms\), lap \d+ at \d+ ms$/);
+  await expect(page.getByTestId("potato-rung-2")).toContainText("2 machines");
   await expect(page.getByTestId("potato-rung-4")).toHaveAttribute("aria-current", "true");
-  await expect(page.getByTestId("potato-record-longest-round")).toContainText(/\d+ catch(es)? a ring of 2/);
   // The ring of 4 starts after the 3 s pause, and the card goes.
   await expect(tiles(page)).toHaveCount(4, { timeout: 10_000 });
   await expect(card).toHaveCount(0);
@@ -229,7 +222,7 @@ for (const scheme of ["light", "dark"] as const) {
     await page.emulateMedia({ colorScheme: scheme });
     await openPotato(page);
     await expect(tiles(page)).toHaveCount(8);
-    await expect(page.getByTestId("potato-pace")).toBeVisible();
+    await expect(page.getByTestId("potato-density")).toBeVisible();
     // with a player asleep, so its dimmed tile's number is checked too
     await expect(page.locator('[data-testid="potato-tile"][data-phase="asleep"]').first()).toBeAttached({ timeout: 10_000 });
     const bg = await page.getByTestId("potato").evaluate((e) => getComputedStyle(e).backgroundColor);
@@ -258,28 +251,19 @@ test("potato: the line under the title and the What is this? control", async ({ 
   await expectLanding(page, { stage: "potato-stage", phone: true });
 });
 
-test("potato: the legend is on the page with room, in the panel without, and never over the ring or the cards", async ({ page }) => {
+test("potato: the legend is in the panel at any width, and the page has no separate strip", async ({ page }) => {
   await startAt(8);
   await page.setViewportSize({ width: 1280, height: 800 });
   await openPotato(page);
-  const legend = page.getByTestId("potato-legend");
-  await expect(legend).toBeVisible();
-  await expect(legend.getByRole("heading", { name: "Legend" })).toBeVisible();
-  const apart = (a: { x: number; y: number; width: number; height: number }, b: typeof a) => a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1;
-  const lg = (await legend.boundingBox())!;
-  expect(apart(lg, (await page.getByTestId("potato-stage").boundingBox())!), "legend clear of the ring's stage").toBe(true);
-  for (const c of await page.locator(".potato-side > .card").all()) {
-    if ((await c.getAttribute("data-testid")) === "potato-legend") continue;
-    expect(apart(lg, (await c.boundingBox())!), "legend clear of the other cards").toBe(true);
-  }
-  await expect(page.getByTestId("landing-panel")).toHaveCount(0);
-  await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByTestId("potato-legend")).toHaveCount(0);
-  await page.getByTestId("landing-button").click();
-  const inPanel = page.getByTestId("landing-panel").getByTestId("potato-legend");
-  await expect(inPanel).toBeVisible();
-  await expect(inPanel).toContainText("saved as a snapshot; uses no CPU");
-  await expect(inPanel).toContainText("slowest player");
+  for (const size of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(size);
+    await page.getByTestId("landing-button").click();
+    const inPanel = page.getByTestId("landing-panel").getByTestId("potato-legend");
+    await expect(inPanel.getByRole("heading", { name: "Legend" })).toBeVisible();
+    await expect(inPanel).toContainText("saved as a snapshot; uses no CPU");
+    await page.keyboard.press("Escape");
+  }
 });
 
 test("potato: hovering a tile shows its readout beside it, and it leaves with the pointer", async ({ page }) => {
@@ -316,6 +300,181 @@ test("potato: hovering a tile shows its readout beside it, and it leaves with th
   await expect(readout).toHaveCount(0);
 });
 
+// ---- the density page: a mock host with an allotment of 3 CPUs for its 8 players ----
+
+const CPUS = 3;
+async function startDense(size: number, over: Record<string, number> = {}): Promise<void> {
+  await admin("/mock/potato", { cpus: CPUS, players: 8, size, next_in_ms: 500, ...over });
+  await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(size);
+}
+type Rect = { x: number; y: number; width: number; height: number };
+/** The arc's label exists only while a throw is in flight, so its presence and its box are read in one task of the page: a count() followed by boundingBox() can find it gone between the two. */
+const arcLabelBox = (page: Page) =>
+  page.evaluate(() => {
+    const el = document.querySelector('[data-testid="potato-arc-label"]');
+    return el ? (el.getBoundingClientRect().toJSON() as Rect) : null;
+  });
+const apart = (a: Rect, b: Rect) => a.x + a.width <= b.x + 1 || b.x + b.width <= a.x + 1 || a.y + a.height <= b.y + 1 || b.y + b.height <= a.y + 1;
+
+test("density: the CPU slots hold the machines that are not asleep, grouped and labelled, never more than the allotment", async ({ page }) => {
+  await startDense(8);
+  await openPotato(page);
+  const heading = page.getByTestId("potato-cpus-heading");
+  await expect(heading).toContainText(/^\d of 3 CPUs in use/);
+  const slots = page.getByTestId("potato-slot");
+  for (let i = 0; i < 25; i++) {
+    expect(await slots.count(), "chips and free slots add up to the allotment").toBe(CPUS);
+    const groups = await page.locator(".slot-group").evaluateAll((els) => els.map((e) => e.getAttribute("data-group")));
+    const order = ["ball", "ready", "waking", "saving", "free"];
+    expect(groups.map((g) => order.indexOf(g!))).toEqual([...groups].map((g) => order.indexOf(g!)).sort((a, b) => a - b));
+    await page.waitForTimeout(120);
+  }
+  await expect(page.locator(".slot-label").first()).toBeVisible();
+});
+
+test("density: the slots stand in the ring's centre on a large screen, clear of the tiles and the arc", async ({ page }) => {
+  await startDense(8);
+  await page.setViewportSize({ width: 1600, height: 1100 });
+  await openPotato(page);
+  await expect(page.locator(".potato-centre")).toBeVisible();
+  const stage = (await page.getByTestId("potato-stage").boundingBox())!;
+  for (let i = 0; i < 12; i++) {
+    const boxes = await tiles(page).evaluateAll((els) => els.map((e) => e.getBoundingClientRect().toJSON() as Rect));
+    const centre = (await page.locator(".potato-centre").boundingBox())!;
+    for (const t of boxes) expect(apart(centre, t), "the slots clear every tile").toBe(true);
+    expect(centre.x).toBeGreaterThanOrEqual(stage.x);
+    expect(centre.x + centre.width).toBeLessThanOrEqual(stage.x + stage.width);
+    const l = await arcLabelBox(page);
+    if (l) {
+      expect(apart(l, centre), "the arc's label clears the slots").toBe(true);
+      for (const t of boxes) expect(apart(l, t), "the arc's label clears the tiles").toBe(true);
+    }
+    await page.waitForTimeout(150);
+  }
+});
+
+for (const [vw, vh] of [[1440, 900], [1280, 800]] as const) {
+  for (const size of [32, 16]) {
+    // The interior of a ring of 16 on 1280 by 800 is 428 px across and the arc's label takes about 70 of it each side.
+    const labelled = !(vw === 1280 && size === 16);
+    test(`density: on a ${vw} by ${vh} laptop the slots in the ring of ${size} are ${labelled ? "labelled" : "small chips or under the ring"}, clear of the tiles and the arc`, async ({ page }) => {
+      await startDense(size, { cpus: 8, players: 32 });
+      await page.setViewportSize({ width: vw, height: vh });
+      await openPotato(page);
+      const cpus = page.getByTestId("potato-cpus");
+      await expect(cpus).toBeVisible();
+      await expect(page.getByTestId("potato-cpus-heading")).toContainText(/^\d of 8 CPUs in use/);
+      expect(await page.getByTestId("potato-slot").count()).toBe(8);
+      if (labelled) {
+        await expect(cpus).toHaveAttribute("data-form", "full");
+        await expect(page.locator(".potato-centre")).toBeVisible();
+        await expect(page.locator(".potato-cpus .slot-label").first()).toBeVisible();
+        await expect(page.locator(".potato-cpus .cpus-asleep")).toHaveText(new RegExp(`^\\d+ of ${size} asleep$`));
+        const chip = (await page.locator(".potato-cpus .potato-swatch").first().boundingBox())!;
+        expect(chip.width).toBeGreaterThanOrEqual(24);
+      } else {
+        await expect(cpus).toHaveAttribute("data-form", /^(compact|full)$/);
+      }
+      for (let i = 0; i < 10; i++) {
+        const boxes = await tiles(page).evaluateAll((els) => els.map((e) => e.getBoundingClientRect().toJSON() as Rect));
+        const c = (await cpus.boundingBox())!;
+        const inRing = (await page.locator(".potato-centre").count()) > 0;
+        if (inRing) for (const t of boxes) expect(apart(c, t), "the slots clear every tile").toBe(true);
+        const l = await arcLabelBox(page);
+        if (l) {
+          if (inRing) expect(apart(l, c), "the arc's label clears the slots").toBe(true);
+          for (const t of boxes) expect(apart(l, t), "the arc's label clears the tiles").toBe(true);
+        }
+        await page.waitForTimeout(150);
+      }
+    });
+  }
+}
+
+test("density: machines per CPU, the figures, the chart with its limit, and one bar per rung", async ({ page }) => {
+  await startDense(8);
+  await openPotato(page);
+  await expect(page.getByTestId("potato-big")).toHaveText("2.7");
+  await expect(page.getByTestId("potato-machines")).toHaveText("8 machines · 3 CPUs");
+  await expect(page.getByTestId("potato-figure-asleep")).toContainText(/^\d+%asleep$/);
+  // after the first lap: the pace, the chart and its limit line
+  await expect(page.getByTestId("potato-figure-pace")).toContainText("catches / s", { timeout: 30_000 });
+  await expect(page.getByTestId("potato-chart")).toContainText("no CPU for the next wake");
+  await expect(page.getByTestId("potato-chart").getByRole("img")).toHaveAttribute("aria-label", /laps, 3 CPUs is the limit$/);
+  const rungs = page.getByTestId("potato-ladder").locator("li");
+  await expect(rungs).toHaveCount(2);
+  await expect(rungs.nth(0)).toContainText("2 per CPU");
+  await expect(rungs.nth(1)).toContainText("2.7 per CPU");
+  await expect(rungs.nth(1)).toHaveAttribute("aria-current", "true");
+  // the cards sit apart from the ring
+  const side = (await page.locator(".potato-side").boundingBox())!;
+  expect(apart((await page.getByTestId("potato-stage").boundingBox())!, side)).toBe(true);
+});
+
+test("density: a drop outlines the late square with its measured cause", async ({ page }) => {
+  await startDense(8, { slow_wake_ms: 3000 });
+  await openPotato(page);
+  await expect(page.getByTestId("potato-drop")).toBeVisible({ timeout: 40_000 });
+  const late = page.getByTestId("potato-late");
+  await expect(late).toHaveCount(1);
+  await expect(late).toHaveText(/^(\d+ ms late|waited \d+ ms for a CPU|still saving|still waking)$/);
+  await expect(page.locator('[data-testid="potato-tile"][data-late]')).toHaveCount(1);
+  const tile = (await page.locator('[data-testid="potato-tile"][data-late]').boundingBox())!;
+  expect(apart(tile, (await late.boundingBox())!), "the label sits clear of its square").toBe(true);
+});
+
+test("density: on a phone the slots sit under the ring, the cards fit, and nothing scrolls sideways", async ({ browser }) => {
+  await startDense(8);
+  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 });
+  const page = await ctx.newPage();
+  await openPotato(page);
+  await expect(page.getByTestId("potato-cpus")).toBeVisible();
+  await expect(page.locator(".potato-centre")).toHaveCount(0);
+  const stage = (await page.getByTestId("potato-stage").boundingBox())!;
+  expect(apart(stage, (await page.getByTestId("potato-cpus").boundingBox())!), "the slots are under the ring, not on it").toBe(true);
+  await expect(page.getByTestId("potato-density")).toBeVisible();
+  const sideways = await page.evaluate(() => Math.max(document.documentElement.scrollWidth - window.innerWidth, document.querySelector('[data-testid="potato"]')!.scrollWidth - document.querySelector('[data-testid="potato"]')!.clientWidth));
+  expect(sideways).toBeLessThanOrEqual(0);
+  expect(await textProblems(page)).toEqual([]);
+  await ctx.close();
+});
+
+for (const [width, cpus] of [[360, 16], [320, 8]] as const) {
+  test(`density: under the ring on a ${width} px phone, ${cpus} CPU slots wrap inside their card`, async ({ browser }) => {
+    await startDense(32, { cpus, players: 32 });
+    const ctx = await browser.newContext({ viewport: { width, height: 800 }, isMobile: true, hasTouch: true, deviceScaleFactor: 1 });
+    const page = await ctx.newPage();
+    await openPotato(page);
+    await expect(page.getByTestId("potato-cpus")).toBeVisible();
+    await expect(page.locator(".potato-centre")).toHaveCount(0);
+    // the card and every chip and word in it, read in one task so no tick redraws the list between
+    const out = await page.evaluate(() => {
+      const card = document.querySelector(".potato-cpus-card")!.getBoundingClientRect();
+      const over: string[] = [];
+      for (const el of document.querySelectorAll(".potato-cpus-card [data-testid='potato-slot'], .potato-cpus-card .cpus-heading, .potato-cpus-card .slot-label")) {
+        const r = el.getBoundingClientRect();
+        if (r.left < card.left - 1 || r.right > card.right + 1) over.push(`${el.className || el.getAttribute("data-testid")} ${Math.round(r.left)}..${Math.round(r.right)} outside ${Math.round(card.left)}..${Math.round(card.right)}`);
+      }
+      return { over, slots: document.querySelectorAll(".potato-cpus-card [data-testid='potato-slot']").length };
+    });
+    expect(out.slots).toBe(cpus);
+    expect(out.over, "every chip and label stays inside the card").toEqual([]);
+    await ctx.close();
+  });
+}
+
+test("density: with no allotment (an old agent) the page shows the ring, the machine count and the ladder, and no CPU figure", async ({ page }) => {
+  await admin("/mock/potato", { cpus: 0, players: 8, size: 8, next_in_ms: 500 });
+  await expect.poll(async () => (await mockPotato()).round?.size ?? null, { timeout: 10_000 }).toBe(8);
+  await openPotato(page);
+  await expect(page.getByTestId("potato-big")).toHaveText("8");
+  await expect(page.getByTestId("potato-machines")).toHaveCount(0);
+  await expect(page.getByTestId("potato-cpus")).toHaveCount(0);
+  await expect(page.getByTestId("potato-figure-asleep")).toHaveCount(0);
+  await expect(page.getByTestId("potato-chart")).toHaveCount(0);
+  await expect(page.getByTestId("potato-rung-8")).toContainText("8 machines");
+  await expect(page.locator("body")).not.toContainText(/\b0 (CPUs|machines)\b/);
+});
 test("potato: the ring is one tab stop; arrows, Home and End move between tiles; a click shows no card, the keyboard does, Escape dismisses it", async ({ page }) => {
   await startAt(8);
   await openPotato(page);
@@ -366,6 +525,80 @@ test("potato: a card does not come back after its tile left the ring and the rin
   await expect(tiles(page)).toHaveCount(8, { timeout: 10_000 });
   await page.waitForTimeout(500);
   await expect(readout, "nothing is focused, so no card").toHaveCount(0);
+});
+
+test("potato: a focused tile's card does not come back when the agent is gone and returns", async ({ page }) => {
+  await startAt(8);
+  await openPotato(page);
+  const readout = page.getByTestId("potato-readout");
+  await tiles(page).first().focus();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowLeft");
+  await expect(tiles(page).first()).toBeFocused();
+  await expect(readout).toBeVisible();
+  // no players are running: the ring is gone, and with it the tile that was focused
+  await admin("/mock/potato", { cpus: 0, players: 0, next_in_ms: 300 });
+  await expect(tiles(page)).toHaveCount(0, { timeout: 10_000 });
+  await admin("/mock/potato", { cpus: 0, players: 8, size: 8, next_in_ms: 300 });
+  await expect(tiles(page)).toHaveCount(8, { timeout: 10_000 });
+  await page.waitForTimeout(500);
+  await expect(readout, "nothing is focused, so no card").toHaveCount(0);
+});
+
+test("density: one ball, two waking, one saving and four free on 8 CPUs take the two rows the compact slots reserve", async ({ page }) => {
+  await startDense(32, { cpus: 8, players: 32 });
+  await openPotato(page);
+  const cpus = page.getByTestId("potato-cpus");
+  // a window whose ring leaves room for two rows of small chips and no more: two rows of 8 CPUs is 4
+  // columns, and slotsLayout sets the list's width to columns x 23 px. The page measures its stage
+  // on a resize and draws on the frame after, so the form and the width are read in one task after two frames.
+  let found = false;
+  const tried: string[] = [];
+  for (const [vw, vh] of [[1280, 800], [1200, 760], [1120, 720], [1040, 700], [980, 680], [920, 660], [860, 640]] as const) {
+    await page.setViewportSize({ width: vw, height: vh });
+    const now = await cpus.evaluate(
+      (el) =>
+        new Promise<{ form: string | null; width: string }>((resolve) =>
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              const live = document.querySelector('[data-testid="potato-cpus"]') ?? el;
+              resolve({ form: live.getAttribute("data-form"), width: (live.querySelector(".slot-groups") as HTMLElement | null)?.style.width ?? "" });
+            }),
+          ),
+        ),
+    );
+    tried.push(`${vw}x${vh}: ${now.form}/${now.width}`);
+    if (now.form === "compact" && now.width === "92px") {
+      found = true;
+      break;
+    }
+  }
+  expect(found, `a viewport with the compact two-row slots; tried ${tried.join(", ")}`).toBe(true);
+  // the page's own markup and stylesheet, given that distribution, read in one task so no tick redraws it between
+  const rows = await cpus.evaluate((el) => {
+    const groups = el.querySelector(".slot-groups")!;
+    const mk = (name: string, n: number, free: boolean) => {
+      const li = document.createElement("li");
+      li.className = "slot-group";
+      const row = document.createElement("span");
+      row.className = "slot-row";
+      for (let i = 0; i < n; i++) {
+        const c = document.createElement("span");
+        c.className = free ? "slot free" : "potato-swatch sm";
+        c.setAttribute("data-testid", "potato-slot");
+        row.append(c);
+      }
+      const label = document.createElement("span");
+      label.className = "sr-only";
+      label.textContent = name;
+      li.append(row, label);
+      return li;
+    };
+    groups.replaceChildren(mk("ball", 1, false), mk("waking", 2, false), mk("saving", 1, false), mk("free", 4, true));
+    const tops = new Set([...groups.querySelectorAll('[data-testid="potato-slot"]')].map((c) => Math.round(c.getBoundingClientRect().top)));
+    return tops.size;
+  });
+  expect(rows, "the chips stand in two rows").toBe(2);
 });
 
 test("potato: the legend's marks keep their colours in the panel, in the dark and the light scheme", async ({ page }) => {

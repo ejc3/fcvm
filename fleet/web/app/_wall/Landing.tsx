@@ -4,27 +4,21 @@
 // pages; the words come from core/landing.ts.
 
 import { createPortal } from "react-dom";
-import { useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { landingPanelText, type LandingView, type LegendEntry } from "../../core/index.ts";
 import "./landing.css";
 
+/**
+ * The control and its panel keep their keys to themselves: a taken-over server's handlers listen on
+ * the window, so Space on Close or a movement key would otherwise reach the game. Nothing is
+ * prevented, so a button still activates on Space and Enter. Escape is taken in the capture phase below.
+ */
+const keepKeys = (e: ReactKeyboardEvent) => {
+  if (e.key !== "Escape") e.stopPropagation();
+};
+
 /** A legend mark, drawn with the Potato tiles' own phase styles. */
 function Mark({ m, colour }: { m: LegendEntry["mark"]; colour: string }) {
-  if (m.kind === "hold-bar") {
-    return (
-      <span className="lg-meter" aria-hidden="true">
-        <span className="fill" style={{ width: "62%" }} />
-      </span>
-    );
-  }
-  if (m.kind === "hold-tick") {
-    return (
-      <span className="lg-meter" aria-hidden="true">
-        <span className="fill" style={{ width: "62%" }} />
-        <span className="need" style={{ left: "80%" }} />
-      </span>
-    );
-  }
   return (
     <span className="potato-swatch" data-phase={m.phase} data-holder={m.holder ? "true" : undefined} style={{ ["--c" as string]: colour } as CSSProperties} aria-hidden="true">
       {m.wake !== undefined ? (
@@ -46,62 +40,31 @@ function Label({ e }: { e: LegendEntry }) {
   );
 }
 
-/** The legend: a strip cut from the ring and a small diagram of the Hold meter, or the same entries as a list. */
-export function PotatoLegend({ legend, form, colour, id }: { legend: NonNullable<LandingView["legend"]>; form: "strip" | "list"; colour: string; id?: string }) {
+/** The legend as a list, for the "What is this?" panel: the phases' tints and what a colour step means. */
+export function PotatoLegend({ legend, colour, id }: { legend: NonNullable<LandingView["legend"]>; colour: string; id?: string }) {
   const h = useId();
-  if (form === "list") {
-    return (
-      <section className="lg lg-list" aria-labelledby={h} data-testid="potato-legend" id={id}>
-        <h2 id={h}>{legend.title}</h2>
-        <ul>
-          {[...legend.strip, ...legend.hold].map((e) => (
-            <li key={e.key}>
-              <Mark m={e.mark} colour={colour} />
-              <span className="lg-text">
-                <Label e={e} />
-              </span>
-            </li>
-          ))}
-          <li>
-            <span className="lg-text">{legend.catchNote}</span>
-          </li>
-        </ul>
-      </section>
-    );
-  }
   return (
-    <section className="card lg lg-strip" aria-labelledby={h} data-testid="potato-legend" id={id}>
+    <section className="lg lg-list" aria-labelledby={h} data-testid="potato-legend" id={id}>
       <h2 id={h}>{legend.title}</h2>
-      <ol className="lg-row lg-ring">
+      <ul>
         {legend.strip.map((e) => (
           <li key={e.key}>
             <Mark m={e.mark} colour={colour} />
-            {e.label !== null ? <span className="lg-label">{e.label}</span> : <span className="sr-only">{e.sr}</span>}
+            <span className="lg-text">
+              <Label e={e} />
+            </span>
           </li>
         ))}
-      </ol>
-      {legend.strip
-        .filter((e) => e.detail)
-        .map((e) => (
-          <p key={e.key} className="lg-note">
-            {e.label}: {e.detail}
-          </p>
-        ))}
-      <p className="lg-note">{legend.catchNote}</p>
-      <ol className="lg-row lg-hold">
-        {legend.hold.map((e) => (
-          <li key={e.key}>
-            <Mark m={e.mark} colour={colour} />
-            <Label e={e} />
-          </li>
-        ))}
-      </ol>
+        <li>
+          <span className="lg-text">{legend.catchNote}</span>
+        </li>
+      </ul>
     </section>
   );
 }
 
 /** The page's line, and the "What is this?" button with its panel (a popover on a wide screen, a bottom sheet on a phone). */
-export function Landing({ landing, legendInPanel, colour, sheet = "bottom", children }: { landing: LandingView; legendInPanel?: boolean; colour: string; sheet?: "top" | "bottom"; children?: ReactNode }) {
+export function Landing({ landing, colour, sheet = "bottom", children }: { landing: LandingView; colour: string; sheet?: "top" | "bottom"; children?: ReactNode }) {
   const [open, setOpen] = useState(false);
   const btnRef = useRef<HTMLButtonElement | null>(null);
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -129,7 +92,7 @@ export function Landing({ landing, legendInPanel, colour, sheet = "bottom", chil
   const text = landingPanelText(landing);
   return (
     <div className="landing" data-testid="landing">
-      <p className="landing-line" data-testid="landing-line">
+      <p className="landing-line" data-testid="landing-line" onKeyDown={keepKeys} onKeyUp={keepKeys}>
         <span data-testid="landing-text">{landing.line}</span>{" "}
         <button ref={btnRef} type="button" className="landing-btn" aria-expanded={open} aria-controls={open ? panelId : undefined} data-testid="landing-button" onClick={() => {
           const r = btnRef.current?.getBoundingClientRect();
@@ -144,14 +107,14 @@ export function Landing({ landing, legendInPanel, colour, sheet = "bottom", chil
         <>
         {/* A tap outside takes the whole pointer sequence (down, up, click) and only closes the panel: nothing under it sees it. */}
         <div className="landing-backdrop" data-testid="landing-backdrop" onPointerDown={(e) => e.stopPropagation()} onPointerUp={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); setOpen(false); }} />
-        <div ref={panelRef} id={panelId} className="landing-panel" data-sheet={sheet} role="dialog" aria-label="What this page shows" tabIndex={-1} data-testid="landing-panel" style={{ ["--lx" as string]: `${Math.min(anchor?.x ?? 0, Math.max(0, window.innerWidth - 436))}px`, ["--ly" as string]: `${anchor?.y ?? 0}px` }}>
+        <div ref={panelRef} id={panelId} className="landing-panel" data-sheet={sheet} role="dialog" aria-label="What this page shows" tabIndex={-1} data-testid="landing-panel" onKeyDown={keepKeys} onKeyUp={keepKeys} style={{ ["--lx" as string]: `${Math.min(anchor?.x ?? 0, Math.max(0, window.innerWidth - 436))}px`, ["--ly" as string]: `${anchor?.y ?? 0}px` }}>
           <button type="button" className="landing-close" aria-label="Close" data-testid="landing-close" onClick={() => { setOpen(false); btnRef.current?.focus(); }}>
             Close
           </button>
           {text.map((t) => (
             <p key={t}>{t}</p>
           ))}
-          {legendInPanel && landing.legend ? <PotatoLegend legend={landing.legend} form="list" colour={colour} /> : null}
+          {landing.legend ? <PotatoLegend legend={landing.legend} colour={colour} /> : null}
         </div>
         </>,
         (btnRef.current?.closest("[data-landing-root]") as HTMLElement | null) ?? document.body,
