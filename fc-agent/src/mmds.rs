@@ -3,16 +3,21 @@ use tokio::time::{sleep, Duration};
 
 use crate::types::{LatestMetadata, Plan};
 
-/// Fetch the container plan from MMDS with retry.
-pub async fn fetch_plan() -> Result<Plan> {
+/// Fetch the container plan from MMDS, once. With `verbose` off the token request and
+/// its failure are not printed here: the caller's retry loop has printed this failure
+/// before and counts its repeats ([`crate::bootplan::RetryLog`]). The error returned
+/// still says which step failed.
+pub async fn fetch_plan(verbose: bool) -> Result<Plan> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    eprintln!(
-        "[fc-agent] requesting MMDS V2 session token from http://169.254.169.254/latest/api/token"
-    );
+    if verbose {
+        eprintln!(
+            "[fc-agent] requesting MMDS V2 session token from http://169.254.169.254/latest/api/token"
+        );
+    }
     let token_response = match client
         .put("http://169.254.169.254/latest/api/token")
         .header("X-metadata-token-ttl-seconds", "21600")
@@ -25,12 +30,14 @@ pub async fn fetch_plan() -> Result<Plan> {
             resp
         }
         Err(e) => {
-            eprintln!("[fc-agent] token request FAILED - detailed error:");
-            eprintln!("[fc-agent]   error type: {:?}", e);
-            if e.is_timeout() {
-                eprintln!("[fc-agent]   TIMEOUT: MMDS not responding within 5 seconds");
-            } else if e.is_connect() {
-                eprintln!("[fc-agent]   CONNECTION ERROR: Cannot reach 169.254.169.254");
+            if verbose {
+                eprintln!("[fc-agent] token request FAILED - detailed error:");
+                eprintln!("[fc-agent]   error type: {:?}", e);
+                if e.is_timeout() {
+                    eprintln!("[fc-agent]   TIMEOUT: MMDS not responding within 5 seconds");
+                } else if e.is_connect() {
+                    eprintln!("[fc-agent]   CONNECTION ERROR: Cannot reach 169.254.169.254");
+                }
             }
             return Err(e).context("requesting MMDS session token");
         }

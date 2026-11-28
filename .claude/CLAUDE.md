@@ -1073,6 +1073,27 @@ Guest side, pushed by fc-agent (`fc-agent/src/vitals.rs`):
 | cgroup `pids.current` / `pids.max` | same | the pids controller rejects forks with no message the caller sees |
 | which threads are runnable or blocked, the vsock-named workers' state and stack, virtio interrupt totals, per-CPU ticks | once a second while runnable plus blocked threads reach three per CPU (six at least), every 10s after 30s of that | the exec stalls of #938 read 12 to 18 runnable for 20 s and the 10s line could not name them; exec cannot reach a guest in that state |
 
+**Where the pile-up lines go, and why not all to the console.** A console byte is an exit to the
+VMM: 4 us in an L1 guest, 33 us in L2, about 2.2 ms in L3 (2048 bytes to `ttyS0`: 0.009 s,
+0.068 s; L3 from a trace). A 420 byte line every second is free in L1 and a second of CPU 0 per
+line in L3, where every device interrupt also lands. The sampler printed that line once a second
+for the 30 s it reported on, so in L3 it held CPU 0 in the UART and sustained the pile-up it
+was reporting: 14.8 KB in 34 s, with fc-agent's boot plan retry error (a kilobyte every 500 ms)
+beside it, L3's kernel calling CPU 0 stuck for 21 to 57 s, and the agent's 30 s FUSE mount wait
+failing when the burst fell on it (#2250). So (`vitals::PileupOut`):
+
+- the first line of a pile-up goes to the serial console, as does the on-failure `VITALS` block:
+  a host whose vsock is down still gets them;
+- the lines after it go to the host on the output connection, where fcvm logs them at DEBUG under
+  `guest-vitals` (outside `fcvm`, like the console's own targets);
+- when that connection is not up (before the boot plan, a TTY VM), they go to the console no
+  sooner than a second and ten times what the last line took to leave the tty, with a count of
+  the lines not printed.
+
+The boot plan retry prints its error in full once, then a count line every 10 s
+(`bootplan::RetryLog`). The 10 s line still goes to the console. **A diagnostic that costs the
+resource it measures sustains what it reports: price it at the deepest level it runs at.**
+
 **It is PUSHED, never pulled, and that is not a style choice.** The obvious design is to run
 `fcvm exec --pid P --vm -- sh -c '...'` from the host at the failure site. That cannot work for
 the cases it exists for: serving an exec makes fc-agent FORK, so a guest out of pids or threads
@@ -1084,7 +1105,8 @@ can no longer create one.
 Routing is by prefix and it is load-bearing (`console_line_is_important` in `src/utils.rs`
 classifies console lines for both backends, and checks this prefix before anything else, because
 a pile-up line can name a thread called `fc-agent`): `[fcvm-vitals]` is DEBUG, so the 10s sampler lands in the per-VM file and NOT the job log, which
-is what lets it run for every VM without flooding a runner. `[fc-agent] VITALS` is INFO, so the
+is what lets it run for every VM without flooding a runner. The pile-up lines that reach fcvm on the
+output connection are DEBUG under `guest-vitals` for the same reason. `[fc-agent] VITALS` is INFO, so the
 on-failure block also reaches the test's captured output. fc-agent's lines go under `fcvm::console`
 (INFO, and WARN for its `ERROR`, `FATAL`, `WARNING` and `Error:` lines, which fcvm's default `warn`
 filter then shows: a restore that failed closed in the guest used to leave only the host's

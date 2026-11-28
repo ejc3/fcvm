@@ -21,6 +21,14 @@
 //! is piled up ([`Pileup`]), one more line of at most 1 KiB per second names
 //! the threads, and after 30 s one per 10 s. An idle guest costs a read of
 //! /proc/loadavg and /proc/stat per second.
+//!
+//! Where the pile-up lines go ([`PileupOut`]). The first line of a pile-up goes
+//! to the serial console, so a host whose vsock is down still learns of it. The
+//! lines after it go to the host on the output connection when that is up. When
+//! it is not, they go to the console no faster than the console carried the last
+//! one: a console byte is an exit to the VMM, which costs microseconds in a
+//! guest and about 2 ms in a guest two levels down, where a 420 byte line every
+//! second kept CPU 0 in the UART for the 30 s it reported on (#2250).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -597,6 +605,12 @@ impl Pileup {
         }
     }
 
+    /// Whether the line [`Self::tick`] just returned is the first of its
+    /// pile-up. The line that says a pile-up cannot be told counts as one.
+    pub fn at_its_first_line(&self) -> bool {
+        self.since.is_none() || self.since == self.last
+    }
+
     /// Whether a line is due at second `now` of a pile-up, which this records.
     fn due(&mut self, now: u64) -> bool {
         let since = *self.since.get_or_insert(now);
@@ -739,6 +753,145 @@ pub fn snapshot_bounded(budget: Duration) -> String {
     match rx.recv_timeout(budget) {
         Ok(text) => text,
         Err(_) => format!("VITALS TRUNCATED: collection exceeded {budget:?}\n"),
+    }
+}
+
+/// The places a pile-up line can go and the sampler's clock, as [`PileupOut`]
+/// sees them.
+pub trait PileupSinks {
+    /// Hand the line to the host on the output connection. False when the
+    /// connection is not there to take it.
+    fn to_host(&mut self, line: &str) -> bool;
+    /// Write the line to the serial console.
+    fn to_console(&mut self, line: &str);
+    /// Console output of this guest that has not left for the UART yet. None
+    /// when that cannot be told.
+    fn console_unsent(&mut self) -> Option<u64>;
+    /// Time since the sampler started.
+    fn now(&mut self) -> Duration;
+    /// Wait this long.
+    fn pause(&mut self, time: Duration);
+}
+
+/// Where [`PileupOut::route`] put a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PileupSent {
+    Console,
+    Host,
+    /// Not printed: no host connection, and the console is not due a line yet.
+    Held,
+}
+
+/// A console line every second at most, and no more than a tenth of the time.
+const CONSOLE_LINE_FLOOR: Duration = Duration::from_secs(1);
+const CONSOLE_COST_FACTOR: u32 = 10;
+
+/// What a console line is taken to have cost when the tty cannot say how much
+/// of it is still queued: enough to space the lines ten seconds apart.
+const CONSOLE_COST_UNKNOWN: Duration = Duration::from_secs(1);
+
+/// After a console line the router watches the console this often, this many
+/// times, so a console that sends the line within a tenth of a second is told
+/// apart from one that takes seconds. A slower one is seen on later ticks.
+const CONSOLE_WATCH_STEP: Duration = Duration::from_millis(10);
+const CONSOLE_WATCH_STEPS: u32 = 10;
+
+/// Routes the sampler's pile-up lines (module doc).
+#[derive(Default)]
+pub struct PileupOut {
+    /// When the last pile-up line went to the console, and how long the console
+    /// took to send it, once it has.
+    console_line: Option<(Duration, Option<Duration>)>,
+    /// Lines held back since the last console line.
+    held: u32,
+}
+
+impl PileupOut {
+    /// Send one pile-up line: `first` is the first line of its pile-up.
+    pub fn route(&mut self, first: bool, line: &str, sinks: &mut dyn PileupSinks) -> PileupSent {
+        if !first && sinks.to_host(line) {
+            return PileupSent::Host;
+        }
+        self.settle(sinks);
+        let now = sinks.now();
+        if !first && !self.console_due(now) {
+            self.held += 1;
+            return PileupSent::Held;
+        }
+        if self.held == 0 {
+            sinks.to_console(line);
+        } else {
+            sinks.to_console(&format!(
+                "{line} ({} lines before this one not printed: no host connection and a slow console)",
+                self.held
+            ));
+        }
+        self.held = 0;
+        self.console_line = Some((now, None));
+        for _ in 0..CONSOLE_WATCH_STEPS {
+            sinks.pause(CONSOLE_WATCH_STEP);
+            self.settle(sinks);
+            if matches!(self.console_line, Some((_, Some(_)))) {
+                break;
+            }
+        }
+        PileupSent::Console
+    }
+
+    /// Note how long the last console line took, once the console has sent it.
+    /// Called on every tick as well, so a slow console's cost is known to the
+    /// second.
+    pub fn settle(&mut self, sinks: &mut dyn PileupSinks) {
+        let Some((at, None)) = self.console_line else {
+            return;
+        };
+        match sinks.console_unsent() {
+            Some(0) => {
+                let cost = sinks.now().saturating_sub(at);
+                self.console_line = Some((at, Some(cost)));
+            }
+            Some(_) => {}
+            None => self.console_line = Some((at, Some(CONSOLE_COST_UNKNOWN))),
+        }
+    }
+
+    /// Whether the console may carry another pile-up line at `now`: the last
+    /// one has left, and at least ten times what it cost ago.
+    fn console_due(&self, now: Duration) -> bool {
+        match self.console_line {
+            None => true,
+            Some((_, None)) => false,
+            Some((at, Some(cost))) => {
+                now.saturating_sub(at) >= CONSOLE_LINE_FLOOR.max(cost * CONSOLE_COST_FACTOR)
+            }
+        }
+    }
+}
+
+/// fc-agent's own console and output connection, on the sampler's clock.
+pub struct AgentSinks {
+    pub start: std::time::Instant,
+}
+
+impl PileupSinks for AgentSinks {
+    fn to_host(&mut self, line: &str) -> bool {
+        crate::console::send_to_host(line)
+    }
+
+    fn to_console(&mut self, line: &str) {
+        eprintln!("{line}");
+    }
+
+    fn console_unsent(&mut self) -> Option<u64> {
+        crate::console::unsent()
+    }
+
+    fn now(&mut self) -> Duration {
+        self.start.elapsed()
+    }
+
+    fn pause(&mut self, time: Duration) {
+        std::thread::sleep(time);
     }
 }
 
@@ -904,6 +1057,151 @@ mod tests {
     /// A pile-up whose scans take 5 s each: a line per scan for the first 30 s
     /// of the pile-up, then one per 10 s, both by the sampler's clock. Counting
     /// scans would keep a line per scan going for thirty scans, 150 s here.
+    /// A fake console that takes `cost` to send a line, and a host connection that is
+    /// there or not.
+    struct FakeSinks {
+        host_up: bool,
+        host: Vec<String>,
+        console: Vec<String>,
+        /// When the console's queue is empty again.
+        console_busy_until: Duration,
+        cost: Duration,
+        now: Duration,
+        tty_knows: bool,
+    }
+
+    impl FakeSinks {
+        fn new(host_up: bool, cost: Duration) -> Self {
+            Self {
+                host_up,
+                host: Vec::new(),
+                console: Vec::new(),
+                console_busy_until: Duration::ZERO,
+                cost,
+                now: Duration::ZERO,
+                tty_knows: true,
+            }
+        }
+    }
+
+    impl PileupSinks for FakeSinks {
+        fn to_host(&mut self, line: &str) -> bool {
+            if self.host_up {
+                self.host.push(line.to_string());
+            }
+            self.host_up
+        }
+        fn to_console(&mut self, line: &str) {
+            self.console.push(line.to_string());
+            self.console_busy_until = self.now + self.cost;
+        }
+        fn console_unsent(&mut self) -> Option<u64> {
+            self.tty_knows
+                .then(|| u64::from(self.now < self.console_busy_until))
+        }
+        fn now(&mut self) -> Duration {
+            self.now
+        }
+        fn pause(&mut self, time: Duration) {
+            self.now += time;
+        }
+    }
+
+    /// Run a pile-up of `seconds` lines, one a second, through the router.
+    fn route_a_pileup(out: &mut PileupOut, sinks: &mut FakeSinks, from: u64, seconds: u64) {
+        for second in from..from + seconds {
+            sinks.now = Duration::from_secs(second);
+            out.settle(sinks);
+            out.route(second == from, &format!("line {second}"), sinks);
+        }
+    }
+
+    /// With the output connection up, a pile-up costs the console its first line and the
+    /// host gets the rest. A second pile-up starts on the console again.
+    #[test]
+    fn a_pileup_writes_one_console_line_and_sends_the_rest_to_the_host() {
+        let mut out = PileupOut::default();
+        let mut sinks = FakeSinks::new(true, Duration::from_secs(1));
+        route_a_pileup(&mut out, &mut sinks, 100, 30);
+        assert_eq!(sinks.console, ["line 100"]);
+        assert_eq!(sinks.host.len(), 29);
+        assert_eq!(sinks.host[0], "line 101");
+        route_a_pileup(&mut out, &mut sinks, 200, 5);
+        assert_eq!(sinks.console, ["line 100", "line 200"]);
+        assert_eq!(sinks.host.len(), 33);
+    }
+
+    /// Without the connection the console carries the lines, and no faster than it sent
+    /// the last one: a console that takes a second a line gets one in ten seconds, where
+    /// the sampler used to hand it one every second.
+    #[test]
+    fn without_the_host_a_slow_console_gets_a_line_only_every_ten_times_its_cost() {
+        let mut out = PileupOut::default();
+        let mut sinks = FakeSinks::new(false, Duration::from_millis(900));
+        route_a_pileup(&mut out, &mut sinks, 100, 30);
+        assert!(sinks.host.is_empty());
+        let printed: Vec<&str> = sinks.console.iter().map(String::as_str).collect();
+        assert_eq!(printed.len(), 3, "{printed:?}");
+        assert_eq!(printed[0], "line 100");
+        // The line's cost is known at the next tick, a second later: ten seconds apart.
+        assert!(
+            printed[1].starts_with("line 110 (9 lines before this one not printed"),
+            "{printed:?}"
+        );
+        assert!(printed[2].starts_with("line 120 (9 lines"), "{printed:?}");
+    }
+
+    /// A console that sends a line in milliseconds keeps the line a second it had.
+    #[test]
+    fn without_the_host_a_fast_console_still_gets_a_line_a_second() {
+        let mut out = PileupOut::default();
+        let mut sinks = FakeSinks::new(false, Duration::from_millis(5));
+        route_a_pileup(&mut out, &mut sinks, 100, 30);
+        assert_eq!(sinks.console.len(), 30);
+        assert!(sinks
+            .console
+            .iter()
+            .all(|line| !line.contains("not printed")));
+    }
+
+    /// A tty that cannot say what it has queued is taken for a slow one.
+    #[test]
+    fn a_console_whose_queue_cannot_be_read_gets_a_line_every_ten_seconds() {
+        let mut out = PileupOut::default();
+        let mut sinks = FakeSinks::new(false, Duration::ZERO);
+        sinks.tty_knows = false;
+        route_a_pileup(&mut out, &mut sinks, 100, 30);
+        assert_eq!(sinks.console.len(), 3, "{:?}", sinks.console);
+    }
+
+    /// A connection that comes up mid pile-up takes the lines from then on.
+    #[test]
+    fn the_host_takes_over_when_its_connection_comes_up() {
+        let mut out = PileupOut::default();
+        let mut sinks = FakeSinks::new(false, Duration::from_millis(900));
+        route_a_pileup(&mut out, &mut sinks, 100, 5);
+        sinks.host_up = true;
+        for second in 105..110 {
+            sinks.now = Duration::from_secs(second);
+            out.route(false, &format!("line {second}"), &mut sinks);
+        }
+        assert_eq!(sinks.console, ["line 100"]);
+        assert_eq!(sinks.host.len(), 5);
+    }
+
+    /// The first line the sampler gets from a pile-up is its first, and no later one is.
+    #[test]
+    fn a_pileup_says_which_line_is_its_first() {
+        let mut pileup = Pileup::default();
+        assert!(pileup.due(100) && pileup.at_its_first_line());
+        assert!(pileup.due(101) && !pileup.at_its_first_line());
+        let unavailable = Pileup {
+            said_unavailable: true,
+            ..Default::default()
+        };
+        assert!(unavailable.at_its_first_line());
+    }
+
     #[test]
     fn a_long_pileup_is_paced_in_seconds_not_in_scans() {
         let mut pileup = Pileup::default();

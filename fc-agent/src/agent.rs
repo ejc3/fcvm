@@ -53,20 +53,27 @@ pub async fn run() -> Result<()> {
     // what lets this run for every VM without flooding a runner.
     //
     // Every 10s the compact line. Every second, while the guest is piled up,
-    // the line that names the threads (`vitals::Pileup`). The thread has its
-    // own name so that it does not count itself as `fc-agent`.
+    // the line that names the threads (`vitals::Pileup`): the first of a
+    // pile-up on the console, the rest to the host on the output connection,
+    // or to the console at the pace the console carries them
+    // (`vitals::PileupOut`). The thread has its own name so that it does not
+    // count itself as `fc-agent`.
     let sampler = std::thread::Builder::new()
         .name("fcvm-vitals".to_string())
         .spawn(|| {
             let start = std::time::Instant::now();
             let mut pileup = crate::vitals::Pileup::default();
+            let mut out = crate::vitals::PileupOut::default();
+            let mut sinks = crate::vitals::AgentSinks { start };
             let (mut tick, mut previous) = (0u64, None);
             loop {
                 if crate::vitals::sample_due(previous, tick) {
                     eprintln!("[fcvm-vitals] {}", crate::vitals::sample_line());
                 }
+                out.settle(&mut sinks);
                 if let Some(line) = pileup.tick(tick) {
-                    eprintln!("[fcvm-vitals] pileup {line}");
+                    let line = format!("[fcvm-vitals] pileup {line}");
+                    out.route(pileup.at_its_first_line(), &line, &mut sinks);
                 }
                 // To the next deadline still ahead, so a slow scan neither
                 // stretches the cadence nor is followed by a burst of scans.
@@ -132,16 +139,24 @@ pub async fn run() -> Result<()> {
     // metadata service like Cloud Hypervisor) from the kernel command line.
     let transport = bootplan::detect_transport();
 
-    // Fetch the container plan with retry.
+    // Fetch the container plan with retry. A failure is printed in full once and then
+    // counted (`bootplan::RetryLog`): every byte of it is a console byte.
+    let fetch_started = std::time::Instant::now();
+    let mut retries = bootplan::RetryLog::default();
     let mut plan = loop {
-        match bootplan::fetch_plan(transport).await {
+        match bootplan::fetch_plan(transport, retries.verbose()).await {
             Ok(p) => {
                 eprintln!("[fc-agent] received container plan successfully");
                 break p;
             }
             Err(e) => {
-                eprintln!("[fc-agent] boot plan not ready: {:?}", e);
-                eprintln!("[fc-agent] retrying in 500ms...");
+                for line in retries.failed(
+                    &format!("{e:#}"),
+                    &format!("{e:?}"),
+                    fetch_started.elapsed(),
+                ) {
+                    eprintln!("{line}");
+                }
                 sleep(Duration::from_millis(500)).await;
             }
         }
@@ -1531,7 +1546,7 @@ mod tests {
         // An agent that starts in the middle of a snapshot boundary serves the host's
         // resume before anything that can wait behind the closed gate (the boot plan,
         // over MMDS), and starts no container until the boundary is over.
-        let plan = run.find("bootplan::fetch_plan(transport)").unwrap();
+        let plan = run.find("bootplan::fetch_plan(transport, ").unwrap();
         let hold = run
             .find("crate::snapshot_network::hold_the_container_start_through_a_boundary().await;")
             .expect("the container's start does not wait for a boundary");
