@@ -15,10 +15,10 @@ use std::process::{Command, Output};
 /// IPv4. It also contains 3f57f0382f6a, the upstream merge of the addr_seen fix
 /// for issue #661 that this repo used to carry as a patch (stable patch-id
 /// 340576aef02fa19411e69e3587566f3c4950057a): `git merge-base --is-ancestor
-/// 3f57f0382f6a 4e8aa70379a3` holds upstream. Nothing here checks that ancestry,
+/// 3f57f0382f6a 15980a90f9a6` holds upstream. Nothing here checks that ancestry,
 /// so a later pin has to be checked the same way.
-const PINNED_COMMIT: &str = "4e8aa70379a35ec9deb11d76513e7f6c4123b667";
-const ARCHIVE_SHA256: &str = "ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe097170e9e5851da8b9";
+const PINNED_COMMIT: &str = "15980a90f9a60e6ae9a3865bb85d20a3d8379deb";
+const ARCHIVE_SHA256: &str = "8a25c40ecfe7bdace74e3c4966c88846b693dce34f6bf8f09e2b607c25b20d42";
 
 /// `scripts/passt-udp-sock-errs-null-flow.patch`, carried on top of the pin and
 /// applied by both build paths, so it is hashed into the pasta binary's
@@ -26,7 +26,7 @@ const ARCHIVE_SHA256: &str = "ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe0971
 /// apart; `the_carried_patch_guards_the_null_flow_udp_error_sites` checks what
 /// the patch does.
 const PATCH_FILE: &str = "scripts/passt-udp-sock-errs-null-flow.patch";
-const PATCH_SHA256: &str = "6ba39e5c7945fd84545c3e5c1c60ab4ab2f48f7f6b282a608064b48463335019";
+const PATCH_SHA256: &str = "dadb69ec23b51e9d5d5f86782692c241b43ea7133d603e60f4262d27447aa94a";
 
 /// Every carried patch, in the order both builds apply them, pinned by content. The last
 /// two serve the pastas of a namespace pool (`fcvm netpool serve`): an option to run
@@ -40,7 +40,7 @@ const PATCHES: &[(&str, &str)] = &[
     ),
     (
         "scripts/passt-control-reset-status.patch",
-        "e9597ffcc9e5cd93b37c0e432bccf9e7c9e2b0130d655fe8a7d716c483fb4c55",
+        "92b96a1356fa9414c24efd6e6b2be734b36bd6475c1f69e0d48e30801f73861c",
     ),
 ];
 

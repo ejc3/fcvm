@@ -56,11 +56,11 @@ allow_seccomp_log = false
 # scripts/publish-passt-archive.sh when the pin moves.
 [pasta]
 repo = "https://passt.top/passt"
-commit = "4e8aa70379a35ec9deb11d76513e7f6c4123b667"
-archive_sha256 = "ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe097170e9e5851da8b9"
+commit = "15980a90f9a60e6ae9a3865bb85d20a3d8379deb"
+archive_sha256 = "8a25c40ecfe7bdace74e3c4966c88846b693dce34f6bf8f09e2b607c25b20d42"
 archives = [
-    "https://github.com/ejc3/fcvm/releases/download/passt-4e8aa70379a3/passt-4e8aa70379a35ec9deb11d76513e7f6c4123b667.tar.xz",
-    "https://passt.top/passt/snapshot/passt-4e8aa70379a35ec9deb11d76513e7f6c4123b667.tar.xz",
+    "https://github.com/ejc3/fcvm/releases/download/passt-15980a90f9a6/passt-15980a90f9a60e6ae9a3865bb85d20a3d8379deb.tar.xz",
+    "https://passt.top/passt/snapshot/passt-15980a90f9a60e6ae9a3865bb85d20a3d8379deb.tar.xz",
 ]
 
 # Pinned libseccomp, linked into every Firecracker that `fcvm setup` builds.
@@ -170,7 +170,7 @@ commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor`. This is upstream's main branch at
-# `commit` (v55.0 plus 117 commits), with no patch of fcvm's own: the restore options fcvm
+# `commit` (v55.0 plus 189 commits), with no patch of fcvm's own: the restore options fcvm
 # passes are upstream's (memory_restore_mode=copyonwrite since v54.0, and
 # clock_restore_mode=preserve, which is on main and in no release yet).
 # `commit` is required. The binary's name is a hash of the repo, the commit, the
@@ -179,7 +179,7 @@ commit = "df341d66cfef596c957d4ebd0865d6f39b787784"
 # it, so moving this pin means every Cloud Hypervisor snapshot is created again.
 [cloud_hypervisor]
 repo = "cloud-hypervisor/cloud-hypervisor"
-commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7"
+commit = "65e8301c5c79577b5de49cac640194e954e718ff"
 
 # Published builds of the pinned VMMs above (src/setup/vmm_artifacts.rs). vmm.yml builds each
 # Firecracker pin of a published kernel profile and the Cloud Hypervisor pin from source, per

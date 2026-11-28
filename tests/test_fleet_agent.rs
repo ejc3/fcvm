@@ -1436,6 +1436,8 @@ async fn the_hello_reports_when_the_store_was_ready() {
 
 type Seen = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
+// tungstenite's handshake callback must return its own large `ErrorResponse` as the error.
+#[allow(clippy::result_large_err)]
 async fn accept_agent(
     listener: &tokio::net::TcpListener,
     seen: &Seen,

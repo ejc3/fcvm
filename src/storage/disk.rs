@@ -255,7 +255,7 @@ pub fn subvolume_snapshot_marks_held(base_dir: &Path, limit: usize) -> usize {
         }
         held += 1;
         // A mark is one byte.
-        let byte = (lock.l_start as i64).clamp(from as i64, to as i64 - 1) as u8;
+        let byte = lock.l_start.clamp(from as i64, to as i64 - 1) as u8;
         unasked.push((from, byte));
         unasked.push((byte + 1, to));
     }

@@ -10,8 +10,9 @@
 //! - a client may send [`RESET`] before its tables: pasta closes every flow it has (TCP,
 //!   spliced TCP, UDP, ping), sending nothing to the guest's side, and takes back the guest
 //!   MAC and addresses it learned from traffic;
-//! - pasta answers with one status byte before it closes, for a reset once the flows are
-//!   closed. Bit 0 says a forwarding rule could not be bound.
+//! - pasta answers with upstream's status byte (`enum pesto_status`, protocol version 3)
+//!   before it closes, for a reset once the flows are closed: 0 applied, 1 a forwarding
+//!   rule could not be bound and the old rules are back, 2 and they could not be restored.
 //!
 //! The reset here sends no tables, which also ends every forward pasta had.
 
@@ -24,7 +25,7 @@ use tokio::net::UnixStream;
 /// `PESTO_SERVER_MAGIC`.
 const MAGIC: &[u8; 8] = b"basil:s\0";
 /// `PESTO_PROTOCOL_VERSION` of the pinned passt. Another version has other messages.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 /// `PIF_NAME_SIZE` and `IFNAMSIZ`, which size the messages below.
 const PIF_NAME_SIZE: u32 = 128;
 const IFNAMSIZ: u32 = 16;
@@ -35,8 +36,10 @@ const RULE_SIZE: usize = 16 + 16 + IFNAMSIZ as usize + 2 + 2 + 2 + 1 + 1;
 const RESET: u8 = 0xff;
 /// The end of the client's tables, and of pasta's (`PIF_NONE`).
 const END: u8 = 0;
-/// `PESTO_STATUS_LISTEN_FAILED`.
-const STATUS_LISTEN_FAILED: u8 = 0x01;
+/// `PESTO_STATUS_ROLLBACK`: the new rules failed and the old ones are back.
+const STATUS_ROLLBACK: u8 = 1;
+/// `PESTO_STATUS_FAILED`: the new rules failed and the old ones could not be restored.
+const STATUS_FAILED: u8 = 2;
 /// A reset is one loop of pasta's event handler; this is for a pasta that has stopped.
 const BUDGET: Duration = Duration::from_secs(5);
 
@@ -110,8 +113,10 @@ async fn exchange(control: &Path, request: &[u8]) -> Result<()> {
         .read_u8()
         .await
         .context("reading pasta's status (a pasta without fcvm's patches sends none)")?;
-    if status & STATUS_LISTEN_FAILED != 0 {
-        bail!("pasta could not bind a forwarding rule");
+    match status {
+        STATUS_ROLLBACK => bail!("pasta could not bind a forwarding rule, old rules restored"),
+        STATUS_FAILED => bail!("pasta could not bind a forwarding rule or restore the old ones"),
+        _ => {}
     }
     ensure!(status == 0, "pasta answered with status {status:#x}");
     Ok(())
@@ -187,15 +192,17 @@ mod tests {
         plain.push(END);
         let (outcome, _) = run(plain.clone(), None).await;
         assert!(format!("{:#}", outcome.unwrap_err()).contains("status"));
-        let (outcome, _) = run(plain.clone(), Some(STATUS_LISTEN_FAILED)).await;
-        assert!(format!("{:#}", outcome.unwrap_err()).contains("could not bind"));
+        let (outcome, _) = run(plain.clone(), Some(STATUS_ROLLBACK)).await;
+        assert!(format!("{:#}", outcome.unwrap_err()).contains("old rules restored"));
+        let (outcome, _) = run(plain.clone(), Some(STATUS_FAILED)).await;
+        assert!(format!("{:#}", outcome.unwrap_err()).contains("restore the old ones"));
         let (outcome, _) = run(plain, Some(0x80)).await;
         assert!(format!("{:#}", outcome.unwrap_err()).contains("0x80"));
 
-        let mut other = hello(3);
+        let mut other = hello(2);
         other.push(END);
         let (outcome, request) = run(other, Some(0)).await;
-        assert!(format!("{:#}", outcome.unwrap_err()).contains("protocol 3"));
+        assert!(format!("{:#}", outcome.unwrap_err()).contains("protocol 2"));
         assert_eq!(
             request, b"",
             "no request goes to a pasta of another version"

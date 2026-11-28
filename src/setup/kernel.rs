@@ -4426,13 +4426,13 @@ mod tests {
             .find("cloud_hypervisor_version_names(")
             .expect("setup does not check the built binary's version");
         assert!(check < body.find("temp.publish(").unwrap());
-        let commit = "4969a51a3d3fcb08685a022cc3efa205b7a44ed7";
-        cloud_hypervisor_version_names("cloud-hypervisor v55.0-117-g4969a51a3d3f\n", commit)
+        let commit = "65e8301c5c79577b5de49cac640194e954e718ff";
+        cloud_hypervisor_version_names("cloud-hypervisor v55.0-189-g65e8301c5c79\n", commit)
             .unwrap();
         for wrong in [
             "cloud-hypervisor v55.0.0",
-            "cloud-hypervisor v55.0-117-g4969a51a",
-            "cloud-hypervisor v55.0-117-g4969a51a3d3f-dirty",
+            "cloud-hypervisor v55.0-189-g65e8301c5",
+            "cloud-hypervisor v55.0-189-g65e8301c5c79-dirty",
             "",
         ] {
             assert!(
