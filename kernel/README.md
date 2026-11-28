@@ -71,11 +71,11 @@ until upstream took it as 81d99abe2bd8, which 6.18.59 carries; it holds no
 x86-only patch today.
 
 The host kernels (`make install-host-kernel`) apply the `patches_dir` of their
-own `host_kernel` table, minus the `.vm.patch` files, both on 7.3.3:
+own `host_kernel` table, minus the `.vm.patch` files, both on 7.3.6:
 `kernel/patches-x86-host` on x86_64, which links the 7.3 fuse patches and holds the KVM
 patch below, and
 `kernel/patches-arm64-host` on arm64, which links the patches it shares with the
-7.3.3 nested guest from `kernel/patches-arm64` and holds the host-only KVM patches
+7.3.6 nested guest from `kernel/patches-arm64` and holds the host-only KVM patches
 below. Each host also sets the Kconfig lines of its `config_fragment` on top of the
 running kernel's config, and its build stops if one does not hold after `olddefconfig`:
 `kernel/host-x86.conf` on x86_64 (ENA built in, wireless extensions off) and
@@ -175,7 +175,7 @@ before the guest runs an instruction (#2132).
 The guest kernels that run KVM themselves carry the same change, for the VMs that run and
 are restored inside them: `kernel/patches-x86/0008-...` for `nested.amd64` (6.18.60),
 `kernel/patches-mountinfo/0004-...` for the `mountinfo` pair (6.16.1; the control's
-`kernel/patches-mountinfo-base` links to it), and for `phone.amd64` (7.3.3, the host's
+`kernel/patches-mountinfo-base` links to it), and for `phone.amd64` (7.3.6, the host's
 release) a link to the host's patch in `kernel/patches-phone-7.3`, beside links to the gpu
 profile's two patches. The function is the same in the three releases but for one
 `WRITE_ONCE`. `every_x86_kernel_that_builds_kvm_carries_the_pv_kick_patch` takes the kernels
