@@ -1,8 +1,8 @@
 /*
- * Verbatim line ranges from Linux v7.3.3 arch/arm64/kvm/nested.c:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/nested.c
- * Complete source SHA256: 2821d3f5d50bc1d41e3e08f7556774cf1a4b9e0f2834c0274aca7d099a2962c5
- * Lines 5-10, 44-136, 871-880, 1266-1275, 1293-1313, 1332-1341, each range separated by one blank line.
+ * Verbatim line ranges from Linux v7.3.6 arch/arm64/kvm/nested.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/kvm/nested.c
+ * Complete source SHA256: 579ee0f507258d3c8acc9a3e0f7f551763181aebf5633b0478dc2dedff430154
+ * Lines 5-10, 44-139, 870-879, 1265-1274, 1292-1312, 1331-1340, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64-host/nv2-targeted-shadow-s2-unmap.patch to these files,
  * then compiles the functions it names from them into a C harness.
@@ -96,6 +96,9 @@ int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
 			vcpu->arch.ctxt.vncr_array = NULL;
 			return ret;
 		}
+
+		for (i = 0; i < S2_MMU_PER_VCPU; i++)
+			kvm_nested_s2_ptdump_create_debugfs(&tmp[i], i + kvm->arch.nested_mmus_size);
 
 		guard(write_lock)(&kvm->mmu_lock);
 

@@ -1,6 +1,6 @@
 /*
- * Verbatim line ranges from Linux v7.3.3 arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
+ * Verbatim line ranges from Linux v7.3.6 arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/kvm/hyp/include/hyp/sysreg-sr.h
  * Complete source SHA256: 70f38f09833d451a375c02629af9594590dc72033506c9e41b708e2a0c121cb7
  * Lines 15-64, 195-207, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies

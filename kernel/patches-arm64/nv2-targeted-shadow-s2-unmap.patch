@@ -1,6 +1,6 @@
-From 371fdb0e229c7b854a26201b5c74c53ec109bc7c Mon Sep 17 00:00:00 2001
+From d63bb0a03c983266524c72df3fc82eebc3b15709 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Mon, 9 Nov 2026 10:48:51 +0000
+Date: Sat, 28 Nov 2026 07:16:27 +0000
 Subject: [PATCH] KVM: arm64: nv: Unmap only the affected shadow stage-2 ranges
  on invalidation
 
@@ -17,7 +17,13 @@ every shadow stage-2 of the VM over its whole IPA range (fcvm #1264, #1274):
   2064f15b0848 KVM: arm64: nv: Drop kvm_s2_mmu pointer from kvm_guest_s2_mapping
   862fa5680785 KVM: arm64: Refactor kvm_unmap_gfn_range() with common variables
 
-All seven are in v7.4-rc1 and cherry-pick onto v7.3.3 without conflicts.
+All seven are in v7.4-rc1. They cherry-pick onto v7.3.3 without conflicts.
+v7.3.5 carries 9f84bde6aaad (upstream 80b0b86dc5e4, "KVM: arm64: Use
+kvm_s2_fault_vma_info in gmem_abort()"), which the series is based on
+upstream, so on v7.3.5 and later gmem_abort() records the mapping as
+upstream does: at the canonical gfn the function already computes, with
+s2vi.vma_pagesize as its size. The lines the series adds to gmem_abort() then
+match v7.4-rc4.
 Original patches by Wei-Lin Chang <weilin.chang@arm.com> and
 Marc Zyngier <maz@kernel.org>.
 
@@ -39,7 +45,7 @@ frees the canonical MMU's records under the mmu_lock, so it is not carried.
  4 files changed, 293 insertions(+), 18 deletions(-)
 
 diff --git a/arch/arm64/include/asm/kvm_host.h b/arch/arm64/include/asm/kvm_host.h
-index cd9b9d2..8dfaa33 100644
+index d7caf8c..21395b8 100644
 --- a/arch/arm64/include/asm/kvm_host.h
 +++ b/arch/arm64/include/asm/kvm_host.h
 @@ -14,6 +14,7 @@
@@ -144,7 +150,7 @@ index 586026e..0f899ad 100644
  extern void kvm_nested_s2_flush(struct kvm *kvm);
  
 diff --git a/arch/arm64/kvm/mmu.c b/arch/arm64/kvm/mmu.c
-index bf6d652..11551dd 100644
+index cae1338..1518ce9 100644
 --- a/arch/arm64/kvm/mmu.c
 +++ b/arch/arm64/kvm/mmu.c
 @@ -7,6 +7,7 @@
@@ -249,15 +255,15 @@ index bf6d652..11551dd 100644
  }
  
  static void hyp_mc_free_fn(void *addr, void *mc)
-@@ -1600,6 +1643,7 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
+@@ -1624,6 +1667,7 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
  	enum kvm_pgtable_walk_flags flags = KVM_PGTABLE_WALK_SHARED;
  	enum kvm_pgtable_prot prot = KVM_PGTABLE_PROT_R;
  	struct kvm_pgtable *pgt = s2fd->vcpu->arch.hw_mmu->pgt;
 +	struct kvm_guest_s2_mapping *mapping = NULL;
- 	unsigned long mmu_seq;
- 	struct page *page;
+ 	struct kvm_s2_fault_vma_info s2vi = {};
  	struct kvm *kvm = s2fd->vcpu->kvm;
-@@ -1613,6 +1657,11 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
+ 	void *memcache = NULL;
+@@ -1635,6 +1679,11 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
  		ret = topup_mmu_memcache(s2fd->vcpu, memcache);
  		if (ret)
  			return ret;
@@ -268,18 +274,18 @@ index bf6d652..11551dd 100644
 +		}
  	}
  
- 	if (s2fd->nested)
-@@ -1633,6 +1682,7 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
+ 	s2vi.vma_pagesize = PAGE_SIZE;
+@@ -1654,6 +1703,7 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
  	if (ret) {
- 		kvm_prepare_memory_fault_exit(s2fd->vcpu, s2fd->fault_ipa, PAGE_SIZE,
- 					      write_fault, exec_fault, false);
+ 		kvm_prepare_memory_fault_exit(s2fd->vcpu, gfn_to_gpa(canonical_gfn),
+ 					      s2vi.vma_pagesize, write_fault, exec_fault, false);
 +		kfree(mapping);
  		return ret;
  	}
  
-@@ -1666,11 +1716,22 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
- 		ret = KVM_PGT_FN(kvm_pgtable_stage2_map)(pgt, s2fd->fault_ipa, PAGE_SIZE,
- 							 __pfn_to_phys(pfn), prot,
+@@ -1688,11 +1738,22 @@ static int gmem_abort(const struct kvm_s2_fault_desc *s2fd)
+ 							 s2vi.vma_pagesize,
+ 							 __pfn_to_phys(s2vi.pfn), prot,
  							 memcache, flags);
 +		/*
 +		 * -EAGAIN from kvm_pgtable_stage2_map() can install mappings.
@@ -287,20 +293,20 @@ index bf6d652..11551dd 100644
 +		 * thing.
 +		 */
 +		if ((ret == 0 || ret == -EAGAIN) && kvm_is_nested_s2_mmu(kvm, pgt->mmu)) {
-+			kvm_record_guest_s2_mapping(pgt->mmu, gfn << PAGE_SHIFT,
-+						    s2fd->fault_ipa, PAGE_SIZE, mapping);
++			kvm_record_guest_s2_mapping(pgt->mmu, canonical_gfn << PAGE_SHIFT,
++						    s2fd->fault_ipa, s2vi.vma_pagesize, mapping);
 +			mapping = NULL;
 +		}
  	}
  
  out_unlock:
- 	kvm_release_faultin_page(kvm, page, !!ret, prot & KVM_PGTABLE_PROT_W);
+ 	kvm_release_faultin_page(kvm, s2vi.page, !!ret, prot & KVM_PGTABLE_PROT_W);
  	kvm_fault_unlock(kvm);
 +	kfree(mapping);
  
  	if ((prot & KVM_PGTABLE_PROT_W) && !ret)
- 		mark_page_dirty_in_slot(kvm, s2fd->memslot, gfn);
-@@ -1997,8 +2058,10 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
+ 		mark_page_dirty_in_slot(kvm, s2fd->memslot, canonical_gfn);
+@@ -2008,8 +2069,10 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
  			    void *memcache)
  {
  	enum kvm_pgtable_walk_flags flags = KVM_PGTABLE_WALK_SHARED;
@@ -311,7 +317,7 @@ index bf6d652..11551dd 100644
  	struct kvm_pgtable *pgt;
  	long perm_fault_granule;
  	long mapping_size;
-@@ -2006,6 +2069,15 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
+@@ -2017,6 +2080,15 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
  	gfn_t gfn;
  	int ret;
  
@@ -327,7 +333,7 @@ index bf6d652..11551dd 100644
  	kvm_fault_lock(kvm);
  	pgt = s2fd->vcpu->arch.hw_mmu->pgt;
  	ret = -EAGAIN;
-@@ -2017,6 +2089,7 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
+@@ -2028,6 +2100,7 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
  	mapping_size = s2vi->vma_pagesize;
  	pfn = s2vi->pfn;
  	gfn = s2vi->gfn;
@@ -335,7 +341,7 @@ index bf6d652..11551dd 100644
  
  	/*
  	 * If we are not forced to use page mapping, check if we are
-@@ -2035,6 +2108,7 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
+@@ -2044,6 +2117,7 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
  				goto out_unlock;
  			}
  		}
@@ -343,7 +349,7 @@ index bf6d652..11551dd 100644
  	}
  
  	if (!perm_fault_granule && !s2vi->map_non_cacheable && kvm_has_mte(kvm))
-@@ -2057,22 +2131,31 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
+@@ -2066,22 +2140,31 @@ static int kvm_s2_fault_map(const struct kvm_s2_fault_desc *s2fd,
  		ret = KVM_PGT_FN(kvm_pgtable_stage2_map)(pgt, gfn_to_gpa(gfn), mapping_size,
  							 __pfn_to_phys(pfn), prot,
  							 memcache, flags);
@@ -380,7 +386,7 @@ index bf6d652..11551dd 100644
  
  	if (ret != -EAGAIN)
  		return ret;
-@@ -2410,14 +2493,16 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
+@@ -2419,14 +2502,16 @@ int kvm_handle_guest_abort(struct kvm_vcpu *vcpu)
  
  bool kvm_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range)
  {
@@ -401,7 +407,7 @@ index bf6d652..11551dd 100644
  	return false;
  }
  
-@@ -2699,7 +2784,7 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
+@@ -2708,7 +2793,7 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
  
  	write_lock(&kvm->mmu_lock);
  	kvm_stage2_unmap_range(&kvm->arch.mmu, gpa, size, true);
@@ -411,7 +417,7 @@ index bf6d652..11551dd 100644
  }
  
 diff --git a/arch/arm64/kvm/nested.c b/arch/arm64/kvm/nested.c
-index b191365..cfc222e 100644
+index bbd7042..f337cfc 100644
 --- a/arch/arm64/kvm/nested.c
 +++ b/arch/arm64/kvm/nested.c
 @@ -5,6 +5,7 @@
@@ -440,7 +446,7 @@ index b191365..cfc222e 100644
  
  	return kvm->arch.nested_mmus ? 0 : -ENOMEM;
  }
-@@ -126,8 +129,10 @@ int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
+@@ -129,8 +132,10 @@ int kvm_vcpu_init_nested(struct kvm_vcpu *vcpu)
  
  		guard(write_lock)(&kvm->mmu_lock);
  
@@ -452,7 +458,7 @@ index b191365..cfc222e 100644
  
  		kvm->arch.nested_mmus_size += S2_MMU_PER_VCPU;
  	}
-@@ -871,6 +876,111 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
+@@ -870,6 +875,111 @@ static struct kvm_s2_mmu *get_s2_mmu_nested(struct kvm_vcpu *vcpu)
  	return s2_mmu;
  }
  
@@ -564,7 +570,7 @@ index b191365..cfc222e 100644
  void kvm_init_nested_s2_mmu(struct kvm_s2_mmu *mmu)
  {
  	/* CnP being set denotes an invalid entry */
-@@ -1293,6 +1403,56 @@ void kvm_nested_s2_wp(struct kvm *kvm)
+@@ -1292,6 +1402,56 @@ void kvm_nested_s2_wp(struct kvm *kvm)
  	kvm_invalidate_vncr_ipa_all(kvm);
  }
  

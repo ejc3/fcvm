@@ -3,9 +3,9 @@
  * Author: Jintack Lim <jintack.lim@linaro.org>
  */
 /*
- * Verbatim function excerpts from Linux v7.3.3 arch/arm64/kvm/nested.c:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/nested.c
- * Complete source SHA256: 2821d3f5d50bc1d41e3e08f7556774cf1a4b9e0f2834c0274aca7d099a2962c5
+ * Verbatim function excerpts from Linux v7.3.6 arch/arm64/kvm/nested.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/kvm/nested.c
+ * Complete source SHA256: 579ee0f507258d3c8acc9a3e0f7f551763181aebf5633b0478dc2dedff430154
  * kvm_vcpu_load_hw_mmu is retained as context. unmap_l1_vncr,
  * this_cpu_reset_vncr_fixmap and invalidate_vncr are what the put and
  * translation paths call.

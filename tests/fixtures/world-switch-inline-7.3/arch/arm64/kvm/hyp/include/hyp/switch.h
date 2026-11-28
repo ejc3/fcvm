@@ -1,6 +1,6 @@
 /*
- * Verbatim line range from Linux v7.3.3 arch/arm64/kvm/hyp/include/hyp/switch.h:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/hyp/include/hyp/switch.h
+ * Verbatim line range from Linux v7.3.6 arch/arm64/kvm/hyp/include/hyp/switch.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/kvm/hyp/include/hyp/switch.h
  * Complete source SHA256: 96b959098f33cf22680f98a206f835c4b48a6813b9264814f74617d23a3e3358
  * Lines 518-580.
  * tests/test_kernel_patch_invariants.rs applies

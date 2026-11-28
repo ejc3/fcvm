@@ -1,8 +1,8 @@
 /*
- * Verbatim line range from Linux v7.3.3 include/kvm/arm_vgic.h:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/include/kvm/arm_vgic.h
- * Complete source SHA256: 81ca6126139286e3882bc61a11e4df9ecd5fdb9868d7b1da9767bbe8db8cfc2a
- * Lines 453-478.
+ * Verbatim line range from Linux v7.3.6 include/kvm/arm_vgic.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/include/kvm/arm_vgic.h
+ * Complete source SHA256: cb38f38e819a85f3631c15cb8a420f02870742ce9f560a9c712d40f2023c5b19
+ * Lines 454-479.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64-host/vgic-v3-keep-hcr-on-quiet-exits.patch
  * to this file, then compiles the definitions it names from it into a C harness.

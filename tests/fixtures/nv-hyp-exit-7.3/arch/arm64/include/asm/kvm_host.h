@@ -1,8 +1,8 @@
 /*
- * Verbatim line ranges from Linux v7.3.3 arch/arm64/include/asm/kvm_host.h:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/include/asm/kvm_host.h
- * Complete source SHA256: ac044465ffccb1446e843e0edfb22626ce8c0c73f34339be978e1163217f65bc
- * Lines 650-672, 1165-1200, 1520-1534, each range separated by one blank line.
+ * Verbatim line ranges from Linux v7.3.6 arch/arm64/include/asm/kvm_host.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/include/asm/kvm_host.h
+ * Complete source SHA256: 6a27377e1103c3ae13914bece4ac85f928cc03aee6ac5a057f6ad624953e10b6
+ * Lines 650-672, 1164-1199, 1519-1533, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64-host/nv-guest-hypervisor-exits-without-calls.patch to this file,
  * then checks or compiles the functions it names from it.
