@@ -427,6 +427,7 @@ pub async fn create_podman_snapshot(
                 Some(&extra_files),
                 source_disposition,
                 None,
+                &_vm_lock,
             )
             .await?,
         ),
@@ -445,6 +446,7 @@ pub async fn create_podman_snapshot(
                 Some(&extra_files),
                 // As before: a Cloud Hypervisor source resumes even for a prepare.
                 crate::commands::common::SnapshotSourceDisposition::Resume,
+                &_vm_lock,
             )
             .await?;
             None

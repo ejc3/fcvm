@@ -281,16 +281,19 @@ fn try_boundary_lock_at(path: &Path) -> BoundaryLock {
 struct BoundaryMarks {
     owed: PathBuf,
     restore: PathBuf,
+    cancelled: PathBuf,
 }
 
 const BOUNDARY_OWED_PATH: &str = "/run/fcvm/snapshot-boundary-owed";
 const RESTORE_UNDER_WAY_PATH: &str = "/run/fcvm/restore-under-way";
+const BOUNDARY_CANCELLED_PATH: &str = "/run/fcvm/snapshot-boundary-cancelled";
 
 impl BoundaryMarks {
     fn system() -> Self {
         Self {
             owed: PathBuf::from(BOUNDARY_OWED_PATH),
             restore: PathBuf::from(RESTORE_UNDER_WAY_PATH),
+            cancelled: PathBuf::from(BOUNDARY_CANCELLED_PATH),
         }
     }
 
@@ -373,6 +376,25 @@ impl BoundaryMarks {
     /// runs as root, and whatever can run it can read the mark.
     fn resume_is_for_the_owed_boundary(&self, token: Option<&str>) -> bool {
         !self.owed.exists() || self.owed_token().as_deref() == token
+    }
+
+    /// Record that the resume of the create with `token` ran before that create's prepare
+    /// took the boundary lock (#1941). The prepare, when it gets the lock, finds its token
+    /// here and refuses: its create has already been reopened, by the create's own reopen
+    /// after a prepare it took for failed or by the guard of a create that died, and
+    /// nobody would reopen it again. One token is kept, the latest: every create has its
+    /// own, so an older one names a create that is over.
+    fn cancel(&self, token: &str) -> Result<()> {
+        Self::write_mark(&self.cancelled, &format!("{BOUNDARY_TOKEN_KEY}{token}\n"))
+    }
+
+    /// The token of the latest resume that ran with nothing owed.
+    fn cancelled_token(&self) -> Option<String> {
+        let record = std::fs::read_to_string(&self.cancelled).ok()?;
+        record
+            .lines()
+            .find_map(|line| line.strip_prefix(BOUNDARY_TOKEN_KEY))
+            .map(str::to_string)
     }
 
     /// Write into an `owed` mark that the agent which served its prepare is gone. Only
@@ -766,6 +788,24 @@ impl std::fmt::Display for RestoreUnderWay {
 }
 
 impl std::error::Error for RestoreUnderWay {}
+
+/// A prepare whose create's resume already ran in this guest (#1941), and that did
+/// nothing: the create took the prepare for failed or is gone, and its reopen has been
+/// and gone, so a gate this closed would stay closed.
+#[derive(Debug)]
+pub struct PrepareCancelled;
+
+impl std::fmt::Display for PrepareCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refused: this snapshot's resume already ran in this guest, so nothing would \
+             reopen a gate this prepare closed; nothing was changed"
+        )
+    }
+}
+
+impl std::error::Error for PrepareCancelled {}
 
 /// A restore's epoch was dispatched: the boundary this guest was captured behind is the
 /// restore's from here to its publication. Before anything else of the restore.
@@ -3489,10 +3529,12 @@ pub struct PrepareFailure {
 ///    its gate, its manifest and its container's freeze are the restore's (#2138). The
 ///    check comes before the freeze, so a refusal neither freezes a restoring clone's
 ///    container nor has anything to thaw.
-/// 2. `owed` is written (`BoundaryMarks`): from here a resume has to open the gate.
-/// 3. The container is frozen, so it opens no socket and faults no page while the
+/// 2. A prepare whose create's resume already ran here refuses, under the lock and before
+///    anything changes: nothing would reopen a gate it closed (#1941, `cancel`).
+/// 3. `owed` is written (`BoundaryMarks`): from here a resume has to open the gate.
+/// 4. The container is frozen, so it opens no socket and faults no page while the
 ///    boundary closes, and a restored clone starts with it frozen.
-/// 4. The gate, the barrier, the manifest (`prepare_with`), then the console hold.
+/// 5. The gate, the barrier, the manifest (`prepare_with`), then the console hold.
 pub async fn prepare_snapshot_network(
     token: Option<&str>,
     freeze: impl FnOnce(),
@@ -3552,6 +3594,12 @@ where
     // A restore dispatched while this waited for the lock.
     if marks.restore_under_way() {
         return Err(refused(RestoreUnderWay("a snapshot's prepare").into()));
+    }
+    // This create's resume ran first (#1941): nothing would reopen what this closed.
+    if let Some(token) = token {
+        if marks.cancelled_token().as_deref() == Some(token) {
+            return Err(refused(PrepareCancelled.into()));
+        }
     }
     marks
         .mark_owed(token)
@@ -3650,6 +3698,19 @@ where
             }
             .into(),
         );
+    }
+    // Nothing is owed: this create's prepare has not taken the lock, or failed before its
+    // mark. Recorded, so that a prepare of this create that takes the lock later refuses
+    // (#1941). A record that cannot be written is a failed resume: the host asks again,
+    // and reports the source gated if it never lands.
+    if !marks.owed.exists() {
+        if let Some(token) = token {
+            if let Err(error) = marks.cancel(token) {
+                return SourceResume::owed(
+                    error.context("recording that this snapshot's prepare is cancelled"),
+                );
+            }
+        }
     }
     resume().await
 }
@@ -9602,6 +9663,7 @@ mod tests {
         BoundaryMarks {
             owed: dir.join("run").join("owed"),
             restore: dir.join("run").join("restore"),
+            cancelled: dir.join("run").join("cancelled"),
         }
     }
 
@@ -10503,6 +10565,117 @@ mod tests {
         );
         // Each refusal has its own exit status: `a_refused_one_shot_exits_with_the_status_
         // the_host_reads` (main.rs) runs both through the function that picks it.
+    }
+
+    /// A create's resume that runs before the create's prepare has taken the boundary lock
+    /// cancels that prepare (#1941). The create's own reopen after a prepare it took for
+    /// failed, and the guard of a create that died, both send a resume that can overtake a
+    /// prepare already sent: the guest serves each exec on its own task, and the prepare can
+    /// still be waiting for the lock. Without the record the late prepare marked the
+    /// boundary owed, froze the container and closed the gate after its create's last
+    /// reopen, and nothing opened it again.
+    ///
+    /// - The resume with the create's token, nothing owed: it runs, and records the token.
+    /// - That create's prepare then refuses before its mark and its freeze, and says it
+    ///   froze nothing, so its caller thaws nothing.
+    /// - Another create's prepare goes on as before, and its resume finds its own mark.
+    /// - A resume with no token (run by hand) records nothing, and a prepare with none is
+    ///   never refused for a record.
+    #[tokio::test]
+    async fn a_prepare_its_creates_resume_overtook_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = marks_in(dir.path());
+        let lock = dir.path().join("run").join("lock");
+        let froze = AtomicU32::new(0);
+        let closed = AtomicU32::new(0);
+        let prepare = |token: Option<&'static str>| {
+            prepare_snapshot_network_in(
+                &marks,
+                &lock,
+                token,
+                || {
+                    froze.fetch_add(1, Ordering::SeqCst);
+                },
+                || async { Ok(false) },
+                || async {
+                    closed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+        };
+        let resume = |token: Option<&'static str>| {
+            resume_source_network_in(&marks, &lock, token, || async {
+                SourceResume {
+                    gate_open: true,
+                    result: Ok(()),
+                }
+            })
+        };
+
+        // create A: its resume overtakes its prepare
+        assert!(resume(Some("create-a")).await.gate_open);
+        assert_eq!(marks.cancelled_token().as_deref(), Some("create-a"));
+        let refused = prepare(Some("create-a")).await.unwrap_err();
+        assert!(
+            refused.error.downcast_ref::<PrepareCancelled>().is_some(),
+            "{:#}",
+            refused.error
+        );
+        assert!(!refused.thaw, "a refused prepare's caller would thaw");
+        assert!(
+            !marks.owed.exists(),
+            "the cancelled prepare marked the boundary owed"
+        );
+        assert_eq!(
+            froze.load(Ordering::SeqCst),
+            0,
+            "the cancelled prepare froze"
+        );
+        assert_eq!(
+            closed.load(Ordering::SeqCst),
+            0,
+            "the cancelled prepare closed the gate"
+        );
+
+        // create B, in order: prepared, and resumed by its own token
+        prepare(Some("create-b")).await.unwrap();
+        assert_eq!(marks.owed_token().as_deref(), Some("create-b"));
+        assert_eq!(
+            (froze.load(Ordering::SeqCst), closed.load(Ordering::SeqCst)),
+            (1, 1)
+        );
+        assert!(resume(Some("create-b")).await.gate_open);
+        assert_eq!(
+            marks.cancelled_token().as_deref(),
+            Some("create-a"),
+            "a resume that found its mark recorded a cancellation"
+        );
+
+        // by hand: no token, no record, no refusal
+        BoundaryMarks::clear(&marks.owed).unwrap();
+        BoundaryMarks::clear(&marks.cancelled).unwrap();
+        assert!(resume(None).await.gate_open);
+        assert!(!marks.cancelled.exists());
+        prepare(None).await.unwrap();
+        assert_eq!(froze.load(Ordering::SeqCst), 2);
+
+        // Both are decided under the lock: the record after the resume's lock, the check
+        // after the prepare's and before its mark.
+        let source = include_str!("snapshot_network.rs");
+        let resume_checks = function_body(source, "async fn resume_source_network_in<");
+        assert!(
+            resume_checks
+                .find("acquire_boundary_lock_at(lock)")
+                .unwrap()
+                < resume_checks.find("marks.cancel(token)").unwrap()
+        );
+        let prepare_checks = function_body(source, "async fn prepare_snapshot_network_in<");
+        let locked = prepare_checks
+            .find("acquire_boundary_lock_at(lock)")
+            .unwrap();
+        let checked = prepare_checks.find("marks.cancelled_token()").unwrap();
+        let marked = prepare_checks.find(".mark_owed(token)").unwrap();
+        assert!(locked < checked && checked < marked);
     }
 
     /// The host fails a snapshot create on the restarted agent's report, which it finds

@@ -6660,7 +6660,7 @@ pub async fn create_disk_only_snapshot_core(
 /// (VM mid-teardown) is expected, and a failed bump must not fail the
 /// snapshot — it only degrades orphan detection for currently-blocked execs
 /// back to the pre-epoch behavior.
-async fn record_vsock_reset_for_snapshot(vm_id: &str, snapshot_name: &str) {
+pub(crate) async fn record_vsock_reset_for_snapshot(vm_id: &str, snapshot_name: &str) {
     let state_manager = crate::state::StateManager::new(paths::state_dir());
     match state_manager.bump_vsock_epoch(vm_id).await {
         Ok(Some(epoch)) => {
@@ -7001,7 +7001,7 @@ fn reopen_try_of(vm_id: &str, output: crate::commands::exec::ExecOutput) -> Reop
 /// the VM test the new agent was up about a second after the kill and the first ask
 /// landed. The bound also covers a stop that waits systemd's 90 s stop timeout for a
 /// frozen container that ignores SIGTERM, which was read from systemd and not observed.
-const SOURCE_REOPEN_BOUND: std::time::Duration = std::time::Duration::from_secs(150);
+pub(crate) const SOURCE_REOPEN_BOUND: std::time::Duration = std::time::Duration::from_secs(150);
 /// The wait between two tries, and the least a try is worth starting for.
 const SOURCE_REOPEN_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
 const SOURCE_REOPEN_LEAST_TRY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -7067,7 +7067,7 @@ enum ReopenTry {
 /// second try writes the record and clears it, and leaves the state as it found it.
 ///
 /// `Ok(true)`: open, and the agent that served the prepare died before the resume.
-async fn reopen_source_network(
+pub(crate) async fn reopen_source_network(
     vsock_socket: &Path,
     vm_id: &str,
     pause_preceded: bool,
@@ -7648,6 +7648,7 @@ pub async fn create_snapshot_core(
     extra_files: SnapshotExtraFiles<'_>,
     source_disposition: SnapshotSourceDisposition,
     memory_dir: Option<&Path>,
+    vm_lock: &std::fs::File,
 ) -> Result<PublishedMemoryFile> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
@@ -7661,6 +7662,32 @@ pub async fn create_snapshot_core(
         .acquire()
         .await
         .map_err(|e| anyhow::anyhow!("snapshot semaphore closed: {}", e))?;
+
+    // Pause timeout: should be fast (just pauses vCPU threads). 30s is generous.
+    // Snapshot timeout: scales with memory size for large VMs.
+    // 64GB at ~500MB/s ≈ 128s for full, but with dirty page tracking overhead can be 2-3x.
+    // Formula: max(300, mem_gib * 10) seconds: 300s minimum, 64GB=640s, 128GB=1280s.
+    let mem_gib = snapshot_config.metadata.memory_mib / 1024;
+    let snapshot_timeout_secs = std::cmp::max(300, (mem_gib as u64) * 10);
+
+    // A source that keeps running gets a guard before anything changes it: a process that
+    // undoes the prepare and the pause if this create stops without reopening the source,
+    // SIGKILL included (#1936, `snapshot_guard`). It holds what it needs from the fork, so
+    // nothing waits for it to start; the stand-down after the reopen checks that it did.
+    let mut source_guard = match source_disposition {
+        SnapshotSourceDisposition::Resume => Some(super::snapshot_guard::SourceGuard::spawn(
+            &super::snapshot_guard::GuardTarget {
+                hypervisor: crate::cli::Hypervisor::Firecracker,
+                api_socket: client.socket_path(),
+                vsock_socket: Some(vsock_socket_path),
+                vm_id: &snapshot_config.vm_id,
+                snapshot: &snapshot_config.name,
+                resume_timeout: std::time::Duration::from_secs(snapshot_timeout_secs),
+            },
+            vm_lock,
+        )?),
+        SnapshotSourceDisposition::LeavePaused => None,
+    };
 
     // Derive directories from snapshot config (memory_path's parent is the snapshot dir)
     let snapshot_dir = snapshot_config
@@ -7872,12 +7899,6 @@ pub async fn create_snapshot_core(
         }
     }
 
-    // Pause timeout: should be fast (just pauses vCPU threads). 30s is generous.
-    // Snapshot timeout: scales with memory size for large VMs.
-    // 64GB at ~500MB/s ≈ 128s for full, but with dirty page tracking overhead can be 2-3x.
-    // Formula: max(300, mem_gib * 10) seconds — 300s minimum, 64GB=640s, 128GB=1280s.
-    let mem_gib = snapshot_config.metadata.memory_mib / 1024;
-    let snapshot_timeout_secs = std::cmp::max(300, (mem_gib as u64) * 10);
     let pause_client = client.with_timeout(std::time::Duration::from_secs(30));
     let snapshot_client =
         client.with_timeout(std::time::Duration::from_secs(snapshot_timeout_secs));
@@ -7900,6 +7921,12 @@ pub async fn create_snapshot_core(
     // failpoint: widen the window before preparation — never sleep after the
     // gate closes and before the pause.
     failpoint::hit_async("snapshot.pre_pause").await;
+    if let Some(guard) = source_guard.as_mut() {
+        if let Err(error) = guard.arm().await {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(error);
+        }
+    }
     info!(snapshot = %snapshot_config.name, "preparing guest network and pausing VM for snapshot");
     let boundary_started = std::time::Instant::now();
     let mut boundary = SnapshotBoundaryTimes::default();
@@ -7911,11 +7938,11 @@ pub async fn create_snapshot_core(
     .await
     {
         // The exec transport can lose the reply after fc-agent has already
-        // closed the gate and brought eth0 down.  Recovery is safe to issue
-        // after every invoked prepare: the guest serializes both commands on
-        // one flock, so this blocks behind an in-flight prepare and then
-        // reopens the exact transaction it completed.  No hypervisor pause was
-        // invoked yet.
+        // closed the gate. Recovery is safe to issue after every invoked
+        // prepare: the guest runs both commands under one flock with this
+        // create's token, so this reopen either follows the prepare or makes a
+        // prepare that has not taken the lock yet refuse. No hypervisor pause
+        // was invoked yet.
         let operation_error =
             error.context("preparing guest network boundary for Firecracker snapshot");
         let guest_network_resume_result = reopen_source_after_failed_prepare(
@@ -7925,6 +7952,9 @@ pub async fn create_snapshot_core(
         )
         .await
         .context("reopening guest network after Firecracker preparation failure");
+        if let Some(guard) = source_guard.take() {
+            let _ = guard.disarm().await;
+        }
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(operation_error),
@@ -7933,6 +7963,24 @@ pub async fn create_snapshot_core(
         );
     }
     boundary.prepare_ms = boundary.lap(boundary_started);
+    // A guard that cannot be told about the pause cannot undo it: fail closed, before the
+    // pause, reopening the guest as after a failed prepare.
+    if let Some(guard) = source_guard.as_mut() {
+        if let Err(error) = guard.mark(super::snapshot_guard::PAUSE).await {
+            drop(source_guard.take());
+            let guest_network_resume_result =
+                reopen_source_network(vsock_socket_path, &snapshot_config.vm_id, false)
+                    .await
+                    .map(|_agent_restarted| ())
+                    .context("reopening guest network after the snapshot source guard was lost");
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return combine_snapshot_boundary_results(
+                Err(error.context("the snapshot source guard is gone; not pausing the VM")),
+                Ok(()),
+                guest_network_resume_result,
+            );
+        }
+    }
     let pause_result = pause_client
         .patch_vm_state(ApiVmState {
             state: "Paused".to_string(),
@@ -7960,6 +8008,9 @@ pub async fn create_snapshot_core(
             resume_paused_source(vsock_socket_path, &snapshot_config.vm_id)
                 .await
                 .context("reopening guest network after Firecracker pause failure");
+        if let Some(guard) = source_guard.take() {
+            let _ = guard.disarm().await;
+        }
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(pause_error),
@@ -8168,11 +8219,17 @@ pub async fn create_snapshot_core(
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to reopen guest network after snapshot!");
     }
+    // A create whose guard never started was not guarded, and fails.
+    let guard_result = match source_guard.take() {
+        Some(guard) => guard.disarm().await,
+        None => Ok(()),
+    };
 
     let (operation_result, extra_files_reader) = match extra_files_result {
         Ok(reader) => (snapshot_result.and(disk_copy_result), reader),
         Err(error) => (snapshot_result.and(disk_copy_result).and(Err(error)), None),
     };
+    let operation_result = operation_result.and(guard_result);
     if let Err(error) = combine_snapshot_boundary_results(
         operation_result,
         hypervisor_resume_result,
@@ -8481,6 +8538,27 @@ impl<'a> ChSnapshotGuest<'a> {
         }
     }
 
+    /// Reopen the boundary after a prepare that succeeded and a guard that was lost before
+    /// the pause: no pause preceded it, so the guest's clock is left alone.
+    async fn reopen_after_lost_guard(&self, vm_id: &str) -> Result<()> {
+        match self {
+            ChSnapshotGuest::FcAgent { vsock_socket_path } => {
+                reopen_source_network(vsock_socket_path, vm_id, false)
+                    .await
+                    .map(|_agent_restarted| ())
+            }
+            ChSnapshotGuest::Raw => Ok(()),
+        }
+    }
+
+    /// The exec vsock socket of a guest that runs fc-agent.
+    fn vsock_socket(&self) -> Option<&'a Path> {
+        match self {
+            ChSnapshotGuest::FcAgent { vsock_socket_path } => Some(vsock_socket_path),
+            ChSnapshotGuest::Raw => None,
+        }
+    }
+
     /// Record the vsock reset the pause caused, before the VM resumes.
     async fn record_pause(&self, vm_id: &str, snapshot_name: &str) {
         match self {
@@ -8517,6 +8595,7 @@ pub async fn create_snapshot_ch(
     guest: ChSnapshotGuest<'_>,
     extra_files: SnapshotExtraFiles<'_>,
     source_disposition: SnapshotSourceDisposition,
+    vm_lock: &std::fs::File,
 ) -> Result<()> {
     // First, as in `create_snapshot_core`: a source an earlier create left gated.
     guest.refuse_if_left_gated(&snapshot_config.vm_id).await?;
@@ -8530,6 +8609,29 @@ pub async fn create_snapshot_ch(
         .acquire()
         .await
         .map_err(|e| anyhow::anyhow!("snapshot semaphore closed: {}", e))?;
+
+    // Dumping all of guest RAM can take well over the default 30s API timeout for large
+    // `--mem` VMs or slow disks, so scale it like the Firecracker path: max(300s, mem_gib*10).
+    let mem_gib = snapshot_config.metadata.memory_mib / 1024;
+    let snapshot_timeout =
+        std::time::Duration::from_secs(std::cmp::max(300, (mem_gib as u64) * 10));
+
+    // As on Firecracker: a source that keeps running is guarded before anything changes it
+    // (#1936, `snapshot_guard`).
+    let mut source_guard = match source_disposition {
+        SnapshotSourceDisposition::Resume => Some(super::snapshot_guard::SourceGuard::spawn(
+            &super::snapshot_guard::GuardTarget {
+                hypervisor: crate::cli::Hypervisor::CloudHypervisor,
+                api_socket: client.socket_path(),
+                vsock_socket: guest.vsock_socket(),
+                vm_id: &snapshot_config.vm_id,
+                snapshot: &snapshot_config.name,
+                resume_timeout: snapshot_timeout,
+            },
+            vm_lock,
+        )?),
+        SnapshotSourceDisposition::LeavePaused => None,
+    };
 
     // Owned so no borrow of `snapshot_config` is held across the later config write.
     let snapshot_dir = snapshot_config
@@ -8581,24 +8683,49 @@ pub async fn create_snapshot_ch(
 
     // As on Firecracker, no fallible or blocking work may separate successful
     // guest preparation from the pause that captures its manifest.
+    if let Some(guard) = source_guard.as_mut() {
+        if let Err(error) = guard.arm().await {
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return Err(error);
+        }
+    }
     info!(snapshot = %snapshot_config.name, "preparing guest network and pausing Cloud Hypervisor VM for snapshot");
     if let Err(error) = guest.prepare(&snapshot_config.vm_id).await {
         // A failed exec response does not prove that preparation did not run.
-        // Guest-side flock serialization makes an unconditional resume the
-        // exact recovery operation even if the prepare command is still
-        // finishing when this second exec arrives.
+        // The guest's flock and this create's token make an unconditional
+        // resume the exact recovery operation: it waits for a prepare that
+        // holds the lock, and a prepare that comes after it refuses.
         let operation_error =
             error.context("preparing guest network boundary for Cloud Hypervisor snapshot");
         let guest_network_resume_result = guest
             .reopen_after_failed_prepare(&snapshot_config.vm_id, &operation_error)
             .await
             .context("reopening guest network after Cloud Hypervisor preparation failure");
+        if let Some(guard) = source_guard.take() {
+            let _ = guard.disarm().await;
+        }
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(operation_error),
             Ok(()),
             guest_network_resume_result,
         );
+    }
+    // As on Firecracker: a guard that cannot be told about the pause fails the create first.
+    if let Some(guard) = source_guard.as_mut() {
+        if let Err(error) = guard.mark(super::snapshot_guard::PAUSE).await {
+            drop(source_guard.take());
+            let guest_network_resume_result = guest
+                .reopen_after_lost_guard(&snapshot_config.vm_id)
+                .await
+                .context("reopening guest network after the snapshot source guard was lost");
+            let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
+            return combine_snapshot_boundary_results(
+                Err(error.context("the snapshot source guard is gone; not pausing the VM")),
+                Ok(()),
+                guest_network_resume_result,
+            );
+        }
     }
     let pause_result = client
         .pause_vm()
@@ -8623,6 +8750,9 @@ pub async fn create_snapshot_ch(
             .resume(&snapshot_config.vm_id)
             .await
             .context("reopening guest network after Cloud Hypervisor pause failure");
+        if let Some(guard) = source_guard.take() {
+            let _ = guard.disarm().await;
+        }
         let _ = crate::storage::disk::remove_snapshot_dir(&temp_snapshot_dir).await;
         return combine_snapshot_boundary_results(
             Err(pause_error),
@@ -8632,12 +8762,7 @@ pub async fn create_snapshot_ch(
     }
 
     // VM is paused — we MUST resume it before returning, regardless of outcome.
-    // Dumping all of guest RAM can take well over the default 30s API timeout for large
-    // `--mem` VMs or slow disks, so scale it like the Firecracker path: max(300s, mem_gib*10).
     let dest_url = format!("file://{}", ch_dir.display());
-    let mem_gib = snapshot_config.metadata.memory_mib / 1024;
-    let snapshot_timeout =
-        std::time::Duration::from_secs(std::cmp::max(300, (mem_gib as u64) * 10));
     let snapshot_result = client
         .with_timeout(snapshot_timeout)
         .snapshot_vm(&dest_url)
@@ -8666,6 +8791,8 @@ pub async fn create_snapshot_ch(
         .record_pause(&snapshot_config.vm_id, &snapshot_config.name)
         .await;
 
+    // failpoint: hold after the save (VM still paused) and before the resume, as on Firecracker.
+    failpoint::hit_async("snapshot.post_save_pre_resume").await;
     // Resume a normal source even if the snapshot or disk copy failed. A `--stop` source
     // never runs again: its fcvm is stopped next, so it stays paused and its guest gate shut.
     let hypervisor_resume_result = match source_disposition {
@@ -8691,11 +8818,17 @@ pub async fn create_snapshot_ch(
         error!(snapshot = %snapshot_config.name, error = %e,
             "CRITICAL: failed to reopen guest network after Cloud Hypervisor snapshot!");
     }
+    // A create whose guard never started was not guarded, and fails.
+    let guard_result = match source_guard.take() {
+        Some(guard) => guard.disarm().await,
+        None => Ok(()),
+    };
 
     let (operation_result, extra_files_reader) = match extra_files_result {
         Ok(reader) => (snapshot_result.and(disk_copy_result), reader),
         Err(error) => (snapshot_result.and(disk_copy_result).and(Err(error)), None),
     };
+    let operation_result = operation_result.and(guard_result);
     if let Err(error) = combine_snapshot_boundary_results(
         operation_result,
         hypervisor_resume_result,
@@ -12526,6 +12659,112 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
         // runs `resume_args` both ways.
         let args = body_of(source, "async fn resume_args(");
         assert!(args.contains("if pause_preceded {\n        let host_time = crate::utils::host_clock_now().as_nanos().to_string();"));
+    }
+
+    /// A create whose source keeps running holds a source guard from before its first
+    /// change until after its own reopen, on both backends, and hands the guard the per-VM
+    /// snapshot lock (#1936, `snapshot_guard`). The guard is armed before the prepare, told
+    /// before the pause, and stood down only after the reopen on each of the three paths
+    /// that reopen (failed prepare, failed pause, after the save), so a create killed
+    /// anywhere between the first and the last is undone by the guard. A guard that cannot
+    /// be told of the pause reopens the guest and returns before the pause. No fake VMM can
+    /// drive these functions; `test_lifecycle_interleave_killed_snapshot_create_resumes_its_source`
+    /// kills one.
+    #[test]
+    fn a_source_that_keeps_running_is_guarded_from_its_prepare_to_its_reopen() {
+        let source = include_str!("common.rs");
+        for (name, prepare, pause, lost_guard_reopen, reopens) in [
+            (
+                "create_snapshot_core",
+                "\"--prepare-snapshot-network\"",
+                "state: \"Paused\".to_string()",
+                "reopen_source_network(vsock_socket_path, &snapshot_config.vm_id, false)",
+                [
+                    "reopen_source_after_failed_prepare(",
+                    "resume_paused_source(",
+                    "resume_paused_source(",
+                ],
+            ),
+            (
+                "create_snapshot_ch",
+                "guest.prepare(",
+                ".pause_vm()",
+                ".reopen_after_lost_guard(",
+                [
+                    ".reopen_after_failed_prepare(",
+                    ".resume(&snapshot_config.vm_id)",
+                    ".resume(&snapshot_config.vm_id)",
+                ],
+            ),
+        ] {
+            let body = body_of(source, &format!("pub async fn {name}("));
+            assert_in_order(
+                name,
+                body,
+                &[
+                    "SnapshotSourceDisposition::Resume => Some(super::snapshot_guard::SourceGuard::spawn(",
+                    "SnapshotSourceDisposition::LeavePaused => None,",
+                    "guard.arm().await",
+                    prepare,
+                    "guard.mark(super::snapshot_guard::PAUSE)",
+                    pause,
+                ],
+            );
+            let spawn = &body[body.find("SourceGuard::spawn(").unwrap()..];
+            let spawn = &spawn[..spawn.find("LeavePaused => None").unwrap()];
+            assert!(
+                spawn.contains("vm_lock,"),
+                "{name} hands the guard its lock"
+            );
+            assert_eq!(body.matches("guard.disarm().await").count(), 3, "{name}");
+            // A failed PAUSE mark reopens the guest and returns before the pause.
+            let marked = body
+                .find("guard.mark(super::snapshot_guard::PAUSE)")
+                .unwrap();
+            let between = &body[marked..body.find(pause).unwrap()];
+            assert!(
+                between.contains(lost_guard_reopen)
+                    && between.contains("return combine_snapshot_boundary_results("),
+                "{name} pauses the VM after its guard could not be told about the pause"
+            );
+            let mut from = 0;
+            for reopen in reopens {
+                let at = from
+                    + body[from..]
+                        .find(reopen)
+                        .unwrap_or_else(|| panic!("{name}: no {reopen} after offset {from}"));
+                let disarm = at + body[at..].find("guard.disarm().await").unwrap();
+                let result = at
+                    + body[at..]
+                        .find("combine_snapshot_boundary_results(")
+                        .unwrap();
+                assert!(
+                    disarm < result,
+                    "{name}: the guard stands down after {reopen} only once the path has returned"
+                );
+                from = disarm;
+            }
+        }
+        // The guard's undo is the create's own reopen, the one that records the gate on the
+        // VM's state and reads the boundary's token from it.
+        let guard = include_str!("snapshot_guard.rs");
+        assert!(guard.contains(
+            "super::common::reopen_source_network(vsock, vm_id, phase == Phase::Paused)"
+        ));
+        for (file, caller) in [
+            (include_str!("snapshot.rs"), "async fn cmd_snapshot_create("),
+            (
+                include_str!("podman/snapshot.rs"),
+                "async fn create_podman_snapshot(",
+            ),
+        ] {
+            let body = body_of(file, caller);
+            assert_eq!(
+                body.matches("&_vm_lock,").count(),
+                2,
+                "{caller} hands both creators the per-VM snapshot lock it holds"
+            );
+        }
     }
 
     /// A memory snapshot's balloon record is read from the VMM inside
