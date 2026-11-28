@@ -1928,7 +1928,7 @@ mod snapshot_dir_tests {
     /// copies or 16 byte copies (they serialize on the root of the one subvolume tree the
     /// clones land in), while subvolume snapshots ran at 1,500 per second alone and 13,900
     /// at 512 at once. The 8 clones of 2000 that took a reflink slot at C=512 took 4.8 to
-    /// 7.8 s each, the start's p99 tail.
+    /// 7.8 s each, the slowest 0.4% of the starts (p99 was 1.6 s).
     ///
     /// RED ON THE PREVIOUS TREE: the small disk was reflinked into a plain directory while
     /// a reflink slot was free.

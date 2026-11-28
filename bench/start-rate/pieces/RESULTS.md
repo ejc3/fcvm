@@ -1,5 +1,8 @@
 # start-pieces results
 
+A historical record: every section below was measured on the stock host kernel 7.0.0-1013-aws, which fcvm no
+longer uses.
+
 One c8g.metal-48xl (192 Graviton4 cores, 377 GiB), host kernel 7.0.0-1013-aws,
 `/mnt/fcvm-btrfs` a btrfs image in a file on tmpfs (`/mnt/ram/btrfs.img`) mounted through a loop
 device, whose request queue holds 128 (`../README.md`, "The store"), one boot, 2026-11-22. Snapshot: `bench-start-rate-prep`
