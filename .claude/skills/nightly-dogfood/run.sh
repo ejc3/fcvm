@@ -9,9 +9,15 @@
 # run.log and machines (one line per instance the session launched: `pbox <slot> <instance id>` or `gpubox <instance id> <region>`).
 # Whatever is listed there and still running when the session ends is taken down here, so a timeout cannot leave a box
 # billing.
+#
+# The session's inference goes through the box's claude-master server, as the box's interactive sessions do
+# (`claude-master connect`, which holds the subscription logins and moves between them). /etc/zsh/zshenv names the server
+# for zsh only, and cron runs bash, so it is read from zsh here; no address is written in the repository. On its own login
+# the session hit that login's weekly limit at its first request (2026-11-21: a 429 three seconds in) and the night never
+# started. DOGFOOD_ROOT overrides the output folder.
 set -u
 [ "$(TZ=America/Los_Angeles date +%H)" = 03 ] || [ "${DOGFOOD_NOW:-}" = 1 ] || exit 0
-root=/mnt/fcvm-btrfs/fcvm-dogfood
+root=${DOGFOOD_ROOT:-/mnt/fcvm-btrfs/fcvm-dogfood}
 out=$root/$(TZ=America/Los_Angeles date +%F)/$(date -u +%H%M%S)
 mkdir -p "$out" || { echo "cannot create $out" >&2; exit 1; }
 log() { echo "$(date -u +%FT%TZ) $*" >>"$out/run.log"; }
@@ -44,11 +50,22 @@ export DOGFOOD_RUN_DIR=$out
 # gpuboxes stay off the staging fleet's region and quota (us-east-1), whatever the caller's environment says.
 export GPUBOX_REGION=us-west-2
 : >"$out/machines"
-log "start $(git rev-parse --short HEAD)"
-timeout -k 5m 6h claude -p "/nightly-dogfood" --permission-mode bypassPermissions \
+zsh_env() { zsh -c "print -r -- \${$1-}" 2>/dev/null; }
+server=${TCLAUDE_INFERENCE_SERVER:-$(zsh_env TCLAUDE_INFERENCE_SERVER)}
+master=${TCLAUDE_CLAUDE_MASTER:-$(zsh_env TCLAUDE_CLAUDE_MASTER)}
+launch=(claude) via="the box's own login"
+if [ -n "$server" ] && [ -n "$master" ]; then
+  launch=("$master" connect --server "$server" --dir "$HOME/.config/claude-master" --) via=claude-master
+fi
+log "start $(git rev-parse --short HEAD) via $via"
+timeout -k 5m 6h "${launch[@]}" -p "/nightly-dogfood" --permission-mode bypassPermissions \
   --output-format stream-json --verbose </dev/null >"$out/session.jsonl" 2>"$out/session.err"
 status=$?
-log "exit $status"
+# Why a session ended in error, as its last line says it (a usage limit, an API error), so run.log tells a night that never
+# started from one that ran.
+why=""
+[ "$status" = 0 ] || why=$(tail -n 1 "$out/session.jsonl" 2>/dev/null | jq -r 'select(.is_error == true) | .result // empty' 2>/dev/null | head -c 200)
+log "exit $status${why:+: $why}"
 # Take down what the session launched and left running. Only instances the session recorded, by id.
 while read -r kind a b; do
   case $kind in
