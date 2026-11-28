@@ -1086,15 +1086,23 @@ pub fn bind(
         "bound the data directory to its runtime directory"
     );
     if runtime.place == Place::Store {
-        tracing::info!(
-            "VM states of {} are kept on the store until the next boot, because {RUN}/fcvm-{} \
-             does not exist. Starts are faster with the states on tmpfs: `sudo fcvm setup \
-             --runtime-dir` makes that directory and has it made at every boot",
-            data_dir.display(),
-            owner.0
-        );
+        tracing::warn!("{}", store_fallback_warning(data_dir, owner.0));
     }
     Ok(Some(found(runtime)))
+}
+
+/// What a command that bound `data_dir` to the store's own place (`<data_dir>/runtime`) warns
+/// once per boot: every start of the boot keeps its state, sockets and markers on the store,
+/// where each write joins a btrfs transaction and waits out the commits other starts force,
+/// and `sudo fcvm setup --runtime-dir` puts them on tmpfs from the next boot (or at once, when
+/// no VM of the store is running).
+fn store_fallback_warning(data_dir: &Path, owner: u32) -> String {
+    format!(
+        "starts from {} are on the slow path until the next boot: their VM states, sockets and \
+         markers are kept on the store, because {RUN}/fcvm-{owner} does not exist. `sudo fcvm \
+         setup --runtime-dir` makes that directory and has it made at every boot",
+        data_dir.display()
+    )
 }
 
 /// What `sudo fcvm setup` does for the owner of `data_dir`, so that the owner's VM states
@@ -1308,6 +1316,31 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         pid
+    }
+
+    /// A store bound to its own place is a WARN, once per boot, that names the slow path,
+    /// the missing tmpfs base and the command that makes it; and `bind` gives it at warn
+    /// level, only for the store's place.
+    #[test]
+    fn binding_the_stores_own_place_warns_and_names_the_fix() {
+        let text = store_fallback_warning(Path::new("/srv/store"), 1000);
+        for part in [
+            "/srv/store",
+            "slow path",
+            "/run/fcvm-1000 does not exist",
+            "`sudo fcvm setup --runtime-dir`",
+        ] {
+            assert!(text.contains(part), "the warning lacks {part:?}: {text}");
+        }
+        let source = include_str!("runtime_dir.rs");
+        let bind = &source[source.find("pub fn bind(").unwrap()..];
+        let bind = &bind[..bind.find("\n}\n").unwrap()];
+        assert!(
+            bind.contains(
+                "if runtime.place == Place::Store {\n        tracing::warn!(\"{}\", store_fallback_warning(data_dir, owner.0));"
+            ),
+            "bind does not warn when it binds the store's own place"
+        );
     }
 
     #[test]

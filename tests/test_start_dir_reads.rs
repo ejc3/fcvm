@@ -2387,6 +2387,18 @@ mod start {
                 .with_context(|| format!("creating {}", data_dir.display()))?;
             std::os::unix::fs::chown(&data_dir, Some(user.uid), Some(user.gid))
                 .with_context(|| format!("giving {} to {}", data_dir.display(), user.name))?;
+            // What `sudo fcvm setup --runtime-dir` does for a store's owner: the tmpfs base
+            // /run/fcvm-<uid>, so the user's starts keep their states and sockets on tmpfs as
+            // root's do, and the store rule covers both. The tmpfiles.d rule goes to a
+            // directory of the test's, not the host's.
+            let rules = tempfile::tempdir().context("a directory for the tmpfiles.d rule")?;
+            fcvm::runtime_dir::install_base(
+                &data_dir,
+                Path::new(fcvm::runtime_dir::RUN),
+                rules.path(),
+                &fcvm::runtime_dir::Host::current()?,
+            )
+            .with_context(|| format!("making {}'s tmpfs base", user.name))?;
         }
         // The starts' cgroup scopes go under a parent of the test's own, so the entries of
         // that directory follow this test's VMs and no other test's.
