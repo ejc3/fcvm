@@ -7,10 +7,17 @@ name: Fleet viewer-path smoke
 # deploy (both call this workflow), and daily; each run is a real viewer and may wake the fleet.
 #
 # The two viewers:
-# - IPv4: a GitHub-hosted runner, which has no IPv6. The smoke proves that before it checks
-#   anything (--single-family: a TCP connection to a public IPv6 address must fail).
 # - IPv6: a self-hosted runner, which has a global IPv6 address (ejc3/aws runner-autoscale.tf
 #   proves one at launch); the smoke proves the runner reaches a public IPv6 address first.
+# - IPv4: a GitHub-hosted runner, which has no IPv6. The smoke proves that before it checks
+#   anything (--single-family: a TCP connection to a public IPv6 address must fail).
+#
+# The IPv6 viewer runs first. A self-hosted runner is launched for the job and took 10.9 to 18.2
+# minutes to start in the five IPv6 failures of 2026-11-21 to 11-28; a GitHub-hosted one starts
+# in seconds. Waiting for it between the viewers let the fleet sleep (10 minutes after its last
+# viewer) and terminate its GPU host, which counts against the account's G quota for about 15
+# minutes more while it shuts down; the second viewer's wake was then refused its new host
+# (VcpuLimitExceeded) past the settle wait, and every fcvm tile failed.
 #
 # A failure fails the job and opens (or comments on) one issue labelled fleet-viewer-smoke.
 
@@ -54,7 +61,9 @@ env:
 jobs:
   ipv4:
     name: IPv4-only viewer
-    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
+    needs: ipv6
+    # After the IPv6 viewer, whatever it found: this viewer's relaunches would race its probes.
+    if: ${{ !cancelled() && github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     environment: fleet-stage-deploy
     timeout-minutes: 45
@@ -102,9 +111,9 @@ jobs:
 
   ipv6:
     name: IPv6 viewer
-    needs: ipv4
-    # After the IPv4 viewer, whatever it found: its relaunches would race this run's probes.
-    if: ${{ !cancelled() && github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' }}
+    # First (see the top of this file): the wait for a self-hosted runner comes before either
+    # viewer, not between them.
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Linux, ARM64]
     environment: fleet-stage-deploy
     timeout-minutes: 45

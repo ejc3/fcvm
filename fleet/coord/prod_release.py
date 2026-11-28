@@ -146,8 +146,13 @@ def smokes(since):
             if not (v4 and v6 and v4.get("conclusion") == v6.get("conclusion") == "success"):
                 continue
             verify = job(listed, VERIFY_JOB) if kind == "gate" else None
-            found.append({"run": int(run["id"]), "workflow": kind, "start": when(v4["started_at"]),
-                          "end": when(v6["completed_at"]),
+            # The smoke runs from its first viewer's start (IPv6's, fleet-viewer-smoke.yml) to its
+            # last viewer's end; an unreadable time leaves the bound unknown (covers() refuses it).
+            starts = [when(v["started_at"]) for v in (v4, v6)]
+            ends = [when(v["completed_at"]) for v in (v4, v6)]
+            found.append({"run": int(run["id"]), "workflow": kind,
+                          "start": None if None in starts else min(starts),
+                          "end": None if None in ends else max(ends),
                           "verify": (when(verify["started_at"]), when(verify["completed_at"]))
                           if verify and verify.get("conclusion") == "success" else None})
     return found

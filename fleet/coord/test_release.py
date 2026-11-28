@@ -2471,6 +2471,16 @@ class ProdDecideTests(unittest.TestCase):
         self.gh.run("fleet-web-deploy.yml", "f" * 40, [release_job("Deploy fcvm-fleet-stage", "Deploy", 1050, 1200)])
         self.skips("no staging smoke")
 
+    def test_a_smoke_whose_first_viewer_started_before_the_web_release_finished_does_not_count(self):
+        # The IPv6 viewer runs first (fleet-viewer-smoke.yml): the smoke starts when it does, and
+        # ends when the IPv4 viewer does.
+        self.gh.jobs[self.coordinator_run][1:] = [
+            {"name": "smoke / IPv6 viewer", "conclusion": "success", "started_at": ts(1100), "completed_at": ts(1300)},
+            {"name": "smoke / IPv4-only viewer", "conclusion": "success", "started_at": ts(1310), "completed_at": ts(1500)}]
+        self.assertEqual(prod.decide()[0]["smoke_run"], self.coordinator_run)
+        self.gh.run("fleet-web-deploy.yml", "f" * 40, [release_job("Deploy fcvm-fleet-stage", "Deploy", 1050, 1200)])
+        self.skips("no staging smoke")
+
     def test_a_smoke_before_the_generation_was_verified_does_not_count_unless_it_is_the_verifying_one(self):
         self.status["verified_at"] = int(at(1600))
         self.skips("no staging smoke")
@@ -3449,6 +3459,26 @@ class ProdWorkflowTests(unittest.TestCase):
                     self.assertRegex(block, r"(?m)^        if: \$\{\{ !cancelled\(\)", "a failed rollback step skips this one")
         final = steps["fleet-prod-promote.yml"].split("      - name: The promotion failed\n", 1)[1]
         self.assertIn("if: ${{ always() }}", final)
+
+    def test_no_runner_wait_falls_between_the_two_viewers(self):
+        # The fleet sleeps 10 minutes after its last viewer leaves and terminates its GPU hosts;
+        # a g4dn.metal counts against the account's G quota for about 15 minutes more while it
+        # shuts down. With the IPv4 viewer first, the IPv6 job asked for a self-hosted runner
+        # only when the IPv4 viewer had left, and waited 10.9 to 18.2 minutes for one in the five
+        # IPv6 failures of 2026-11-21 to 11-28 (staging and prod). The fleet slept in between,
+        # the IPv6 viewer woke it again inside its old host's shutdown, and EC2 refused the new
+        # host (VcpuLimitExceeded) until after the smoke's 600 s wait: every fcvm tile was not
+        # running. So the viewer on the self-hosted runner runs first, and the viewer on the
+        # GitHub-hosted runner, which starts in seconds, follows it.
+        for name in ("fleet-viewer-smoke.yml", "fleet-prod-smoke.yml"):
+            with self.subTest(workflow=name):
+                jobs = self.jobs(name)
+                self.assertIn("runs-on: [self-hosted, Linux, ARM64]", jobs["ipv6"])
+                self.assertIn("runs-on: ubuntu-24.04", jobs["ipv4"])
+                self.assertNotRegex(jobs["ipv6"], r"(?m)^    needs:")
+                self.assertRegex(jobs["ipv4"], r"(?m)^    needs: ipv6$")
+                # The second viewer runs whatever the first found, as the IPv6 viewer did.
+                self.assertIn("!cancelled()", jobs["ipv4"])
 
     def test_the_prod_smoke_is_both_families_with_the_unverified_probe_and_its_callers_pass_secrets(self):
         jobs = self.jobs("fleet-prod-smoke.yml")
