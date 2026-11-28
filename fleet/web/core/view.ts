@@ -564,6 +564,20 @@ export function wakeMedianMs(p: FleetState["fleet"]["power"]): number | null {
  * a fleet that slept for want of viewers), so the card offers the Wake button.
  * `waking`: a `wake` this page sent has no receipt yet.
  */
+/**
+ * What a mode's page says when the coordinator lists none of its machines. The coordinator
+ * learns a fleet's phones, sandboxes and servers from the GPU hosts that run them, so while no
+ * host is connected (asleep, waking, or a host still booting or refused) none are listed and
+ * that says nothing about the fleet. Only a fleet with a host up and still none listed runs none.
+ */
+export function noneListedText(st: FleetState, runsNone: string, what: string): string {
+  const power = st.fleet.power.state;
+  if (power === "asleep") return `The ${what} start when the fleet wakes.`;
+  if (power === "waking") return `The fleet is waking. The ${what} start when a GPU host is up.`;
+  if (st.fleet.hosts.length === 0) return `No GPU host is up yet. The ${what} start when one is.`;
+  return runsNone;
+}
+
 export function sleepView(st: FleetState, srvNow: number, online: boolean, waking: boolean): SleepView | null {
   const p = st.fleet.power;
   if (p.state === "awake") return null;

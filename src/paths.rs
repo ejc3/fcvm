@@ -7,6 +7,21 @@ static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// Global directory for shared content-addressed assets
 static ASSETS_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// `paths.runtime_dir` of the config this process loaded, if it names a base.
+static RUNTIME_SETTING: OnceLock<Option<String>> = OnceLock::new();
+
+/// Where VM states and the namespace pool live (`crate::runtime_dir`), once that is
+/// settled for this process: the store's record of this boot names it, or a setting does.
+static RUNTIME_DIR: OnceLock<crate::runtime_dir::RuntimeDir> = OnceLock::new();
+
+/// Until then, the directory [`runtime`] last returned: where this process would bind the
+/// store as the first writer of this boot.
+static RUNTIME_CANDIDATE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Set once this process has found its runtime directory bound to its data directory
+/// (`bind_runtime_dir`).
+static RUNTIME_BOUND: OnceLock<()> = OnceLock::new();
+
 /// Default base directory when no config file exists
 const DEFAULT_BASE_DIR: &str = "/mnt/fcvm-btrfs";
 
@@ -15,10 +30,16 @@ const DEFAULT_BASE_DIR: &str = "/mnt/fcvm-btrfs";
 ///
 /// For nested VM support, each nesting level uses a different data_dir
 /// while sharing the same assets_dir for content-addressed files.
-pub fn init_from_config() {
+///
+/// A config that will not load is an error the command returns, so fcvm exits 1 with the
+/// list of places it searched; it is not a panic (exit 101), which a caller that reads the
+/// exit status would take for a crash.
+pub fn init_from_config() -> anyhow::Result<()> {
+    use anyhow::Context;
     let (config, _, _) = crate::setup::rootfs::load_config(None)
-        .expect("Failed to load config - run 'fcvm setup --generate-config' first");
+        .context("Failed to load config - run 'fcvm setup --generate-config' first")?;
     init_from_loaded_config(&config);
+    Ok(())
 }
 
 /// Initialize directories from an already loaded config. The FCVM_DATA_DIR environment
@@ -27,6 +48,9 @@ pub fn init_from_config() {
 /// sharing a directory such as `reclaim/0` with host root fails its ownership check.
 pub fn init_from_loaded_config(config: &crate::setup::rootfs::Plan) {
     let _ = DATA_DIR.set(resolve_data_dir(&config.paths.data_dir));
+    let _ = RUNTIME_SETTING.set(config.paths.runtime_dir.clone());
+    crate::confine::set_config_mode(config.confine.mode);
+    crate::confine::set_config_allow_seccomp_log(config.confine.allow_seccomp_log);
     let _ = ASSETS_DIR.set(resolve_assets_dir(&config.paths.assets_dir));
 }
 
@@ -80,7 +104,8 @@ pub fn init_with_paths(data_dir: impl Into<PathBuf>, assets_dir: impl Into<PathB
     let _ = ASSETS_DIR.set(absolute(assets_dir.into(), "assets_dir"));
 }
 
-/// Directory for mutable per-instance data (vm-disks, state, snapshots).
+/// Directory for mutable per-instance data that outlives its processes (vm-disks,
+/// snapshots, owner records). VM states are in [`runtime_dir`].
 /// Configure via `paths.data_dir` in rootfs-config.toml for nested VM nesting.
 /// FCVM_DATA_DIR environment variable overrides config value. Always absolute: a relative
 /// value is taken against the working directory once, when it is first read.
@@ -107,6 +132,14 @@ pub fn assets_dir() -> PathBuf {
             resolve_assets_dir(&config.paths.assets_dir)
         })
         .clone()
+}
+
+/// The assets directory `config` names, as an absolute path, whatever paths this process
+/// started with. `fcvm fleet` starts with the default paths ([`init_with_defaults`]) and
+/// runs `fcvm` commands that read the config, so a lookup it shares with those commands
+/// takes the directory from the config.
+pub fn configured_assets_dir(config: &crate::setup::rootfs::Plan) -> PathBuf {
+    resolve_assets_dir(&config.paths.assets_dir)
 }
 
 /// Assets directory *only if* it has already been initialised.
@@ -152,21 +185,207 @@ pub fn cache_dir() -> PathBuf {
     assets_dir().join("cache")
 }
 
-// === Mutable per-instance data (use data_dir) ===
-
-/// Directory for VM state files
-pub fn state_dir() -> PathBuf {
-    data_dir().join("state")
+/// Make `dir`, and any missing parent, looking each up before making it.
+///
+/// A mkdir of a directory that exists fails with EEXIST, but the kernel takes the lock of
+/// the directory it would be made in, for writing, before it finds that out, and on btrfs
+/// the holder can wait out a transaction commit. `std::fs::create_dir_all` makes that mkdir
+/// first and looks only after it fails, so every start that called it on a store directory
+/// queued on that directory's parent. This looks first: a directory that exists costs one
+/// lookup and takes no lock for writing. A missing one is made, parents first, and a mkdir
+/// that loses a race to another process (EEXIST) is success when a directory is there.
+pub fn ensure_dir(dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    let dir = dir.as_ref();
+    match std::fs::metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a directory", dir.display()),
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        ensure_dir(parent)?;
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
-/// Directory for VM runtime data (disks, sockets, logs)
+/// [`ensure_dir`] on a blocking thread, for async callers.
+pub async fn ensure_dir_async(dir: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    let dir = dir.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || ensure_dir(dir))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+// === Mutable per-instance data (use data_dir) ===
+
+/// The runtime directory, for what describes running processes only: where the store's
+/// record of this boot says it is, else where this process would put it as the boot's
+/// first writer (`crate::runtime_dir::locate`). With a data directory set without a config
+/// (`init_with_paths`, `init_with_defaults`) only FCVM_RUNTIME_DIR can name its base.
+///
+/// Settled once: by the store's record, by a setting, or by this process's own
+/// [`bind_runtime_dir`]. Until then every call locates again, because another first
+/// writer may choose another place between two calls.
+pub fn runtime() -> crate::runtime_dir::RuntimeDir {
+    use crate::runtime_dir::Host;
+    if let Some(runtime) = RUNTIME_DIR.get() {
+        return runtime.clone();
+    }
+    let configured = RUNTIME_SETTING.get_or_init(|| match DATA_DIR.get() {
+        Some(_) => None,
+        None => {
+            let (config, _, _) =
+                crate::setup::rootfs::load_config(None).expect("Failed to load config");
+            let _ = DATA_DIR.set(resolve_data_dir(&config.paths.data_dir));
+            config.paths.runtime_dir
+        }
+    });
+    // A host whose boot id cannot be read binds nothing: `bind_runtime_dir` returns that
+    // error before anything is made or read here.
+    let host = Host::current().unwrap_or_else(|_| Host {
+        boot_id: "unknown".to_string(),
+        euid: nix::unistd::geteuid().as_raw(),
+    });
+    let located = crate::runtime_dir::locate(
+        std::env::var_os("FCVM_RUNTIME_DIR"),
+        configured.as_deref(),
+        &data_dir(),
+        std::path::Path::new(crate::runtime_dir::RUN),
+        &host,
+    );
+    if located.settled() {
+        return RUNTIME_DIR.get_or_init(|| located).clone();
+    }
+    *RUNTIME_CANDIDATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(located.dir.clone());
+    located
+}
+
+/// [`runtime`]'s directory. For a path into it, call [`bind_runtime_dir`] first: before
+/// the store is bound in this boot this is only where it would be.
+pub fn runtime_dir() -> PathBuf {
+    runtime().dir
+}
+
+/// Directory for VM state files, in the runtime directory.
+pub fn state_dir() -> PathBuf {
+    runtime_dir().join("state")
+}
+
+/// Whether `dir` is this process's own state directory: the one in the runtime directory
+/// its data directory is bound to, or would be bound to by this process. False until a
+/// path function has located it, and for the directories tests and other tools give a
+/// `StateManager` directly.
+pub fn is_store_state_dir(dir: &std::path::Path) -> bool {
+    RUNTIME_DIR
+        .get()
+        .is_some_and(|runtime| runtime.dir.join("state") == dir)
+        || RUNTIME_CANDIDATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|candidate| candidate.join("state") == dir)
+}
+
+/// Check, and for a writer make, the binding between the data directory and the runtime
+/// directory (`crate::runtime_dir::bind`), once per process once it holds. From then on
+/// [`runtime_dir`] is the directory the store is bound to, which is not the one it
+/// returned before when another first writer of this boot chose another place.
+/// `Ok(false)` tells a reader that the store has no runtime directory in this boot, so no
+/// VMs.
+pub fn bind_runtime_dir(access: crate::runtime_dir::Access) -> anyhow::Result<bool> {
+    if RUNTIME_BOUND.get().is_some() {
+        return Ok(true);
+    }
+    let host = crate::runtime_dir::Host::current()?;
+    let Some(bound) = crate::runtime_dir::bind(&data_dir(), &runtime(), access, &host)? else {
+        return Ok(false);
+    };
+    let _ = RUNTIME_DIR.set(bound);
+    let _ = RUNTIME_BOUND.set(());
+    Ok(true)
+}
+
+/// The directory the VMs' runtime directories are in, one bucket down (`vm_runtime_dir`).
+pub fn vm_disks_dir() -> PathBuf {
+    data_dir().join("vm-disks")
+}
+
+/// The bucket of `vm-disks` that VM `vm_id`'s runtime directory is in: the first byte of
+/// sha256(vm_id) as two hex digits, so 256 buckets. A pure function of the id: a snapshot
+/// records its VM's paths, and a restore finds the VM's directory again from the id.
+///
+/// Every start makes its runtime directory, and a mkdir holds its parent directory's lock
+/// for writing across btrfs_mkdir, which joins the running transaction and so can wait out
+/// a commit (every clone's disk is a subvolume snapshot, which ends in one). With one
+/// `vm-disks` directory that lock was what every start queued on: 968 of 1411 ms of lock
+/// wait a clone at 512 starts in flight, fcvm's host kernel, states off btrfs (2026-11-27).
+pub fn vm_bucket(vm_id: &str) -> String {
+    crate::store_buckets::name(vm_id)
+}
+
+/// Whether `name` is the name of a bucket of `vm-disks` (two lowercase hex digits). A VM id
+/// is never one (`vm-` and 32 hex digits).
+pub fn is_vm_bucket(name: &str) -> bool {
+    crate::store_buckets::is_name(name)
+}
+
+/// Directory for VM runtime data (disks, sockets, logs): `vm-disks/<bucket>/<vm_id>`.
 pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
-    data_dir().join("vm-disks").join(vm_id)
+    vm_runtime_dir_under(&data_dir(), vm_id)
+}
+
+/// [`vm_runtime_dir`] under an explicit data directory.
+pub fn vm_runtime_dir_under(data_dir: &std::path::Path, vm_id: &str) -> PathBuf {
+    data_dir.join("vm-disks").join(vm_bucket(vm_id)).join(vm_id)
+}
+
+/// Make VM `vm_id`'s runtime directory in its bucket of `vm-disks` ([`crate::store_buckets`]:
+/// the first start of a store makes all the buckets, with `vm-disks`' owner and permission
+/// bits, so root's and a user's VMs share them when they share a data directory).
+pub async fn create_vm_runtime_dir(vm_id: &str) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    let dir = vm_runtime_dir(vm_id);
+    let bucket = vm_bucket(vm_id);
+    let vm_disks = vm_disks_dir_of(&dir);
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::store_buckets::ensure(&vm_disks, &bucket)
+            .map(|_| ())
+            .with_context(|| format!("making the bucket {bucket} of {}", vm_disks.display()))
+    })
+    .await
+    .context("the bucket task")??;
+    tokio::fs::create_dir(&dir)
+        .await
+        .or_else(|error| match error.kind() {
+            std::io::ErrorKind::AlreadyExists => Ok(()),
+            _ => Err(error),
+        })
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// The `vm-disks` directory a runtime directory `<vm-disks>/<bucket>/<vm_id>` is in.
+fn vm_disks_dir_of(dir: &std::path::Path) -> PathBuf {
+    dir.parent()
+        .and_then(std::path::Path::parent)
+        .expect("a runtime directory is in a bucket of vm-disks")
+        .to_path_buf()
 }
 
 /// `sockaddr_un.sun_path` is 108 bytes including the NUL, so a path of 107
 /// bytes is the most that can ever be bound.
-const SUN_PATH_MAX: usize = 107;
+pub const SUN_PATH_MAX: usize = 107;
 
 /// The longest socket file placed in a VM's runtime directory.
 ///
@@ -200,10 +419,7 @@ pub fn check_socket_path_budget_under(
     data_dir: &std::path::Path,
     vm_id: &str,
 ) -> anyhow::Result<()> {
-    let longest = data_dir
-        .join("vm-disks")
-        .join(vm_id)
-        .join(LONGEST_SOCKET_NAME);
+    let longest = vm_runtime_dir_under(data_dir, vm_id).join(LONGEST_SOCKET_NAME);
     let length = longest.as_os_str().len();
     anyhow::ensure!(
         length <= SUN_PATH_MAX,
@@ -240,8 +456,9 @@ mod tests {
         let text = error.to_string();
         // 128 bytes for the incident's firecracker.socket; the reserved name is longer now.
         let length = format!(
-            "{}/vm-disks/{VM_ID}/{LONGEST_SOCKET_NAME}",
-            too_deep.display()
+            "{}/vm-disks/{}/{VM_ID}/{LONGEST_SOCKET_NAME}",
+            too_deep.display(),
+            vm_bucket(VM_ID)
         )
         .len();
         assert!(
@@ -256,7 +473,7 @@ mod tests {
     fn the_shortened_nested_data_dir_fits() {
         let short = Path::new("/mnt/fcvm-btrfs/nd/9db69791");
         check_socket_path_budget_under(short, VM_ID)
-            .expect("91 bytes must be accepted; if this fails the budget is miscomputed");
+            .expect("94 bytes must be accepted; if this fails the budget is miscomputed");
     }
 
     /// The default layout must have room, or every VM would fail to start.
@@ -282,7 +499,11 @@ mod tests {
     /// boundary, so an off-by-one cannot creep in unnoticed.
     #[test]
     fn the_boundary_is_exact() {
-        let suffix_len = format!("/vm-disks/{VM_ID}/{LONGEST_SOCKET_NAME}").len();
+        let suffix_len = format!(
+            "/vm-disks/{}/{VM_ID}/{LONGEST_SOCKET_NAME}",
+            vm_bucket(VM_ID)
+        )
+        .len();
         let at_limit = "/".repeat(SUN_PATH_MAX - suffix_len);
         assert_eq!(
             at_limit.len() + suffix_len,
@@ -295,6 +516,115 @@ mod tests {
         let over = format!("{at_limit}x");
         check_socket_path_budget_under(Path::new(&over), VM_ID)
             .expect_err("one byte over SUN_PATH_MAX must be refused");
+    }
+
+    /// A VM's runtime directory is in the bucket its id gives, two hex digits, the same for
+    /// the same id every time (a restore finds a snapshot's source directory from the id).
+    #[test]
+    fn a_runtime_directory_is_in_the_bucket_of_its_id() {
+        let dir = vm_runtime_dir_under(Path::new("/srv/store"), VM_ID);
+        let bucket = vm_bucket(VM_ID);
+        assert_eq!(
+            dir,
+            Path::new("/srv/store/vm-disks").join(&bucket).join(VM_ID)
+        );
+        assert!(is_vm_bucket(&bucket), "{bucket}");
+        assert_eq!(vm_bucket(VM_ID), bucket);
+        let buckets: std::collections::BTreeSet<String> = (0..4096)
+            .map(|index| vm_bucket(&format!("vm-{index:032x}")))
+            .collect();
+        assert_eq!(
+            buckets.len(),
+            256,
+            "4096 ids reach every one of the 256 buckets"
+        );
+        for name in [VM_ID, "a", "abc", "AB", "0g", ".ab"] {
+            assert!(!is_vm_bucket(name), "{name} is not a bucket's name");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ensure_dir_tests {
+    use super::*;
+
+    /// A directory that exists is looked up and nothing is made; a missing one is made with
+    /// its missing parents; a file in the way is an error.
+    #[test]
+    fn ensure_dir_makes_only_what_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = root.path().join("a/b/c");
+        ensure_dir(&deep).unwrap();
+        assert!(deep.is_dir());
+        ensure_dir(&deep).unwrap();
+        let file = root.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        assert!(ensure_dir(&file).is_err());
+    }
+
+    /// The modules a start, a restore and their teardown run through make directories only
+    /// with [`ensure_dir`]: `create_dir_all` makes the mkdir before it looks, and a mkdir of
+    /// a directory that exists takes its parent's lock for writing. Test modules are not
+    /// checked (everything from a file's `#[cfg(test)] mod` on).
+    #[test]
+    fn the_start_path_makes_directories_only_through_ensure_dir() {
+        let sources = [
+            (
+                "commands/podman/image.rs",
+                include_str!("commands/podman/image.rs"),
+            ),
+            (
+                "commands/podman/mod.rs",
+                include_str!("commands/podman/mod.rs"),
+            ),
+            (
+                "commands/podman/snapshot.rs",
+                include_str!("commands/podman/snapshot.rs"),
+            ),
+            (
+                "commands/podman/vm_config.rs",
+                include_str!("commands/podman/vm_config.rs"),
+            ),
+            ("commands/snapshot.rs", include_str!("commands/snapshot.rs")),
+            ("commands/common.rs", include_str!("commands/common.rs")),
+            ("commands/vm.rs", include_str!("commands/vm.rs")),
+            ("storage/disk.rs", include_str!("storage/disk.rs")),
+            ("storage/disk_dir.rs", include_str!("storage/disk_dir.rs")),
+            (
+                "storage/hugepage_spares.rs",
+                include_str!("storage/hugepage_spares.rs"),
+            ),
+            (
+                "storage/pmem_store.rs",
+                include_str!("storage/pmem_store.rs"),
+            ),
+            ("storage/snapshot.rs", include_str!("storage/snapshot.rs")),
+            ("network/mod.rs", include_str!("network/mod.rs")),
+            ("network/routed.rs", include_str!("network/routed.rs")),
+            ("network/pasta.rs", include_str!("network/pasta.rs")),
+            ("store_buckets.rs", include_str!("store_buckets.rs")),
+            ("reclaim.rs", include_str!("reclaim.rs")),
+            ("state/manager.rs", include_str!("state/manager.rs")),
+            ("runtime_dir.rs", include_str!("runtime_dir.rs")),
+            ("uffd/server.rs", include_str!("uffd/server.rs")),
+            ("utils.rs", include_str!("utils.rs")),
+        ];
+        let mut found = Vec::new();
+        for (file, source) in sources {
+            let code = source
+                .find("#[cfg(test)]\nmod ")
+                .map_or(source, |at| &source[..at]);
+            for (number, line) in code.lines().enumerate() {
+                if line.contains("create_dir_all(") && !line.trim_start().starts_with("//") {
+                    found.push(format!("src/{file}:{}: {}", number + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "create_dir_all on the start path (use paths::ensure_dir):\n{}",
+            found.join("\n")
+        );
     }
 }
 

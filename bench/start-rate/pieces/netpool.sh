@@ -37,7 +37,7 @@ until [ "$(stats | jq -r .ready)" = "$SLOTS" ]; do
 done
 echo "pool of $SLOTS namespaces built in $((SECONDS - build_start)) s"
 stats > "$out_root/pool-built.json"
-socket=$(echo "$data_dir"/netpool/*/pool.sock)
+socket=$(stats | jq -er .socket) || { echo "netpool stats names no socket"; exit 1; }
 
 cell() {  # OUT C COUNT
   local cell=$1/netpool-c$2-n$3-a$ALIVE
@@ -62,7 +62,7 @@ for rung in $RUNGS; do
   if [ -n "${TRACE:-}" ]; then
     traced=$out_root/traced/netpool-c$c-n$n-a$ALIVE
     mkdir -p "$out_root/traced"
-    if [ ! -f "$traced/summary.json" ]; then
+    if ! ARGS="--netpool-socket $socket --steady-secs 5" cell_done "$traced"; then
       quiet "traced netpool C=$c" || continue
       rm -f "$traced.bt" "$traced.bt.err"
       sudo bpftrace "$here/kernel.bt" > "$traced.bt" 2> "$traced.bt.err" &

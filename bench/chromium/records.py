@@ -91,6 +91,18 @@ BOOT_RACE_RAW = (
 )
 
 
+# The raw files of a pages-mode campaign (results/renders-<id>, one directory per run of
+# `make fleet-renders-bench`): a row per render and a sample a second. Each run's summary.json,
+# teardown.json and host-record.txt stay, and so does the campaign's summary, which lists every
+# file's sha256 (renders_campaign.py).
+RENDERS_RAW = (
+    "renders.jsonl",
+    "samples.jsonl",
+    "*/renders.jsonl",
+    "*/samples.jsonl",
+)
+
+
 class MissingRecord(FileNotFoundError):
     """A moved record that could not be read, or whose bytes do not match."""
 
@@ -259,7 +271,8 @@ def run_raw_files(run_dir):
     """The committed raw files of one run directory, repository-relative."""
     prefix = os.path.relpath(os.path.realpath(run_dir), REPO).replace(os.sep, "/") + "/"
     boot_race = os.path.relpath(BOOT_RACE_RESULTS, REPO).replace(os.sep, "/") + "/"
-    patterns = BOOT_RACE_RAW if prefix.startswith(boot_race) else RAW
+    renders = os.path.relpath(RESULTS, REPO).replace(os.sep, "/") + "/renders-"
+    patterns = BOOT_RACE_RAW if prefix.startswith(boot_race) else RENDERS_RAW if prefix.startswith(renders) else RAW
     return [p for p in committed_files(prefix) if is_raw(p[len(prefix):], patterns)]
 
 

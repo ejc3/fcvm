@@ -24,6 +24,7 @@ pub mod lambda_front;
 pub mod live;
 pub mod metrics;
 pub mod minecraft_log;
+pub mod minecraft_status;
 pub mod poster;
 pub mod potato_log;
 pub mod scene_token;
@@ -90,6 +91,8 @@ pub enum Cmd {
     /// Would a `word` be refused before its text check? (`fleet_core::precheck_word`)
     PrecheckWord {
         client: String,
+        /// `word`, or `renders_overlay` (pages mode's text).
+        name: String,
         args: serde_json::Value,
         reply: oneshot::Sender<Option<String>>,
     },
@@ -147,6 +150,8 @@ struct AgentConn {
     last_budget: Option<BudgetPlan>,
     /// Potato mode: the round this host was last told to play (`Some(None)`: told none).
     last_potato: Option<Option<fleet_core::potato::PotatoRound>>,
+    /// The pages-mode order last sent to this host; none to a host that does not run it.
+    last_renders: Option<fleet_core::renders::RendersOrder>,
 }
 
 /// The channels the actor publishes on.
@@ -414,6 +419,24 @@ impl Actor {
                 });
                 conn.last_potato = Some(potato);
             }
+            // Pages mode: only a host whose hello said it runs the mode gets an order (an
+            // agent built before the mode ends its connection on a message it cannot parse).
+            if self.state.fleet.renders.hosts.contains_key(&conn.host) {
+                let awake = self.state.fleet.power.state != "asleep";
+                let order = self.state.fleet.renders.order(awake);
+                if conn.last_renders.as_ref() != Some(&order) {
+                    tracing::info!(
+                        host = %conn.host,
+                        run = order.run,
+                        overlay = ?order.overlay.as_ref().map(|o| o.seq),
+                        "pages order sent"
+                    );
+                    let _ = conn.tx.send(CoordMsg::Renders {
+                        order: order.clone(),
+                    });
+                    conn.last_renders = Some(order);
+                }
+            }
         }
         let f = &self.state.fleet;
         let ec2_layout = f.layout.ec2.map(|region| Layout {
@@ -459,13 +482,21 @@ impl Actor {
             *cur = power.clone();
             changed
         });
+        // The wall's hosts and pages mode's host: each launcher keeps the notices of its own
+        // instances.
+        let f = &self.state.fleet;
         self.out.draining.publish(
-            self.state
-                .fleet
-                .hosts
+            f.hosts
                 .iter()
                 .filter(|(_, h)| h.draining)
                 .map(|(name, _)| name.clone())
+                .chain(
+                    f.renders
+                        .hosts
+                        .iter()
+                        .filter(|(_, h)| h.draining)
+                        .map(|(name, _)| name.clone()),
+                )
                 .collect(),
         );
         let ec2 = ec2_assignment(&self.state);
@@ -715,11 +746,16 @@ impl Actor {
             }
             Cmd::PrecheckWord {
                 client,
+                name,
                 args,
                 reply,
             } => {
                 let at = self.stamp();
-                let _ = reply.send(fleet_core::precheck_word(&self.state, &client, &args, at));
+                let _ = reply.send(if name == "renders_overlay" {
+                    fleet_core::precheck_overlay(&self.state, &client, &args, at)
+                } else {
+                    fleet_core::precheck_word(&self.state, &client, &args, at)
+                });
             }
             Cmd::Sky { reply } => {
                 let _ = reply.send(fleet_core::apply::sky(&self.state));
@@ -832,6 +868,7 @@ impl Actor {
                         last_scene: None,
                         last_budget: None,
                         last_potato: None,
+                        last_renders: None,
                     },
                 );
                 let _ = reply.send(true);
@@ -1044,6 +1081,9 @@ pub struct Handle {
     pub lambda: watch::Receiver<Vec<AssignSlot>>,
     pub ec2_layout: watch::Receiver<Option<Layout>>,
     pub broadcast_layout: watch::Receiver<Option<Layout>>,
+    /// The hosts' Minecraft status rows, from the agents' connections to the pages' (never
+    /// through the actor: they are no part of the state).
+    pub minecraft_status: minecraft_status::MinecraftStatuses,
 }
 
 impl Handle {
@@ -1132,11 +1172,17 @@ impl Handle {
         rx.await.ok().flatten()
     }
 
-    pub async fn precheck_word(&self, client: &str, args: &serde_json::Value) -> Option<String> {
+    pub async fn precheck_word(
+        &self,
+        client: &str,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
         let (tx, rx) = oneshot::channel();
         self.cmds
             .send(Cmd::PrecheckWord {
                 client: client.to_string(),
+                name: name.to_string(),
                 args: args.clone(),
                 reply: tx,
             })
@@ -1146,32 +1192,29 @@ impl Handle {
     }
 }
 
-/// Spot interruption notices, each host's sent once to the host launcher on a channel that
-/// keeps every notice until the launcher reads it. A watch of the draining hosts would lose a
-/// notice whose host left the state (its agent disconnected) before the launcher looked.
+/// Spot interruption notices, each host's sent once to every host launcher (one per host
+/// group) on a channel that keeps every notice until the launcher reads it. A watch of the
+/// draining hosts would lose a notice whose host left the state (its agent disconnected)
+/// before the launcher looked. A launcher keeps only the notices of its own instances.
 #[derive(Default)]
 pub struct DrainNotices {
-    tx: Option<mpsc::UnboundedSender<String>>,
+    tx: Vec<mpsc::UnboundedSender<String>>,
     /// The hosts draining now whose notice was sent.
     sent: std::collections::BTreeSet<String>,
 }
 
 impl DrainNotices {
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<String>) {
+    /// A launcher's channel: every notice published from now on.
+    pub fn subscribe(&mut self) -> mpsc::UnboundedReceiver<String> {
         let (tx, rx) = mpsc::unbounded_channel();
-        (
-            DrainNotices {
-                tx: Some(tx),
-                sent: Default::default(),
-            },
-            rx,
-        )
+        self.tx.push(tx);
+        rx
     }
 
     /// Send the notice of every host in `draining` not sent yet.
     fn publish(&mut self, draining: std::collections::BTreeSet<String>) {
-        if let Some(tx) = &self.tx {
-            for id in draining.difference(&self.sent) {
+        for id in draining.difference(&self.sent) {
+            for tx in &self.tx {
                 let _ = tx.send(id.clone());
             }
         }
@@ -1210,6 +1253,29 @@ pub fn start_with_lambda(
     power: Option<hosts::HostConfig>,
     names: Option<Names>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
+    start_with_groups(
+        state,
+        store,
+        ec2,
+        lambda,
+        ec2_aggregate_local,
+        power.into_iter().collect(),
+        names,
+    )
+}
+
+/// [`start_with_lambda`] with any number of host groups (`groups`): the GPU hosts and pages
+/// mode's host, each launched and terminated by its own [`hosts::run`] over the same power
+/// state.
+pub fn start_with_groups(
+    state: State,
+    store: Option<store::StoreTx>,
+    ec2: Option<Arc<dyn ec2::Ec2Driver>>,
+    lambda: Option<Arc<dyn ec2::Ec2Driver>>,
+    ec2_aggregate_local: Option<String>,
+    groups: Vec<hosts::HostConfig>,
+    names: Option<Names>,
+) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(Snapshot {
         version: 0,
@@ -1220,7 +1286,8 @@ pub fn start_with_lambda(
     let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
     let (broadcast_layout_tx, broadcast_layout_rx) = watch::channel(None);
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
-    let (draining_tx, draining_rx) = DrainNotices::new();
+    let mut draining_tx = DrainNotices::default();
+    let draining_rx: Vec<_> = groups.iter().map(|_| draining_tx.subscribe()).collect();
     let (scene_tx, scene_rx) = watch::channel(None);
     let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
     let (owned_tx, owned_rx) = watch::channel(store.is_none());
@@ -1256,6 +1323,7 @@ pub fn start_with_lambda(
         lambda: lambda_rx.clone(),
         ec2_layout: ec2_layout_rx,
         broadcast_layout: broadcast_layout_rx,
+        minecraft_status: Default::default(),
     };
     let tick = handle.clone();
     tokio::spawn(async move {
@@ -1299,8 +1367,8 @@ pub fn start_with_lambda(
             }
         });
     }
-    if let Some(cfg) = power {
-        tokio::spawn(hosts::run(cfg, power_rx, draining_rx, handle.clone()));
+    for (cfg, draining) in groups.into_iter().zip(draining_rx) {
+        tokio::spawn(hosts::run(cfg, power_rx.clone(), draining, handle.clone()));
     }
     (handle, task)
 }
@@ -1360,10 +1428,89 @@ pub fn admin_router(handle: Handle) -> axum::Router {
         .with_state(handle)
 }
 
-/// Whether the fleet sleeps with no active viewer: it launches its GPU hosts, or it was told
-/// to sleep on fixed hosts.
+/// Whether the fleet sleeps with no active viewer: it launches its GPU hosts or pages mode's
+/// host, or it was told to sleep on fixed hosts.
 pub fn power_managed(args: &FleetCoordArgs) -> bool {
-    !args.host_templates.is_empty() || args.sleep_when_idle
+    !args.host_templates.is_empty() || !args.renders_templates.is_empty() || args.sleep_when_idle
+}
+
+/// The most on-demand hosts pages mode's group runs: its one host, when spot is refused.
+pub const RENDERS_ON_DEMAND_MAX: u32 = 1;
+
+/// A host group's driver, launching only the types `rates` prices: the table the meter uses
+/// (`spend::on_demand_rates`, the built-in rates and `--spend-rates`). Every group's driver is
+/// made here, so no group launches by another table.
+fn priced_driver(
+    args: &FleetCoordArgs,
+    class: hosts::HostClass,
+    rates: &std::collections::BTreeMap<String, f64>,
+) -> Result<hosts::AwsHosts> {
+    let (templates, subnets) = match class {
+        hosts::HostClass::Gpu => (&args.host_templates, &args.host_subnets),
+        hosts::HostClass::Renders => (&args.renders_templates, &args.renders_subnets),
+    };
+    Ok(
+        hosts::AwsHosts::for_class(templates, subnets, args.fleet_name.clone(), class)?
+            .priced_by(rates.clone()),
+    )
+}
+
+/// The host groups the coordinator launches: the GPU hosts with `--host-template`, and pages
+/// mode's host with `--renders-template` (one host while awake, in the templates' one
+/// region). Each lists and launches only its own class's instances.
+pub fn host_groups(args: &FleetCoordArgs) -> Result<Vec<hosts::HostConfig>> {
+    let mut groups = Vec::new();
+    // Each group launches only types this table prices (hosts::unpriced_launch).
+    let rates = spend::on_demand_rates(&args.spend_rates)?;
+    if args.host_templates.is_empty() {
+        anyhow::ensure!(
+            args.host_subnets.is_empty(),
+            "--host-subnet needs a --host-template"
+        );
+    } else {
+        let driver = priced_driver(args, hosts::HostClass::Gpu, &rates)?;
+        groups.push(hosts::HostConfig {
+            class: hosts::HostClass::Gpu,
+            regions: driver.regions(),
+            driver: Arc::new(driver),
+            awake_hosts: args.awake_hosts,
+            spread: args.host_spread,
+            on_demand_max: args.host_on_demand_max,
+            // While hosts come up or go away: one DescribeInstances per region.
+            poll: Duration::from_secs(2),
+            // While they run: a reclaimed spot host is replaced within this.
+            liveness: Duration::from_secs(15),
+            capacity_retry: Duration::from_secs(10),
+            lost_launch_ttl: Duration::from_secs(120),
+        });
+    }
+    if args.renders_templates.is_empty() {
+        anyhow::ensure!(
+            args.renders_subnets.is_empty(),
+            "--renders-subnet needs a --renders-template"
+        );
+    } else {
+        let driver = priced_driver(args, hosts::HostClass::Renders, &rates)?;
+        let regions = driver.regions();
+        anyhow::ensure!(
+            regions.len() == 1,
+            "--renders-template names {}: pages mode runs one host, in one region",
+            regions.join(", ")
+        );
+        groups.push(hosts::HostConfig {
+            class: hosts::HostClass::Renders,
+            regions,
+            driver: Arc::new(driver),
+            awake_hosts: 1,
+            spread: hosts::HostSpread::None,
+            on_demand_max: RENDERS_ON_DEMAND_MAX,
+            poll: Duration::from_secs(2),
+            liveness: Duration::from_secs(15),
+            capacity_retry: Duration::from_secs(10),
+            lost_launch_ttl: Duration::from_secs(120),
+        });
+    }
+    Ok(groups)
 }
 
 /// The addresses `--admin-listen` binds: every address it names must be loopback. The endpoint
@@ -1420,6 +1567,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         Some(a) => Some(admin_addresses(a).await?),
         None => None,
     };
+    // The host groups, checked before anything starts.
+    let groups = host_groups(&args)?;
     if args.ec2_aggregate_listen.is_some()
         && args.ec2_aggregate_url.is_none()
         && !args.ec2_aggregate_tls
@@ -1462,6 +1611,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         power_managed: power_managed(&args),
         idle_scale_down_secs: args.idle_scale_down,
         sleep_without_new_viewer_secs: args.sleep_without_new_viewer,
+        min_wake_remaining_secs: args.min_wake_remaining,
         daily_spend_usd: args.daily_spend_usd,
         warm_hours: args.warm_hours.clone(),
         history_idle_secs: args.history_idle,
@@ -1627,38 +1777,18 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             crate::fleet::aggregate::child::connect_addr(l)
         )
     });
-    let power = if args.host_templates.is_empty() {
-        anyhow::ensure!(
-            args.host_subnets.is_empty(),
-            "--host-subnet needs a --host-template"
-        );
-        None
-    } else {
-        let driver = hosts::AwsHosts::new(
-            &args.host_templates,
-            &args.host_subnets,
-            args.fleet_name.clone(),
-        )?;
-        Some(hosts::HostConfig {
-            regions: driver.regions(),
-            driver: Arc::new(driver),
-            awake_hosts: args.awake_hosts,
-            spread: args.host_spread,
-            on_demand_max: args.host_on_demand_max,
-            // While hosts come up or go away: one DescribeInstances per region.
-            poll: Duration::from_secs(2),
-            // While they run: a reclaimed spot host is replaced within this.
-            liveness: Duration::from_secs(15),
-            capacity_retry: Duration::from_secs(10),
-            lost_launch_ttl: Duration::from_secs(120),
-        })
-    };
     // With host templates the coordinator launches its GPU hosts, so a dialed agent must be on
     // one of them.
-    let agent_identity: Option<Arc<dyn agents::AgentIdentity>> = power.as_ref().map(|p| {
+    let agent_identity: Option<Arc<dyn agents::AgentIdentity>> = (!groups.is_empty()).then(|| {
         Arc::new(agents::FleetHosts {
-            driver: p.driver.clone(),
-            regions: p.regions.clone(),
+            groups: groups
+                .iter()
+                .map(|p| agents::FleetGroup {
+                    class: p.class,
+                    driver: p.driver.clone(),
+                    regions: p.regions.clone(),
+                })
+                .collect(),
             fleet: args.fleet_name.clone(),
         }) as Arc<dyn agents::AgentIdentity>
     });
@@ -1751,7 +1881,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         .into_iter()
         .chain(lambda.clone().map(|d| ("Lambda", d)))
         .collect();
-    let (handle, _actor) = start_with_lambda(state, store_tx, ec2, lambda, ec2_local, power, names);
+    let (handle, _actor) =
+        start_with_groups(state, store_tx, ec2, lambda, ec2_local, groups, names);
     if let Some(obj) = budget_drill {
         tokio::spawn(spend::watch_drill(obj, handle.clone()));
     }
@@ -2069,6 +2200,57 @@ mod power_tests {
         ])));
     }
 
+    /// The two limits of the arrival rule come from their flags or from the environment (the
+    /// coordinator's task definition sets variables, not arguments). Which variable each
+    /// reads, and its default, are read from the argument definitions: a test here does not
+    /// set a variable in its own process (`crate::test_env`).
+    #[test]
+    fn the_arrival_limits_name_their_environment_variables_and_defaults() {
+        let cli = <Cli as clap::CommandFactory>::command();
+        let coord_cmd = cli
+            .find_subcommand("fleet")
+            .and_then(|f| f.find_subcommand("coord"))
+            .expect("the fleet coord subcommand");
+        for (id, long, env, default) in [
+            (
+                "sleep_without_new_viewer",
+                "sleep-without-new-viewer",
+                "FLEET_SLEEP_WITHOUT_NEW_VIEWER",
+                "3600",
+            ),
+            (
+                "min_wake_remaining",
+                "min-wake-remaining",
+                "FLEET_MIN_WAKE_REMAINING",
+                "600",
+            ),
+        ] {
+            let arg = coord_cmd
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("no argument {id}"));
+            assert_eq!(arg.get_long(), Some(long));
+            assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some(env), "{id}");
+            let defaults: Vec<_> = arg
+                .get_default_values()
+                .iter()
+                .map(|v| v.to_str())
+                .collect();
+            assert_eq!(defaults, [Some(default)], "{id}");
+        }
+        // The flags reach the fields the coordinator's config is built from.
+        let a = coord(&[
+            "--sleep-without-new-viewer",
+            "7200",
+            "--min-wake-remaining",
+            "0",
+        ]);
+        assert_eq!(
+            (a.sleep_without_new_viewer, a.min_wake_remaining),
+            (7200, 0)
+        );
+    }
+
     /// A race launches every EC2 tile, so more EC2 tiles than the viewers' launch budget would
     /// leave `restart_now` refused for ever: such a count is refused when the coordinator starts.
     #[test]
@@ -2121,6 +2303,97 @@ mod power_tests {
             .await
             .expect_err("--warm-hours without power management was accepted");
         assert!(e.to_string().contains("--warm-hours needs"), "{e}");
+    }
+
+    /// Every host group's driver prices launches by the meter's table: a type given with
+    /// `--spend-rates` may launch, in both groups, and one given nowhere may not.
+    #[test]
+    fn a_host_groups_driver_prices_by_the_spend_rates() {
+        let base = [
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0",
+            "--renders-template",
+            "us-east-2:fcvm-fleet-renders-arm64",
+            "--renders-subnet",
+            "us-east-2:subnet-0123456789abcdef1",
+        ];
+        let mut with = base.to_vec();
+        with.extend(["--spend-rates", "x9z.metal=3.5"]);
+        for class in [
+            super::hosts::HostClass::Gpu,
+            super::hosts::HostClass::Renders,
+        ] {
+            let args = coord(&with);
+            let rates = super::spend::on_demand_rates(&args.spend_rates).unwrap();
+            let d = super::priced_driver(&args, class, &rates).unwrap();
+            assert!(d.prices("x9z.metal"), "{class:?}");
+            assert!(
+                d.prices("m8gd.metal-24xl") && !d.prices("y1.metal"),
+                "{class:?}"
+            );
+            let args = coord(&base);
+            let rates = super::spend::on_demand_rates(&args.spend_rates).unwrap();
+            assert!(!super::priced_driver(&args, class, &rates)
+                .unwrap()
+                .prices("x9z.metal"));
+        }
+        // and no group makes a driver any other way
+        let source = include_str!("mod.rs");
+        let groups = &source[source.find("pub fn host_groups(").unwrap()..];
+        let groups = &groups[..groups.find("\n}\n").unwrap()];
+        assert!(
+            !groups.contains("AwsHosts::"),
+            "host_groups makes its drivers with priced_driver"
+        );
+        assert_eq!(groups.matches("priced_driver(").count(), 2);
+    }
+
+    /// With pages mode's templates the fleet sleeps (its host must not run with no viewer),
+    /// and the coordinator builds a second host group from them: one host while awake, at
+    /// most one on demand, in the one region its templates name. Without them nothing
+    /// changes; templates in two regions, or a subnet without a template, are refused.
+    #[test]
+    fn the_renders_templates_make_a_second_host_group() {
+        let renders = [
+            "--renders-template",
+            "us-east-2:fcvm-fleet-renders-arm64",
+            "--renders-subnet",
+            "us-east-2:subnet-0123456789abcdef1",
+        ];
+        assert!(super::power_managed(&coord(&renders)));
+        let gpu = [
+            "--host-template",
+            "us-east-1:fcvm-fleet-host-x86_64",
+            "--host-subnet",
+            "us-east-1:subnet-0123456789abcdef0",
+        ];
+        let groups = super::host_groups(&coord(&gpu)).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].class, super::hosts::HostClass::Gpu);
+        let mut both = gpu.to_vec();
+        both.extend(renders);
+        let groups = super::host_groups(&coord(&both)).unwrap();
+        assert_eq!(groups.len(), 2);
+        let r = &groups[1];
+        assert_eq!(r.class, super::hosts::HostClass::Renders);
+        assert_eq!(r.regions, ["us-east-2"]);
+        assert_eq!((r.awake_hosts, r.on_demand_max), (1, 1));
+        assert_eq!(r.spread, super::hosts::HostSpread::None);
+        assert!(super::host_groups(&coord(&[])).unwrap().is_empty());
+        let two_regions = [
+            "--renders-template",
+            "us-east-2:a,us-west-2:b",
+            "--renders-subnet",
+            "us-east-2:subnet-1,us-west-2:subnet-2",
+        ];
+        let e = super::host_groups(&coord(&two_regions))
+            .err()
+            .expect("two regions refused")
+            .to_string();
+        assert!(e.contains("one region"), "{e}");
+        assert!(super::host_groups(&coord(&["--renders-subnet", "us-east-2:subnet-1"])).is_err());
     }
 
     #[test]

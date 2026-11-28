@@ -360,6 +360,13 @@ pub struct SnapshotMetadata {
     /// field existed; those restore on the binary their kernel profile resolves to.
     #[serde(default)]
     pub firecracker_bin: Option<PathBuf>,
+    /// What the Cloud Hypervisor that wrote this snapshot prints for `--version`
+    /// (`cloud-hypervisor v55.0-117-g4969a51a3d3f`). A restore runs only on a build that
+    /// prints the same, because Cloud Hypervisor's saved state is its own build's. None
+    /// for Firecracker snapshots, and for Cloud Hypervisor snapshots written before this
+    /// field existed, which no restore accepts.
+    #[serde(default)]
+    pub cloud_hypervisor_version: Option<String>,
     /// Balloon target in MiB the source VM booted with (--balloon). A memory
     /// restore gets the device from the VMM state. The cold boots, which are a
     /// disk-only clone and a restored clone's relaunch after a guest reboot,
@@ -554,7 +561,7 @@ impl SnapshotManager {
 
         // Create snapshot directory
         let snapshot_dir = self.snapshots_dir.join(&config.name);
-        fs::create_dir_all(&snapshot_dir)
+        crate::paths::ensure_dir_async(&snapshot_dir)
             .await
             .context("creating snapshot directory")?;
 
@@ -1160,6 +1167,7 @@ mod tests {
                 memory_mib: 512,
                 network_config: NetworkConfig {
                     tap_device: "tap-abc123".to_string(),
+                    tap_fd: None,
                     guest_mac: "AA:BB:CC:DD:EE:FF".to_string(),
                     guest_ip: Some("172.30.0.2".to_string()),
                     host_ip: Some("172.30.0.1".to_string()),
@@ -1201,6 +1209,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                cloud_hypervisor_version: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
@@ -1377,6 +1386,7 @@ mod tests {
                 memory_mib: 512,
                 network_config: NetworkConfig {
                     tap_device: "tap-test".to_string(),
+                    tap_fd: None,
                     guest_mac: "AA:BB:CC:DD:EE:FF".to_string(),
                     guest_ip: Some("172.30.0.2".to_string()),
                     host_ip: Some("172.30.0.1".to_string()),
@@ -1418,6 +1428,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                cloud_hypervisor_version: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
@@ -1477,6 +1488,7 @@ mod tests {
                     memory_mib: 256,
                     network_config: NetworkConfig {
                         tap_device: "tap".to_string(),
+                        tap_fd: None,
                         guest_mac: "00:00:00:00:00:00".to_string(),
                         guest_ip: None,
                         host_ip: None,
@@ -1518,6 +1530,7 @@ mod tests {
                     image_disk_identity: None,
                     hypervisor: Default::default(),
                     firecracker_bin: None,
+                    cloud_hypervisor_version: None,
                     balloon_mib: None,
                     balloon_free_page_reporting: false,
                     page_reporting_order: None,
@@ -1564,6 +1577,7 @@ mod tests {
                 memory_mib: 256,
                 network_config: NetworkConfig {
                     tap_device: "tap".to_string(),
+                    tap_fd: None,
                     guest_mac: "00:00:00:00:00:00".to_string(),
                     guest_ip: None,
                     host_ip: None,
@@ -1605,6 +1619,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                cloud_hypervisor_version: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
@@ -1776,6 +1791,7 @@ mod tests {
                 memory_mib: 256,
                 network_config: NetworkConfig {
                     tap_device: "tap".to_string(),
+                    tap_fd: None,
                     guest_mac: "00:00:00:00:00:00".to_string(),
                     guest_ip: None,
                     host_ip: None,
@@ -1817,6 +1833,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                cloud_hypervisor_version: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
                 page_reporting_order: None,
@@ -2016,6 +2033,7 @@ mod tests {
             image_disk_identity: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
+            cloud_hypervisor_version: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
             page_reporting_order: None,

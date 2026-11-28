@@ -127,7 +127,7 @@ describe("potato in the snapshot", () => {
     expect(p.colours).toBe(12);
     expect(p.capacity).toBe(0);
     expect(p.round).toBeNull();
-    expect(p.ladder.map((r) => [r.size, r.record_hold_ms, r.rounds])).toEqual([[2, 2000, 1], [4, null, 1], [8, null, 0], [16, null, 0], [32, null, 0], [64, null, 0], [96, null, 0]]);
+    expect(p.ladder.map((r) => [r.size, r.rounds])).toEqual([[2, 1], [4, 1]]);
     expect(p.ladder[0]!.broke).toMatchObject({ reason: "proof", player: 1, stage: "proof", seq: 3 });
     expect(p.last_drop).toMatchObject({ reason: "not_listening", player: 1, thrower: 0, stage: "waking", stage_ms: 90, listening_after_ms: 84, sleep_stages: { save_ms: 61 }, wake_stages: {} });
     expect(p.records.fastest_cycle_ms).toEqual({ value: 650, size: 2, player: 0, at: 4750 });

@@ -68,6 +68,7 @@ fn test_run_args(name: &str) -> RunArgs {
         pmem_devices: vec![],
         resolved_extra_disks: None,
         no_swap: false,
+        confine: false,
     }
 }
 

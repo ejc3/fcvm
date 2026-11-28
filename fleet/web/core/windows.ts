@@ -11,7 +11,7 @@ import { sameViewer, type Tile, type Windows, type WindowTile } from "./protocol
 import type { ClientState, Notice, TileFrameStats } from "./store.ts";
 import { streamUrl, type Family } from "./net.ts";
 import { BLANK_PLAN, directPlan, gridOf, openedArea, tenths } from "./phones.ts";
-import { phaseText, sleepView, verifyView, type DrawPlan, type SleepView } from "./view.ts";
+import { noneListedText, phaseText, sleepView, verifyView, type DrawPlan, type SleepView } from "./view.ts";
 
 export const WINDOWS_TITLE = "Windows";
 export const WINDOWS_SENTENCE = "Each sandbox is a Windows desktop in its own virtual machine, restored from one snapshot. Click a desktop to throw it away and restore a new one.";
@@ -410,7 +410,7 @@ export function windowsView(inp: WindowsInput): WindowsView {
   if (w === null || s.accepted === null) {
     return {
       ...common,
-      empty: s.accepted === null ? (s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet.") : NO_WINDOWS,
+      empty: s.accepted === null ? (s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet.") : noneListedText(s.accepted, NO_WINDOWS, "Windows sandboxes"),
       banner,
       header: null,
       resetAll: { label: "Reset all", disabled: true },

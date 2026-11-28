@@ -810,6 +810,10 @@ fn pid_file_is_written(pid_file: &Path) -> bool {
         .is_ok_and(|text| text.ends_with('\n') && text.trim().parse::<u32>().is_ok())
 }
 
+/// The host's global IPv6 address as this process first found it
+/// ([`PastaNetwork::detect_host_ipv6`]).
+static HOST_IPV6: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 /// What a pool key holds of the host and of the user, beside the network's own shape.
 struct PoolHost {
     /// The host's global IPv6 address, which pasta is started with.
@@ -903,6 +907,12 @@ pub struct PastaNetwork {
     // Where pasta's PID file goes when not in the VM's runtime directory: a pooled
     // namespace is no VM's.
     pid_dir: Option<PathBuf>,
+    // pasta is started with a control socket and without its neighbour listener
+    // (`with_control_socket`): the pastas a pool keeps.
+    control: bool,
+    // The VMM's TAP is made attached and its queue kept by the holder (`with_attached_tap`):
+    // the namespaces a pool builds.
+    attached_tap: bool,
     // Whether this VM may ask a namespace pool for its namespace (`with_pooling`).
     pooling: bool,
     // The pooled namespace this VM runs in, when it claimed one (`crate::netpool`). The pool
@@ -1022,9 +1032,65 @@ impl PastaNetwork {
             isolated: false,
             dns_server: None,
             pid_dir: None,
+            control: false,
+            attached_tap: false,
             pooling: false,
             lease: None,
         }
+    }
+
+    /// Start pasta with a control socket beside its PID file (`pasta -c`), over which
+    /// [`Self::reset_pasta`] has it forget one guest for the next, and without its
+    /// listener for the host's neighbour table (`--no-neigh-notify`): the kernel visits
+    /// every such listener on the host for each link event of any namespace, under
+    /// `rtnl_mutex`. Both are options of the patches fcvm carries
+    /// (`scripts/passt-*.patch`). Needs [`Self::with_pid_dir`].
+    pub fn with_control_socket(mut self) -> Self {
+        self.control = true;
+        self
+    }
+
+    /// `args` with what a pooled pasta gets beside an unpooled one's: its control socket and
+    /// no neighbour listener. They go before the last argument, which names the namespace,
+    /// and are not part of [`Self::pool_key`]: a clone asks for a namespace by what it would
+    /// build for itself.
+    fn with_control_args(mut args: Vec<OsString>, control: &Path) -> Vec<OsString> {
+        let at = args.len().saturating_sub(1);
+        args.splice(
+            at..at,
+            [
+                OsString::from("-c"),
+                control.as_os_str().to_os_string(),
+                OsString::from("--no-neigh-notify"),
+            ],
+        );
+        args
+    }
+
+    /// Where this network's pasta listens for control connections, when it was started
+    /// with one.
+    fn control_socket(&self) -> Result<PathBuf> {
+        let dir = self
+            .pid_dir
+            .as_ref()
+            .context("a pasta with a control socket needs a directory of its own")?;
+        Ok(dir.join("pasta.ctl"))
+    }
+
+    /// Have the running pasta forget its guest: every flow closed with nothing sent to the
+    /// guest's side, the guest's MAC and addresses as pasta started with them
+    /// ([`super::pesto::reset`]). pasta keeps running and stays attached to its TAP, so
+    /// nothing changes a link.
+    pub async fn reset_pasta(&self) -> Result<()> {
+        super::pesto::reset(&self.control_socket()?).await
+    }
+
+    /// Build the namespace with the VMM's TAP attached, its queue held by the holder
+    /// ([`super::netns_agent::Shape::tap_attached`]): what a pool builds, for VMMs that take
+    /// the queue as a descriptor.
+    pub fn with_attached_tap(mut self) -> Self {
+        self.attached_tap = true;
+        self
     }
 
     /// Let this VM run in a pooled namespace when one is to be had ([`Self::poolable`]).
@@ -1057,14 +1123,25 @@ impl PastaNetwork {
     /// [`Self::pool_key`] with the host probed now. A pool lives for days: what it found
     /// when it started (the host's IPv6 address, its resolver file) may no longer be what a
     /// clone that starts now finds.
-    pub fn pool_key_now(&self) -> String {
-        self.pool_key_of(&PoolHost::of(Self::probe_host_ipv6()))
+    ///
+    /// `None` when the host's address could not be probed: a key made from a failed probe
+    /// would say the host has no IPv6 address.
+    pub fn pool_key_now(&self) -> Option<String> {
+        match Self::probe_host_ipv6() {
+            Ok(ipv6) => Some(self.pool_key_of(&PoolHost::of(ipv6))),
+            Err(error) => {
+                warn!(%error, "probing the host's IPv6 address failed");
+                None
+            }
+        }
     }
 
     fn pool_key_of(&self, host: &PoolHost) -> String {
         use sha2::Digest;
         let mut shape = self.shape();
         shape.tap = String::new();
+        // A pooled namespace's TAP is attached, whatever this VM would build for itself.
+        shape.tap_attached = true;
         let args = self.build_pasta_args(
             Path::new("/"),
             0,
@@ -1174,6 +1251,7 @@ impl PastaNetwork {
                 .expect("NAMESPACE_IP is an IPv4 address"),
             bridge_prefix: 24,
             mtu: self.links_mtu(),
+            tap_attached: self.attached_tap,
         }
     }
 
@@ -1250,30 +1328,71 @@ impl PastaNetwork {
     /// Detect host's global IPv6 address for pasta outbound traffic.
     ///
     /// Memoised for the process lifetime: `setup()` and `start_pasta()` both need
-    /// it, and the answer cannot change during one launch.
+    /// it, and the answer cannot change during one launch. Only an answer is kept: a
+    /// probe that failed is "no address" for this call and is made again at the next
+    /// ([`Self::remembered`]).
     fn detect_host_ipv6() -> Option<String> {
-        static HOST_IPV6: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        HOST_IPV6.get_or_init(Self::probe_host_ipv6).clone()
+        Self::remembered(&HOST_IPV6, Self::probe_host_ipv6)
+    }
+
+    /// Probe the host's IPv6 address now unless this process already has its answer, and
+    /// fail when the probe does. For a process whose key and namespaces last for days (the
+    /// namespace pool): it must not start on "no address" because one probe failed.
+    pub fn host_ipv6_known() -> std::io::Result<()> {
+        Self::remembered_or_error(&HOST_IPV6, Self::probe_host_ipv6).map(drop)
+    }
+
+    /// `probe`'s answer, kept in `kept` once there is one. A probe that fails is logged
+    /// and answered as `None` without being kept, so a failure that passes (the address
+    /// dump interrupted four times in a row on a host that is changing its addresses) does
+    /// not become "this host has no IPv6 address" for the rest of a long-lived process.
+    fn remembered(
+        kept: &std::sync::OnceLock<Option<String>>,
+        probe: impl FnOnce() -> std::io::Result<Option<String>>,
+    ) -> Option<String> {
+        match Self::remembered_or_error(kept, probe) {
+            Ok(answer) => answer,
+            Err(error) => {
+                warn!(%error, "probing the host's IPv6 address failed; none is assumed for now");
+                None
+            }
+        }
+    }
+
+    /// [`Self::remembered`] for a caller that must have an answer: the probe's failure is
+    /// its error, and nothing is kept.
+    fn remembered_or_error(
+        kept: &std::sync::OnceLock<Option<String>>,
+        probe: impl FnOnce() -> std::io::Result<Option<String>>,
+    ) -> std::io::Result<Option<String>> {
+        if let Some(answer) = kept.get() {
+            return Ok(answer.clone());
+        }
+        let answer = probe()?;
+        Ok(kept.get_or_init(|| answer).clone())
     }
 
     /// The first global-scope IPv6 address of this network namespace's interfaces that is
     /// not a unique local one (fd00::/8), from one netlink dump of the IPv6 addresses: no
     /// process is started. Only addresses are asked for. A dump of the links as well, which
     /// getifaddrs makes, waits for `rtnl_mutex` on a host that is starting many VMs.
-    fn probe_host_ipv6() -> Option<String> {
-        let mut rtnl = super::rtnl::Rtnl::open().ok()?;
+    ///
+    /// An error is the probe failing (no netlink socket, a dump the kernel kept
+    /// interrupting), which is not the same as a host without such an address.
+    fn probe_host_ipv6() -> std::io::Result<Option<String>> {
+        let mut rtnl = super::rtnl::Rtnl::open()?;
         // struct ifaddrmsg: family, prefix length, flags, scope, index.
         let mut header = [0u8; 8];
         header[0] = libc::AF_INET6 as u8;
-        let entries = rtnl.dump(super::rtnl::RTM_GETADDR, &header).ok()?;
+        let entries = rtnl.dump(super::rtnl::RTM_GETADDR, &header)?;
         const RT_SCOPE_UNIVERSE: u8 = 0;
-        Self::first_global_ipv6(
+        Ok(Self::first_global_ipv6(
             entries
                 .iter()
                 .filter(|entry| entry.payload.get(3) == Some(&RT_SCOPE_UNIVERSE))
                 .filter_map(|entry| Self::own_ipv6_address(&entry.attrs(8))),
         )
-        .map(|address| address.to_string())
+        .map(|address| address.to_string()))
     }
 
     /// This host's own address in one dumped IPv6 address entry: `IFA_LOCAL` when the entry
@@ -1627,12 +1746,30 @@ impl PastaNetwork {
         let pasta_bin = crate::setup::get_pasta_for_config(config.pasta.as_ref())?;
         info!(pasta_bin = %pasta_bin.display(), "resolved pasta binary");
 
-        let args = self.build_pasta_args(
+        let mut args = self.build_pasta_args(
             &pid_file,
             namespace_pid,
             host_ipv6.as_deref(),
             nix::unistd::geteuid().is_root(),
         );
+        if self.control {
+            let control = self.control_socket()?;
+            // pasta binds the path and refuses one that exists; `sun_path` holds 107 bytes.
+            anyhow::ensure!(
+                control.as_os_str().len() < 108,
+                "the control socket path {} is too long for a UNIX socket",
+                control.display()
+            );
+            match tokio::fs::remove_file(&control).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("removing a stale {}", control.display()))
+                }
+            }
+            args = Self::with_control_args(args, &control);
+        }
         debug!(pasta_args = ?args, "pasta arguments");
         let mut cmd = pasta_command(&pasta_bin, &args);
         debug!(cmd = ?cmd, "pasta command");
@@ -2047,6 +2184,7 @@ impl NetworkManager for PastaNetwork {
         }
         info!(vm_id = %self.vm_id, "setting up rootless networking with pasta (bridge mode)");
 
+        let mut tap_fd = None;
         // A namespace from the pool, when one serves this data directory and has a free
         // namespace built the way this VM's would be. Here, before anything names the TAP:
         // a pooled namespace's TAP has the pool's name, not this VM's.
@@ -2074,6 +2212,7 @@ impl NetworkManager for PastaNetwork {
                     "running in a pooled namespace"
                 );
                 self.tap_device = lease.grant.tap.clone();
+                tap_fd = Some(lease.tap_fd());
                 self.lease = Some(lease);
                 failpoint::hit_async("pool.post_claim").await;
             }
@@ -2115,6 +2254,7 @@ impl NetworkManager for PastaNetwork {
 
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
+            tap_fd,
             guest_mac,
             guest_ip: Some(format!("{}/24", self.guest_ip)),
             host_ip: Some(GUEST_GATEWAY.to_string()),
@@ -3427,6 +3567,30 @@ mod tests {
     /// The pool builds its namespaces from a network with the pool's TAP name and no
     /// loopback address. A default restored clone's key is that network's: neither the
     /// TAP's name nor the clone's loopback address is part of what the namespace is.
+    /// A pooled pasta's extra arguments sit before the namespace's PID, which pasta takes
+    /// last, and a network that asks for them has the key of one that does not.
+    #[test]
+    fn a_pooled_pasta_gets_its_control_socket_before_the_namespace() {
+        let net = PastaNetwork::new("vm-test123".to_string(), "tap-fc".to_string(), vec![]);
+        let args = net.build_pasta_args(Path::new("/run/p.pid"), 4242, None, false);
+        let with = PastaNetwork::with_control_args(args.clone(), Path::new("/run/pasta.ctl"));
+        assert_eq!(with.len(), args.len() + 3);
+        assert_eq!(with.last(), Some(&OsString::from("4242")));
+        let tail: Vec<&str> = with[with.len() - 4..]
+            .iter()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(tail, ["-c", "/run/pasta.ctl", "--no-neigh-notify", "4242"]);
+        assert_eq!(with[..args.len() - 1], args[..args.len() - 1]);
+
+        let plain = PastaNetwork::new("a".to_string(), "tap-a".to_string(), vec![]);
+        let pooled = PastaNetwork::new("b".to_string(), "tap-b".to_string(), vec![])
+            .with_pid_dir("/run/pool/0".into())
+            .with_attached_tap()
+            .with_control_socket();
+        assert_eq!(plain.with_restore_mode().pool_key(), pooled.pool_key());
+    }
+
     #[test]
     fn a_default_restored_clone_has_the_key_of_a_pooled_namespace() {
         let pooled = PastaNetwork::new("slot".into(), "tap-pool".into(), vec![]);
@@ -3472,7 +3636,7 @@ mod tests {
             ))
         );
         // In one process the two public forms agree while the host does not change.
-        assert_eq!(network.pool_key(), network.pool_key_now());
+        assert_eq!(Some(network.pool_key()), network.pool_key_now());
     }
 
     /// A clone whose pasta would be started differently does not match: here one that
@@ -4246,6 +4410,7 @@ mod tests {
                 bridge_address: "10.0.2.1".parse().unwrap(),
                 bridge_prefix: 24,
                 mtu: Some(GUEST_MTU),
+                tap_attached: false,
             }
         );
     }
@@ -4340,8 +4505,43 @@ mod tests {
             .unwrap()
             .filter_map(|interface| Some(interface.address?.as_sockaddr_in6()?.ip()));
         assert_eq!(
-            PastaNetwork::probe_host_ipv6(),
+            PastaNetwork::probe_host_ipv6().unwrap(),
             PastaNetwork::first_global_ipv6(listed).map(|address| address.to_string())
+        );
+    }
+
+    /// A probe that fails is not remembered as "no address": the next call probes again,
+    /// and the first answer is the one kept.
+    #[test]
+    fn a_failed_probe_of_the_host_address_is_not_remembered() {
+        let kept = std::sync::OnceLock::new();
+        let interrupted = || Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        assert_eq!(PastaNetwork::remembered(&kept, interrupted), None);
+        assert!(kept.get().is_none(), "a failed probe was kept");
+        let found = || Ok(Some("2001:db8::1".to_string()));
+        assert_eq!(
+            PastaNetwork::remembered(&kept, found).as_deref(),
+            Some("2001:db8::1")
+        );
+        let never = || -> std::io::Result<Option<String>> { panic!("probed again") };
+        assert_eq!(
+            PastaNetwork::remembered(&kept, never).as_deref(),
+            Some("2001:db8::1")
+        );
+        // A host without an address is an answer, and is kept.
+        let none = std::sync::OnceLock::new();
+        assert_eq!(PastaNetwork::remembered(&none, || Ok(None)), None);
+        assert_eq!(none.get(), Some(&None));
+        // A caller that must have an answer gets the failure itself, and nothing is kept.
+        let asked = std::sync::OnceLock::new();
+        let failed = PastaNetwork::remembered_or_error(&asked, interrupted).unwrap_err();
+        assert_eq!(failed.kind(), std::io::ErrorKind::Interrupted);
+        assert!(asked.get().is_none());
+        assert_eq!(
+            PastaNetwork::remembered_or_error(&asked, found)
+                .unwrap()
+                .as_deref(),
+            Some("2001:db8::1")
         );
     }
 

@@ -82,7 +82,8 @@ pub struct PieceArgs {
     /// attach also changes the device's offload features, which the bridge above it follows.
     #[arg(long, default_value_t = 1)]
     pub tap_warm_cycles: u32,
-    /// The pool's socket (`<data_dir>/netpool/<user>/pool.sock`) for the netpool piece.
+    /// The pool's socket (`socket` in the output of `fcvm netpool stats`) for the netpool
+    /// piece.
     #[arg(long)]
     pub netpool_socket: Option<PathBuf>,
     /// The tap-attach piece prepares namespaces with the TAP and the bridge and no pasta
@@ -239,7 +240,7 @@ async fn isolated_network(held: &mut Held) -> Result<u32> {
     Ok(pid)
 }
 
-/// The clone's runtime directory (`vm-disks/<vm_id>`), as `cmd_snapshot_run_inner` makes it.
+/// The clone's runtime directory (`vm-disks/<bucket>/<vm_id>`), as `cmd_snapshot_run_inner` makes it.
 async fn runtime_dir(held: &mut Held) -> Result<PathBuf> {
     let dir = fcvm::paths::vm_runtime_dir(&held.vm_id);
     tokio::fs::create_dir_all(&dir).await?;
@@ -379,7 +380,7 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
             // Held from the claim on, so teardown deletes the record if a later step fails.
             let manager = held.state.insert(manager);
             let t = Instant::now();
-            manager.allocate_loopback_ip(&mut vm_state).await?;
+            manager.allocate_loopback_ip(&mut vm_state)?;
             stages.push(("loopback", ms(t)));
             let t = Instant::now();
             manager
@@ -407,6 +408,12 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
                 .await?
                 .context("the pool had no free namespace")?;
             stages.push(("generation", lease.grant.generation as f64));
+            // What the clone's VMM then does with the namespace's TAP: three ioctls on
+            // the queue it inherits, where a VMM in a namespace of its own attaches by
+            // name (the tap-attach piece).
+            let t = Instant::now();
+            crate::tap::use_inherited(lease.tap_fd())?;
+            stages.push(("vmm-tap", ms(t)));
             held.lease = Some(lease);
         }
         Piece::FcSpawn => {
@@ -417,6 +424,7 @@ async fn op(args: &PieceArgs, held: &mut Held) -> Result<Stages> {
                 held.vm_id.clone(),
                 dir.join("firecracker.sock"),
                 None,
+                vmm_decision()?,
             );
             vmm.set_user_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/user")));
             vmm.set_net_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/net")));
@@ -477,8 +485,12 @@ async fn restore(args: &PieceArgs, held: &mut Held, stages: &mut Stages) -> Resu
     let disk = held.disk_path.clone().context("no disk")?;
     let dir = fcvm::paths::vm_runtime_dir(&held.vm_id);
     let t = Instant::now();
-    let mut vmm =
-        fcvm::firecracker::VmManager::new(held.vm_id.clone(), dir.join("firecracker.sock"), None);
+    let mut vmm = fcvm::firecracker::VmManager::new(
+        held.vm_id.clone(),
+        dir.join("firecracker.sock"),
+        None,
+        vmm_decision()?,
+    );
     vmm.set_user_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/user")));
     vmm.set_net_namespace_path(PathBuf::from(format!("/proc/{pid}/ns/net")));
     let started = vmm.start(firecracker, None, None).await;
@@ -508,6 +520,7 @@ async fn restore(args: &PieceArgs, held: &mut Held, stages: &mut Stages) -> Resu
             network_overrides: Some(vec![NetworkOverride {
                 iface_id: "eth0".into(),
                 host_dev_name: tap_device(&held.vm_id),
+                host_dev_fd: None,
             }]),
             vsock_override: Some(VsockOverride {
                 uds_path: dir.join("vsock.sock").display().to_string(),
@@ -634,5 +647,69 @@ mod state_order_tests {
         assert!(arm.find("claim_name").unwrap() < held);
         assert!(held < arm.find("allocate_loopback_ip").unwrap());
         assert!(held < arm.find("update_state").unwrap());
+    }
+}
+
+/// The pieces measure fcvm's unconfined VMMs: confinement is refused for them, so a host
+/// whose mode is `required` refuses the harness rather than running it confined.
+fn vmm_request() -> fcvm::confine::Request<'static> {
+    fcvm::confine::Request {
+        flag: false,
+        backend: fcvm::hypervisor::Backend::Firecracker,
+        network: fcvm::confine::Network::Rootless,
+        firecracker_args: None,
+        unsupported: Some("the start-rate pieces harness measures unconfined VMMs"),
+        kernel_profile: None,
+        passthrough_devices: 0,
+    }
+}
+
+/// The decision for a piece's VMM, as an error the caller's teardown path handles, not a
+/// panic that skips it.
+fn vmm_decision() -> Result<fcvm::confine::Decision> {
+    fcvm::confine::resolve(&vmm_request()).context("deciding a piece VMM's confinement")
+}
+
+#[cfg(test)]
+mod confine_tests {
+    use fcvm::confine::{decide, Host, Mode, SeccompMode};
+
+    fn host(mode: Mode) -> Host {
+        Host {
+            mode,
+            landlock_abi: Ok(11),
+            strace_fc: false,
+            no_seccomp: false,
+            firecracker_args: None,
+            core_pattern: Some("core".to_string()),
+            core_hard_limit: u64::MAX,
+            seccomp: SeccompMode::Enforce,
+            firecracker_commit: None,
+            allow_seccomp_log: true,
+        }
+    }
+
+    #[test]
+    fn a_required_host_refuses_the_pieces_and_an_off_host_runs_them_unconfined() {
+        let error = decide(&super::vmm_request(), &host(Mode::Required))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("measures unconfined VMMs"), "{error}");
+        assert_eq!(
+            decide(&super::vmm_request(), &host(Mode::Off)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_refused_decision_is_an_error_not_a_panic() {
+        let source = include_str!("pieces.rs");
+        let start = source.find("fn vmm_decision()").unwrap();
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        assert!(
+            body.contains("-> Result<fcvm::confine::Decision>"),
+            "{body}"
+        );
+        assert!(!body.contains(".expect("), "{body}");
     }
 }

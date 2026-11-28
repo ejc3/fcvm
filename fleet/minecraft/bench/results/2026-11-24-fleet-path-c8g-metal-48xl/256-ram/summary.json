@@ -1,0 +1,86 @@
+{
+ "servers": 256,
+ "host": [
+  "kernel 7.0.0-1018-aws",
+  "cpus 192",
+  "MemTotal:       395386980 kB",
+  "store /dev/loop3 btrfs   96G",
+  "/dev/loop3: [0057]:169929 (/mnt/ram/store.img)",
+  "NAME    MODEL                       SIZE",
+  "nvme1n1 Amazon Elastic Block Store  100G",
+  "nvme0n1 Amazon Elastic Block Store   30G"
+ ],
+ "all_up_s": {
+  "from": "agent hello",
+  "s": 6.9
+ },
+ "restore_all_s": 6.0,
+ "launch_ms_first_wave": {
+  "n": 256,
+  "p50": 4591,
+  "p90": 6594,
+  "max": 6767
+ },
+ "mark_60s": {
+  "since_all_up_s": 60.0,
+  "oldest_age_s": null,
+  "tps": {
+   "n": 256,
+   "min": 19.9,
+   "p01": 19.9,
+   "p10": 20.0,
+   "p50": 20.0,
+   "below_19_5": 0,
+   "no_answer": 0
+  },
+  "busy_cpus": 51.4,
+  "busy_per_server": 0.201,
+  "per_server_mib": {
+   "host_used_delta": 224.4,
+   "pss": 222.5,
+   "pss_anon": 221.4,
+   "rss": 465.2
+  },
+  "host_used_mib": 86467,
+  "meminfo": {
+   "MemTotal": 386120,
+   "MemAvailable": 299583,
+   "Cached": 50203,
+   "Dirty": 164,
+   "AnonPages": 57568,
+   "Shmem": 18519
+  }
+ },
+ "reset_all_s": 16.0,
+ "launch_ms_after_reset": {
+  "n": 256,
+  "p50": 5286,
+  "p90": 6746,
+  "max": 13026
+ },
+ "reset_sent_s_after_all_ran": 100.1,
+ "samples_all_up": 20,
+ "readings": 5120,
+ "readings_under_19_5": 0,
+ "readings_unanswered": 0,
+ "low_or_unanswered": [],
+ "busy_cpus_per_server_by_minute": {
+  "0": 0.239,
+  "1": 0.201
+ },
+ "samples_with_a_reading_under_19_5": 0,
+ "lowest_tps_reading": 19.6,
+ "readings_no_answer_max": 0,
+ "store_mib": {
+  "start": 3848,
+  "max": 6567,
+  "end": 4930,
+  "per_server_at_max": 10.6
+ },
+ "wire": {
+  "snapshots": 240,
+  "snapshot_bytes_mean": 23682,
+  "status_msgs": 121,
+  "status_bytes_mean": 2891
+ }
+}

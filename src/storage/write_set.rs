@@ -109,11 +109,7 @@ impl Target {
             return Ok(None);
         }
         let path = self.with_suffix(".claim");
-        let claim = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
+        let claim = crate::utils::open_shared_lock_file(&path)
             .with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: flock on a descriptor this function owns.
         if unsafe { libc::flock(claim.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
@@ -548,6 +544,26 @@ mod tests {
         assert!(!target.marked_unrecordable());
         let next = Target::at_restore(&snapshot, &memory, &config).unwrap();
         assert!(next.recorded().is_none());
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
+    }
+
+    /// A generation replaced after the mapping matched (only `config.json` changes, so the
+    /// VMM still maps the same image) records nothing and marks nothing: the next clone of
+    /// the generation it restored may still record. Reached through the generation check in
+    /// `record`, after `written_runs` found the mapping.
+    #[test]
+    fn a_generation_changed_after_the_mapping_matched_records_nothing() {
+        let (_dir, snapshot, memory, config) = generation(8);
+        let target = Target::at_restore(&snapshot, &memory, &config).unwrap();
+        let bytes = map(&memory, 0, 8, &[1], &[]);
+        let recording = target.claim(std::process::id()).unwrap().unwrap();
+        std::fs::write(&config, r#"{"generation":2}"#).unwrap();
+        let error = recording.record().unwrap_err().to_string();
+        assert!(error.contains("generation changed"), "{error}");
+        assert!(!target.marked_unrecordable());
+        assert!(!target.sidecar().exists());
+        assert!(target.claim(std::process::id()).unwrap().is_some());
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(bytes.cast(), 8 * PAGE as usize) };
     }

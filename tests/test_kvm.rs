@@ -970,7 +970,8 @@ async fn test_nested_l2_fuse() -> Result<()> {
         BenchmarkMode::None,
         ImageCacheMount::Fuse,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test L1→L2 nesting with image cache via NFS (--nfs)
@@ -984,7 +985,8 @@ async fn test_nested_l2_nfs() -> Result<()> {
         BenchmarkMode::None,
         ImageCacheMount::Nfs,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test L1→L2 nesting with standard benchmarks
@@ -1000,7 +1002,8 @@ async fn test_nested_l2_with_benchmarks() -> Result<()> {
         BenchmarkMode::Standard,
         ImageCacheMount::Fuse,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test L1→L2 nesting with large file benchmarks (100MB copies)
@@ -1016,7 +1019,8 @@ async fn test_nested_l2_with_large_files() -> Result<()> {
         BenchmarkMode::WithLargeFiles,
         ImageCacheMount::Fuse,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test nested VMs with network throughput benchmarks
@@ -1032,7 +1036,8 @@ async fn test_nested_l2_network_fuse() -> Result<()> {
         BenchmarkMode::WithNetwork,
         ImageCacheMount::Fuse,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test L2 network benchmarks with image cache via NFS
@@ -1044,7 +1049,8 @@ async fn test_nested_l2_network_nfs() -> Result<()> {
         BenchmarkMode::WithNetwork,
         ImageCacheMount::Nfs,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test L3 network: measures throughput degradation through triple NAT chain.
@@ -1062,7 +1068,8 @@ async fn test_nested_l3_network_fuse() -> Result<()> {
         BenchmarkMode::WithNetwork,
         ImageCacheMount::Fuse,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test L3 network with the image cache over NFS.
@@ -1077,7 +1084,8 @@ async fn test_nested_l3_network_nfs() -> Result<()> {
         BenchmarkMode::WithNetwork,
         ImageCacheMount::Nfs,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test L1→L2→L3: 3 levels of nesting.
@@ -1093,7 +1101,8 @@ async fn test_nested_l3() -> Result<()> {
         BenchmarkMode::None,
         ImageCacheMount::Fuse,
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// Test L1→L2→L3→L4: 4 levels of nesting.
@@ -1115,7 +1124,106 @@ async fn test_nested_l4() -> Result<()> {
         BenchmarkMode::None,
         ImageCacheMount::Fuse,
     )
-    .await
+    .await?;
+    Ok(())
+}
+
+/// A guest's user space must read the counter its kernel keeps time with, at every
+/// nesting level.
+///
+/// The vDSO computes a clock from CNTVCT_EL0 read at EL0 and the `cycle_last` the kernel
+/// recorded from its own counter. Measured 2026-11-27 and 28 on a c8gd.metal-24xl, host
+/// and guest kernels 7.3.3, while fcvm's guest patch made `arm64.nv2` set
+/// ID_AA64MMFR4_EL1.NV_frac to 2 (NV2P1; 1 is NV2_ONLY): on the host and in L1
+/// CNTVCT_EL0 was 0.4 to 15 ms past `cycle_last`, as it should be, and in L2 it was 9 to
+/// 73 s behind it, L1's counter when it created L2. L1's boot log showed `FEAT_NV2p1`,
+/// which the CPU has not. The vDSO's difference then wraps and overflows: in L2
+/// `clock_gettime` through the vDSO was 2125 to 2190 s from the syscall's for
+/// CLOCK_MONOTONIC_RAW, and CLOCK_MONOTONIC, REALTIME and BOOTTIME jumped by whole
+/// multiples of 2^33 ns (8.59 s) as NTP moved the clocksource multiplier, 38 jumps in
+/// 179 samples. Every tokio timer and `Instant` in L2 runs on that clock ("Firecracker
+/// socket not ready after 5 seconds", #2246). A Firecracker that sets no counter
+/// offset for L2 showed the same gap. With NV_frac = 1 the two agree in L1, L2 and L3
+/// (kernel/patches-arm64/mmfr4-override.vm.patch has the numbers).
+///
+/// `counter_check.py` runs in each level's container, and here on the host, and prints
+/// one line. This asserts each level printed it, that it says ok, and that no guest's
+/// kernel detected FEAT_NV2p1 when the host's did not. No L3: 17 to 110 s.
+#[cfg(target_arch = "aarch64")]
+#[tokio::test]
+async fn test_nested_l2_user_space_reads_the_kernels_counter() -> Result<()> {
+    let log = run_nested_n_levels(
+        2,
+        "MARKER_L2_OK_12345",
+        BenchmarkMode::None,
+        ImageCacheMount::Fuse,
+    )
+    .await?;
+    // The same check on the host: its counters must agree too, and its kernel log says
+    // whether this CPU has FEAT_NV2p1, which no guest may claim beyond. python3 reads the
+    // script from its stdin: this test runs as root, and a script written to the shared
+    // temp directory under a predictable name could be replaced before python3 opened it.
+    let mut check = std::process::Command::new("python3")
+        .args(["-", "0"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("starting python3 for counter_check.py on the host")?;
+    {
+        use std::io::Write;
+        let mut stdin = check.stdin.take().context("python3 has no stdin pipe")?;
+        stdin
+            .write_all(include_str!("nested/counter_check.py").as_bytes())
+            .context("sending counter_check.py to python3")?;
+    }
+    let host = check
+        .wait_with_output()
+        .context("running counter_check.py on the host")?;
+    let host_line = String::from_utf8_lossy(&host.stdout).trim().to_string();
+    println!("{host_line}");
+    let host_has_nv2p1 = host_line.contains(" nv2p1=yes");
+
+    let mut failures = Vec::new();
+    if !host_line.starts_with("COUNTER_L0 ok ") {
+        failures.push(format!("host: {host_line}"));
+    }
+    for level in 1..=2 {
+        let tag = format!("COUNTER_L{level} ");
+        // The level's script runs under `set -x` in places and the line can arrive
+        // with a prefix: find the tag anywhere in a line, and take the last one.
+        let Some(line) = log
+            .lines()
+            .rev()
+            .find_map(|l| l.find(&tag).map(|at| &l[at..]))
+        else {
+            failures.push(format!("L{level} printed no COUNTER_L{level} line"));
+            continue;
+        };
+        println!("{line}");
+        if !line.starts_with(&format!("{tag}ok ")) {
+            failures.push(line.to_string());
+        }
+        // The cause, where it starts: a guest kernel that believes in FEAT_NV2p1 on a
+        // CPU without it. Its KVM then programs its guests' counter traps where the
+        // host cannot see them. A guest whose boot log is no longer whole cannot be
+        // vouched for, so that fails too.
+        if !host_has_nv2p1 && !line.contains(" nv2p1=no") {
+            failures.push(format!(
+                "L{level}'s kernel log does not show a kernel without FEAT_NV2p1 on a host \
+                 that has none (host: {}): {line}",
+                host_line
+                    .split_whitespace()
+                    .find(|w| w.starts_with("nv2p1="))
+                    .unwrap_or("nv2p1 not reported"),
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "user space does not read the kernel's counter at every level:\n{}",
+        failures.join("\n")
+    );
+    Ok(())
 }
 
 /// Benchmark mode for nested tests
@@ -1123,7 +1231,7 @@ async fn test_nested_l4() -> Result<()> {
 enum BenchmarkMode {
     /// No benchmarks - just verify nesting works
     None,
-    /// Standard benchmarks (egress, disk I/O, FUSE latency, memory)
+    /// Standard benchmarks (gateway reachability, disk I/O, FUSE latency, memory)
     Standard,
     /// Standard + large file tests (100MB copies)
     WithLargeFiles,
@@ -1139,6 +1247,13 @@ LEVEL=${1:-unknown}
 echo "=== L${LEVEL} BASIC CHECK ==="
 echo "Kernel: $(uname -r)"
 echo "Memory: $(grep MemAvailable /proc/meminfo | awk '{print $2/1024 " MB"}')"
+# One COUNTER_L<level> line: whether this level's user space reads the counter its
+# kernel keeps time with (tests/nested/counter_check.py). It never fails the level;
+# test_nested_l2_user_space_reads_the_kernels_counter asserts on the lines.
+# Bounded: a guest with a broken clock can hang anything that waits on it, and a hang
+# here would be reported as a missing marker 19 minutes later instead of as this line.
+timeout 30 python3 "$(dirname "$0")/counter_check.py" "$LEVEL" ||
+    echo "COUNTER_L${LEVEL} FAIL the check did not finish in 30 s (exit $?)"
 echo "=== END L${LEVEL} ==="
 echo "MARKER_L${LEVEL}_OK"
 "#
@@ -1146,7 +1261,7 @@ echo "MARKER_L${LEVEL}_OK"
 
 /// Benchmark script that runs at each nesting level
 ///
-/// Measures: egress connectivity, local disk I/O, FUSE disk I/O, FUSE latency, memory usage.
+/// Measures: gateway reachability, local disk I/O, FUSE disk I/O, FUSE latency, memory usage.
 /// Outputs MARKER_L{level}_OK on success.
 fn benchmark_script() -> &'static str {
     r#"#!/bin/bash
@@ -1155,14 +1270,21 @@ LEVEL=${1:-unknown}
 
 echo "=== BENCHMARK L${LEVEL} ==="
 
-# Test 1: Egress - can we reach the gateway?
-echo "--- Egress Test ---"
-# Test by pinging the gateway (10.0.2.2 for rootless via pasta)
-# This validates network connectivity without external dependencies
-if ping -c 1 -W 5 10.0.2.2 > /dev/null 2>&1; then
-    echo "EGRESS_L${LEVEL}=OK gateway=10.0.2.2"
+# Test 1: Ping the default gateway the routing table names. Every level runs
+# with --network bridged, so the gateway is not pasta's 10.0.2.2. No route or
+# no answer fails the level.
+echo "--- Gateway Reachability Test ---"
+ROUTES=$(ip -4 route show default)
+GATEWAY=$(printf '%s\n' "$ROUTES" | awk '$1 == "default" && $2 == "via" {print $3; exit}')
+if [ -z "$GATEWAY" ]; then
+    echo "GATEWAY_L${LEVEL}=FAIL no default gateway: $ROUTES" >&2
+    exit 1
+fi
+if ping -c 1 -W 5 "$GATEWAY"; then
+    echo "GATEWAY_L${LEVEL}=OK gateway=$GATEWAY"
 else
-    echo "EGRESS_L${LEVEL}=FAIL"
+    echo "GATEWAY_L${LEVEL}=FAIL gateway=$GATEWAY routes=$ROUTES" >&2
+    exit 1
 fi
 
 # Test 2: Local disk performance (dd to /tmp which is on rootfs)
@@ -1234,7 +1356,7 @@ if mountpoint -q /mnt/fcvm-btrfs 2>/dev/null; then
     START=$(date +%s%N)
     for i in $(seq 1 100); do cat "${FUSE_DIR}/lat.txt" > /dev/null; done
     END=$(date +%s%N)
-    READ_US=$(( (END - START) / 1000 ))
+    READ_US=$(( (END - START) / (1000 * 100) ))
     echo "FUSE_SMALLREAD_L${LEVEL}=${READ_US}us/op (100 ops)"
 
     rm -rf "$FUSE_DIR"
@@ -1528,7 +1650,7 @@ echo "MARKER_NET_L${{LEVEL}}_OK"
 fn print_benchmark_summary(log_content: &str, include_large_files: bool, include_network: bool) {
     println!("\n=== BENCHMARK SUMMARY ===");
     for line in log_content.lines() {
-        let is_standard = line.contains("EGRESS_L")
+        let is_standard = line.contains("GATEWAY_L")
             || line.contains("LOCAL_WRITE_L")
             || line.contains("LOCAL_READ_L")
             || line.contains("FUSE_WRITE_L")
@@ -1563,7 +1685,7 @@ async fn run_nested_n_levels(
     marker: &str,
     mode: BenchmarkMode,
     image_cache_mount: ImageCacheMount,
-) -> Result<()> {
+) -> Result<String> {
     assert!(n >= 2, "Need at least 2 levels for nesting");
 
     println!(
@@ -1705,6 +1827,11 @@ async fn run_nested_n_levels(
 
     tokio::fs::write(&bench_path, benchmark_script()).await?;
     tokio::fs::write(&basic_path, basic_script()).await?;
+    tokio::fs::write(
+        format!("{}/counter_check.py", scripts_dir),
+        include_str!("nested/counter_check.py"),
+    )
+    .await?;
     tokio::fs::write(&large_path, large_file_script()).await?;
     let hop_path = format!("{}/hop.sh", scripts_dir);
     if mode == BenchmarkMode::WithNetwork {
@@ -2052,8 +2179,11 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
     // so the VM dies (and cleans up) before the test harness gives up. The L3
     // tests complete in 627 to 810 s (#660), so 840 s left them as little as 4% headroom,
     // and an L3 run on a host busy with other VM tests took 847 s and was killed.
+    // No sudo: the privileged runner already runs this test as root, and sudo
+    // would reset the environment, dropping FCVM_NO_SNAPSHOT, FCVM_DATA_DIR and
+    // FCVM_CONFIG_DIR before L1 starts.
     let fcvm_cmd = format!(
-        "timeout -k 10 1140 sudo ./target/release/fcvm podman run \
+        "timeout -k 10 1140 ./target/release/fcvm podman run \
          --name l1-nested-{}-{}-{}-{} \
          --network bridged \
          --privileged \
@@ -2165,7 +2295,7 @@ FCVM_DATA_DIR=$NESTED_DATA FCVM_FUSE_TRACE_RATE=100 FCVM_FUSE_MAX_WRITE={fuse_ma
         }
     }
 
-    Ok(())
+    Ok(log_content)
 }
 
 /// Test podman load performance over FUSE (localhost/nested-test)

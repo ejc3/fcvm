@@ -29,7 +29,8 @@
 //!
 //! # Reset
 //!
-//! At the end of a lease the pool restarts the namespace's pasta, has the holder remove
+//! At the end of a lease the pool has the namespace's pasta forget its guest (a reset over
+//! pasta's control socket, `crate::network::pesto`), has the holder remove
 //! what a VM's use leaves ([`crate::network::netns_agent::reset`]) and compares the
 //! namespace's [fingerprint](crate::network::fingerprint) with the one taken when it was
 //! built. A namespace that differs is destroyed and built again. Its generation counts the

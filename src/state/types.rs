@@ -47,6 +47,18 @@ pub struct VmState {
     /// racing the earlier PID/state write performed during setup.
     #[serde(default)]
     pub lifecycle_ready: bool,
+    /// For a VM restored from a memory snapshot: its guest has acknowledged this restore.
+    /// The guest acknowledges after it has retired the snapshot's connections, run the
+    /// restore hook and opened its network gate. The owning fcvm writes this under the
+    /// state lock when it has the acknowledgement, before it prints the restored record,
+    /// and `snapshot create` refuses a restored VM without it
+    /// (`commands::common::ensure_restore_acknowledged`). Never written for a VM that was
+    /// booted, for a raw guest's clone (it has no agent; `lifecycle_ready` admits it), for a
+    /// restore that failed, or for `podman prepare`'s disposable VM. Once
+    /// true it stays true: `StateManager` keeps it through every later write of this
+    /// process's state. Absent from a state file while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restore_acknowledged: bool,
     /// Namespace holder PID for rootless networking (used for nsenter health checks)
     #[serde(default)]
     pub holder_pid: Option<u32>,
@@ -56,6 +68,9 @@ pub struct VmState {
     /// afterwards. A reader of a state whose owner is dead must not use it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub netpool: Option<PooledNamespace>,
+    /// How this VM's VMM is confined (`--confine`), when it is (`crate::confine`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confinement: Option<crate::confine::Confinement>,
     /// Monotonically increasing count of host-side vsock transport resets.
     /// Bumped (locked read-modify-write via `StateManager::bump_vsock_epoch`)
     /// after every snapshot pause/save of this VM and BEFORE the VM resumes:
@@ -65,6 +80,26 @@ pub struct VmState {
     /// to 0 so state files written before this field existed still load.
     #[serde(default)]
     pub vsock_epoch: u64,
+    /// A snapshot create closed this VM's network gate and could not open it again: the
+    /// guest refuses every new TCP connection, in and out, and keeps the ones it has.
+    /// Written before a create's first ask of the guest to reopen and cleared by the ask
+    /// that opens the gate (`commands::common::reopen_until_open`), so it is also true
+    /// while a create is asking, and stays true when the guest refuses a resume as
+    /// another boundary's. A later
+    /// `snapshot create` asks the guest once more and is refused while the gate stays
+    /// closed. Absent from a state file while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_gate_closed: bool,
+    /// The token of the snapshot create whose boundary this VM's guest last was, or still
+    /// is, owed a resume for (#2159). The create writes it before its prepare, which puts
+    /// it into the guest's `owed` mark, and every resume carries it; it is cleared when
+    /// the guest reports its gate open. While `network_gate_closed` it is what a later
+    /// create's one ask sends. It can differ from the guest's mark (a prepare that failed
+    /// before it wrote the mark, over an older boundary's): the guest then refuses the
+    /// resume as stale and the create reports it. It orders resumes and is not a secret.
+    /// Absent while none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_token: Option<String>,
     pub created_at: jiff::Timestamp,
     pub last_updated: jiff::Timestamp,
     pub config: VmConfig,
@@ -229,6 +264,12 @@ pub struct VmConfig {
     /// `source_vsock_socket_path`, since the source may use `--vsock-dir`.
     #[serde(default)]
     pub original_vsock_vm_id: Option<String>,
+    /// This VM's runtime directory (`paths::vm_runtime_dir` when it started: its API socket,
+    /// log, disks), recorded so a later fcvm finds it where the build that started the VM put
+    /// it, whatever layout that build used (`VmState::vm_runtime_dir`). None in a state written
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_runtime_dir: Option<std::path::PathBuf>,
     /// Actual host-side base socket used for this running VM's vsock device.
     ///
     /// This may live outside the per-VM runtime directory when `--vsock-dir`
@@ -420,6 +461,16 @@ impl VmConfig {
 }
 
 impl VmState {
+    /// This VM's runtime directory: the one its state recorded when it started. Every fcvm
+    /// that puts a VM's directory in a bucket of `vm-disks` records it, so a state without
+    /// the record was written by a build that put it directly in `vm-disks`.
+    pub fn vm_runtime_dir(&self) -> std::path::PathBuf {
+        match &self.config.vm_runtime_dir {
+            Some(dir) => dir.clone(),
+            None => crate::paths::vm_disks_dir().join(&self.vm_id),
+        }
+    }
+
     pub fn new(vm_id: String, image: String, vcpu: u8, memory_mib: u32) -> Self {
         let now = jiff::Timestamp::now();
         Self {
@@ -432,12 +483,17 @@ impl VmState {
             pid: None,
             pid_start_time: None,
             lifecycle_ready: false,
+            restore_acknowledged: false,
             holder_pid: None,
             netpool: None,
+            confinement: None,
             vsock_epoch: 0,
+            network_gate_closed: false,
+            boundary_token: None,
             created_at: now,
             last_updated: now,
             config: VmConfig {
+                vm_runtime_dir: None,
                 image,
                 vcpu,
                 memory_mib,
@@ -495,6 +551,42 @@ impl VmState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every start records its VM's runtime directory before it writes the VM's first state
+    /// (`claim_name`): a reader of a running VM's directory (exec, health, the memory server
+    /// writing why it refused a clone) takes it from the state, and one written without it is
+    /// read as the layout before the buckets, a directory the VM does not have.
+    #[test]
+    fn every_start_records_its_runtime_directory_before_the_first_state() {
+        let sources = [
+            ("podman/mod.rs", include_str!("../commands/podman/mod.rs")),
+            ("snapshot.rs", include_str!("../commands/snapshot.rs")),
+            ("vm.rs", include_str!("../commands/vm.rs")),
+        ];
+        let mut claims = 0;
+        for (file, source) in sources {
+            for (at, _) in source.match_indices(".claim_name(&mut vm_state)") {
+                if source[..at].ends_with('"') {
+                    continue;
+                }
+                let function = ["\nfn ", "\npub fn ", "\nasync fn ", "\npub async fn "]
+                    .iter()
+                    .filter_map(|start| source[..at].rfind(start))
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    source[function..at].contains("config.vm_runtime_dir = Some("),
+                    "{file}: the state is first written at byte {at} before its runtime \
+                     directory is recorded"
+                );
+                claims += 1;
+            }
+        }
+        assert_eq!(
+            claims, 4,
+            "podman run, snapshot run, the raw restore and vm run"
+        );
+    }
 
     #[test]
     fn test_vm_state_new() {

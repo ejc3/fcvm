@@ -871,11 +871,7 @@ async fn test_file_open_across_snapshot_keeps_reading() -> Result<()> {
 /// clone, which needs the snapshot to carry the portable volume's inode table (#1200).
 #[tokio::test]
 async fn test_file_open_across_cloud_hypervisor_snapshot_keeps_reading() -> Result<()> {
-    if fcvm::commands::common::find_cloud_hypervisor().is_err() {
-        eprintln!(
-            "SKIP: cloud-hypervisor not found (build it with `fcvm setup --cloud-hypervisor`, set \
-             FCVM_CLOUD_HYPERVISOR_BIN, or install on PATH)"
-        );
+    if !common::cloud_hypervisor_built()? {
         return Ok(());
     }
     held_open_file_across_snapshot("pv-ch-heldopen", 0, "cloud-hypervisor").await

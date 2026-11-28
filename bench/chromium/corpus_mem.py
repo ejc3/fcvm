@@ -48,8 +48,11 @@ import uuid
 import host_resource_finalizer
 from reqbench import (
     DEVTOOLS_VERSION_REQUEST,
+    fcvm_state_dir,
     host_facts,
     host_identity,
+    list_state_paths,
+    require_state_layout,
     snapshot_generation,
     valid_snapshot_name,
 )
@@ -613,8 +616,11 @@ def spawn_in_cgroup(cg_path, argv, log_path, env=None):
 
 
 def state_files(state_dir):
+    require_state_layout(state_dir)
     try:
-        return [os.path.join(state_dir, f) for f in os.listdir(state_dir) if f.endswith(".json")]
+        # A store that is not there cannot prove a clone gone; a missing bucket can.
+        os.stat(state_dir)
+        return list_state_paths(state_dir)
     except OSError as exc:
         raise CloneStateReadError(
             f"cannot enumerate clone state directory {state_dir}: {exc}"
@@ -678,7 +684,7 @@ def clone_forensics(args, clone, reason):
     this clone's pasta or an earlier clone's. fcvm's readiness probe counts a
     reset from the guest as an answer, so it does not show the port open. This
     records the host listeners on the port with their owners (`ss -ltnp`), the
-    clone's own pasta pid (vm-disks/<vm_id>/pasta.pid) and whether it owns the
+    clone's own pasta pid (vm-disks/<bucket>/<vm_id>/pasta.pid) and whether it owns the
     endpoint's listener, and, from inside the guest (`fcvm exec --vm`), whether
     DevTools answers on 127.0.0.1 there, which ports the guest listens on and
     by whom, the restore ingress gate's rules and counters, and whether a
@@ -716,7 +722,9 @@ def clone_forensics(args, clone, reason):
         owners = None
     pasta_pid = None
     if clone.get("vm_id"):
-        path = os.path.join(args.data_root, "vm-disks", clone["vm_id"], "pasta.pid")
+        # vm-disks/<bucket>/<vm_id>, bucket = first byte of sha256(vm_id) as two hex digits.
+        bucket = hashlib.sha256(clone["vm_id"].encode()).hexdigest()[:2]
+        path = os.path.join(args.data_root, "vm-disks", bucket, clone["vm_id"], "pasta.pid")
         try:
             with open(path) as f:
                 pasta_pid = int(f.read().strip())
@@ -1977,7 +1985,6 @@ def main_with_resources(resources):
         args.ns = [int(x) for x in parse_csv(args.ns, "--ns")]
     except ValueError as exc:
         die(f"--ns must be comma-separated integers: {exc}")
-    args.state_dir = os.path.join(args.data_root, "state")
     args.run_id = (
         args.run_id or os.environ.get("FCVM_MEMORY_RUN_ID") or uuid.uuid4().hex)
     args.container_owner_token = (
@@ -1997,6 +2004,11 @@ def main_with_resources(resources):
             die(f"'{tool}' is missing; this harness cannot render a verdict without it")
     if not os.access(args.fcvm, os.X_OK):
         die(f"no fcvm binary at {args.fcvm}")
+    # Where this fcvm keeps VM state, asked of it with the clones' environment.
+    try:
+        args.state_dir = fcvm_state_dir(args.fcvm)
+    except RuntimeError as exc:
+        die(str(exc))
     try:
         fcvm_sha256 = sha256_file(args.fcvm)
     except OSError as exc:

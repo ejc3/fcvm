@@ -20,6 +20,8 @@ pub struct Lease {
     connection: AsyncFd<UnixStream>,
     user_namespace: OwnedFd,
     net_namespace: OwnedFd,
+    /// The queue the namespace's TAP is attached by. The VMM inherits it.
+    tap: OwnedFd,
     /// This process's channel to the namespace's holder, for sockets in the namespace.
     pub agent: Arc<netns_agent::Client>,
     pub grant: Grant,
@@ -36,6 +38,12 @@ impl Lease {
     /// ([`crate::utils::NamespaceParams::keep_fds`]).
     pub fn fd(&self) -> RawFd {
         self.connection.get_ref().as_raw_fd()
+    }
+
+    /// The queue of the namespace's TAP, for the VMM to inherit and use the device through
+    /// ([`crate::network::rtnl::add_attached_tap`]).
+    pub fn tap_fd(&self) -> RawFd {
+        self.tap.as_raw_fd()
     }
 
     /// A path that names the namespace's user namespace for as long as this lease is held:
@@ -181,6 +189,7 @@ pub async fn claim_at(socket: &std::path::Path, key: &str) -> Result<Option<Leas
             fds.len()
         );
     }
+    let tap = fds.pop().unwrap();
     let agent = UnixStream::from(fds.pop().unwrap());
     let net_namespace = fds.pop().unwrap();
     let user_namespace = fds.pop().unwrap();
@@ -188,6 +197,7 @@ pub async fn claim_at(socket: &std::path::Path, key: &str) -> Result<Option<Leas
         connection,
         user_namespace,
         net_namespace,
+        tap,
         agent: Arc::new(netns_agent::Client::new(agent).context("registering the holder channel")?),
         grant,
     }))
@@ -203,7 +213,7 @@ async fn ask(
         return Ok(None);
     };
     // The reply names namespaces this process then enters. A pool is its user's own
-    // (`<data_dir>/netpool/<user>/`), so whatever listens here as another user is not it.
+    // (`<runtime_dir>/netpool/<user>/`), so whatever listens here as another user is not it.
     require_peer(&connection, nix::unistd::geteuid().as_raw())?;
     let connection = proto::watch(connection).context("registering the pool connection")?;
     let request = serde_json::to_vec(request)?;
@@ -249,9 +259,13 @@ pub async fn stats_at(socket: &std::path::Path) -> Result<Option<Stats>> {
 /// `fcvm netpool stats`: the running pool's counters as one JSON line.
 pub async fn print_stats() -> Result<()> {
     let dir = proto::existing_dir()?.context("no namespace pool has run in this data directory")?;
-    let stats = stats_at(&proto::socket_path(&dir))
+    let socket = proto::socket_path(&dir);
+    let stats = stats_at(&socket)
         .await?
         .context("no namespace pool is running for this user in this data directory")?;
-    println!("{}", serde_json::to_string(&stats)?);
+    // With the socket the counters came from, for a tool that talks to the pool itself.
+    let mut stats = serde_json::to_value(stats)?;
+    stats["socket"] = serde_json::json!(socket);
+    println!("{stats}");
     Ok(())
 }

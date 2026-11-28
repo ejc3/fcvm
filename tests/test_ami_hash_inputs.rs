@@ -76,6 +76,16 @@ fn try_compute_hash_with_dirs(
     script_dir: &Path,
     source_commit: &str,
 ) -> (bool, String, String) {
+    try_compute_hash_for_arch(kernel_dir, script_dir, source_commit, None)
+}
+
+/// `ami_arch` is build-ami.sh's AMI_ARCH; None leaves it unset, which builds arm64.
+fn try_compute_hash_for_arch(
+    kernel_dir: &Path,
+    script_dir: &Path,
+    source_commit: &str,
+    ami_arch: Option<&str>,
+) -> (bool, String, String) {
     let script = std::fs::read_to_string(repo_root().join("scripts/build-ami.sh"))
         .expect("read scripts/build-ami.sh");
 
@@ -101,14 +111,18 @@ fn try_compute_hash_with_dirs(
         func = func
     );
 
-    let out = Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .arg("-c")
         .arg(&program)
         .env("KERNEL_DIR", kernel_dir)
         .env("SCRIPT_DIR", script_dir)
         .env("SOURCE_COMMIT", source_commit)
-        .output()
-        .expect("run bash");
+        .env_remove("AMI_ARCH");
+    if let Some(arch) = ami_arch {
+        command.env("AMI_ARCH", arch);
+    }
+    let out = command.output().expect("run bash");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -555,6 +569,72 @@ fn ami_hash_refuses_to_compute_when_no_host_patches_match() {
         "compute_hash SUCCEEDED with no host-kernel patches at all, returning {out:?} — a key \
          computed over an empty patch set, which matches nothing that was ever built. \
          stderr: {err}"
+    );
+}
+
+/// The x64 image installs the host kernel of [kernel_profiles.nested.amd64.host_kernel]. Its
+/// key must read that table and that table's patches, and must never equal the arm64 key:
+/// the cache lookup is by key alone, so an equal key would hand one architecture the other's
+/// image.
+#[test]
+fn ami_hash_follows_the_images_architecture() {
+    let fx = make_fixture();
+    let root = fx.path();
+    std::fs::write(root.join("kernel/nested-x86.conf"), "CONFIG_KVM_INTEL=y\n").unwrap();
+    std::fs::create_dir_all(root.join("kernel/patches-x86-host")).unwrap();
+    let x86_patch = root.join("kernel/patches-x86-host/0001-fuse.patch");
+    std::fs::write(&x86_patch, "fuse patch v1\n").unwrap();
+    let config = root.join("rootfs-config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "[kernel_profiles.nested.amd64.host_kernel]\n\
+         kernel_version = \"6.18.3\"\n\
+         patches_dir = \"kernel/patches-x86-host\"\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let hash = |arch: Option<&str>| {
+        let (ok, out, err) = try_compute_hash_for_arch(
+            &root.join("kernel"),
+            &root.join("scripts"),
+            TEST_SOURCE_COMMIT,
+            arch,
+        );
+        assert!(
+            ok && !out.is_empty(),
+            "compute_hash failed for {arch:?}: {err}"
+        );
+        out
+    };
+
+    let (arm64, x64) = (hash(Some("arm64")), hash(Some("x64")));
+    assert_eq!(
+        hash(None),
+        arm64,
+        "an unset AMI_ARCH builds the arm64 image"
+    );
+    assert_ne!(arm64, x64, "the two images must not share a cache key");
+
+    std::fs::write(&x86_patch, "fuse patch v2\n").unwrap();
+    assert_eq!(
+        hash(Some("arm64")),
+        arm64,
+        "an x86 host patch moved the arm64 key"
+    );
+    assert_ne!(
+        hash(Some("x64")),
+        x64,
+        "an x86 host patch left the x64 key unchanged"
+    );
+
+    let (ok, _, err) = try_compute_hash_for_arch(
+        &root.join("kernel"),
+        &root.join("scripts"),
+        TEST_SOURCE_COMMIT,
+        Some("riscv64"),
+    );
+    assert!(
+        !ok && err.contains("AMI_ARCH must be arm64 or x64"),
+        "{err}"
     );
 }
 
