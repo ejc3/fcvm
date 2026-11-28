@@ -148,7 +148,10 @@ def describe (R : Rules) (l : Label) (s : State) : String :=
     | some r => s!"restore: FAILS at the step that {stepName r}; the restore fails closed"
     | none => "restore fails"
   | .kill => "fc-agent is killed; systemd kills the container and any one-shot with it"
-  | .restart => "systemd restarts fc-agent: it fetches its boot plan and serves exec again"
+  | .restart =>
+    if R.execFirst && s.owedMark then
+      "systemd restarts fc-agent: it finds the boundary owed and serves the resume alone before its boot plan"
+    else "systemd restarts fc-agent: it fetches its boot plan and serves exec again"
   | .boot =>
     if R.restartKeeps then "the restarted fc-agent starts the container"
     else "the restarted fc-agent's start of the container is refused: it powers the VM off"
@@ -175,6 +178,7 @@ def showState (s : State) : String :=
     ++ (if s.lst.isEmpty then "" else s!" list={s.lst}")
     ++ sp ++ rp ++ b "agent-dead" (!s.ag) ++ b "container-dead" (!s.up) ++ b "host-dead" (!s.host)
     ++ b "reported-failed" s.reported
+    ++ b "agent-early" s.early
     ++ (if s.tries == 0 then "" else s!" tries={s.tries}") ++ b "old-epoch" s.again
     ++ s!" socks={s.socks.map showSock}"
     ++ (match s.ctA with
@@ -265,7 +269,7 @@ def allRuns : List Run := Gate.runs.map (fun (n, w, c) => { name := n, what := w
 
 def books : List Rules :=
   [Today.ctstate, Today.flags, Today.cookieA, Today.cookieB, Today.cookieBOneLook,
-   Today.cookieBKept, Design.rules]
+   Today.cookieBKept, Today.owed, Design.rules]
 
 /-- Print one run: its steps in words, the state it ends in, the run as a Lean term, and the
 same run under the design. -/

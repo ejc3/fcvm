@@ -1,11 +1,11 @@
 import GateVerify.Spec
 
 /-!
-# The code as it is and as it was: four rule books
+# The code as it is and as it was: five rule books
 
 Each is one commit of ejc3/fcvm, and each field cites the lines that make it so. `sn.rs` is
 fc-agent/src/snapshot_network.rs. A rule book is a fixed commit and is named for what the
-boundary does there, not for a branch: `main` has moved through three of them
+boundary does there, not for a branch: `main` has moved through four of them
 (`verify/GateVerify/README.md`, "The rule books").
 
 | rule book | commit | what it is |
@@ -13,10 +13,12 @@ boundary does there, not for a branch: `main` has moved through three of them
 | `Today.ctstate` | 4adc1dee6 | `main` before #2113: the gate's TCP rule is `--ctstate NEW` |
 | `Today.flags` | a1e5fc687 | PR #2113, `gate-syn-flags` |
 | `Today.cookieA` | a80e1ad34 | PR #2124, its first commit, the one that was reviewed |
-| `Today.cookieB` | 27add63dd | PR #2124, its head, and `main` since #2124 landed (57aa83bb6) |
+| `Today.cookieB` | 27add63dd | PR #2124, its head, and `main` from #2124 (57aa83bb6) until #2154 landed |
+| `Today.owed` | da5f2bb22 | `main` with #2151 and #2154: the boundary is owed a resume until the host's opens it |
 
-What all four share, cited at `main` 57aa83bb6 (the same code is in the other three, at other
-lines):
+What the first four share, cited at `main` 57aa83bb6 (the same code is in the other three, at
+other lines; `owed` changes the host's reopen, the resume, the watchdog and the restarted agent,
+and its docstring says how):
 
 - `snapshot create` on the host: the prepare one-shot, pause, resume, the resume one-shot, and
   the resume one-shot alone after a prepare that failed (src/commands/common.rs:6568-6622,
@@ -87,6 +89,7 @@ def ctstate : Rules where
   backFails := false
   restartKeeps := false
   startWaits := false
+  execFirst := false
   guard := false
   rcuUndo := false
 
@@ -112,6 +115,7 @@ def flags : Rules where
   backFails := false
   restartKeeps := false
   startWaits := false
+  execFirst := false
   guard := false
   rcuUndo := false
 
@@ -142,6 +146,7 @@ def cookieA : Rules where
   backFails := false
   restartKeeps := false
   startWaits := false
+  execFirst := false
   guard := false
   rcuUndo := false
 
@@ -188,8 +193,84 @@ def cookieB : Rules where
   backFails := false
   restartKeeps := false
   startWaits := false
+  execFirst := false
   guard := false
   rcuUndo := false
+
+/-- `main` at da5f2bb22, which has #2151 and #2154 on top of `cookieB`: the source's boundary
+is owed a resume until the host's resume opens it. Named for that (`snapshot-boundary-owed`).
+Cited at da5f2bb22. `sn.rs` is fc-agent/src/snapshot_network.rs, `common.rs`
+src/commands/common.rs.
+
+The restore is `cookieB`'s, step for step: `restore_boundary_with` (sn.rs:3212), `publish_with`
+(sn.rs:3452), `manifest_sockets` (2672), `unlisted_sockets` (2706) and `gate_chain_rules` (1736)
+are line for line 57aa83bb6's, and `handle_clone_restore` (fc-agent/src/restore.rs:388) differs
+only by a failpoint (`restore.pre_boundary`, restore.rs:182). The order fc-agent's tests pin is
+the same 16 sequences, so `gate-seq check` cannot tell this rule book from `cookieB`; the
+differences are the fields below. `sockets_leaving_the_guest` (sn.rs:2606) adds #2152's
+reserved source ports for a `/loopback` port's clients, which the model's kinds cannot express
+(`Limits.lean`).
+
+- `snapUnpublished := false`: `snapshot create` waits for, and then refuses, a VM whose restore
+  has not been acknowledged (`await_restore_acknowledged`, src/commands/snapshot.rs:1502, 1577;
+  `ensure_restore_acknowledged`, common.rs:6116, #2151). In the guest a restore's dispatch
+  writes `restore-under-way` (`begin_restore_boundary`, sn.rs:772, from fc-agent/src/mmds.rs:415)
+  and both one-shots refuse with exit 3 while it is there, before and again under the boundary
+  lock (`prepare_snapshot_network_in`, sn.rs:3533; `resume_source_network_in`, sn.rs:3622).
+- `reopenRetry := true`: the host runs the resume one-shot until it opens the gate or 150 s have
+  passed (`reopen_source_network`, common.rs:7070; `SOURCE_REOPEN_BOUND`, common.rs:7004), with
+  `network_gate_closed` written on the VM's state before the first ask and cleared by the try
+  that opens it (`record_source_gate`, common.rs:7087). A source still gated then is left
+  running, the create fails naming it, and the next create of it asks once and is refused while
+  the gate stays closed (`refuse_a_source_left_gated`, common.rs:7128, the first step of
+  `create_snapshot_core`, common.rs:7656). The model's `retryMax` tries stand for the 150 s.
+- `rcuUndo := true`: the resume one-shot writes `rcu_expedited` back from its record before it
+  tries the gate (`ExpeditedGracePeriods::put_back`, sn.rs:3691). The agent's start does the same
+  (fc-agent/src/main.rs:261), which the model does not hold.
+- `wdMidBoundary := false`: the watchdog does not count a look while the boundary lock is held or
+  a restore is under way (`boundary_in_progress`, sn.rs:881; fc-agent/src/payload_freeze.rs:425),
+  nor 150 more while a source's boundary is owed and its gate installed (`source_gate_is_owed`,
+  sn.rs:806; `SOURCE_REOPEN_LOOKS`, payload_freeze.rs:389, 426). The model's switch `Cfg.slow`
+  does not count looks; it leaves the freeze alone while a clone has not published or a prepare
+  is in progress, as `Design.rules` does.
+- `startWaits := true`: a restarted agent holds its container's start while a restore is under
+  way, or the `owed` mark is there and the gate installed
+  (`hold_the_container_start_through_a_boundary`, sn.rs:665, called at fc-agent/src/agent.rs:702,
+  after the boot plan), and gives up after 300 looks that find nobody at work on the boundary.
+  The model does not count those looks.
+- `execFirst := true`: an agent that starts and finds the `owed` mark opens exec before its boot
+  plan, for the resume one-shot alone (fc-agent/src/agent.rs:104-128;
+  `exec::serve_only_the_boundary_resume`, fc-agent/src/exec.rs:404).
+- `restartKeeps := false`: #2158 is open; the restarted agent's start of the container is still
+  refused and it powers the VM off, after the hold.
+- `guard := false`: #1936 is open.
+- `natGate`, `backFails`: unchanged from `cookieB` (repairs 5 and 7 have no pull request).
+
+Not in the model: the boundary's token (#2159): the host gives each create a token
+(`run_snapshot_network_command`, common.rs:6732), the prepare writes it into the mark
+(`mark_owed`), and the guest runs a resume only when it carries the mark's token
+(`resume_is_for_the_owed_boundary`, sn.rs:374), refusing any other with exit 5. The model holds
+one `snapshot create` at a time, so no resume of an earlier create exists in it. Nor a create
+failing when the agent that served its prepare died before its resume
+(`note_the_agent_restarted_in_a_boundary`, sn.rs:489; `resume_paused_source`, common.rs:6867):
+the model has no property about what the image holds of the agent. -/
+def owed : Rules where
+  name := "owed"
+  tcpByCt := false
+  manAddr := false
+  list := .mirror
+  look := true
+  restore := cookieB.restore
+  natGate := false
+  wdMidBoundary := false
+  snapUnpublished := false
+  reopenRetry := true
+  backFails := false
+  restartKeeps := false
+  startWaits := true
+  execFirst := true
+  guard := false
+  rcuUndo := true
 
 /-- 27add63dd with its second dump taken out: what its red run "one dump" removes. Not a state
 of the code; it shows what the second dump is for. -/

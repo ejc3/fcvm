@@ -110,7 +110,7 @@ jobs:
           ./search-expected.sh quick
           # The rule book of this tree's fc-agent (verify/GateVerify/README.md, "The rule
           # books"). Change it in the pull request that changes the boundary's order.
-          lake exe gate-seq check ../fc-agent/src/snapshot_network.rs cookieB
+          lake exe gate-seq check ../fc-agent/src/snapshot_network.rs owed
           # The boundary model's exhaustive search of its default configurations, every rule
           # book, against the result its documents quote: state counts, which properties
           # break, and how soon.

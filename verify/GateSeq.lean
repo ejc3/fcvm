@@ -29,6 +29,8 @@ What it cannot see:
 - the steps the Rust models log no event for: the manifest's load and removal, the thaw, the
   write of `tcp_syncookies` back, the two halves of the barrier as two steps. `cookieA` and
   `cookieB` differ in the place of the write-back, which is one of those;
+- the rule books' fields that are not an order: `cookieB` and `owed` pin the same sequences,
+  and the source pins both or neither;
 - the gate's rules themselves (`Rules.tcpByCt`, `natGate`), the manifest's and the list's rules;
 - every file but snapshot_network.rs: the order of `handle_clone_restore` in restore.rs, the
   host's `snapshot create`, the agent's start.
@@ -51,7 +53,8 @@ def events : RStep → List (String × Bool)
   | .ingress => [("gate-open", false)]
   | _ => []
 
-def books : List Rules := [Today.ctstate, Today.flags, Today.cookieA, Today.cookieB, Design.rules]
+def books : List Rules :=
+  [Today.ctstate, Today.flags, Today.cookieA, Today.cookieB, Today.owed, Design.rules]
 
 def restoreSeq (R : Rules) : List (String × Bool) := R.restore.flatMap events
 

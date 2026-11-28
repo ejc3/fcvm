@@ -28,7 +28,7 @@ says which recorded breaks changed.
 ## Build
 
 ```sh
-make verify              # check-imports.sh, lake build (both models), the search against search.expected
+make verify              # all of CI's Lean job: lake build, the sweeps, the gate tests, the drift check, this search against search.expected
 make verify-gate-search  # lake exe gate-breaks: the exhaustive search, every rule book
 make verify-gate-drift   # lake exe gate-seq check: the model's order against the Rust source
 ```
@@ -44,9 +44,10 @@ already installed. Peak memory is the largest single process:
 |---|---|---|
 | `lake build` from cold, both models | 1 min 32 s | 1.5 GB |
 | `lake build GateVerify gate-breaks gate-seq` from cold, this model alone | 58 s | 1.5 GB |
-| `lake exe gate-breaks` (20 runs, 7 rule books, 1,994,314 states in all) | 7.2 s | 96 MB |
+| `lake exe gate-breaks` (20 runs, 8 rule books, 2,294,713 states in all) | 7.2 s with 7 books; 8.7 s with 8 on a box shared with another job | 96 MB; 118 MB |
 | `lake exe gate-breaks design all-routed all-proxy` (2,493,312 states) | 15 s | 0.5 GB |
 | `lake exe gate-breaks limit=10000000 all-routed all-proxy` for today's five rule books | 7 min 40 s | 2.5 GB |
+| `lake exe gate-breaks limit=10000000 owed all-routed all-proxy` (5,999,880 states, both complete) | 36 s on a box shared with another job | 1.2 GB |
 
 CI runs the first and the third (as `summary`, compared with `search.expected`) in the one job,
 under its 15 minute cap (`../../.github/workflows/verify.yml`).
@@ -61,9 +62,10 @@ branch, because `main` moves from one to the next as the fixes land.
 | `ctstate` | 4adc1dee6 | the gate's TCP rule is `--ctstate NEW`; the manifest leaves out by address; no list | until #2113 landed |
 | `flags` | a1e5fc687 | #2113: the TCP rule reads the packet's flags | from #2113 (a0ef91072) until #2124 landed |
 | `cookieA` | a80e1ad34 | #2124 at its first commit: SYN cookies refused, the restore's own list | never |
-| `cookieB` | 27add63dd | #2124 at its head: the mirror rule, a second dump, the write-back after the gate | since #2124 landed (57aa83bb6) |
-| `cookieB-restart-kept` | none | `cookieB` with #2158 fixed and nothing else: a restarted fc-agent gets a container running again | not yet |
-| `design` | none | `cookieB` with the repairs of `REPAIRS.md` | not yet |
+| `cookieB` | 27add63dd | #2124 at its head: the mirror rule, a second dump, the write-back after the gate | from #2124 (57aa83bb6) until #2151 and #2154 landed |
+| `cookieB-restart-kept` | none | `cookieB` with #2158 fixed and nothing else: a restarted fc-agent gets a container running again | never |
+| `owed` | da5f2bb22 | #2151 and #2154 on `cookieB`: `snapshot create` refuses an unpublished clone, the host asks for the reopen until the gate opens or reports the source, the resume puts `rcu_expedited` back, the watchdog leaves a boundary in progress alone, a restarted agent serves the resume before its boot plan and holds its container's start | since #2154 landed (9b32c630c) |
+| `design` | none | `cookieB` with the repairs of `REPAIRS.md`; `owed` has four of them | not yet |
 
 The drift check in CI names the rule book of the tree it runs in (below, "The model against the
 code").
@@ -73,8 +75,8 @@ code").
 | File | What it holds |
 |---|---|
 | `Spec.lean` | `State` (one guest: its sockets, tracked connections, rules, settings, files under /run, processes), the kernel's handling of a segment and of a datagram, the guest's own processes, `snapshot create` and the restore one step at a time with each step able to fail or its process to be killed, `step`, `replay`, `Reachable`. `Rules` is a rule book's type; `Cfg` is what exists around the guest and which moves a search allows |
-| `Today.lean` | `Today.ctstate`, `Today.flags`, `Today.cookieA`, `Today.cookieB`: four commits, each field cited. Two variants that are no state of the code: `Today.cookieBOneLook`, `cookieB` without its second dump, and `Today.cookieBKept`, `cookieB` with #2158 fixed and nothing else |
-| `Design.lean` | `Design.rules`: `main` with eight repairs |
+| `Today.lean` | `Today.ctstate`, `Today.flags`, `Today.cookieA`, `Today.cookieB`, `Today.owed`: five commits, each field cited. Two variants that are no state of the code: `Today.cookieBOneLook`, `cookieB` without its second dump, and `Today.cookieBKept`, `cookieB` with #2158 fixed and nothing else |
+| `Design.lean` | `Design.rules`: `cookieB` with eight repairs, four of which `main` has (`owed`) |
 | `search.expected` | What `lake exe gate-breaks summary` prints: every default configuration and rule book, its state count, the properties it breaks and at how many steps. CI compares the search with it |
 | `Properties.lean` | The properties, as tests on a state |
 | `Configs.lean` | The configurations the search runs, by name |
@@ -161,26 +163,30 @@ reached, and P1 and P5 are about every run and not only the ones that end by the
 
 ## Results
 
-| | `ctstate` 4adc1dee6 | `flags` a1e5fc687 (#2113) | `cookieA` a80e1ad34 | `cookieB` 27add63dd (#2124) | Design |
-|---|---|---|---|---|---|
-| P1 `sourceDisturbed` | broken | broken | broken | broken | **proved**, with one exemption: a source reported failed |
-| P2 `generationBroken` | broken | broken | broken | broken | **proved** for the connections `step` makes (`Limits.lean`) |
-| P3 `staleAtPublication` | broken | broken | broken | broken (by an early snapshot, in every run found) | **proved** |
-| P3 `smuggledLate` | broken | broken | broken | searched: holds, one configuration capped | **proved** |
-| P4 `retiredBehindEgress` | searched: holds | searched: holds | searched: holds | searched: holds | **proved** |
-| P4 `hookMisplaced` | searched: holds | searched: holds | searched: holds | searched: holds | **proved** |
-| P4 `workloadBehindEgress` | broken | broken | broken | broken | **proved** |
-| P5 `lastingChange` | searched: holds | searched: holds | broken | broken | **proved** |
-| P5 `capturedChange` | broken | broken | broken | broken | **proved** |
-| P6 `stuck` | broken | broken | broken | broken | **proved**, and that every boundary ends (`Ends.lean`) |
-| U1 `clientDatagram` | assumed: the host's gate | the same | the same | the same | assumed; the guest's part **proved** (`design_udpRuleHolds`) |
+| | `ctstate` 4adc1dee6 | `flags` a1e5fc687 (#2113) | `cookieA` a80e1ad34 | `cookieB` 27add63dd (#2124) | `owed` da5f2bb22 (`main`) | Design |
+|---|---|---|---|---|---|---|
+| P1 `sourceDisturbed` | broken | broken | broken | broken | searched: holds | **proved**, with one exemption: a source reported failed |
+| P2 `generationBroken` | broken | broken | broken | broken | broken (the egress proxy, repair 5) | **proved** for the connections `step` makes (`Limits.lean`) |
+| P3 `staleAtPublication` | broken | broken | broken | broken (by an early snapshot, in every run found) | searched: holds | **proved** |
+| P3 `smuggledLate` | broken | broken | broken | searched: holds, one configuration capped | searched: holds | **proved** |
+| P4 `retiredBehindEgress` | searched: holds | searched: holds | searched: holds | searched: holds | searched: holds | **proved** |
+| P4 `hookMisplaced` | searched: holds | searched: holds | searched: holds | searched: holds | searched: holds | **proved** |
+| P4 `workloadBehindEgress` | broken | broken | broken | broken | searched: holds | **proved** |
+| P5 `lastingChange` | searched: holds | searched: holds | broken | broken | broken (the write-back, repair 7) | **proved** |
+| P5 `capturedChange` | broken | broken | broken | broken | broken (after the write-back fails) | **proved** |
+| P6 `stuck` | broken | broken | broken | broken | broken (a dying host, #1936) | **proved**, and that every boundary ends (`Ends.lean`) |
+| U1 `clientDatagram` | assumed: the host's gate | the same | the same | the same | the same | assumed; the guest's part **proved** (`design_udpRuleHolds`) |
 
 "broken" is a run in `Breaks.lean` (`BREAKS.md` has which). "searched: holds" is the 20 default
 configurations searched to the end, which CI does on every run and compares with
 `search.expected`, and the two `all-` configurations as far as `BREAKS.md`, "Everything at
 once", says. 17 of the 20 have the boot plan over MMDS (Firecracker) and 3 over vsock (Cloud
 Hypervisor). For the code today the vsock ones add no break: a restarted agent powers the VM
-off (#2158). They add `containerMidBoundary` and `agentDiesVsock` for `cookieB-restart-kept`. Most of what
+off (#2158). They add `containerMidBoundary` and `agentDiesVsock` for `cookieB-restart-kept`.
+`owed`, `main` since #2154, breaks only what the four repairs it lacks are for: P2 through the
+egress proxy (5), P5 through the write-back (7), P6 through a dying host (3's guard, #1941);
+nothing through a killed agent or one-shot, a failed reopen, an early snapshot or the
+watchdog (`BREAKS.md`, "Fixes landed, and what is left"). Most of what
 breaks `ctstate` and #2113 beyond the known issues breaks the head of #2124 too, because it is in
 code #2124 does not touch: the one-shots, the watchdog, what a dead fc-agent leaves.
 
@@ -445,15 +451,18 @@ src/commands/common.rs; the unit file in src/setup/rootfs.rs.
 of events that fc-agent's own model tests pin (`ModelGate`, `ModelBarrier`, `ModelDiag`,
 `ModelHook`: the `vec![...]` literals of event names) and compares them with each rule book's
 restore order. It prints the rule books the source pins and fails unless the one named is among
-them. CI names `cookieB`, the rule book of this tree, so a tree that goes to an order the model
+them. CI names `owed`, the rule book of this tree, so a tree that goes to an order the model
 does not have fails, and so does one that goes back to an earlier order once the name has been
-moved on. A pull request that changes that file starts the job.
+moved on. `owed` pins the same sequences as `cookieB`: what tells the two apart is fields of
+the rule book, which the check does not read, so a tree that went back from #2154 to
+57aa83bb6 would still pass it. A pull request that changes that file starts the job.
 
 | Source at | Rule books it pins |
 |---|---|
 | 4adc1dee6, a1e5fc687 | `ctstate`, `flags` |
 | a80e1ad34 | `cookieA` |
-| 27add63dd, and `main` at 57aa83bb6 | `cookieB`, `design` |
+| 27add63dd, and `main` at 57aa83bb6 | `cookieB`, `owed`, `design` |
+| `main` at da5f2bb22 | `cookieB`, `owed`, `design` |
 | 27add63dd with the second `cookie-dump` deleted from the one test that pins two | `cookieA`: naming `cookieB` exits 1 |
 | 4adc1dee6 with `gate-udp-ingress` and `rx-barrier` swapped in one test | none: exit 1 |
 
@@ -468,6 +477,7 @@ What the check cannot see:
   write of `tcp_syncookies` back, the barrier as two writes. `cookieA` and `cookieB` differ in
   the place of the write-back and are told apart only by the second dump. The order of those
   steps is in `Today.lean` by citation only;
+- the rule books' fields that are not an order (`cookieB` and `owed` differ only there);
 - the gate's rules, the manifest's and the list's rules, which are fields of a rule book and
   not an order;
 - every file but snapshot_network.rs: `handle_clone_restore` in restore.rs, the host's

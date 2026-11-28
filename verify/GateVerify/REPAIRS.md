@@ -1,7 +1,8 @@
 # What the breaks need
 
-`Design.rules` (`Design.lean`) is PR #2124 at its head, 27add63dd, which is `main` since
-57aa83bb6, with the changes below. Each
+`Design.rules` (`Design.lean`) is PR #2124 at its head, 27add63dd, with the changes below.
+Four of them have landed in `main` (#2151 and #2154: `Today.owed`, da5f2bb22), and four have
+not. Each
 is one field of the rule book. For each: what it is in the real system, where, the break it
 answers (`BREAKS.md`), what the model shows of it, and wording proposed for the code or its
 documents.
@@ -18,11 +19,13 @@ Each repair is carried by a proof: with its field put back, `lake build GateVeri
 fails (the table at the end). Of the four rules the design inherits from #2113 and #2124, three
 are carried the same way and one is redundant in the design.
 
-None of this is in this pull request. Two pull requests are open and in review for most of it:
-#2151 for repair 2 (the host's half of #2138), and #2154 for the guest's half of #2138, for
-repairs 3, 4, 6 and 8 (#2142 and #2149, #2141, #2140) and for #2152, built to the two rulings
-recorded under repairs 3 and 8 (`BREAKS.md`, "Fixes in flight"). Repairs 5 and 7 have no pull
-request. The fixes #2113 and #2124 already make are not repeated here: the flag rule
+None of this is in this pull request. #2151 landed repair 2 (the host's half of #2138), and
+#2154 the guest's half of #2138, repairs 3 (its `reopenRetry` half), 4, 6 and 8 (#2142 and
+#2149, #2141, #2140) and the fix of #2152, built to the two rulings recorded under repairs 3
+and 8 (`BREAKS.md`, "Fixes in flight"). `main` went further than repair 8: a restarted agent
+that finds the boundary owed serves the resume before its boot plan (`Today.owed`,
+`execFirst`), which the design does not do. Repair 3's `guard` half is #1941, open; repair 9 is
+#2158, open; repairs 5 and 7 have no pull request. The fixes #2113 and #2124 already make are not repeated here: the flag rule
 (`tcpByCt := false`), the restore's own list with the mirror image deciding and a second dump,
 `tcp_syncookies` refused from the restore's first step and written back after the gate is
 removed.
@@ -40,7 +43,9 @@ What that repair also carried, the write of `tcp_syncookies` back, is repair 7.
 
 ## 2. `snapshot create` refuses a clone that has not published (#2138)
 
-Model: `snapUnpublished := false`.
+Model: `snapUnpublished := false`. Landed: #2151 (the host waits for, then refuses, a VM whose
+restore is not acknowledged) and #2154 (the guest's `restore-under-way` mark refuses both
+one-shots).
 
 Change: on the host, `create_snapshot_core` and `create_snapshot_ch` refuse a VM whose restore
 has not been acknowledged or has failed. `lifecycle_ready` is already written after the
@@ -67,7 +72,8 @@ Proposed wording, for the doc of `resume_source_network`:
 
 ## 3. A source's reopen is owed until it lands; one that cannot be reopened is left running and reported failed (#1936, #2142, #2149)
 
-Model: `guard := true`, `reopenRetry := true`.
+Model: `guard := true`, `reopenRetry := true`. `reopenRetry` landed in #2154
+(`reopen_source_network`, 150 s; `network_gate_closed`); `guard` is #1941, open.
 
 Change:
 
@@ -124,7 +130,7 @@ Proposed wording, for the comment in `resume_source_network`:
 
 ## 4. The resume one-shot writes `rcu_expedited` back, whether or not its reopen lands (#2141)
 
-Model: `rcuUndo := true`.
+Model: `rcuUndo := true`. Landed in #2154.
 
 Change: `ExpeditedGracePeriods::begin` writes a file under `/run/fcvm/` before it writes 1 to
 the switch and removes it after writing the switch back. `resume_source_network` writes 0 to
@@ -171,7 +177,9 @@ costs the gate's verification on the restore path.
 
 ## 6. The freeze watchdog leaves a boundary in progress alone (#2140)
 
-Model: `wdMidBoundary := false`.
+Model: `wdMidBoundary := false`. Landed in #2154, counting looks: none while the boundary lock is
+held or a restore is under way, and 150 more while a source's boundary is owed with its gate
+installed (`SOURCE_REOPEN_LOOKS`).
 
 Change: `payload_freeze`'s watchdog skips a freeze from the moment a prepare one-shot makes it
 until that `snapshot create` has resumed the guest, and while a restore is running. The first
@@ -211,7 +219,9 @@ was at boot.
 
 ## 8. A restarted fc-agent serves exec at once and holds the container's start while a boundary is in progress
 
-Model: `startWaits := true`. `restart` is the agent back with its exec server; `boot` is what
+Model: `startWaits := true`. Landed in #2154 (`hold_the_container_start_through_a_boundary`),
+with exec opened before the boot plan when the boundary is owed (`execFirst`, which the design
+does not have). `restart` is the agent back with its exec server; `boot` is what
 it then does about its container.
 
 Change: the restarted agent's boot path brings the exec server up as today, and before it
@@ -310,7 +320,7 @@ what matters where there is no list: on `ctstate` and #2113 (`loopbackClient`).
   connection, at 27add63dd and in the design. The model cannot express a chosen source port, so
   it neither finds the break nor proves its absence (`Limits.lean`). Its fix, a source port
   range reserved for the `/loopback` rewrite with a loopback peer in that range counted as
-  outside the guest, is in flight; it would be a ninth field of the rule book and a new kind of
-  socket.
+  outside the guest, landed in #2154; modelling it would take a new field of the rule book and
+  a new kind of socket.
 - **What a restarted fc-agent writes before its plan loop** (resolv.conf, the boot command
   line's IPv6 address): not in the model.

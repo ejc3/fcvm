@@ -641,6 +641,80 @@ theorem design_keeps_writeBackFails :
     (replay Design.rules Runs.fails Run.writeBackFails (init Runs.fails)).map
       (lastingChange Runs.fails) = some false := by decide
 
+/-! ## What `main` still has (`owed`, da5f2bb22) -/
+
+/-- **#1936, open.** The same with #2151 and #2154: the host asks for the reopen until the gate opens,
+but a host that dies after the prepare asks nothing, and the guest opens an owed gate for nobody.
+#1941 is the guard that does the dead host's part (9 steps). -/
+def Run.hostDiesOwed : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .hostDie]
+
+theorem breaks_hostDiesOwed :
+    after (replay Today.owed Runs.host Run.hostDiesOwed (init Runs.host))
+      (stuck Today.owed Runs.host) := by decide
+
+theorem design_keeps_hostDiesOwed :
+    (replay Design.rules Runs.host Run.hostDiesOwed (init Runs.host)).map
+      (stuck Design.rules Runs.host) = some false := by decide
+
+/-- Repair 5, no pull request: the egress proxy's redirect still bypasses the closed egress half, and
+the restore's list retires the process's two sockets (22 steps). -/
+def Run.proxyConnectOwed : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .restore, .conn .dmn, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent]
+
+theorem breaks_proxyConnectOwed :
+    after (replay Today.owed Runs.proxy Run.proxyConnectOwed (init Runs.proxy))
+      generationBroken := by decide
+
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.proxyConnectOwedDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .restore, .conn .dmn]
+
+theorem design_refuses_proxyConnectOwed :
+    replay Design.rules Runs.proxy Run.proxyConnectOwedDesign (init Runs.proxy) = none
+    ∧ (replay Design.rules Runs.proxy (Run.proxyConnectOwedDesign.take 10) (init Runs.proxy)).isSome = true := by decide
+
+/-- Repair 7, no pull request: a write of `tcp_syncookies` back that fails three times still leaves
+the clone published without SYN cookies (26 steps). -/
+def Run.writeBackFailsOwed : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agentFail]
+
+theorem breaks_writeBackFailsOwed :
+    after (replay Today.owed Runs.fails Run.writeBackFailsOwed (init Runs.fails))
+      (lastingChange Runs.fails) := by decide
+
+theorem design_keeps_writeBackFailsOwed :
+    (replay Design.rules Runs.fails Run.writeBackFailsOwed (init Runs.fails)).map
+      (lastingChange Runs.fails) = some false := by decide
+
+/-- And the next snapshot of that clone captures the 0: the clone is published, so #2151 admits it (35
+steps). -/
+def Run.writeBackCapturedOwed : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agentFail, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .snap]
+
+theorem breaks_writeBackCapturedOwed :
+    after (replay Today.owed Runs.fails Run.writeBackCapturedOwed (init Runs.fails))
+      capturedChange := by decide
+
+/-- The same run with the design's restore: it refuses the last step. -/
+def Run.writeBackCapturedOwedDesign : List Label :=
+  [.snap, .snap, .snap, .snap, .snap, .snap,
+   .snap, .snap, .snap, .restore, .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agent,
+   .agent, .agent, .agent, .agent, .agent, .agent, .agent, .agentFail, .snap]
+
+theorem design_refuses_writeBackCapturedOwed :
+    replay Design.rules Runs.fails Run.writeBackCapturedOwedDesign (init Runs.fails) = none
+    ∧ (replay Design.rules Runs.fails (Run.writeBackCapturedOwedDesign.take 26) (init Runs.fails)).isSome = true := by decide
+
 /-! ## UDP -/
 
 /-- What a stale entry opens: a datagram from the address and port the guest itself sent to before the
