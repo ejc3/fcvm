@@ -1,6 +1,6 @@
-From 7801adaf75c250fd4e0c9501b064e9c7bcaeab06 Mon Sep 17 00:00:00 2001
+From d25663516981b1a617ad266a60c2d6f1f24f4ad6 Mon Sep 17 00:00:00 2001
 From: ejc3 <ejc3@users.noreply.github.com>
-Date: Sat, 28 Nov 2026 01:53:42 +0000
+Date: Sat, 28 Nov 2026 11:23:48 +0000
 Subject: [PATCH] arm64: make arm64.nv2 set ID_AA64MMFR4_EL1.NV_frac to
  NV2_ONLY
 
@@ -26,6 +26,15 @@ multiplier. The same happens when the VMM sets no counter offset for L2
 (KVM's default virtual offset is enough). With the value 1, L1 does not
 detect FEAT_NV2p1 and the two agree to 5 to 15 ms in L1, L2 and L3, as on
 the host.
+
+That gap reaches user space only in a guest whose device tree lacks the EL2
+virtual timer's interrupt: a kernel at EL2 with VHE then keeps time on the
+physical counter while its vDSO reads the virtual one. fcvm's Firecracker
+listed four timer interrupts for such a guest until fcvm #2257. With the
+fifth listed, the kernel runs on the EL2 virtual timer and L2's two counters
+agree even with the value 2 (9 and 18 ms apart on the same hardware, where
+they were 64 and 71 s apart without it). The value stays 1 all the same: an
+override must not claim a feature the hypervisor below does not emulate.
 
 Which FEAT_NV2p1-conditional path in L1's KVM does it has not been traced.
 The ones that differ in 7.3.3: timer_set_traps() writes a guest's counter
