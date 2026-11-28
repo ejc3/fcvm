@@ -3350,7 +3350,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
   btrfs, or btrfs behind a FUSE map in a nested guest) `disk/` is an ordinary directory and the clone reflinks the
   disk as before, and so does an unprivileged clone of a snapshot another user made (a snapshot keeps every inode's
   owner, so it would get a disk it cannot write or remove). Every other clone takes the subvolume snapshot, a small
-  disk included. On fcvm's host kernel (7.3.3-fcvm, one local NVMe device, a standalone microbenchmark of 2000
+  disk included, and falls back to a reflink only when the snapshot is refused. On fcvm's host kernel (7.3.3-fcvm, one local NVMe device, a standalone microbenchmark of 2000
   operations, 2026-11-28) reflinks of an 871-extent file ran one after another at 230 to 250 per second at every
   concurrency from 1 to 512, from one file, 16 reflinked copies or 16 byte copies alike: they serialize on the root of
   the one subvolume tree the clones land in (`btrfs_lock_root_node < btrfs_insert_replace_extent < btrfs_clone`), and
