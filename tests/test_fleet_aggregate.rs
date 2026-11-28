@@ -843,8 +843,8 @@ async fn the_public_listener_serves_frames_with_tls_and_no_control_routes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_supervised_aggregator_that_needs_a_layout_stops_without_one() {
     use fcvm::fleet::aggregate::child::{supervise_with, Supervision};
-    let port = test_ports::released_port(std::net::Ipv4Addr::LOCALHOST.into());
-    let listen = format!("127.0.0.1:{port}");
+    let (_held, listen) = test_ports::reserved_port();
+    let listen = listen.to_string();
     let (tx, rx) = tokio::sync::watch::channel(None::<Layout>);
     let argv = vec![
         env!("CARGO_BIN_EXE_fcvm").to_string(),
@@ -973,7 +973,7 @@ async fn the_push_child_dies_with_its_aggregator() {
     )
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let port = test_ports::released_port(std::net::Ipv4Addr::LOCALHOST.into());
+    let (_held, listen) = test_ports::reserved_port();
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_fcvm"));
     cmd.args([
         "fleet",
@@ -983,7 +983,7 @@ async fn the_push_child_dies_with_its_aggregator() {
         "--image-height",
         "36",
     ])
-    .args(["--listen", &format!("127.0.0.1:{port}")])
+    .args(["--listen", &listen.to_string()])
     .arg("--ffmpeg")
     .arg(&fake)
     .args(["--push-url-env", "TEST_PUSH_URL"])

@@ -33,6 +33,15 @@ struct Fake {
 
 /// A temp dir, a wrapper that runs the fake fcvm with `env`, and `gpus` fake renderers.
 fn fake(gpus: usize, env: &[(&str, &str)]) -> Fake {
+    fake_with(gpus, env, None)
+}
+
+/// [`fake`] with its renderers on listeners the test bound (the first port, and each one).
+fn fake_with(
+    gpus: usize,
+    env: &[(&str, &str)],
+    renderers: Option<(u16, Vec<std::net::TcpListener>)>,
+) -> Fake {
     let dir = tempfile::tempdir().unwrap();
     let mut script = format!(
         "#!/bin/sh\nexport FAKE_FCVM_DIR='{}'\n",
@@ -46,7 +55,7 @@ fn fake(gpus: usize, env: &[(&str, &str)]) -> Fake {
     std::fs::write(&fcvm, script).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fcvm, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let (base, listeners) = consecutive_listeners(gpus);
+    let (base, listeners) = renderers.unwrap_or_else(|| consecutive_listeners(gpus));
     let (scenes, budgets) = start_renderers_with_budgets(dir.path(), base, listeners);
     Fake {
         dir,
@@ -1013,9 +1022,17 @@ async fn a_spot_notice_is_reported_as_draining() {
 /// certificate file) and the agent reports the host's public IPv4 address with that port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_agent_runs_and_feeds_its_aggregator() {
-    let f = fake(2, &[]);
-    let free_port = || test_ports::released_port(std::net::Ipv4Addr::LOCALHOST.into());
-    let (port, tls_port) = (free_port(), free_port());
+    // The aggregator binds its two ports itself, on the publish address. That address is
+    // this process's own, so the renderers move to it too, on ports bound by number.
+    let (_held_renderers, first) = test_ports::reserved_ports_in_a_row(2);
+    let publish_ip = *first.ip();
+    let renderers = (0..2)
+        .map(|i| std::net::TcpListener::bind((publish_ip, first.port() + i)).unwrap())
+        .collect();
+    let f = fake_with(2, &[], Some((first.port(), renderers)));
+    let (_held_port, listen) = test_ports::reserved_port();
+    let (_held_tls_port, tls_listen) = test_ports::reserved_port();
+    let (port, tls_port) = (listen.port(), tls_listen.port());
     let tls_dir = tempfile::tempdir().unwrap();
     let ck = rcgen::generate_simple_self_signed(vec!["agg.fleet.test".to_string()]).unwrap();
     std::fs::write(
@@ -1033,7 +1050,10 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         phones: vec![],
         capacity: 2,
         base_port: f.base,
-        cfg: cfg(&f.fcvm),
+        cfg: AgentCfg {
+            publish_ip: publish_ip.to_string(),
+            ..cfg(&f.fcvm)
+        },
         spot_notice_url: None,
         spot_poll: Duration::from_millis(50),
         store_ready_file: None,
@@ -1140,7 +1160,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         .add_root_certificate(reqwest::Certificate::from_pem(ck.cert.pem().as_bytes()).unwrap())
         .resolve(
             "agg.fleet.test",
-            std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)),
+            std::net::SocketAddr::from((publish_ip, tls_port)),
         )
         .no_proxy()
         .build()
@@ -1157,7 +1177,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         .await
         .unwrap();
     assert_eq!(r.status(), 404, "the layout is not served to browsers");
-    let layout_url = format!("http://127.0.0.1:{port}/layout");
+    let layout_url = format!("http://{publish_ip}:{port}/layout");
     let deadline = Instant::now() + Duration::from_secs(10);
     let layout = loop {
         let l: serde_json::Value = reqwest::get(&layout_url)
@@ -1182,7 +1202,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
     assert_eq!(layout["tiles"][0]["id"], "slot-1");
     assert_eq!(
         layout["tiles"][0]["url"],
-        format!("ws://127.0.0.1:{}/frames", f.base)
+        format!("ws://{publish_ip}:{}/frames", f.base)
     );
 
     // A new region reaches it too.

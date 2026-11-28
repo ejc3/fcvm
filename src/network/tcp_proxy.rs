@@ -1720,8 +1720,9 @@ mod tests {
     /// whose address the restore does not publish is closed.
     #[tokio::test]
     async fn handed_over_listeners_stay_open_from_the_teardown_to_the_restore() {
-        let (loopback, host, other) = (test_ip(11), test_ip(12), test_ip(13));
-        let port = crate::test_ports::released_port(host.into());
+        let (loopback, other) = (test_ip(11), test_ip(13));
+        let (_held, published_at) = crate::test_ports::reserved_port();
+        let (host, port) = (*published_at.ip(), published_at.port());
         let published = [mapping(Some(&host.to_string()), port)];
 
         // The torn-down VM: its relay ran on a duplicate and has stopped.
@@ -2074,11 +2075,8 @@ mod tests {
             }
         });
 
-        // Start port forward: a host port that bind_port_forwards binds → namespace 127.0.0.1:9999
-        let host_addr = SocketAddr::from((
-            std::net::Ipv4Addr::LOCALHOST,
-            crate::test_ports::released_port(std::net::Ipv4Addr::LOCALHOST.into()),
-        ));
+        // Start port forward: an address only bind_port_forwards can bind → namespace 127.0.0.1:9999
+        let (_held, host_addr) = crate::test_ports::reserved_port();
 
         let mapping = PortMapping {
             host_port: host_addr.port(),
@@ -2089,7 +2087,8 @@ mod tests {
         };
 
         let mappings = [mapping];
-        let listeners = bind_port_forwards("127.0.0.1", &mappings, Default::default())?;
+        let listeners =
+            bind_port_forwards(&host_addr.ip().to_string(), &mappings, Default::default())?;
         let handles = start_port_forwards(&listeners, &mappings, &ns_name, "127.0.0.1", None)?;
 
         // Give the listener a moment to start accepting

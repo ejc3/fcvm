@@ -3,9 +3,8 @@
 //! A test that binds a listener to port 0, reads its address and drops it holds nothing:
 //! the kernel can give that port to any other socket on the host the next moment. In the
 //! unit lane those sockets are other tests' listeners, so an address a test expects to
-//! refuse can answer. `src/test_ports.rs` has what such a test wants instead, and is the
-//! one file allowed to close a listener and hand out its port (`released_port`, for a
-//! program under test that binds the port itself).
+//! refuse can answer, and a program the test starts on that port can fail to bind it.
+//! `src/test_ports.rs` has an address for each of the two that stays the test's.
 //!
 //! The pin below is a lint over the three ways this tree wrote that, found when the
 //! sites were converted. It is not a Rust parser: a new way to write the same thing is
@@ -18,9 +17,8 @@ mod test_ports;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 
-/// The one file that may close a listener and hand out its port, and this file, whose
-/// fixtures spell the shapes out.
-const EXEMPT: [&str; 2] = ["src/test_ports.rs", "tests/test_listener_ports.rs"];
+/// This file, whose fixtures spell the shapes out. Nothing else is exempt.
+const EXEMPT: [&str; 1] = ["tests/test_listener_ports.rs"];
 
 #[test]
 fn nothing_else_can_listen_on_a_refused_address() {
@@ -37,6 +35,36 @@ fn nothing_else_can_listen_on_a_refused_address() {
         Err(std::io::ErrorKind::AddrInUse),
         "another socket could listen on an address a test expects to be refused",
     );
+}
+
+#[test]
+fn only_the_program_it_is_for_can_bind_a_reserved_port() {
+    let kind = |bound: std::io::Result<()>| bound.map_err(|err| err.kind());
+    let (_held, reserved) = test_ports::reserved_port();
+    let (_held_too, another) = test_ports::reserved_port();
+    assert_eq!(reserved.ip(), another.ip());
+    assert_ne!(reserved.port(), another.port());
+    // A socket on the wildcard address would have the port on the test's address too.
+    let wildcard = (std::net::Ipv4Addr::UNSPECIFIED, reserved.port());
+    assert_eq!(
+        kind(std::net::TcpListener::bind(wildcard).map(|_| ())),
+        Err(std::io::ErrorKind::AddrInUse),
+        "a wildcard TCP socket could take a reserved port",
+    );
+    assert_eq!(
+        kind(std::net::UdpSocket::bind(wildcard).map(|_| ())),
+        Err(std::io::ErrorKind::AddrInUse),
+        "a wildcard UDP socket could take a reserved port",
+    );
+    // The program binds the address it was given, either protocol.
+    let _tcp = std::net::TcpListener::bind(reserved).expect("binding a reserved TCP port");
+    let _udp = std::net::UdpSocket::bind(reserved).expect("binding a reserved UDP port");
+
+    // The port for ::1 is one the kernel never assigns.
+    let (_held_v6, port) = test_ports::reserved_ipv6_loopback_port();
+    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+    assert!((1024..low).contains(&port), "{port} is not in 1024..{low}");
 }
 
 /// Source with every run of whitespace reduced to one space and none before a `.`, so a
@@ -150,7 +178,7 @@ fn no_listener_is_bound_only_for_its_address() {
         findings.is_empty(),
         "a listener bound only for its address is closed before the address is used, and \
          the kernel can give its port to another socket. Use test_ports::refused_address \
-         for an address that must refuse, or test_ports::released_port for a program that \
+         for an address that must refuse, or test_ports::reserved_port for a program that \
          binds the port itself (src/test_ports.rs):\n{}",
         findings.join("\n")
     );

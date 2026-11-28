@@ -4950,11 +4950,11 @@ mod tests {
             assert!(answered.is_empty(), "{}", answered.join("\n\n"));
         }
 
-        /// A loopback address and a port on it for pasta to bind, for one test.
-        fn free_loopback_port() -> (String, u16) {
-            let address = format!("127.88.{}.7", std::process::id() % 250 + 1);
-            let port = crate::test_ports::released_port(address.parse().unwrap());
-            (address, port)
+        /// A loopback address and a port on it, TCP and UDP, that only pasta can bind while
+        /// the test holds what comes with them.
+        fn free_loopback_port() -> (crate::test_ports::Held, String, u16) {
+            let (held, address) = crate::test_ports::reserved_port();
+            (held, address.ip().to_string(), address.port())
         }
 
         fn link_state(holder_pid: u32, name: &str) -> serde_json::Value {
@@ -5053,7 +5053,7 @@ mod tests {
         #[tokio::test]
         async fn pasta_attaches_to_the_holders_tap_and_leaves_it_behind() {
             use crate::network::Protocol;
-            let (loopback, port) = free_loopback_port();
+            let (_held, loopback, port) = free_loopback_port();
             let mappings = vec![
                 mapping(port, 80, Protocol::Tcp),
                 mapping(port, 53, Protocol::Udp),
