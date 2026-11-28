@@ -221,7 +221,7 @@ pub struct RestoreProxy {
 }
 
 /// The guest's resolvers, as `fcvm_dns=` and `fcvm_dns_search=` carry them at boot.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub struct RestoreDns {
     #[serde(default)]
     pub servers: Vec<String>,
