@@ -2111,7 +2111,10 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
     ///
     /// - Dropped until publication: a datagram from a peer the guest has not sent
     ///   to since the restore began, from a different port of that peer, or to a
-    ///   different local port than the guest sent from. Tracked state from before
+    ///   different local port than the guest sent from. A fragment after the first
+    ///   of an IPv6 datagram passes, since it holds no ports and IPv6 reassembles after
+    ///   this hook when nothing else in the guest does it earlier; the datagram it
+    ///   belongs to is whole only if its first fragment passed. Tracked state from before
     ///   the snapshot is not carried over: a reply to a datagram the guest sent
     ///   before the snapshot is dropped, and its sender retries. A client that
     ///   exchanged traffic before the snapshot is no more admitted than a new one.
@@ -6293,6 +6296,8 @@ mod tests {
             udp: bool,
             on_lo: bool,
             from_loopback: bool,
+            /// A fragment after the first of an IPv6 datagram: no UDP header.
+            later_fragment: bool,
         }
         let datagram = Datagram {
             peer: 9,
@@ -6301,6 +6306,7 @@ mod tests {
             udp: true,
             on_lo: false,
             from_loopback: false,
+            later_fragment: false,
         };
         #[derive(Default)]
         struct Guest {
@@ -6328,6 +6334,7 @@ mod tests {
                         UdpGateRule::PassLoopbackSource if got.from_loopback => return true,
                         UdpGateRule::PassKnownPeer
                             if got.udp
+                                && !got.later_fragment
                                 && self.peers.contains(&(
                                     got.peer,
                                     got.peer_port,
@@ -6336,7 +6343,7 @@ mod tests {
                         {
                             return true
                         }
-                        UdpGateRule::DropUdp if got.udp => return false,
+                        UdpGateRule::DropUdp if got.udp && !got.later_fragment => return false,
                         UdpGateRule::PassLoopbackInterface
                         | UdpGateRule::PassLoopbackSource
                         | UdpGateRule::PassKnownPeer
@@ -6380,6 +6387,13 @@ mod tests {
             }),
             "only UDP is gated"
         );
+        assert!(
+            guest.receives(Datagram {
+                later_fragment: true,
+                ..datagram
+            }),
+            "a later fragment of a reply passes, or the reply never reassembles"
+        );
         assert!(guest.receives(Datagram {
             on_lo: true,
             peer: 1,
@@ -6397,6 +6411,13 @@ mod tests {
     /// when the gate was written (`nft list ruleset` prints these rules as
     /// `update @peers { ip daddr . udp dport . udp sport }` on the output hook
     /// and `ip saddr . udp sport . udp dport @peers return` on the input hook).
+    /// The drop rule loads the transport header before it drops: that load fails on
+    /// a later IPv6 fragment, which ends the rule and passes the fragment. Without the
+    /// load a known peer's fragmented reply lost every fragment after the first, as
+    /// measured in a network namespace (a 4000-byte reply from a peer the guest had
+    /// sent to was dropped, and arrived with the load).
+    ///
+    /// RED BEFORE THE FIX: the drop rule was `meta`, `cmp`, `immediate`.
     #[test]
     fn the_udp_gate_rules_name_the_expressions_the_kernel_was_checked_with() {
         use crate::nftables::{expression_names, UdpGateRule, UDP_GATE_INPUT, UDP_GATE_OUTPUT};
@@ -6429,7 +6450,7 @@ mod tests {
         );
         assert_eq!(
             names(UdpGateRule::DropUdp),
-            expected(&["meta", "cmp", "immediate"])
+            expected(&["meta", "cmp", "payload", "immediate"])
         );
         assert_eq!(UDP_GATE_OUTPUT.len() + UDP_GATE_INPUT.len(), 5);
     }

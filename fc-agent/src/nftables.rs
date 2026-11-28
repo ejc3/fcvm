@@ -559,7 +559,8 @@ pub(crate) enum UdpGateRule {
     /// Input: a UDP datagram from `(source address, source port)` to
     /// `destination port` that the set holds continues.
     PassKnownPeer,
-    /// Input: every other UDP datagram is dropped.
+    /// Input: every other UDP datagram is dropped, a fragment after the first
+    /// of one excepted (it has no ports to judge, see the rule).
     DropUdp,
 }
 
@@ -778,6 +779,12 @@ pub(crate) fn udp_rule_expressions(family: Family, rule: UdpGateRule) -> Vec<u8>
         UdpGateRule::DropUdp => {
             meta_load(&mut list, NFT_META_L4PROTO, NFT_REG_1);
             compare_equal(&mut list, NFT_REG_1, &[IPPROTO_UDP]);
+            // A load that fails ends the rule without a verdict. IPv6 reassembles
+            // after this hook when nothing else in the guest does it earlier, and a
+            // fragment after the first has no UDP header to read: the rule does not
+            // drop it, as the lookup did not pass it. The datagram it belongs to is
+            // whole only if its first fragment, which holds the ports, passed.
+            payload_load(&mut list, NFT_PAYLOAD_TRANSPORT_HEADER, 0, 2, NFT_REG_1);
             verdict(&mut list, NF_DROP);
         }
     }
