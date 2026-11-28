@@ -3008,9 +3008,15 @@ On serve process exit (SIGTERM/SIGINT):
 **Where** (`src/runtime_dir.rs`). VM states and the namespace pool describe running
 processes and nothing else (a state names an fcvm process by PID and start time, and that
 process dies with the host), so they are not user state a reboot must keep, and they live
-in the runtime directory, apart from what does outlive a reboot: `vm-disks/<vm_id>`, the
-owner records that reclaim it (`reclaim/`), snapshots and their working sets, all in the
-data directory. A start rewrites its state five times, and on btrfs every rewrite is
+in the runtime directory, apart from what does outlive a reboot: a VM's disk directory
+`vm-disks/<bucket>/<vm_id>`, the owner records that reclaim it (`reclaim/`), snapshots and
+their working sets, all in the data directory. Each VM's runtime directory
+(`<runtime_dir>/vm/<16 hex digits of its id>`: its sockets, `pasta.pid`, the container
+markers, the memory server's failure note) is there too: every one of those is a directory
+entry a start creates, and in `vm-disks` each create waited for the running btrfs
+transaction commit that clone disk snapshots start, 0.6 to 1.0 s a clone. The start records
+both directories with its owner before it makes either (two `RuntimeDir` records), so a
+sweep after a reboot, which emptied the tmpfs, still frees the disk directory. A start rewrites its state five times, and on btrfs every rewrite is
 directory operations that join a transaction of the store's one tree: with state on the
 store a clone waited 1,667 ms of its 2,212 ms of lock wait on the state buckets'
 directory locks (512 clones at a time, 2026-11-25).
@@ -3337,7 +3343,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 **Architecture:**
 - All data under `/mnt/fcvm-btrfs/` — native btrfs used directly if host is btrfs, otherwise a loopback image is created (size from `paths.btrfs_size` in rootfs-config.toml, default 60G)
 - Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
-- VM disks: `/mnt/fcvm-btrfs/vm-disks/{bucket}/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
+- VM disks: `/mnt/fcvm-btrfs/vm-disks/{bucket}/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`), in the VM's disk directory; its sockets are in its runtime directory on tmpfs (`<runtime_dir>/vm/<16 hex digits of the id>`)
 - A snapshot keeps its disks (`disk.raw` and the extra disks) in `snapshots/{tag}/disk/`, a btrfs subvolume, and a
   clone's `disks/` directory is one subvolume snapshot of it with the disk renamed to `rootfs.raw`, made in fcvm's own
   process with `BTRFS_IOC_SNAP_CREATE_V2` (`snapshot_subvolume`; a start forks and execs no `btrfs` tool). A reflink
@@ -4088,7 +4094,12 @@ assets_dir (default: /mnt/fcvm-btrfs)
 └── cache/                        # Downloaded cloud images
 
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
-├── vm-disks/{bucket}/{vm_id}/disks/  # CoW reflink copies per VM (bucket: first byte of sha256(vm_id), two hex digits)
+├── vm-disks/{bucket}/{vm_id}/    # a VM's disk directory, paths::vm_disk_dir (bucket: first byte of sha256(vm_id), two hex digits)
+│   ├── disks/                    # CoW reflink copies or a subvolume snapshot, extra disks, --disk-dir images
+│   ├── disk-dir-staging/         # a --disk-dir copy while its image is built
+│   ├── ch-restore/               # a Cloud Hypervisor clone's copy of its snapshot's files
+│   ├── firecracker.log, ch-console.log, container.log  # the VMM log (unbounded), the CH console, a prepare's output
+│   └── snapshot.lock             # the per-VM snapshot lock
 ├── state/{layout,runtime}        # which runtime directory holds this store's VM states
 ├── reclaim/{euid}/<b>/{id}.json   # what a live fcvm made on the host, in buckets; a dead one's is reclaimed by the first launch 1 s or more after the last sweep began, or the next setup, snapshot import or export (src/reclaim.rs)
 ├── pmem/{sha}.img                # --pmem copies, one per image content and owner, read-only
@@ -4099,6 +4110,9 @@ data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 runtime_dir (/run/fcvm-<uid>/<key of data_dir>/boot-<boot>, or <data_dir>/runtime/boot-<boot>)
 ├── store                         # the data directory this serves, and the binding's id
 ├── state/vms/<b>/{vm_id}.json    # VM state files, in buckets
+├── vm/<16 hex digits of vm_id>/  # a VM's runtime directory, paths::vm_runtime_dir: firecracker.sock,
+│                                 # vsock.sock and vsock.sock_<port>, pasta.pid, container-ready,
+│                                 # container-exit, the memory server's socket and failure note, rdp/
 └── netpool/<user>/               # the namespace pool's socket and lock
 ```
 

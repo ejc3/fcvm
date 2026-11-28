@@ -4997,13 +4997,19 @@ mod tests {
 
         impl Running {
             async fn start(
-                name: &str,
                 loopback: &str,
                 mappings: Vec<crate::network::PortMapping>,
             ) -> (Self, anyhow::Result<()>) {
-                let vm_id = format!("{name}-{}", std::process::id());
-                let runtime_dir = crate::paths::vm_runtime_dir(&vm_id);
-                std::fs::create_dir_all(&runtime_dir).expect("creating the runtime directory");
+                // A VM id of the real shape: its runtime directory is named by 16 digits of
+                // it, which must not be another test process's.
+                let vm_id = format!("vm-{}", uuid::Uuid::new_v4().simple());
+                // Made as a start makes it: binding the store's runtime directory first, so
+                // its place gets its own mode and owner, not this process's umask.
+                let dirs = crate::paths::create_vm_runtime_dir(&vm_id)
+                    .await
+                    .expect("creating the VM's directories");
+                let _ = std::fs::remove_dir_all(&dirs.disk);
+                let runtime_dir = dirs.runtime;
                 let (holder, holder_pid) = crate::commands::common::spawn_namespace_holder()
                     .await
                     .expect("spawning the namespace holder");
@@ -5062,7 +5068,7 @@ mod tests {
                 mapping(port, 80, Protocol::Tcp),
                 mapping(port, 53, Protocol::Udp),
             ];
-            let (running, started) = Running::start("pasta-attach", &loopback, mappings).await;
+            let (running, started) = Running::start(&loopback, mappings).await;
             started.expect("starting pasta");
 
             let under = link_state(running.holder_pid, PASTA_DEVICE_NAME);

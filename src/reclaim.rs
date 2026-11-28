@@ -1,8 +1,9 @@
 //! Host resources a killed fcvm leaves behind, and how the next fcvm takes them back.
 //!
 //! fcvm creates host resources that outlive its process unless teardown removes them: a
-//! VM's runtime directory (`vm-disks/<bucket>/<vm_id>`, with its disks), the temporaries of an
-//! image export. A SIGKILL skips
+//! VM's two directories (its disk directory `vm-disks/<bucket>/<vm_id>` on the store, and its
+//! runtime directory `<runtime>/vm/<v>` for sockets and markers, `crate::paths`), the
+//! temporaries of an image export. A SIGKILL skips
 //! teardown. The kernel ends the child processes (pdeathsig) and releases locks; every
 //! other resource stays.
 //!
@@ -40,8 +41,15 @@
 //!
 //! Recording comes before creating, so a kill between the two leaves a record of something
 //! that does not exist, and undoing it finds nothing. That is safe only for names no other
-//! process can create, which holds for a VM's directory, named by its random vm_id, and a
-//! temporary, named by a random UUID.
+//! process can create, which holds for a VM's directories, named by its random vm_id (the
+//! runtime directory by 16 hex digits of it, made exclusively), and a temporary, named by a
+//! random UUID.
+//!
+//! A VM's two directories are two [`Resource::RuntimeDir`] records, each undone on its own.
+//! A reboot empties the runtime directory's tmpfs, so a sweep after one finds that record's
+//! directory gone, which counts as undone, and still removes the disk directory on the
+//! store. A new kind would be dropped as [`Resource::Unknown`] by an fcvm before it, which
+//! would delete the record with the disk directory still there.
 //!
 //! A snapshot create's staging directory (`<tag>.creating`) is the exception: every create
 //! of one tag stages under that name, so a killed create's record names a directory that a
@@ -84,7 +92,8 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Resource {
-    /// A VM's runtime directory. Removed whole.
+    /// A directory of a VM, its runtime directory or its disk directory (one record each).
+    /// Removed whole; one that is gone (a runtime directory after a reboot) is done.
     RuntimeDir { path: PathBuf },
     /// A snapshot create's staging directory (`<tag>.creating`), which is renamed into
     /// place or removed when the create finishes. Every create of the tag uses this name
@@ -148,7 +157,7 @@ impl Resource {
 impl std::fmt::Display for Resource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Resource::RuntimeDir { path } => write!(f, "runtime directory {}", path.display()),
+            Resource::RuntimeDir { path } => write!(f, "VM directory {}", path.display()),
             Resource::SnapshotStaging { path, .. } => {
                 write!(f, "snapshot staging directory {}", path.display())
             }
@@ -1844,6 +1853,52 @@ mod tests {
             "a completed owner accepted a record"
         );
         drop(owner);
+    }
+
+    /// A VM records its runtime directory and its disk directory with its owner, and the
+    /// process ends without completing. A reboot then empties the runtime directory's tmpfs.
+    /// The sweep after it finds the runtime directory gone, which is done, still removes the
+    /// disk directory on the store, and deletes the record with nothing remaining.
+    #[tokio::test]
+    async fn a_sweep_after_a_reboot_frees_the_disk_dir_without_the_runtime_dir() {
+        let (root, dir) = test_dir();
+        let runtime_dir = root.path().join("run/boot-old/vm/0123456789abcdef");
+        let disk_dir = root
+            .path()
+            .join("vm-disks/ab/vm-0123456789abcdef0123456789abcdef");
+        let owner = Owner::begin_in(&dir, "vm-0123456789abcdef0123456789abcdef").unwrap();
+        owner
+            .record(Resource::RuntimeDir {
+                path: runtime_dir.clone(),
+            })
+            .unwrap();
+        owner
+            .record(Resource::RuntimeDir {
+                path: disk_dir.clone(),
+            })
+            .unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::write(runtime_dir.join("firecracker.sock"), b"").unwrap();
+        std::fs::create_dir_all(disk_dir.join("disks")).unwrap();
+        std::fs::write(disk_dir.join("disks/rootfs.raw"), b"disk").unwrap();
+        drop(owner);
+        // The reboot: the runtime directory's tmpfs is empty again.
+        std::fs::remove_dir_all(root.path().join("run")).unwrap();
+
+        assert_eq!(
+            reclaim_abandoned_in(&dir).await,
+            Reclaimed {
+                owners: 1,
+                resources: 2,
+                remaining: 0
+            }
+        );
+        assert!(!disk_dir.exists(), "the disk directory is left");
+        assert!(
+            files_in(&dir).is_empty(),
+            "owner files left: {:?}",
+            files_in(&dir)
+        );
     }
 
     /// A record that holds a resource of a kind this build does not know (here a

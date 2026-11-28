@@ -83,7 +83,10 @@ pub struct PreparedRestore {
 pub struct VmContext {
     pub vm_id: String,
     pub vm_name: String,
+    /// The VM's runtime directory (`paths::vm_runtime_dir`): sockets and markers.
     pub data_dir: PathBuf,
+    /// The VM's disk directory (`paths::vm_disk_dir`): disks and logs.
+    pub disk_dir: PathBuf,
     pub vm_manager: Box<dyn Hypervisor>,
     pub holder_child: Option<tokio::process::Child>,
     /// Boot-plan vsock listener task. Every backend binds one: it carries the plan for

@@ -579,12 +579,16 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
     crate::commands::podman::spawn_lifecycle_signal_handler("shutting down VM")?;
 
     // What VMs of processes killed without teardown left goes first, then this VM's
-    // runtime directory is recorded before anything creates it (crate::reclaim).
+    // directories are recorded before anything creates them (crate::reclaim).
     crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    let vm_dirs = paths::VmDirs::for_start(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
-        path: paths::vm_runtime_dir(&vm_id),
+        path: vm_dirs.runtime.clone(),
+    })?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: vm_dirs.disk.clone(),
     })?;
     paths::check_socket_path_budget(&vm_id)?;
     // Refused when the host requires confinement: this command does not confine.
@@ -597,7 +601,10 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         kernel_profile: None,
         passthrough_devices: 0,
     })?;
-    let data_dir = paths::create_vm_runtime_dir(&vm_id)
+    let paths::VmDirs {
+        runtime: data_dir,
+        disk: disk_dir,
+    } = paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory")?;
 
@@ -618,11 +625,12 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
     vm_state.config.published_guest_ports = Some(Vec::new());
     vm_state.config.balloon_mib = args.balloon;
     // No vsock device: nothing in the guest listens on one. The restore machinery still
-    // keys the source VM's directory off the path its vsock socket would have had, which is
-    // the directory that holds the disk and the console log a restore redirects.
+    // keys the source VM's directory off the path its vsock socket would have had, which
+    // names the disk directory: it holds the disk and the console log a restore redirects.
     vm_state.config.vm_runtime_dir = Some(data_dir.clone());
+    vm_state.config.vm_disk_dir = Some(disk_dir.clone());
     vm_state.config.vsock_socket_path = None;
-    vm_state.config.source_vsock_socket_path = Some(data_dir.join("vsock.sock"));
+    vm_state.config.source_vsock_socket_path = Some(disk_dir.join("vsock.sock"));
 
     let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
@@ -631,7 +639,13 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         .await
         .context("claiming the VM name")
     {
-        crate::commands::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        crate::commands::podman::cleanup_failed_prepare(
+            &state_manager,
+            &vm_id,
+            &data_dir,
+            &disk_dir,
+        )
+        .await;
         return Err(e);
     }
 
@@ -643,8 +657,13 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
             if let Err(error) = network.cleanup().await {
                 warn!(%error, "failed to clean up the network after a setup error");
             }
-            crate::commands::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir)
-                .await;
+            crate::commands::podman::cleanup_failed_prepare(
+                &state_manager,
+                &vm_id,
+                &data_dir,
+                &disk_dir,
+            )
+            .await;
             return Err(e);
         }
     };
@@ -659,6 +678,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         &args,
         &ch_bin,
         &data_dir,
+        &disk_dir,
         &mut network,
         &network_config,
         &mut vm_state,
@@ -684,7 +704,13 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         if let Err(error) = network.cleanup().await {
             warn!(%error, "failed to clean up the network after a boot error");
         }
-        crate::commands::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        crate::commands::podman::cleanup_failed_prepare(
+            &state_manager,
+            &vm_id,
+            &data_dir,
+            &disk_dir,
+        )
+        .await;
         return Err(e);
     }
     info!(vm_id = %vm_id, name = %args.name, "raw VM booted");
@@ -693,6 +719,7 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
         RawVm {
             vm_id,
             data_dir,
+            disk_dir,
             vm_manager: vm_slot.expect("boot_raw_vm sets the VMM on success"),
             holder_child: holder_slot,
             network: Box::new(network),
@@ -715,7 +742,10 @@ async fn cmd_vm_run(mut args: VmRunArgs) -> Result<()> {
 async fn boot_raw_vm(
     args: &VmRunArgs,
     ch_bin: &Path,
+    // The VM's runtime directory: the API socket, the generation, the RDP relay.
     data_dir: &Path,
+    // The VM's disk directory: the disk and the logs.
+    disk_dir: &Path,
     network: &mut PastaNetwork,
     network_config: &crate::network::NetworkConfig,
     vm_state: &mut VmState,
@@ -730,7 +760,7 @@ async fn boot_raw_vm(
     // The disk is the VM's own reflink copy, at the path every VM's disk has, which is
     // where `snapshot create` copies it from.
     let disk =
-        crate::storage::DiskManager::new(vm_id.clone(), args.disk.clone(), data_dir.join("disks"))
+        crate::storage::DiskManager::new(vm_id.clone(), args.disk.clone(), disk_dir.join("disks"))
             .create_cow_disk()
             .await
             .context("creating the VM's copy of the disk")?;
@@ -756,7 +786,7 @@ async fn boot_raw_vm(
     let backend = vm_slot.insert(Box::new(CloudHypervisorBackend::new(
         vm_id.clone(),
         data_dir.join("firecracker.sock"),
-        Some(data_dir.join("firecracker.log")),
+        Some(disk_dir.join("firecracker.log")),
         decision.clone(),
     )) as Box<dyn Hypervisor>);
     backend
@@ -912,7 +942,10 @@ async fn relaunch(vm: &mut RawVm) -> Result<()> {
 /// What a running raw VM owns, cold-booted or restored.
 pub(crate) struct RawVm {
     pub vm_id: String,
+    /// The runtime directory (`paths::vm_runtime_dir`).
     pub data_dir: PathBuf,
+    /// The disk directory (`paths::vm_disk_dir`).
+    pub disk_dir: PathBuf,
     pub vm_manager: Box<dyn Hypervisor>,
     pub holder_child: Option<tokio::process::Child>,
     pub network: Box<dyn NetworkManager>,
@@ -998,6 +1031,7 @@ pub(crate) async fn run_until_exit(
             volume_server_handles: Vec::new(),
             volume_tables: Vec::new(),
             data_dir: vm.data_dir,
+            disk_dir: vm.disk_dir,
             health_cancel_token: Some(health_cancel),
             health_monitor_handle: Some(health),
             output_listener_handle: None,

@@ -684,7 +684,7 @@ def clone_forensics(args, clone, reason):
     this clone's pasta or an earlier clone's. fcvm's readiness probe counts a
     reset from the guest as an answer, so it does not show the port open. This
     records the host listeners on the port with their owners (`ss -ltnp`), the
-    clone's own pasta pid (vm-disks/<bucket>/<vm_id>/pasta.pid) and whether it owns the
+    clone's own pasta pid (pasta.pid in the runtime directory its state records) and whether it owns the
     endpoint's listener, and, from inside the guest (`fcvm exec --vm`), whether
     DevTools answers on 127.0.0.1 there, which ports the guest listens on and
     by whom, the restore ingress gate's rules and counters, and whether a
@@ -721,10 +721,10 @@ def clone_forensics(args, clone, reason):
         record["host_listeners"] = {"error": f"{type(exc).__name__}: {exc}"}
         owners = None
     pasta_pid = None
-    if clone.get("vm_id"):
-        # vm-disks/<bucket>/<vm_id>, bucket = first byte of sha256(vm_id) as two hex digits.
-        bucket = hashlib.sha256(clone["vm_id"].encode()).hexdigest()[:2]
-        path = os.path.join(args.data_root, "vm-disks", bucket, clone["vm_id"], "pasta.pid")
+    if clone.get("vm_id") and not clone.get("vm_runtime_dir"):
+        record["clone_pasta_pid_error"] = "the clone's state records no vm_runtime_dir"
+    elif clone.get("vm_id"):
+        path = os.path.join(clone["vm_runtime_dir"], "pasta.pid")
         try:
             with open(path) as f:
                 pasta_pid = int(f.read().strip())
@@ -846,6 +846,8 @@ class FcvmSide:
             st, ip = found
             c["vm_id"] = st.get("vm_id")
             c["fcvm_pid"] = st.get("pid")
+            # The directory its sockets and pid files are in, as the clone's state records it.
+            c["vm_runtime_dir"] = (st.get("config") or {}).get("vm_runtime_dir")
             c["endpoint"] = f"{ip}:{self.args.cdp_port}"
             deadline = time.monotonic() + 180
             while not port_open(ip, self.args.cdp_port):

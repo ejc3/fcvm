@@ -405,7 +405,8 @@ pub(super) async fn attach_pmem_devices(
 pub(super) async fn attach_extra_disks(
     args: &RunArgs,
     hv: &mut dyn crate::hypervisor::Hypervisor,
-    data_dir: &std::path::Path,
+    // The VM's disk directory (`paths::vm_disk_dir`), whose `disks/` holds the images.
+    disk_dir: &std::path::Path,
     image_disk_path: Option<&std::path::Path>,
     image_disk_identity: Option<&str>,
     image_disk_read_only: bool,
@@ -516,12 +517,12 @@ pub(super) async fn attach_extra_disks(
             );
         }
 
-        // Create disk image in VM's data directory. On an in-place reboot relaunch
+        // Create disk image in VM's disk directory. On an in-place reboot relaunch
         // the image already exists and holds the guest's writes — rebuilding it from
         // the host directory would silently destroy them, so the relaunch re-attaches
         // the existing image instead.
         let disk_idx = disk_offset + i;
-        let image_path = data_dir
+        let image_path = disk_dir
             .join("disks")
             .join(format!("disk-dir-{}.raw", disk_idx));
         if rebuild_disk_dir_images || !image_path.exists() {
@@ -1157,7 +1158,9 @@ pub(super) struct VmSetupParams<'a> {
     pub decision: crate::confine::Decision,
     pub args: &'a RunArgs,
     pub vm_id: &'a str,
-    pub data_dir: &'a std::path::Path,
+    /// The VM's disk directory (`paths::vm_disk_dir`): its disks and VMM log. Its sockets
+    /// are in its runtime directory, which `socket_path` and `vsock_socket_path` name.
+    pub disk_dir: &'a std::path::Path,
     pub base_rootfs: &'a std::path::Path,
     pub socket_path: &'a std::path::Path,
     pub kernel_path: &'a std::path::Path,
@@ -1594,7 +1597,8 @@ pub(crate) async fn configure_and_boot_vm(
     args: &RunArgs,
     network_config: &crate::network::NetworkConfig,
     vm_state: &mut VmState,
-    data_dir: &std::path::Path,
+    // The VM's disk directory (`paths::vm_disk_dir`).
+    disk_dir: &std::path::Path,
     vm_id: &str,
     volume_mappings: &[VolumeMapping],
     network: Option<&mut dyn NetworkManager>,
@@ -1613,7 +1617,7 @@ pub(crate) async fn configure_and_boot_vm(
     let (extra_disks, image_device) = attach_extra_disks(
         args,
         hv,
-        data_dir,
+        disk_dir,
         plan.image_disk_path.as_deref(),
         // Expected build identity from the snapshot-key config; None when
         // snapshots are disabled (no key was computed, nothing to pin).
@@ -1849,7 +1853,7 @@ async fn run_vm_setup_inner(
         decision,
         args,
         vm_id,
-        data_dir,
+        disk_dir,
         base_rootfs,
         socket_path,
         kernel_path,
@@ -1864,7 +1868,7 @@ async fn run_vm_setup_inner(
         boot_inputs,
     } = params;
     // Setup storage - just need CoW copy (fc-agent is injected via initrd at boot)
-    let vm_dir = data_dir.join("disks");
+    let vm_dir = disk_dir.join("disks");
     let disk_manager =
         DiskManager::new(vm_id.to_string(), base_rootfs.to_path_buf(), vm_dir.clone());
 
@@ -1905,7 +1909,7 @@ async fn run_vm_setup_inner(
     let vm_name = args.name.clone();
     info!(vm_name = %vm_name, vm_id = %vm_id, "creating VM manager");
     // VMM debug log (named firecracker.log for both backends for tooling compatibility).
-    let vmm_log_path = data_dir.join("firecracker.log");
+    let vmm_log_path = disk_dir.join("firecracker.log");
     let _ = std::fs::File::create(&vmm_log_path);
 
     // Select the VMM backend (#632) and its binary.
@@ -2037,7 +2041,7 @@ async fn run_vm_setup_inner(
         args,
         network_config,
         vm_state,
-        data_dir,
+        disk_dir,
         vm_id,
         volume_mappings,
         Some(network),

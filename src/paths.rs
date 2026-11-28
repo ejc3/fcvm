@@ -1,3 +1,19 @@
+//! Where fcvm keeps what it makes.
+//!
+//! - The assets directory (`assets_dir`): content-addressed kernels, root filesystems,
+//!   initrds and image exports, shared by every data directory.
+//! - The data directory (`data_dir`), on the store: what outlives a process and a reboot.
+//!   Snapshots, owner records (`crate::reclaim`), and each VM's disk directory
+//!   (`vm_disk_dir`, `vm-disks/<bucket>/<vm_id>`), which holds its disks and logs.
+//! - The runtime directory (`runtime_dir`, `crate::runtime_dir`), on tmpfs where it can be:
+//!   what describes running processes only. VM states, the namespace pool, and each VM's
+//!   runtime directory (`vm_runtime_dir`, `<runtime>/vm/<16 hex digits of the id>`), which
+//!   holds its sockets and markers. A start creates a dozen entries there; on the store each
+//!   create waited for the btrfs transaction commit that clone disk snapshots start.
+//!
+//! A VM's two directories are recorded in its state (`VmConfig::vm_runtime_dir`,
+//! `VmConfig::vm_disk_dir`) and with its owner before either is made.
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -316,16 +332,16 @@ pub fn bind_runtime_dir(access: crate::runtime_dir::Access) -> anyhow::Result<bo
     Ok(true)
 }
 
-/// The directory the VMs' runtime directories are in, one bucket down (`vm_runtime_dir`).
+/// The directory the VMs' disk directories are in, one bucket down (`vm_disk_dir`).
 pub fn vm_disks_dir() -> PathBuf {
     data_dir().join("vm-disks")
 }
 
-/// The bucket of `vm-disks` that VM `vm_id`'s runtime directory is in: the first byte of
+/// The bucket of `vm-disks` that VM `vm_id`'s disk directory is in: the first byte of
 /// sha256(vm_id) as two hex digits, so 256 buckets. A pure function of the id: a snapshot
 /// records its VM's paths, and a restore finds the VM's directory again from the id.
 ///
-/// Every start makes its runtime directory, and a mkdir holds its parent directory's lock
+/// Every start makes its disk directory, and a mkdir holds its parent directory's lock
 /// for writing across btrfs_mkdir, which joins the running transaction and so can wait out
 /// a commit (every clone's disk is a subvolume snapshot, which ends in one). With one
 /// `vm-disks` directory that lock was what every start queued on: 968 of 1411 ms of lock
@@ -340,22 +356,82 @@ pub fn is_vm_bucket(name: &str) -> bool {
     crate::store_buckets::is_name(name)
 }
 
-/// Directory for VM runtime data (disks, sockets, logs): `vm-disks/<bucket>/<vm_id>`.
-pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
-    vm_runtime_dir_under(&data_dir(), vm_id)
+/// VM `vm_id`'s disk directory, `vm-disks/<bucket>/<vm_id>` on the store: what needs the
+/// store's filesystem (reflinks, subvolume snapshots) or can grow without bound. It holds
+/// `disks/` (the root disk, extra disks, `--disk-dir` images), `disk-dir-staging/`, a Cloud
+/// Hypervisor restore's `ch-restore/`, `firecracker.log` and a prepare's container output.
+pub fn vm_disk_dir(vm_id: &str) -> PathBuf {
+    vm_disk_dir_under(&data_dir(), vm_id)
 }
 
-/// [`vm_runtime_dir`] under an explicit data directory.
-pub fn vm_runtime_dir_under(data_dir: &std::path::Path, vm_id: &str) -> PathBuf {
+/// [`vm_disk_dir`] under an explicit data directory.
+pub fn vm_disk_dir_under(data_dir: &std::path::Path, vm_id: &str) -> PathBuf {
     data_dir.join("vm-disks").join(vm_bucket(vm_id)).join(vm_id)
 }
 
-/// Make VM `vm_id`'s runtime directory in its bucket of `vm-disks` ([`crate::store_buckets`]:
+/// VM `vm_id`'s runtime directory, `<runtime>/vm/<v>` in [`runtime_dir`]: its Unix sockets
+/// (`firecracker.sock`, `vsock.sock` and every `vsock.sock_<port>`, the memory server's and
+/// the RDP relay's), `pasta.pid`, the container's ready and exit markers and the memory
+/// server's failure note. Each of those is a directory entry a start creates, and on the
+/// store each create waited for the running btrfs transaction commit, which every clone's
+/// subvolume snapshot starts: 0.6 to 1.0 s a clone. On tmpfs nothing waits.
+///
+/// `<v>` is the first 16 hex digits of the id after `vm-` (an id is `vm-` and 32 hex
+/// digits), which keeps the sockets short; the start makes the directory exclusively, so
+/// two VMs that share those digits cannot share it.
+///
+/// For a path that names the directory the store is bound to, call
+/// [`bind_runtime_dir`] first, as every start does.
+pub fn vm_runtime_dir(vm_id: &str) -> PathBuf {
+    vm_runtime_dir_under(&runtime_dir(), vm_id)
+}
+
+/// [`vm_runtime_dir`] under an explicit runtime directory.
+pub fn vm_runtime_dir_under(runtime_dir: &std::path::Path, vm_id: &str) -> PathBuf {
+    runtime_dir
+        .join(crate::runtime_dir::VM_DIR)
+        .join(vm_runtime_name(vm_id))
+}
+
+/// The name of VM `vm_id`'s runtime directory: the first 16 characters of the id after
+/// `vm-`, or the whole of a shorter id.
+fn vm_runtime_name(vm_id: &str) -> &str {
+    let id = vm_id.strip_prefix("vm-").unwrap_or(vm_id);
+    id.get(..16).unwrap_or(id)
+}
+
+/// Both directories of one VM ([`vm_disk_dir`], [`vm_runtime_dir`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmDirs {
+    /// On tmpfs: sockets, markers, the failure note.
+    pub runtime: PathBuf,
+    /// On the store: disks and logs.
+    pub disk: PathBuf,
+}
+
+impl VmDirs {
+    /// Where a start of VM `vm_id` puts its directories. Binds the runtime directory for
+    /// writing first (`bind_runtime_dir`), so the runtime path is the one the store is bound
+    /// to: the start records both paths with its owner (`crate::reclaim`) before it makes
+    /// either.
+    pub fn for_start(vm_id: &str) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        bind_runtime_dir(crate::runtime_dir::Access::Write)
+            .context("binding the runtime directory for the VM's runtime directory")?;
+        Ok(Self {
+            runtime: vm_runtime_dir(vm_id),
+            disk: vm_disk_dir(vm_id),
+        })
+    }
+}
+
+/// Make VM `vm_id`'s disk directory in its bucket of `vm-disks` ([`crate::store_buckets`]:
 /// the first start of a store makes all the buckets, with `vm-disks`' owner and permission
-/// bits, so root's and a user's VMs share them when they share a data directory).
-pub async fn create_vm_runtime_dir(vm_id: &str) -> anyhow::Result<PathBuf> {
+/// bits, so root's and a user's VMs share them when they share a data directory). One that
+/// exists already is used: a `--disk-dir` launch makes it before it stages the directory.
+pub async fn create_vm_disk_dir(vm_id: &str) -> anyhow::Result<PathBuf> {
     use anyhow::Context;
-    let dir = vm_runtime_dir(vm_id);
+    let dir = vm_disk_dir(vm_id);
     let bucket = vm_bucket(vm_id);
     let vm_disks = vm_disks_dir_of(&dir);
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -375,11 +451,36 @@ pub async fn create_vm_runtime_dir(vm_id: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// The `vm-disks` directory a runtime directory `<vm-disks>/<bucket>/<vm_id>` is in.
+/// Make both of VM `vm_id`'s directories: its disk directory ([`create_vm_disk_dir`]), and
+/// its runtime directory in the runtime directory's `vm/` (made for the store's owner when
+/// missing, `crate::runtime_dir::make_vm_dir`). The runtime directory is made exclusively:
+/// one that exists belongs to another VM whose id starts with the same 16 digits, and the
+/// start fails rather than share it.
+pub async fn create_vm_runtime_dir(vm_id: &str) -> anyhow::Result<VmDirs> {
+    use anyhow::Context;
+    let dirs = VmDirs::for_start(vm_id)?;
+    create_vm_disk_dir(vm_id).await?;
+    let runtime = runtime_dir();
+    let data = data_dir();
+    tokio::task::spawn_blocking(move || crate::runtime_dir::make_vm_dir(&data, &runtime))
+        .await
+        .context("the runtime directory task")??;
+    tokio::fs::create_dir(&dirs.runtime)
+        .await
+        .with_context(|| {
+            format!(
+                "creating the VM's runtime directory {} (one that exists is another VM's)",
+                dirs.runtime.display()
+            )
+        })?;
+    Ok(dirs)
+}
+
+/// The `vm-disks` directory a disk directory `<vm-disks>/<bucket>/<vm_id>` is in.
 fn vm_disks_dir_of(dir: &std::path::Path) -> PathBuf {
     dir.parent()
         .and_then(std::path::Path::parent)
-        .expect("a runtime directory is in a bucket of vm-disks")
+        .expect("a disk directory is in a bucket of vm-disks")
         .to_path_buf()
 }
 
@@ -394,9 +495,9 @@ pub const SUN_PATH_MAX: usize = 107;
 /// together.
 const LONGEST_SOCKET_NAME: &str = "vsock.sock_inode_tables";
 
-/// Fail early when this VM's data directory leaves no room for its sockets.
+/// Fail early when this VM's runtime directory leaves no room for its sockets.
 ///
-/// A data directory only a few characters too deep pushes the VM's sockets past
+/// A directory only a few characters too deep pushes the VM's sockets past
 /// `sun_path`, `bind` returns ENAMETOOLONG, and what the operator sees is a
 /// downstream symptom with no mention of paths at all. Observed 2026-08-16: a
 /// nested data directory keyed by a full uuid produced a 128 byte socket path,
@@ -406,28 +507,45 @@ const LONGEST_SOCKET_NAME: &str = "vsock.sock_inode_tables";
 /// appears to have been misdiagnosed in 55ef6350 as "FUSE doesn't support Unix
 /// sockets", and the workaround for that non-problem disabled reflinks for
 /// every nested VM for seven months (issue #810).
+///
+/// The sockets are in the VM's runtime directory ([`vm_runtime_dir`]), so the setting to
+/// shorten is the runtime directory's base, or the data directory when the runtime
+/// directory is in the store's own place. Call [`bind_runtime_dir`] first.
 pub fn check_socket_path_budget(vm_id: &str) -> anyhow::Result<()> {
-    check_socket_path_budget_under(&data_dir(), vm_id)
+    check_socket_path_budget_under(&runtime(), vm_id)
 }
 
-/// [`check_socket_path_budget`] against an explicit data directory.
+/// [`check_socket_path_budget`] against an explicit runtime directory.
 ///
 /// Split out so the rule is testable: the real one reads a process-global
 /// `OnceLock`, and a check that cannot be tested is how the limit gets
 /// forgotten again.
 pub fn check_socket_path_budget_under(
-    data_dir: &std::path::Path,
+    runtime: &crate::runtime_dir::RuntimeDir,
     vm_id: &str,
 ) -> anyhow::Result<()> {
-    let longest = vm_runtime_dir_under(data_dir, vm_id).join(LONGEST_SOCKET_NAME);
+    use crate::runtime_dir::Place;
+    let longest = vm_runtime_dir_under(&runtime.dir, vm_id).join(LONGEST_SOCKET_NAME);
     let length = longest.as_os_str().len();
+    let shorten = match runtime.place {
+        Place::Named => {
+            "Shorten the runtime directory's base (FCVM_RUNTIME_DIR or paths.runtime_dir)"
+        }
+        Place::Store => {
+            "Shorten the data directory (FCVM_DATA_DIR or paths.data_dir), which holds the \
+             runtime directory, or name a short base for the runtime directory \
+             (FCVM_RUNTIME_DIR or paths.runtime_dir)"
+        }
+        Place::Run => {
+            "Name a short base for the runtime directory (FCVM_RUNTIME_DIR or paths.runtime_dir)"
+        }
+    };
     anyhow::ensure!(
         length <= SUN_PATH_MAX,
-        "the data directory is too deep for this VM's Unix sockets: {length} bytes, \
+        "the runtime directory is too deep for this VM's Unix sockets: {length} bytes, \
          limit {SUN_PATH_MAX} (sockaddr_un.sun_path)\n  {}\n\
-         Shorten the data directory (FCVM_DATA_DIR or paths.data_dir). This fails \
-         here on purpose: bind() would otherwise return ENAMETOOLONG and surface \
-         as an unrelated-looking readiness or channel error.",
+         {shorten}. This fails here on purpose: bind() would otherwise return \
+         ENAMETOOLONG and surface as an unrelated-looking readiness or channel error.",
         longest.display()
     );
     Ok(())
@@ -441,46 +559,95 @@ pub fn snapshot_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_dir::{Place, RuntimeDir};
     use std::path::Path;
 
     /// A 32-hex vm_id, the real shape.
     const VM_ID: &str = "vm-1036ea9415214256aff023d3e28646a9";
 
-    /// The exact directory that broke the nested L2 launch on 2026-08-16.
+    /// The runtime directory a data directory has in the store's own place
+    /// (`<data_dir>/runtime/boot-<16>`).
+    fn on_store(data_dir: &Path) -> RuntimeDir {
+        RuntimeDir {
+            dir: data_dir
+                .join(crate::runtime_dir::STORE_PLACE)
+                .join("boot-0123456789abcdef"),
+            place: Place::Store,
+            followed: false,
+        }
+    }
+
+    /// The exact data directory that broke the nested L2 launch on 2026-08-16, holding its
+    /// runtime directory. The error names the data directory as the setting to shorten.
     #[test]
-    fn a_data_dir_that_overflows_sun_path_is_rejected() {
+    fn a_runtime_dir_that_overflows_sun_path_is_rejected() {
         let too_deep =
             Path::new("/mnt/fcvm-btrfs/nested-data/9db69791-596f-4f92-9717-44208140b129");
-        let error = check_socket_path_budget_under(too_deep, VM_ID)
-            .expect_err("a 128 byte socket path must be refused, not bound");
+        let runtime = on_store(too_deep);
+        let error = check_socket_path_budget_under(&runtime, VM_ID)
+            .expect_err("a socket path past sun_path must be refused, not bound");
         let text = error.to_string();
-        // 128 bytes for the incident's firecracker.socket; the reserved name is longer now.
         let length = format!(
-            "{}/vm-disks/{}/{VM_ID}/{LONGEST_SOCKET_NAME}",
-            too_deep.display(),
-            vm_bucket(VM_ID)
+            "{}/vm/1036ea9415214256/{LONGEST_SOCKET_NAME}",
+            runtime.dir.display()
         )
         .len();
+        assert!(length > SUN_PATH_MAX, "test set-up is wrong: {length}");
         assert!(
             text.contains("sun_path") && text.contains(&format!("{length} bytes")),
             "the error must name the limit AND the measured length, or the operator \
              is left with the same unattributable symptom this replaces: {text}"
         );
+        assert!(
+            text.contains("FCVM_DATA_DIR or paths.data_dir"),
+            "a runtime directory in the store's place is shortened through the data \
+             directory: {text}"
+        );
     }
 
-    /// The shortened form must pass, or the guard would block the fix.
+    /// A runtime directory under a named base is shortened through that base, and the
+    /// error says so.
+    #[test]
+    fn a_named_base_that_overflows_names_the_runtime_dir_setting() {
+        let base = format!("/{}", "b".repeat(80));
+        let runtime = RuntimeDir {
+            dir: Path::new(&base)
+                .join("0123456789abcdef")
+                .join("boot-0123456789abcdef"),
+            place: Place::Named,
+            followed: false,
+        };
+        let text = check_socket_path_budget_under(&runtime, VM_ID)
+            .expect_err("past sun_path")
+            .to_string();
+        assert!(
+            text.contains("FCVM_RUNTIME_DIR or paths.runtime_dir")
+                && !text.contains("FCVM_DATA_DIR"),
+            "{text}"
+        );
+    }
+
+    /// The shortened nested data directory still fits with its runtime directory in it.
     #[test]
     fn the_shortened_nested_data_dir_fits() {
-        let short = Path::new("/mnt/fcvm-btrfs/nd/9db69791");
-        check_socket_path_budget_under(short, VM_ID)
-            .expect("94 bytes must be accepted; if this fails the budget is miscomputed");
+        check_socket_path_budget_under(&on_store(Path::new("/mnt/fcvm-btrfs/nd/9db69791")), VM_ID)
+            .expect("the shortened nested data directory must be accepted");
     }
 
-    /// The default layout must have room, or every VM would fail to start.
+    /// The default layouts must have room, or every VM would fail to start: the store's
+    /// place in the default data directory, and `/run/fcvm-<uid>` for the widest uid.
     #[test]
-    fn the_default_data_dir_fits() {
-        check_socket_path_budget_under(Path::new("/mnt/fcvm-btrfs"), VM_ID)
+    fn the_default_runtime_dirs_fit() {
+        check_socket_path_budget_under(&on_store(Path::new("/mnt/fcvm-btrfs")), VM_ID)
             .expect("the default data dir must leave room for VM sockets");
+        let run = RuntimeDir {
+            dir: Path::new("/run/fcvm-4294967295/0123456789abcdef/boot-0123456789abcdef")
+                .to_path_buf(),
+            place: Place::Run,
+            followed: false,
+        };
+        check_socket_path_budget_under(&run, VM_ID)
+            .expect("/run/fcvm-<uid> must leave room for VM sockets");
     }
 
     /// Every socket fcvm binds in a VM's runtime directory must fit the name the budget reserves.
@@ -499,30 +666,31 @@ mod tests {
     /// boundary, so an off-by-one cannot creep in unnoticed.
     #[test]
     fn the_boundary_is_exact() {
-        let suffix_len = format!(
-            "/vm-disks/{}/{VM_ID}/{LONGEST_SOCKET_NAME}",
-            vm_bucket(VM_ID)
-        )
-        .len();
+        let suffix_len = format!("/vm/1036ea9415214256/{LONGEST_SOCKET_NAME}").len();
+        let named = |dir: String| RuntimeDir {
+            dir: PathBuf::from(dir),
+            place: Place::Named,
+            followed: false,
+        };
         let at_limit = "/".repeat(SUN_PATH_MAX - suffix_len);
         assert_eq!(
             at_limit.len() + suffix_len,
             SUN_PATH_MAX,
             "test set-up is wrong"
         );
-        check_socket_path_budget_under(Path::new(&at_limit), VM_ID)
+        check_socket_path_budget_under(&named(at_limit.clone()), VM_ID)
             .expect("a path of exactly SUN_PATH_MAX bytes must be accepted");
 
         let over = format!("{at_limit}x");
-        check_socket_path_budget_under(Path::new(&over), VM_ID)
+        check_socket_path_budget_under(&named(over), VM_ID)
             .expect_err("one byte over SUN_PATH_MAX must be refused");
     }
 
-    /// A VM's runtime directory is in the bucket its id gives, two hex digits, the same for
+    /// A VM's disk directory is in the bucket its id gives, two hex digits, the same for
     /// the same id every time (a restore finds a snapshot's source directory from the id).
     #[test]
-    fn a_runtime_directory_is_in_the_bucket_of_its_id() {
-        let dir = vm_runtime_dir_under(Path::new("/srv/store"), VM_ID);
+    fn a_disk_directory_is_in_the_bucket_of_its_id() {
+        let dir = vm_disk_dir_under(Path::new("/srv/store"), VM_ID);
         let bucket = vm_bucket(VM_ID);
         assert_eq!(
             dir,
@@ -541,6 +709,29 @@ mod tests {
         for name in [VM_ID, "a", "abc", "AB", "0g", ".ab"] {
             assert!(!is_vm_bucket(name), "{name} is not a bucket's name");
         }
+    }
+
+    /// A VM's runtime directory is `<runtime>/vm/` and the first 16 hex digits of its id, a
+    /// plain directory with no bucket, and never the `vm` directory itself.
+    #[test]
+    fn a_runtime_directory_is_named_by_16_digits_of_its_id() {
+        let runtime = Path::new("/run/fcvm-1000/0123456789abcdef/boot-0123456789abcdef");
+        assert_eq!(
+            vm_runtime_dir_under(runtime, VM_ID),
+            runtime.join("vm").join("1036ea9415214256")
+        );
+        // Shorter ids, as tests give, keep what they have.
+        assert_eq!(
+            vm_runtime_dir_under(runtime, "vm-abc123"),
+            runtime.join("vm").join("abc123")
+        );
+        assert_ne!(
+            vm_runtime_dir_under(runtime, VM_ID),
+            vm_disk_dir_under(Path::new("/srv/store"), VM_ID)
+        );
+        // An empty id names the directory every VM's runtime directory is in, so nothing
+        // may derive a directory to remove from one.
+        assert_eq!(vm_runtime_dir_under(runtime, ""), runtime.join("vm"));
     }
 }
 

@@ -1,6 +1,7 @@
-//! The runtime directory: where a data directory's VM states and namespace pool live.
+//! The runtime directory: where a data directory's VM states, namespace pool and VMs'
+//! runtime directories (`vm/<v>`: sockets and markers, `crate::paths::vm_runtime_dir`) live.
 //!
-//! Both describe running processes and nothing else: a VM's state names an fcvm process by
+//! All of them describe running processes and nothing else: a VM's state names an fcvm process by
 //! PID and start time, and that process dies with the host. So they are kept apart from
 //! what must outlive a reboot (a VM's disk directory and the owner record that reclaims
 //! it, snapshots and their working sets), which stays in the data directory. A start
@@ -87,6 +88,9 @@ pub const TMPFILES_DIR: &str = "/etc/tmpfiles.d";
 /// base under [`RUN`].
 pub const STORE_PLACE: &str = "runtime";
 const BOOT_PREFIX: &str = "boot-";
+/// The directory of a runtime directory that holds the VMs' runtime directories
+/// (`crate::paths::vm_runtime_dir`).
+pub const VM_DIR: &str = "vm";
 
 /// The directory of the data directory that holds the store's markers: the layout number,
 /// the binding and its lock. Earlier layouts kept the states here.
@@ -551,10 +555,20 @@ fn check_dir(path: &Path, owners: &[u32]) -> Result<()> {
     let metadata =
         std::fs::symlink_metadata(path).with_context(|| format!("reading {}", path.display()))?;
     if !metadata.is_dir() || !owners.contains(&metadata.uid()) || metadata.mode() & 0o022 != 0 {
+        // Only the write bits are wrong when the owner is right: what a `mkdir -p` under the
+        // umask leaves before fcvm made the directory itself. Clearing them is the fix.
+        let fix = if metadata.is_dir() && owners.contains(&metadata.uid()) {
+            format!(
+                "Run `chmod go-w {}`, or remove it if no fcvm uses it",
+                path.display()
+            )
+        } else {
+            "Remove it if no fcvm uses it".to_string()
+        };
         bail!(
             "refusing the runtime directory {}: it must be a directory owned by uid {} that \
-             no one else can write (found uid {}, mode {:o}{}). Remove it if no fcvm uses \
-             it, or set FCVM_RUNTIME_DIR (paths.runtime_dir) to a directory that is",
+             no one else can write (found uid {}, mode {:o}{}). {fix}, or set \
+             FCVM_RUNTIME_DIR (paths.runtime_dir) to a directory that is",
             path.display(),
             owners
                 .iter()
@@ -652,6 +666,18 @@ fn make_dir(dir: &Path, mode: u32, owner: (u32, u32), host: &Host) -> Result<()>
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(error).with_context(|| format!("making {}", dir.display())),
     }
+}
+
+/// Make `runtime_dir`'s [`VM_DIR`] when it is missing: mode 0755, and given to the owner of
+/// `data_dir` when root makes it, as the `state` directory beside it is, so root's and the
+/// store owner's VMs both make their directories in it. One that exists is used as it is.
+pub fn make_vm_dir(data_dir: &Path, runtime_dir: &Path) -> Result<PathBuf> {
+    let dir = runtime_dir.join(VM_DIR);
+    if std::fs::symlink_metadata(&dir).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(dir);
+    }
+    make_dir(&dir, 0o755, store_owner(data_dir)?, &Host::current()?)?;
+    Ok(dir)
 }
 
 /// Make this boot's runtime directory, its place and for a place under a base the base,
@@ -1959,10 +1985,15 @@ mod tests {
             let mode = std::fs::metadata(dir).unwrap().mode() & 0o7777;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o002)).unwrap();
             for access in [Access::Read, Access::Write] {
-                let error = bind(&fixture.data, &runtime, access, &boot).unwrap_err();
+                let error = format!(
+                    "{:#}",
+                    bind(&fixture.data, &runtime, access, &boot).unwrap_err()
+                );
+                assert!(error.contains("no one else can write"), "{error}");
+                // The owner is right, so the refusal names the one command that fixes it.
                 assert!(
-                    format!("{error:#}").contains("no one else can write"),
-                    "{error:#}"
+                    error.contains(&format!("chmod go-w {}", dir.display())),
+                    "{error}"
                 );
             }
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();

@@ -52,7 +52,7 @@
 //! for writing, and on btrfs the holder can wait out a transaction commit (a clone's disk is
 //! a subvolume snapshot, each ending in one), so a store directory that every start writes
 //! into makes the starts take turns however few entries it holds: measured on fcvm's host
-//! kernel, `vm-disks`, where every start makes its runtime directory, held 968 of 1411 ms of
+//! kernel, `vm-disks`, where every start makes its disk directory, held 968 of 1411 ms of
 //! lock wait per clone at 512 starts in flight. So every start is traced, the measured two
 //! and the four added beside them, and a directory under the data directory that each of
 //! the six created an entry in, and that is not a VM's own (no component is a VM id), fails.
@@ -763,17 +763,28 @@ fn judge(few: &Reads, many: &Reads, added: u64, allowances: &[Allowance]) -> Vec
 type Creates = BTreeMap<String, u64>;
 
 /// The name a directory a start created an entry in is compared under: [`dir_key`]'s, with
-/// every component that is a VM's id (`vm-` and 32 hex digits) as `<vm>`, so a directory of
-/// the start's own VM is named the same in every start and is known to be its own, and every
+/// every component that is a VM's id (`vm-` and 32 hex digits), or the name of a VM's
+/// runtime directory in a runtime directory's `vm/` (16 hex digits of the id), as `<vm>`, so
+/// a directory of the start's own VM is named the same in every start and is known to be its
+/// own, and every
 /// component that is a bucket of a hashed layout (one or two lowercase hex digits) as
 /// `<b16>` or `<b256>`, the number of buckets a name of that length is one of, so the
 /// buckets of one layout are one family whatever bucket each start's key fell in.
 fn create_key(dir: &str, roots: &[Root]) -> String {
-    dir_key(dir, roots)
-        .split('/')
-        .map(|part| {
+    let key = dir_key(dir, roots);
+    let parts: Vec<&str> = key.split('/').collect();
+    parts
+        .iter()
+        .enumerate()
+        .map(|(at, part)| {
             let id = part.strip_prefix("vm-");
-            if id.is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())) {
+            let runtime_name = at > 0
+                && parts[at - 1] == "vm"
+                && part.len() == 16
+                && part.bytes().all(|b| b.is_ascii_hexdigit());
+            if runtime_name
+                || id.is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
                 "<vm>".to_string()
             } else if let Some(buckets) = bucket_family(part) {
                 format!("<b{buckets}>")
@@ -1393,6 +1404,19 @@ mod judging {
             (
                 "/mnt/store/dl-1/reclaim/1000/c",
                 "<data>/reclaim/1000/<b16>",
+            ),
+            (
+                "/mnt/store/dl-1/runtime/boot-0123456789abcdef/vm/0123456789abcdef",
+                "<data>/runtime/boot-<id>/vm/<vm>",
+            ),
+            (
+                "/mnt/store/dl-1/runtime/boot-0123456789abcdef/vm",
+                "<data>/runtime/boot-<id>/vm",
+            ),
+            // Only in a `vm/` directory: 16 hex digits elsewhere are not a VM's.
+            (
+                "/mnt/store/dl-1/snapshots/0123456789abcdef",
+                "<data>/snapshots/0123456789abcdef",
             ),
         ] {
             assert_eq!(create_key(dir, &roots), key, "{dir}");
@@ -2143,10 +2167,13 @@ mod start {
         // changing their count is a layout change the runtime directory's upgrade refusal
         // would have to cover for running VMs, which is not worth it for a fallback the
         // binding already tells the operator to replace (`sudo fcvm setup --runtime-dir`).
+        // The directory the VMs' runtime directories are in is one plain directory for the
+        // same reason, made on tmpfs everywhere but here.
         [
             "<data>/runtime/boot-<id>/state/vms/<b16>",
             "<data>/runtime/boot-<id>/state/names/<b16>",
             "<data>/runtime/boot-<id>/state/pids/<b16>",
+            "<data>/runtime/boot-<id>/vm",
         ]
         .map(|dir| CreateAllowance { dir, issue: 2240 })
         .into()

@@ -2237,7 +2237,10 @@ pub struct CleanupContext {
     /// Each volume's server, for its inode table at snapshot time, one entry per volume.
     /// Dropped during cleanup.
     pub volume_tables: Vec<crate::volume::TableSource>,
+    /// The VM's runtime directory (`paths::vm_runtime_dir`): sockets and markers.
     pub data_dir: PathBuf,
+    /// The VM's disk directory (`paths::vm_disk_dir`): disks and logs.
+    pub disk_dir: PathBuf,
     pub health_cancel_token: Option<tokio_util::sync::CancellationToken>,
     pub health_monitor_handle: Option<JoinHandle<()>>,
     pub output_listener_handle: Option<JoinHandle<()>>,
@@ -2559,6 +2562,7 @@ async fn cleanup_vm_inner(
         mut volume_server_handles,
         volume_tables: _,
         data_dir,
+        disk_dir,
         health_cancel_token,
         health_monitor_handle,
         mut output_listener_handle,
@@ -2712,15 +2716,15 @@ async fn cleanup_vm_inner(
     let state_deleted = state_manager.delete_state(&vm_id);
     let data_dir_removed = async {
         // The logs are copied out BEFORE removing the directory they live in.
-        let saved = save_vm_logs(&data_dir, &vm_id, std::path::Path::new("/tmp")).await;
+        let saved = save_vm_logs(&disk_dir, &vm_id, std::path::Path::new("/tmp")).await;
 
         failpoint::hit_async("teardown.pre_remove_data_dir").await;
-        // Includes disks, sockets, everything under the VM's runtime directory. A clone of
-        // this VM's snapshot binds its own directory on a tmpfs of its own namespace, not
-        // over this one, so nothing waits for a restore (#1311).
-        let removed = remove_runtime_dir(&data_dir)
+        // The runtime directory (sockets, markers) and the disk directory (disks, logs). A
+        // clone of this VM's snapshot binds its own directories on a tmpfs of its own
+        // namespace, not over these, so nothing waits for a restore (#1311).
+        let removed = remove_vm_dirs(&data_dir, &disk_dir)
             .await
-            .map(|()| info!(vm_id = %vm_id, "cleaned up VM data directory"));
+            .map(|()| info!(vm_id = %vm_id, "cleaned up VM directories"));
         (saved, removed)
     };
     let (exports_removed, state_deleted, (logs_saved, data_dir_removed)) =
@@ -3344,7 +3348,10 @@ pub struct RestoreParams<'a> {
     pub decision: crate::confine::Decision,
     pub vm_id: &'a str,
     pub vm_name: &'a str,
+    /// The clone's runtime directory (`paths::vm_runtime_dir`): its sockets.
     pub data_dir: &'a Path,
+    /// The clone's disk directory (`paths::vm_disk_dir`): its disks and log.
+    pub disk_dir: &'a Path,
     pub socket_path: &'a Path,
     pub runtime_config: &'a RuntimeConfig,
     pub restore_config: &'a SnapshotRestoreConfig,
@@ -3466,7 +3473,7 @@ fn rootfs_disk_vm_ids_in_bytes(bytes: &[u8]) -> Vec<String> {
         .position(|w| w == PREFIX)
     {
         let mut id_start = search_from + rel + PREFIX.len();
-        // `vm-disks/<bucket>/<id>` (paths::vm_runtime_dir), or `vm-disks/<id>` from builds
+        // `vm-disks/<bucket>/<id>` (paths::vm_disk_dir), or `vm-disks/<id>` from builds
         // before the buckets.
         let bucket = bytes.get(id_start..id_start + 3);
         if bucket.is_some_and(|b| {
@@ -3524,14 +3531,18 @@ fn assert_vmstate_vsock_source_matches(vmstate_path: &Path, source_path: &Path) 
 
 /// Build the ordered `(mountpoint, source)` bind pairs that isolate a clone.
 ///
-/// Every disk dir the vmstate references is redirected to the clone runtime
-/// dir. The source vsock directory (parent of the vmstate-embedded socket) is
-/// redirected to `vsock_target_dir` — the clone runtime dir by default, or a
-/// caller-owned `--vsock-dir`. When the source colocated its vsock with its
-/// disks AND the clone wants a different vsock target, the pair list splits at
-/// the existing `disks/` directory boundary: the whole source dir goes to the
-/// vsock target first, then the clone's `disks/` is bound back on top (order
-/// matters — the second mountpoint resolves inside the first mount).
+/// Every source disk directory the vmstate references is redirected to the clone's disk
+/// directory (`clone_dir`). The source vsock directory is the parent of the socket path
+/// the snapshot recorded (`source_vsock_socket_path`), never one derived from the source
+/// VM's id: a snapshot made before the runtime directories moved to tmpfs records it in
+/// the source's disk directory, a later one in the source's runtime directory, and a
+/// `--vsock-dir` source wherever that named. It is redirected to `vsock_target_dir`, the
+/// clone's runtime directory by default or a caller-owned `--vsock-dir`. When the source
+/// colocated its vsock with its disks and the clone wants a different vsock target, which
+/// is every snapshot made before the move, the pair list splits at the existing `disks/`
+/// directory boundary: the whole source dir goes to the vsock target first, then the
+/// clone's `disks/` is bound back on top (order matters: the second mountpoint resolves
+/// inside the first mount).
 ///
 /// `vsock_redirected` is false when the snapshot load overrides the vsock path
 /// (Firecracker 1.16.0 and later): the source vsock directory then gets no pair, and
@@ -3593,6 +3604,79 @@ fn build_clone_mount_redirects(
         redirects.push((source_vsock_dir, vsock_target_dir.to_path_buf()));
     }
     Ok(redirects)
+}
+
+/// The redirect pairs of a restored clone ([`build_clone_mount_redirects`]) and the
+/// directory its vsock sockets go to: `vsock_dir` (`--vsock-dir`) when given, else the
+/// clone's runtime directory. The source disk directories (`source_dirs`, from what the
+/// snapshot recorded) go to the clone's disk directory, and the source vsock directory is
+/// taken from `source_vsock_socket_path`, the path the snapshot recorded. A load that
+/// overrides every source path needs no pair.
+fn clone_redirect_pairs(
+    source_dirs: &[PathBuf],
+    source_vsock_socket_path: &Path,
+    vsock_dir: Option<&Path>,
+    runtime_dir: &Path,
+    disk_dir: &Path,
+    overrides: LoadOverrides,
+) -> Result<(Vec<(PathBuf, PathBuf)>, PathBuf)> {
+    if overrides == LoadOverrides::None && in_a_runtime_place(source_vsock_socket_path) {
+        let (major, minor, patch) = VSOCK_OVERRIDE_MIN_FIRECRACKER;
+        bail!(
+            "this snapshot records its vsock socket in its source VM's runtime directory on tmpfs \
+             ({}), and this Firecracker is older than {major}.{minor}.{patch}, so its snapshot load \
+             cannot be told the clone's own socket. Redirecting the recorded directory instead \
+             would make that directory on the host when the source is gone, and let a running \
+             source's teardown detach the clone's socket. Restore it with Firecracker \
+             {major}.{minor}.{patch} or later (every Firecracker fcvm builds is)",
+            source_vsock_socket_path.display()
+        );
+    }
+    let disk_dirs = match overrides {
+        LoadOverrides::Everything => Vec::new(),
+        LoadOverrides::None | LoadOverrides::Vsock => source_dirs.to_vec(),
+    };
+    let vsock_target_dir = vsock_dir.unwrap_or(runtime_dir).to_path_buf();
+    let redirects = build_clone_mount_redirects(
+        &disk_dirs,
+        source_vsock_socket_path,
+        disk_dir,
+        &vsock_target_dir,
+        overrides == LoadOverrides::None,
+    )?;
+    Ok((redirects, vsock_target_dir))
+}
+
+/// Whether `socket` is in a VM's runtime directory on tmpfs (`<runtime>/vm/<16 hex>/`), where
+/// a VM started by this build keeps its vsock socket, rather than in a disk directory under
+/// `vm-disks` (a snapshot from before the move) or a `--vsock-dir`.
+fn in_a_runtime_place(socket: &Path) -> bool {
+    let Some(dir) = socket.parent() else {
+        return false;
+    };
+    let named = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 16
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    named
+        && dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == crate::runtime_dir::VM_DIR)
+}
+
+/// What a load overrides, from whether it overrides the drives and the vsock path.
+fn overrides_of(drives: bool, vsock: bool) -> LoadOverrides {
+    match (drives, vsock) {
+        (true, _) => LoadOverrides::Everything,
+        (false, true) => LoadOverrides::Vsock,
+        (false, false) => LoadOverrides::None,
+    }
 }
 
 /// The directories directly inside `view`, sorted.
@@ -3662,10 +3746,10 @@ fn expand_buckets(
 /// The mount view of a clone's VMM, or `None` when the snapshot load overrides every source
 /// path and the VMM needs no mount namespace.
 ///
-/// With `None` nothing under `view` is read. `view` is the directory every VM's runtime
+/// With `None` nothing under `view` is read. `view` is the directory every VM's disk
 /// directory is in, so listing it costs a directory entry per VM alive, and btrfs takes a
 /// directory's lock exclusively to open it for reading and again in each read of it, which
-/// is the lock every other start's `mkdir` of its own runtime directory needs. Two listings
+/// is the lock every other start's `mkdir` of its own disk directory needs. Two listings
 /// a start (directories, then files) made that lock the one thing every start queued on:
 /// of 1555 ms a clone spent asleep on locks and I/O in a ramp of 1000 at 512 at a time,
 /// 641 ms was these listings waiting for it and 133 ms the `mkdir`s waiting behind them
@@ -3689,11 +3773,12 @@ fn clone_mount_redirects(
 }
 
 /// The mount namespace for a clone's VMM: `pairs` (from [`build_clone_mount_redirects`])
-/// under a tmpfs over `view`, the directory every VM's runtime directory is in.
+/// under a tmpfs over `view`, the directory every VM's disk directory is in (`vm-disks`).
 ///
-/// Only what a pair names is visible under `view`. The clone's runtime directory (API
-/// socket, log, disks) and its vsock directory, when that is inside `view`, get a pair
-/// onto themselves. Every other directory `view` holds (`view_entries`, listed before the
+/// Only what a pair names is visible under `view`. The clone's disk directory (`clone_dir`:
+/// disks, log) and its vsock directory, when that is inside `view`, get a pair onto
+/// themselves. The clone's runtime directory (API socket, vsock sockets) is on tmpfs
+/// outside `view`, where the VMM reaches it as the host does. Every other directory `view` holds (`view_entries`, listed before the
 /// VMM starts) that no redirect replaces is kept: bound onto itself if it still exists as
 /// the VMM starts, so a read-only `--disk` under another VM's directory stays reachable,
 /// and passed over if that VM's teardown removed it first. Nothing is read out of the
@@ -3778,7 +3863,7 @@ fn vmstate_rootfs_covered(bytes: &[u8], covered_dirs: &[PathBuf]) -> bool {
 }
 
 /// #608 real fix: refuse to restore if vmstate.bin does not reference a rootfs disk path
-/// covered by the mount-namespace redirect (`vm_runtime_dir(original|snapshot)`).
+/// covered by the mount-namespace redirect (`vm_disk_dir(original|snapshot)`).
 ///
 /// `LoadSnapshot` reopens the rootfs path embedded in vmstate BEFORE `patch_drive`
 /// retargets it; the redirect only covers the baseline VM dirs. If the embedded rootfs
@@ -3840,7 +3925,7 @@ fn assert_vmstate_rootfs_covered(
 ///
 /// CH has no `patch_drive`: it opens the disk paths embedded in the snapshot's
 /// `config.json` directly, and the mount-namespace redirect only retargets the baseline VM
-/// dirs (`vm_runtime_dir(original|snapshot)`). A WRITABLE disk path outside those dirs
+/// dirs (`vm_disk_dir(original|snapshot)`). A WRITABLE disk path outside those dirs
 /// (sibling VM, or a different `data_dir` prefix between create and restore) would be
 /// opened read-write against another VM's real disk and corrupt it — the exact exposure the
 /// FC path guards against. Read-only disks (external `--disk`) may legitimately point
@@ -3951,6 +4036,22 @@ fn assert_ch_config_vsock_source_matches(
     Ok(())
 }
 
+/// Point the vsock device of a Cloud Hypervisor snapshot's config at `socket`, the
+/// restored clone's own vsock base, as a Firecracker load's vsock override does. The
+/// snapshot names the source VM's socket, in the source's runtime directory (or, for a
+/// snapshot made when one directory held disks and sockets, in its disk directory). With
+/// the clone's own path the source's vsock directory needs no redirect, so a restore makes
+/// nothing at the source's runtime directory on the host, which is outside the clone's
+/// mount view over `vm-disks` (#1311). A config without a vsock device is left alone.
+fn point_ch_vsock_at(cfg: &mut serde_json::Value, socket: &Path) {
+    if let Some(vsock) = cfg.get_mut("vsock").and_then(|v| v.as_object_mut()) {
+        vsock.insert(
+            "socket".to_string(),
+            serde_json::Value::String(socket.display().to_string()),
+        );
+    }
+}
+
 /// Backend-neutral substrate for a snapshot restore: the per-clone CoW disk, the holder
 /// process (rootless), and the namespace/mount isolation to apply to the VMM process.
 ///
@@ -3966,7 +4067,7 @@ pub struct CloneSubstrate {
     /// caller fills in after spawn.
     pub holder_pid_for_post_start: Option<u32>,
     /// Namespace/mount isolation to apply to the VMM spawn. `mount_redirects` is already
-    /// set to `(baseline_dirs, clone_dir)` so the VMM opens the clone's CoW disk where the
+    /// set to `(baseline_dirs, clone disk dir)` so the VMM opens the clone's CoW disk where the
     /// snapshot embedded the baseline's path.
     pub namespace: crate::utils::NamespaceParams,
 }
@@ -4001,13 +4102,18 @@ async fn prepare_clone_substrate(
     // (`recorded_source_dirs`, from the hypervisor's coverage check).
     source_dirs: &[PathBuf],
     vm_id: &str,
-    data_dir: &Path,
+    // The clone's runtime directory, where its vsock sockets go unless `--vsock-dir`
+    // names another.
+    runtime_dir: &Path,
+    // The clone's disk directory, where its disks go and the source disk directories are
+    // redirected.
+    disk_dir: &Path,
     vm_state: &mut VmState,
     // What the snapshot load overrides, so needs no redirect.
     overrides: LoadOverrides,
     decision: &crate::confine::Decision,
 ) -> Result<CloneSubstrate> {
-    let vm_dir = data_dir.join("disks");
+    let vm_dir = disk_dir.join("disks");
     let mut holder_child: Option<tokio::process::Child> = None;
     let mut holder_pid_for_post_start: Option<u32> = None;
     let mut namespace = crate::utils::NamespaceParams::new(vm_id, decision.clone());
@@ -4148,20 +4254,13 @@ async fn prepare_clone_substrate(
     // make the VMM open only clone-local disks while binding its socket in the
     // clone's vsock target directory.
     // A load that overrides every such path needs neither the namespace nor the lease.
-    let disk_dirs = match overrides {
-        LoadOverrides::Everything => Vec::new(),
-        LoadOverrides::None | LoadOverrides::Vsock => source_dirs.to_vec(),
-    };
-    let vsock_target_dir = restore_config
-        .vsock_target_dir
-        .clone()
-        .unwrap_or_else(|| data_dir.to_path_buf());
-    let redirects = build_clone_mount_redirects(
-        &disk_dirs,
+    let (redirects, vsock_target_dir) = clone_redirect_pairs(
+        source_dirs,
         &restore_config.source_vsock_socket_path,
-        data_dir,
-        &vsock_target_dir,
-        overrides == LoadOverrides::None,
+        restore_config.vsock_target_dir.as_deref(),
+        runtime_dir,
+        disk_dir,
+        overrides,
     )?;
     // A split pair binds the clone's disks back INSIDE the vsock target mount,
     // so the nested mountpoint needs a backing directory there.
@@ -4174,7 +4273,7 @@ async fn prepare_clone_substrate(
             .context("creating disks backing dir inside the vsock target")?;
     }
     let view = paths::data_dir().join("vm-disks");
-    match clone_mount_redirects(overrides, &view, redirects, data_dir, &vsock_target_dir) {
+    match clone_mount_redirects(overrides, &view, redirects, disk_dir, &vsock_target_dir) {
         Ok(Some(redirects)) => {
             info!(
                 view = %redirects.view.display(),
@@ -4242,14 +4341,27 @@ async fn prepare_clone_substrate(
     })
 }
 
-/// Remove a VM's runtime directory (`vm-disks/<vm_id>`). A missing directory is not an
-/// error.
-async fn remove_runtime_dir(dir: &Path) -> Result<()> {
+/// Remove both of a VM's directories, its runtime directory and its disk directory, the
+/// second also when the first fails. A missing directory is not an error.
+pub(crate) async fn remove_vm_dirs(runtime_dir: &Path, disk_dir: &Path) -> Result<()> {
+    match (
+        remove_runtime_dir(runtime_dir).await,
+        remove_runtime_dir(disk_dir).await,
+    ) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(runtime), Err(disk)) => Err(anyhow::anyhow!("{runtime:#}; {disk:#}")),
+    }
+}
+
+/// Remove a directory of a VM (its runtime directory or its disk directory). A missing
+/// directory is not an error.
+pub(crate) async fn remove_runtime_dir(dir: &Path) -> Result<()> {
     match tokio::fs::remove_dir_all(dir).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => {
-            Err(error).with_context(|| format!("removing runtime directory {}", dir.display()))
+            Err(error).with_context(|| format!("removing VM directory {}", dir.display()))
         }
     }
 }
@@ -4294,6 +4406,7 @@ pub async fn restore_from_snapshot(
         vm_id,
         vm_name,
         data_dir,
+        disk_dir,
         socket_path,
         runtime_config,
         restore_config,
@@ -4310,7 +4423,7 @@ pub async fn restore_from_snapshot(
     if raw_ns_helper.is_some() {
         bail!("a raw VM restores on Cloud Hypervisor, not Firecracker");
     }
-    let vm_dir = data_dir.join("disks");
+    let vm_dir = disk_dir.join("disks");
 
     // #608: abort BEFORE any side effects (holder/disk) if vmstate's rootfs path would not
     // be covered by the mount redirect — otherwise LoadSnapshot opens a sibling VM's disk.
@@ -4351,11 +4464,7 @@ pub async fn restore_from_snapshot(
         &restore_config.extra_disks,
         &vm_dir,
     );
-    let load_overrides = match (&drive_overrides, &vsock_override) {
-        (Some(_), _) => LoadOverrides::Everything,
-        (None, Some(_)) => LoadOverrides::Vsock,
-        (None, None) => LoadOverrides::None,
-    };
+    let load_overrides = overrides_of(drive_overrides.is_some(), vsock_override.is_some());
     let firecracker_args = runtime_config.effective_firecracker_args();
 
     // Configure namespace isolation, create the CoW disk, copy extra disks, and compute the
@@ -4366,6 +4475,7 @@ pub async fn restore_from_snapshot(
         &source_dirs,
         vm_id,
         data_dir,
+        disk_dir,
         vm_state,
         load_overrides,
         &decision,
@@ -4384,7 +4494,7 @@ pub async fn restore_from_snapshot(
     }
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
 
-    let fc_log_path = data_dir.join("firecracker.log");
+    let fc_log_path = disk_dir.join("firecracker.log");
     let mut vm_manager = VmManager::new(
         vm_id.to_string(),
         socket_path.to_path_buf(),
@@ -5025,6 +5135,7 @@ pub async fn restore_from_snapshot_ch(
         vm_id,
         vm_name,
         data_dir,
+        disk_dir,
         socket_path,
         runtime_config: _, // the binary is find_cloud_hypervisor's: the configured build
         restore_config,
@@ -5043,7 +5154,7 @@ pub async fn restore_from_snapshot_ch(
     if !gpus.is_empty() {
         bail!("a Cloud Hypervisor restore cannot attach passthrough devices ({gpus:?})");
     }
-    let vm_dir = data_dir.join("disks");
+    let vm_dir = disk_dir.join("disks");
 
     // CH's own snapshot files live in the `ch/` subdir (written by create_snapshot_ch).
     let snapshot_dir = restore_config
@@ -5088,6 +5199,17 @@ pub async fn restore_from_snapshot_ch(
         vm_state.config.guest,
     )?;
 
+    // The clone's vsock base, which its copied config names (`point_ch_vsock_at`), so the
+    // vsock path is overridden as a Firecracker load overrides it. A raw guest has none.
+    let clone_vsock =
+        if vm_state.config.guest.runs_fc_agent() {
+            Some(vm_state.config.vsock_socket_path.clone().ok_or_else(|| {
+                anyhow::anyhow!("clone {vm_id} has no recorded vsock socket path")
+            })?)
+        } else {
+            None
+        };
+
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
     let mut substrate = prepare_clone_substrate(
         network,
@@ -5095,8 +5217,9 @@ pub async fn restore_from_snapshot_ch(
         &source_dirs,
         vm_id,
         data_dir,
+        disk_dir,
         vm_state,
-        LoadOverrides::None,
+        LoadOverrides::Vsock,
         &decision,
     )
     .await?;
@@ -5110,13 +5233,17 @@ pub async fn restore_from_snapshot_ch(
     // LoadSnapshot's `network_overrides`). Copying also avoids mutating the shared snapshot,
     // which concurrent clones restore from.
     let clone_prepare: Result<(PathBuf, u64)> = async {
-        let clone_ch_dir = data_dir.join("ch-restore");
+        // On the store: a reflink copy of the snapshot's files, its memory file among them.
+        let clone_ch_dir = disk_dir.join("ch-restore");
         let _ = tokio::fs::remove_dir_all(&clone_ch_dir).await;
         crate::paths::ensure_dir_async(&clone_ch_dir)
             .await
             .context("creating CH restore directory")?;
         prepare_ch_restore_files(&ch_dir, &clone_ch_dir).await?;
         // `cfg` was read, parsed, and #608-validated above (before the substrate side effects).
+        if let Some(socket) = clone_vsock.as_deref() {
+            point_ch_vsock_at(&mut cfg, socket);
+        }
         if let Some(nets) = cfg.get_mut("net").and_then(|v| v.as_array_mut()) {
             for net in nets.iter_mut() {
                 if let Some(obj) = net.as_object_mut() {
@@ -5150,7 +5277,7 @@ pub async fn restore_from_snapshot_ch(
             return Err(error);
         }
     };
-    let log_path = data_dir.join("firecracker.log");
+    let log_path = disk_dir.join("firecracker.log");
     let mut backend = CloudHypervisorBackend::new(
         vm_id.to_string(),
         socket_path.to_path_buf(),
@@ -5247,8 +5374,12 @@ pub async fn restore_from_snapshot_ch(
         vm_state.pid = Some(std::process::id());
         // Future snapshots of this clone must redirect using the original vsock vm_id.
         vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
-        vm_state.config.source_vsock_socket_path =
-            Some(restore_config.source_vsock_socket_path.clone());
+        // A snapshot of this clone names the socket its config names: its own.
+        vm_state.config.source_vsock_socket_path = Some(
+            clone_vsock
+                .clone()
+                .unwrap_or_else(|| restore_config.source_vsock_socket_path.clone()),
+        );
         if !restore_config.extra_disks.is_empty() {
             vm_state.config.extra_disks = restore_config
                 .extra_disks
@@ -5329,9 +5460,9 @@ pub(crate) async fn reflink_copy(source: &Path, dest: &Path) -> Result<()> {
 }
 
 /// The `disks` directory of the VM being snapshotted, from its rootfs path: the VM's own
-/// record of where its disks are (`<runtime dir>/disks/<rootfs>`), so a VM an older build
+/// record of where its disks are (`<disk dir>/disks/<rootfs>`), so a VM an older build
 /// started under another layout is found. A rootfs outside a `disks` directory named by the
-/// VM's id falls back to where this build puts a VM's disks.
+/// VM's id falls back to where this build puts a VM's disks (`paths::vm_disk_dir`).
 fn runtime_disks_of(disk_path: &Path, vm_id: &str) -> PathBuf {
     disk_path
         .parent()
@@ -5343,7 +5474,7 @@ fn runtime_disks_of(disk_path: &Path, vm_id: &str) -> PathBuf {
                 .is_some_and(|name| name == vm_id)
         })
         .map_or_else(
-            || paths::vm_runtime_dir(vm_id).join("disks"),
+            || paths::vm_disk_dir(vm_id).join("disks"),
             Path::to_path_buf,
         )
 }
@@ -5717,11 +5848,11 @@ pub fn volume_configs_to_snapshot(
 
 /// Convert VmState extra_disks to SnapshotExtraDisk for snapshot metadata.
 ///
-/// Only includes disks inside the VM's data directory (disk-dir disks).
+/// Only includes disks inside the VM's disk directory (disk-dir disks).
 /// External --disk files are at arbitrary host paths and don't need copying
 /// into the snapshot — clones access them directly.
 pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::SnapshotExtraDisk> {
-    let vm_data_dir = vm_state.vm_runtime_dir();
+    let vm_data_dir = vm_state.vm_disk_dir();
     let vm_data_prefix = vm_data_dir.to_string_lossy().to_string();
     vm_state
         .config
@@ -10143,7 +10274,8 @@ mod tests {
 
     fn make_vm_state(vm_id: &str, original_vsock: Option<&str>) -> VmState {
         let mut state = VmState::new(vm_id.to_string(), "nginx:alpine".to_string(), 2, 1024);
-        state.config.vm_runtime_dir = Some(paths::vm_runtime_dir(vm_id));
+        state.config.vm_runtime_dir = Some(PathBuf::from(format!("/runtime/{vm_id}")));
+        state.config.vm_disk_dir = Some(paths::vm_disk_dir(vm_id));
         state.config.network = NetworkConfig::default();
         state.config.health_check_url = Some("http://localhost/".to_string());
         state.config.hugepages = false;
@@ -11599,6 +11731,30 @@ mod tests {
                 ".spawn(&spec)",
             ],
         );
+    }
+
+    /// A restored Cloud Hypervisor clone's config names its own vsock base, so the
+    /// source's vsock directory gets no redirect pair; a config without a vsock device (a
+    /// raw guest) gets none.
+    #[test]
+    fn a_ch_restore_names_the_clone_s_own_vsock_socket() {
+        let source = "/run/fcvm-0/k/boot-b/vm/0123456789abcdef/vsock.sock";
+        let mut cfg = serde_json::json!({"vsock": {"cid": 3, "socket": source}});
+        let clone = Path::new("/run/fcvm-0/k/boot-b/vm/fedcba9876543210/vsock.sock");
+        point_ch_vsock_at(&mut cfg, clone);
+        assert_eq!(
+            cfg["vsock"],
+            serde_json::json!({"cid": 3, "socket": clone.display().to_string()})
+        );
+        let mut raw = serde_json::json!({"vsock": null, "disks": []});
+        point_ch_vsock_at(&mut raw, clone);
+        assert_eq!(raw, serde_json::json!({"vsock": null, "disks": []}));
+        // The restore rewrites it and tells the substrate the vsock needs no redirect.
+        let source = include_str!("common.rs");
+        let body = body_of(source, "pub async fn restore_from_snapshot_ch(");
+        assert!(body.contains("point_ch_vsock_at(&mut cfg, socket)"));
+        assert!(body.contains("LoadOverrides::Vsock,"));
+        assert!(!body.contains("LoadOverrides::None,"));
     }
 
     /// The mapping check reads `/proc/<pid>/maps`: the memory file is there by inode and
@@ -14009,14 +14165,14 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
 
     #[test]
     fn test_extra_disks_to_snapshot_filters_external() {
-        // Only disks inside vm_runtime_dir should be included
+        // Only disks inside the VM's disk directory should be included
         let mut state = make_vm_state("vm-test123", None);
         state.config.extra_disks = vec![
-            // Disk inside data dir → should be included
+            // Disk inside the disk directory → should be included
             crate::state::types::ExtraDisk {
                 path: format!(
                     "{}/disk-dir-0.raw",
-                    paths::vm_runtime_dir("vm-test123").display()
+                    paths::vm_disk_dir("vm-test123").display()
                 ),
                 mount_path: "/data".to_string(),
                 read_only: false,
@@ -15386,7 +15542,7 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
         let id = "vm-0123456789abcdef0123456789abcdef";
         let vm_disks = paths::vm_disks_dir();
         let flat = vm_disks.join(id);
-        let bucketed = paths::vm_runtime_dir(id);
+        let bucketed = paths::vm_disk_dir(id);
         let dir = tempfile::tempdir().unwrap();
         let vmstate = dir.path().join("vmstate.bin");
         let state = |rootfs: &Path, extra: &Path| {
@@ -15414,7 +15570,7 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
                 recorded.display()
             );
         }
-        let sibling = paths::vm_runtime_dir("vm-ffffffffffffffffffffffffffffffff");
+        let sibling = paths::vm_disk_dir("vm-ffffffffffffffffffffffffffffffff");
         std::fs::write(&vmstate, state(&sibling.join("disks/rootfs.raw"), &sibling)).unwrap();
         assert!(assert_vmstate_rootfs_covered(&vmstate, id, None).is_err());
         let elsewhere = Path::new("/other-data/vm-disks").join(id);
@@ -15424,6 +15580,135 @@ ffffb0000000-ffffb0021000 rw-p 00000000 00:00 0 [heap]\n";
         )
         .unwrap();
         assert!(assert_vmstate_rootfs_covered(&vmstate, id, None).is_err());
+    }
+
+    /// A snapshot made before the runtime directories moved to tmpfs records its vsock
+    /// socket in the source's disk directory (`vm-disks/<bucket>/<id>/vsock.sock`), a later
+    /// one in the source's runtime directory (`<runtime>/vm/<v>/vsock.sock`). Both restore,
+    /// through the functions a restore calls in the order it calls them, whatever the load
+    /// overrides:
+    ///
+    /// - with the vsock path overridden (Firecracker 1.16.0 and later) the override names
+    ///   the clone's runtime directory and only the source's disk directory is redirected;
+    /// - with nothing overridden the source vsock directory the snapshot recorded goes to
+    ///   the clone's runtime directory and the source's disks to the clone's disk directory
+    ///   (split at `disks/` when the snapshot kept both in one directory);
+    /// - with the drives overridden too nothing is redirected.
+    #[test]
+    fn a_snapshot_of_either_vsock_layout_restores_with_override_or_redirect() {
+        let source = "vm-0123456789abcdef0123456789abcdef";
+        let clone = "vm-fedcba9876543210fedcba9876543210";
+        let runtime = Path::new("/run/fcvm-1000/0123456789abcdef/boot-0123456789abcdef");
+        let source_disk = paths::vm_disk_dir(source);
+        let clone_disk = paths::vm_disk_dir(clone);
+        let clone_runtime = paths::vm_runtime_dir_under(runtime, clone);
+        let clone_vsock = clone_runtime.join("vsock.sock");
+        let before = source_disk.join("vsock.sock");
+        let after = paths::vm_runtime_dir_under(runtime, source).join("vsock.sock");
+        let versions = [
+            ("override", "Firecracker v1.16.0"),
+            ("redirect", "Firecracker v1.15.2"),
+            ("drives", "Firecracker v1.17.0+fcvm.drive-overrides"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let vmstate = dir.path().join("vmstate.bin");
+        let own = |path: &Path| (path.to_path_buf(), path.to_path_buf());
+        for (layout, recorded) in [("before", &before), ("after", &after)] {
+            let mut bytes = b"\x00\x10".to_vec();
+            bytes.extend_from_slice(
+                source_disk
+                    .join("disks/rootfs.raw")
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            );
+            bytes.extend_from_slice(b"\x00\x22");
+            bytes.extend_from_slice(recorded.as_os_str().as_encoded_bytes());
+            bytes.push(0);
+            std::fs::write(&vmstate, &bytes).unwrap();
+            let source_dirs = assert_vmstate_rootfs_covered(&vmstate, source, None).unwrap();
+            assert_eq!(source_dirs, std::slice::from_ref(&source_disk), "{layout}");
+            assert_vmstate_vsock_source_matches(&vmstate, recorded).unwrap();
+            for (mode, version) in versions {
+                let case = format!("snapshot {layout} the move, {mode}");
+                let version = parse_firecracker_version(version).unwrap();
+                let vsock_override = snapshot_load_vsock_override(version, &clone_vsock);
+                let drive_overrides = snapshot_load_drive_overrides(
+                    version,
+                    vsock_override.is_some(),
+                    &bytes,
+                    &source_dirs,
+                    recorded,
+                    &[],
+                    &clone_disk.join("disks"),
+                );
+                let overrides = overrides_of(drive_overrides.is_some(), vsock_override.is_some());
+                let made = clone_redirect_pairs(
+                    &source_dirs,
+                    recorded,
+                    None,
+                    &clone_runtime,
+                    &clone_disk,
+                    overrides,
+                );
+                if (mode, layout) == ("redirect", "after") {
+                    let error = format!("{:#}", made.expect_err(&case));
+                    assert!(
+                        error.contains("older than 1.16.0") && error.contains("vsock socket"),
+                        "{case}: a Firecracker without the vsock override refuses a snapshot \
+                         whose socket is on tmpfs: {error}"
+                    );
+                    continue;
+                }
+                let (pairs, target) = made.unwrap();
+                assert_eq!(target, clone_runtime, "{case}");
+                assert_eq!(
+                    vsock_override.map(|vsock| PathBuf::from(vsock.uds_path)),
+                    (mode != "redirect").then(|| clone_vsock.clone()),
+                    "{case}: the override names the clone's runtime directory"
+                );
+                let expected = match (mode, layout) {
+                    ("drives", _) => {
+                        let drives = drive_overrides.expect("the drives are overridden");
+                        assert_eq!(
+                            drives[0].path_on_host,
+                            clone_disk.join("disks/rootfs.raw").display().to_string(),
+                            "{case}"
+                        );
+                        assert_eq!(overrides, LoadOverrides::Everything, "{case}");
+                        assert!(pairs.is_empty(), "{case}: {pairs:?}");
+                        continue;
+                    }
+                    ("override", _) => vec![(source_disk.clone(), clone_disk.clone())],
+                    ("redirect", "before") => vec![
+                        (source_disk.clone(), clone_runtime.clone()),
+                        (source_disk.join("disks"), clone_disk.join("disks")),
+                    ],
+                    _ => vec![
+                        (source_disk.clone(), clone_disk.clone()),
+                        (
+                            recorded.parent().unwrap().to_path_buf(),
+                            clone_runtime.clone(),
+                        ),
+                    ],
+                };
+                assert_eq!(pairs, expected, "{case}");
+                // The view over vm-disks keeps the clone's disk directory visible; its
+                // runtime directory is outside the view.
+                let view = clone_mount_view(
+                    &paths::vm_disks_dir(),
+                    pairs,
+                    &clone_disk,
+                    &clone_runtime,
+                    &[],
+                )
+                .unwrap();
+                assert_eq!(
+                    view.pairs,
+                    [expected, vec![own(clone_disk.as_path())]].concat(),
+                    "{case}"
+                );
+            }
+        }
     }
 
     /// Only directories named by a source id, inside this host's vm-disks, holding the disk

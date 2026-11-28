@@ -630,7 +630,7 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
         );
         // The clone's listener is its own: in its runtime directory, neither the
         // custom directory nor the still-live source's listener.
-        let clone_listener = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("vsock.sock");
+        let clone_listener = clone_state.vm_runtime_dir().join("vsock.sock");
         assert_eq!(
             clone_state.config.vsock_socket_path.as_deref(),
             Some(clone_listener.as_path()),
@@ -3729,7 +3729,7 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
         .await
         .context("loading the clone's state")?;
     if cfg!(target_arch = "x86_64") && clone_state.config.hypervisor.is_firecracker() {
-        let vmm_log_path = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("firecracker.log");
+        let vmm_log_path = clone_state.vm_disk_dir().join("firecracker.log");
         let vmm_log = std::fs::read_to_string(&vmm_log_path)
             .with_context(|| format!("reading {}", vmm_log_path.display()))?;
         anyhow::ensure!(
@@ -5563,7 +5563,7 @@ async fn test_snapshot_clone_free_page_reporting_reaches_the_page_server() -> Re
             .await
             .context("loading the source VM's state")?
             .vm_id;
-        let vmm_log_path = fcvm::paths::vm_runtime_dir(&source_vm_id).join("firecracker.log");
+        let vmm_log_path = fcvm::paths::vm_disk_dir(&source_vm_id).join("firecracker.log");
         let vmm_log = std::fs::read_to_string(&vmm_log_path)
             .with_context(|| format!("reading {}", vmm_log_path.display()))?;
         anyhow::ensure!(
@@ -8866,7 +8866,7 @@ async fn clone_disks_case(
                 common::poll_health(&mut clone, 300).await?;
                 let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
                 let clone_state = states.load_state_by_pid(clone_pid).await?;
-                let disks = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("disks");
+                let disks = clone_state.vm_disk_dir().join("disks");
                 let disks_ino = std::fs::metadata(&disks)?.ino();
                 let mut entries: Vec<String> = std::fs::read_dir(&disks)?
                     .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))

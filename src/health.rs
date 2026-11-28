@@ -746,8 +746,13 @@ async fn check_health_once(
         // First check if Firecracker process is still running
         if std::fs::metadata(format!("/proc/{}", pid)).is_err() {
             debug!(target: "health-monitor", pid = pid, "process not found");
-            // Process exited - check for container-exit file to get exit code
-            let exit_file = paths::vm_runtime_dir(vm_id).join("container-exit");
+            // Process exited - check for container-exit file to get exit code, in the
+            // runtime directory the VM's state recorded.
+            let runtime_dir = match state_manager.load_state(vm_id).await {
+                Ok(state) => state.vm_runtime_dir(),
+                Err(_) => paths::vm_runtime_dir(vm_id),
+            };
+            let exit_file = runtime_dir.join("container-exit");
             if exit_file.exists() {
                 let exit_code = std::fs::read_to_string(&exit_file)
                     .ok()
@@ -759,10 +764,15 @@ async fn check_health_once(
                 (HealthStatus::Unreachable, None)
             }
         } else {
+            let state = state_manager
+                .load_state(vm_id)
+                .await
+                .context("loading state for health check")?;
+
             // Process exists - first check if container has already exited (e.g., failed to load)
             // This catches cases where the container fails early (exit 125 = image load error)
             // but the Firecracker VM is still running
-            let exit_file = paths::vm_runtime_dir(vm_id).join("container-exit");
+            let exit_file = state.vm_runtime_dir().join("container-exit");
             if exit_file.exists() {
                 let exit_code = std::fs::read_to_string(&exit_file)
                     .ok()
@@ -772,10 +782,6 @@ async fn check_health_once(
             }
 
             // Process exists and container hasn't exited, now check application health
-            let state = state_manager
-                .load_state(vm_id)
-                .await
-                .context("loading state for health check")?;
 
             // A raw guest (no fc-agent) is healthy when its RDP stack answers a
             // connection request. Nothing writes a container-ready or container-exit

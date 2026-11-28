@@ -264,12 +264,17 @@ pub struct VmConfig {
     /// `source_vsock_socket_path`, since the source may use `--vsock-dir`.
     #[serde(default)]
     pub original_vsock_vm_id: Option<String>,
-    /// This VM's runtime directory (`paths::vm_runtime_dir` when it started: its API socket,
-    /// log, disks), recorded so a later fcvm finds it where the build that started the VM put
-    /// it, whatever layout that build used (`VmState::vm_runtime_dir`). None in a state written
-    /// before this field existed.
+    /// This VM's runtime directory (`paths::vm_runtime_dir` when it started, on tmpfs: its
+    /// API socket, vsock sockets, markers), recorded so a later fcvm finds it where the build
+    /// that started the VM put it, whatever layout that build used
+    /// (`VmState::vm_runtime_dir`). None in a state written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_runtime_dir: Option<std::path::PathBuf>,
+    /// This VM's disk directory (`paths::vm_disk_dir` when it started, on the store: its
+    /// disks and logs). None in a state written before the two were apart, whose runtime
+    /// directory held both (`VmState::vm_disk_dir`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_disk_dir: Option<std::path::PathBuf>,
     /// Actual host-side base socket used for this running VM's vsock device.
     ///
     /// This may live outside the per-VM runtime directory when `--vsock-dir`
@@ -471,6 +476,15 @@ impl VmState {
         }
     }
 
+    /// This VM's disk directory: the one its state recorded, else its runtime directory,
+    /// which held the disks too in a state written before the two were apart.
+    pub fn vm_disk_dir(&self) -> std::path::PathBuf {
+        match &self.config.vm_disk_dir {
+            Some(dir) => dir.clone(),
+            None => self.vm_runtime_dir(),
+        }
+    }
+
     pub fn new(vm_id: String, image: String, vcpu: u8, memory_mib: u32) -> Self {
         let now = jiff::Timestamp::now();
         Self {
@@ -494,6 +508,7 @@ impl VmState {
             last_updated: now,
             config: VmConfig {
                 vm_runtime_dir: None,
+                vm_disk_dir: None,
                 image,
                 vcpu,
                 memory_mib,
@@ -552,10 +567,11 @@ impl VmState {
 mod tests {
     use super::*;
 
-    /// Every start records its VM's runtime directory before it writes the VM's first state
-    /// (`claim_name`): a reader of a running VM's directory (exec, health, the memory server
-    /// writing why it refused a clone) takes it from the state, and one written without it is
-    /// read as the layout before the buckets, a directory the VM does not have.
+    /// Every start records its VM's runtime directory and disk directory before it writes
+    /// the VM's first state (`claim_name`): a reader of a running VM's directory (exec,
+    /// health, the memory server writing why it refused a clone, snapshot create reading the
+    /// disks) takes it from the state, and one written without it is read as an older
+    /// layout, a directory the VM does not have.
     #[test]
     fn every_start_records_its_runtime_directory_before_the_first_state() {
         let sources = [
@@ -579,6 +595,11 @@ mod tests {
                     "{file}: the state is first written at byte {at} before its runtime \
                      directory is recorded"
                 );
+                assert!(
+                    source[function..at].contains("config.vm_disk_dir = Some("),
+                    "{file}: the state is first written at byte {at} before its disk \
+                     directory is recorded"
+                );
                 claims += 1;
             }
         }
@@ -586,6 +607,25 @@ mod tests {
             claims, 4,
             "podman run, snapshot run, the raw restore and vm run"
         );
+    }
+
+    /// A state that records no disk directory was written when the runtime directory held
+    /// the disks too, so the disks are looked for there; one that records it is believed.
+    #[test]
+    fn a_state_without_a_disk_directory_finds_its_disks_in_its_runtime_directory() {
+        let mut state = VmState::new("vm-123".to_string(), "image".to_string(), 1, 512);
+        let old = std::path::PathBuf::from("/srv/store/vm-disks/ab/vm-123");
+        state.config.vm_runtime_dir = Some(old.clone());
+        assert_eq!(state.vm_disk_dir(), old);
+        let disk = std::path::PathBuf::from("/srv/store/vm-disks/cd/vm-123");
+        state.config.vm_runtime_dir = Some("/run/fcvm-0/k/boot-b/vm/123".into());
+        state.config.vm_disk_dir = Some(disk.clone());
+        assert_eq!(state.vm_disk_dir(), disk);
+        let json = serde_json::to_value(&state.config).unwrap();
+        assert_eq!(json["vm_disk_dir"], "/srv/store/vm-disks/cd/vm-123");
+        state.config.vm_disk_dir = None;
+        let json = serde_json::to_value(&state.config).unwrap();
+        assert!(json.get("vm_disk_dir").is_none(), "{json}");
     }
 
     #[test]
