@@ -61,6 +61,9 @@ status=$(node -e '
 [ "$status" = "200" ] || fail "GET / returned $status, not 200: $(head -c 300 "$body")"
 grep -qF "$want" "$body" || fail "GET / returned 200 without $want: $(head -c 300 "$body")"
 echo "worker-smoke: GET / 200 with $want"
+# Every file the page asks for under /media (scripts/media-check.ts), from the built assets.
+node scripts/media-check.ts "http://127.0.0.1:$port" || fail "the built Worker does not serve every /media file the page asks for"
+
 grep -qF 'wss://fleet-api-stage.fcvm.dev/live' "$body" || fail "without a service token the page does not connect to FLEET_COORD_URL"
 
 # The forwarding: a stand-in coordinator, and the Worker with a test token in front of it.

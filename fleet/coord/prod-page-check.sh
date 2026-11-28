@@ -17,4 +17,7 @@ if [ "$code" != 200 ] || ! grep -qF "$want" "$body"; then
   echo "prod-page-check: the page answered $code over ${family#-} without the wall's title" >&2
   exit 1
 fi
+# Every file the page asks for under /media is served too (fleet/web/scripts/media-check.ts).
+node "$(dirname "$0")/../web/scripts/media-check.ts" "${origin%/}" || {
+  echo "prod-page-check: a /media file the page asks for is not served over ${family#-}" >&2; exit 1; }
 echo "prod page: 200 with the wall's title over IPv${family#-}"
