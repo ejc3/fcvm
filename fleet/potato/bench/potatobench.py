@@ -267,7 +267,10 @@ class Player:
         assert self.phase in ("awake", "sleeping"), self.phase
         self.phase = "sleeping"
         t0 = now()
-        args = [(env or ENV).get("FCVM_BIN", FCVM), "snapshot", "create", "--pid", str(self.proc.pid), "--tag", self.tag]
+        # A player is awake when it answers, a moment before its `snapshot run` has recorded the
+        # restore's acknowledgement; a create in between is refused unless it waits.
+        args = [(env or ENV).get("FCVM_BIN", FCVM), "snapshot", "create", "--pid", str(self.proc.pid), "--tag", self.tag,
+                "--await-restore", "10"]
         if STOP:
             args.append("--stop")
         p = await asyncio.create_subprocess_exec(
@@ -496,11 +499,16 @@ def reply_ok(line):
 
 
 def hold_at(start, shrink, min_hold, n, seq):
-    """The hold the ball carries when caught at `seq` in a ring of `n` (fleet_potato::Ball)."""
-    h = start
+    """The hold the ball carries when caught at `seq` in a ring of `n`, in ms: shrunk in
+    microseconds, as the players do (fleet_potato::hold_us_after), so it reaches the floor."""
+    us, floor = start * 1000, min_hold * 1000
     for _ in range(seq // max(n, 1)):
-        h = max(min_hold, h - h * shrink // 1000)
-    return h
+        nxt = max(floor, us - us * shrink // 1000)
+        if nxt == us:
+            break
+        us = nxt
+    us = max(us, floor)
+    return us // 1000 if us % 1000 == 0 else us / 1000
 
 
 def catch_ok(colour, counter, chain, msg):

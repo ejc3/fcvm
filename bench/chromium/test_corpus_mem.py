@@ -46,6 +46,8 @@ import compare as bench_compare  # noqa: E402
 import campaign_summary as bench_campaign_summary  # noqa: E402
 import host_resource_finalizer  # noqa: E402
 import phase_supervisor  # noqa: E402
+import reqbench  # noqa: E402
+import state_fixture  # noqa: E402
 import report as bench_report  # noqa: E402
 import serve_guardian  # noqa: E402
 
@@ -1418,8 +1420,11 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 corpus_mem.clone_gone(missing, "clone-a")
 
     def test_malformed_state_cannot_prove_a_clone_is_gone(self):
-        with tempfile.TemporaryDirectory() as state_dir:
-            with open(os.path.join(state_dir, "unknown.json"), "w") as handle:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = state_fixture.make_store(os.path.join(tmp, "state"))
+            path = reqbench.vm_state_path(state_dir, "vm-unknown")
+            os.makedirs(os.path.dirname(path))
+            with open(path, "w") as handle:
                 handle.write("{not-json\n")
             with self.assertRaises(corpus_mem.CloneStateReadError):
                 corpus_mem.clone_gone(state_dir, "clone-a")
@@ -3590,14 +3595,15 @@ class ZeroBasis(unittest.TestCase):
                 bench_report.measure_cgroup_set(missing, "serve-")
 
     def _forensics_box(self, tmp, pasta_pid):
-        """A results dir, a clone's vm-disks/<id>/pasta.pid, a fake `ss` that
+        """A results dir, a clone's vm-disks/<bucket>/<id>/pasta.pid, a fake `ss` that
         lists two listeners on the DevTools port and a fake fcvm whose exec
         prints what the guest would."""
         bindir = os.path.join(tmp, "bin")
         os.makedirs(bindir)
         vm_id = "vm-" + "7" * 32
-        os.makedirs(os.path.join(tmp, "vm-disks", vm_id))
-        with open(os.path.join(tmp, "vm-disks", vm_id, "pasta.pid"), "w") as f:
+        bucket = hashlib.sha256(vm_id.encode()).hexdigest()[:2]
+        os.makedirs(os.path.join(tmp, "vm-disks", bucket, vm_id))
+        with open(os.path.join(tmp, "vm-disks", bucket, vm_id, "pasta.pid"), "w") as f:
             f.write(f"{pasta_pid}\n")
         with open(os.path.join(bindir, "ss"), "w") as f:
             f.write("#!/bin/sh\n"

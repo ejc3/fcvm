@@ -75,8 +75,14 @@ pub struct Ball {
     pub seq: u64,
     /// Every player of the ring, as `[addr]:port` (or `host:port`), in throwing order.
     pub ring: Vec<String>,
-    /// How long the catcher holds the ball before it throws, in ms.
+    /// How long the catcher holds the ball before it throws, in ms: `hold_us` rounded, for a
+    /// player built before `hold_us`.
     pub hold_ms: u64,
+    /// The hold in microseconds, which is what shrinks: a tenth off 9 ms is 0 in whole
+    /// milliseconds, so a hold kept in them stops at 9 ms and never reaches its floor. None
+    /// on a ball from before this field; the hold is then `hold_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_us: Option<u64>,
     /// The fraction `hold_ms` shrinks by each lap, in parts per thousand.
     pub shrink_permille: u32,
     /// `hold_ms` never goes below this.
@@ -93,6 +99,26 @@ impl Ball {
         self.seq / self.ring.len().max(1) as u64
     }
 
+    /// The hold the ball carries, in microseconds.
+    pub fn hold_us(&self) -> u64 {
+        self.hold_us.unwrap_or(self.hold_ms * 1000)
+    }
+
+    /// The hold a catcher keeps, in microseconds: the ball's, capped by a viewers' pace (a hold
+    /// in ms), never under the floor.
+    pub fn kept_us(&self, pace_ms: Option<u64>) -> u64 {
+        match pace_ms {
+            Some(p) => self.hold_us().min(p.max(self.min_hold_ms) * 1000),
+            None => self.hold_us(),
+        }
+    }
+
+    /// How long a thrower that kept `kept_us` tries to reach the catcher: `flight_ms`, or the
+    /// hold when that is shorter, so a lap is not completed at a hold the throws did not keep.
+    pub fn flight_us(&self, kept_us: u64) -> u64 {
+        (self.flight_ms * 1000).min(kept_us)
+    }
+
     /// The ball the catcher of `self` throws: the next seq, the catcher's colour on the
     /// trail, and the hold shrunk when the throw starts a new lap.
     pub fn thrown(&self, colour: u32) -> Ball {
@@ -103,17 +129,41 @@ impl Ball {
             let cut = b.trail.len() - TRAIL_MAX;
             b.trail.drain(..cut);
         }
+        let mut us = self.hold_us();
         if b.lap() != self.lap() {
-            b.hold_ms = shrink(self.hold_ms, self.shrink_permille, self.min_hold_ms);
+            us = shrink_us(us, self.shrink_permille, self.min_hold_ms);
         }
+        b.hold_us = Some(us);
+        b.hold_ms = ms_of(us);
         b
     }
 }
 
-/// `hold` shrunk by `permille` thousandths, never below `min`.
-pub fn shrink(hold: u64, permille: u32, min: u64) -> u64 {
-    let cut = hold * u64::from(permille.min(1000)) / 1000;
-    (hold - cut).max(min)
+/// A hold of `us` microseconds shrunk by `permille` thousandths, never below `min_ms`
+/// milliseconds.
+pub fn shrink_us(us: u64, permille: u32, min_ms: u64) -> u64 {
+    let cut = us * u64::from(permille.min(1000)) / 1000;
+    (us - cut).max(min_ms * 1000)
+}
+
+/// The hold a ball that started at `start_ms` carries after `laps` laps, in microseconds.
+pub fn hold_us_after(start_ms: u64, permille: u32, min_ms: u64, laps: u64) -> u64 {
+    let floor = min_ms * 1000;
+    let mut us = start_ms * 1000;
+    // a hold that no longer shrinks (the floor, or a shrink of 0) ends the loop
+    for _ in 0..laps {
+        let next = shrink_us(us, permille, min_ms);
+        if next == us {
+            break;
+        }
+        us = next;
+    }
+    us.max(floor)
+}
+
+/// Microseconds as whole milliseconds, rounded.
+pub fn ms_of(us: u64) -> u64 {
+    (us + 500) / 1000
 }
 
 /// A message on a player's ball port.
@@ -202,6 +252,9 @@ pub enum Report {
         seq: u64,
         #[serde(flatten)]
         proof: Proof,
+        /// The hold the catcher keeps before it throws, in microseconds, after any pace cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_us: Option<u64>,
     },
     /// The catcher accepted the ball.
     Threw {
@@ -246,6 +299,7 @@ mod tests {
             seq: 0,
             ring: vec!["a".into(), "b".into()],
             hold_ms: 1000,
+            hold_us: None,
             shrink_permille: 100,
             min_hold_ms: 50,
             flight_ms: 500,
@@ -294,8 +348,46 @@ mod tests {
         let c = b.thrown(5);
         assert_eq!((c.seq, c.lap(), c.hold_ms), (2, 1, 900));
         let d = c.thrown(6);
-        assert_eq!(d.hold_ms, 900);
-        assert_eq!(shrink(55, 100, 50), 50);
+        assert_eq!((d.hold_ms, d.hold_us), (900, Some(900_000)));
+        assert_eq!(shrink_us(55_000, 100, 50), 50_000);
+        assert_eq!(hold_us_after(1000, 100, 50, 2), 810_000);
+        assert_eq!(hold_us_after(1000, 100, 50, 1_000_000), 50_000);
+    }
+
+    /// A ball from a player built before `hold_us` carries only `hold_ms`.
+    #[test]
+    fn a_ball_without_microseconds_holds_its_milliseconds() {
+        let old: Ball = serde_json::from_str(
+            r#"{"round":1,"seq":0,"ring":["a","b"],"hold_ms":300,"shrink_permille":100,"min_hold_ms":2,"flight_ms":100}"#,
+        )
+        .unwrap();
+        assert_eq!(old.hold_us(), 300_000);
+        assert!(!serde_json::to_string(&old).unwrap().contains("hold_us"));
+    }
+
+    #[test]
+    fn a_pace_caps_the_hold_kept_and_the_flight_is_no_longer_than_it() {
+        let b = ball();
+        assert_eq!(b.kept_us(None), 1_000_000);
+        assert_eq!(b.kept_us(Some(200)), 200_000);
+        assert_eq!(b.kept_us(Some(1)), 50_000, "never under the floor");
+        assert_eq!(b.flight_us(1_000_000), 500_000, "the ball's flight window");
+        assert_eq!(b.flight_us(200_000), 200_000, "the hold, when shorter");
+    }
+
+    /// A tenth off each lap, from 400 ms: cut in whole milliseconds the hold stops at 9 ms
+    /// (a tenth of 9 is 0), and the floor is never reached.
+    #[test]
+    fn the_hold_reaches_its_floor() {
+        let mut b = Ball {
+            hold_ms: 400,
+            min_hold_ms: 2,
+            ..ball()
+        };
+        for c in 0..400 {
+            b = b.thrown(c);
+        }
+        assert_eq!(b.hold_ms, 2, "200 laps of a tenth off each");
     }
 
     #[test]
@@ -319,6 +411,7 @@ mod tests {
                 counter: 9,
                 chain: chain_hex(&CHAIN_ZERO),
             },
+            hold_us: Some(250_000),
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.starts_with("{\"type\":\"caught\""), "{s}");

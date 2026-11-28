@@ -625,3 +625,210 @@ fn a_held_wall_loan_counts_against_the_borrow_cap() {
         s.receipts["c2"].reason
     );
 }
+
+// What a restart does to the power rules: nothing. The stored arrival stays, the pages
+// that reconnect are not arrivals, and the fleet is up until the stored limit.
+
+fn power_config() -> Config {
+    let mut base = serde_json::to_value(Config::default()).unwrap();
+    base["max_tiles"] = json!(2);
+    base["power_managed"] = json!(true);
+    base["idle_scale_down_secs"] = json!(60);
+    base["sleep_without_new_viewer_secs"] = json!(1000);
+    serde_json::from_value(base).unwrap()
+}
+
+#[test]
+fn a_restart_keeps_an_awake_fleet_awake_until_the_stored_limit() {
+    // Awake with one viewer that arrived at 5 s: the limit ends at 1005 s. Stored at 900 s.
+    let stored = run(
+        State::new(power_config(), 0),
+        vec![
+            hello(1000),
+            running(2000, "slot-1", 1),
+            running(2000, "slot-2", 1),
+            running(2000, "slot-3", 1),
+            joined(5000, "v1"),
+            tick(900_000),
+        ],
+    );
+    assert_eq!(stored.fleet.power.state, "awake");
+    // The coordinator is killed and the next one starts at 950 s from what was stored.
+    let read: State = serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
+    let mut s = read.resumed(power_config(), 950_000);
+    assert_eq!(s.fleet.power.state, "awake");
+    assert_eq!(s.fleet.power.last_arrival_at, Some(5000));
+    // Its first ticks, before any page is back, sleep nothing.
+    s = run(s, vec![tick(950_500), tick(951_500)]);
+    assert_eq!(s.fleet.power.state, "awake", "{:?}", s.fleet.power);
+    // The host's agent and the page reconnect; the page says it connected before.
+    s = run(
+        s,
+        vec![
+            hello(952_000),
+            running(952_001, "slot-1", 1),
+            running(952_001, "slot-2", 1),
+            running(952_001, "slot-3", 1),
+            ev(
+                json!({"at": 953_000, "type": "viewer_joined", "viewer": "v1",
+                "client": "198.51.100.20", "returning": true}),
+            ),
+            tick(1_004_999),
+        ],
+    );
+    assert_eq!(s.fleet.power.state, "awake");
+    assert_eq!(s.fleet.power.last_arrival_at, Some(5000));
+    // The stored limit, neither earlier nor later.
+    s = run(s, vec![tick(1_005_000)]);
+    assert_eq!(s.fleet.power.state, "asleep");
+}
+
+fn pages_hello(at: u64) -> Event {
+    ev(
+        json!({"at": at, "type": "agent", "host": "r1", "msg": {"type": "hello", "host": "r1",
+        "arch": "aarch64", "capacity": 0, "gpus": [], "renders": {"cpus": 40,
+        "pages": [{"id": "example", "url": "https://example.com/"}]}}}),
+    )
+}
+
+/// Pages mode's overlay is acknowledged state: the state as stored and read back by a
+/// restarted coordinator still holds it, the returning host is ordered it with the number
+/// it had, and it ends when it was going to.
+#[test]
+fn a_pages_overlay_survives_a_restart_and_still_ends_on_time() {
+    let s = run(
+        State::new(config(), 0),
+        vec![
+            pages_hello(1_000),
+            intent(
+                2_000,
+                "v1",
+                "o-1",
+                "renders_transform",
+                json!({"name": "mirror"}),
+            ),
+        ],
+    );
+    assert_eq!(s.receipts["o-1"].outcome, Outcome::Committed);
+    let before = s.fleet.renders.overlay.clone().expect("the overlay is set");
+    // Stored, the process gone, read back.
+    let stored = serde_json::to_string(&s).unwrap();
+    let s: State = serde_json::from_str(&stored).unwrap();
+    let s = s.resumed(config(), 50_000);
+    assert_eq!(s.fleet.renders.overlay, Some(before.clone()));
+    // No host until one says hello again, so no view yet; the order is ready for it.
+    assert!(s.fleet.renders.hosts.is_empty());
+    let s = run(s, vec![pages_hello(51_000)]);
+    let order = s.fleet.renders.order(true).overlay.expect("ordered again");
+    assert_eq!(order.transform.as_deref(), Some("mirror"));
+    assert_eq!(order.seq, before.seq);
+    let v = serde_json::to_value(fleet_core::view(&s)).unwrap();
+    assert_eq!(v["renders"]["overlay"]["until"], before.until);
+    // The intent sent again gets its first receipt, and changes nothing.
+    let s = run(
+        s,
+        vec![intent(
+            52_000,
+            "v1",
+            "o-1",
+            "renders_transform",
+            json!({"name": "mirror"}),
+        )],
+    );
+    assert_eq!(s.fleet.renders.overlay, Some(before.clone()));
+    // It ends at its time, not later for the restart.
+    let s = run(s, vec![tick(before.until - 1)]);
+    assert!(s.fleet.renders.overlay.is_some());
+    let s = run(s, vec![tick(before.until)]);
+    assert!(s.fleet.renders.overlay.is_none());
+    assert_eq!(s.fleet.renders.order(true).overlay, None);
+}
+
+/// The recent-actions list, which every viewer sees, shows of a pages intent only what the
+/// coordinator parsed and committed: a refused transform's name is free text nobody checked,
+/// and so is any other key a viewer puts beside `text` or `name`.
+#[test]
+fn a_pages_action_shows_only_what_was_parsed_and_committed() {
+    let intent = |at: u64, client: &str, id: &str, name: &str, args: serde_json::Value| {
+        ev(
+            json!({"at": at, "type": "intent", "viewer": "v1", "client": client, "id": id,
+            "name": name, "args": args, "check": {"verdict": "allow", "reason": ""}}),
+        )
+    };
+    let s = run(
+        State::new(config(), 0),
+        vec![
+            pages_hello(1_000),
+            intent(
+                2_000,
+                "198.51.100.20",
+                "t-1",
+                "renders_transform",
+                json!({"name": "so nasty"}),
+            ),
+            intent(
+                3_000,
+                "198.51.100.21",
+                "o-1",
+                "renders_overlay",
+                json!({"text": "  hello   there ", "note": "so nasty"}),
+            ),
+            intent(
+                20_000,
+                "198.51.100.22",
+                "t-2",
+                "renders_transform",
+                json!({"name": "mirror", "note": "so nasty"}),
+            ),
+            intent(
+                40_000,
+                "198.51.100.23",
+                "c-1",
+                "renders_clear",
+                json!({"note": "so nasty"}),
+            ),
+        ],
+    );
+    assert_eq!(s.receipts["t-1"].outcome, Outcome::Refused);
+    for id in ["o-1", "t-2", "c-1"] {
+        assert_eq!(s.receipts[id].outcome, Outcome::Committed, "{id}");
+    }
+    let v = serde_json::to_value(fleet_core::view(&s)).unwrap();
+    assert!(!v.to_string().contains("nasty"), "{v}");
+    let shown: Vec<_> = v["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["id"].as_str().unwrap().to_string(), a["args"].clone()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("t-1".to_string(), json!({})),
+            ("o-1".to_string(), json!({"text": "hello there"})),
+            ("t-2".to_string(), json!({"name": "mirror"})),
+            ("c-1".to_string(), json!({})),
+        ]
+    );
+}
+
+/// A text the check refused is in no viewer's snapshot: not as the overlay, and not in the
+/// recent-actions list, which every viewer sees.
+#[test]
+fn a_refused_pages_overlay_text_reaches_no_snapshot() {
+    let refused = ev(json!({"at": 2_000, "type": "intent", "viewer": "v1",
+        "client": "198.51.100.20", "id": "o-1", "name": "renders_overlay",
+        "args": {"text": "so nasty"},
+        "check": {"verdict": "refuse", "reason": "not for this wall"}}));
+    let s = run(State::new(config(), 0), vec![pages_hello(1_000), refused]);
+    assert_eq!(s.receipts["o-1"].outcome, Outcome::Refused);
+    let v = serde_json::to_string(&fleet_core::view(&s)).unwrap();
+    assert!(!v.contains("nasty"), "{v}");
+    // An allowed one is shown, as an allowed word is.
+    let allowed = ev(json!({"at": 3_000, "type": "intent", "viewer": "v1",
+        "client": "198.51.100.20", "id": "o-2", "name": "renders_overlay",
+        "args": {"text": "hello"}, "check": {"verdict": "allow", "reason": ""}}));
+    let s = run(s, vec![allowed]);
+    let v = serde_json::to_value(fleet_core::view(&s)).unwrap();
+    assert_eq!(v["renders"]["overlay"]["text"], "hello");
+}

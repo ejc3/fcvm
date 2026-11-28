@@ -500,6 +500,10 @@ export interface MinecraftResetAll {
   /** `viewer:<id>`, or whatever else the coordinator names. */
   by: string;
   servers: number;
+  /** How many of those servers are back from this reset; absent from a coordinator that does not count them. */
+  back?: number;
+  /** The click to the last of them back, ms; null while none is. */
+  took_ms?: number | null;
 }
 
 /** The last fork that reached `running`, with the agent's times. */
@@ -530,7 +534,44 @@ export interface Minecraft {
   borrow: Borrow;
   last_reset_all: MinecraftResetAll | null;
   last_fork: MinecraftFork | null;
+  /** Every server of a small fleet; of a large one, the first 16 and every lent one. */
   tiles: MinecraftTile[];
+  /** With more servers than are listed as tiles: every server, by host (PROTOCOL.md, "Many servers"). */
+  field: MinecraftField | null;
+}
+
+/** One host's servers, in the order of its status rows. */
+export interface MinecraftFieldHost {
+  /** `minecraft_status.host`. */
+  key: string;
+  /** The servers' numbers (`mc-<n>`). */
+  servers: number[];
+  /** Each one's view URL, and its IPv4 one; null for a server with none now. */
+  frames: (string | null)[];
+  frames_v4: (string | null)[];
+}
+
+export interface MinecraftField {
+  servers: number;
+  hosts: MinecraftFieldHost[];
+}
+
+/**
+ * A host's Minecraft servers as its agent last read them (PROTOCOL.md, "Many servers"): sent
+ * about once a second to a page whose `visibility` said `minecraft`. `rows` is base64, 8 bytes a
+ * server (core/minecraft-field.ts reads them).
+ */
+export interface MinecraftStatusMsg {
+  type: "minecraft_status";
+  host: string;
+  /** The coordinator's clock when the report reached it; null from a coordinator that does not say. */
+  received_at: number | null;
+  t: number;
+  rows: string;
+  cpus: number | null;
+  busy: number | null;
+  mem_total_mib: number | null;
+  mem_used_mib: number | null;
 }
 
 /**
@@ -775,7 +816,7 @@ export interface ErrorMsg {
   reason: string;
 }
 
-export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMsg | VerifiedMsg | ClaimMsg | AdmissionMsg;
+export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMsg | VerifiedMsg | ClaimMsg | AdmissionMsg | MinecraftStatusMsg;
 
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
@@ -1084,7 +1125,12 @@ function parseWindows(v: unknown): Windows | null {
 function parseMinecraftResetAll(v: unknown, where: string): MinecraftResetAll | null {
   if (v === null || v === undefined) return null;
   if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
-  return { clicked_at: num(v, "clicked_at", where), by: str(v, "by", where), servers: num(v, "servers", where) };
+  const r: MinecraftResetAll = { clicked_at: num(v, "clicked_at", where), by: str(v, "by", where), servers: num(v, "servers", where) };
+  if (v["back"] !== undefined && v["back"] !== null) {
+    r.back = num(v, "back", where);
+    r.took_ms = numOrNull(v, "took_ms", where);
+  }
+  return r;
 }
 
 function parseMinecraftFork(v: unknown, where: string): MinecraftFork | null {
@@ -1127,7 +1173,45 @@ function parseMinecraft(v: unknown): Minecraft | null {
     last_reset_all: parseMinecraftResetAll(v["last_reset_all"], `${w}.last_reset_all`),
     last_fork: parseMinecraftFork(v["last_fork"], `${w}.last_fork`),
     tiles,
+    field: parseMinecraftField(v["field"]),
   };
+}
+
+/** `prefix + name + suffix` for each name; null stays null. */
+function unsqueeze(v: unknown, count: number, where: string): (string | null)[] {
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  const prefix = str(v, "prefix", where);
+  const suffix = str(v, "suffix", where);
+  const names = arr(v, "names", where);
+  if (names.length !== count) throw new ProtocolError(`${where}.names holds ${names.length} names for ${count} servers`);
+  return names.map((n, i) => {
+    if (n === null) return null;
+    if (typeof n !== "string") throw new ProtocolError(`${where}.names[${i}] is not a string`);
+    return prefix + n + suffix;
+  });
+}
+
+export function parseMinecraftField(v: unknown): MinecraftField | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError("minecraft.field is not an object");
+  const w = "minecraft.field";
+  const seen = new Set<number>();
+  const hosts = arr(v, "hosts", w).map((h, i) => {
+    const hw = `${w}.hosts[${i}]`;
+    if (!isObj(h)) throw new ProtocolError(`${hw} is not an object`);
+    const servers = arr(h, "servers", hw).map((n) => {
+      if (typeof n !== "number" || !Number.isInteger(n) || n < 1 || seen.has(n)) throw new ProtocolError(`${hw}.servers is not a list of distinct server numbers`);
+      seen.add(n);
+      return n;
+    });
+    return {
+      key: str(h, "key", hw),
+      servers,
+      frames: unsqueeze(h["frames"], servers.length, `${hw}.frames`),
+      frames_v4: h["frames_v4"] === null || h["frames_v4"] === undefined ? servers.map(() => null) : unsqueeze(h["frames_v4"], servers.length, `${hw}.frames_v4`),
+    };
+  });
+  return { servers: num(v, "servers", w), hosts };
 }
 
 function msMap(v: unknown, where: string): Record<string, number> {
@@ -1556,6 +1640,18 @@ export function parseServerMsg(text: string): ServerMsg {
     }
     case "error":
       return { type: "error", reason: typeof v["reason"] === "string" ? v["reason"] : "" };
+    case "minecraft_status":
+      return {
+        type: "minecraft_status",
+        host: str(v, "host", "minecraft_status"),
+        received_at: numOrNull(v, "received_at", "minecraft_status"),
+        t: num(v, "t", "minecraft_status"),
+        rows: str(v, "rows", "minecraft_status"),
+        cpus: numOrNull(v, "cpus", "minecraft_status"),
+        busy: numOrNull(v, "busy", "minecraft_status"),
+        mem_total_mib: numOrNull(v, "mem_total_mib", "minecraft_status"),
+        mem_used_mib: numOrNull(v, "mem_used_mib", "minecraft_status"),
+      };
     default:
       throw new ProtocolError(`unknown message type ${String(v["type"])}`);
   }

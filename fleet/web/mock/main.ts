@@ -41,6 +41,7 @@
 //   FLEET_MOCK_MINECRAFT_RESTORE_MS  a server's reset, click to its first chunk (2000)
 //   FLEET_MOCK_MINECRAFT_SNAPSHOT_MS a fork's snapshot of its source, before the copy's restore (600)
 //   FLEET_MOCK_MINECRAFT_JOIN_ZONE   with a zone, each server's join address is mc-<n>.<zone> (unset: none)
+//   FLEET_MOCK_MINECRAFT_PER_HOST    servers on each host (8); more than 16 servers in all are a field on the page
 //   FLEET_MOCK_POTATO_PLAYERS    potato players one host runs (0: none, and no `potato` in the snapshot)
 //   FLEET_MOCK_POTATO_BUDGET_MS  a ring of n starts at this / (n - 1) ms of hold (2000)
 //   FLEET_MOCK_POTATO_FLOOR_MS   and never below this (400)
@@ -177,6 +178,7 @@ export async function startMock() {
             restoreMs: int("FLEET_MOCK_MINECRAFT_RESTORE_MS", 2000),
             forkSnapshotMs: int("FLEET_MOCK_MINECRAFT_SNAPSHOT_MS", 600),
             joinZone: process.env.FLEET_MOCK_MINECRAFT_JOIN_ZONE || null,
+            perHost: int("FLEET_MOCK_MINECRAFT_PER_HOST", 8),
           },
         }
       : {}),

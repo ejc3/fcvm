@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import faultanalyze  # noqa: E402
 import faultbench  # noqa: E402
+import reqbench  # noqa: E402
+import state_fixture  # noqa: E402
 
 
 def trace_file(directory, name, mtime):
@@ -236,20 +238,26 @@ class Schedule(unittest.TestCase):
 
 
 class ServeIdentity(unittest.TestCase):
-    """A serve is identified by tag AND uffd mode."""
+    """A serve is identified by tag AND uffd mode, read from fcvm's bucketed store.
+
+    RED BEFORE THE FIX: serve_pid_for globbed `<state>/*.json`, fcvm state layout 1, so
+    against a layout 2 store it found no serve and start_serve gave up after 60 s.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        self.store = state_fixture.make_store(os.path.join(self.tmp.name, "state"))
         real = faultbench.STATE_DIR
-        faultbench.STATE_DIR = Path(self.tmp.name)
+        faultbench.STATE_DIR = Path(self.store)
         self.addCleanup(setattr, faultbench, "STATE_DIR", real)
 
     def write_serve(self, name, tag, umode, pid):
-        (Path(self.tmp.name) / f"{name}.json").write_text(json.dumps({
-            "pid": pid,
-            "config": {"process_type": "serve", "snapshot_name": tag, "uffd_mode": umode},
-        }))
+        config = {"process_type": "serve", "snapshot_name": tag}
+        if umode is not None:
+            config["uffd_mode"] = umode
+        state_fixture.write_vm_state(self.store, f"vm-{name}", {
+            "vm_id": f"vm-{name}", "pid": pid, "config": config})
 
     def test_the_other_mode_s_serve_is_not_this_one(self):
         self.write_serve("a", "cb-golden-rootless", "minor", 4242)
@@ -265,12 +273,67 @@ class ServeIdentity(unittest.TestCase):
 
     def test_a_serve_without_a_recorded_mode_reads_as_copy(self):
         """`snapshot serve` defaults to the copy backend when no mode is given."""
-        (Path(self.tmp.name) / "c.json").write_text(json.dumps({
-            "pid": 4444,
-            "config": {"process_type": "serve", "snapshot_name": "t"},
-        }))
+        self.write_serve("c", "t", None, 4444)
         self.assertEqual(faultbench.serve_pid_for("t", "copy"), 4444)
         self.assertIsNone(faultbench.serve_pid_for("t", "minor"))
+
+
+class ClonesGone(unittest.TestCase):
+    """wait_clones_gone counts the run's clones by their top-level name.
+
+    RED BEFORE THE FIX: it globbed layout 1 paths and matched `config.name`, which no
+    state has, so it reported every clone gone at once.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = state_fixture.make_store(os.path.join(self.tmp.name, "state"))
+        real = faultbench.STATE_DIR
+        faultbench.STATE_DIR = Path(self.store)
+        self.addCleanup(setattr, faultbench, "STATE_DIR", real)
+
+    def test_a_live_clone_of_the_run_is_not_gone(self):
+        state_fixture.write_vm_state(self.store, "vm-a", {
+            "vm_id": "vm-a", "name": "fb-run1-0", "pid": 7,
+            "config": {"process_type": "clone"}})
+        self.assertFalse(faultbench.wait_clones_gone("fb-run1-", timeout=0.2))
+
+    def test_another_run_s_clone_does_not_count(self):
+        state_fixture.write_vm_state(self.store, "vm-b", {
+            "vm_id": "vm-b", "name": "fb-run2-0", "pid": 8,
+            "config": {"process_type": "clone"}})
+        self.assertTrue(faultbench.wait_clones_gone("fb-run1-", timeout=0.2))
+
+
+class StateDirFromFcvm(unittest.TestCase):
+    """faultbench asks FCVM for its state directory (`fcvm paths --json`) once."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        reqbench._FCVM_PATHS.clear()
+        self.addCleanup(reqbench._FCVM_PATHS.clear)
+        for name in ("STATE_DIR", "FCVM"):
+            self.addCleanup(setattr, faultbench, name, getattr(faultbench, name))
+        faultbench.STATE_DIR = None
+
+    def test_the_state_directory_is_fcvm_s_answer(self):
+        store = os.path.join(self.tmp.name, "elsewhere", "state")
+        faultbench.FCVM = Path(state_fixture.write_fake_fcvm(
+            os.path.join(self.tmp.name, "fcvm"), store))
+        self.assertEqual(faultbench.state_dir(), store)
+
+    def test_an_fcvm_that_cannot_answer_stops_the_run(self):
+        fcvm = os.path.join(self.tmp.name, "fcvm")
+        with open(fcvm, "w") as handle:
+            handle.write("#!/bin/bash\necho 'no config' >&2\nexit 1\n")
+        os.chmod(fcvm, 0o755)
+        faultbench.FCVM = Path(fcvm)
+        with self.assertRaises(SystemExit) as raised:
+            faultbench.state_dir()
+        self.assertIn("paths --json", str(raised.exception))
+        self.assertIn("no config", str(raised.exception))
 
 
 class _FakeSubprocess:

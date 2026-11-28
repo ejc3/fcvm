@@ -1,0 +1,5 @@
+kernel 7.0.0-1018-aws
+net.ipv4.neigh.default.gc_thresh3 = 16384
+net.ipv6.neigh.default.gc_thresh3 = 16384
+2026-11-24T22:08:52Z
+32 VMs: fcvm podman run --network routed --ipv6-prefix <the host's> --publish 443:443 --mem 256 --cpu 1 <an image the host holds>, one every 0.5 s

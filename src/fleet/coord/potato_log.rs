@@ -84,7 +84,9 @@ pub fn line(e: &PotatoEvent) -> Option<Line> {
             stages: stages_text(stages),
             written_mib: *written_mib,
         },
-        PotatoKind::Woke { wake_ms, stages } => Line::Woke {
+        PotatoKind::Woke {
+            wake_ms, stages, ..
+        } => Line::Woke {
             player: e.player,
             started_at: start_of(e.at, *wake_ms),
             ended_at: e.at,
@@ -105,6 +107,7 @@ pub fn line(e: &PotatoEvent) -> Option<Line> {
             reason,
             catcher_phase,
             catcher_phase_ms,
+            ..
         } => Line::Dropped {
             thrower: e.player,
             at: e.at,
@@ -129,7 +132,7 @@ pub fn line(e: &PotatoEvent) -> Option<Line> {
         PotatoKind::Hello { .. }
         | PotatoKind::Caught { .. }
         | PotatoKind::Threw { .. }
-        | PotatoKind::Waking {} => return None,
+        | PotatoKind::Waking { .. } => return None,
     })
 }
 
@@ -383,6 +386,7 @@ mod tests {
             PotatoKind::Woke {
                 wake_ms: 1_200.0,
                 stages: BTreeMap::from([("restore_ms".to_string(), 900.0)]),
+                ready_margin_ms: None,
             },
         ));
         assert_eq!(
@@ -414,6 +418,10 @@ mod tests {
             stage: "sleeping".into(),
             stage_ms: 99_400.0,
             listening_after_ms: None,
+            cause: Some("saving".into()),
+            cause_ms: Some(99_400.0),
+            cpu_wait_ms: None,
+            pace: None,
             sleep_stages: BTreeMap::from([("create_ms".to_string(), 1_500.0)]),
             wake_stages: BTreeMap::new(),
             detail: "player 14 was sleeping when player 13 threw".into(),
@@ -470,6 +478,9 @@ mod tests {
             send_ms: 0.0,
         };
         assert_eq!(line(&event(1, 2, threw)), None);
-        assert_eq!(line(&event(1, 2, PotatoKind::Waking {})), None);
+        assert_eq!(
+            line(&event(1, 2, PotatoKind::Waking { cpu_wait_ms: None })),
+            None
+        );
     }
 }

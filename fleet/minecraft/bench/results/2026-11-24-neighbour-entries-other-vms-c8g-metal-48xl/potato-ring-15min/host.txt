@@ -1,0 +1,12 @@
+kernel 7.0.0-1018-aws
+net.ipv4.neigh.default.gc_thresh1 = 8192
+net.ipv4.neigh.default.gc_thresh2 = 28672
+net.ipv4.neigh.default.gc_thresh3 = 32768
+net.ipv6.neigh.default.gc_thresh1 = 8192
+net.ipv6.neigh.default.gc_thresh2 = 28672
+net.ipv6.neigh.default.gc_thresh3 = 32768
+2026-11-24T22:13:23Z
+ring: fcvm fleet agent --potato-players 64 --potato-cpus 32, first round 2026-11-24T22:13:35Z, stopped 22:28:33Z
+from the coordinator's log: 61 rounds started, 10704 "potato player woke" and 10742 "potato player slept" lines
+kernel log: no "neighbor table overflow" line
+forced_gc_runs and table_fulls in neigh.log count from the boot: this run added what its last line holds over its first
