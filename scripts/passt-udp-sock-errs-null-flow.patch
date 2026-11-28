@@ -11,8 +11,13 @@ Fall back to the non-flow logging macros when there is no flow, matching
 udp_sock_recverr(), which already logs the no-flow cases with debug() and
 err().
 
-Carried by fcvm until upstream merges the same change. The diff is
-identical against upstream passt head cba357068dc5.
+Upstream bfbd2deae0c3 ("flow: Handle NULL (unknown) flows in flow logging
+functions") made flow_log__() accept a NULL flow, but flow_log_() still reads
+(f_)->state as an argument before that call, so a NULL flow still faults in
+the caller. This patch avoids calling the flow macros without a flow.
+
+Carried by fcvm. The diff applies unchanged to upstream passt head
+15980a90f9a6.
 
 diff --git a/udp.c b/udp.c
 index 505e554..a2acd0d 100644

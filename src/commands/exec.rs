@@ -143,7 +143,7 @@ fn connect_to_exec_server_with_retry(vsock_socket: &Path) -> Result<UnixStream> 
         // Connect to the vsock Unix socket
         let mut stream = match UnixStream::connect(vsock_socket) {
             Ok(s) => s,
-            Err(e) if attempt < MAX_EXEC_CONNECT_ATTEMPTS => {
+            Err(_) if attempt < MAX_EXEC_CONNECT_ATTEMPTS => {
                 debug!(attempt, delay_ms, "vsock socket not ready, retrying");
                 std::thread::sleep(Duration::from_millis(delay_ms));
                 waited_ms += delay_ms;

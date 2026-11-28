@@ -7,21 +7,23 @@
 # Local patches (passt-*.patch, kept next to this script) are applied on top, in order:
 #   - passt-udp-sock-errs-null-flow.patch: guards udp_sock_errs() against a NULL
 #     flow, so a published UDP port's listening socket does not crash pasta on a
-#     socket error. Submitted upstream; drop it when the pin moves past the merge.
+#     socket error. Upstream bfbd2deae0c3 makes flow_log__() accept a NULL flow, but
+#     the logging macro still reads the flow's state first.
 #   - passt-no-neigh-notify.patch: --no-neigh-notify, for the pastas of a namespace
 #     pool (fcvm netpool serve).
 #   - passt-control-reset-status.patch: a reset over the control socket and a status
-#     reply, for the same pastas (src/network/pesto.rs).
+#     reply (upstream's status byte, sent after the flows are closed), for the same
+#     pastas (src/network/pesto.rs).
 set -euo pipefail
 
-PASST_COMMIT="4e8aa70379a35ec9deb11d76513e7f6c4123b667"
+PASST_COMMIT="15980a90f9a60e6ae9a3865bb85d20a3d8379deb"
 # The same archive from two places, tried in order. passt.top refused TLS
 # handshakes from the runners for hours on 2026-09-24 (#1008), so the first
 # copy is a release asset of this repository; scripts/publish-passt-archive.sh
 # uploads it when the pin moves. The checksum, not the host, decides what is
 # built.
 PASST_TARBALL_URLS="https://github.com/ejc3/fcvm/releases/download/passt-${PASST_COMMIT:0:12}/passt-${PASST_COMMIT}.tar.xz https://passt.top/passt/snapshot/passt-${PASST_COMMIT}.tar.xz"
-PASST_TARBALL_SHA256="ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe097170e9e5851da8b9"
+PASST_TARBALL_SHA256="8a25c40ecfe7bdace74e3c4966c88846b693dce34f6bf8f09e2b607c25b20d42"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PASST_PATCHES=(
     "$SCRIPT_DIR/passt-udp-sock-errs-null-flow.patch"

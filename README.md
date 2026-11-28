@@ -459,7 +459,7 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
 - AWS: c6g.metal (ARM64) or c5.metal (x86_64)
 
 **Dependencies:**
-- Rust 1.93 (pinned by `rust-toolchain.toml`) with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
+- Rust 1.96 (pinned by `rust-toolchain.toml`) with musl target: `rustup target add $(uname -m)-unknown-linux-musl`
 - Firecracker binary in PATH (default backend)
 - Cloud Hypervisor (only if using `--hypervisor cloud-hypervisor`): `fcvm setup --cloud-hypervisor` builds the upstream commit that `[cloud_hypervisor]` in `rootfs-config.toml` pins, and fcvm runs that build and no other. `FCVM_CLOUD_HYPERVISOR_BIN` names another binary instead; it has to take the restore options fcvm passes (`memory_restore_mode=copyonwrite`, in releases from v54.0, and `clock_restore_mode=preserve`, on upstream's main since 2026-11-23 and in no release up to v55.0). `cloud-hypervisor` on PATH is used only with a config that has no `[cloud_hypervisor]` section. A snapshot restores only on the Cloud Hypervisor build that wrote it
 - For rootless: `passt` package (provides `pasta`)

@@ -297,13 +297,10 @@ mod clock_tests {
     fn the_clock_target_adds_the_time_since_the_host_value_was_read() {
         let host = std::time::Duration::from_secs(1_700_000_000);
         let spec = clock_target(host, std::time::Duration::from_millis(31_250));
-        assert_eq!(spec.tv_sec as i64, 1_700_000_031);
-        assert_eq!(spec.tv_nsec as i64, 250_000_000);
+        assert_eq!(spec.tv_sec, 1_700_000_031);
+        assert_eq!(spec.tv_nsec, 250_000_000);
         let spec = clock_target(host, std::time::Duration::ZERO);
-        assert_eq!(
-            (spec.tv_sec as i64, spec.tv_nsec as i64),
-            (1_700_000_000, 0)
-        );
+        assert_eq!((spec.tv_sec, spec.tv_nsec), (1_700_000_000, 0));
     }
 
     /// The host stamps its clock to the nanosecond in "host-time-ns", and the
