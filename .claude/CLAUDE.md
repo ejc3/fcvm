@@ -293,13 +293,15 @@ it says "a source, and its snapshot is over" by running `--resume-snapshot-netwo
 guest's part is that the request can always be served and that a served request either
 opens the gate or leaves the boundary owed.
 
-Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
-`fc-agent/src/snapshot_network.rs`); they are in guest memory, so in the image:
+Two files under `/run/fcvm` say whose a closed gate is, and a third which prepare may not
+close one (`BoundaryMarks`, `fc-agent/src/snapshot_network.rs`); they are in guest memory, so
+in the image:
 
 | mark | written | removed | while it is there |
 |---|---|---|---|
 | `snapshot-boundary-owed` | by the prepare, under the boundary lock, before the freeze and the gate | by the resume that opened the gate; by a restore when it is dispatched | a resume that fails leaves it, the manifest and the freeze; an fc-agent that starts and finds it opens exec at once, for the resume one-shot alone (`exec::serve_only_the_boundary_resume`) |
 | `restore-under-way` | when a restore's epoch is dispatched, before anything else of the restore | at publication, before the acknowledgement | both one-shots refuse with exit 3, before they wait for the boundary lock, and change nothing; the freeze watchdog does not count its looks |
+| `snapshot-boundary-cancelled` | under the boundary lock, by a resume with a token that finds no `owed` mark | never; the next such resume writes its own token over it | a prepare with that token refuses under the lock, before its mark and its freeze, and changes nothing (#1941) |
 
 - **The host asks until the gate is open** (`reopen_source_network`,
   `src/commands/common.rs`): for 150 s in all, 2 s between tries, every try cut off at
@@ -409,9 +411,30 @@ Two files under `/run/fcvm` say whose a closed gate is (`BoundaryMarks`,
   lands does not leave the switch on for the next snapshot to capture. The undo writes
   the recorded 0 even if someone set the switch to 1 on purpose meanwhile, and a guest
   whose host died keeps the 1 until its agent restarts or its next snapshot.
-- Not covered: the host's `snapshot create` dying as well (#1936, #1941), and a stray
-  one-shot on a clone before its restore is dispatched, which only the host can refuse
-  (#2138's host half).
+- **A `snapshot create` that dies is undone by its guard** (#1936,
+  `src/commands/snapshot_guard.rs`). A create whose source keeps running spawns
+  `fcvm snapshot source-guard` before its first change. The guard inherits its end of a
+  socket pair, a pidfd of the create, and the create's per-VM snapshot lock (the same open
+  file description, so the flock stays held from the create's death to the end of the
+  undo). The create tells it the prepare is next and the pause is next, and after its own
+  reopen tells it to stand down and waits for it to drop the lock. A guard that never said it
+  was ready fails the create, and a create that cannot tell it of the pause reopens the guest
+  and does not pause. When the create stops otherwise (SIGKILL included) the guard bumps the
+  vsock epoch and resumes the VMM if the pause was asked for, then runs the create's own
+  reopen (`reopen_source_network`, with the state's token and its 150 s bound), so a source
+  it cannot open is left running and recorded gated, as a live create leaves it.
+- **A resume can overtake its own create's prepare.** The guest serves each exec on a task of
+  its own, so the reopen after a prepare the host took for failed, or a guard's reopen, can
+  take the boundary lock while that create's prepare still waits for it. The resume finds no
+  `owed` mark and records its token in `snapshot-boundary-cancelled`; the prepare then finds
+  its token there and refuses. Without it the late prepare closed the gate after the
+  create's last reopen and nothing opened it again.
+  `a_prepare_its_creates_resume_overtook_changes_nothing` pins the guest's half;
+  `test_lifecycle_interleave_killed_snapshot_create_resumes_its_source` and its Cloud
+  Hypervisor twin SIGKILL a create held paused at `snapshot.post_save_pre_resume`.
+- Not covered: a stray one-shot on a clone before its restore is dispatched, which only the
+  host can refuse (#2138's host half), and `--disk-only` and `--gpu-warm` creates killed
+  in their own steps (#1939).
 
 `a_sources_gate_is_reopened_after_its_agent_dies_between_the_prepare_and_the_resume` and
 `a_restoring_clone_refuses_a_prepare_and_stays_frozen_past_the_watchdogs_deadline`

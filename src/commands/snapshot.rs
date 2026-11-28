@@ -255,6 +255,9 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
         SnapshotCommands::Import(import_args) => {
             super::snapshot_import::cmd_snapshot_import(import_args).await
         }
+        SnapshotCommands::SourceGuard(guard_args) => {
+            super::snapshot_guard::cmd_snapshot_source_guard(guard_args).await
+        }
     }
 }
 
@@ -1865,6 +1868,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                             super::common::SnapshotSourceDisposition::Resume
                         },
                         args.memory_dir.as_deref(),
+                        &_vm_lock,
                     )
                 };
                 if args.gpu_warm {
@@ -1908,6 +1912,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     } else {
                         super::common::SnapshotSourceDisposition::Resume
                     },
+                    &_vm_lock,
                 )
                 .await?;
                 None
