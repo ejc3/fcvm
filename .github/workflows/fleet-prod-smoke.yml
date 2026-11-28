@@ -34,7 +34,11 @@ env:
 jobs:
   ipv4:
     name: IPv4-only viewer
-    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && vars.FLEET_PROD_ENABLED == 'true'
+    # After the IPv6 viewer, whatever it found, as in fleet-viewer-smoke.yml: the self-hosted
+    # runner's start comes before either viewer, so prod does not sleep between them and wake
+    # again while its old hosts still hold the G quota.
+    needs: ipv6
+    if: ${{ !cancelled() && needs.ipv6.result != 'skipped' && github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && vars.FLEET_PROD_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     environment: fleet-prod-deploy
     # A held seat (hold_minutes, up to 30) and the second viewer path need up to 45 more minutes.
@@ -83,8 +87,7 @@ jobs:
 
   ipv6:
     name: IPv6 viewer
-    needs: ipv4
-    if: ${{ !cancelled() && needs.ipv4.result != 'skipped' && github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' }}
+    if: github.repository == 'ejc3/fcvm' && github.ref == 'refs/heads/main' && vars.FLEET_PROD_ENABLED == 'true'
     runs-on: [self-hosted, Linux, ARM64]
     environment: fleet-prod-deploy
     timeout-minutes: 45
