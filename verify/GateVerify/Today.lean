@@ -14,7 +14,7 @@ boundary does there, not for a branch: `main` has moved through four of them
 | `Today.flags` | a1e5fc687 | PR #2113, `gate-syn-flags` |
 | `Today.cookieA` | a80e1ad34 | PR #2124, its first commit, the one that was reviewed |
 | `Today.cookieB` | 27add63dd | PR #2124, its head, and `main` from #2124 (57aa83bb6) until #2154 landed |
-| `Today.owed` | da5f2bb22 | `main` with #2151 and #2154: the boundary is owed a resume until the host's opens it |
+| `Today.owed` | da5f2bb22 and #2256 | `main` with #2151, #2154 and the guard of #2256: the boundary is owed a resume until the host's or the guard's opens it |
 
 What the first four share, cited at `main` 57aa83bb6 (the same code is in the other three, at
 other lines; `owed` changes the host's reopen, the resume, the watchdog and the restarted agent,
@@ -197,8 +197,9 @@ def cookieB : Rules where
   guard := false
   rcuUndo := false
 
-/-- `main` at da5f2bb22, which has #2151 and #2154 on top of `cookieB`: the source's boundary
-is owed a resume until the host's resume opens it. Named for that (`snapshot-boundary-owed`).
+/-- `main` at da5f2bb22, which has #2151 and #2154 on top of `cookieB`, with #2256's guard of a
+dead `snapshot create`: the source's boundary is owed a resume until the host's resume, or the
+guard's, opens it. Named for that (`snapshot-boundary-owed`).
 Cited at da5f2bb22. `sn.rs` is fc-agent/src/snapshot_network.rs, `common.rs`
 src/commands/common.rs.
 
@@ -243,7 +244,14 @@ reserved source ports for a `/loopback` port's clients, which the model's kinds 
   `exec::serve_only_the_boundary_resume`, fc-agent/src/exec.rs:404).
 - `restartKeeps := false`: #2158 is open; the restarted agent's start of the container is still
   refused and it powers the VM off, after the hold.
-- `guard := false`: #1936 is open.
+- `guard := true`: #2256 (ejc3/fcvm acf8b6259, which lands with or before this rule book). A
+  create whose source keeps running spawns a guard that holds the per-VM snapshot lock and, when
+  the create dies without standing it down, resumes the VMM if the pause was asked for and runs
+  the create's own reopen (`reopen_source_network`, its 150 s bound, the gate recorded closed
+  until it opens): src/commands/snapshot_guard.rs:321 (`cmd_snapshot_source_guard`), 457
+  (`undo`); spawned at src/commands/common.rs:7678 and 8622. A prepare the guard's reopen
+  overtook refuses in the guest (the cancelled record, `prepare_snapshot_network_in`). The model
+  has one `snapshot create` at a time, so that race is outside it.
 - `natGate`, `backFails`: unchanged from `cookieB` (repairs 5 and 7 have no pull request).
 
 Not in the model: the boundary's token (#2159): the host gives each create a token
@@ -269,7 +277,7 @@ def owed : Rules where
   restartKeeps := false
   startWaits := true
   execFirst := true
-  guard := false
+  guard := true
   rcuUndo := true
 
 /-- 27add63dd with its second dump taken out: what its red run "one dump" removes. Not a state

@@ -59,7 +59,7 @@ are in the last section.
 | P4 `workloadBehindEgress` | `watchdogThaw`, after an early snapshot | the same | the same | the same | holds | proved |
 | P5 `lastingChange` | holds | holds | `writeBackFails` | the same | `writeBackFailsOwed` | proved |
 | P5 `capturedChange` | `barrierKillCaptured`, after an early snapshot | the same | and `failedCloneSnapshot`, `earlySnapshotCaptures`, after `writeBackFails` | the same | `writeBackCapturedOwed` | proved |
-| P6 `stuck` | `agentDies`, `hostDies`, `reopenFailsStuck` | the same | the same | the same | `hostDiesOwed` | proved |
+| P6 `stuck` | `agentDies`, `hostDies`, `reopenFailsStuck` | the same | the same | the same | holds | proved |
 | U1 `clientDatagram` | `clientDatagram` without the host's gate | the same | the same | the same | the same | the same: assumed, not proved |
 
 What the design does with each recorded run is in `Breaks.lean` beside it: `design_refuses_`
@@ -500,9 +500,10 @@ is in flight with the others.
 ## Fixes landed, and what is left
 
 None of the repairs in `REPAIRS.md` is in this pull request. #2113 and #2124 are in `main`, and
-so are #2151 and #2154: their rule book is `owed` (`Today.owed`, `main` at da5f2bb22). The search
-of `owed` in the 20 default configurations (`search.expected`) finds none of the runs below
-marked closed, and the kinds it does find are the ones the last three rows name.
+so are #2151 and #2154; #2256 lands with or before this. Their rule book is `owed`
+(`Today.owed`: `main` at da5f2bb22 with #2256's guard). The search of `owed` in the 20 default
+configurations (`search.expected`) finds none of the runs below marked closed, and the kinds
+it does find are the ones the last two rows name.
 
 | Break | Issue | Fix | In `owed` |
 |---|---|---|---|
@@ -514,7 +515,7 @@ marked closed, and the kinds it does find are the ones the last three rows name.
 | `agentDiesVsock`, `containerMidBoundary` (once #2158 is fixed) | #2149 | #2154 | not searched with #2158 fixed: `owed` keeps `restartKeeps := false` |
 | a restarted fc-agent cannot start its container and powers the VM off | #2158 | open. The model's `restartKeeps` | the same |
 | a `/loopback` client that picks its source port | #2152 | #2154: a source port range reserved for the rewrite | not expressible in the model (`Limits.lean`) |
-| `hostDies` | #1936 | #1941, open | `hostDiesOwed` |
+| `hostDies` | #1936 | #2256: a guard that does the dead host's part | closed: `host` and `kills-vsock-all` have no P6 (`breaks_hostDiesOwed` stopped building when `guard` was set) |
 | `proxyConnect` | none | repair 5, no pull request | `proxyConnectOwed` |
 | `writeBackFails` and the snapshot after it | none | repair 7, no pull request | `writeBackFailsOwed`, `writeBackCapturedOwed` |
 
@@ -569,15 +570,15 @@ them.
 | `cookieA` | capped | 5,030,180, complete |
 | `cookieB` | capped | 4,889,396, complete |
 | `cookieB` without its second dump | capped | 4,646,780, complete |
-| `owed` | 4,837,841, complete | 1,162,039, complete |
+| `owed` | 5,710,945, complete | 1,340,538, complete |
 | design | 1,971,774 states, complete, no break | 521,538, complete, no break |
 
 One run each, on a shared dev box: 7 min 40 s and 2.5 GB for today's five rule books, 15 s and
 0.5 GB for the design. A capped search has looked at the first ten million states in breadth-first order
 and says nothing of the rest.
 
-`owed` was run alone, on a box shared with another job, one run: 36 s and 1.2 GB for both.
-It finds P5 and P6 in `all-routed`, and P2, P5 and P6 in `all-proxy`, the kinds the table above
+`owed` was run alone, on a box shared with another job, one run: 42 s and 1.2 GB for both.
+It finds P5 in `all-routed`, and P2 and P5 in `all-proxy`, the kinds the table above
 gives it.
 
 In both configurations each of today's rule books breaks only properties it breaks in the

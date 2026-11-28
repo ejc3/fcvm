@@ -643,21 +643,6 @@ theorem design_keeps_writeBackFails :
 
 /-! ## What `main` still has (`owed`, da5f2bb22) -/
 
-/-- **#1936, open.** The same with #2151 and #2154: the host asks for the reopen until the gate opens,
-but a host that dies after the prepare asks nothing, and the guest opens an owed gate for nobody.
-#1941 is the guard that does the dead host's part (9 steps). -/
-def Run.hostDiesOwed : List Label :=
-  [.snap, .snap, .snap, .snap, .snap, .snap, .snap, .snap,
-   .hostDie]
-
-theorem breaks_hostDiesOwed :
-    after (replay Today.owed Runs.host Run.hostDiesOwed (init Runs.host))
-      (stuck Today.owed Runs.host) := by decide
-
-theorem design_keeps_hostDiesOwed :
-    (replay Design.rules Runs.host Run.hostDiesOwed (init Runs.host)).map
-      (stuck Design.rules Runs.host) = some false := by decide
-
 /-- Repair 5, no pull request: the egress proxy's redirect still bypasses the closed egress half, and
 the restore's list retires the process's two sockets (22 steps). -/
 def Run.proxyConnectOwed : List Label :=

@@ -44,10 +44,10 @@ already installed. Peak memory is the largest single process:
 |---|---|---|
 | `lake build` from cold, both models | 1 min 32 s | 1.5 GB |
 | `lake build GateVerify gate-breaks gate-seq` from cold, this model alone | 58 s | 1.5 GB |
-| `lake exe gate-breaks` (20 runs, 8 rule books, 2,294,713 states in all) | 7.2 s with 7 books; 8.7 s with 8 on a box shared with another job | 96 MB; 118 MB |
+| `lake exe gate-breaks` (20 runs, 8 rule books, 2,318,222 states in all) | 7.2 s with 7 books; 8.7 s with 8 on a box shared with another job | 96 MB; 118 MB |
 | `lake exe gate-breaks design all-routed all-proxy` (2,493,312 states) | 15 s | 0.5 GB |
 | `lake exe gate-breaks limit=10000000 all-routed all-proxy` for today's five rule books | 7 min 40 s | 2.5 GB |
-| `lake exe gate-breaks limit=10000000 owed all-routed all-proxy` (5,999,880 states, both complete) | 36 s on a box shared with another job | 1.2 GB |
+| `lake exe gate-breaks limit=10000000 owed all-routed all-proxy` (7,051,483 states, both complete) | 42 s on a box shared with another job | 1.2 GB |
 
 CI runs the first and the third (as `summary`, compared with `search.expected`) in the one job,
 under its 15 minute cap (`../../.github/workflows/verify.yml`).
@@ -64,8 +64,8 @@ branch, because `main` moves from one to the next as the fixes land.
 | `cookieA` | a80e1ad34 | #2124 at its first commit: SYN cookies refused, the restore's own list | never |
 | `cookieB` | 27add63dd | #2124 at its head: the mirror rule, a second dump, the write-back after the gate | from #2124 (57aa83bb6) until #2151 and #2154 landed |
 | `cookieB-restart-kept` | none | `cookieB` with #2158 fixed and nothing else: a restarted fc-agent gets a container running again | never |
-| `owed` | da5f2bb22 | #2151 and #2154 on `cookieB`: `snapshot create` refuses an unpublished clone, the host asks for the reopen until the gate opens or reports the source, the resume puts `rcu_expedited` back, the watchdog leaves a boundary in progress alone, a restarted agent serves the resume before its boot plan and holds its container's start | since #2154 landed (9b32c630c) |
-| `design` | none | `cookieB` with the repairs of `REPAIRS.md`; `owed` has four of them | not yet |
+| `owed` | da5f2bb22 and #2256 | #2151, #2154 and #2256's guard on `cookieB`: `snapshot create` refuses an unpublished clone, the host asks for the reopen until the gate opens or reports the source, the resume puts `rcu_expedited` back, the watchdog leaves a boundary in progress alone, a restarted agent serves the resume before its boot plan and holds its container's start | since #2154 landed (9b32c630c) |
+| `design` | none | `cookieB` with the repairs of `REPAIRS.md`; `owed` has five of them | not yet |
 
 The drift check in CI names the rule book of the tree it runs in (below, "The model against the
 code").
@@ -76,7 +76,7 @@ code").
 |---|---|
 | `Spec.lean` | `State` (one guest: its sockets, tracked connections, rules, settings, files under /run, processes), the kernel's handling of a segment and of a datagram, the guest's own processes, `snapshot create` and the restore one step at a time with each step able to fail or its process to be killed, `step`, `replay`, `Reachable`. `Rules` is a rule book's type; `Cfg` is what exists around the guest and which moves a search allows |
 | `Today.lean` | `Today.ctstate`, `Today.flags`, `Today.cookieA`, `Today.cookieB`, `Today.owed`: five commits, each field cited. Two variants that are no state of the code: `Today.cookieBOneLook`, `cookieB` without its second dump, and `Today.cookieBKept`, `cookieB` with #2158 fixed and nothing else |
-| `Design.lean` | `Design.rules`: `cookieB` with eight repairs, four of which `main` has (`owed`) |
+| `Design.lean` | `Design.rules`: `cookieB` with eight repairs, five of which `main` has with #2256 (`owed`) |
 | `search.expected` | What `lake exe gate-breaks summary` prints: every default configuration and rule book, its state count, the properties it breaks and at how many steps. CI compares the search with it |
 | `Properties.lean` | The properties, as tests on a state |
 | `Configs.lean` | The configurations the search runs, by name |
@@ -174,7 +174,7 @@ reached, and P1 and P5 are about every run and not only the ones that end by the
 | P4 `workloadBehindEgress` | broken | broken | broken | broken | searched: holds | **proved** |
 | P5 `lastingChange` | searched: holds | searched: holds | broken | broken | broken (the write-back, repair 7) | **proved** |
 | P5 `capturedChange` | broken | broken | broken | broken | broken (after the write-back fails) | **proved** |
-| P6 `stuck` | broken | broken | broken | broken | broken (a dying host, #1936) | **proved**, and that every boundary ends (`Ends.lean`) |
+| P6 `stuck` | broken | broken | broken | broken | searched: holds (#2256's guard) | **proved**, and that every boundary ends (`Ends.lean`) |
 | U1 `clientDatagram` | assumed: the host's gate | the same | the same | the same | the same | assumed; the guest's part **proved** (`design_udpRuleHolds`) |
 
 "broken" is a run in `Breaks.lean` (`BREAKS.md` has which). "searched: holds" is the 20 default
@@ -183,9 +183,9 @@ configurations searched to the end, which CI does on every run and compares with
 once", says. 17 of the 20 have the boot plan over MMDS (Firecracker) and 3 over vsock (Cloud
 Hypervisor). For the code today the vsock ones add no break: a restarted agent powers the VM
 off (#2158). They add `containerMidBoundary` and `agentDiesVsock` for `cookieB-restart-kept`.
-`owed`, `main` since #2154, breaks only what the four repairs it lacks are for: P2 through the
-egress proxy (5), P5 through the write-back (7), P6 through a dying host (3's guard, #1941);
-nothing through a killed agent or one-shot, a failed reopen, an early snapshot or the
+`owed`, `main` with #2151, #2154 and #2256, breaks only what the three repairs it lacks are
+for: P2 through the egress proxy (5) and P5 through the write-back (7); nothing through a
+killed agent or one-shot, a failed reopen, a dying host, an early snapshot or the
 watchdog (`BREAKS.md`, "Fixes landed, and what is left"). Most of what
 breaks `ctstate` and #2113 beyond the known issues breaks the head of #2124 too, because it is in
 code #2124 does not touch: the one-shots, the watchdog, what a dead fc-agent leaves.

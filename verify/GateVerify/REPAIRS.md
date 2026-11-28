@@ -1,7 +1,7 @@
 # What the breaks need
 
 `Design.rules` (`Design.lean`) is PR #2124 at its head, 27add63dd, with the changes below.
-Four of them have landed in `main` (#2151 and #2154: `Today.owed`, da5f2bb22), and four have
+Five of them have landed in `main` (#2151, #2154 and #2256: `Today.owed`), and three have
 not. Each
 is one field of the rule book. For each: what it is in the real system, where, the break it
 answers (`BREAKS.md`), what the model shows of it, and wording proposed for the code or its
@@ -24,8 +24,8 @@ None of this is in this pull request. #2151 landed repair 2 (the host's half of 
 #2149, #2141, #2140) and the fix of #2152, built to the two rulings recorded under repairs 3
 and 8 (`BREAKS.md`, "Fixes in flight"). `main` went further than repair 8: a restarted agent
 that finds the boundary owed serves the resume before its boot plan (`Today.owed`,
-`execFirst`), which the design does not do. Repair 3's `guard` half is #1941, open; repair 9 is
-#2158, open; repairs 5 and 7 have no pull request. The fixes #2113 and #2124 already make are not repeated here: the flag rule
+`execFirst`), which the design does not do. Repair 3's `guard` half is #2256 (the rebuild of
+#1941); repair 9 is #2158, open; repairs 5 and 7 have no pull request. The fixes #2113 and #2124 already make are not repeated here: the flag rule
 (`tcpByCt := false`), the restore's own list with the mirror image deciding and a second dump,
 `tcp_syncookies` refused from the restore's first step and written back after the gate is
 removed.
@@ -73,7 +73,8 @@ Proposed wording, for the doc of `resume_source_network`:
 ## 3. A source's reopen is owed until it lands; one that cannot be reopened is left running and reported failed (#1936, #2142, #2149)
 
 Model: `guard := true`, `reopenRetry := true`. `reopenRetry` landed in #2154
-(`reopen_source_network`, 150 s; `network_gate_closed`); `guard` is #1941, open.
+(`reopen_source_network`, 150 s; `network_gate_closed`); `guard` in #2256, whose guard runs that
+same reopen for a create that died.
 
 Change:
 

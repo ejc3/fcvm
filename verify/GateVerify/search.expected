@@ -106,7 +106,7 @@ cookieA: 1274 states; P1 sourceDisturbed@11 P5 lastingChange@25 P5 capturedChang
 cookieB: 1289 states; P1 sourceDisturbed@11 P5 lastingChange@26 P5 capturedChange@35 P6 stuck@9
 cookieB-one-dump: 1277 states; P1 sourceDisturbed@11 P5 lastingChange@25 P5 capturedChange@34 P6 stuck@9
 cookieB-restart-kept: 1289 states; P1 sourceDisturbed@11 P5 lastingChange@26 P5 capturedChange@35 P6 stuck@9
-owed: 1607 states; P5 lastingChange@26 P5 capturedChange@35 P6 stuck@9
+owed: 1692 states; P5 lastingChange@26 P5 capturedChange@35
 design: 1209 states;
 
 ## slow: a boundary that outlives the payload freeze's deadline; the container connects out
@@ -186,7 +186,7 @@ cookieA: 101503 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@11 P5 lasti
 cookieB: 102264 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@11 P5 lastingChange@26 P5 capturedChange@15 P6 stuck@4
 cookieB-one-dump: 101607 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@11 P5 lastingChange@25 P5 capturedChange@15 P6 stuck@4
 cookieB-restart-kept: 112801 states; P1 sourceDisturbed@4 P4 workloadBehindEgress@11 P5 lastingChange@26 P5 capturedChange@15 P6 stuck@4
-owed: 132735 states; P5 lastingChange@26 P5 capturedChange@35 P6 stuck@4
+owed: 156159 states; P5 lastingChange@26 P5 capturedChange@35
 design: 57473 states;
 
 ## two-gen-vsock: over vsock: two restores, kills and failures

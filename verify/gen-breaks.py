@@ -70,7 +70,6 @@ items=[
  ('reopenFailsStuck','cookieB','fails','P6 stuck',"The same run read as P6: the gate is closed and no step of the system is left that would open it"),
  ('writeBackFails','cookieB','fails','P5 lastingChange',"The write of `tcp_syncookies` back fails three times: the clone is published without SYN cookies, with a warning (documented in the PR)"),
  ('What `main` still has (`owed`, da5f2bb22)', None,None,None,None),
- ('hostDiesOwed','owed','host','P6 stuck',"**#1936, open.** The same with #2151 and #2154: the host asks for the reopen until the gate opens, but a host that dies after the prepare asks nothing, and the guest opens an owed gate for nobody. #1941 is the guard that does the dead host's part"),
  ('proxyConnectOwed','owed','proxy','P2 generationBroken',"Repair 5, no pull request: the egress proxy's redirect still bypasses the closed egress half, and the restore's list retires the process's two sockets"),
  ('writeBackFailsOwed','owed','fails','P5 lastingChange',"Repair 7, no pull request: a write of `tcp_syncookies` back that fails three times still leaves the clone published without SYN cookies"),
  ('writeBackCapturedOwed','owed','fails','P5 capturedChange',"And the next snapshot of that clone captures the 0: the clone is published, so #2151 admits it"),

@@ -5,13 +5,13 @@ import GateVerify.Today
 
 `Design.rules` is the boundary with every repair the search and the proofs called for. Each is
 one field, and `verify/GateVerify/REPAIRS.md` has the change it stands for and the wording
-proposed. Against `main` (`Today.owed`, da5f2bb22), four of them have landed and four have not:
+proposed. Against `main` (`Today.owed`: da5f2bb22 with #2256), five of them have landed and three have not:
 
 | field | repair | against | in `main` |
 |---|---|---|---|
 | `snapUnpublished := false` | 2: `snapshot create` refuses a clone that has not published | the resume one-shot publishing an unrestored clone | #2151, #2154 |
 | `reopenRetry := true` | 3: a source's reopen is owed until it lands, tried `retryMax` times; then the create fails, the source is left running and the host records it as failed and still gated and refuses further creates of it | a failed `snapshot create`, and an fc-agent that died before the reopen | #2154 |
-| `guard := true` | 3: a dead `snapshot create`'s part is done by a guard | a `snapshot create` that dies | no: #1936, #1941 |
+| `guard := true` | 3: a dead `snapshot create`'s part is done by a guard | a `snapshot create` that dies | #2256 |
 | `rcuUndo := true` | 4: the resume one-shot writes `rcu_expedited` back, whether or not its reopen lands | a prepare killed inside the barrier | #2154 |
 | `natGate := true` | 5: the proxy's redirect closes with the egress half | a connect behind the closed egress half | no |
 | `wdMidBoundary := false` | 6: the freeze watchdog leaves a freeze alone while its boundary is in progress | a workload thawed behind the closed gate | #2154 |
