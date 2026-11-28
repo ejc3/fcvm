@@ -1,11 +1,27 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * Runs the x86 host kernel's kvm_arch_async_page_present() and
- * kvm_set_mp_state() against a model of the vCPU state they touch. The
- * functions are the release's own: the test compiles them from the excerpts,
- * with or without
- * kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch,
- * into extracted.c, which this file includes after the stubs below.
+ * Runs kvm_arch_async_page_present() and kvm_set_mp_state() of one Linux
+ * release against a model of the vCPU state they touch. The functions are the
+ * release's own: the test compiles them from the excerpts beside this file,
+ * with or without that kernel's PV kick patch, into extracted.c, which this
+ * file includes after the stubs below.
+ *
+ * One harness serves every release fcvm builds KVM from. The fixtures of the
+ * other releases link to this file, and each runs with the patch of the
+ * kernels that pin its release:
+ *
+ *   kvm-pv-kick-7.3   kernel/patches-x86-host/0003-... (the x86_64 host kernel;
+ *                     phone.amd64 links to it from kernel/patches-phone-7.3)
+ *   kvm-pv-kick-6.18  kernel/patches-x86/0008-... (nested.amd64)
+ *   kvm-pv-kick-6.16  kernel/patches-mountinfo/0004-... (the mountinfo pair;
+ *                     the control links to it from kernel/patches-mountinfo-base)
+ *
+ * Each excerpt's header names its release, its URL, the SHA-256 of the whole
+ * upstream file and the line range. To check one again:
+ *
+ *   curl -fsSL <the URL in the header> > f
+ *   sha256sum f                 # the header's SHA-256
+ *   sed -n '<first>,<last>p' f  # the excerpt below the header, byte for byte
  *
  * A PV spinlock waiter checks the lock and then executes HLT. A kick
  * (KVM_HC_KICK_CPU) that arrives between the two is recorded in
@@ -17,9 +33,9 @@
  *           interface: the kick must still be pending.
  *   wake    the function's own statements: entered with the vCPU marked
  *           halted for an async page fault it leaves it runnable, and it
- *           invents no kick. (7.3.3 calls it only for a running vCPU, whose
- *           mp_state is already RUNNABLE, so this pins the function and not
- *           a state the hang passes through.)
+ *           invents no kick. (These releases call it only for a running
+ *           vCPU, whose mp_state is already RUNNABLE, so this pins the
+ *           function and not a state the hang passes through.)
  *   helper  kvm_set_mp_state() itself still clears the kick on a move to
  *           runnable, which its other callers rely on, and leaves it alone
  *           on a move to halted.

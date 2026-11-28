@@ -1037,13 +1037,7 @@ pub async fn add_host_route_to_guest(
                     let dev_part = &existing_route[dev_start + 4..];
                     let old_dev = dev_part.split_whitespace().next().unwrap_or("");
 
-                    // Check if the old device exists
-                    let dev_check = Command::new("ip")
-                        .args(["link", "show", old_dev])
-                        .output()
-                        .await;
-
-                    let device_exists = dev_check.map(|o| o.status.success()).unwrap_or(false);
+                    let device_exists = device_exists(old_dev);
 
                     if !device_exists {
                         // Stale route pointing to dead device - delete it
@@ -1097,6 +1091,17 @@ pub async fn add_host_route_to_guest(
     );
 
     Ok(())
+}
+
+/// Whether this network namespace has a device named `name`, asked of the kernel by name.
+///
+/// `ip link show <name>` exiting 0 answered the same, and was `false` for a device that
+/// is gone, for an empty name, for one too long to be a device's and for an `ip` that
+/// could not be started. For a veth it also listed /run/netns, to print the name of the
+/// namespace the peer is in: an entry for every bridged or routed VM running, read by
+/// every clone's start while it held the subnet lock (#2194).
+fn device_exists(name: &str) -> bool {
+    nix::net::if_::if_nametoindex(name).is_ok()
 }
 
 /// Deletes the host route to a guest IP, but only the route this clone owns
@@ -1217,6 +1222,21 @@ pub async fn delete_veth_forward_rule(veth_name: &str) -> Result<()> {
 #[cfg(test)]
 mod parse_tests {
     use super::*;
+
+    /// Each answer `ip link show <name>` gave by its exit status.
+    #[test]
+    fn a_device_exists_only_under_its_own_name() {
+        // A device that is there. Every network namespace has the loopback device.
+        assert!(device_exists("lo"));
+        // A device that is gone: `ip` exited 1 with "does not exist".
+        assert!(!device_exists("veth0-gone-0a1b"));
+        // No name: the route's line ended at "dev".
+        assert!(!device_exists(""));
+        // Longer than a device name can be (15 bytes): `ip` refused it.
+        assert!(!device_exists("veth0-a-name-longer-than-ifnamsiz"));
+        // A name `ip` could not have been started with.
+        assert!(!device_exists("veth0\0x"));
+    }
 
     #[test]
     fn rps_mask_names_every_cpu_in_32_bit_words() {

@@ -49,6 +49,11 @@ const FIRST_WAKE_MS: f64 = 1500.0;
 /// The lead is computed over the wakes of this long. The latest wake is kept beyond it, so
 /// a ring that paused starts from its last measurement.
 const WAKE_WINDOW: Duration = Duration::from_secs(30);
+/// How long a player's `snapshot create` waits for the player's own restore to be recorded
+/// as acknowledged (`--await-restore`). A player is ready when it answers on its ball port,
+/// which its guest opens before it sends the acknowledgement, so a create can arrive a few
+/// milliseconds ahead of the record and is refused without the wait.
+const RESTORE_ACKNOWLEDGEMENT_WAIT_SECS: u64 = 10;
 /// How long an fcvm the agent stops has to exit after SIGTERM before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(30);
 /// How long an fcvm that exited is given for its last lines to be read into its failure.
@@ -97,6 +102,8 @@ impl PotatoCfg {
             "--tag".into(),
             Self::tag(n),
             "--stop".into(),
+            "--await-restore".into(),
+            RESTORE_ACKNOWLEDGEMENT_WAIT_SECS.to_string(),
         ];
         if let Some(dir) = memory_dir {
             args.push("--memory-dir".into());
@@ -1147,6 +1154,8 @@ impl Ops for FcvmOps {
                             "--tag".into(),
                             GOLD.into(),
                             "--stop".into(),
+                            "--await-restore".into(),
+                            RESTORE_ACKNOWLEDGEMENT_WAIT_SECS.to_string(),
                         ],
                         cfg.cgroup.as_deref(),
                     )
@@ -1255,11 +1264,15 @@ impl Ops for FcvmOps {
                 _ => {}
             }
             let created = create.elapsed();
-            // --stop has stopped the VM's fcvm (also on failure); reap it
+            // --stop has stopped the VM's fcvm; reap it. A create that failed either
+            // stopped it too, and waited for its exit, or refused the player before it
+            // touched it (a restore never acknowledged), which leaves it running: there is
+            // nothing to wait for, so it is stopped below at once.
             let reap = Instant::now();
-            if tokio::time::timeout(REAP_DEADLINE, vm.exited())
-                .await
-                .is_err()
+            if r.is_ok()
+                && tokio::time::timeout(REAP_DEADLINE, vm.exited())
+                    .await
+                    .is_err()
             {
                 tracing::warn!(player = n, "potato: a slept player's fcvm had not exited after {REAP_DEADLINE:?}; stopping it");
             }
@@ -2702,13 +2715,25 @@ mod tests {
                 "--tag",
                 "potato-3",
                 "--stop",
+                "--await-restore",
+                "10",
                 "--memory-dir",
                 "/dev/shm/fcvm-potato",
             ]
         );
         assert_eq!(
             PotatoCfg::sleep_args(3, 4242, None),
-            ["snapshot", "create", "--pid", "4242", "--tag", "potato-3", "--stop"]
+            [
+                "snapshot",
+                "create",
+                "--pid",
+                "4242",
+                "--tag",
+                "potato-3",
+                "--stop",
+                "--await-restore",
+                "10",
+            ]
         );
     }
 
@@ -2797,6 +2822,30 @@ mod tests {
         });
         memory.reserve(0).unwrap().finish();
         assert_eq!(memory.state.lock().unwrap().held.len(), 1);
+    }
+
+    /// A sleep whose `snapshot create` failed does not wait for the player's fcvm to exit by
+    /// itself before stopping it: a create that refused the player (its restore was never
+    /// acknowledged) left it running, and the wait held the player's CPU for `REAP_DEADLINE`.
+    /// The sleep task has no fake fcvm to drive, so the order is pinned by its source.
+    ///
+    /// RED BEFORE THE FIX: the wait ran whatever the create returned.
+    #[test]
+    fn a_failed_sleep_stops_its_player_without_waiting_for_it() {
+        let source = include_str!("potato.rs");
+        let ops = &source[source.find("impl Ops for FcvmOps {").unwrap()..];
+        let sleep = &ops[ops
+            .find("    fn sleep(&self, n: u32, vm: Option<Vm>")
+            .unwrap()..];
+        let sleep = &sleep[..sleep.find("\n    }\n").unwrap()];
+        let squeezed: String = sleep.split_whitespace().collect();
+        assert!(
+            squeezed.contains("ifr.is_ok()&&tokio::time::timeout(REAP_DEADLINE,vm.exited())"),
+            "the wait for a slept player's exit is not limited to a create that succeeded"
+        );
+        let waited = squeezed.find("timeout(REAP_DEADLINE,vm.exited())").unwrap();
+        let stopped = squeezed.find("vm.ended(STOP_GRACE)").unwrap();
+        assert!(waited < stopped, "the player is not stopped after the wait");
     }
 
     /// The agent starts from an empty memory directory: what an earlier agent's sleeps left,

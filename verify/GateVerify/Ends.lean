@@ -487,7 +487,7 @@ theorem clone_never_restarts {C : Cfg} {s : State} (hr : Reachable Design.rules 
     (hc : s.rp ≠ .none) : step Design.rules C .restart s = none := by
   have hi := reachable_scal hr
   cases hpw : s.pw
-  · simp [step, restart, State.running, hpw]
+  · simp [step, restartFirst, restart, State.running, hpw, Design.rules]
   · have hi := hi hpw
     have hpl : s.plan = false := by
       cases hrp : s.rp with
@@ -495,7 +495,7 @@ theorem clone_never_restarts {C : Cfg} {s : State} (hr : Reachable Design.rules 
       | «at» n => simp only [hrp] at hi; exact hi.noPlan
       | failed => simp only [hrp] at hi; exact hi.2.2.1
       | done => simp only [hrp] at hi; exact (hi.2.2.2.2.2.2.2.2.2.2.2 hrp).2
-    simp [step, restart, hpl]
+    simp [step, restartFirst, restart, hpl, Design.rules]
 
 /-- No step serves a boot plan to a guest that has none. -/
 theorem step_noPlan {C : Cfg} {l : Label} {s t : State}
@@ -530,8 +530,8 @@ theorem step_noPlan {C : Cfg} {l : Label} {s t : State}
       | unfold restore
       | unfold agentFail
       | unfold kill
-      | unfold restart
-      | unfold boot
+      | unfold restartFirst restart
+      | unfold bootFirst boot
       | unfold off
       | unfold timeout
       | unfold watchdog
@@ -695,13 +695,13 @@ theorem kill_restart_repeats {C : Cfg} (hk : C.kills = true) (k : Nat) :
                  rcuOwn := false }
         = some { s with ag := true, up := false, saved := none, seen := [], lst := [],
                         rcuOwn := false } := by
-      simp [step, restart, State.running, hp, hs, hl, ho4]
+      simp [step, restartFirst, restart, Design.rules, State.running, hp, hs, hl, ho4]
     have h3 : step Design.rules C .boot
         { s with ag := true, up := false, saved := none, seen := [], lst := [],
                  rcuOwn := false }
         = some { s with ag := true, up := true, frozen := false, saved := none, seen := [],
                         lst := [], rcuOwn := false } := by
-      simp [step, boot, State.running, State.gated, hp, hs, hi4, hi6, ho4, ho6, Design.rules]
+      simp [step, bootFirst, boot, State.running, State.gated, hp, hs, hi4, hi6, ho4, ho6, Design.rules]
     obtain ⟨ls, v, h4, h5, h6, vp, vs, va, vl, vo⟩ :=
       ih { s with ag := true, up := true, frozen := false, saved := none, seen := [], lst := [],
                   rcuOwn := false } hp hs rfl hl ho
@@ -773,6 +773,21 @@ theorem restartPowersOffToday :
       (init Runs.killsVsock)).map (·.pw) = some false
     ∧ (replay Today.cookieB Runs.killsVsock [.snap, .snap, .kill, .restart, .boot]
       (init Runs.killsVsock)).map (·.pw) = some false := by decide
+
+/-- `main` since #2154 (`Today.owed`), over MMDS (Firecracker): the agent of a source dies
+during the prepare. The new one finds the boundary owed and serves the host's resume before its
+boot plan, so the reopen lands although the plan is behind the closed egress half; then it
+fetches the plan, and its start of the container is still refused (#2158) and it powers the VM
+off. Under `cookieB` the same agent is not back at all: its plan is behind the closed egress
+half. -/
+theorem owedReopensBeforeThePlan :
+    (replay Today.owed Runs.kills [.snap, .snap, .kill, .restart, .snap, .snap]
+      (init Runs.kills)).map (fun s => s.pw && !s.gated && s.sp == .idle && s.early && !s.up)
+      = some true
+    ∧ (replay Today.owed Runs.kills [.snap, .snap, .kill, .restart, .snap, .snap, .boot]
+      (init Runs.kills)).map (·.pw) = some false
+    ∧ (replay Today.cookieB Runs.kills [.snap, .snap, .kill, .restart]
+      (init Runs.kills)) = none := by decide
 
 /-- The same over vsock (Cloud Hypervisor): the restarted agent serves exec behind the closed
 gate, the reopen lands, and then the container is started. Nothing is reported. -/

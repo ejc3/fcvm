@@ -1124,6 +1124,219 @@ class DirWatch:
             self.fd = -1
 
 
+# The fields of `fcvm paths --json` this harness reads (src/commands/paths.rs).
+FCVM_PATHS_FIELDS = ("state_dir", "data_dir")
+# A run's answers, by binary and the variables fcvm resolves its directories from.
+_FCVM_PATHS = {}
+FCVM_PATHS_TIMEOUT_S = 30.0
+
+
+def fcvm_paths(fcvm: str, env=None, run=subprocess.run) -> dict:
+    """fcvm's directories, from `fcvm paths --json`, asked once per run.
+
+    Asked of the binary the run gives its clones, with the environment it gives them
+    (``os.environ`` unless ``env``), so a binary that keeps its state somewhere else is
+    followed and no harness joins ``state`` to a data root of its own. The answer is
+    cached by the binary and FCVM_DATA_DIR and FCVM_CONFIG_DIR, the variables fcvm takes
+    its directories from. A call that fails, or an answer without an absolute path for a
+    field, raises RuntimeError naming the command and its stderr: a harness that guessed
+    the directory would read no state and take every VM for gone.
+    """
+    env = os.environ if env is None else env
+    key = (fcvm, env.get("FCVM_DATA_DIR"), env.get("FCVM_CONFIG_DIR"))
+    cached = _FCVM_PATHS.get(key)
+    if cached is not None:
+        return dict(cached)
+    argv = [fcvm, "paths", "--json"]
+    command = shlex.join(argv)
+    try:
+        done = run(argv, capture_output=True, text=True, env=dict(env),
+                   stdin=subprocess.DEVNULL, timeout=FCVM_PATHS_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"`{command}` could not run: {type(error).__name__}: {error}") from error
+    stderr = (done.stderr or "").strip()[-2000:]
+    if done.returncode != 0:
+        raise RuntimeError(f"`{command}` exited with status {done.returncode}; stderr: {stderr!r}")
+    try:
+        answer = json.loads(done.stdout)
+    except ValueError as error:
+        raise RuntimeError(
+            f"`{command}` printed no JSON object ({error}): {done.stdout[-2000:]!r}; "
+            f"stderr: {stderr!r}") from error
+    if not isinstance(answer, dict):
+        raise RuntimeError(f"`{command}` printed {type(answer).__name__}, not an object: "
+                           f"{done.stdout[-2000:]!r}")
+    for field in FCVM_PATHS_FIELDS:
+        value = answer.get(field)
+        if not isinstance(value, str) or not os.path.isabs(value):
+            raise RuntimeError(f"`{command}` printed no absolute {field}: "
+                               f"{done.stdout[-2000:]!r}; stderr: {stderr!r}")
+    found = {field: answer[field] for field in FCVM_PATHS_FIELDS}
+    _FCVM_PATHS[key] = found
+    return dict(found)
+
+
+def fcvm_state_dir(fcvm: str, env=None, run=subprocess.run) -> str:
+    """The state directory `fcvm` keeps VM state in (`fcvm_paths`)."""
+    return fcvm_paths(fcvm, env, run)["state_dir"]
+
+
+STATE_LAYOUT = "2"
+_BUCKET_NAME = re.compile(r"^[0-9a-f]$")
+
+
+def bucket_of(key: str) -> str:
+    """fcvm's state bucket: the first byte of SHA-256 of the key (src/state/manager.rs)."""
+    return hashlib.sha256(key.encode()).hexdigest()[:1]
+
+
+def vm_state_path(state_dir: str, vm_id: str) -> str:
+    return os.path.join(state_dir, "vms", bucket_of(vm_id), f"{vm_id}.json")
+
+
+def vm_disks_bucket(vm_id: str) -> str:
+    """The bucket of ``vm-disks`` holding a VM's runtime directory: the first byte of SHA-256
+    of the id as two hex digits (``fcvm::paths::vm_bucket``)."""
+    return hashlib.sha256(vm_id.encode()).hexdigest()[:2]
+
+
+def vm_runtime_dir(data_root: str, vm_id: str) -> str:
+    """A VM's runtime directory, ``<data_root>/vm-disks/<bucket>/<vm_id>``."""
+    return os.path.join(data_root, "vm-disks", vm_disks_bucket(vm_id), vm_id)
+
+
+def pid_bucket_dir(state_dir: str, pid: int) -> str:
+    return os.path.join(state_dir, "pids", bucket_of(str(pid)))
+
+
+def require_state_layout(state_dir: str) -> None:
+    """Raise unless ``state_dir`` is empty or holds fcvm state layout 2.
+
+    Layout 2 keeps a VM's state in ``vms/<bucket>/<vm_id>.json`` and marks the store
+    with a ``layout`` file.  A store without that file and with layout 1 entries
+    (``<vm_id>.json``, ``name/``, ``pid/`` in the directory itself) would read as "no
+    VM" here, so it is refused.  A store that does not exist yet, or is empty, is fine:
+    the first fcvm command makes it.
+    """
+    try:
+        with open(os.path.join(state_dir, "layout"), encoding="utf-8") as handle:
+            layout = handle.read().strip()
+    except FileNotFoundError:
+        try:
+            entries = os.listdir(state_dir)
+        except FileNotFoundError:
+            return
+        flat = [
+            e for e in entries
+            if e.endswith((".json", ".json.lock")) or e in ("name", "pid", "names.lock")
+        ]
+        if flat:
+            raise RuntimeError(
+                f"{state_dir} has no 'layout' file and holds fcvm state layout 1 "
+                f"entries ({flat[0]!r}); these harnesses read layout {STATE_LAYOUT} "
+                "(states in vms/<bucket>/) and need an fcvm that writes it"
+            )
+        return
+    if layout != STATE_LAYOUT:
+        raise RuntimeError(
+            f"{state_dir} holds fcvm state layout {layout!r}; these harnesses read "
+            f"layout {STATE_LAYOUT} and need a matching fcvm"
+        )
+
+
+def read_state_file(path: str):
+    """A state file's object, or None when it vanished, is unreadable or is not an object."""
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _list_dir(path: str) -> list[str]:
+    try:
+        return os.listdir(path)
+    except FileNotFoundError:
+        return []
+
+
+def list_state_paths(state_dir: str) -> list[str]:
+    """Every VM's state path: the union of ``*.json`` and ``*.json.lock`` ids.
+
+    A temp file is skipped.  A lock without a state (a VM starting or exiting) names a
+    path that may not exist, and a listing that overlaps a rename can miss the state
+    name but not the lock's, so the caller opens each path and treats a missing one as
+    gone.  A missing ``vms/`` or bucket directory lists nothing.
+    """
+    out = []
+    vms = os.path.join(state_dir, "vms")
+    for bucket in sorted(_list_dir(vms)):
+        if not _BUCKET_NAME.match(bucket):
+            continue
+        ids = set()
+        for entry in _list_dir(os.path.join(vms, bucket)):
+            if entry.endswith(".json.lock"):
+                ids.add(entry[: -len(".json.lock")])
+            elif entry.endswith(".json"):
+                ids.add(entry[: -len(".json")])
+        out.extend(os.path.join(vms, bucket, f"{vm_id}.json") for vm_id in sorted(ids))
+    return out
+
+
+def pid_state_paths(state_dir: str, pid: int) -> list[str]:
+    """State paths the PID index names for fcvm process ``pid`` (entries may be stale)."""
+    prefix = f"{pid}."
+    return [
+        vm_state_path(state_dir, entry[len(prefix):])
+        for entry in sorted(_list_dir(pid_bucket_dir(state_dir, pid)))
+        if entry.startswith(prefix) and len(entry) > len(prefix)
+    ]
+
+
+def candidate_state_paths(state_dir: str, pid: int = 0) -> list[str]:
+    """The PID index's states first, then every other state, without duplicates.
+
+    The index lags a state by a moment and only names states saved with a PID, so a
+    caller that has not found its VM through it still lists every bucket.
+    """
+    first = pid_state_paths(state_dir, pid) if pid else []
+    seen = set(first)
+    return first + [p for p in list_state_paths(state_dir) if p not in seen]
+
+
+class StateWatch(DirWatch):
+    """inotify watch over a layout 2 store: the root, ``vms/``, ``pids/`` and each bucket.
+
+    A bucket directory is made by the first write that needs it, so ``drain()`` adds a
+    watch for every bucket that exists by then.  Scan after ``drain()``: a bucket made
+    before its watch was added shows no event, but the scan sees what it holds.
+    """
+
+    def __init__(self, path: str):
+        super().__init__(path)
+        self._state_dir = path
+        self._sync()
+
+    def _add(self, path: str) -> bool:
+        return _libc.inotify_add_watch(
+            self.fd, path.encode(), IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE
+        ) >= 0
+
+    def _sync(self) -> None:
+        for sub in ("vms", "pids"):
+            parent = os.path.join(self._state_dir, sub)
+            if self._add(parent):
+                for bucket in _list_dir(parent):
+                    if _BUCKET_NAME.match(bucket):
+                        self._add(os.path.join(parent, bucket))
+
+    def drain(self) -> None:
+        super().drain()
+        if self.fd >= 0:
+            self._sync()
+
+
 def state_path_baseline(state_dir: str) -> frozenset[str]:
     """Snapshot state paths that existed before a clone was spawned.
 
@@ -1133,12 +1346,9 @@ def state_path_baseline(state_dir: str) -> frozenset[str]:
     the directory watch but before ``Popen`` and permanently exclude every path
     in it from this clone's discovery and recovery scope.
     """
+    require_state_layout(state_dir)
     try:
-        return frozenset(
-            os.path.join(state_dir, entry)
-            for entry in os.listdir(state_dir)
-            if entry.endswith(".json")
-        )
+        return frozenset(list_state_paths(state_dir))
     except OSError as error:
         raise RuntimeError(f"cannot snapshot state directory {state_dir}: {error}")
 
@@ -1162,20 +1372,16 @@ def scan_state(
     window. Pre-spawn paths are excluded because name alone is discovery, not
     ownership; destructive cleanup separately requires the exact PID start time.
     """
+    require_state_layout(state_dir)
     try:
-        names = os.listdir(state_dir)
+        paths = candidate_state_paths(state_dir, fcvm_pid)
     except OSError:
         return None, None
-    for fname in names:
-        if not fname.endswith(".json"):
-            continue
-        path = os.path.join(state_dir, fname)
+    for path in paths:
         if path in excluded_paths:
             continue
-        try:
-            with open(path) as f:
-                st = json.load(f)
-        except (OSError, ValueError):
+        st = read_state_file(path)
+        if st is None:
             continue
         if name:
             # A numeric PID can be reused while a stale state file still names
@@ -1258,9 +1464,10 @@ def find_state(
     actually changes: zero CPU while waiting, and it notices the file sooner than a
     poll loop would. `discover_ms` still records the wall cost.
     """
+    require_state_layout(state_dir)
     own = watch is None
     if own:
-        watch = DirWatch(state_dir)
+        watch = StateWatch(state_dir)
     pid_fd = pidfd_open(fcvm_pid) if proc is not None else None
     poller = select.poll()
     poller.register(watch.fd, select.POLLIN)
@@ -1487,7 +1694,7 @@ def clone_data_dir(data_root: str, state: dict) -> str:
     vm_id = state.get("vm_id")
     if not valid_vm_id(vm_id):
         raise RuntimeError(f"clone state has an invalid vm_id: {vm_id!r}")
-    return os.path.join(data_root, "vm-disks", vm_id)
+    return vm_runtime_dir(data_root, vm_id)
 
 
 def wait_port(
@@ -1876,20 +2083,49 @@ def libc_version_tag() -> str:
     return "libc-unknown"
 
 
-def firecracker_build_name(profile: str, repo: str, branch: str, commit: str,
-                           arch: str, libc_tag: str) -> str:
-    """The file name fcvm setup gives a Firecracker build of these fields.
+# libseccomp's configure arguments, which fcvm hashes into the archive's name
+# (CONFIGURE_ARGS in src/setup/libseccomp.rs).
+LIBSECCOMP_CONFIGURE_ARGS = ("--enable-static", "--disable-shared", "--with-pic")
 
-    compute_firecracker_sha_for_fields in src/setup/kernel.rs: SHA-256 over a
-    domain tag and each field length-prefixed as a little-endian u64, first
-    six bytes in hex. FirecrackerBuildNamePin holds the two to the same bytes.
-    """
-    digest = hashlib.sha256(b"fcvm-firecracker-cache-v2\0")
-    for field in (repo, branch, commit, arch, libc_tag):
+
+def _length_prefixed_digest(tag: bytes, fields) -> str:
+    """SHA-256 over a domain tag and each field length-prefixed as a
+    little-endian u64, first six bytes in hex: how fcvm names what it builds."""
+    digest = hashlib.sha256(tag)
+    for field in fields:
         encoded = field.encode()
         digest.update(len(encoded).to_bytes(8, "little"))
         digest.update(encoded)
-    return f"firecracker-{profile}-{digest.digest()[:6].hex()}.bin"
+    return digest.digest()[:6].hex()
+
+
+def libseccomp_identity(pin, arch: str, libc_tag: str) -> str:
+    """The name fcvm setup gives the libseccomp archive a Firecracker build
+    links, which is one of the fields of that build's own name.
+
+    content_hash_for in src/setup/libseccomp.rs. pin is rootfs-config.toml's
+    [libseccomp] table; without one the build links the host's library and the
+    identity is empty.
+    """
+    if not pin:
+        return ""
+    return _length_prefixed_digest(
+        b"fcvm-libseccomp-v1\0",
+        (pin["version"], pin["archive_sha256"], arch, libc_tag,
+         *LIBSECCOMP_CONFIGURE_ARGS))
+
+
+def firecracker_build_name(profile: str, repo: str, branch: str, commit: str,
+                           arch: str, libc_tag: str, libseccomp: str) -> str:
+    """The file name fcvm setup gives a Firecracker build of these fields.
+
+    compute_firecracker_sha_for_fields in src/setup/kernel.rs.
+    FirecrackerBuildNamePin holds the two to the same bytes.
+    """
+    sha = _length_prefixed_digest(
+        b"fcvm-firecracker-cache-v3\0",
+        (repo, branch, commit, arch, libc_tag, libseccomp))
+    return f"firecracker-{profile}-{sha}.bin"
 
 
 def firecracker_identity(binary, config_text: str, arch: str = None,
@@ -1898,9 +2134,9 @@ def firecracker_identity(binary, config_text: str, arch: str = None,
 
     binary is the snapshot's metadata.firecracker_bin, the build restores run
     on. config_text is rootfs-config.toml at the run's source revision; its
-    [firecracker] table pins repo, branch and commit, and fcvm setup names the
-    binary it builds from exactly those fields, so a matching name ties the
-    binary to that commit. commit_matches_binary says whether it did; a
+    [firecracker] table pins repo, branch and commit and its [libseccomp] table
+    the library the build links, and fcvm setup names the binary it builds from
+    exactly those fields, so a matching name ties the binary to that commit. commit_matches_binary says whether it did; a
     binary built from anything else keeps its path and hash and no commit.
     """
     import tomllib
@@ -1914,14 +2150,17 @@ def firecracker_identity(binary, config_text: str, arch: str = None,
             pass
     if not config_text:
         return record
-    pin = tomllib.loads(config_text).get("firecracker") or {}
+    config = tomllib.loads(config_text)
+    pin = config.get("firecracker") or {}
     repo, branch, commit = pin.get("repo"), pin.get("branch"), pin.get("commit")
     if not all(isinstance(value, str) and value for value in (repo, branch, commit)):
         return record
     record.update(repo=repo, branch=branch)
+    arch = arch or platform.machine()
+    libc_tag = libc_tag or libc_version_tag()
     expected = firecracker_build_name(
-        "default", repo, branch, commit,
-        arch or platform.machine(), libc_tag or libc_version_tag(),
+        "default", repo, branch, commit, arch, libc_tag,
+        libseccomp_identity(config.get("libseccomp"), arch, libc_tag),
     )
     if isinstance(binary, str) and os.path.basename(binary) == expected:
         record.update(commit=commit, commit_matches_binary=True)
@@ -1982,24 +2221,18 @@ def valid_guest_env(value) -> bool:
 
 def serve_uffd_mode(state_dir: str, serve_pid: int, snapshot_name: str) -> str:
     """Validate the exact live serve process and return its memory mode."""
+    require_state_layout(state_dir)
     actual = proc_stat_fields(serve_pid)
     if actual is None:
         raise RuntimeError(f"serve PID {serve_pid} is not running")
     candidates = []
     try:
-        names = os.listdir(state_dir)
+        paths = candidate_state_paths(state_dir, serve_pid)
     except OSError as error:
         raise RuntimeError(f"cannot inspect serve state in {state_dir}: {error}")
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        path = os.path.join(state_dir, name)
-        try:
-            with open(path) as f:
-                state = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if state.get("pid") == serve_pid:
+    for path in paths:
+        state = read_state_file(path)
+        if state is not None and state.get("pid") == serve_pid:
             candidates.append((path, state))
     exact = [
         (path, state)
@@ -2151,19 +2384,18 @@ def valid_snapshot_name(name) -> bool:
 
 
 def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
-    """Return an exact child of this run's trusted ``vm-disks`` root, else "".
+    """Return the exact ``vm-disks/<bucket>/<vm_id>`` directory of this run, else "".
 
-    Every call site computes `os.path.join(data_root, "vm-disks", vm_id)` from a
-    state file, and `state.get("vm_id", "")` is empty on a partially-written
-    file. `os.path.join("/mnt/fcvm-btrfs", "vm-disks", "")` is
-    `/mnt/fcvm-btrfs/vm-disks/`, `os.path.isdir` says True, and the rmtree below
-    then deletes EVERY VM's disks on the box — under sudo. Commit e1286e3f called
+    Every call site computes `vm_runtime_dir(data_root, vm_id)` from a state
+    file, and `state.get("vm_id", "")` is empty on a partially-written file.
+    With an empty id the path is a whole bucket of `vm-disks`, `os.path.isdir`
+    says True, and the rmtree below then deletes EVERY VM's disks in it — under sudo. Commit e1286e3f called
     exactly this arithmetic catastrophic and guarded `tests/test_signal_cleanup.rs`
     (`an_empty_vm_id_resolves_to_the_shared_disk_root_and_must_be_rejected`); the
     Python harness that does the identical computation was left unguarded, so the
     guarantee held only for the Rust fixture.
 
-    Symlinks are resolved on both sides before comparing, so a `vm-disks/<id>`
+    Symlinks are resolved on both sides before comparing, so a `vm-disks/<bucket>/<id>`
     that points somewhere else cannot smuggle the deletion out of the tree.
     """
     if not data_root or not state_path or not data_dir:
@@ -2185,7 +2417,7 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
         return ""
     raw = os.path.abspath(os.path.normpath(data_dir))
     head, vm_id = os.path.split(raw)
-    expected = os.path.join(trusted, vm_id)
+    expected = os.path.join(trusted, vm_disks_bucket(vm_id), vm_id)
     real = os.path.realpath(raw)
     try:
         contained = os.path.commonpath((trusted, real)) == trusted
@@ -2194,7 +2426,7 @@ def safe_vm_data_dir(data_root: str, state_path: str, data_dir: str) -> str:
     if (
         not valid_vm_id(vm_id)
         or os.path.basename(state_path) != f"{vm_id}.json"
-        or os.path.realpath(head) != trusted
+        or os.path.realpath(head) != os.path.join(trusted, vm_disks_bucket(vm_id))
         or os.path.islink(raw)
         or real != expected
         or not contained
@@ -2419,8 +2651,8 @@ def reap_disk(
         if not safe:
             out.setdefault("disk_errors", []).append(
                 f"{data_dir}: refusing to remove — not an exact child of "
-                f"{os.path.join(data_root, 'vm-disks')} "
-                f"(an empty vm_id collapses to the SHARED disk root)"
+                f"{os.path.join(data_root, 'vm-disks', '<bucket>')} "
+                f"(an empty vm_id collapses to a SHARED bucket)"
             )
             # The state file is the only durable pointer to the disk we just
             # refused to touch.  Deleting it here would orphan that disk, so an
@@ -4163,7 +4395,8 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     env = dict(os.environ, RUST_LOG=args.rust_log)
     # Watch registered BEFORE the spawn: a watch created afterwards can miss the
     # state file's creation and then block waiting for an event already past.
-    watch = DirWatch(args.state_dir)
+    require_state_layout(args.state_dir)
+    watch = StateWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
     # reqscale times each request of an open-loop run from these monotonic
@@ -4461,7 +4694,8 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     rec: dict = {"arm": "noop-fast" if fast else "noop", "rep": rep, "name": name}
     cmd = clone_run_cmd(args, name)
     env = dict(os.environ, RUST_LOG=args.rust_log)
-    watch = DirWatch(args.state_dir)
+    require_state_layout(args.state_dir)
+    watch = StateWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
     state_path = data_dir = None
@@ -4606,7 +4840,8 @@ def run_exec_request(args, rep: int) -> dict:
     parent_fd = None
     kids: list[int] = []
     fds: list[int | None] = []
-    watch = DirWatch(args.state_dir)
+    require_state_layout(args.state_dir)
+    watch = StateWatch(args.state_dir)
     fcvm_start_time = None
     try:
         pre_spawn_state_paths = state_path_baseline(args.state_dir)
@@ -5055,7 +5290,6 @@ def main_with_resources(resources: ExitStack) -> int:
     p.add_argument("--ws-url", default="")
     p.add_argument("--fcvm", default=os.path.join(HERE, "..", "..", "target", "release", "fcvm"))
     p.add_argument("--data-root", default="/mnt/fcvm-btrfs")
-    p.add_argument("--state-dir", default="")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--timeout", type=float, default=120.0)
     p.add_argument("--teardown-timeout", type=float, default=60.0)
@@ -5074,7 +5308,6 @@ def main_with_resources(resources: ExitStack) -> int:
     # The harness owns these handlers.  Do not inherit a caller's blocked mask:
     # every clone and the harness itself must be able to observe shutdown.
     signal.pthread_sigmask(signal.SIG_UNBLOCK, TERMINATION_SIGNALS)
-    args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
 
     # EXACTLY ONE backend. With neither flag `clone_backend_args` returned
     # `["--pid", "0"]` — a silently wrong invocation that would be recorded as
@@ -5138,6 +5371,12 @@ def main_with_resources(resources: ExitStack) -> int:
             f"snapshot {snapshot_name} does not publish TCP "
             f"{args.cdp_port}:{args.cdp_port}: {snapshot['port_mappings']!r}"
         )
+    # The state directory is fcvm's answer, asked of the binary the clones run, never a
+    # join of the data root (fcvm_paths).
+    try:
+        args.state_dir = fcvm_state_dir(args.fcvm)
+    except RuntimeError as error:
+        p.error(str(error))
     try:
         uffd_mode = (
             serve_uffd_mode(args.state_dir, args.serve_pid, snapshot_name)

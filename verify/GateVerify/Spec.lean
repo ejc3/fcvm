@@ -275,6 +275,11 @@ structure Rules where
   otherwise it starts the container as soon as its boot path gets there, which over vsock is
   also behind a closed gate and inside a prepare -/
   startWaits : Bool
+  /-- a restarted fc-agent that finds a source's boundary owed (`State.owedMark`) opens its exec
+  server before its boot plan and serves the resume one-shot alone until it has the plan
+  (`State.early`); otherwise exec comes back only once the plan is fetched, which over MMDS is
+  behind the closed egress half -/
+  execFirst : Bool
   /-- what a dead `snapshot create` left is undone by a guard -/
   guard : Bool
   /-- the resume one-shot writes `rcu_expedited` back when a barrier of this boundary left it
@@ -427,6 +432,10 @@ structure State where
   rp : RP := .none
   /-- the long-running fc-agent is alive and serves exec -/
   ag : Bool := true
+  /-- the agent was restarted with a boundary owed and serves the resume one-shot alone: it
+  opened exec before its boot plan (`Rules.execFirst`) and has not started its container yet.
+  It refuses every other command, a snapshot's prepare among them -/
+  early : Bool := false
   /-- the host serves this guest a boot plan: true from a cold boot, false once the guest is
   restored from a memory image. A restore replaces the MMDS store with a `latest` object that
   has no `container-plan` (src/commands/common.rs:4456-4487), and the Cloud Hypervisor restore
@@ -522,6 +531,14 @@ def State.unpublished (s : State) : Bool :=
 
 /-- Any half of the gate is installed in any family. -/
 def State.gated (s : State) : Bool := s.in4 || s.in6 || s.out4 || s.out6
+
+/-- The guest holds the `snapshot-boundary-owed` mark (`BoundaryMarks`,
+fc-agent/src/snapshot_network.rs): a prepare wrote it, under the boundary lock and before the
+freeze, and no resume has opened the gate and removed it since. A `snapshot create` is under
+way (`sp` is not `idle`), or one gave this source up as still gated (`reported`). A restore's
+dispatch removes it, so a clone holds none. Read by `Rules.execFirst` only: in the other rule
+books nothing reads the mark. -/
+def State.owedMark (s : State) : Bool := s.sp != .idle || s.reported
 
 /-- Connection tracking sees a family's packets: its hooks for that family are attached while a
 rule of that family uses it (`nf_ct_netns_get`, xt_conntrack.c:270), and a little longer
@@ -869,7 +886,7 @@ def snap (R : Rules) (C : Cfg) (byGuard : Bool) (s : State) : Option State :=
     match s.sp with
     | .idle =>
       -- the host starts a snapshot of a guest it holds no snapshot of
-      if byGuard || !s.host || !s.ag || s.reported then none
+      if byGuard || !s.host || !s.ag || (R.execFirst && s.early) || s.reported then none
       else if s.unpublished && !(R.snapUnpublished && C.earlySnap) then none
       else some { s with sp := .frozen, frozen := true, tries := 0 }
     | .frozen =>
@@ -1084,6 +1101,11 @@ and the exec server.
   MMDS and the gate's egress half is closed. Over vsock (Cloud Hypervisor) it is served behind
   a closed gate too: the gate is iptables rules and vsock is outside them.
 
+With `Rules.execFirst` (fc-agent/src/agent.rs:104-128 at `main` da5f2bb22) a new process that
+finds the boundary owed (`State.owedMark`) opens exec before it fetches its plan, for the resume
+one-shot alone (`exec::serve_only_the_boundary_resume`), whatever the plan's transport and the
+gate: it is back as `State.early`, and `boot` waits for the plan.
+
 This step is the agent back with its exec server. What it then does about the container is
 `boot`.
 
@@ -1093,6 +1115,13 @@ def restart (C : Cfg) (s : State) : Option State :=
   if !s.running || s.ag || !s.plan || (C.mmds && s.out4) then none
   else some { s with ag := true }
 
+/-- `Rules.execFirst`: the restart of an agent that finds the boundary owed. It is back for the
+resume one-shot alone, whatever its plan's transport and the gate (`State.early`). Otherwise
+the restart is `restart`'s. -/
+def restartFirst (R : Rules) (C : Cfg) (s : State) : Option State :=
+  if R.execFirst && s.running && !s.ag && s.owedMark then some { s with ag := true, early := true }
+  else restart C s
+
 /-- The restarted agent's boot path reaches the container, about a second after its boot plan
 arrives.
 
@@ -1100,13 +1129,25 @@ Without `Rules.restartKeeps`, which is the code today: the start is refused and 
 powers the VM off (#2158; seen in 4 of 4 runs that reached the container start). So a guest
 whose agent died and was served a plan again ends here, whatever a boundary was doing.
 
-With it: the container runs again. And with `Rules.startWaits` the agent holds that while a
-boundary is in progress: a `snapshot create` under way, or a half of the gate installed. -/
+With it: the container runs again.
+
+Either way, with `Rules.startWaits` the agent holds the start while a boundary is in progress:
+a `snapshot create` under way, or a half of the gate installed. The hold comes first, so
+without `Rules.restartKeeps` the power-off waits for it. -/
 def boot (R : Rules) (s : State) : Option State :=
   if !s.running || !s.ag || s.up then none
-  else if !R.restartKeeps then some s.dead
   else if R.startWaits && (s.sp != .idle || s.gated) then none
+  else if !R.restartKeeps then some s.dead
   else some { s with up := true, frozen := false }
+
+/-- `boot` for an agent that opened exec early (`Rules.execFirst`): it gets to the container
+only once it can fetch its plan, the guest is served one and not over MMDS behind a closed
+egress half, and from then on it serves every command. -/
+def bootFirst (R : Rules) (C : Cfg) (s : State) : Option State :=
+  if R.execFirst then
+    if s.early && (!s.plan || (C.mmds && s.out4)) then none
+    else (boot R s).map (fun t => { t with early := false })
+  else boot R s
 
 /-- The failed restore's `shutdown_vm(1)` lands. -/
 def off (s : State) : Option State :=
@@ -1197,8 +1238,8 @@ def step (R : Rules) (C : Cfg) (l : Label) (s : State) : Option State :=
   | .agent => agent R C s
   | .agentFail => agentFail R C s
   | .kill => kill C s
-  | .restart => restart C s
-  | .boot => boot R s
+  | .restart => restartFirst R C s
+  | .boot => bootFirst R C s
   | .off => off s
   | .timeout => timeout s
   | .watchdog => watchdog R C s

@@ -7,12 +7,12 @@
 //! the FUSE servers then start inside it, and guest memory and the memory server's page
 //! cache are charged to the scope, not to the session that launched fcvm.
 //!
-//! Where the scope lives: `fcvm.slice/fcvm-<pid>-<starttime>.scope` at the root of the
-//! cgroup2 hierarchy, created by writing cgroupfs directly. A systemd transient scope was
-//! the alternative. `systemd-run --scope` starts a new process and cannot place a running
-//! one, and placing this process takes a `StartTransientUnit` call on the system bus, a
-//! bus client and a running systemd, which the CI containers and nested guests do not all
-//! have. The placement also matters for oomd: a root-level `fcvm.slice` is outside the
+//! Where the scope lives: for root, `fcvm.slice/fcvm-<pid>-<starttime>.scope` at the root
+//! of the cgroup2 hierarchy, created by writing cgroupfs directly. A systemd transient
+//! scope was the alternative. `systemd-run --scope` starts a new process and cannot place a
+//! running one, and placing this process takes a `StartTransientUnit` call on the system
+//! bus, a bus client and a running systemd, which the CI containers and nested guests do
+//! not all have. The placement also matters for oomd: a root-level `fcvm.slice` is outside the
 //! user slice, so a rule that protects the host by killing a user's session scope does not
 //! take the VM with it, which is what happened when the VM was charged to the session.
 //! A host whose oomd should be able to pick VMs sets `FCVM_CGROUP_PARENT` to a slice it
@@ -22,10 +22,11 @@
 //! FCVM_CGROUP_PARENT=none fcvm ...`: fcvm then runs from its first instruction in the
 //! unit's scope, which is all the entry here exists to achieve.
 //!
-//! `FCVM_CGROUP_PARENT` names the parent as a path below the cgroup2 root (default
-//! `fcvm.slice`), or `none`, which keeps the process in the cgroup it started in. The bench
-//! harness sets `none`: it places fcvm in accounting cgroups of its own and audits that
-//! fcvm stays there.
+//! `FCVM_CGROUP_PARENT` names the parent as a path below the cgroup2 root, for root and
+//! unprivileged callers alike, or `none`, which keeps the process in the cgroup it started
+//! in. Unset, the parent is `fcvm.slice` below the root for root, and inside the caller's
+//! delegated cgroup otherwise (below). The bench harness sets `none`: it places fcvm in
+//! accounting cgroups of its own and audits that fcvm stays there.
 //!
 //! The root is the root of the caller's cgroup namespace. A caller confined by a cgroup
 //! namespace stays inside it, because the kernel resolves `/sys/fs/cgroup` there. A caller
@@ -33,10 +34,40 @@
 //! leave that cgroup anyway, and fcvm leaves it by default for the reason above. A caller who
 //! wants the VM charged inside its slice names that slice in `FCVM_CGROUP_PARENT`.
 //!
-//! Only a process that can write the parent can enter. An unprivileged caller cannot, and
-//! keeps its own cgroup as before; one line says so. `--no-swap` is refused in that case and
-//! whenever no scope with a memory controller could be made, because a flag that promises
-//! guest memory will not be swapped must not run a VM that can be.
+//! Only a process that can write the parent can enter. An unprivileged caller with
+//! `FCVM_CGROUP_PARENT` unset puts its parent, `fcvm.slice`, inside a cgroup delegated to
+//! it ([`delegated_parent`]): the kernel lets a process move only within a subtree whose
+//! common root it can write, so that is the only place it can go. The launches that find
+//! one:
+//!
+//! - root, or a caller that can write the cgroup2 root (a cgroup namespace whose root was
+//!   handed to it), as above;
+//! - a system unit run for the user with `Delegate=yes` and `DelegateSubgroup=` (for
+//!   instance `systemd-run --uid=<user> --gid=<group> -p Delegate=yes -p
+//!   DelegateSubgroup=payload ...`): systemd marks the unit's cgroup delegated
+//!   (`user.delegate=1`), hands it to the user, and runs the payload in a leaf, so the
+//!   unit's cgroup holds no process and can enable memory for its children;
+//! - a subtree root made and handed to the user (`mkdir`, `+memory`, `chown -R`) outside
+//!   any systemd manager's tree: nothing manages it, so the outermost cgroup the user can
+//!   write above its own is the delegated one.
+//!
+//! systemd's rule is "Never create your own cgroups below arbitrary cgroups systemd
+//! manages, i.e cgroups you haven't set `Delegate=` in" (systemd.io/CGROUP_DELEGATION),
+//! so inside a systemd manager's tree only a cgroup it marked delegated is used. The user
+//! manager of systemd 255 to 262 marks none of its units, `Delegate=yes` or not:
+//! `cgroup_xattr_apply()` in src/core/cgroup.c returns early with
+//! `if (!MANAGER_IS_SYSTEM(u->manager)) return;` before `cgroup_delegate_xattr_apply(u)`.
+//! So a `systemd-run --user -p Delegate=yes` launch gets no scope there; systemd commit
+//! 70a8c5eb ("core: Apply more cgroups for the user manager", after v262) has the user
+//! manager mark its delegated units, and such a launch with `DelegateSubgroup=` is found.
+//! `user@<uid>.service` itself is delegated to the user manager, not to its units, and is
+//! never used. fcvm does not move processes it did not start: a delegated cgroup that holds
+//! processes (no `DelegateSubgroup=`) gets no scope.
+//!
+//! Anything else keeps its own cgroup as before (an SSH session's scope, a system service,
+//! a CI runner), and one line says so. `--no-swap` is refused in that case and whenever no
+//! scope with a memory controller could be made, because a flag that promises guest memory
+//! will not be swapped must not run a VM that can be.
 //!
 //! The fcvm process keeps its parent-death signals: moving between cgroups does not touch
 //! `pdeath_signal`, so a VM dies with the process that launched fcvm wherever the launcher
@@ -52,17 +83,45 @@
 //! Removal: a cgroup can be removed once it holds no process, and a process cannot remove
 //! the cgroup it is in. On a normal exit fcvm moves itself back to the cgroup it came from
 //! and removes its scope. A scope that is still populated then, or whose owner was killed,
-//! is removed by the next entry's sweep: every entry removes the scopes whose owner, the
-//! (pid, start time) in the name, is gone.
+//! is removed by a sweep of the parent: the scopes whose owner, the (pid, start time) in
+//! the name, is gone.
 //!
-//! The sweep and the creation run under an exclusive `flock` on the parent directory. A
-//! scope is empty between its `mkdir` and the write that moves its owner in, and the owner
-//! holds the lock across that window, so no sweep can remove it there. Outside the window a
-//! scope holds its owner's processes, and the kernel refuses `rmdir` of a populated cgroup.
-//! That covers an owner in another pid namespace, whose pid this process cannot resolve.
+//! A start sweeps only when a sweep is due ([`sweep_if_due`]): at most once per interval
+//! and parent, from the start that has the turn (`crate::sweep`, the mechanism the owner
+//! records and the routed address leases share). A sweep in every start listed every scope
+//! under the parent's exclusive lock, so starts ran one at a time and each took longer the
+//! more VMs were running (#2178).
+//!
+//! The parent directory's `flock` orders creation against removal (`crate::sweep::table`).
+//! A scope is empty between its `mkdir` and the write that moves its owner in. A start
+//! holds the lock SHARED across that window, so starts do not wait for each other; a sweep
+//! removes only under the lock held EXCLUSIVELY, so it never meets a scope in that window.
+//! Outside the window a scope holds its owner's processes, and the kernel refuses `rmdir`
+//! of a populated cgroup. That covers an owner in another pid namespace, whose pid the
+//! sweeper cannot resolve.
+//!
+//! cgroupfs holds no ordinary file, so the sweep's stamp and lock are on the store, in
+//! this user's directory under `<data_dir>/cgroup-sweep/` (made as the owner records'
+//! directory is), under names keyed by the parent. Two stores whose root launches share
+//! one parent (`fcvm.slice`) each keep a stamp and each sweep it on their own interval. A
+//! stamp on a disk outlives the boot whose scopes it speaks of: it names that boot, and
+//! the first start of the next boot sweeps.
+//!
+//! The cases, each with a test below or in `crate::sweep`:
+//!
+//! | case | what happens |
+//! |------|---------------|
+//! | a sweep finds a scope between its mkdir and its owner's entry | the owner is alive, so the scope is not listed as dead; listed anyway (an owner in another pid namespace), the sweep waits for the exclusive lock and by then the scope is populated |
+//! | a sweeper dies | the kernel releases its locks; what it had not removed waits for the next sweep, one interval later |
+//! | two starts find a sweep due together | one has the turn |
+//! | the owner's pid was reused | the name carries the start time, and the scope of the earlier process is dead |
+//! | a scope's own teardown and a sweep remove it together | whichever is second finds it gone |
+//! | an fcvm is SIGKILLed | its scope is removed by the first start under that parent that begins an interval or more after the last sweep began; until then it is an empty cgroup |
+//! | the lock stays held (shared, by a stream of starts) for a sweep's whole wait | that sweep removes nothing and the next one tries again |
+//! | the stamp cannot be read or written | no sweep from this start, not a sweep in every start |
+//! | a level above the parent (the cgroup namespace root of a container below a thread root, #2226) is threaded, a thread root or an invalid domain | no scope and nothing made, one info line: the kernel makes only invalid domains there, which refuse a process |
 
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -78,6 +137,10 @@ pub const DEFAULT_PARENT: &str = "fcvm.slice";
 /// Where this process's VM scope goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Placement {
+    /// `FCVM_CGROUP_PARENT` unset: for root, or a caller that can write the cgroup2 root,
+    /// [`DEFAULT_PARENT`] below that root; for anyone else, [`DEFAULT_PARENT`] inside the
+    /// cgroup delegated to the caller ([`delegated_parent`]).
+    Default,
     /// Under this parent, a path relative to the cgroup2 root.
     Under(PathBuf),
     /// Nowhere: the process stays in the cgroup it started in.
@@ -88,7 +151,7 @@ impl Placement {
     /// Read the placement from the value of `FCVM_CGROUP_PARENT`.
     pub fn from_env_value(value: Option<&str>) -> Result<Self> {
         let Some(value) = value else {
-            return Ok(Self::Under(PathBuf::from(DEFAULT_PARENT)));
+            return Ok(Self::Default);
         };
         if value == "none" {
             return Ok(Self::Stay);
@@ -157,36 +220,44 @@ pub struct SweepCount {
     pub populated: usize,
 }
 
-/// Remove the scopes in `parent` whose owner is gone. `start_time_of` gives a live
-/// process's start time, or `None` when no process has that pid.
-///
-/// The caller holds the parent's lock ([`lock_parent`]), so no scope here is between its
-/// creation and its owner's entry except the caller's own, which it has not made yet.
-fn sweep(parent: &Path, start_time_of: &dyn Fn(u32) -> Option<u64>) -> SweepCount {
-    let mut count = SweepCount::default();
+/// The scopes in `parent` whose owner is gone. `start_time_of` gives a live process's
+/// start time, or `None` when no process has that pid. Reads only: no lock is needed to
+/// look.
+fn dead_scopes(parent: &Path, start_time_of: &dyn Fn(u32) -> Option<u64>) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(parent) else {
-        return count;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(owner) = name.to_str().and_then(scope_owner) else {
-            continue;
-        };
-        let owner_alive = match owner {
-            ScopeOwner::Process { pid, start_time } => start_time_of(pid) == Some(start_time),
-            // A pid alone cannot tell a reused pid from the owner, and an rmdir of a scope
-            // that still holds Firecracker fails, so the kernel is the only check.
-            ScopeOwner::Legacy => false,
-        };
-        if owner_alive {
-            continue;
-        }
-        let path = entry.path();
-        match std::fs::remove_dir(&path) {
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            match name.to_str().and_then(scope_owner) {
+                Some(ScopeOwner::Process { pid, start_time }) => {
+                    start_time_of(pid) != Some(start_time)
+                }
+                // A pid alone cannot tell a reused pid from the owner, and an rmdir of a
+                // scope that still holds Firecracker fails, so the kernel is the only check.
+                Some(ScopeOwner::Legacy) => true,
+                None => false,
+            }
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Remove `scopes`, each one's owner gone. The caller holds the parent's lock exclusively
+/// (`crate::sweep::sweep_table`), so none of them is between its creation and its owner's
+/// entry: a start holds the lock shared across that window. A scope that holds a process
+/// after all is refused by the kernel.
+fn remove_scopes(scopes: &[PathBuf]) -> SweepCount {
+    let mut count = SweepCount::default();
+    for path in scopes {
+        match std::fs::remove_dir(path) {
             Ok(()) => {
                 count.removed += 1;
                 debug!(scope = %path.display(), "removed the scope of a process that is gone");
             }
+            // Its own teardown, or another sweep, removed it first.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             // EBUSY on cgroupfs (still has processes or child cgroups); ENOTEMPTY elsewhere.
             Err(e) => {
@@ -198,17 +269,79 @@ fn sweep(parent: &Path, start_time_of: &dyn Fn(u32) -> Option<u64>) -> SweepCoun
     count
 }
 
-/// Hold an exclusive `flock` on the parent directory. Released when the file is dropped.
-fn lock_parent(parent: &Path) -> io::Result<std::fs::File> {
-    let dir = std::fs::File::open(parent)?;
-    loop {
-        // SAFETY: flock on a descriptor this function owns.
-        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(dir);
+/// Remove the scopes in `parent` whose owner is gone, when a sweep is due: at most once
+/// per interval and parent, by the start that has the turn (`crate::sweep::CGROUP_SCOPES`).
+///
+/// Every start used to sweep, under the parent's lock held exclusively: a listing of
+/// every scope and a /proc read for each, so a start's time under the lock grew with the
+/// VMs running and starts ran one at a time. With 2000 clones entering scopes of one
+/// parent, 512 at a time, that was 73 starts a second with 15 of 96 cores busy, against
+/// 620 or more with the clones in cgroups made beforehand (#2178).
+///
+/// Looking needs no lock. Removing takes the lock exclusively, and only when something
+/// was found, so in the steady state a sweep holds nothing. A sweep that cannot get the
+/// lock within `crate::sweep::TABLE_WAIT`, or that dies part way, leaves the rest to the
+/// next one. A stamp that cannot be read or written (the store refuses it) means no sweep
+/// from this start, not a sweep in every start.
+fn sweep_if_due(
+    hierarchy: &Hierarchy,
+    parent: &Path,
+    start_time_of: &dyn Fn(u32) -> Option<u64>,
+) -> SweepCount {
+    use crate::sweep::TableSweep;
+    let swept = hierarchy.stamps.dir().and_then(|stamps| {
+        let dir = crate::sweep::open_dir(&stamps)?;
+        let key = sweep_key(parent);
+        crate::sweep::sweep_table(
+            &crate::sweep::Place::keyed(&dir, &stamps, &key),
+            hierarchy.sweep_every,
+            parent,
+            crate::sweep::TABLE_WAIT,
+            || dead_scopes(parent, start_time_of),
+            |dead| remove_scopes(&dead),
+        )
+    });
+    match swept {
+        Ok(TableSweep::Swept(count)) => count,
+        Ok(TableSweep::NotDue | TableSweep::NothingFound) => SweepCount::default(),
+        Ok(TableSweep::TableBusy) => {
+            debug!(parent = %parent.display(), "the scopes' parent stayed locked; the next sweep removes what this one found");
+            SweepCount::default()
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
+        Err(error) => {
+            debug!(parent = %parent.display(), error = %format!("{error:#}"), "no sweep of the scopes' parent from this start");
+            SweepCount::default()
+        }
+    }
+}
+
+/// The key of `parent`'s sweep among the sweeps kept in one directory.
+fn sweep_key(parent: &Path) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(parent.as_os_str().as_encoded_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Where the sweeps of scopes' parents keep their stamps and locks.
+#[derive(Debug, Clone)]
+pub enum Stamps {
+    /// In this user's directory under `<data_dir>/cgroup-sweep/`, made when first asked
+    /// for: an fcvm that enters no scope makes nothing on the store.
+    OnTheStore,
+    /// In this directory.
+    At(PathBuf),
+}
+
+impl Stamps {
+    fn dir(&self) -> Result<PathBuf> {
+        match self {
+            Self::OnTheStore => {
+                crate::reclaim::owner_dir_under(&crate::paths::data_dir(), "cgroup-sweep")
+            }
+            Self::At(dir) => Ok(dir.clone()),
         }
     }
 }
@@ -259,14 +392,62 @@ fn enable_memory_below(root: &Path, parent: &Path) -> io::Result<()> {
 pub struct Hierarchy {
     pub root: PathBuf,
     pub mkdir: fn(&Path) -> io::Result<()>,
+    /// Where the sweeps of the parents keep their stamps and locks ([`sweep_if_due`]).
+    pub stamps: Stamps,
+    /// How often a start sweeps a parent.
+    pub sweep_every: std::time::Duration,
+    /// Whether the caller is root, which may write every cgroup.
+    pub caller_is_root: bool,
+    /// Whether the caller can make a cgroup in this one and move a process into it.
+    pub writable: fn(&Path) -> bool,
+    /// Whether a service manager marked this cgroup as delegated (`user.delegate` or
+    /// `trusted.delegate` set to `1`).
+    pub delegated: fn(&Path) -> bool,
+}
+
+/// Whether this process can make a cgroup in `level` and write its `cgroup.procs`.
+fn writable_by_this_process(level: &Path) -> bool {
+    let access = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            // SAFETY: access on a NUL-terminated path.
+            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::W_OK) } == 0)
+    };
+    access(level) && access(&level.join("cgroup.procs"))
+}
+
+/// Whether a service manager marked `level` as delegated. systemd sets both xattrs to `1`
+/// on a cgroup it delegates; an unprivileged caller can read only `user.delegate`.
+fn marked_delegated(level: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(level.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    [c"user.delegate", c"trusted.delegate"].iter().any(|name| {
+        let mut value = [0u8; 8];
+        // SAFETY: getxattr into a buffer of the length passed, on NUL-terminated strings.
+        let len = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        len == 1 && value[0] == b'1'
+    })
 }
 
 impl Hierarchy {
-    /// The host's hierarchy at [`CGROUP2_ROOT`].
+    /// The host's hierarchy at [`CGROUP2_ROOT`], swept at
+    /// `crate::sweep::CGROUP_SCOPES`'s interval, with its stamps on the store.
     pub fn system() -> Self {
         Self {
             root: PathBuf::from(CGROUP2_ROOT),
             mkdir: |path| std::fs::create_dir(path),
+            stamps: Stamps::OnTheStore,
+            sweep_every: crate::sweep::CGROUP_SCOPES.interval(),
+            caller_is_root: nix::unistd::geteuid().is_root(),
+            writable: writable_by_this_process,
+            delegated: marked_delegated,
         }
     }
 }
@@ -285,7 +466,7 @@ impl VmScope {
     }
 
     /// Move back to the cgroup this process came from and remove the scope. A scope that
-    /// still holds a process, or whose origin is gone, stays for the next entry's sweep.
+    /// still holds a process, or whose origin is gone, stays for the next sweep.
     pub fn leave(self) {
         let Some(origin) = &self.origin else {
             return;
@@ -293,7 +474,7 @@ impl VmScope {
         if let Err(e) = write_interface(&origin.join("cgroup.procs"), &self.pid.to_string()) {
             debug!(
                 origin = %origin.display(), scope = %self.path.display(), error = %e,
-                "could not move back to the cgroup fcvm started in; the next fcvm sweeps the scope"
+                "could not move back to the cgroup fcvm started in; the next sweep removes the scope"
             );
             return;
         }
@@ -301,7 +482,7 @@ impl VmScope {
             Ok(()) => debug!(scope = %self.path.display(), "removed the VM's cgroup"),
             Err(e) => debug!(
                 scope = %self.path.display(), error = %e,
-                "the VM's cgroup still holds a process; the next fcvm sweeps it"
+                "the VM's cgroup still holds a process; the next sweep removes it"
             ),
         }
     }
@@ -313,6 +494,28 @@ pub struct NotEntered {
     pub reason: String,
     /// The caller lacks permission: the expected case for an unprivileged caller.
     pub unprivileged: bool,
+    /// No cgroup at the parent's place can be a domain: a level above it is threaded, a
+    /// thread root or an invalid domain. Nothing fcvm does can make a scope there.
+    pub no_domain: bool,
+}
+
+/// Why no domain cgroup can be made below `level`, from its `cgroup.type`, or `None` when
+/// one can. A threaded cgroup and a thread root ("domain threaded") hold only threaded or
+/// invalid-domain children, and an invalid domain can neither hold a process nor make a
+/// valid child. The cgroup2 root has no `cgroup.type` and can always hold domains.
+fn no_domain_below(level: &Path) -> Option<String> {
+    let kind = std::fs::read_to_string(level.join("cgroup.type")).ok()?;
+    let why = match kind.trim() {
+        "threaded" => "is a threaded cgroup (its parent is a thread root)",
+        "domain threaded" => "is a thread root (it holds processes and threaded controllers)",
+        "domain invalid" => "is an invalid domain (an ancestor is a thread root)",
+        _ => return None,
+    };
+    Some(format!(
+        "{} {why}, so no cgroup below it can be a domain that holds a process with a memory \
+         controller of its own",
+        level.display()
+    ))
 }
 
 /// The errors a caller without write access to the hierarchy gets.
@@ -321,6 +524,88 @@ fn is_permission_error(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc::EACCES | libc::EPERM | libc::EROFS)
     )
+}
+
+fn holds_processes(cgroup: &Path) -> bool {
+    std::fs::read_to_string(cgroup.join("cgroup.procs"))
+        .map(|procs| !procs.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The cgroup an unprivileged caller in `origin` (a path below the root) may make its
+/// scopes' parent in, or why there is none.
+///
+/// The kernel lets a process move only to a cgroup whose `cgroup.procs` it can write, and
+/// only when it can also write the `cgroup.procs` of the nearest cgroup that holds both
+/// where it is and where it goes. So an unprivileged caller can move only inside a subtree
+/// it already runs in, and the search walks up from `origin`:
+///
+/// - The walk stops below the first cgroup holding an `init.scope`: the root of a systemd
+///   manager (`user@<uid>.service` for the user manager). systemd's rule is "Never create
+///   your own cgroups below arbitrary cgroups systemd manages, i.e cgroups you haven't set
+///   `Delegate=` in" (systemd.io/CGROUP_DELEGATION), and `user@<uid>.service` is delegated
+///   to the user manager, not to its units.
+/// - The innermost cgroup on the way that a manager marked delegated is the caller's, when
+///   the caller can write it.
+/// - With no manager root on the way (a subtree made by hand and handed to the user, a
+///   container's root without systemd), nothing manages the cgroups, and the outermost one
+///   the caller can write, every level from `origin` up to it writable, is the caller's.
+///   It must be above `origin`: a scope's parent cannot have a memory controller below a
+///   cgroup that holds processes.
+///
+/// The cgroup found must hold no process unless it already enables memory for its
+/// children, for the same reason. A delegated unit gets that from `DelegateSubgroup=`,
+/// which puts the payload in a leaf; fcvm does not move processes it did not start.
+fn delegated_parent(h: &Hierarchy, origin: Option<&Path>) -> Result<PathBuf, String> {
+    let Some(origin) = origin else {
+        return Err("this process's cgroup is unknown".to_string());
+    };
+    let origin = h.root.join(origin.strip_prefix("/").unwrap_or(origin));
+    let mut levels = Vec::new();
+    let mut manager = None;
+    let mut level = origin.clone();
+    while level != h.root && level.starts_with(&h.root) {
+        if level.join("init.scope").is_dir() {
+            manager = Some(level);
+            break;
+        }
+        levels.push(level.clone());
+        level.pop();
+    }
+    let room = |cgroup: &Path| -> Result<PathBuf, String> {
+        if holds_processes(cgroup) && !lists_memory(&cgroup.join("cgroup.subtree_control")) {
+            return Err(format!(
+                "{} holds processes, so no cgroup below it can have a memory controller; \
+                 start fcvm in a unit with DelegateSubgroup=, which runs it in a leaf",
+                cgroup.display()
+            ));
+        }
+        Ok(cgroup.to_path_buf())
+    };
+    if let Some(delegated) = levels.iter().find(|level| (h.delegated)(level)) {
+        if !(h.writable)(delegated) {
+            return Err(format!(
+                "{} is delegated, but not to this user",
+                delegated.display()
+            ));
+        }
+        return room(delegated);
+    }
+    if let Some(manager) = manager {
+        return Err(format!(
+            "no cgroup between {} and the systemd manager's own {} is delegated to this user",
+            origin.display(),
+            manager.display()
+        ));
+    }
+    let outermost = levels.iter().take_while(|level| (h.writable)(level)).last();
+    match outermost {
+        Some(outermost) if *outermost != origin => room(outermost),
+        _ => Err(format!(
+            "no cgroup above {} is writable by this user",
+            origin.display()
+        )),
+    }
 }
 
 /// Enter `pid`'s scope under `placement`. `origin` is the cgroup the process is in, as a
@@ -337,10 +622,11 @@ pub fn enter(
     let not_entered = |reason: String, error: Option<&io::Error>| NotEntered {
         reason,
         unprivileged: error.is_some_and(is_permission_error),
+        no_domain: false,
     };
-    let Placement::Under(parent_relative) = placement else {
+    if *placement == Placement::Stay {
         return Err(not_entered(format!("{PARENT_ENV}=none"), None));
-    };
+    }
     let root = &hierarchy.root;
     if !root.join("cgroup.controllers").exists() {
         return Err(not_entered(
@@ -348,8 +634,43 @@ pub fn enter(
             None,
         ));
     }
-    let parent = root.join(parent_relative);
-    let mut level = root.clone();
+    // The cgroup the parent is made in, and the parent's path below it.
+    let (base, parent_relative) = match placement {
+        Placement::Under(relative) => (root.clone(), relative.clone()),
+        // A caller that can write the root (a cgroup namespace whose root was handed to it)
+        // places as root does, as it did before delegated parents were looked for.
+        Placement::Default if hierarchy.caller_is_root || (hierarchy.writable)(root) => {
+            (root.clone(), PathBuf::from(DEFAULT_PARENT))
+        }
+        Placement::Default => match delegated_parent(hierarchy, origin) {
+            Ok(delegated) => (delegated, PathBuf::from(DEFAULT_PARENT)),
+            Err(reason) => {
+                return Err(NotEntered {
+                    reason,
+                    unprivileged: true,
+                    no_domain: false,
+                })
+            }
+        },
+        Placement::Stay => unreachable!("returned above"),
+    };
+    let parent = base.join(&parent_relative);
+    // Before anything is made: a level above the parent that exists and cannot hold a domain
+    // below it (the cgroup namespace root of a container under a thread root, #2226) would
+    // give a scope that can be made and never entered.
+    if let Some(reason) = parent
+        .ancestors()
+        .take_while(|level| level.starts_with(root))
+        .filter(|level| level.exists())
+        .find_map(no_domain_below)
+    {
+        return Err(NotEntered {
+            reason,
+            unprivileged: false,
+            no_domain: true,
+        });
+    }
+    let mut level = base;
     for component in parent_relative.components() {
         level.push(component);
         match (hierarchy.mkdir)(&level) {
@@ -373,10 +694,7 @@ pub fn enter(
             Some(&e),
         ));
     }
-    let lock = lock_parent(&parent)
-        .map_err(|e| not_entered(format!("locking {}: {e}", parent.display()), Some(&e)))?;
-
-    let swept = sweep(&parent, start_time_of);
+    let swept = sweep_if_due(hierarchy, &parent, start_time_of);
     if swept.removed > 0 || swept.populated > 0 {
         info!(
             parent = %parent.display(), removed = swept.removed, still_populated = swept.populated,
@@ -393,6 +711,13 @@ pub fn enter(
             ));
         }
     }
+    // Shared, from before the scope exists until this process is inside it: a sweep, which
+    // removes under the exclusive lock, never meets the scope empty. Starts do not wait
+    // for each other.
+    let lock = crate::sweep::table::shared(&parent).map_err(|e| {
+        let e = io::Error::from(e);
+        not_entered(format!("locking {}: {e}", parent.display()), Some(&e))
+    })?;
     let path = parent.join(scope_name(pid, start_time));
     (hierarchy.mkdir)(&path)
         .map_err(|e| not_entered(format!("creating {}: {e}", path.display()), Some(&e)))?;
@@ -493,14 +818,23 @@ pub fn enter_this_process(no_swap: bool) -> Result<Option<VmScope>> {
         Err(not) if no_swap => bail!(
             "--no-swap needs the VM's own cgroup with memory.swap.max set to 0, and none \
              could be made ({}). Run fcvm as root on a cgroup2 host, with {PARENT_ENV} unset \
-             or naming a cgroup where the memory controller can be enabled",
+             or naming a cgroup where the memory controller can be enabled, or unprivileged \
+             in a cgroup delegated to its user, with {PARENT_ENV} unset",
             not.reason
         ),
+        Err(not) if not.no_domain => {
+            info!(
+                reason = %not.reason,
+                "no cgroup of the VM's own (no domain cgroup can be made here); the VM's \
+                 memory is charged to the cgroup fcvm was started in"
+            );
+            Ok(None)
+        }
         Err(not) if not.unprivileged => {
             info!(
                 reason = %not.reason,
-                "no cgroup of the VM's own (needs root); the VM's memory is charged to the \
-                 cgroup fcvm was started in"
+                "no cgroup of the VM's own (needs root, or a cgroup delegated to this user); \
+                 the VM's memory is charged to the cgroup fcvm was started in"
             );
             Ok(None)
         }
@@ -557,10 +891,15 @@ fn swap_disabled_in(root: &Path, proc_cgroup: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sweep::Sweep;
 
     /// A `mkdir` that adds the interface files cgroupfs gives a new cgroup. Controller files
-    /// appear only when the parent enables the controller, as in the kernel.
+    /// appear only when the parent enables the controller, as in the kernel. A parent marked
+    /// read-only ([`readonly`]) refuses, as one owned by another user does.
     fn fake_mkdir(path: &Path) -> io::Result<()> {
+        if !fake_writable(path.parent().unwrap()) {
+            return Err(io::Error::from_raw_os_error(libc::EACCES));
+        }
         std::fs::create_dir(path)?;
         for file in [
             "cgroup.procs",
@@ -569,6 +908,14 @@ mod tests {
         ] {
             std::fs::write(path.join(file), "")?;
         }
+        // Below a threaded cgroup or a thread root the kernel makes only invalid domains.
+        let parent_type = std::fs::read_to_string(path.parent().unwrap().join("cgroup.type"))
+            .unwrap_or_else(|_| "domain".to_string());
+        let kind = match parent_type.trim() {
+            "threaded" | "domain threaded" | "domain invalid" => "domain invalid",
+            _ => "domain",
+        };
+        std::fs::write(path.join("cgroup.type"), format!("{kind}\n"))?;
         if fake_enabled(&path.parent().unwrap().join("cgroup.subtree_control")) {
             std::fs::write(path.join("memory.swap.max"), "max\n")?;
             std::fs::write(path.join("memory.current"), "0\n")?;
@@ -592,11 +939,430 @@ mod tests {
         };
         std::fs::write(dir.path().join("cgroup.subtree_control"), control).unwrap();
         std::fs::write(dir.path().join("cgroup.procs"), "").unwrap();
+        let stamps = dir.path().join("stamps");
+        std::fs::create_dir(&stamps).unwrap();
         let hierarchy = Hierarchy {
             root: dir.path().to_path_buf(),
             mkdir: fake_mkdir,
+            stamps: Stamps::At(stamps),
+            sweep_every: crate::sweep::CGROUP_SCOPES.every,
+            caller_is_root: true,
+            writable: fake_writable,
+            delegated: fake_delegated,
         };
         (dir, hierarchy)
+    }
+
+    /// A cgroup the caller cannot write: another user's, or root's for an unprivileged caller.
+    fn readonly(cgroup: &Path) {
+        std::fs::write(cgroup.join(".fake-readonly"), "").unwrap();
+    }
+
+    fn fake_writable(cgroup: &Path) -> bool {
+        !cgroup.join(".fake-readonly").exists()
+    }
+
+    /// A cgroup a service manager marked as delegated (`user.delegate=1`).
+    fn delegate(cgroup: &Path) {
+        std::fs::write(cgroup.join(".fake-delegated"), "").unwrap();
+    }
+
+    fn fake_delegated(cgroup: &Path) -> bool {
+        cgroup.join(".fake-delegated").exists()
+    }
+
+    /// The cgroup `relative` below the fake root, each missing level made as the kernel
+    /// makes one, whatever the caller may write.
+    fn cgroup(h: &Hierarchy, relative: &str) -> PathBuf {
+        let mut level = h.root.clone();
+        for part in Path::new(relative).components() {
+            level.push(part);
+            if !level.exists() {
+                std::fs::create_dir(&level).unwrap();
+                for file in [
+                    "cgroup.procs",
+                    "cgroup.subtree_control",
+                    "cgroup.controllers",
+                ] {
+                    std::fs::write(level.join(file), "").unwrap();
+                }
+            }
+        }
+        level
+    }
+
+    fn enable_memory(cgroup: &Path) {
+        std::fs::write(cgroup.join("cgroup.subtree_control"), "memory\n").unwrap();
+    }
+
+    /// The systemd user manager of uid 1000 in [`systemd_host`].
+    const USER_MANAGER: &str = "user.slice/user-1000.slice/user@1000.service";
+
+    /// A systemd host as an unprivileged caller (uid 1000) sees it: the root and the slices
+    /// are root's; `user@1000.service` is the user's, marked delegated by the system manager
+    /// and holding the user manager in its `init.scope`; memory is enabled down to it.
+    fn systemd_host() -> (tempfile::TempDir, Hierarchy) {
+        let (dir, mut h) = fake_root(true);
+        h.caller_is_root = false;
+        cgroup(&h, "init.scope");
+        for slice in ["system.slice", "user.slice", "user.slice/user-1000.slice"] {
+            let slice = cgroup(&h, slice);
+            enable_memory(&slice);
+            readonly(&slice);
+        }
+        let manager = cgroup(&h, USER_MANAGER);
+        enable_memory(&manager);
+        delegate(&manager);
+        cgroup(&h, &format!("{USER_MANAGER}/init.scope"));
+        enable_memory(&cgroup(&h, &format!("{USER_MANAGER}/app.slice")));
+        readonly(&h.root);
+        (dir, h)
+    }
+
+    /// A system unit run for the user with `Delegate=yes` and `DelegateSubgroup=payload`
+    /// (`systemd-run --uid=1000 -p Delegate=yes -p DelegateSubgroup=payload`): the unit's
+    /// cgroup is the user's, marked delegated, and holds no process; the payload runs in its
+    /// leaf. An unprivileged fcvm started there gets a scope with a memory controller inside
+    /// the unit, and creates nothing outside it.
+    #[test]
+    fn an_unprivileged_start_in_a_delegated_unit_gets_a_scope_with_memory() {
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, "system.slice/plan.service");
+        delegate(&unit);
+        let payload = cgroup(&h, "system.slice/plan.service/payload");
+        std::fs::write(payload.join("cgroup.procs"), "100\n4242\n").unwrap();
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/system.slice/plan.service/payload")),
+            false,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(scope.path(), unit.join("fcvm.slice/fcvm-4242-77.scope"));
+        assert!(fake_enabled(&unit.join("cgroup.subtree_control")));
+        assert!(fake_enabled(
+            &unit.join("fcvm.slice/cgroup.subtree_control")
+        ));
+        assert!(scope.path().join("memory.swap.max").exists());
+        assert!(!h.root.join("fcvm.slice").exists());
+        assert_eq!(scope.origin.as_deref(), Some(payload.as_path()));
+    }
+
+    /// Every directory below the fake root named `fcvm.slice`: where a start made a parent.
+    fn parents_made(h: &Hierarchy) -> Vec<PathBuf> {
+        fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if entry.file_name() == DEFAULT_PARENT {
+                        found.push(path.clone());
+                    }
+                    walk(&path, found);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&h.root, &mut found);
+        found
+    }
+
+    /// Enter as pid 4242 from `origin` with the default placement, and expect no scope:
+    /// the unprivileged case, with nothing made anywhere.
+    fn refused(h: &Hierarchy, origin: &str, no_swap: bool) -> String {
+        let error = enter(
+            h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new(origin)),
+            no_swap,
+            &nobody,
+        )
+        .unwrap_err();
+        assert!(error.unprivileged, "{}", error.reason);
+        assert_eq!(parents_made(h), Vec::<PathBuf>::new(), "{}", error.reason);
+        error.reason
+    }
+
+    /// A user manager unit with `Delegate=yes` and `DelegateSubgroup=`, on a systemd whose
+    /// user manager marks delegated units (after systemd commit 70a8c5eb, "core: Apply more
+    /// cgroups for the user manager"): its scopes go inside the unit, not beside it.
+    #[test]
+    fn a_marked_unit_of_the_user_manager_holds_the_scopes() {
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, &format!("{USER_MANAGER}/app.slice/run-u5.service"));
+        delegate(&unit);
+        let payload = cgroup(
+            &h,
+            &format!("{USER_MANAGER}/app.slice/run-u5.service/payload"),
+        );
+        let origin = format!("/{USER_MANAGER}/app.slice/run-u5.service/payload");
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new(&origin)),
+            false,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(scope.path(), unit.join("fcvm.slice/fcvm-4242-77.scope"));
+        assert!(fake_enabled(
+            &unit.join("fcvm.slice/cgroup.subtree_control")
+        ));
+        assert_eq!(scope.origin.as_deref(), Some(payload.as_path()));
+        assert_eq!(parents_made(&h), [unit.join("fcvm.slice")]);
+    }
+
+    /// systemd 255 to 262 mark no unit of the user manager as delegated, `Delegate=yes` or
+    /// not (`cgroup_xattr_apply()` returns for a user manager before it sets the xattrs),
+    /// so fcvm cannot tell a delegated one from one it must not write. The only mark on the
+    /// way is the user manager's own `user@<uid>.service`, which is delegated to that
+    /// manager: no scope, and nothing made beside `app.slice`.
+    #[test]
+    fn an_unmarked_unit_of_the_user_manager_gets_no_scope() {
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, &format!("{USER_MANAGER}/app.slice/plan.scope"));
+        std::fs::write(unit.join("cgroup.procs"), "100\n4242\n").unwrap();
+        let reason = refused(&h, &format!("/{USER_MANAGER}/app.slice/plan.scope"), false);
+        assert!(reason.contains("systemd manager"), "{reason}");
+    }
+
+    /// A delegated unit without `DelegateSubgroup=` runs its payload in the unit's own
+    /// cgroup, where the kernel refuses a memory controller for children. fcvm does not move
+    /// the processes it did not start; it enters no scope and names the fix.
+    #[test]
+    fn a_delegated_unit_that_holds_processes_gets_no_scope() {
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, "system.slice/plan.service");
+        delegate(&unit);
+        std::fs::write(unit.join("cgroup.procs"), "100\n4242\n").unwrap();
+        let reason = refused(&h, "/system.slice/plan.service", false);
+        assert!(reason.contains("DelegateSubgroup="), "{reason}");
+    }
+
+    /// A unit marked delegated whose cgroup the caller cannot write (a scope run as the
+    /// user by `systemd-run --uid= --scope`, whose cgroup stays root's) is not the caller's.
+    #[test]
+    fn a_delegated_unit_of_another_user_gets_no_scope() {
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, "system.slice/plan.scope");
+        delegate(&unit);
+        readonly(&unit);
+        let reason = refused(&h, "/system.slice/plan.scope", false);
+        assert!(reason.contains("not to this user"), "{reason}");
+    }
+
+    /// An SSH login's session scope is made for logind by the system manager and is root's:
+    /// today's behaviour, no scope, with or without `--no-swap`.
+    #[test]
+    fn a_login_session_gets_no_scope() {
+        let (_dir, h) = systemd_host();
+        let session = cgroup(&h, "user.slice/user-1000.slice/session-3.scope");
+        readonly(&session);
+        refused(&h, "/user.slice/user-1000.slice/session-3.scope", false);
+        refused(&h, "/user.slice/user-1000.slice/session-3.scope", true);
+    }
+
+    /// A subtree root made and handed to the user (`mkdir`, `+memory`, `chown -R`), outside
+    /// any systemd manager: nothing manages it, so the outermost cgroup the user can write
+    /// holds the parent, and the user's shell can stay in a sibling leaf.
+    #[test]
+    fn a_subtree_handed_to_the_user_holds_the_scopes() {
+        let (_dir, h) = systemd_host();
+        let handed = cgroup(&h, "sr");
+        enable_memory(&handed);
+        let shell = cgroup(&h, "sr/h");
+        std::fs::write(shell.join("cgroup.procs"), "100\n4242\n").unwrap();
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/sr/h")),
+            true,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(scope.path(), handed.join("fcvm.slice/fcvm-4242-77.scope"));
+        assert_eq!(
+            std::fs::read_to_string(scope.path().join("memory.swap.max")).unwrap(),
+            "0"
+        );
+    }
+
+    /// A user who can write only its own cgroup, not the one above it, has nowhere to put a
+    /// parent: one below its own cgroup could not have a memory controller.
+    #[test]
+    fn a_writable_cgroup_of_its_own_alone_gets_no_scope() {
+        let (_dir, h) = systemd_host();
+        readonly(&cgroup(&h, "ws"));
+        cgroup(&h, "ws/h");
+        refused(&h, "/ws/h", false);
+    }
+
+    /// Root keeps `fcvm.slice` at the cgroup2 root wherever it starts, a delegated unit
+    /// included, and an explicit parent keeps naming a cgroup below the root for everyone.
+    #[test]
+    fn root_and_an_explicit_parent_place_as_before() {
+        let (_dir, h) = fake_root(true);
+        let unit = cgroup(&h, "system.slice/plan.service");
+        delegate(&unit);
+        cgroup(&h, "system.slice/plan.service/payload");
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/system.slice/plan.service/payload")),
+            false,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(scope.path(), h.root.join("fcvm.slice/fcvm-4242-77.scope"));
+
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, "system.slice/plan.service");
+        delegate(&unit);
+        cgroup(&h, "system.slice/plan.service/payload");
+        let error = enter(
+            &h,
+            &Placement::from_env_value(Some("vms.slice")).unwrap(),
+            4242,
+            77,
+            Some(Path::new("/system.slice/plan.service/payload")),
+            false,
+            &nobody,
+        )
+        .unwrap_err();
+        assert!(error.unprivileged, "{}", error.reason);
+        assert!(!h.root.join("vms.slice").exists());
+        assert_eq!(parents_made(&h), Vec::<PathBuf>::new());
+    }
+
+    /// A caller that is not root but can write the cgroup2 root (a cgroup namespace whose
+    /// root was delegated to it, mounted at `/sys/fs/cgroup`) places as before delegated
+    /// parents were looked for: `fcvm.slice` at that root, not nothing.
+    #[test]
+    fn a_writable_namespace_root_places_as_before() {
+        let (_dir, mut h) = fake_root(true);
+        h.caller_is_root = false;
+        delegate(&h.root);
+        cgroup(&h, "payload");
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/payload")),
+            true,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(scope.path(), h.root.join("fcvm.slice/fcvm-4242-77.scope"));
+        assert_eq!(
+            std::fs::read_to_string(scope.path().join("memory.swap.max")).unwrap(),
+            "0"
+        );
+    }
+
+    /// A subtree outside any manager whose middle level the user cannot write
+    /// (`/delegated` and `/delegated/branch/payload` the user's, `branch` root's): unmarked,
+    /// fcvm does what it did before, no scope and nothing made; marked delegated, the scope
+    /// goes in the marked cgroup, where the kernel lets the user move (it can write the
+    /// common ancestor, `/delegated`).
+    #[test]
+    fn a_root_owned_level_between_two_of_the_users() {
+        let (_dir, h) = systemd_host();
+        let delegated = cgroup(&h, "delegated");
+        enable_memory(&delegated);
+        let branch = cgroup(&h, "delegated/branch");
+        enable_memory(&branch);
+        readonly(&branch);
+        cgroup(&h, "delegated/branch/payload");
+        refused(&h, "/delegated/branch/payload", false);
+
+        delegate(&delegated);
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/delegated/branch/payload")),
+            false,
+            &nobody,
+        )
+        .unwrap();
+        assert_eq!(
+            scope.path(),
+            delegated.join("fcvm.slice/fcvm-4242-77.scope")
+        );
+    }
+
+    /// `--no-swap` in a delegated unit: the user's scope gets `memory.swap.max` 0. Leaving
+    /// moves fcvm back to the payload's leaf and removes the scope.
+    #[test]
+    fn no_swap_and_leaving_in_a_delegated_unit() {
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, "system.slice/plan.service");
+        delegate(&unit);
+        let payload = cgroup(&h, "system.slice/plan.service/payload");
+        let scope = enter(
+            &h,
+            &default_placement(),
+            4242,
+            77,
+            Some(Path::new("/system.slice/plan.service/payload")),
+            true,
+            &nobody,
+        )
+        .unwrap();
+        let path = scope.path().to_path_buf();
+        assert_eq!(
+            std::fs::read_to_string(path.join("memory.swap.max")).unwrap(),
+            "0"
+        );
+        for file in std::fs::read_dir(&path).unwrap() {
+            std::fs::remove_file(file.unwrap().path()).unwrap();
+        }
+        scope.leave();
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(payload.join("cgroup.procs")).unwrap(),
+            "4242"
+        );
+    }
+
+    /// The sweep runs under the parent found in the delegated unit: a dead owner's scope
+    /// there goes, a live one stays.
+    #[test]
+    fn the_sweep_covers_the_parent_in_a_delegated_unit() {
+        let (_dir, h) = systemd_host();
+        let unit = cgroup(&h, "system.slice/plan.service");
+        delegate(&unit);
+        cgroup(&h, "system.slice/plan.service/payload");
+        let parent = unit.join(DEFAULT_PARENT);
+        std::fs::create_dir(&parent).unwrap();
+        enable_memory(&parent);
+        std::fs::create_dir(parent.join("fcvm-200-9.scope")).unwrap();
+        std::fs::create_dir(parent.join("fcvm-50001-7.scope")).unwrap();
+        enter(
+            &h,
+            &default_placement(),
+            50_000,
+            7,
+            Some(Path::new("/system.slice/plan.service/payload")),
+            false,
+            &alive_from_50000,
+        )
+        .unwrap();
+        assert!(!parent.join("fcvm-200-9.scope").exists());
+        assert!(parent.join("fcvm-50001-7.scope").exists());
+        assert!(parent.join("fcvm-50000-7.scope").exists());
     }
 
     fn default_placement() -> Placement {
@@ -634,10 +1400,7 @@ mod tests {
 
     #[test]
     fn the_parent_comes_from_fcvm_cgroup_parent() {
-        assert_eq!(
-            default_placement(),
-            Placement::Under(PathBuf::from("fcvm.slice"))
-        );
+        assert_eq!(default_placement(), Placement::Default);
         assert_eq!(
             Placement::from_env_value(Some("none")).unwrap(),
             Placement::Stay
@@ -738,6 +1501,34 @@ mod tests {
         enter(&h, &default_placement(), 4242, 77, None, false, &nobody).unwrap();
     }
 
+    /// Below a cgroup namespace root that is threaded (its parent is a thread root) or is a
+    /// thread root itself, the kernel makes only invalid domains: a scope there can be made
+    /// and never entered, EOPNOTSUPP on `cgroup.procs` (#2226, fcvm in a guest's container
+    /// before fc-agent stopped making its unit a thread root). fcvm says so and makes nothing.
+    #[test]
+    fn a_threaded_namespace_root_gets_no_scope_and_nothing_made() {
+        for kind in ["threaded", "domain threaded"] {
+            let (_dir, h) = fake_root(true);
+            std::fs::write(h.root.join("cgroup.type"), format!("{kind}\n")).unwrap();
+            let error = enter(
+                &h,
+                &default_placement(),
+                8,
+                344,
+                Some(Path::new("/")),
+                false,
+                &nobody,
+            )
+            .unwrap_err();
+            assert!(error.no_domain, "{kind}: {}", error.reason);
+            assert!(error.reason.contains("thread"), "{kind}: {}", error.reason);
+            assert!(
+                !h.root.join("fcvm.slice").exists(),
+                "{kind}: fcvm.slice was made"
+            );
+        }
+    }
+
     #[test]
     fn staying_or_a_host_without_cgroup2_enters_nothing() {
         let (_dir, h) = fake_root(true);
@@ -791,7 +1582,7 @@ mod tests {
         std::fs::write(parent.join("fcvm-500.scope/held"), "").unwrap();
         let start_time_of = |pid: u32| (pid == 100).then_some(5);
 
-        let count = sweep(&parent, &start_time_of);
+        let count = remove_scopes(&dead_scopes(&parent, &start_time_of));
         assert_eq!(
             count,
             SweepCount {
@@ -827,32 +1618,153 @@ mod tests {
         assert!(parent.join("fcvm-4242-77.scope").exists());
     }
 
-    /// An entry holds the parent's lock from its sweep until its process is inside its
-    /// scope, so a concurrent entry's sweep cannot remove a scope in the window where it is
-    /// empty. Here the test holds the lock and the entry must wait for it.
-    #[test]
-    fn entry_waits_for_the_parent_lock() {
-        let (_dir, h) = fake_root(true);
+    /// A copy of `h` for another thread.
+    fn same(h: &Hierarchy) -> Hierarchy {
+        Hierarchy {
+            root: h.root.clone(),
+            mkdir: h.mkdir,
+            stamps: h.stamps.clone(),
+            sweep_every: h.sweep_every,
+            caller_is_root: h.caller_is_root,
+            writable: h.writable,
+            delegated: h.delegated,
+        }
+    }
+
+    fn slice(h: &Hierarchy) -> PathBuf {
         let parent = h.root.join("fcvm.slice");
         std::fs::create_dir(&parent).unwrap();
         std::fs::write(parent.join("cgroup.subtree_control"), "memory\n").unwrap();
-        let held = lock_parent(&parent).unwrap();
-        let root = h.root.clone();
-        let entry = std::thread::spawn(move || {
+        parent
+    }
+
+    /// Two sweeps of the same dead scopes, and a teardown racing a sweep: whichever comes
+    /// second finds the scope gone and counts nothing.
+    #[test]
+    fn a_scope_removed_twice_is_removed_once() {
+        let (_dir, h) = fake_root(true);
+        let parent = slice(&h);
+        std::fs::create_dir(parent.join("fcvm-200-9.scope")).unwrap();
+        let dead = dead_scopes(&parent, &nobody);
+        assert_eq!(remove_scopes(&dead).removed, 1);
+        assert_eq!(remove_scopes(&dead), SweepCount::default());
+    }
+
+    /// A stamp that cannot be written means no sweep from that start, not a sweep in
+    /// every start: a sweep per start is what ran starts one at a time.
+    #[test]
+    fn a_start_that_cannot_write_the_stamp_does_not_sweep() {
+        let (_dir, mut h) = fake_root(true);
+        h.stamps = Stamps::At(h.root.join("no-such-directory"));
+        let parent = slice(&h);
+        std::fs::create_dir(parent.join("fcvm-200-9.scope")).unwrap();
+        enter(&h, &default_placement(), 4242, 77, None, false, &nobody).unwrap();
+        assert!(parent.join("fcvm-200-9.scope").exists());
+    }
+
+    /// The scopes' parent as a caller of the sweep (`crate::sweep::testing`): a parent in
+    /// a fake hierarchy, scopes of dead and of live owners, and what an entry does.
+    struct ScopesOfAParent {
+        _dir: tempfile::TempDir,
+        h: Hierarchy,
+        parent: PathBuf,
+        entered: std::sync::atomic::AtomicU32,
+    }
+
+    /// The processes of [`ScopesOfAParent`] that are alive: pids from 50000, started at 7.
+    fn alive_from_50000(pid: u32) -> Option<u64> {
+        (pid >= 50_000).then_some(7)
+    }
+
+    impl crate::sweep::testing::Caller for ScopesOfAParent {
+        const SWEEP: &'static Sweep = &crate::sweep::CGROUP_SCOPES;
+
+        fn new() -> Self {
+            let (dir, h) = fake_root(true);
+            let parent = slice(&h);
+            Self {
+                _dir: dir,
+                h,
+                parent,
+                entered: std::sync::atomic::AtomicU32::new(60_000),
+            }
+        }
+
+        fn abandon(&self, n: usize) -> PathBuf {
+            let scope = self.parent.join(scope_name(9_000 + n as u32, 1));
+            std::fs::create_dir(&scope).unwrap();
+            scope
+        }
+
+        fn live(&self, n: usize) -> (PathBuf, Box<dyn std::any::Any>) {
+            let scope = self.parent.join(scope_name(50_000 + n as u32, 7));
+            std::fs::create_dir(&scope).unwrap();
+            (scope, Box::new(()))
+        }
+
+        fn start(&self, every: std::time::Duration) {
+            let pid = self
+                .entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let h = Hierarchy {
-                root,
-                mkdir: fake_mkdir,
+                sweep_every: every,
+                ..same(&self.h)
             };
-            enter(&h, &default_placement(), 4242, 77, None, false, &nobody).map(|s| s.path)
-        });
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            !parent.join("fcvm-4242-77.scope").exists(),
-            "the entry made its scope while another process held the parent's lock"
+            enter(
+                &h,
+                &default_placement(),
+                pid,
+                7,
+                None,
+                false,
+                &alive_from_50000,
+            )
+            .unwrap();
+        }
+
+        fn with_place<R>(&self, f: impl FnOnce(&crate::sweep::Place) -> R) -> R {
+            let stamps = self.h.stamps.dir().unwrap();
+            let dir = crate::sweep::open_dir(&stamps).unwrap();
+            f(&crate::sweep::Place::keyed(
+                &dir,
+                &stamps,
+                &sweep_key(&self.parent),
+            ))
+        }
+
+        fn listed(&self) -> Vec<PathBuf> {
+            vec![self.parent.clone()]
+        }
+
+        fn table(&self) -> Option<PathBuf> {
+            Some(self.parent.clone())
+        }
+    }
+
+    crate::sweep::testing::caller_matrix!(ScopesOfAParent);
+    crate::sweep::testing::table_matrix!(ScopesOfAParent);
+
+    /// The sweeps of two parents kept in one directory have a stamp and a lock each, under
+    /// names that are a file's and not a path's.
+    #[test]
+    fn each_parent_has_its_own_stamp() {
+        let (_dir, h) = fake_root(true);
+        let (a, b) = (h.root.join("fcvm.slice"), h.root.join("ring/fcvm.slice"));
+        assert_ne!(sweep_key(&a), sweep_key(&b));
+        assert_eq!(sweep_key(&a), sweep_key(&h.root.join("fcvm.slice")));
+        assert!(sweep_key(&b).bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let parent = slice(&h);
+        enter(&h, &default_placement(), 4242, 77, None, false, &nobody).unwrap();
+        let mut names: Vec<String> = std::fs::read_dir(h.stamps.dir().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let key = sweep_key(&parent);
+        assert_eq!(
+            names,
+            [format!(".sweep-lock-{key}"), format!(".sweep-stamp-{key}")]
         );
-        drop(held);
-        let path = entry.join().unwrap().unwrap();
-        assert!(path.exists());
     }
 
     #[test]

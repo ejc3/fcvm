@@ -1,9 +1,11 @@
 import WakeVerify.Spec
 
 /-!
-# Today's rules, as the code runs them
+# Today's rules: the code as it was before the repairs
 
-Two host kernels and one VMM, each rule citing the file and line it models.
+Two host kernels and one VMM, each rule citing the file and line it models. "Today" is the day
+the model was written. The kernels are Linux as released, which is still what a host runs when
+fcvm does not build its kernel. The VMM is the fork before the restore kick.
 
 - `V614`: Linux v6.14, the last release before `kvm_set_mp_state()`. Paths are under
   arch/x86/kvm/ of https://github.com/gregkh/linux at tag `v6.14`.
@@ -12,7 +14,8 @@ Two host kernels and one VMM, each rule citing the file and line it models.
   pv_unhalted on all transitions to KVM_MP_STATE_RUNNABLE") every write of `mp_state` goes through
   `kvm_set_mp_state()` (x86.h:143-148), which also clears the kick when the new state is runnable.
 - `firecracker`: the restore order of ejc3/firecracker at 3e203733cb91, the commit
-  `rootfs-config.toml` pins (`[firecracker]`).
+  `rootfs-config.toml` pinned (`[firecracker]`) until #2135 moved the pin to a commit with the
+  restore kick (`firecrackerWithKick` in `Design.lean`).
 -/
 
 namespace Wake
@@ -32,7 +35,7 @@ def unhalt (h : Hv) : Hv :=
   match h.mp with
   | .halted | .apResetHold => { mp := .runnable, pv := false, apfHalted := false }
   | .runnable => { h with apfHalted := false }
-  | .initReceived => h
+  | .initReceived | .uninitialized => h
 
 /-- The tail of `kvm_arch_async_page_present` (x86.c:13476-13477): a plain assignment. -/
 def present (h : Hv) : Hv :=
@@ -95,7 +98,7 @@ def unhalt (h : Hv) : Hv :=
   match h.mp with
   | .halted | .apResetHold => { setMp .runnable h with apfHalted := false }
   | .runnable => { h with apfHalted := false }
-  | .initReceived => h
+  | .initReceived | .uninitialized => h
 
 /-- The tail of `kvm_arch_async_page_present` (x86.c:10603-10604): through the helper, so a
 pending kick is cleared. -/
@@ -154,10 +157,10 @@ def firecracker : List Ioctl :=
 
 namespace Today
 
-/-- Host kernel v6.14 under Firecracker as pinned. -/
+/-- Host kernel v6.14 under Firecracker before the restore kick. -/
 def v614 : Rules := { kernel := V614.kernel, restore := firecracker }
 
-/-- Host kernel v7.3.3, unpatched, under Firecracker as pinned. -/
+/-- Host kernel v7.3.3, unpatched, under Firecracker before the restore kick. -/
 def v733 : Rules := { kernel := V733.kernel, restore := firecracker }
 
 end Today

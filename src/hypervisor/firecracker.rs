@@ -252,7 +252,10 @@ impl Hypervisor for FirecrackerBackend {
         self.vm
             .client()?
             .put_action(api::InstanceAction::InstanceStart)
-            .await
+            .await?;
+        // Firecracker installs the seccomp filters as the VM starts: a confined VMM is
+        // checked here, before the boot is reported.
+        self.vm.verify_confined().await
     }
 
     async fn pause(&self) -> Result<()> {

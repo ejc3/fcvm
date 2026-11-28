@@ -369,7 +369,12 @@ impl PeerVmm {
                 })?;
             // A blocking write on a thread of its own, so a filesystem that stops answering
             // cannot hold this task past the timeout and keep the kill below from running.
-            let dir = crate::paths::vm_runtime_dir(&vm_id);
+            // The clone's runtime directory as its state recorded it.
+            let dir = states
+                .iter()
+                .find(|state| state.vm_id == vm_id)
+                .map(crate::state::VmState::vm_runtime_dir)
+                .with_context(|| format!("no VM state for {vm_id}"))?;
             let reason = reason.to_string();
             tokio::task::spawn_blocking(move || super::failure::write_failure(&dir, &reason))
                 .await
@@ -1447,7 +1452,7 @@ impl UffdServer {
 
         // Ensure parent directory exists
         if let Some(parent) = socket_path.parent() {
-            tokio::fs::create_dir_all(parent)
+            crate::paths::ensure_dir_async(parent)
                 .await
                 .context("creating socket directory")?;
         }
@@ -2265,7 +2270,7 @@ struct FaultTrace {
 impl FaultTrace {
     fn from_env(vm_id: &str, origin: std::time::Instant) -> Option<Self> {
         let dir = PathBuf::from(std::env::var(FAULT_TRACE_ENV).ok()?);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        if let Err(e) = crate::paths::ensure_dir(&dir) {
             warn!(
                 target: "uffd",
                 dir = %dir.display(),

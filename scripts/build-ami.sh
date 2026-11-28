@@ -21,8 +21,8 @@ FCVM_SOURCE_REMOTE="${FCVM_SOURCE_REMOTE:-https://github.com/ejc3/fcvm.git}"
 # ejc3/aws#1031. Until that is applied a run fails closed, publishing nothing.
 AMI_ARCH="${AMI_ARCH:-arm64}"
 case "$AMI_ARCH" in
-  arm64) UBUNTU_ARCH=arm64 EC2_ARCH=arm64 BUILDER_TYPE=c7gd.8xlarge BOOT_TEST_TYPE=c7gd.metal ;;
-  x64) UBUNTU_ARCH=amd64 EC2_ARCH=x86_64 BUILDER_TYPE=c5d.9xlarge BOOT_TEST_TYPE=c5d.metal ;;
+  arm64) UBUNTU_ARCH=arm64 EC2_ARCH=arm64 KERNEL_MACHINE=aarch64 BUILDER_TYPE=c7gd.8xlarge BOOT_TEST_TYPE=c7gd.metal ;;
+  x64) UBUNTU_ARCH=amd64 EC2_ARCH=x86_64 KERNEL_MACHINE=x86_64 BUILDER_TYPE=c5d.9xlarge BOOT_TEST_TYPE=c5d.metal ;;
   *)
     echo "ERROR: AMI_ARCH must be arm64 or x64, got '$AMI_ARCH'" >&2
     exit 1
@@ -107,6 +107,27 @@ compute_pinned_hash() {
   fi
   rm -rf -- "$source_tree"
   printf '%s\n' "$hash"
+}
+
+# Print the release of the host kernel the pinned commit builds for this image's
+# architecture ($KERNEL_MACHINE, as `uname -m` names it): the one kernel this run may
+# publish an image of. scripts/check-runner-kernel.py fails every CI job on a runner that
+# boots another, so an image with another would take the pool down. The script and its
+# inputs are read from the commit, not from the caller's working tree, for the reason
+# compute_pinned_hash is. Prints nothing when it fails.
+compute_pinned_host_kernel() {
+  local repo_root="$1" source_commit="$2" tree release
+  tree="$(mktemp -d)" || return 1
+  if ! git -C "$repo_root" archive --format=tar "$source_commit" \
+    rootfs-config.toml kernel scripts/check-runner-kernel.py | tar -xf - -C "$tree" ||
+    ! release=$(python3 -B "$tree/scripts/check-runner-kernel.py" \
+      --print-expected --machine "$KERNEL_MACHINE") ||
+    [[ ! $release =~ ^[0-9]+\.[0-9]+\.[0-9]+-fcvm-[0-9a-f]{12}$ ]]; then
+    rm -rf -- "$tree"
+    return 1
+  fi
+  rm -rf -- "$tree"
+  printf '%s\n' "$release"
 }
 
 # Compute build hash (from kernel config + patches + boot_args + passt build inputs)
@@ -458,6 +479,9 @@ wait_for_dpkg_lock
 update-grub
 BOOT_KERNEL=$(./scripts/grub-boot-kernel.sh)
 ./scripts/check-bridge-teardown-kernel.sh "$BOOT_KERNEL"
+# And it must be the host kernel this checkout builds, which is the one every CI job then
+# requires of its runner (the same script, on the running kernel).
+./scripts/check-runner-kernel.py --current-only --release "$BOOT_KERNEL"
 # Report that release: the boot test of the candidate image must find exactly it running.
 aws ec2 create-tags --resources $INSTANCE_ID --tags "Key=KernelVersion,Value=$BOOT_KERNEL" --region us-west-1
 # The boot test runs the same check on the kernel that booted.
@@ -479,6 +503,21 @@ echo "ubuntu:100000:65536" >> /etc/subgid
 
 # FUSE config
 echo "user_allow_other" > /etc/fuse.conf
+
+# The NIC before cloud-init-local, on arm64 (#2174). The arm64 host kernel keeps ENA a module
+# and the image boots without an initramfs, so udev loads ENA from the root disk, and whether
+# it binds before cloud-init-local looks for a NIC is a race: won by 3.5 s when measured, lost
+# on an x86 host whose kernel had ENA as a module (ejc3/aws#823; kernel/host-x86.conf now
+# builds it in). A runner that loses it runs no user data and never registers.
+# systemd-modules-load loads ENA, which binds the present device inside its module load (its
+# pci_driver sets no probe type), and the drop-in orders cloud-init-local after the loader:
+# neither unit has default dependencies. The boot test checks the order systemd resolved.
+if [ "$RUNNER_ARCH" = arm64 ]; then
+  echo ena > /etc/modules-load.d/fcvm-runner-nic.conf
+  install -d /etc/systemd/system/cloud-init-local.service.d
+  printf '[Unit]\nAfter=systemd-modules-load.service\n' \
+    > /etc/systemd/system/cloud-init-local.service.d/10-fcvm-runner-nic.conf
+fi
 
 # GitHub Actions Runner
 mkdir -p /opt/actions-runner
@@ -595,8 +634,25 @@ TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-meta
 INSTANCE_ID=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" -s http://169.254.169.254/latest/meta-data/instance-id)
 unset TOKEN
 set -x
+# On arm64 the image orders cloud-init-local after the loader of the NIC's driver (#2174).
+# The loader must have been told to load it and have run without a failure this boot, and
+# the order systemd resolved must name the loader; an order that cannot be read fails. The
+# list is matched in the shell: a reader that stops at the first match can end the writer
+# with SIGPIPE, which pipefail reports as a failure.
+NIC_MODULES_LOAD=/etc/modules-load.d/fcvm-runner-nic.conf
+nic_order_ok() {
+  local after
+  [ "$(uname -m)" = aarch64 ] || return 0
+  grep -qx ena "$NIC_MODULES_LOAD" || return 1
+  systemctl is-active --quiet systemd-modules-load.service || return 1
+  after=$(systemctl show cloud-init-local.service -p After --value) || return 1
+  case " $after " in
+    *" systemd-modules-load.service "*) return 0 ;;
+  esac
+  return 1
+}
 STATUS=boot-failed
-if /usr/local/sbin/check-bridge-teardown-kernel.sh; then
+if /usr/local/sbin/check-bridge-teardown-kernel.sh && nic_order_ok; then
   STATUS=boot-ok
 fi
 /usr/local/bin/aws ec2 create-tags --resources "$INSTANCE_ID" --region us-west-1 \
@@ -747,7 +803,7 @@ LAUNCHED=()
 # Main
 main() {
   local hash repo_root source_commit
-  for tool in aws jq git; do
+  for tool in aws jq git python3; do
     command -v "$tool" >/dev/null 2>&1 || {
       echo "ERROR: required tool '$tool' is missing" >&2
       exit 1
@@ -783,6 +839,15 @@ main() {
   fi
 
   echo "No cached AMI, building..."
+
+  # The one kernel release this run may publish. Computed before this run changes anything in AWS.
+  local expected_kernel
+  if ! expected_kernel=$(compute_pinned_host_kernel "$repo_root" "$source_commit"); then
+    echo "ERROR: cannot compute the host kernel this commit builds for $KERNEL_MACHINE;" >&2
+    echo "       refusing to build an image whose kernel cannot be checked" >&2
+    exit 1
+  fi
+  echo "Host kernel this commit builds: $expected_kernel"
 
   # The first write of a run that will build. A cache hit builds nothing and leaves an
   # earlier candidate to the pruner in ejc3/aws, which removes it a day after its creation.
@@ -862,6 +927,10 @@ main() {
     echo "ERROR: the builder did not report a kernel with the fix (KernelVersion=$kernel_version)" >&2
     exit 1
   fi
+  if [ "$kernel_version" != "$expected_kernel" ]; then
+    echo "ERROR: the builder installed $kernel_version, and this commit builds $expected_kernel" >&2
+    exit 1
+  fi
 
   # Create the image as a CANDIDATE. The runner launcher takes the newest available
   # image tagged Purpose=github-runner of each architecture, so an image created with
@@ -893,7 +962,8 @@ main() {
 
   # Boot test: one instance from the candidate, on bare metal as the runners are. It
   # must report that the kernel it is RUNNING passes the bridge teardown check, and that
-  # kernel must be the one the builder resolved, which passed the same check above.
+  # kernel must be the one the builder resolved, which passed the same check above and is
+  # the build this commit gives.
   local boot_user_data_file test_instance boot_kernel
   boot_user_data_file=$(mktemp)
   create_boot_test_user_data > "$boot_user_data_file"
@@ -908,8 +978,12 @@ main() {
     reject_candidate "$ami_id"
     exit 1
   fi
-  if [ "$boot_kernel" != "$kernel_version" ]; then
-    echo "ERROR: the image booted $boot_kernel, not the $kernel_version the builder installed" >&2
+  # kernel_version already equals expected_kernel here (the image is created only then), so
+  # the second comparison cannot fail on its own. It is kept so that this check holds by
+  # itself if the earlier one is ever moved or removed.
+  if [ "$boot_kernel" != "$kernel_version" ] || [ "$boot_kernel" != "$expected_kernel" ]; then
+    echo "ERROR: the image booted $boot_kernel, not the $kernel_version the builder installed" \
+      "(this commit builds $expected_kernel)" >&2
     reject_candidate "$ami_id"
     exit 1
   fi

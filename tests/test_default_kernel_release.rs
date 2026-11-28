@@ -2930,6 +2930,31 @@ fn every_kernel_table_is_published_by_a_leg_or_says_it_is_not() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Setup downloads a published kernel only as the bytes its table records
+/// (`kernel_artifact_sha256`), so every published table must record them: without
+/// the digest every fresh host builds the kernel locally.
+#[test]
+fn every_published_kernel_table_records_its_artifact_digest() {
+    let config = rootfs_config();
+    let legs = published_kernel_legs(&kernels_workflow());
+    assert!(!legs.is_empty(), "kernels.yml publishes no kernel table");
+    for (profile_name, arch) in legs {
+        let profile = kernel_profile_table(&config, &profile_name, &arch);
+        let digest = profile
+            .kernel_artifact_sha256
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "[kernel_profiles.{profile_name}.{arch}] needs kernel_artifact_sha256 = the SHA-256 \
+             of its released vmlinux (sha256sum of the asset), got {digest:?}"
+        );
+    }
+}
+
 /// #957: a binary with no source checkout beside it names a release only from
 /// `kernel_sha`, and only the default tables carried one, so an installed
 /// binary failed on nested and btrfs before it asked for the release. Every

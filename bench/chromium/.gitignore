@@ -93,3 +93,14 @@ results/corpusextra-*/corpus-dns.log
 # busy listener plus the kernel's accept-queue overflows. A measurement, not DNS evidence.
 !results/**/*.corpus-listen.log
 !results/**/corpus-listen.log
+# A pages-mode campaign (renders_campaign.py): its summary, and per run the
+# module's summary, the teardown's result and the host record. The campaign
+# directory also holds the stage kills' result, the transform check's and the
+# engine bundles' digests. The rows per render and the samples go to the
+# records repository (records.py, RENDERS_RAW).
+!results/renders-*-summary.json
+!results/renders-*/*/teardown.json
+!results/renders-*/*/host-record.txt
+!results/renders-*/teardown-check.json
+!results/renders-*/transforms.json
+!results/renders-*/kitesurf-bundles.txt

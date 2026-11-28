@@ -507,8 +507,8 @@ theorem step_pw {R : Rules} {C : Cfg} {l : Label} {s t : State}
   · exfalso
     cases l <;>
       simp [step, pkt, udpC, udpR, udpS, conn, shut, pair, unpair, snap, snapFail, snapKill,
-        restore, agent, agentFail, kill, restart, boot, off, timeout, watchdog, State.running,
-        agentRuns, hp] at h
+        restore, agent, agentFail, kill, restartFirst, restart, bootFirst, boot, off, timeout,
+        watchdog, State.running, agentRuns, hp] at h
   · rfl
 
 theorem sk_dead (s : State) : Sk s.dead := by

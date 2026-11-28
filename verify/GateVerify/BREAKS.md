@@ -9,8 +9,8 @@ boundary holds and that booted without the snapshot cache.
 Rule books are fixed commits, named for what the boundary does at each and not for a branch:
 `ctstate` is 4adc1dee6, where the gate's TCP rule is `--ctstate NEW` (what `main` was before
 #2113); `flags` is #2113 at a1e5fc687; `cookieA` is #2124 at its first commit a80e1ad34;
-`cookieB` is #2124 at its head. `README.md`, "The rule books", says which one `main` matches
-now.
+`cookieB` is #2124 at its head; `owed` is `main` at da5f2bb22, with #2151 and #2154.
+`README.md`, "The rule books", says which one `main` matches now.
 
 No run here was run in a VM by this model's author. Each is a run of the model, whose rules
 are read from the source at those commits and from Linux v6.18.60; "by source" below means
@@ -49,18 +49,18 @@ vsock). CI runs that search and compares its result with `search.expected`. A na
 recorded run of that kind. The two `all-` configurations, which turn everything on at once,
 are in the last section.
 
-| | `ctstate` | `flags` | `cookieA` | `cookieB` | design |
-|---|---|---|---|---|---|
-| P1 `sourceDisturbed` | `liveReset`, `agentDiesSource`, `barrierKill`, `reopenFails` | `agentDiesSource`, `barrierKill`, `reopenFails` | the same | the same | proved |
-| P2 `generationBroken` | after an early snapshot | the same | `twoDumps`, `proxyConnectA`, and that | `proxyConnect`, and that | proved, for the connections the model makes (`Limits.lean`) |
-| P3 `staleAtPublication` | `staleTuple`, `staleTupleGrown`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `cookieAck`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `loopbackClientA`, `earlySnapshot` | `earlySnapshot`, `earlySnapshotFails` | proved |
-| P3 `smuggledLate` | `staleTupleLate`, `halfOpenRetransmit`, `reusedTuple` | `cookieAckClone` | `cookiesBackFirst` | holds | proved |
-| P4 `retiredBehindEgress`, `hookMisplaced` | holds | holds | holds | holds | proved |
-| P4 `workloadBehindEgress` | `watchdogThaw`, after an early snapshot | the same | the same | the same | proved |
-| P5 `lastingChange` | holds | holds | `writeBackFails` | the same | proved |
-| P5 `capturedChange` | `barrierKillCaptured`, after an early snapshot | the same | and `failedCloneSnapshot`, `earlySnapshotCaptures`, after `writeBackFails` | the same | proved |
-| P6 `stuck` | `agentDies`, `hostDies`, `reopenFailsStuck` | the same | the same | the same | proved |
-| U1 `clientDatagram` | `clientDatagram` without the host's gate | the same | the same | the same | the same: assumed, not proved |
+| | `ctstate` | `flags` | `cookieA` | `cookieB` | `owed` | design |
+|---|---|---|---|---|---|---|
+| P1 `sourceDisturbed` | `liveReset`, `agentDiesSource`, `barrierKill`, `reopenFails` | `agentDiesSource`, `barrierKill`, `reopenFails` | the same | the same | holds | proved |
+| P2 `generationBroken` | after an early snapshot | the same | `twoDumps`, `proxyConnectA`, and that | `proxyConnect`, and that | `proxyConnectOwed` | proved, for the connections the model makes (`Limits.lean`) |
+| P3 `staleAtPublication` | `staleTuple`, `staleTupleGrown`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `cookieAck`, `loopbackClient`, `proxyStale`, `earlySnapshot` | `loopbackClientA`, `earlySnapshot` | `earlySnapshot`, `earlySnapshotFails` | holds | proved |
+| P3 `smuggledLate` | `staleTupleLate`, `halfOpenRetransmit`, `reusedTuple` | `cookieAckClone` | `cookiesBackFirst` | holds | holds | proved |
+| P4 `retiredBehindEgress`, `hookMisplaced` | holds | holds | holds | holds | holds | proved |
+| P4 `workloadBehindEgress` | `watchdogThaw`, after an early snapshot | the same | the same | the same | holds | proved |
+| P5 `lastingChange` | holds | holds | `writeBackFails` | the same | `writeBackFailsOwed` | proved |
+| P5 `capturedChange` | `barrierKillCaptured`, after an early snapshot | the same | and `failedCloneSnapshot`, `earlySnapshotCaptures`, after `writeBackFails` | the same | `writeBackCapturedOwed` | proved |
+| P6 `stuck` | `agentDies`, `hostDies`, `reopenFailsStuck` | the same | the same | the same | `hostDiesOwed` | proved |
+| U1 `clientDatagram` | `clientDatagram` without the host's gate | the same | the same | the same | the same | the same: assumed, not proved |
 
 What the design does with each recorded run is in `Breaks.lean` beside it: `design_refuses_`
 (a step of the run is not possible under the design) or `design_keeps_` (the run is possible
@@ -358,18 +358,22 @@ What the new agent can do decides the outcome:
   create goes on first; either way the source is not kept. `restartPowersOffToday` in
   `Ends.lean` is both orders.
 
-So today the legs are: gated for good, or powered off. This is the reopen that cannot be
-attempted; #2142 is the reopen that is attempted and fails. The same holds for a kill at any
+So under `cookieB` the legs are: gated for good, or powered off. This is the reopen that cannot
+be attempted; #2142 is the reopen that is attempted and fails. The same holds for a kill at any
 later step of the create up to the reopen.
 
-With #2154 (in review; by its author's runs): the host's ask reopens the gate, the create
-succeeds, and the VM then powers off, because #2154 does not change what a restarted agent does
-with its container. The source is kept only once #2158 is fixed as well.
+In `main` since #2154 (`owed`): the new agent finds the boundary owed and serves the host's
+resume before its boot plan, on every leg above, and the host asks until it lands, so the gate
+is reopened; the create then fails on the agent's restart and discards its image. A guest that
+is served a plan then powers off, because #2154 does not change what a restarted agent does
+with its container (`owedReopensBeforeThePlan` in `Ends.lean`, over MMDS); a restored guest is
+served none and runs on with no container. The source is kept only once #2158 is fixed as
+well.
 
 ### `agentDiesVsock`, `containerMidBoundary`: what the fix of #2158 uncovers
 
-Rule book `cookieB-restart-kept`: `main` with #2158 fixed and nothing else. Not breaks of the
-code today, where both runs end in the power-off above. Run `kills-vsock`, 6 and 13 steps. P6
+Rule book `cookieB-restart-kept`: #2124's head with #2158 fixed and nothing else. Not breaks of
+that code, where both runs end in the power-off above. Run `kills-vsock`, 6 and 13 steps. P6
 and P4. Low: Cloud Hypervisor, a guest that booted without the cache, and for the second a
 window of about a second.
 
@@ -493,33 +497,39 @@ client's source port. `design_noStaleAtPublication` is therefore about clients t
 (`Limits.lean`; `README.md`, "Assumed"). The fix (a reserved source port range for the rewrite)
 is in flight with the others.
 
-## Fixes in flight
+## Fixes landed, and what is left
 
-None of the repairs in `REPAIRS.md` is in this pull request. #2113 and #2124 are in `main`. For
-the rest:
+None of the repairs in `REPAIRS.md` is in this pull request. #2113 and #2124 are in `main`, and
+so are #2151 and #2154: their rule book is `owed` (`Today.owed`, `main` at da5f2bb22). The search
+of `owed` in the 20 default configurations (`search.expected`) finds none of the runs below
+marked closed, and the kinds it does find are the ones the last three rows name.
 
-| Break | Issue | Fix |
-|---|---|---|
-| `earlySnapshot`, `earlySnapshotFails`, `earlySnapshotCaptures`, `failedCloneSnapshot` | #2138 | #2151, in review: on the host, `snapshot create` refuses a clone whose restore is not acknowledged (repair 2). #2154 has the guest's half |
-| `watchdogThaw` | #2140 | #2154, in review (head 7040f0a32) |
-| `barrierKill`, `barrierKillCaptured` | #2141 | #2154 |
-| `reopenFails`, `reopenFailsStuck` | #2142 | #2154 |
-| `agentDies`, `agentDiesSource` | #2149 | #2154 reopens the gate; the source is kept only with #2158 fixed too |
-| `agentDiesVsock`, `containerMidBoundary` (once #2158 is fixed) | #2149 | #2154 |
-| a restarted fc-agent cannot start its container and powers the VM off | #2158 | being built; not decided in the issue. The model's `restartKeeps` |
-| a `/loopback` client that picks its source port | #2152 | #2154: a source port range reserved for the rewrite. Observed in a VM with a two-port range: at the range's limit NAT drops the SYN and takes no other port |
-| `hostDies` | #1936 | #1941 |
+| Break | Issue | Fix | In `owed` |
+|---|---|---|---|
+| `earlySnapshot`, `earlySnapshotFails`, `earlySnapshotCaptures`, `failedCloneSnapshot` | #2138 | #2151 (the host refuses a clone whose restore is not acknowledged, repair 2) and #2154 (the guest's `restore-under-way` mark) | closed: `early` 411 states and `early-fails` 938, against 1,623 and 3,597 under `cookieB`, with no P2, P3 or P4 |
+| `watchdogThaw` | #2140 | #2154 | closed: `slow` breaks nothing |
+| `barrierKill`, `barrierKillCaptured` | #2141 | #2154 | closed: `kills` breaks nothing |
+| `reopenFails`, `reopenFailsStuck` | #2142 | #2154 | closed: `fails` has no P1 or P6 |
+| `agentDies`, `agentDiesSource` | #2149 | #2154: the reopen is asked until it lands, and a restarted agent serves it before its boot plan | closed: `kills` and `kills-vsock` break nothing. The restarted agent still powers the VM off once it has its plan (#2158): `owedReopensBeforeThePlan` in `Ends.lean` |
+| `agentDiesVsock`, `containerMidBoundary` (once #2158 is fixed) | #2149 | #2154 | not searched with #2158 fixed: `owed` keeps `restartKeeps := false` |
+| a restarted fc-agent cannot start its container and powers the VM off | #2158 | open. The model's `restartKeeps` | the same |
+| a `/loopback` client that picks its source port | #2152 | #2154: a source port range reserved for the rewrite | not expressible in the model (`Limits.lean`) |
+| `hostDies` | #1936 | #1941, open | `hostDiesOwed` |
+| `proxyConnect` | none | repair 5, no pull request | `proxyConnectOwed` |
+| `writeBackFails` and the snapshot after it | none | repair 7, no pull request | `writeBackFailsOwed`, `writeBackCapturedOwed` |
 
 Open beside these, and not a break of this model's: #2156, a restore that blocks a runtime
 worker left the exec server unanswered for 15 s (1 try in 9 of #2151's VM test; cause not
 established). It bears on #2138's window, where the model has exec either answer or not.
 
-#2154 is built to the two rulings of `REPAIRS.md`, 3 and 8: a source that cannot be reopened is
-left running and reported, and a restarted fc-agent serves exec before it starts a container.
+What `owed` does that the model holds by abstraction only: the host's 150 s of asking is
+`retryMax` tries; the watchdog's and the hold's counted looks are the switch `Cfg.slow`; the
+boundary's token (#2159) orders the resumes of two creates, and the model has one create at a
+time; a create whose source's agent restarted in its boundary fails and discards its image,
+which no property reads. `owed`'s doc comment says where each is in the code.
 
-The rule book of each fix is not written yet: when one lands, its commit gets a rule book in
-`Today.lean`, the search says which of these runs it closes, and the drift check's name moves
-to it.
+The rule book of the next fix that lands gets its commit in `Today.lean`, the search says which
+of these runs it closes, and the drift check's name moves to it.
 
 ## UDP (#2112)
 
@@ -559,11 +569,16 @@ them.
 | `cookieA` | capped | 5,030,180, complete |
 | `cookieB` | capped | 4,889,396, complete |
 | `cookieB` without its second dump | capped | 4,646,780, complete |
+| `owed` | 4,837,841, complete | 1,162,039, complete |
 | design | 1,971,774 states, complete, no break | 521,538, complete, no break |
 
 One run each, on a shared dev box: 7 min 40 s and 2.5 GB for today's five rule books, 15 s and
 0.5 GB for the design. A capped search has looked at the first ten million states in breadth-first order
 and says nothing of the rest.
+
+`owed` was run alone, on a box shared with another job, one run: 36 s and 1.2 GB for both.
+It finds P5 and P6 in `all-routed`, and P2, P5 and P6 in `all-proxy`, the kinds the table above
+gives it.
 
 In both configurations each of today's rule books breaks only properties it breaks in the
 table above: none breaks one the table calls `holds`. In particular `cookieB` has no

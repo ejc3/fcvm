@@ -219,10 +219,36 @@ host's GPUs re-tile coarser over the whole side, and the side gets finer again a
 replacement's GPUs render. One host alone keeps the old behaviour: its places stay dark for
 its replacement, which is what a viewer of a one-host fleet sees anyway. The spend meter
 prices every instance the fleet runs, the replacement included, and a budget trip sleeps the
-fleet, which terminates every host.
+fleet, which terminates every host. Because the ceiling is computed from the rates, a host
+group launches only types the rate table prices (built in, and `--spend-rates`): a template
+whose type has no rate gets no CreateFleet, and the group's component (`scale`,
+`scale-renders`) is degraded with the template and the type until a rate is given. One such
+template holds its region's whole request, its priced templates included; the group's other
+regions launch. The rule holds with or without `--daily-spend-usd`. An instance of such a type
+already running is metered at the highest rate known. EC2 tiles are launched from their
+templates without reading the type, and are not checked (#2169); nothing is checked when the
+coordinator starts, because the types are read from the templates at the first launch.
 
 ECS is used for the coordinator only. The GPU hosts stay plain EC2: the ECS GPU AMIs bind
 the NVIDIA driver on the host, and these hosts must leave every GPU to vfio-pci.
+
+Pages mode's host (below) is a second host group of the same launcher, not a second
+launcher. With `FLEET_RENDERS_TEMPLATES` and `FLEET_RENDERS_SUBNETS` (one region) the
+coordinator runs one more `hosts::run` over the same power state, whose driver lists, launches
+and terminates only instances tagged `Purpose=fcvm-fleet-renders`: one host while the fleet is
+awake, launched in the same wake as the GPU hosts (spot first, on demand in the same pass when
+spot is refused for capacity, at most one on demand, apart from the GPU hosts' cap), none
+while it sleeps, adopted by its tags after a restart. With one host, a spot notice waits for
+EC2 to take the instance. A quota refusal marks the component `scale-renders` degraded. It is
+not a GPU host: no slot, no place in the wall's tiling or the potato ring, no phone, sandbox
+or server, no entry in a wake's record, none of the hosts the fcvm side waits for, and not one
+of the hosts the other modes' pages count. Its spot notice and its loss change pages mode's
+state only, never the wall's reclaimed-host failure. The instance's class decides what its
+agent's hello may say: an agent on a renders instance must say it runs the mode and offer
+nothing of the wall's, and one on a GPU instance must not say it runs the mode, or it is
+refused before the hello is applied. The
+spend meter lists its instances with the rest and charges them under the same daily ceiling;
+m8gd.metal-24xl, its type, has a built-in on-demand rate (5.53536 USD/h).
 
 ### EC2 tiles (the comparison)
 
@@ -2030,6 +2056,9 @@ disk step took 17 ms p50 and 192 ms p99 as a reflink against 193 ms and 1.8 s as
 snapshot, and fcvm now reflinks a clone's disk of at most 4096 extents while fewer than 8
 reflinks of that snapshot's disk are in flight (the fleet relaunches 8 tiles of one snapshot at
 once); a deeper queue takes subvolume snapshots, which do not wait on the source inode's lock.
+A clone that takes one holds a byte of the snapshot's mark file, drawn at random among 64, until
+100 ms after it, and while four or more of those bytes are held the next clone takes a
+subvolume snapshot too.
 
 A soak of the coordinator and one host shaped like staging (96 players, two phones, the
 ladder from 2 to 96, 2026-11-07) put a number on the host's side. Sleeps finished at up to
@@ -2371,6 +2400,264 @@ Measured above, and each a later PR of this stack, to be measured on the ring:
 8. Zoom to a player: a server in the player VM for viewers, apart from the ball's port,
    handled only after a catch; the viewer cap set by measuring the wake with 0, 10, 100 and
    1000 viewers reconnecting at once.
+
+## Pages mode
+
+"One VM per page" (`?mode=pages`): a renders host renders a fixed set of replayed web pages on
+two sides at once, a new microVM running unmodified Chromium for every render and Kitesurf
+engines on workerd, each side on its own equal set of pinned CPUs. The protocol, the
+coordinator's state and the `/live` view are in `fleet/PROTOCOL.md`, "Pages mode". The
+coordinator launches and terminates the host as a host group of its own ("Hosts and
+capacity" above) and names its frame socket `renders-<host>-<token>` in its subzone, from
+the addresses the host's hello gives. This section is the host's half. The fleet agent runs the
+module with `--renders` (below), and `fcvm fleet renders-bench` (`make fleet-renders-bench`)
+runs the same module without a coordinator or viewers, through the same function
+(`renders::session`), so the benchmark's reference figures and the live wall's come from one
+piece of code.
+
+### The host module
+
+`src/fleet/renders`. The figures and the decision how many renders each side runs in flight are
+`fleet_core::renders_wall::Wall` and `fleet_core::renders_search` (pure functions of completed
+renders and cgroup counters). The module starts and ends the processes and moves lines between
+them.
+
+| cgroup under the unit | CPUs (defaults, 96-CPU host) | holds |
+|---|---|---|
+| `renders-fcvm` | 0 to 39 | the memory server (`fcvm snapshot serve`) and every clone. One pool: nothing below it is pinned or limited |
+| `renders-engines` | 40 to 79 | the Kitesurf engines, one child cgroup each, for its memory. One engine per render in flight: a workerd process runs its isolates on one thread |
+| `renders-harness` | 80 to 95 | `replay-fcvm` and `replay-engines` (each side's replay processes behind one address) and `drivers` (the workers that drive the renders). One pool: the three are cgroups of their own for their counters and share the 16 CPUs |
+
+The cgroups are made with `src/fleet/cpuset.rs`, which the potato ring's cgroup uses too: the
+process runs in a subgroup of a delegated unit, a cgroup's `cpuset.cpus` is written and read back
+from `cpuset.cpus.effective`, a process joins before it executes, and `cgroup.kill` ends what
+is left.
+
+- **The harness is one pool too.** With each replay confined to four of the harness CPUs
+  (`--replay-cpus 4`), the engines' replay read a CPU pressure of 0.14 at 1.3 CPUs busy with 36
+  Kitesurf renders in flight, and a probe request's 90th percentile was 1.2 and 1.9 ms. Sharing
+  the 16 CPUs it read 0.002, and 0.74 and 0.85 ms (working data from one host boot, two runs
+  each way). The page shows nothing of the harness; the samples carry each part's counters.
+- **A render in flight** is one whose answer is not in hand. A clone's teardown follows its
+  answer and is outside the render's time, so the fcvm side starts its next clone while the last
+  is torn down (it has more workers than its most renders in flight).
+- **2 MiB pages.** A clone reserves its memory when it starts. The side starts one only while the
+  pool has room for it, and counts the times it waited (`pool_waits`); a pool too small is never
+  a failed render. The side's most renders in flight is lowered at start to what the pool
+  carries (the memory server's copy and a clone for each of the side's workers), so the search
+  never sits at a level the pool keeps it from reaching.
+- **An engine is started again** between renders once its anonymous memory passes
+  `--recycle-mib`: every process in its cgroup is ended and a new engine takes its port. The
+  engines start together and render the same pages, so each engine's first threshold is spread
+  between half of `--recycle-mib` and all of it; otherwise they are all started again within a
+  few minutes of each other and the side loses a tenth of its rate while they are. An engine
+  that died, or on which three renders in a row failed, is started again too
+  (`engine_restarts`).
+- **Three failed renders in a row** on a side make it start nothing for a second.
+- **The kernel rule.** The module refuses to run on a kernel without the bridge teardown fix
+  (`kernel_has_bridge_fix`).
+
+### Start and end
+
+Stages, written to `--status-file` as the module reaches each: `start` (the reaper is
+running), `cgroups`, `replays`, `golden` (written before the snapshot is made, and only when it
+is absent: `fcvm podman prepare` of the bench image), `serve-starting`, `serve`,
+`engines-starting`, `engines`, `workers` (every worker said it is ready), `running`,
+`stopping`, then `stopped`, or `stopped-unclean` when the reaper could not remove something.
+
+Nothing the module starts is trusted to end itself. Before anything else it starts a reaper
+(`fcvm fleet renders-reap`) that holds the read end of a pipe. When the module is gone, however
+it went, the reaper kills the three cgroups, waits until they are empty, removes them, runs
+fcvm's own sweeps for what killed clones leave (owner records, state files), removes the
+sockets of the snapshot's memory servers that are gone and the run directory, and writes what
+it found to `teardown.json`. The same sweep runs when a module starts. The module ends every
+engine start that is under way before it lets the reaper go, and the reaper writes
+`cgroup.kill` again for as long as a cgroup is populated.
+
+One module runs per run directory: the module takes an exclusive lock beside it
+(`<run dir>.lock`), and its reaper inherits the lock, so a new module starts only when both are
+gone. The same file records that the path is a run's. A start claims the path after its sweep,
+while the directory is absent or empty, and the claim ends when a sweep has removed the
+directory. A sweep removes only a claimed directory, whatever it holds, so a removal that was cut
+short, or that could not remove an entry, is finished by the next one. A directory that holds
+files at a path nobody claimed is refused at start and never removed, and so is a lock file that
+holds anything else. A lock file removed while its directory holds a run's files leaves a
+directory the next start refuses until a person removes it.
+
+The module runs as a systemd service unit. Its children are ended by the reaper and, with the
+reaper gone too, by systemd stopping the unit: no child arms a parent-death signal, so under a
+scope or outside systemd a module and reaper killed together would leave them running.
+
+The unit must keep systemd's default `KillMode=control-group`. With `KillMode=mixed` systemd
+sends SIGKILL to every process left the moment the main process is gone, the reaper included.
+
+`make test-fleet-renders-teardown` (`bench/chromium/renders_teardown_check.py`) ends a module at
+each stage, by SIGKILL and by SIGTERM, and counts what is left: processes, the unit's cgroup,
+network namespaces, clones' state files and directories, sockets, listening ports, the run
+directory, 2 MiB pages. Every count must be zero.
+
+### In the fleet agent
+
+`fcvm fleet agent --renders` takes the module's options as renders-bench takes them, one per
+`--renders-arg` (`--renders-arg=--corpus=/srv/corpus`). The benchmark's own options
+(`--levels`, `--seconds`, `--overlay-text`, `--overlay-transform`) are refused: the
+coordinator's orders say when to render and what to inject, and the search sets the levels.
+The module runs the agent's own binary, and the agent must run in a subgroup of a delegated
+unit, as renders-bench must. Without `--renders` the agent says no `renders` in its hello and
+starts nothing of the mode.
+
+| who | owns | ends it |
+|---|---|---|
+| `serve` | the order (a watch channel) and the mode's task (`agent/renders.rs`) | the end of its connection drops the order's sender, then it waits for the task |
+| the mode's task | one module at a time, as a future it awaits | the order's sender gone, once the module has ended |
+| the module (`renders::session`) | its lock, its reaper, its processes and cgroups | an order to stop, the sender gone, or an error; then the reaper's sweep |
+
+- **An order to run** starts a module: the same sequence as the benchmark's, from the kernel
+  rule and the lock to the reaper and the stages. The module applies each later order itself.
+- **An overlay order** is written to each side's injected file by rename (a Chromium-only
+  transform to the fcvm side's alone) when its content or its `seq` differs from what the
+  replays serve, and the next reports carry its `seq` as `overlay_seq`. A new `seq` also starts
+  both searches again. An order equal to the one the replays serve writes nothing.
+- **An order to stop** ends the module: during its start the start is dropped where it is
+  (every child it started is killed with its handle; the only tasks the start spawns are the
+  workers' output readers, which end with the workers' output and start no process, and the
+  engines' first starts are polled in the start itself), during the renders the loop ends;
+  then the reaper sweeps and the agent stays up. The next order to run starts a new module.
+  A module held by `--hold-at` (the host checks' option) at a stage of its start (`cgroups` to
+  `workers`) ends the same way; one held at `start`, `running` or `stopping` waits outside
+  the start and the loop, and ends only with the agent's process, whose end lets the reaper
+  remove everything.
+- **The agent killed outright**, by SIGKILL or by SIGTERM (the module registers no signal
+  handler in the agent), closes the reaper's pipe, and the reaper removes everything, as it
+  does for the benchmark. A module started inside the agent's connection is ended when the
+  connection ends (`--stdio`); a dialing agent keeps it across reconnects, as it keeps its VMs.
+- **The host check.** `make test-fleet-renders-agent OUT=dir KITESURF=dir`
+  (`bench/chromium/renders_agent_check.py`, through `renders_bench.sh agent-check`) starts the
+  agent as a transient unit with the bench's unit properties and `--stdio` on its pipes
+  (`systemd-run --pipe`), with `--host renders-agent-check`, `--image unused`, `--base-port 1`
+  and `--sysfs-root` at a missing directory (no GPU) for the agent's own options. It plays the
+  coordinator, and counts what is left as `renders_teardown_check.py` does (it imports that
+  census): the hello and no report before the first order; renders on both sides; an overlay
+  order end to end (the report's `overlay_seq`, each side's injected file); `run: false` while
+  rendering and while held at `HOLD_STAGES` (nothing left, the agent up and rendering again);
+  SIGKILL of the agent at each stage and SIGTERM while rendering (nothing left). One line per
+  case, all of them in `<OUT>.agent-check.json`; the exit status is 1 when any fails.
+- **Reports** go only after the connection's first `renders` order (the dialing agent keeps
+  that rule per connection), about every 5 s: the module's own while its loop runs (every
+  fifth tick of a one-second loop), and the agent's every 5 s with nothing in flight while the
+  module is stopped, starting, or sweeping after its loop. A module that fails reports
+  `withheld` with its error, and is started again after 60 s while the order says run, or at
+  once on any new order. An agent started again right after it was killed reports `withheld`
+  (the run directory's lock) until the killed module's reaper has finished its sweep.
+- **Records are bounded** under the agent, which runs as long as its host (`AGENT_BOUNDS`):
+  `renders.jsonl` is rotated at 64 MiB and `samples.jsonl` at 16 MiB, each keeping one
+  previous file (`.1`), and only the newest 50 failed clones' logs are kept (a log is counted
+  once it has been untouched for twice the render timeout and a minute). The benchmark keeps
+  its whole record: a run's record is its evidence.
+
+### The recorded campaign
+
+The recorded figures for the page come from one campaign: every regime on one boot of one host,
+on fcvm's own host kernel, at one fcvm commit and one Kitesurf commit, each regime a run of
+`make fleet-renders-bench`. When a run has ended, `bench/chromium/renders_host_record.py` writes
+`host-record.txt` beside its records: the kernel release, the kernel parameters that change what
+is measured (from a list in that file; the rest of the command line is dropped), the fcvm
+commit, Kitesurf's commit, the instance type, a hash of the boot id, the run's arguments (the
+launcher's variables from a list, each with a value of its shape, a path cut to its last name)
+and the time. The record is those seven lines and no other. `bench/chromium/renders_campaign.py` writes the campaign's
+summary, `bench/chromium/results/renders-<id>-summary.json`, from the runs' records. It writes
+nothing when two runs differ in kernel, fcvm commit, Kitesurf commit, instance type or boot,
+when the kernel is not fcvm's own, when a run's summary names another kernel, when a host record
+says a thing twice or holds anything its writer would not write, when a run or the campaign
+holds a `WITHDRAWN` marker, or when a run's teardown does not say it left nothing. Per regime the summary holds each side's figures over a stated window
+(`renders_analyze.py`), the levels the search moved through, and the sha256 and size of the run's
+files.
+
+Each run's `summary.json`, `teardown.json` and `host-record.txt` stay in the tree under
+`bench/chromium/results/renders-<id>/<run>/`. Its row per render and its samples are in
+ejc3/fcvm-bench-records at the same path, listed in `results/records-renders-<id>.json`
+(`records.py`). `renders_campaign.py` and `renders_analyze.py` read them through that manifest,
+so with a checkout of the records repository named by `FCVM_BENCH_RECORDS` the summary is
+rebuilt from this tree; the committed one is byte for byte what that gives.
+
+`bench/chromium/renders_reference.py` writes `fleet/web/core/renders-reference.gen.ts` from the
+one summary in the tree: the campaign, its date, instance type, kernel and commits, and each
+regime's figures by label. The regime labelled `held` is the table the page will show: both sides
+held at the limits the module's own search ended on. The generator takes a `held` regime only
+from a run held at fixed levels on both sides, each side's renders in flight at its level; a
+search run under that label gives no file. No figure is typed;
+`test_renders_reference.py` fails when the file is not what the summary gives. A `WITHDRAWN`
+marker in the campaign's directory, or in the directory of a run the summary cites, withdraws the
+file: the generator and its check stop there, holding the directories' shared locks as
+`campaign_summary.py` does. Nothing in `fleet/web` reads the file yet.
+
+The campaign in the tree, `renders-20261125`, has these regimes:
+
+| label | what ran |
+|---|---|
+| `search`, `search-2`, `search-3` | both sides, the search live, three starts (30, 20 and 20 minutes); scored over the last five minutes |
+| `held`, `held-2` | both sides held at the limits the first search ended on, five scored minutes, taken after the first search and again after the last regime that runs both sides |
+| `alone-fcvm`, `alone-kitesurf` | one side at its limit while the other half is idle |
+| `one-fcvm`, `one-kitesurf` | one render at a time |
+| `bundle-default-*`, `bundle-opt-*` | Kitesurf alone on its production bundle built in Bazel's default mode and with `-c opt`, at one render in flight and at its limit, each twice |
+
+Beside them: `teardown-check.json` (the stage kills, taken in the same session; the file names
+no kernel or commit), `transforms.json` (the mean
+pixel difference of Kitesurf's screenshots with each transform against its plain ones: which
+transforms it draws at that commit) and `kitesurf-bundles.txt` (the two bundles' digests).
+
+### The renders host image
+
+The host boots from an arm64 image of its own, built and validated by the image factory
+(`fleet/ami/renders`, `fleet/ami/README.md`, "The renders track") on the type it runs on,
+m8gd.metal-24xl. The image makes a host the configuration the recorded figures were measured on:
+
+- fcvm's arm64 host kernel (`make install-host-kernel`), booted with
+  `kvm-arm.mode=nested numa=off arm64.nv2`. The three are `RENDERS_BOOT_PARAMS` in
+  `fleet/ami/renders/renders.conf`, which a test holds equal to the nested arm64 profile's
+  `boot_args`; the build and every validation boot fail on another kernel, on a missing one of the
+  three, or on any parameter other than them and the base image's (`RENDERS_BOOT_BASE_KEYS`: the
+  boot loader's and the cloud image's). A test holds every parameter the campaign's host record
+  keeps to one of the three or refused, so none can be present without being recorded.
+- The NIC driver (ENA) stays a module of the arm64 host kernel, the kernel the reference was
+  measured on: its config is the running Ubuntu kernel's, which has ENA `=m`, and
+  `kernel/host-arm64.conf` does not pin it. The host boots without an initramfs, as Ubuntu's image
+  and the campaign's host do. `systemd-modules-load.service` loads ENA, which binds the NIC during
+  the load, and `cloud-init-local.service` is ordered after it, so the NIC is bound before
+  cloud-init-local looks for one and the host runs its user data. `host-check.py` checks the two
+  files, that `systemd-modules-load.service` ran, and the order systemd resolved, at build and on
+  every validation boot, and the launch-path proof checks the order the boot took on each of the
+  three validation boots.
+- 34,000 pages of 2 MiB (`RENDERS_HUGEPAGES`) reserved through sysfs by
+  `fcvm-fleet-hugepages.service` in the first transaction of the boot, before the store's restore.
+  A short pool fails the unit and the agent, which requires it, does not start.
+- The store on the instance-store NVMe, restored at every boot as a GPU host's is: the default
+  kernel and rootfs, the bench image's export, the module's snapshot (made at build by the module
+  itself, so a host's first module does not take the two minutes `fcvm podman prepare` takes), and
+  Kitesurf at the recorded campaign's commit (`RENDERS_KITESURF_REV` in `renders.conf`, held equal
+  to the summary's `kitesurf_commit`) with its production bundle in Bazel's default mode, served
+  from Bazel's output directory. `bench/chromium/kitesurf_pins.sh` stays the other benchmark arm's
+  pin; the image builds from a copy of it with that commit, and its toolchain (node, pnpm,
+  Bazelisk) is the file's, the combination the campaign's host built.
+- `fcvm-fleet-renders-agent.service`: `fcvm fleet agent --renders` as the build user, with
+  `renders_bench.sh`'s unit properties (`Delegate=yes`, `DelegateSubgroup=agent`, the default
+  `KillMode`, `LimitNOFILE=1048576`, `TasksMax=infinity`). The host's boot writes the fleet's
+  arguments to `/etc/fcvm-fleet/agent.env`; the module's (CPU sets 0-39, 40-79 and 80-95, at most
+  40 and 48 renders in flight, the corpus, the snapshot tag, Kitesurf, and `--setup fcvm.commit=`
+  and `--setup kitesurf.commit=` so the hello's build map names both) are in
+  `/etc/fcvm-fleet/renders.env`, written at build from `renders.conf`. `RENDERS_FRAME_ARGS` in that
+  file is where the frame server's options go.
+
+The image runs the reference's Kitesurf commit and boot line, and the image's other settings that
+the campaign's summary and host records carry (the most renders in flight per side, the pool, the
+instance type, the host kernel's version) are read from them by `fleet/ami/test_pipeline.py`. When
+either the Kitesurf commit or the boot line changes, the reference is measured again: a new
+campaign, whose summary the test then reads.
+
+The image publishes only after `make test-fleet-renders-agent` has passed every case on its cold
+boot, and the check's running case has passed on the agent unit's own words (its settings,
+`ExecStart` and `renders.env`, with `--stdio` standing in for the coordinator's address). It is a track of its own: it shares no renderer with the GPU host and tile pair, so neither
+track's failure holds or publishes the other.
 
 ## Windows mode
 
