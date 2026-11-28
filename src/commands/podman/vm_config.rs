@@ -1250,19 +1250,49 @@ pub(super) async fn run_vm_setup(
     Ok((vm_manager, holder_slot, reboot_spec, bootplan_handle_slot))
 }
 
+/// What a guest whose serial console is slow boots with: kernel messages below warnings
+/// and systemd's status lines stay off the console.
+///
+/// A console byte is an exit to the VMM. That costs 4 us in a guest of a bare-metal host
+/// and 34 us in a guest of that guest, and 2.2 ms one level further down (2048 bytes to
+/// `ttyS0`: 0.009 s, 0.070 s, 4.482 s on a c8gd.metal-24xl). A guest prints about 23 KB of
+/// kernel messages and 12 KB of systemd status while it boots, and in an L3 guest that
+/// was 117 s of a 325 s boot (#2250). `loglevel=5` keeps warnings and everything above
+/// them, so a panic, an Oops, a BUG, a WARN, a stall and an OOM kill still reach the
+/// console, and so does a unit systemd fails to start (it logs that to the kernel log at
+/// error level). fc-agent's lines are not affected.
+pub(crate) const SLOW_CONSOLE_BOOT_ARGS: &str = "loglevel=5 systemd.show_status=false";
+
 /// The extra kernel boot args a launch will actually append.
 ///
-/// Resolves the kernel profile's `boot_args`, falling back to FCVM_BOOT_ARGS.
+/// Resolves the kernel profile's `boot_args`, falling back to FCVM_BOOT_ARGS, after
+/// [`SLOW_CONSOLE_BOOT_ARGS`] when this fcvm itself runs in a virtual machine: its
+/// guest's console is then an exit to a VMM that is a guest's process. The profile's
+/// own arguments come last, so one that sets `loglevel` keeps its value.
 /// Resolved once at FirecrackerConfig construction (hashed);
 /// build_runtime_boot_args emits the config's value, so the hashed value and
 /// the applied value cannot drift.
 pub(crate) fn effective_extra_boot_args(
     runtime_config: &crate::commands::common::RuntimeConfig,
 ) -> Option<String> {
-    runtime_config
-        .boot_args
-        .clone()
-        .or_else(|| std::env::var("FCVM_BOOT_ARGS").ok())
+    extra_boot_args_for(
+        runtime_config
+            .boot_args
+            .clone()
+            .or_else(|| std::env::var("FCVM_BOOT_ARGS").ok()),
+        crate::utils::runs_in_a_virtual_machine(),
+    )
+}
+
+/// [`effective_extra_boot_args`] for a launcher that runs in a virtual machine or not.
+fn extra_boot_args_for(extra: Option<String>, in_a_virtual_machine: bool) -> Option<String> {
+    if !in_a_virtual_machine {
+        return extra;
+    }
+    Some(match extra {
+        Some(extra) => format!("{SLOW_CONSOLE_BOOT_ARGS} {extra}"),
+        None => SLOW_CONSOLE_BOOT_ARGS.to_string(),
+    })
 }
 
 /// Guest-visible boot inputs read from the host, resolved once per
@@ -2251,6 +2281,41 @@ mod tests {
         let launched = select_vmm_binary(Backend::Firecracker, &runtime, &mut state).unwrap();
         assert_eq!(launched, firecracker);
         assert_eq!(state.config.firecracker_bin, Some(firecracker));
+    }
+
+    /// A guest of a bare-metal host boots with the profile's own arguments and nothing
+    /// more, so its snapshot key is what it was. A guest of a guest boots with the slow
+    /// console arguments first and the profile's after them, where a `loglevel` of the
+    /// profile's wins.
+    #[test]
+    fn a_guest_of_a_guest_boots_with_a_quiet_console() {
+        assert_eq!(extra_boot_args_for(None, false), None);
+        assert_eq!(
+            extra_boot_args_for(Some("arm64.nv2".to_string()), false).as_deref(),
+            Some("arm64.nv2")
+        );
+        assert_eq!(
+            extra_boot_args_for(None, true).as_deref(),
+            Some("loglevel=5 systemd.show_status=false")
+        );
+        assert_eq!(
+            extra_boot_args_for(Some("arm64.nv2 loglevel=7".to_string()), true).as_deref(),
+            Some("loglevel=5 systemd.show_status=false arm64.nv2 loglevel=7")
+        );
+    }
+
+    /// Warnings and worse stay on a slow console: the kernel prints a message when its
+    /// level is below the console's, and a WARN, an Oops, a BUG, a panic, a stall and an
+    /// OOM kill are at warning (4) or above it.
+    #[test]
+    fn the_slow_console_keeps_kernel_warnings() {
+        let level: u32 = SLOW_CONSOLE_BOOT_ARGS
+            .split_whitespace()
+            .find_map(|arg| arg.strip_prefix("loglevel="))
+            .expect("the slow console arguments set loglevel")
+            .parse()
+            .unwrap();
+        assert!(level > 4, "loglevel={level} would drop kernel warnings");
     }
 
     /// Fail-closed inventory of the runtime kernel-cmdline tokens. Everything
