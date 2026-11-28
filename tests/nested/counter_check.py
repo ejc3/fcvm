@@ -24,7 +24,10 @@ this check hung in L2 that way until the test's own 1140 s limit, twice. The lev
 script also runs it under `timeout`, whose timer is relative.
 
 Two checks, three samples each, back to back:
-  - CLOCK_MONOTONIC_RAW through the vDSO and through the syscall agree within 1 ms;
+  - CLOCK_MONOTONIC_RAW through the vDSO lies between two reads of it through the
+    syscall, give or take 1 ms. Readings whose syscall reads are over 10 ms apart are
+    taken again, up to 30. It fails when every reading kept is outside its bracket, or
+    none could be kept. `--self-test` runs that comparison on made-up readings;
   - 0 <= CNTVCT_EL0 - cycle_last < 600 s of ticks, with cycle_last, mask, mult and
     shift read from the vDSO data page under its seqlock. Skipped, and said so, when
     the page does not look like the layout this was written against.
@@ -35,6 +38,75 @@ import platform
 import struct
 import sys
 import time
+
+# CLOCK_MONOTONIC_RAW through the vDSO is read between two reads through the syscall.
+# A healthy vDSO reading lies between them, wherever in the interval a deschedule fell,
+# so it is compared with the bracket and not with its midpoint.
+RAW_TOLERANCE_S = 0.001
+# A reading whose two syscall reads are further apart than this says too little and
+# is taken again.
+RAW_MAX_INTERVAL_S = 0.010
+RAW_SAMPLES = 3
+RAW_MAX_TRIES = 30
+
+
+def outside_bracket(before, vdso, after, tolerance=RAW_TOLERANCE_S):
+    """Seconds by which `vdso` lies outside [before - tolerance, after + tolerance]:
+    0.0 inside, negative below, positive above."""
+    if vdso < before - tolerance:
+        return vdso - before
+    if vdso > after + tolerance:
+        return vdso - after
+    return 0.0
+
+
+def retained(reading):
+    before, _vdso, after = reading
+    return 0 <= after - before <= RAW_MAX_INTERVAL_S
+
+
+def raw_failure(readings):
+    """None, or why these (before, vdso, after) readings fail: every retained one lies
+    outside its bracket, or none could be retained (which proves nothing, so it fails)."""
+    kept = [r for r in readings if retained(r)]
+    if not kept:
+        return (
+            f"no MONOTONIC_RAW reading had its two syscall reads within "
+            f"{RAW_MAX_INTERVAL_S * 1000:.0f} ms of each other in {len(readings)} tries"
+        )
+    outside = [outside_bracket(*r) for r in kept]
+    if all(outside):
+        return f"vDSO MONOTONIC_RAW is {outside[0]:+.3f} s from the syscall's"
+    return None
+
+
+def self_test():
+    """The comparison alone, on made-up readings: no clock, no VM, any architecture."""
+    quantum = 2**33 / 1e9
+    cases = [
+        # A deschedule after the vDSO read: clocks that agree, 3.9 ms apart.
+        ("delayed after the vDSO read", [(0.0, 0.0, 0.00390625)] * 3, False),
+        ("delayed before the vDSO read", [(0.0, 0.0039, 0.0039)] * 3, False),
+        ("undisturbed", [(5.0, 5.000001, 5.000002)] * 3, False),
+        ("one vDSO jump of 2^33 ns", [(100.0, 100.0 + quantum, 100.0001)] * 3, True),
+        ("the gap measured in L2", [(29.4, 29.4 + 2125.558, 29.4001)] * 3, True),
+        ("vDSO behind", [(100.0, 100.0 - quantum, 100.0001)] * 3, True),
+        ("just past the tolerance", [(1.0, 1.0031, 1.002)] * 3, True),
+        ("wide readings are taken again", [(0.0, 0.0, 0.5)] * 5 + [(1.0, 1.0001, 1.0002)], False),
+        ("a wide reading cannot excuse a gap", [(0.0, 0.2, 0.5)] * 5 + [(1.0, 9.6, 1.0002)], True),
+        ("nothing retained fails", [(0.0, 0.2, 0.5)] * RAW_MAX_TRIES, True),
+        ("a syscall clock that fails fails", [(float("nan"), 1.0, float("nan"))] * 3, True),
+    ]
+    wrong = [name for name, readings, fails in cases if (raw_failure(readings) is not None) != fails]
+    if wrong:
+        print("counter_check self-test FAILED: " + "; ".join(wrong))
+        return 1
+    print(f"counter_check self-test ok: {len(cases)} cases")
+    return 0
+
+
+if "--self-test" in sys.argv[1:]:
+    sys.exit(self_test())
 
 level = sys.argv[1] if len(sys.argv) > 1 else "?"
 tag = f"COUNTER_L{level}"
@@ -94,14 +166,20 @@ def kernel_record():
 freq = cntfrq()
 failures = []
 facts = [f"cntfrq={freq}"]
-for sample in range(3):
+readings = []
+while len([r for r in readings if retained(r)]) < RAW_SAMPLES and len(readings) < RAW_MAX_TRIES:
     before = syscall_clock(time.CLOCK_MONOTONIC_RAW)
     vdso = time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
     after = syscall_clock(time.CLOCK_MONOTONIC_RAW)
-    gap = vdso - (before + after) / 2
-    facts.append(f"raw_vdso_minus_syscall_s={gap:+.6f}")
-    if not abs(gap) < 0.001:
-        failures.append(f"vDSO MONOTONIC_RAW is {gap:+.3f} s from the syscall's")
+    readings.append((before, vdso, after))
+for before, vdso, after in [r for r in readings if retained(r)]:
+    facts.append(f"raw_vdso_minus_syscall_s={vdso - (before + after) / 2:+.6f}")
+if len(readings) > RAW_SAMPLES:
+    facts.append(f"raw_readings_taken={len(readings)}")
+failure = raw_failure(readings)
+if failure:
+    failures.append(failure)
+for sample in range(3):
     record = kernel_record() if vvar and freq else None
     if record is None:
         facts.append("vdso_data=unreadable")

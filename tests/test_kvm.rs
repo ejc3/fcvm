@@ -1160,15 +1160,25 @@ async fn test_nested_l2_user_space_reads_the_kernels_counter() -> Result<()> {
     )
     .await?;
     // The same check on the host: its counters must agree too, and its kernel log says
-    // whether this CPU has FEAT_NV2p1, which no guest may claim beyond.
-    let script = std::env::temp_dir().join(format!("counter_check-{}.py", std::process::id()));
-    std::fs::write(&script, include_str!("nested/counter_check.py"))?;
-    let host = std::process::Command::new("python3")
-        .arg(&script)
-        .arg("0")
-        .output()
+    // whether this CPU has FEAT_NV2p1, which no guest may claim beyond. python3 reads the
+    // script from its stdin: this test runs as root, and a script written to the shared
+    // temp directory under a predictable name could be replaced before python3 opened it.
+    let mut check = std::process::Command::new("python3")
+        .args(["-", "0"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("starting python3 for counter_check.py on the host")?;
+    {
+        use std::io::Write;
+        let mut stdin = check.stdin.take().context("python3 has no stdin pipe")?;
+        stdin
+            .write_all(include_str!("nested/counter_check.py").as_bytes())
+            .context("sending counter_check.py to python3")?;
+    }
+    let host = check
+        .wait_with_output()
         .context("running counter_check.py on the host")?;
-    let _ = std::fs::remove_file(&script);
     let host_line = String::from_utf8_lossy(&host.stdout).trim().to_string();
     println!("{host_line}");
     let host_has_nv2p1 = host_line.contains(" nv2p1=yes");
