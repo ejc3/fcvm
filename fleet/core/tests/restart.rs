@@ -832,3 +832,65 @@ fn a_refused_pages_overlay_text_reaches_no_snapshot() {
     let v = serde_json::to_value(fleet_core::view(&s)).unwrap();
     assert_eq!(v["renders"]["overlay"]["text"], "hello");
 }
+
+/// Two claims made with one token (a client can reuse a token on purpose) are two sessions:
+/// resumed from one address, the second is a second GPU there and is refused, whatever its
+/// token (#1956, item 5).
+#[test]
+fn two_claims_with_one_token_resume_one_per_address() {
+    let four_gpus = ev(
+        json!({"at": 1000, "type": "agent", "host": "h1", "msg": {"type": "hello", "host": "h1",
+        "arch": "x86_64", "capacity": 8, "gpus": [
+            {"name": "Tesla T4", "sbdf": "0000:01:00.0"},
+            {"name": "Tesla T4", "sbdf": "0000:02:00.0"},
+            {"name": "Tesla T4", "sbdf": "0000:03:00.0"},
+            {"name": "Tesla T4", "sbdf": "0000:04:00.0"}]}}),
+    );
+    let claim_from = |at: u64, viewer: &str, client: &str, id: &str| {
+        ev(
+            json!({"at": at, "type": "intent", "viewer": viewer, "client": client,
+            "id": id, "name": "claim_gpu", "args": {}, "secret": "token-a"}),
+        )
+    };
+    let s = run(
+        State::new(config(), 0),
+        vec![
+            four_gpus,
+            running(1500, "slot-1", 1),
+            running(1500, "slot-2", 1),
+            ev(json!({"at": 2000, "type": "viewer_joined", "viewer": "v1",
+                "client": "198.51.100.20"})),
+            ev(json!({"at": 2000, "type": "viewer_joined", "viewer": "v2",
+                "client": "198.51.100.21"})),
+            claim_from(3000, "v1", "198.51.100.20", "c1"),
+            claim_from(3100, "v2", "198.51.100.21", "c2"),
+        ],
+    );
+    assert_eq!(s.receipts["c1"].outcome, Outcome::Committed);
+    assert_eq!(s.receipts["c2"].outcome, Outcome::Committed);
+    let stored: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    let s = stored.resumed(config(), 5000);
+    assert_eq!(s.fleet.held_claims.len(), 2, "both claims are kept");
+    let resume = |at: u64, viewer: &str, id: &str| {
+        ev(
+            json!({"at": at, "type": "intent", "viewer": viewer, "client": "203.0.113.7",
+            "id": id, "name": "resume_claim", "args": {"token": "token-a"}}),
+        )
+    };
+    let s = run(
+        s,
+        vec![
+            ev(json!({"at": 7000, "type": "viewer_joined", "viewer": "w1",
+                "client": "203.0.113.7"})),
+            ev(json!({"at": 7000, "type": "viewer_joined", "viewer": "w2",
+                "client": "203.0.113.7"})),
+            resume(7100, "w1", "r1"),
+            resume(7200, "w2", "r2"),
+        ],
+    );
+    assert_eq!(s.receipts["r1"].outcome, Outcome::Committed);
+    assert_eq!(
+        s.receipts["r2"].reason.as_deref(),
+        Some("one GPU per client at a time")
+    );
+}

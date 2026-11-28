@@ -1618,30 +1618,40 @@ fn resume_claim(f: &mut Fleet, c: &Ctx, token: &str) -> Result<String, String> {
     {
         return Err("this viewer already holds a GPU".into());
     }
-    // The page's address may have changed with its connection: the claim counts against the
-    // address that takes it back, which may hold no other GPU (as `claim`).
-    let elsewhere = f
+    // The claim this page takes back, picked first. Both deadlines hold at the intent's own
+    // time, not only at the next tick.
+    let target = f
         .slots
         .values()
         .filter_map(|s| s.claim.as_ref())
         .chain(f.held_claims.iter().map(|h| &h.claim))
-        .any(|k| k.token != token && k.client == c.client);
-    // Both deadlines hold at the intent's own time, not only at the next tick.
-    let claim = f
-        .slots
-        .values_mut()
-        .filter_map(|s| s.claim.as_mut())
-        .chain(f.held_claims.iter_mut().map(|h| &mut h.claim))
         .find(|k| {
             k.token == token
                 && k.viewer.is_empty()
                 && k.resume_by.is_some_and(|t| c.at < t)
                 && c.at < k.expires_at
         })
+        .map(|k| k.session.clone())
         .ok_or("no claim waits for that token: it ended, or the coordinator did not restart")?;
+    // The page's address may have changed with its connection: the claim counts against the
+    // address that takes it back, which may hold no other GPU (as `claim`). Every other
+    // session counts, whatever its token: a client can send one token with two claims.
+    let elsewhere = f
+        .slots
+        .values()
+        .filter_map(|s| s.claim.as_ref())
+        .chain(f.held_claims.iter().map(|h| &h.claim))
+        .any(|k| k.session != target && k.client == c.client);
     if elsewhere {
         return Err("one GPU per client at a time".into());
     }
+    let claim = f
+        .slots
+        .values_mut()
+        .filter_map(|s| s.claim.as_mut())
+        .chain(f.held_claims.iter_mut().map(|h| &mut h.claim))
+        .find(|k| k.session == target)
+        .ok_or("no claim waits for that token: it ended, or the coordinator did not restart")?;
     claim.viewer = c.viewer.to_string();
     claim.client = c.client.to_string();
     claim.resume_by = None;
