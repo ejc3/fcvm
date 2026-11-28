@@ -225,8 +225,10 @@ whose type has no rate gets no CreateFleet, and the group's component (`scale`,
 `scale-renders`) is degraded with the template and the type until a rate is given. One such
 template holds its region's whole request, its priced templates included; the group's other
 regions launch. The rule holds with or without `--daily-spend-usd`. An instance of such a type
-already running is metered at the highest rate known. EC2 tiles are launched from their
-templates without reading the type, and are not checked (#2169); nothing is checked when the
+already running is metered at the highest rate known. EC2 tiles are checked the same way: the launch reads the template's
+type (`DescribeLaunchTemplateVersions`, cached 5 minutes) before its first RunInstances and
+fails with the type and the `--spend-rates` remedy when the table has no rate, so the tile
+shows `failed` with that text. Nothing is checked when the
 coordinator starts, because the types are read from the templates at the first launch.
 
 ECS is used for the coordinator only. The GPU hosts stay plain EC2: the ECS GPU AMIs bind

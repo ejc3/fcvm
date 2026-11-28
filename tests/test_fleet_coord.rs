@@ -8392,7 +8392,15 @@ async fn the_aws_tile_driver_launches_waits_and_terminates() {
         Some("wss://ec2-1.fcvm.example/frames")
     );
     {
-        let calls = api.calls.lock().unwrap();
+        // The launches; the template-type reads before each are not counted.
+        let calls: Vec<_> = api
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p)| p["Action"] == "RunInstances")
+            .cloned()
+            .collect();
         assert_eq!(calls[0].0, "us-east-1", "the first region is tried first");
         let (region, p) = &calls[1];
         assert_eq!(region, "us-west-2");
@@ -9156,7 +9164,7 @@ async fn pool_ec2_api(api: Arc<std::sync::Mutex<PoolEc2>>) -> String {
                     ok(format!("<DescribeInstancesResponse><reservationSet>{items}</reservationSet></DescribeInstancesResponse>"))
                 }
                 "DescribeLaunchTemplateVersions" => ok(format!(
-                    "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><imageId>{}</imageId></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>",
+                    "<DescribeLaunchTemplateVersionsResponse><launchTemplateVersionSet><item><launchTemplateData><imageId>{}</imageId><instanceType>g4dn.metal</instanceType></launchTemplateData></item></launchTemplateVersionSet></DescribeLaunchTemplateVersionsResponse>",
                     if p["LaunchTemplateVersion.1"] == "$Default" { &a.image } else { a.candidate_image.as_ref().unwrap_or(&a.image) }
                 )),
                 "StartInstances" => {
