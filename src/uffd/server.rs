@@ -1452,7 +1452,7 @@ impl UffdServer {
 
         // Ensure parent directory exists
         if let Some(parent) = socket_path.parent() {
-            tokio::fs::create_dir_all(parent)
+            crate::paths::ensure_dir_async(parent)
                 .await
                 .context("creating socket directory")?;
         }
@@ -2270,7 +2270,7 @@ struct FaultTrace {
 impl FaultTrace {
     fn from_env(vm_id: &str, origin: std::time::Instant) -> Option<Self> {
         let dir = PathBuf::from(std::env::var(FAULT_TRACE_ENV).ok()?);
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        if let Err(e) = crate::paths::ensure_dir(&dir) {
             warn!(
                 target: "uffd",
                 dir = %dir.display(),

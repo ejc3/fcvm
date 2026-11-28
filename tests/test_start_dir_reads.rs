@@ -88,6 +88,9 @@ struct Trace {
     /// Entry-creating calls that succeeded (a directory made, a file opened with O_CREAT, a
     /// rename's target, a link, a symlink, a node), by the directory the entry is in.
     creates: BTreeMap<String, u64>,
+    /// What those calls were, by the same directory: the call, the entry's name and its
+    /// result (`mkdirat snapshots = -1 EEXIST`), so a finding names them.
+    created: BTreeMap<String, BTreeSet<String>>,
     /// Such calls whose directory strace's log does not name (a relative path of a call
     /// that takes no directory descriptor).
     unplaced_creates: u64,
@@ -98,7 +101,7 @@ enum Pending {
     Listing(Option<String>),
     Exec(String),
     /// A call that may create a directory entry: where it lands, if it creates one.
-    Create(Option<Placed>),
+    Create(Option<Placed>, String),
 }
 
 /// The directory an entry-creating call puts its entry in, or that the log does not say, or
@@ -381,13 +384,42 @@ fn placed_by(name: &str, args: &[String]) -> Result<Option<Placed>> {
     )))
 }
 
-fn finish_create(placed: Option<Placed>, result: &str, trace: &mut Trace) {
-    // "?" is a process that died in the call, "-1 ..." a call that failed: nothing was made.
-    if result.starts_with('?') || result.starts_with('-') {
+/// The call and the name of the entry it creates, for a finding to name: `mkdirat snapshots`.
+fn create_label(call: &str, args: &[String]) -> String {
+    let path = CREATING
+        .iter()
+        .find(|(name, _, _)| *name == call)
+        .and_then(|&(_, _, path)| args.get(path))
+        .and_then(|arg| string_arg(arg));
+    let name = path
+        .as_deref()
+        .map(|path| {
+            path.rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(path)
+                .to_string()
+        })
+        .unwrap_or_else(|| "?".to_string());
+    format!("{call} {name}")
+}
+
+fn finish_create(placed: Option<Placed>, label: &str, result: &str, trace: &mut Trace) {
+    // "?" is a process that died in the call. A call that failed ("-1 EEXIST", a rename that
+    // lost, an O_CREAT open of a file another start made) still took the directory's lock to
+    // find that out, so it counts like one that made its entry.
+    if result.starts_with('?') {
         return;
     }
     match placed {
-        Some(Placed::In(dir)) => *trace.creates.entry(dir).or_default() += 1,
+        Some(Placed::In(dir)) => {
+            let result = result.split(" (").next().unwrap_or(result);
+            trace
+                .created
+                .entry(dir.clone())
+                .or_default()
+                .insert(format!("{label} = {result}"));
+            *trace.creates.entry(dir).or_default() += 1;
+        }
         Some(Placed::Unplaced) => trace.unplaced_creates += 1,
         Some(Placed::Bucket) | None => {}
     }
@@ -531,20 +563,23 @@ fn parse_line(line: &str, trace: &mut Trace, processes: &mut Processes) -> Resul
         {
             let (args, after) = call_args(args);
             let placed = placed_by(call, &args)?;
+            let label = create_label(call, &args);
             match result_of(after)? {
-                Some(result) => finish_create(placed, result, trace),
+                Some(result) => finish_create(placed, &label, result, trace),
                 None => {
-                    processes.pending.insert(pid, Pending::Create(placed));
+                    processes
+                        .pending
+                        .insert(pid, Pending::Create(placed, label));
                 }
             }
             return Ok(());
         }
         if let Some(rest) = rest.strip_prefix(&format!("<... {call} resumed>")) {
-            let Some(Pending::Create(placed)) = processes.pending.remove(&pid) else {
+            let Some(Pending::Create(placed, label)) = processes.pending.remove(&pid) else {
                 bail!("the end of a {call} whose beginning is not in the log");
             };
             let result = result_of(rest)?.context("a resumed call that is unfinished again")?;
-            finish_create(placed, result, trace);
+            finish_create(placed, &label, result, trace);
             return Ok(());
         }
     }
@@ -723,35 +758,92 @@ type Creates = BTreeMap<String, u64>;
 
 /// The name a directory a start created an entry in is compared under: [`dir_key`]'s, with
 /// every component that is a VM's id (`vm-` and 32 hex digits) as `<vm>`, so a directory of
-/// the start's own VM is named the same in every start and is known to be its own.
+/// the start's own VM is named the same in every start and is known to be its own, and every
+/// component that is a bucket of a hashed layout (one or two lowercase hex digits) as
+/// `<b16>` or `<b256>`, the number of buckets a name of that length is one of, so the
+/// buckets of one layout are one family whatever bucket each start's key fell in.
 fn create_key(dir: &str, roots: &[Root]) -> String {
     dir_key(dir, roots)
         .split('/')
         .map(|part| {
             let id = part.strip_prefix("vm-");
             if id.is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())) {
-                "<vm>"
+                "<vm>".to_string()
+            } else if let Some(buckets) = bucket_family(part) {
+                format!("<b{buckets}>")
+            } else if part
+                .strip_prefix("boot-")
+                .is_some_and(|boot| boot.len() >= 8 && boot.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                // A runtime directory's boot: one name in every start of a run.
+                "boot-<id>".to_string()
             } else {
-                part
+                part.to_string()
             }
         })
         .collect::<Vec<_>>()
         .join("/")
 }
 
+/// How many buckets a directory named `part` is one of, when it is a bucket of a hashed
+/// layout: 16 for one lowercase hex digit, 256 for two.
+fn bucket_family(part: &str) -> Option<u32> {
+    let hex = part
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    match part.len() {
+        1 | 2 if hex => Some(16u32.pow(part.len() as u32)),
+        _ => None,
+    }
+}
+
+/// The buckets a directory key's family spreads starts over: the product of its bucket
+/// components' families, 1 when it has none.
+fn fan_out(key: &str) -> u32 {
+    key.split('/')
+        .filter_map(|part| {
+            part.strip_prefix("<b")?
+                .strip_suffix('>')?
+                .parse::<u32>()
+                .ok()
+        })
+        .product()
+}
+
+/// The fewest buckets a family every start writes into may have: with more starts than
+/// that at once, each bucket's lock is shared by a sixty-fourth of them at most.
+const MIN_FAN_OUT: u32 = 64;
+
 fn creates_of(trace: &Trace, roots: &[Root]) -> Creates {
     let mut creates = Creates::new();
     for (dir, calls) in &trace.creates {
         *creates.entry(create_key(dir, roots)).or_default() += calls;
     }
+    let mut labels = CREATE_LABELS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (dir, made) in &trace.created {
+        labels
+            .entry(create_key(dir, roots))
+            .or_default()
+            .extend(made.iter().cloned());
+    }
     creates
 }
 
-/// A store directory every traced start creates an entry in, with the calls of each start.
+/// The entry-creating calls each directory key received in the traced starts of this
+/// process ([`creates_of`]), for a finding to name. One test runs per process.
+static CREATE_LABELS: std::sync::Mutex<BTreeMap<String, BTreeSet<String>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// A store directory more than one traced start creates an entry in, or a family of buckets
+/// every start writes into that has fewer than [`MIN_FAN_OUT`] buckets, with the calls of
+/// each start and the family's buckets (1 for a plain directory).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SharedCreate {
     dir: String,
     per_start: Vec<u64>,
+    fan_out: u32,
 }
 
 /// A store directory every start is still known to create an entry in, with its issue.
@@ -769,33 +861,43 @@ enum CreateFinding {
     StaleAllowance { dir: &'static str, issue: u32 },
 }
 
-/// The directories under the data directory that every one of `starts` created an entry in
-/// and that are no start's own (no `<vm>` component). Each such call takes the directory's
-/// inode lock for writing, and on btrfs the holder can wait out a transaction commit, so a
-/// directory that every start writes into makes the starts take turns. A hashed bucket of
-/// 16 is one start's in 16, so with six starts it is every start's with odds of 16^-5.
+/// The directories under the data directory, no start's own (no `<vm>` component), that the
+/// starts share. Each entry-creating call takes the directory's inode lock for writing, and on
+/// btrfs the holder can wait out a transaction commit, so the starts that write into one
+/// directory take turns, and the rate is bounded by how many starts each directory is
+/// shared by. What bounds it is judged from the layout, not from which bucket six random
+/// keys fell in: a plain directory that two or more starts write into is shared by all of
+/// them; a family of buckets every start writes into shares each bucket among one start in
+/// its fan-out, which must be at least [`MIN_FAN_OUT`].
 fn judge_creates(starts: &[Creates], allowances: &[CreateAllowance]) -> Vec<CreateFinding> {
-    let every = |dir: &str| {
+    let writers = |dir: &str| {
         starts
             .iter()
-            .all(|start| start.get(dir).is_some_and(|n| *n > 0))
+            .filter(|start| start.get(dir).is_some_and(|n| *n > 0))
+            .count()
+    };
+    let shared = |dir: &str| {
+        let fan_out = fan_out(dir);
+        if fan_out == 1 {
+            writers(dir) >= 2
+        } else {
+            writers(dir) == starts.len() && fan_out < MIN_FAN_OUT
+        }
     };
     let mut findings = Vec::new();
     for allowance in allowances {
-        if !every(allowance.dir) {
+        if !shared(allowance.dir) {
             findings.push(CreateFinding::StaleAllowance {
                 dir: allowance.dir,
                 issue: allowance.issue,
             });
         }
     }
-    let Some(first) = starts.first() else {
-        return findings;
-    };
-    for dir in first.keys() {
+    let dirs: BTreeSet<&String> = starts.iter().flat_map(|start| start.keys()).collect();
+    for dir in dirs {
         let ours = dir == "<data>" || dir.starts_with("<data>/");
         let a_vms_own = dir.split('/').any(|part| part == "<vm>");
-        if !ours || a_vms_own || !every(dir) {
+        if !ours || a_vms_own || !shared(dir) {
             continue;
         }
         if allowances.iter().any(|allowance| allowance.dir == dir) {
@@ -803,7 +905,11 @@ fn judge_creates(starts: &[Creates], allowances: &[CreateAllowance]) -> Vec<Crea
         }
         findings.push(CreateFinding::Shared(SharedCreate {
             dir: dir.clone(),
-            per_start: starts.iter().map(|start| start[dir]).collect(),
+            per_start: starts
+                .iter()
+                .map(|start| start.get(dir).copied().unwrap_or(0))
+                .collect(),
+            fan_out: fan_out(dir),
         }));
     }
     findings
@@ -985,8 +1091,10 @@ mod parsing {
         assert_eq!(trace.unplaced_creates, 0);
     }
 
+    /// A create that failed (a mkdir of a directory that exists) took the directory's lock
+    /// as one that succeeded does, so it counts; one whose process died in it does not.
     #[test]
-    fn a_create_that_failed_or_never_ended_made_nothing_and_a_split_one_counts_once() {
+    fn a_failed_create_counts_one_that_never_ended_does_not_and_a_split_one_counts_once() {
         let trace = parse_trace(concat!(
             "5111<fcvm> mkdirat(AT_FDCWD</h>, \"/srv/store/vm-disks\", 0777) = -1 EEXIST (File exists)\n",
             "5111<fcvm> openat(AT_FDCWD</h>, \"/srv/store/x.lock\", O_RDWR|O_CREAT|O_CLOEXEC, 0666 <unfinished ...>\n",
@@ -999,7 +1107,15 @@ mod parsing {
         .unwrap();
         assert_eq!(
             trace.creates,
-            BTreeMap::from([("/srv/store".to_string(), 1)])
+            BTreeMap::from([("/srv/store".to_string(), 2)])
+        );
+        assert_eq!(
+            trace.created["/srv/store"],
+            BTreeSet::from([
+                "mkdirat vm-disks = -1 EEXIST".to_string(),
+                "openat x.lock = 5</srv/store/x.lock>".to_string(),
+            ]),
+            "a finding names each call, its entry and its result"
         );
     }
 
@@ -1237,35 +1353,62 @@ mod judging {
             ),
             ("/mnt/store/dl-1/vm-disks", "<data>/vm-disks"),
             ("/mnt/store/dl-1/vm-disks/vm-12", "<data>/vm-disks/vm-12"),
+            (
+                "/mnt/store/dl-1/vm-disks/7f/vm-0123456789abcdef0123456789abcdef",
+                "<data>/vm-disks/<b256>/<vm>",
+            ),
+            (
+                "/mnt/store/dl-1/reclaim/1000/c",
+                "<data>/reclaim/1000/<b16>",
+            ),
         ] {
             assert_eq!(create_key(dir, &roots), key, "{dir}");
         }
     }
 
+    /// A plain store directory two starts write into is shared, whichever starts; a family of
+    /// 16 buckets every start writes into is too narrow; a family of 256 is not, and neither
+    /// is a VM's own directory, a directory one start writes into, or one outside the store.
     #[test]
-    fn a_store_directory_every_start_writes_into_is_found_and_no_other() {
+    fn a_shared_store_directory_and_a_narrow_bucket_family_are_found_and_no_other() {
         let starts = vec![
             creates(&[
                 ("<data>/vm-disks", 1),
-                ("<data>/vm-disks/<vm>", 2),
-                ("<data>/state/vms/a", 2),
+                ("<data>/vm-disks/<b256>/<vm>", 2),
+                ("<data>/reclaim/1000/<b16>", 3),
+                ("<data>/vm-disks/<b256>", 1),
+                ("<data>/image-cache", 1),
+                ("<data>/snapshots/s", 1),
                 ("<scopes>", 1),
-                ("/run/user/1000", 1),
             ]),
             creates(&[
-                ("<data>/vm-disks", 1),
-                ("<data>/vm-disks/<vm>", 2),
-                ("<data>/state/vms/3", 2),
+                ("<data>/vm-disks/<b256>/<vm>", 2),
+                ("<data>/reclaim/1000/<b16>", 3),
+                ("<data>/vm-disks/<b256>", 1),
                 ("<scopes>", 1),
-                ("/run/user/1000", 1),
+            ]),
+            creates(&[
+                ("<data>/vm-disks/<b256>/<vm>", 2),
+                ("<data>/reclaim/1000/<b16>", 3),
+                ("<data>/vm-disks/<b256>", 1),
+                ("<data>/snapshots/s", 2),
+                ("<scopes>", 1),
             ]),
         ];
         assert_eq!(
             judge_creates(&starts, &[]),
-            [CreateFinding::Shared(SharedCreate {
-                dir: "<data>/vm-disks".to_string(),
-                per_start: vec![1, 1],
-            })]
+            [
+                CreateFinding::Shared(SharedCreate {
+                    dir: "<data>/reclaim/1000/<b16>".to_string(),
+                    per_start: vec![3, 3, 3],
+                    fan_out: 16,
+                }),
+                CreateFinding::Shared(SharedCreate {
+                    dir: "<data>/snapshots/s".to_string(),
+                    per_start: vec![1, 0, 2],
+                    fan_out: 1,
+                }),
+            ]
         );
     }
 
@@ -1280,9 +1423,9 @@ mod judging {
             creates(&[("<data>/snapshots/s", 2)]),
         ];
         assert_eq!(judge_creates(&shared, &[allowance]), []);
-        let not_every = vec![creates(&[("<data>/snapshots/s", 1)]), creates(&[])];
+        let not_shared = vec![creates(&[("<data>/snapshots/s", 1)]), creates(&[])];
         assert_eq!(
-            judge_creates(&not_every, &[allowance]),
+            judge_creates(&not_shared, &[allowance]),
             [CreateFinding::StaleAllowance {
                 dir: "<data>/snapshots/s",
                 issue: 1
@@ -1652,6 +1795,17 @@ mod start {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// The calls a finding about `dir` names, from [`CREATE_LABELS`].
+    fn labels_of(dir: &str) -> String {
+        let labels = CREATE_LABELS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        labels
+            .get(dir)
+            .map(|made| made.iter().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default()
+    }
+
     /// The clones alive when the first measured start begins, and the clones added before
     /// the second: the first measured clone itself and four more.
     const ALIVE_AT_FIRST: usize = 1;
@@ -1937,8 +2091,25 @@ mod start {
 
     /// The store directories every start is still known to create an entry in. Each entry
     /// names its issue and comes out with the fix ([`judge_creates`]).
-    fn create_allowances() -> Vec<CreateAllowance> {
-        Vec::new()
+    ///
+    /// `fallback`: the starts keep their VM states in the runtime directory's fallback place,
+    /// `<data>/runtime` (a user with no base).
+    fn create_allowances(fallback: bool) -> Vec<CreateAllowance> {
+        if !fallback {
+            return Vec::new();
+        }
+        // The 16 state buckets, on the store only in the fallback place: production and the
+        // rate measurements keep states under /run/fcvm-<uid> or a named base, on tmpfs, and
+        // changing their count is a layout change the runtime directory's upgrade refusal
+        // would have to cover for running VMs, which is not worth it for a fallback the
+        // binding already tells the operator to replace (`sudo fcvm setup --runtime-dir`).
+        [
+            "<data>/runtime/boot-<id>/state/vms/<b16>",
+            "<data>/runtime/boot-<id>/state/names/<b16>",
+            "<data>/runtime/boot-<id>/state/pids/<b16>",
+        ]
+        .map(|dir| CreateAllowance { dir, issue: 2240 })
+        .into()
     }
 
     /// Remove the scopes' parent the starts made, with whatever empty scopes are left in it.
@@ -2173,15 +2344,42 @@ mod start {
                  directory:\n{made}",
                 creates.len()
             );
-            for finding in judge_creates(&creates, &create_allowances()) {
+            let fallback = creates
+                .iter()
+                .any(|start| start.keys().any(|dir| dir.starts_with("<data>/runtime/")));
+            let allowances = create_allowances(fallback);
+            for allowance in &allowances {
+                println!(
+                    "allowed as a shared directory while states are in the fallback place \
+                     <data>/runtime (#{}): {}; production keeps states on tmpfs under \
+                     /run/fcvm-<uid> or a named base",
+                    allowance.issue, allowance.dir
+                );
+            }
+            for finding in judge_creates(&creates, &allowances) {
                 report.push_str(&match finding {
-                    CreateFinding::Shared(SharedCreate { dir, per_start }) => format!(
-                        "every start created an entry in {dir} ({per_start:?} calls): a directory \
-                         every start writes into makes the starts take turns on its inode lock\n"
+                    CreateFinding::Shared(SharedCreate {
+                        dir,
+                        per_start,
+                        fan_out: 1,
+                    }) => format!(
+                        "more than one start created an entry in {dir} ({per_start:?} calls: {}): \
+                         the starts that write into one directory take turns on its inode lock\n",
+                        labels_of(&dir)
+                    ),
+                    CreateFinding::Shared(SharedCreate {
+                        dir,
+                        per_start,
+                        fan_out,
+                    }) => format!(
+                        "every start created an entry in a bucket of {dir} ({per_start:?} calls: \
+                         {}), a family of {fan_out} buckets: each bucket's lock is shared by one \
+                         start in {fan_out}, fewer than one in {MIN_FAN_OUT}\n",
+                        labels_of(&dir)
                     ),
                     CreateFinding::StaleAllowance { dir, issue } => format!(
-                        "{dir} is allowed as a directory every start writes into (#{issue}) and \
-                         not every start did: remove its entry from `create_allowances`\n"
+                        "{dir} is allowed as a directory the starts share (#{issue}) and the \
+                         starts no longer share it: remove its entry from `create_allowances`\n"
                     ),
                 });
             }

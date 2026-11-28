@@ -8,8 +8,8 @@
 //!
 //! An owner record makes each of them reclaimable. Its files live in
 //! `<data_dir>/reclaim/<euid>/<b>/`, where `<b>` is the bucket of the owner's id
-//! (`state::manager::bucket_of`, 16 buckets), so that owners beginning and completing
-//! together do not all take one directory's lock:
+//! (`crate::store_buckets`, 256 buckets made once per owner directory), so that owners
+//! beginning and completing together share each directory's lock with one start in 256:
 //!
 //! | step | what the owner does |
 //! |------|----------------------|
@@ -303,10 +303,21 @@ pub fn owner_dir_in(data_dir: &Path) -> Result<PathBuf> {
 /// directory is: mode 0700, owned by this user, refused when anyone else can write it. Root
 /// and a user share a data directory but never such a directory.
 pub fn owner_dir_under(data_dir: &Path, area: &str) -> Result<PathBuf> {
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    // Each directory is looked up before it is made: a mkdir of one that exists fails with
+    // EEXIST but still takes, for writing, the lock of the directory it would be made in,
+    // which every launch would then queue on.
+    let present = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    if !present(data_dir) {
+        crate::paths::ensure_dir(data_dir)
+            .with_context(|| format!("creating data directory {}", data_dir.display()))?;
+    }
     let shared = data_dir.join(area);
-    match std::fs::DirBuilder::new().mode(0o1777).create(&shared) {
+    let made = if present(&shared) {
+        Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+    } else {
+        std::fs::DirBuilder::new().mode(0o1777).create(&shared)
+    };
+    match made {
         // Like /tmp: every user makes a directory of its own here, and the sticky bit
         // keeps users from removing each other's. The umask cleared some of the bits.
         Ok(()) => std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777))
@@ -356,12 +367,14 @@ struct OwnerDir {
 
 impl OwnerDir {
     /// Open `path` without following a symlink, and refuse it unless it is a directory of
-    /// this user's that no one else can write, judged on the descriptor itself.
+    /// this user's that no one else can write, judged on the descriptor itself. Opened
+    /// `O_PATH`: every use is `fstat` or an `*at` call, and opening a directory for reading
+    /// takes its inode lock on btrfs, which every launch would queue on.
     fn open(path: &Path) -> Result<Self> {
         use nix::fcntl::OFlag;
         let fd = nix::fcntl::open(
             path,
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             nix::sys::stat::Mode::empty(),
         )
         .with_context(|| format!("opening owner directory {}", path.display()))?;
@@ -386,48 +399,37 @@ impl OwnerDir {
         Ok(Self { path, fd })
     }
 
-    /// The bucket directory `name` of this owner directory, opened through this descriptor
-    /// and held to the rules of the owner directory itself, or `None` when there is none.
+    /// The bucket directory `name` of this owner directory, opened `O_PATH` through this
+    /// descriptor and held to the rules of the owner directory itself, or `None` when there
+    /// is none.
     fn open_bucket(&self, name: &str) -> Result<Option<Self>> {
-        use nix::fcntl::OFlag;
         let path = self.path.join(name);
-        match nix::fcntl::openat(
-            &self.fd,
-            name,
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            nix::sys::stat::Mode::empty(),
-        ) {
-            Ok(fd) => Self::checked(path, File::from(fd)).map(Some),
-            Err(nix::errno::Errno::ENOENT) => Ok(None),
-            Err(error) => {
-                Err(error).with_context(|| format!("opening owner bucket {}", path.display()))
-            }
+        match crate::store_buckets::open(&self.fd, name)
+            .with_context(|| format!("opening owner bucket {}", path.display()))?
+        {
+            Some(fd) => Self::checked(path, File::from(fd)).map(Some),
+            None => Ok(None),
         }
     }
 
-    /// The bucket directory that holds the files of the owner `id`, made if it is missing.
+    /// The bucket directory that holds the files of the owner `id`. A launch looks it up;
+    /// the first launch of an owner directory that finds it missing makes all of them.
     fn bucket_of(&self, id: &str) -> Result<Self> {
-        let name = crate::state::manager::bucket_of(id);
-        match nix::sys::stat::mkdirat(
-            &self.fd,
-            name.as_str(),
-            nix::sys::stat::Mode::from_bits_truncate(0o700),
-        ) {
-            Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("creating owner bucket {}", self.display(&name)))
-            }
-        }
+        let name = crate::store_buckets::name(id);
+        crate::store_buckets::ensure_at(&self.fd, &self.path, &name)?;
         self.open_bucket(&name)?
             .with_context(|| format!("the owner bucket {} is gone", self.display(&name)))
     }
 
     /// Every directory of this owner directory that can hold records: the buckets that
-    /// exist, and the owner directory itself, where an fcvm before the buckets kept them.
+    /// exist, the one-digit buckets of the builds from 7fe6dc9e2 (2026-11-25) to before the
+    /// 256 buckets, and the owner directory itself, where an fcvm before 7fe6dc9e2 kept them.
+    /// A VM an older build started can outlive the upgrade, and its records are where that
+    /// build wrote them: only the sweep reads them, and not reading them would leak what
+    /// such a VM's fcvm made if it is killed.
     fn record_dirs(self) -> Result<Vec<Self>> {
         let mut dirs = Vec::new();
-        for name in BUCKETS.chars().map(String::from) {
+        for name in crate::store_buckets::names().chain(OLD_BUCKETS.chars().map(String::from)) {
             if let Some(bucket) = self.open_bucket(&name)? {
                 dirs.push(bucket);
             }
@@ -509,8 +511,9 @@ impl OwnerDir {
     }
 }
 
-/// The names of an owner directory's buckets: every value of `state::manager::bucket_of`.
-const BUCKETS: &str = "0123456789abcdef";
+/// The names of the buckets the builds from 7fe6dc9e2 to before the 256 buckets wrote owner
+/// records into (one hex digit of sha256(id)), read by the sweep only ([`OwnerDir::record_dirs`]).
+const OLD_BUCKETS: &str = "0123456789abcdef";
 
 /// How often a VM launch sweeps ([`reclaim_abandoned_if_due`]): [`crate::sweep::RECLAIM`]'s
 /// interval, which `FCVM_SWEEP_EVERY_MS` replaces (`reclaim=<milliseconds>`; `reclaim=0`
@@ -538,7 +541,7 @@ fn record_temp_name(id: &str) -> String {
 /// Where the owner `id`'s record is, in the owner directory `dir`.
 #[doc(hidden)]
 pub fn record_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(crate::state::manager::bucket_of(id))
+    dir.join(crate::store_buckets::name(id))
         .join(record_name(id))
 }
 
@@ -558,12 +561,8 @@ pub fn record_files(dir: &Path) -> Vec<PathBuf> {
             .unwrap_or_default()
     };
     let mut files: Vec<PathBuf> = list(dir).into_iter().filter(is_record_file).collect();
-    for bucket in BUCKETS.chars() {
-        files.extend(
-            list(&dir.join(bucket.to_string()))
-                .into_iter()
-                .filter(is_record_file),
-        );
+    for bucket in crate::store_buckets::names().chain(OLD_BUCKETS.chars().map(String::from)) {
+        files.extend(list(&dir.join(bucket)).into_iter().filter(is_record_file));
     }
     files.sort();
     files
@@ -1585,9 +1584,9 @@ mod tests {
         fn listed(&self) -> Vec<PathBuf> {
             let mut dirs = vec![self.dir.clone()];
             dirs.extend(
-                BUCKETS
-                    .chars()
-                    .map(|bucket| self.dir.join(bucket.to_string()))
+                crate::store_buckets::names()
+                    .chain(OLD_BUCKETS.chars().map(String::from))
+                    .map(|bucket| self.dir.join(bucket))
                     .filter(|bucket| bucket.is_dir()),
             );
             dirs
@@ -2600,7 +2599,7 @@ mod tests {
                 path: root.path().join("t.tmp"),
             })
             .unwrap();
-        let bucket = dir.join(crate::state::manager::bucket_of("vm-bucketed"));
+        let bucket = dir.join(crate::store_buckets::name("vm-bucketed"));
         assert_eq!(
             record_files(&dir),
             [
@@ -2615,7 +2614,8 @@ mod tests {
         assert!(record_files(&dir).is_empty());
     }
 
-    /// The sweep reclaims a record in any bucket, and one in the owner directory itself,
+    /// The sweep reclaims a record in any bucket, one in a one-digit bucket, where the builds
+    /// before the 256 buckets kept their records, and one in the owner directory itself,
     /// where an fcvm before the buckets kept its records. The sweep's own lock and stamp
     /// are not taken for an owner's files, by this sweep or by that fcvm's.
     #[tokio::test]
@@ -2654,19 +2654,41 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("vm-flat.lock"), b"").unwrap();
+        // A record of a build with the one-digit buckets, in one of them.
+        let one_digit = root.path().join("one-digit.tmp");
+        std::fs::write(&one_digit, b"x").unwrap();
+        let old_bucket = dir.join("a");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&old_bucket)
+            .unwrap();
+        let record = Record {
+            pid: 1,
+            boot_id: boot_id(),
+            user_namespace: current_user_namespace(),
+            resources: vec![Resource::Temp {
+                path: one_digit.clone(),
+            }],
+        };
+        std::fs::write(
+            old_bucket.join("vm-one-digit.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(old_bucket.join("vm-one-digit.lock"), b"").unwrap();
 
         // A launch's sweep, which leaves its lock and stamp in the owner directory.
         let swept = reclaim_abandoned_if_due_in(&dir, std::time::Duration::from_secs(3600)).await;
         assert_eq!(
             (swept.owners, swept.resources, swept.remaining),
-            (65, 65, 0)
+            (66, 66, 0)
         );
-        assert!(temps.iter().all(|temp| !temp.exists()) && !old.exists());
+        assert!(temps.iter().all(|temp| !temp.exists()) && !old.exists() && !one_digit.exists());
         assert!(record_files(&dir).is_empty());
         let mut left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.len() > 1)
+            .filter(|name| name.len() > 1 && !crate::store_buckets::is_name(name))
             .collect();
         left.sort();
         assert_eq!(left, [SWEEP_LOCK, SWEEP_STAMP]);
