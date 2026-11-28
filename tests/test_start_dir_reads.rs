@@ -100,6 +100,10 @@ struct Trace {
     /// Such calls whose directory strace's log does not name (a relative path of a call
     /// that takes no directory descriptor).
     unplaced_creates: u64,
+    /// Unix sockets bound to a path, by the directory the socket's entry is in: the call and
+    /// the socket's name with its result (`bind vsock.sock_4999 = 0`). Abstract sockets have
+    /// no entry and are not counted.
+    binds: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// A call strace logged the beginning of, by the process that is still in it.
@@ -108,6 +112,8 @@ enum Pending {
     Exec(String),
     /// A call that may create a directory entry: where it lands, if it creates one.
     Create(Option<Placed>, String),
+    /// A bind of a Unix socket to a path: the directory its entry lands in, and the label.
+    Bind(Option<String>, String),
 }
 
 /// The directory an entry-creating call puts its entry in, or that the log does not say, or
@@ -431,6 +437,39 @@ fn finish_create(placed: Option<Placed>, label: &str, result: &str, trace: &mut 
     }
 }
 
+/// The directory a `bind` call's Unix socket lands in and the call's label, from the call's
+/// arguments as strace printed them (`3<UNIX:[1]>, {sa_family=AF_UNIX, sun_path="/a/b"}, 110`);
+/// `None` for a socket that is not a Unix socket with a path (an abstract one, `sun_path=@...`,
+/// or another family).
+fn bind_target(args: &str) -> Option<(String, String)> {
+    let start = args.find("sun_path=\"")? + "sun_path=\"".len();
+    let bytes = args.as_bytes();
+    let mut end = start;
+    while end < bytes.len() && bytes[end] != b'"' {
+        end += if bytes[end] == b'\\' { 2 } else { 1 };
+    }
+    let path = args.get(start..end)?;
+    let (dir, name) = path.rsplit_once('/')?;
+    let dir = if dir.is_empty() { "/" } else { dir };
+    Some((dir.to_string(), format!("bind {name}")))
+}
+
+/// Record a finished `bind` of a Unix socket to a path. A bind that failed (`-1 EADDRINUSE`)
+/// still looked its name up in the directory, so it counts like one that made its entry.
+fn finish_bind(target: Option<String>, label: &str, result: &str, trace: &mut Trace) {
+    if result.starts_with('?') {
+        return;
+    }
+    if let Some(dir) = target {
+        let result = result.split(" (").next().unwrap_or(result);
+        trace
+            .binds
+            .entry(dir)
+            .or_default()
+            .insert(format!("{label} = {result}"));
+    }
+}
+
 fn finish_listing(
     reader: String,
     dir: Option<String>,
@@ -560,6 +599,28 @@ fn parse_line(line: &str, trace: &mut Trace, processes: &mut Processes) -> Resul
         if result_of(rest)? == Some("0") {
             processes.became(pid, program, trace);
         }
+        return Ok(());
+    }
+    if let Some(args) = rest.strip_prefix("bind(") {
+        let (_, after) = call_args(args);
+        let (dir, label) = match bind_target(args) {
+            Some((dir, label)) => (Some(dir), label),
+            None => (None, String::new()),
+        };
+        match result_of(after)? {
+            Some(result) => finish_bind(dir, &label, result, trace),
+            None => {
+                processes.pending.insert(pid, Pending::Bind(dir, label));
+            }
+        }
+        return Ok(());
+    }
+    if let Some(rest) = rest.strip_prefix("<... bind resumed>") {
+        let Some(Pending::Bind(dir, label)) = processes.pending.remove(&pid) else {
+            bail!("the end of a bind whose beginning is not in the log");
+        };
+        let result = result_of(rest)?.context("a resumed call that is unfinished again")?;
+        finish_bind(dir, &label, result, trace);
         return Ok(());
     }
     for (call, _, _) in CREATING {
@@ -845,7 +906,37 @@ fn creates_of(trace: &Trace, roots: &[Root]) -> Creates {
             .or_default()
             .extend(made.iter().cloned());
     }
+    let mut binds = STORE_BINDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (dir, bound) in &trace.binds {
+        binds
+            .entry(create_key(dir, roots))
+            .or_default()
+            .extend(bound.iter().cloned());
+    }
     creates
+}
+
+/// The Unix sockets the traced starts of this process bound, by directory key
+/// ([`creates_of`]), for [`binds_on_the_store`]. One test runs per process.
+static STORE_BINDS: std::sync::Mutex<BTreeMap<String, BTreeSet<String>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// The directories under the data directory (`<data>`) a start bound a Unix socket in, with
+/// what it bound. A bind makes the socket's entry, and on the store that joins a btrfs
+/// transaction, which waits out whatever commit another start's subvolume snapshot forced: 7
+/// sockets a start, 108 ms a clone at C=512. A VM's sockets belong in its runtime directory on
+/// tmpfs. The runtime directory's fallback place in the data directory (`<data>/runtime`, where
+/// there is no tmpfs) is not the store's disk path and is left out.
+fn binds_on_the_store(binds: &BTreeMap<String, BTreeSet<String>>) -> Vec<(String, Vec<String>)> {
+    binds
+        .iter()
+        .filter(|(dir, _)| {
+            (dir.starts_with("<data>/") && !dir.starts_with("<data>/runtime/")) || *dir == "<data>"
+        })
+        .map(|(dir, bound)| (dir.clone(), bound.iter().cloned().collect()))
+        .collect()
 }
 
 /// The entry-creating calls each directory key received in the traced starts of this
@@ -976,12 +1067,13 @@ fn table(few: &Reads, many: &Reads) -> String {
     text
 }
 
-/// The calls strace logs: every program a process becomes, every directory read, and every
-/// call that can create a directory entry ([`CREATING`]). A `?` keeps strace from refusing a
+/// The calls strace logs: every program a process becomes, every directory read, every call
+/// that can create a directory entry ([`CREATING`]), and every `bind` (a Unix socket bound to a
+/// path makes its entry: [`bind_target`]). A `?` keeps strace from refusing a
 /// call the architecture does not have (arm64 has only the `*at` forms and `renameat2`).
 const TRACED: &str =
     "trace=execve,?getdents,getdents64,openat,?openat2,?open,?creat,mkdirat,?mkdir,\
-     renameat2,?renameat,?rename,linkat,?link,symlinkat,?symlink,mknodat,?mknod";
+     renameat2,?renameat,?rename,linkat,?link,symlinkat,?symlink,mknodat,?mknod,bind";
 
 /// strace's arguments before the command it runs. `-D` makes strace the grandchild and
 /// the command the child, so the caller's child is the command itself, with its pid. `-f`
@@ -1160,6 +1252,67 @@ mod parsing {
                 "openat x.lock = 5</srv/store/x.lock>".to_string(),
             ]),
             "a finding names each call, its entry and its result"
+        );
+    }
+
+    /// A bind of a Unix socket to a path is read with the directory its entry lands in, whole
+    /// or split across a resume, failed or not; an abstract socket and an inet socket make no
+    /// entry. A socket bound in a VM's disk directory on the store is a finding, one in the
+    /// runtime directory (on tmpfs, or in the data directory's fallback place) is not.
+    ///
+    /// RED BEFORE THE CHANGE: strace was not asked for `bind`, so every socket a start bound
+    /// on the store went uncounted.
+    #[test]
+    fn a_unix_socket_bound_on_the_store_is_a_finding_and_one_in_the_runtime_directory_is_not() {
+        let trace = parse_trace(concat!(
+            "5111<fcvm> bind(7<UNIX:[1]>, {sa_family=AF_UNIX, sun_path=\"/srv/store/vm-disks/ab/vm-1/vsock.sock_4999\"}, 110) = 0\n",
+            "5112<firecracker> bind(8<UNIX:[2]>, {sa_family=AF_UNIX, sun_path=\"/run/fcvm-0/k/boot-b/vm/1/firecracker.sock\"} <unfinished ...>\n",
+            "5112<firecracker> <... bind resumed>, 110) = 0\n",
+            "5111<fcvm> bind(9<UNIX:[3]>, {sa_family=AF_UNIX, sun_path=\"/srv/store/vm-disks/ab/vm-1/vsock.sock_52000\"}, 110) = -1 EADDRINUSE (Address in use)\n",
+            "5111<fcvm> bind(10<UNIX:[4]>, {sa_family=AF_UNIX, sun_path=@\"fcvm-abstract\"}, 16) = 0\n",
+            "5111<fcvm> bind(11<TCP:[5]>, {sa_family=AF_INET, sin_port=htons(80), sin_addr=inet_addr(\"127.0.0.1\")}, 16) = 0\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            trace.binds,
+            BTreeMap::from([
+                (
+                    "/run/fcvm-0/k/boot-b/vm/1".to_string(),
+                    BTreeSet::from(["bind firecracker.sock = 0".to_string()])
+                ),
+                (
+                    "/srv/store/vm-disks/ab/vm-1".to_string(),
+                    BTreeSet::from([
+                        "bind vsock.sock_4999 = 0".to_string(),
+                        "bind vsock.sock_52000 = -1 EADDRINUSE".to_string(),
+                    ])
+                ),
+            ])
+        );
+        assert!(
+            trace.creates.is_empty(),
+            "a bind is not counted as a create"
+        );
+        let keyed = BTreeMap::from([
+            (
+                "<data>/vm-disks/<b256>/<vm>".to_string(),
+                BTreeSet::from(["bind vsock.sock_4999 = 0".to_string()]),
+            ),
+            (
+                "<data>/runtime/boot-<id>/vm/<vm>".to_string(),
+                BTreeSet::from(["bind firecracker.sock = 0".to_string()]),
+            ),
+            (
+                "/run/fcvm-0/<k>/boot-<id>/vm/<vm>".to_string(),
+                BTreeSet::from(["bind vsock.sock = 0".to_string()]),
+            ),
+        ]);
+        assert_eq!(
+            binds_on_the_store(&keyed),
+            vec![(
+                "<data>/vm-disks/<b256>/<vm>".to_string(),
+                vec!["bind vsock.sock_4999 = 0".to_string()]
+            )]
         );
     }
 
@@ -2453,6 +2606,18 @@ mod start {
                          starts no longer share it: remove its entry from `create_allowances`\n"
                     ),
                 });
+            }
+            let bound = STORE_BINDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for (dir, sockets) in binds_on_the_store(&bound) {
+                report.push_str(&format!(
+                    "a start bound a Unix socket on the store in {dir} ({}): a bind there joins a \
+                     btrfs transaction and waits out the commit another start's snapshot forced; \
+                     a VM's sockets belong in its runtime directory\n",
+                    sockets.join(", ")
+                ));
             }
             ensure!(report.is_empty(), "{report}{listed}\n{made}");
             Ok(())
