@@ -433,6 +433,15 @@ pub fn static_boot_args() -> &'static str {
     }
 }
 
+/// A read-only `HOST:GUEST:ro` map as the pre-start key holds it, `:GUEST:ro`, or `None` for
+/// a read-write map or a spec that is not a map (both stay in the key as given).
+fn read_only_map_guest_side(spec: &str) -> Option<String> {
+    match spec.split(':').collect::<Vec<_>>().as_slice() {
+        [_, guest, "ro"] => Some(format!(":{guest}:ro")),
+        _ => None,
+    }
+}
+
 /// Whether a `KEY=value` env entry is one a restore sets for itself, and so no part
 /// of the snapshot key: `HOST_IPV6`, the host identity address fc-agent adds to lo.
 fn is_restore_set_env(entry: &str) -> bool {
@@ -445,9 +454,21 @@ impl FirecrackerConfig {
     /// Healthy and so when its startup snapshot is taken. The pre-start snapshot is taken
     /// before the container starts, and a restore of it monitors the restoring run's own
     /// check, so runs and prepares that differ only in the URL share it (#953).
+    ///
+    /// Nor does it hold a read-only map's host path, only its guest path and mode: a restore
+    /// serves each read-only map from the restoring run's own directory (`snapshot run --map`),
+    /// so runs that map one guest path read-only from different host directories share the
+    /// pre-start snapshot (#2239). The startup snapshot keeps the host path, because its
+    /// container already read the map's files. A read-write map keeps its host path in both:
+    /// a restore cannot move it.
     pub fn snapshot_key(&self) -> String {
         let mut pre_start = self.keyed().into_owned();
         pre_start.health_check_url = None;
+        for map in &mut pre_start.volume_mounts {
+            if let Some(guest_side) = read_only_map_guest_side(map) {
+                *map = guest_side;
+            }
+        }
         pre_start.key_of()
     }
 
@@ -1032,6 +1053,39 @@ mod tests {
         let mut config2 = test_config();
         config2.volume_mounts = vec!["/tmp/data:/data:ro".to_string()];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    /// A read-only map's host path is in no pre-start key: a restore serves each read-only map
+    /// from the restoring run's own directory (`snapshot run --map`), so runs that map the same
+    /// guest path read-only from different host directories, as every `make` run does with its
+    /// own test-config directory, share the pre-start snapshot (#2239). The startup snapshot
+    /// keeps the host path: its container already read the map's files. A read-write map stays
+    /// keyed by its host path, since a restore cannot move it, and so do its mode and guest path.
+    #[test]
+    fn a_read_only_maps_host_path_is_in_no_pre_start_key() {
+        let with = |maps: &[&str]| {
+            let mut config = test_config();
+            config.volume_mounts = maps.iter().map(|m| m.to_string()).collect();
+            config
+        };
+        let a = with(&["/run/a/cfg:/root/.config/fcvm:ro", "/data:/data"]);
+        let b = with(&["/run/b/cfg:/root/.config/fcvm:ro", "/data:/data"]);
+        assert_eq!(a.snapshot_key(), b.snapshot_key());
+        assert_ne!(a.startup_snapshot_base_key(), b.startup_snapshot_base_key());
+        for other in [
+            with(&["/run/a/cfg:/root/.config/fcvm:ro", "/elsewhere:/data"]),
+            with(&["/run/a/cfg:/root/.config/fcvm", "/data:/data"]),
+            with(&["/run/a/cfg:/root/.config/other:ro", "/data:/data"]),
+            with(&["/data:/data", "/run/a/cfg:/root/.config/fcvm:ro"]),
+            with(&["/data:/data"]),
+        ] {
+            assert_ne!(
+                a.snapshot_key(),
+                other.snapshot_key(),
+                "{:?}",
+                other.volume_mounts
+            );
+        }
     }
 
     #[test]

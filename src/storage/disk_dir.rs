@@ -255,7 +255,7 @@ fn cp_args(keep_owners: bool) -> Vec<&'static str> {
 /// `cp -a --reflink=auto host dest`: a reflink copy where the filesystem allows one.
 fn copy_tree(host: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)
+        crate::paths::ensure_dir(parent)
             .with_context(|| format!("creating --disk-dir staging {}", parent.display()))?;
     }
     let output = crate::utils::helper_command_std("cp")

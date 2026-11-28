@@ -5,6 +5,7 @@ pub mod names;
 pub mod namespace;
 pub mod netns_agent;
 pub mod pasta;
+pub mod pesto;
 pub mod portmap;
 pub mod relay_socket;
 pub mod routed;
@@ -55,7 +56,7 @@ pub(crate) async fn acquire_host_network_lock(
     name: &str,
 ) -> Result<nix::fcntl::Flock<std::fs::File>> {
     let dir = std::path::Path::new(HOST_NETWORK_LOCK_DIR);
-    tokio::fs::create_dir_all(dir)
+    crate::paths::ensure_dir_async(dir)
         .await
         .with_context(|| format!("creating the host network lock directory {}", dir.display()))?;
     let path = dir.join(name);

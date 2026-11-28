@@ -139,9 +139,18 @@ export class WallClient {
     return this.urls[this.live.index]!;
   }
 
-  constructor(url: string, probeTiles: (st: FleetState) => readonly Tile[] = (st) => st.tiles, directUrl: string | null = null) {
+  /** `minecraft`: this page shows Minecraft mode, and asks for the servers' status rows with its visibility. */
+  constructor(url: string, probeTiles: (st: FleetState) => readonly Tile[] = (st) => st.tiles, directUrl: string | null = null, minecraft = false) {
     this.urls = directUrl === null ? [url] : [directUrl, url];
     this.probeTiles = probeTiles;
+    this.minecraft = minecraft;
+  }
+
+  private readonly minecraft: boolean;
+
+  /** The visibility message: a page that shows Minecraft mode says so, and only then (an older coordinator ignores it). */
+  private visibilityText(): string {
+    return JSON.stringify(this.minecraft ? { type: "visibility", visible: this.visible, minecraft: true } : { type: "visibility", visible: this.visible });
   }
 
   // ---- store ------------------------------------------------------------------
@@ -310,7 +319,7 @@ export class WallClient {
   /** Tell the coordinator whether this tab is visible (also sent on every connect). */
   setVisible(visible: boolean): void {
     this.visible = visible;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "visibility", visible }));
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(this.visibilityText());
   }
 
   private connect(): void {
@@ -361,7 +370,7 @@ export class WallClient {
       this.dispatch({ type: "socket", status: "open", at: now() });
       ws.send(seatMessage(savedSeat(), this.opened));
       this.opened = true;
-      ws.send(JSON.stringify({ type: "visibility", visible: this.visible }));
+      ws.send(this.visibilityText());
       for (const intent of intentsToResend(this.state)) ws.send(JSON.stringify(intent));
       this.ping();
     };

@@ -4,7 +4,7 @@
 
 use crate::event::{Event, Intent};
 use crate::history;
-use crate::protocol::{AgentMsg, HealthReport, SlotReport};
+use crate::protocol::{AgentMsg, HealthReport, SlotReport, VmStats};
 use crate::scene::{drag, Keyframe, Light, Word, MAX_LIGHTS, MAX_WORDS};
 use crate::state::*;
 use crate::tiling::{bands, grid_in, sides, Half, Rect};
@@ -123,6 +123,23 @@ pub fn precheck_word(
     }
 }
 
+/// Why a `renders_overlay` from `client` would be refused before its text is checked, if it
+/// would be: so a text that cannot be applied costs no check.
+pub fn precheck_overlay(
+    state: &State,
+    client: &str,
+    args: &serde_json::Value,
+    at: u64,
+) -> Option<String> {
+    match Intent::parse("renders_overlay", args) {
+        Err(reason) => Some(reason),
+        Ok(_) => state
+            .fleet
+            .renders
+            .refusal(client, at, &state.config.renders),
+    }
+}
+
 /// The viewers' words in the sky now, which a new word must be checked together with. A
 /// system word is the wall's own and is not part of what is checked, so one placed while a
 /// viewer's word is being checked does not make that check stale.
@@ -221,8 +238,16 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 secret: secret.as_deref(),
                 at,
             };
-            let result = Intent::parse(name, args)
-                .and_then(|intent| intent_effect(state, &ctx, &intent, check.as_ref()));
+            let parsed = Intent::parse(name, args);
+            // What a pages intent shows of itself once committed: the parsed value, never
+            // the args as sent.
+            let pages_args = match &parsed {
+                Ok(Intent::RendersOverlay { text }) => Some(serde_json::json!({"text": text})),
+                Ok(Intent::RendersTransform { name }) => Some(serde_json::json!({"name": name})),
+                _ => None,
+            };
+            let result =
+                parsed.and_then(|intent| intent_effect(state, &ctx, &intent, check.as_ref()));
             let (outcome, reason, summary) = match result {
                 Ok(summary) => (Outcome::Committed, None, summary),
                 // The reason reaches the public actions feed and the viewer's receipt.
@@ -231,13 +256,22 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     (Outcome::Refused, Some(reason.clone()), reason)
                 }
             };
-            // A refused word's text is never shown: its args are left out and the summary
-            // is the reason only. Args that are not an object (refused, `args must be an
+            // A refused word's text is never shown: its args are left out and the summary is
+            // the reason only. Args that are not an object (refused, `args must be an
             // object`) are shown as `{}` too: an intent's args are an object on the wire, and
             // a page keeps nothing else.
             // A claim's and a resume's args are the claim's token, which only its viewer may
             // hold.
-            let shown_args = if (name == "word" && outcome == Outcome::Refused)
+            // A pages intent (`renders_*`) shows what was parsed and committed and nothing
+            // else: a refused one shows `{}`, whatever it was refused for, and a committed
+            // one its text as kept or its transform's name. Its args as sent can hold text
+            // nobody checked (a transform's name that is none, a key beside `text`).
+            let shown_args = if name.starts_with("renders_") {
+                match outcome {
+                    Outcome::Committed => pages_args.unwrap_or_else(|| serde_json::json!({})),
+                    _ => serde_json::json!({}),
+                }
+            } else if (name == "word" && outcome == Outcome::Refused)
                 || name == "resume_claim"
                 || name == "claim_gpu"
                 || !args.is_object()
@@ -308,6 +342,23 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 return None;
             }
             let f = &mut state.fleet;
+            // Pages mode's host's frame socket, for the addresses its hello gave.
+            if let Some(h) = f
+                .renders
+                .hosts
+                .iter_mut()
+                .find(|(name, _)| crate::state::renders_id(name).as_deref() == Some(slot.as_str()))
+                .map(|(_, h)| h)
+            {
+                if names.names(
+                    h.hello.ipv6.as_deref(),
+                    h.hello.ipv4.as_deref(),
+                    h.hello.v4_port,
+                ) {
+                    h.published = Some(names.clone());
+                }
+                return None;
+            }
             // A host aggregator's names, for the addresses it reports now.
             if let Some(h) = f
                 .hosts
@@ -442,10 +493,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             let awake = state.fleet.power.state != "asleep";
             let cfg = state.config.potato.clone();
             state.fleet.potato.tick(at, awake, &cfg);
+            state.fleet.renders.tick(at);
             None
         }
         Event::Ec2Health { report, .. } | Event::LambdaHealth { report, .. } => {
-            health(&mut state.fleet, None, report);
+            health(&mut state.fleet, None, report, at);
             None
         }
         Event::Agent { host, msg, .. } => {
@@ -460,19 +512,35 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     phones,
                     phone_actions,
                     potato_players,
+                    potato_cpus,
+                    potato_confined,
                     windows,
                     windows_actions,
                     minecraft,
                     minecraft_server,
+                    renders,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
                         state.fleet.registrations.registered(host, at);
+                        state.fleet.renders.agent_hello(host, renders.as_ref());
+                        if renders.is_some() {
+                            // Pages mode's host is no host of the wall: not in `hosts` (the
+                            // count the other modes' pages read), no slot, no place in the
+                            // potato ring or a wake's record. A name that was a wall host
+                            // leaves the wall.
+                            leave_wall(state, host, at);
+                            return None;
+                        }
                         let cfg = state.config.potato.clone();
-                        state
-                            .fleet
-                            .potato
-                            .agent_hello(host, *potato_players, at, &cfg);
+                        state.fleet.potato.agent_hello(
+                            host,
+                            *potato_players,
+                            *potato_cpus,
+                            *potato_confined,
+                            at,
+                            &cfg,
+                        );
                         // A hello again on the same connection keeps the image it reported.
                         let image = state
                             .fleet
@@ -521,8 +589,13 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         observe_minecraft(&mut state.fleet, n, host, r, at);
                     }
                 }
-                AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h),
+                AgentMsg::Health(h) => health(&mut state.fleet, Some(host), h, at),
                 AgentMsg::Draining { .. } => {
+                    // Pages mode's host: its own state only, never the wall's reclaimed list.
+                    if let Some(h) = state.fleet.renders.hosts.get_mut(host) {
+                        h.draining = true;
+                        return None;
+                    }
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.draining = true;
                     }
@@ -575,6 +648,9 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     let cfg = state.config.potato.clone();
                     state.fleet.potato.event(host, e, at, &cfg);
                 }
+                AgentMsg::Renders(report) => {
+                    state.fleet.renders.report(host, report, at);
+                }
                 AgentMsg::WindowsImage(image) => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.windows_image = Some(image.clone());
@@ -584,8 +660,15 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             None
         }
         Event::AgentGone { host, .. } => {
+            // Pages mode's host leaves pages mode's state only: it was never a wall host, so
+            // it is not a reclaimed one.
+            if state.fleet.renders.hosts.contains_key(host) {
+                state.fleet.renders.agent_gone(host);
+                return None;
+            }
             let cfg = state.config.potato.clone();
             state.fleet.potato.agent_gone(host, at, &cfg);
+            state.fleet.renders.agent_gone(host);
             let f = &mut state.fleet;
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
@@ -691,8 +774,9 @@ fn image_complete(f: &Fleet) -> bool {
 
 /// Sleep after `idle_scale_down_secs` with no active viewer, or once no viewer has arrived
 /// for `sleep_without_new_viewer_secs` (never during a claim, a race or a warm window); wake
-/// on an active viewer while a viewer has arrived within that limit, and at once inside a
-/// warm window (`crate::warm`); be awake once the image is complete.
+/// on an active viewer while at least `min_wake_remaining_secs` of that limit remain
+/// (`crate::view::page_wakes`), and at once inside a warm window (`crate::warm`); be awake
+/// once the image is complete.
 fn power_step(state: &mut State, at: u64) {
     // Read from the clock and the configured windows, and false while the day's budget is
     // spent, so the warm rule stands down for the budget.
@@ -711,6 +795,7 @@ fn power_step(state: &mut State, at: u64) {
     let interval = state.config.race_interval_secs;
     let no_arrival = crate::view::no_arrival_deadline(&state.fleet.power, &state.config)
         .is_some_and(|t| at >= t);
+    let page_wakes = crate::view::page_wakes(&state.fleet.power, &state.config, at);
     let f = &mut state.fleet;
     let active = f.viewers.keys().filter(|v| !f.hidden.contains(*v)).count();
     if active > 0 {
@@ -725,8 +810,9 @@ fn power_step(state: &mut State, at: u64) {
         || f.minecraft.values().any(|s| minecraft_claim(s).is_some());
     let racing = race_running(f);
     if f.power.state == "asleep" {
-        // Connected pages do not wake it once the limit has run out: an arrival does.
-        if (active > 0 && !no_arrival) || warm {
+        // Connected pages wake it only while enough of the limit remains for the wake to be
+        // worth its hosts; with less, or none, an arrival does (a new viewer, or `wake`).
+        if (active > 0 && page_wakes) || warm {
             f.power.state = "waking".into();
             f.power.woke_at = Some(at);
             f.power.asleep_since = None;
@@ -1207,6 +1293,41 @@ fn intent_effect(
                 crate::potato::PotatoIntent::Done => Ok("restart".into()),
                 crate::potato::PotatoIntent::Refused(r) => Err(r),
             }
+        }
+        Intent::RendersOverlay { text } => {
+            let cfg = state.config.renders.clone();
+            // The limits first: a change that would be refused anyway needs no verdict.
+            if let Some(reason) = state.fleet.renders.refusal(c.client, at, &cfg) {
+                return Err(reason);
+            }
+            match check {
+                None => return Err("the text check did not run".into()),
+                Some(k) if k.verdict == "error" => return Err(k.reason.clone()),
+                Some(k) if !k.allowed() => {
+                    return Err(format!("the text check refused it: {}", k.reason))
+                }
+                Some(_) => {}
+            }
+            let change = crate::renders::Change::Text(text.clone());
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &change, at, &cfg)
+        }
+        Intent::RendersTransform { name } => {
+            let cfg = state.config.renders.clone();
+            let change = crate::renders::Change::Transform(name.clone());
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &change, at, &cfg)
+        }
+        Intent::RendersClear => {
+            let cfg = state.config.renders.clone();
+            state
+                .fleet
+                .renders
+                .change(c.viewer, c.client, &crate::renders::Change::Clear, at, &cfg)
         }
         Intent::ResumeClaim { token } => resume_claim(&mut state.fleet, c, token),
         Intent::ReleaseGpu { claim } => {
@@ -1780,6 +1901,23 @@ fn tick(state: &mut State, at: u64) {
     }
 }
 
+/// A host that said hello as pages mode's host: whatever it held of the wall as a GPU host
+/// under the same name goes (its place among the hosts, slots, phones, sandboxes, servers and
+/// potato players), as when its agent is gone, but it is not counted as reclaimed.
+fn leave_wall(state: &mut State, host: &str, at: u64) {
+    let cfg = state.config.potato.clone();
+    state.fleet.potato.agent_hello(host, 0, 0, false, at, &cfg);
+    let f = &mut state.fleet;
+    if f.hosts.remove(host).is_none() {
+        return;
+    }
+    f.slots.retain(|_, s| s.host.as_deref() != Some(host));
+    f.phones.retain(|_, s| s.host.as_deref() != Some(host));
+    forget_windows(f, |s| s.host.as_deref() == Some(host), at);
+    forget_minecraft(f, |s| s.host.as_deref() == Some(host), at);
+    drop_missing_from_races(f, at);
+}
+
 fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, at: u64) {
     // One slot per GPU address; a repeated address is ignored. At most `capacity` slots.
     let mut seen = std::collections::BTreeSet::new();
@@ -1925,6 +2063,7 @@ fn note_running(slot: &mut Slot, r: &SlotReport, at: u64) -> bool {
     if r.phase != "running" {
         slot.observed.fps = None;
         slot.observed.gpu_stats = None;
+        slot.observed.vm_stats = None;
         slot.observed.budget_fit = None;
         slot.observed.render_ms_max = None;
         slot.observed.budget_every_pixel = None;
@@ -2048,7 +2187,7 @@ fn finish_half(h: &mut HalfRace, started_at: u64, last: Option<String>, at: u64)
         .unwrap_or(0);
 }
 
-fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
+fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport, at: u64) {
     let slot = match host {
         Some(_) if h.id.starts_with("phone-") => {
             phone_number(&h.id).and_then(|n| f.phones.get_mut(&n))
@@ -2085,7 +2224,20 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
             }
         }
     }
-    slot.observed.gpu_stats = Some(h.gpu.clone());
+    let mut gpu = h.gpu.clone();
+    if let Some(o) = gpu.as_object_mut() {
+        o.insert("at".into(), at.into());
+    }
+    slot.observed.gpu_stats = Some(gpu);
+    slot.observed.vm_stats = h
+        .vm_stats
+        .as_ref()
+        .filter(|v| v.cpu_pct.is_finite() && v.cpu_pct >= 0.0 && v.vcpus > 0)
+        .map(|v| VmStats {
+            cpu_pct: v.cpu_pct.min(100.0),
+            vcpus: v.vcpus,
+            at: Some(at),
+        });
     slot.observed.budget_fit = h.budget_fit.filter(|v| v.is_finite());
     slot.observed.render_ms_max = h.render_ms_max.filter(|v| v.is_finite());
     slot.observed.budget_every_pixel = h.budget_every_pixel.filter(|v| v.is_finite() && *v > 0.0);
@@ -3125,6 +3277,9 @@ fn running_current(s: &Slot) -> bool {
 
 /// A server's new launch: its generation moves, timed from `at`, and any fork the old one
 /// was is over.
+/// Who a launch begun by a reset of every server is by.
+const RESET_ALL_BY: &str = "reset_all";
+
 fn bump_minecraft(slot: &mut Slot, by: &str, at: u64) {
     bump(slot, by, at);
     if let Some(m) = slot.minecraft.as_mut() {
@@ -3219,6 +3374,20 @@ fn observe_minecraft(f: &mut Fleet, n: u32, host: &str, r: &SlotReport, at: u64)
                     rl.clicked_at = chunk.saturating_sub(took);
                     rl.first_frame_at = Some(chunk);
                 }
+            }
+        }
+        // A launch the last reset of every server began is back: that reset counts it, once.
+        if let (Some(rl), Some(all)) = (
+            slot.last_relaunch.as_ref(),
+            f.last_minecraft_reset_all.as_mut(),
+        ) {
+            let own = rl.by == RESET_ALL_BY
+                && rl.clicked_at == all.clicked_at
+                && rl.generation == r.generation;
+            if let (true, Some(back), Some(first)) = (own, all.back.as_mut(), rl.first_frame_at) {
+                *back += 1;
+                let took = first.saturating_sub(all.clicked_at);
+                all.took_ms = Some(all.took_ms.map_or(took, |t| t.max(took)));
             }
         }
     }
@@ -3399,7 +3568,7 @@ fn minecraft_reset(state: &mut State, c: &Ctx, slot: Option<&str>) -> Result<Str
                 if minecraft_claim(s).is_some() || host_draining(&hosts, s) {
                     continue;
                 }
-                bump_minecraft(s, "reset_all", at);
+                bump_minecraft(s, RESET_ALL_BY, at);
                 n += 1;
             }
             if n == 0 {
@@ -3411,6 +3580,8 @@ fn minecraft_reset(state: &mut State, c: &Ctx, slot: Option<&str>) -> Result<Str
                 clicked_at: at,
                 by: format!("viewer:{}", c.viewer),
                 servers: n,
+                back: Some(0),
+                took_ms: None,
             });
             Ok(format!("reset all {n} servers"))
         }

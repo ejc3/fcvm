@@ -1,0 +1,19 @@
+# Pages mode's 2 MiB pool (hugepages.sh, RENDERS_HUGEPAGES in /etc/fcvm-fleet/renders.conf),
+# reserved in the first transaction of the boot, before sysinit.target and before the store's
+# restore fills the page cache: memory fragments as it is used, and the kernel reserves 2 MiB
+# pages only where it finds them free. The agent requires this unit, so a host whose pool is short
+# says so here and starts no agent.
+[Unit]
+Description=fcvm fleet: reserve pages mode's 2 MiB pages before memory fragments
+DefaultDependencies=no
+Before=sysinit.target fcvm-fleet-store.service shutdown.target
+Conflicts=shutdown.target
+ConditionPathExists=/etc/fcvm-fleet/renders.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/fcvm-fleet/hugepages.sh
+
+[Install]
+WantedBy=sysinit.target

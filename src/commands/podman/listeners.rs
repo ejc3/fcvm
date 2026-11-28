@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -987,9 +986,9 @@ pub(crate) async fn run_output_listener(
             .spawn(move || {
                 for (is_stdout, content) in rx {
                     if is_stdout {
-                        let _ = writeln!(std::io::stdout(), "{}", content);
+                        let _ = crate::utils::write_whole_line(&mut std::io::stdout(), &content);
                     } else {
-                        let _ = writeln!(std::io::stderr(), "{}", content);
+                        let _ = crate::utils::write_whole_line(&mut std::io::stderr(), &content);
                     }
                 }
             })
@@ -1090,10 +1089,11 @@ pub(crate) async fn run_output_listener(
                                 crate::utils::log_agent_line(content);
                                 continue;
                             } else {
-                                // Use writeln! instead of println!/eprintln! to avoid
-                                // panicking on broken pipe. println! panics on write
-                                // error, which kills the listener task and stops
-                                // draining the vsock — deadlocking the container.
+                                // write_whole_line instead of println!/eprintln!: println!
+                                // panics on a write error, which kills the listener task
+                                // and stops draining the vsock, deadlocking the container.
+                                // It also writes the line in one call, so a record on the
+                                // other stream cannot land inside it.
                                 let is_stdout = stream == "stdout";
                                 // `podman prepare` reserves stdout for its single JSON result
                                 // and stderr for host diagnostics, so it forwards nothing here.
@@ -1105,9 +1105,9 @@ pub(crate) async fn run_output_listener(
                                         // Writer thread handles the blocking stdout write.
                                         let _ = tx.try_send((is_stdout, content.to_string()));
                                     } else if is_stdout {
-                                        let _ = writeln!(std::io::stdout(), "{}", content);
+                                        let _ = crate::utils::write_whole_line(&mut std::io::stdout(), content);
                                     } else {
-                                        let _ = writeln!(std::io::stderr(), "{}", content);
+                                        let _ = crate::utils::write_whole_line(&mut std::io::stderr(), content);
                                     }
                                 }
                                 lines_forwarded += 1;
@@ -1820,11 +1820,10 @@ mod tests {
         );
     }
 
-    /// Verify that writeln! to a broken pipe doesn't panic (returns Err),
+    /// Verify that write_whole_line to a broken pipe doesn't panic (returns Err),
     /// while println! would panic with "failed printing to stdout".
     #[test]
     fn test_writeln_survives_broken_pipe() {
-        use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
         // O_CLOEXEC, and a bounded retry below: a sibling test thread can
@@ -1836,14 +1835,17 @@ mod tests {
         let mut writer = unsafe {
             std::fs::File::from_raw_fd(std::os::unix::io::IntoRawFd::into_raw_fd(write_fd))
         };
-        let mut result = writeln!(writer, "test output");
+        let mut result = crate::utils::write_whole_line(&mut writer, "test output");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while result.is_ok() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            result = writeln!(writer, "test output");
+            result = crate::utils::write_whole_line(&mut writer, "test output");
         }
 
-        assert!(result.is_err(), "writeln! should return Err on broken pipe");
+        assert!(
+            result.is_err(),
+            "write_whole_line should return Err on broken pipe"
+        );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
     }
 

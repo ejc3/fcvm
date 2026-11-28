@@ -408,7 +408,8 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
       "vm": "fleet-slot-1",
       "generation": 3,
       "fps": 30.0,
-      "gpu_stats": { ... },
+      "gpu_stats": { ... },   // the renderer's /health gpu object plus "at", the coordinator's receipt time (Unix ms)
+      "vm_stats": {"cpu_pct": 12.5, "vcpus": 6, "at": 1761134401000},  // phones only; "at" is the coordinator's receipt time (its clock), vcpus the VMM's vCPU thread count; absent when the agent has no reading
       "error": null,
       "failure": null,
       "last_relaunch": {"clicked_at": 1761134400000, "by": "viewer:v-4", "first_frame_at": 1761134405200,
@@ -574,10 +575,12 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   through `fleet/coord/stage-smoke.py --agents`): a release host absent from it never
   registered since `since`.
 - `fleet.power` is whether the GPU capacity is up, when the coordinator launches the GPU
-  hosts (`--host-template`), or with `--sleep-when-idle` on hosts it does not launch (a
+  hosts (`--host-template`) or pages mode's host (`--renders-template`), or with
+  `--sleep-when-idle` on hosts it does not launch (a
   fixed host, a test box); without either it stays `awake`. After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), or
-  after `--sleep-without-new-viewer` seconds (default 3600, 0 never) with no arrival, even
+  after `--sleep-without-new-viewer` seconds (default 3600, 0 never; also
+  `FLEET_SLEEP_WITHOUT_NEW_VIEWER`) with no arrival, even
   while viewers stay connected and visible, and never while a claim (a wall GPU or a phone)
   is active or a race is running, the fleet goes `asleep` (`asleep_since`). A claim or race
   that outlasts either limit holds the fleet awake until it ends, and it sleeps then. An
@@ -596,12 +599,19 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
   terminated), no race is scheduled (`next_race_at` null) and
   `restart_now`, `claim_gpu` and `claim_phone` are refused. Hosts that leave then are not reclaimed. When an active viewer
-  is there and the last arrival is within the limit (a new viewer arrived, a page sent
-  `wake`, or a hidden page turned visible again before the limit ran out) it is `waking`
+  is there and at least `--min-wake-remaining` seconds (default 600; also
+  `FLEET_MIN_WAKE_REMAINING`) of the limit remain
+  (a new viewer arrived or a page sent `wake`, each of which has the whole limit ahead, or
+  a hidden page turned visible again, or a page reconnected, that long before the limit
+  runs out) it is `waking`
   from `woke_at`, the moment the wake began: every host region gets `--awake-hosts` hosts
-  again (default 1) and the EC2 half launches its `--ec2-tiles` tiles. Connected pages alone
-  never wake a fleet whose limit has run out: the page shows the sleep card with a Wake
-  button, which sends `wake`. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
+  again (default 1) and the EC2 half launches its `--ec2-tiles` tiles. A wake for a page
+  shown again or reconnecting is not an arrival and moves no limit, so with less than the
+  minimum left the fleet stays asleep: the wake would launch hosts that the limit
+  terminates minutes later. Nor do connected pages wake a fleet whose limit has run out.
+  In both cases the page shows the sleep card with a Wake
+  button, which sends `wake`. A limit shorter than the minimum leaves only arrivals to wake
+  the fleet. `hosts` lists each GPU host by EC2 instance id with the phases it has reached, in
   order: `instance_pending` and `booted` from EC2 (pending, then running),
   `store_ready` when the host marked its store mounted (the agent's hello reports it; the
   phase is absent when the host does not mark it), `agent_connected` when its agent says
@@ -725,7 +735,9 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--host-template <region>:<template>... --host-subnet <region>:<subnet id>...]
                  [--awake-hosts 1] [--host-spread none|az] [--host-on-demand-max 8] [--idle-scale-down 600]
-                 [--sleep-without-new-viewer 3600] [--history-idle 60]
+                 [--renders-template <region>:<template>... --renders-subnet <region>:<subnet id>...]
+                 [--sleep-without-new-viewer 3600] [--min-wake-remaining 600]
+                 [--history-idle 60]
                  [--daily-spend-usd <usd> [--spend-rates <instance type>=<usd per hour>,...]]
                  [--warm-hours <Mon..Sun> HH:MM-HH:MM,...]
                  [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
@@ -757,18 +769,27 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
 
 - `--daily-spend-usd` (also `FLEET_DAILY_SPEND_USD`) is the most the fleet may spend in one
   UTC day, in USD (`fleet.spend` above); off without it. It needs a fleet that sleeps
-  (`--host-template` or `--sleep-when-idle`) and instances to meter (`--host-template` or
-  `--ec2 aws`). Every 30 s the meter lists the instances tagged `Fleet=<--fleet-name>` and
-  `Purpose` `fcvm-fleet-host` or `fcvm-fleet-tile` in every host and tile region
+  (`--host-template`, `--renders-template` or `--sleep-when-idle`) and instances to meter
+  (`--host-template`, `--renders-template` or `--ec2 aws`). Every 30 s the meter lists the
+  instances tagged `Fleet=<--fleet-name>` and `Purpose` `fcvm-fleet-host`, `fcvm-fleet-tile`
+  or `fcvm-fleet-renders` in every host, renders and tile region
   (`DescribeInstances`, pending to shutting-down) and prices each: spot at the current spot
   price of its type in its zone (`DescribeSpotPriceHistory`, `Linux/UNIX`, read again after
   30 minutes), on demand at the on-demand rate of its type. `--spend-rates` (also
   `FLEET_SPEND_RATES`) sets on-demand rates, `<instance type>=<USD per hour>` comma
   separated, over the built-in us-east-1 list prices of `g4dn.metal` (7.824), `g4dn.xlarge`
-  (0.526), `g5g.metal` (2.744) and `g5g.xlarge` (0.42). The meter errs high where it cannot
+  (0.526), `g5g.metal` (2.744), `g5g.xlarge` (0.42), `m8gd.metal-24xl` (5.53536, pages mode's
+  host) and `c8gd.metal-24xl` (4.70304). The meter errs high where it cannot
   know: a spot instance without a spot price is charged its on-demand rate, an instance
   type without a rate the highest rate known, and a region it cannot list keeps its last
   listed instances; each marks the `spend` component degraded (`degraded`).
+- A host group (`--host-template`, `--renders-template`) launches only instance types the
+  table above prices (built in and `--spend-rates`, with or without `--daily-spend-usd`). When
+  a template's validated default starts a type without a rate, the group sends no
+  `CreateFleet` and marks its component (`scale`, `scale-renders`) degraded with the template,
+  the type, and how to give it a rate. An instance of such a type that is already running is
+  still metered, at the highest rate known. EC2 tiles (`--ec2 aws`) launch from their
+  templates by `RunInstances` without reading the template's type, and are not checked.
 - Every 30 s the coordinator writes one CloudWatch embedded metric format line to stdout,
   namespace `FCVM/Fleet`, dimension `Fleet` (`--fleet-name`), with or without a ceiling:
   `ActiveViewers` (joined viewers whose page is not hidden), `VerifiedViewers` (joined
@@ -1025,6 +1046,22 @@ both are PEM that nginx and rustls read. Renderers get it from their agent
   host launch`, the line the coordinator's degraded alarm matches; it still asks again
   10 s later, and stays degraded through the polls in between until an attempt is refused
   for something else or the region holds its awake hosts.
+- `--renders-template` and `--renders-subnet` (also `FLEET_RENDERS_TEMPLATES` and
+  `FLEET_RENDERS_SUBNETS`, comma separated, the same `<region>:<name>` form) are pages mode's
+  host's launch templates and subnets, in one region (templates in two regions stop the
+  coordinator at start). Without them nothing of this paragraph applies. With them the
+  coordinator runs a second host group as it runs the GPU hosts, over the same power state:
+  one host while the fleet is awake, launched in the same wake as the GPU hosts, spot first
+  and on demand in the same pass when spot is refused for capacity (at most one on-demand
+  host of this group, counted apart from `--host-on-demand-max`), none while it sleeps. Its
+  instances are tagged `Purpose=fcvm-fleet-renders`, `Fleet=<--fleet-name>` and
+  `Market=spot|on-demand`, and found by those tags, so a restarted coordinator keeps the host
+  it finds. With its one host, a spot interruption notice launches nothing: the replacement
+  is launched when EC2 takes the instance. A failed call or a quota refusal marks the
+  coordinator degraded as for the GPU hosts, under the component `scale-renders`, and logs
+  `EC2 refused a renders host launch`. The host is no GPU host: it has no slot, takes no part
+  in a wake's record (`fleet.power.hosts`) or the hosts the fcvm side waits for, and its agent
+  passes the check below as an instance of this group, with a hello that fits it.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication, so the coordinator refuses to start when the address
@@ -1215,7 +1252,8 @@ in front.
 
 `?mode=potato` on the page shows the hot potato game (design: `docs/fleet/ARCHITECTURE.md`,
 "Potato mode"). An agent started with `--potato-players N` runs up to N CPU-only player
-VMs and says so in its hello (`potato_players`, below); the first such host to connect is
+VMs and says so in its hello (`potato_players`, below), with the ring's CPU allotment
+(`potato_cpus`, from `--potato-cpus`, and `potato_confined`); the first such host to connect is
 the potato host. The ball goes from player VM to player VM and never through the
 coordinator; the coordinator reads what the agent reports, checks every player's proof,
 and keeps the ladder.
@@ -1230,33 +1268,93 @@ Intents:
 The snapshot's `state.potato` is absent until a host has run players, else:
 
 ```json
-{"size": 4, "colours": 12, "capacity": 96, "host": "<host name>", "next_round_at": null,
- "ladder": [{"size": 2, "record_hold_ms": 1458, "record_at": 1762317000000, "rounds": 3,
+{"size": 4, "colours": 12, "capacity": 96, "cpus": 8, "confined": true, "host": "<host name>",
+ "next_round_at": null,
+ "ladder": [{"size": 2, "record_pace": 0.84, "record_pace_at": 1762317000000, "record_prev_pace": null,
+             "rounds": 3,
              "broke": {"reason": "not_listening", "player": 1, "thrower": 0, "seq": 11, "lap": 5,
                        "hold_ms": 1182, "stage": "waking", "stage_ms": 90.0, "listening_after_ms": 84.0,
+                       "cause": "waking", "cause_ms": 84.0, "pace": 0.84,
                        "sleep_stages": {"prepare_ms": 17.6, "pause_ms": 0.5, "save_ms": 74.5, "disk_ms": 114.7, "stop_ms": 106.7},
                        "wake_stages": {"restore_ms": 352.0, "ack_ms": 201.0, "listen_ms": 355.3},
                        "at": 1762317000000, "round": 7, "size": 2, "detail": "player 1 was waking when player 0 threw (1 tries in 100 ms: connection timed out)"}},
-            {"size": 4, "record_hold_ms": null, "record_at": null, "broke": null, "rounds": 0}],
+            {"size": 4, "record_pace": null, "record_pace_at": null, "record_prev_pace": null,
+             "broke": null, "rounds": 0}],
  "round": {"id": 8, "size": 4, "ring": [0, 1, 2, 3], "started_at": 1762317005000, "seq": 6, "lap": 1,
            "hold_ms": 599, "start_hold_ms": 666, "min_hold_ms": 2, "flight_ms": 100, "pace_ms": null,
            "turnaround_ms": 1797, "holder": 2, "last_catch_at": 1762317009100,
-           "flight": {"from": 2, "to": 3, "at": 1762317009700}, "best_lap_hold_ms": 666},
+           "flight": {"from": 2, "to": 3, "at": 1762317009700}, "best_lap_hold_ms": 666,
+           "pace": 1.5, "best_pace": 1.5,
+           "laps": [{"lap": 0, "pace": 1.5, "hold_ms": 666, "cpus_peak": 3, "cpus_busy": 1.42}],
+           "cpus_in_use": 3, "cpus_peak": 3, "cpus_busy": 1.42, "asleep": 1, "lead": 2,
+           "slowest_wake_ms": 355.3,
+           "cpu_slots": [{"player": 2, "phase": "ball"}, {"player": 3, "phase": "waking"},
+                         {"player": 1, "phase": "saving"}]},
  "players": [{"player": 0, "colour": 5, "counter": 31, "phase": "asleep", "since": 1762317009400,
-              "last_sleep_ms": 330.1, "last_wake_ms": 355.3}],
+              "last_sleep_ms": 330.1, "last_wake_ms": 355.3, "cpu_wait_ms": null,
+              "ready_margin_ms": 212.0}],
  "records": {"fastest_cycle_ms": {"value": 650.0, "size": 2, "player": 0, "at": 1762317000000},
              "longest_round": {"value": 151.0, "size": 64, "player": null, "at": 1762317000000}},
  "last_drop": {...}}
 ```
 
-- `ladder`: every size of the game, smallest first, each with its record (`record_hold_ms`:
-  the shortest hold of a lap a round of that size completed) and what ended its latest
-  round (`broke`). Kept in the state file across a coordinator restart, with `records`,
-  `last_drop` and the size being played (`size`).
+- `ladder`: the sizes being played, smallest first, each with its record and what ended its
+  latest round (`broke`). The sizes come from the potato host's hello: 2 x `cpus`, doubling
+  while below its players, then its players (8 CPUs and 96 players: 16, 32, 64, 96); from an
+  agent that reports no allotment, the configured sizes it can run. `record_pace` is the
+  fastest measured pace, in catches per second, a round of that size held for one full lap
+  on `cpus` CPUs, `record_pace_at` when, and `record_prev_pace` the record that stood when
+  the round that set it began (null until a record of that size has been beaten: a size's
+  first record replaces nothing). Kept in the state file across a coordinator restart, with
+  `records`, `last_drop` and the size being played (`size`). A ladder belongs to its
+  allotment: a host that connects with another `cpus` gets its own, and the earlier one is
+  kept for a host with that allotment. `record_hold_ms` and `record_at`, which older
+  coordinators sent, are gone: a hold is not a pace, and none is shown as one.
+- A round starts near where the pace last outran its size: `round.start_hold_ms` is 1.5
+  times the median hold of the size's last five drops with a `cause` of `waking`, `cpu_wait`
+  or `saving` for the size's first round since the host connected, 1.25 times for its later
+  ones, and the configured start for a size with no such drop. It is never above the
+  configured start.
 - `round`: the round being played, or null between rounds (`next_round_at` says when the
   next starts). `hold_ms` is the hold the ball carries now; `turnaround_ms` is (size - 1)
   holds, the time a player has between its throw and its next catch to sleep and wake.
   `flight` is the ball in the air (thrown by `from` to `to` at `at`), null once caught.
+  `flight_ms` is the most a thrower retries for; a thrower that reports its hold (`hold_us`,
+  below) retries for that hold when it is shorter. `pace` is catches per second over the last
+  completed lap, measured: the lap's catches divided by the time from the catch before its
+  first to its last, by the host agent's stamps of the catch reports (lap 0: its last catch
+  minus its first, over size - 1 catches); null before a lap completes, and never computed
+  from the hold. The stamps are the agent's monotonic ones (`mono_us`, below) when every
+  catch of the lap has one, and its wall clock (`at`) otherwise. A lap cannot have taken
+  less than the holds its catchers kept: one whose monotonic stamps span less than all of
+  them (less 1 ms), or whose wall stamps span less than nine tenths, was read late or in a
+  burst and did not happen at that speed. Its `pace` is null, it sets no record and is not
+  the round's best, and a page does not draw it. `best_pace` is the
+  fastest of the round's laps, and `laps` the completed laps, oldest first, at most the last
+  60, each with its pace (null as above) and the longest hold a catch of it carried.
+  A page that does not know `pace`, `best_pace` or `laps` ignores them, and one that does
+  shows nothing for a field that is null or absent (an older coordinator sends none).
+- `cpus` is K, the CPU allotment of the host that played the ladder last: its agent never has
+  more than K machines not asleep. `confined` says whether those machines, and the fcvm
+  commands that save and restore them, run in a cpuset of exactly K host CPUs (true), or
+  are only counted (false: a page says "CPU slots", not "CPUs"). Both are null from an agent
+  that reports no allotment, and both stay after the host disconnects, as the ladder does.
+- The round's CPU fields are the agent's own count, taken when it read the latest catch, so
+  they move once per catch: `cpus_in_use` (machines not asleep: awake, waking, booting, or
+  going to sleep until the save has finished and the process has exited), `asleep` (the
+  ring's players asleep; one whose wake waits for a CPU is asleep), `lead` (how many catches
+  ahead of the ball a wake is asked for), `slowest_wake_ms` (over the agent's 30 s window)
+  and `cpu_slots`: one entry per machine not asleep, so as many as `cpus_in_use`, each with
+  its `phase`, `ball` (caught and not yet thrown), `ready`, `waking`, `saving` or `booting`,
+  in that order and in ring order within a phase. `cpus_peak` is the most in use at any
+  instant of the last completed lap, and `cpus_busy` the host CPUs the ring's cpuset used on
+  average over it (`cpu.stat`), null unless `confined`. Each of `laps` carries its own
+  `cpus_peak` and `cpus_busy`. All are null before the first catch (the lap ones before the
+  first lap) and from an agent without an allotment; a page shows nothing for a null or
+  absent field, never zero.
+- A player's `cpu_wait_ms` is how long its latest wake waited for a free CPU (null: it did
+  not wait), and `ready_margin_ms` how long before the throw to it began it was ready at its
+  latest catch (negative: the thrower waited; null for a round's first catch).
 - `host`: the potato host, by its agent's name (as a tile's `host`); null while none is
   connected. The viewer-path smoke attributes its potato probe to it for the image release
   gate.
@@ -1273,6 +1371,19 @@ The snapshot's `state.potato` is absent until a host has run players, else:
   verified ones), `<stage>_failed` for an agent's `failed` report (`boot_failed`,
   `sleep_failed`, `wake_failed`, `kickoff_failed` today; a page shows any such value),
   `deadline` (no catch reported by the hold plus the flight plus 3 s) or `host_gone`.
+- A drop's `cause` is what was measured, or null: `waking` (the catcher's wake was not
+  finished in time; `cause_ms` is how late it was, null until the agent reports it a moment
+  later), `cpu_wait` (its wake waited for a free CPU; `cause_ms` is how long), `saving` (it
+  was still going to sleep from its last throw; `cause_ms` is how long that had run) or
+  `proof` (no `cause_ms`). `cpu_wait_ms` is how long the catcher's wake waited for a free
+  CPU, whatever the cause, null when it did not wait. Between `waking` and `cpu_wait` the
+  wait decides when it is more than half of the lateness; a wake that had not started is
+  `cpu_wait`; and until the lateness is known, a wake that waited longer than it has run
+  is `cpu_wait`. So a `cause` can change once, from `waking` to `cpu_wait` or back, when
+  the lateness arrives. A catcher whose wake was reported less than a flight window before
+  the drop was read (`stage` is then `awake`) is `waking` or `cpu_wait` by the same rule.
+  Every other drop has a null `cause`, and a page shows its `reason`. `pace` is the pace of
+  the last completed lap when the ball dropped, null if none had completed.
 
 ### Windows mode
 
@@ -1390,7 +1501,7 @@ The snapshot's `state.minecraft` is absent with no servers, else:
 {"server": "Pumpkin 3ea7d281 (Java Edition 26.3)",
  "image_aspect": 2.0, "claim_secs": 120,
  "borrow": {"cap": 2, "lent": 1, "next_return_at": 1761134525000},
- "last_reset_all": {"clicked_at": 1761134400000, "by": "viewer:v-3", "servers": 4},
+ "last_reset_all": {"clicked_at": 1761134400000, "by": "viewer:v-3", "servers": 4, "back": 4, "took_ms": 6120},
  "last_fork": {"from": "mc-1", "to": "mc-2", "clicked_at": 1761134410000, "by": "viewer:v-5",
                "first_chunk_at": 1761134412300, "snapshot_ms": 640, "restore_ms": 1100, "total_ms": 2300},
  "tiles": [{"id": "mc:1", "slot": "mc-1", "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5}, "phase": "running",
@@ -1426,7 +1537,11 @@ of, null for a launch from the gold snapshot; it is cleared by the server's next
 `first_chunk_at` the copy's first chunk (kept as `first_frame_at` is), `snapshot_ms` the
 source's `fcvm snapshot create`, `restore_ms` the copy's `fcvm snapshot run` until its view
 answered, `total_ms` the click to the copy's first chunk. `last_reset_all` is the last committed
-`minecraft_reset` of every server, with how many it reset.
+`minecraft_reset` of every server, with how many it reset, and the coordinator's count of it:
+`back`, how many of those servers are back on the launch the reset began (a server reset again
+before that is never counted, nor one the reset did not touch), and once one is, `took_ms`, the
+click to the first chunk of the last of them. Both are absent from a record written before the
+coordinator counted.
 
 Intents:
 
@@ -1484,6 +1599,65 @@ leaves or the coordinator restarts is reset when its host reports it again, and 
 that reset until its fresh launch reports running, as a sandbox does. There is no drive intent:
 keys go from the page to the tile.
 
+#### Many servers: the field and the status rows
+
+A snapshot that listed every server of a large fleet as a tile would be large and would be sent
+again at every restore: measured with `make fleet-snapshot-size`, 512 servers on one host made
+a snapshot of 271,732 bytes (525 a server). So:
+
+- **`tiles` lists at most 16 servers** (`fleet_core::minecraft::TILES_LISTED`) once the fleet
+  runs more: the first 16 by number and every lent one (its holder's page needs its borrow), laid
+  out in an image of their own (`rect`, `image_aspect`), with their ids unchanged (`mc:<k>`, k
+  the server's place among all of them). A fleet of 16 or fewer is listed whole, as before.
+- **`field`** (absent with 16 servers or fewer) names every server:
+
+  ```json
+  "field": {"servers": 512,
+            "hosts": [{"key": "3f9a0c2b7d1e", "servers": [1, 2, 3, "..."],
+                       "frames": {"prefix": "wss://mc-", "suffix": ".mc.example.test/view",
+                                  "names": ["1-abcdefgh", null, "3-zyxwvuts", "..."]},
+                       "frames_v4": {"prefix": "...", "suffix": "...", "names": ["..."]}}]}
+  ```
+
+  A host's `servers` are its servers' numbers (`mc-<n>`) in the order of its status rows.
+  `frames` is each one's view URL (`frame_url`): `prefix + name + suffix`, null for a server with
+  none now; `frames_v4` the same for `frame_url_v4`, absent when no server has one. `key` is a
+  hash of the host's name, never the name. The field holds no state of any server, so a restore
+  changes it only when the server's URL changes. With it, the 512-server snapshot is 15,810
+  bytes.
+- **Status rows** carry the servers' state, outside the snapshot. A page that shows Minecraft
+  mode says so in its `visibility` message (`"minecraft": true`; absent or false for every other
+  page), and is then sent, for each host, about once a second:
+
+  ```json
+  {"type": "minecraft_status", "host": "3f9a0c2b7d1e", "received_at": 1761134400310,
+   "t": 1761134400000, "rows": "<base64>", "cpus": 192, "busy": 98.7,
+   "mem_total_mib": 385024, "mem_used_mib": 20480}
+  ```
+
+  `rows` is 8 bytes for each of the host's servers, in the order of `field.hosts[].servers`:
+  the phase (0 not reported, 1 restoring, 2 forking, 3 running, 4 failed), ticks per second
+  times ten (255: none), players (255: none), a zero, then two little-endian 16-bit numbers:
+  seconds since this launch's first chunk, and the launch's milliseconds to that chunk (65535:
+  none; a larger value is 65534). "None" is what the host did not read, and a page draws
+  nothing for it, never a zero. `t` is the host's clock. `cpus`, `busy` (CPUs busy over the last
+  second) and the memory figures (`MemTotal`, and `MemTotal` less `MemAvailable`) are the whole
+  host's, whatever else it runs; each is absent when the host could not read it. A page whose
+  rows are not 8 bytes for each server of the host in its snapshot ignores them. The messages
+  are no part of the state: they move no version, nothing stores them, and a page that asks
+  later gets each host's latest at its next report. A page from before them sends no
+  `minecraft` and is sent none (it would refuse a message type it does not know).
+
+  Rows are a reading, and an old reading is none. `received_at` is the coordinator's clock when
+  the report reached it; rows older than 5 s (`STATUS_EXPIRE_MS`, five missed reports) are
+  sent to no page, and a page that holds them shows their servers as not reported, never as
+  they last were. A host whose last server is unassigned sends one report with every row not
+  reported and then none. The coordinator takes a report only from the host's current
+  connection and only when `rows` is base64 of whole rows for no more servers than the host's
+  hello said it runs; anything else is dropped. It takes them no closer together than 500 ms
+  (an agent sends one a second): of those that come sooner it keeps the latest and takes it
+  when the 500 ms end, so a host's last report is not lost.
+
 #### Agent messages (Minecraft mode)
 
 - Hello: `minecraft` (the servers the host runs, 0 or absent for none) and `minecraft_server`
@@ -1497,6 +1671,74 @@ keys go from the page to the tile.
 - Slot report: as a sandbox's, with the `mc-<n>` id, `phase` one of the above, `frame_url` the
   view socket, `timings` with `restore_ms`, `first_chunk_ms`, `total_ms` and for a fork
   `snapshot_ms`, and `first_chunk_at` (Unix ms, host clock) with `running`.
+- Status rows: about once a second, a health report whose `id` is `minecraft` and whose
+  `minecraft` field is the status message above without its `type` and `host`
+  (`{"type": "health", "id": "minecraft", "fps": 0, "minecraft": {"t", "rows", "cpus", "busy",
+  "mem_total_mib", "mem_used_mib"}}`). The agent asks each running server's `/health` (64 at a
+  time, 400 ms each; one that does not answer has no tick rate in that row) and reads
+  `/proc/stat` and `/proc/meminfo`. It rides in a health report because the coordinator closes
+  an agent's connection on a message it cannot parse: a coordinator from before the field reads
+  it as a health report for a slot it does not have, and drops it.
+
+### Pages mode
+
+`?mode=pages` ("One VM per page"). A renders host renders a fixed set of web pages from a local
+replay on two sides at once, each on its own equal set of pinned CPUs: `fcvm` (every render
+restores a new microVM running Chromium and discards it) and `kitesurf` (Kitesurf engines on
+workerd). Each side searches for the number of renders in flight its CPUs carry. Every figure
+is measured on the host from completed renders. Screenshots and per-render events go from the
+host to the page on the host's frame socket; the coordinator carries the summary below.
+
+`state.renders` is absent while no host runs the mode. With one:
+
+| field | what |
+|-------|------|
+| `host` | the host's name |
+| `pages` | `[{"id", "url"}]`, the wall's tiles in order; `url` is the live site the tile's name links to |
+| `cpus`, `confined` | the pinned CPUs of each side, and whether each side runs in a cpuset of exactly that many |
+| `build` | what runs, by name, for the `Setup` lists (absent when empty) |
+| `report`, `report_at` | the host's last report as it sent it (below), and when the coordinator received it; absent before the first |
+| `draining` | true once the host reported a spot interruption notice; absent otherwise |
+| `frame_url`, `frame_url_v4` | the host's frame socket and its IPv4-only name: with the coordinator's subzone, the names it published for the addresses the hello gave (`renders-<host>-<token>`, below; absent until published), otherwise the report's |
+| `overlay` | `{"text"?, "transform"?, "chromium_only", "until", "seq"}`: what viewers put on every page; absent with none |
+| `transforms` | `{"both": [...], "chromium_only": [...]}`: the names a viewer may pick from |
+| `max_overlay_chars`, `change_interval_s` | the text's limit, and the least seconds between two changes from one viewer |
+
+The host is no host of the wall's: it is not in `fleet.hosts` (the hosts the phones, Windows
+and Minecraft pages count), it has no slot and no entry in `fleet.power.hosts`, and its spot
+interruption notice and its loss change only this section (`draining`, then no `renders`),
+never `failures` (no `host_reclaimed`) or the wall's tiling. A host that said hello as a wall
+host and then with `renders` on the same name leaves the wall.
+
+While `overlay.chromium_only` is true the transform is in the `fcvm` side's pages only, the two
+sides render different work, and a page compares nothing across them.
+
+| intent | args | effect |
+|--------|------|--------|
+| `renders_overlay` | `{"text": "hello"}` | the text on every page: 1 to 40 characters once its ends are trimmed and each run of whitespace is one space, plain text (the host escapes it into the page). Refused with a control character (a tab or a newline is one), with a character that changes the direction of the text around it (the embeddings, overrides and isolates, U+202A to U+202E and U+2066 to U+2069), and when it shows nothing (only spaces, zero-width characters, fillers and the like). Checked alone by the text check as a `word` is, and its receipt carries the `check` |
+| `renders_transform` | `{"name": "mirror"}` | one of `transforms`; any other name is refused |
+| `renders_clear` | `{}` | the text and the transform go; refused with nothing set |
+
+A change is refused with no host of the mode, within 30 s of the same client's last change, and
+within 10 s of anyone's (every change starts both sides' searches again). A change keeps the
+other part of the overlay and sets `until` to two minutes on, so an overlay goes two minutes
+after its last change, whoever made it. A change that arrives at `until` or after it starts
+from nothing. The overlay leaves `/live` and the hosts' order at the coordinator's next tick, up to
+a second after `until`, so a page treats an overlay whose `until` has passed as gone. Each
+change, an expiry included, takes the next `seq`. The overlay is in the stored state before its receipt is sent,
+and a restarted coordinator keeps it, its `until` and its `seq`.
+
+The order a change gives the host is sent when the change is applied, which can be before the
+state holding it is stored, as with every other order. A coordinator that dies in between comes
+back without the change and can give its `seq` to another one. A host's connection ends with
+the coordinator, and the order at the start of the next one replaces whatever the host served,
+so a host or a page compares an overlay by its content and its `seq` within one connection,
+never by a `seq` kept across connections.
+
+In the recent-actions list a pages intent shows what was parsed and committed and nothing else:
+a committed `renders_overlay` its text as kept, a committed `renders_transform` its `name`, and
+`{}` for a `renders_clear` and for any of the three that was refused. Its args as sent can hold
+text nobody checked.
 
 ## Agent
 
@@ -1518,16 +1760,21 @@ coordinator's is adopted, so the next relaunch goes past it. The coordinator ser
 admits only the agents' service token there. With `--agent-access-aud`, the coordinator also
 verifies that token itself (`Cf-Access-Jwt-Assertion`: the team's RS256 signature, issuer,
 one of those audiences, expiry, and a service token rather than a person) and answers `403`
-without it. With host templates (`--host-template`), the host a dialed agent's hello names
-must be one of this fleet's GPU hosts: an EC2 instance, pending or running, tagged
-`Purpose=fcvm-fleet-host` and `Fleet=<--fleet-name>` in a host region, and the connection
+without it. With host templates (`--host-template` or `--renders-template`), the host a dialed
+agent's hello names must be one of this fleet's hosts: an EC2 instance, pending or running,
+tagged `Fleet=<--fleet-name>` and `Purpose=fcvm-fleet-host` in a host region or
+`Purpose=fcvm-fleet-renders` in the renders region, and the connection
 must come from that instance: its public IPv4 address, one of its IPv6 addresses, or an
 address in one of its delegated IPv6 prefixes (the source is `CF-Connecting-IP` with
 `--trust-cf-connecting-ip`, which a coordinator behind Cloudflare needs for this, else the
 peer address). Instance ids appear in snapshots, so the name alone proves nothing. Any other
 name (another fleet's instance, a terminated one, no instance), a connection from elsewhere,
 or a listing that fails, closes the connection before the hello is applied, and the agent
-dials again. Both refusals are
+dials again. So does a hello that does not fit the class of the instance: an agent on a
+`fcvm-fleet-renders` instance must carry `renders` and no GPU, phone, Windows sandbox,
+Minecraft server or potato player, and an agent on a `fcvm-fleet-host` instance must not carry
+`renders`; the refusal names the instance's class and what the hello said. Without host
+templates nothing is checked and the hello alone says what a host runs. Both refusals are
 logged at warn with `marker=fleet-agent-refused`. Agents started with `--agent-cmd` are not
 checked.
 
@@ -1602,6 +1849,66 @@ reports `standby` once its GPU is free (and scrubbed, with `--scrub`) and no VM 
 
 A `/health` reply carrying `error` (the renderer failed) fails the relaunch at once.
 
+```json
+{"type": "renders", "at": 1795560000000, "frame_url": "wss://renders-h1-4f2a.tiles.example/frames",
+ "frame_url_v4": "wss://renders-h1-4f2a-v4.tiles.example/frames",
+ "sides": {"fcvm": {"search": {"in_flight": 16, "phase": "holding", "limit": 16,
+     "backed_off": {"from": 18, "cause": "render_time", "ratio": 1.3, "at": 1795559990000},
+     "curve": [{"in_flight": 1, "renders_per_s": 1.9, "render_ms": 300.0}]},
+   "renders_per_s": 23.0, "render_ms": 360.0, "cpus_busy": 32.5, "cpu_ms_per_render": 1400.0,
+   "done": 500, "failed": 0, "since": 1795559000000, "setup": {"vcpus": "4"}}},
+ "tiles": [{"page": "example", "side": "fcvm", "state": "rendering", "renders_per_s": 1.7,
+   "last_ms": 180.0, "last_at": 1795559999000, "done": 40, "failed": 0}],
+ "overlay_seq": 3, "harness": {"cpu_pressure": 0.0, "replay_ms": {"fcvm": 0.4, "kitesurf": 0.5}}}
+```
+
+Pages mode: the host's summary, about every 5 s. At the top level only `at` is required. A
+side that is present carries `search` (with `in_flight` and `phase`),
+`renders_per_s`, `cpus_busy`, `done`, `failed` and `since`; a tile carries `page`, `side`,
+`state`, `renders_per_s`, `done` and `failed`. A host says it runs
+the mode with `renders` in its hello (`{"pages": [{"id", "url"}], "cpus", "confined"?,
+"build"?, "ipv6"?, "ipv4"?, "v4_port"?}`), and sends this message on a connection only after it
+has received a `renders` order on that connection: a coordinator built before the mode sends
+none, and would close the connection on this message. The agent (`fcvm fleet agent --renders`)
+sends the module's summary while the module's loop runs (every fifth tick of its one-second
+loop, so 5 s or a little more apart), and otherwise its own every 5 s, with nothing in flight
+and every tile `waiting`: while the order is `run: false`, while the module starts, while it
+sweeps after its loop has ended, and, with `withheld` set to the error, after a module failed.
+A failed module is started again after 60 s while the order is `run: true`, and at once on any
+new order that says `run: true`. An agent started again right after it was killed reports
+`withheld` (the run directory's lock is held) until the killed module's reaper has finished
+its sweep, and starts the module at the next retry.
+
+`build` names, when the host knows them: `instance_type` (on EC2), `kernel`, `fcvm_commit`
+and `kitesurf_commit` (the agent's `--setup fcvm.commit=` and `--setup kitesurf.commit=`
+module options), `bundle_sha256` (the engine bundle's `index.js`), `viewport`, `vcpus` and
+`page_size` (the snapshot's once it is made), and `recycle_mib`.
+
+`ipv6` and `ipv4` are the public addresses of the host's frame socket (port 443 on IPv6,
+`v4_port` on IPv4, 443 when absent); the agent sends none until it serves frames. With its
+subzone the coordinator names them as it names a host's aggregator: `renders-<host>-<token>`
+AAAA the IPv6 address and `renders-<host>-<token>-v4` A the IPv4 address, a label minted once
+for those addresses and never answered before it is minted; `state.renders.frame_url` and
+`frame_url_v4` are then those names.
+
+- `sides`, by `fcvm` and `kitesurf`. `search` is the side's search for its limit: `in_flight`
+  now; `phase` `starting` (no baseline at one in flight yet), `adding` or `holding`;
+  `backed_off`, the last step back (`from`, `cause` one of `render_time`, `cpu_pressure`,
+  `failed`, with the `ratio` or `pressure` measured there); `limit`, the highest level that
+  held, absent before a side has found one; `curve`, what each level last measured. The rest
+  is over the host's window: `renders_per_s`, `render_ms` (the mean over the pages of each
+  page's median render time, as in a `curve` point), `cpus_busy` of the side's set, the mean `cpu_ms_per_render`, `done` and `failed` since `since`, and for
+  `kitesurf` the `engines` running and `recycles`. `setup` holds the live values of the
+  side's `Setup` list.
+- `tiles`, one per page and side: `state` is `waiting` (no render yet), `rendering`, `stopped`
+  (repeated failures) or `unsupported`, with the host's `reason` for the last two.
+- `overlay_seq`: the `seq` of the overlay order the replays serve now; absent while they serve
+  the pages as captured.
+- `harness`: the replays', drivers' and frame server's own CPU pressure and each replay's
+  response time to a probe. The page shows none of it; the smoke fails on it.
+- `withheld`: why the host renders nothing, when it does not.
+
+
 A Windows sandbox (Windows mode) reports as a slot with its `win-<n>` id, its phases
 `stopping`, `restoring` (fcvm started the clone), `connecting` (fcvm reports it healthy; the
 bridge is starting), `running` (the bridge reports the desktop) and `failed` (`error`,
@@ -1637,7 +1944,7 @@ sandbox is stopped within a minute of it (the agent checks the image every minut
 coordinator logs a new warning, refusal or gold failure.
 
 ```json
-{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2}
+{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2, "vm_stats": {"cpu_pct": 12.5, "vcpus": 6}}
 ```
 
 Once a second per running slot: the renderer's `/health` `fps`, its GPU readings,
@@ -1680,21 +1987,28 @@ the same GPU quarantines it again.
 ```
 
 Potato mode (`--potato-players N`, which the hello reports as `potato_players`): one thing
-that happened to player `player`, at `at` on the host's clock. `kind` is one of:
+that happened to player `player`, at `at` on the host's clock. The hello also carries
+`potato_cpus` (`--potato-cpus`, the ring's CPU allotment; absent or 0 from an agent built
+before it, which caps nothing) and `potato_confined` (true when the ring's processes run in a
+cpuset of that many host CPUs; absent means false). `kind` is one of:
 
 | kind | fields | when |
 |------|--------|------|
 | `hello` | `colour`, `counter`, `chain`, `colours`, `connections`, `last_round`, `last_seq` | the player opened a report connection: once when new (`connections` 1, `counter` 0), and once after each wake. `last_round`/`last_seq` name its last catch |
-| `caught` | `round`, `seq`, `colour`, `counter`, `chain` | it caught the ball |
+| `caught` | `round`, `seq`, `colour`, `counter`, `chain`, `hold_us`, `ring`, `ready_margin_ms`, `mono_us` | it caught the ball. `ring` is the agent's count when it read the catch, `{"cpus_in_use", "cpus_peak" (the most since the catch before), "asleep", "lead", "slowest_wake_ms", "slots": [{"player", "phase"}], "cpu_usec" (the cpuset's `usage_usec`, absent when not confined)}`; `ready_margin_ms` is how long before the throw to it began the catcher was ready, absent for a round's first catch and when the catch was read before the end of the catcher's wake. Both are absent from an agent without an allotment. `mono_us` is when the agent read the report on its monotonic clock, in microseconds since the agent started (`at` is its wall clock, which can step); laps are timed by it, and an agent built before it sends none. `hold_us` is the hold it will keep, in microseconds, after any pace cap; absent from a player built before it, and the coordinator then computes the hold as those players do (a tenth off per lap in whole milliseconds) |
 | `threw` | `round`, `seq` (the ball's new seq), `to`, `attempts`, `wait_ms`, `send_ms` | the next player accepted the ball |
-| `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to` |
+| `dropped` | `round`, `seq`, `to`, `attempts`, `reason`, `catcher_phase`, `catcher_phase_ms`, `catcher_cpu_wait_ms`, `catcher_late_ms` | nothing accepted the ball within its flight window; `catcher_phase` is what the agent was doing with `to`. `catcher_cpu_wait_ms`, when present, is how long `to`'s wake has waited for a free CPU (it is still `asleep`) or waited before it started (`waking`, `awake`). `catcher_late_ms`, present when `to` is `awake` by the time the drop is read, is how long after the end of the thrower's flight window it was ready (0: between the thrower's last try and that end) |
 | `slept` | `sleep_ms`, `stages`, `written_mib` | its snapshot is written and its fcvm has exited. `stages` splits `sleep_ms` into the agent's steps, `ask_ms` (telling the player its round is over), `create_ms` (`fcvm snapshot create --stop`) and `reap_ms` (waiting for the player's fcvm to exit), and splits `create_ms` with fcvm's own: `stage_ms` (the new generation's directory and memory file), `prepare_ms`, `pause_ms`, `save_ms`, `disk_ms`, `publish_ms` (installing it and removing the old one) and `stop_ms` |
-| `waking` | | its restore started |
-| `woke` | `wake_ms`, `stages` (`restore_ms`, `ack_ms`, `listen_ms`) | its ball port accepts again |
+| `waking` | `cpu_wait_ms` | its restore started; `cpu_wait_ms`, when present, is how long it waited for a free CPU first |
+| `woke` | `wake_ms`, `stages` (`restore_ms`, `ack_ms`, `listen_ms`), `ready_margin_ms` | its ball port accepts again; `ready_margin_ms` as a catch's, when the player's catch was read before this |
 | `listening` | `round`, `seq`, `after_ms` | the catcher of a dropped ball accepted, `after_ms` after the drop |
 | `failed` | `stage` (`boot`, `sleep`, `wake`, `kickoff`), `error` | a step failed |
 
 The ball itself is never reported: the players throw it to each other.
+
+Every addition to these messages is an optional field. The coordinator closes an agent's
+connection on a message it cannot parse, so a new `kind` or a new message type from an agent
+would disconnect it from a coordinator built before it; an unknown field is ignored.
 
 ### Coordinator to agent
 
@@ -1858,7 +2172,23 @@ agent reconciles to it as to an assignment. A round it has not played starts: it
 player it does not have from its player snapshot, wakes the players within reach of the ball,
 and throws the first ball to `ring[0]` once that player accepts; a round it no longer gets
 ends, and every awake player sleeps, so a ball still in the air drops. A new `pace_ms` in the
-same round goes to the awake players, whose next throws hold no longer than it.
+same round goes to the awake players, whose next throws hold no longer than it. `flight_ms`
+is the most a thrower retries for: a player retries for its hold when that is shorter.
+
+```json
+{"type": "renders", "order": {"run": true, "overlay": {"text": "hello", "transform": "invert", "chromium_only": true, "seq": 3}}}
+```
+
+Pages mode, only to a host whose hello carried `renders` (an agent built before the mode ends
+its connection on a message it cannot parse), at the start of its connection and whenever the
+order changes. `run` is false while the fleet is asleep: the host stops every clone and engine.
+`overlay` is what the replays put into every page's main document before it is rendered, absent
+for none: `text` (plain text; the host escapes it), `transform` (a name; the style behind it is
+the host's), `chromium_only` (the transform goes into the `fcvm` side's pages only), and `seq`,
+which the host's reports repeat as `overlay_seq` once its replays serve it. A render sees the
+old overlay or the new one whole. An overlay whose content or `seq` differs from the one the
+replays serve is written again; one with another `seq` (a clear included) also starts both
+sides' searches again. The same order sent again changes nothing.
 
 ### Grid budget
 
@@ -2881,7 +3211,7 @@ pixel in both, drawn identically.
 
 ```json
 {"fps":30.0,"heights":[240],"streams":[{"h":240,"q":"std"}],
- "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3,
+ "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3,"mem_total_mb":15360.0,
         "clock_mhz":1590,"app_clock_mhz":1590,"max_clock_mhz":1590},
  "t":1234.5,"frame":5678,"boot_id":"9f0c2a6e41d84b7c8e2f5a1b3c4d6e7f",
  "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"checkerboard":1,"hold":false,"hold_samples":0,"slots_missed":0,
@@ -3681,13 +4011,25 @@ rules (`SCENE_TOKEN_FILE` is not used; `TLS_CERT_FILE` and its `scene_token`, re
   - `{"type": "map", "seq": 41, "region": {"x0", "z0", "w", "h"}, "cells": "<base64>"}`: every
     column, row by row (z then x), two bytes each: its top block's material (an index into
     `materials`) and its height (`y + 64`, held to 0..255). Sent on connect, when the region
-    changes, and to a socket that fell behind.
+    changes, and to a socket that fell behind. Optional `"ground": "<base64>"`, in the same
+    layout and of the same length (the page refuses another length): for each column the highest
+    block that is not leaves, a plant or water. The page reads it only under those three; without
+    it the page guesses the forest floor and the lake's bed from the columns beside them.
   - `{"type": "delta", "seq": 42, "cells": [[index, material, height], ...]}`: the columns that
-    changed, at most every 200 ms.
+    changed, at most every 200 ms. Optional `"ground": [[index, material, height], ...]`, the
+    ground that changed, read only by a page that holds a `map.ground`.
   - `{"type": "status", "t": <unix ms>, "tps": 19.98 | null, "players": [{"name", "x", "y",
     "z", "yaw", "bot", "driven"}], "drive": {"seq": 12, "moved_at": <unix ms>} | null}`, ten a
     second. `drive` is the last drive message whose effect the tile saw (the driven bot moved
-    or turned), on the tile's clock.
+    or turned), on the tile's clock. Optional `"day_time": 0..23999`, the game's tick of the day
+    (0 sunrise, 6000 noon, 12000 sunset, 18000 midnight), for the world's sky; without it the
+    page lights every world at mid-morning.
+
+  `ground` and `day_time` are optional: without them the page guesses the forest floor and the
+  lake's bed and lights every world at mid-morning. The tile sends `ground` in every `map`, and
+  in a `delta` when the ground changed. No tile sends `day_time`: Pumpkin 3ea7d281's time
+  packets carried no day clock that moved (none in 150 s on five servers, 2026-11-24), so every
+  world keeps the one sky. The page's mock sends both from every other server.
   - `{"type": "drive_ack", "seq": 12, "ok": true, "at": <unix ms>}` or `{"ok": false,
     "reason": "..."}`, for each drive message.
 

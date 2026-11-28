@@ -54,11 +54,9 @@ describe("mock potato", () => {
     const rung2 = dropped.ladder.find((g) => g.size === 2)!;
     expect(rung2.rounds).toBe(1);
     expect(rung2.broke).toEqual(d);
-    // the record is the hold of the last lap completed: the one before the lap that dropped
     expect(d.lap).toBeGreaterThanOrEqual(1);
-    let h = 700;
-    for (let k = 0; k < d.lap - 1; k++) h -= Math.floor(h / 10);
-    expect(rung2.record_hold_ms).toBe(h);
+    // the coordinator no longer sends the old hold record
+    expect("record_hold_ms" in rung2).toBe(false);
     expect(dropped.size).toBe(4);
     expect(dropped.next_round_at).toBe(d.at + 2000);
     expect(dropped.records.longest_round).toMatchObject({ size: 2, value: d.seq });
@@ -126,7 +124,8 @@ describe("mock potato", () => {
     const coordinator = shapes(fixture.views["33_potato"]!.potato);
     shapes(JSON.parse(example), "", coordinator);
     // The stage maps' keys are whatever the agent measured: the coordinator passes them on.
-    const free = (p: string) => /\.(sleep|wake)_stages\./.test(p);
+    const free = (p: string) => /\.(sleep|wake)_stages\./.test(p) || /^round\.cpu_slots/.test(p); // null with no allotment, a list of slots otherwise
+    // The pace record and its time come with the density page's fields; the coordinator's vector holds them too.
     start({ slowWakeChance: 0.2 });
     const mock = new Set<string>();
     for (let i = 0; i < 3000; i++) {
@@ -137,5 +136,35 @@ describe("mock potato", () => {
     expect(mock.has("last_drop.listening_after_ms")).toBe(true);
     expect([...mock].filter((p) => p !== "" && !coordinator.has(p) && !free(p)).sort()).toEqual([]);
     expect([...coordinator].filter((p) => p !== "" && !mock.has(p) && !free(p)).sort()).toEqual([]);
+  });
+
+  it("plays by the allotment: no more machines than CPUs not asleep, wakes that wait, measured pace, rungs from K, causes and a record", () => {
+    start({ cpus: 3, slowWakeChance: 0.25 });
+    expect(game.state().ladder.map((g) => g.size)).toEqual([6, 8]);
+    expect([game.state().cpus, game.state().confined]).toEqual([3, true]);
+    let peak = 0;
+    let waited = false;
+    let laps = 0;
+    const causes = new Set<string>();
+    for (let i = 0; i < 9000; i++) {
+      const st = game.state();
+      const held = st.players.filter((p) => p.phase !== "asleep").length;
+      peak = Math.max(peak, held);
+      if (st.players.some((p) => p.cpu_wait_ms !== null && p.cpu_wait_ms !== undefined)) waited = true;
+      laps = Math.max(laps, st.round?.laps.length ?? 0);
+      const c = st.last_drop?.cause;
+      if (c) causes.add(c);
+      vi.advanceTimersByTime(20);
+    }
+    // phase "sleeping" counts as held too: the state shows a thrower as sleeping until its save is done
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(waited).toBe(true);
+    expect(laps).toBeGreaterThan(0);
+    const st = game.state();
+    const paced = st.ladder.filter((g) => g.record_pace !== null);
+    expect(paced.length).toBeGreaterThan(0);
+    expect(paced[0]!.record_pace).toBeGreaterThan(0);
+    expect(causes.size).toBeGreaterThan(0);
+    for (const c of causes) expect(["waking", "cpu_wait", "saving"]).toContain(c);
   });
 });

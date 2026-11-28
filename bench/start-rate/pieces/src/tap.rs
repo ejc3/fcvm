@@ -54,6 +54,38 @@ fn ioctl<T>(fd: &OwnedFd, request: libc::c_ulong, arg: *const T, what: &str) -> 
     Ok(())
 }
 
+/// What Firecracker does with a TAP queue it inherited, the VMM's TAP in a pooled namespace
+/// (`Tap::from_inherited`, `Net::new_inherited`, `Net::restore`): `TUNGETIFF` to check the
+/// queue, `TUNSETVNETHDRSZ`, `TUNSETOFFLOAD`. Nothing attaches and nothing detaches; each
+/// ioctl still takes `rtnl_mutex`. They work on the queue from any namespace.
+pub fn use_inherited(queue: std::os::fd::RawFd) -> Result<()> {
+    const TUNGETIFF: libc::c_ulong = 0x8004_54d2;
+    let mut req = IfReq {
+        name: [0; libc::IFNAMSIZ],
+        flags: 0,
+        pad: [0; 22],
+    };
+    // The request's type is the libc's choice (c_ulong on glibc, c_int on musl).
+    // SAFETY: `req` is a `struct ifreq` the kernel fills, and outlives the call.
+    if unsafe { libc::ioctl(queue, TUNGETIFF as _, &mut req) } != 0 {
+        bail!("TUNGETIFF: {}", std::io::Error::last_os_error());
+    }
+    anyhow::ensure!(
+        req.flags & (IFF_TAP | IFF_NO_PI | IFF_VNET_HDR) == IFF_TAP | IFF_NO_PI | IFF_VNET_HDR,
+        "the queue's flags are {:#x}",
+        req.flags
+    );
+    // SAFETY: TUNSETVNETHDRSZ reads one int, which outlives the call.
+    if unsafe { libc::ioctl(queue, TUNSETVNETHDRSZ as _, &VNET_HDR_SIZE) } != 0 {
+        bail!("TUNSETVNETHDRSZ: {}", std::io::Error::last_os_error());
+    }
+    // SAFETY: TUNSETOFFLOAD takes its flags by value.
+    if unsafe { libc::ioctl(queue, TUNSETOFFLOAD as _, OFFLOAD as libc::c_ulong) } != 0 {
+        bail!("TUNSETOFFLOAD: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn us(since: Instant) -> u128 {
     since.elapsed().as_micros()
 }

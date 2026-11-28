@@ -22,6 +22,15 @@ def podman_build_line(**proxy: str) -> str:
     return line
 
 
+class FileLimitTests(unittest.TestCase):
+    def test_the_build_raises_the_open_file_limit(self):
+        # cargo starts one rustc per core; on a 192-core host the Pumpkin build ran out of file
+        # descriptors under podman's default limit ("Too many open files (os error 24)")
+        args = podman_build_line().split()
+        self.assertIn("--ulimit", args)
+        self.assertEqual(args[args.index("--ulimit") + 1], "nofile=65536:65536")
+
+
 class ProxyTests(unittest.TestCase):
     def test_a_loopback_proxy_is_reached_on_the_hosts_network_and_kept(self):
         for name, value in (("https_proxy", "http://user:secret@127.0.0.1:46147"),

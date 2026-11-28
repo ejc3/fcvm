@@ -22,3 +22,5 @@ export * from "./potato.ts";
 export * from "./windows.ts";
 export * from "./minecraft.ts";
 export * as fmt from "./format.ts";
+export * from "./minecraft3d.ts";
+export * from "./minecraft-field.ts";

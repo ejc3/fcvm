@@ -889,6 +889,7 @@ std::string Pipeline::health_json() {
   num("power_w", g.power_w);
   num("util_pct", g.util_pct);
   num("mem_used_mb", g.mem_used_mb);
+  num("mem_total_mb", g.mem_total_mb);
   num("clock_mhz", g.clock_mhz);
   num("app_clock_mhz", g.app_clock_mhz);
   num("max_clock_mhz", g.max_clock_mhz);

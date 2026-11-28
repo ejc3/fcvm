@@ -1,5 +1,10 @@
-//! The GPU hosts. The coordinator launches and terminates them itself, from the host launch
-//! templates: none while the fleet is asleep, `awake_hosts` per region otherwise.
+//! The GPU hosts, and pages mode's host. The coordinator launches and terminates them
+//! itself, from the launch templates of each host group ([`HostConfig`]): none while the
+//! fleet is asleep, `awake_hosts` per region otherwise. Each group runs its own [`run`] over
+//! the same power state, and lists, launches and terminates only its own class's instances
+//! ([`HostClass`]), so its on-demand count and cap and its degraded component are its own.
+//! Pages mode's host group is one host in one region, with an on-demand cap of one; it
+//! reports nothing a wake's record or the wall's tiling counts GPU hosts by.
 //!
 //! A host region short of hosts asks EC2 for the shortfall on spot first (EC2 Fleet,
 //! `CreateFleet` of type `instant`, over every host template and subnet of the region, so EC2
@@ -11,16 +16,17 @@
 //! capacity in either market, or the on-demand cap reached) asks again after
 //! `capacity_retry`, spot first. A region left short by the account's quota
 //! (`VcpuLimitExceeded`, `MaxSpotInstanceCountExceeded`) also marks the coordinator degraded
-//! (`scale`). Asleep, every host of the fleet is terminated; the next wake tries spot first
-//! again.
+//! (`scale` for the GPU hosts, `scale-renders` for pages mode's host). Asleep, every host of
+//! the fleet is terminated; the next wake tries spot first again.
 //!
 //! This replaced Auto Scaling groups whose desired capacity the coordinator set: Auto
 //! Scaling took 6 to 14 s to start a launch after the desired capacity was raised, recorded a
 //! refused spot launch about 10 s after that, and never moved a spot group's capacity to on
 //! demand itself.
 //!
-//! Hosts are found by their tags (`Purpose=fcvm-fleet-host`, `Fleet=<fleet>`), so a restarted
-//! coordinator keeps the hosts an earlier one launched. A host that is reclaimed (spot) or
+//! Hosts are found by their tags (`Purpose=fcvm-fleet-host`, or `fcvm-fleet-renders` for
+//! pages mode's host, and `Fleet=<fleet>`), so a restarted coordinator keeps the hosts an
+//! earlier one launched. A host that is reclaimed (spot) or
 //! stops is replaced: the regions are listed every `poll` while a wake's hosts come up and
 //! every `liveness` while they run. An instance just launched counts as pending while lists
 //! leave it out, for up to a minute, so DescribeInstances lagging behind CreateFleet does not
@@ -86,6 +92,52 @@ pub enum HostSpread {
     Az,
 }
 
+/// A host group's class: what its instances are for. Each group lists, launches and
+/// terminates only the instances tagged with its class's `Purpose`, so its counts (awake,
+/// on demand, excess) are its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostClass {
+    /// The GPU hosts of the wall and the GPU modes (`--host-template`).
+    Gpu,
+    /// The CPU host that runs pages mode alone (`--renders-template`): no GPU, no place on
+    /// the wall and no part in a wake's record.
+    Renders,
+}
+
+impl HostClass {
+    /// The `Purpose` tag of the class's instances.
+    pub fn purpose(self) -> &'static str {
+        match self {
+            HostClass::Gpu => "fcvm-fleet-host",
+            HostClass::Renders => "fcvm-fleet-renders",
+        }
+    }
+
+    /// The coordinator component a quota or launch failure of the class marks degraded.
+    pub fn component(self) -> &'static str {
+        match self {
+            HostClass::Gpu => "scale",
+            HostClass::Renders => "scale-renders",
+        }
+    }
+
+    /// The class's hosts, as the log names them.
+    pub fn noun(self) -> &'static str {
+        match self {
+            HostClass::Gpu => "GPU host",
+            HostClass::Renders => "renders host",
+        }
+    }
+
+    /// The class's launch template and subnet flags, for errors.
+    fn flags(self) -> (&'static str, &'static str) {
+        match self {
+            HostClass::Gpu => ("--host-template", "--host-subnet"),
+            HostClass::Renders => ("--renders-template", "--renders-subnet"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Market {
     Spot,
@@ -101,7 +153,7 @@ impl Market {
     }
 }
 
-/// One GPU host instance of this fleet.
+/// One host instance of this fleet.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Host {
     pub id: String,
@@ -141,7 +193,7 @@ pub struct Launch {
 
 #[async_trait]
 pub trait HostDriver: Send + Sync {
-    /// This fleet's GPU hosts in `region`, in any state EC2 still lists.
+    /// This fleet's hosts of the driver's class in `region`, in any state EC2 still lists.
     async fn hosts(&self, region: &str) -> Result<Vec<Host>>;
     /// The availability zones of `region`'s host subnets, each once.
     async fn zones(&self, region: &str) -> Result<Vec<String>>;
@@ -163,6 +215,8 @@ pub trait HostDriver: Send + Sync {
 
 /// The host regions, their awake capacity, and the on-demand cap.
 pub struct HostConfig {
+    /// What the group's hosts are for.
+    pub class: HostClass,
     pub driver: Arc<dyn HostDriver>,
     pub regions: Vec<String>,
     /// Hosts per region while the fleet is awake.
@@ -396,7 +450,7 @@ pub async fn run(
                 };
             }
             last_want = Some(want);
-            tracing::info!(power = %state, hosts_per_region = want, "hosts set for the power state");
+            tracing::info!(power = %state, hosts_per_region = want, class = cfg.class.noun(), "hosts set for the power state");
         }
         let now = Instant::now();
         // Tokens are kept across power changes (an asleep pass terminates what a lost launch
@@ -405,7 +459,7 @@ pub async fn run(
             let keep = token_step(*first, *last, now, cfg.lost_launch_ttl) != TokenStep::Drop;
             if !keep {
                 tracing::warn!(%region, market = market.name(), hosts = *count,
-                    "a lost GPU host launch got no answer in time; the hosts lists name what it launched");
+                    "a lost {} launch got no answer in time; the hosts lists name what it launched", cfg.class.noun());
             }
             keep
         });
@@ -420,7 +474,7 @@ pub async fn run(
             match cfg.driver.hosts(region).await {
                 Ok(h) => listed.push(Some(with_recent(region, h, &mut recent, now))),
                 Err(e) => {
-                    tracing::warn!(%region, error = %format!("{e:#}"), "listing the GPU hosts failed");
+                    tracing::warn!(%region, error = %format!("{e:#}"), "listing the {}s failed", cfg.class.noun());
                     errors.push(format!("{region}: {e:#}"));
                     listed.push(None);
                 }
@@ -512,10 +566,10 @@ pub async fn run(
                 busy = true;
                 match cfg.driver.terminate(region, &ids).await {
                     Ok(()) => {
-                        tracing::info!(%region, instances = ?ids, power = %state, "terminating GPU hosts")
+                        tracing::info!(%region, instances = ?ids, power = %state, "terminating {}s", cfg.class.noun())
                     }
                     Err(e) => {
-                        tracing::warn!(%region, error = %format!("{e:#}"), "terminating GPU hosts failed");
+                        tracing::warn!(%region, error = %format!("{e:#}"), "terminating {}s failed", cfg.class.noun());
                         errors.push(format!("{region}: {e:#}"));
                     }
                 }
@@ -539,10 +593,10 @@ pub async fn run(
                     busy = true;
                     match cfg.driver.terminate(region, &lost).await {
                         Ok(()) => {
-                            tracing::info!(%region, instances = ?lost, power = %state, "terminating GPU hosts of lost launches")
+                            tracing::info!(%region, instances = ?lost, power = %state, "terminating {}s of lost launches", cfg.class.noun())
                         }
                         Err(e) => {
-                            tracing::warn!(%region, error = %format!("{e:#}"), "terminating GPU hosts failed");
+                            tracing::warn!(%region, error = %format!("{e:#}"), "terminating {}s failed", cfg.class.noun());
                             errors.push(format!("{region}: {e:#}"));
                         }
                     }
@@ -622,8 +676,11 @@ pub async fn run(
         }
         // The hosts kept for the awake capacity, once every region is listed and holds that
         // many: the side then needs no place for a GPU no connected host listed (#1517).
+        // Only the GPU hosts are the wall's: pages mode's host has no GPU, and is no host of
+        // a wake's record.
+        let gpu = cfg.class == HostClass::Gpu;
         let expected = expected_hosts(&listed, want, &leaving);
-        if last_expected.as_ref() != Some(&expected) {
+        if gpu && last_expected.as_ref() != Some(&expected) {
             handle
                 .send(Event::HostsExpected {
                     at: 0,
@@ -632,7 +689,7 @@ pub async fn run(
                 .await;
             last_expected = Some(expected);
         }
-        if watching {
+        if gpu && watching {
             handle
                 .send(Event::ScaleInstances {
                     at: 0,
@@ -642,10 +699,10 @@ pub async fn run(
         }
         if !errors.is_empty() {
             reported = true;
-            degraded(&handle, &errors.join("; ")).await;
+            degraded(&handle, cfg.class.component(), &errors.join("; ")).await;
         } else if reported || changed {
             reported = false;
-            healthy(&handle).await;
+            healthy(&handle, cfg.class.component()).await;
         }
         let wait = if state == "waking" || busy || !errors.is_empty() {
             cfg.poll
@@ -733,7 +790,7 @@ async fn reconcile(
                 found.extend(new.into_iter().cloned());
             }
             Err(e) => {
-                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "asking a lost GPU host launch again failed");
+                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "asking a lost {} launch again failed", cfg.class.noun());
                 errors.push(format!("{region} {}: {e:#}", market.name()));
                 return None;
             }
@@ -821,7 +878,7 @@ async fn launch_shortfall(
                         *n += ask;
                     }
                 }
-                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "launching GPU hosts failed");
+                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "launching {}s failed", cfg.class.noun());
                 errors.push(format!("{region} {}: {e:#}", market.name()));
                 return (placed, false);
             }
@@ -850,7 +907,7 @@ async fn launch_shortfall(
         launched += got.ids.len() as u32;
         if !got.failed.is_empty() {
             let why = got.failed.join("; ");
-            tracing::warn!(%region, market = market.name(), error = %why, "EC2 refused a GPU host launch");
+            tracing::warn!(%region, market = market.name(), error = %why, "EC2 refused a {} launch", cfg.class.noun());
             errors.push(format!("{region} {}: {why}", market.name()));
             failed = true;
         }
@@ -868,7 +925,7 @@ async fn launch_shortfall(
     if launched < short {
         // `refused` is the last market's: on demand's, when spot fell back to it.
         tracing::warn!(%region, launched, short, zones = ?zones, reason = %refused.join("; "),
-            "GPU hosts still short; asking again after the capacity retry");
+            "{}s still short; asking again after the capacity retry", cfg.class.noun());
         // A quota refusal is this account's limit, not EC2's capacity: it holds until the
         // quota is raised or the account's other hosts finish shutting down. It is reported
         // (the `scale` failure, kept by `run` until an attempt is not refused for quota, and
@@ -881,7 +938,7 @@ async fn launch_shortfall(
             .collect();
         if !quota.is_empty() {
             let why = quota.join("; ");
-            tracing::warn!(%region, market = last.name(), error = %why, "EC2 refused a GPU host launch");
+            tracing::warn!(%region, market = last.name(), error = %why, "EC2 refused a {} launch", cfg.class.noun());
             **quota_refusal = Some(format!("{region} {}: {why}", last.name()));
         }
     }
@@ -974,21 +1031,21 @@ async fn launch_spread(
     (launched, true)
 }
 
-async fn degraded(handle: &Handle, reason: &str) {
+async fn degraded(handle: &Handle, component: &str, reason: &str) {
     handle
         .send(Event::Degraded {
             at: 0,
-            component: "scale".into(),
+            component: component.into(),
             reason: Some(reason.to_string()),
         })
         .await;
 }
 
-async fn healthy(handle: &Handle) {
+async fn healthy(handle: &Handle, component: &str) {
     handle
         .send(Event::Degraded {
             at: 0,
-            component: "scale".into(),
+            component: component.into(),
             reason: None,
         })
         .await;
@@ -1020,12 +1077,18 @@ pub struct AwsHosts {
     pub subnets: BTreeMap<String, Vec<String>>,
     /// Tagged on every host (`Fleet=<name>`); only this fleet's hosts are listed.
     pub fleet: String,
+    /// Tagged on every host as `Purpose=<class purpose>`; only the class's hosts are listed.
+    pub class: HostClass,
     /// Per-region API base; default `https://ec2.<region>.amazonaws.com`.
     pub endpoints: BTreeMap<String, String>,
     /// How long a template's instance type is reused before it is read again.
     pub template_type_ttl: Duration,
     /// Each template's instance type, as its validated default says, and when it was read.
     types: Mutex<HashMap<(String, String), (String, Instant)>>,
+    /// The on-demand rate of every type the group may launch (built in, and `--spend-rates`):
+    /// the spend meter and the daily cap price instances by it, so a template whose type has
+    /// none is not launched ([`unpriced_launch`]).
+    rates: BTreeMap<String, f64>,
     /// By ClientToken, the parameters of each CreateFleet that got no decision, and when they
     /// were sent. A retry with the token sends them again unchanged: EC2 refuses a token with
     /// other parameters (IdempotentParameterMismatch), and the template's instance type can
@@ -1047,7 +1110,20 @@ type QueryParams = Vec<(String, String)>;
 const UNANSWERED_TTL: Duration = Duration::from_secs(24 * 3600);
 
 impl AwsHosts {
+    /// The GPU hosts' driver.
     pub fn new(templates: &[Regional], subnets: &[Regional], fleet: String) -> Result<Self> {
+        AwsHosts::for_class(templates, subnets, fleet, HostClass::Gpu)
+    }
+
+    /// The driver of `class`'s hosts, launching only types the built-in rates price
+    /// ([`AwsHosts::priced_by`] gives it the coordinator's).
+    pub fn for_class(
+        templates: &[Regional],
+        subnets: &[Regional],
+        fleet: String,
+        class: HostClass,
+    ) -> Result<Self> {
+        let (template_flag, subnet_flag) = class.flags();
         let mut t: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for r in templates {
             t.entry(r.region.clone()).or_default().push(r.name.clone());
@@ -1059,22 +1135,27 @@ impl AwsHosts {
         for region in t.keys() {
             anyhow::ensure!(
                 s.contains_key(region),
-                "--host-template in {region} needs a --host-subnet in {region}"
+                "{template_flag} in {region} needs a {subnet_flag} in {region}"
             );
         }
         for region in s.keys() {
             anyhow::ensure!(
                 t.contains_key(region),
-                "--host-subnet in {region} has no --host-template in {region}"
+                "{subnet_flag} in {region} has no {template_flag} in {region}"
             );
         }
         Ok(AwsHosts {
             templates: t,
             subnets: s,
             fleet,
+            class,
             endpoints: BTreeMap::new(),
             template_type_ttl: TEMPLATE_TYPE_TTL,
             types: Mutex::new(HashMap::new()),
+            rates: super::spend::DEFAULT_ON_DEMAND
+                .iter()
+                .map(|(t, r)| (t.to_string(), *r))
+                .collect(),
             unanswered: Mutex::new(HashMap::new()),
             subnet_zones: Mutex::new(HashMap::new()),
             chain: CredentialChain::new()?,
@@ -1082,6 +1163,17 @@ impl AwsHosts {
                 .timeout(Duration::from_secs(20))
                 .build()?,
         })
+    }
+
+    /// The driver, launching only types `rates` prices (built in and `--spend-rates`).
+    pub fn priced_by(mut self, rates: BTreeMap<String, f64>) -> Self {
+        self.rates = rates;
+        self
+    }
+
+    /// Whether this driver may launch `instance_type`: its table has a rate for it.
+    pub fn prices(&self, instance_type: &str) -> bool {
+        self.rates.contains_key(instance_type)
     }
 
     /// The regions with host templates, in name order.
@@ -1210,8 +1302,25 @@ fn p(k: impl Into<String>, v: impl Into<String>) -> (String, String) {
     (k.into(), v.into())
 }
 
+/// Why a launch over `templates` (each template name with its instance type) in `region` is
+/// refused, or `None`: every type needs an on-demand rate in `rates`. The spend meter charges
+/// an instance at its type's rate and the daily cap is computed from the rates, so launching a
+/// type the coordinator cannot price would leave the cap without a bound on it. An instance
+/// already running with such a type is still metered, at the highest rate known.
+pub fn unpriced_launch(
+    region: &str,
+    templates: &[(String, String)],
+    rates: &BTreeMap<String, f64>,
+) -> Option<String> {
+    let (template, ty) = templates.iter().find(|(_, ty)| !rates.contains_key(ty))?;
+    Some(format!(
+        "launch template {template} in {region} starts {ty}, which has no on-demand rate: not \
+         launched; add it with --spend-rates {ty}=<USD per hour> or to spend::DEFAULT_ON_DEMAND"
+    ))
+}
+
 /// The `CreateFleet` (instant) parameters for `count` hosts in `market` over `templates` x
-/// `subnets`, tagged for `fleet`. `templates` pairs each template name with its instance
+/// `subnets`, tagged for `fleet` and `purpose` (the class's `Purpose`). `templates` pairs each template name with its instance
 /// type, which every override names: IAM checks `ec2:InstanceType` on the fleet's instances,
 /// and for `CreateFleet` it takes that key only from the request, not from the template.
 pub fn create_fleet_params(
@@ -1220,6 +1329,7 @@ pub fn create_fleet_params(
     market: Market,
     count: u32,
     fleet: &str,
+    purpose: &str,
     token: &str,
 ) -> Vec<(String, String)> {
     let mut v = vec![
@@ -1273,8 +1383,8 @@ pub fn create_fleet_params(
         }
     }
     for (i, (k, val)) in [
-        ("Name", "fcvm-fleet-host"),
-        ("Purpose", "fcvm-fleet-host"),
+        ("Name", purpose),
+        ("Purpose", purpose),
         ("Fleet", fleet),
         ("Market", market.name()),
     ]
@@ -1407,7 +1517,7 @@ impl HostDriver for AwsHosts {
             let mut params = vec![
                 p("Action", "DescribeInstances"),
                 p("Filter.1.Name", "tag:Purpose"),
-                p("Filter.1.Value.1", "fcvm-fleet-host"),
+                p("Filter.1.Value.1", self.class.purpose()),
                 p("Filter.2.Name", "tag:Fleet"),
                 p("Filter.2.Value.1", self.fleet.as_str()),
             ];
@@ -1485,7 +1595,22 @@ impl HostDriver for AwsHosts {
                 for t in templates {
                     typed.push((t.clone(), self.template_type(region, t).await?));
                 }
-                create_fleet_params(&typed, &subnets, market, count, &self.fleet, token)
+                // Refused before any request: nothing is launched and no token is kept.
+                if let Some(why) = unpriced_launch(region, &typed, &self.rates) {
+                    return Ok(Launch {
+                        failed: vec![why],
+                        ..Launch::default()
+                    });
+                }
+                create_fleet_params(
+                    &typed,
+                    &subnets,
+                    market,
+                    count,
+                    &self.fleet,
+                    self.class.purpose(),
+                    token,
+                )
             }
         };
         let answer = self.call(region, &params).await;
@@ -1569,6 +1694,15 @@ pub struct FakeHosts {
 }
 
 impl FakeHosts {
+    /// Hosts whose instance ids start at `first` (`i-` and 17 hex digits), so two fakes, one
+    /// per host group, mint ids that differ as two classes' instances do.
+    pub fn numbered_from(first: u64) -> Self {
+        FakeHosts {
+            next: std::sync::atomic::AtomicU64::new(first),
+            ..FakeHosts::default()
+        }
+    }
+
     /// Every host of `region` in a present state (not shutting down or terminated).
     pub fn present(&self, region: &str) -> Vec<Host> {
         self.hosts
@@ -1806,6 +1940,67 @@ impl HostDriver for FakeHosts {
 mod tests {
     use super::*;
 
+    /// The spend meter and the daily cap price every instance by its type's on-demand rate,
+    /// so a group launches only types the effective table (built in, and `--spend-rates`)
+    /// prices: a type without one is a launch that names the type and how to price it.
+    #[test]
+    fn a_launch_type_needs_an_on_demand_rate() {
+        let typed = vec![("tpl-a".to_string(), "x9z.metal".to_string())];
+        let builtin = super::super::spend::on_demand_rates(&[]).unwrap();
+        let why = unpriced_launch("us-east-1", &typed, &builtin).expect("refused");
+        assert!(why.contains("x9z.metal"), "{why}");
+        assert!(why.contains("tpl-a"), "{why}");
+        assert!(
+            why.contains("--spend-rates x9z.metal=<USD per hour>"),
+            "{why}"
+        );
+        let given = super::super::spend::on_demand_rates(&["x9z.metal=3.5".into()]).unwrap();
+        assert_eq!(unpriced_launch("us-east-1", &typed, &given), None);
+        // pages mode's host launches on the built-in rate
+        let renders = vec![("tpl-r".to_string(), "m8gd.metal-24xl".to_string())];
+        assert_eq!(unpriced_launch("us-east-1", &renders, &builtin), None);
+        // one unpriced template of several holds the whole request
+        let mixed = vec![
+            ("tpl-g".to_string(), "g4dn.metal".to_string()),
+            ("tpl-a".to_string(), "x9z.metal".to_string()),
+        ];
+        assert!(unpriced_launch("us-east-1", &mixed, &builtin).is_some());
+    }
+
+    /// A group whose template starts an unpriced type sends no CreateFleet: the launch comes
+    /// back failed (the class's degraded component carries the text), with no token kept for
+    /// a retry, as no request was sent.
+    #[tokio::test]
+    async fn a_template_whose_type_has_no_rate_launches_nothing() {
+        let regional = |name: &str| Regional {
+            region: "us-east-1".into(),
+            name: name.into(),
+        };
+        let mut d = AwsHosts::for_class(
+            &[regional("tpl-a")],
+            &[regional("subnet-a")],
+            "stage".into(),
+            HostClass::Renders,
+        )
+        .unwrap()
+        .priced_by(super::super::spend::on_demand_rates(&[]).unwrap());
+        // nothing listens here: a request that went out would fail, not come back failed
+        d.endpoints
+            .insert("us-east-1".into(), "http://127.0.0.1:9".into());
+        d.types.lock().unwrap().insert(
+            ("us-east-1".into(), "tpl-a".into()),
+            ("x9z.metal".into(), Instant::now()),
+        );
+        let got = d
+            .launch("us-east-1", Market::Spot, 1, "token-1", &[])
+            .await
+            .expect("a refusal, not an undecided request");
+        assert!(got.ids.is_empty() && got.refused.is_empty(), "{got:?}");
+        assert_eq!(got.failed.len(), 1, "{got:?}");
+        assert!(got.failed[0].contains("x9z.metal"), "{got:?}");
+        assert!(d.unanswered.lock().unwrap().is_empty());
+    }
+
     /// A token whose last ask launched a host just before its time ran out is held, not
     /// dropped: dropping it then would release its on-demand reservation while that host is
     /// still missing from the lists, and another region could take the place (Codex on #1585).
@@ -1867,6 +2062,7 @@ mod tests {
                 .insert(Market::OnDemand, r.into());
         }
         let cfg = HostConfig {
+            class: HostClass::Gpu,
             driver: fake.clone(),
             regions: vec!["r".into()],
             awake_hosts: 1,
@@ -2050,6 +2246,7 @@ mod tests {
             Market::Spot,
             2,
             "stage",
+            "fcvm-fleet-host",
             "token",
         );
         let get = |k: &str| {
@@ -2094,6 +2291,7 @@ mod tests {
             Market::OnDemand,
             1,
             "stage",
+            "fcvm-fleet-host",
             "x",
         );
         assert!(od

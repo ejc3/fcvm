@@ -123,7 +123,7 @@ impl Spares {
     /// The pool at `dir`, created if missing. Refuses a directory that is not on a hugetlbfs
     /// mount with 2 MiB pages.
     pub fn open(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)
+        crate::paths::ensure_dir(dir)
             .with_context(|| format!("creating the hugepage spare directory {}", dir.display()))?;
         let stat =
             nix::sys::statfs::statfs(dir).with_context(|| format!("statfs {}", dir.display()))?;
@@ -277,7 +277,7 @@ impl Spares {
     /// page is allocated.
     fn create(&self, node: Option<u32>, mib: u64) -> Result<()> {
         let dir = self.pool_dir(node, mib);
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        crate::paths::ensure_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let tmp = dir.join(format!("{TMP_PREFIX}{id}"));
         let file = std::fs::OpenOptions::new()

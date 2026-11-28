@@ -119,12 +119,10 @@ impl ColdRun {
     /// State files of this run's VMs: (path, state).
     fn states(run: &RunCtx) -> Vec<(PathBuf, fcvm::state::VmState)> {
         let prefix = Self::name_prefix(run);
-        let Ok(rd) = std::fs::read_dir(fcvm::paths::state_dir()) else {
-            return Vec::new();
-        };
-        rd.flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        fcvm::state::StateManager::new(fcvm::paths::state_dir())
+            .state_files()
+            .expect("listing the state files")
+            .into_iter()
             .filter_map(|p| {
                 let state: fcvm::state::VmState =
                     serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
@@ -355,7 +353,10 @@ impl Scenario for ColdRun {
                     failed.push(Failure::new(
                         "leak",
                         None,
-                        format!("VM directory vm-disks/{vm_id} outlived its VM"),
+                        format!(
+                            "VM directory vm-disks/{}/{vm_id} outlived its VM",
+                            fcvm::paths::vm_bucket(vm_id)
+                        ),
                     ));
                     let _ = std::fs::remove_dir_all(&dir);
                 }

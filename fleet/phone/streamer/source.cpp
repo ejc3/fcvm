@@ -665,7 +665,7 @@ std::string PhoneSource::health_json() {
   char b[4096];
   snprintf(b, sizeof b,
            "{\"fps\":%.1f,\"heights\":[%d],\"streams\":%s,"
-           "\"gpu\":{\"name\":\"%s\",\"temp_c\":%s,\"power_w\":%s,\"util_pct\":%s,\"mem_used_mb\":%s},"
+           "\"gpu\":{\"name\":\"%s\",\"temp_c\":%s,\"power_w\":%s,\"util_pct\":%s,\"mem_used_mb\":%s,\"mem_total_mb\":%s},"
            "\"t\":%.6f,\"frame\":%u,\"boot_id\":\"%s\",\"ready\":%s,%s"
            "\"startup_ms\":{\"first_capture\":%.0f,\"first_frame_sent\":%.0f},"
            "\"phone\":{\"picture\":\"%s\",\"screen\":[%d,%d],\"copies\":%llu,\"scene_frames\":%llu,\"screen_frames\":%llu,"
@@ -674,7 +674,7 @@ std::string PhoneSource::health_json() {
            "\"app_connects\":%llu,\"app_error\":%s,"
            "\"draw_to_capture_ms\":%s,\"capture_to_sent_ms\":%s,\"encode_ms\":%s}}",
            fps_, geo_.h, sj.c_str(), json_escape(gs.name.empty() ? gpu_name_ : gs.name).c_str(),
-           num(gs.temp_c).c_str(), num(gs.power_w).c_str(), num(gs.util_pct).c_str(), num(gs.mem_used_mb).c_str(),
+           num(gs.temp_c).c_str(), num(gs.power_w).c_str(), num(gs.util_pct).c_str(), num(gs.mem_used_mb).c_str(), num(gs.mem_total_mb).c_str(),
            t_, frame_, boot_id_.c_str(), ready_ && fatal_.empty() ? "true" : "false",
            fatal_.empty() ? "" : ("\"error\":\"" + json_escape(fatal_) + "\",").c_str(), first_capture_ms_, first_sent_ms_,
            frame_ ? (geo_.scene ? "scene" : "screen") : "none", screen_w_, screen_h_, (unsigned long long)copies_,

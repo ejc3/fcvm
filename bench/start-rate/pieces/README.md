@@ -19,7 +19,7 @@ In order, for `fcvm snapshot run --pid <serve>` (UFFD) or `--snapshot <tag>` (Fi
 | 5 | listeners | volume servers, output listener, status listener, the restore boot-plan and completion listeners on the clone's vsock paths | `snapshot.rs:3570-4320` | not split out |
 | 6 | network config | `PastaNetwork::setup`: MAC, addresses, one `ip -6 addr show` fork per process for the host IPv6 | `src/network/pasta.rs:2202,1350` | `rootless-net` stage `config` |
 | 7 | namespace holder | `fcvm __netns-agent` unshares its user and network namespaces, then `newuidmap` and `newgidmap`, then the agent confirms it is ready | `spawn_namespace_holder`, `src/commands/common.rs`; `src/network/netns_agent.rs` | `holder`; `rootless-net` stage `holder` |
-| 8 | disk | the clone's disk directory as a reflink of `disk.raw` when its extent count is at most 4096 (`REFLINK_MAX_EXTENTS`) and one of the snapshot's 8 reflink slots (`REFLINK_SLOTS`) is free, else as a btrfs subvolume snapshot of the snapshot's `disk/`; runs beside 9 | `DiskManager::create_cow_disk`, `src/storage/disk.rs:587` | `disk` |
+| 8 | disk | the clone's disk directory as a reflink of `disk.raw` when its extent count is at most 4096 (`REFLINK_MAX_EXTENTS`), one of the snapshot's 8 reflink slots (`REFLINK_SLOTS`) is free and fewer than 4 bytes of the snapshot's mark file are held (`SNAPSHOT_BURST`; a clone holds one byte of 64, drawn at random, while it takes a subvolume snapshot and for 100 ms after it), else as a btrfs subvolume snapshot of the snapshot's `disk/`; runs beside 9 | `DiskManager::create_cow_disk`, `src/storage/disk.rs:587` | `disk` |
 | 9 | links | one request to the holder, which makes the VMM's TAP and pasta's (both persistent), `br0` with its MAC and address, and sets the MTUs, over netlink in its own namespace (one request per TAP, four for the bridge); runs beside 8 | `PastaNetwork::build_namespace`, `netns_agent::build`, `src/network/rtnl.rs` | `rootless-net` stage `links` |
 | 10 | pasta | pasta spawned in the namespace, where it attaches to its TAP, and waited for through its PID file (ready once pasta has written its PID into it) | `PastaNetwork::post_start`, `start_pasta` | `rootless-net` stage `pasta` |
 | 11 | Firecracker spawn | fork/exec of Firecracker with `setns` into the holder's user and net namespaces in `pre_exec` (no `nsenter` hop), then a wait for its API socket | `VmManager::start`, `src/firecracker/vm.rs:258`; `install_namespace_pre_exec`, `src/utils.rs:1092` | `fc-spawn`; `vmm` stage `spawn` |
@@ -104,7 +104,7 @@ anything only on a quiet box.
 | `disk` | `SNAPSHOT_DIR=` a snapshot directory (`.../snapshots/<tag>`) |
 | `fc-spawn` | `FIRECRACKER=` the Firecracker binary fcvm restores with |
 | `tap-attach` | nothing; `tap-floor.sh` runs its campaign |
-| `netpool` | `ARGS="--netpool-socket <data_dir>/netpool/<user>/pool.sock"` of a running `fcvm netpool serve`; `netpool.sh` runs its campaign |
+| `netpool` | `ARGS="--netpool-socket <socket>"`, the `socket` that `fcvm netpool stats` prints, of a running `fcvm netpool serve`; `netpool.sh` runs its campaign |
 | `vmm` | both; `UFFD_SOCKET=` a `snapshot serve` socket to load through UFFD |
 
 ## netpool: a namespace from the pool
@@ -112,9 +112,12 @@ anything only on a quiet box.
 `netpool` is the claim a restored clone makes when a pool runs (`fcvm netpool serve`,
 `src/netpool/`): one connection to the pool's socket, one request, one reply that carries the
 namespace's descriptors. It runs in the instance's own process, as it does in a clone's,
-because the connection is the lease and has to be held. The op is the claim; the instance holds
-the lease through the steady phase and drops it at teardown. The stage `generation` is the
-namespace's generation, not a time: 1 for a namespace no lease has used.
+because the connection is the lease and has to be held. The op is the claim and what the
+clone's VMM then does with the namespace's TAP: the three ioctls Firecracker makes on the
+queue it inherits (`TUNGETIFF`, `TUNSETVNETHDRSZ`, `TUNSETOFFLOAD`; stage `vmm-tap`), where
+a VMM in a namespace of its own attaches by name and detaches at its exit (`tap-attach`).
+The instance holds the lease through the steady phase and drops it at teardown. The stage
+`generation` is the namespace's generation, not a time: 1 for a namespace no lease has used.
 
 The pool resets a namespace after its lease has ended, so the reset is not in the teardown's
 latency. The driver reads the pool's counters before the teardown and waits until every
