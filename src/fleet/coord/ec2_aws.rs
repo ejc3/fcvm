@@ -77,6 +77,13 @@ pub struct AwsEc2 {
     /// Per region, the subnets (one per AZ) a launch tries in order, and the security group
     /// the tile's interface gets there. A region without subnets launches in the template's.
     pub networks: BTreeMap<String, Network>,
+    /// The on-demand rate of every type a tile may launch (built in, and `--spend-rates`).
+    /// A template whose type has none is not launched ([`super::hosts::unpriced_launch`]).
+    rates: BTreeMap<String, f64>,
+    /// What a template's default version names as its instance type, and when it was read.
+    types: std::sync::Mutex<HashMap<(String, String), (String, Instant)>>,
+    /// How long a template's type is trusted before it is read again.
+    pub template_type_ttl: Duration,
     /// Sent as the bearer token of every scene and budget post (fleet/PROTOCOL.md, "Access").
     pub scene_token: super::scene_token::SceneToken,
     chain: CredentialChain,
@@ -127,6 +134,36 @@ impl LaunchOption {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tile whose template starts a type with no rate launches nothing: the launch fails
+    /// naming the type and the `--spend-rates` remedy, before any RunInstances (#2169).
+    #[tokio::test]
+    async fn a_template_whose_type_has_no_rate_launches_no_tile() {
+        let mut d = AwsEc2::new(
+            vec!["us-east-1".into()],
+            "tpl-a".into(),
+            None,
+            "example.test".into(),
+        )
+        .unwrap()
+        .priced_by(crate::fleet::coord::spend::on_demand_rates(&[]).unwrap());
+        // nothing listens here: a request that went out would fail with a connection error
+        d.endpoints
+            .insert("us-east-1".into(), "http://127.0.0.1:9".into());
+        d.types.lock().unwrap().insert(
+            ("us-east-1".into(), "tpl-a".into()),
+            ("x9z.metal".into(), Instant::now()),
+        );
+        match d.launch("slot-1").await {
+            Err(LaunchError::Failed(e)) => {
+                let e = format!("{e:#}");
+                assert!(e.contains("x9z.metal"), "{e}");
+                assert!(e.contains("--spend-rates x9z.metal=<USD per hour>"), "{e}");
+            }
+            Err(LaunchError::NoCapacity(e)) => panic!("not a capacity refusal: {e}"),
+            Ok(l) => panic!("launched {l:?}"),
+        }
+    }
 
     #[test]
     fn a_late_success_leaves_a_refusal_recorded_after_it_was_sent() {
@@ -401,12 +438,60 @@ impl AwsEc2 {
             throttle_attempts: 8,
             fleet: "stage".into(),
             networks: BTreeMap::new(),
+            rates: super::spend::DEFAULT_ON_DEMAND
+                .iter()
+                .map(|(t, r)| (t.to_string(), *r))
+                .collect(),
+            types: std::sync::Mutex::new(HashMap::new()),
+            template_type_ttl: Duration::from_secs(300),
             scene_token: Default::default(),
             chain: CredentialChain::new()?,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()?,
         })
+    }
+
+    /// The driver, launching only types `rates` prices (built in and `--spend-rates`).
+    pub fn priced_by(mut self, rates: BTreeMap<String, f64>) -> Self {
+        self.rates = rates;
+        self
+    }
+
+    /// The instance type of `template`'s default version in `region`, read at most once per
+    /// `template_type_ttl`.
+    async fn template_type(&self, region: &str, template: &str) -> Result<String> {
+        let key = (region.to_string(), template.to_string());
+        if let Some((ty, at)) = self.types.lock().unwrap().get(&key) {
+            if at.elapsed() < self.template_type_ttl {
+                return Ok(ty.clone());
+            }
+        }
+        let xml = self
+            .call(
+                region,
+                &[
+                    ("Action", "DescribeLaunchTemplateVersions".into()),
+                    ("LaunchTemplateName", template.into()),
+                    ("LaunchTemplateVersion.1", "$Default".into()),
+                ],
+            )
+            .await
+            .map_err(|e| match e {
+                CallError::Capacity(m) => anyhow::anyhow!(m),
+                CallError::Other(e) => e,
+            })
+            .with_context(|| format!("reading launch template {template} in {region}"))?;
+        let ty = xml_tag(&xml, "instanceType")
+            .filter(|t| !t.is_empty())
+            .with_context(|| {
+                format!("launch template {template} in {region} names no instance type")
+            })?;
+        self.types
+            .lock()
+            .unwrap()
+            .insert(key, (ty.clone(), Instant::now()));
+        Ok(ty)
     }
 
     fn base(&self, region: &str) -> String {
@@ -876,6 +961,18 @@ impl Ec2Driver for AwsEc2 {
         let templates = std::iter::once(first).chain(self.on_demand_template.iter());
         for template in templates {
             for region in &self.regions {
+                // Refused before any RunInstances: the daily cap is computed from the rates,
+                // so a type with none is not launched. The tile reports the type and the
+                // remedy as its failure.
+                let ty = self
+                    .template_type(region, template)
+                    .await
+                    .map_err(LaunchError::Failed)?;
+                if let Some(why) =
+                    super::hosts::unpriced_launch(region, &[(template.clone(), ty)], &self.rates)
+                {
+                    return Err(LaunchError::Failed(anyhow::anyhow!(why)));
+                }
                 // The region's subnets, one AZ each, or the template's own.
                 let nets: Vec<Option<(&str, &str)>> = match self.networks.get(region) {
                     Some(n) => n

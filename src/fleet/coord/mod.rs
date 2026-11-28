@@ -1704,6 +1704,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                 args.ec2_on_demand_template.clone(),
                 tls.tile_zone.clone(),
             )?;
+            d = d.priced_by(spend::on_demand_rates(&args.spend_rates)?);
             d.fleet = args.fleet_name.clone();
             d.pool_max = args.ec2_pool;
             d.pool_template = args.ec2_pool_template.clone();
