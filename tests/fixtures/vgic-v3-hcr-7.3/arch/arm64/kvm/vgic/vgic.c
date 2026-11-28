@@ -1,8 +1,8 @@
 /*
- * Verbatim line range from Linux v7.3.3 arch/arm64/kvm/vgic/vgic.c:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/vgic/vgic.c
- * Complete source SHA256: 23dc80fa91beb8670ac8d404cf40555d65650c7c1be3a18f26f59eb1426edb10
- * Lines 1063-1188.
+ * Verbatim line range from Linux v7.3.6 arch/arm64/kvm/vgic/vgic.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/kvm/vgic/vgic.c
+ * Complete source SHA256: acf7867987b055b5f7b5fba71665f43c017c5e8d7c55190b72fa22b4b2b929d6
+ * Lines 1063-1182.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64-host/vgic-v3-keep-hcr-on-quiet-exits.patch
  * to this file, then compiles the definitions it names from it into a C harness.
@@ -99,7 +99,7 @@ void kvm_vgic_flush_hwstate(struct kvm_vcpu *vcpu)
 	 *
 	 *   We do that by placing a request to ourselves which will
 	 *   abort the entry procedure and inject the exception at the
-	 *   beginning of the run loop.
+	 *   beginning of the run loop (see kvm_nested_flush_hwstate()).
 	 *
 	 * - Otherwise, do exactly *NOTHING* apart from enabling the virtual
 	 *   CPU interface. The guest state is already loaded, and we can
@@ -109,15 +109,9 @@ void kvm_vgic_flush_hwstate(struct kvm_vcpu *vcpu)
 	 * maintenance interrupt state, as it may fire.
 	 */
 	if (vgic_state_is_nested(vcpu)) {
-		if (kvm_vgic_vcpu_pending_irq(vcpu))
-			kvm_make_request(KVM_REQ_GUEST_HYP_IRQ_PENDING, vcpu);
-
 		vgic_v3_flush_nested(vcpu);
 		return;
 	}
-
-	if (vcpu_has_nv(vcpu))
-		vgic_v3_nested_update_mi(vcpu);
 
 	DEBUG_SPINLOCK_BUG_ON(!irqs_disabled());
 

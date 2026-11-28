@@ -316,6 +316,8 @@ static inline bool kvm_s2_mmu_valid(struct kvm_s2_mmu *mmu)
 }
 
 static void kvm_mmu_free_memory_cache(struct kvm_mmu_memory_cache *mc) { (void)mc; }
+/* Linux 7.3.4 and later name each new nested MMU's page-table dump in kvm_vcpu_init_nested(). */
+static inline void kvm_nested_s2_ptdump_create_debugfs(struct kvm_s2_mmu *mmu, int idx) { (void)mmu; (void)idx; }
 static int kvm_init_ipa_range(struct kvm_s2_mmu *mmu, unsigned long type) { return 0; }
 static int kvm_s2_mm_ops;
 

@@ -1,6 +1,6 @@
 /*
- * Verbatim line ranges from Linux v7.3.3 arch/arm64/include/asm/kvm_nested.h:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/include/asm/kvm_nested.h
+ * Verbatim line ranges from Linux v7.3.6 arch/arm64/include/asm/kvm_nested.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/include/asm/kvm_nested.h
  * Complete source SHA256: c15ab343081d711ecd1a3399ecd307553542c06f2ab18bb2ca4c46f9b74fc62e
  * Lines 78-83, 166-171, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies

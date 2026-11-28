@@ -1,7 +1,7 @@
 /*
- * Verbatim line ranges from Linux v7.3.3 arch/arm64/include/asm/kvm_host.h:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/include/asm/kvm_host.h
- * Complete source SHA256: ac044465ffccb1446e843e0edfb22626ce8c0c73f34339be978e1163217f65bc
+ * Verbatim line ranges from Linux v7.3.6 arch/arm64/include/asm/kvm_host.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/include/asm/kvm_host.h
+ * Complete source SHA256: 6a27377e1103c3ae13914bece4ac85f928cc03aee6ac5a057f6ad624953e10b6
  * Lines 14-19, 150-155, 211-237, 326-331, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64-host/nv2-targeted-shadow-s2-unmap.patch to these files,

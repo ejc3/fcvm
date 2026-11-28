@@ -1,8 +1,8 @@
 /*
- * Verbatim line ranges from Linux v7.3.3 arch/arm64/kvm/mmu.c:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/mmu.c
- * Complete source SHA256: 26b498fd11ef50a6837cc95d5a395b2c516e8ff088911f62c23df84eb2488cec
- * Lines 7-12, 40-95, 322-356, 975-1062, 1131-1158, 1600-1605, 1613-1618, 1633-1638, 1666-1676, 1997-2011, 2017-2022, 2035-2040, 2057-2078, 2410-2423, 2694-2705, each range separated by one blank line.
+ * Verbatim line ranges from Linux v7.3.6 arch/arm64/kvm/mmu.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/kvm/mmu.c
+ * Complete source SHA256: dea62f968ccc421fd50371eeb1f4548461b420cf5f19f9b6472ed8d73f578f03
+ * Lines 7-12, 40-95, 322-356, 975-1062, 1131-1158, 1624-1629, 1635-1642, 1654-1659, 1687-1698, 2008-2022, 2028-2033, 2044-2049, 2066-2087, 2419-2432, 2703-2714, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64-host/nv2-targeted-shadow-s2-unmap.patch to these files,
  * then compiles the functions it names from them into a C harness.
@@ -228,35 +228,38 @@ static void hyp_mc_free_fn(void *addr, void *mc)
 	enum kvm_pgtable_walk_flags flags = KVM_PGTABLE_WALK_SHARED;
 	enum kvm_pgtable_prot prot = KVM_PGTABLE_PROT_R;
 	struct kvm_pgtable *pgt = s2fd->vcpu->arch.hw_mmu->pgt;
-	unsigned long mmu_seq;
-	struct page *page;
+	struct kvm_s2_fault_vma_info s2vi = {};
 	struct kvm *kvm = s2fd->vcpu->kvm;
+	void *memcache = NULL;
 
 		ret = topup_mmu_memcache(s2fd->vcpu, memcache);
 		if (ret)
 			return ret;
 	}
 
-	if (s2fd->nested)
+	s2vi.vma_pagesize = PAGE_SIZE;
+	s2vi.gfn = ALIGN_DOWN(s2fd->fault_ipa, s2vi.vma_pagesize) >> PAGE_SHIFT;
+	canonical_gfn = get_canonical_gfn(s2fd, &s2vi);
 
 	if (ret) {
-		kvm_prepare_memory_fault_exit(s2fd->vcpu, s2fd->fault_ipa, PAGE_SIZE,
-					      write_fault, exec_fault, false);
+		kvm_prepare_memory_fault_exit(s2fd->vcpu, gfn_to_gpa(canonical_gfn),
+					      s2vi.vma_pagesize, write_fault, exec_fault, false);
 		return ret;
 	}
 
 
-		ret = KVM_PGT_FN(kvm_pgtable_stage2_map)(pgt, s2fd->fault_ipa, PAGE_SIZE,
-							 __pfn_to_phys(pfn), prot,
+		ret = KVM_PGT_FN(kvm_pgtable_stage2_map)(pgt, gfn_to_gpa(s2vi.gfn),
+							 s2vi.vma_pagesize,
+							 __pfn_to_phys(s2vi.pfn), prot,
 							 memcache, flags);
 	}
 
 out_unlock:
-	kvm_release_faultin_page(kvm, page, !!ret, prot & KVM_PGTABLE_PROT_W);
+	kvm_release_faultin_page(kvm, s2vi.page, !!ret, prot & KVM_PGTABLE_PROT_W);
 	kvm_fault_unlock(kvm);
 
 	if ((prot & KVM_PGTABLE_PROT_W) && !ret)
-		mark_page_dirty_in_slot(kvm, s2fd->memslot, gfn);
+		mark_page_dirty_in_slot(kvm, s2fd->memslot, canonical_gfn);
 
 			    void *memcache)
 {
