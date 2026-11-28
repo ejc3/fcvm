@@ -29,6 +29,7 @@ mod payload_freeze;
 mod proxy;
 mod relay_socket;
 mod restore;
+mod restore_nudge;
 mod retired_address;
 mod snapshot_network;
 mod system;

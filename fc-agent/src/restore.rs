@@ -142,6 +142,10 @@ pub struct RestoreSignals {
     /// the epoch watcher polls MMDS every 50 ms only while it does not; while it does, the
     /// reset is the restore event and the watcher polls every 10 s as a backstop.
     pub vsock_reset: crate::output::ResetWatch,
+    /// Incremented for each connection the host makes to the restore-nudge port
+    /// ([`crate::restore_nudge`]), the restore event on Cloud Hypervisor, whose vsock device
+    /// raises no transport reset. None on Firecracker, or when the port could not be bound.
+    pub restore_nudge: Option<watch::Receiver<u64>>,
     /// The NFS shares fc-agent mounted at boot, each with the ID of its mount, kept for
     /// post-restore remounting. Set once, right after the boot mounted them, which comes
     /// before the cache-ready handshake and so before any snapshot. MMDS can't be
