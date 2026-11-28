@@ -1733,7 +1733,7 @@ pub(crate) fn find_firecracker_with_version(
     Ok((firecracker_bin, version))
 }
 
-/// What `<cloud-hypervisor> --version` prints, trimmed (`cloud-hypervisor v55.0-117-g4969a51a3d3f`).
+/// What `<cloud-hypervisor> --version` prints, trimmed (`cloud-hypervisor v55.0-189-g65e8301c5c79`).
 /// Cached per binary identity, and only when the probe succeeds, so a binary that cannot
 /// run here keeps failing.
 pub(crate) fn cloud_hypervisor_version(bin: &std::path::Path) -> Option<String> {

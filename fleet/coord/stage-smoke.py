@@ -627,6 +627,8 @@ class Probe:
         # The host and tile instance ids /live reported serving it; only digests are printed,
         # and only in the summary line (`attributed`).
         self.hosts, self.instances = list(attribution[0]), list(attribution[1])
+        # Why the fleet runs no such tile, when its snapshot says (`fleet_cause`), fixed text.
+        self.cause = None
 
     def attributed(self):
         verdict = "pass" if self.ok else "image_failure" if self.image_failure else "inconclusive"
@@ -642,6 +644,8 @@ class Probe:
             out.update(step=self.step, errorType=self.error[0], error=self.error[1])
             if self.seen is not None:
                 out["seen"] = self.seen
+            if self.cause is not None:
+                out["cause"] = self.cause
         return out
 
 
@@ -916,6 +920,40 @@ def probe_all(jobs):
     return out
 
 
+# What a snapshot says keeps the fleet from running tiles, as fixed text: the spend ceiling's
+# rest (`fleet.power.reason`), or the `scale` component degraded for a refused GPU host launch
+# (`failures`, fleet/PROTOCOL.md). Seven of the eight staging and prod smoke failures of
+# 2026-11-21 to 11-24 were one of these, and each line said only "the tile is not running" or
+# "the coordinator reports no tiles of this mode"; the cause was in the coordinator's log.
+def quota_codes():
+    # The coordinator's own list (src/fleet/coord/hosts.rs QUOTA_CODES), from the same commit.
+    source = (Path(__file__).resolve().parent.parent.parent / "src/fleet/coord/hosts.rs").read_text()
+    value = re.search(r"pub const QUOTA_CODES: &\[&str\] = &\[([^\]]*)\];", source)
+    if value is None:
+        raise ValueError("coordinator quota codes unavailable")
+    return tuple(re.findall(r'"([A-Za-z]+)"', value[1]))
+
+
+def fleet_cause(state, half=None):
+    """The cause for a tile of `half` (None: a whole mode). The GPU hosts' scaling is no
+    cause for an EC2 tile."""
+    power = ((state.get("fleet") or {}).get("power") or {})
+    if power.get("reason") == "budget":
+        return "the day's spend ceiling holds the fleet asleep"
+    if half == "ec2":
+        return None
+    for failure in state.get("failures") or []:
+        if not isinstance(failure, dict) or failure.get("kind") != "coordinator_degraded" \
+                or failure.get("component") != "scale":
+            continue
+        # Each refusal in the reason starts "<region> <market>: <code>: ..." (hosts.rs).
+        codes = {part.split(":", 1)[0].strip() for part in str(failure.get("reason") or "").split(": ")[1:]}
+        if codes & set(quota_codes()):
+            return "EC2 refused a GPU host launch for the account's quota"
+        return "the coordinator's GPU host scaling is degraded"
+    return None
+
+
 def sweep_jobs(state, modes, family, admit, viewer, resolvers):
     """A probe per tile of every mode (and per serving aggregate), and a Probe failed already
     for each tile the coordinator has no running stream of and each mode it reports nothing of."""
@@ -927,6 +965,7 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
         if tiles is None:
             p = Probe(mode, None, family)
             p.step, p.error = "coordinator state", ("AssertionError", "the coordinator reports no tiles of this mode")
+            p.cause = fleet_cause(state)
             failed.append(p)
             continue
         for half, t in tiles:
@@ -942,6 +981,7 @@ def sweep_jobs(state, modes, family, admit, viewer, resolvers):
             if t.get("phase", "running") not in ("running", "borrowed"):
                 p = Probe(mode, t.get("id"), family, tile_attribution(t))
                 p.step, p.error = "coordinator state", ("AssertionError", "the tile is not running")
+                p.cause = fleet_cause(state, t.get("half"))
                 failed.append(p)
                 continue
             jobs.append((mode, half, t, family, admit, viewer, resolvers))
@@ -1026,6 +1066,16 @@ def relaunch_interval_seconds():
     return int(value[1].replace("_", "")) / 1000
 
 
+def minecraft_claim_cooldown_seconds():
+    # As above: how long a client waits after giving a Minecraft server back to borrow again.
+    source = (Path(__file__).resolve().parent.parent / "core/src/state.rs").read_text()
+    defaults = source.split("impl Default for Config", 1)[1]
+    value = re.search(r"minecraft_claim_cooldown_secs:\s*([0-9_]+)", defaults)
+    if value is None:
+        raise ValueError("coordinator Minecraft borrow cooldown unavailable")
+    return int(value[1].replace("_", ""))
+
+
 def ec2_relaunch_cooldown_seconds():
     # As above: the coordinator's own constant, from the same commit as the image.
     source = (Path(__file__).resolve().parent.parent / "core/src/apply.rs").read_text()
@@ -1075,6 +1125,25 @@ def refused_relaunch_messages():
     """Every message a refused relaunch can raise (the relaunch step's `raise`, same
     template): fixed text `describe` may print."""
     return {f"staging refused the relaunch: {why}" for why in {w for _, w in REFUSALS} | {UNLISTED_REFUSAL}}
+
+
+# A Minecraft borrow refusal's reason, as fixed text (fleet/core/src/apply.rs claim_minecraft).
+# The per-client cooldown counts by client key, an IPv6 viewer's /64, so the smoke's previous run
+# from another runner in the same subnet holds it: on 2026-11-23 (45149219637) the IPv6 viewer
+# claimed 49 s after the previous run's IPv6 viewer gave its server back, and was refused.
+CLAIM_COOLDOWN = "this client's borrow cooldown"
+CLAIM_REFUSALS = (
+    ("borrow again in", CLAIM_COOLDOWN),
+    ("one server per client", "this client holds a server already"),
+    ("servers are already lent", "every server that may be lent is lent"),
+    ("none is running and free", "no server is running and free"),
+    ("GPUs are asleep", "the GPUs are asleep"),
+    ("budget is spent", "the day's GPU budget is spent"),
+)
+
+
+def claim_refusal(reason):
+    return next((why for text, why in CLAIM_REFUSALS if text in (reason or "")), UNLISTED_REFUSAL)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1309,6 +1378,8 @@ def main(family="v4", single=False, modes=(), relaunch=True, takeover=False, age
                 if message.get("type") == "receipt" and message.get("id") == intent["id"]:
                     refusal["reason"] = message.get("reason")
                     return message.get("outcome") == "committed"
+        # The take-over reads why a claim was refused (`claim_refusal`).
+        commit.refusal = refusal
         if agents:
             step("/live: registered agents")
             until(lambda s: agents_line(s, 0) is not None)
@@ -1534,8 +1605,21 @@ def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
         new viewer with its own token, and a claim sent again on it is that viewer's."""
         _, admission, viewer_now = now()
         return viewer_now or viewer, ((admission or {}).get("direct") or {}).get("value") or token
-    if not commit("claim_minecraft", {}):
-        p.error = ("AssertionError", "the coordinator refused the take-over")
+    claimed = commit("claim_minecraft", {})
+    reason = None if claimed else getattr(commit, "refusal", {}).get("reason")
+    why = None if claimed else claim_refusal(reason)
+    waited = None
+    if why == CLAIM_COOLDOWN:
+        # Read /live while the cooldown runs out (what the receipt says is left, at most the
+        # core's cooldown), then claim once more.
+        cooldown = minecraft_claim_cooldown_seconds()
+        left = re.search(r"borrow again in ([0-9]+) s", reason or "")
+        waited = min(int(left[1]) if left else cooldown, cooldown) + CLOCK_SKEW_SECONDS
+        until(lambda s: False, by=time.monotonic() + waited)
+        claimed = commit("claim_minecraft", {})
+        why = None if claimed else claim_refusal(getattr(commit, "refusal", {}).get("reason"))
+    if not claimed:
+        p.error = ("AssertionError", f"the coordinator refused the take-over: {why}")
         return p
     try:
         held_by = time.monotonic() + 30
@@ -1549,6 +1633,8 @@ def minecraft_takeover(family, token, viewer, resolvers, until, commit, now):
             return p
         p = probe_tile("minecraft", "fcvm", tile, family, admit, holder, resolvers, takeover=True)
         p.tile = (p.tile or "") + " take-over"
+        if waited is not None:
+            p.detail["claimWaitedS"] = waited
         return p
     finally:
         # Bounded, so a silent /live cannot replace the probe being returned with a TimeoutError.

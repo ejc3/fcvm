@@ -4,8 +4,8 @@
 //! that keeps `-a`, `-g` and `-n` on a host without IPv4. On top of it fcvm
 //! carries three patches (see `PATCHES`). The first guards `udp_sock_errs()`
 //! against a NULL flow, so a published UDP port's listening socket cannot crash
-//! pasta on a socket error; it is submitted upstream and dropped once the pin
-//! moves past the merge. The other two serve the pastas of a namespace pool:
+//! pasta on a socket error: upstream's `flow_log__()` now accepts a NULL flow,
+//! but the logging macro reads the flow's state before calling it. The other two serve the pastas of a namespace pool:
 //! `--no-neigh-notify`, and a reset with a status reply on the control socket
 //! (`crate::network::pesto`). fcvm builds pasta on demand into the content-addressed shared
 //! assets directory, so rootless networking does not depend on the host's

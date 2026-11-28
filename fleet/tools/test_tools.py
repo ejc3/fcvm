@@ -664,7 +664,7 @@ class GpuboxWallReserve(unittest.TestCase):
         run = open(os.path.join(HERE, "..", "..", ".claude", "skills", "nightly-dogfood", "run.sh")).read()
         pin = run.find("export GPUBOX_REGION=us-west-2")
         self.assertGreater(pin, 0, "run.sh does not pin the gpubox region")
-        self.assertLess(pin, run.index('claude -p "/nightly-dogfood"'), "the pin comes after the session starts")
+        self.assertLess(pin, run.index('-p "/nightly-dogfood"'), "the pin comes after the session starts")
         self.assertIn('bash fleet/tools/gpubox.sh down "$a" ${b:+"$b"}', run)
 
     def test_ami_launchers_in_us_west_2_never_consult_the_staging_reserve(self):
