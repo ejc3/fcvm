@@ -10860,6 +10860,28 @@ class AssertVmArtifactsAbsent(unittest.TestCase):
             self.assertEqual(self.run_check(state_dir, d).returncode, 1)
 
 
+
+class ClonePastaPidLookup(unittest.TestCase):
+    """The forensic dump names a clone's own pasta by the pid file in the runtime
+    directory its state records, the file ``src/network/pasta.rs`` writes."""
+
+    def test_the_lookup_finds_the_pid_file_the_clone_s_state_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = os.path.join(tmp, "vm", "0123456789abcdef")
+            os.makedirs(runtime)
+            with open(os.path.join(runtime, "pasta.pid"), "w") as handle:
+                handle.write("4242\n")
+            state = {"vm_id": "vm-" + "0123456789abcdef" * 2,
+                     "config": {"vm_runtime_dir": runtime}}
+            pasta = reqbench.clone_pasta_pid(state)
+            self.assertEqual(pasta.get("pid"), 4242, pasta)
+            self.assertEqual(pasta["pid_file"], os.path.join(runtime, "pasta.pid"))
+
+    def test_a_state_without_the_record_says_so(self):
+        pasta = reqbench.clone_pasta_pid({"vm_id": "vm-" + "0" * 32, "config": {}})
+        self.assertNotIn("pid", pasta)
+        self.assertIn("vm_runtime_dir", pasta["error"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

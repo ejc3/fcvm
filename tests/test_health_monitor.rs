@@ -49,6 +49,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
         last_updated: now,
         config: VmConfig {
             vm_runtime_dir: None,
+            vm_disk_dir: None,
             image: "test:latest".to_string(),
             vcpu: 1,
             memory_mib: 256,
@@ -105,7 +106,7 @@ async fn test_health_monitor_behaviors() {
     // Create unique temp directory for this test instance
     let base_dir = create_unique_test_dir();
 
-    // Initialize paths module with test directory (required for paths::vm_runtime_dir calls)
+    // Initialize paths module with test directory (required for path lookups)
     // OnceLock::set() is idempotent - safe to call multiple times
     paths::init_with_paths(&base_dir, &base_dir);
 
@@ -213,7 +214,7 @@ async fn a_container_start_notification_makes_the_vm_healthy_without_asking_podm
     );
     state.config.health_check_url = None;
     // What a start of this build records: the directory the status listener writes into.
-    let runtime_dir = paths::vm_runtime_dir(vm_id);
+    let runtime_dir = base_dir.join("runtime").join(vm_id);
     state.config.vm_runtime_dir = Some(runtime_dir.clone());
     manager.save_state(&state).await.unwrap();
     std::fs::create_dir_all(&runtime_dir).unwrap();

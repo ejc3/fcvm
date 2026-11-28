@@ -1689,6 +1689,25 @@ def wait_clone_endpoint(state_path, state, port, deadline, watch, proc, log_path
         poller.poll(min(remaining, 0.1) * 1000)
 
 
+def clone_pasta_pid(state) -> dict:
+    """The clone's pasta pid file and pid, from the runtime directory its state records
+    (``config.vm_runtime_dir``; ``src/network/pasta.rs`` writes ``pasta.pid`` there), or the
+    error that kept them from being read."""
+    pasta: dict = {}
+    runtime_dir = ((state or {}).get("config") or {}).get("vm_runtime_dir")
+    if not runtime_dir:
+        pasta["error"] = "the clone's state records no vm_runtime_dir to find its pasta pid file in"
+        return pasta
+    pid_path = os.path.join(runtime_dir, "pasta.pid")
+    pasta["pid_file"] = pid_path
+    try:
+        with open(pid_path) as handle:
+            pasta["pid"] = int(handle.read().strip())
+    except (OSError, ValueError) as error:
+        pasta["error"] = f"{type(error).__name__}: {error}"
+    return pasta
+
+
 def clone_data_dir(data_root: str, state: dict) -> str:
     """Return the exact per-clone disk directory from a complete state record."""
     vm_id = state.get("vm_id")
@@ -4056,20 +4075,9 @@ class FailureProbe:
         except OSError as error:
             note("loadavg", f"{type(error).__name__}: {error}")
 
-        # pasta identifies itself by a per-VM pid file (`src/network/pasta.rs`
-        # writes `pasta-<vm_id[:8]>.pid` under the data dir), which is the only
-        # way to name THIS clone's pasta rather than one of the others'.
-        pasta: dict = {}
-        if valid_vm_id(vm_id):
-            pid_path = os.path.join(self.data_root, f"pasta-{vm_id[:8]}.pid")
-            pasta["pid_file"] = pid_path
-            try:
-                with open(pid_path) as handle:
-                    pasta["pid"] = int(handle.read().strip())
-            except (OSError, ValueError) as error:
-                pasta["error"] = f"{type(error).__name__}: {error}"
-        else:
-            pasta["error"] = f"no usable vm_id to locate the pasta pid file: {vm_id!r}"
+        # pasta identifies itself by its pid file in the clone's runtime directory,
+        # which is the only way to name THIS clone's pasta rather than one of the others'.
+        pasta = clone_pasta_pid(state)
         if isinstance(pasta.get("pid"), int):
             pasta["process"] = probe_process_facts(pasta["pid"])
         dump["host"]["pasta"] = pasta

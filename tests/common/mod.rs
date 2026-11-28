@@ -27,17 +27,25 @@ pub const DIRECT_WGET: [&str; 5] = ["env", "http_proxy=http://127.0.0.1:9/", "wg
 
 /// [`DIRECT_WGET`] followed by `args`.
 /// A data directory for one test, `<base>/<tag><6 hex>`, short enough that a VM's deepest
-/// socket under it fits `sockaddr_un` (`fcvm::paths::check_socket_path_budget_under`, which a
-/// launch also runs). Checked here, so a fixture too deep for a lane's base (the container
-/// lane's is the longest) fails with that message rather than as a launch refused partway
-/// through the test.
+/// socket fits `sockaddr_un` when the runtime directory is in the data directory's own place
+/// (`<dir>/runtime/boot-<16>`, `fcvm::paths::check_socket_path_budget_under`, which a launch
+/// also runs). Checked here, so a fixture too deep for a lane's base (the container lane's is
+/// the longest) fails with that message rather than as a launch refused partway through the
+/// test.
 pub fn short_data_dir(base: &std::path::Path, tag: &str) -> PathBuf {
     let dir = base.join(format!(
         "{tag}{}",
         &uuid::Uuid::new_v4().simple().to_string()[..6]
     ));
+    let runtime = fcvm::runtime_dir::RuntimeDir {
+        dir: dir
+            .join(fcvm::runtime_dir::STORE_PLACE)
+            .join("boot-0000000000000000"),
+        place: fcvm::runtime_dir::Place::Store,
+        followed: false,
+    };
     if let Err(error) =
-        fcvm::paths::check_socket_path_budget_under(&dir, "vm-00000000000000000000000000000000")
+        fcvm::paths::check_socket_path_budget_under(&runtime, "vm-00000000000000000000000000000000")
     {
         panic!("{error:#}");
     }
@@ -1753,7 +1761,7 @@ pub async fn firecracker_client_by_pid(
         .load_state_by_pid(pid)
         .await
         .with_context(|| format!("loading the state of fcvm process {pid}"))?;
-    let socket = fcvm::paths::vm_runtime_dir(&state.vm_id).join("firecracker.sock");
+    let socket = state.vm_runtime_dir().join("firecracker.sock");
     fcvm::firecracker::FirecrackerClient::new(socket)
 }
 

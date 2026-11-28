@@ -244,7 +244,22 @@ struct VmArtifacts {
     state: fcvm::state::VmState,
     state_path: PathBuf,
     lock_path: PathBuf,
+    /// The VM's runtime directory (sockets), on tmpfs.
     data_dir: PathBuf,
+    /// The VM's disk directory (disks, log), in vm-disks.
+    disk_dir: PathBuf,
+}
+
+impl VmArtifacts {
+    /// Both of the VM's directories.
+    fn dirs(&self) -> [PathBuf; 2] {
+        [self.data_dir.clone(), self.disk_dir.clone()]
+    }
+}
+
+/// Whether none of `dirs` exists.
+fn all_gone(dirs: &[PathBuf]) -> bool {
+    dirs.iter().all(|dir| !dir.exists())
 }
 
 /// An exact process identity captured immediately after spawn. Signals go
@@ -358,11 +373,19 @@ fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
         );
 
         let lock_path = path.with_extension("json.lock");
-        let data_dir = fcvm::paths::vm_runtime_dir(&state.vm_id);
+        let data_dir = state.vm_runtime_dir();
+        let disk_dir = state.vm_disk_dir();
         let vm_disks = fcvm::paths::vm_disks_dir();
         anyhow::ensure!(
-            data_dir.parent().and_then(|bucket| bucket.parent()) == Some(vm_disks.as_path())
-                && data_dir != vm_disks,
+            disk_dir.parent().and_then(|bucket| bucket.parent()) == Some(vm_disks.as_path())
+                && disk_dir != vm_disks,
+            "refusing to treat {} as one VM's disk directory",
+            disk_dir.display()
+        );
+        anyhow::ensure!(
+            data_dir == fcvm::paths::vm_runtime_dir(&state.vm_id)
+                && data_dir.parent().and_then(std::path::Path::file_name)
+                    == Some(std::ffi::OsStr::new("vm")),
             "refusing to treat {} as one VM's runtime directory",
             data_dir.display()
         );
@@ -372,6 +395,7 @@ fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
             state_path: path,
             lock_path,
             data_dir,
+            disk_dir,
         });
     }
 
@@ -392,6 +416,7 @@ async fn wait_for_artifacts(
             if artifacts.state_path.is_file()
                 && artifacts.lock_path.is_file()
                 && artifacts.data_dir.is_dir()
+                && artifacts.disk_dir.is_dir()
             {
                 return Ok(artifacts);
             }
@@ -419,20 +444,23 @@ async fn wait_for_artifacts_removed(artifacts: &VmArtifacts, timeout: Duration) 
         let state_exists = artifacts.state_path.exists();
         let lock_exists = artifacts.lock_path.exists();
         let data_exists = artifacts.data_dir.exists();
-        if !state_exists && !lock_exists && !data_exists {
+        let disk_exists = artifacts.disk_dir.exists();
+        if !state_exists && !lock_exists && !data_exists && !disk_exists {
             return Ok(());
         }
         if Instant::now() > deadline {
             anyhow::bail!(
-                "clone {} left artifacts after orderly exit: state={}, lock={}, data={}\n\
-                 state_path={}\nlock_path={}\ndata_dir={}",
+                "clone {} left artifacts after orderly exit: state={}, lock={}, data={}, \
+                 disk={}\nstate_path={}\nlock_path={}\ndata_dir={}\ndisk_dir={}",
                 artifacts.vm_id,
                 state_exists,
                 lock_exists,
                 data_exists,
+                disk_exists,
                 artifacts.state_path.display(),
                 artifacts.lock_path.display(),
-                artifacts.data_dir.display()
+                artifacts.data_dir.display(),
+                artifacts.disk_dir.display()
             );
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -519,6 +547,7 @@ fn cleanup_exact_artifacts(artifacts: &VmArtifacts) -> Result<()> {
             && artifacts.lock_path
                 == fcvm::state::StateManager::new(state_dir.clone()).lock_file(&artifacts.vm_id)
             && artifacts.data_dir == fcvm::paths::vm_runtime_dir(&artifacts.vm_id)
+            && artifacts.disk_dir == fcvm::paths::vm_disk_dir(&artifacts.vm_id)
             && !artifacts.vm_id.is_empty(),
         "refusing cleanup for paths that are not one exact VM's artifacts: {artifacts:?}"
     );
@@ -530,11 +559,11 @@ fn cleanup_exact_artifacts(artifacts: &VmArtifacts) -> Result<()> {
             Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
         }
     }
-    match std::fs::remove_dir_all(&artifacts.data_dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| format!("removing {}", artifacts.data_dir.display()))
+    for dir in artifacts.dirs() {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", dir.display())),
         }
     }
     Ok(())
@@ -2427,9 +2456,9 @@ async fn test_lifecycle_interleave_source_teardown_does_not_wait_for_a_restoring
         common::poll_health_by_pid(baseline_pid, 300)
             .await
             .context("waiting for baseline health")?;
-        let baseline_dir = artifacts_for_name(&baseline_name)?
+        let baseline_dirs = artifacts_for_name(&baseline_name)?
             .context("baseline published no state")?
-            .data_dir;
+            .dirs();
         common::create_snapshot_by_pid(baseline_pid, &snapshot_name)
             .await
             .context("creating the snapshot the clone restores")?;
@@ -2481,9 +2510,10 @@ async fn test_lifecycle_interleave_source_teardown_does_not_wait_for_a_restoring
             "baseline exited unsuccessfully: {baseline_status:?}"
         );
         anyhow::ensure!(
-            !baseline_dir.exists(),
-            "the baseline's teardown left {}",
-            baseline_dir.display()
+            all_gone(&baseline_dirs),
+            "the baseline's teardown left {} or {}",
+            baseline_dirs[0].display(),
+            baseline_dirs[1].display()
         );
         anyhow::ensure!(
             search_log_from(
@@ -2652,9 +2682,9 @@ async fn clone_vsock_outlives_its_source(prefix: &str, hypervisor: &str) -> Resu
         common::poll_health_by_pid(baseline_pid, 300)
             .await
             .context("waiting for baseline health")?;
-        let baseline_dir = artifacts_for_name(&baseline_name)?
+        let baseline_dirs = artifacts_for_name(&baseline_name)?
             .context("baseline published no state")?
-            .data_dir;
+            .dirs();
         common::create_snapshot_by_pid(baseline_pid, &snapshot_name)
             .await
             .context("snapshotting the baseline")?;
@@ -2701,9 +2731,10 @@ async fn clone_vsock_outlives_its_source(prefix: &str, hypervisor: &str) -> Resu
             .context("stopping the baseline")?;
         baseline = None;
         anyhow::ensure!(
-            !baseline_dir.exists(),
-            "the baseline's teardown left {}",
-            baseline_dir.display()
+            all_gone(&baseline_dirs),
+            "the baseline's teardown left {} or {}",
+            baseline_dirs[0].display(),
+            baseline_dirs[1].display()
         );
 
         probe_guest_initiated_vsock(clone_pid, &listener_path)
@@ -2928,11 +2959,11 @@ async fn restore_never_recreates_the_source_dir(prefix: &str, hypervisor: &str) 
         .context("spawning rootless baseline")?;
         let baseline_process =
             PinnedProcess::capture(baseline_pid).context("pinning rootless baseline")?;
-        let seeded: Result<PathBuf> = async {
+        let seeded: Result<[PathBuf; 2]> = async {
             common::poll_health_by_pid(baseline_pid, 300).await?;
             let dir = artifacts_for_name(&baseline_name)?
                 .context("baseline published no state")?
-                .data_dir;
+                .dirs();
             common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
             Ok(dir)
         }
@@ -2941,11 +2972,12 @@ async fn restore_never_recreates_the_source_dir(prefix: &str, hypervisor: &str) 
         stop_test_child(&mut baseline_child, &baseline_process)
             .await
             .context("stopping the baseline")?;
-        let baseline_dir = seeded.context("snapshotting the baseline")?;
+        let baseline_dirs = seeded.context("snapshotting the baseline")?;
         anyhow::ensure!(
-            !baseline_dir.exists(),
-            "the baseline's teardown left {}",
-            baseline_dir.display()
+            all_gone(&baseline_dirs),
+            "the baseline's teardown left {} or {}",
+            baseline_dirs[0].display(),
+            baseline_dirs[1].display()
         );
 
         let (clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
@@ -2977,9 +3009,10 @@ async fn restore_never_recreates_the_source_dir(prefix: &str, hypervisor: &str) 
             "the clone published no state"
         );
         anyhow::ensure!(
-            !baseline_dir.exists(),
-            "the restore made the source directory {} on the host while the clone runs",
-            baseline_dir.display()
+            all_gone(&baseline_dirs),
+            "the restore made the source directory {} or {} on the host while the clone runs",
+            baseline_dirs[0].display(),
+            baseline_dirs[1].display()
         );
         let (clone_child, clone_process) = clone.as_mut().context("clone fixture disappeared")?;
         stop_test_child(clone_child, clone_process)
@@ -2987,9 +3020,10 @@ async fn restore_never_recreates_the_source_dir(prefix: &str, hypervisor: &str) 
             .context("stopping the clone")?;
         clone = None;
         anyhow::ensure!(
-            !baseline_dir.exists(),
-            "the restore left the source directory {}",
-            baseline_dir.display()
+            all_gone(&baseline_dirs),
+            "the restore left the source directory {} or {}",
+            baseline_dirs[0].display(),
+            baseline_dirs[1].display()
         );
         Ok(())
     }
@@ -3046,7 +3080,7 @@ async fn vm_snapshot_lock_path(pid: u32) -> Result<PathBuf> {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         if let Some(state) = ls_vm_by_pid(pid).await? {
-            return Ok(fcvm::paths::vm_runtime_dir(&state.vm_id).join("snapshot.lock"));
+            return Ok(state.vm_disk_dir().join("snapshot.lock"));
         }
         anyhow::ensure!(
             Instant::now() < deadline,

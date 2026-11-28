@@ -1972,7 +1972,7 @@ async fn test_first_firecracker_log_line_from_the_api_thread_rootless() -> Resul
             .load_state_by_pid(fcvm_pid)
             .await
             .with_context(|| format!("loading the state of fcvm process {fcvm_pid}"))?;
-        let socket = fcvm::paths::vm_runtime_dir(&state.vm_id).join("firecracker.sock");
+        let socket = state.vm_runtime_dir().join("firecracker.sock");
         let body = r#"{"vcpu_count": "x"}"#;
         let request = format!(
             "PUT /machine-config HTTP/1.1\r\nHost: localhost\r\nContent-Type: \

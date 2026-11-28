@@ -47,7 +47,7 @@ pub async fn cmd_balloon(args: BalloonArgs) -> Result<()> {
     // a snapshot.
     let _snapshot_lock = match args.mib {
         Some(mib) => {
-            let disk = vm_state.vm_runtime_dir().join("disks/rootfs.raw");
+            let disk = vm_state.vm_disk_dir().join("disks/rootfs.raw");
             Some(lock_for_set(&disk, mib, &vm, SNAPSHOT_LOCK_WAIT).await?)
         }
         None => None,

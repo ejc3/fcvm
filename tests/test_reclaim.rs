@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn vm_disks(vm_id: &str) -> PathBuf {
-    fcvm::paths::vm_runtime_dir(vm_id)
+    fcvm::paths::vm_disk_dir(vm_id)
 }
 
 /// What `fcvm ls --json` says about the VM whose fcvm process is `pid`.
@@ -155,34 +155,43 @@ async fn a_sigkilled_vm_leaves_its_runtime_dir_and_pasta_pid_file_to_the_next_la
     let observed = async {
         common::poll_health_by_pid(pid, 120).await?;
         let vm_id = vm_id_of(pid).await?;
-        let runtime_dir = vm_disks(&vm_id);
+        let disk_dir = vm_disks(&vm_id);
+        let runtime_dir = fcvm::paths::vm_runtime_dir(&vm_id);
         // Where pasta's PID file is, and where it was before it moved into the VM's
-        // directory: neither may remain.
+        // runtime directory: neither may remain.
         let pid_files = [
             runtime_dir.join("pasta.pid"),
+            disk_dir.join("pasta.pid"),
             fcvm::paths::data_dir().join(format!("pasta-{vm_id}.pid")),
         ];
         anyhow::ensure!(
-            runtime_dir.join("disks/rootfs.raw").exists(),
+            disk_dir.join("disks/rootfs.raw").exists(),
             "the running VM has no disk in {}",
+            disk_dir.display()
+        );
+        anyhow::ensure!(
+            runtime_dir.join("firecracker.sock").exists(),
+            "the running VM has no API socket in its runtime directory {}",
             runtime_dir.display()
         );
         anyhow::ensure!(
             pid_files.iter().any(|f| f.exists()),
             "the running rootless VM has no pasta PID file at {pid_files:?}"
         );
-        Ok((runtime_dir, pid_files))
+        Ok((disk_dir, runtime_dir, pid_files))
     }
     .await;
     sigkill(&mut child, pid).await?;
-    let (runtime_dir, pid_files) = observed?;
+    let (disk_dir, runtime_dir, pid_files) = observed?;
 
     next_launch().await?;
-    assert!(
-        !runtime_dir.exists(),
-        "the killed VM's runtime directory survived the next launch: {}",
-        runtime_dir.display()
-    );
+    for dir in [&disk_dir, &runtime_dir] {
+        assert!(
+            !dir.exists(),
+            "the killed VM's directory survived the next launch: {}",
+            dir.display()
+        );
+    }
     let left: Vec<_> = pid_files.iter().filter(|f| f.exists()).collect();
     assert!(
         left.is_empty(),

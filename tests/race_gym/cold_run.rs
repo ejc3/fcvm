@@ -347,18 +347,19 @@ impl Scenario for ColdRun {
                 .unwrap_or_default();
             let mut seen: Vec<_> = seen.into_iter().collect();
             seen.sort();
-            for vm_id in &seen {
-                let dir = fcvm::paths::vm_runtime_dir(vm_id);
-                if path_exists(&dir) {
-                    failed.push(Failure::new(
-                        "leak",
-                        None,
-                        format!(
-                            "VM directory vm-disks/{}/{vm_id} outlived its VM",
-                            fcvm::paths::vm_bucket(vm_id)
-                        ),
-                    ));
-                    let _ = std::fs::remove_dir_all(&dir);
+            for vm_id in seen.iter().filter(|vm_id| !vm_id.is_empty()) {
+                for dir in [
+                    fcvm::paths::vm_disk_dir(vm_id),
+                    fcvm::paths::vm_runtime_dir(vm_id),
+                ] {
+                    if path_exists(&dir) {
+                        failed.push(Failure::new(
+                            "leak",
+                            None,
+                            format!("VM directory {} outlived its VM", dir.display()),
+                        ));
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
                 }
             }
             // 2. Artifacts, and that the generation restores.
@@ -386,7 +387,8 @@ impl Scenario for ColdRun {
                 )),
             }
             // Clean up after the fresh restore: it can recreate a source directory again.
-            for vm_id in &seen {
+            for vm_id in seen.iter().filter(|vm_id| !vm_id.is_empty()) {
+                let _ = std::fs::remove_dir_all(fcvm::paths::vm_disk_dir(vm_id));
                 let _ = std::fs::remove_dir_all(fcvm::paths::vm_runtime_dir(vm_id));
             }
             // The fresh restore's VM is gone too.

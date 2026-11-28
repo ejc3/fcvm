@@ -65,7 +65,10 @@ fn record_snapshot_lineage_retry(retries: &mut usize) -> Result<()> {
 /// partially-created network while deleting the state/data that identifies it.
 struct CloneSetupResources {
     vm_id: String,
+    /// The clone's runtime directory (sockets).
     data_dir: PathBuf,
+    /// The clone's disk directory (disks, log).
+    disk_dir: PathBuf,
     volume_servers: Option<SpawnedVolumes>,
     tty_cancel: tokio_util::sync::CancellationToken,
     tty_handle: Option<std::thread::JoinHandle<Result<i32>>>,
@@ -81,10 +84,11 @@ struct CloneSetupResources {
 }
 
 impl CloneSetupResources {
-    fn new(vm_id: String, data_dir: PathBuf) -> Self {
+    fn new(vm_id: String, data_dir: PathBuf, disk_dir: PathBuf) -> Self {
         Self {
             vm_id,
             data_dir,
+            disk_dir,
             volume_servers: None,
             tty_cancel: tokio_util::sync::CancellationToken::new(),
             tty_handle: None,
@@ -206,16 +210,13 @@ impl CloneSetupResources {
             ));
         }
         let mut data_removed = true;
-        match tokio::fs::remove_dir_all(&self.data_dir).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                data_removed = false;
-                errors.push(format!(
-                    "removing runtime directory after failed clone setup {}: {error:#}",
-                    self.data_dir.display()
-                ));
-            }
+        if let Err(error) =
+            crate::commands::common::remove_vm_dirs(&self.data_dir, &self.disk_dir).await
+        {
+            data_removed = false;
+            errors.push(format!(
+                "removing the VM's directories after failed clone setup: {error:#}"
+            ));
         }
         if data_removed {
             if let Err(error) = state_manager.delete_state(&self.vm_id).await {
@@ -1640,7 +1641,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     }
 
     // Check VM disk exists
-    let vm_disk_path = vm_state.vm_runtime_dir().join("disks/rootfs.raw");
+    let vm_disk_path = vm_state.vm_disk_dir().join("disks/rootfs.raw");
     if !vm_disk_path.exists() {
         anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
     }
@@ -3347,8 +3348,12 @@ async fn cmd_snapshot_run_inner(
     crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    let vm_dirs = paths::VmDirs::for_start(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
-        path: paths::vm_runtime_dir(&vm_id),
+        path: vm_dirs.runtime.clone(),
+    })?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: vm_dirs.disk.clone(),
     })?;
     // A GPU restore's hugepage prefill starts here, as soon as the restore's Firecracker is
     // known, beside the checks and the clone's setup (its state, volume servers and network);
@@ -3552,9 +3557,12 @@ async fn cmd_snapshot_run_inner(
         }
     }
 
-    // Setup paths
-    let data_dir = paths::vm_runtime_dir(&vm_id);
-    let mut setup = CloneSetupResources::new(vm_id.clone(), data_dir.clone());
+    // Setup paths: sockets in the runtime directory, disks and logs in the disk directory.
+    let paths::VmDirs {
+        runtime: data_dir,
+        disk: disk_dir,
+    } = vm_dirs;
+    let mut setup = CloneSetupResources::new(vm_id.clone(), data_dir.clone(), disk_dir.clone());
 
     // Every fallible operation after setup ownership begins must use this
     // funnel.  It waits for the complete teardown transaction before returning
@@ -3606,6 +3614,7 @@ async fn cmd_snapshot_run_inner(
     // live VM already has that name. It records the clone's runtime directory from the
     // start: the memory server writes why it refused or killed this clone's VMM there.
     vm_state.config.vm_runtime_dir = Some(data_dir.clone());
+    vm_state.config.vm_disk_dir = Some(disk_dir.clone());
     setup_try!(state_manager
         .claim_name(&mut vm_state)
         .await
@@ -3768,7 +3777,7 @@ async fn cmd_snapshot_run_inner(
     // the VM's directory and teardown copies it out, as on a cold prepare.
     let (log_tx, container_log) = if args.prepare.is_some() && !tty_mode {
         let (tx, _) = tokio::sync::broadcast::channel::<super::podman::LogLine>(1000);
-        let writer = super::podman::ContainerLogWriter::spawn(tx.subscribe(), &data_dir);
+        let writer = super::podman::ContainerLogWriter::spawn(tx.subscribe(), &disk_dir);
         (Some(tx), Some(writer))
     } else {
         (None, None)
@@ -4227,8 +4236,9 @@ async fn cmd_snapshot_run_inner(
             release_idle_snapshot_memory(&snapshot_name);
 
             // Just "implicit" — NOT the vm_id. This socket is created inside `data_dir`,
-            // which IS this VM's own directory (`vm-disks/<vm_id>/`), so repeating the id in
-            // the filename buys no uniqueness and costs 9 bytes of a 107-byte budget.
+            // which IS this VM's own runtime directory (`<runtime>/vm/<v>/`), so repeating
+            // the id in the filename buys no uniqueness and costs 9 bytes of a 107-byte
+            // budget.
             // `UffdServer::new` appends `-{pid}-{pid_start_time}`, which is what actually
             // makes the name unique, and that identity is unaffected by this.
             //
@@ -4491,6 +4501,7 @@ async fn cmd_snapshot_run_inner(
         vm_id: &vm_id,
         vm_name: &vm_name,
         data_dir: &data_dir,
+        disk_dir: &disk_dir,
         socket_path: &socket_path,
         runtime_config: &runtime_config,
         restore_config: &restore_config,
@@ -4660,7 +4671,7 @@ async fn cmd_snapshot_run_inner(
     let mut publication_lock: Option<std::fs::File> = None;
     let restore_completion_result = match restore_completion_result {
         Ok(RestoreAck::Acked { guest_phases }) if args.prepare.is_none() => {
-            let vm_disk = data_dir.join("disks/rootfs.raw");
+            let vm_disk = disk_dir.join("disks/rootfs.raw");
             let locked = tokio::select! {
                 lock = super::common::acquire_vm_snapshot_lock(&vm_disk) => lock.map(Some),
                 _ = cancel.cancelled() => Ok(None),
@@ -4862,6 +4873,7 @@ async fn cmd_snapshot_run_inner(
                 volume_server_handles: volume_servers.handles,
                 volume_tables: volume_servers.tables,
                 data_dir: data_dir.clone(),
+                disk_dir: disk_dir.clone(),
                 health_cancel_token: None, // no health monitor in exec path
                 health_monitor_handle: None,
                 output_listener_handle: output_handle, // abort output listener task
@@ -5142,7 +5154,7 @@ async fn cmd_snapshot_run_inner(
         ));
 
         // Get disk path for startup snapshot creation
-        let disk_path = data_dir.join("disks/rootfs.raw");
+        let disk_path = disk_dir.join("disks/rootfs.raw");
 
         // Watch the memory server for as long as this clone runs on restored memory,
         // not just at connect time. A guest reboot ends that, and the relaunch drops
@@ -5247,7 +5259,7 @@ async fn cmd_snapshot_run_inner(
                 _ = watchdog.expired() => {
                     warn!(
                         deadline_s = super::podman::GUEST_POWEROFF_DEADLINE.as_secs(),
-                        log = %data_dir.join("firecracker.log").display(),
+                        log = %disk_dir.join("firecracker.log").display(),
                         "the guest did not power off after the container exited; killing the VMM"
                     );
                     if let Err(error) = watchdog.fire(vm_manager.as_mut()) {
@@ -5374,7 +5386,7 @@ async fn cmd_snapshot_run_inner(
                                 args.host_ipv6,
                                 &network_config,
                                 &runtime_config,
-                                &data_dir.join("disks/rootfs.raw"),
+                                &disk_dir.join("disks/rootfs.raw"),
                                 &clone_vsock_base,
                                 // The clone's own mode, which may be its run's override.
                                 vm_state.config.guest_thp.clone(),
@@ -5474,7 +5486,7 @@ async fn cmd_snapshot_run_inner(
                                     synth_args,
                                     &network_config,
                                     &mut vm_state,
-                                    &data_dir,
+                                    &disk_dir,
                                     &vm_id,
                                     volume_mappings,
                                     None,
@@ -5702,6 +5714,7 @@ async fn cmd_snapshot_run_inner(
         volume_server_handles: volume_servers.handles,
         volume_tables: volume_servers.tables,
         data_dir: data_dir.clone(),
+        disk_dir: disk_dir.clone(),
         health_cancel_token: Some(health_cancel_token),
         health_monitor_handle,
         output_listener_handle: output_handle, // abort output listener task
@@ -6385,8 +6398,12 @@ async fn cmd_snapshot_run_raw(
     crate::reclaim::reclaim_abandoned_if_due().await;
     let vm_id = generate_vm_id();
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    let vm_dirs = paths::VmDirs::for_start(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
-        path: paths::vm_runtime_dir(&vm_id),
+        path: vm_dirs.runtime.clone(),
+    })?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: vm_dirs.disk.clone(),
     })?;
     let vm_name = args
         .name
@@ -6420,8 +6437,12 @@ async fn cmd_snapshot_run_raw(
     vm_state.config.firmware = meta.firmware.clone();
     let ch_bin = super::common::find_cloud_hypervisor()?;
 
-    let data_dir = paths::vm_runtime_dir(&vm_id);
+    let paths::VmDirs {
+        runtime: data_dir,
+        disk: disk_dir,
+    } = vm_dirs;
     vm_state.config.vm_runtime_dir = Some(data_dir.clone());
+    vm_state.config.vm_disk_dir = Some(disk_dir.clone());
     vm_state.config.rdp_socket = Some(super::vm::rdp_socket_path(&data_dir));
     if let Err(e) = async {
         state_manager
@@ -6435,7 +6456,7 @@ async fn cmd_snapshot_run_raw(
     }
     .await
     {
-        super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir).await;
         return Err(e);
     }
 
@@ -6447,7 +6468,8 @@ async fn cmd_snapshot_run_raw(
             if let Err(error) = network.cleanup().await {
                 warn!(%error, "failed to clean up the network after a setup error");
             }
-            super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+            super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir)
+                .await;
             return Err(e);
         }
     };
@@ -6460,7 +6482,7 @@ async fn cmd_snapshot_run_raw(
         firmware: meta.firmware.clone(),
         vcpus: meta.vcpu,
         mem_mib: meta.memory_mib,
-        disk: data_dir.join("disks/rootfs.raw"),
+        disk: disk_dir.join("disks/rootfs.raw"),
         tap_device: network_config.tap_device.clone(),
         guest_mac: network_config.guest_mac.clone(),
         balloon_mib: args.balloon.or(meta.balloon_mib),
@@ -6494,7 +6516,7 @@ async fn cmd_snapshot_run_raw(
         if let Err(error) = network.cleanup().await {
             warn!(%error, "failed to clean up the network after a setup error");
         }
-        super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir).await;
         return Err(e);
     }
     let mut ns_helper = None;
@@ -6505,6 +6527,7 @@ async fn cmd_snapshot_run_raw(
             vm_id: &vm_id,
             vm_name: &vm_name,
             data_dir: &data_dir,
+            disk_dir: &disk_dir,
             socket_path: &data_dir.join("firecracker.sock"),
             runtime_config: &RuntimeConfig::default(),
             restore_config: &restore_config,
@@ -6534,7 +6557,8 @@ async fn cmd_snapshot_run_raw(
             if let Err(error) = network.cleanup().await {
                 warn!(%error, "failed to clean up the network after a restore error");
             }
-            super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+            super::podman::cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir)
+                .await;
             return Err(e);
         }
     };
@@ -6549,6 +6573,7 @@ async fn cmd_snapshot_run_raw(
         super::vm::RawVm {
             vm_id,
             data_dir,
+            disk_dir,
             vm_manager: Box::new(vm_manager),
             holder_child,
             network: Box::new(network),

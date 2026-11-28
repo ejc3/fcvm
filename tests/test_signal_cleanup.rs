@@ -2383,7 +2383,7 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                         continue;
                     };
                     if v.get("pid").and_then(|p| p.as_u64()) == Some(want_pid as u64) {
-                        // NEVER default this. `vm_runtime_dir("")` is a bucket of
+                        // NEVER default this. `vm_disk_dir("")` is a bucket of
                         // `<data_dir>/vm-disks` ITSELF, and this test later calls
                         // `remove_dir_all` on that path — so a state file missing `vm_id`
                         // would delete every disk in that bucket on the machine, including those of tests running concurrently in CI. A
@@ -2402,11 +2402,11 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
                                 )
                             })?
                             .to_string();
-                        let dir = fcvm::paths::vm_runtime_dir(&vm_id);
+                        let dir = fcvm::paths::vm_disk_dir(&vm_id);
                         anyhow::ensure!(
                             dir.parent().and_then(|bucket| bucket.parent())
                                 == Some(fcvm::paths::vm_disks_dir().as_path()),
-                            "refusing to treat {} as a per-VM runtime directory",
+                            "refusing to treat {} as a per-VM disk directory",
                             dir.display()
                         );
                         return Ok(Some((path, dir)));
@@ -2661,9 +2661,9 @@ fn test_bench_fast_teardown_leaks_nothing_clone() -> Result<()> {
     })
 }
 
-/// `vm_runtime_dir("")` is a shared bucket of `vm-disks`, not a per-VM directory.
+/// `vm_disk_dir("")` is a shared bucket of `vm-disks`, not a per-VM directory.
 ///
-/// A test that derives a runtime directory from a state file and then `remove_dir_all`s it
+/// A test that derives a disk directory from a state file and then `remove_dir_all`s it
 /// must never accept an empty id: doing so deletes every VM's disks in that bucket,
 /// including those of tests running concurrently in CI. This pins the arithmetic so the
 /// guard above cannot be simplified away by someone who has not thought about it.
@@ -2673,14 +2673,14 @@ fn an_empty_vm_id_resolves_to_a_shared_bucket_and_must_be_rejected() {
     let bucket = shared.join(fcvm::paths::vm_bucket(""));
 
     assert_eq!(
-        fcvm::paths::vm_runtime_dir(""),
+        fcvm::paths::vm_disk_dir(""),
         bucket,
         "an empty vm_id collapses to a SHARED bucket of vm-disks, not a VM directory. Any \
-         caller that deletes its computed runtime directory would wipe every VM in that \
+         caller that deletes its computed disk directory would wipe every VM in that \
          bucket, which is why the lookup rejects an empty id rather than defaulting it."
     );
     assert_eq!(bucket.parent(), Some(shared.as_path()));
-    let dir = fcvm::paths::vm_runtime_dir("vm-abc123");
+    let dir = fcvm::paths::vm_disk_dir("vm-abc123");
     assert_ne!(
         dir, bucket,
         "a real vm_id must resolve BELOW its bucket, never to the shared bucket"

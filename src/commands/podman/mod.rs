@@ -1280,21 +1280,22 @@ async fn invalidate_unusable_snapshot(
 
 /// Best-effort removal of host state persisted during a failed `prepare_vm`.
 ///
-/// `prepare_vm` creates the per-VM data directory and (for rootless and routed modes
-/// with published ports) persists the VM state file with an allocated loopback IP
-/// before the VM is fully set up. When setup fails partway, remove both so failed
-/// runs don't leave phantom `fcvm ls` entries, allocated loopback IPs, or per-VM
-/// disk directories behind.
+/// `prepare_vm` creates the VM's runtime directory (`data_dir`) and disk directory
+/// (`disk_dir`) and (for rootless and routed modes with published ports) persists the VM
+/// state file with an allocated loopback IP before the VM is fully set up. When setup
+/// fails partway, remove them so failed runs don't leave phantom `fcvm ls` entries,
+/// allocated loopback IPs, or per-VM directories behind.
 pub(crate) async fn cleanup_failed_prepare(
     state_manager: &StateManager,
     vm_id: &str,
     data_dir: &std::path::Path,
+    disk_dir: &std::path::Path,
 ) {
     if let Err(e) = state_manager.delete_state(vm_id).await {
         warn!(vm_id = %vm_id, error = %e, "failed to delete VM state after setup error");
     }
-    if let Err(e) = tokio::fs::remove_dir_all(data_dir).await {
-        warn!(vm_id = %vm_id, error = %e, "failed to remove VM data directory after setup error");
+    if let Err(e) = crate::commands::common::remove_vm_dirs(data_dir, disk_dir).await {
+        warn!(vm_id = %vm_id, error = %format!("{e:#}"), "failed to remove VM directories after setup error");
     }
     if let Err(e) = crate::reclaim::complete(vm_id).await {
         warn!(vm_id = %vm_id, error = %format!("{e:#}"), "failed to reclaim the VM's resources after setup error");
@@ -1988,15 +1989,19 @@ async fn prepare_vm_for_lifecycle(
     // What VMs of processes killed without teardown left on the host goes first.
     crate::reclaim::reclaim_abandoned_if_due().await;
     // Generated before the snapshot key so the staging path of a read-only --disk-dir
-    // is in this VM's data directory, which teardown removes.
+    // is in this VM's disk directory, which teardown removes.
     let vm_id = generate_vm_id();
     let vm_name = args.name.clone();
-    // The data directory outlives this process unless teardown removes it, so it is
-    // recorded before anything creates it, and a SIGKILLed run leaves it to the next
+    // The VM's directories outlive this process unless teardown removes them, so they are
+    // recorded before anything creates them, and a SIGKILLed run leaves them to the next
     // launch to reclaim (crate::reclaim).
     let reclaim_owner = crate::reclaim::Owner::begin(&vm_id)?;
+    let vm_dirs = paths::VmDirs::for_start(&vm_id)?;
     reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
-        path: paths::vm_runtime_dir(&vm_id),
+        path: vm_dirs.runtime.clone(),
+    })?;
+    reclaim_owner.record(crate::reclaim::Resource::RuntimeDir {
+        path: vm_dirs.disk.clone(),
     })?;
 
     // Resolve the extra disks for the snapshot key ONCE: the key carries each read-only
@@ -2007,11 +2012,11 @@ async fn prepare_vm_for_lifecycle(
     // file identity. Without the snapshot cache nothing is keyed or staged.
     let mut disk_dir_staging = None;
     if !no_snapshot && (!args.disk.is_empty() || !args.disk_dir.is_empty()) {
-        // The runtime directory first, through the helper that makes its bucket with
+        // The disk directory first, through the helper that makes its bucket with
         // vm-disks' owner and mode: the staging below would otherwise make the bucket
         // itself, with this process's owner and umask (root's, in a user's store).
-        paths::create_vm_runtime_dir(&vm_id).await?;
-        let root = paths::vm_runtime_dir(&vm_id).join("disk-dir-staging");
+        paths::create_vm_disk_dir(&vm_id).await?;
+        let root = vm_dirs.disk.join("disk-dir-staging");
         let (disk, disk_dir) = (args.disk.clone(), args.disk_dir.clone());
         let (staging, resolved) = tokio::task::spawn_blocking(move || {
             crate::storage::disk_dir::DiskDirStaging::resolve(&root, &disk, &disk_dir)
@@ -2294,7 +2299,10 @@ async fn prepare_vm_for_lifecycle(
     // the cause (observed as "VolumeServer failed to signal ready: channel
     // closed"), so refuse it here where the path can still be named.
     paths::check_socket_path_budget(&vm_id)?;
-    let data_dir = paths::create_vm_runtime_dir(&vm_id)
+    let paths::VmDirs {
+        runtime: data_dir,
+        disk: disk_dir,
+    } = paths::create_vm_runtime_dir(&vm_id)
         .await
         .context("creating VM data directory")?;
 
@@ -2398,12 +2406,13 @@ async fn prepare_vm_for_lifecycle(
     // records the VM's runtime directory from the start: every reader of a running VM's
     // directory (exec, health, the memory server's failure note) takes it from there.
     vm_state.config.vm_runtime_dir = Some(data_dir.clone());
+    vm_state.config.vm_disk_dir = Some(disk_dir.clone());
     if let Err(e) = state_manager
         .claim_name(&mut vm_state)
         .await
         .context("claiming the VM name")
     {
-        cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir).await;
         return Err(e);
     }
     // The state holds the address now, and gives it back when it is deleted.
@@ -2488,7 +2497,7 @@ async fn prepare_vm_for_lifecycle(
     let mut network = match network {
         Ok(network) => network,
         Err(e) => {
-            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir).await;
             return Err(e);
         }
     };
@@ -2505,7 +2514,7 @@ async fn prepare_vm_for_lifecycle(
                     cleanup_err
                 );
             }
-            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir).await;
             return Err(e);
         }
     };
@@ -2546,7 +2555,7 @@ async fn prepare_vm_for_lifecycle(
                         cleanup_err
                     );
                 }
-                cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+                cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir).await;
                 return Err(e);
             }
         }
@@ -2594,7 +2603,7 @@ async fn prepare_vm_for_lifecycle(
                     cleanup_err
                 );
             }
-            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir).await;
             return Err(e);
         }
     };
@@ -2712,7 +2721,7 @@ async fn prepare_vm_for_lifecycle(
     // Subscribed before the output listener starts, so no line is sent before there is a receiver.
     let container_log = lifecycle
         .is_prepare()
-        .then(|| listeners::ContainerLogWriter::spawn(log_tx.subscribe(), &data_dir));
+        .then(|| listeners::ContainerLogWriter::spawn(log_tx.subscribe(), &disk_dir));
 
     // For non-TTY mode, use async output listener
     let output_reconnect = Arc::new(tokio::sync::Notify::new());
@@ -2766,7 +2775,7 @@ async fn prepare_vm_for_lifecycle(
             decision: decision.clone(),
             args: &args,
             vm_id: &vm_id,
-            data_dir: &data_dir,
+            disk_dir: &disk_dir,
             base_rootfs: &base_rootfs,
             socket_path: &socket_path,
             kernel_path: &kernel_path,
@@ -2837,7 +2846,7 @@ async fn prepare_vm_for_lifecycle(
         }
 
         // Remove the persisted state file and per-VM data directory
-        cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        cleanup_failed_prepare(&state_manager, &vm_id, &data_dir, &disk_dir).await;
         return Err(e);
     }
 
@@ -2858,7 +2867,7 @@ async fn prepare_vm_for_lifecycle(
         startup_tx,
     );
 
-    let disk_path = data_dir.join("disks/rootfs.raw");
+    let disk_path = disk_dir.join("disks/rootfs.raw");
 
     Ok(VmPreparation::Active(Box::new(VmContext {
         restore_from_cache: None,
@@ -2866,6 +2875,7 @@ async fn prepare_vm_for_lifecycle(
         vm_id,
         vm_name,
         data_dir,
+        disk_dir,
         vm_manager,
         holder_child,
         bootplan_handle,
@@ -3214,7 +3224,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
             _ = watchdog.expired() => {
                 warn!(
                     deadline_s = GUEST_POWEROFF_DEADLINE.as_secs(),
-                    log = %ctx.data_dir.join("firecracker.log").display(),
+                    log = %ctx.disk_dir.join("firecracker.log").display(),
                     "the guest did not power off after the container exited; killing the VMM and reporting the container's exit code"
                 );
                 watchdog
@@ -3347,7 +3357,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         &ctx.args,
                         &ctx.network_config,
                         &mut ctx.vm_state,
-                        &ctx.data_dir,
+                        &ctx.disk_dir,
                         &ctx.vm_id,
                         &volume_mappings,
                         None,
@@ -3970,6 +3980,7 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
             volume_server_handles: ctx.volume_servers.handles,
             volume_tables: ctx.volume_servers.tables,
             data_dir: ctx.data_dir,
+            disk_dir: ctx.disk_dir,
             health_cancel_token: Some(ctx.health_cancel_token),
             health_monitor_handle: Some(ctx.health_monitor_handle),
             output_listener_handle: ctx.output_handle,
@@ -4016,6 +4027,7 @@ async fn cleanup_vm_context_verified(mut ctx: VmContext) -> Result<()> {
             volume_server_handles: ctx.volume_servers.handles,
             volume_tables: ctx.volume_servers.tables,
             data_dir: ctx.data_dir,
+            disk_dir: ctx.disk_dir,
             health_cancel_token: Some(ctx.health_cancel_token),
             health_monitor_handle: Some(ctx.health_monitor_handle),
             output_listener_handle: ctx.output_handle,
@@ -4970,10 +4982,11 @@ mod tests {
         );
     }
 
-    /// #1183: a launch records its runtime directory with its owner before anything in
-    /// it exists (the --disk-dir staging, then the directory itself), and reclaims what
-    /// killed launches left before it records anything. A launch killed in between
-    /// leaves the directory to the next sweep only if the record comes first.
+    /// #1183: a launch records its runtime directory and its disk directory with its owner
+    /// before anything in them exists (the --disk-dir staging, then the directories
+    /// themselves), and reclaims what killed launches left before it records anything. A
+    /// launch killed in between leaves the directories to the next sweep only if the
+    /// records come first.
     #[test]
     fn a_launch_records_its_runtime_dir_before_creating_it() {
         let source = include_str!("mod.rs");
@@ -4986,21 +4999,26 @@ mod tests {
         };
         let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
-        let recorded = at("crate::reclaim::Resource::RuntimeDir {");
+        let recorded = at("crate::reclaim::Resource::RuntimeDir {\n        path: vm_dirs.runtime");
+        let recorded_disk =
+            at("crate::reclaim::Resource::RuntimeDir {\n        path: vm_dirs.disk");
         let staged = at("DiskDirStaging::resolve(");
+        let disk_created = at("paths::create_vm_disk_dir(&vm_id)");
         let created = at("paths::create_vm_runtime_dir(&vm_id)");
         assert!(
-            reclaimed < owned && owned < recorded,
+            reclaimed < owned && owned < recorded && owned < recorded_disk,
             "the launch must reclaim, then begin its owner, then record"
         );
+        for record in [recorded, recorded_disk] {
+            assert!(
+                record < staged && record < disk_created && record < created,
+                "a VM directory is created before it is recorded"
+            );
+        }
         assert!(
-            recorded < staged && recorded < created,
-            "the runtime directory is created before it is recorded"
-        );
-        assert!(
-            created < staged,
+            disk_created < staged,
             "the --disk-dir staging makes the VM's bucket itself, with this process's owner \
-             and umask, unless the runtime directory (and its bucket) is made first"
+             and umask, unless the disk directory (and its bucket) is made first"
         );
 
         // The same order in a restore.
@@ -5014,12 +5032,18 @@ mod tests {
         };
         let reclaimed = at("crate::reclaim::reclaim_abandoned_if_due().await");
         let owned = at("crate::reclaim::Owner::begin(&vm_id)?");
-        let recorded = at("crate::reclaim::Resource::RuntimeDir {");
+        let recorded = at("crate::reclaim::Resource::RuntimeDir {\n        path: vm_dirs.runtime");
+        let recorded_disk =
+            at("crate::reclaim::Resource::RuntimeDir {\n        path: vm_dirs.disk");
         let created = at("paths::create_vm_runtime_dir(&vm_id)");
         assert!(
-            reclaimed < owned && owned < recorded && recorded < created,
-            "a restore must reclaim, begin its owner and record its runtime directory, in \
-             that order, before creating the directory"
+            reclaimed < owned
+                && owned < recorded
+                && owned < recorded_disk
+                && recorded < created
+                && recorded_disk < created,
+            "a restore must reclaim, begin its owner and record its directories, in that \
+             order, before creating them"
         );
     }
 
@@ -7752,9 +7776,16 @@ mod tests {
     async fn test_cleanup_failed_prepare_removes_state_and_data_dir() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
-        let data_dir = temp.path().join("vm-data");
+        let data_dir = temp.path().join("vm-runtime");
+        let disk_dir = temp.path().join("vm-disk");
         tokio::fs::create_dir_all(&data_dir).await.unwrap();
-        tokio::fs::write(data_dir.join("firecracker.log"), "log")
+        tokio::fs::write(data_dir.join("container-ready"), "")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(disk_dir.join("disks"))
+            .await
+            .unwrap();
+        tokio::fs::write(disk_dir.join("firecracker.log"), "log")
             .await
             .unwrap();
 
@@ -7769,20 +7800,20 @@ mod tests {
         state_manager.save_state(&vm_state).await.unwrap();
         assert!(state_manager.state_file("vm-test-cleanup").exists());
 
-        cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
+        cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir, &disk_dir).await;
 
         assert!(
             !state_manager.state_file("vm-test-cleanup").exists(),
             "state file should be removed after a failed prepare"
         );
         assert!(
-            !data_dir.exists(),
-            "data dir should be removed after a failed prepare"
+            !data_dir.exists() && !disk_dir.exists(),
+            "both VM directories should be removed after a failed prepare"
         );
 
         // Error paths can run before any state was persisted — calling the helper
         // again with nothing left to remove must not panic.
-        cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir).await;
+        cleanup_failed_prepare(&state_manager, "vm-test-cleanup", &data_dir, &disk_dir).await;
     }
 
     /// A launch names an image's disk after the key `podman image inspect` gives the image
