@@ -330,8 +330,9 @@ fn kernel_versions(value: &toml::Value, path: &str, found: &mut Vec<(String, Str
 /// (05984ba6), which a 6.18 host does not emulate. On one c8g.metal, host 7.3.1
 /// with guest 7.3.1 passed 15 of 15 nested checks and host 7.3.1 with guest
 /// 6.18.60 passed 9 of 9, while host 6.18.60 with any guest from 6.19 wedged.
-/// So the arm64 nested host kernel moves to 7.3.3 first, and the guests stay on
-/// the 6.18 longterm line until the hosts that run them are on 7.3.
+/// So the arm64 nested host kernel moved to the 7.3 series first (7.3.3, now 7.3.6, the
+/// newest stable release), and the x86_64 guests stay on the 6.18 longterm line until the
+/// hosts that run them are on 7.3.
 ///
 /// Within that line the pin has a floor.
 ///
@@ -407,8 +408,8 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
         assert!(
             toml_section(&config, profile)
                 .lines()
-                .any(|line| line.trim() == "kernel_version = \"7.3.3\""),
-            "[{profile}] must pin Linux 7.3.3: an arm64 nested host older than its L1 guest \
+                .any(|line| line.trim() == "kernel_version = \"7.3.6\""),
+            "[{profile}] must pin Linux 7.3.6: an arm64 nested host older than its L1 guest \
              wedges L2 (#659), and 7.3.1 hosts passed every nested check with 7.3.1 guests"
         );
     }

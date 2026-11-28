@@ -1,6 +1,6 @@
 /*
- * Verbatim line range from Linux v7.3.3 arch/arm64/include/asm/kvm_emulate.h:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/include/asm/kvm_emulate.h
+ * Verbatim line range from Linux v7.3.6 arch/arm64/include/asm/kvm_emulate.h:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/include/asm/kvm_emulate.h
  * Complete source SHA256: 92f7093348c599dee6b7901c24b6685fd6ff9d2caaf447f397b73477cf1c8944
  * Lines 255-268.
  * tests/test_kernel_patch_invariants.rs applies

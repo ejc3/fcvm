@@ -1,6 +1,6 @@
 /*
- * Verbatim line range from Linux v7.3.3 arch/arm64/kvm/hyp/vgic-v3-sr.c:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/hyp/vgic-v3-sr.c
+ * Verbatim line range from Linux v7.3.6 arch/arm64/kvm/hyp/vgic-v3-sr.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/kvm/hyp/vgic-v3-sr.c
  * Complete source SHA256: 8369587de161f54ad621313eea6f4073d3bbe1c621f1802cec2882836a5759bc
  * Lines 198-368.
  * tests/test_kernel_patch_invariants.rs applies

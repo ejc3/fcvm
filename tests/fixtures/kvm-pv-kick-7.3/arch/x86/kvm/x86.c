@@ -1,8 +1,8 @@
 /*
- * Verbatim line range from Linux v7.3.3 arch/x86/kvm/x86.c:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/x86/kvm/x86.c
- * Complete source SHA256: 6cded92f7a275e369117007f0a49aa79c7ce483ae00a91fb4da0362ed1645b43
- * Lines 10582-10607.
+ * Verbatim line range from Linux v7.3.6 arch/x86/kvm/x86.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/x86/kvm/x86.c
+ * Complete source SHA256: 78e9346f86e794c71ba1f5a85849b8a0dcf7d3b54a1ea749abe99301757c9efd
+ * Lines 10589-10614.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-x86-host/0003-kvm-x86-keep-a-pending-pv-kick-across-async-page-ready.patch
  * to this file, then compiles the function it names from it into a C harness.

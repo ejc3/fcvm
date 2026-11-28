@@ -1,8 +1,8 @@
 /*
- * Verbatim line ranges from Linux v7.3.3 arch/arm64/kvm/hyp/vhe/switch.c:
- * https://raw.githubusercontent.com/gregkh/linux/v7.3.3/arch/arm64/kvm/hyp/vhe/switch.c
- * Complete source SHA256: 5189d2c878c16cccf8ee8ca1356522b34b259e4070ad84eb92d367d62330f846
- * Lines 50-117, 556-591, each range separated by one blank line.
+ * Verbatim line ranges from Linux v7.3.6 arch/arm64/kvm/hyp/vhe/switch.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v7.3.6/arch/arm64/kvm/hyp/vhe/switch.c
+ * Complete source SHA256: 951e482933f0149628900f43cac593124b3f449f16423e353fb6619eaa5d8d5e
+ * Lines 50-117, 557-592, each range separated by one blank line.
  * tests/test_kernel_patch_invariants.rs applies
  * kernel/patches-arm64-host/nv-guest-hypervisor-exits-without-calls.patch to this file,
  * then compiles the functions it names from it into a C harness.
