@@ -607,6 +607,10 @@ pub fn log_console_line_under_fcvm(clean: &str) -> bool {
 /// line under that target is still proof that the guest's serial console works.
 pub const AGENT_TARGET: &str = "fcvm::agent";
 
+/// The target of the guest sampler's lines that reached fcvm on the output connection
+/// (`vitals::PileupOut` in fc-agent). Outside `fcvm`, like the console's own targets.
+pub const VITALS_TARGET: &str = "guest-vitals";
+
 /// One `agent` line of the output connection, `<when> <line>`: when the guest logged the
 /// line, by its own clock in microseconds since the Unix epoch, and fc-agent's line. The
 /// time is returned in the form of fcvm's log timestamps (UTC, microseconds). None when
@@ -627,7 +631,12 @@ pub fn log_agent_line(content: &str) {
         tracing::info!(target: "fcvm::agent", "{}", content);
         return;
     };
-    if console_line_is_an_agent_error(line) {
+    if line.starts_with("[fcvm-vitals]") {
+        // A sampler line the guest sent here instead of over its console: DEBUG under a
+        // target outside `fcvm`, as its console form is, so it lands in the per-VM file
+        // and RUST_LOG=fcvm=debug does not pull it into a job log (#1104).
+        tracing::debug!(target: VITALS_TARGET, %logged, "{}", line);
+    } else if console_line_is_an_agent_error(line) {
         tracing::warn!(target: "fcvm::agent", %logged, "{}", line);
     } else {
         tracing::info!(target: "fcvm::agent", %logged, "{}", line);
@@ -2376,6 +2385,28 @@ mod tests {
     /// log at INFO with its text unchanged, under a target of its own (a line under the
     /// console's target has crossed the serial console, which tests rely on), and with
     /// the time the guest logged it, in the form of the log's own timestamps.
+    /// A sampler line that came over the output connection is DEBUG outside `fcvm`, as on
+    /// the console: a pile-up prints one a second, and neither RUST_LOG=fcvm=info nor
+    /// fcvm=debug may pull them into a job log (#1104).
+    #[test]
+    fn a_vitals_line_from_the_output_connection_stays_out_of_fcvms_targets() {
+        let send = || {
+            log_agent_line("1795332623625264 [fcvm-vitals] pileup up=41.75 runnable=9");
+            log_agent_line("1795332623625264 [fc-agent] handling restore (epoch=e)");
+        };
+        let all = log_capture::logged("debug", send);
+        assert!(
+            all.contains("DEBUG guest-vitals: [fcvm-vitals] pileup up=41.75 runnable=9"),
+            "{all:?}"
+        );
+        let fcvm_debug = log_capture::logged("fcvm=debug", send);
+        assert!(
+            !fcvm_debug.contains("fcvm-vitals")
+                && fcvm_debug.contains("[fc-agent] handling restore"),
+            "{fcvm_debug:?}"
+        );
+    }
+
     #[test]
     fn an_agent_line_from_the_output_connection_is_logged_under_its_own_target() {
         let log = log_capture::logged("fcvm=info", || {
