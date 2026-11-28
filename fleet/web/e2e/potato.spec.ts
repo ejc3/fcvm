@@ -282,6 +282,92 @@ test("potato: the legend is on the page with room, in the panel without, and nev
   await expect(inPanel).toContainText("slowest player");
 });
 
+test("potato: hovering a tile shows its readout beside it, and it leaves with the pointer", async ({ page }) => {
+  await startAt(8);
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await openPotato(page);
+  const tile = tiles(page).first();
+  const readout = page.getByTestId("potato-readout");
+  await expect(readout).toHaveCount(0);
+  await tile.hover();
+  await expect(readout).toBeVisible();
+  // The head and the label both carry a live duration ("asleep 312 ms"), so they are read in one
+  // task of the page, where no render can come between the two reads. A label read first and
+  // compared later went stale while the head kept counting (Fleet Web on 774a3257e).
+  const same = await tile.evaluate((el) => {
+    const head = document.querySelector('[data-testid="potato-readout"] .head')?.textContent ?? null;
+    return { head, label: (el.getAttribute("aria-label") ?? "").split(". ")[0] };
+  });
+  expect(same.head, "the readout's head is the first sentence of the tile's label").toBe(same.label);
+  await expect(tile).not.toHaveAttribute("title", /.+/);
+  // Clear of the tile it describes, and inside the stage.
+  const r = (await readout.boundingBox())!;
+  const t = (await tile.boundingBox())!;
+  const s = (await page.getByTestId("potato-stage").boundingBox())!;
+  expect(r.x + r.width <= t.x + 1 || t.x + t.width <= r.x + 1 || r.y + r.height <= t.y + 1 || t.y + t.height <= r.y + 1).toBe(true);
+  expect(r.x).toBeGreaterThanOrEqual(s.x - 1);
+  expect(r.x + r.width).toBeLessThanOrEqual(s.x + s.width + 1);
+  await page.mouse.move(2, 2);
+  await expect(readout).toHaveCount(0);
+  // The same on keyboard focus.
+  await tile.focus();
+  await expect(readout).toBeVisible();
+  await tile.blur();
+  await expect(readout).toHaveCount(0);
+});
+
+test("potato: the ring is one tab stop; arrows, Home and End move between tiles; a click shows no card, the keyboard does, Escape dismisses it", async ({ page }) => {
+  await startAt(8);
+  await openPotato(page);
+  const tabbable = await tiles(page).evaluateAll((els) => els.filter((e) => (e as HTMLElement).tabIndex === 0).length);
+  expect(tabbable).toBe(1);
+  const readout = page.getByTestId("potato-readout");
+  await tiles(page).nth(3).click();
+  await page.mouse.move(2, 2);
+  await expect(readout, "a click does not leave a card").toHaveCount(0);
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Tab");
+  // some tab stop reached the ring's one tile (or passed it); focus it directly and use the keys
+  await tiles(page).first().focus();
+  await page.keyboard.press("Tab").catch(() => {});
+  await page.keyboard.press("Shift+Tab");
+  await tiles(page).first().focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(tiles(page).nth(1)).toBeFocused();
+  await expect(readout).toBeVisible();
+  await page.keyboard.press("End");
+  await expect(tiles(page).nth(7)).toBeFocused();
+  await page.keyboard.press("Home");
+  await expect(tiles(page).first()).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(readout).toHaveCount(0);
+});
+
+test("potato: the stage is a labelled group that owns the named tiles", async ({ page }) => {
+  await startAt(8);
+  await openPotato(page);
+  await expect(page.getByTestId("potato-stage")).toHaveAttribute("role", "group");
+  for (const t of await tiles(page).all()) await expect(t).toHaveAttribute("aria-label", /^Player \d/);
+});
+
+test("potato: a card does not come back after its tile left the ring and the ring grew back", async ({ page }) => {
+  await startAt(8);
+  await openPotato(page);
+  const readout = page.getByTestId("potato-readout");
+  await tiles(page).nth(7).focus();
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowRight");
+  await expect(tiles(page).nth(7)).toBeFocused();
+  await expect(readout).toBeVisible();
+  // the ring shrinks to 2 (tile 7 is gone), then grows back to 8
+  await admin("/mock/potato", { cpus: 0, players: 8, size: 2, next_in_ms: 300 });
+  await expect(tiles(page)).toHaveCount(2, { timeout: 10_000 });
+  await admin("/mock/potato", { cpus: 0, players: 8, size: 8, next_in_ms: 300 });
+  await expect(tiles(page)).toHaveCount(8, { timeout: 10_000 });
+  await page.waitForTimeout(500);
+  await expect(readout, "nothing is focused, so no card").toHaveCount(0);
+});
+
 test("potato: the legend's marks keep their colours in the panel, in the dark and the light scheme", async ({ page }) => {
   await startAt(8);
   for (const scheme of ["dark", "light"] as const) {

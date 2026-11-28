@@ -86,6 +86,10 @@
 .potato-line { position: absolute; transform: translateX(-50%); font: 500 14px var(--sans); color: var(--muted); white-space: nowrap; pointer-events: none; }
 .potato-line[data-phase="waking"] { color: var(--text); font-family: var(--mono); }
 .potato-line[data-phase="failed"] { color: var(--refused); }
+.potato-tile:focus-visible { outline: 3px solid var(--fcvm); outline-offset: 3px; }
+.potato-tile { touch-action: manipulation; -webkit-touch-callout: none; user-select: none; }
+.potato-readout { position: absolute; z-index: 4; display: flex; flex-direction: column; gap: 2px; width: max-content; max-width: min(260px, 80%); padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); font: 500 14px var(--sans); pointer-events: none; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35); }
+.potato-readout .detail { color: var(--muted); font-weight: 400; }
 .potato-ball { position: absolute; border-radius: 50%; background: radial-gradient(circle at 35% 35%, #fff6cf, var(--p-ball) 60%); box-shadow: 0 0 0 2px var(--p-ball-edge), 0 4px 14px rgba(0, 0, 0, 0.35); pointer-events: none; z-index: 2; }
 .potato-ball[data-dropped="true"] { filter: grayscale(0.7); opacity: 0.8; }
 

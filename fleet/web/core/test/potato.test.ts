@@ -23,6 +23,8 @@ import {
   recordsOf,
   ringGeometry,
   type PotatoInput,
+  placeReadout,
+  tileReadout,
 } from "../potato.ts";
 import { parseServerMsg, ProtocolError, type Potato, type PotatoDrop, type PotatoRound } from "../protocol.ts";
 import { initialState, reduce, type ClientState } from "../store.ts";
@@ -190,10 +192,20 @@ describe("the ring", () => {
     expect(tiles.map((t) => t.holder)).toEqual([false, false, true, false]);
     // waking: 200 ms of a last wake of 400
     expect(tiles[1]!.wake).toEqual({ fraction: 0.5, text: "200 ms" });
-    expect(tiles[1]!.ariaLabel).toBe("Player 1, waking for 200 ms; its last wake took 400 ms, 30 catches");
-    expect(tiles[0]!.ariaLabel).toBe("Player 0, asleep for 600 ms, 31 catches");
-    expect(tiles[2]!.ariaLabel).toBe("Player 2, awake, 31 catches, holding the ball");
+    expect(tiles.map((t) => t.readout)).toEqual([
+      { head: "Player 0 · asleep 600 ms", detail: "31 catches · last sleep 330 ms · last wake 355 ms" },
+      { head: "Player 1 · waking 200 ms", detail: "30 catches · last sleep 340 ms · last wake 400 ms" },
+      { head: "Player 2 · has the ball", detail: "31 catches · last sleep 300 ms · last wake 360 ms" },
+      { head: "Player 3 · failed", detail: "30 catches" },
+    ]);
     expect(v.ring!.caption).toBe("Ring of 4: player 2 has the ball, catch 7");
+  });
+
+  it("reads a player that has not started without a detail line or a trailing separator", () => {
+    expect(tileReadout(5, "not started", false, null)).toEqual({ head: "Player 5 · not started", detail: "" });
+    const p = potato({ players: [] });
+    const t = potatoView(input(stateWith({ ...p, round: round({ ring: [0, 1], size: 2, holder: 0 }) }))).ring!.tiles[1]!;
+    expect(t.ariaLabel).toBe("Player 1 · not started");
   });
 
   it("shows a player that threw as going to sleep until its sleep is done", () => {
@@ -202,7 +214,8 @@ describe("the ring", () => {
     const t = potatoView(input(stateWith(p))).ring!.tiles[2]!;
     expect(t.phase).toBe("sleeping");
     expect(t.line).toBe("going to sleep");
-    expect(t.ariaLabel).toContain("going to sleep for 120 ms");
+    expect(t.readout.head).toBe("Player 2 · going to sleep 120 ms · has the ball");
+    expect(t.ariaLabel).toBe(`${t.readout.head}. ${t.readout.detail}`);
   });
 
   it("caps the wake bar at its end, has no bar without a last wake, and shows a ring member that has not said hello as not started", () => {
@@ -466,4 +479,25 @@ describe("the view", () => {
     const tiles = potatoView(input(s, { now: T - 5000 })).ring!.tiles;
     expect(tiles[1]!.wake!.text).toBe("200 ms");
   });
+});
+
+describe("the readout card stays inside the stage", () => {
+  const card = { w: 260, h: 64 };
+  for (const [name, stage] of [["a 360 px phone", { w: 328, h: 328 }], ["a desktop", { w: 880, h: 710 }]] as const) {
+    it(`on ${name}, for a tile on each of the four sides and the corners, the card is wholly inside the stage and off its tile`, () => {
+      const g = ringGeometry({ x: 0, y: 0, ...stage }, 32);
+      for (let i = 0; i < 32; i++) {
+        const c = g.places[i]!;
+        const tile = { x: c.x - g.tile / 2, y: c.y - g.tile / 2, w: g.tile, h: g.tile };
+        const p = placeReadout(tile, g.centre, card, stage);
+        const w = Math.min(card.w, stage.w - 8);
+        expect(p.x, `tile ${i} left`).toBeGreaterThanOrEqual(0);
+        expect(p.y, `tile ${i} top`).toBeGreaterThanOrEqual(0);
+        expect(p.x + w, `tile ${i} right`).toBeLessThanOrEqual(stage.w);
+        expect(p.y + card.h, `tile ${i} bottom`).toBeLessThanOrEqual(stage.h);
+        const off = p.x + w <= tile.x || p.x >= tile.x + tile.w || p.y + card.h <= tile.y || p.y >= tile.y + tile.h;
+        expect(off, `tile ${i} clear of its card`).toBe(true);
+      }
+    });
+  }
 });

@@ -65,7 +65,7 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      testIgnore: /(screenshots|phones|potato|windows|windows8|minecraft|mirror)\.spec\.ts/,
+      testIgnore: /(screenshots|phones|potato|potato-touch|windows|windows8|minecraft|mirror)\.spec\.ts/,
       use: { ...devices["Desktop Chrome"], viewport, deviceScaleFactor: 1 },
     },
     // WebKit (Playwright's Linux build, not Apple's Safari) runs the tests tagged
@@ -73,7 +73,7 @@ export default defineConfig({
     {
       name: "webkit",
       grep: /@engines/,
-      testIgnore: /(screenshots|phones|potato|windows|windows8|minecraft|mirror)\.spec\.ts/,
+      testIgnore: /(screenshots|phones|potato|potato-touch|windows|windows8|minecraft|mirror)\.spec\.ts/,
       dependencies: ["chromium"],
       use: {
         ...devices["Desktop Safari"],
