@@ -56,11 +56,11 @@ allow_seccomp_log = false
 # scripts/publish-passt-archive.sh when the pin moves.
 [pasta]
 repo = "https://passt.top/passt"
-commit = "4e8aa70379a35ec9deb11d76513e7f6c4123b667"
-archive_sha256 = "ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe097170e9e5851da8b9"
+commit = "15980a90f9a60e6ae9a3865bb85d20a3d8379deb"
+archive_sha256 = "8a25c40ecfe7bdace74e3c4966c88846b693dce34f6bf8f09e2b607c25b20d42"
 archives = [
-    "https://github.com/ejc3/fcvm/releases/download/passt-4e8aa70379a3/passt-4e8aa70379a35ec9deb11d76513e7f6c4123b667.tar.xz",
-    "https://passt.top/passt/snapshot/passt-4e8aa70379a35ec9deb11d76513e7f6c4123b667.tar.xz",
+    "https://github.com/ejc3/fcvm/releases/download/passt-15980a90f9a6/passt-15980a90f9a60e6ae9a3865bb85d20a3d8379deb.tar.xz",
+    "https://passt.top/passt/snapshot/passt-15980a90f9a60e6ae9a3865bb85d20a3d8379deb.tar.xz",
 ]
 
 # Pinned libseccomp, linked into every Firecracker that `fcvm setup` builds.
