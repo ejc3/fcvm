@@ -389,6 +389,11 @@ fn pdeathsig_hook() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'stat
 #[path = "../../src/test_child.rs"]
 pub mod test_child;
 
+/// The library's `cfg(test)` module `src/test_ports.rs`, shared the same way: an address
+/// that refuses for as long as the test holds it, and a port for a program that binds it.
+#[path = "../../src/test_ports.rs"]
+pub mod test_ports;
+
 /// Check if we're running inside a container.
 ///
 /// Containers create marker files that we can use to detect containerized environments.

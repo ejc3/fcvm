@@ -1,6 +1,11 @@
 //! The player program as host processes: the ball between two players, the report
 //! connection a wake retires, and a throw nothing accepts.
 
+// The fcvm library's `cfg(test)` module, by path: an address that refuses while the test holds
+// it, and a port for a program that binds it itself.
+#[path = "../../../src/test_ports.rs"]
+mod test_ports;
+
 use fleet_potato::{
     chain_from_hex, chain_hex, chain_step, Ball, Inbound, Reply, Report, DEFAULT_COLOURS,
 };
@@ -740,11 +745,8 @@ fn a_throw_does_not_retry_past_the_hold() {
     let (report, reports, _conns, _latest) = report_server();
     let (_a, pa) = player(0, report);
     hello_of(next(&reports));
-    let nobody = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_held, nobody) = test_ports::refused_address();
+    let nobody = nobody.port();
     let ball = Ball {
         round: 1,
         seq: 0,

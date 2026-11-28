@@ -23,6 +23,8 @@ pub mod sweep;
 mod test_child;
 #[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod test_ports;
 pub mod uffd;
 pub mod utils;
 pub mod version_cache;

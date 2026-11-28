@@ -26,6 +26,11 @@ use tokio_tungstenite::tungstenite::Message;
 #[path = "../src/fleet/coord/access_jwt_testing.rs"]
 mod access_testing;
 
+// The library's `cfg(test)` module, by path: an address that refuses while the test holds
+// it, and a port for a program that binds it itself.
+#[path = "../src/test_ports.rs"]
+mod test_ports;
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -7888,12 +7893,13 @@ async fn the_aws_tile_driver_sees_a_reclaimed_instance_and_a_stopped_renderer() 
         Liveness::Dead(why) => assert!(why.contains("CUDA error 999"), "{why}"),
         other => panic!("a failed renderer is {other:?}"),
     }
-    // Nothing listens on a port that was bound and released.
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    match driver(closed).alive("ec2-1", &running).await.unwrap() {
+    // Nothing listens on this address, and nothing else can while the socket is held.
+    let (_held, closed) = test_ports::refused_address();
+    match driver(closed.port())
+        .alive("ec2-1", &running)
+        .await
+        .unwrap()
+    {
         Liveness::Silent(_) => {}
         other => panic!("a renderer that does not answer is {other:?}"),
     }
