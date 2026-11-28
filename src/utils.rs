@@ -441,6 +441,36 @@ pub async fn graceful_kill_async(pid: u32, timeout_ms: u64) {
         .await;
 }
 
+/// Whether `/proc/cpuinfo` is that of a virtual machine: x86 CPUs report it as the
+/// `hypervisor` flag (CPUID leaf 1, ECX bit 31), which a hypervisor sets for its guests.
+fn cpuinfo_is_a_virtual_machines(cpuinfo: &str) -> bool {
+    cpuinfo
+        .lines()
+        .filter(|line| line.starts_with("flags"))
+        .filter_map(|line| line.split_once(':'))
+        .any(|(_, flags)| flags.split_whitespace().any(|flag| flag == "hypervisor"))
+}
+
+/// Whether a device tree's `model` is that of a virtual machine. arm64 has no CPU flag
+/// for it; Firecracker, Cloud Hypervisor and QEMU's virt machine all boot their guests
+/// with this model, and a bare-metal arm64 server boots from ACPI with none.
+fn device_tree_model_is_a_virtual_machines(model: &[u8]) -> bool {
+    model.strip_suffix(b"\0").unwrap_or(model) == b"linux,dummy-virt"
+}
+
+/// Whether this fcvm runs in a virtual machine. Its guest's serial console is then slow:
+/// every byte is an exit to a VMM that is itself a guest's process (see
+/// `SLOW_CONSOLE_BOOT_ARGS` in commands/podman/vm_config.rs). Read once.
+pub fn runs_in_a_virtual_machine() -> bool {
+    static IN_A_VM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN_A_VM.get_or_init(|| {
+        std::fs::read_to_string("/proc/cpuinfo")
+            .is_ok_and(|cpuinfo| cpuinfo_is_a_virtual_machines(&cpuinfo))
+            || std::fs::read("/sys/firmware/devicetree/base/model")
+                .is_ok_and(|model| device_tree_model_is_a_virtual_machines(&model))
+    })
+}
+
 /// Whether a guest console line is logged at INFO (fc-agent's own lines and
 /// container output) or at DEBUG (everything else). A guest kernel crash
 /// headline is logged apart from both, by [`log_kernel_crash_headline`].
@@ -1653,6 +1683,32 @@ mod tests {
     }
 
     use super::*;
+
+    /// A guest is told apart from a bare-metal host by the x86 `hypervisor` flag or by
+    /// the device tree model every VMM fcvm drives gives its arm64 guests.
+    #[test]
+    fn a_virtual_machine_is_told_from_its_cpu_flags_or_its_device_tree_model() {
+        let guest = "processor\t: 0\nflags\t\t: fpu vme de hypervisor lahf_lm\nbogomips\t: 1\n";
+        let metal = "processor\t: 0\nflags\t\t: fpu vme de lahf_lm\nbogomips\t: 1\n";
+        assert!(cpuinfo_is_a_virtual_machines(guest));
+        assert!(!cpuinfo_is_a_virtual_machines(metal));
+        // A flag that only contains the word, and the word outside the flags line.
+        assert!(!cpuinfo_is_a_virtual_machines(
+            "flags\t\t: fpu nohypervisor\nmodel name\t: hypervisor\n"
+        ));
+        // arm64's cpuinfo has a Features line and no such flag.
+        assert!(!cpuinfo_is_a_virtual_machines(
+            "processor\t: 0\nFeatures\t: fp asimd evtstrm\n"
+        ));
+        assert!(device_tree_model_is_a_virtual_machines(
+            b"linux,dummy-virt\0"
+        ));
+        assert!(device_tree_model_is_a_virtual_machines(b"linux,dummy-virt"));
+        assert!(!device_tree_model_is_a_virtual_machines(
+            b"Raspberry Pi 5\0"
+        ));
+        assert!(!device_tree_model_is_a_virtual_machines(b""));
+    }
 
     /// A helper spawned through `helper_command` is killed when the thread that spawned it
     /// exits, as fcvm's threads do when fcvm is killed (#1316). A plain command's child lives on.
