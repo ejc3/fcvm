@@ -647,9 +647,11 @@ export interface PotatoDrop {
 
 export interface PotatoRung {
   size: number;
-  /** The shortest hold of a lap a round of this size completed, ever. */
-  record_hold_ms: number | null;
-  record_at: number | null;
+  /** The fastest pace, in catches per second, a round of this size held for one full lap. */
+  record_pace: number | null;
+  record_pace_at: number | null;
+  /** The record that stood before this one; null until a record of this size has been beaten. */
+  record_prev_pace: number | null;
   /** What ended its latest round. */
   broke: PotatoDrop | null;
   rounds: number;
@@ -1300,8 +1302,9 @@ function parsePotato(v: unknown): Potato | null {
     if (!isObj(r)) throw new ProtocolError(`${at} is not an object`);
     return {
       size: num(r, "size", at),
-      record_hold_ms: numOrNull(r, "record_hold_ms", at),
-      record_at: numOrNull(r, "record_at", at),
+      record_pace: numOrNull(r, "record_pace", at),
+      record_pace_at: numOrNull(r, "record_pace_at", at),
+      record_prev_pace: numOrNull(r, "record_prev_pace", at),
       broke: parsePotatoDrop(r["broke"], `${at}.broke`),
       rounds: numOrNull(r, "rounds", at) ?? 0,
     };

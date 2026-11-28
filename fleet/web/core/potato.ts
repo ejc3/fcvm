@@ -438,14 +438,14 @@ export interface LadderView {
 
 export function ladderOf(p: Potato): LadderView {
   return {
-    caption: "Ring sizes, smallest first. A record is the shortest hold of a lap that completed.",
-    head: { players: "Ring", record: "Record hold", broke: "What ended its last round", rounds: "Rounds" },
+    caption: "Ring sizes, smallest first. A record is the fastest pace, in catches per second, a round of that size held for a full lap.",
+    head: { players: "Ring", record: "Record pace", broke: "What ended its last round", rounds: "Rounds" },
     rows: p.ladder.map((g) => {
       const skipped = p.capacity > 0 && g.size > p.capacity;
       return {
         size: g.size,
         players: String(g.size),
-        record: g.record_hold_ms === null ? (g.rounds > 0 ? "no lap completed" : "--") : ms(g.record_hold_ms),
+        record: g.record_pace === null ? (g.rounds > 0 ? "no lap completed" : "--") : `${Math.round(g.record_pace * 100) / 100} catches/s`,
         broke: g.broke ? `${brokeText(g.broke)}, lap ${g.broke.lap + 1} at ${ms(g.broke.hold_ms)}` : skipped ? `skipped: the host runs ${p.capacity} players` : "",
         rounds: String(g.rounds),
         current: g.size === p.size,

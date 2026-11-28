@@ -102,8 +102,6 @@ interface Lap {
 
 interface Rung {
   size: number;
-  record_hold_ms: number | null;
-  record_at: number | null;
   record_pace: number | null;
   record_pace_at: number | null;
   record_prev_pace: number | null;
@@ -185,7 +183,7 @@ export class MockPotato {
     this.host = host;
     this.rand = rng(opts.seed ?? 4096);
     this.cpus = opts.cpus ?? null;
-    this.ladder = this.rungs().map((size) => ({ size, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 }));
+    this.ladder = this.rungs().map((size) => ({ size, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 }));
     // the host says hello: the first round starts a second later, as the coordinator's tick starts it
     this.scheduleStart(1000);
   }
@@ -225,8 +223,7 @@ export class MockPotato {
     const seq = r?.seq ?? 0;
     const hold = r ? this.holdAt(r, seq) : 0;
     return {
-      // the coordinator no longer sends the old hold records (PROTOCOL.md): only the pace record
-      ladder: this.ladder.map(({ record_hold_ms: _h, record_at: _a, ...g }) => ({ ...g, broke: g.broke && { ...g.broke } })),
+      ladder: this.ladder.map((g) => ({ ...g, broke: g.broke && { ...g.broke } })),
       size: r?.size ?? this.ladder[this.rung]?.size ?? null,
       round: r && {
         id: r.id,
@@ -509,10 +506,6 @@ export class MockPotato {
     if (rung) {
       rung.rounds += 1;
       rung.broke = drop;
-      if (r.best_lap_hold_ms !== null && (rung.record_hold_ms === null || r.best_lap_hold_ms < rung.record_hold_ms)) {
-        rung.record_hold_ms = r.best_lap_hold_ms;
-        rung.record_at = now;
-      }
     }
     const catches = r.seq === null ? 0 : r.seq + 1;
     if (catches > 0 && (this.records.longest_round === null || catches > this.records.longest_round.value)) {
@@ -716,7 +709,7 @@ export class MockPotato {
     this.cpuQueue = [];
     if (over.players !== undefined) this.opts.players = over.players;
     if (over.cpus !== undefined) this.cpus = over.cpus === null || over.cpus <= 0 ? null : over.cpus;
-    this.ladder = (over.cpus === undefined && over.players === undefined ? this.ladder.map((g) => g.size) : this.rungs()).map((size) => ({ size, record_hold_ms: null, record_at: null, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 }));
+    this.ladder = (over.cpus === undefined && over.players === undefined ? this.ladder.map((g) => g.size) : this.rungs()).map((size) => ({ size, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 }));
     if (over.cpus !== undefined || over.players !== undefined) this.rung = 0;
     this.records = { fastest_cycle_ms: null, longest_round: null };
     this.lastDrop = null;

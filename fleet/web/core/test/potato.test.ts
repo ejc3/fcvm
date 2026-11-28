@@ -78,9 +78,9 @@ function potato(over: Partial<Potato> = {}): Potato {
     capacity: 96,
     next_round_at: null,
     ladder: [
-      { size: 2, record_hold_ms: 1458, record_at: T - 30_000, rounds: 3, broke: BROKE },
-      { size: 4, record_hold_ms: null, record_at: null, broke: null, rounds: 0 },
-      { size: 8, record_hold_ms: null, record_at: null, broke: null, rounds: 0 },
+      { size: 2, record_pace: 4.5, record_pace_at: T - 30_000, record_prev_pace: 3.25, rounds: 3, broke: BROKE },
+      { size: 4, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 },
+      { size: 8, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: null, rounds: 0 },
     ],
     round: round(),
     players: [
@@ -128,6 +128,8 @@ describe("potato in the snapshot", () => {
     expect(p.capacity).toBe(0);
     expect(p.round).toBeNull();
     expect(p.ladder.map((r) => [r.size, r.rounds])).toEqual([[2, 1], [4, 1]]);
+    expect(p.ladder.map((r) => [r.record_pace, r.record_pace_at, r.record_prev_pace])).toEqual([[0.5, 4101, null], [null, null, null]]);
+    expect(ladderOf(p).rows.map((r) => r.record)).toEqual(["0.5 catches/s", "no lap completed"]);
     expect(p.ladder[0]!.broke).toMatchObject({ reason: "proof", player: 1, stage: "proof", seq: 3 });
     expect(p.last_drop).toMatchObject({ reason: "not_listening", player: 1, thrower: 0, stage: "waking", stage_ms: 90, listening_after_ms: 84, sleep_stages: { save_ms: 61 }, wake_stages: {} });
     expect(p.records.fastest_cycle_ms).toEqual({ value: 650, size: 2, player: 0, at: 4750 });
@@ -366,13 +368,13 @@ describe("drops, the ladder and the records", () => {
 
   it("fills the ladder: each size's record, what broke it, its rounds, the current size and sizes the host skips", () => {
     const l = ladderOf(potato({ capacity: 4 }));
-    expect(l.head).toEqual({ players: "Ring", record: "Record hold", broke: "What ended its last round", rounds: "Rounds" });
+    expect(l.head).toEqual({ players: "Ring", record: "Record pace", broke: "What ended its last round", rounds: "Rounds" });
     expect(l.rows.map((r) => [r.players, r.record, r.broke, r.rounds, r.current, r.skipped])).toEqual([
-      ["2", "1458 ms", "player 1 still waking (90 ms), lap 6 at 1182 ms", "3", false, false],
+      ["2", "4.5 catches/s", "player 1 still waking (90 ms), lap 6 at 1182 ms", "3", false, false],
       ["4", "--", "", "0", true, false],
       ["8", "--", "skipped: the host runs 4 players", "0", false, true],
     ]);
-    const tried = ladderOf(potato({ ladder: [{ size: 2, record_hold_ms: null, record_at: null, broke: { ...BROKE, lap: 0 }, rounds: 1 }] }));
+    const tried = ladderOf(potato({ ladder: [{ size: 2, record_pace: null, record_pace_at: null, record_prev_pace: null, broke: { ...BROKE, lap: 0 }, rounds: 1 }] }));
     expect(tried.rows[0]!.record).toBe("no lap completed");
   });
 
