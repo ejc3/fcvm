@@ -3829,34 +3829,12 @@ separately.
   `filled_holes_mapped` counts the pages replay mapped at holes earlier clones filled.
 - **Replay trades memory for latency.** A replaying clone materialises the recorded set at
   restore instead of faulting it in as it runs. The set is a union over the recording
-  windows of a generation's first few clones (above). With three waves of 1000 rootless
-  nginx clones per snapshot at C=128, each held 330 s, past the 300 s window (256 MiB
-  guests; m8gd.metal-24xl, Ubuntu's 7.0.0-1018-aws, btrfs on NVMe RAID0; one snapshot per
-  arm, #2056), the set held 68 MiB with every clone's window unioned and 66 MiB with the
-  bound, and wave 3's private memory was 68.5 and 69.9 MiB per clone. With the guest's
-  120 s boot burst gone (#2052) these clones' windows record the same pages, so on this
-  workload the bound changes nothing; it bounds growth where windows differ. Where they
-  differ it holds the set. Seven clones in turn, one run per arm, each reading a different
-  128 MiB of an 896 MiB tmpfs file that the snapshot of a 2 GiB alpine guest holds, inside a
-  60 s window, the seventh repeating the first's 128 MiB (c8gd.metal-24xl, Ubuntu's
-  7.0.0-1018-aws, btrfs on NVMe RAID0; private memory is the clone's Firecracker
-  `Anonymous` after its read):
-
-  | clone | set after it, MiB (all windows / bound) | clone private memory, MiB (all windows / bound) |
-  |---|---|---|
-  | 1 | 316 / 321 | 182 / 174 |
-  | 2 | 455 / 456 | 393 / 381 |
-  | 3 | 586 / 587 | 530 / 512 |
-  | 4 | 721 / 718 | 662 / 643 |
-  | 5 | 851 / 718 | 792 / 774 |
-  | 6 | 982 / 718 | 923 / 776 |
-  | 7, as 1 | 982 / 718 | 923 / 645 |
-
-  The repeat clone was no slower with the bound (all windows first, then the bound): 877
-  and 1,216 demand faults, replay 59 and 43 ms, restore acknowledged in 52 and 44 ms. In copy
-  mode every replayed page is a private copy, so a clone also holds pages it would never have
-  touched, including a clone that is created and destroyed at once (#955, #956). Turn replay
-  off for workloads that spawn many clones which never run, or
+  windows of a generation's first few clones (above). With the guest's 120 s boot burst gone
+  (#2052), clones of one workload record the same pages, so there the bound changes nothing;
+  it bounds the set's growth where the clones' windows differ, and there it holds the set.
+  In copy mode every replayed page is a private copy, so a clone also holds pages it would
+  never have touched, including a clone that is created and destroyed at once (#955, #956).
+  Turn replay off for workloads that spawn many clones which never run, or
   bound what each clone replays with `--uffd-prefetch-max-mib` (`FCVM_UFFD_PREFETCH_MAX_MIB`
   for the implicit server): replay stops planning once it has passed that much of the set,
   and the rest faults on demand (#955). Unbounded by default.

@@ -1,5 +1,7 @@
 # Restore: where the time goes between resume and fc-agent ready
 
+A historical record: measured on the stock host kernel 7.0.0-1013-aws, which fcvm no longer uses.
+
 One session on one c8g.metal-48xl (192 cores, kernel 7.0.0-1013-aws), fcvm at 4f67a0fbd (built from
 this branch at 320b5a55, which differs from it under bench/start-rate only), measured with the tools
 at 3d43a1c52, store on btrfs in RAM. Guest: nginx:alpine, 1 vCPU, 256 MiB, rootless network,
