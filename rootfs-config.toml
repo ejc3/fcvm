@@ -561,7 +561,7 @@ guest_kvm = true
 kernel_version = "7.3.3"
 kernel_repo = "ejc3/fcvm"
 kernel_sha = "bb3a9cf0f7cc"
-kernel_artifact_sha256 = "c92d9f7c3c415d1a0fd3d738bb3f8fead961d6de177623bb067301616061403c"
+kernel_artifact_sha256 = "6a0a3e0cbe7623593fbc62c3c51ba82ab72761c91a873b180a86652627201a1f"
 
 # Build configuration - these files determine when kernel needs rebuilding
 # SHA is computed from contents of all files matching these patterns
