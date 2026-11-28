@@ -362,22 +362,22 @@ theorem design_keeps_fork_level_lostDeviceIrq :
     healthy Cfg.level (replayWhile Design.firecracker Cfg.level Run.fork_level_lostDeviceIrq (init Cfg.level)) = true := by
   decide
 
-/-- R1, `fork-rebase` in `level`, 4 steps:
+/-- R1, `fork-chain` in `level`, 4 steps:
 1. the VMM pauses the vCPUs
 2. the VMM saves the state
 3. a new VM is restored from the image
 4. the VMM resumes the vCPUs
 
 Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en] device-waits; counter exact -/
-def Run.rebase_level_lostDeviceIrq : List Label :=
+def Run.chain_level_lostDeviceIrq : List Label :=
   [.pause, .save, .restore, .resume]
 
-theorem breaks_rebase_level_lostDeviceIrq :
-    (replay Today.forkRebase Cfg.level Run.rebase_level_lostDeviceIrq (init Cfg.level)).map (lostDeviceIrq Cfg.level) = some true := by
+theorem breaks_chain_level_lostDeviceIrq :
+    (replay Today.forkChain Cfg.level Run.chain_level_lostDeviceIrq (init Cfg.level)).map (lostDeviceIrq Cfg.level) = some true := by
   decide
 
-theorem design_keeps_rebase_level_lostDeviceIrq :
-    healthy Cfg.level (replayWhile Design.firecracker Cfg.level Run.rebase_level_lostDeviceIrq (init Cfg.level)) = true := by
+theorem design_keeps_chain_level_lostDeviceIrq :
+    healthy Cfg.level (replayWhile Design.firecracker Cfg.level Run.chain_level_lostDeviceIrq (init Cfg.level)) = true := by
   decide
 
 /-- R2, `cloud-hypervisor` in `offline`, 8 steps:
@@ -438,24 +438,6 @@ theorem breaks_ch_offline_strayEnable :
 
 theorem design_keeps_ch_offline_strayEnable :
     healthy Cfg.offline (replayWhile Design.cloudHypervisor Cfg.offline Run.ch_offline_strayEnable (init Cfg.offline)) = true := by
-  decide
-
-/-- R2, `fork-default` in `offline`, 4 steps:
-1. the VMM pauses the vCPUs
-2. the VMM saves the state
-3. a new VM is restored from the image
-4. the VMM resumes the vCPUs
-
-Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest STOPPED offline tmr[DIS] sgi[en]; spi[en latch] device-waits; counter exact -/
-def Run.fork_offline_strayEnable : List Label :=
-  [.pause, .save, .restore, .resume]
-
-theorem breaks_fork_offline_strayEnable :
-    (replay Today.forkDefault Cfg.offline Run.fork_offline_strayEnable (init Cfg.offline)).map (strayEnable) = some true := by
-  decide
-
-theorem design_keeps_fork_offline_strayEnable :
-    healthy Cfg.offline (replayWhile Design.firecracker Cfg.offline Run.fork_offline_strayEnable (init Cfg.offline)) = true := by
   decide
 
 /-- R1, `cloud-hypervisor` in `dump`, 5 steps:
@@ -1001,44 +983,6 @@ theorem design_keeps_fork_lags_clockOffClone :
     healthy Cfg.lags (replayWhile Design.firecracker Cfg.lags Run.fork_lags_clockOffClone (init Cfg.lags)) = true := by
   decide
 
-/-- R4, `fork-rebase` in `lags`, 5 steps:
-1. the VMM pauses the vCPUs
-2. host time passes while the guest does not run
-3. the VMM saves the state
-4. a new VM is restored from the image
-5. the VMM resumes the vCPUs
-
-Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
-def Run.rebase_lags_clockOff : List Label :=
-  [.pause, .wait, .save, .restore, .resume]
-
-theorem breaks_rebase_lags_clockOff :
-    (replay Today.forkRebase Cfg.lags Run.rebase_lags_clockOff (init Cfg.lags)).map (clockOff) = some true := by
-  decide
-
-theorem design_keeps_rebase_lags_clockOff :
-    healthy Cfg.lags (replayWhile Design.firecracker Cfg.lags Run.rebase_lags_clockOff (init Cfg.lags)) = true := by
-  decide
-
-/-- R4, `fork-rebase` in `lags`, 5 steps:
-1. the VMM pauses the vCPUs
-2. host time passes while the guest does not run
-3. the VMM saves the state
-4. a new VM is restored from the image
-5. the VMM resumes the vCPUs
-
-Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
-def Run.rebase_lags_clockOffClone : List Label :=
-  [.pause, .wait, .save, .restore, .resume]
-
-theorem breaks_rebase_lags_clockOffClone :
-    (replay Today.forkRebase Cfg.lags Run.rebase_lags_clockOffClone (init Cfg.lags)).map (clockOffClone) = some true := by
-  decide
-
-theorem design_keeps_rebase_lags_clockOffClone :
-    healthy Cfg.lags (replayWhile Design.firecracker Cfg.lags Run.rebase_lags_clockOffClone (init Cfg.lags)) = true := by
-  decide
-
 /-- R4, `fork-before-630` in `nv-dump`, 4 steps:
 1. the VMM pauses the vCPUs
 2. the VMM saves the state
@@ -1225,44 +1169,6 @@ theorem breaks_nested_nvLags_clockOffClone :
 
 theorem design_keeps_nested_nvLags_clockOffClone :
     healthy Cfg.nvLags (replayWhile Design.firecracker Cfg.nvLags Run.nested_nvLags_clockOffClone (init Cfg.nvLags)) = true := by
-  decide
-
-/-- R4, `fork-rebase` in `nv-lags`, 5 steps:
-1. the VMM pauses the vCPUs
-2. host time passes while the guest does not run
-3. the VMM saves the state
-4. a new VM is restored from the image
-5. the VMM resumes the vCPUs
-
-Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
-def Run.rebase_nvLags_clockOff : List Label :=
-  [.pause, .wait, .save, .restore, .resume]
-
-theorem breaks_rebase_nvLags_clockOff :
-    (replay Today.forkRebase Cfg.nvLags Run.rebase_nvLags_clockOff (init Cfg.nvLags)).map (clockOff) = some true := by
-  decide
-
-theorem design_keeps_rebase_nvLags_clockOff :
-    healthy Cfg.nvLags (replayWhile Design.firecracker Cfg.nvLags Run.rebase_nvLags_clockOff (init Cfg.nvLags)) = true := by
-  decide
-
-/-- R4, `fork-rebase` in `nv-lags`, 5 steps:
-1. the VMM pauses the vCPUs
-2. host time passes while the guest does not run
-3. the VMM saves the state
-4. a new VM is restored from the image
-5. the VMM resumes the vCPUs
-
-Ends in: cpu0: run/in-guest tmr[en] sgi[en]; cpu1: run/in-guest tmr[en] sgi[en]; spi[en]; counter off by 1 of host time, 0 of CNTVOFF_EL2 -/
-def Run.rebase_nvLags_clockOffClone : List Label :=
-  [.pause, .wait, .save, .restore, .resume]
-
-theorem breaks_rebase_nvLags_clockOffClone :
-    (replay Today.forkRebase Cfg.nvLags Run.rebase_nvLags_clockOffClone (init Cfg.nvLags)).map (clockOffClone) = some true := by
-  decide
-
-theorem design_keeps_rebase_nvLags_clockOffClone :
-    healthy Cfg.nvLags (replayWhile Design.firecracker Cfg.nvLags Run.rebase_nvLags_clockOffClone (init Cfg.nvLags)) = true := by
   decide
 
 end Resume

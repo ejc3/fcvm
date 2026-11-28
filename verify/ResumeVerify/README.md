@@ -72,8 +72,8 @@ make verify-resume-search RESUME_ARGS=mutants   # every mutant of the designs; e
 make verify-counter-probe                 # probe/: what a counter write does on this host's KVM (arm64, kvm-arm.mode=nested)
 ```
 
-The search is 2,844,058 states over eight configurations; the mutants' search is about three
-times that work. In CI the first took 7 s at 2,626,361 states, before the re-based fork's rule
+The search is 2,817,400 states over eight configurations; the mutants' search is about three
+times that work. In CI the first took 7 s at 2,626,361 states, before the chain's rule
 book was added, and the second 22 s. The
 guest-step lemmas (`Guest0.lean`, `Guest1.lean`) are most of the library's build time, about
 90 s each, side by side.
@@ -84,7 +84,7 @@ guest-step lemmas (`Guest0.lean`, `Guest1.lean`) are most of the library's build
 |---|---|
 | `Spec.lean` | The state, the guest's steps, KVM's rules with file and line, the save, the restore one request at a time (`Op`, `apply`), what a VMM writes to a paused source (`SrcOp`, `srcApply`), `step`, `Reachable`. `Rules` is the rule books' type, `Cfg` what exists around the guest |
 | `Labels.lean` | The list of steps the search expands, and `labels_complete`: none is left out |
-| `Today.lean` | `cloudHypervisor` (a354afd77), `cloudHypervisorRepin` (the fork's fix branch, 4c327e57), `cloudHypervisorUpstream` (upstream main at 4969a51a3d3f, `clock_restore_mode` preserve or advance), `forkBefore630` (ba79650e), `forkDefault` (2a33289b55b7), `forkNested` (dbea5779fb37) |
+| `Today.lean` | `cloudHypervisor` (a354afd77), `cloudHypervisorRepin` (the fork's fix branch, 4c327e57), `cloudHypervisorUpstream` (upstream main at 4969a51a3d3f, `clock_restore_mode` preserve or advance), `forkBefore630` (ba79650e), `forkDefault` (df341d66cfef, `main`'s default pin), `forkNested` (8750b5219068, `main`'s nested arm64 pin), `forkChain` (96d35ac08e49, the chain #2211 moves to) |
 | `Design.lean` | `Design.cloudHypervisor`, `Design.firecracker`: each VMM with the five repairs |
 | `Mutants.lean` | 27 mutants of the designs: each repair put back, and things a VMM must not do |
 | `Properties.lean` | R1 to R6 as tests on a state |
@@ -130,7 +130,7 @@ reset at the save, #799) or an interrupt with nothing behind it. Four mutants do
 
 `lake exe resume-breaks`, shortest run to each break (`@n` is its length in steps; where
 configurations differ the shortest is given). NV2 configurations run only the fork's rule
-books; `fork-rebase` runs in all eight.
+books; `fork-chain` runs in all eight.
 
 | Rule book | R1 | R2 | R3 | R4 | R5 | R6 |
 |---|---|---|---|---|---|---|
@@ -138,10 +138,10 @@ books; `fork-rebase` runs in all eight.
 | `cloud-hypervisor-repin` (fix branch) | lostDeviceIrq@5 (level device only) | holds | holds | clockOff@3 | proved | holds |
 | `cloud-hypervisor-upstream-preserve` | lostDeviceIrq@5 (level device only) | holds | holds | source resumed in place: clockOff@3. Clone: right, unless its source's clock had moved (@7) | proved | holds |
 | `cloud-hypervisor-upstream-advance` | lostDeviceIrq@5 (level device only) | holds | holds | source: clockOff@3. Clone: clockOffClone@5, ahead by the host time since the pause | proved | holds |
-| `fork-default` | lostDeviceIrq@4 (level device only) | strayEnable@4 | holds | clockOff@3 | proved [b] | holds |
+| `fork-default` (df341d66cfef, `main`'s default pin) | lostDeviceIrq@4 (level device only) | holds | holds | clockOff@3 | proved [b] | holds |
 | `fork-before-630` (NV2) [a] | timerCannotFire@6 (`CNTVOFF_EL2` not zero) | lostNestedMask@5 | holds | clockOff@3 (gaps), @4 (pause in place), @5 (`CNTVOFF_EL2` not zero) | proved [b] | holds |
-| `fork-nested` (NV2) [a] | holds | lostNestedMask@5 | holds | clockOff@5, only by the two gaps of `BREAKS.md`, 6 | proved [b] | holds |
-| `fork-rebase` (139f0e595157, written, not run; also NV2 [a]) | lostDeviceIrq@4 (level device only) | holds | holds | clockOff@5, only by the two gaps of `BREAKS.md`, 6 | proved [b] | holds |
+| `fork-nested` (8750b5219068, `main`'s nested pin; NV2) [a] | holds | lostNestedMask@5 | holds | clockOff@5, only by the two gaps of `BREAKS.md`, 6 | proved [b] | holds |
+| `fork-chain` (96d35ac08e49, the target of #2211, not yet pinned; also NV2 [a]) | lostDeviceIrq@4 (level device only) | holds | holds | holds | proved [b] | holds |
 | `design-cloud-hypervisor` | proved | proved | proved | proved | proved | proved |
 | `design-firecracker` (also NV2 [a]) | proved | proved | proved | proved | proved [b] | proved |
 
@@ -208,13 +208,13 @@ other):
   state it reaches (`not_sound_of_run`), not from its flag.
 - `cloudHypervisor_not_sound` and the like: each of today's rule books fails a named field of
   `Sound`.
-- `forkRebase_repaired`: the re-based fork with the three things it lacks (the image's counter
-  the one of the pause, the pause recorded at a load, the level information), in its own order
-  of a load, keeps R1 to R6 in every configuration. `forkRebase_vs_design`: with those three it
-  is `design-firecracker` but for where the ioctl sits in a load. `forkRebase_loadLag`,
-  `forkRebaseLoadRecorded_loadLag`, `forkRebaseLoadRecorded_saveLag`: its two gaps one at a
-  time (`BREAKS.md`, 10).
-- Each of the 64 runs of `Breaks.lean` and the 27 of `MutantBreaks.lean`: possible under the
+- `forkChain_repaired`: the chain at 96d35ac08e49 with the one thing it lacks (the level
+  information), in its own order of a load, keeps R1 to R6 in every configuration.
+  `forkChain_vs_design`: with it the chain is `design-firecracker` but for where the ioctl sits
+  in a load. `forkChain_noLag`: neither of break 6's two gaps leaves the clone's clock off;
+  `forkChain_fields_close_the_gaps`: with `cntAtPause` or `freezeLoaded` put back as
+  139f0e595157 had it, its gap does (`BREAKS.md`, 10).
+- Each of the 59 runs of `Breaks.lean` and the 27 of `MutantBreaks.lean`: possible under the
   rule book named, and the test true at its end (`decide`). `break_reachable` turns any of them
   into a reachable state.
 - `labels_complete`: the search expands every step there is.
@@ -259,8 +259,8 @@ search and the mutants and compares both with their expected files.
 **Read** (in the source at the named commit, not run): every rule of `Spec.lean` and
 `Today.lean`. Kernel paths are under arch/arm64/kvm/ at v7.3.3. The faithfulness review of
 c58a2d263 checked each rule against the source and found them faithful apart from what later
-commits change. `Today.forkRebase` was added after both reviews and has been read by its
-author alone, at a commit whose code had not run on a box.
+commits change. `Today.forkChain` and the re-cited `forkDefault` and `forkNested` were written
+after both reviews and have been read by their author alone.
 
 **Observed:**
 

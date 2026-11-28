@@ -3,7 +3,9 @@ import ResumeVerify.Spec
 /-!
 # The VMMs as they are
 
-One rule book per VMM as fcvm pins it, every rule with the file and line it was read from.
+One rule book per VMM as fcvm pins it at `main` da5f2bb22, and the Firecracker chain #2211
+moves every profile but the GPU and phone ones to (`forkChain`), every rule with the file and
+line it was read from.
 "Read" means read in the source at the named commit; nothing here was observed in a running
 VM. Host KVM is Linux v7.3.3 for all of them (`Spec.lean`).
 -/
@@ -155,13 +157,27 @@ def forkBefore630 : Rules :=
     advance := false, levelInfo := false, clearInverted := false,
     nestedIcc := false, onSave := [.devEvent], onResume := [.kick], restore := fcOrder false }
 
-/-- The fork as pinned for every profile but the nested arm64 one, ejc3/firecracker
-2a33289b55b7 (rootfs-config.toml `[firecracker]`). It does not carry 0baf5b0b: for the
-counter it is `forkBefore630`. Its guests are not hypervisors. -/
-def forkDefault : Rules := { forkBefore630 with name := "fork-default", onResume := [] }
+/-- The fork as `main` (da5f2bb22) pins it for every profile but the nested arm64 one and the
+GPU and phone profiles, ejc3/firecracker df341d66cfef (rootfs-config.toml `[firecracker]`):
+upstream 2a8d0138cdf9 and the default chain. It carries no counter code: for the counter it is
+`forkBefore630`. Its guests are not hypervisors. Against `forkBefore630`:
 
-/-- The fork as pinned for the nested arm64 profile, ejc3/firecracker dbea5779fb37, which has
-0baf5b0b and 865fcab0: `KVM_ARM_SET_COUNTER_OFFSET` at boot, before the register replay of a
+* The clear-registers are written with the complement of the saved value (9e4961dad6ab:
+  src/vmm/src/arch/aarch64/gic/regs.rs:136; `clears_on_write`, gicv3/regs/redist_regs.rs:66,
+  dist_regs.rs:120): `clearInverted`.
+* The vsock device's `kick` signals the event queue only while a reset event waits for the
+  guest (src/vmm/src/devices/virtio/vsock/device.rs:436-460), which in the model is the
+  interrupt the save already raised: no `.kick`. It also replays the TX queue's notification,
+  which raises an interrupt only for descriptors the guest published, an event of the device
+  the model's device may raise at any time once the guest runs. -/
+def forkDefault : Rules :=
+  { forkBefore630 with name := "fork-default", onResume := [], clearInverted := true }
+
+/-- The fork as `main` (da5f2bb22) pins it for the nested arm64 profile, ejc3/firecracker
+8750b5219068: dbea5779fb37 and one commit, which writes the clear-registers with the complement
+of the saved value (src/vmm/src/arch/aarch64/gic/regs.rs:136; `clears_on_write`,
+gicv3/regs/redist_regs.rs:66, dist_regs.rs:120): `clearInverted`. It is not on upstream main.
+dbea5779fb37 has 0baf5b0b and 865fcab0 (the lines below are dbea5779fb37's): `KVM_ARM_SET_COUNTER_OFFSET` at boot, before the register replay of a
 restore from vCPU 0's saved `CNTPCT_EL0` (src/vmm/src/builder.rs:520-535), and on `resume_vm`
 moved by the time since `pause_vm` (src/vmm/src/lib.rs:478-524). A restored VM starts with
 `paused_at_counter: None`, so the time between its load and its resume is not taken out.
@@ -171,63 +187,64 @@ a failed ioctl at a resume is an error and the VM stays paused. -/
 def forkNested : Rules :=
   { name := "fork-nested",
     slotsFromRestore := false, cntAtPause := false, freeze := true, freezeLoaded := false,
-    advance := false, levelInfo := false, clearInverted := false,
+    advance := false, levelInfo := false, clearInverted := true,
     nestedIcc := false, onSave := [.devEvent], onResume := [.kick], restore := fcOrder true }
 
-/-- The fork re-based on upstream main, ejc3/firecracker 139f0e595157 (branch
-wip/fcvm-base-2a8d0138-nv2: upstream 2a8d0138cdf9, the default chain to 9e4961dad6ab, and five
-commits). Read at that commit; written, not yet run. Its counter and vGIC code is not behind
-`--enable-nv2`, so it is the rule book of an ordinary guest and of a guest hypervisor.
+/-- The fork's chain on upstream main with every patch fcvm carries, ejc3/firecracker
+96d35ac08e49 (branch wip/fcvm-base-2a8d0138-nv2-r2: upstream 2a8d0138cdf9, the default chain to
+df341d66cfef, and six commits: the x86_64 nested state, `--enable-nv2`, the counter offset, the
+register dump, the dirty-log reset a slot at a time, and the `ICH_*_EL2` registers). This is
+the target: #2211 moves every profile but the GPU and phone ones to it; `main` (da5f2bb22) does
+not pin it yet. Read at that commit. Its counter and vGIC code is not behind `--enable-nv2`, so
+it is the rule book of an ordinary guest and of a guest hypervisor. Lines are 96d35ac08e49's.
 
 * Addressing as every pin of the fork: each vCPU's redistributor and CPU interface by that
-  vCPU's saved MPIDR (`construct_kvm_mpidrs`, src/vmm/src/lib.rs:932-940, 647-651).
+  vCPU's saved MPIDR (`construct_kvm_mpidrs`, src/vmm/src/lib.rs:971, used by `save_state`,
+  lib.rs:661).
 * The clear-registers are written with the complement of the saved value
-  (src/vmm/src/arch/aarch64/gic/regs.rs:139-151; `clears_on_write`,
+  (src/vmm/src/arch/aarch64/gic/regs.rs:154; `clears_on_write`,
   gicv3/regs/redist_regs.rs:66, dist_regs.rs:120): 9e4961dad6ab, `clearInverted`.
 * A guest hypervisor's `ICH_HCR_EL2`, `ICH_VMCR_EL2`, `ICH_LR0..15_EL2` and the
   `ICH_AP0Rn_EL2`/`ICH_AP1Rn_EL2` its priority bits allow are read where the `ICC_*` registers
   are, when `KVM_HAS_DEVICE_ATTR` finds `ICH_HCR_EL2` for that MPIDR, and written after them
-  (gicv3/regs/icc_regs.rs:39-72, 188-202, 214-218, 243-270): `nestedIcc`. KVM answers that
+  (gicv3/regs/icc_regs.rs:39-66, 174-210, 214-218, 220-270): `nestedIcc`. KVM answers that
   attribute for a vCPU with a virtual EL2 only (v7.3.3 vgic-sys-reg-v3.c:366-370, 461-472),
   bounds the active-priority index as it does for `ICC_APxRn_EL1` (314-335), and its setters
-  store the value and nothing else (300-305).
-* The image's counter is the one read at the save: `save_state` reads every register of the
-  list (src/vmm/src/arch/aarch64/vcpu.rs:233-240), and a pause does not move the offset
-  (`cntAtPause := false`).
-* `pause_vm` records the host counter after the vCPUs are parked, once
-  (src/vmm/src/lib.rs:568-581); `resume_vm` moves the offset on by the host time since, before
-  the devices are kicked and the vCPUs run (lib.rs:543-558): `freeze`. A VM built from a
-  snapshot starts with `paused_at_counter: None` (src/vmm/src/builder.rs:725-726), so its first
-  resume moves nothing and the host time since the ioctl of the load is in its counter
-  (`freezeLoaded := false`). At a boot the offset is the host counter (builder.rs:389-403).
-* No request for `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` anywhere under src/vmm/src.
+  store the value and nothing else (300-305). A save that finds a vCPU with a virtual EL2 and
+  no such registers is refused (lib.rs:675-682).
+* The image's counter is the guest's counter at the pause: `save_state` writes the pause's
+  host counter less the offset into `VmState::guest_counter_at_pause` (lib.rs:684-688); the
+  vCPUs' saved `CNTPCT_EL0` are read later, at the save (src/vmm/src/arch/aarch64/vcpu.rs:233),
+  and a load sets the offset from the field, not from them (src/vmm/src/builder.rs:623-629):
+  `cntAtPause`. A state without the field, which an earlier build wrote, falls back to vCPU 0's
+  saved `CNTPCT_EL0`; the layout mark refuses such a file anyway
+  (src/vmm/src/snapshot/mod.rs:52-58).
+* `pause_vm` records the host counter after the vCPUs are parked, once (lib.rs:582-596);
+  `resume_vm` moves the offset on by the host time since, before the devices are kicked and the
+  vCPUs run, and drops the record only once they run (lib.rs:546-575): `freeze`. A VM built
+  from a snapshot is built paused with the load's host counter as its record
+  (builder.rs:618, 733), so its first resume takes out the time since the load:
+  `freezeLoaded`. At a boot the offset is the host counter (builder.rs:389-403).
+* No request for `KVM_DEV_ARM_VGIC_GRP_LEVEL_INFO` anywhere under src/vmm/src: `levelInfo` is
+  false, and break 3 stays.
 * The save still publishes the vsock reset in the source's event queue and raises its
   interrupt (src/vmm/src/devices/virtio/vsock/device.rs:258-290, 479-487): `.devEvent`. A
   resume raises that queue's interrupt only while the event waits for the guest
-  (device.rs:436-457), as the default pin does.
+  (device.rs:436-460), as the default pin does.
 * A load: every vCPU made and the vGIC after them (`create_vcpus`,
-  src/vmm/src/vstate/vm.rs:292-308; src/vmm/src/arch/aarch64/vm.rs:103-109), then
-  `KVM_ARM_SET_COUNTER_OFFSET` with the host counter less vCPU 0's saved `CNTPCT_EL0`
-  (builder.rs:618-646), then for each vCPU its `KVM_ARM_VCPU_INIT`, its registers in the saved
-  order and `KVM_SET_MP_STATE` (builder.rs:651-656; vcpu.rs:270-300), then the distributor and
-  per vCPU its redistributor and its CPU interface (builder.rs:662-664;
-  gicv3/regs/mod.rs:44-58), then the devices. `KVM_ARM_VCPU_INIT` is issued after the ioctl,
-  not before it; it resets no offset (v7.3.3 arch_timer.c `kvm_timer_vcpu_reset`). This is
-  `fcOrder true`.
-* This is the path on which the ioctl succeeds and the snapshot was made by a VM this build
-  booted or restored, whose two saved counters are equal. A failed ioctl or an image with no
-  `CNTPCT_EL0` is logged and leaves the counters to the register replay (builder.rs:625-645).
-  A snapshot of an earlier layout is refused (src/vmm/src/snapshot/mod.rs:82-84). -/
-def forkRebase : Rules :=
-  { name := "fork-rebase",
-    slotsFromRestore := false, cntAtPause := false, freeze := true, freezeLoaded := false,
+  src/vmm/src/vstate/vm.rs:294; builder.rs:587-591), then `KVM_ARM_SET_COUNTER_OFFSET`
+  (builder.rs:612-653), then for each vCPU its `KVM_ARM_VCPU_INIT`, its registers in the saved
+  order and `KVM_SET_MP_STATE` (builder.rs:655-662; vcpu.rs:270), then the distributor and per
+  vCPU its redistributor and its CPU interface (builder.rs:668), then the devices.
+  `KVM_ARM_VCPU_INIT` is issued after the ioctl, not before it; it resets no offset (v7.3.3
+  arch_timer.c `kvm_timer_vcpu_reset`). This is `fcOrder true`.
+* This is the path on which the ioctl succeeds. A failed ioctl is logged and leaves the
+  counters to the register replay, and the VM owns no offset (builder.rs:631-650). -/
+def forkChain : Rules :=
+  { name := "fork-chain",
+    slotsFromRestore := false, cntAtPause := true, freeze := true, freezeLoaded := true,
     advance := false, levelInfo := false, clearInverted := true,
     nestedIcc := true, onSave := [.devEvent], onResume := [], restore := fcOrder true }
-
-/-- `forkRebase` with the pause recorded at the load: the host counter read for the offset of
-the load kept as `paused_at_counter`, so that the first resume takes out the time since. -/
-def forkRebaseLoadRecorded : Rules :=
-  { forkRebase with name := "fork-rebase-load-recorded", freezeLoaded := true }
 
 end Today
 

@@ -347,32 +347,30 @@ theorem Design.cloudHypervisorOffsetLast_sound : Sound Design.cloudHypervisorOff
         clearSet_inv, rebuilt, vcpuOf, emptyVM, memVcpu, freshVcpu, VM.get, VM.set, Image.slot, IrqSt.none,
         hnv, h0, h1, hc0, hc1]⟩
 
-/-- The re-based fork (`Today.forkRebase`) with the three things it lacks, in its own order of
-a load: the image's counter is the one of the pause, the pause is recorded at the load, and
-the lines of the level-triggered interrupts are saved and restored. -/
-def Design.forkRebaseRepaired : Rules :=
-  { Today.forkRebase with
-    name := "fork-rebase-repaired", cntAtPause := true, freezeLoaded := true, levelInfo := true,
-    restore := Today.fcOrder true ++ [.level] }
+/-- The fork's chain on upstream main (`Today.forkChain`) with the one thing it lacks, in its
+own order of a load: the lines of the level-triggered interrupts saved and restored. -/
+def Design.forkChainRepaired : Rules :=
+  { Today.forkChain with
+    name := "fork-chain-repaired", levelInfo := true, restore := Today.fcOrder true ++ [.level] }
 
-theorem Design.forkRebaseRepaired_sound : Sound Design.forkRebaseRepaired :=
+theorem Design.forkChainRepaired_sound : Sound Design.forkChainRepaired :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, quiet_devEvent, quiet_nil, fun C i => by
     cases hnv : C.nv <;> cases h0 : i.s0.l2 <;> cases h1 : i.s1.l2 <;> cases hc0 : i.s0.cnt <;>
       cases hc1 : i.s1.cnt <;>
-      simp [build, Design.forkRebaseRepaired, Today.forkRebase, Today.fcOrder, apply, clrOf,
+      simp [build, Design.forkChainRepaired, Today.forkChain, Today.fcOrder, apply, clrOf,
         clearSet_inv, rebuilt, vcpuOf, emptyVM, memVcpu, freshVcpu, VM.get, VM.set, Image.slot,
         IrqSt.none, hnv, h0, h1, hc0, hc1]⟩
 
-/-- With those three, the re-based fork keeps R1 to R6 in every configuration. -/
-theorem forkRebase_repaired {C : Cfg} {s : State} (h : Reachable Design.forkRebaseRepaired C s) :
-    healthy C s = true := sound_healthy Design.forkRebaseRepaired_sound h
+/-- With it, the chain keeps R1 to R6 in every configuration. -/
+theorem forkChain_repaired {C : Cfg} {s : State} (h : Reachable Design.forkChainRepaired C s) :
+    healthy C s = true := sound_healthy Design.forkChainRepaired_sound h
 
-/-- The re-based fork is `Design.firecracker` but for those three and the place of the ioctl
-in a load: after the vCPUs and the vGIC are made, where the design has it first. -/
-theorem forkRebase_vs_design :
-    { Today.forkRebase with
-      name := Design.firecracker.name, cntAtPause := true, freezeLoaded := true,
-      levelInfo := true, restore := Design.firecracker.restore } = Design.firecracker := rfl
+/-- The chain is `Design.firecracker` but for that and the place of the ioctl in a load: after
+the vCPUs and the vGIC are made, where the design has it first. -/
+theorem forkChain_vs_design :
+    { Today.forkChain with
+      name := Design.firecracker.name, levelInfo := true,
+      restore := Design.firecracker.restore } = Design.firecracker := rfl
 
 theorem design_cloudHypervisor {C : Cfg} {s : State} (h : Reachable Design.cloudHypervisor C s) :
     healthy C s = true := sound_healthy Design.cloudHypervisor_sound h
@@ -402,10 +400,8 @@ theorem forkDefault_not_sound : ¬ Sound Today.forkDefault := fun h => nomatch h
 theorem forkBefore630_not_sound : ¬ Sound Today.forkBefore630 := fun h => nomatch h.freeze
 theorem forkNested_not_sound : ¬ Sound Today.forkNested := fun h => nomatch h.cntAtPause
 
-theorem forkRebase_counter_of_save : Today.forkRebase.cntAtPause = false := rfl
-theorem forkRebase_load_not_frozen : Today.forkRebase.freezeLoaded = false := rfl
-theorem forkRebase_no_levelInfo : Today.forkRebase.levelInfo = false := rfl
-theorem forkRebase_not_sound : ¬ Sound Today.forkRebase := fun h => nomatch h.cntAtPause
+theorem forkChain_no_levelInfo : Today.forkChain.levelInfo = false := rfl
+theorem forkChain_not_sound : ¬ Sound Today.forkChain := fun h => nomatch h.levelInfo
 
 /-! ## A recorded run is a reachable state -/
 
@@ -540,7 +536,7 @@ theorem today_r5_forkDefault {C : Cfg} {s : State} (h : Reachable Today.forkDefa
     sourceDisturbed s = false := r5_of_harmless harmless_devEvent harmless_nil h
 theorem today_r5_forkNested {C : Cfg} {s : State} (h : Reachable Today.forkNested C s) :
     sourceDisturbed s = false := r5_of_harmless harmless_devEvent harmless_kick h
-theorem today_r5_forkRebase {C : Cfg} {s : State} (h : Reachable Today.forkRebase C s) :
+theorem today_r5_forkChain {C : Cfg} {s : State} (h : Reachable Today.forkChain C s) :
     sourceDisturbed s = false := r5_of_harmless harmless_devEvent harmless_nil h
 
 /-- What today's VMMs do write to a paused source takes nothing from it, and shows as an
@@ -618,36 +614,33 @@ theorem upstream_resumeInPlace (advance : Bool) :
       (init Cfg.dump)).map clockOff = some true := by
   cases advance <;> decide
 
-/-! ### The re-based fork's two gaps, one at a time -/
+/-! ### The chain's counter: two gaps, each closed by one field -/
 
 /-- Host time passes between a load and its resume. -/
 def Run.loadLag : List Label := [.pause, .save, .restore, .wait, .resume]
 /-- Host time passes between the pause and the save. -/
 def Run.saveLag : List Label := [.pause, .wait, .save, .restore, .resume]
 
-/-- The re-based fork: the clone's counter is ahead by the host time between the load and the
-resume, for an ordinary guest and for a guest hypervisor. -/
-theorem forkRebase_loadLag :
-    (replay Today.forkRebase Cfg.lags Run.loadLag (init Cfg.lags)).map clockOffClone = some true
-      ∧ (replay Today.forkRebase Cfg.nvLags Run.loadLag (init Cfg.nvLags)).map clockOffClone
-          = some true := by
-  decide
-
-/-- With the pause recorded at the load, that run leaves the clone's counter right. -/
-theorem forkRebaseLoadRecorded_loadLag :
-    (replay Today.forkRebaseLoadRecorded Cfg.lags Run.loadLag (init Cfg.lags)).map clockOff
-        = some false
-      ∧ (replay Today.forkRebaseLoadRecorded Cfg.nvLags Run.loadLag (init Cfg.nvLags)).map clockOff
+/-- The chain at 96d35ac08e49: neither run leaves the clone's counter off, for an ordinary
+guest and for a guest hypervisor. -/
+theorem forkChain_noLag :
+    (replay Today.forkChain Cfg.lags Run.loadLag (init Cfg.lags)).map clockOff = some false
+      ∧ (replay Today.forkChain Cfg.nvLags Run.loadLag (init Cfg.nvLags)).map clockOff
+          = some false
+      ∧ (replay Today.forkChain Cfg.lags Run.saveLag (init Cfg.lags)).map clockOff = some false
+      ∧ (replay Today.forkChain Cfg.nvLags Run.saveLag (init Cfg.nvLags)).map clockOff
           = some false := by
   decide
 
-/-- It does not close the other gap: the image holds the counter of the save, so the host time
-between the pause and the save is in the clone's counter. -/
-theorem forkRebaseLoadRecorded_saveLag :
-    (replay Today.forkRebaseLoadRecorded Cfg.lags Run.saveLag (init Cfg.lags)).map clockOffClone
-        = some true
-      ∧ (replay Today.forkRebaseLoadRecorded Cfg.nvLags Run.saveLag (init Cfg.nvLags)).map
-          clockOffClone = some true := by
+/-- What each field carries: with the image's counter read at the save (`cntAtPause := false`,
+as 139f0e595157 had it), the host time between the pause and the save is in the clone's
+counter; with no pause recorded at the load (`freezeLoaded := false`, the same), the host time
+between the load and the resume is. -/
+theorem forkChain_fields_close_the_gaps :
+    (replay { Today.forkChain with cntAtPause := false } Cfg.lags Run.saveLag
+        (init Cfg.lags)).map clockOffClone = some true
+      ∧ (replay { Today.forkChain with freezeLoaded := false } Cfg.lags Run.loadLag
+        (init Cfg.lags)).map clockOffClone = some true := by
   decide
 
 end Resume
